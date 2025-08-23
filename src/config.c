@@ -171,7 +171,7 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     }
     
     /* Create temporary file path for atomic write */
-    if (snprintf(temp_path, sizeof(temp_path), "%s.tmp", config_path) >= sizeof(temp_path)) {
+    if (SAFE_SNPRINTF(temp_path, sizeof(temp_path), "%s.tmp", config_path) != 0) {
         set_error(ERR_INVALID_ARGS, "Temporary file path too long");
         return -1;
     }
@@ -504,8 +504,8 @@ int config_backup(const char *config_path) {
     }
     
     /* Create backup path */
-    if (snprintf(backup_path, sizeof(backup_path), "%s.backup.%s", 
-                config_path, timestamp) >= sizeof(backup_path)) {
+    if (SAFE_SNPRINTF(backup_path, sizeof(backup_path), "%s.backup.%s", 
+                     config_path, timestamp) != 0) {
         set_error(ERR_INVALID_ARGS, "Backup path too long");
         return -1;
     }
@@ -773,7 +773,7 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         const account_t *account = &ctx->accounts[i];
         
         /* Create section name */
-        if (snprintf(section_name, sizeof(section_name), "accounts.%u", account->id) >= sizeof(section_name)) {
+        if (SAFE_SNPRINTF(section_name, sizeof(section_name), "accounts.%u", account->id) != 0) {
             set_error(ERR_ACCOUNT_INVALID, "Account ID too large: %u", account->id);
             return -1;
         }

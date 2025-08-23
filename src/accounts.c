@@ -762,8 +762,8 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
     }
     
     /* Try to find the key in the GPG keyring */
-    if (snprintf(command, sizeof(command), "gpg --list-secret-keys %s >/dev/null 2>&1", 
-                gpg_key_id) >= sizeof(command)) {
+    if (SAFE_SNPRINTF(command, sizeof(command), "gpg --list-secret-keys %s >/dev/null 2>&1", 
+                     gpg_key_id) != 0) {
         log_error("GPG command too long");
         return -1;
     }

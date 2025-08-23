@@ -105,11 +105,6 @@ int toml_get_boolean(const toml_document_t *doc, const char *section,
 int toml_set_string(toml_document_t *doc, const char *section, 
                     const char *key, const char *value);
 
-/**
- * Set integer value in TOML document
- */
-int toml_set_integer(toml_document_t *doc, const char *section, 
-                     const char *key, int value);
 
 /**
  * Set boolean value in TOML document  
@@ -125,25 +120,12 @@ int toml_set_boolean(toml_document_t *doc, const char *section,
  */
 int toml_write_file(const toml_document_t *doc, const char *file_path);
 
-/**
- * Generate TOML string from document
- */
-int toml_generate_string(const toml_document_t *doc, char *buffer, size_t buffer_size);
 
 /**
  * Validate TOML document structure for our specific config schema
  */
 int toml_validate_gitswitch_schema(const toml_document_t *doc);
 
-/**
- * Check if section exists in document
- */
-bool toml_has_section(const toml_document_t *doc, const char *section);
-
-/**
- * Check if key exists in section
- */
-bool toml_has_key(const toml_document_t *doc, const char *section, const char *key);
 
 /**
  * Get list of all sections in document
@@ -151,11 +133,6 @@ bool toml_has_key(const toml_document_t *doc, const char *section, const char *k
 int toml_get_sections(const toml_document_t *doc, char sections[][TOML_MAX_SECTION_LEN], 
                       size_t max_sections, size_t *section_count);
 
-/**
- * Get list of all keys in a section
- */
-int toml_get_keys(const toml_document_t *doc, const char *section, 
-                  char keys[][TOML_MAX_KEY_LEN], size_t max_keys, size_t *key_count);
 
 /**
  * Security validation functions

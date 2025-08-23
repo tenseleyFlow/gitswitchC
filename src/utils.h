@@ -20,12 +20,6 @@
 
 /* Function prototypes */
 
-/**
- * Safe printf utilities - fixes signed/unsigned comparison warnings
- */
-static inline bool safe_snprintf_check(int result, size_t buffer_size) {
-    return (result >= 0 && (size_t)result < buffer_size);
-}
 
 /**
  * String utilities

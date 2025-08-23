@@ -180,7 +180,7 @@ void set_system_error_context(error_code_t code, const char *file, int line,
                  "System error: %s (errno=%d)", strerror(saved_errno), saved_errno);
         
         /* Append system error to message if there's room */
-        if (msg_len < sizeof(g_last_error.message) - 50) {
+        if (msg_len < (int)(sizeof(g_last_error.message) - 50)) {
             snprintf(g_last_error.message + msg_len, 
                     sizeof(g_last_error.message) - msg_len,
                     " (%s)", strerror(saved_errno));
