@@ -18,10 +18,8 @@
 /* Internal helper functions */
 static int execute_git_command(const char *args, char *output, size_t output_size);
 static int validate_git_installation(void);
-static int detect_repository_scope(git_scope_t *detected_scope);
 static bool is_valid_git_config_value(const char *value);
 static int backup_git_config_if_needed(git_scope_t scope);
-static int restore_git_config_if_needed(git_scope_t scope);
 
 /* Initialize git operations */
 int git_ops_init(void) {
@@ -476,9 +474,9 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
     }
     
     /* Build SSH command with security options */
-    if (snprintf(ssh_command, sizeof(ssh_command),
-                 "ssh -i '%s' -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no",
-                 expanded_key_path) >= sizeof(ssh_command)) {
+    if ((size_t)snprintf(ssh_command, sizeof(ssh_command),
+                        "ssh -i '%s' -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no",
+                        expanded_key_path) >= sizeof(ssh_command)) {
         set_error(ERR_INVALID_ARGS, "SSH command too long");
         return -1;
     }
@@ -628,20 +626,6 @@ static int validate_git_installation(void) {
     return 0;
 }
 
-/* Detect repository scope */
-static int detect_repository_scope(git_scope_t *detected_scope) {
-    if (!detected_scope) {
-        return -1;
-    }
-    
-    if (git_is_repository()) {
-        *detected_scope = GIT_SCOPE_LOCAL;
-    } else {
-        *detected_scope = GIT_SCOPE_GLOBAL;
-    }
-    
-    return 0;
-}
 
 /* Validate git config value for security */
 static bool is_valid_git_config_value(const char *value) {
@@ -674,9 +658,3 @@ static int backup_git_config_if_needed(git_scope_t scope) {
     return 0;
 }
 
-/* Restore git config if needed */
-static int restore_git_config_if_needed(git_scope_t scope) {
-    /* TODO: Implement config restore */
-    (void)scope; /* Suppress unused parameter warning */
-    return 0;
-}

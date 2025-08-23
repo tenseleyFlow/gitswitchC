@@ -227,9 +227,9 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     }
     
     /* Build ssh-agent command with socket path */
-    if (snprintf(command, sizeof(command), 
-                 "ssh-agent -a '%s/ssh-agent.%s.sock'", 
-                 socket_dir, account->name) >= sizeof(command)) {
+    if ((size_t)snprintf(command, sizeof(command), 
+                        "ssh-agent -a '%s/ssh-agent.%s.sock'", 
+                        socket_dir, account->name) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "SSH agent command too long");
         return -1;
     }
@@ -359,7 +359,7 @@ int ssh_add_key(ssh_config_t *ssh_config, const char *key_path) {
     }
     
     /* Build ssh-add command */
-    if (snprintf(command, sizeof(command), "ssh-add '%s'", key_path) >= sizeof(command)) {
+    if ((size_t)snprintf(command, sizeof(command), "ssh-add '%s'", key_path) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "SSH add command too long");
         return -1;
     }
@@ -483,7 +483,7 @@ int ssh_configure_host_alias(const account_t *account) {
     log_debug("Configuring SSH host alias: %s", account->ssh_host_alias);
     
     /* Get SSH config directory */
-    if (snprintf(ssh_config_dir, sizeof(ssh_config_dir), "%s/.ssh", getenv("HOME")) >= sizeof(ssh_config_dir)) {
+    if ((size_t)snprintf(ssh_config_dir, sizeof(ssh_config_dir), "%s/.ssh", getenv("HOME")) >= sizeof(ssh_config_dir)) {
         set_error(ERR_INVALID_PATH, "SSH config directory path too long");
         return -1;
     }
@@ -496,7 +496,7 @@ int ssh_configure_host_alias(const account_t *account) {
     }
     
     /* SSH config file path */
-    if (snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config", ssh_config_dir) >= sizeof(ssh_config_path)) {
+    if ((size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config", ssh_config_dir) >= sizeof(ssh_config_path)) {
         set_error(ERR_INVALID_PATH, "SSH config file path too long");
         return -1;
     }
@@ -547,9 +547,9 @@ int ssh_test_connection(const account_t *account, const char *host) {
     /* Build SSH test command */
     if (strlen(account->ssh_host_alias) > 0) {
         /* Use host alias */
-        if (snprintf(command, sizeof(command), 
-                     "ssh -o ConnectTimeout=5 -o BatchMode=yes %s echo 'SSH connection test successful'",
-                     account->ssh_host_alias) >= sizeof(command)) {
+        if ((size_t)snprintf(command, sizeof(command), 
+                            "ssh -o ConnectTimeout=5 -o BatchMode=yes %s echo 'SSH connection test successful'",
+                            account->ssh_host_alias) >= sizeof(command)) {
             set_error(ERR_INVALID_ARGS, "SSH test command too long");
             return -1;
         }
@@ -560,9 +560,9 @@ int ssh_test_connection(const account_t *account, const char *host) {
             return -1;
         }
         
-        if (snprintf(command, sizeof(command),
-                     "ssh -o ConnectTimeout=5 -o BatchMode=yes -i '%s' %s echo 'SSH connection test successful'",
-                     expanded_key_path, host) >= sizeof(command)) {
+        if ((size_t)snprintf(command, sizeof(command),
+                            "ssh -o ConnectTimeout=5 -o BatchMode=yes -i '%s' %s echo 'SSH connection test successful'",
+                            expanded_key_path, host) >= sizeof(command)) {
             set_error(ERR_INVALID_ARGS, "SSH test command too long");
             return -1;
         }
@@ -663,12 +663,12 @@ static int create_isolated_agent_socket_dir(char *socket_dir, size_t socket_dir_
     
     /* Prefer XDG_RUNTIME_DIR if available */
     if (runtime_dir && path_exists(runtime_dir)) {
-        if (snprintf(socket_dir, socket_dir_size, "%s/gitswitch-ssh", runtime_dir) >= socket_dir_size) {
+        if ((size_t)snprintf(socket_dir, socket_dir_size, "%s/gitswitch-ssh", runtime_dir) >= socket_dir_size) {
             set_error(ERR_INVALID_PATH, "Socket directory path too long");
             return -1;
         }
     } else {
-        if (snprintf(socket_dir, socket_dir_size, "%s/gitswitch-ssh-%d", tmp_dir, getuid()) >= socket_dir_size) {
+        if ((size_t)snprintf(socket_dir, socket_dir_size, "%s/gitswitch-ssh-%d", tmp_dir, getuid()) >= socket_dir_size) {
             set_error(ERR_INVALID_PATH, "Socket directory path too long");
             return -1;
         }
