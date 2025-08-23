@@ -135,8 +135,7 @@ void display_header(const char *title) {
     printf("┐\n");
     
     /* Title line */
-    printf("│%s%*s%s%s%*s│\n", 
-           display_colorize("", "header"),
+    printf("│%*s%s%s%*s│\n", 
            padding, "",
            display_colorize(title, "header"),
            COLOR_RESET,
@@ -182,9 +181,13 @@ void display_status(const char *level, const char *message, ...) {
         color_type = "info";
     }
     
-    printf("%s %s\n", 
-           display_colorize(icon, color_type),
-           display_colorize(formatted_message, color_type));
+    if (strlen(formatted_message) > 0) {
+        printf("%s %s\n", 
+               display_colorize(icon, color_type),
+               display_colorize(formatted_message, color_type));
+    } else {
+        printf("%s\n", display_colorize(icon, color_type));
+    }
 }
 
 /* Print error message with context */
