@@ -724,9 +724,19 @@ static int validate_ssh_key_security(const char *ssh_key_path) {
         return -1;
     }
     
-    if ((file_mode & 077) != 0) {
-        log_warning("SSH key file has insecure permissions: %o", file_mode & 0777);
-        return -1;
+    /* Check if it's a private key (should be 600) or public key (can be 644) */
+    if (strstr(ssh_key_path, ".pub") == NULL) {
+        /* Private key - should be 600 */
+        if ((file_mode & 077) != 0) {
+            log_warning("SSH private key file has insecure permissions: %o", file_mode & 0777);
+            return -1;
+        }
+    } else {
+        /* Public key - 644 is acceptable */
+        if ((file_mode & 022) != 0 && (file_mode & 044) == 0) {
+            log_warning("SSH public key file has unusual permissions: %o", file_mode & 0777);
+            /* Continue anyway for public keys */
+        }
     }
     
     /* Check if it looks like a valid SSH key */
