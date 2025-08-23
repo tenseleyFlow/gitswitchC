@@ -223,7 +223,7 @@ int create_directory_recursive(const char *path, mode_t mode) {
     char *p = NULL;
     size_t len;
     
-    if (SAFE_SNPRINTF(temp_path, sizeof(temp_path), "%s", path) != 0) {
+    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s", path) >= sizeof(temp_path)) {
         set_error(ERR_INVALID_ARGS, "Path too long");
         return -1;
     }
@@ -406,8 +406,8 @@ int backup_file(const char *file_path, const char *backup_suffix) {
         return -1;
     }
     
-    if (SAFE_SNPRINTF(backup_path, sizeof(backup_path), "%s%s", 
-                     file_path, backup_suffix) != 0) {
+    if ((size_t)snprintf(backup_path, sizeof(backup_path), "%s%s", 
+                        file_path, backup_suffix) >= sizeof(backup_path)) {
         set_error(ERR_INVALID_ARGS, "Backup path too long");
         return -1;
     }
@@ -520,8 +520,8 @@ bool command_exists(const char *command) {
     
     if (!command) return false;
     
-    if (SAFE_SNPRINTF(test_command, sizeof(test_command), 
-                     "command -v %s >/dev/null 2>&1", command) != 0) {
+    if ((size_t)snprintf(test_command, sizeof(test_command), 
+                        "command -v %s >/dev/null 2>&1", command) >= sizeof(test_command)) {
         return false;
     }
     

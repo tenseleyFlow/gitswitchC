@@ -340,8 +340,8 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
     }
     
     /* Build git config command */
-    if (SAFE_SNPRINTF(command, sizeof(command), "config %s '%s' '%s'", 
-                     scope_flag, key, value) != 0) {
+    if ((size_t)snprintf(command, sizeof(command), "config %s '%s' '%s'", 
+                        scope_flag, key, value) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "Git config command too long");
         return -1;
     }
@@ -374,7 +374,7 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
     }
     
     /* Build git config command */
-    if (SAFE_SNPRINTF(command, sizeof(command), "config %s '%s'", scope_flag, key) != 0) {
+    if ((size_t)snprintf(command, sizeof(command), "config %s '%s'", scope_flag, key) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "Git config command too long");
         return -1;
     }
@@ -410,8 +410,8 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
     }
     
     /* Build git config unset command */
-    if (SAFE_SNPRINTF(command, sizeof(command), "config %s --unset '%s'", 
-                     scope_flag, key) != 0) {
+    if ((size_t)snprintf(command, sizeof(command), "config %s --unset '%s'", 
+                        scope_flag, key) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "Git config command too long");
         return -1;
     }
@@ -441,7 +441,7 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
     }
     
     /* Build git config list command */
-    if (SAFE_SNPRINTF(command, sizeof(command), "config %s --list", scope_flag) != 0) {
+    if ((size_t)snprintf(command, sizeof(command), "config %s --list", scope_flag) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "Git config command too long");
         return -1;
     }
@@ -571,7 +571,7 @@ static int execute_git_command(const char *args, char *output, size_t output_siz
     }
     
     /* Build full git command */
-    if (SAFE_SNPRINTF(command, sizeof(command), "git %s 2>&1", args) != 0) {
+    if ((size_t)snprintf(command, sizeof(command), "git %s 2>&1", args) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "Git command too long");
         return -1;
     }
