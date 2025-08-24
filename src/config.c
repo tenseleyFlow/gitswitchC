@@ -57,6 +57,7 @@ static int validate_config_file_security(const char *config_path);
 static int create_config_directory_secure(const char *config_dir);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
+static int remove_existing_account_sections(toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
 
@@ -179,16 +180,18 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     /* Initialize TOML document */
     toml_init_document(&toml_doc);
     
-    /* Add settings section */
+    /* Add/update settings section */
     if (toml_set_string(&toml_doc, "settings", "default_scope", 
                         config_scope_to_string(ctx->config.default_scope)) != 0) {
         goto cleanup;
     }
     
-    /* Add accounts */
+    /* Add current accounts */
+    log_debug("About to save accounts to TOML doc with %zu sections", toml_doc.section_count);
     if (save_accounts_to_toml(ctx, &toml_doc) != 0) {
         goto cleanup;
     }
+    log_debug("After saving accounts, TOML doc has %zu sections", toml_doc.section_count);
     
     /* Write to temporary file first */
     if (toml_write_file(&toml_doc, temp_path) != 0) {
@@ -759,6 +762,34 @@ static int validate_account_security(const account_t *account) {
     return 0;
 }
 
+/* Remove all existing account sections from TOML document */
+static int remove_existing_account_sections(toml_document_t *doc) {
+    size_t i = 0;
+    
+    if (!doc) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to remove_existing_account_sections");
+        return -1;
+    }
+    
+    /* Iterate through sections and remove account sections */
+    while (i < doc->section_count) {
+        if (string_starts_with(doc->sections[i].name, "accounts.")) {
+            log_debug("Removing existing account section: %s", doc->sections[i].name);
+            
+            /* Shift remaining sections down */
+            for (size_t j = i; j < doc->section_count - 1; j++) {
+                doc->sections[j] = doc->sections[j + 1];
+            }
+            doc->section_count--;
+            /* Don't increment i since we shifted sections down */
+        } else {
+            i++;
+        }
+    }
+    
+    return 0;
+}
+
 /* Save accounts to TOML document */
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc) {
     char section_name[64];
@@ -768,15 +799,23 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         return -1;
     }
     
+    log_debug("Saving %zu accounts to TOML (doc has %zu sections before save)", 
+              ctx->account_count, doc->section_count);
+    
     /* Save each account */
     for (size_t i = 0; i < ctx->account_count; i++) {
         const account_t *account = &ctx->accounts[i];
+        
+        log_debug("Saving account %zu: ID=%u, name='%s', email='%s'", 
+                  i, account->id, account->name, account->email);
         
         /* Create section name */
         if ((size_t)snprintf(section_name, sizeof(section_name), "accounts.%u", account->id) >= sizeof(section_name)) {
             set_error(ERR_ACCOUNT_INVALID, "Account ID too large: %u", account->id);
             return -1;
         }
+        
+        log_debug("Creating/updating section: %s", section_name);
         
         /* Save required fields */
         if (toml_set_string(doc, section_name, "name", account->name) != 0) {
@@ -811,6 +850,15 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
             toml_set_string(doc, section_name, "gpg_key", account->gpg_key_id);
             toml_set_boolean(doc, section_name, "gpg_signing_enabled", account->gpg_signing_enabled);
         }
+    }
+    
+    log_debug("Completed saving %zu accounts. TOML doc now has %zu sections", 
+              ctx->account_count, doc->section_count);
+    
+    /* Debug: List all sections in the document */
+    for (size_t i = 0; i < doc->section_count; i++) {
+        log_debug("TOML section %zu: '%s' (is_set=%s)", 
+                  i, doc->sections[i].name, doc->sections[i].is_set ? "true" : "false");
     }
     
     return 0;

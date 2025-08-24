@@ -582,12 +582,17 @@ bool toml_check_injection_patterns(const char *input, size_t length) {
 static toml_section_t *find_section(toml_document_t *doc, const char *section_name) {
     if (!doc || !section_name) return NULL;
     
+    log_debug("Finding section '%s' among %zu sections", section_name, doc->section_count);
+    
     for (size_t i = 0; i < doc->section_count; i++) {
+        log_debug("  Section %zu: '%s'", i, doc->sections[i].name);
         if (strcmp(doc->sections[i].name, section_name) == 0) {
+            log_debug("  Found matching section!");
             return &doc->sections[i];
         }
     }
     
+    log_debug("  Section '%s' not found", section_name);
     return NULL;
 }
 
@@ -623,12 +628,17 @@ static toml_section_t *find_or_create_section(toml_document_t *doc, const char *
 static toml_keyvalue_t *find_key(toml_section_t *section, const char *key_name) {
     if (!section || !key_name) return NULL;
     
+    log_debug("Finding key '%s' in section with %zu keys", key_name, section->key_count);
+    
     for (size_t i = 0; i < section->key_count; i++) {
+        log_debug("  Key %zu: '%s' = '%s' (is_set=%d)", i, section->keys[i].key, section->keys[i].value, section->keys[i].is_set);
         if (strcmp(section->keys[i].key, key_name) == 0) {
+            log_debug("  Found matching key! is_set=%d", section->keys[i].is_set);
             return &section->keys[i];
         }
     }
     
+    log_debug("  Key '%s' not found", key_name);
     return NULL;
 }
 
@@ -707,7 +717,11 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
     if (c == '"') {
         /* String value */
         kv->type = TOML_TYPE_STRING;
-        return parse_string_value(state, kv->value, sizeof(kv->value));
+        if (parse_string_value(state, kv->value, sizeof(kv->value)) == 0) {
+            kv->is_set = true;
+            return 0;
+        }
+        return -1;
     } else if (c == 't' || c == 'f') {
         /* Boolean value */
         kv->type = TOML_TYPE_BOOLEAN;
