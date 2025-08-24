@@ -746,12 +746,28 @@ static int validate_ssh_key_security(const char *ssh_key_path) {
     }
     
     if (fgets(first_line, sizeof(first_line), key_file)) {
-        /* Check for common SSH key formats */
-        if (!string_starts_with(first_line, "-----BEGIN OPENSSH PRIVATE KEY-----") &&
-            !string_starts_with(first_line, "-----BEGIN RSA PRIVATE KEY-----") &&
-            !string_starts_with(first_line, "-----BEGIN DSA PRIVATE KEY-----") &&
-            !string_starts_with(first_line, "-----BEGIN EC PRIVATE KEY-----") &&
-            !string_starts_with(first_line, "-----BEGIN SSH2 PRIVATE KEY-----")) {
+        /* Check for SSH key formats - both public and private */
+        bool is_valid_key = false;
+        
+        /* Private key formats */
+        if (string_starts_with(first_line, "-----BEGIN OPENSSH PRIVATE KEY-----") ||
+            string_starts_with(first_line, "-----BEGIN RSA PRIVATE KEY-----") ||
+            string_starts_with(first_line, "-----BEGIN DSA PRIVATE KEY-----") ||
+            string_starts_with(first_line, "-----BEGIN EC PRIVATE KEY-----") ||
+            string_starts_with(first_line, "-----BEGIN SSH2 PRIVATE KEY-----")) {
+            is_valid_key = true;
+        }
+        
+        /* Public key formats */
+        if (string_starts_with(first_line, "ssh-rsa ") ||
+            string_starts_with(first_line, "ssh-dss ") ||
+            string_starts_with(first_line, "ssh-ed25519 ") ||
+            string_starts_with(first_line, "ecdsa-sha2-") ||
+            string_starts_with(first_line, "ssh-ecdsa ")) {
+            is_valid_key = true;
+        }
+        
+        if (!is_valid_key) {
             fclose(key_file);
             log_warning("SSH key file format not recognized");
             return -1;
