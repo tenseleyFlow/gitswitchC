@@ -201,7 +201,10 @@ void display_error(const char *context, const char *message, ...) {
     vsnprintf(formatted_message, sizeof(formatted_message), message, args);
     va_end(args);
     
-    if (context) {
+    /* Don't display if message is empty */
+    if (strlen(formatted_message) == 0) return;
+    
+    if (context && strlen(context) > 0) {
         display_status("error", "%s: %s", context, formatted_message);
     } else {
         display_status("error", "%s", formatted_message);
@@ -410,7 +413,7 @@ uint32_t display_account_menu(const gitswitch_ctx_t *ctx) {
     unsigned long selected_id;
     
     if (!ctx || ctx->account_count == 0) {
-        display_error("No accounts available", "");
+        display_error(NULL, "No accounts available");
         return 0;
     }
     
@@ -420,7 +423,7 @@ uint32_t display_account_menu(const gitswitch_ctx_t *ctx) {
     fflush(stdout);
     
     if (!fgets(input, sizeof(input), stdin)) {
-        display_error("Failed to read input", "");
+        display_error(NULL, "Failed to read input");
         return 0;
     }
     
