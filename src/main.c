@@ -1,5 +1,5 @@
 /* gitswitch-c: Safe git identity switching with SSH/GPG isolation
- * Phase 2: Configuration Management - Full CLI with account management
+ * Complete CLI with account management and authentication isolation
  */
 
 #include <stdio.h>
@@ -18,7 +18,7 @@
 
 static void print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
-    printf("\nPhase 5: Complete Authentication Isolation\n");
+    printf("\nComplete Git Identity Management\n");
     printf("Safe git identity switching with actual git configuration management\n");
     printf("\nCommands:\n");
     printf("  add                  Add new account interactively\n");
@@ -45,7 +45,7 @@ static void print_usage(const char *prog_name) {
     printf("  %s work                   # Switch to account matching 'work'\n", prog_name);
     printf("  %s remove 2               # Remove account ID 2\n", prog_name);
     printf("  %s doctor                 # Run health check\n", prog_name);
-    printf("\nPhase 3 Features:\n");
+    printf("\nKey Features:\n");
     printf("- Secure TOML configuration management\n");
     printf("- Interactive account creation with validation\n");
     printf("- Comprehensive account health checking\n");
@@ -57,42 +57,26 @@ static void print_usage(const char *prog_name) {
     printf("- Git configuration validation and testing\n");
 }
 static void print_version(void) {
-    printf("%s version %s (Phase 5: Complete Authentication Isolation)\n", GITSWITCH_NAME, GITSWITCH_VERSION);
+    printf("%s version %s\n", GITSWITCH_NAME, GITSWITCH_VERSION);
     printf("Safe git identity switching with SSH/GPG isolation\n");
     printf("Built with security and reliability in mind\n\n");
-    printf("Phase 2 Features [COMPLETE]:\n");
-    printf("- [DONE] Comprehensive error handling and logging\n");
-    printf("- [DONE] Security-focused utility functions\n");
-    printf("- [DONE] Terminal display with color support\n");
-    printf("- [DONE] Custom secure TOML parser\n");
-    printf("- [DONE] Configuration management with validation\n");
-    printf("- [DONE] Interactive account creation and management\n");
-    printf("- [DONE] SSH/GPG key validation and security checks\n");
-    printf("- [DONE] Comprehensive health checking system\n");
-    printf("- [DONE] Atomic file operations with backups\n");
-    printf("\nPhase 3 Features [COMPLETE]:\n");
-    printf("- [DONE] Git operations and configuration management\n");
-    printf("- [DONE] Repository detection and scope handling\n");
-    printf("- [DONE] Git configuration testing and validation\n");
-    printf("- [DONE] Actual account switching with git integration\n");
-    printf("- [DONE] Local vs global scope automatic detection\n");
-    printf("- [DONE] Git configuration validation and verification\n");
-    printf("\nPhase 4 Features [COMPLETE]:\n");
-    printf("- [DONE] Isolated SSH agents per account\n");
-    printf("- [DONE] SSH agent lifecycle management\n");
-    printf("- [DONE] SSH key loading and validation\n");
-    printf("- [DONE] SSH connection testing and isolation\n");
-    printf("- [DONE] Per-account SSH environment isolation\n");
-    printf("- [DONE] Secure SSH agent socket management\n");
-    printf("\nPhase 5 Features [COMPLETE]:\n");
-    printf("- [DONE] Isolated GPG environments with GNUPGHOME per account\n");
-    printf("- [DONE] Complete GPG signing and key management\n");
-    printf("- [DONE] GPG key import/export and validation\n");
-    printf("- [DONE] Git GPG signing configuration\n");
-    printf("- [DONE] GPG environment isolation and cleanup\n");
-    printf("- [DONE] Production-ready authentication isolation\n");
-    printf("\n[COMPLETE]: All phases implemented!\n");
-    printf("gitswitch-c provides complete SSH/GPG authentication isolation\n");
+    
+    printf("Features:\n");
+    printf("• Comprehensive error handling and logging\n");
+    printf("• Security-focused utility functions\n");
+    printf("• Terminal display with color support\n");
+    printf("• Secure TOML configuration management\n");
+    printf("• Interactive account creation and management\n");
+    printf("• SSH/GPG key validation and security checks\n");
+    printf("• Comprehensive health checking system\n");
+    printf("• Atomic file operations with backups\n");
+    printf("• Git operations and configuration management\n");
+    printf("• Repository detection and scope handling\n");
+    printf("• Isolated SSH agents per account\n");
+    printf("• SSH connection testing and isolation\n");
+    printf("• Isolated GPG environments per account\n");
+    printf("• Complete GPG signing and key management\n");
+    printf("• Production-ready authentication isolation\n");
 }
 static int handle_add_command(gitswitch_ctx_t *ctx);
 static int handle_list_command(gitswitch_ctx_t *ctx);
@@ -246,11 +230,31 @@ int main(int argc, char *argv[]) {
         exit_code = handle_switch_command(&ctx, command);
     }
     
-    /* Save configuration if it was modified and no errors occurred */
-    if (exit_code == EXIT_SUCCESS && !dry_run) {
-        if (config_save(&ctx, ctx.config.config_path) != 0) {
-            display_warning("Failed to save configuration changes");
-            /* Don't fail the command, just warn */
+    /* Save configuration only for commands that modify accounts */
+    bool should_save = false;
+    if (command && exit_code == EXIT_SUCCESS && !dry_run) {
+        if (strcmp(command, "add") == 0 || 
+            strcmp(command, "remove") == 0 || 
+            strcmp(command, "rm") == 0 || 
+            strcmp(command, "delete") == 0) {
+            should_save = true;
+        } else if (strcmp(command, "list") != 0 && 
+                   strcmp(command, "ls") != 0 &&
+                   strcmp(command, "status") != 0 &&
+                   strcmp(command, "doctor") != 0 &&
+                   strcmp(command, "health") != 0 &&
+                   strcmp(command, "config") != 0) {
+            /* Assume it's a switch command - may have modified default scope */
+            should_save = true;
+        }
+        
+        if (should_save) {
+            log_debug("Saving configuration after %s command (account_count=%zu)", 
+                     command, ctx.account_count);
+            if (config_save(&ctx, ctx.config.config_path) != 0) {
+                display_warning("Failed to save configuration changes");
+                /* Don't fail the command, just warn */
+            }
         }
     }
     
