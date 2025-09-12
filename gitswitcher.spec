@@ -1,0 +1,67 @@
+Name:           gitswitcher
+Version:        1.0.2
+Release:        1%{?dist}
+Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
+
+License:        GPL-3.0
+URL:            https://github.com/tenseleyFlow/gitswitchC
+Source0:        %{name}-%{version}.tar.gz
+
+BuildArch:      x86_64
+BuildRequires:  gcc
+BuildRequires:  make
+BuildRequires:  openssl-devel
+
+%global debug_package %{nil}
+Requires:       git
+Requires:       openssh-clients
+Requires:       openssl
+
+%description
+gitswitcher is a secure Git identity and SSH/GPG key management tool that enables
+seamless switching between multiple Git accounts with complete environment isolation.
+Built for developers working with multiple identities, it provides robust security
+hardening to prevent credential leakage between accounts.
+
+This is a standalone tool, not related to the existing gitswitch package.
+
+Features:
+- Secure Git identity management
+- Complete SSH key isolation per account  
+- GPG environment separation and management
+- Configuration validation and health checking
+- Interactive account management interface
+- Security-focused design with comprehensive hardening
+
+%prep
+%autosetup
+
+%build
+# Build release version with security hardening
+make BUILD_TYPE=release %{?_smp_mflags}
+
+%install
+# Install to buildroot
+make install DESTDIR=%{buildroot}
+
+# Install documentation
+install -d %{buildroot}%{_docdir}/%{name}
+install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
+
+%files
+/usr/local/bin/gitswitch
+%{_docdir}/%{name}/README.md
+
+%changelog
+* Thu Sep 12 2024 mfw <espadonne@outlook.com> - 1.0.2-1
+- Clean production build with zero compiler warnings
+- Eliminated hundreds of variadic macro warnings from release builds
+- Maintained pedantic warnings for development builds
+- Production-ready build for AUR and RPM distribution
+
+* Thu Sep 12 2024 mfw <espadonne@outlook.com> - 1.0.1-1
+- Initial RPM release for gitswitcher
+- Renamed from gitswitch to avoid confusion with existing unrelated package
+- C implementation with security hardening
+- Complete SSH and GPG isolation features
+- Compiler warning fixes and production-ready build

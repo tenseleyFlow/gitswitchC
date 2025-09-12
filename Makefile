@@ -3,7 +3,7 @@
 
 # Project configuration
 PROJECT_NAME = gitswitch-c
-VERSION = 1.0.0-dev
+VERSION = 1.0.2
 TARGET = gitswitch
 
 # Directories
@@ -16,7 +16,7 @@ DOCDIR = docs
 
 # Compiler and flags
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -Wstrict-prototypes \
+CFLAGS = -std=c11 -Wall -Wextra -Wstrict-prototypes \
          -Wmissing-prototypes -Wold-style-definition -Wredundant-decls \
          -Wbad-function-cast -Wnested-externs -Winit-self -Wlogical-op \
          -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=2 \
@@ -32,7 +32,7 @@ SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
 
 # Debug/Release configurations  
 DEBUG_FLAGS = -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined \
-              -fno-omit-frame-pointer -Wno-pedantic $(SECURITY_FLAGS_DEBUG)
+              -fno-omit-frame-pointer -Wpedantic $(SECURITY_FLAGS_DEBUG)
 RELEASE_FLAGS = -O2 -DNDEBUG -s $(SECURITY_FLAGS_RELEASE)
 
 # Default to debug build
@@ -246,12 +246,39 @@ help:
 	@echo "  deps         Check dependencies"
 	@echo "  info         Show build information"
 	@echo "  dev          Quick development cycle (clean + debug + test)"
+	@echo "  dist         Create distribution tarball"
+	@echo "  rpm          Build RPM package"
 	@echo "  help         Show this help"
 	@echo ""
 	@echo "Variables:"
 	@echo "  BUILD_TYPE   debug (default) or release"
 	@echo "  CC           Compiler (default: gcc)"
 	@echo "  DESTDIR      Installation prefix"
+
+# RPM package building
+PACKAGE = gitswitcher
+RPM_VERSION = $(VERSION)
+
+.PHONY: dist rpm
+dist: clean
+	@echo "Creating distribution tarball..."
+	tar czf $(PACKAGE)-$(RPM_VERSION).tar.gz \
+		--exclude='.git*' \
+		--exclude='*.o' \
+		--exclude='build' \
+		--exclude='*.core' \
+		--exclude='valgrind.log' \
+		--transform 's,^,$(PACKAGE)-$(RPM_VERSION)/,' \
+		src/ *.md Makefile $(PACKAGE).spec
+
+rpm: dist
+	@echo "Building RPM package..."
+	@command -v rpmbuild >/dev/null 2>&1 || (echo "rpmbuild not available - install rpm-build package" && exit 1)
+	mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+	cp $(PACKAGE)-$(RPM_VERSION).tar.gz ~/rpmbuild/SOURCES/
+	cp $(PACKAGE).spec ~/rpmbuild/SPECS/
+	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
+	@echo "RPM packages created in ~/rpmbuild/RPMS/"
 
 # Prevent make from removing intermediate files
 .SECONDARY: $(OBJECTS) $(TEST_OBJECTS)

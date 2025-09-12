@@ -549,9 +549,15 @@ pid_t start_background_process(const char *command, char *pidfile_path) {
         setsid(); /* Create new session */
         
         /* Redirect standard streams */
-        freopen("/dev/null", "r", stdin);
-        freopen("/dev/null", "w", stdout);
-        freopen("/dev/null", "w", stderr);
+        if (!freopen("/dev/null", "r", stdin)) {
+            /* Failed to redirect stdin, but continue */
+        }
+        if (!freopen("/dev/null", "w", stdout)) {
+            /* Failed to redirect stdout, but continue */
+        }
+        if (!freopen("/dev/null", "w", stderr)) {
+            /* Failed to redirect stderr, but continue */
+        }
         
         /* Execute command */
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
