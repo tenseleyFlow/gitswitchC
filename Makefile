@@ -14,21 +14,41 @@ BINDIR = $(BUILDDIR)/bin
 TESTDIR = tests
 DOCDIR = docs
 
+# Platform detection
+UNAME_S := $(shell uname -s)
+
 # Compiler and flags
 CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -Wstrict-prototypes \
          -Wmissing-prototypes -Wold-style-definition -Wredundant-decls \
-         -Wbad-function-cast -Wnested-externs -Winit-self -Wlogical-op \
+         -Wbad-function-cast -Wnested-externs -Winit-self \
          -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=2 \
-         -Wmissing-include-dirs -Wdate-time -Wformat=2 -Winit-self \
+         -Wmissing-include-dirs -Wformat=2 -Winit-self \
          -Wswitch-default -Wunused -Werror-implicit-function-declaration
 
-# Security hardening flags
-SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
-                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                        -fstack-clash-protection -fcf-protection \
-                        -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+# Platform-specific flags
+ifeq ($(UNAME_S),Linux)
+    # GCC-specific warnings
+    CFLAGS += -Wlogical-op -Wdate-time
+    # Linux-specific security flags
+    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
+                          -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+                            -fstack-clash-protection -fcf-protection \
+                            -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+endif
+
+ifeq ($(UNAME_S),Darwin)
+    # macOS-specific security flags (no cf-protection, stack-clash-protection, or Linux linker flags)
+    SECURITY_FLAGS_DEBUG = -fstack-protector-strong
+    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+    # macOS OpenSSL paths (Homebrew)
+    OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null)
+    ifneq ($(OPENSSL_PREFIX),)
+        INCLUDES += -I$(OPENSSL_PREFIX)/include
+        LDFLAGS += -L$(OPENSSL_PREFIX)/lib
+    endif
+endif
 
 # Debug/Release configurations  
 DEBUG_FLAGS = -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined \
@@ -92,7 +112,7 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) | $(OBJDIR)
 # Link main executable
 $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 	@echo "Linking $@..."
-	$(CC) $(CFLAGS) $(OBJECTS) -o $@ $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
 	@echo "Build complete: $@"
 
 # Install target
@@ -118,7 +138,7 @@ $(OBJDIR)/test_%.o: $(TESTDIR)/%.c $(HEADERS) | $(OBJDIR)
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LIBS)
 
 # Build and run tests
 .PHONY: test
