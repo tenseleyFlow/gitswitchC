@@ -109,8 +109,12 @@ int main(int argc, char *argv[]) {
         {0, 0, 0, 0}
     };
     
-    /* Initialize error handling */
+    /* Initialize error handling - use WARN level for release builds, INFO for debug */
+#ifdef DEBUG
     if (error_init(LOG_LEVEL_INFO, NULL) != 0) {
+#else
+    if (error_init(LOG_LEVEL_WARNING, NULL) != 0) {
+#endif
         fprintf(stderr, "Failed to initialize error handling\n");
         return EXIT_FAILURE;
     }
