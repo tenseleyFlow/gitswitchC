@@ -182,12 +182,13 @@ void display_status(const char *level, const char *message, ...) {
     }
     
     if (strlen(formatted_message) > 0) {
-        printf("%s %s\n", 
+        printf("%s %s\n",
                display_colorize(icon, color_type),
                display_colorize(formatted_message, color_type));
     } else {
         printf("%s\n", display_colorize(icon, color_type));
     }
+    fflush(stdout);
 }
 
 /* Print error message with context */
