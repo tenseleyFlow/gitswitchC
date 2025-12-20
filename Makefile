@@ -3,7 +3,7 @@
 
 # Project configuration
 PROJECT_NAME = gitswitch-c
-VERSION = 1.0.0-dev
+VERSION = 1.0.2
 TARGET = gitswitch
 
 # Directories
@@ -14,25 +14,45 @@ BINDIR = $(BUILDDIR)/bin
 TESTDIR = tests
 DOCDIR = docs
 
+# Platform detection
+UNAME_S := $(shell uname -s)
+
 # Compiler and flags
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -Wstrict-prototypes \
+CFLAGS = -std=c11 -Wall -Wextra -Wstrict-prototypes \
          -Wmissing-prototypes -Wold-style-definition -Wredundant-decls \
-         -Wbad-function-cast -Wnested-externs -Winit-self -Wlogical-op \
+         -Wbad-function-cast -Wnested-externs -Winit-self \
          -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=2 \
-         -Wmissing-include-dirs -Wdate-time -Wformat=2 -Winit-self \
+         -Wmissing-include-dirs -Wformat=2 -Winit-self \
          -Wswitch-default -Wunused -Werror-implicit-function-declaration
 
-# Security hardening flags
-SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
-                      -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                        -fstack-clash-protection -fcf-protection \
-                        -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+# Platform-specific flags
+ifeq ($(UNAME_S),Linux)
+    # GCC-specific warnings
+    CFLAGS += -Wlogical-op -Wdate-time
+    # Linux-specific security flags
+    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
+                          -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+                            -fstack-clash-protection -fcf-protection \
+                            -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+endif
+
+ifeq ($(UNAME_S),Darwin)
+    # macOS-specific security flags (no cf-protection, stack-clash-protection, or Linux linker flags)
+    SECURITY_FLAGS_DEBUG = -fstack-protector-strong
+    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+    # macOS OpenSSL paths (Homebrew)
+    OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null)
+    ifneq ($(OPENSSL_PREFIX),)
+        INCLUDES += -I$(OPENSSL_PREFIX)/include
+        LDFLAGS += -L$(OPENSSL_PREFIX)/lib
+    endif
+endif
 
 # Debug/Release configurations  
 DEBUG_FLAGS = -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined \
-              -fno-omit-frame-pointer -Wno-pedantic $(SECURITY_FLAGS_DEBUG)
+              -fno-omit-frame-pointer -Wpedantic $(SECURITY_FLAGS_DEBUG)
 RELEASE_FLAGS = -O2 -DNDEBUG -s $(SECURITY_FLAGS_RELEASE)
 
 # Default to debug build
@@ -92,7 +112,7 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) | $(OBJDIR)
 # Link main executable
 $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 	@echo "Linking $@..."
-	$(CC) $(CFLAGS) $(OBJECTS) -o $@ $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
 	@echo "Build complete: $@"
 
 # Install target
@@ -118,7 +138,7 @@ $(OBJDIR)/test_%.o: $(TESTDIR)/%.c $(HEADERS) | $(OBJDIR)
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LIBS)
 
 # Build and run tests
 .PHONY: test
@@ -246,12 +266,39 @@ help:
 	@echo "  deps         Check dependencies"
 	@echo "  info         Show build information"
 	@echo "  dev          Quick development cycle (clean + debug + test)"
+	@echo "  dist         Create distribution tarball"
+	@echo "  rpm          Build RPM package"
 	@echo "  help         Show this help"
 	@echo ""
 	@echo "Variables:"
 	@echo "  BUILD_TYPE   debug (default) or release"
 	@echo "  CC           Compiler (default: gcc)"
 	@echo "  DESTDIR      Installation prefix"
+
+# RPM package building
+PACKAGE = gitswitcher
+RPM_VERSION = $(VERSION)
+
+.PHONY: dist rpm
+dist: clean
+	@echo "Creating distribution tarball..."
+	tar czf $(PACKAGE)-$(RPM_VERSION).tar.gz \
+		--exclude='.git*' \
+		--exclude='*.o' \
+		--exclude='build' \
+		--exclude='*.core' \
+		--exclude='valgrind.log' \
+		--transform 's,^,$(PACKAGE)-$(RPM_VERSION)/,' \
+		src/ *.md Makefile $(PACKAGE).spec
+
+rpm: dist
+	@echo "Building RPM package..."
+	@command -v rpmbuild >/dev/null 2>&1 || (echo "rpmbuild not available - install rpm-build package" && exit 1)
+	mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+	cp $(PACKAGE)-$(RPM_VERSION).tar.gz ~/rpmbuild/SOURCES/
+	cp $(PACKAGE).spec ~/rpmbuild/SPECS/
+	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
+	@echo "RPM packages created in ~/rpmbuild/RPMS/"
 
 # Prevent make from removing intermediate files
 .SECONDARY: $(OBJECTS) $(TEST_OBJECTS)
