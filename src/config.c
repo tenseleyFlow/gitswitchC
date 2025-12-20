@@ -626,44 +626,55 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                 continue;
             }
             
-            /* Load optional fields */
-            if (toml_get_string(doc, sections[i], "description", 
+            /* Load optional fields - clear errors after each since missing optional fields are not errors */
+            if (toml_get_string(doc, sections[i], "description",
                                account.description, sizeof(account.description)) != 0) {
                 /* Use name as description if not provided */
                 safe_strncpy(account.description, account.name, sizeof(account.description));
+                clear_error();
             }
-            
+
             if (toml_get_string(doc, sections[i], "preferred_scope", temp_str, sizeof(temp_str)) == 0) {
                 account.preferred_scope = config_parse_scope(temp_str);
+            } else {
+                clear_error();
             }
-            
+
             /* SSH configuration */
-            if (toml_get_string(doc, sections[i], "ssh_key", 
+            if (toml_get_string(doc, sections[i], "ssh_key",
                                account.ssh_key_path, sizeof(account.ssh_key_path)) == 0 &&
                 strlen(account.ssh_key_path) > 0) {
                 account.ssh_enabled = true;
-                
+
                 /* Expand path if needed */
                 char expanded_path[MAX_PATH_LEN];
                 if (expand_path(account.ssh_key_path, expanded_path, sizeof(expanded_path)) == 0) {
                     safe_strncpy(account.ssh_key_path, expanded_path, sizeof(account.ssh_key_path));
                 }
-                
+
                 /* Optional SSH host alias */
-                toml_get_string(doc, sections[i], "ssh_host", 
-                               account.ssh_host_alias, sizeof(account.ssh_host_alias));
+                if (toml_get_string(doc, sections[i], "ssh_host",
+                                   account.ssh_host_alias, sizeof(account.ssh_host_alias)) != 0) {
+                    clear_error();
+                }
+            } else {
+                clear_error();
             }
-            
+
             /* GPG configuration */
-            if (toml_get_string(doc, sections[i], "gpg_key", 
+            if (toml_get_string(doc, sections[i], "gpg_key",
                                account.gpg_key_id, sizeof(account.gpg_key_id)) == 0 &&
                 strlen(account.gpg_key_id) > 0) {
                 account.gpg_enabled = true;
-                
+
                 /* GPG signing preference */
-                if (toml_get_boolean(doc, sections[i], "gpg_signing_enabled", &temp_bool) == 0) {
+                if (toml_get_boolean(doc, sections[i], "gpg_signing_enabled", &temp_bool) != 0) {
+                    clear_error();
+                } else {
                     account.gpg_signing_enabled = temp_bool;
                 }
+            } else {
+                clear_error();
             }
             
             /* Validate and add account */

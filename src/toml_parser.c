@@ -238,69 +238,69 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
 }
 
 /* Get string value from TOML document */
-int toml_get_string(const toml_document_t *doc, const char *section, 
+int toml_get_string(const toml_document_t *doc, const char *section,
                     const char *key, char *value, size_t value_size) {
     const toml_section_t *sec;
     const toml_keyvalue_t *kv;
-    
+
     if (!doc || !section || !key || !value || value_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_get_string");
         return -1;
     }
-    
+
     if (!doc->is_valid) {
         set_error(ERR_CONFIG_INVALID, "TOML document is not valid");
         return -1;
     }
-    
+
     sec = find_section((toml_document_t *)doc, section);
     if (!sec) {
-        set_error(ERR_CONFIG_INVALID, "Section not found: %s", section);
+        /* Section not found - return silently, caller handles missing data */
         return -1;
     }
-    
+
     kv = find_key((toml_section_t *)sec, key);
     if (!kv || !kv->is_set) {
-        set_error(ERR_CONFIG_INVALID, "Key not found: %s.%s", section, key);
+        /* Key not found - return silently, caller handles missing data */
         return -1;
     }
-    
+
     if (kv->type != TOML_TYPE_STRING) {
         set_error(ERR_CONFIG_INVALID, "Key %s.%s is not a string", section, key);
         return -1;
     }
-    
+
     /* Sanitize the value before returning */
     return toml_sanitize_string(kv->value, value, value_size);
 }
 
 /* Get integer value from TOML document */
-int toml_get_integer(const toml_document_t *doc, const char *section, 
+int toml_get_integer(const toml_document_t *doc, const char *section,
                      const char *key, int *value) {
     const toml_section_t *sec;
     const toml_keyvalue_t *kv;
     char *endptr;
     long parsed_value;
-    
+
     if (!doc || !section || !key || !value) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_get_integer");
         return -1;
     }
-    
+
     if (!doc->is_valid) {
         set_error(ERR_CONFIG_INVALID, "TOML document is not valid");
         return -1;
     }
-    
+
     sec = find_section((toml_document_t *)doc, section);
     if (!sec) {
-        set_error(ERR_CONFIG_INVALID, "Section not found: %s", section);
+        /* Section not found - return silently, caller handles missing data */
         return -1;
     }
-    
+
     kv = find_key((toml_section_t *)sec, key);
     if (!kv || !kv->is_set) {
-        set_error(ERR_CONFIG_INVALID, "Key not found: %s.%s", section, key);
+        /* Key not found - return silently, caller handles missing data */
         return -1;
     }
     
@@ -327,30 +327,30 @@ int toml_get_integer(const toml_document_t *doc, const char *section,
 }
 
 /* Get boolean value from TOML document */
-int toml_get_boolean(const toml_document_t *doc, const char *section, 
+int toml_get_boolean(const toml_document_t *doc, const char *section,
                      const char *key, bool *value) {
     const toml_section_t *sec;
     const toml_keyvalue_t *kv;
-    
+
     if (!doc || !section || !key || !value) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_get_boolean");
         return -1;
     }
-    
+
     if (!doc->is_valid) {
         set_error(ERR_CONFIG_INVALID, "TOML document is not valid");
         return -1;
     }
-    
+
     sec = find_section((toml_document_t *)doc, section);
     if (!sec) {
-        set_error(ERR_CONFIG_INVALID, "Section not found: %s", section);
+        /* Section not found - return silently, caller handles missing data */
         return -1;
     }
-    
+
     kv = find_key((toml_section_t *)sec, key);
     if (!kv || !kv->is_set) {
-        set_error(ERR_CONFIG_INVALID, "Key not found: %s.%s", section, key);
+        /* Key not found - return silently, caller handles missing data */
         return -1;
     }
     
