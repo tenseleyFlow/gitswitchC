@@ -275,7 +275,8 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
         if (runtime_dir) {
             printf("\n  Tip: Add to your shell rc for persistent SSH:\n");
-            printf("       export SSH_AUTH_SOCK=%s/gitswitch-ssh/current.sock\n", runtime_dir);
+            printf("    bash/zsh: export SSH_AUTH_SOCK=%s/gitswitch-ssh/current.sock\n", runtime_dir);
+            printf("    fish:     set -gx SSH_AUTH_SOCK %s/gitswitch-ssh/current.sock\n", runtime_dir);
         }
     }
 
