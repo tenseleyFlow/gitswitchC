@@ -80,13 +80,16 @@ bool display_supports_color(void) {
 
 /* Format and colorize text based on content type */
 const char *display_colorize(const char *text, const char *type) {
-    static char colored_buffer[512];
+    /* Use rotating buffers to allow multiple calls in same expression */
+    static char colored_buffers[4][512];
+    static int buffer_index = 0;
+    char *colored_buffer;
     const char *color_code = "";
-    
+
     if (!g_color_enabled || !text || !type) {
         return text;
     }
-    
+
     /* Select color based on type */
     if (strcmp(type, "success") == 0) {
         color_code = COLOR_GREEN;
@@ -105,10 +108,14 @@ const char *display_colorize(const char *text, const char *type) {
     } else {
         return text; /* No coloring */
     }
-    
-    snprintf(colored_buffer, sizeof(colored_buffer), 
+
+    /* Use next buffer in rotation */
+    colored_buffer = colored_buffers[buffer_index];
+    buffer_index = (buffer_index + 1) % 4;
+
+    snprintf(colored_buffer, 512,
              "%s%s%s", color_code, text, COLOR_RESET);
-    
+
     return colored_buffer;
 }
 
