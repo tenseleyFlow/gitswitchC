@@ -118,8 +118,8 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                             log_warning("SSH connection test failed for %s", account->ssh_host_alias);
                         }
                     } else {
-                        /* Test with default GitHub host */
-                        if (ssh_test_connection(account, "github.com") == 0) {
+                        /* Test with default GitHub host (git@ is required for GitHub SSH) */
+                        if (ssh_test_connection(account, "git@github.com") == 0) {
                             log_info("SSH connection test passed for github.com");
                         } else {
                             log_debug("SSH connection test failed for github.com (this may be normal)");

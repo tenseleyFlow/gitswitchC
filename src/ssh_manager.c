@@ -561,11 +561,13 @@ int ssh_test_connection(const account_t *account, const char *host) {
     
     log_debug("Testing SSH connection to: %s", host);
     
-    /* Build SSH test command */
+    /* Build SSH test command using -T (no TTY) for git hosting services
+     * GitHub/GitLab/Bitbucket don't allow shell commands, they return a
+     * greeting message on successful auth (exit code 1 but with success message) */
     if (strlen(account->ssh_host_alias) > 0) {
         /* Use host alias */
-        if ((size_t)snprintf(command, sizeof(command), 
-                            "ssh -o ConnectTimeout=5 -o BatchMode=yes %s echo 'SSH connection test successful'",
+        if ((size_t)snprintf(command, sizeof(command),
+                            "ssh -T -o ConnectTimeout=5 -o BatchMode=yes %s 2>&1",
                             account->ssh_host_alias) >= sizeof(command)) {
             set_error(ERR_INVALID_ARGS, "SSH test command too long");
             return -1;
@@ -576,28 +578,31 @@ int ssh_test_connection(const account_t *account, const char *host) {
         if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
             return -1;
         }
-        
+
         if ((size_t)snprintf(command, sizeof(command),
-                            "ssh -o ConnectTimeout=5 -o BatchMode=yes -i '%s' %s echo 'SSH connection test successful'",
+                            "ssh -T -o ConnectTimeout=5 -o BatchMode=yes -i '%s' %s 2>&1",
                             expanded_key_path, host) >= sizeof(command)) {
             set_error(ERR_INVALID_ARGS, "SSH test command too long");
             return -1;
         }
     }
-    
-    /* Execute SSH test */
-    if (execute_ssh_command(command, output, sizeof(output)) != 0) {
-        set_error(ERR_SSH_CONNECTION_FAILED, "SSH connection test failed to %s: %s", host, output);
-        return -1;
+
+    /* Execute SSH test - for git hosts, check output for success indicators
+     * Note: GitHub returns exit code 1 even on success (no shell access) */
+    (void)execute_ssh_command(command, output, sizeof(output));
+
+    /* Check for authentication success messages from common git hosting services */
+    if (strstr(output, "successfully authenticated") ||  /* GitHub */
+        strstr(output, "Welcome to GitLab") ||           /* GitLab */
+        strstr(output, "logged in as") ||                /* Bitbucket */
+        strstr(output, "Hi ") ||                         /* GitHub greeting */
+        strstr(output, "authentication successful")) {   /* Generic */
+        log_debug("SSH authentication successful to %s", host);
+        return 0;
     }
-    
-    if (!strstr(output, "SSH connection test successful")) {
-        set_error(ERR_SSH_CONNECTION_FAILED, "SSH connection test did not return expected output");
-        return -1;
-    }
-    
-    log_info("SSH connection test successful to: %s", host);
-    return 0;
+
+    log_debug("SSH connection test failed to %s: %s", host, output);
+    return -1;
 }
 
 /* Internal helper functions */
