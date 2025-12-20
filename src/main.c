@@ -305,18 +305,19 @@ static int handle_status_command(gitswitch_ctx_t *ctx) {
 
 static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier) {
     if (!ctx || !identifier) return EXIT_FAILURE;
-    
+
     if (ctx->config.dry_run) {
         display_info("DRY RUN MODE - No actual changes will be made");
     }
-    
+
     if (accounts_switch(ctx, identifier) != 0) {
         display_error("Failed to switch account", get_last_error()->message);
         return EXIT_FAILURE;
     }
-    
-    display_success("Successfully switched to account: %s", ctx->current_account->name);
-    
+
+    /* accounts_switch already prints detailed status, just confirm success */
+    display_success("Switched to: %s", ctx->current_account->name);
+
     return EXIT_SUCCESS;
 }
 
