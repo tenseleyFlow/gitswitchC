@@ -207,29 +207,46 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     char command[512];
     char output[1024];
     char socket_dir[MAX_PATH_LEN];
-    
+    char socket_path[MAX_PATH_LEN];
+
     if (!ssh_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
         return -1;
     }
-    
+
     log_info("Starting isolated SSH agent for account: %s", account->name);
-    
+
     /* Stop any existing agent we own */
     if (ssh_config->agent_owned && ssh_config->agent_pid > 0) {
         log_debug("Stopping existing SSH agent");
         ssh_stop_agent(ssh_config);
     }
-    
+
     /* Create secure socket directory */
     if (create_isolated_agent_socket_dir(socket_dir, sizeof(socket_dir)) != 0) {
         return -1;
     }
-    
+
+    /* Build socket path and check for stale sockets */
+    if ((size_t)snprintf(socket_path, sizeof(socket_path),
+                        "%s/ssh-agent.%s.sock",
+                        socket_dir, account->name) >= sizeof(socket_path)) {
+        set_error(ERR_INVALID_ARGS, "SSH socket path too long");
+        return -1;
+    }
+
+    /* Remove stale socket if it exists */
+    if (path_exists(socket_path)) {
+        log_debug("Removing stale SSH agent socket: %s", socket_path);
+        if (unlink(socket_path) != 0) {
+            set_system_error(ERR_FILE_IO, "Failed to remove stale SSH socket");
+            return -1;
+        }
+    }
+
     /* Build ssh-agent command with socket path */
-    if ((size_t)snprintf(command, sizeof(command), 
-                        "ssh-agent -a '%s/ssh-agent.%s.sock'", 
-                        socket_dir, account->name) >= sizeof(command)) {
+    if ((size_t)snprintf(command, sizeof(command),
+                        "ssh-agent -a '%s'", socket_path) >= sizeof(command)) {
         set_error(ERR_INVALID_ARGS, "SSH agent command too long");
         return -1;
     }
