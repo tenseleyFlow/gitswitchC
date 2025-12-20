@@ -2,6 +2,9 @@
  * Implements secure account switching and management for gitswitch-c
  */
 
+/* Enable POSIX extensions for setenv/unsetenv */
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +21,20 @@
 #include "ssh_manager.h"
 #include "gpg_manager.h"
 
+/* Active session state - tracks SSH/GPG resources for proper cleanup */
+typedef struct {
+    ssh_config_t ssh_config;
+    gpg_config_t gpg_config;
+    bool ssh_active;
+    bool gpg_active;
+    char original_gnupghome[MAX_PATH_LEN];
+    bool had_original_gnupghome;
+    bool gnupghome_saved;
+} active_session_t;
+
+/* Static session state - only one active session at a time */
+static active_session_t g_session = {0};
+
 /* Internal helper functions */
 static uint32_t get_next_available_id(const gitswitch_ctx_t *ctx);
 static int validate_ssh_key_security(const char *ssh_key_path);
@@ -31,14 +48,52 @@ int accounts_init(gitswitch_ctx_t *ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to accounts_init");
         return -1;
     }
-    
+
     /* Initialize account array */
     memset(ctx->accounts, 0, sizeof(ctx->accounts));
     ctx->account_count = 0;
     ctx->current_account = NULL;
-    
+
+    /* Initialize session state */
+    memset(&g_session, 0, sizeof(g_session));
+
     log_debug("Accounts system initialized");
     return 0;
+}
+
+/* Clean up active session resources */
+void accounts_session_cleanup(void) {
+    log_debug("Cleaning up active session resources");
+
+    /* Clean up SSH agent if we started one */
+    if (g_session.ssh_active) {
+        log_info("Stopping SSH agent (pid=%d)", g_session.ssh_config.agent_pid);
+        ssh_manager_cleanup(&g_session.ssh_config);
+        g_session.ssh_active = false;
+    }
+
+    /* Clean up GPG environment if we modified it */
+    if (g_session.gpg_active) {
+        log_info("Cleaning up GPG environment");
+        gpg_manager_cleanup(&g_session.gpg_config);
+        g_session.gpg_active = false;
+    }
+
+    /* Restore original GNUPGHOME environment variable */
+    if (g_session.gnupghome_saved) {
+        if (g_session.had_original_gnupghome) {
+            log_debug("Restoring original GNUPGHOME: %s", g_session.original_gnupghome);
+            setenv("GNUPGHOME", g_session.original_gnupghome, 1);
+        } else {
+            log_debug("Unsetting GNUPGHOME (was not set originally)");
+            unsetenv("GNUPGHOME");
+        }
+        g_session.gnupghome_saved = false;
+    }
+
+    /* Clear session state */
+    memset(&g_session, 0, sizeof(g_session));
+    log_debug("Session cleanup complete");
 }
 
 /* Switch to specified account with SSH isolation and validation */
@@ -64,6 +119,21 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     if (!validate_name(account->name) || !validate_email(account->email)) {
         set_error(ERR_ACCOUNT_INVALID, "Account has invalid name or email");
         return -1;
+    }
+
+    /* Clean up any previous session before starting new one */
+    accounts_session_cleanup();
+
+    /* Save original GNUPGHOME if not already saved */
+    if (!g_session.gnupghome_saved) {
+        const char *orig = getenv("GNUPGHOME");
+        if (orig) {
+            safe_strncpy(g_session.original_gnupghome, orig, sizeof(g_session.original_gnupghome));
+            g_session.had_original_gnupghome = true;
+        } else {
+            g_session.had_original_gnupghome = false;
+        }
+        g_session.gnupghome_saved = true;
     }
 
     /* Determine git scope - use account preference or context default */
@@ -105,20 +175,21 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             log_info("Setting up SSH isolation for account: %s", account->name);
 
-            /* Initialize SSH manager with isolated agents */
-            ssh_config_t ssh_config = {0};
-            if (ssh_manager_init(&ssh_config, SSH_AGENT_ISOLATED) != 0) {
+            /* Initialize SSH manager with isolated agents using session state */
+            memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
+            if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0) {
                 printf("  [!!] SSH agent failed to start\n");
                 log_warning("Failed to initialize SSH manager: %s", get_last_error()->message);
             } else {
                 /* Switch to account's SSH configuration */
-                if (ssh_switch_account(&ssh_config, account) != 0) {
+                if (ssh_switch_account(&g_session.ssh_config, account) != 0) {
                     printf("  [!!] SSH key failed to load\n");
                     log_warning("Failed to switch SSH configuration: %s", get_last_error()->message);
                     /* Clean up SSH manager on failure */
-                    ssh_manager_cleanup(&ssh_config);
+                    ssh_manager_cleanup(&g_session.ssh_config);
                 } else {
                     ssh_ok = true;
+                    g_session.ssh_active = true;  /* Mark session as active for cleanup */
                     printf("  [OK] SSH key loaded\n");
                     log_info("SSH isolation activated for account: %s", account->name);
 
@@ -144,23 +215,24 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
             log_info("Setting up GPG isolation for account: %s", account->name);
 
-            /* Initialize GPG manager with isolated environments */
-            gpg_config_t gpg_config = {0};
-            if (gpg_manager_init(&gpg_config, GPG_MODE_ISOLATED) != 0) {
+            /* Initialize GPG manager with isolated environments using session state */
+            memset(&g_session.gpg_config, 0, sizeof(g_session.gpg_config));
+            if (gpg_manager_init(&g_session.gpg_config, GPG_MODE_ISOLATED) != 0) {
                 printf("  [!!] GPG manager failed to initialize\n");
                 log_warning("Failed to initialize GPG manager: %s", get_last_error()->message);
             } else {
                 /* Switch to account's GPG configuration */
-                if (gpg_switch_account(&gpg_config, account) != 0) {
+                if (gpg_switch_account(&g_session.gpg_config, account) != 0) {
                     printf("  [!!] GPG key failed to activate\n");
                     log_warning("Failed to switch GPG configuration: %s", get_last_error()->message);
                     /* Clean up GPG manager on failure */
-                    gpg_manager_cleanup(&gpg_config);
+                    gpg_manager_cleanup(&g_session.gpg_config);
                 } else {
+                    g_session.gpg_active = true;  /* Mark session as active for cleanup */
                     log_info("GPG isolation activated for account: %s", account->name);
 
                     /* Configure git GPG signing */
-                    if (gpg_configure_git_signing(&gpg_config, account, scope) != 0) {
+                    if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
                         printf("  [!!] GPG signing config failed\n");
                         log_warning("Failed to configure git GPG signing: %s", get_last_error()->message);
                     } else {
@@ -197,6 +269,15 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
 
     /* Set as current account */
     ctx->current_account = account;
+
+    /* Print shell integration tip if SSH was set up */
+    if (ssh_ok) {
+        const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+        if (runtime_dir) {
+            printf("\n  Tip: Add to your shell rc for persistent SSH:\n");
+            printf("       export SSH_AUTH_SOCK=%s/gitswitch-ssh/current.sock\n", runtime_dir);
+        }
+    }
 
     printf("\n");
     log_info("Successfully switched to account: %s (%s)", account->name, account->description);

@@ -27,6 +27,7 @@ static bool is_ssh_agent_running(pid_t pid);
 static int kill_ssh_agent_gracefully(pid_t pid);
 static int validate_ssh_agent_socket(const char *socket_path);
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
+static void kill_orphaned_gitswitch_agents(void);
 
 /* Global SSH configuration for cleanup */
 static ssh_config_t *g_active_ssh_config = NULL;
@@ -216,6 +217,9 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
 
     log_info("Starting isolated SSH agent for account: %s", account->name);
 
+    /* Kill any orphaned gitswitch agents from previous runs */
+    kill_orphaned_gitswitch_agents();
+
     /* Stop any existing agent we own */
     if (ssh_config->agent_owned && ssh_config->agent_pid > 0) {
         log_debug("Stopping existing SSH agent");
@@ -280,8 +284,23 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         return -1;
     }
     
-    log_info("Isolated SSH agent started successfully (PID: %d, Socket: %s)", 
+    log_info("Isolated SSH agent started successfully (PID: %d, Socket: %s)",
              ssh_config->agent_pid, ssh_config->agent_socket_path);
+
+    /* Create/update symlink for easy shell integration */
+    char symlink_path[MAX_PATH_LEN];
+    if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
+                        "%s/current.sock", socket_dir) < sizeof(symlink_path)) {
+        /* Remove old symlink if it exists */
+        unlink(symlink_path);
+        /* Create new symlink to current socket */
+        if (symlink(socket_path, symlink_path) == 0) {
+            log_debug("Created symlink: %s -> %s", symlink_path, socket_path);
+        } else {
+            log_warning("Failed to create socket symlink: %s", strerror(errno));
+        }
+    }
+
     return 0;
 }
 
@@ -846,6 +865,38 @@ static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) 
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to parse ssh-agent output");
         return -1;
     }
-    
+
     return 0;
+}
+
+/* Kill orphaned gitswitch ssh-agents from previous runs */
+static void kill_orphaned_gitswitch_agents(void) {
+    char socket_dir[256];
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+
+    /* Determine socket directory - use short buffer since runtime_dir is typically short */
+    if (runtime_dir && strlen(runtime_dir) < 200 && path_exists(runtime_dir)) {
+        snprintf(socket_dir, sizeof(socket_dir), "%s/gitswitch-ssh", runtime_dir);
+    } else {
+        snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid());
+    }
+
+    /* Use pkill to kill any existing gitswitch ssh-agents */
+    char command[512];
+    snprintf(command, sizeof(command),
+             "pkill -f 'ssh-agent -a %.200s/' 2>/dev/null", socket_dir);
+
+    int result = system(command);
+    if (result == 0) {
+        log_debug("Killed orphaned gitswitch ssh-agents");
+    }
+    /* result != 0 is normal if no agents were running */
+
+    /* Also clean up any stale socket files */
+    char cleanup_cmd[512];
+    snprintf(cleanup_cmd, sizeof(cleanup_cmd),
+             "rm -f %.200s/ssh-agent.*.sock 2>/dev/null", socket_dir);
+    if (system(cleanup_cmd) != 0) {
+        /* Ignore cleanup failures - files may not exist */
+    }
 }

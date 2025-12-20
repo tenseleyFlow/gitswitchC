@@ -116,4 +116,13 @@ void accounts_cleanup_struct(account_t *account);
  */
 int accounts_health_check(const gitswitch_ctx_t *ctx);
 
+/**
+ * Clean up active session resources
+ * - Stops SSH agent if one was started
+ * - Restores original GNUPGHOME environment
+ * - Cleans up isolated GPG home if created
+ * Call this before program exit or when switching accounts
+ */
+void accounts_session_cleanup(void);
+
 #endif /* ACCOUNTS_H */

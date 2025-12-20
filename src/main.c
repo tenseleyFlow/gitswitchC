@@ -15,6 +15,7 @@
 #include "display.h"
 #include "error.h"
 #include "utils.h"
+#include "git_ops.h"
 
 static void print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
@@ -262,7 +263,11 @@ int main(int argc, char *argv[]) {
         }
     }
     
-    /* Cleanup */
+    /* Note: We intentionally do NOT clean up SSH agents on exit.
+     * The agent should persist so subsequent git commands can use it.
+     * Cleanup happens at the start of the next account switch. */
+
+    /* Cleanup error handling */
     error_cleanup();
     return exit_code == EXIT_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
