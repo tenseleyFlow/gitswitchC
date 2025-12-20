@@ -110,11 +110,13 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         git_unset_config_value(GIT_CONFIG_CORE_SSHCOMMAND, scope);
     }
     
-    /* Verify configuration was set correctly */
-    git_current_config_t current_config;
-    if (git_get_current_config(&current_config) == 0) {
-        if (strcmp(current_config.name, account->name) != 0 ||
-            strcmp(current_config.email, account->email) != 0) {
+    /* Verify configuration was set correctly - check the same scope we just wrote to */
+    char verify_name[MAX_NAME_LEN];
+    char verify_email[MAX_EMAIL_LEN];
+    if (git_get_config_value(GIT_CONFIG_USER_NAME, verify_name, sizeof(verify_name), scope) == 0 &&
+        git_get_config_value(GIT_CONFIG_USER_EMAIL, verify_email, sizeof(verify_email), scope) == 0) {
+        if (strcmp(verify_name, account->name) != 0 ||
+            strcmp(verify_email, account->email) != 0) {
             set_error(ERR_GIT_CONFIG_FAILED, "Git configuration verification failed");
             return -1;
         }
@@ -262,55 +264,62 @@ git_scope_t git_get_config_scope(const char *config_key) {
 
 /* Test git configuration */
 int git_test_config(const account_t *account, git_scope_t scope) {
-    git_current_config_t current_config;
-    (void)scope; /* Suppress unused parameter warning */
-    
+    char verify_name[MAX_NAME_LEN];
+    char verify_email[MAX_EMAIL_LEN];
+
     if (!account) {
         set_error(ERR_INVALID_ARGS, "NULL account to git_test_config");
         return -1;
     }
-    
+
     log_info("Testing git configuration for account: %s", account->name);
-    
-    /* Get current configuration and verify it matches */
-    if (git_get_current_config(&current_config) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to read current git configuration");
+
+    /* Get configuration from the specified scope and verify it matches */
+    if (git_get_config_value(GIT_CONFIG_USER_NAME, verify_name, sizeof(verify_name), scope) != 0 ||
+        git_get_config_value(GIT_CONFIG_USER_EMAIL, verify_email, sizeof(verify_email), scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to read git configuration from %s scope",
+                  git_scope_to_flag(scope));
         return -1;
     }
-    
-    if (strcmp(current_config.name, account->name) != 0) {
+
+    if (strcmp(verify_name, account->name) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Git user.name does not match account: expected '%s', got '%s'",
-                  account->name, current_config.name);
+                  account->name, verify_name);
         return -1;
     }
-    
-    if (strcmp(current_config.email, account->email) != 0) {
+
+    if (strcmp(verify_email, account->email) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Git user.email does not match account: expected '%s', got '%s'",
-                  account->email, current_config.email);
+                  account->email, verify_email);
         return -1;
     }
     
     /* Test GPG configuration if enabled */
     if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-        if (strlen(current_config.signing_key) == 0) {
+        char signing_key[MAX_KEY_ID_LEN];
+        char gpg_sign[16];
+
+        if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, signing_key, sizeof(signing_key), scope) != 0 ||
+            strlen(signing_key) == 0) {
             set_error(ERR_GIT_CONFIG_FAILED, "GPG signing key not configured in git");
             return -1;
         }
-        
-        if (!current_config.gpg_signing_enabled) {
+
+        if (git_get_config_value(GIT_CONFIG_COMMIT_GPGSIGN, gpg_sign, sizeof(gpg_sign), scope) != 0 ||
+            strcmp(gpg_sign, "true") != 0) {
             log_warning("GPG signing is configured but not enabled");
         }
-        
+
         /* Test GPG key availability */
         char gpg_test[256];
-        snprintf(gpg_test, sizeof(gpg_test), "gpg --list-secret-keys '%s' >/dev/null 2>&1", 
+        snprintf(gpg_test, sizeof(gpg_test), "gpg --list-secret-keys '%s' >/dev/null 2>&1",
                  account->gpg_key_id);
         if (system(gpg_test) != 0) {
             set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s", account->gpg_key_id);
             return -1;
         }
     }
-    
+
     log_info("Git configuration test passed for %s", account->name);
     return 0;
 }
@@ -475,7 +484,7 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
     
     /* Build SSH command with security options */
     if ((size_t)snprintf(ssh_command, sizeof(ssh_command),
-                        "ssh -i '%s' -o IdentitiesOnly=yes -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no",
+                        "ssh -i '%s' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR",
                         expanded_key_path) >= sizeof(ssh_command)) {
         set_error(ERR_INVALID_ARGS, "SSH command too long");
         return -1;
