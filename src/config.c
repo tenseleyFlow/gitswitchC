@@ -57,7 +57,6 @@ static int validate_config_file_security(const char *config_path);
 static int create_config_directory_secure(const char *config_dir);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
-static int remove_existing_account_sections(toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
 
@@ -767,34 +766,6 @@ static int validate_account_security(const account_t *account) {
         if (!validate_key_id(account->gpg_key_id)) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid GPG key ID: %s", account->gpg_key_id);
             return -1;
-        }
-    }
-    
-    return 0;
-}
-
-/* Remove all existing account sections from TOML document */
-static int remove_existing_account_sections(toml_document_t *doc) {
-    size_t i = 0;
-    
-    if (!doc) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to remove_existing_account_sections");
-        return -1;
-    }
-    
-    /* Iterate through sections and remove account sections */
-    while (i < doc->section_count) {
-        if (string_starts_with(doc->sections[i].name, "accounts.")) {
-            log_debug("Removing existing account section: %s", doc->sections[i].name);
-            
-            /* Shift remaining sections down */
-            for (size_t j = i; j < doc->section_count - 1; j++) {
-                doc->sections[j] = doc->sections[j + 1];
-            }
-            doc->section_count--;
-            /* Don't increment i since we shifted sections down */
-        } else {
-            i++;
         }
     }
     

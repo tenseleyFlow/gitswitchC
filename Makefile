@@ -19,7 +19,7 @@ UNAME_S := $(shell uname -s)
 
 # Compiler and flags
 CC = gcc
-CFLAGS = -std=c11 -Wall -Wextra -Wstrict-prototypes \
+CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
          -Wmissing-prototypes -Wold-style-definition -Wredundant-decls \
          -Wbad-function-cast -Wnested-externs -Winit-self \
          -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=2 \
@@ -50,8 +50,8 @@ ifeq ($(UNAME_S),Darwin)
     endif
 endif
 
-# Debug/Release configurations  
-DEBUG_FLAGS = -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined \
+# Debug/Release configurations
+DEBUG_FLAGS = -g -O0 -DDEBUG -Wp,-U_FORTIFY_SOURCE -fsanitize=address -fsanitize=undefined \
               -fno-omit-frame-pointer -Wpedantic $(SECURITY_FLAGS_DEBUG)
 RELEASE_FLAGS = -O2 -DNDEBUG -s $(SECURITY_FLAGS_RELEASE)
 
