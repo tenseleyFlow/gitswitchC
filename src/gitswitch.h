@@ -8,7 +8,7 @@
 #include <stdint.h>
 
 /* Version information */
-#define GITSWITCH_VERSION "1.0.0-dev"
+#define GITSWITCH_VERSION "1.1.5"
 #define GITSWITCH_NAME "gitswitch-c"
 
 /* Configuration constants */
