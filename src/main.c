@@ -58,26 +58,7 @@ static void print_usage(const char *prog_name) {
     printf("- Git configuration validation and testing\n");
 }
 static void print_version(void) {
-    printf("%s version %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
-    printf("Safe git identity switching with SSH/GPG isolation\n");
-    printf("Built with security and reliability in mind\n\n");
-    
-    printf("Features:\n");
-    printf("• Comprehensive error handling and logging\n");
-    printf("• Security-focused utility functions\n");
-    printf("• Terminal display with color support\n");
-    printf("• Secure TOML configuration management\n");
-    printf("• Interactive account creation and management\n");
-    printf("• SSH/GPG key validation and security checks\n");
-    printf("• Comprehensive health checking system\n");
-    printf("• Atomic file operations with backups\n");
-    printf("• Git operations and configuration management\n");
-    printf("• Repository detection and scope handling\n");
-    printf("• Isolated SSH agents per account\n");
-    printf("• SSH connection testing and isolation\n");
-    printf("• Isolated GPG environments per account\n");
-    printf("• Complete GPG signing and key management\n");
-    printf("• Production-ready authentication isolation\n");
+    printf("%s %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
 }
 static int handle_add_command(gitswitch_ctx_t *ctx);
 static int handle_list_command(gitswitch_ctx_t *ctx);

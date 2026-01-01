@@ -5,10 +5,10 @@
 PROJECT_NAME = gitswitch-c
 TARGET = gitswitch
 
-# Version from git (single source of truth)
-GIT_VERSION := $(shell git describe --tags --always 2>/dev/null | sed 's/^v//' || echo "unknown")
-GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-VERSION_FLAGS = -DGITSWITCH_VERSION=\"$(GIT_VERSION)\" -DGITSWITCH_COMMIT=\"$(GIT_COMMIT)\"
+# Version: use VERSION/COMMIT env vars if set (for tarball builds), else extract from git
+VERSION ?= $(shell git describe --tags --always 2>/dev/null | sed 's/^v//' || echo "unknown")
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+VERSION_FLAGS = -DGITSWITCH_VERSION=\"$(VERSION)\" -DGITSWITCH_COMMIT=\"$(COMMIT)\"
 
 # Directories
 SRCDIR = src
