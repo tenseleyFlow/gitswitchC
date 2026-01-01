@@ -9,6 +9,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "accounts.h"
 #include "config.h"
 #include "toml_parser.h"
 #include "error.h"
@@ -142,12 +143,15 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
         toml_cleanup_document(&toml_doc);
         return -1;
     }
-    
+
     /* Store config path */
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
-    
+
     toml_cleanup_document(&toml_doc);
-    
+
+    /* Detect current account from SSH socket symlink */
+    accounts_detect_current(ctx);
+
     log_info("Configuration loaded successfully: %zu accounts", ctx->account_count);
     return 0;
 }

@@ -125,4 +125,13 @@ int accounts_health_check(const gitswitch_ctx_t *ctx);
  */
 void accounts_session_cleanup(void);
 
+/**
+ * Detect current account from SSH socket symlink
+ * - Reads the current.sock symlink in gitswitch-ssh directory
+ * - Parses account name from socket filename
+ * - Sets ctx->current_account if a match is found
+ * Call this after accounts are loaded from config
+ */
+int accounts_detect_current(gitswitch_ctx_t *ctx);
+
 #endif /* ACCOUNTS_H */

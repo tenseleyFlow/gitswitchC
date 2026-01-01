@@ -996,3 +996,79 @@ int accounts_health_check(const gitswitch_ctx_t *ctx) {
         return -1;
     }
 }
+
+/* Detect current account from SSH socket symlink */
+int accounts_detect_current(gitswitch_ctx_t *ctx) {
+    char symlink_path[MAX_PATH_LEN];
+    char target_path[MAX_PATH_LEN];
+    ssize_t len;
+    const char *runtime_dir;
+    const char *account_name_start;
+    const char *account_name_end;
+    char account_name[MAX_NAME_LEN];
+    size_t name_len;
+
+    if (!ctx) {
+        return -1;
+    }
+
+    /* Already have a current account set */
+    if (ctx->current_account) {
+        return 0;
+    }
+
+    /* Build path to symlink */
+    runtime_dir = getenv("XDG_RUNTIME_DIR");
+    if (!runtime_dir) {
+        log_debug("XDG_RUNTIME_DIR not set, cannot detect current account");
+        return -1;
+    }
+
+    if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
+                         "%s/gitswitch-ssh/current.sock", runtime_dir) >= sizeof(symlink_path)) {
+        return -1;
+    }
+
+    /* Read symlink target */
+    len = readlink(symlink_path, target_path, sizeof(target_path) - 1);
+    if (len < 0) {
+        log_debug("No current.sock symlink found, no active account");
+        return -1;
+    }
+    target_path[len] = '\0';
+
+    /* Parse account name from target: ssh-agent.<name>.sock */
+    account_name_start = strstr(target_path, "ssh-agent.");
+    if (!account_name_start) {
+        log_debug("Symlink target doesn't match expected format: %s", target_path);
+        return -1;
+    }
+    account_name_start += strlen("ssh-agent.");
+
+    account_name_end = strstr(account_name_start, ".sock");
+    if (!account_name_end) {
+        log_debug("Symlink target missing .sock suffix: %s", target_path);
+        return -1;
+    }
+
+    name_len = (size_t)(account_name_end - account_name_start);
+    if (name_len == 0 || name_len >= sizeof(account_name)) {
+        log_debug("Invalid account name length in symlink target");
+        return -1;
+    }
+
+    memcpy(account_name, account_name_start, name_len);
+    account_name[name_len] = '\0';
+
+    /* Find matching account */
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strcmp(ctx->accounts[i].name, account_name) == 0) {
+            ctx->current_account = &ctx->accounts[i];
+            log_debug("Detected current account from symlink: %s", account_name);
+            return 0;
+        }
+    }
+
+    log_debug("No matching account found for name: %s", account_name);
+    return -1;
+}
