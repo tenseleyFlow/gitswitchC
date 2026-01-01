@@ -7,8 +7,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Version information */
-#define GITSWITCH_VERSION "1.1.5"
+/* Version information - can be overridden at build time via -D flags */
+#ifndef GITSWITCH_VERSION
+#define GITSWITCH_VERSION "1.1.7"
+#endif
+#ifndef GITSWITCH_COMMIT
+#define GITSWITCH_COMMIT "unknown"
+#endif
 #define GITSWITCH_NAME "gitswitch-c"
 
 /* Configuration constants */

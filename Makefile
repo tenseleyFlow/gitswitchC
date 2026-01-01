@@ -3,8 +3,12 @@
 
 # Project configuration
 PROJECT_NAME = gitswitch-c
-VERSION = 1.0.2
 TARGET = gitswitch
+
+# Version from git (single source of truth)
+GIT_VERSION := $(shell git describe --tags --always 2>/dev/null | sed 's/^v//' || echo "unknown")
+GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+VERSION_FLAGS = -DGITSWITCH_VERSION=\"$(GIT_VERSION)\" -DGITSWITCH_COMMIT=\"$(GIT_COMMIT)\"
 
 # Directories
 SRCDIR = src
@@ -24,7 +28,8 @@ CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
          -Wbad-function-cast -Wnested-externs -Winit-self \
          -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=2 \
          -Wmissing-include-dirs -Wformat=2 -Winit-self \
-         -Wswitch-default -Wunused -Werror-implicit-function-declaration
+         -Wswitch-default -Wunused -Werror-implicit-function-declaration \
+         $(VERSION_FLAGS)
 
 # Platform-specific flags
 ifeq ($(UNAME_S),Linux)

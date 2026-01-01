@@ -58,7 +58,7 @@ static void print_usage(const char *prog_name) {
     printf("- Git configuration validation and testing\n");
 }
 static void print_version(void) {
-    printf("%s version %s\n", GITSWITCH_NAME, GITSWITCH_VERSION);
+    printf("%s version %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
     printf("Safe git identity switching with SSH/GPG isolation\n");
     printf("Built with security and reliability in mind\n\n");
     
