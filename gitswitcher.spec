@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.0.2
+Version:        1.1.9
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -7,7 +7,7 @@ License:        GPL-3.0
 URL:            https://github.com/tenseleyFlow/gitswitchC
 Source0:        %{name}-%{version}.tar.gz
 
-BuildArch:      x86_64
+# BuildArch is not specified to allow building on all architectures including aarch64
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  openssl-devel
@@ -53,6 +53,15 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Tue Jan 07 2026 mfw <espadonne@outlook.com> - 1.1.9-1
+- Fix: Use WARNING log level for release builds (was INFO)
+- Fix: Silence error logs for missing optional config fields
+- Fix: Improve SSH connection testing for git hosting services
+- Feature: Persistent SSH agents with session state tracking
+- Fix: Account detection from SSH socket symlinks
+- Fix: Version stamping from git tags for tarball builds
+- Multi-architecture support (aarch64, x86_64, etc.)
+
 * Thu Sep 12 2024 mfw <espadonne@outlook.com> - 1.0.2-1
 - Clean production build with zero compiler warnings
 - Eliminated hundreds of variadic macro warnings from release builds
