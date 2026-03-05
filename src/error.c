@@ -408,8 +408,8 @@ int safe_snprintf(char *buffer, size_t buffer_size, const char *fmt, ...) {
         set_error(ERR_INVALID_ARGS, "snprintf output truncated");
         return -1;
     }
-    
-    return result;
+
+    return 0;
 }
 
 /* Safe memory allocation with error context */
