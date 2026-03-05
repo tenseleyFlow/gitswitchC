@@ -390,15 +390,11 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
         return -1;
     }
     
-    /* Set GPG program if using isolated environment */
-    if (gpg_config->mode == GPG_MODE_ISOLATED && strlen(gpg_config->gnupg_home) > 0) {
-        char gpg_command[MAX_PATH_LEN + 50];
-        if (safe_snprintf(gpg_command, sizeof(gpg_command), "gpg --homedir '%s'", gpg_config->gnupg_home) == 0) {
-            if (git_set_config_value("gpg.program", gpg_command, scope) != 0) {
-                log_warning("Failed to set git GPG program");
-            }
-        }
-    }
+    /* GNUPGHOME is already set via gpg_set_environment() - no need to override
+     * gpg.program. git inherits the env var and gpg uses it automatically.
+     * Setting gpg.program to "gpg --homedir ..." breaks because git execs it
+     * as a single binary path, not a shell command. */
+    git_unset_config_value("gpg.program", scope);
     
     log_info("Git GPG signing configured successfully for account: %s", account->name);
     return 0;
