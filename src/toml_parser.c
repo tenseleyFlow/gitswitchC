@@ -531,7 +531,8 @@ bool toml_validate_file_path(const char *path) {
     }
     
     /* Check for absolute paths outside user home */
-    if (path[0] == '/' && !string_starts_with(path, "/home/") && 
+    if (path[0] == '/' && !string_starts_with(path, "/home/") &&
+        !string_starts_with(path, "/Users/") &&
         !string_starts_with(path, "/tmp/")) {
         log_warning("Suspicious absolute path: %s", path);
         return false;
