@@ -73,8 +73,15 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         log_warning("Failed to backup git configuration");
     }
     
+    /* When setting global scope inside a repo, clear local config so stale
+     * values (e.g. signing key from a prior account) don't take precedence */
+    if (scope == GIT_SCOPE_GLOBAL && git_is_repository()) {
+        log_info("Clearing local git config to prevent stale overrides");
+        git_clear_config(GIT_SCOPE_LOCAL);
+    }
+
     log_info("Setting git configuration for account: %s (%s scope)", account->name, scope_flag);
-    
+
     /* Set user.name */
     if (git_set_config_value(GIT_CONFIG_USER_NAME, account->name, scope) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set user.name");
