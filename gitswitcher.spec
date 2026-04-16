@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.3.0
+Version:        1.3.1
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -37,8 +37,9 @@ Features:
 %autosetup
 
 %build
-# Build release version with security hardening
-make BUILD_TYPE=release %{?_smp_mflags}
+# Build release version with security hardening. Pass VERSION explicitly so
+# the binary reports the RPM version even when .git isn't present in %{_builddir}.
+make BUILD_TYPE=release VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
 
 %install
 # Install to buildroot
@@ -53,6 +54,10 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Thu Apr 16 2026 mfw <espadonne@outlook.com> - 1.3.1-1
+- Fix: version string resolves to the tagged release when built from a source tarball (no .git) via new VERSION file fallback in the Makefile.
+- Build: RPM spec now passes VERSION=%{version} explicitly.
+
 * Thu Apr 16 2026 mfw <espadonne@outlook.com> - 1.3.0-1
 - Feature: `gitswitch init <shell>` subcommand emits SSH_AUTH_SOCK wiring for fish/bash/zsh/sh/dash/ksh
 - Feature: `--ssh-agent-info` compat alias auto-detects shell from $SHELL for Python-era rc files
