@@ -16,6 +16,11 @@
 #include "error.h"
 #include "utils.h"
 #include "git_ops.h"
+#include "ssh_manager.h"
+
+/* Long-only options (no short form). Values above 0xff avoid colliding with
+ * ASCII short options handled by getopt_long. */
+#define OPT_SSH_AGENT_INFO 0x100
 
 static void print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
@@ -28,6 +33,7 @@ static void print_usage(const char *prog_name) {
     printf("  status               Show current account status\n");
     printf("  doctor, health       Run comprehensive health check\n");
     printf("  config               Show configuration file information\n");
+    printf("  init <shell>         Emit shell integration (fish|bash|zsh|sh)\n");
     printf("  <account>            Switch to specified account\n");
     printf("\nOptions:\n");
     printf("  --global, -g         Use global git scope\n");
@@ -67,6 +73,8 @@ static int handle_status_command(gitswitch_ctx_t *ctx);
 static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier);
 static int handle_doctor_command(gitswitch_ctx_t *ctx);
 static int handle_config_command(gitswitch_ctx_t *ctx);
+static int handle_init_command(const char *shell);
+static const char *detect_shell_from_env(void);
 
 int main(int argc, char *argv[]) {
     gitswitch_ctx_t ctx;
@@ -88,6 +96,9 @@ int main(int argc, char *argv[]) {
         {"dry-run", no_argument, 0, 'n'},
         {"global", no_argument, 0, 'g'},
         {"local", no_argument, 0, 'l'},
+        /* Compat alias for the Python gitswitch era. Dispatches to `init`
+         * with shell auto-detected from $SHELL so stale rc lines keep working. */
+        {"ssh-agent-info", no_argument, 0, OPT_SSH_AGENT_INFO},
         {0, 0, 0, 0}
     };
     
@@ -129,6 +140,11 @@ int main(int argc, char *argv[]) {
             case 'l':
                 /* Local scope - will be handled by command handlers */
                 break;
+            case OPT_SSH_AGENT_INFO: {
+                int rc = handle_init_command(detect_shell_from_env());
+                error_cleanup();
+                return rc;
+            }
             default:
                 print_usage(argv[0]);
                 error_cleanup();
@@ -211,6 +227,8 @@ int main(int argc, char *argv[]) {
         exit_code = handle_doctor_command(&ctx);
     } else if (strcmp(command, "config") == 0) {
         exit_code = handle_config_command(&ctx);
+    } else if (strcmp(command, "init") == 0) {
+        exit_code = handle_init_command(arg1 ? arg1 : detect_shell_from_env());
     } else {
         /* Assume it's an account identifier for switching */
         exit_code = handle_switch_command(&ctx, command);
@@ -224,12 +242,13 @@ int main(int argc, char *argv[]) {
             strcmp(command, "rm") == 0 || 
             strcmp(command, "delete") == 0) {
             should_save = true;
-        } else if (strcmp(command, "list") != 0 && 
+        } else if (strcmp(command, "list") != 0 &&
                    strcmp(command, "ls") != 0 &&
                    strcmp(command, "status") != 0 &&
                    strcmp(command, "doctor") != 0 &&
                    strcmp(command, "health") != 0 &&
-                   strcmp(command, "config") != 0) {
+                   strcmp(command, "config") != 0 &&
+                   strcmp(command, "init") != 0) {
             /* Assume it's a switch command - may have modified default scope */
             should_save = true;
         }
@@ -387,7 +406,63 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
             display_warning("Configuration file has unsafe permissions (%o)", file_mode & 0777);
         }
     }
-    
+
     return EXIT_SUCCESS;
 }
 
+/* Return the basename of $SHELL, or NULL if it can't be determined. The
+ * pointer aliases into the environment string — callers must not free it. */
+static const char *detect_shell_from_env(void) {
+    const char *shell = getenv("SHELL");
+    if (!shell || !*shell) {
+        return NULL;
+    }
+    const char *slash = strrchr(shell, '/');
+    return slash ? slash + 1 : shell;
+}
+
+/* Emit shell-integration snippet for `shell` on stdout. The snippet sets
+ * SSH_AUTH_SOCK to the stable gitswitch symlink, guarded by a socket test so
+ * sourcing before the first switch (or after /tmp is wiped) is silent. */
+static int handle_init_command(const char *shell) {
+    char sock_path[MAX_PATH_LEN];
+    if (ssh_manager_get_auth_sock_path(sock_path, sizeof(sock_path)) != 0) {
+        fprintf(stderr, "gitswitch: failed to compute SSH_AUTH_SOCK path: %s\n",
+                get_last_error()->message);
+        return EXIT_FAILURE;
+    }
+
+    if (!shell || !*shell) {
+        fprintf(stderr,
+                "gitswitch: could not detect shell; pass one explicitly:\n"
+                "  gitswitch init fish | source\n"
+                "  eval \"$(gitswitch init bash)\"\n"
+                "  eval \"$(gitswitch init zsh)\"\n");
+        return EXIT_FAILURE;
+    }
+
+    if (strcmp(shell, "fish") == 0) {
+        printf("# gitswitch shell integration (fish)\n");
+        printf("set -l __gitswitch_auth_sock %s\n", sock_path);
+        printf("if test -S $__gitswitch_auth_sock\n");
+        printf("    set -gx SSH_AUTH_SOCK $__gitswitch_auth_sock\n");
+        printf("end\n");
+        printf("set -e __gitswitch_auth_sock\n");
+        return EXIT_SUCCESS;
+    }
+
+    if (strcmp(shell, "bash") == 0 || strcmp(shell, "zsh") == 0 ||
+        strcmp(shell, "sh") == 0 || strcmp(shell, "dash") == 0 ||
+        strcmp(shell, "ksh") == 0) {
+        printf("# gitswitch shell integration (%s)\n", shell);
+        printf("__gitswitch_auth_sock=%s\n", sock_path);
+        printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
+        printf("unset __gitswitch_auth_sock\n");
+        return EXIT_SUCCESS;
+    }
+
+    fprintf(stderr,
+            "gitswitch: unsupported shell '%s' (supported: fish, bash, zsh, sh, dash, ksh)\n",
+            shell);
+    return EXIT_FAILURE;
+}
