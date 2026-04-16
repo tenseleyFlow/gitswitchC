@@ -85,4 +85,13 @@ int ssh_configure_host_alias(const account_t *account);
  */
 int ssh_test_connection(const account_t *account, const char *host);
 
+/**
+ * Write the stable SSH_AUTH_SOCK symlink path to buf.
+ * Uses $XDG_RUNTIME_DIR/gitswitch-ssh/current.sock when XDG_RUNTIME_DIR is set,
+ * otherwise /tmp/gitswitch-ssh-<uid>/current.sock. Shared by runtime switch
+ * logic and the `init` shell-integration command so both agree on the path.
+ * Returns 0 on success, -1 if the computed path would overflow buf.
+ */
+int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size);
+
 #endif /* SSH_MANAGER_H */

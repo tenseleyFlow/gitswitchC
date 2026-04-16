@@ -697,6 +697,31 @@ static int setup_ssh_environment(ssh_config_t *ssh_config) {
     return 0;
 }
 
+/* Public: compute the stable SSH_AUTH_SOCK symlink path.
+ * Mirrors the selection done by create_isolated_agent_socket_dir() so shell
+ * integration emitted by `gitswitch init` points at the same socket the
+ * runtime maintains. */
+int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size) {
+    if (!buf || buf_size == 0) {
+        set_error(ERR_INVALID_ARGS, "NULL/empty buffer to ssh_manager_get_auth_sock_path");
+        return -1;
+    }
+
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    int written;
+    if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
+        written = snprintf(buf, buf_size, "%s/gitswitch-ssh/current.sock", runtime_dir);
+    } else {
+        written = snprintf(buf, buf_size, "/tmp/gitswitch-ssh-%d/current.sock", getuid());
+    }
+
+    if (written < 0 || (size_t)written >= buf_size) {
+        set_error(ERR_INVALID_PATH, "SSH auth sock path too long");
+        return -1;
+    }
+    return 0;
+}
+
 /* Create isolated agent socket directory */
 static int create_isolated_agent_socket_dir(char *socket_dir, size_t socket_dir_size) {
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
