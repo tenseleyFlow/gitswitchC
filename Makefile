@@ -5,8 +5,13 @@
 PROJECT_NAME = gitswitch-c
 TARGET = gitswitch
 
-# Version: use VERSION/COMMIT env vars if set (for tarball builds), else extract from git
-VERSION ?= $(shell git describe --tags --always 2>/dev/null | sed 's/^v//' || echo "unknown")
+# Version: use VERSION/COMMIT env vars if set (for tarball builds), else extract
+# from git, and fall back to the VERSION file shipped in source tarballs when
+# `git describe` produces nothing (e.g. GitHub release tarballs strip .git).
+VERSION ?= $(shell git describe --tags --always 2>/dev/null | sed 's/^v//')
+ifeq ($(strip $(VERSION)),)
+    VERSION := $(shell cat VERSION 2>/dev/null || echo unknown)
+endif
 COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 VERSION_FLAGS = -DGITSWITCH_VERSION=\"$(VERSION)\" -DGITSWITCH_COMMIT=\"$(COMMIT)\"
 
