@@ -859,20 +859,27 @@ bool is_terminal(int fd) {
 
 int get_terminal_size(int *width, int *height) {
     struct winsize ws;
-    
+
     if (!width || !height) {
         set_error(ERR_INVALID_ARGS, "NULL arguments to get_terminal_size");
         return -1;
     }
-    
+
+    /* Skip the ioctl when stdout isn't a terminal (piped, redirected,
+     * command-substituted). Return failure silently so callers fall back to
+     * their default width without spamming stderr on every invocation. */
+    if (!isatty(STDOUT_FILENO)) {
+        return -1;
+    }
+
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) {
         set_system_error(ERR_SYSTEM_CALL, "Failed to get terminal size");
         return -1;
     }
-    
+
     *width = ws.ws_col;
     *height = ws.ws_row;
-    
+
     return 0;
 }
 
