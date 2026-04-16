@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.1.9
+Version:        1.3.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -53,6 +53,11 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Thu Apr 16 2026 mfw <espadonne@outlook.com> - 1.3.0-1
+- Feature: `gitswitch init <shell>` subcommand emits SSH_AUTH_SOCK wiring for fish/bash/zsh/sh/dash/ksh
+- Feature: `--ssh-agent-info` compat alias auto-detects shell from $SHELL for Python-era rc files
+- Fix: silence spurious "Failed to get terminal size" stderr when stdout is piped/command-substituted
+
 * Tue Jan 07 2026 mfw <espadonne@outlook.com> - 1.1.9-1
 - Fix: Use WARNING log level for release builds (was INFO)
 - Fix: Silence error logs for missing optional config fields
