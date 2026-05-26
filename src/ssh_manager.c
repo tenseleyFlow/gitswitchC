@@ -3,7 +3,6 @@
  */
 
 #define _POSIX_C_SOURCE 200809L
-#define _DEFAULT_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +12,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <time.h>
 
 #include "ssh_manager.h"
 #include "error.h"
@@ -795,7 +795,8 @@ static int kill_ssh_agent_gracefully(pid_t pid) {
         if (!is_ssh_agent_running(pid)) {
             return 0;
         }
-        usleep(100000); /* 100ms */
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
+        nanosleep(&ts, NULL);
     }
     
     /* Force kill if still running */

@@ -60,6 +60,17 @@ ifeq ($(UNAME_S),Darwin)
     endif
 endif
 
+ifeq ($(UNAME_S),FreeBSD)
+    # GCC-specific warnings (GCC from ports)
+    CFLAGS += -Wlogical-op -Wdate-time
+    # FreeBSD security flags (ELF linker supports relro/now/noexecstack)
+    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
+                          -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+                            -fstack-clash-protection -fcf-protection \
+                            -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+endif
+
 # Debug/Release configurations
 DEBUG_FLAGS = -g -O0 -DDEBUG -Wp,-U_FORTIFY_SOURCE -fsanitize=address -fsanitize=undefined \
               -fno-omit-frame-pointer -Wpedantic $(SECURITY_FLAGS_DEBUG)
