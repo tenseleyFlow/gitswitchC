@@ -228,14 +228,17 @@ distclean: clean
 	@echo "Cleaning all generated files..."
 	rm -rf $(DOCDIR)
 
-# Development helpers
+# Development helpers. Re-invoke make with BUILD_TYPE on the command line so it
+# is set before the parse-time `ifeq ($(BUILD_TYPE),release)` that selects the
+# flag set. A target-specific `release: BUILD_TYPE=release` is applied too late
+# (after parsing) and would silently build with the default debug flags.
 .PHONY: debug
-debug: BUILD_TYPE=debug
-debug: all
+debug:
+	$(MAKE) BUILD_TYPE=debug all
 
 .PHONY: release
-release: BUILD_TYPE=release
-release: all
+release:
+	$(MAKE) BUILD_TYPE=release all
 
 # Quick development cycle
 .PHONY: dev
