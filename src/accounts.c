@@ -270,13 +270,18 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     /* Set as current account */
     ctx->current_account = account;
 
-    /* Print shell integration tip if SSH was set up */
-    if (ssh_ok) {
-        const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
-        if (runtime_dir) {
-            printf("\n  Tip: Add to your shell rc for persistent SSH:\n");
-            printf("    bash/zsh: export SSH_AUTH_SOCK=%s/gitswitch-ssh/current.sock\n", runtime_dir);
-            printf("    fish:     set -gx SSH_AUTH_SOCK %s/gitswitch-ssh/current.sock\n", runtime_dir);
+    /* Print shell-integration tip if we set up SSH and/or GPG isolation. The
+     * `init` snippet wires SSH_AUTH_SOCK (and, when GPG is used, GNUPGHOME) to
+     * the stable symlinks so every subsequent switch takes effect transparently. */
+    if (ssh_ok || gpg_ok) {
+        printf("\n  Tip: wire your shell once so every switch takes effect transparently:\n");
+        printf("    bash/zsh: eval \"$(gitswitch init bash)\"\n");
+        printf("    fish:     gitswitch init fish | source\n");
+        if (gpg_ok) {
+            printf("  Note: this scopes GNUPGHOME to a per-account keyring, so gpg in that\n");
+            printf("        shell sees only '%s'. Use a shell without the integration for\n",
+                   account->name);
+            printf("        general gpg work (other keys, contacts, encryption).\n");
         }
     }
 
@@ -877,15 +882,19 @@ static int validate_ssh_key_security(const char *ssh_key_path) {
     return 0;
 }
 
-/* Validate GPG key availability */
+/* Validate GPG key availability.
+ * Deliberately checks the *system* keyring (no GNUPGHOME override): this is the
+ * fallback sanity check run from accounts_switch() when the isolated GPG path
+ * did not already confirm the key (gpg_ok), and during health checks. The
+ * isolated-home validation lives in gpg_validate_key()/gpg_test_signing(). */
 static int validate_gpg_key_availability(const char *gpg_key_id) {
     char command[256];
     int result;
-    
+
     if (!gpg_key_id) {
         return -1;
     }
-    
+
     /* Try to find the key in the GPG keyring */
     if ((size_t)snprintf(command, sizeof(command), "gpg --list-secret-keys %s >/dev/null 2>&1", 
                         gpg_key_id) >= sizeof(command)) {

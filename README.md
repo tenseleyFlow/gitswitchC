@@ -39,9 +39,10 @@ Examples:
 
 ## shell integration
 
-gitswitch maintains a stable SSH agent socket at a fixed path so your shell
-can point `SSH_AUTH_SOCK` at it once and have every `gitswitch <account>`
-switch transparently. Add the matching line to your shell rc:
+gitswitch maintains stable paths at fixed locations — an SSH agent socket and,
+for accounts with GPG signing, a per-account `GNUPGHOME` — so your shell can
+point `SSH_AUTH_SOCK` and `GNUPGHOME` at them once and have every `gitswitch
+<account>` switch transparently. Add the matching line to your shell rc:
 
 ```fish
 # ~/.config/fish/config.fish
@@ -58,9 +59,14 @@ eval "$(gitswitch init bash)"
 eval "$(gitswitch init zsh)"
 ```
 
-The snippet guards on the socket's existence, so sourcing it before the
-first switch (or after `/tmp` has been wiped) is a silent no-op rather than
-an error.
+The snippet guards on each path's existence, so sourcing it before the first
+switch (or after `/tmp` has been wiped) is a silent no-op rather than an error.
+
+> **GPG scoping:** when an account uses GPG signing, the snippet points
+> `GNUPGHOME` at a per-account keyring containing only that account's key. That
+> is the isolation — but it means *all* gpg in that shell is scoped to the
+> active account (no other public keys, contacts, or ownertrust). For general
+> gpg work, use a shell that doesn't source the integration.
 
 > **Migrating from the Python gitswitch?** The old `gitswitch --ssh-agent-info`
 > invocation still works as a compat alias that auto-detects your shell from

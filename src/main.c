@@ -17,6 +17,7 @@
 #include "utils.h"
 #include "git_ops.h"
 #include "ssh_manager.h"
+#include "gpg_manager.h"
 
 /* Long-only options (no short form). Values above 0xff avoid colliding with
  * ASCII short options handled by getopt_long. */
@@ -432,6 +433,11 @@ static int handle_init_command(const char *shell) {
         return EXIT_FAILURE;
     }
 
+    /* GPG home is best-effort: if it can't be computed we still emit the SSH
+     * wiring rather than failing the whole init. */
+    char gpg_home[MAX_PATH_LEN];
+    bool have_gpg_home = (gpg_manager_get_home_path(gpg_home, sizeof(gpg_home)) == 0);
+
     if (!shell || !*shell) {
         fprintf(stderr,
                 "gitswitch: could not detect shell; pass one explicitly:\n"
@@ -448,6 +454,13 @@ static int handle_init_command(const char *shell) {
         printf("    set -gx SSH_AUTH_SOCK $__gitswitch_auth_sock\n");
         printf("end\n");
         printf("set -e __gitswitch_auth_sock\n");
+        if (have_gpg_home) {
+            printf("set -l __gitswitch_gnupghome %s\n", gpg_home);
+            printf("if test -d $__gitswitch_gnupghome\n");
+            printf("    set -gx GNUPGHOME $__gitswitch_gnupghome\n");
+            printf("end\n");
+            printf("set -e __gitswitch_gnupghome\n");
+        }
         return EXIT_SUCCESS;
     }
 
@@ -458,6 +471,11 @@ static int handle_init_command(const char *shell) {
         printf("__gitswitch_auth_sock=%s\n", sock_path);
         printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
         printf("unset __gitswitch_auth_sock\n");
+        if (have_gpg_home) {
+            printf("__gitswitch_gnupghome=%s\n", gpg_home);
+            printf("[ -d \"$__gitswitch_gnupghome\" ] && export GNUPGHOME=\"$__gitswitch_gnupghome\"\n");
+            printf("unset __gitswitch_gnupghome\n");
+        }
         return EXIT_SUCCESS;
     }
 
