@@ -267,8 +267,10 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
     }
 
-    /* Set as current account */
+    /* Set as current account, and record it for boot resume. The config is
+     * persisted by the save-after-switch path in main(). */
     ctx->current_account = account;
+    safe_strncpy(ctx->config.active_account, account->name, sizeof(ctx->config.active_account));
 
     /* Print shell-integration tip if we set up SSH and/or GPG isolation. The
      * `init` snippet wires SSH_AUTH_SOCK (and, when GPG is used, GNUPGHOME) to
@@ -1007,6 +1009,24 @@ int accounts_health_check(const gitswitch_ctx_t *ctx) {
 }
 
 /* Detect current account from SSH socket symlink */
+/* Fallback for accounts_detect_current: use the persisted last-active account
+ * when no live runtime symlink is available (e.g. right after a boot, before
+ * any resume has run). Returns 0 if it set ctx->current_account. */
+static int detect_current_from_saved(gitswitch_ctx_t *ctx) {
+    if (ctx->config.active_account[0] == '\0') {
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strcmp(ctx->accounts[i].name, ctx->config.active_account) == 0) {
+            ctx->current_account = &ctx->accounts[i];
+            log_debug("Detected current account from saved state: %s",
+                      ctx->config.active_account);
+            return 0;
+        }
+    }
+    return -1;
+}
+
 int accounts_detect_current(gitswitch_ctx_t *ctx) {
     char symlink_path[MAX_PATH_LEN];
     char target_path[MAX_PATH_LEN];
@@ -1029,8 +1049,8 @@ int accounts_detect_current(gitswitch_ctx_t *ctx) {
     /* Build path to symlink */
     runtime_dir = getenv("XDG_RUNTIME_DIR");
     if (!runtime_dir) {
-        log_debug("XDG_RUNTIME_DIR not set, cannot detect current account");
-        return -1;
+        log_debug("XDG_RUNTIME_DIR not set, falling back to saved account");
+        return detect_current_from_saved(ctx);
     }
 
     if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
@@ -1041,8 +1061,8 @@ int accounts_detect_current(gitswitch_ctx_t *ctx) {
     /* Read symlink target */
     len = readlink(symlink_path, target_path, sizeof(target_path) - 1);
     if (len < 0) {
-        log_debug("No current.sock symlink found, no active account");
-        return -1;
+        log_debug("No current.sock symlink found, falling back to saved account");
+        return detect_current_from_saved(ctx);
     }
     target_path[len] = '\0';
 

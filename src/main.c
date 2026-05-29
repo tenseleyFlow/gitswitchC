@@ -35,6 +35,7 @@ static void print_usage(const char *prog_name) {
     printf("  doctor, health       Run comprehensive health check\n");
     printf("  config               Show configuration file information\n");
     printf("  init <shell>         Emit shell integration (fish|bash|zsh|sh)\n");
+    printf("  resume               Re-activate the last-used account (used on login)\n");
     printf("  <account>            Switch to specified account\n");
     printf("\nOptions:\n");
     printf("  --global, -g         Use global git scope\n");
@@ -75,6 +76,7 @@ static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier);
 static int handle_doctor_command(gitswitch_ctx_t *ctx);
 static int handle_config_command(gitswitch_ctx_t *ctx);
 static int handle_init_command(const char *shell);
+static int handle_resume_command(gitswitch_ctx_t *ctx);
 static const char *detect_shell_from_env(void);
 
 int main(int argc, char *argv[]) {
@@ -230,6 +232,8 @@ int main(int argc, char *argv[]) {
         exit_code = handle_config_command(&ctx);
     } else if (strcmp(command, "init") == 0) {
         exit_code = handle_init_command(arg1 ? arg1 : detect_shell_from_env());
+    } else if (strcmp(command, "resume") == 0) {
+        exit_code = handle_resume_command(&ctx);
     } else {
         /* Assume it's an account identifier for switching */
         exit_code = handle_switch_command(&ctx, command);
@@ -249,10 +253,13 @@ int main(int argc, char *argv[]) {
                    strcmp(command, "doctor") != 0 &&
                    strcmp(command, "health") != 0 &&
                    strcmp(command, "config") != 0 &&
-                   strcmp(command, "init") != 0) {
+                   strcmp(command, "init") != 0 &&
+                   strcmp(command, "resume") != 0) {
             /* Assume it's a switch command - may have modified default scope */
             should_save = true;
         }
+        /* `resume` re-activates the already-saved account and changes nothing
+         * durable, so it is intentionally excluded above to avoid backup churn. */
         
         if (should_save) {
             log_debug("Saving configuration after %s command (account_count=%zu)", 
@@ -450,6 +457,14 @@ static int handle_init_command(const char *shell) {
     if (strcmp(shell, "fish") == 0) {
         printf("# gitswitch shell integration (fish)\n");
         printf("set -l __gitswitch_auth_sock %s\n", sock_path);
+        /* First interactive shell after a boot (runtime socket gone): resume the
+         * last account. Interactive-gated so pinentry has a TTY; the notice
+         * explains the PIN prompt that follows (pinentry draws on the TTY, so it
+         * shows despite resume's output being redirected). */
+        printf("if status is-interactive; and not test -S $__gitswitch_auth_sock\n");
+        printf("    echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
+        printf("    gitswitch resume >/dev/null 2>&1\n");
+        printf("end\n");
         printf("if test -S $__gitswitch_auth_sock\n");
         printf("    set -gx SSH_AUTH_SOCK $__gitswitch_auth_sock\n");
         printf("end\n");
@@ -469,6 +484,12 @@ static int handle_init_command(const char *shell) {
         strcmp(shell, "ksh") == 0) {
         printf("# gitswitch shell integration (%s)\n", shell);
         printf("__gitswitch_auth_sock=%s\n", sock_path);
+        /* First interactive shell after a boot (runtime socket gone): resume the
+         * last account. Interactive-gated so pinentry has a TTY; the notice
+         * explains the PIN prompt that follows. */
+        printf("case $- in *i*) if [ ! -S \"$__gitswitch_auth_sock\" ]; then "
+               "echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2; "
+               "gitswitch resume >/dev/null 2>&1; fi ;; esac\n");
         printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
         printf("unset __gitswitch_auth_sock\n");
         if (have_gpg_home) {
@@ -483,4 +504,33 @@ static int handle_init_command(const char *shell) {
             "gitswitch: unsupported shell '%s' (supported: fish, bash, zsh, sh, dash, ksh)\n",
             shell);
     return EXIT_FAILURE;
+}
+
+/* Re-activate the last-active account, recorded in config across reboots. This
+ * is what `gitswitch init` auto-runs on the first login after a boot (when the
+ * runtime SSH socket is gone), and is also usable manually. It is a thin wrapper
+ * over a normal switch, so it reloads the SSH key, reasserts git identity, and
+ * rebuilds the isolated GPG home + symlinks. A no-op (success) when there is no
+ * saved account or it no longer exists, so it can never break a login shell. */
+static int handle_resume_command(gitswitch_ctx_t *ctx) {
+    if (!ctx) return EXIT_FAILURE;
+
+    if (ctx->config.active_account[0] == '\0') {
+        log_debug("No saved account to resume");
+        return EXIT_SUCCESS;
+    }
+
+    if (!config_find_account(ctx, ctx->config.active_account)) {
+        log_debug("Saved account no longer exists, skipping resume: %s",
+                  ctx->config.active_account);
+        return EXIT_SUCCESS;
+    }
+
+    if (accounts_switch(ctx, ctx->config.active_account) != 0) {
+        display_error("Failed to resume account", get_last_error()->message);
+        return EXIT_FAILURE;
+    }
+
+    display_success("Resumed: %s", ctx->current_account->name);
+    return EXIT_SUCCESS;
 }

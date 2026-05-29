@@ -15,6 +15,7 @@ Commands:
   doctor, health       Run comprehensive health check
   config               Show configuration file information
   init <shell>         Emit shell integration (fish|bash|zsh|sh)
+  resume               Re-activate the last-used account (used on login)
   <account>            Switch to specified account
 
 Options:
@@ -61,6 +62,20 @@ eval "$(gitswitch init zsh)"
 
 The snippet guards on each path's existence, so sourcing it before the first
 switch (or after `/tmp` has been wiped) is a silent no-op rather than an error.
+
+### Persistence across reboots
+
+gitswitch's live state (SSH agent, isolated GPG home) lives under
+`$XDG_RUNTIME_DIR`, which is wiped on reboot. So on the **first login after a
+boot** the integration auto-runs `gitswitch resume` to re-activate the account
+you last switched to — reloading its SSH key, reasserting your git identity, and
+rebuilding its isolated GPG home.
+
+> **That GPG PIN prompt at first login is gitswitch, not an error.** Rebuilding
+> the isolated GPG keyring re-imports your secret key, which prompts your PIN
+> once per boot. The integration prints a heads-up line right before it. This
+> requires `GPG_TTY` to be set before the integration line, e.g. in fish:
+> `set -x GPG_TTY (tty)`. You can also run `gitswitch resume` manually anytime.
 
 > **GPG scoping:** when an account uses GPG signing, the snippet points
 > `GNUPGHOME` at a per-account keyring containing only that account's key. That
