@@ -7,9 +7,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Version information - can be overridden at build time via -D flags */
+/* Version information. The real version is injected via -DGITSWITCH_VERSION
+ * from the VERSION file by the Makefile; this sentinel only appears when a
+ * source file is compiled outside the build system (never on a release). */
 #ifndef GITSWITCH_VERSION
-#define GITSWITCH_VERSION "1.1.7"
+#define GITSWITCH_VERSION "0.0.0-dev"
 #endif
 #ifndef GITSWITCH_COMMIT
 #define GITSWITCH_COMMIT "unknown"

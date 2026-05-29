@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.3.1
+Version:        1.4.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -54,6 +54,10 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Thu May 29 2026 mfw <espadonne@outlook.com> - 1.4.0-1
+- Build: VERSION file is now the single source of truth for the binary version stamp.
+- Build: drop the stale gitswitch.spec; gitswitcher.spec is the sole maintained spec.
+
 * Thu Apr 16 2026 mfw <espadonne@outlook.com> - 1.3.1-1
 - Fix: version string resolves to the tagged release when built from a source tarball (no .git) via new VERSION file fallback in the Makefile.
 - Build: RPM spec now passes VERSION=%{version} explicitly.
