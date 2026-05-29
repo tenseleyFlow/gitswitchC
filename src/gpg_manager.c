@@ -20,6 +20,9 @@
 #include "git_ops.h"
 
 /* Internal helper functions */
+static int gpg_get_base_dir(char *buf, size_t size);
+static int update_current_symlink(const char *real_home);
+static bool gpg_colons_have_sign_capability(const char *colons);
 static int create_isolated_gnupg_home_dir(const char *gnupg_home);
 static int execute_gpg_command_in_env(const gpg_config_t *gpg_config, 
                                        const char *command, char *output, size_t output_size);
@@ -81,24 +84,15 @@ void gpg_manager_cleanup(gpg_config_t *gpg_config) {
     }
     
     log_debug("Cleaning up GPG manager");
-    
-    /* Clean up owned GNUPGHOME directory if needed */
-    if (gpg_config->home_owned && strlen(gpg_config->gnupg_home) > 0) {
-        log_debug("Cleaning up owned GNUPGHOME: %s", gpg_config->gnupg_home);
-        
-        /* Only remove if it's clearly our isolated directory */
-        if (strstr(gpg_config->gnupg_home, "gitswitch-gpg") != NULL) {
-            char command[512];
-            if (safe_snprintf(command, sizeof(command), "rm -rf '%s'", gpg_config->gnupg_home) == 0) {
-                if (system(command) != 0) {
-                    log_warning("Failed to remove GNUPGHOME directory: %s", gpg_config->gnupg_home);
-                } else {
-                    log_debug("Successfully removed GNUPGHOME: %s", gpg_config->gnupg_home);
-                }
-            }
-        }
-    }
-    
+
+    /* Intentionally NOT deleting the isolated GNUPGHOME. Isolated homes are
+     * keyed by account and persist across switches (mirroring how the SSH agent
+     * persists): the user's shell points GNUPGHOME at the <base>/current
+     * symlink, so removing a home could pull the rug out from under a shell
+     * still pointed at it. Homes are reused on switch-back, and re-import is
+     * skipped when the key is already present. A deliberate teardown command
+     * (not yet implemented) is the right place to reclaim them. */
+
     /* Clear configuration */
     memset(gpg_config, 0, sizeof(gpg_config_t));
     
@@ -188,8 +182,95 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
             log_info("GPG signing test passed for key: %s", account->gpg_key_id);
         }
     }
-    
+
+    /* Retarget the stable GNUPGHOME symlink to this account's now-ready home so
+     * a shell exporting GNUPGHOME=<base>/current follows the switch. Done last,
+     * after the key is imported and validated. Isolated mode only; non-fatal. */
+    if (gpg_config->mode == GPG_MODE_ISOLATED && strlen(gpg_config->gnupg_home) > 0) {
+        update_current_symlink(gpg_config->gnupg_home);
+    }
+
     log_info("Successfully switched to GPG configuration for account: %s", account->name);
+    return 0;
+}
+
+/* Compute the base directory that holds per-account isolated GNUPGHOMEs and the
+ * stable `current` symlink. Two-way like the SSH side: prefer XDG_RUNTIME_DIR,
+ * else /tmp/gitswitch-gpg-<uid>. There is deliberately no HOME fallback: that
+ * branch would place secret-key material on persistent disk, and its longer
+ * paths risk overrunning the gpg-agent socket sun_path limit. Returns 0 on
+ * success. */
+static int gpg_get_base_dir(char *buf, size_t size) {
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    int written;
+
+    if (!buf || size == 0) {
+        set_error(ERR_INVALID_ARGS, "NULL/empty buffer to gpg_get_base_dir");
+        return -1;
+    }
+
+    if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
+        written = snprintf(buf, size, "%s/gitswitch-gpg", runtime_dir);
+    } else {
+        written = snprintf(buf, size, "/tmp/gitswitch-gpg-%d", getuid());
+    }
+
+    if (written < 0 || (size_t)written >= size) {
+        set_error(ERR_INVALID_PATH, "GPG base directory path too long");
+        return -1;
+    }
+    return 0;
+}
+
+/* Public: compute the stable GNUPGHOME path that `gitswitch init` exports and
+ * that the per-switch symlink points at. Shared with gpg_get_base_dir so the
+ * symlink location and the shell-integration path never disagree. Mirrors
+ * ssh_manager_get_auth_sock_path(). Returns 0 on success, -1 on overflow. */
+int gpg_manager_get_home_path(char *buf, size_t size) {
+    char base_dir[MAX_PATH_LEN];
+    int written;
+
+    if (!buf || size == 0) {
+        set_error(ERR_INVALID_ARGS, "NULL/empty buffer to gpg_manager_get_home_path");
+        return -1;
+    }
+
+    if (gpg_get_base_dir(base_dir, sizeof(base_dir)) != 0) {
+        return -1;
+    }
+
+    written = snprintf(buf, size, "%s/current", base_dir);
+    if (written < 0 || (size_t)written >= size) {
+        set_error(ERR_INVALID_PATH, "GPG home path too long");
+        return -1;
+    }
+    return 0;
+}
+
+/* Point the stable <base>/current symlink at the active account's real
+ * GNUPGHOME so a shell that exports GNUPGHOME=<base>/current (via
+ * `gitswitch init`) transparently follows each switch. Mirrors the SSH
+ * current.sock retargeting in ssh_manager.c. Non-fatal on failure. */
+static int update_current_symlink(const char *real_home) {
+    char link_path[MAX_PATH_LEN];
+
+    if (!real_home || strlen(real_home) == 0) {
+        return -1;
+    }
+
+    if (gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
+        return -1;
+    }
+
+    /* Remove any existing symlink, then retarget. */
+    unlink(link_path);
+    if (symlink(real_home, link_path) != 0) {
+        log_warning("Failed to create GNUPGHOME symlink %s -> %s: %s",
+                    link_path, real_home, strerror(errno));
+        return -1;
+    }
+
+    log_debug("Created GNUPGHOME symlink: %s -> %s", link_path, real_home);
     return 0;
 }
 
@@ -197,38 +278,18 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
 int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account) {
     char gnupg_base_dir[MAX_PATH_LEN];
     char gnupg_home[MAX_PATH_LEN];
-    const char *home_dir;
-    const char *runtime_dir;
-    
+
     if (!gpg_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_create_isolated_home");
         return -1;
     }
-    
-    /* Determine base directory for isolated GNUPGHOME */
-    runtime_dir = getenv("XDG_RUNTIME_DIR");
-    home_dir = getenv("HOME");
-    
-    if (runtime_dir) {
-        /* Use XDG runtime directory if available */
-        if (safe_snprintf(gnupg_base_dir, sizeof(gnupg_base_dir), "%s/gitswitch-gpg", runtime_dir) != 0) {
-            set_error(ERR_INVALID_PATH, "GNUPG base directory path too long");
-            return -1;
-        }
-    } else if (home_dir) {
-        /* Fall back to home directory */
-        if (safe_snprintf(gnupg_base_dir, sizeof(gnupg_base_dir), "%s/.local/run/gitswitch-gpg", home_dir) != 0) {
-            set_error(ERR_INVALID_PATH, "GNUPG base directory path too long");
-            return -1;
-        }
-    } else {
-        /* Last resort: use /tmp */
-        if (safe_snprintf(gnupg_base_dir, sizeof(gnupg_base_dir), "/tmp/gitswitch-gpg-%d", getuid()) != 0) {
-            set_error(ERR_INVALID_PATH, "GNUPG base directory path too long");
-            return -1;
-        }
+
+    /* Determine base directory for isolated GNUPGHOME (shared with the stable
+     * `current` symlink path so the two never disagree). */
+    if (gpg_get_base_dir(gnupg_base_dir, sizeof(gnupg_base_dir)) != 0) {
+        return -1;
     }
-    
+
     /* Create base directory */
     if (create_directory_recursive(gnupg_base_dir, 0700) != 0) {
         set_error(ERR_FILE_IO, "Failed to create GPG base directory: %s", gnupg_base_dir);
@@ -399,39 +460,90 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
     return 0;
 }
 
-/* Test GPG signing by creating a test signature */
+/* Return true if `gpg --with-colons` output contains a secret-key record
+ * (primary `sec` or subkey `ssb`) whose capability field (field 12, the 12th
+ * ':'-separated field) advertises signing. Lowercase 's' means this key can
+ * sign; uppercase 'S' on a primary means a signing-capable subkey exists. */
+static bool gpg_colons_have_sign_capability(const char *colons) {
+    const char *line;
+
+    if (!colons) {
+        return false;
+    }
+
+    for (line = colons; line && *line; ) {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+
+        if (line_len >= 3 &&
+            (strncmp(line, "sec", 3) == 0 || strncmp(line, "ssb", 3) == 0)) {
+            const char *line_end = line + line_len;
+            const char *field_start = line;
+            const char *p;
+            int field = 0;
+
+            for (p = line; p <= line_end; p++) {
+                if (p == line_end || *p == ':') {
+                    if (field == 11) {  /* field 12, 0-indexed: capabilities */
+                        const char *c;
+                        for (c = field_start; c < p; c++) {
+                            if (*c == 's' || *c == 'S') {
+                                return true;
+                            }
+                        }
+                        break;
+                    }
+                    field++;
+                    field_start = p + 1;
+                }
+            }
+        }
+
+        if (!eol) {
+            break;
+        }
+        line = eol + 1;
+    }
+
+    return false;
+}
+
+/* Verify the isolated keyring can sign for key_id, without unlocking the key.
+ * The previous implementation ran an interactive `gpg --clearsign`, which
+ * forced a pinentry PIN prompt on every switch and failed outright when the
+ * configured pinentry path was wrong. Instead, confirm a signing-capable secret
+ * key is present via the colon-delimited listing: PIN-free, pinentry-free, and
+ * sufficient — real signing is exercised when the user actually commits. */
 int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
-    char command[512];
-    char output[1024];
+    char command[256];
+    char output[4096];
     int result;
-    
+
     if (!gpg_config || !key_id) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_test_signing");
         return -1;
     }
-    
-    log_debug("Testing GPG signing with key: %s", key_id);
-    
-    /* Create test signature */
-    if (safe_snprintf(command, sizeof(command), 
-                     "echo 'GPG signing test' | gpg --clearsign --local-user %s", key_id) != 0) {
-        set_error(ERR_INVALID_ARGS, "GPG test command too long");
+
+    log_debug("Verifying signing capability for key: %s", key_id);
+
+    if (safe_snprintf(command, sizeof(command),
+                     "gpg --list-secret-keys --with-colons %s", key_id) != 0) {
+        set_error(ERR_INVALID_ARGS, "GPG capability command too long");
         return -1;
     }
-    
+
     result = execute_gpg_command_in_env(gpg_config, command, output, sizeof(output));
     if (result != 0) {
-        set_error(ERR_GPG_SIGNING_FAILED, "GPG signing test failed: %s", output);
+        set_error(ERR_GPG_SIGNING_FAILED, "No secret key available for signing: %s", key_id);
         return -1;
     }
-    
-    /* Verify the signature contains expected content */
-    if (strstr(output, "BEGIN PGP SIGNED MESSAGE") == NULL) {
-        set_error(ERR_GPG_SIGNING_FAILED, "GPG signing test produced invalid output");
+
+    if (!gpg_colons_have_sign_capability(output)) {
+        set_error(ERR_GPG_SIGNING_FAILED, "Key has no signing-capable secret key: %s", key_id);
         return -1;
     }
-    
-    log_debug("GPG signing test passed for key: %s", key_id);
+
+    log_debug("Signing capability confirmed for key: %s", key_id);
     return 0;
 }
 
@@ -588,9 +700,25 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
         set_error(ERR_INVALID_ARGS, "Invalid arguments to copy_key_from_system_keyring");
         return -1;
     }
-    
+
     log_debug("Copying GPG key from system keyring: %s", key_id);
-    
+
+    /* Idempotency: if the secret key is already present in the isolated home
+     * (e.g. switching back to an account whose home persists from an earlier
+     * switch), skip the export/import. The export step prompts the system
+     * agent's PIN, so skipping it avoids a PIN prompt on every switch. */
+    {
+        char check_command[256];
+        char check_output[1024];
+        if (safe_snprintf(check_command, sizeof(check_command),
+                          "gpg --list-secret-keys %s", key_id) == 0 &&
+            execute_gpg_command_in_env(gpg_config, check_command,
+                                       check_output, sizeof(check_output)) == 0) {
+            log_debug("Secret key already present in isolated home; skipping import: %s", key_id);
+            return 0;
+        }
+    }
+
     /* Export key from system keyring */
     if (safe_snprintf(export_command, sizeof(export_command), 
                      "gpg --armor --export-secret-keys %s 2>/dev/null", key_id) != 0) {
@@ -689,8 +817,31 @@ static int setup_gpg_agent_config(const char *gnupg_home) {
     fprintf(conf_file, "# GPG Agent configuration for gitswitch isolated environment\n");
     fprintf(conf_file, "default-cache-ttl 3600\n");
     fprintf(conf_file, "max-cache-ttl 7200\n");
-    fprintf(conf_file, "pinentry-program /usr/bin/pinentry-curses\n");
-    
+
+    /* Detect a pinentry program rather than hardcoding a path: it lives in
+     * different locations per platform (/usr/bin on Linux, /usr/local/bin on
+     * the BSDs, /opt/homebrew/bin or /usr/local/bin on macOS). Prefer the
+     * generic `pinentry` symlink, then common flavors including macOS's
+     * pinentry-mac. If none is found, omit the directive entirely and let
+     * gpg-agent fall back to its compiled-in default. */
+    {
+        static const char *const pinentry_candidates[] = {
+            "pinentry", "pinentry-curses", "pinentry-mac", "pinentry-tty"
+        };
+        char pinentry_path[MAX_PATH_LEN];
+        bool wrote_pinentry = false;
+        for (size_t i = 0; i < sizeof(pinentry_candidates) / sizeof(pinentry_candidates[0]); i++) {
+            if (find_command_path(pinentry_candidates[i], pinentry_path, sizeof(pinentry_path)) == 0) {
+                fprintf(conf_file, "pinentry-program %s\n", pinentry_path);
+                wrote_pinentry = true;
+                break;
+            }
+        }
+        if (!wrote_pinentry) {
+            log_debug("No pinentry program found in PATH; relying on gpg-agent default");
+        }
+    }
+
     fclose(conf_file);
     
     /* Set proper permissions */
