@@ -130,12 +130,18 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
     }
     
     /* Load settings section */
-    if (toml_get_string(&toml_doc, "settings", "default_scope", 
+    if (toml_get_string(&toml_doc, "settings", "default_scope",
                         scope_str, sizeof(scope_str)) == 0) {
         ctx->config.default_scope = config_parse_scope(scope_str);
     } else {
         log_warning("No default_scope found in settings, using local");
         ctx->config.default_scope = GIT_SCOPE_LOCAL;
+    }
+
+    /* Last-active account for boot resume (optional; absent on older configs) */
+    if (toml_get_string(&toml_doc, "settings", "active_account",
+                        ctx->config.active_account, sizeof(ctx->config.active_account)) != 0) {
+        ctx->config.active_account[0] = '\0';
     }
     
     /* Load accounts */
@@ -184,11 +190,19 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     toml_init_document(&toml_doc);
     
     /* Add/update settings section */
-    if (toml_set_string(&toml_doc, "settings", "default_scope", 
+    if (toml_set_string(&toml_doc, "settings", "default_scope",
                         config_scope_to_string(ctx->config.default_scope)) != 0) {
         goto cleanup;
     }
-    
+
+    /* Persist the last-active account for boot resume (when one is set) */
+    if (ctx->config.active_account[0] != '\0') {
+        if (toml_set_string(&toml_doc, "settings", "active_account",
+                            ctx->config.active_account) != 0) {
+            goto cleanup;
+        }
+    }
+
     /* Add current accounts */
     log_debug("About to save accounts to TOML doc with %zu sections", toml_doc.section_count);
     if (save_accounts_to_toml(ctx, &toml_doc) != 0) {

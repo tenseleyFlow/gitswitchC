@@ -71,6 +71,7 @@ typedef struct {
 typedef struct {
     git_scope_t default_scope;
     char config_path[MAX_PATH_LEN];
+    char active_account[MAX_NAME_LEN];  /* Last-switched account, persisted for boot resume */
     bool verbose;
     bool dry_run;
     bool color_output;
