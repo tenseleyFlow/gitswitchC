@@ -63,6 +63,14 @@ int execute_command(const char *command, char *output, size_t output_size);
 int execute_command_with_input(const char *command, const char *input,
                                char *output, size_t output_size);
 bool command_exists(const char *command);
+
+/**
+ * Resolve the absolute path of an external command found in PATH.
+ * Uses the POSIX `command -v` builtin, so it is portable across Linux, macOS,
+ * and the BSDs. Writes the path into buf on success.
+ * Returns 0 if an absolute, existing path was found; -1 otherwise.
+ */
+int find_command_path(const char *name, char *buf, size_t size);
 pid_t start_background_process(const char *command, char *pidfile_path);
 int kill_process_by_pidfile(const char *pidfile_path);
 bool process_is_running(pid_t pid);

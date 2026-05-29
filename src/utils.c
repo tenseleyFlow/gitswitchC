@@ -529,6 +529,50 @@ bool command_exists(const char *command) {
     return result == 0;
 }
 
+int find_command_path(const char *name, char *buf, size_t size) {
+    char test_command[256];
+    FILE *fp;
+    size_t len;
+
+    if (!name || !buf || size == 0) {
+        return -1;
+    }
+
+    /* `command -v` is a POSIX shell builtin that prints the absolute path of an
+     * external program found in PATH. It is portable across sh/bash/zsh on
+     * Linux, macOS, and the BSDs (unlike `which`, which is non-standard and
+     * absent on some systems). */
+    if ((size_t)snprintf(test_command, sizeof(test_command),
+                        "command -v %s 2>/dev/null", name) >= sizeof(test_command)) {
+        return -1;
+    }
+
+    fp = popen(test_command, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    if (!fgets(buf, size, fp)) {
+        pclose(fp);
+        return -1;
+    }
+    pclose(fp);
+
+    /* Strip trailing newline(s). */
+    len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+        buf[--len] = '\0';
+    }
+
+    /* `command -v` can echo a shell builtin/alias name with no leading slash;
+     * require an absolute path to a file that actually exists. */
+    if (len == 0 || buf[0] != '/' || !path_exists(buf)) {
+        return -1;
+    }
+
+    return 0;
+}
+
 pid_t start_background_process(const char *command, char *pidfile_path) {
     pid_t pid;
     FILE *pidfile;
