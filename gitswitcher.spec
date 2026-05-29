@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.4.0
+Version:        1.5.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -54,6 +54,13 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Fri May 29 2026 mfw <espadonne@outlook.com> - 1.5.0-1
+- Feat: GPG isolation now persists into the shell — `gitswitch init` exports GNUPGHOME alongside SSH_AUTH_SOCK, backed by a stable per-account GNUPGHOME symlink retargeted on each switch.
+- Fix: detect the pinentry program instead of hardcoding /usr/bin/pinentry-curses, which broke the signing self-test on FreeBSD and macOS.
+- Fix: skip GPG secret-key re-import when the key is already in the isolated home, avoiding a PIN prompt on every switch.
+- Fix: replace the interactive signing self-test with a non-interactive capability check (no PIN, no pinentry dependency).
+- Change: isolated GPG homes now persist and are reused rather than deleted, so a shell pointed at the stable GNUPGHOME is never orphaned.
+
 * Thu May 29 2026 mfw <espadonne@outlook.com> - 1.4.0-1
 - Build: VERSION file is now the single source of truth for the binary version stamp.
 - Build: drop the stale gitswitch.spec; gitswitcher.spec is the sole maintained spec.
