@@ -457,13 +457,19 @@ static int handle_init_command(const char *shell) {
     if (strcmp(shell, "fish") == 0) {
         printf("# gitswitch shell integration (fish)\n");
         printf("set -l __gitswitch_auth_sock %s\n", sock_path);
-        /* First interactive shell after a boot (runtime socket gone): resume the
-         * last account. Interactive-gated so pinentry has a TTY; the notice
-         * explains the PIN prompt that follows (pinentry draws on the TTY, so it
-         * shows despite resume's output being redirected). */
-        printf("if status is-interactive; and not test -S $__gitswitch_auth_sock\n");
-        printf("    echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
-        printf("    gitswitch resume >/dev/null 2>&1\n");
+        /* First interactive shell after a boot: if no SSH agent is reachable at
+         * the stable socket, resume the last account. We probe with `ssh-add -l`
+         * (exit > 1 means no agent reachable) rather than `test -S`, because a
+         * stale socket file left behind after a reboot — common on macOS, which
+         * doesn't wipe /tmp — passes a plain -S test and would silently skip
+         * resume. Interactive-gated so pinentry has a user; the notice explains
+         * the PIN prompt that follows (pinentry draws on the TTY directly). */
+        printf("if status is-interactive\n");
+        printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
+        printf("    if test $status -gt 1\n");
+        printf("        echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
+        printf("        gitswitch resume >/dev/null 2>&1\n");
+        printf("    end\n");
         printf("end\n");
         printf("if test -S $__gitswitch_auth_sock\n");
         printf("    set -gx SSH_AUTH_SOCK $__gitswitch_auth_sock\n");
@@ -484,12 +490,19 @@ static int handle_init_command(const char *shell) {
         strcmp(shell, "ksh") == 0) {
         printf("# gitswitch shell integration (%s)\n", shell);
         printf("__gitswitch_auth_sock=%s\n", sock_path);
-        /* First interactive shell after a boot (runtime socket gone): resume the
-         * last account. Interactive-gated so pinentry has a TTY; the notice
-         * explains the PIN prompt that follows. */
-        printf("case $- in *i*) if [ ! -S \"$__gitswitch_auth_sock\" ]; then "
-               "echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2; "
-               "gitswitch resume >/dev/null 2>&1; fi ;; esac\n");
+        /* First interactive shell after a boot: if no SSH agent is reachable at
+         * the stable socket, resume the last account. We probe with `ssh-add -l`
+         * (exit > 1 means no agent reachable) rather than `test -S`, because a
+         * stale socket file left behind after a reboot — common on macOS, which
+         * doesn't wipe /tmp — passes a plain -S test and would silently skip
+         * resume. Interactive-gated so pinentry has a user. */
+        printf("case $- in *i*)\n");
+        printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
+        printf("    if [ $? -gt 1 ]; then\n");
+        printf("        echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
+        printf("        gitswitch resume >/dev/null 2>&1\n");
+        printf("    fi ;;\n");
+        printf("esac\n");
         printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
         printf("unset __gitswitch_auth_sock\n");
         if (have_gpg_home) {
