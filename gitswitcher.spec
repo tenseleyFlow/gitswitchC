@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.5.0
+Version:        1.6.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -54,6 +54,12 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Fri May 29 2026 mfw <espadonne@outlook.com> - 1.6.0-1
+- Feat: boot persistence — the last-active account is recorded and auto-resumed on the first interactive login after a reboot (via `gitswitch init`), restoring the SSH agent, git identity, and isolated GPG home. A heads-up line precedes the one-per-boot GPG PIN prompt.
+- Feat: new `gitswitch resume` command to re-activate the last-active account manually.
+- Fix: detect a dead SSH agent via `ssh-add -l` instead of a socket-file test, so resume reliably fires after a reboot even when a stale socket lingers (e.g. on macOS, which doesn't wipe /tmp).
+- `gitswitch status` now reports the saved account after a reboot, before any resume has run.
+
 * Fri May 29 2026 mfw <espadonne@outlook.com> - 1.5.0-1
 - Feat: GPG isolation now persists into the shell — `gitswitch init` exports GNUPGHOME alongside SSH_AUTH_SOCK, backed by a stable per-account GNUPGHOME symlink retargeted on each switch.
 - Fix: detect the pinentry program instead of hardcoding /usr/bin/pinentry-curses, which broke the signing self-test on FreeBSD and macOS.
