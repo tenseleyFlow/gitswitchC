@@ -292,9 +292,12 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     }
 
     /* Set as current account, and record it for boot resume. The config is
-     * persisted by the save-after-switch path in main(). */
-    ctx->current_account = account;
-    safe_strncpy(ctx->config.active_account, account->name, sizeof(ctx->config.active_account));
+     * persisted by the save-after-switch path in main(). Skipped under dry-run
+     * so a preview mutates no state, in memory or on disk. */
+    if (!ctx->config.dry_run) {
+        ctx->current_account = account;
+        safe_strncpy(ctx->config.active_account, account->name, sizeof(ctx->config.active_account));
+    }
 
     /* Print shell-integration tip if we set up SSH and/or GPG isolation. The
      * `init` snippet wires SSH_AUTH_SOCK (and, when GPG is used, GNUPGHOME) to

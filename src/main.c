@@ -125,7 +125,7 @@ int main(int argc, char *argv[]) {
     }
     
     /* Parse command line options */
-    while ((opt = getopt_long(argc, argv, "hvccVdngl", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hvcCVdngl", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h':
                 show_help = true;
@@ -196,7 +196,7 @@ int main(int argc, char *argv[]) {
     ctx.config.dry_run = dry_run;
     ctx.config.force_global = force_global;
     ctx.config.force_local = force_local;
-    ctx.config.verbose = (get_last_error() != NULL && should_log(LOG_LEVEL_DEBUG));
+    ctx.config.verbose = should_log(LOG_LEVEL_DEBUG);
     
     /* Parse command and arguments */
     const char *command = NULL;
@@ -342,8 +342,13 @@ static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier) {
         return EXIT_FAILURE;
     }
 
-    /* accounts_switch already prints detailed status, just confirm success */
-    display_success("Switched to: %s", ctx->current_account->name);
+    /* accounts_switch already prints detailed status; confirm success. Under
+     * dry-run it mutates nothing (current_account stays unset), so don't deref it. */
+    if (ctx->config.dry_run) {
+        display_success("DRY RUN complete - no changes were made");
+    } else {
+        display_success("Switched to: %s", ctx->current_account->name);
+    }
 
     return EXIT_SUCCESS;
 }
@@ -492,7 +497,7 @@ static int handle_init_command(const char *shell) {
         printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
         printf("    if test $status -gt 1\n");
         printf("        echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
-        printf("        gitswitch resume >/dev/null 2>&1\n");
+        printf("        gitswitch resume >/dev/null\n");
         printf("    end\n");
         printf("end\n");
         printf("if test -S $__gitswitch_auth_sock\n");
@@ -524,7 +529,7 @@ static int handle_init_command(const char *shell) {
         printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
         printf("    if [ $? -gt 1 ]; then\n");
         printf("        echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
-        printf("        gitswitch resume >/dev/null 2>&1\n");
+        printf("        gitswitch resume >/dev/null\n");
         printf("    fi ;;\n");
         printf("esac\n");
         printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
@@ -564,11 +569,15 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
     }
 
     if (accounts_switch(ctx, ctx->config.active_account) != 0) {
-        display_error("Failed to resume account", get_last_error()->message);
+        /* Emitted to stderr (not the suppressed stdout) so a failed login-time
+         * resume isn't silent: the `init` snippet runs `gitswitch resume
+         * >/dev/null`, leaving stderr visible. */
+        fprintf(stderr, "gitswitch: failed to resume '%s': %s\n",
+                ctx->config.active_account, get_last_error()->message);
         return EXIT_FAILURE;
     }
 
-    display_success("Resumed: %s", ctx->current_account->name);
+    display_success("Resumed: %s", ctx->config.active_account);
     return EXIT_SUCCESS;
 }
 
