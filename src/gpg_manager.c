@@ -799,10 +799,56 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
     return 0;
 }
 
-/* Set up GPG agent configuration for isolated environment */
+/* True if the file has an active (non-comment) pinentry-program directive. */
+static bool conf_has_pinentry(const char *path) {
+    FILE *f = fopen(path, "r");
+    char line[1024];
+    bool found = false;
+    if (!f) {
+        return false;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "pinentry-program", 16) == 0) {
+            found = true;
+            break;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+/* Resolve the user's real gpg home to inherit agent settings from: their
+ * configured GNUPGHOME when it isn't one of our isolated homes (avoids reading
+ * our own generated conf), otherwise ~/.gnupg. Returns 0 on success. */
+static int gpg_user_source_home(char *buf, size_t size) {
+    const char *env_gh = getenv("GNUPGHOME");
+    const char *home;
+    if (env_gh && *env_gh && strstr(env_gh, "gitswitch-gpg") == NULL) {
+        return safe_strncpy(buf, env_gh, size);
+    }
+    home = getenv("HOME");
+    if (!home || !*home) {
+        return -1;
+    }
+    return ((size_t)snprintf(buf, size, "%s/.gnupg", home) < size) ? 0 : -1;
+}
+
+/* Set up gpg-agent.conf for the isolated environment.
+ *
+ * Inherits the user's real gpg-agent.conf (their pinentry choice — e.g. a GUI
+ * pinentry — plus cache settings) so isolation never silently downgrades their
+ * pinentry. Only when the user has no config of their own do we write minimal
+ * defaults, and a *detected* pinentry is appended only if none is already set
+ * (the compiled-in default can be wrong, e.g. on FreeBSD). Re-run each switch,
+ * so edits to the user's real config propagate. */
 static int setup_gpg_agent_config(const char *gnupg_home) {
     char gpg_agent_conf_path[MAX_PATH_LEN];
-    FILE *conf_file;
+    char source_home[MAX_PATH_LEN];
+    char source_conf[MAX_PATH_LEN];
+    bool inherited = false;
+    bool has_pinentry = false;
     
     if (!gnupg_home) {
         set_error(ERR_INVALID_ARGS, "NULL gnupg_home path");
@@ -816,42 +862,50 @@ static int setup_gpg_agent_config(const char *gnupg_home) {
         return -1;
     }
     
-    /* Create basic gpg-agent.conf */
-    conf_file = fopen(gpg_agent_conf_path, "w");
-    if (!conf_file) {
-        set_system_error(ERR_FILE_IO, "Failed to create gpg-agent.conf");
-        return -1;
+    /* Inherit the user's real gpg-agent.conf verbatim when present, so their
+     * pinentry choice and cache settings carry into the isolated home. */
+    if (gpg_user_source_home(source_home, sizeof(source_home)) == 0 &&
+        safe_snprintf(source_conf, sizeof(source_conf), "%s/gpg-agent.conf", source_home) == 0 &&
+        path_exists(source_conf)) {
+        if (copy_file(source_conf, gpg_agent_conf_path) == 0) {
+            inherited = true;
+            has_pinentry = conf_has_pinentry(gpg_agent_conf_path);
+            log_debug("Inherited gpg-agent.conf from %s", source_conf);
+        }
     }
-    
-    fprintf(conf_file, "# GPG Agent configuration for gitswitch isolated environment\n");
-    fprintf(conf_file, "default-cache-ttl 3600\n");
-    fprintf(conf_file, "max-cache-ttl 7200\n");
 
-    /* Detect a pinentry program rather than hardcoding a path: it lives in
-     * different locations per platform (/usr/bin on Linux, /usr/local/bin on
-     * the BSDs, /opt/homebrew/bin or /usr/local/bin on macOS). Prefer the
-     * generic `pinentry` symlink, then common flavors including macOS's
-     * pinentry-mac. If none is found, omit the directive entirely and let
-     * gpg-agent fall back to its compiled-in default. */
-    {
+    /* No user config to inherit: write minimal defaults. */
+    if (!inherited) {
+        FILE *conf_file = fopen(gpg_agent_conf_path, "w");
+        if (!conf_file) {
+            set_system_error(ERR_FILE_IO, "Failed to create gpg-agent.conf");
+            return -1;
+        }
+        fprintf(conf_file, "# GPG Agent configuration for gitswitch isolated environment\n");
+        fprintf(conf_file, "default-cache-ttl 3600\n");
+        fprintf(conf_file, "max-cache-ttl 7200\n");
+        fclose(conf_file);
+    }
+
+    /* Ensure a pinentry-program is set: honor the user's if one was inherited,
+     * otherwise append a detected one (the compiled-in default can be wrong,
+     * e.g. on FreeBSD). Prefer the generic `pinentry`, then common flavors. */
+    if (!has_pinentry) {
         static const char *const pinentry_candidates[] = {
             "pinentry", "pinentry-curses", "pinentry-mac", "pinentry-tty"
         };
         char pinentry_path[MAX_PATH_LEN];
-        bool wrote_pinentry = false;
         for (size_t i = 0; i < sizeof(pinentry_candidates) / sizeof(pinentry_candidates[0]); i++) {
             if (find_command_path(pinentry_candidates[i], pinentry_path, sizeof(pinentry_path)) == 0) {
-                fprintf(conf_file, "pinentry-program %s\n", pinentry_path);
-                wrote_pinentry = true;
+                FILE *cf = fopen(gpg_agent_conf_path, "a");
+                if (cf) {
+                    fprintf(cf, "pinentry-program %s\n", pinentry_path);
+                    fclose(cf);
+                }
                 break;
             }
         }
-        if (!wrote_pinentry) {
-            log_debug("No pinentry program found in PATH; relying on gpg-agent default");
-        }
     }
-
-    fclose(conf_file);
     
     /* Set proper permissions */
     if (chmod(gpg_agent_conf_path, 0600) != 0) {
