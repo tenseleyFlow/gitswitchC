@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.7.1
+Version:        1.7.2
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -54,6 +54,10 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Sat May 30 2026 mfw <espadonne@outlook.com> - 1.7.2-1
+- Fix: isolated GPG homes now inherit your real ~/.gnupg/gpg-agent.conf, so a configured (e.g. GUI) pinentry is preserved instead of reverting to a detected default.
+- Fix: tidy switch output (removed stray blank lines around the switch summary).
+
 * Fri May 29 2026 mfw <espadonne@outlook.com> - 1.7.1-1
 - Fix: build on glibc/Linux (incl. Arch/AUR) — nftw() needs _XOPEN_SOURCE; 1.7.0 failed to compile there. macOS/BSD were unaffected.
 - CI: run the FreeBSD job's tests in release mode (ASan is incompatible with the VM's ASLR).
