@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.7.0
+Version:        1.7.1
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -54,6 +54,10 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Fri May 29 2026 mfw <espadonne@outlook.com> - 1.7.1-1
+- Fix: build on glibc/Linux (incl. Arch/AUR) — nftw() needs _XOPEN_SOURCE; 1.7.0 failed to compile there. macOS/BSD were unaffected.
+- CI: run the FreeBSD job's tests in release mode (ASan is incompatible with the VM's ASLR).
+
 * Fri May 29 2026 mfw <espadonne@outlook.com> - 1.7.0-1
 - SECURITY: fix an arbitrary command-execution vulnerability — a crafted ssh_key path in accounts.toml could inject a shell command via ssh-add. All external commands (git/ssh/gpg) now run via execvp with explicit argv, never a shell. Versions <= 1.6.0 are affected.
 - Security: SSH host-alias config no longer disables host-key checking (StrictHostKeyChecking/UserKnownHostsFile), is written idempotently, and validates the alias.

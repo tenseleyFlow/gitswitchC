@@ -2,7 +2,9 @@
  * Implements per-account GNUPGHOME environments to prevent GPG key mixing
  */
 
-#define _POSIX_C_SOURCE 200809L
+/* _XOPEN_SOURCE 700 (implies POSIX.1-2008) exposes nftw()/FTW_* from <ftw.h>
+ * on glibc, which _POSIX_C_SOURCE alone does not. */
+#define _XOPEN_SOURCE 700
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -42,10 +42,13 @@ jobs:
           operating_system: freebsd
           version: '14.2'
           shell: bash
+          # Tests run in release mode here: FreeBSD enables ASLR, which is
+          # incompatible with ASan/PIE binaries (they abort on init). The
+          # Linux/macOS jobs provide the ASan/UBSan coverage.
           run: |
             sudo pkg install -y gmake gcc openssl
-            gmake BUILD_TYPE=debug test
-            gmake clean && gmake BUILD_TYPE=release
+            gmake BUILD_TYPE=release
+            gmake BUILD_TYPE=release test
 
   macos:
     runs-on: macos-latest
