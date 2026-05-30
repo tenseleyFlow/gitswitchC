@@ -136,11 +136,35 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         g_session.gnupghome_saved = true;
     }
 
-    /* Determine git scope - use account preference or context default */
+    /* Determine git scope. Explicit --global/--local override the account
+     * preference. Writing an identity GLOBALLY affects every repository on the
+     * machine, so we never silently promote local->global outside a repo:
+     * require explicit consent (interactive prompt) or the --global flag. */
     git_scope_t scope = account->preferred_scope;
-    if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
-        display_warning("Not in a git repository, using global scope instead of local");
+    if (ctx->config.force_global) {
         scope = GIT_SCOPE_GLOBAL;
+    } else if (ctx->config.force_local) {
+        scope = GIT_SCOPE_LOCAL;
+    }
+    if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
+        if (isatty(STDIN_FILENO)) {
+            char resp[16];
+            printf("Not in a git repository. Write %s's identity to your GLOBAL git\n"
+                   "config (affects every repository on this machine)? [y/N]: ",
+                   account->name);
+            fflush(stdout);
+            if (fgets(resp, sizeof(resp), stdin) && (resp[0] == 'y' || resp[0] == 'Y')) {
+                scope = GIT_SCOPE_GLOBAL;
+            } else {
+                set_error(ERR_GIT_NOT_REPOSITORY,
+                          "Switch aborted: not in a git repository (pass --global to write global config)");
+                return -1;
+            }
+        } else {
+            set_error(ERR_GIT_NOT_REPOSITORY,
+                      "Not in a git repository; pass --global to write global config, or run inside a repo");
+            return -1;
+        }
     }
     scope_str = (scope == GIT_SCOPE_LOCAL) ? "local" : "global";
 
@@ -153,95 +177,95 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     /* Show what we're doing */
     printf("\nSwitching to account: %s <%s>\n", account->name, account->email);
 
-    /* If not in dry-run mode, actually set git configuration */
+    /* If not in dry-run mode, actually perform the switch.
+     *
+     * Ordering matters for safety: validate availability first (read-only), then
+     * activate SSH and GPG (recoverable mutations), and write git config LAST.
+     * git config is snapshotted up front and restored on any failure, so a
+     * partial switch can never leave a half-applied identity. */
     if (!ctx->config.dry_run) {
-        log_info("Setting git configuration for account: %s (%s scope)",
-                 account->name, scope_str);
+        /* --- 1. Validate availability up front (no mutation yet) --- */
+        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
+            char expanded_key[MAX_PATH_LEN];
+            if (expand_path(account->ssh_key_path, expanded_key, sizeof(expanded_key)) != 0 ||
+                ssh_validate_key_file(expanded_key) != 0) {
+                set_error(ERR_SSH_KEY_LOAD_FAILED,
+                          "SSH key not usable: %s", account->ssh_key_path);
+                return -1;
+            }
+        }
+        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+            if (validate_gpg_key_availability(account->gpg_key_id) != 0) {
+                set_error(ERR_GPG_KEY_NOT_FOUND,
+                          "GPG key not found in keyring: %s", account->gpg_key_id);
+                return -1;
+            }
+        }
 
+        /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
+        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
+            log_info("Setting up SSH isolation for account: %s", account->name);
+            memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
+            if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0 ||
+                ssh_switch_account(&g_session.ssh_config, account) != 0) {
+                printf("  [!!] SSH key failed to load\n");
+                ssh_manager_cleanup(&g_session.ssh_config);
+                set_error(ERR_SSH_KEY_LOAD_FAILED,
+                          "Failed to set up SSH for account: %s", account->name);
+                return -1;
+            }
+            ssh_ok = true;
+            g_session.ssh_active = true;
+            printf("  [OK] SSH key loaded\n");
+
+            /* Connection test is best-effort (network) and never fatal. */
+            if (strlen(account->ssh_host_alias) > 0) {
+                if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
+                    printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
+                } else {
+                    printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
+                }
+            } else if (ssh_test_connection(account, "git@github.com") == 0) {
+                printf("  [OK] SSH connection verified (github.com)\n");
+            }
+        }
+
+        /* --- 3. GPG isolated home (mutation; fatal on failure) --- */
+        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+            log_info("Setting up GPG isolation for account: %s", account->name);
+            memset(&g_session.gpg_config, 0, sizeof(g_session.gpg_config));
+            if (gpg_manager_init(&g_session.gpg_config, GPG_MODE_ISOLATED) != 0 ||
+                gpg_switch_account(&g_session.gpg_config, account) != 0) {
+                printf("  [!!] GPG key failed to activate\n");
+                gpg_manager_cleanup(&g_session.gpg_config);
+                set_error(ERR_GPG_KEY_FAILED,
+                          "Failed to set up GPG for account: %s", account->name);
+                return -1;
+            }
+            g_session.gpg_active = true;
+        }
+
+        /* --- 4. git config LAST, snapshotted for rollback --- */
+        git_config_snapshot(scope);
         if (git_set_config(account, scope) != 0) {
-            set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration: %s",
-                      get_last_error()->message);
+            git_config_restore();
+            set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
             return -1;
+        }
+        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+            if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
+                git_config_restore();
+                set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
+                return -1;
+            }
+            gpg_ok = true;
+            printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
         }
         printf("  [OK] Git config set (%s scope)\n", scope_str);
 
-        /* Validate the configuration was set correctly */
+        /* Read-back validation is best-effort (warn only). */
         if (git_test_config(account, scope) != 0) {
             log_warning("Git configuration validation failed: %s", get_last_error()->message);
-            /* Don't fail completely, just warn */
-        }
-
-        /* Handle SSH agent isolation if SSH is enabled */
-        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
-            log_info("Setting up SSH isolation for account: %s", account->name);
-
-            /* Initialize SSH manager with isolated agents using session state */
-            memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
-            if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0) {
-                printf("  [!!] SSH agent failed to start\n");
-                log_warning("Failed to initialize SSH manager: %s", get_last_error()->message);
-            } else {
-                /* Switch to account's SSH configuration */
-                if (ssh_switch_account(&g_session.ssh_config, account) != 0) {
-                    printf("  [!!] SSH key failed to load\n");
-                    log_warning("Failed to switch SSH configuration: %s", get_last_error()->message);
-                    /* Clean up SSH manager on failure */
-                    ssh_manager_cleanup(&g_session.ssh_config);
-                } else {
-                    ssh_ok = true;
-                    g_session.ssh_active = true;  /* Mark session as active for cleanup */
-                    printf("  [OK] SSH key loaded\n");
-                    log_info("SSH isolation activated for account: %s", account->name);
-
-                    /* Test SSH connection if connection testing is available */
-                    if (strlen(account->ssh_host_alias) > 0) {
-                        if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
-                            printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
-                        } else {
-                            printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
-                        }
-                    } else {
-                        /* Test with default GitHub host (git@ is required for GitHub SSH) */
-                        if (ssh_test_connection(account, "git@github.com") == 0) {
-                            printf("  [OK] SSH connection verified (github.com)\n");
-                        }
-                        /* Silently skip if GitHub unreachable - not an error */
-                    }
-                }
-            }
-        }
-
-        /* Handle GPG environment isolation if GPG is enabled */
-        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-            log_info("Setting up GPG isolation for account: %s", account->name);
-
-            /* Initialize GPG manager with isolated environments using session state */
-            memset(&g_session.gpg_config, 0, sizeof(g_session.gpg_config));
-            if (gpg_manager_init(&g_session.gpg_config, GPG_MODE_ISOLATED) != 0) {
-                printf("  [!!] GPG manager failed to initialize\n");
-                log_warning("Failed to initialize GPG manager: %s", get_last_error()->message);
-            } else {
-                /* Switch to account's GPG configuration */
-                if (gpg_switch_account(&g_session.gpg_config, account) != 0) {
-                    printf("  [!!] GPG key failed to activate\n");
-                    log_warning("Failed to switch GPG configuration: %s", get_last_error()->message);
-                    /* Clean up GPG manager on failure */
-                    gpg_manager_cleanup(&g_session.gpg_config);
-                } else {
-                    g_session.gpg_active = true;  /* Mark session as active for cleanup */
-                    log_info("GPG isolation activated for account: %s", account->name);
-
-                    /* Configure git GPG signing */
-                    if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
-                        printf("  [!!] GPG signing config failed\n");
-                        log_warning("Failed to configure git GPG signing: %s", get_last_error()->message);
-                    } else {
-                        gpg_ok = true;
-                        printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
-                        log_info("Git GPG signing configured for account: %s", account->name);
-                    }
-                }
-            }
         }
     } else {
         printf("  [--] DRY RUN: Would set git config (%s scope)\n", scope_str);
@@ -555,7 +579,13 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (ctx->current_account == account) {
         ctx->current_account = NULL;
     }
-    
+
+    /* Drop the persisted boot-resume target if it names this account, so a later
+     * resume can't re-activate a deleted (or, worse, a wrongly-matched) account. */
+    if (strcmp(ctx->config.active_account, account->name) == 0) {
+        ctx->config.active_account[0] = '\0';
+    }
+
     uint32_t account_id = account->id;
     
     /* Remove account */

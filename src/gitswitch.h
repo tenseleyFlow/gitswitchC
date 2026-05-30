@@ -75,6 +75,8 @@ typedef struct {
     bool verbose;
     bool dry_run;
     bool color_output;
+    bool force_global;   /* --global: write global scope (and consent to it outside a repo) */
+    bool force_local;    /* --local:  force local scope */
 } config_t;
 
 /* Application context */

@@ -16,6 +16,7 @@ Commands:
   config               Show configuration file information
   init <shell>         Emit shell integration (fish|bash|zsh|sh)
   resume               Re-activate the last-used account (used on login)
+  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)
   <account>            Switch to specified account
 
 Options:
@@ -82,6 +83,14 @@ rebuilding its isolated GPG home.
 > is the isolation — but it means *all* gpg in that shell is scoped to the
 > active account (no other public keys, contacts, or ownertrust). For general
 > gpg work, use a shell that doesn't source the integration.
+
+> **Secret keys on disk:** isolating GPG works by exporting each account's
+> secret key into a per-account `GNUPGHOME` under `$XDG_RUNTIME_DIR/gitswitch-gpg/`
+> (or `/tmp/gitswitch-gpg-<uid>/`). These homes **persist** so switching back
+> doesn't re-prompt for your PIN — meaning a copy of each account's private key
+> stays on disk (mode 0700). Run `gitswitch reset` to kill the agents and delete
+> all isolated homes (wiping those copies), or `gitswitch reset <account>` for
+> one. They are also cleared when `$XDG_RUNTIME_DIR` is wiped at reboot.
 
 > **Migrating from the Python gitswitch?** The old `gitswitch --ssh-agent-info`
 > invocation still works as a compat alias that auto-detects your shell from

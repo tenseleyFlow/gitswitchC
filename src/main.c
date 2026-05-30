@@ -36,6 +36,7 @@ static void print_usage(const char *prog_name) {
     printf("  config               Show configuration file information\n");
     printf("  init <shell>         Emit shell integration (fish|bash|zsh|sh)\n");
     printf("  resume               Re-activate the last-used account (used on login)\n");
+    printf("  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n");
     printf("  <account>            Switch to specified account\n");
     printf("\nOptions:\n");
     printf("  --global, -g         Use global git scope\n");
@@ -77,6 +78,7 @@ static int handle_doctor_command(gitswitch_ctx_t *ctx);
 static int handle_config_command(gitswitch_ctx_t *ctx);
 static int handle_init_command(const char *shell);
 static int handle_resume_command(gitswitch_ctx_t *ctx);
+static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account);
 static const char *detect_shell_from_env(void);
 
 int main(int argc, char *argv[]) {
@@ -87,6 +89,8 @@ int main(int argc, char *argv[]) {
     bool show_help = false;
     bool show_version = false;
     bool dry_run = false;
+    bool force_global = false;
+    bool force_local = false;
     int exit_code = EXIT_SUCCESS;
     
     static struct option long_options[] = {
@@ -138,10 +142,10 @@ int main(int argc, char *argv[]) {
                 dry_run = true;
                 break;
             case 'g':
-                /* Global scope - will be handled by command handlers */
+                force_global = true;
                 break;
             case 'l':
-                /* Local scope - will be handled by command handlers */
+                force_local = true;
                 break;
             case OPT_SSH_AGENT_INFO: {
                 int rc = handle_init_command(detect_shell_from_env());
@@ -185,6 +189,8 @@ int main(int argc, char *argv[]) {
     
     /* Set dry run mode if requested */
     ctx.config.dry_run = dry_run;
+    ctx.config.force_global = force_global;
+    ctx.config.force_local = force_local;
     ctx.config.verbose = (get_last_error() != NULL && should_log(LOG_LEVEL_DEBUG));
     
     /* Parse command and arguments */
@@ -234,6 +240,8 @@ int main(int argc, char *argv[]) {
         exit_code = handle_init_command(arg1 ? arg1 : detect_shell_from_env());
     } else if (strcmp(command, "resume") == 0) {
         exit_code = handle_resume_command(&ctx);
+    } else if (strcmp(command, "reset") == 0) {
+        exit_code = handle_reset_command(&ctx, arg1);
     } else {
         /* Assume it's an account identifier for switching */
         exit_code = handle_switch_command(&ctx, command);
@@ -254,7 +262,8 @@ int main(int argc, char *argv[]) {
                    strcmp(command, "health") != 0 &&
                    strcmp(command, "config") != 0 &&
                    strcmp(command, "init") != 0 &&
-                   strcmp(command, "resume") != 0) {
+                   strcmp(command, "resume") != 0 &&
+                   strcmp(command, "reset") != 0) {
             /* Assume it's a switch command - may have modified default scope */
             should_save = true;
         }
@@ -545,5 +554,39 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
     }
 
     display_success("Resumed: %s", ctx->current_account->name);
+    return EXIT_SUCCESS;
+}
+
+/* Tear down isolated SSH/GPG state: kill the per-account agents and delete the
+ * isolated GPG homes (wiping the exported secret-key copies on disk). With an
+ * account argument, only that account; otherwise all. Destructive — confirmed. */
+static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
+    char resp[16];
+
+    if (!ctx) return EXIT_FAILURE;
+
+    if (account && *account) {
+        printf("This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
+               "'%s', removing its on-disk secret-key copy. Continue? [y/N]: ", account);
+    } else {
+        printf("This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
+               "homes, removing every on-disk secret-key copy. Continue? [y/N]: ");
+    }
+    fflush(stdout);
+
+    if (!fgets(resp, sizeof(resp), stdin) || (resp[0] != 'y' && resp[0] != 'Y')) {
+        printf("Reset cancelled.\n");
+        return EXIT_SUCCESS;
+    }
+
+    const char *target = (account && *account) ? account : NULL;
+    ssh_manager_reset(target);
+    gpg_manager_reset(target);
+
+    if (target) {
+        display_success("Reset gitswitch state for: %s", target);
+    } else {
+        display_success("Reset all gitswitch SSH/GPG state");
+    }
     return EXIT_SUCCESS;
 }

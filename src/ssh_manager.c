@@ -891,6 +891,48 @@ static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) 
     return 0;
 }
 
+/* Tear down isolated SSH agents: one account, or all when account is NULL.
+ * Kills the agent(s) by recorded PID and removes their sockets/sidecars. */
+int ssh_manager_reset(const char *account) {
+    char socket_dir[MAX_PATH_LEN];
+    const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+
+    if (!account || !*account) {
+        /* All: reuse the orphan reaper (kills every recorded PID, unlinks
+         * sockets/pids/current.sock). */
+        kill_orphaned_gitswitch_agents();
+        return 0;
+    }
+
+    if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
+        if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "%s/gitswitch-ssh", runtime_dir) >= sizeof(socket_dir)) {
+            return -1;
+        }
+    } else {
+        if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid()) >= sizeof(socket_dir)) {
+            return -1;
+        }
+    }
+
+    char pid_path[MAX_PATH_LEN];
+    char sock_path[MAX_PATH_LEN];
+    if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid", socket_dir, account) < sizeof(pid_path)) {
+        FILE *pf = fopen(pid_path, "r");
+        if (pf) {
+            long pid = 0;
+            if (fscanf(pf, "%ld", &pid) == 1 && pid > 1) {
+                kill((pid_t)pid, SIGTERM);
+            }
+            fclose(pf);
+        }
+        unlink(pid_path);
+    }
+    if ((size_t)snprintf(sock_path, sizeof(sock_path), "%s/ssh-agent.%s.sock", socket_dir, account) < sizeof(sock_path)) {
+        unlink(sock_path);
+    }
+    return 0;
+}
+
 /* Kill orphaned gitswitch ssh-agents from previous runs and remove stale
  * sockets. Shell-free: agents are reaped precisely by the PID recorded in their
  * sidecar (ssh-agent.<name>.pid) rather than a pkill pattern match, and stale

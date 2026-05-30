@@ -13,6 +13,8 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <ftw.h>
 
 #include "gpg_manager.h"
 #include "error.h"
@@ -273,6 +275,86 @@ static int update_current_symlink(const char *real_home) {
     }
 
     log_debug("Created GNUPGHOME symlink: %s -> %s", link_path, real_home);
+    return 0;
+}
+
+/* nftw callback: remove a single path (depth-first, so children precede dirs). */
+static int rm_tree_cb(const char *path, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
+    (void)sb; (void)typeflag; (void)ftwbuf;
+    return remove(path);
+}
+
+/* Recursively remove a directory tree (no shell). */
+static int remove_tree(const char *path) {
+    return nftw(path, rm_tree_cb, 16, FTW_DEPTH | FTW_PHYS);
+}
+
+/* Kill the gpg-agent in an isolated home (best-effort) and delete the home. */
+static void gpg_kill_and_remove_home(const char *home) {
+    const char *argv[] = {"gpgconf", "--kill", "all", NULL};
+    char envbuf[MAX_PATH_LEN + 16];
+    const char *env[2] = {NULL, NULL};
+    run_opts_t opts;
+
+    memset(&opts, 0, sizeof(opts));
+    if ((size_t)snprintf(envbuf, sizeof(envbuf), "GNUPGHOME=%s", home) < sizeof(envbuf)) {
+        env[0] = envbuf;
+        opts.extra_env = env;
+    }
+    opts.stderr_to_devnull = true;
+    run_argv(argv, &opts, NULL); /* best-effort; gpgconf may be absent */
+    remove_tree(home);
+    log_debug("Removed isolated GPG home: %s", home);
+}
+
+/* Tear down isolated GPG homes: one account, or all when account is NULL.
+ * Kills the per-home gpg-agents and deletes the homes (wiping the on-disk
+ * secret-key copies), then drops the stable `current` symlink if it dangles. */
+int gpg_manager_reset(const char *account) {
+    char base[MAX_PATH_LEN];
+    char current[MAX_PATH_LEN];
+
+    if (gpg_get_base_dir(base, sizeof(base)) != 0) {
+        return -1;
+    }
+
+    if (account && *account) {
+        char home[MAX_PATH_LEN];
+        if ((size_t)snprintf(home, sizeof(home), "%s/%s", base, account) >= sizeof(home)) {
+            return -1;
+        }
+        if (path_exists(home)) {
+            gpg_kill_and_remove_home(home);
+        }
+    } else {
+        DIR *d = opendir(base);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                char home[MAX_PATH_LEN];
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0 ||
+                    strcmp(ent->d_name, "current") == 0) {
+                    continue;
+                }
+                if ((size_t)snprintf(home, sizeof(home), "%s/%s", base, ent->d_name) < sizeof(home)) {
+                    gpg_kill_and_remove_home(home);
+                }
+            }
+            closedir(d);
+        }
+    }
+
+    /* Drop the stable symlink if it no longer points at a live home. */
+    if (gpg_manager_get_home_path(current, sizeof(current)) == 0) {
+        char target[MAX_PATH_LEN];
+        ssize_t n = readlink(current, target, sizeof(target) - 1);
+        if (n > 0) {
+            target[n] = '\0';
+            if (!path_exists(target)) {
+                unlink(current);
+            }
+        }
+    }
     return 0;
 }
 

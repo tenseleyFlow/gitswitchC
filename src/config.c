@@ -440,36 +440,64 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     return 0;
 }
 
-/* Find account by ID or name/description */
+/* Find account by identifier, exact matches first to avoid selecting the wrong
+ * identity. Precedence: numeric id -> exact name -> exact email -> unambiguous
+ * substring of name/description. A substring that matches more than one account
+ * is rejected as ambiguous (rather than silently returning the first). */
 account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
     char *endptr;
     unsigned long account_id;
-    
-    if (!ctx || !identifier) {
+    account_t *match = NULL;
+    size_t match_count = 0;
+
+    if (!ctx || !identifier || !*identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account");
         return NULL;
     }
-    
-    /* Try to parse as numeric ID */
+
+    /* 1. Exact numeric ID (only when the whole identifier is a number). */
     account_id = strtoul(identifier, &endptr, 10);
     if (*endptr == '\0') {
-        /* It's a number - search by ID */
         for (size_t i = 0; i < ctx->account_count; i++) {
             if (ctx->accounts[i].id == (uint32_t)account_id) {
                 return &ctx->accounts[i];
             }
         }
-    } else {
-        /* Search by name, email, or description */
-        for (size_t i = 0; i < ctx->account_count; i++) {
-            if (strstr(ctx->accounts[i].name, identifier) ||
-                strstr(ctx->accounts[i].description, identifier) ||
-                strcmp(ctx->accounts[i].email, identifier) == 0) {
-                return &ctx->accounts[i];
-            }
+        /* No id match — fall through; the identifier may be a literal name. */
+    }
+
+    /* 2. Exact name. */
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strcmp(ctx->accounts[i].name, identifier) == 0) {
+            return &ctx->accounts[i];
         }
     }
-    
+
+    /* 3. Exact email. */
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strcmp(ctx->accounts[i].email, identifier) == 0) {
+            return &ctx->accounts[i];
+        }
+    }
+
+    /* 4. Unambiguous substring of name or description. */
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strstr(ctx->accounts[i].name, identifier) ||
+            strstr(ctx->accounts[i].description, identifier)) {
+            match = &ctx->accounts[i];
+            match_count++;
+        }
+    }
+    if (match_count == 1) {
+        return match;
+    }
+    if (match_count > 1) {
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "Ambiguous identifier '%s' matches %zu accounts; use the exact name or numeric id",
+                  identifier, match_count);
+        return NULL;
+    }
+
     return NULL;
 }
 

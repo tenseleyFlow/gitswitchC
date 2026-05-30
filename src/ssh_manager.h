@@ -94,4 +94,11 @@ int ssh_test_connection(const account_t *account, const char *host);
  */
 int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size);
 
+/**
+ * Tear down isolated SSH agents (kill by recorded PID and remove sockets/PID
+ * sidecars). Resets a single account when `account` is non-NULL, or all
+ * accounts when NULL. Returns 0 on success.
+ */
+int ssh_manager_reset(const char *account);
+
 #endif /* SSH_MANAGER_H */

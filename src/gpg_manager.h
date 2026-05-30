@@ -114,4 +114,11 @@ int gpg_set_environment(const gpg_config_t *gpg_config);
  */
 int gpg_manager_get_home_path(char *buf, size_t size);
 
+/**
+ * Tear down isolated GPG homes (kill per-home gpg-agents and delete the homes,
+ * wiping on-disk secret-key copies). Resets a single account when `account` is
+ * non-NULL, or all accounts when NULL. Returns 0 on success.
+ */
+int gpg_manager_reset(const char *account);
+
 #endif /* GPG_MANAGER_H */

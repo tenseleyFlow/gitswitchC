@@ -20,7 +20,74 @@
 static int git_run(char *output, size_t output_size, ...);
 static int validate_git_installation(void);
 static bool is_valid_git_config_value(const char *value);
-static int backup_git_config_if_needed(git_scope_t scope);
+
+/* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
+typedef struct {
+    const char *key;
+    char value[512];
+    bool present;
+} git_kv_t;
+
+#define GIT_MANAGED_KEY_COUNT 6
+static const char *const g_managed_keys[GIT_MANAGED_KEY_COUNT] = {
+    GIT_CONFIG_USER_NAME, GIT_CONFIG_USER_EMAIL, GIT_CONFIG_USER_SIGNINGKEY,
+    GIT_CONFIG_COMMIT_GPGSIGN, GIT_CONFIG_GPG_PROGRAM, GIT_CONFIG_CORE_SSHCOMMAND
+};
+
+static struct {
+    git_scope_t scope;
+    bool local_also;
+    git_kv_t primary[GIT_MANAGED_KEY_COUNT];
+    git_kv_t local[GIT_MANAGED_KEY_COUNT];
+    bool valid;
+} g_git_snapshot;
+
+static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        out[i].key = g_managed_keys[i];
+        if (git_get_config_value(g_managed_keys[i], out[i].value, sizeof(out[i].value), scope) == 0) {
+            out[i].present = true;
+        } else {
+            out[i].present = false;
+            out[i].value[0] = '\0';
+        }
+    }
+}
+
+static void git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KEY_COUNT]) {
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (in[i].present) {
+            git_set_config_value(in[i].key, in[i].value, scope);
+        } else {
+            git_unset_config_value(in[i].key, scope);
+        }
+    }
+}
+
+int git_config_snapshot(git_scope_t scope) {
+    g_git_snapshot.scope = scope;
+    g_git_snapshot.local_also = (scope == GIT_SCOPE_GLOBAL && git_is_repository());
+    git_capture_keys(scope, g_git_snapshot.primary);
+    if (g_git_snapshot.local_also) {
+        git_capture_keys(GIT_SCOPE_LOCAL, g_git_snapshot.local);
+    }
+    g_git_snapshot.valid = true;
+    return 0;
+}
+
+int git_config_restore(void) {
+    if (!g_git_snapshot.valid) {
+        return 0;
+    }
+    log_info("Rolling back git configuration after a failed switch");
+    /* Restore local first (it was cleared earliest), then the primary scope. */
+    if (g_git_snapshot.local_also) {
+        git_restore_keys(GIT_SCOPE_LOCAL, g_git_snapshot.local);
+    }
+    git_restore_keys(g_git_snapshot.scope, g_git_snapshot.primary);
+    g_git_snapshot.valid = false;
+    return 0;
+}
 
 /* Initialize git operations */
 int git_ops_init(void) {
@@ -69,11 +136,10 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         return -1;
     }
     
-    /* Backup current configuration if requested */
-    if (backup_git_config_if_needed(scope) != 0) {
-        log_warning("Failed to backup git configuration");
-    }
-    
+    /* The caller (accounts_switch) snapshots managed keys via
+     * git_config_snapshot() before this point and restores them on failure, so
+     * the whole switch is rolled back atomically rather than left half-applied. */
+
     /* When setting global scope inside a repo, clear local config so stale
      * values (e.g. signing key from a prior account) don't take precedence */
     if (scope == GIT_SCOPE_GLOBAL && git_is_repository()) {
@@ -635,9 +701,4 @@ static bool is_valid_git_config_value(const char *value) {
 }
 
 /* Backup git config if needed */
-static int backup_git_config_if_needed(git_scope_t scope) {
-    /* TODO: Implement config backup for safety */
-    (void)scope; /* Suppress unused parameter warning */
-    return 0;
-}
 
