@@ -121,4 +121,10 @@ int gpg_manager_get_home_path(char *buf, size_t size);
  */
 int gpg_manager_reset(const char *account);
 
+/**
+ * Return true if `gpg --with-colons` output contains a secret key (sec/ssb)
+ * whose capability field advertises signing ('s' or 'S'). Exposed for testing.
+ */
+bool gpg_colons_have_sign_capability(const char *colons);
+
 #endif /* GPG_MANAGER_H */

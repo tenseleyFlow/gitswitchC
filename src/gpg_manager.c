@@ -25,7 +25,6 @@
 /* Internal helper functions */
 static int gpg_get_base_dir(char *buf, size_t size);
 static int update_current_symlink(const char *real_home);
-static bool gpg_colons_have_sign_capability(const char *colons);
 static int create_isolated_gnupg_home_dir(const char *gnupg_home);
 static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
                           const char *env_out[2]);
@@ -526,7 +525,7 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
  * (primary `sec` or subkey `ssb`) whose capability field (field 12, the 12th
  * ':'-separated field) advertises signing. Lowercase 's' means this key can
  * sign; uppercase 'S' on a primary means a signing-capable subkey exists. */
-static bool gpg_colons_have_sign_capability(const char *colons) {
+bool gpg_colons_have_sign_capability(const char *colons) {
     const char *line;
 
     if (!colons) {

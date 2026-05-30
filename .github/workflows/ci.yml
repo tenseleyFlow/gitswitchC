@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [trunk]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev cppcheck flawfinder
+      - name: No-shell gate (no popen/system in src)
+        run: |
+          if grep -rn -e 'popen(' -e 'system(' src/*.c; then
+            echo "ERROR: shell-based process execution reintroduced in src/" >&2
+            exit 1
+          fi
+      - name: Build + test (ASan/UBSan)
+        run: make BUILD_TYPE=debug test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      - name: Release build (FORTIFY/RELRO)
+        run: make clean && make BUILD_TYPE=release
+      - name: Static analysis (cppcheck)
+        run: make analyze
+        continue-on-error: true
+      - name: Security scan (flawfinder)
+        run: make security-scan
+        continue-on-error: true
+
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build + test on FreeBSD
+        uses: cross-platform-actions/action@v0.27.0
+        with:
+          operating_system: freebsd
+          version: '14.2'
+          shell: bash
+          run: |
+            sudo pkg install -y gmake gcc openssl
+            gmake BUILD_TYPE=debug test
+            gmake clean && gmake BUILD_TYPE=release
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install openssl@3
+      - name: Build + test (ASan/UBSan)
+        run: make BUILD_TYPE=debug test
+      - name: Release build
+        run: make clean && make BUILD_TYPE=release
