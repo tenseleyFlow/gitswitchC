@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <errno.h>
 #include <pwd.h>
 #include <termios.h>
@@ -445,132 +446,237 @@ time_t get_file_mtime(const char *file_path) {
 
 /* Process utilities */
 
-int execute_command(const char *command, char *output, size_t output_size) {
-    return execute_command_with_input(command, NULL, output, output_size);
+/* ---- Shell-free subprocess execution -------------------------------------
+ *
+ * run_argv_real spawns argv[0] via fork+execvp (no shell) with optional
+ * stdin input, stdout capture, extra environment, and stderr policy. I/O is
+ * driven by poll() so an input+output pair cannot deadlock regardless of
+ * payload size. The real child exit code is reported via WEXITSTATUS. */
+
+static void set_nonblock(int fd) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl != -1) {
+        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    }
 }
 
-int execute_command_with_input(const char *command, const char *input,
-                               char *output, size_t output_size) {
-    FILE *pipe;
-    char *line = NULL;
-    size_t len = 0;
-    ssize_t read_len;
-    int status;
-    
-    if (!command) {
-        set_error(ERR_INVALID_ARGS, "NULL command to execute_command_with_input");
+int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    run_opts_t no_opts;
+    run_result_t local;
+    memset(&no_opts, 0, sizeof(no_opts));
+    if (!opts) opts = &no_opts;
+    if (!result) result = &local;
+    result->exit_code = -1;
+    result->term_signal = 0;
+    result->spawned = false;
+    result->out_len = 0;
+
+    if (!argv || !argv[0]) {
+        set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
         return -1;
     }
-    
-    /* Clear output buffer */
-    if (output && output_size > 0) {
-        output[0] = '\0';
-    }
-    
-    pipe = popen(command, "r");
-    if (!pipe) {
-        set_system_error(ERR_SYSTEM_CALL, "Failed to execute command: %s", command);
+
+    bool want_in = (opts->input != NULL);
+    bool want_out = (opts->out && opts->out_size > 0);
+    if (want_out) opts->out[0] = '\0';
+
+    int in_pipe[2] = {-1, -1};
+    int out_pipe[2] = {-1, -1};
+    if (want_in && pipe(in_pipe) != 0) {
+        set_system_error(ERR_SYSTEM_CALL, "pipe() failed");
         return -1;
     }
-    
-    /* Write input to command if provided */
-    if (input) {
-        /* Note: This is simplified - full implementation would need bidirectional pipes */
-        log_warning("Input to command not fully implemented yet");
+    if (want_out && pipe(out_pipe) != 0) {
+        set_system_error(ERR_SYSTEM_CALL, "pipe() failed");
+        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        return -1;
     }
-    
-    /* Read output */
-    if (output && output_size > 0) {
-        size_t total_read = 0;
-        
-        while ((read_len = getline(&line, &len, pipe)) != -1 && 
-               total_read < output_size - 1) {
-            
-            size_t to_copy = (size_t)read_len;
-            if (total_read + to_copy >= output_size) {
-                to_copy = output_size - total_read - 1;
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        set_system_error(ERR_SYSTEM_CALL, "fork() failed");
+        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* ---- child ---- */
+        int devnull = open("/dev/null", O_RDWR);
+        if (want_in) { dup2(in_pipe[0], STDIN_FILENO); }
+        else if (devnull >= 0) { dup2(devnull, STDIN_FILENO); }
+        if (want_out) { dup2(out_pipe[1], STDOUT_FILENO); }
+        else if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); }
+        if (opts->merge_stderr) { dup2(STDOUT_FILENO, STDERR_FILENO); }
+        else if (opts->stderr_to_devnull && devnull >= 0) { dup2(devnull, STDERR_FILENO); }
+
+        if (in_pipe[0] >= 0) close(in_pipe[0]);
+        if (in_pipe[1] >= 0) close(in_pipe[1]);
+        if (out_pipe[0] >= 0) close(out_pipe[0]);
+        if (out_pipe[1] >= 0) close(out_pipe[1]);
+        if (devnull >= 0) close(devnull);
+
+        if (opts->extra_env) {
+            for (size_t i = 0; opts->extra_env[i]; i++) {
+                const char *e = opts->extra_env[i];
+                const char *eq = strchr(e, '=');
+                if (eq) {
+                    char key[256];
+                    size_t klen = (size_t)(eq - e);
+                    if (klen < sizeof(key)) {
+                        memcpy(key, e, klen);
+                        key[klen] = '\0';
+                        setenv(key, eq + 1, 1);
+                    }
+                }
             }
-            
-            memcpy(output + total_read, line, to_copy);
-            total_read += to_copy;
         }
-        
-        output[total_read] = '\0';
-        
-        /* Remove trailing newline if present */
-        if (total_read > 0 && output[total_read - 1] == '\n') {
-            output[total_read - 1] = '\0';
+
+        execvp(argv[0], (char *const *)argv);
+        _exit(127); /* exec failed (e.g. command not found) */
+    }
+
+    /* ---- parent ---- */
+    result->spawned = true;
+    if (want_in) close(in_pipe[0]);
+    if (want_out) close(out_pipe[1]);
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
+    int infd = want_in ? in_pipe[1] : -1;
+    int outfd = want_out ? out_pipe[0] : -1;
+    size_t in_off = 0, out_off = 0;
+    if (infd >= 0) set_nonblock(infd);
+    if (outfd >= 0) set_nonblock(outfd);
+
+    while (infd >= 0 || outfd >= 0) {
+        struct pollfd pfds[2];
+        int n = 0, in_idx = -1, out_idx = -1;
+        if (infd >= 0) { pfds[n].fd = infd; pfds[n].events = POLLOUT; in_idx = n++; }
+        if (outfd >= 0) { pfds[n].fd = outfd; pfds[n].events = POLLIN; out_idx = n++; }
+
+        if (poll(pfds, (nfds_t)n, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (in_idx >= 0 && (pfds[in_idx].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            if (pfds[in_idx].revents & (POLLERR | POLLHUP)) {
+                close(infd); infd = -1;
+            } else {
+                ssize_t w = write(infd, opts->input + in_off, opts->input_len - in_off);
+                if (w > 0) {
+                    in_off += (size_t)w;
+                    if (in_off >= opts->input_len) { close(infd); infd = -1; }
+                } else if (w < 0 && errno != EAGAIN && errno != EINTR) {
+                    close(infd); infd = -1;
+                }
+            }
+        }
+
+        if (out_idx >= 0 && (pfds[out_idx].revents & (POLLIN | POLLERR | POLLHUP))) {
+            char buf[4096];
+            ssize_t r = read(outfd, buf, sizeof(buf));
+            if (r > 0) {
+                if (out_off < opts->out_size - 1) {
+                    size_t space = opts->out_size - 1 - out_off;
+                    size_t cp = ((size_t)r < space) ? (size_t)r : space;
+                    memcpy(opts->out + out_off, buf, cp);
+                    out_off += cp;
+                }
+                /* keep draining even when the capture buffer is full */
+            } else if (r == 0) {
+                close(outfd); outfd = -1;
+            } else if (r < 0 && errno != EAGAIN && errno != EINTR) {
+                close(outfd); outfd = -1;
+            }
         }
     }
-    
-    free(line);
-    status = pclose(pipe);
-    
-    if (status == -1) {
-        set_system_error(ERR_SYSTEM_CALL, "pclose failed for command: %s", command);
+    if (want_out) opts->out[out_off] = '\0';
+    result->out_len = out_off;
+
+    int status = 0;
+    pid_t w;
+    do { w = waitpid(pid, &status, 0); } while (w < 0 && errno == EINTR);
+    signal(SIGPIPE, old_sigpipe);
+
+    if (w < 0) {
+        set_system_error(ERR_SYSTEM_CALL, "waitpid() failed");
         return -1;
     }
-    
-    return WEXITSTATUS(status);
+    if (WIFEXITED(status)) {
+        result->exit_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        result->term_signal = WTERMSIG(status);
+        result->exit_code = -1;
+    }
+    return (result->spawned && result->exit_code == 0) ? 0 : -1;
 }
 
-bool command_exists(const char *command) {
-    char test_command[256];
-    int result;
-    
-    if (!command) return false;
-    
-    if ((size_t)snprintf(test_command, sizeof(test_command), 
-                        "command -v %s >/dev/null 2>&1", command) >= sizeof(test_command)) {
-        return false;
-    }
-    
-    result = system(test_command);
-    return result == 0;
+static command_runner_fn g_runner = run_argv_real;
+
+command_runner_fn run_set_runner(command_runner_fn fn) {
+    command_runner_fn prev = g_runner;
+    g_runner = fn ? fn : run_argv_real;
+    return prev;
+}
+
+int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    return g_runner(argv, opts, result);
 }
 
 int find_command_path(const char *name, char *buf, size_t size) {
-    char test_command[256];
-    FILE *fp;
-    size_t len;
+    const char *path_env;
+    const char *p;
 
-    if (!name || !buf || size == 0) {
+    if (!name || !buf || size == 0 || name[0] == '\0') {
         return -1;
     }
 
-    /* `command -v` is a POSIX shell builtin that prints the absolute path of an
-     * external program found in PATH. It is portable across sh/bash/zsh on
-     * Linux, macOS, and the BSDs (unlike `which`, which is non-standard and
-     * absent on some systems). */
-    if ((size_t)snprintf(test_command, sizeof(test_command),
-                        "command -v %s 2>/dev/null", name) >= sizeof(test_command)) {
+    /* An absolute/relative path with a slash: test it directly, no PATH search. */
+    if (strchr(name, '/')) {
+        if (access(name, X_OK) == 0) {
+            if (safe_strncpy(buf, name, size) != 0) return -1;
+            return 0;
+        }
         return -1;
     }
 
-    fp = popen(test_command, "r");
-    if (!fp) {
-        return -1;
+    path_env = getenv("PATH");
+    if (!path_env || !*path_env) {
+        path_env = "/usr/local/bin:/usr/bin:/bin";
     }
 
-    if (!fgets(buf, size, fp)) {
-        pclose(fp);
-        return -1;
-    }
-    pclose(fp);
+    /* Walk colon-separated PATH entries, testing <dir>/<name> for X_OK. */
+    p = path_env;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        size_t dirlen = colon ? (size_t)(colon - p) : strlen(p);
+        char candidate[MAX_PATH_LEN];
+        const char *dir = p;
+        size_t dl = dirlen;
 
-    /* Strip trailing newline(s). */
-    len = strlen(buf);
-    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
-        buf[--len] = '\0';
-    }
+        if (dl == 0) { dir = "."; dl = 1; } /* empty entry => current dir */
 
-    /* `command -v` can echo a shell builtin/alias name with no leading slash;
-     * require an absolute path to a file that actually exists. */
-    if (len == 0 || buf[0] != '/' || !path_exists(buf)) {
-        return -1;
-    }
+        if (dl + 1 + strlen(name) + 1 <= sizeof(candidate)) {
+            memcpy(candidate, dir, dl);
+            candidate[dl] = '/';
+            strcpy(candidate + dl + 1, name);
+            if (access(candidate, X_OK) == 0) {
+                if (safe_strncpy(buf, candidate, size) != 0) return -1;
+                return 0;
+            }
+        }
 
-    return 0;
+        if (!colon) break;
+        p = colon + 1;
+    }
+    return -1;
+}
+
+bool command_exists(const char *command) {
+    char path[MAX_PATH_LEN];
+    if (!command) return false;
+    return find_command_path(command, path, sizeof(path)) == 0;
 }
 
 pid_t start_background_process(const char *command, char *pidfile_path) {

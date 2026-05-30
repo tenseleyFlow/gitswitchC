@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -24,8 +25,9 @@ static int gpg_get_base_dir(char *buf, size_t size);
 static int update_current_symlink(const char *real_home);
 static bool gpg_colons_have_sign_capability(const char *colons);
 static int create_isolated_gnupg_home_dir(const char *gnupg_home);
-static int execute_gpg_command_in_env(const gpg_config_t *gpg_config, 
-                                       const char *command, char *output, size_t output_size);
+static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
+                          const char *env_out[2]);
+static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ...);
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id);
 static int validate_gnupg_home_permissions(const char *gnupg_home);
 static int setup_gpg_agent_config(const char *gnupg_home);
@@ -323,7 +325,6 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
 
 /* Import GPG key from file or keyserver */
 int gpg_import_key(gpg_config_t *gpg_config, const char *key_source) {
-    char command[512];
     char output[1024];
     int result;
     
@@ -333,25 +334,16 @@ int gpg_import_key(gpg_config_t *gpg_config, const char *key_source) {
     }
     
     log_debug("Importing GPG key from: %s", key_source);
-    
-    /* Check if key_source is a file or key ID */
+
+    /* Import from a key file, or fetch by id from the keyserver. */
     if (path_exists(key_source)) {
-        /* Import from file */
-        if (safe_snprintf(command, sizeof(command), "gpg --import '%s'", key_source) != 0) {
-            set_error(ERR_INVALID_ARGS, "GPG import command too long");
-            return -1;
-        }
+        result = gpg_run(gpg_config, output, sizeof(output),
+                         "gpg", "--import", key_source, NULL);
     } else {
-        /* Import from keyserver */
-        if (safe_snprintf(command, sizeof(command), "gpg --keyserver hkps://keys.openpgp.org --recv-keys %s", 
-                         key_source) != 0) {
-            set_error(ERR_INVALID_ARGS, "GPG keyserver command too long");
-            return -1;
-        }
+        result = gpg_run(gpg_config, output, sizeof(output),
+                         "gpg", "--keyserver", "hkps://keys.openpgp.org",
+                         "--recv-keys", key_source, NULL);
     }
-    
-    /* Execute import command */
-    result = execute_gpg_command_in_env(gpg_config, command, output, sizeof(output));
     if (result != 0) {
         set_error(ERR_GPG_KEY_FAILED, "Failed to import GPG key: %s", output);
         return -1;
@@ -362,21 +354,15 @@ int gpg_import_key(gpg_config_t *gpg_config, const char *key_source) {
 }
 
 /* Export GPG public key for backup/sharing */
-int gpg_export_public_key(gpg_config_t *gpg_config, const char *key_id, 
+int gpg_export_public_key(gpg_config_t *gpg_config, const char *key_id,
                           char *output, size_t output_size) {
-    char command[256];
-    
     if (!gpg_config || !key_id || !output || output_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_export_public_key");
         return -1;
     }
-    
-    if (safe_snprintf(command, sizeof(command), "gpg --armor --export %s", key_id) != 0) {
-        set_error(ERR_INVALID_ARGS, "GPG export command too long");
-        return -1;
-    }
-    
-    return execute_gpg_command_in_env(gpg_config, command, output, output_size);
+
+    return gpg_run(gpg_config, output, output_size,
+                   "gpg", "--armor", "--export", key_id, NULL);
 }
 
 /* List available GPG keys */
@@ -386,29 +372,24 @@ int gpg_list_keys(gpg_config_t *gpg_config, char *output, size_t output_size) {
         return -1;
     }
     
-    return execute_gpg_command_in_env(gpg_config, "gpg --list-keys --with-colons", output, output_size);
+    return gpg_run(gpg_config, output, output_size,
+                   "gpg", "--list-keys", "--with-colons", NULL);
 }
 
 /* Validate GPG key exists and is usable */
 int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id) {
-    char command[256];
     char output[512];
     int result;
-    
+
     if (!gpg_config || !key_id) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_validate_key");
         return -1;
     }
-    
+
     log_debug("Validating GPG key: %s", key_id);
-    
-    /* Check if key exists in keyring */
-    if (safe_snprintf(command, sizeof(command), "gpg --list-secret-keys %s", key_id) != 0) {
-        set_error(ERR_INVALID_ARGS, "GPG validation command too long");
-        return -1;
-    }
-    
-    result = execute_gpg_command_in_env(gpg_config, command, output, sizeof(output));
+
+    result = gpg_run(gpg_config, output, sizeof(output),
+                     "gpg", "--list-secret-keys", key_id, NULL);
     if (result != 0) {
         set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found: %s", key_id);
         return -1;
@@ -515,7 +496,6 @@ static bool gpg_colons_have_sign_capability(const char *colons) {
  * key is present via the colon-delimited listing: PIN-free, pinentry-free, and
  * sufficient — real signing is exercised when the user actually commits. */
 int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
-    char command[256];
     char output[4096];
     int result;
 
@@ -526,13 +506,8 @@ int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
 
     log_debug("Verifying signing capability for key: %s", key_id);
 
-    if (safe_snprintf(command, sizeof(command),
-                     "gpg --list-secret-keys --with-colons %s", key_id) != 0) {
-        set_error(ERR_INVALID_ARGS, "GPG capability command too long");
-        return -1;
-    }
-
-    result = execute_gpg_command_in_env(gpg_config, command, output, sizeof(output));
+    result = gpg_run(gpg_config, output, sizeof(output),
+                     "gpg", "--list-secret-keys", "--with-colons", key_id, NULL);
     if (result != 0) {
         set_error(ERR_GPG_SIGNING_FAILED, "No secret key available for signing: %s", key_id);
         return -1;
@@ -549,19 +524,21 @@ int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
 
 /* Generate new GPG key for account */
 int gpg_generate_key(gpg_config_t *gpg_config, const account_t *account) {
-    char command[1024];
     char key_params[512];
     char output[2048];
-    int result;
-    
+    char envbuf[MAX_PATH_LEN + 16];
+    const char *env[2];
+    run_opts_t opts;
+    const char *argv[] = {"gpg", "--batch", "--generate-key", NULL};
+
     if (!gpg_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_generate_key");
         return -1;
     }
-    
+
     log_info("Generating new GPG key for account: %s", account->name);
-    
-    /* Create key generation parameters */
+
+    /* Key-generation parameters are fed to gpg on stdin (no shell). */
     if (safe_snprintf(key_params, sizeof(key_params),
                      "Key-Type: RSA\n"
                      "Key-Length: 4096\n"
@@ -576,19 +553,21 @@ int gpg_generate_key(gpg_config_t *gpg_config, const account_t *account) {
         set_error(ERR_INVALID_ARGS, "GPG key parameters too long");
         return -1;
     }
-    
-    /* Generate key */
-    if (safe_snprintf(command, sizeof(command), "echo '%s' | gpg --batch --generate-key", key_params) != 0) {
-        set_error(ERR_INVALID_ARGS, "GPG generation command too long");
-        return -1;
-    }
-    
-    result = execute_gpg_command_in_env(gpg_config, command, output, sizeof(output));
-    if (result != 0) {
+
+    gpg_build_env(gpg_config, envbuf, sizeof(envbuf), env);
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.input = key_params;
+    opts.input_len = strlen(key_params);
+    opts.merge_stderr = true;
+    if (env[0]) opts.extra_env = env;
+
+    if (run_argv(argv, &opts, NULL) != 0) {
         set_error(ERR_GPG_KEY_FAILED, "Failed to generate GPG key: %s", output);
         return -1;
     }
-    
+
     log_info("Successfully generated GPG key for account: %s", account->name);
     return 0;
 }
@@ -637,65 +616,62 @@ static int create_isolated_gnupg_home_dir(const char *gnupg_home) {
     return 0;
 }
 
-/* Execute GPG command in specified environment */
-static int execute_gpg_command_in_env(const gpg_config_t *gpg_config, 
-                                       const char *command, char *output, size_t output_size) {
-    char full_command[1024];
-    FILE *fp;
-    int status;
-    size_t bytes_read;
-    
-    if (!gpg_config || !command || !output || output_size == 0) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to execute_gpg_command_in_env");
-        return -1;
-    }
-    
-    /* Prepare command with GNUPGHOME if needed */
-    if (gpg_config->mode == GPG_MODE_ISOLATED && strlen(gpg_config->gnupg_home) > 0) {
-        if (safe_snprintf(full_command, sizeof(full_command), 
-                         "GNUPGHOME='%s' %s 2>&1", gpg_config->gnupg_home, command) != 0) {
-            set_error(ERR_INVALID_ARGS, "GPG command too long");
-            return -1;
-        }
-    } else {
-        if (safe_snprintf(full_command, sizeof(full_command), "%s 2>&1", command) != 0) {
-            set_error(ERR_INVALID_ARGS, "GPG command too long");
-            return -1;
+/* Build a one-entry GNUPGHOME extra-env array for isolated mode (else empty). */
+static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
+                          const char *env_out[2]) {
+    env_out[0] = NULL;
+    env_out[1] = NULL;
+    if (cfg && cfg->mode == GPG_MODE_ISOLATED && strlen(cfg->gnupg_home) > 0) {
+        if ((size_t)snprintf(envbuf, envbuf_size, "GNUPGHOME=%s", cfg->gnupg_home) < envbuf_size) {
+            env_out[0] = envbuf;
         }
     }
-    
-    log_debug("Executing GPG command: %s", full_command);
-    
-    /* Execute command */
-    fp = popen(full_command, "r");
-    if (!fp) {
-        set_system_error(ERR_SYSTEM_COMMAND_FAILED, "Failed to execute GPG command");
-        return -1;
+}
+
+/* Run `gpg`/argv (NULL-terminated varargs, argv[0] is the first vararg), no
+ * shell, with GNUPGHOME set from cfg in isolated mode. Captures merged
+ * stdout+stderr. Returns 0 iff the child exits 0. */
+static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ...) {
+    const char *argv[24];
+    size_t n = 0;
+    va_list ap;
+    const char *a;
+    run_opts_t opts;
+    run_result_t res;
+    char envbuf[MAX_PATH_LEN + 16];
+    const char *env[2];
+
+    va_start(ap, output_size);
+    while ((a = va_arg(ap, const char *)) != NULL) {
+        if (n >= sizeof(argv) / sizeof(argv[0]) - 1) {
+            va_end(ap);
+            set_error(ERR_INVALID_ARGS, "Too many gpg arguments");
+            return -1;
+        }
+        argv[n++] = a;
     }
-    
-    /* Read output */
-    bytes_read = fread(output, 1, output_size - 1, fp);
-    output[bytes_read] = '\0';
-    
-    status = pclose(fp);
-    if (status != 0) {
-        log_debug("GPG command failed with status: %d, output: %s", status, output);
-        return -1;
-    }
-    
-    log_debug("GPG command completed successfully");
-    return 0;
+    va_end(ap);
+    argv[n] = NULL;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = output_size;
+    opts.merge_stderr = true;
+    gpg_build_env(cfg, envbuf, sizeof(envbuf), env);
+    if (env[0]) opts.extra_env = env;
+
+    return run_argv(argv, &opts, &res);
 }
 
 /* Copy GPG key from system keyring to isolated environment */
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id) {
-    char export_command[256];
-    char import_command[512];
     char key_data[8192];
-    FILE *export_fp, *import_fp;
-    int export_status, import_status;
-    size_t bytes_read;
-    
+    char check_output[1024];
+    char envbuf[MAX_PATH_LEN + 16];
+    const char *env[2];
+    run_opts_t opts;
+    run_result_t res;
+
     if (!gpg_config || !key_id) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to copy_key_from_system_keyring");
         return -1;
@@ -707,61 +683,40 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
      * (e.g. switching back to an account whose home persists from an earlier
      * switch), skip the export/import. The export step prompts the system
      * agent's PIN, so skipping it avoids a PIN prompt on every switch. */
+    if (gpg_run(gpg_config, check_output, sizeof(check_output),
+                "gpg", "--list-secret-keys", key_id, NULL) == 0) {
+        log_debug("Secret key already present in isolated home; skipping import: %s", key_id);
+        return 0;
+    }
+
+    /* Export the secret key from the SYSTEM keyring (no GNUPGHOME override). */
     {
-        char check_command[256];
-        char check_output[1024];
-        if (safe_snprintf(check_command, sizeof(check_command),
-                          "gpg --list-secret-keys %s", key_id) == 0 &&
-            execute_gpg_command_in_env(gpg_config, check_command,
-                                       check_output, sizeof(check_output)) == 0) {
-            log_debug("Secret key already present in isolated home; skipping import: %s", key_id);
-            return 0;
+        const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys", key_id, NULL};
+        memset(&opts, 0, sizeof(opts));
+        opts.out = key_data;
+        opts.out_size = sizeof(key_data);
+        opts.stderr_to_devnull = true;
+        if (run_argv(export_argv, &opts, &res) != 0 || res.out_len == 0) {
+            set_error(ERR_GPG_KEY_NOT_FOUND, "Failed to export GPG key from system keyring");
+            return -1;
         }
     }
 
-    /* Export key from system keyring */
-    if (safe_snprintf(export_command, sizeof(export_command), 
-                     "gpg --armor --export-secret-keys %s 2>/dev/null", key_id) != 0) {
-        set_error(ERR_INVALID_ARGS, "Export command too long");
-        return -1;
+    /* Import into the isolated GNUPGHOME by feeding the key on stdin. */
+    {
+        const char *import_argv[] = {"gpg", "--batch", "--import", NULL};
+        gpg_build_env(gpg_config, envbuf, sizeof(envbuf), env);
+        memset(&opts, 0, sizeof(opts));
+        opts.input = key_data;
+        opts.input_len = res.out_len;
+        opts.stderr_to_devnull = true;
+        if (env[0]) opts.extra_env = env;
+        if (run_argv(import_argv, &opts, NULL) != 0) {
+            set_error(ERR_GPG_KEY_FAILED, "Failed to import GPG key into isolated environment");
+            return -1;
+        }
     }
-    
-    export_fp = popen(export_command, "r");
-    if (!export_fp) {
-        set_system_error(ERR_SYSTEM_COMMAND_FAILED, "Failed to export GPG key");
-        return -1;
-    }
-    
-    bytes_read = fread(key_data, 1, sizeof(key_data) - 1, export_fp);
-    key_data[bytes_read] = '\0';
-    
-    export_status = pclose(export_fp);
-    if (export_status != 0 || bytes_read == 0) {
-        set_error(ERR_GPG_KEY_NOT_FOUND, "Failed to export GPG key from system keyring");
-        return -1;
-    }
-    
-    /* Import key into isolated environment */
-    if (safe_snprintf(import_command, sizeof(import_command), 
-                     "GNUPGHOME='%s' gpg --batch --import 2>/dev/null", gpg_config->gnupg_home) != 0) {
-        set_error(ERR_INVALID_ARGS, "Import command too long");
-        return -1;
-    }
-    
-    import_fp = popen(import_command, "w");
-    if (!import_fp) {
-        set_system_error(ERR_SYSTEM_COMMAND_FAILED, "Failed to start GPG import");
-        return -1;
-    }
-    
-    fwrite(key_data, 1, bytes_read, import_fp);
-    import_status = pclose(import_fp);
-    
-    if (import_status != 0) {
-        set_error(ERR_GPG_KEY_FAILED, "Failed to import GPG key into isolated environment");
-        return -1;
-    }
-    
+
     log_info("Successfully copied GPG key to isolated environment: %s", key_id);
     return 0;
 }

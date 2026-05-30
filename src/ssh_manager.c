@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -13,6 +14,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <time.h>
+#include <dirent.h>
 
 #include "ssh_manager.h"
 #include "error.h"
@@ -20,7 +22,7 @@
 #include "display.h"
 
 /* Internal helper functions */
-static int execute_ssh_command(const char *command, char *output, size_t output_size);
+static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...);
 static int setup_ssh_environment(ssh_config_t *ssh_config);
 static int create_isolated_agent_socket_dir(char *socket_dir, size_t socket_dir_size);
 static bool is_ssh_agent_running(pid_t pid);
@@ -205,7 +207,6 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
 
 /* Start isolated SSH agent */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account) {
-    char command[512];
     char output[1024];
     char socket_dir[MAX_PATH_LEN];
     char socket_path[MAX_PATH_LEN];
@@ -248,17 +249,10 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         }
     }
 
-    /* Build ssh-agent command with socket path */
-    if ((size_t)snprintf(command, sizeof(command),
-                        "ssh-agent -a '%s'", socket_path) >= sizeof(command)) {
-        set_error(ERR_INVALID_ARGS, "SSH agent command too long");
-        return -1;
-    }
-    
-    log_debug("Starting SSH agent: %s", command);
-    
-    /* Execute ssh-agent */
-    if (execute_ssh_command(command, output, sizeof(output)) != 0) {
+    /* Start ssh-agent on the per-account socket (no shell). Capture its stdout
+     * (the eval script) only; stderr stays on the terminal. */
+    log_debug("Starting SSH agent on socket: %s", socket_path);
+    if (ssh_run(output, sizeof(output), false, "ssh-agent", "-a", socket_path, NULL) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to start SSH agent");
         return -1;
     }
@@ -277,7 +271,26 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     
     /* Mark as owned */
     ssh_config->agent_owned = true;
-    
+
+    /* Record the agent PID in a sidecar file so a later invocation can reap this
+     * agent precisely by PID (instead of a pkill pattern match). */
+    {
+        char pid_path[MAX_PATH_LEN];
+        if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid",
+                             socket_dir, account->name) < sizeof(pid_path)) {
+            int pfd = open(pid_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (pfd >= 0) {
+                char pidbuf[32];
+                int len = snprintf(pidbuf, sizeof(pidbuf), "%d\n", (int)ssh_config->agent_pid);
+                if (len > 0) {
+                    ssize_t wr = write(pfd, pidbuf, (size_t)len);
+                    (void)wr;
+                }
+                close(pfd);
+            }
+        }
+    }
+
     /* Set up environment */
     if (setup_ssh_environment(ssh_config) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to set up SSH environment");
@@ -362,7 +375,7 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
     }
     
     /* Execute ssh-add -D to delete all keys */
-    if (execute_ssh_command("ssh-add -D", output, sizeof(output)) != 0) {
+    if (ssh_run(output, sizeof(output), false, "ssh-add", "-D", NULL) != 0) {
         log_warning("Failed to clear SSH agent keys (agent may be empty)");
         /* This is not necessarily an error - agent might be empty */
     } else {
@@ -374,38 +387,32 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
 
 /* Add key to SSH agent */
 int ssh_add_key(ssh_config_t *ssh_config, const char *key_path) {
-    char command[MAX_PATH_LEN + 32];
     char output[512];
-    
+
     if (!ssh_config || !key_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_add_key");
         return -1;
     }
-    
+
     if (strlen(ssh_config->agent_socket_path) == 0) {
         set_error(ERR_SSH_AGENT_NOT_FOUND, "No SSH agent available");
         return -1;
     }
-    
+
     log_debug("Adding SSH key to agent: %s", key_path);
-    
+
     /* Set up environment */
     if (setup_ssh_environment(ssh_config) != 0) {
         return -1;
     }
-    
-    /* Build ssh-add command */
-    if ((size_t)snprintf(command, sizeof(command), "ssh-add '%s'", key_path) >= sizeof(command)) {
-        set_error(ERR_INVALID_ARGS, "SSH add command too long");
-        return -1;
-    }
-    
-    /* Execute ssh-add */
-    if (execute_ssh_command(command, output, sizeof(output)) != 0) {
+
+    /* Execute ssh-add with the key path as a distinct argv element (no shell):
+     * a path containing shell metacharacters can no longer be interpreted. */
+    if (ssh_run(output, sizeof(output), false, "ssh-add", key_path, NULL) != 0) {
         set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to add SSH key: %s", output);
         return -1;
     }
-    
+
     log_info("SSH key added successfully: %s", key_path);
     return 0;
 }
@@ -428,7 +435,7 @@ int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size) {
     }
     
     /* Execute ssh-add -l */
-    if (execute_ssh_command("ssh-add -l", output, output_size) != 0) {
+    if (ssh_run(output, output_size, false, "ssh-add", "-l", NULL) != 0) {
         safe_strncpy(output, "No keys loaded in SSH agent", output_size);
         return -1;
     }
@@ -570,9 +577,8 @@ int ssh_configure_host_alias(const account_t *account) {
 
 /* Test SSH connection */
 int ssh_test_connection(const account_t *account, const char *host) {
-    char command[512];
     char output[1024];
-    
+
     if (!account || !host) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_test_connection");
         return -1;
@@ -583,32 +589,22 @@ int ssh_test_connection(const account_t *account, const char *host) {
     /* Build SSH test command using -T (no TTY) for git hosting services
      * GitHub/GitLab/Bitbucket don't allow shell commands, they return a
      * greeting message on successful auth (exit code 1 but with success message) */
+    /* Execute SSH test (merged stderr: git hosts print their greeting there)
+     * with each option as a distinct argv element — no shell.
+     * Note: GitHub returns exit code 1 even on success (no shell access). */
     if (strlen(account->ssh_host_alias) > 0) {
-        /* Use host alias */
-        if ((size_t)snprintf(command, sizeof(command),
-                            "ssh -T -o ConnectTimeout=5 -o BatchMode=yes %s 2>&1",
-                            account->ssh_host_alias) >= sizeof(command)) {
-            set_error(ERR_INVALID_ARGS, "SSH test command too long");
-            return -1;
-        }
+        (void)ssh_run(output, sizeof(output), true,
+                      "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                      account->ssh_host_alias, NULL);
     } else {
-        /* Use direct host with identity file */
         char expanded_key_path[MAX_PATH_LEN];
         if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
             return -1;
         }
-
-        if ((size_t)snprintf(command, sizeof(command),
-                            "ssh -T -o ConnectTimeout=5 -o BatchMode=yes -i '%s' %s 2>&1",
-                            expanded_key_path, host) >= sizeof(command)) {
-            set_error(ERR_INVALID_ARGS, "SSH test command too long");
-            return -1;
-        }
+        (void)ssh_run(output, sizeof(output), true,
+                      "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                      "-i", expanded_key_path, host, NULL);
     }
-
-    /* Execute SSH test - for git hosts, check output for success indicators
-     * Note: GitHub returns exit code 1 even on success (no shell access) */
-    (void)execute_ssh_command(command, output, sizeof(output));
 
     /* Check for authentication success messages from common git hosting services */
     if (strstr(output, "successfully authenticated") ||  /* GitHub */
@@ -626,47 +622,47 @@ int ssh_test_connection(const account_t *account, const char *host) {
 
 /* Internal helper functions */
 
-/* Execute SSH command */
-static int execute_ssh_command(const char *command, char *output, size_t output_size) {
-    FILE *pipe;
-    
-    if (!command) {
-        return -1;
-    }
-    
-    log_debug("Executing SSH command: %s", command);
-    
-    pipe = popen(command, "r");
-    if (!pipe) {
-        set_system_error(ERR_SYSTEM_COMMAND_FAILED, "Failed to execute SSH command");
-        return -1;
-    }
-    
-    /* Read output if buffer provided */
-    if (output && output_size > 0) {
-        size_t total_read = 0;
-        char *pos = output;
-        
-        while (total_read < output_size - 1 && 
-               fgets(pos, output_size - total_read, pipe)) {
-            size_t line_len = strlen(pos);
-            total_read += line_len;
-            pos += line_len;
+/* Run an ssh/ssh-add/ssh-agent command (NULL-terminated varargs argv, argv[0]
+ * is the first vararg), no shell. SSH_AUTH_SOCK/SSH_AGENT_PID are inherited from
+ * the process env (set by setup_ssh_environment). When merge_stderr is false,
+ * the child's stderr is left attached to the terminal so ssh-add's "Identity
+ * added" message still reaches the user (preserving prior behavior). Trailing
+ * newline in captured stdout is trimmed. Returns 0 iff the child exits 0. */
+static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...) {
+    const char *argv[16];
+    size_t n = 0;
+    va_list ap;
+    const char *a;
+    run_opts_t opts;
+    run_result_t res;
+    int rc;
+
+    va_start(ap, merge_stderr);
+    while ((a = va_arg(ap, const char *)) != NULL) {
+        if (n >= sizeof(argv) / sizeof(argv[0]) - 1) {
+            va_end(ap);
+            set_error(ERR_INVALID_ARGS, "Too many ssh arguments");
+            return -1;
         }
-        output[total_read] = '\0';
-        
-        /* Remove trailing newline */
-        if (total_read > 0 && output[total_read - 1] == '\n') {
-            output[total_read - 1] = '\0';
-        }
+        argv[n++] = a;
     }
-    
-    int exit_code = pclose(pipe);
-    if (exit_code != 0) {
-        log_debug("SSH command failed with exit code: %d", exit_code);
+    va_end(ap);
+    argv[n] = NULL;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = output_size;
+    opts.merge_stderr = merge_stderr;
+
+    rc = run_argv(argv, &opts, &res);
+
+    if (output && output_size > 0 && res.out_len > 0 && output[res.out_len - 1] == '\n') {
+        output[res.out_len - 1] = '\0';
+    }
+    if (rc != 0) {
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -895,34 +891,59 @@ static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) 
     return 0;
 }
 
-/* Kill orphaned gitswitch ssh-agents from previous runs */
+/* Kill orphaned gitswitch ssh-agents from previous runs and remove stale
+ * sockets. Shell-free: agents are reaped precisely by the PID recorded in their
+ * sidecar (ssh-agent.<name>.pid) rather than a pkill pattern match, and stale
+ * sockets are unlinked via readdir. Only operates inside our own 0700 dir. */
 static void kill_orphaned_gitswitch_agents(void) {
-    char socket_dir[256];
+    char socket_dir[MAX_PATH_LEN];
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
+    DIR *d;
+    struct dirent *ent;
 
-    /* Determine socket directory - use short buffer since runtime_dir is typically short */
-    if (runtime_dir && strlen(runtime_dir) < 200 && path_exists(runtime_dir)) {
-        snprintf(socket_dir, sizeof(socket_dir), "%s/gitswitch-ssh", runtime_dir);
+    if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
+        if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "%s/gitswitch-ssh", runtime_dir) >= sizeof(socket_dir)) {
+            return;
+        }
     } else {
-        snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid());
+        if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid()) >= sizeof(socket_dir)) {
+            return;
+        }
     }
 
-    /* Use pkill to kill any existing gitswitch ssh-agents */
-    char command[512];
-    snprintf(command, sizeof(command),
-             "pkill -f 'ssh-agent -a %.200s/' 2>/dev/null", socket_dir);
-
-    int result = system(command);
-    if (result == 0) {
-        log_debug("Killed orphaned gitswitch ssh-agents");
+    d = opendir(socket_dir);
+    if (!d) {
+        return; /* nothing to clean up */
     }
-    /* result != 0 is normal if no agents were running */
 
-    /* Also clean up any stale socket files */
-    char cleanup_cmd[512];
-    snprintf(cleanup_cmd, sizeof(cleanup_cmd),
-             "rm -f %.200s/ssh-agent.*.sock 2>/dev/null", socket_dir);
-    if (system(cleanup_cmd) != 0) {
-        /* Ignore cleanup failures - files may not exist */
+    while ((ent = readdir(d)) != NULL) {
+        const char *name = ent->d_name;
+        size_t nlen = strlen(name);
+        char full[MAX_PATH_LEN];
+
+        if (strncmp(name, "ssh-agent.", 10) != 0 && strcmp(name, "current.sock") != 0) {
+            continue;
+        }
+        if ((size_t)snprintf(full, sizeof(full), "%s/%s", socket_dir, name) >= sizeof(full)) {
+            continue;
+        }
+
+        if (nlen > 4 && strcmp(name + nlen - 4, ".pid") == 0) {
+            /* Reap the recorded agent PID, then drop the sidecar. */
+            FILE *pf = fopen(full, "r");
+            if (pf) {
+                long pid = 0;
+                if (fscanf(pf, "%ld", &pid) == 1 && pid > 1) {
+                    kill((pid_t)pid, SIGTERM);
+                    log_debug("Reaped orphaned ssh-agent PID %ld", pid);
+                }
+                fclose(pf);
+            }
+            unlink(full);
+        } else {
+            /* Stale socket (ssh-agent.<name>.sock or current.sock). */
+            unlink(full);
+        }
     }
+    closedir(d);
 }

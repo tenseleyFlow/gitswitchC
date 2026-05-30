@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -16,7 +17,7 @@
 #include "display.h"
 
 /* Internal helper functions */
-static int execute_git_command(const char *args, char *output, size_t output_size);
+static int git_run(char *output, size_t output_size, ...);
 static int validate_git_installation(void);
 static bool is_valid_git_config_value(const char *value);
 static int backup_git_config_if_needed(git_scope_t scope);
@@ -223,7 +224,7 @@ int git_validate_repository(void) {
     }
     
     /* Check if repository is bare */
-    if (execute_git_command("rev-parse --is-bare-repository", output, sizeof(output)) == 0) {
+    if (git_run(output, sizeof(output), "rev-parse", "--is-bare-repository", NULL) == 0) {
         trim_whitespace(output);
         if (strcmp(output, "true") == 0) {
             set_error(ERR_GIT_REPOSITORY_INVALID, "Repository is bare");
@@ -232,7 +233,7 @@ int git_validate_repository(void) {
     }
     
     /* Check repository health - verify we can read HEAD */
-    if (execute_git_command("rev-parse --verify HEAD", output, sizeof(output)) != 0) {
+    if (git_run(output, sizeof(output), "rev-parse", "--verify", "HEAD", NULL) != 0) {
         /* This is OK for new repositories with no commits */
         log_debug("Repository has no commits yet (new repository)");
     }
@@ -317,11 +318,12 @@ int git_test_config(const account_t *account, git_scope_t scope) {
             log_warning("GPG signing is configured but not enabled");
         }
 
-        /* Test GPG key availability */
-        char gpg_test[256];
-        snprintf(gpg_test, sizeof(gpg_test), "gpg --list-secret-keys '%s' >/dev/null 2>&1",
-                 account->gpg_key_id);
-        if (system(gpg_test) != 0) {
+        /* Test GPG key availability (system keyring, no shell) */
+        const char *gpg_argv[] = {"gpg", "--list-secret-keys", account->gpg_key_id, NULL};
+        run_opts_t gpg_opts;
+        memset(&gpg_opts, 0, sizeof(gpg_opts));
+        gpg_opts.stderr_to_devnull = true;
+        if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
             set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s", account->gpg_key_id);
             return -1;
         }
@@ -333,46 +335,39 @@ int git_test_config(const account_t *account, git_scope_t scope) {
 
 /* Set single git configuration value */
 int git_set_config_value(const char *key, const char *value, git_scope_t scope) {
-    char command[1024];
     char output[256];
     const char *scope_flag;
-    
+
     if (!key || !value) {
         set_error(ERR_INVALID_ARGS, "NULL key or value to git_set_config_value");
         return -1;
     }
-    
+
+    /* Belt-and-suspenders only: argv execution means the value is never parsed
+     * by a shell, so this is no longer the security boundary. */
     if (!is_valid_git_config_value(value)) {
         set_error(ERR_INVALID_ARGS, "Invalid characters in git config value");
         return -1;
     }
-    
+
     scope_flag = git_scope_to_flag(scope);
     if (!scope_flag) {
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
-    
-    /* Build git config command */
-    if ((size_t)snprintf(command, sizeof(command), "config %s '%s' '%s'", 
-                        scope_flag, key, value) >= sizeof(command)) {
-        set_error(ERR_INVALID_ARGS, "Git config command too long");
-        return -1;
-    }
-    
+
     log_debug("Setting git config: %s = %s (%s)", key, value, scope_flag);
-    
-    if (execute_git_command(command, output, sizeof(output)) != 0) {
+
+    if (git_run(output, sizeof(output), "config", scope_flag, key, value, NULL) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git config %s: %s", key, output);
         return -1;
     }
-    
+
     return 0;
 }
 
 /* Get single git configuration value */
 int git_get_config_value(const char *key, char *value, size_t value_size, git_scope_t scope) {
-    char command[512];
     char output[512];
     const char *scope_flag;
     
@@ -387,13 +382,7 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
         return -1;
     }
     
-    /* Build git config command */
-    if ((size_t)snprintf(command, sizeof(command), "config %s '%s'", scope_flag, key) >= sizeof(command)) {
-        set_error(ERR_INVALID_ARGS, "Git config command too long");
-        return -1;
-    }
-    
-    if (execute_git_command(command, output, sizeof(output)) != 0) {
+    if (git_run(output, sizeof(output), "config", scope_flag, key, NULL) != 0) {
         /* Config value not found - this is not always an error */
         value[0] = '\0';
         return -1;
@@ -408,63 +397,48 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
 
 /* Unset git configuration value */
 int git_unset_config_value(const char *key, git_scope_t scope) {
-    char command[512];
     char output[256];
     const char *scope_flag;
-    
+
     if (!key) {
         set_error(ERR_INVALID_ARGS, "NULL key to git_unset_config_value");
         return -1;
     }
-    
+
     scope_flag = git_scope_to_flag(scope);
     if (!scope_flag) {
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
-    
-    /* Build git config unset command */
-    if ((size_t)snprintf(command, sizeof(command), "config %s --unset '%s'", 
-                        scope_flag, key) >= sizeof(command)) {
-        set_error(ERR_INVALID_ARGS, "Git config command too long");
-        return -1;
-    }
-    
+
     log_debug("Unsetting git config: %s (%s)", key, scope_flag);
-    
-    /* Execute command - ignore errors as key might not exist */
-    execute_git_command(command, output, sizeof(output));
-    
+
+    /* Ignore errors as the key might not exist */
+    git_run(output, sizeof(output), "config", scope_flag, "--unset", key, NULL);
+
     return 0;
 }
 
 /* List all git configuration values */
 int git_list_config(git_scope_t scope, char *output, size_t output_size) {
-    char command[256];
     const char *scope_flag;
-    
+
     if (!output || output_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to git_list_config");
         return -1;
     }
-    
+
     scope_flag = git_scope_to_flag(scope);
     if (!scope_flag) {
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
-    
-    /* Build git config list command */
-    if ((size_t)snprintf(command, sizeof(command), "config %s --list", scope_flag) >= sizeof(command)) {
-        set_error(ERR_INVALID_ARGS, "Git config command too long");
-        return -1;
-    }
-    
-    if (execute_git_command(command, output, output_size) != 0) {
+
+    if (git_run(output, output_size, "config", scope_flag, "--list", NULL) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to list git configuration");
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -536,7 +510,7 @@ bool git_is_repository(void) {
     char output[256];
     
     /* Use git rev-parse --git-dir to check for repository */
-    if (execute_git_command("rev-parse --git-dir", output, sizeof(output)) == 0) {
+    if (git_run(output, sizeof(output), "rev-parse", "--git-dir", NULL) == 0) {
         return true;
     }
     
@@ -552,7 +526,7 @@ int git_get_repo_root(char *path, size_t path_size) {
         return -1;
     }
     
-    if (execute_git_command("rev-parse --show-toplevel", output, sizeof(output)) != 0) {
+    if (git_run(output, sizeof(output), "rev-parse", "--show-toplevel", NULL) != 0) {
         set_error(ERR_GIT_NOT_REPOSITORY, "Not in a git repository");
         return -1;
     }
@@ -576,43 +550,36 @@ const char *git_scope_to_flag(git_scope_t scope) {
 /* Internal helper functions */
 
 /* Execute git command and capture output */
-static int execute_git_command(const char *args, char *output, size_t output_size) {
-    char command[1024];
-    FILE *pipe;
-    
-    if (!args) {
-        return -1;
-    }
-    
-    /* Build full git command */
-    if ((size_t)snprintf(command, sizeof(command), "git %s 2>&1", args) >= sizeof(command)) {
-        set_error(ERR_INVALID_ARGS, "Git command too long");
-        return -1;
-    }
-    
-    log_debug("Executing git command: %s", command);
-    
-    /* Execute command */
-    pipe = popen(command, "r");
-    if (!pipe) {
-        set_system_error(ERR_SYSTEM_COMMAND_FAILED, "Failed to execute git command");
-        return -1;
-    }
-    
-    /* Read output if buffer provided */
-    if (output && output_size > 0) {
-        if (!fgets(output, output_size, pipe)) {
-            output[0] = '\0';
+/* Run `git <args...>` (NULL-terminated varargs), no shell. Captures merged
+ * stdout+stderr into output. Returns 0 iff git exits 0. */
+static int git_run(char *output, size_t output_size, ...) {
+    const char *argv[32];
+    size_t n = 0;
+    va_list ap;
+    const char *a;
+    run_opts_t opts;
+    run_result_t res;
+
+    argv[n++] = "git";
+    va_start(ap, output_size);
+    while ((a = va_arg(ap, const char *)) != NULL) {
+        if (n >= sizeof(argv) / sizeof(argv[0]) - 1) {
+            va_end(ap);
+            set_error(ERR_INVALID_ARGS, "Too many git arguments");
+            return -1;
         }
+        argv[n++] = a;
     }
-    
-    int exit_code = pclose(pipe);
-    if (exit_code != 0) {
-        log_debug("Git command failed with exit code: %d", exit_code);
-        return -1;
-    }
-    
-    return 0;
+    va_end(ap);
+    argv[n] = NULL;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = output_size;
+    opts.merge_stderr = true;
+
+    log_debug("Executing git command: %s %s", argv[1] ? argv[1] : "", argv[2] ? argv[2] : "");
+    return run_argv(argv, &opts, &res);
 }
 
 /* Validate git installation */
@@ -626,7 +593,7 @@ static int validate_git_installation(void) {
     }
     
     /* Get git version */
-    if (execute_git_command("--version", version_output, sizeof(version_output)) != 0) {
+    if (git_run(version_output, sizeof(version_output), "--version", NULL) != 0) {
         set_error(ERR_SYSTEM_REQUIREMENT, "Failed to get git version");
         return -1;
     }

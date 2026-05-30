@@ -890,26 +890,21 @@ static int validate_ssh_key_security(const char *ssh_key_path) {
  * did not already confirm the key (gpg_ok), and during health checks. The
  * isolated-home validation lives in gpg_validate_key()/gpg_test_signing(). */
 static int validate_gpg_key_availability(const char *gpg_key_id) {
-    char command[256];
-    int result;
-
     if (!gpg_key_id) {
         return -1;
     }
 
-    /* Try to find the key in the GPG keyring */
-    if ((size_t)snprintf(command, sizeof(command), "gpg --list-secret-keys %s >/dev/null 2>&1", 
-                        gpg_key_id) >= sizeof(command)) {
-        log_error("GPG command too long");
-        return -1;
-    }
-    
-    result = system(command);
-    if (result != 0) {
+    /* Look up the key in the system keyring, no shell. */
+    const char *argv[] = {"gpg", "--list-secret-keys", gpg_key_id, NULL};
+    run_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.stderr_to_devnull = true;
+
+    if (run_argv(argv, &opts, NULL) != 0) {
         log_debug("GPG key %s not found in keyring", gpg_key_id);
         return -1;
     }
-    
+
     return 0;
 }
 

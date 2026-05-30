@@ -58,17 +58,54 @@ time_t get_file_mtime(const char *file_path);
 
 /**
  * Process utilities
+ *
+ * All external commands are run via run_argv(), which spawns a child with
+ * execvp() and an explicit argv vector — NO shell is involved, so command
+ * arguments (account names, key paths, etc.) can never be interpreted as shell
+ * syntax. This is the structural defense against command injection.
  */
-int execute_command(const char *command, char *output, size_t output_size);
-int execute_command_with_input(const char *command, const char *input,
-                               char *output, size_t output_size);
+
+/* Options for a single child invocation. Any field may be left zero/NULL. */
+typedef struct {
+    char       *out;                /* stdout capture buffer; NULL/0 => discard */
+    size_t      out_size;           /* size of out; output is NUL-terminated, truncated to fit */
+    const char *input;              /* bytes written to child stdin; NULL => stdin is /dev/null */
+    size_t      input_len;          /* length of input (not strlen; binary-safe) */
+    bool        merge_stderr;       /* true => child stderr merged into captured stdout (2>&1) */
+    bool        stderr_to_devnull;  /* when !merge_stderr: silence child stderr */
+    const char *const *extra_env;   /* NULL-terminated "KEY=VALUE" entries set in the child (e.g. GNUPGHOME) */
+} run_opts_t;
+
+/* Result of a child invocation. */
+typedef struct {
+    int    exit_code;    /* WEXITSTATUS on normal exit; -1 if killed by signal or spawn failed */
+    int    term_signal;  /* signal number if killed by signal, else 0 */
+    bool   spawned;      /* true if the child actually started */
+    size_t out_len;      /* bytes captured into out (excluding the NUL) */
+} run_result_t;
+
+/* Pluggable runner (tests install a recording fake via run_set_runner). */
+typedef int (*command_runner_fn)(const char *const argv[],
+                                 const run_opts_t *opts, run_result_t *result);
+
+/* Install a runner; returns the previous one (NULL means the default). */
+command_runner_fn run_set_runner(command_runner_fn fn);
+
+/* Run argv[0] (resolved via PATH by execvp), argv NULL-terminated, through the
+ * active runner. Returns 0 iff the child spawned and exited 0. opts/result may
+ * be NULL. */
+int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result);
+
+/* The real fork+execvp implementation; normally reached via run_argv(). */
+int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result);
+
+/* True if an executable named `command` is found in PATH. */
 bool command_exists(const char *command);
 
 /**
- * Resolve the absolute path of an external command found in PATH.
- * Uses the POSIX `command -v` builtin, so it is portable across Linux, macOS,
- * and the BSDs. Writes the path into buf on success.
- * Returns 0 if an absolute, existing path was found; -1 otherwise.
+ * Resolve the absolute path of an executable found in PATH by walking $PATH
+ * entries and testing X_OK — no shell involved. Portable across Linux, macOS,
+ * and the BSDs. Returns 0 and writes the path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
 pid_t start_background_process(const char *command, char *pidfile_path);
