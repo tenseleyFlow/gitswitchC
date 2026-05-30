@@ -175,7 +175,7 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     }
 
     /* Show what we're doing */
-    printf("\nSwitching to account: %s <%s>\n", account->name, account->email);
+    printf("Switching to account: %s <%s>\n", account->name, account->email);
 
     /* If not in dry-run mode, actually perform the switch.
      *
@@ -314,7 +314,6 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
     }
 
-    printf("\n");
     log_info("Successfully switched to account: %s (%s)", account->name, account->description);
     return 0;
 }
