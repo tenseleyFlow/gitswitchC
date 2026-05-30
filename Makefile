@@ -110,10 +110,11 @@ SOURCES = $(PHASE5_SOURCES)
 OBJECTS = $(SOURCES:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
 HEADERS = $(wildcard $(SRCDIR)/*.h)
 
-# Test files
-TEST_SOURCES = $(wildcard $(TESTDIR)/*.c)
-TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/%.c=$(OBJDIR)/test_%.o)
-TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/%.c=$(BINDIR)/test_%)
+# Test files. Sources are named tests/test_*.c so the binary name reads
+# naturally (tests/test_foo.c -> build/bin/test_foo); test.h is the harness.
+TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
+TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
+TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
 
 # Default target
 .PHONY: all
@@ -153,9 +154,9 @@ uninstall:
 	@echo "Uninstall complete"
 
 # Test compilation
-$(OBJDIR)/test_%.o: $(TESTDIR)/%.c $(HEADERS) | $(OBJDIR)
+$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(TESTDIR)/test.h $(HEADERS) | $(OBJDIR)
 	@echo "Compiling test $<..."
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) -c $< -o $@
 
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
