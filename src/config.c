@@ -213,6 +213,7 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     
     /* Write to temporary file first */
     if (toml_write_file(&toml_doc, temp_path) != 0) {
+        unlink(temp_path); /* don't leave a stale/partial .tmp behind */
         goto cleanup;
     }
     

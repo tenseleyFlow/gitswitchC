@@ -270,6 +270,15 @@ int toml_get_string(const toml_document_t *doc, const char *section,
         return -1;
     }
 
+    /* Reject rather than truncate when the value won't fit the destination, so
+     * the bytes the caller validates are exactly the bytes it stores (the
+     * value buffer is larger than some account fields, e.g. email/key id). */
+    if (strlen(kv->value) >= value_size) {
+        set_error(ERR_CONFIG_INVALID, "Value for %s.%s is too long (max %zu bytes)",
+                  section, key, value_size - 1);
+        return -1;
+    }
+
     /* Sanitize the value before returning */
     return toml_sanitize_string(kv->value, value, value_size);
 }
@@ -668,9 +677,17 @@ static int parse_section_header(toml_parser_state_t *state, char *section_name) 
     }
     
     section_name[name_pos] = '\0';
-    
+
+    /* If we stopped because the buffer filled (not because of ']'), the section
+     * name is too long — error rather than silently truncate (which could
+     * collide two distinct [accounts.<id>] sections into one). */
+    if (name_pos >= TOML_MAX_SECTION_LEN - 1 && !is_at_end(state) && current_char(state) != ']') {
+        set_parser_error(state, "Section name too long");
+        return -1;
+    }
+
     skip_whitespace(state);
-    
+
     if (!match_char(state, ']')) {
         set_parser_error(state, "Expected ']' at end of section");
         return -1;
@@ -702,9 +719,16 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
     }
     
     kv->key[key_pos] = '\0';
-    
+
+    /* Stopped because the key buffer filled, with more key text remaining? Too long. */
+    if (key_pos >= TOML_MAX_KEY_LEN - 1 && !is_at_end(state) &&
+        (isalnum((unsigned char)current_char(state)) || current_char(state) == '_')) {
+        set_parser_error(state, "Key name too long");
+        return -1;
+    }
+
     skip_whitespace(state);
-    
+
     if (!match_char(state, '=')) {
         set_parser_error(state, "Expected '=' after key name");
         return -1;
@@ -728,7 +752,7 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
         kv->type = TOML_TYPE_BOOLEAN;
         bool bool_val;
         if (parse_boolean_value(state, &bool_val) == 0) {
-            strcpy(kv->value, bool_val ? "true" : "false");
+            snprintf(kv->value, sizeof(kv->value), "%s", bool_val ? "true" : "false");
             kv->is_set = true;
             return 0;
         }
@@ -781,12 +805,19 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
     }
     
     value[value_pos] = '\0';
-    
+
+    /* Stopped because the value buffer filled, with more content before the
+     * closing quote? Too long — error rather than silently truncate. */
+    if (value_pos >= value_size - 1 && !is_at_end(state) && current_char(state) != '"') {
+        set_parser_error(state, "String value too long");
+        return -1;
+    }
+
     if (!match_char(state, '"')) {
         set_parser_error(state, "Expected '\"' at end of string");
         return -1;
     }
-    
+
     return 0;
 }
 

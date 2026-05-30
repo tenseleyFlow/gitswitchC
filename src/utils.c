@@ -375,10 +375,19 @@ int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size)
         fclose(file);
         return -1;
     }
-    
+
+    /* If we filled the buffer without reaching EOF, the file is larger than the
+     * caller's buffer — fail rather than silently returning a truncated copy. */
+    if (bytes_read == buffer_size - 1 && !feof(file)) {
+        set_error(ERR_FILE_IO, "File too large for buffer: %s", file_path);
+        fclose(file);
+        return -1;
+    }
+
     buffer[bytes_read] = '\0';
     fclose(file);
-    
+
+    /* bytes_read <= buffer_size-1, so the cast is safe for any sane buffer. */
     return (int)bytes_read;
 }
 
