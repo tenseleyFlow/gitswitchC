@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.6.0
+Version:        1.7.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -54,6 +54,14 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Fri May 29 2026 mfw <espadonne@outlook.com> - 1.7.0-1
+- SECURITY: fix an arbitrary command-execution vulnerability — a crafted ssh_key path in accounts.toml could inject a shell command via ssh-add. All external commands (git/ssh/gpg) now run via execvp with explicit argv, never a shell. Versions <= 1.6.0 are affected.
+- Security: SSH host-alias config no longer disables host-key checking (StrictHostKeyChecking/UserKnownHostsFile), is written idempotently, and validates the alias.
+- Security: isolated SSH/GPG dirs are verified (owner/mode/not-a-symlink) before use; symlinks updated atomically; umask 077 at startup.
+- Safety: account resolution prefers exact id/name/email and rejects ambiguous matches; switches are validate-first with git-config snapshot/restore rollback (no half-applied identity); local->global never silent (prompt or --global).
+- Feature: `gitswitch reset [account]` tears down isolated agents/homes (wiping on-disk key copies).
+- Robustness: TOML parser errors on over-long input instead of truncating; assorted correctness fixes. Initial test suite + CI added.
+
 * Fri May 29 2026 mfw <espadonne@outlook.com> - 1.6.0-1
 - Feat: boot persistence — the last-active account is recorded and auto-resumed on the first interactive login after a reboot (via `gitswitch init`), restoring the SSH agent, git identity, and isolated GPG home. A heads-up line precedes the one-per-boot GPG PIN prompt.
 - Feat: new `gitswitch resume` command to re-activate the last-active account manually.
