@@ -45,6 +45,22 @@ int get_file_permissions(const char *path, mode_t *mode);
 int set_file_permissions(const char *path, mode_t mode);
 
 /**
+ * Ensure `path` is a directory that is safe to hold private material: created
+ * with mode 0700 if absent, and verified (via lstat) to be a real directory
+ * (not a symlink), owned by the current uid, with no group/other permission
+ * bits. Refuses (returns -1) if an existing path fails these checks — defends
+ * against a hostile pre-created/redirected dir in a shared /tmp. Returns 0 ok.
+ */
+int ensure_private_dir(const char *path);
+
+/**
+ * Atomically (re)point a symlink: create a temp link to `target` then rename it
+ * over `linkpath`, so a follower never observes a missing/half-updated link.
+ * Returns 0 on success.
+ */
+int atomic_symlink(const char *target, const char *linkpath);
+
+/**
  * File utilities
  */
 int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size);

@@ -31,7 +31,6 @@ static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_s
                           const char *env_out[2]);
 static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ...);
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id);
-static int validate_gnupg_home_permissions(const char *gnupg_home);
 static int setup_gpg_agent_config(const char *gnupg_home);
 
 /* Initialize GPG manager with specified mode */
@@ -266,11 +265,11 @@ static int update_current_symlink(const char *real_home) {
         return -1;
     }
 
-    /* Remove any existing symlink, then retarget. */
-    unlink(link_path);
-    if (symlink(real_home, link_path) != 0) {
-        log_warning("Failed to create GNUPGHOME symlink %s -> %s: %s",
-                    link_path, real_home, strerror(errno));
+    /* Atomically retarget (temp symlink + rename) so a follower never sees a
+     * missing or half-updated link. */
+    if (atomic_symlink(real_home, link_path) != 0) {
+        log_warning("Failed to create GNUPGHOME symlink %s -> %s",
+                    link_path, real_home);
         return -1;
     }
 
@@ -374,9 +373,9 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
         return -1;
     }
 
-    /* Create base directory */
-    if (create_directory_recursive(gnupg_base_dir, 0700) != 0) {
-        set_error(ERR_FILE_IO, "Failed to create GPG base directory: %s", gnupg_base_dir);
+    /* Create + verify the base directory (real, user-owned, 0700; not a
+     * symlink or a dir pre-created by another user in a shared /tmp). */
+    if (ensure_private_dir(gnupg_base_dir) != 0) {
         return -1;
     }
     
@@ -682,18 +681,14 @@ static int create_isolated_gnupg_home_dir(const char *gnupg_home) {
         set_error(ERR_INVALID_ARGS, "NULL gnupg_home path");
         return -1;
     }
-    
-    /* Create directory with 700 permissions */
-    if (create_directory_recursive(gnupg_home, 0700) != 0) {
-        set_error(ERR_FILE_IO, "Failed to create GNUPGHOME directory: %s", gnupg_home);
+
+    /* Create + verify: real dir, owned by us, 0700, not a symlink. This holds
+     * exported secret-key material, so a hostile pre-created/redirected dir
+     * must be refused. */
+    if (ensure_private_dir(gnupg_home) != 0) {
         return -1;
     }
-    
-    /* Validate permissions */
-    if (validate_gnupg_home_permissions(gnupg_home) != 0) {
-        return -1;
-    }
-    
+
     log_debug("Created isolated GNUPGHOME directory: %s", gnupg_home);
     return 0;
 }
@@ -800,30 +795,6 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
     }
 
     log_info("Successfully copied GPG key to isolated environment: %s", key_id);
-    return 0;
-}
-
-/* Validate GNUPGHOME directory permissions */
-static int validate_gnupg_home_permissions(const char *gnupg_home) {
-    mode_t dir_mode;
-    
-    if (!gnupg_home) {
-        set_error(ERR_INVALID_ARGS, "NULL gnupg_home path");
-        return -1;
-    }
-    
-    if (get_file_permissions(gnupg_home, &dir_mode) != 0) {
-        set_error(ERR_FILE_IO, "Failed to check GNUPGHOME permissions: %s", gnupg_home);
-        return -1;
-    }
-    
-    /* Check for 700 permissions */
-    if ((dir_mode & 0777) != 0700) {
-        set_error(ERR_PERMISSION_DENIED, "GNUPGHOME has insecure permissions: %o", dir_mode & 0777);
-        return -1;
-    }
-    
-    log_debug("GNUPGHOME permissions validated: %s", gnupg_home);
     return 0;
 }
 

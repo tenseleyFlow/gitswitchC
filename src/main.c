@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <getopt.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "gitswitch.h"
 #include "config.h"
@@ -84,6 +85,10 @@ static const char *detect_shell_from_env(void);
 int main(int argc, char *argv[]) {
     gitswitch_ctx_t ctx;
     int opt;
+
+    /* Restrict permissions on everything we create (config, keys, agent dirs,
+     * gpg homes): files born 0600, dirs 0700, closing fopen-then-chmod windows. */
+    umask(077);
     bool force_color = false;
     bool no_color = false;
     bool show_help = false;
@@ -454,6 +459,16 @@ static int handle_init_command(const char *shell) {
     char gpg_home[MAX_PATH_LEN];
     bool have_gpg_home = (gpg_manager_get_home_path(gpg_home, sizeof(gpg_home)) == 0);
 
+    /* The paths are emitted inside single-quoted shell assignments below; a
+     * stray single quote would break out of the quoting, so refuse it. */
+    if (strchr(sock_path, '\'')) {
+        fprintf(stderr, "gitswitch: refusing to emit SSH_AUTH_SOCK path containing a quote\n");
+        return EXIT_FAILURE;
+    }
+    if (have_gpg_home && strchr(gpg_home, '\'')) {
+        have_gpg_home = false;
+    }
+
     if (!shell || !*shell) {
         fprintf(stderr,
                 "gitswitch: could not detect shell; pass one explicitly:\n"
@@ -465,7 +480,7 @@ static int handle_init_command(const char *shell) {
 
     if (strcmp(shell, "fish") == 0) {
         printf("# gitswitch shell integration (fish)\n");
-        printf("set -l __gitswitch_auth_sock %s\n", sock_path);
+        printf("set -l __gitswitch_auth_sock '%s'\n", sock_path);
         /* First interactive shell after a boot: if no SSH agent is reachable at
          * the stable socket, resume the last account. We probe with `ssh-add -l`
          * (exit > 1 means no agent reachable) rather than `test -S`, because a
@@ -485,7 +500,7 @@ static int handle_init_command(const char *shell) {
         printf("end\n");
         printf("set -e __gitswitch_auth_sock\n");
         if (have_gpg_home) {
-            printf("set -l __gitswitch_gnupghome %s\n", gpg_home);
+            printf("set -l __gitswitch_gnupghome '%s'\n", gpg_home);
             printf("if test -d $__gitswitch_gnupghome\n");
             printf("    set -gx GNUPGHOME $__gitswitch_gnupghome\n");
             printf("end\n");
@@ -498,7 +513,7 @@ static int handle_init_command(const char *shell) {
         strcmp(shell, "sh") == 0 || strcmp(shell, "dash") == 0 ||
         strcmp(shell, "ksh") == 0) {
         printf("# gitswitch shell integration (%s)\n", shell);
-        printf("__gitswitch_auth_sock=%s\n", sock_path);
+        printf("__gitswitch_auth_sock='%s'\n", sock_path);
         /* First interactive shell after a boot: if no SSH agent is reachable at
          * the stable socket, resume the last account. We probe with `ssh-add -l`
          * (exit > 1 means no agent reachable) rather than `test -S`, because a
@@ -515,7 +530,7 @@ static int handle_init_command(const char *shell) {
         printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
         printf("unset __gitswitch_auth_sock\n");
         if (have_gpg_home) {
-            printf("__gitswitch_gnupghome=%s\n", gpg_home);
+            printf("__gitswitch_gnupghome='%s'\n", gpg_home);
             printf("[ -d \"$__gitswitch_gnupghome\" ] && export GNUPGHOME=\"$__gitswitch_gnupghome\"\n");
             printf("unset __gitswitch_gnupghome\n");
         }

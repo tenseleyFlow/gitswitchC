@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <dirent.h>
+#include <ctype.h>
 
 #include "ssh_manager.h"
 #include "error.h"
@@ -300,14 +301,11 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     log_info("Isolated SSH agent started successfully (PID: %d, Socket: %s)",
              ssh_config->agent_pid, ssh_config->agent_socket_path);
 
-    /* Create/update symlink for easy shell integration */
+    /* Atomically (re)point the stable current.sock at this agent's socket. */
     char symlink_path[MAX_PATH_LEN];
     if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
                         "%s/current.sock", socket_dir) < sizeof(symlink_path)) {
-        /* Remove old symlink if it exists */
-        unlink(symlink_path);
-        /* Create new symlink to current socket */
-        if (symlink(socket_path, symlink_path) == 0) {
+        if (atomic_symlink(socket_path, symlink_path) == 0) {
             log_debug("Created symlink: %s -> %s", symlink_path, socket_path);
         } else {
             log_warning("Failed to create socket symlink: %s", strerror(errno));
@@ -512,65 +510,131 @@ int ssh_validate_key_file(const char *key_path) {
     return 0;
 }
 
-/* Configure SSH host alias */
+/* A host alias is written verbatim into ~/.ssh/config, so restrict it to a
+ * single line of safe characters (no whitespace/newlines/directive injection). */
+static bool valid_ssh_host_alias(const char *alias) {
+    if (!alias || !*alias) {
+        return false;
+    }
+    for (const char *p = alias; *p; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '-' ||
+              *p == '_' || *p == '*' || *p == '?')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Configure an SSH host alias in ~/.ssh/config. The block is delimited by
+ * gitswitch markers and rewritten idempotently (no unbounded appending), and
+ * deliberately does NOT weaken host-key checking. Written atomically at 0600. */
 int ssh_configure_host_alias(const account_t *account) {
-    char ssh_config_path[MAX_PATH_LEN];
     char ssh_config_dir[MAX_PATH_LEN];
-    FILE *ssh_config_file;
+    char ssh_config_path[MAX_PATH_LEN];
+    char tmp_path[MAX_PATH_LEN];
     char expanded_key_path[MAX_PATH_LEN];
-    
+    char begin_marker[MAX_NAME_LEN + 32];
+    char end_marker[MAX_NAME_LEN + 32];
+    char buf[65536];
+    const char *home = getenv("HOME");
+    int fd;
+    FILE *out;
+
     if (!account || strlen(account->ssh_host_alias) == 0) {
         return 0; /* Nothing to configure */
     }
-    
+    if (!home || !*home) {
+        set_error(ERR_INVALID_PATH, "HOME not set");
+        return -1;
+    }
+    if (!valid_ssh_host_alias(account->ssh_host_alias)) {
+        set_error(ERR_INVALID_ARGS, "Invalid SSH host alias: %s", account->ssh_host_alias);
+        return -1;
+    }
+
     log_debug("Configuring SSH host alias: %s", account->ssh_host_alias);
-    
-    /* Get SSH config directory */
-    if ((size_t)snprintf(ssh_config_dir, sizeof(ssh_config_dir), "%s/.ssh", getenv("HOME")) >= sizeof(ssh_config_dir)) {
-        set_error(ERR_INVALID_PATH, "SSH config directory path too long");
+
+    if ((size_t)snprintf(ssh_config_dir, sizeof(ssh_config_dir), "%s/.ssh", home) >= sizeof(ssh_config_dir) ||
+        (size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config", ssh_config_dir) >= sizeof(ssh_config_path) ||
+        (size_t)snprintf(tmp_path, sizeof(tmp_path), "%s/config.gitswitch.tmp", ssh_config_dir) >= sizeof(tmp_path)) {
+        set_error(ERR_INVALID_PATH, "SSH config path too long");
         return -1;
     }
-    
-    /* Create .ssh directory if it doesn't exist */
-    if (!path_exists(ssh_config_dir)) {
-        if (create_directory_recursive(ssh_config_dir, 0700) != 0) {
-            return -1;
-        }
-    }
-    
-    /* SSH config file path */
-    if ((size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config", ssh_config_dir) >= sizeof(ssh_config_path)) {
-        set_error(ERR_INVALID_PATH, "SSH config file path too long");
+    if (!path_exists(ssh_config_dir) && create_directory_recursive(ssh_config_dir, 0700) != 0) {
         return -1;
     }
-    
-    /* Expand key path */
     if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
         return -1;
     }
-    
-    /* Append to SSH config file */
-    ssh_config_file = fopen(ssh_config_path, "a");
-    if (!ssh_config_file) {
-        set_system_error(ERR_FILE_IO, "Failed to open SSH config file: %s", ssh_config_path);
+
+    snprintf(begin_marker, sizeof(begin_marker), "# >>> gitswitch %s >>>", account->ssh_host_alias);
+    snprintf(end_marker, sizeof(end_marker), "# <<< gitswitch %s <<<", account->ssh_host_alias);
+
+    /* Load the existing config (if any), preserving all bytes except a prior
+     * managed block for this alias, which we splice out. */
+    buf[0] = '\0';
+    if (path_exists(ssh_config_path)) {
+        if (get_file_size(ssh_config_path) >= sizeof(buf)) {
+            set_error(ERR_FILE_IO, "SSH config too large to update safely");
+            return -1;
+        }
+        if (read_file_to_string(ssh_config_path, buf, sizeof(buf)) < 0) {
+            set_error(ERR_FILE_IO, "Failed to read SSH config");
+            return -1;
+        }
+        char *bstart = strstr(buf, begin_marker);
+        if (bstart) {
+            char *bend = strstr(bstart, end_marker);
+            /* back up to the start of the begin-marker line */
+            char *line_start = bstart;
+            while (line_start > buf && line_start[-1] != '\n') line_start--;
+            if (bend) {
+                char *after = strchr(bend, '\n');
+                after = after ? after + 1 : bend + strlen(bend);
+                memmove(line_start, after, strlen(after) + 1);
+            } else {
+                *line_start = '\0'; /* malformed: truncate from the marker */
+            }
+        }
+    }
+
+    /* Write existing content + a fresh managed block, atomically at 0600. */
+    fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        unlink(tmp_path); /* clear a stale temp, then retry once */
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd < 0) {
+            set_system_error(ERR_FILE_IO, "Failed to create temp SSH config");
+            return -1;
+        }
+    }
+    out = fdopen(fd, "w");
+    if (!out) {
+        close(fd);
+        unlink(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to open temp SSH config");
         return -1;
     }
-    
-    /* Write host configuration */
-    fprintf(ssh_config_file, "\n# gitswitch-c configuration for account: %s\n", account->name);
-    fprintf(ssh_config_file, "Host %s\n", account->ssh_host_alias);
-    fprintf(ssh_config_file, "  IdentityFile %s\n", expanded_key_path);
-    fprintf(ssh_config_file, "  IdentitiesOnly yes\n");
-    fprintf(ssh_config_file, "  StrictHostKeyChecking no\n");
-    fprintf(ssh_config_file, "  UserKnownHostsFile /dev/null\n");
-    
-    fclose(ssh_config_file);
-    
-    /* Set proper permissions on SSH config file */
-    if (chmod(ssh_config_path, 0600) != 0) {
-        log_warning("Failed to set permissions on SSH config file");
+    fputs(buf, out);
+    if (buf[0] != '\0' && buf[strlen(buf) - 1] != '\n') {
+        fputc('\n', out);
     }
-    
+    fprintf(out, "%s\n", begin_marker);
+    fprintf(out, "Host %s\n", account->ssh_host_alias);
+    fprintf(out, "  IdentityFile %s\n", expanded_key_path);
+    fprintf(out, "  IdentitiesOnly yes\n");
+    fprintf(out, "%s\n", end_marker);
+    if (fclose(out) != 0) {
+        unlink(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to write SSH config");
+        return -1;
+    }
+    if (rename(tmp_path, ssh_config_path) != 0) {
+        unlink(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to install SSH config");
+        return -1;
+    }
+
     log_info("SSH host alias configured: %s -> %s", account->ssh_host_alias, expanded_key_path);
     return 0;
 }
@@ -736,26 +800,12 @@ static int create_isolated_agent_socket_dir(char *socket_dir, size_t socket_dir_
         }
     }
     
-    /* Create directory with secure permissions */
-    if (!path_exists(socket_dir)) {
-        if (create_directory_recursive(socket_dir, 0700) != 0) {
-            return -1;
-        }
-        log_debug("Created SSH socket directory: %s", socket_dir);
-    }
-    
-    /* Verify permissions */
-    struct stat dir_stat;
-    if (stat(socket_dir, &dir_stat) != 0) {
-        set_system_error(ERR_FILE_IO, "Failed to stat socket directory");
+    /* Create + verify the directory is a real, user-owned, 0700 dir (not a
+     * symlink, not pre-created by another user in a shared /tmp). */
+    if (ensure_private_dir(socket_dir) != 0) {
         return -1;
     }
-    
-    if ((dir_stat.st_mode & 0777) != 0700) {
-        set_error(ERR_PERMISSION_DENIED, "Socket directory has insecure permissions");
-        return -1;
-    }
-    
+
     return 0;
 }
 

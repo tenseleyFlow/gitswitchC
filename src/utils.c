@@ -249,7 +249,75 @@ int create_directory_recursive(const char *path, mode_t mode) {
         set_system_error(ERR_FILE_IO, "Failed to create directory: %s", temp_path);
         return -1;
     }
-    
+
+    return 0;
+}
+
+int ensure_private_dir(const char *path) {
+    struct stat st;
+
+    if (!path || !*path) {
+        set_error(ERR_INVALID_ARGS, "NULL path to ensure_private_dir");
+        return -1;
+    }
+
+    if (lstat(path, &st) != 0) {
+        if (errno != ENOENT) {
+            set_system_error(ERR_FILE_IO, "Cannot stat directory: %s", path);
+            return -1;
+        }
+        /* Create it (parents may already exist with other ownership, which is
+         * fine — only the leaf holds our private material). */
+        if (create_directory_recursive(path, 0700) != 0) {
+            return -1;
+        }
+        if (lstat(path, &st) != 0) {
+            set_system_error(ERR_FILE_IO, "Cannot stat created directory: %s", path);
+            return -1;
+        }
+    }
+
+    /* Must be a real directory (lstat does not follow symlinks), owned by us,
+     * with no group/other access — refuse a hostile pre-created/redirected dir. */
+    if (S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED, "Refusing to use non-directory/symlink path: %s", path);
+        return -1;
+    }
+    if (st.st_uid != getuid()) {
+        set_error(ERR_PERMISSION_DENIED, "Directory not owned by current user: %s", path);
+        return -1;
+    }
+    if (st.st_mode & 077) {
+        /* Tighten if we can; refuse if it then still isn't private. */
+        if (chmod(path, 0700) != 0 || (lstat(path, &st) == 0 && (st.st_mode & 077))) {
+            set_error(ERR_PERMISSION_DENIED, "Directory has unsafe permissions: %s", path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int atomic_symlink(const char *target, const char *linkpath) {
+    char tmp[MAX_PATH_LEN];
+
+    if (!target || !linkpath) {
+        set_error(ERR_INVALID_ARGS, "NULL args to atomic_symlink");
+        return -1;
+    }
+    if ((size_t)snprintf(tmp, sizeof(tmp), "%s.tmp.%d", linkpath, (int)getpid()) >= sizeof(tmp)) {
+        set_error(ERR_INVALID_PATH, "Symlink temp path too long");
+        return -1;
+    }
+    unlink(tmp); /* clear any stale temp */
+    if (symlink(target, tmp) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to create symlink: %s", linkpath);
+        return -1;
+    }
+    if (rename(tmp, linkpath) != 0) {
+        unlink(tmp);
+        set_system_error(ERR_FILE_IO, "Failed to install symlink: %s", linkpath);
+        return -1;
+    }
     return 0;
 }
 

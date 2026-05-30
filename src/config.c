@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include "accounts.h"
 #include "config.h"
@@ -525,6 +526,56 @@ const char *config_scope_to_string(git_scope_t scope) {
     }
 }
 
+static int prune_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
+/* Keep only the newest `keep` timestamped backups of config_path; delete older
+ * ones so they don't accumulate unbounded (each holds account metadata). The
+ * "%Y%m%d_%H%M%S" timestamp sorts lexicographically == chronologically. */
+static void prune_old_backups(const char *config_path, size_t keep) {
+    char dir[MAX_PATH_LEN];
+    char prefix[MAX_PATH_LEN];
+    const char *slash = strrchr(config_path, '/');
+    const char *base;
+    char names[64][256];
+    size_t n = 0, plen;
+    DIR *d;
+    struct dirent *e;
+
+    if (slash) {
+        size_t dl = (size_t)(slash - config_path);
+        if (dl >= sizeof(dir)) return;
+        memcpy(dir, config_path, dl);
+        dir[dl] = '\0';
+        base = slash + 1;
+    } else {
+        strcpy(dir, ".");
+        base = config_path;
+    }
+    if ((size_t)snprintf(prefix, sizeof(prefix), "%s.backup.", base) >= sizeof(prefix)) return;
+    plen = strlen(prefix);
+
+    d = opendir(dir);
+    if (!d) return;
+    while ((e = readdir(d)) != NULL && n < 64) {
+        if (strncmp(e->d_name, prefix, plen) == 0) {
+            snprintf(names[n], sizeof(names[n]), "%s", e->d_name);
+            n++;
+        }
+    }
+    closedir(d);
+    if (n <= keep) return;
+
+    qsort(names, n, sizeof(names[0]), prune_cmp);
+    for (size_t i = 0; i < n - keep; i++) {
+        char full[MAX_PATH_LEN];
+        if ((size_t)snprintf(full, sizeof(full), "%s/%s", dir, names[i]) < sizeof(full)) {
+            unlink(full);
+        }
+    }
+}
+
 /* Backup configuration file with timestamp */
 int config_backup(const char *config_path) {
     char backup_path[MAX_PATH_LEN];
@@ -569,6 +620,9 @@ int config_backup(const char *config_path) {
     }
     
     log_info("Created configuration backup: %s", backup_path);
+
+    /* Keep the backup set bounded. */
+    prune_old_backups(config_path, 5);
     return 0;
 }
 
