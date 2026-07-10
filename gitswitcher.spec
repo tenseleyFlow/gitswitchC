@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.7.2
+Version:        1.7.3
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -54,6 +54,9 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Thu Jul 09 2026 mfw <espadonne@outlook.com> - 1.7.3-1
+- Fix: the shell integration no longer prints the "restoring your last account" notice on every new shell when no account has ever been switched; the notice now comes from `gitswitch resume` itself, only when there is a saved account to restore.
+
 * Sat May 30 2026 mfw <espadonne@outlook.com> - 1.7.2-1
 - Fix: isolated GPG homes now inherit your real ~/.gnupg/gpg-agent.conf, so a configured (e.g. GUI) pinentry is preserved instead of reverting to a detected default.
 - Fix: tidy switch output (removed stray blank lines around the switch summary).
