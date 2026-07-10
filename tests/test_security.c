@@ -216,7 +216,7 @@ TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast) {
         if (child_lock >= 0) {
             /* Acquired concurrently with the live holder: exclusion broken. */
             runtime_state_lock_release(child_lock);
-            (void)write(pipefd[1], "X", 1);
+            if (write(pipefd[1], "X", 1) != 1) _exit(4);
             _exit(2);
         }
         if (write(pipefd[1], "B", 1) != 1) _exit(3);
@@ -446,7 +446,7 @@ TEST(runtime_state_lock_excludes_contender_after_leaf_replacement) {
         if (child_lock >= 0) {
             /* Entered concurrently via the replacement leaf: anchor broken. */
             runtime_state_lock_release(child_lock);
-            (void)write(entered[1], "X", 1);
+            if (write(entered[1], "X", 1) != 1) _exit(4);
             _exit(2);
         }
         if (write(entered[1], "B", 1) != 1) _exit(3);
