@@ -12,8 +12,12 @@
  * Both guards are on the base branch (earlier audit batch); these tests lock
  * them. gpgconf invocations are swallowed by a recording runner. */
 
+/* glibc-only: on macOS and the BSDs the strict macros hide default-namespace
+ * declarations (mkdtemp) — the trap documented in ssh_manager.c. */
+#ifdef __linux__
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#endif
 
 #include "test.h"
 #include "gitswitch.h"

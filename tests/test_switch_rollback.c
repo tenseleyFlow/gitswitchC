@@ -14,9 +14,13 @@
  * test_security.c; the runtime symlinks live under a private fake
  * XDG_RUNTIME_DIR so no real agents are involved. */
 
-/* Enable POSIX extensions for mkdtemp/symlink/fork */
+/* Enable POSIX extensions for mkdtemp/symlink/fork. glibc-only: on macOS and
+ * the BSDs the strict macros hide default-namespace declarations (mkdtemp,
+ * SA_*) — the trap documented in ssh_manager.c. */
+#ifdef __linux__
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#endif
 
 #include "test.h"
 #include "gitswitch.h"

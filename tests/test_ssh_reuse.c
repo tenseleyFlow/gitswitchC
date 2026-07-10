@@ -10,8 +10,12 @@
  * private fake XDG_RUNTIME_DIR so validate_ssh_agent_socket sees a genuine
  * 0600 socket. */
 
+/* glibc-only: on macOS and the BSDs the strict macros hide default-namespace
+ * declarations (mkdtemp, sockets) — the trap documented in ssh_manager.c. */
+#ifdef __linux__
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
+#endif
 
 #include "test.h"
 #include "gitswitch.h"

@@ -2,8 +2,12 @@
  * registry (SIG-02). Death-by-signal behaviors are exercised in forked
  * children so the harness process survives to report. */
 
-/* Enable POSIX extensions for sigaction/fork/kill */
+/* Enable POSIX extensions for sigaction/fork/kill. glibc-only: on macOS and
+ * the BSDs the strict macro hides default-namespace declarations (SA_RESTART,
+ * mkdtemp) — the trap documented in ssh_manager.c. */
+#ifdef __linux__
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "test.h"
 #include "gitswitch.h"

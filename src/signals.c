@@ -4,8 +4,13 @@
  * stores, unlink(), signal(), raise().
  */
 
-/* Enable POSIX extensions for sigaction */
+/* glibc wants a POSIX feature macro for sigaction; FreeBSD gates SA_RESTART
+ * as an XSI extension that strict _POSIX_C_SOURCE hides, and macOS likewise
+ * prunes its default namespace under it — leave those on their fully-visible
+ * defaults (the same trap documented in ssh_manager.c). */
+#ifdef __linux__
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include <signal.h>
 #include <string.h>
