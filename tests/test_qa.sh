@@ -40,10 +40,16 @@ for tool in cppcheck flawfinder valgrind; do
 done
 
 out=$tmp/qa.out
-if PATH="$shim_dir:$PATH" QA_TOOL_EXIT=71 \
+arg_log=$tmp/cppcheck.args
+if PATH="$shim_dir:$PATH" QA_TOOL_EXIT=71 QA_ARG_LOG="$arg_log" \
+    QA_REQUIRE_ARG=--error-exitcode=1 \
     "$make_cmd" -C "$root" analyze >"$out" 2>&1; then
     fail "analyze succeeded after an installed cppcheck failed"
 fi
+grep -F -- "--enable=warning,performance,portability" "$arg_log" >/dev/null ||
+    fail "analyze did not enable actionable cppcheck diagnostics"
+grep -F -- "--error-exitcode=1" "$arg_log" >/dev/null ||
+    fail "analyze did not configure cppcheck findings as fatal"
 if grep -F "not installed" "$out" >/dev/null; then
     fail "analyze misreported an installed failing cppcheck as absent"
 fi

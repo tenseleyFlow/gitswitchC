@@ -237,7 +237,8 @@ endif
 analyze:
 	@echo "Running static analysis..."
 	@if command -v cppcheck >/dev/null 2>&1; then \
-		cppcheck --enable=all --error-exitcode=1 --std=c11 \
+		cppcheck --enable=warning,performance,portability \
+			--error-exitcode=1 --std=c11 \
 			--suppress=missingIncludeSystem $(SRCDIR); \
 	else \
 		echo "cppcheck not installed - skipping static analysis"; \

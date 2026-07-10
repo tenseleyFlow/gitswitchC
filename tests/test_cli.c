@@ -159,7 +159,10 @@ TEST(init_fails_when_stdout_is_closed) {
 
     if (!make_temp_dir(rt, sizeof(rt))) { CHECK(!"mkdtemp failed"); return; }
     snprintf(cmd, sizeof(cmd),
-             "XDG_RUNTIME_DIR='%s' '%s' init bash >&- 2>/dev/null", rt, g_bin);
+             /* Keep fd 1 occupied by a read-only file. A merely closed fd can
+              * be reused by the sanitizer/runtime before main(), making the
+              * supposed failure sink writable on some platforms. */
+             "XDG_RUNTIME_DIR='%s' '%s' init bash 1</dev/null 2>/dev/null", rt, g_bin);
     rc = run_shell(cmd);
     CHECK(rc != 0);
     remove_tree(rt);
@@ -304,6 +307,44 @@ TEST(resume_gpg_only_restores_when_current_points_at_other_account) {
 
     remove_tree(home);
     remove_tree(rt);
+}
+
+/* A live directory outside the managed GPG base is not this account's
+ * isolated home merely because its basename matches. The old resume probe
+ * compared only "gpgonly" and followed the link, silently accepting this
+ * external target. */
+TEST(resume_gpg_only_restores_when_same_basename_is_external) {
+    char home[256], rt[256], external[256];
+    char path[4352], target[4352], cmd[16384];
+    char cfg[1024], err[8192], err_path[4352];
+
+    if (!make_temp_dir(home, sizeof(home)) ||
+        !make_temp_dir(rt, sizeof(rt)) ||
+        !make_temp_dir(external, sizeof(external))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+
+    snprintf(target, sizeof(target), "%s/gpgonly", external);
+    CHECK_EQ_INT(mkdir(target, 0700), 0);
+    snprintf(path, sizeof(path), "%s/gitswitch-gpg", rt);
+    CHECK_EQ_INT(mkdir(path, 0700), 0);
+    snprintf(path, sizeof(path), "%s/gitswitch-gpg/current", rt);
+    CHECK_EQ_INT(symlink(target, path), 0);
+
+    snprintf(err_path, sizeof(err_path), "%s/resume.err", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' resume </dev/null >/dev/null 2>'%s'",
+             home, rt, g_bin, err_path);
+    (void)run_shell(cmd);
+
+    slurp(err_path, err, sizeof(err));
+    CHECK(strstr(err, "restoring") != NULL);
+
+    remove_tree(home);
+    remove_tree(rt);
+    remove_tree(external);
 }
 
 TEST(resume_gpg_only_restores_when_current_dangles) {
@@ -1137,6 +1178,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(resume_gpg_only_noops_silently_when_state_live);
     RUN_TEST(resume_gpg_only_attempts_restore_after_boot_wipe);
     RUN_TEST(resume_gpg_only_restores_when_current_points_at_other_account);
+    RUN_TEST(resume_gpg_only_restores_when_same_basename_is_external);
     RUN_TEST(resume_gpg_only_restores_when_current_dangles);
     RUN_TEST(resume_never_blocks_reading_stdin);
     RUN_TEST(reset_account_removes_current_sock_pointing_at_it);

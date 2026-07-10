@@ -12,12 +12,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 static char g_bin[PATH_MAX];
+
+static int install_live_current_socket(const char *runtime,
+                                       const char *account_name);
 
 static int resolve_binary(void) {
     const char *bin = getenv("GITSWITCH_BIN");
@@ -199,6 +204,7 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     char link_target[1024];
     struct stat ssh_before, ssh_after, gpg_before, gpg_after;
     ssize_t link_len;
+    int listener = -1;
     static const char inactive_config[] =
         "[settings]\n"
         "default_scope = \"global\"\n"
@@ -238,14 +244,12 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
                             0600), 0);
     slurp(path, before_git, sizeof(before_git));
 
-    snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
-    CHECK_EQ_INT(mkdir_private(path), 0);
     snprintf(ssh_target, sizeof(ssh_target),
              "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
-    CHECK_EQ_INT(write_text(ssh_target, "active ssh runtime\n", 0600), 0);
     snprintf(ssh_current, sizeof(ssh_current),
              "%s/gitswitch-ssh/current.sock", runtime);
-    CHECK_EQ_INT(symlink(ssh_target, ssh_current), 0);
+    listener = install_live_current_socket(runtime, "work");
+    CHECK(listener >= 0);
     CHECK_EQ_INT(lstat(ssh_current, &ssh_before), 0);
 
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", runtime);
@@ -287,12 +291,20 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     /* The remainder of this test exercises edits to an inactive `work`
      * account. Remove the deliberately-live `work` runtime first so startup
      * detection does not correctly classify it as active. */
+    if (listener >= 0) {
+        close(listener);
+        listener = -1;
+    }
     CHECK_EQ_INT(unlink(ssh_current), 0);
     CHECK_EQ_INT(unlink(ssh_target), 0);
+    snprintf(path, sizeof(path), "%s/gitswitch-ssh/.lock", runtime);
+    CHECK(unlink(path) == 0 || errno == ENOENT);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
     CHECK_EQ_INT(rmdir(path), 0);
     CHECK_EQ_INT(unlink(gpg_current), 0);
     CHECK_EQ_INT(rmdir(gpg_target), 0);
+    snprintf(path, sizeof(path), "%s/gitswitch-gpg/.lock", runtime);
+    CHECK(unlink(path) == 0 || errno == ENOENT);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", runtime);
     CHECK_EQ_INT(rmdir(path), 0);
 
@@ -505,7 +517,8 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
      * be recreated cleanly after the earlier teardown. */
     CHECK_EQ_INT(chmod(config_dir, 0700), 0);
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
+             "HOME='%s' XDG_RUNTIME_DIR='%s' "
+             "PATH='%s:/usr/local/bin:/usr/bin:/bin' "
              "'%s' -C -y work >'%s' 2>&1",
              home, runtime, shims, g_bin, output);
     int switch_rc = run_shell(cmd);
@@ -724,9 +737,58 @@ static int install_current_link(const char *runtime, const char *target) {
     return symlink(target, path);
 }
 
+static int install_live_current_socket(const char *runtime,
+                                       const char *account_name) {
+    char dir[1024];
+    char current[1024];
+    char socket_path[1024];
+    struct sockaddr_un addr;
+    int fd;
+
+    if ((size_t)snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", runtime) >=
+        sizeof(dir)) {
+        return -1;
+    }
+    if (mkdir_private(dir) != 0) return -1;
+    if ((size_t)snprintf(socket_path, sizeof(socket_path),
+                         "%s/ssh-agent.%s.sock", dir, account_name) >=
+        sizeof(socket_path)) {
+        return -1;
+    }
+    if (strlen(socket_path) >= sizeof(addr.sun_path)) return -1;
+
+    unlink(socket_path);
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    memcpy(addr.sun_path, socket_path, strlen(socket_path) + 1);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        chmod(socket_path, 0600) != 0 || listen(fd, 4) != 0) {
+        close(fd);
+        unlink(socket_path);
+        return -1;
+    }
+
+    if ((size_t)snprintf(current, sizeof(current), "%s/current.sock", dir) >=
+        sizeof(current)) {
+        close(fd);
+        unlink(socket_path);
+        return -1;
+    }
+    unlink(current);
+    if (symlink(socket_path, current) != 0) {
+        close(fd);
+        unlink(socket_path);
+        return -1;
+    }
+    return fd;
+}
+
 TEST(sock_substrings_round_trip_and_malformed_links_fall_back) {
     char runtime[256];
     gitswitch_ctx_t ctx;
+    int listener;
 
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
@@ -736,16 +798,18 @@ TEST(sock_substrings_round_trip_and_malformed_links_fall_back) {
     add_account(&ctx, 2, "saved");
     snprintf(ctx.config.active_account, sizeof(ctx.config.active_account), "%s", "saved");
 
-    CHECK_EQ_INT(install_current_link(runtime,
-                 "/tmp/ssh-agent.alice.sock.work.sock"), 0);
+    listener = install_live_current_socket(runtime, "alice.sock.work");
+    CHECK(listener >= 0);
     CHECK_EQ_INT(accounts_detect_current(&ctx), 0);
     CHECK(ctx.current_account == &ctx.accounts[0]);
+    if (listener >= 0) close(listener);
 
     ctx.current_account = NULL;
-    CHECK_EQ_INT(install_current_link(runtime,
-                 "ssh-agent.a.sock.b.sock.c.sock"), 0);
+    listener = install_live_current_socket(runtime, "a.sock.b.sock.c");
+    CHECK(listener >= 0);
     CHECK_EQ_INT(accounts_detect_current(&ctx), 0);
     CHECK(ctx.current_account == &ctx.accounts[1]);
+    if (listener >= 0) close(listener);
 
     ctx.current_account = NULL;
     CHECK_EQ_INT(install_current_link(runtime,
