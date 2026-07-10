@@ -234,6 +234,31 @@ static bool path_is_memory_backed(const char *path) {
     return false;
 }
 
+/* Memory-backed-ness of the directory that will actually hold the isolated
+ * homes. Probes the base itself, not a hardcoded parent: the base may be a
+ * distinct mount from its parent (admin bind-mount or per-user quota mount at
+ * exactly /tmp/gitswitch-gpg-<uid> — AR-02 #22), and on the XDG branch the
+ * parent is whatever the user exported, tmpfs or not (AR-02 #3). On the first
+ * switch the base does not exist yet, so fall back to the nearest existing
+ * ancestor — the mount the base would be created on. Unknown => false, so
+ * callers fail safe. */
+static bool base_is_memory_backed(const char *base) {
+    char probe[MAX_PATH_LEN];
+    if (!base || safe_strncpy(probe, base, sizeof(probe)) != 0) {
+        return false;
+    }
+    for (;;) {
+        if (path_exists(probe)) {
+            return path_is_memory_backed(probe);
+        }
+        char *slash = strrchr(probe, '/');
+        if (!slash || slash == probe) {
+            return path_is_memory_backed("/");
+        }
+        *slash = '\0';
+    }
+}
+
 /* Compute the base directory that holds per-account isolated GNUPGHOMEs and the
  * stable `current` symlink. Two-way like the SSH side: prefer XDG_RUNTIME_DIR,
  * else /tmp/gitswitch-gpg-<uid>. There is deliberately no HOME fallback: that
@@ -258,19 +283,23 @@ static int gpg_get_base_dir(char *buf, size_t size) {
          * isolated home's exported secret keys would then live, contradicting
          * this function's own no-persistent-disk intent. Warn once (per process)
          * when we can't confirm the fallback is memory-backed, so the user can
-         * export XDG_RUNTIME_DIR or accept the risk knowingly. The create path
-         * (gpg_create_isolated_home) additionally refuses to write secret
-         * material here unless the user opts in. */
+         * export XDG_RUNTIME_DIR or accept the risk knowingly. Probes the
+         * actual base (nearest existing ancestor when absent), not a hardcoded
+         * "/tmp": the base could be a distinct persistent mount under a tmpfs
+         * /tmp (AR-02 #22). The create path (gpg_create_isolated_home)
+         * additionally refuses to write secret material to any non-memory-
+         * backed base unless the user opts in. */
+        written = snprintf(buf, size, "/tmp/gitswitch-gpg-%d", getuid());
         static bool warned = false;
-        if (!warned && !path_is_memory_backed("/tmp")) {
+        if (!warned && written > 0 && (size_t)written < size &&
+            !base_is_memory_backed(buf)) {
             warned = true;
             display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
-                            "/tmp/gitswitch-gpg-%d, which is not memory-backed. Exported "
+                            "%s, which is not memory-backed. Exported "
                             "secret keys could remain recoverable on disk after exit. Set "
                             "XDG_RUNTIME_DIR to a memory-backed dir to avoid this.",
-                            getuid());
+                            buf);
         }
-        written = snprintf(buf, size, "/tmp/gitswitch-gpg-%d", getuid());
     }
 
     if (written < 0 || (size_t)written >= size) {
@@ -469,13 +498,16 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
         return -1;
     }
 
-    /* Refuse to export secret-key material onto persistent disk. When
-     * XDG_RUNTIME_DIR is unset we fall back to /tmp/gitswitch-gpg-<uid>; if that
-     * isn't memory-backed the imported private keys would survive on disk until
-     * a manual reset. Fail closed unless the user explicitly opts in with
-     * GITSWITCH_ALLOW_TMP_GPG=1 (or, better, sets XDG_RUNTIME_DIR to a tmpfs). */
-    if (strncmp(gnupg_base_dir, "/tmp/gitswitch-gpg-", 19) == 0 &&
-        !path_is_memory_backed("/tmp")) {
+    /* Refuse to export secret-key material onto persistent disk, wherever the
+     * base came from. XDG_RUNTIME_DIR is only USUALLY a tmpfs — rootless
+     * containers, NFS-homed logins, or a hand-exported disk path are not — and
+     * the /tmp fallback (or even a bind/quota mount at exactly the base path
+     * under a tmpfs /tmp) can be persistent too, so probe the actual computed
+     * base rather than trusting its source or a hardcoded parent (AR-02 #3,
+     * #22). Fail closed unless the user explicitly opts in with
+     * GITSWITCH_ALLOW_TMP_GPG=1 (or, better, points XDG_RUNTIME_DIR at a
+     * tmpfs); on opt-in, remind them once per process what they accepted. */
+    if (!base_is_memory_backed(gnupg_base_dir)) {
         const char *optin = getenv("GITSWITCH_ALLOW_TMP_GPG");
         if (!optin || strcmp(optin, "1") != 0) {
             set_error(ERR_PERMISSION_DENIED,
@@ -483,6 +515,13 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
                       "Set XDG_RUNTIME_DIR to a tmpfs, or GITSWITCH_ALLOW_TMP_GPG=1 "
                       "to accept on-disk secret-key persistence.", gnupg_base_dir);
             return -1;
+        }
+        static bool warned_optin = false;
+        if (!warned_optin) {
+            warned_optin = true;
+            display_warning("GITSWITCH_ALLOW_TMP_GPG=1: writing GPG secret keys to "
+                            "non-memory-backed %s; they may remain recoverable on "
+                            "disk after deletion.", gnupg_base_dir);
         }
     }
 

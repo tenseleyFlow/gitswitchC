@@ -30,6 +30,12 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#else
+#include <sys/param.h>
+#include <sys/mount.h>
+#endif
 
 /* Swallow gpgconf --kill (and anything else) without executing it. */
 static int null_runner(const char *const argv[], const run_opts_t *opts,
@@ -150,8 +156,71 @@ TEST(gpg_manager_reset_refuses_symlinked_base) {
     run_set_runner(prev);
 }
 
+/* Test-local mirror of the manager's tmpfs probe, so the assertions below can
+ * adapt to where the suite happens to run instead of hard-assuming /tmp is
+ * tmpfs (it isn't on FreeBSD/macOS CI) or the workspace is disk (it usually is). */
+static bool test_dir_is_tmpfs(const char *path) {
+#ifdef __linux__
+    struct statfs sfs;
+    return statfs(path, &sfs) == 0 &&
+           ((unsigned long)sfs.f_type == 0x01021994UL ||
+            (unsigned long)sfs.f_type == 0x858458f6UL);
+#else
+    struct statfs sfs;
+    return statfs(path, &sfs) == 0 && strcmp(sfs.f_fstypename, "tmpfs") == 0;
+#endif
+}
+
+/* AR-02 #3/#22: the no-persistent-disk guard must fire on the ACTUAL computed
+ * base dir — including one under XDG_RUNTIME_DIR, which used to bypass the
+ * check entirely — failing closed without the GITSWITCH_ALLOW_TMP_GPG opt-in
+ * and proceeding with it. */
+TEST(create_isolated_home_refuses_persistent_xdg_base) {
+    char cwd[512], xdg[768], home_expect[1024];
+    gpg_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+
+    /* A directory in the build tree: persistent disk in CI and on dev boxes.
+     * If this workspace is itself tmpfs-backed, the scenario can't be built
+     * here — skip rather than assert a wrong premise. */
+    CHECK(getcwd(cwd, sizeof(cwd)) != NULL);
+    if (test_dir_is_tmpfs(cwd)) {
+        return;
+    }
+    snprintf(xdg, sizeof(xdg), "%s/build/gswgpg-xdg-XXXXXX", cwd);
+    CHECK(mkdtemp(xdg) != NULL);
+    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    setenv("XDG_RUNTIME_DIR", xdg, 1);
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = GPG_MODE_ISOLATED;
+    memset(&acct, 0, sizeof(acct));
+    snprintf(acct.name, sizeof(acct.name), "t");
+
+    prev = run_set_runner(null_runner);
+
+    /* Pre-fix this SUCCEEDED, silently placing secret keys on disk. */
+    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    snprintf(home_expect, sizeof(home_expect), "%s/gitswitch-gpg/t", xdg);
+    CHECK(!path_exists(home_expect));
+
+    /* Explicit opt-in still works (documented escape hatch). */
+    setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
+    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), 0);
+    CHECK(path_exists(home_expect));
+
+    /* Cleanup through the manager itself (base is valid 0700). */
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    run_set_runner(prev);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(gpg_manager_reset_rejects_traversal);
     RUN_TEST(gpg_manager_reset_refuses_symlinked_base);
+    RUN_TEST(create_isolated_home_refuses_persistent_xdg_base);
 TEST_MAIN_END()
