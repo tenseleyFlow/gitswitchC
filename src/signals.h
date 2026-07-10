@@ -91,10 +91,11 @@ void signals_dispatch_pending(void);
  * here do the rest. Registration is only effective while a guard is active:
  *   - src/config.c config_save() registers "<config_path>.tmp.<pid>" itself,
  *     and main() holds a guard across the save-after-switch (AR-02 #27).
- * Remaining hook point:
- *   - src/ssh_manager.c ssh_configure_host_alias(): the mkstemp-resolved
- *     "~/.ssh/config.gitswitch.XXXXXX" path (created inside accounts_switch's
- *     guarded window, where its error paths already unlink it)
+ *   - src/ssh_manager.c ssh_configure_host_alias() registers the mkstemp-
+ *     resolved "~/.ssh/config.gitswitch.XXXXXX" path across its write+rename
+ *     (created inside accounts_switch's guarded window; its error paths also
+ *     unlink it themselves) — AR-03 L9 closed what used to be the remaining
+ *     hook point here.
  */
 
 /**

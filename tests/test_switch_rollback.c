@@ -187,19 +187,28 @@ static int bind_fake_agent_socket(const char *path) {
 #define FAKE_AGENT_PID 1073741824
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
-    if (strcmp(argv[0], "ssh-agent") == 0 && argv[1] &&
-        strcmp(argv[1], "-a") == 0 && argv[2]) {
-        if (g_log) { fprintf(g_log, "ssh-agent -a %s\n", argv[2]); fflush(g_log); }
+    if (strcmp(argv[0], "ssh-agent") == 0) {
+        /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
+         * explicit -s ahead of it, so the socket is no longer argv[2]. */
+        const char *sock = NULL;
+        for (size_t i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "-a") == 0 && argv[i + 1]) {
+                sock = argv[i + 1];
+                break;
+            }
+        }
+        if (!sock) return -1;
+        if (g_log) { fprintf(g_log, "ssh-agent -a %s\n", sock); fflush(g_log); }
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
         }
-        if (bind_fake_agent_socket(argv[2]) != 0) return -1;
+        if (bind_fake_agent_socket(sock) != 0) return -1;
         if (opts && opts->out && opts->out_size > 0) {
             snprintf(opts->out, opts->out_size,
                      "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
                      "SSH_AGENT_PID=%d; export SSH_AGENT_PID;\n",
-                     argv[2], FAKE_AGENT_PID);
+                     sock, FAKE_AGENT_PID);
             if (result) result->out_len = strlen(opts->out);
         }
         return 0;
