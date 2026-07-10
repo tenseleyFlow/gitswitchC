@@ -38,17 +38,40 @@ _gitswitch() {
     )
 
     # Live account names; silence errors so a broken config yields no matches
-    # rather than an error.
-    accounts=(${(f)"$(gitswitch list --names 2>/dev/null)"})
+    # rather than an error. Escape any ':' in a name: _describe reads each item
+    # as 'value:description', so an unescaped colon truncated the name to the
+    # text before it (AR-06 F38).
+    accounts=("${(@)${(f)\"$(gitswitch list --names 2>/dev/null)\"}//:/\\:}")
 
-    if (( CURRENT == 2 )); then
+    # Find the first non-option word AFTER the command name (mirrors the bash
+    # loop). getopt_long parses options before the subcommand, so `gitswitch
+    # --local <TAB>` puts words[2]='--local' and the old `words[2]` dispatch
+    # offered only more options — never the subcommands/accounts this position
+    # accepts (AR-06 F14). Scan for the effective subcommand instead.
+    local seen_cmd="" i
+    for (( i = 2; i < CURRENT; i++ )); do
+        case "${words[i]}" in
+            -*) ;;
+            *) seen_cmd="${words[i]}"; break ;;
+        esac
+    done
+
+    # The word being completed is itself an option: offer options.
+    if [[ "${words[CURRENT]}" == -* ]]; then
+        _values 'option' $options
+        return
+    fi
+
+    # No subcommand yet (only options seen): this position takes a subcommand
+    # or a bare account name to switch to.
+    if [[ -z "$seen_cmd" ]]; then
         _describe -t commands 'gitswitch command' subcommands
         _describe -t accounts 'account' accounts
         _values 'option' $options
         return
     fi
 
-    case "${words[2]}" in
+    case "$seen_cmd" in
         edit|remove|rm|delete|reset)
             _describe -t accounts 'account' accounts
             ;;
