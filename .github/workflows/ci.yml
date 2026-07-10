@@ -46,7 +46,10 @@ jobs:
           # incompatible with ASan/PIE binaries (they abort on init). The
           # Linux/macOS jobs provide the ASan/UBSan coverage.
           run: |
-            sudo pkg install -y gmake gcc openssl
+            # git: the git_ops perf tests prove availability via a PATH walk
+            # and assert no subprocess spawn — they need a real git binary,
+            # which the Linux/macOS runners ship but this VM does not.
+            sudo pkg install -y gmake gcc openssl git
             gmake BUILD_TYPE=release
             gmake BUILD_TYPE=release test
 

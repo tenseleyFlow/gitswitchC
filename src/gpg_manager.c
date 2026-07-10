@@ -3,8 +3,14 @@
  */
 
 /* _XOPEN_SOURCE 700 (implies POSIX.1-2008) exposes nftw()/FTW_* from <ftw.h>
- * on glibc, which _POSIX_C_SOURCE alone does not. */
+ * on glibc, which _POSIX_C_SOURCE alone does not. Scope it to Linux: on macOS
+ * and the BSDs nftw is visible in the default namespace, and defining
+ * _XOPEN_SOURCE there puts the headers into strict X/Open mode, which hides
+ * the u_int/u_char typedefs that <sys/mount.h>/<sys/ucred.h> (needed below
+ * for the tmpfs check) rely on — the same trap documented in ssh_manager.c. */
+#ifdef __linux__
 #define _XOPEN_SOURCE 700
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +25,9 @@
 #include <ftw.h>
 #ifdef __linux__
 #include <sys/vfs.h>
+#else
+#include <sys/param.h>
+#include <sys/mount.h>
 #endif
 
 #include "gpg_manager.h"
@@ -204,6 +213,27 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
     return 0;
 }
 
+/* Best-effort check whether `path` lives on a memory-backed filesystem
+ * (tmpfs/ramfs). Used to decide whether exported secret-key material may safely
+ * be written there. Returns true ONLY on positive confirmation; unknown => false
+ * so callers fail safe. Cross-platform: statfs magic on Linux, f_fstypename on
+ * the BSDs/macOS. */
+static bool path_is_memory_backed(const char *path) {
+#ifdef __linux__
+    struct statfs sfs;
+    if (statfs(path, &sfs) == 0) {
+        unsigned long t = (unsigned long)sfs.f_type;
+        return t == 0x01021994UL /* TMPFS_MAGIC */ || t == 0x858458f6UL /* RAMFS_MAGIC */;
+    }
+#else
+    struct statfs sfs;
+    if (statfs(path, &sfs) == 0) {
+        return strcmp(sfs.f_fstypename, "tmpfs") == 0;
+    }
+#endif
+    return false;
+}
+
 /* Compute the base directory that holds per-account isolated GNUPGHOMEs and the
  * stable `current` symlink. Two-way like the SSH side: prefer XDG_RUNTIME_DIR,
  * else /tmp/gitswitch-gpg-<uid>. There is deliberately no HOME fallback: that
@@ -224,28 +254,21 @@ static int gpg_get_base_dir(char *buf, size_t size) {
     } else {
         /* Fallback: XDG_RUNTIME_DIR is unset (cron, minimal login, some SSH
          * sessions). /tmp is a tmpfs on most Linux desktops, but on many
-         * servers and default FreeBSD it is persistent disk — where the
+         * servers and default FreeBSD/macOS it is persistent disk — where the
          * isolated home's exported secret keys would then live, contradicting
-         * this function's own no-persistent-disk intent. Warn once (per
-         * process) when we can't confirm the fallback is memory-backed, so the
-         * user can export XDG_RUNTIME_DIR or accept the risk knowingly. */
+         * this function's own no-persistent-disk intent. Warn once (per process)
+         * when we can't confirm the fallback is memory-backed, so the user can
+         * export XDG_RUNTIME_DIR or accept the risk knowingly. The create path
+         * (gpg_create_isolated_home) additionally refuses to write secret
+         * material here unless the user opts in. */
         static bool warned = false;
-        if (!warned) {
+        if (!warned && !path_is_memory_backed("/tmp")) {
             warned = true;
-            bool tmpfs = false;
-#ifdef __linux__
-            struct statfs sfs;
-            if (statfs("/tmp", &sfs) == 0 && (unsigned long)sfs.f_type == 0x01021994UL /* TMPFS_MAGIC */) {
-                tmpfs = true;
-            }
-#endif
-            if (!tmpfs) {
-                display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
-                                "/tmp/gitswitch-gpg-%d, which may be persistent disk. Exported "
-                                "secret keys could remain recoverable after exit. Set "
-                                "XDG_RUNTIME_DIR to a memory-backed dir to avoid this.",
-                                getuid());
-            }
+            display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
+                            "/tmp/gitswitch-gpg-%d, which is not memory-backed. Exported "
+                            "secret keys could remain recoverable on disk after exit. Set "
+                            "XDG_RUNTIME_DIR to a memory-backed dir to avoid this.",
+                            getuid());
         }
         written = snprintf(buf, size, "/tmp/gitswitch-gpg-%d", getuid());
     }
@@ -349,6 +372,32 @@ int gpg_manager_reset(const char *account) {
         return -1;
     }
 
+    /* Guard the base before we opendir/recursively remove under it. When
+     * XDG_RUNTIME_DIR is unset the base is the predictable path
+     * /tmp/gitswitch-gpg-<uid> in world-writable, sticky /tmp, so a co-located
+     * user could pre-create it as a symlink to, e.g., the victim's home —
+     * turning `reset` into an arbitrary recursive delete (nftw follows the
+     * symlinked base as an intermediate path component; FTW_PHYS only governs
+     * leaf traversal). The create path already validates the base via
+     * ensure_private_dir(); reset must be at least as strict. lstat (no follow)
+     * and refuse a symlink, a foreign owner, or any group/other access. A
+     * missing base means there is simply nothing to reset. */
+    struct stat bst;
+    if (lstat(base, &bst) != 0) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO, "Cannot stat GPG base dir: %s", base);
+        return -1;
+    }
+    if (S_ISLNK(bst.st_mode) || !S_ISDIR(bst.st_mode) ||
+        bst.st_uid != getuid() || (bst.st_mode & 077)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing to reset: GPG base dir is a symlink, foreign-owned, "
+                  "or not private: %s", base);
+        return -1;
+    }
+
     if (account && *account) {
         char home[MAX_PATH_LEN];
         /* The account name becomes a path component under a directory we then
@@ -377,7 +426,13 @@ int gpg_manager_reset(const char *account) {
                     continue;
                 }
                 if ((size_t)snprintf(home, sizeof(home), "%s/%s", base, ent->d_name) < sizeof(home)) {
-                    gpg_kill_and_remove_home(home);
+                    /* Base is validated private+owned above, so entries are ours;
+                     * still refuse to recurse into a symlinked entry as belt-and-
+                     * suspenders against a symlink planted inside the base. */
+                    struct stat est;
+                    if (lstat(home, &est) == 0 && !S_ISLNK(est.st_mode)) {
+                        gpg_kill_and_remove_home(home);
+                    }
                 }
             }
             closedir(d);
@@ -412,6 +467,23 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
      * `current` symlink path so the two never disagree). */
     if (gpg_get_base_dir(gnupg_base_dir, sizeof(gnupg_base_dir)) != 0) {
         return -1;
+    }
+
+    /* Refuse to export secret-key material onto persistent disk. When
+     * XDG_RUNTIME_DIR is unset we fall back to /tmp/gitswitch-gpg-<uid>; if that
+     * isn't memory-backed the imported private keys would survive on disk until
+     * a manual reset. Fail closed unless the user explicitly opts in with
+     * GITSWITCH_ALLOW_TMP_GPG=1 (or, better, sets XDG_RUNTIME_DIR to a tmpfs). */
+    if (strncmp(gnupg_base_dir, "/tmp/gitswitch-gpg-", 19) == 0 &&
+        !path_is_memory_backed("/tmp")) {
+        const char *optin = getenv("GITSWITCH_ALLOW_TMP_GPG");
+        if (!optin || strcmp(optin, "1") != 0) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing to write GPG secret keys to non-memory-backed %s. "
+                      "Set XDG_RUNTIME_DIR to a tmpfs, or GITSWITCH_ALLOW_TMP_GPG=1 "
+                      "to accept on-disk secret-key persistence.", gnupg_base_dir);
+            return -1;
+        }
     }
 
     /* Create + verify the base directory (real, user-owned, 0700; not a

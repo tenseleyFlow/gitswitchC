@@ -80,6 +80,24 @@ TEST(injection_patterns_structural_only) {
     CHECK(!toml_check_injection_patterns(nested, sizeof(nested) - 1));
 }
 
+/* Brackets inside quoted values and comments are data, not structure: the
+ * guard must not count them, or it rejects files the writer itself produces
+ * (toml F1). Structural bracket floods are still rejected (previous test). */
+TEST(injection_guard_ignores_brackets_in_strings_and_comments) {
+    char src[256];
+    char many[64];
+    memset(many, '[', sizeof(many) - 1);
+    many[sizeof(many) - 1] = '\0';
+    snprintf(src, sizeof(src), "description = \"%s\"\n", many);
+    CHECK(toml_check_injection_patterns(src, strlen(src)));
+    snprintf(src, sizeof(src), "# comment %s\nname = \"x\"\n", many);
+    CHECK(toml_check_injection_patterns(src, strlen(src)));
+    /* An escaped quote must not end the string early and expose the
+     * brackets as structural. */
+    snprintf(src, sizeof(src), "d = \"a\\\"%s\"\n", many);
+    CHECK(toml_check_injection_patterns(src, strlen(src)));
+}
+
 TEST(safe_characters_reject_control) {
     char ctrl[4] = { 'a', 0x01, 'b', '\0' };
     CHECK(!toml_validate_safe_characters(ctrl, 3));
@@ -118,6 +136,69 @@ TEST(quote_in_value_round_trips) {
     remove(path);
 }
 
+/* Write→read round-trip with a bracket-heavy description: the injection guard
+ * used to count these data brackets and refuse to reload a config the tool
+ * had just written (toml F1). */
+TEST(bracket_heavy_value_round_trips) {
+    toml_document_t doc;
+    char desc[48];
+    memset(desc, '[', sizeof(desc) - 1);
+    desc[sizeof(desc) - 1] = '\0';
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "name", "alice"), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "email", "a@b.com"), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "description", desc), 0);
+    char path[] = "/tmp/gitswitch_toml_bracket_rt_test.toml";
+    CHECK_EQ_INT(toml_write_file(&doc, path), 0);
+    chmod(path, 0600); /* toml_parse_file requires 0600, like config_save sets */
+    toml_cleanup_document(&doc);
+
+    toml_document_t doc2;
+    toml_init_document(&doc2);
+    CHECK_EQ_INT(toml_parse_file(path, &doc2), 0); /* must NOT be rejected */
+    char buf[64];
+    CHECK_EQ_INT(toml_get_string(&doc2, "accounts.1", "description", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, desc);
+    toml_cleanup_document(&doc2);
+    remove(path);
+}
+
+/* A bare relative ssh_key would resolve against the invocation CWD, making
+ * key selection CWD-dependent (toml F3): schema validation must reject it. */
+TEST(rejects_relative_ssh_key) {
+    toml_document_t doc;
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "ssh_key = \"keys/id_ed25519\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
+}
+
+/* Absolute and ~-anchored ssh_key paths are CWD-independent and stay valid. */
+TEST(accepts_anchored_ssh_key) {
+    toml_document_t doc;
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "ssh_key = \"~/.ssh/id_ed25519\"\n", &doc), 0);
+    toml_cleanup_document(&doc);
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "ssh_key = \"/home/alice/.ssh/id_ed25519\"\n", &doc), 0);
+    toml_cleanup_document(&doc);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(parses_valid_config);
@@ -125,7 +206,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(rejects_overlong_section_name);
     RUN_TEST(get_string_rejects_value_too_long_for_dest);
     RUN_TEST(injection_patterns_structural_only);
+    RUN_TEST(injection_guard_ignores_brackets_in_strings_and_comments);
     RUN_TEST(safe_characters_reject_control);
     RUN_TEST(rejects_control_char_in_string);
     RUN_TEST(quote_in_value_round_trips);
+    RUN_TEST(bracket_heavy_value_round_trips);
+    RUN_TEST(rejects_relative_ssh_key);
+    RUN_TEST(accepts_anchored_ssh_key);
 TEST_MAIN_END()

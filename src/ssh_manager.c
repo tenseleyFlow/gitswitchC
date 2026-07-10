@@ -2,15 +2,15 @@
  * Implements per-account SSH agents to prevent key leakage between accounts
  */
 
-/* flock()/LOCK_EX are BSD extensions, not POSIX. On macOS they need
- * _DARWIN_C_SOURCE; on the BSDs they need the default fully-visible namespace,
- * so defining _POSIX_C_SOURCE there (strict POSIX) hides them and the build
- * fails. glibc still exposes flock under _POSIX_C_SOURCE, so keep it on Linux
- * for the other POSIX APIs this file relies on. */
+/* flock()/LOCK_EX are BSD extensions, not POSIX, and syscall()/pidfd need the
+ * GNU namespace on glibc. On macOS they need _DARWIN_C_SOURCE; on the BSDs they
+ * need the default fully-visible namespace, so defining _POSIX_C_SOURCE there
+ * (strict POSIX) hides them and the build fails. On Linux use _GNU_SOURCE (a
+ * superset of _POSIX_C_SOURCE) so flock AND syscall()/SYS_pidfd_* are visible. */
 #if defined(__APPLE__)
 #  define _DARWIN_C_SOURCE 1
 #elif defined(__linux__)
-#  define _POSIX_C_SOURCE 200809L
+#  define _GNU_SOURCE
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -26,6 +27,9 @@
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #include "ssh_manager.h"
 #include "error.h"
@@ -42,15 +46,19 @@ static int validate_ssh_agent_socket(const char *socket_path);
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
 static void kill_orphaned_gitswitch_agents(const char *keep_account);
 
-/* Best-effort check that a PID recorded in a sidecar still belongs to an
+/* Best-effort check that a PID recorded in a sidecar still belongs to OUR
  * ssh-agent before we SIGTERM it. Sidecars can outlive their agent (crash,
  * logout, reboot on a /tmp-preserving distro); once the kernel recycles that
- * PID to an unrelated same-uid process (editor, browser, build), a blind kill
- * would terminate it. On Linux we confirm via /proc/<pid>/comm. Where /proc is
- * unavailable we cannot verify cheaply, so we fall back to the previous
- * behavior (treat a live PID as reapable) — the per-dir lock and pid-scoped
- * temp files below shrink the window that produces stale sidecars. */
-static bool pid_is_ssh_agent(pid_t pid) {
+ * PID, a blind kill would terminate an unrelated process. Checking only that
+ * the PID is *an* ssh-agent is not enough: the recycled PID may belong to the
+ * user's OWN login/session ssh-agent (comm is also "ssh-agent"), and killing it
+ * drops every key they had loaded. So on Linux we require BOTH comm=="ssh-agent"
+ * AND that our exact per-account socket path (which we passed as `ssh-agent -a
+ * <expected_sock>`) appears among the process's argv — proving it's the agent we
+ * started, not a same-uid impostor. Where /proc is unavailable (BSD/macOS) we
+ * cannot verify argv cheaply and fall back to a liveness check; the per-dir lock
+ * and pid-scoped sidecars shrink the window that produces stale sidecars. */
+static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
     if (pid <= 1) {
         return false;
     }
@@ -68,10 +76,66 @@ static bool pid_is_ssh_agent(pid_t pid) {
         is_agent = (strcmp(comm, "ssh-agent") == 0);
     }
     fclose(f);
-    return is_agent;
+    if (!is_agent) {
+        return false;
+    }
+
+    /* Require our exact socket path in the process's argv to defeat PID reuse. */
+    if (!expected_sock || !*expected_sock) {
+        return false;
+    }
+    snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char cmd[4096];
+    ssize_t n = read(fd, cmd, sizeof(cmd) - 1);
+    close(fd);
+    if (n <= 0) {
+        return false;
+    }
+    /* /proc/<pid>/cmdline is NUL-separated argv; require an exact token match. */
+    size_t exp_len = strlen(expected_sock);
+    for (ssize_t i = 0; i < n; ) {
+        const char *tok = cmd + i;
+        size_t tlen = strnlen(tok, (size_t)(n - i));
+        if (tlen == exp_len && memcmp(tok, expected_sock, exp_len) == 0) {
+            return true;
+        }
+        i += (ssize_t)tlen + 1;
+    }
+    return false;
 #else
+    (void)expected_sock;
     return (kill(pid, 0) == 0);
 #endif
+}
+
+/* Verify a recorded PID is our agent (holding `sock`) and SIGTERM it. On Linux,
+ * pin the process with a pidfd BEFORE verifying+signaling so a PID recycled in
+ * the check-then-signal window (CONC-4 TOCTOU) cannot receive the signal — the
+ * pidfd refers to a specific process instance, not a reusable number. Where
+ * pidfd is unavailable (older kernels, non-Linux) fall back to a plain kill
+ * guarded by the identity check. */
+static void reap_ssh_agent(pid_t pid, const char *sock) {
+    if (pid <= 1) {
+        return;
+    }
+#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+    int pidfd = (int)syscall(SYS_pidfd_open, (long)pid, 0L);
+    if (pidfd >= 0) {
+        if (pid_is_our_ssh_agent(pid, sock)) {
+            syscall(SYS_pidfd_send_signal, (long)pidfd, (long)SIGTERM, (void *)0, 0L);
+        }
+        close(pidfd);
+        return;
+    }
+    /* pidfd_open unsupported/failed (ENOSYS on <5.3): fall through. */
+#endif
+    if (pid_is_our_ssh_agent(pid, sock)) {
+        kill(pid, SIGTERM);
+    }
 }
 
 /* Acquire an exclusive, blocking flock on <dir>/.lock, serializing the
@@ -368,11 +432,23 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     int rc = -1;
     ssh_config->key_already_loaded = false;
 
-    /* Build this account's per-account socket path up front. */
-    if ((size_t)snprintf(socket_path, sizeof(socket_path),
-                        "%s/ssh-agent.%s.sock",
-                        socket_dir, account->name) >= sizeof(socket_path)) {
+    /* Build this account's per-account socket path up front. Guard against the
+     * kernel's sockaddr_un.sun_path cap (108 on Linux, 104 on the BSDs), NOT
+     * just the 4096 buffer: validate_name permits long names (up to 255 bytes),
+     * and a name long enough to push the socket path past sun_path makes
+     * `ssh-agent -a` fail to bind with a confusing error. Reject early with a
+     * clear message instead. */
+    int spn = snprintf(socket_path, sizeof(socket_path),
+                       "%s/ssh-agent.%s.sock", socket_dir, account->name);
+    if (spn < 0 || (size_t)spn >= sizeof(socket_path)) {
         set_error(ERR_INVALID_ARGS, "SSH socket path too long");
+        goto done;
+    }
+    if ((size_t)spn >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Account name too long: the SSH agent socket path (%d bytes) "
+                  "exceeds the %zu-byte UNIX socket limit. Use a shorter name.",
+                  spn, sizeof(((struct sockaddr_un *)0)->sun_path));
         goto done;
     }
 
@@ -448,11 +524,19 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         goto done;
     }
 
-    /* Parse ssh-agent output to get socket and PID */
+    /* Parse ssh-agent output for the PID. Do NOT trust the echoed SSH_AUTH_SOCK
+     * path: modern OpenSSH ssh-agent double-quotes it when the path contains
+     * shell-special characters — which validate_name permits in account names
+     * (spaces/parens, e.g. "Jane Doe (Work)") — so the quotes would be taken
+     * literally and the socket "not found", silently breaking SSH for that
+     * account. We passed `-a socket_path`, so that is the authoritative path;
+     * use it directly and keep only the parsed PID. */
     if (parse_ssh_agent_output(output, ssh_config) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to parse ssh-agent output");
         goto done;
     }
+    safe_strncpy(ssh_config->agent_socket_path, socket_path,
+                 sizeof(ssh_config->agent_socket_path));
 
     /* Validate the agent is working */
     if (validate_ssh_agent_socket(ssh_config->agent_socket_path) != 0) {
@@ -1122,6 +1206,21 @@ static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) 
             if (socket_end) {
                 *socket_end = '\0';
             }
+            /* ssh-agent quotes the value when the path has shell-special chars
+             * (spaces/parens). Trim surrounding whitespace and a matching pair
+             * of single/double quotes so the stored path is the real one. */
+            while (*socket_start == ' ' || *socket_start == '\t') socket_start++;
+            size_t slen = strlen(socket_start);
+            while (slen > 0 && (socket_start[slen - 1] == ' ' ||
+                                socket_start[slen - 1] == '\t')) {
+                socket_start[--slen] = '\0';
+            }
+            if (slen >= 2 &&
+                ((socket_start[0] == '"' && socket_start[slen - 1] == '"') ||
+                 (socket_start[0] == '\'' && socket_start[slen - 1] == '\''))) {
+                socket_start[slen - 1] = '\0';
+                socket_start++;
+            }
             safe_strncpy(ssh_config->agent_socket_path, socket_start,
                         sizeof(ssh_config->agent_socket_path));
         }
@@ -1156,19 +1255,12 @@ int ssh_manager_reset(const char *account) {
     char socket_dir[MAX_PATH_LEN];
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
 
-    if (!account || !*account) {
-        /* All: reuse the orphan reaper (kills every recorded PID, unlinks
-         * sockets/pids/current.sock). */
-        kill_orphaned_gitswitch_agents(NULL);
-        return 0;
-    }
-
-    /* The account name becomes a path component in the socket/pid filenames we
-     * unlink below. Every loaded account already passed validate_name, so this
-     * is unreachable in practice — but guard it anyway, symmetrically with
-     * gpg_manager_reset(), so a crafted name can never escape socket_dir. */
-    if (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
-        account[0] == '.') {
+    /* Validate the name up front (the single-account branch uses it as a path
+     * component). Every loaded account already passed validate_name, so this is
+     * unreachable in practice — but guard it symmetrically with gpg_manager_reset(). */
+    if (account && *account &&
+        (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
+         account[0] == '.')) {
         set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
         return -1;
     }
@@ -1183,23 +1275,59 @@ int ssh_manager_reset(const char *account) {
         }
     }
 
+    /* Take the per-dir lock for the whole reap/unlink sequence. Without it, this
+     * writer races a concurrent ssh_start_isolated_agent (which holds the same
+     * lock): we would reap its freshly-started agent and unlink current.sock
+     * while its switch reports success. lock_agent_dir returns -1 if the dir
+     * doesn't exist yet — in that case there is nothing to reset, so proceeding
+     * without a lock is harmless (all operations below are no-ops on a missing
+     * dir). kill_orphaned_gitswitch_agents deliberately does NOT self-lock
+     * because ssh_start_isolated_agent already calls it under this same lock. */
+    int lock_fd = lock_agent_dir(socket_dir);
+
+    if (!account || !*account) {
+        /* All: reuse the orphan reaper (kills every recorded PID, unlinks
+         * sockets/pids/current.sock). */
+        kill_orphaned_gitswitch_agents(NULL);
+        unlock_agent_dir(lock_fd);
+        return 0;
+    }
+
     char pid_path[MAX_PATH_LEN];
     char sock_path[MAX_PATH_LEN];
+    bool have_sock = (size_t)snprintf(sock_path, sizeof(sock_path),
+                                      "%s/ssh-agent.%s.sock", socket_dir, account) < sizeof(sock_path);
     if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid", socket_dir, account) < sizeof(pid_path)) {
         FILE *pf = fopen(pid_path, "r");
         if (pf) {
             long pid = 0;
-            if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
-                pid_is_ssh_agent((pid_t)pid)) {
-                kill((pid_t)pid, SIGTERM);
+            if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 && have_sock) {
+                reap_ssh_agent((pid_t)pid, sock_path);
             }
             fclose(pf);
         }
         unlink(pid_path);
     }
-    if ((size_t)snprintf(sock_path, sizeof(sock_path), "%s/ssh-agent.%s.sock", socket_dir, account) < sizeof(sock_path)) {
+    if (have_sock) {
+        /* F3: if the stable current.sock symlink points at the account we're
+         * resetting, drop it too — otherwise shells keep SSH_AUTH_SOCK pointing
+         * at the socket we just removed (a dangling link), mirroring the GPG
+         * side's dangling-symlink cleanup. current.sock is an absolute symlink
+         * to the per-account socket (see ssh_start_isolated_agent). */
+        char current[MAX_PATH_LEN];
+        if ((size_t)snprintf(current, sizeof(current), "%s/current.sock", socket_dir) < sizeof(current)) {
+            char target[MAX_PATH_LEN];
+            ssize_t tn = readlink(current, target, sizeof(target) - 1);
+            if (tn > 0) {
+                target[tn] = '\0';
+                if (strcmp(target, sock_path) == 0) {
+                    unlink(current);
+                }
+            }
+        }
         unlink(sock_path);
     }
+    unlock_agent_dir(lock_fd);
     return 0;
 }
 
@@ -1255,13 +1383,18 @@ static void kill_orphaned_gitswitch_agents(const char *keep_account) {
         }
 
         if (nlen > 4 && strcmp(name + nlen - 4, ".pid") == 0) {
+            /* The socket this agent was started on (ssh-agent.<name>.sock),
+             * used to confirm the recorded PID is genuinely our agent. */
+            char sock_full[MAX_PATH_LEN];
+            int sw = snprintf(sock_full, sizeof(sock_full), "%s/%.*ssock",
+                              socket_dir, (int)(nlen - 3), name);
             /* Reap the recorded agent PID, then drop the sidecar. */
             FILE *pf = fopen(full, "r");
             if (pf) {
                 long pid = 0;
                 if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
-                    pid_is_ssh_agent((pid_t)pid)) {
-                    kill((pid_t)pid, SIGTERM);
+                    sw > 0 && (size_t)sw < sizeof(sock_full)) {
+                    reap_ssh_agent((pid_t)pid, sock_full);
                     log_debug("Reaped orphaned ssh-agent PID %ld", pid);
                 }
                 fclose(pf);
