@@ -3,8 +3,14 @@
  */
 
 /* _XOPEN_SOURCE 700 (implies POSIX.1-2008) exposes nftw()/FTW_* from <ftw.h>
- * on glibc, which _POSIX_C_SOURCE alone does not. */
+ * on glibc, which _POSIX_C_SOURCE alone does not. Scope it to Linux: on macOS
+ * and the BSDs nftw is visible in the default namespace, and defining
+ * _XOPEN_SOURCE there puts the headers into strict X/Open mode, which hides
+ * the u_int/u_char typedefs that <sys/mount.h>/<sys/ucred.h> (needed below
+ * for the tmpfs check) rely on — the same trap documented in ssh_manager.c. */
+#ifdef __linux__
 #define _XOPEN_SOURCE 700
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
