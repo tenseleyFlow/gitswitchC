@@ -30,6 +30,22 @@ DOCDIR = docs
 
 # Platform detection
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Control-flow integrity flag, gated by architecture (AR-06 F12). -fcf-protection
+# is Intel CET and x86-only: gcc AND clang HARD-ERROR with
+# "'-fcf-protection=full' is not supported for this target" on aarch64, so the
+# unconditional flag broke every non-x86 build — while the spec advertises
+# aarch64 support. Use the ARM equivalent (-mbranch-protection=standard, PAC/BTI)
+# on aarch64, and nothing on other arches, so the hardening is applied where the
+# toolchain supports it instead of failing the build.
+ifneq ($(filter x86_64 i386 i486 i586 i686,$(UNAME_M)),)
+    CF_PROTECTION := -fcf-protection
+else ifneq ($(filter aarch64 arm64,$(UNAME_M)),)
+    CF_PROTECTION := -mbranch-protection=standard
+else
+    CF_PROTECTION :=
+endif
 
 # Compiler and flags
 CC = gcc
@@ -67,10 +83,10 @@ ifeq ($(UNAME_S),Linux)
     # toolchains (vanilla upstream gcc, older cross compilers) shipped
     # ASLR-defeating non-PIE release binaries with all QA green (AR-05 L9).
     # distcheck now asserts the staged binary is ET_DYN with RELRO+NOW.
-    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
+    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION) \
                           -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection -fcf-protection -fPIE -pie \
+                            -fstack-clash-protection $(CF_PROTECTION) -fPIE -pie \
                             -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 
@@ -86,10 +102,10 @@ ifeq ($(UNAME_S),FreeBSD)
     # FreeBSD security flags (ELF linker supports relro/now/noexecstack).
     # -fPIE/-pie requested explicitly — the ports gcc used in CI does not
     # default to PIE (AR-05 L9).
-    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
+    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION) \
                           -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection -fcf-protection -fPIE -pie \
+                            -fstack-clash-protection $(CF_PROTECTION) -fPIE -pie \
                             -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 
@@ -213,18 +229,26 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
-# BUILD_TYPE stamp: debug and release share build/obj and build/bin, but
+# Build-config stamp: debug and release share build/obj and build/bin, but
 # their flag sets differ radically (ASan/UBSan -O0 vs stripped NDEBUG -O2)
 # and BUILD_TYPE is invisible to the dependency graph. Without the stamp,
 # `make BUILD_TYPE=release` followed by `make BUILD_TYPE=debug test` printed
 # "Nothing to be done" and ran the "sanitizer" suite against uninstrumented
 # release objects — silently fake QA results (AR-05 M3). The recipe rewrites
-# the stamp only when the recorded type differs, so crossing BUILD_TYPE (and
-# only that) forces a full rebuild.
-BUILDTYPE_STAMP = $(OBJDIR)/.buildtype
+# the stamp only when the recorded config differs, forcing a full rebuild.
+#
+# The stamp also carries VERSION and COMMIT (AR-06 F11): those feed -D macros
+# baked into every object via CFLAGS, but objects depend only on sources,
+# headers, and this stamp — so a VERSION bump or new commits changed the -D
+# values while `make` reported nothing to do and the binary kept reporting the
+# stale version. Folding them into the stamp makes any change force the rebuild
+# exactly like a BUILD_TYPE cross. Field 1 stays BUILD_TYPE so the install
+# guard can read it with a simple prefix check.
+BUILDTYPE_STAMP = $(OBJDIR)/.buildconfig
+BUILD_STAMP_CONTENT = $(BUILD_TYPE)|$(VERSION)|$(COMMIT)
 $(BUILDTYPE_STAMP): buildtype-force | $(OBJDIR)
-	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "$(BUILD_TYPE)" ]; then \
-		echo "$(BUILD_TYPE)" > $(BUILDTYPE_STAMP); \
+	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "$(BUILD_STAMP_CONTENT)" ]; then \
+		echo "$(BUILD_STAMP_CONTENT)" > $(BUILDTYPE_STAMP); \
 	fi
 
 .PHONY: buildtype-force
@@ -258,8 +282,9 @@ install:
 		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
 		exit 1; \
 	fi
-	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "release" ]; then \
-		echo "Warning: installing a '`cat $(BUILDTYPE_STAMP) 2>/dev/null`' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
+	@bt=`cut -d'|' -f1 $(BUILDTYPE_STAMP) 2>/dev/null`; \
+	if [ "$$bt" != "release" ]; then \
+		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
 	fi
 	@echo "Installing $(TARGET)..."
 	install -d $(DESTDIR)$(PREFIX)/bin
