@@ -1831,6 +1831,36 @@ bool validate_email(const char *email) {
     return regexec(&regex, email, 0, NULL, 0) == 0;
 }
 
+/* AR-06 F26: a new account name that collides with a command keyword or is
+ * purely numeric can never be switched to by name (the dispatcher matches the
+ * keyword, and a bare number is read as an account ID first), and completion
+ * would feed such a name straight back as a destructive command. Reject at the
+ * CREATION/rename path only — NOT in validate_name, which also gates loads and
+ * runtime teardown, so an already-created such account can still be reset/
+ * removed. Numeric = one or more ASCII digits with no other characters. */
+bool name_is_reserved_for_commands(const char *name) {
+    static const char *const keywords[] = {
+        "add", "edit", "list", "ls", "remove", "rm", "delete", "status",
+        "doctor", "health", "config", "init", "resume", "reset", NULL
+    };
+    if (!name || !*name) {
+        return false;
+    }
+    for (size_t i = 0; keywords[i]; i++) {
+        if (strcasecmp(name, keywords[i]) == 0) {
+            return true;
+        }
+    }
+    bool all_digits = true;
+    for (const char *p = name; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            all_digits = false;
+            break;
+        }
+    }
+    return all_digits;
+}
+
 bool validate_name(const char *name) {
     if (!name || strlen(name) == 0 || strlen(name) >= MAX_NAME_LEN) {
         return false;

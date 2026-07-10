@@ -1061,6 +1061,24 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
  * identity. Precedence: numeric id -> exact name -> exact email -> unambiguous
  * substring of name/description. A substring that matches more than one account
  * is rejected as ambiguous (rather than silently returning the first). */
+/* Exact-name lookup only (AR-06 F22). config.active_account is always stored as
+ * an exact account name, but config_find_account resolves numeric-ID FIRST — so
+ * a legacy all-digit account name (e.g. "2") persisted as the active account
+ * would resume a DIFFERENT account whose id is 2. The boot-resume path must
+ * resolve the persisted name literally, never through the id-first fuzzy
+ * matcher. */
+account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name) {
+    if (!ctx || !name || !*name) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strcmp(ctx->accounts[i].name, name) == 0) {
+            return &ctx->accounts[i];
+        }
+    }
+    return NULL;
+}
+
 account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
     char *endptr;
     unsigned long account_id;

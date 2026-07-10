@@ -374,8 +374,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         return -1;
     }
 
-    /* Find the account */
-    account = config_find_account(ctx, identifier);
+    /* Find the account. On the boot-resume path the identifier is the persisted
+     * exact name, so resolve it literally (AR-06 F22) — the id-first fuzzy
+     * matcher could otherwise re-resolve a legacy all-digit name to a different
+     * account whose id matches. Interactive switches keep the fuzzy matcher. */
+    account = ctx->config.resuming
+        ? config_find_account_exact(ctx, identifier)
+        : config_find_account(ctx, identifier);
     if (!account) {
         set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: %s", identifier);
         return -1;
@@ -1142,6 +1147,13 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
 
     if (!validate_name(acct.name) || !validate_email(acct.email)) {
         printf("[ERROR]: Account validation failed: Invalid name or email\n");
+        return -1;
+    }
+    /* AR-06 F26: refuse a name that shadows a command keyword or is purely
+     * numeric — it could never be switched to by name. */
+    if (name_is_reserved_for_commands(acct.name)) {
+        printf("[ERROR]: '%s' is a reserved command keyword or a numeric ID and "
+               "cannot be used as an account name.\n", acct.name);
         return -1;
     }
 

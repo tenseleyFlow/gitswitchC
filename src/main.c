@@ -998,7 +998,10 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
         return EXIT_SUCCESS;
     }
 
-    acct = config_find_account(ctx, ctx->config.active_account);
+    /* Exact-name resolution (AR-06 F22): the persisted active_account is a
+     * literal name; the id-first fuzzy matcher could resume a different account
+     * whose id equals a legacy all-digit name. */
+    acct = config_find_account_exact(ctx, ctx->config.active_account);
     if (!acct) {
         log_debug("Saved account no longer exists, skipping resume: %s",
                   ctx->config.active_account);

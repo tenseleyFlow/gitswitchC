@@ -122,6 +122,13 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account);
 account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier);
 
 /**
+ * Find account by EXACT name only, for the boot-resume path (AR-06 F22): the
+ * persisted active_account is always an exact name and must not be re-resolved
+ * through config_find_account's id-first fuzzy matching.
+ */
+account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name);
+
+/**
  * Parse git scope from string
  */
 git_scope_t config_parse_scope(const char *scope_str);
