@@ -894,6 +894,187 @@ TEST(add_reprompts_email_at_exact_length_bound) {
     remove_tree(rt);
 }
 
+/* ---------- AR-03 T4: resume-hint writer end-to-end ---------- */
+
+/* A -y switch to an identity-only account must leave .resume-hint with the
+ * exact content "none\n" (the snippet's no-probe arm), and a -y reset must
+ * remove the marker AND the persisted active_account — pre-fix reset touched
+ * neither, so every later login shell auto-resumed (re-created agents,
+ * re-imported GPG keys for) the state the user had just torn down. */
+TEST(switch_writes_resume_hint_and_reset_clears_it) {
+    char home[256], rt[256], cmd[16384], hint[4352], toml_path[4352];
+    char buf[8192];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"solo\"\n"
+        "email = \"s@example.com\"\n"
+        "preferred_scope = \"global\"\n"), 0); /* global: write only $HOME/.gitconfig */
+    snprintf(hint, sizeof(hint), "%s/.config/gitswitch/.resume-hint", home);
+    snprintf(toml_path, sizeof(toml_path), "%s/.config/gitswitch/accounts.toml", home);
+
+    /* Switch: identity-only, global scope — only git config is written. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y solo </dev/null >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+
+    /* Exact content: the shell snippet string-matches on it. */
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "none\n");
+    slurp(toml_path, buf, sizeof(buf));
+    CHECK(strstr(buf, "active_account = \"solo\"") != NULL);
+
+    /* Reset (full): marker gone, active_account cleared. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y reset >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    CHECK(access(hint, F_OK) != 0);                       /* pre-fix: stale marker */
+    slurp(toml_path, buf, sizeof(buf));
+    CHECK(strstr(buf, "active_account = \"solo\"") == NULL); /* pre-fix: still "solo" */
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+/* ---------- AR-03 M8/M9: partial load must fail closed, loudly ---------- */
+
+/* One healthy account, one section the loader skips (over-long name), one
+ * unrecognized section. `add` must refuse up front with a nonzero exit
+ * (pre-fix: full interactive flow, "Account added successfully!", exit 0,
+ * nothing persisted). A switch to the healthy account must still persist
+ * active_account via the settings-only write-back (pre-fix: silently
+ * dropped), and both problem sections must survive every step (pre-fix M8:
+ * the unrecognized one was erased by any completed save). */
+TEST(partial_load_blocks_add_but_switch_persists_active) {
+    char home[256], rt[256], cmd[16384], stdin_path[4352], out_path[4352];
+    char toml_path[4352], buf[8192], cfg[2048], longname[300];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    memset(longname, 'N', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    snprintf(cfg, sizeof(cfg),
+             "[settings]\n"
+             "default_scope = \"global\"\n"
+             "\n"
+             "[accounts.1]\n"
+             "name = \"good\"\n"
+             "email = \"g@example.com\"\n"
+             "preferred_scope = \"global\"\n"
+             "\n"
+             "[accounts.2]\n"
+             "name = \"%s\"\n"
+             "email = \"long@example.com\"\n"
+             "\n"
+             "[account.3]\n"
+             "name = \"typod\"\n"
+             "email = \"t@example.com\"\n",
+             longname);
+    CHECK_EQ_INT(write_config(home, cfg), 0);
+    snprintf(toml_path, sizeof(toml_path), "%s/.config/gitswitch/accounts.toml", home);
+
+    /* add: refused before any prompt is consumed, nonzero exit. */
+    CHECK_EQ_INT(write_stdin_script(rt,
+        "newacct\nn@example.com\ndesc\n\n\n\n", stdin_path, sizeof(stdin_path)), 0);
+    snprintf(out_path, sizeof(out_path), "%s/add.out", rt);
+    rc = run_add(home, rt, stdin_path, out_path);
+    CHECK(rc != 0);                                /* pre-fix: 0 */
+    slurp(toml_path, buf, sizeof(buf));
+    CHECK(strstr(buf, "newacct") == NULL);
+    slurp(out_path, buf, sizeof(buf));
+    CHECK(strstr(buf, "Account added successfully") == NULL); /* pre-fix banner */
+
+    /* remove: same up-front refusal. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y remove good >/dev/null 2>&1",
+             home, rt, g_bin);
+    CHECK(run_shell(cmd) != 0);
+    slurp(toml_path, buf, sizeof(buf));
+    CHECK(strstr(buf, "\"good\"") != NULL);        /* nothing was rewritten */
+
+    /* switch: succeeds AND persists active_account without touching the
+     * skipped/unknown sections. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y good </dev/null >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    slurp(toml_path, buf, sizeof(buf));
+    CHECK(strstr(buf, "active_account = \"good\"") != NULL); /* pre-fix: absent */
+    CHECK(strstr(buf, longname) != NULL);                    /* skipped intact */
+    CHECK(strstr(buf, "[account.3]") != NULL);               /* unknown intact (M8) */
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+/* ---------- AR-03 M9: save failure must surface in the exit code ---------- */
+
+/* Deny the config directory write permission after load: the switch itself
+ * succeeds (git config is written), the save cannot create its temp file, and
+ * the command must exit nonzero — pre-fix it warned and exited 0, so scripted
+ * callers could not detect that active_account went stale. */
+TEST(switch_save_failure_exits_nonzero) {
+    char home[256], rt[256], cmd[16384], dir[4352], lock[4352], err_path[4352];
+    char buf[8192];
+    int rc;
+
+    if (getuid() == 0) {
+        fprintf(stderr, "  (skipped: running as root, permission denial won't bite)\n");
+        return;
+    }
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"solo\"\n"
+        "email = \"s@example.com\"\n"
+        "preferred_scope = \"global\"\n"), 0);
+
+    /* Pre-create the lock file (the locked open needs no dir write), then
+     * make the config dir read-only so the save's temp create fails. */
+    snprintf(dir, sizeof(dir), "%s/.config/gitswitch", home);
+    snprintf(lock, sizeof(lock), "%s/.config.lock", dir);
+    FILE *f = fopen(lock, "w");
+    CHECK(f != NULL);
+    if (f) fclose(f);
+    CHECK_EQ_INT(chmod(lock, 0600), 0);
+    CHECK_EQ_INT(chmod(dir, 0500), 0);
+
+    snprintf(err_path, sizeof(err_path), "%s/switch.out", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y solo </dev/null >'%s' 2>&1",
+             home, rt, g_bin, err_path);
+    rc = run_shell(cmd);
+    CHECK(rc != 0);                                 /* pre-fix: 0 */
+    slurp(err_path, buf, sizeof(buf));
+    CHECK(strstr(buf, "Failed to save configuration changes") != NULL);
+
+    chmod(dir, 0700); /* so remove_tree can clean up */
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 TEST_MAIN_BEGIN()
     if (resolve_binary() != 0) {
         fprintf(stderr, "RESULT FAIL: cannot locate gitswitch binary\n");
@@ -917,4 +1098,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_reprompts_invalid_host_alias_until_valid);
     RUN_TEST(add_refuses_ssh_key_path_over_256_chars);
     RUN_TEST(add_reprompts_email_at_exact_length_bound);
+    RUN_TEST(switch_writes_resume_hint_and_reset_clears_it);
+    RUN_TEST(partial_load_blocks_add_but_switch_persists_active);
+    RUN_TEST(switch_save_failure_exits_nonzero);
 TEST_MAIN_END()

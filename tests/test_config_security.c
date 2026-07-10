@@ -13,6 +13,7 @@
 #include "error.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -275,9 +276,11 @@ TEST(load_counts_overlong_name_as_skipped_and_save_preserves_it) {
     CHECK_EQ_INT(ctx.account_count, 1);          /* alice still loads */
     CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1); /* pre-fix: 0 */
 
-    /* The save must refuse the rewrite (returns 0 but preserves the file),
-     * keeping the over-long section on disk for the user to repair. */
-    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    /* The save must refuse the rewrite AND say so in its return value
+     * (AR-03 M9: the old `return 0` refusal made add/edit report success
+     * for a discarded change), keeping the over-long section on disk for
+     * the user to repair. */
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
     f = fopen(path, "r");
     CHECK(f != NULL);
     n = f ? fread(after, 1, sizeof(after) - 1, f) : 0;
@@ -324,10 +327,12 @@ TEST(load_strips_cr_from_description) {
     /* The classic line-overwrite spoof: an escape-decoded \r renders
      * "[CURRENT] trusted" over the real row. Locks the layered guarantee —
      * whichever layer handles it, no CR may reach the loaded description.
-     * Since AR-03 M6 the handling layer is toml_get_string, which REFUSES a
-     * value sanitization would alter instead of repairing it, so the loader
-     * takes its description-absent fallback (name) rather than receiving a
-     * stripped spelling that the next save would silently persist. */
+     * Since AR-03 M6 toml_get_string REFUSES a value sanitization would
+     * alter instead of repairing it; the loader now treats such a PRESENT-
+     * but-unloadable description as a skip of the whole account (counted,
+     * so config_save refuses to rewrite) — the old description-absent
+     * fallback (name) was a silent alteration the next save persisted over
+     * the user's on-disk bytes (AR-03 T4-owner flag (b)). */
     const char *cfg =
         "[settings]\n"
         "default_scope = \"local\"\n"
@@ -343,11 +348,8 @@ TEST(load_strips_cr_from_description) {
 
     memset(&ctx, 0, sizeof(ctx));
     CHECK_EQ_INT(config_load(&ctx, path), 0);
-    CHECK_EQ_INT(ctx.account_count, 1);
-    if (ctx.account_count == 1) {
-        CHECK(strchr(ctx.accounts[0].description, '\r') == NULL);
-        CHECK_STR_EQ(ctx.accounts[0].description, "alice"); /* name fallback */
-    }
+    CHECK_EQ_INT(ctx.account_count, 0);            /* skipped, not repaired */
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1); /* save guard covers it */
 }
 
 TEST(load_rejects_raw_c1_byte_in_file) {
@@ -532,6 +534,232 @@ TEST(dup_name_id_rejected_on_load) {
     CHECK_EQ_INT(api.account_count, 2);
 }
 
+/* ---- AR-03 M8: unknown sections must block (and survive) a rewrite ------- */
+
+TEST(unknown_section_blocks_rewrite_and_is_preserved) {
+    /* A typo'd [account.3] (or any custom section) is invisible to
+     * config_save's rebuild — pre-fix it was not counted at load, so the
+     * refuse-to-rewrite guard read zero, config_save returned 0, and the
+     * section was permanently deleted by the very next save. */
+    const char *cfg =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "[account.3]\n"          /* typo: singular */
+        "name = \"typod\"\n"
+        "email = \"t@b.com\"\n";
+    char dir[128], path[256], after[1024];
+    gitswitch_ctx_t ctx;
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);              /* alice loads fine */
+    CHECK_EQ_INT(ctx.unknown_sections_on_load, 1);   /* pre-fix: field absent */
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 0);
+
+    /* Both gates must refuse, and the section must survive on disk. */
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+    CHECK_EQ_INT(config_save(&ctx, path), -1);       /* pre-fix: 0 + erased */
+    slurp(path, after, sizeof(after));
+    CHECK(strstr(after, "[account.3]") != NULL);
+    CHECK(strstr(after, "typod") != NULL);
+}
+
+/* ---- AR-03 M9(4): settings-only save must work around the skip guard ---- */
+
+TEST(settings_only_save_records_active_and_preserves_sections) {
+    /* One healthy account, one skipped (over-long name), one unknown section:
+     * the full rewrite is (correctly) refused, but a switch to the healthy
+     * account must still persist active_account — pre-fix the switch printed
+     * success while active_account stayed stale, so the next boot's resume
+     * restored the wrong identity. The write-back must keep BOTH problem
+     * sections byte-for-byte-meaningful on disk. */
+    char longname[300], cfg[1024], after[2048];
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+
+    memset(longname, 'N', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    snprintf(cfg, sizeof(cfg),
+             "[settings]\n"
+             "default_scope = \"local\"\n"
+             "[accounts.1]\n"
+             "name = \"alice\"\n"
+             "email = \"a@b.com\"\n"
+             "[accounts.2]\n"
+             "name = \"%s\"\n"
+             "email = \"long@b.com\"\n"
+             "[account.3]\n"
+             "name = \"typod\"\n",
+             longname);
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(ctx.unknown_sections_on_load, 1);
+
+    /* Simulate the switch's bookkeeping, then the targeted save. */
+    strncpy(ctx.config.active_account, "alice", sizeof(ctx.config.active_account) - 1);
+    CHECK_EQ_INT(config_save_active_account(&ctx, path), 0); /* succeeds where config_save refuses */
+
+    slurp(path, after, sizeof(after));
+    CHECK(strstr(after, "active_account = \"alice\"") != NULL); /* pre-fix: never persisted */
+    CHECK(strstr(after, longname) != NULL);                     /* skipped account intact */
+    CHECK(strstr(after, "[account.3]") != NULL);                /* unknown section intact */
+    CHECK(strstr(after, "typod") != NULL);
+    CHECK(strstr(after, "default_scope = \"local\"") != NULL);  /* other settings intact */
+
+    /* And the write-back result must load again with the same view. */
+    gitswitch_ctx_t ctx2;
+    memset(&ctx2, 0, sizeof(ctx2));
+    CHECK_EQ_INT(config_load(&ctx2, path), 0);
+    CHECK_EQ_INT(ctx2.account_count, 1);
+    CHECK_STR_EQ(ctx2.config.active_account, "alice");
+    CHECK_EQ_INT(ctx2.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(ctx2.unknown_sections_on_load, 1);
+}
+
+/* ---- AR-03 T4: the resume-hint writer itself ----------------------------- */
+
+TEST(resume_hint_reflects_account_runtime_needs) {
+    /* config_update_resume_hint records the active account's boot-volatile
+     * runtime needs; the shell snippet branches on this exact content, so a
+     * wrong value reintroduces either the doomed per-shell ssh-add probe
+     * (AR-02 #23) or a wrongly-skipped resume. Drive it through config_save
+     * (its only caller) with HOME pointed at a scratch dir. */
+    char dir[128], path[256], hint[512], buf[64];
+    char old_home[512];
+    const char *home_env = getenv("HOME");
+    gitswitch_ctx_t ctx;
+
+    snprintf(old_home, sizeof(old_home), "%s", home_env ? home_env : "");
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(setenv("HOME", dir, 1), 0);
+
+    /* The hint lives in <config_dir>; create it like config_init would. */
+    snprintf(path, sizeof(path), "%s/.config", dir);
+    CHECK_EQ_INT(mkdir(path, 0700), 0);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch", dir);
+    CHECK_EQ_INT(mkdir(path, 0700), 0);
+    snprintf(hint, sizeof(hint), "%s/.config/gitswitch/.resume-hint", dir);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
+    ctx.account_count = 1;
+    strncpy(ctx.config.active_account, "alice", sizeof(ctx.config.active_account) - 1);
+
+    /* Identity-only: no boot-volatile state, the snippet must not probe. */
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(hint, buf, sizeof(buf)) > 0);
+    CHECK_STR_EQ(buf, "none\n");
+
+    /* SSH-only. */
+    ctx.accounts[0].ssh_enabled = true;
+    strncpy(ctx.accounts[0].ssh_key_path, "/tmp/id_fake",
+            sizeof(ctx.accounts[0].ssh_key_path) - 1);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "ssh\n");
+
+    /* SSH + GPG. */
+    ctx.accounts[0].gpg_enabled = true;
+    strncpy(ctx.accounts[0].gpg_key_id, "ABCDEF0123456789",
+            sizeof(ctx.accounts[0].gpg_key_id) - 1);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "ssh gpg\n");
+
+    /* GPG-only. */
+    ctx.accounts[0].ssh_enabled = false;
+    ctx.accounts[0].ssh_key_path[0] = '\0';
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "gpg\n");
+
+    /* An UNKNOWN active account (just-removed race) must fall back to the
+     * conservative "ssh gpg" so the snippet still probes rather than
+     * wrongly skipping a needed resume. */
+    strncpy(ctx.config.active_account, "ghost", sizeof(ctx.config.active_account) - 1);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "ssh gpg\n");
+
+    /* Cleared active account (reset path): the marker must be REMOVED, or
+     * login shells keep probing/resuming state the user tore down. Exercised
+     * through the settings-only save, the path `reset` actually takes. */
+    ctx.config.active_account[0] = '\0';
+    CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
+    CHECK(access(hint, F_OK) != 0);
+
+    if (old_home[0]) setenv("HOME", old_home, 1); else unsetenv("HOME");
+}
+
+/* ---- AR-03 M5 (config half): ssh_key length cap at the validation gate --- */
+
+TEST(add_rejects_ssh_key_path_over_256_chars_api) {
+    /* The loader skips accounts whose persisted ssh_key exceeds 256 chars, so
+     * the programmatic add/update gate must refuse such a path up front —
+     * pre-fix config_add_account accepted it (with an existing 0600 key), the
+     * save succeeded, and the account vanished on the next invocation. */
+    char dir[128], seg[130], dir_a[512], dir_b[1024], key[1300];
+    gitswitch_ctx_t ctx;
+    account_t a;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    memset(seg, 'd', 120);
+    seg[120] = '\0';
+    snprintf(dir_a, sizeof(dir_a), "%s/a%s", dir, seg);
+    CHECK_EQ_INT(mkdir(dir_a, 0700), 0);
+    snprintf(dir_b, sizeof(dir_b), "%s/b%s", dir_a, seg);
+    CHECK_EQ_INT(mkdir(dir_b, 0700), 0);
+    snprintf(key, sizeof(key), "%s/id_long", dir_b);
+    CHECK_EQ_INT(write_config(key, "KEY", 3), 0); /* creates it 0600 */
+    CHECK((int)strlen(key) > 256);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&a, 1, "longkey", "l@x.com", "d");
+    a.ssh_enabled = true;
+    strncpy(a.ssh_key_path, key, sizeof(a.ssh_key_path) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_INVALID);
+}
+
+/* ---- AR-03 M6 follow-through: the write gate matches the read gate ------- */
+
+TEST(add_rejects_values_that_cannot_roundtrip) {
+    /* Since M6 toml_get_string FAILS on any value its sanitizer would alter
+     * (quote, backslash, ...). The write side must refuse the same values,
+     * or gitswitch persists a name/description its own next load cannot hand
+     * back — the account it just created is then skipped with a warning. */
+    gitswitch_ctx_t ctx;
+    account_t a;
+    memset(&ctx, 0, sizeof(ctx));
+
+    fill_account(&a, 1, "Jane \"Work\"", "j@x.com", "d"); /* the M6 repro name */
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);       /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+
+    fill_account(&a, 1, "jane", "j@x.com", "back\\slash desc");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);       /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+
+    /* Plain values (including multi-byte UTF-8) still pass. */
+    fill_account(&a, 1, "jane", "j@x.com", "caf\xC3\xA9 desk");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(load_accepts_regular_file);
@@ -550,4 +778,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_rejects_escape_in_description);
     RUN_TEST(config_validate_rejects_hostile_account);
     RUN_TEST(dup_name_id_rejected_on_load);
+    RUN_TEST(unknown_section_blocks_rewrite_and_is_preserved);
+    RUN_TEST(settings_only_save_records_active_and_preserves_sections);
+    RUN_TEST(resume_hint_reflects_account_runtime_needs);
+    RUN_TEST(add_rejects_ssh_key_path_over_256_chars_api);
+    RUN_TEST(add_rejects_values_that_cannot_roundtrip);
 TEST_MAIN_END()

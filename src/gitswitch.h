@@ -91,10 +91,18 @@ typedef struct {
     account_t *current_account;
     /* Number of account sections present in the config file that were dropped
      * at load time because they failed validation (e.g. an SSH key on an
-     * unmounted path, or wrong permissions). When non-zero the in-memory set
-     * is an incomplete view of the file, so config_save must NOT rewrite the
-     * file — doing so would silently erase the dropped accounts. */
+     * unmounted path, or wrong permissions) or carried a field that could not
+     * be loaded faithfully. When non-zero the in-memory set is an incomplete
+     * view of the file, so config_save must NOT rewrite the file — doing so
+     * would silently erase the dropped accounts. */
     size_t accounts_skipped_on_load;
+    /* Number of sections in the config file that are neither [settings] nor an
+     * [accounts.<id>] section — a typo'd [account.3] or [Accounts.3], a custom
+     * section, stray keys before the first header. config_save rebuilds the
+     * file from settings + the in-memory accounts only, so such sections are
+     * invisible to it: rewriting while any exist would silently delete them
+     * (AR-03 M8). Gated exactly like accounts_skipped_on_load. */
+    size_t unknown_sections_on_load;
 } gitswitch_ctx_t;
 
 /* Function prototypes */
