@@ -42,9 +42,57 @@ static struct {
     bool valid;
 } g_git_snapshot;
 
+/* Extract the value of a lowercased key from `git config --list` output
+ * (lines of the form "key=value"). Returns the LAST occurrence, matching git's
+ * last-wins resolution. Returns true and fills out[] if found. */
+static bool parse_config_list_value(const char *list, const char *key,
+                                    char *out, size_t out_size) {
+    size_t key_len = strlen(key);
+    bool found = false;
+    const char *line = list;
+    while (line && *line) {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        /* Match "key=" at line start */
+        if (line_len > key_len && line[key_len] == '=' &&
+            strncmp(line, key, key_len) == 0) {
+            const char *val = line + key_len + 1;
+            size_t val_len = line_len - key_len - 1;
+            if (val_len < out_size) {
+                memcpy(out, val, val_len);
+                out[val_len] = '\0';
+                found = true; /* keep scanning: last wins */
+            }
+        }
+        line = eol ? eol + 1 : NULL;
+    }
+    return found;
+}
+
 static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         out[i].key = g_managed_keys[i];
+        out[i].present = false;
+        out[i].value[0] = '\0';
+    }
+
+    /* Fast path: one `git config --list` exec instead of one per key. Fall
+     * back to per-key reads if the listing failed or looks truncated (buffer
+     * full) — a truncated list could miss a pre-existing value and corrupt the
+     * rollback snapshot, so correctness wins over the extra execs. */
+    char list[16384];
+    if (git_list_config(scope, list, sizeof(list)) == 0 &&
+        strlen(list) < sizeof(list) - 1) {
+        for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+            if (parse_config_list_value(list, g_managed_keys[i],
+                                        out[i].value, sizeof(out[i].value))) {
+                out[i].present = true;
+            }
+        }
+        return;
+    }
+
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         if (git_get_config_value(g_managed_keys[i], out[i].value, sizeof(out[i].value), scope) == 0) {
             out[i].present = true;
         } else {
@@ -184,16 +232,22 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         git_unset_config_value(GIT_CONFIG_CORE_SSHCOMMAND, scope);
     }
     
-    /* Verify configuration was set correctly - check the same scope we just wrote to */
-    char verify_name[MAX_NAME_LEN];
-    char verify_email[MAX_EMAIL_LEN];
-    if (git_get_config_value(GIT_CONFIG_USER_NAME, verify_name, sizeof(verify_name), scope) == 0 &&
-        git_get_config_value(GIT_CONFIG_USER_EMAIL, verify_email, sizeof(verify_email), scope) == 0) {
-        if (strcmp(verify_name, account->name) != 0 ||
-            strcmp(verify_email, account->email) != 0) {
-            set_error(ERR_GIT_CONFIG_FAILED, "Git configuration verification failed");
-            return -1;
-        }
+    /* Verify configuration was set correctly - check the same scope we just
+     * wrote to. A failed read-back of a key we just wrote is itself a
+     * verification failure: we cannot confirm the identity was applied, which
+     * is the whole point of the check. (Previously a failed read-back short-
+     * circuited the && and the function returned success unverified.) */
+    char verify_name[MAX_NAME_LEN] = {0};
+    char verify_email[MAX_EMAIL_LEN] = {0};
+    if (git_get_config_value(GIT_CONFIG_USER_NAME, verify_name, sizeof(verify_name), scope) != 0 ||
+        git_get_config_value(GIT_CONFIG_USER_EMAIL, verify_email, sizeof(verify_email), scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Could not read back git configuration to verify it");
+        return -1;
+    }
+    if (strcmp(verify_name, account->name) != 0 ||
+        strcmp(verify_email, account->email) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Git configuration verification failed");
+        return -1;
     }
     
     log_info("Git configuration set successfully for %s", account->name);
@@ -202,10 +256,10 @@ int git_set_config(const account_t *account, git_scope_t scope) {
 
 /* Get current git configuration */
 int git_get_current_config(git_current_config_t *config) {
-    char name[MAX_NAME_LEN];
-    char email[MAX_EMAIL_LEN];
-    char signing_key[MAX_KEY_ID_LEN];
-    char gpg_sign[16];
+    char name[MAX_NAME_LEN] = {0};
+    char email[MAX_EMAIL_LEN] = {0};
+    char signing_key[MAX_KEY_ID_LEN] = {0};
+    char gpg_sign[16] = {0};
     
     if (!config) {
         set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
@@ -456,8 +510,14 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
     
     /* Remove trailing newline */
     trim_whitespace(output);
-    safe_strncpy(value, output, value_size);
-    
+    /* safe_strncpy writes nothing and returns -1 when the value is too long for
+     * the caller's buffer. Propagate that as failure (and NUL the buffer) so
+     * callers can't read an uninitialized stack buffer while we report success. */
+    if (safe_strncpy(value, output, value_size) != 0) {
+        value[0] = '\0';
+        return -1;
+    }
+
     return 0;
 }
 
@@ -528,7 +588,21 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
         set_error(ERR_SSH_KEY_NOT_FOUND, "SSH key file not found: %s", expanded_key_path);
         return -1;
     }
-    
+
+    /* core.sshCommand is the one value git executes through /bin/sh, so the
+     * key path below is wrapped in single quotes. Inside '...' the shell
+     * treats every byte literally EXCEPT a single quote, which ends the quote
+     * and would let a crafted path inject extra ssh options (e.g.
+     * -oProxyCommand=…, i.e. arbitrary code on the next fetch). Reject a path
+     * containing a single quote (or a control char/newline) so the quoting
+     * cannot be broken. A real SSH key path never needs these. */
+    if (strpbrk(expanded_key_path, "'\n\r") != NULL) {
+        set_error(ERR_INVALID_PATH,
+                  "SSH key path contains an illegal character (quote/newline): %s",
+                  expanded_key_path);
+        return -1;
+    }
+
     /* Build SSH command with security options */
     if ((size_t)snprintf(ssh_command, sizeof(ssh_command),
                         "ssh -i '%s' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR",
@@ -676,27 +750,33 @@ static int validate_git_installation(void) {
 }
 
 
-/* Validate git config value for security */
+/* Validate a git config value.
+ *
+ * Every value is written via git_run -> run_argv (execvp, no shell), so shell
+ * metacharacters are NOT dangerous here and must be allowed: a user.name like
+ * "Jane Doe (Work)" is common and legitimate, and the old blocklist of
+ * ";|&`$(){}[]" rejected it, failing the switch. The only value git itself
+ * feeds to a shell is core.sshCommand, whose sole variable component (the key
+ * path) is separately validated and single-quoted in git_configure_ssh.
+ *
+ * So we reject only what is genuinely unsafe for `git config <key> <value>`:
+ * control characters (which corrupt the config file / terminal), and a leading
+ * '-' (which git could mistake for an option). */
 static bool is_valid_git_config_value(const char *value) {
     if (!value) {
         return false;
     }
-    
-    /* Check for dangerous characters */
-    const char *dangerous_chars = ";|&`$(){}[]";
-    for (const char *p = dangerous_chars; *p; p++) {
-        if (strchr(value, *p)) {
-            return false;
-        }
+
+    if (value[0] == '-') {
+        return false;
     }
-    
-    /* Check for control characters */
+
     for (const char *p = value; *p; p++) {
-        if (*p < 32 && *p != '\t') {
+        if ((unsigned char)*p < 32 && *p != '\t') {
             return false;
         }
     }
-    
+
     return true;
 }
 
