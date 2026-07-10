@@ -728,9 +728,13 @@ static int handle_init_command(const char *shell) {
     }
 
     /* GPG home is best-effort: if it can't be computed we still emit the SSH
-     * wiring rather than failing the whole init. */
+     * wiring rather than failing the whole init. The _quiet variant is
+     * mandatory here: the plain one prints a not-memory-backed [WARN] to STDOUT
+     * on any host with XDG_RUNTIME_DIR unset and a disk-backed /tmp (stock
+     * macOS), and this stdout is eval'd by the shell — the warning would become
+     * `bash: [WARN]: command not found` at every prompt (AR-06 F08). */
     char gpg_home[MAX_PATH_LEN];
-    bool have_gpg_home = (gpg_manager_get_home_path(gpg_home, sizeof(gpg_home)) == 0);
+    bool have_gpg_home = (gpg_manager_get_home_path_quiet(gpg_home, sizeof(gpg_home)) == 0);
 
     /* The paths are emitted inside single-quoted shell assignments below; a
      * stray single quote would break out of the quoting, so refuse it. */

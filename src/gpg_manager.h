@@ -131,6 +131,13 @@ int gpg_set_environment(const gpg_config_t *gpg_config);
 int gpg_manager_get_home_path(char *buf, size_t size);
 
 /**
+ * As gpg_manager_get_home_path, but suppresses the "not memory-backed" warning
+ * that would otherwise print to stdout. Used by `gitswitch init`, whose stdout
+ * is eval'd by the shell (AR-06 F08). Returns 0 on success, -1 on overflow.
+ */
+int gpg_manager_get_home_path_quiet(char *buf, size_t size);
+
+/**
  * Resolve the user's REAL/system gpg home for operations documented to consult
  * the system keyring (secret-key export, availability probe). Returns the
  * configured $GNUPGHOME when it is NOT one of our managed isolated homes,

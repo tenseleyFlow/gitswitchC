@@ -38,6 +38,13 @@
 #include "git_ops.h"
 #include "signals.h"
 
+/* When set, gpg_get_base_dir suppresses the "XDG_RUNTIME_DIR unset / not
+ * memory-backed" display_warning. `gitswitch init` toggles this while it
+ * computes the GNUPGHOME path, because that warning goes to STDOUT and would
+ * otherwise be eval'd by the shell as a command (AR-06 F08). The warning still
+ * fires on a real switch (a separate process; the latch is per-process). */
+static bool g_gpg_suppress_base_warning = false;
+
 /* Internal helper functions */
 static int gpg_get_base_dir(char *buf, size_t size);
 static int gpg_prepare_base_dir(char *base, size_t size);
@@ -527,8 +534,8 @@ static int gpg_get_base_dir(char *buf, size_t size) {
     written = snprintf(buf, size, "%s/%s", runtime_parent, child);
     if (strcmp(runtime_parent, "/tmp") == 0) {
         static bool warned = false;
-        if (!warned && written > 0 && (size_t)written < size &&
-            !base_memory_backed_cached(buf)) {
+        if (!warned && !g_gpg_suppress_base_warning && written > 0 &&
+            (size_t)written < size && !base_memory_backed_cached(buf)) {
             warned = true;
             display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
                             "%s, which is not memory-backed. Exported "
@@ -596,6 +603,19 @@ int gpg_manager_get_home_path(char *buf, size_t size) {
         return -1;
     }
     return 0;
+}
+
+/* Same as gpg_manager_get_home_path but suppresses the not-memory-backed
+ * stdout warning (AR-06 F08): `gitswitch init`'s stdout is a serialization
+ * boundary consumed by `eval`, so any diagnostic printed there becomes a bogus
+ * shell command. The warning is still emitted on real GPG operations. */
+int gpg_manager_get_home_path_quiet(char *buf, size_t size) {
+    bool prev = g_gpg_suppress_base_warning;
+    int rc;
+    g_gpg_suppress_base_warning = true;
+    rc = gpg_manager_get_home_path(buf, size);
+    g_gpg_suppress_base_warning = prev;
+    return rc;
 }
 
 /* Acquire an exclusive, blocking flock on <base>/.lock, serializing every
