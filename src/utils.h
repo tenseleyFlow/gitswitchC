@@ -43,7 +43,6 @@ bool is_directory(const char *path);
 bool is_regular_file(const char *path);
 int create_directory_recursive(const char *path, mode_t mode);
 int get_file_permissions(const char *path, mode_t *mode);
-int set_file_permissions(const char *path, mode_t mode);
 
 /**
  * Ensure `path` is a directory that is safe to hold private material: created
@@ -55,11 +54,51 @@ int set_file_permissions(const char *path, mode_t mode);
 int ensure_private_dir(const char *path);
 
 /**
+ * Open and pin the runtime parent used by SSH/GPG state.  A configured
+ * XDG_RUNTIME_DIR is accepted only when it is a real, self-owned private
+ * directory; the returned descriptor names the validated inode even if its
+ * pathname is subsequently renamed.  When XDG_RUNTIME_DIR is absent, /tmp is
+ * opened as the parent for the uid-specific fallback directories.
+ */
+int open_runtime_parent(char *path, size_t path_size);
+
+/**
+ * Open one private child directory relative to a pinned parent descriptor.
+ * When create is true, an absent child is created at 0700.  Existing children
+ * are never followed through symlinks and must be self-owned/private.  On an
+ * absent non-creating lookup, *absent is true and -1 is returned without
+ * installing an error.
+ */
+int open_private_subdir_at(int parent_fd, const char *name, bool create,
+                           bool *absent);
+
+/**
+ * Acquire the replace-resistant private lock domain for dir_fd.  The returned
+ * descriptor is an opaque token, not the legacy lock-file descriptor; release
+ * it with unlock_private_file().  Acquisition retains locks on the pinned
+ * parent directory, the leaf directory, and the validated legacy lock file so
+ * replacing either named entry cannot create a concurrent lock domain.
+ */
+int lock_private_file_at(int dir_fd, const char *name);
+int try_lock_private_file_at(int dir_fd, const char *name);
+void unlock_private_file(int token_fd);
+
+/**
+ * Serialize cross-manager SSH/GPG runtime transactions for processes sharing
+ * XDG_RUNTIME_DIR (or the same uid-specific /tmp fallback), even when their
+ * different HOME values give them different configuration locks. The caller
+ * owns the returned descriptor until runtime_state_lock_release().
+ */
+int runtime_state_lock_acquire(void);
+void runtime_state_lock_release(int fd);
+
+/**
  * Atomically (re)point a symlink: create a temp link to `target` then rename it
  * over `linkpath`, so a follower never observes a missing/half-updated link.
  * Returns 0 on success.
  */
 int atomic_symlink(const char *target, const char *linkpath);
+int atomic_symlink_at(int dir_fd, const char *target, const char *link_name);
 
 /**
  * File utilities
@@ -91,6 +130,8 @@ typedef struct {
     bool        merge_stderr;       /* true => child stderr merged into captured stdout (2>&1) */
     bool        stderr_to_devnull;  /* when !merge_stderr: silence child stderr */
     const char *const *extra_env;   /* NULL-terminated "KEY=VALUE" entries set in the child (e.g. GNUPGHOME) */
+    int         cwd_fd;             /* pinned directory inherited across fork; ignored unless use_cwd_fd */
+    bool        use_cwd_fd;         /* fchdir(cwd_fd) in the child before closing inherited descriptors */
 } run_opts_t;
 
 /* Result of a child invocation. */

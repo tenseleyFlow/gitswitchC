@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <dirent.h>
 
 /* Minimal valid config: one account, no key material (so no key-permission
  * checks fire in validate_account_security). */
@@ -156,7 +159,7 @@ static void check_symlinked_config_directory_refused(mode_t target_mode) {
      * no config, lock, or resume marker may appear through the link. */
     int lock_fd = config_write_lock();
     CHECK_EQ_INT(lock_fd, -1);
-    if (lock_fd >= 0) close(lock_fd);
+    if (lock_fd >= 0) config_write_unlock(lock_fd);
     CHECK_EQ_INT(config_create_default(linked_accounts), -1);
 
     CHECK_EQ_INT(lstat(link, &link_st), 0);
@@ -240,6 +243,121 @@ TEST(config_init_secures_real_or_absent_final_directory) {
     CHECK(S_ISDIR(st.st_mode));
     CHECK_EQ_INT((long)(st.st_mode & 0777), 0700);
 
+    restore_home_env(saved_home);
+}
+
+/* ---- AR-04: private metadata nodes are no-follow and nonblocking -------- */
+
+TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char lock[640], victim[640], before[64], after[64];
+    struct stat st;
+    int fd, fifo_reader;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(lock, sizeof(lock), "%s/.config.lock", config_dir);
+    snprintf(victim, sizeof(victim), "%s/lock-victim", home);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(victim, "victim-content\n", 15), 0);
+    CHECK(slurp(victim, before, sizeof(before)) > 0);
+    CHECK_EQ_INT(symlink(victim, lock), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    fd = config_write_lock();
+    CHECK_EQ_INT(fd, -1); /* pre-fix: locks the symlink target */
+    if (fd >= 0) config_write_unlock(fd);
+    CHECK_EQ_INT(lstat(lock, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK(slurp(victim, after, sizeof(after)) > 0);
+    CHECK_STR_EQ(after, before);
+
+    CHECK_EQ_INT(unlink(lock), 0);
+    CHECK_EQ_INT(mkfifo(lock, 0600), 0);
+    /* Keep a nonblocking reader open so the old O_WRONLY path cannot hang the
+     * regression process; it would open and incorrectly return a FIFO fd. */
+    fifo_reader = open(lock, O_RDONLY | O_NONBLOCK);
+    CHECK(fifo_reader >= 0);
+    fd = config_write_lock();
+    CHECK_EQ_INT(fd, -1);
+    if (fd >= 0) config_write_unlock(fd);
+    if (fifo_reader >= 0) close(fifo_reader);
+
+    CHECK_EQ_INT(unlink(lock), 0);
+    CHECK_EQ_INT(write_config(lock, "", 0), 0);
+    CHECK_EQ_INT(chmod(lock, 0660), 0);
+    fd = config_write_lock();
+    CHECK_EQ_INT(fd, -1);
+    if (fd >= 0) config_write_unlock(fd);
+
+    CHECK_EQ_INT(chmod(lock, 0600), 0);
+    fd = config_write_lock();
+    CHECK(fd >= 0);
+    if (fd >= 0) config_write_unlock(fd);
+
+    restore_home_env(saved_home);
+}
+
+static int config_lock_child_contended(void) {
+    pid_t pid = fork();
+    int status = 0;
+
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int token = config_write_lock();
+        if (token >= 0) {
+            config_write_unlock(token);
+            _exit(1); /* entered a replacement lock domain */
+        }
+        if (errno == EWOULDBLOCK
+#if EAGAIN != EWOULDBLOCK
+            || errno == EAGAIN
+#endif
+        ) {
+            _exit(0);
+        }
+        _exit(2);
+    }
+    if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+TEST(config_lock_survives_post_acquisition_namespace_replacement) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char moved_dir[512], lock[640], moved_lock[640];
+    int token;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(moved_dir, sizeof(moved_dir), "%s/gitswitch.moved", dotconfig);
+    snprintf(lock, sizeof(lock), "%s/.config.lock", config_dir);
+    snprintf(moved_lock, sizeof(moved_lock), "%s/.config.lock.old", config_dir);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    token = config_write_lock();
+    CHECK(token >= 0);
+    CHECK_EQ_INT(rename(lock, moved_lock), 0);
+    CHECK_EQ_INT(write_config(lock, "", 0), 0);
+    CHECK_EQ_INT(config_lock_child_contended(), 0);
+    if (token >= 0) config_write_unlock(token);
+
+    token = config_write_lock();
+    CHECK(token >= 0);
+    CHECK_EQ_INT(rename(config_dir, moved_dir), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(config_lock_child_contended(), 0);
+    if (token >= 0) config_write_unlock(token);
+
+    token = config_write_lock();
+    CHECK(token >= 0);
+    if (token >= 0) config_write_unlock(token);
     restore_home_env(saved_home);
 }
 
@@ -881,6 +999,82 @@ TEST(resume_hint_reflects_account_runtime_needs) {
     if (old_home[0]) setenv("HOME", old_home, 1); else unsetenv("HOME");
 }
 
+TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char path[640], hint[640], victim[640], buf[64];
+    struct stat before, after;
+    gitswitch_ctx_t ctx;
+    DIR *stream;
+    struct dirent *entry;
+    int leaked_temps = 0;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", config_dir);
+    snprintf(victim, sizeof(victim), "%s/hint-victim", home);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(victim, "victim-content\n", 15), 0);
+    CHECK_EQ_INT(symlink(victim, hint), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
+    ctx.account_count = 1;
+    strncpy(ctx.config.active_account, "alice",
+            sizeof(ctx.config.active_account) - 1);
+
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(victim, buf, sizeof(buf)) > 0);
+    CHECK_STR_EQ(buf, "victim-content\n"); /* pre-fix: truncated to none */
+    CHECK_EQ_INT(lstat(hint, &after), 0);
+    CHECK(S_ISLNK(after.st_mode));
+
+    CHECK_EQ_INT(unlink(hint), 0);
+    CHECK_EQ_INT(mkfifo(hint, 0600), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0); /* never opens/blocks on FIFO */
+    CHECK_EQ_INT(lstat(hint, &after), 0);
+    CHECK(S_ISFIFO(after.st_mode));
+
+    CHECK_EQ_INT(unlink(hint), 0);
+    CHECK_EQ_INT(write_config(hint, "unsafe\n", 7), 0);
+    CHECK_EQ_INT(chmod(hint, 0660), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(hint, buf, sizeof(buf)) > 0);
+    CHECK_STR_EQ(buf, "unsafe\n");
+    CHECK_EQ_INT(lstat(hint, &after), 0);
+    CHECK_EQ_INT((long)(after.st_mode & 0777), 0660);
+
+    /* A safe existing marker is replaced, not truncated in place: readers
+     * see either complete old or complete new content, never a partial file. */
+    CHECK_EQ_INT(chmod(hint, 0600), 0);
+    CHECK_EQ_INT(lstat(hint, &before), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK_EQ_INT(lstat(hint, &after), 0);
+    CHECK(S_ISREG(after.st_mode));
+    CHECK_EQ_INT((long)(after.st_mode & 0777), 0600);
+    CHECK(before.st_dev != after.st_dev || before.st_ino != after.st_ino);
+    CHECK(slurp(hint, buf, sizeof(buf)) > 0);
+    CHECK_STR_EQ(buf, "none\n");
+
+    stream = opendir(config_dir);
+    CHECK(stream != NULL);
+    if (stream) {
+        while ((entry = readdir(stream)) != NULL) {
+            if (strncmp(entry->d_name, ".resume-hint.tmp.", 17) == 0) {
+                leaked_temps++;
+            }
+        }
+        closedir(stream);
+    }
+    CHECK_EQ_INT(leaked_temps, 0);
+
+    restore_home_env(saved_home);
+}
+
 /* ---- AR-03 M5 (config half): ssh_key length cap at the validation gate --- */
 
 TEST(add_rejects_ssh_key_path_over_256_chars_api) {
@@ -944,6 +1138,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
     RUN_TEST(config_init_rejects_nondirectory_final_components);
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
+    RUN_TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode);
+    RUN_TEST(config_lock_survives_post_acquisition_namespace_replacement);
     RUN_TEST(config_init_preserves_symlinked_parent_policy);
     RUN_TEST(save_refuses_symlinked_config_path);
     RUN_TEST(backup_refuses_symlinked_source);
@@ -962,6 +1158,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(unknown_section_blocks_rewrite_and_is_preserved);
     RUN_TEST(settings_only_save_records_active_and_preserves_sections);
     RUN_TEST(resume_hint_reflects_account_runtime_needs);
+    RUN_TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically);
     RUN_TEST(add_rejects_ssh_key_path_over_256_chars_api);
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
 TEST_MAIN_END()

@@ -427,7 +427,7 @@ int main(int argc, char *argv[]) {
      * no-op for read-only commands that never took it; the OS would also drop it
      * at exit). */
     if (config_lock_fd >= 0) {
-        close(config_lock_fd);
+        config_write_unlock(config_lock_fd);
     }
 
     /* Note: We intentionally do NOT clean up SSH agents on exit.
@@ -904,32 +904,13 @@ static bool resume_already_applied(const account_t *acct) {
     }
 
     if (wants_gpg) {
-        char link_path[MAX_PATH_LEN];
-        char target[MAX_PATH_LEN];
-        struct stat st;
-        const char *base;
-        ssize_t len;
+        bool live = false;
 
-        if (gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
-            return false;
-        }
-        len = readlink(link_path, target, sizeof(target) - 1);
-        if (len <= 0 || (size_t)len >= sizeof(target) - 1) {
-            return false; /* absent (fresh boot) or possibly truncated */
-        }
-        target[len] = '\0';
-
-        /* Each switch points <base>/current at <base>/<account-name>; a stale
-         * link left at some OTHER account's home must not suppress the resume. */
-        base = strrchr(target, '/');
-        base = base ? base + 1 : target;
-        if (strcmp(base, acct->name) != 0) {
-            return false;
-        }
-
-        /* stat() follows the symlink: a dangling link (home deleted, e.g. by
-         * `gitswitch reset`) means the state is gone and a resume is needed. */
-        return stat(link_path, &st) == 0 && S_ISDIR(st.st_mode);
+        /* The manager validates and locks the private base, compares the full
+         * managed target (not just its basename), and checks that exact home
+         * while locked. Any uncertainty safely forces a real resume. */
+        return gpg_manager_current_is_live_for_account(acct->name, &live) == 0 &&
+               live;
     }
 
     return true;
@@ -1026,6 +1007,7 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     char gpg_error[sizeof(g_last_error.message)] = "";
     int ssh_rc;
     int gpg_rc;
+    int runtime_lock_fd;
 
     if (!ctx) return EXIT_FAILURE;
 
@@ -1064,6 +1046,13 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
         }
     }
 
+    runtime_lock_fd = runtime_state_lock_acquire();
+    if (runtime_lock_fd < 0) {
+        display_error("Cannot lock shared runtime state", "%s",
+                      get_last_error()->message);
+        return EXIT_FAILURE;
+    }
+
     /* ssh_manager_reset already drops the stable current.sock link (under its
      * per-dir lock) when it targets the account being reset. The redundant
      * unlocked readlink/compare/unlink that used to live here raced a
@@ -1089,6 +1078,7 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
                  get_last_error()->message[0] ? get_last_error()->message
                                               : "unknown GPG teardown error");
     }
+    runtime_state_lock_release(runtime_lock_fd);
 
     if (ssh_rc != 0 || gpg_rc != 0) {
         if (ssh_rc != 0) {

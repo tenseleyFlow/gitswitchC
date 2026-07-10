@@ -5,6 +5,9 @@
 #include "error.h"
 #include <errno.h>
 #include <signal.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <string.h>
 #include <stdint.h>
 #include <sys/wait.h>
@@ -162,6 +165,83 @@ TEST(run_passes_extra_env) {
     CHECK_STR_EQ(out, "hello_env\n");
 }
 
+TEST(run_uses_pinned_child_working_directory) {
+    char dir[] = "/tmp/gswrunpwd_XXXXXX";
+    char out[512];
+    char expected[512];
+    char parent_before[512];
+    char parent_after[512];
+    const char *argv[] = {"pwd", NULL};
+    run_opts_t opts;
+    run_result_t res;
+    int dir_fd;
+
+    CHECK(getcwd(parent_before, sizeof(parent_before)) != NULL);
+    CHECK(mkdtemp(dir) != NULL);
+    CHECK_EQ_INT(chmod(dir, 0700), 0);
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = out;
+    opts.out_size = sizeof(out);
+    opts.cwd_fd = dir_fd;
+    opts.use_cwd_fd = true;
+    CHECK_EQ_INT(run_argv(argv, &opts, &res), 0);
+    CHECK(res.spawned);
+    CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected), "%s\n", dir), 0);
+    CHECK_STR_EQ(out, expected);
+
+    CHECK(getcwd(parent_after, sizeof(parent_after)) != NULL);
+    CHECK_STR_EQ(parent_after, parent_before);
+    if (dir_fd >= 0) close(dir_fd);
+    CHECK_EQ_INT(rmdir(dir), 0);
+}
+
+/* A caller may legitimately begin with stdout closed, making the subsequently
+ * opened directory land on fd 1.  The child must preserve that descriptor
+ * before installing its stdout pipe or the pinned fchdir silently fails. */
+TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio) {
+    char dir[] = "/tmp/gswrunstdio_XXXXXX";
+    char expected[512];
+    pid_t child;
+    int status = 0;
+
+    CHECK(mkdtemp(dir) != NULL);
+    CHECK_EQ_INT(chmod(dir, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected), "%s\n", dir), 0);
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        const char *argv[] = {"pwd", NULL};
+        char out[512];
+        run_opts_t opts;
+        run_result_t res;
+        int dir_fd;
+
+        close(STDOUT_FILENO);
+        dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_fd != STDOUT_FILENO) _exit(2);
+        memset(&opts, 0, sizeof(opts));
+        opts.out = out;
+        opts.out_size = sizeof(out);
+        opts.cwd_fd = dir_fd;
+        opts.use_cwd_fd = true;
+        if (run_argv(argv, &opts, &res) != 0 || !res.spawned ||
+            strcmp(out, expected) != 0) {
+            _exit(3);
+        }
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    CHECK_EQ_INT(rmdir(dir), 0);
+}
+
 TEST(run_empty_argv_fails) {
     const char *argv[] = {NULL};
     CHECK_EQ_INT(run_argv(argv, NULL, NULL), -1);
@@ -223,6 +303,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_feeds_binary_stdin_at_exact_length);
     RUN_TEST(run_null_input_retains_devnull_eof);
     RUN_TEST(run_passes_extra_env);
+    RUN_TEST(run_uses_pinned_child_working_directory);
+    RUN_TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio);
     RUN_TEST(run_empty_argv_fails);
     RUN_TEST(run_reports_output_truncation);
     RUN_TEST(run_reports_death_by_signal);
