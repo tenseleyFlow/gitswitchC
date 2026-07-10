@@ -679,6 +679,221 @@ TEST(no_color_output_contains_no_escape_bytes) {
     remove_tree(rt);
 }
 
+/* ---------- AR-03 add-flow input validation (L1, L2, L3, M5) ---------- */
+
+/* Write `body` to <rt>/add.stdin for feeding the interactive add flow. */
+static int write_stdin_script(const char *rt, const char *body,
+                              char *path, size_t path_size) {
+    FILE *f;
+    snprintf(path, path_size, "%s/add.stdin", rt);
+    f = fopen(path, "w");
+    if (!f) return -1;
+    fputs(body, f);
+    return fclose(f);
+}
+
+/* Run `gitswitch -y add` with scripted stdin; stdout+stderr land in out_path. */
+static int run_add(const char *home, const char *rt, const char *stdin_path,
+                   const char *out_path) {
+    char cmd[16384];
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y add <'%s' >'%s' 2>&1",
+             home, rt, g_bin, stdin_path, out_path);
+    return run_shell(cmd);
+}
+
+/* Create a 0600 private-key-shaped file so the add flow's key validation
+ * passes; returns 0 on success. */
+static int write_key_file(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fputs("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n"
+          "-----END OPENSSH PRIVATE KEY-----\n", f);
+    if (fclose(f) != 0) return -1;
+    return chmod(path, 0600);
+}
+
+/* AR-03 L3: with a hand-planted [accounts.4294967295], `add` used to assign
+ * max_id+1 == 0 — an id the loader rejects, so the new account "saved" into a
+ * config no later command could load. The add must fall back to the lowest
+ * unused id instead. */
+TEST(add_after_uint32_max_id_does_not_wrap_to_zero) {
+    char home[256], rt[256], stdin_path[4352], out_path[4352], cmd[16384];
+    char toml_path[4352], toml[8192];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.4294967295]\n"
+        "name = \"maxed\"\n"
+        "email = \"m@example.com\"\n"), 0);
+
+    /* name, email, description, SSH skip, GPG skip, scope default. */
+    CHECK_EQ_INT(write_stdin_script(rt,
+        "newacct\nn@example.com\nnew account\n\n\n\n",
+        stdin_path, sizeof(stdin_path)), 0);
+    snprintf(out_path, sizeof(out_path), "%s/add.out", rt);
+    rc = run_add(home, rt, stdin_path, out_path);
+    CHECK_EQ_INT(rc, 0);
+
+    /* The wrapped id 0 must not be persisted; the fallback id 1 must be. */
+    snprintf(toml_path, sizeof(toml_path), "%s/.config/gitswitch/accounts.toml", home);
+    slurp(toml_path, toml, sizeof(toml));
+    CHECK(strstr(toml, "[accounts.0]") == NULL);
+    CHECK(strstr(toml, "[accounts.1]") != NULL);
+    CHECK(strstr(toml, "newacct") != NULL);
+
+    /* And the config is still loadable (pre-fix: bricked by the id-0 entry). */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' list >/dev/null 2>&1",
+             home, rt, g_bin);
+    CHECK_EQ_INT(run_shell(cmd), 0);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+/* AR-03 L2: the host-alias prompt must reject aliases the ~/.ssh/config
+ * writer can't take verbatim (quotes/control bytes) and aliases too long for
+ * the account field (>= 256: safe_strncpy used to fail silently and the alias
+ * was dropped while add still reported success), re-prompting each time. */
+TEST(add_reprompts_invalid_host_alias_until_valid) {
+    char home[256], rt[256], stdin_path[4352], out_path[4352];
+    char key_path[4352], toml_path[4352], toml[8192], script[2048];
+    char long_alias[321];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\ndefault_scope = \"global\"\n"), 0);
+    snprintf(key_path, sizeof(key_path), "%s/id_test", home);
+    CHECK_EQ_INT(write_key_file(key_path), 0);
+
+    memset(long_alias, 'a', sizeof(long_alias) - 1);
+    long_alias[sizeof(long_alias) - 1] = '\0';
+
+    /* name, email, description, SSH key, then three alias answers: a quoted
+     * one (charset), an overlong one (length), then a valid one; GPG skip,
+     * scope default. */
+    snprintf(script, sizeof(script),
+             "aliasacct\na@example.com\nalias test\n%s\n"
+             "bad\"alias\n%s\ngithub.com-good\n\n\n",
+             key_path, long_alias);
+    CHECK_EQ_INT(write_stdin_script(rt, script, stdin_path, sizeof(stdin_path)), 0);
+    snprintf(out_path, sizeof(out_path), "%s/add.out", rt);
+    rc = run_add(home, rt, stdin_path, out_path);
+    CHECK_EQ_INT(rc, 0);
+
+    /* Only the valid alias may be persisted — not the quoted one (pre-fix it
+     * was accepted verbatim) and not a silent drop of all three. */
+    snprintf(toml_path, sizeof(toml_path), "%s/.config/gitswitch/accounts.toml", home);
+    slurp(toml_path, toml, sizeof(toml));
+    CHECK(strstr(toml, "github.com-good") != NULL);
+    CHECK(strstr(toml, "bad\"alias") == NULL);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+/* AR-03 M5 (write entry): the loader skips accounts whose ssh_key exceeds 256
+ * chars, so the add prompt must refuse such a path up front with a re-prompt —
+ * pre-fix it saved the account and the very next invocation dropped it. */
+TEST(add_refuses_ssh_key_path_over_256_chars) {
+    char home[256], rt[256], stdin_path[4352], out_path[4352];
+    char dir_a[4352], dir_b[4352], key_path[4352];
+    char toml_path[4352], toml[8192], out[8192], script[2048], seg[130];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\ndefault_scope = \"global\"\n"), 0);
+
+    /* Two 120-char directory components push the key path well past 256
+     * while every component stays under NAME_MAX. */
+    memset(seg, 'd', 120);
+    seg[120] = '\0';
+    snprintf(dir_a, sizeof(dir_a), "%s/a%s", home, seg);
+    CHECK_EQ_INT(mkdir(dir_a, 0700), 0);
+    snprintf(dir_b, sizeof(dir_b), "%s/b%s", dir_a, seg);
+    CHECK_EQ_INT(mkdir(dir_b, 0700), 0);
+    snprintf(key_path, sizeof(key_path), "%s/id_long", dir_b);
+    CHECK_EQ_INT(write_key_file(key_path), 0);
+    CHECK(strlen(key_path) > 256);
+
+    /* name, email, description, overlong key (refused), Enter to skip SSH,
+     * GPG skip, scope default. */
+    snprintf(script, sizeof(script),
+             "longkey\nl@example.com\nlong key test\n%s\n\n\n\n", key_path);
+    CHECK_EQ_INT(write_stdin_script(rt, script, stdin_path, sizeof(stdin_path)), 0);
+    snprintf(out_path, sizeof(out_path), "%s/add.out", rt);
+    rc = run_add(home, rt, stdin_path, out_path);
+    CHECK_EQ_INT(rc, 0);
+
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "max 256") != NULL); /* the refusal was explicit */
+
+    /* The overlong path must not be persisted (pre-fix it was, and the next
+     * load skipped the whole account). */
+    snprintf(toml_path, sizeof(toml_path), "%s/.config/gitswitch/accounts.toml", home);
+    slurp(toml_path, toml, sizeof(toml));
+    CHECK(strstr(toml, "id_long") == NULL);
+    CHECK(strstr(toml, "longkey") != NULL); /* the account itself saved */
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+/* AR-03 L1 (both halves): an exactly-320-char email must be re-prompted, not
+ * accepted. Pre-fix validate_email's `>` bound admitted it, the copy into
+ * email[320] failed silently, and the add aborted at the end with a
+ * misleading "Invalid name or email" — exit nonzero, nothing saved. */
+TEST(add_reprompts_email_at_exact_length_bound) {
+    char home[256], rt[256], stdin_path[4352], out_path[4352];
+    char toml_path[4352], toml[8192], script[2048], long_email[321];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\ndefault_scope = \"global\"\n"), 0);
+
+    /* 313 a's + "@ex.com" == exactly 320 chars, format-valid. */
+    memset(long_email, 'a', 313);
+    long_email[313] = '\0';
+    strcat(long_email, "@ex.com");
+    CHECK_EQ_INT((int)strlen(long_email), 320);
+
+    /* name, overlong email (re-prompted), valid email, description, SSH skip,
+     * GPG skip, scope default. */
+    snprintf(script, sizeof(script),
+             "emailacct\n%s\ne@example.com\nemail test\n\n\n\n", long_email);
+    CHECK_EQ_INT(write_stdin_script(rt, script, stdin_path, sizeof(stdin_path)), 0);
+    snprintf(out_path, sizeof(out_path), "%s/add.out", rt);
+    rc = run_add(home, rt, stdin_path, out_path);
+    CHECK_EQ_INT(rc, 0); /* pre-fix: the add aborted with exit 1 */
+
+    snprintf(toml_path, sizeof(toml_path), "%s/.config/gitswitch/accounts.toml", home);
+    slurp(toml_path, toml, sizeof(toml));
+    CHECK(strstr(toml, "e@example.com") != NULL);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 TEST_MAIN_BEGIN()
     if (resolve_binary() != 0) {
         fprintf(stderr, "RESULT FAIL: cannot locate gitswitch binary\n");
@@ -698,4 +913,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(mutating_commands_block_on_config_lock_readonly_dont);
     RUN_TEST(utf8_account_name_cli_round_trip);
     RUN_TEST(no_color_output_contains_no_escape_bytes);
+    RUN_TEST(add_after_uint32_max_id_does_not_wrap_to_zero);
+    RUN_TEST(add_reprompts_invalid_host_alias_until_valid);
+    RUN_TEST(add_refuses_ssh_key_path_over_256_chars);
+    RUN_TEST(add_reprompts_email_at_exact_length_bound);
 TEST_MAIN_END()

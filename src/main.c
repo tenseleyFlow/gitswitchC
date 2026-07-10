@@ -362,9 +362,13 @@ int main(int argc, char *argv[]) {
             /* SIG-02 (AR-02 #27): hold the deferring guard across the save so
              * config_save's scratch registration of its temp file has a live
              * handler behind it — a signal mid-save then defers instead of
-             * orphaning accounts.toml.tmp.<pid>. The command's work is already
-             * fully applied at this point, so (matching accounts_switch's
-             * success path) a deferred signal is not re-raised: the process
+             * orphaning accounts.toml.tmp.<pid>. After a switch the guard is
+             * ALREADY armed: accounts_switch's success path leaves it up so
+             * the stretch between "identity applied" and this save is never
+             * signal-killable (M3) — this begin is then a no-op re-begin that
+             * preserves any deferred signal. For add/edit/remove it arms
+             * fresh. The command's work is already fully applied at this
+             * point, so a deferred signal is not re-raised: the process
              * finishes persisting and exits normally moments later. */
             signals_guard_begin();
             if (config_save(&ctx, ctx.config.config_path) != 0) {
@@ -372,10 +376,15 @@ int main(int argc, char *argv[]) {
                 /* Don't fail the command, just warn */
             }
             signals_scratch_cleanup();
-            signals_guard_end();
         }
     }
-    
+
+    /* M3: drop the guard a successful switch left armed (see above). Done
+     * unconditionally — it also closes the save-path guard, and it is an
+     * idempotent no-op for every command that never armed one. */
+    signals_guard_end();
+
+
     /* Release the config write-lock now that load+mutate+save is done (harmless
      * no-op for read-only commands that never took it; the OS would also drop it
      * at exit). */
