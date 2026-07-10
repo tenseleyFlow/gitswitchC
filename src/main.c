@@ -183,7 +183,18 @@ int main(int argc, char *argv[]) {
         error_cleanup();
         return EXIT_SUCCESS;
     }
-    
+
+    /* `init` needs no config — it only emits shell-integration text derived
+     * from env-based paths — and it runs on every interactive shell startup.
+     * Dispatch it before config_init so it stays cheap and a broken config
+     * (e.g. accounts.toml chmod'd wrong) can't blank the shell integration. */
+    if (optind < argc && strcmp(argv[optind], "init") == 0) {
+        const char *shell = (optind + 1 < argc) ? argv[optind + 1] : detect_shell_from_env();
+        int rc = handle_init_command(shell);
+        error_cleanup();
+        return rc;
+    }
+
     /* Initialize configuration system */
     log_info("Initializing gitswitch-c configuration system");
     if (config_init(&ctx) != 0) {
@@ -201,13 +212,19 @@ int main(int argc, char *argv[]) {
     /* Parse command and arguments */
     const char *command = NULL;
     const char *arg1 = NULL;
-    
+
     if (optind < argc) {
         command = argv[optind];
         if (optind + 1 < argc) {
             arg1 = argv[optind + 1];
         }
     }
+
+    /* Snapshot the active account so a switch that doesn't actually change it
+     * (re-switching to the current account) skips config_save below and its
+     * backup churn. */
+    char prev_active[MAX_NAME_LEN];
+    safe_strncpy(prev_active, ctx.config.active_account, sizeof(prev_active));
     
     /* Execute command */
     if (command == NULL) {
@@ -241,8 +258,6 @@ int main(int argc, char *argv[]) {
         exit_code = handle_doctor_command(&ctx);
     } else if (strcmp(command, "config") == 0) {
         exit_code = handle_config_command(&ctx);
-    } else if (strcmp(command, "init") == 0) {
-        exit_code = handle_init_command(arg1 ? arg1 : detect_shell_from_env());
     } else if (strcmp(command, "resume") == 0) {
         exit_code = handle_resume_command(&ctx);
     } else if (strcmp(command, "reset") == 0) {
@@ -269,8 +284,10 @@ int main(int argc, char *argv[]) {
                    strcmp(command, "init") != 0 &&
                    strcmp(command, "resume") != 0 &&
                    strcmp(command, "reset") != 0) {
-            /* Assume it's a switch command - may have modified default scope */
-            should_save = true;
+            /* A switch: the only durable change is active_account, so save
+             * only when it actually changed. Re-switching to the current
+             * account rewrites nothing, so we skip the save (and its backup). */
+            should_save = (strcmp(prev_active, ctx.config.active_account) != 0);
         }
         /* `resume` re-activates the already-saved account and changes nothing
          * durable, so it is intentionally excluded above to avoid backup churn. */
@@ -474,6 +491,15 @@ static int handle_init_command(const char *shell) {
         have_gpg_home = false;
     }
 
+    /* Path of the resume-hint marker, used to gate the per-shell resume probe:
+     * with no saved account the marker is absent, so a machine that has never
+     * switched skips the ssh-add + `gitswitch resume` spawn on every shell. If
+     * the path can't be computed or contains a quote, fall back to the old
+     * unconditional probe rather than emitting broken shell. */
+    char hint_path[MAX_PATH_LEN];
+    bool have_hint = (config_resume_hint_path(hint_path, sizeof(hint_path)) == 0) &&
+                     (strchr(hint_path, '\'') == NULL);
+
     if (!shell || !*shell) {
         fprintf(stderr,
                 "gitswitch: could not detect shell; pass one explicitly:\n"
@@ -497,10 +523,20 @@ static int handle_init_command(const char *shell) {
          * echoing it here would nag on every shell when there is nothing saved,
          * since a no-op resume never creates the socket the probe looks for. */
         printf("if status is-interactive\n");
-        printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
-        printf("    if test $status -gt 1\n");
-        printf("        gitswitch resume >/dev/null\n");
-        printf("    end\n");
+        if (have_hint) {
+            /* Only probe/resume when there's a saved account to resume. */
+            printf("    if test -e '%s'\n", hint_path);
+            printf("        env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
+            printf("        if test $status -gt 1\n");
+            printf("            gitswitch resume >/dev/null\n");
+            printf("        end\n");
+            printf("    end\n");
+        } else {
+            printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
+            printf("    if test $status -gt 1\n");
+            printf("        gitswitch resume >/dev/null\n");
+            printf("    end\n");
+        }
         printf("end\n");
         printf("if test -S $__gitswitch_auth_sock\n");
         printf("    set -gx SSH_AUTH_SOCK $__gitswitch_auth_sock\n");
@@ -530,10 +566,20 @@ static int handle_init_command(const char *shell) {
          * from `resume` itself (stderr) only when there is an account to
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
-        printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
-        printf("    if [ $? -gt 1 ]; then\n");
-        printf("        gitswitch resume >/dev/null\n");
-        printf("    fi ;;\n");
+        if (have_hint) {
+            /* Only probe/resume when there's a saved account to resume. */
+            printf("    if [ -e '%s' ]; then\n", hint_path);
+            printf("        SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
+            printf("        if [ $? -gt 1 ]; then\n");
+            printf("            gitswitch resume >/dev/null\n");
+            printf("        fi\n");
+            printf("    fi ;;\n");
+        } else {
+            printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
+            printf("    if [ $? -gt 1 ]; then\n");
+            printf("        gitswitch resume >/dev/null\n");
+            printf("    fi ;;\n");
+        }
         printf("esac\n");
         printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
         printf("unset __gitswitch_auth_sock\n");
@@ -598,24 +644,42 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
  * account argument, only that account; otherwise all. Destructive — confirmed. */
 static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     char resp[16];
+    const char *target = NULL;
 
     if (!ctx) return EXIT_FAILURE;
 
+    /* Resolve the argument to a real account first (fuzzy/ID matching for
+     * free) so a typo can't report a false success while the intended
+     * account's on-disk secret-key copy is left in place. */
     if (account && *account) {
+        account_t *acct = config_find_account(ctx, account);
+        if (!acct) {
+            display_error("Account not found", "%s", account);
+            return EXIT_FAILURE;
+        }
+        target = acct->name;
         printf("This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
-               "'%s', removing its on-disk secret-key copy. Continue? [y/N]: ", account);
+               "'%s', removing its on-disk secret-key copy.\n", target);
     } else {
         printf("This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
-               "homes, removing every on-disk secret-key copy. Continue? [y/N]: ");
+               "homes, removing every on-disk secret-key copy.\n");
     }
-    fflush(stdout);
 
-    if (!fgets(resp, sizeof(resp), stdin) || (resp[0] != 'y' && resp[0] != 'Y')) {
+    /* This is the most destructive operation (it wipes exported secret-key
+     * copies), so require a typed 'yes' — matching remove and stronger than a
+     * bare 'y', which is easy to hit by muscle memory. */
+    printf("Type 'yes' to continue: ");
+    fflush(stdout);
+    if (!fgets(resp, sizeof(resp), stdin)) {
+        printf("Reset cancelled.\n");
+        return EXIT_SUCCESS;
+    }
+    resp[strcspn(resp, "\n")] = '\0';
+    if (strcmp(resp, "yes") != 0) {
         printf("Reset cancelled.\n");
         return EXIT_SUCCESS;
     }
 
-    const char *target = (account && *account) ? account : NULL;
     ssh_manager_reset(target);
     gpg_manager_reset(target);
 

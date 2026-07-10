@@ -165,6 +165,28 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
     return 0;
 }
 
+/* Compute the resume-hint marker path (<config_dir>/.resume-hint). */
+int config_resume_hint_path(char *buf, size_t size) {
+    char dir[MAX_PATH_LEN];
+    if (!buf || size == 0) return -1;
+    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
+    if ((size_t)snprintf(buf, size, "%s/.resume-hint", dir) >= size) return -1;
+    return 0;
+}
+
+/* Create or remove the resume-hint marker so the shell integration knows
+ * whether a boot-time resume is worth attempting. Cheap and best-effort. */
+static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
+    char hint[MAX_PATH_LEN];
+    if (config_resume_hint_path(hint, sizeof(hint)) != 0) return;
+    if (ctx->config.active_account[0] != '\0') {
+        FILE *f = fopen(hint, "w");
+        if (f) fclose(f);
+    } else {
+        unlink(hint);
+    }
+}
+
 /* Save configuration to TOML file */
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     toml_document_t toml_doc;
@@ -249,8 +271,9 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     }
     
     log_info("Configuration saved successfully to: %s", config_path);
+    config_update_resume_hint(ctx);
     result = 0;
-    
+
 cleanup:
     toml_cleanup_document(&toml_doc);
     return result;
