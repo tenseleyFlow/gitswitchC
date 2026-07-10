@@ -2343,7 +2343,10 @@ static int probe_ssh_agent_socket(const char *path, bool *reachable) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     safe_strncpy(addr.sun_path, path, sizeof(addr.sun_path));
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+    /* Cast through void*: the direct sockaddr_un->sockaddr cast trips
+     * -Wstrict-aliasing=2 on gcc 13 at -O2 (the CI release toolchain), which
+     * WERROR promotes to an error. Same idiom as the test suites. */
+    if (connect(fd, (struct sockaddr *)(void *)&addr, sizeof(addr)) == 0) {
         *reachable = true;
         close(fd);
         return 0;

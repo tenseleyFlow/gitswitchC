@@ -98,6 +98,16 @@ ifeq ($(WERROR),1)
     CFLAGS += -Werror
 endif
 
+# clang flags the deliberate ##__VA_ARGS__ comma-pasting GNU extension in
+# error.h's logging macros as -Wgnu-zero-variadic-macro-arguments under
+# -Wpedantic (macOS 'gcc' is clang; WERROR promoted the long-standing noise
+# to a hard error). The extension is intentional — the build is -std=gnu11 —
+# so silence clang's style objection; gcc has no such warning.
+CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -c clang)
+ifneq ($(CC_IS_CLANG),0)
+    CFLAGS += -Wno-gnu-zero-variadic-macro-arguments
+endif
+
 # Include directories
 INCLUDES = -I$(SRCDIR)
 
