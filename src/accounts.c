@@ -521,11 +521,24 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
          * recreated isolated home, which would make this "system keyring"
          * check look inside the missing home and wrongly hard-fail the resume. */
         if (write_git && account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+            /* AR-06 F17: the system keyring is a key SOURCE, not the sole gate.
+             * When an isolated home already exists for this account the key may
+             * live only there (e.g. removed from the system keyring after an
+             * earlier switch), and gpg_switch_account probes that home
+             * authoritatively. Only require the system keyring when no isolated
+             * home is present — preserving the pre-mutation fast-fail for a
+             * genuine first-time switch to a key that exists nowhere. */
             if (validate_gpg_key_availability(account->gpg_key_id) != 0) {
-                set_error(ERR_GPG_KEY_NOT_FOUND,
-                          "GPG key not found in keyring: %s", account->gpg_key_id);
-                runtime_state_lock_release(runtime_lock_fd);
-                return -1;
+                bool isolated_present = false;
+                if (gpg_manager_isolated_home_present(account->name,
+                                                      &isolated_present) != 0 ||
+                    !isolated_present) {
+                    set_error(ERR_GPG_KEY_NOT_FOUND,
+                              "GPG key not found in keyring: %s",
+                              account->gpg_key_id);
+                    runtime_state_lock_release(runtime_lock_fd);
+                    return -1;
+                }
             }
         }
 
@@ -1197,6 +1210,43 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
                       "switch away or reset it, then rerun edit",
                       original.name);
             return -1;
+        }
+
+        /* AR-06 F16: a non-active account's runtime resources are keyed by
+         * name (the isolated GNUPGHOME <base>/<name> holding an exported
+         * secret-key copy, and the per-account ssh-agent) and by alias (the
+         * managed ~/.ssh/config host stanza). Renaming/aliasing in place would
+         * orphan them under the old key, so a later targeted reset/remove under
+         * the new name would silently miss them. Retire the old identity before
+         * committing the rename. The active account can't reach here — its live
+         * fields (name included) are frozen by the guard above. */
+        bool name_changed = (strcmp(original.name, acct.name) != 0);
+        bool alias_changed =
+            (strcmp(original.ssh_host_alias, acct.ssh_host_alias) != 0);
+        if (name_changed) {
+            int rt_fd = runtime_state_lock_acquire();
+            if (rt_fd < 0) {
+                return -1;
+            }
+            int s_rc = ssh_manager_reset(original.name);
+            int g_rc = gpg_manager_reset(original.name);
+            runtime_state_lock_release(rt_fd);
+            if (s_rc != 0 || g_rc != 0) {
+                set_error(ERR_SYSTEM_CALL,
+                          "Cannot rename '%s' to '%s': runtime teardown of the "
+                          "old identity failed; the account is unchanged",
+                          original.name, acct.name);
+                return -1;
+            }
+        }
+        /* A changed alias orphans the old managed host-alias block (edit never
+         * rewrites it; only switch does, and switch now uses the new alias).
+         * Best-effort: a stale stanza is visible, not silent. */
+        if (alias_changed && original.ssh_host_alias[0] != '\0' &&
+            ssh_remove_host_alias(original.ssh_host_alias) != 0) {
+            log_warning("Could not remove stale ~/.ssh/config host-alias block "
+                        "for '%s': %s", original.ssh_host_alias,
+                        get_last_error()->message);
         }
 
         *existing = acct;

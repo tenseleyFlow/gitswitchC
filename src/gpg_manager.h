@@ -161,6 +161,16 @@ int gpg_manager_system_keyring_home(char *buf, size_t size);
 int gpg_manager_reset(const char *account);
 
 /**
+ * Report whether a safe isolated GPG home already exists for `account` (AR-06
+ * F17). The switch preflight uses this to treat the system keyring as a key
+ * source rather than a hard gate: a present isolated home may hold the only
+ * copy of the account's secret key, which gpg_switch_account probes
+ * authoritatively. A missing base or missing/unsafe home yields *present=false.
+ * Sets *present and returns 0; returns -1 only on a bad argument.
+ */
+int gpg_manager_isolated_home_present(const char *account, bool *present);
+
+/**
  * Atomically (re)point the stable GNUPGHOME `current` symlink at `real_home`,
  * or drop it entirely — both under the GPG base dir's cross-process lock so
  * neither can interleave with gpg_manager_reset's dangling-link cleanup

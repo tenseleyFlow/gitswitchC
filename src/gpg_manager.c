@@ -1651,6 +1651,46 @@ reset_unlock:
     return 0;
 }
 
+/* AR-06 F17: report whether a safe isolated GPG home already exists for
+ * `account`. The switch preflight uses this to treat the system keyring as a
+ * key SOURCE, not a hard gate: when the isolated home is present, the account's
+ * secret key may live only there (e.g. the user deleted it from the system
+ * keyring after a prior switch), and gpg_switch_account probes that home
+ * authoritatively. A missing base or missing/unsafe child home reports
+ * *present=false so a first-time switch still requires the system keyring. */
+int gpg_manager_isolated_home_present(const char *account, bool *present) {
+    char base[MAX_PATH_LEN];
+    bool absent = false;
+    int base_fd;
+    struct stat st;
+
+    if (!account || !*account || !present) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid arguments to gpg_manager_isolated_home_present");
+        return -1;
+    }
+    *present = false;
+    if (!validate_name(account)) {
+        set_error(ERR_INVALID_ARGS, "Invalid account name: %s", account);
+        return -1;
+    }
+    if (gpg_get_base_dir(base, sizeof(base)) != 0) {
+        return -1;
+    }
+    base_fd = gpg_open_base_dir(base, sizeof(base), false, &absent);
+    if (base_fd < 0) {
+        /* No base yet is a normal first-run state, not an error. */
+        return absent ? 0 : -1;
+    }
+    if (fstatat(base_fd, account, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISDIR(st.st_mode) && st.st_uid == getuid() &&
+        (st.st_mode & 077) == 0) {
+        *present = true;
+    }
+    close(base_fd);
+    return 0;
+}
+
 /* Compute, policy-check, and create the base directory for isolated
  * GNUPGHOMEs (shared with the stable `current` symlink path so the two never
  * disagree). Split out of gpg_create_isolated_home so gpg_switch_account can
