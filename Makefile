@@ -164,8 +164,25 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
+# BUILD_TYPE stamp: debug and release share build/obj and build/bin, but
+# their flag sets differ radically (ASan/UBSan -O0 vs stripped NDEBUG -O2)
+# and BUILD_TYPE is invisible to the dependency graph. Without the stamp,
+# `make BUILD_TYPE=release` followed by `make BUILD_TYPE=debug test` printed
+# "Nothing to be done" and ran the "sanitizer" suite against uninstrumented
+# release objects — silently fake QA results (AR-05 M3). The recipe rewrites
+# the stamp only when the recorded type differs, so crossing BUILD_TYPE (and
+# only that) forces a full rebuild.
+BUILDTYPE_STAMP = $(OBJDIR)/.buildtype
+$(BUILDTYPE_STAMP): buildtype-force | $(OBJDIR)
+	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "$(BUILD_TYPE)" ]; then \
+		echo "$(BUILD_TYPE)" > $(BUILDTYPE_STAMP); \
+	fi
+
+.PHONY: buildtype-force
+buildtype-force:
+
 # Compile source files
-$(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) | $(OBJDIR)
+$(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling $<..."
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -201,7 +218,7 @@ uninstall:
 	@echo "Uninstall complete"
 
 # Test compilation
-$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(TESTDIR)/test.h $(HEADERS) | $(OBJDIR)
+$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(TESTDIR)/test.h $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
 	$(CC) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) -c $< -o $@
 
