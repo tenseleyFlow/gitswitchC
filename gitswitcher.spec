@@ -1,5 +1,5 @@
 Name:           gitswitcher
-Version:        1.7.3
+Version:        1.8.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
@@ -57,6 +57,13 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 %{_docdir}/%{name}/README.md
 
 %changelog
+* Thu Jul 09 2026 mfw <espadonne@outlook.com> - 1.8.0-1
+- Security/correctness: fixes from a full adversarial audit (46 findings), incl. a core.sshCommand injection, unescaped TOML writes that could brick the config, silent account loss on save, and SSH/GPG teardown and concurrency races.
+- Feature: `gitswitch edit <account>` to edit an account interactively.
+- Feature: bash/zsh/fish shell completions (backed by `gitswitch list --names`).
+- Feature: `--yes` to skip confirmations, `--names` for scriptable listing, and GNU readline line-editing/TAB completion on the interactive prompts.
+- Build: fix flock detection on macOS/FreeBSD.
+
 * Thu Jul 09 2026 mfw <espadonne@outlook.com> - 1.7.3-1
 - Fix: the shell integration no longer prints the "restoring your last account" notice on every new shell when no account has ever been switched; the notice now comes from `gitswitch resume` itself, only when there is a saved account to restore.
 
