@@ -34,12 +34,15 @@ TEST(run_true_succeeds) {
     CHECK_EQ_INT(res.exit_code, 0);
 }
 
-TEST(run_nonexistent_command_is_127) {
+/* Since the PS-1/PS-2 exec pinning, an unresolvable command fails closed in
+ * the parent (no fork, no execvp PATH search), so spawned stays false instead
+ * of the old "child exec failed with 127" convention. */
+TEST(run_nonexistent_command_fails_without_spawn) {
     const char *argv[] = {"gitswitch_no_such_command_xyz", NULL};
     run_result_t res;
     CHECK_EQ_INT(run_argv(argv, NULL, &res), -1);
-    CHECK(res.spawned);
-    CHECK_EQ_INT(res.exit_code, 127);
+    CHECK(!res.spawned);
+    CHECK_EQ_INT(res.exit_code, -1);
 }
 
 TEST(run_feeds_stdin) {
@@ -81,7 +84,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_echo_captures_stdout);
     RUN_TEST(run_false_reports_exit_1);
     RUN_TEST(run_true_succeeds);
-    RUN_TEST(run_nonexistent_command_is_127);
+    RUN_TEST(run_nonexistent_command_fails_without_spawn);
     RUN_TEST(run_feeds_stdin);
     RUN_TEST(run_passes_extra_env);
     RUN_TEST(run_empty_argv_fails);

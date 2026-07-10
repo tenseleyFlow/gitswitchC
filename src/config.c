@@ -12,6 +12,17 @@
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <errno.h>
+#include <ctype.h>
+
+/* Linux, macOS and FreeBSD all provide O_NOFOLLOW; keep a guard for exotic
+ * libcs so the file still compiles there. Refusing symlinks is load-bearing
+ * for the config reader/writer (cfg-symlink-01/02), so every open below is
+ * additionally paired with an explicit lstat()/fstat() check rather than
+ * relying on the flag alone. */
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
 
 #include "accounts.h"
 #include "config.h"
@@ -59,7 +70,12 @@ const char *default_config_template =
 "# - Use absolute paths or ~ expansion for key files\n";
 
 /* Internal helper functions */
+static int open_config_validated(const char *config_path);
 static int validate_config_file_security(const char *config_path);
+static int validate_config_write_destination(const char *config_path);
+static int copy_file_nofollow(const char *src_path, const char *dst_path);
+static bool sanitize_tty_text(char *text);
+static bool text_is_tty_safe(const char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
@@ -116,24 +132,75 @@ int config_init(gitswitch_ctx_t *ctx) {
 int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
     toml_document_t toml_doc;
     char scope_str[32];
-    
+    char *buffer = NULL;
+    struct stat fst;
+    size_t file_size, total = 0;
+    int fd;
+
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
         return -1;
     }
-    
-    /* Validate file security before loading */
-    if (validate_config_file_security(config_path) != 0) {
+
+    /* Open with O_NOFOLLOW and validate the fd, then read and parse from that
+     * same fd (cfg-symlink-01/02). The old flow validated the path with
+     * stat() and then had the parser fopen() the path a second time, so a
+     * symlinked accounts.toml passed validation against its target and,
+     * worse, the file validated and the file parsed could differ (TOCTOU).
+     * Parsing the bytes read from the validated fd removes the second
+     * path lookup entirely. */
+    fd = open_config_validated(config_path);
+    if (fd < 0) {
         return -1;
     }
-    
+    if (fstat(fd, &fst) != 0) {
+        set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot stat config file: %s", config_path);
+        close(fd);
+        return -1;
+    }
+    file_size = (size_t)fst.st_size;
+    buffer = malloc(file_size + 1);
+    if (!buffer) {
+        set_error(ERR_MEMORY_ALLOCATION, "Failed to allocate config read buffer");
+        close(fd);
+        return -1;
+    }
+    while (total < file_size) {
+        ssize_t n = read(fd, buffer + total, file_size - total);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
+    close(fd);
+    if (total != file_size) {
+        set_system_error(ERR_FILE_IO, "Failed to read complete config file: %s", config_path);
+        goto fail_buffer;
+    }
+    buffer[file_size] = '\0';
+
+    /* Same content vetting toml_parse_file applied before it parsed. */
+    if (!toml_validate_safe_characters(buffer, file_size)) {
+        set_error(ERR_CONFIG_INVALID, "Configuration file contains unsafe characters");
+        goto fail_buffer;
+    }
+    if (!toml_check_injection_patterns(buffer, file_size)) {
+        set_error(ERR_CONFIG_INVALID, "Configuration file contains potentially malicious patterns");
+        goto fail_buffer;
+    }
+
     /* Parse TOML configuration */
     toml_init_document(&toml_doc);
-    if (toml_parse_file(config_path, &toml_doc) != 0) {
+    if (toml_parse_string(buffer, file_size, &toml_doc) != 0) {
         toml_cleanup_document(&toml_doc);
-        return -1;
+        goto fail_buffer;
     }
-    
+
+    /* Config content can reference key material paths; don't leave a stray
+     * copy on the heap (mirrors toml_parse_file's cleanup discipline). */
+    secure_zero_memory(buffer, file_size + 1);
+    free(buffer);
+    buffer = NULL;
+
     /* Load settings section */
     if (toml_get_string(&toml_doc, "settings", "default_scope",
                         scope_str, sizeof(scope_str)) == 0) {
@@ -143,12 +210,17 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
         ctx->config.default_scope = GIT_SCOPE_LOCAL;
     }
 
-    /* Last-active account for boot resume (optional; absent on older configs) */
+    /* Last-active account for boot resume (optional; absent on older configs).
+     * Sanitized like the other untrusted display fields; a name that needed
+     * sanitizing can no longer match any (validated) account name, which is
+     * the correct fail-closed outcome for resume. */
     if (toml_get_string(&toml_doc, "settings", "active_account",
                         ctx->config.active_account, sizeof(ctx->config.active_account)) != 0) {
         ctx->config.active_account[0] = '\0';
+    } else if (sanitize_tty_text(ctx->config.active_account)) {
+        log_warning("Removed terminal control bytes from active_account setting");
     }
-    
+
     /* Load accounts */
     if (load_accounts_from_toml(ctx, &toml_doc) != 0) {
         toml_cleanup_document(&toml_doc);
@@ -165,6 +237,13 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
 
     log_info("Configuration loaded successfully: %zu accounts", ctx->account_count);
     return 0;
+
+fail_buffer:
+    if (buffer) {
+        secure_zero_memory(buffer, file_size + 1);
+        free(buffer);
+    }
+    return -1;
 }
 
 /* Acquire an exclusive, cross-process lock for a mutating config cycle. Returns
@@ -235,6 +314,15 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
         return 0;
     }
 
+    /* Refuse to write through or next to a symlink (cfg-symlink-01). rename()
+     * would replace a symlinked accounts.toml with a real file, but the
+     * backup step reads through the link (exfiltrating the target into a
+     * 0600 backup we own) and a symlinked/foreign parent directory lets an
+     * attacker choose where the temp+rename lands. Fail closed instead. */
+    if (validate_config_write_destination(config_path) != 0) {
+        return -1;
+    }
+
     /* Create backup if file exists */
     if (path_exists(config_path)) {
         if (config_backup(config_path) != 0) {
@@ -251,7 +339,24 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
         set_error(ERR_INVALID_ARGS, "Temporary file path too long");
         return -1;
     }
-    
+
+    /* Pre-create the temp file with O_CREAT|O_EXCL (which never follows
+     * symlinks) and mode 0600, so the name is guaranteed to be a fresh
+     * regular file we own before toml_write_file() reopens it by path. The
+     * destination directory was validated above as a user-owned, non-symlink
+     * directory that nobody else can write, so no other principal can swap
+     * the name between the two opens (cfg-symlink-01). */
+    unlink(temp_path); /* clear any stale temp from a crashed run of this pid */
+    {
+        int tfd = open(temp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (tfd < 0) {
+            set_system_error(ERR_CONFIG_WRITE_FAILED,
+                             "Failed to create temporary config file: %s", temp_path);
+            return -1;
+        }
+        close(tfd);
+    }
+
     /* Initialize TOML document */
     toml_init_document(&toml_doc);
     
@@ -276,18 +381,13 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     }
     log_debug("After saving accounts, TOML doc has %zu sections", toml_doc.section_count);
     
-    /* Write to temporary file first */
+    /* Write to temporary file first (already created 0600 above, so the
+     * content is never observable with looser permissions) */
     if (toml_write_file(&toml_doc, temp_path) != 0) {
         unlink(temp_path); /* don't leave a stale/partial .tmp behind */
         goto cleanup;
     }
-    
-    /* Set secure permissions on temp file */
-    if (set_file_permissions(temp_path, PERM_USER_RW) != 0) {
-        unlink(temp_path);
-        goto cleanup;
-    }
-    
+
     /* Atomic move from temp to final location */
     if (rename(temp_path, config_path) != 0) {
         set_system_error(ERR_CONFIG_WRITE_FAILED, 
@@ -328,13 +428,24 @@ int config_create_default(const char *config_path) {
         return -1;
     }
     
-    /* Create file with secure permissions */
-    file = fopen(config_path, "w");
-    if (!file) {
+    /* Create the file with O_CREAT|O_EXCL (never follows symlinks) and mode
+     * 0600 directly, instead of fopen("w") + chmod afterwards: fopen would
+     * happily truncate-through an attacker-planted symlink, and the old
+     * create-then-chmod left a window where the file existed with the
+     * (potentially loose) umask permissions (cfg-symlink-01). */
+    int fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) {
         set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to create config file: %s", config_path);
         return -1;
     }
-    
+    file = fdopen(fd, "w");
+    if (!file) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to open config file stream: %s", config_path);
+        close(fd);
+        unlink(config_path);
+        return -1;
+    }
+
     /* Write default template */
     if (fwrite(default_config_template, 1, strlen(default_config_template), file) != 
         strlen(default_config_template)) {
@@ -344,12 +455,7 @@ int config_create_default(const char *config_path) {
     }
     
     fclose(file);
-    
-    /* Set secure permissions */
-    if (set_file_permissions(config_path, PERM_USER_RW) != 0) {
-        return -1;
-    }
-    
+
     log_info("Created default configuration file: %s", config_path);
     return 0;
 }
@@ -532,15 +638,33 @@ account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
         return NULL;
     }
 
-    /* 1. Exact numeric ID (only when the whole identifier is a number). */
-    account_id = strtoul(identifier, &endptr, 10);
-    if (*endptr == '\0') {
-        for (size_t i = 0; i < ctx->account_count; i++) {
-            if (ctx->accounts[i].id == (uint32_t)account_id) {
-                return &ctx->accounts[i];
+    /* 1. Exact numeric ID (only when the whole identifier is a canonical
+     * decimal in range, int-id-02). The old bare strtoul + (uint32_t) cast
+     * silently wrapped: "4294967297" truncated to 1 and "-4294967295"
+     * converted to 1, so an out-of-range spelling could select an unrelated
+     * account. Ids are stored canonically ([1-9][0-9]*), so anything else —
+     * leading zero/sign/whitespace, out of range — is treated as a possible
+     * name instead, never coerced onto an id. */
+    if (identifier[0] >= '1' && identifier[0] <= '9') {
+        bool all_digits = true;
+        for (const char *p = identifier + 1; *p; p++) {
+            if (!isdigit((unsigned char)*p)) {
+                all_digits = false;
+                break;
             }
         }
-        /* No id match — fall through; the identifier may be a literal name. */
+        if (all_digits) {
+            errno = 0;
+            account_id = strtoul(identifier, &endptr, 10);
+            if (errno == 0 && *endptr == '\0' && account_id <= UINT32_MAX) {
+                for (size_t i = 0; i < ctx->account_count; i++) {
+                    if (ctx->accounts[i].id == (uint32_t)account_id) {
+                        return &ctx->accounts[i];
+                    }
+                }
+            }
+            /* No (valid) id match — fall through; may be a literal name. */
+        }
     }
 
     /* 2. Exact name. */
@@ -710,16 +834,16 @@ int config_backup(const char *config_path) {
         return -1;
     }
     
-    /* Copy file */
-    if (copy_file(config_path, backup_path) != 0) {
+    /* Copy without following symlinks on either end (cfg-symlink-01): a
+     * symlinked accounts.toml would otherwise be read through (copying
+     * another user's file into a backup we own), and the timestamped backup
+     * name is predictable enough for an attacker to plant a symlink at it and
+     * redirect the write. The destination is created O_EXCL with mode 0600,
+     * so no separate chmod (and no loose-permission window) is needed. */
+    if (copy_file_nofollow(config_path, backup_path) != 0) {
         return -1;
     }
-    
-    /* Set secure permissions on backup */
-    if (set_file_permissions(backup_path, PERM_USER_RW) != 0) {
-        return -1;
-    }
-    
+
     log_info("Created configuration backup: %s", backup_path);
 
     /* Keep the backup set bounded. */
@@ -729,36 +853,225 @@ int config_backup(const char *config_path) {
 
 /* Internal helper functions implementation */
 
-/* Validate configuration file security */
-static int validate_config_file_security(const char *config_path) {
-    struct stat file_stat;
-    
-    if (stat(config_path, &file_stat) != 0) {
+/* Open the config file for reading and validate the opened fd
+ * (cfg-symlink-01/02). The previous implementation stat()'d the path — which
+ * follows symlinks, so a symlinked accounts.toml was validated against its
+ * (possibly foreign) target — and the eventual open happened later on the
+ * same path, leaving a classic TOCTOU. Here: lstat() first to refuse a
+ * symlink with a precise message, open with O_NOFOLLOW to close the race at
+ * the syscall level, and check every security property with fstat() on the
+ * fd the caller will actually read. Returns the open fd, or -1. */
+static int open_config_validated(const char *config_path) {
+    struct stat link_stat, file_stat;
+    int fd;
+
+    if (lstat(config_path, &link_stat) != 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot access config file: %s", config_path);
         return -1;
     }
-    
-    /* Check file permissions - must not be readable by group/others */
-    if (file_stat.st_mode & (S_IRGRP | S_IROTH | S_IWGRP | S_IWOTH)) {
-        set_error(ERR_PERMISSION_DENIED, 
-                  "Configuration file has unsafe permissions: %o (should be 600)", 
-                  file_stat.st_mode & 0777);
+    if (S_ISLNK(link_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is a symlink; refusing to follow it: %s", config_path);
         return -1;
     }
-    
+
+    fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot open config file: %s", config_path);
+        return -1;
+    }
+    if (fstat(fd, &file_stat) != 0) {
+        set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot stat config file: %s", config_path);
+        goto fail;
+    }
+
+    /* Must be a plain regular file (not a fifo/device that could stall or
+     * feed us attacker-timed content) */
+    if (!S_ISREG(file_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED, "Configuration file is not a regular file: %s", config_path);
+        goto fail;
+    }
+
+    /* Check file permissions - must not be readable by group/others */
+    if (file_stat.st_mode & (S_IRGRP | S_IROTH | S_IWGRP | S_IWOTH)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file has unsafe permissions: %o (should be 600)",
+                  file_stat.st_mode & 0777);
+        goto fail;
+    }
+
     /* Check ownership - must be owned by current user */
     if (file_stat.st_uid != getuid()) {
         set_error(ERR_PERMISSION_DENIED, "Configuration file not owned by current user");
-        return -1;
+        goto fail;
     }
-    
+
     /* Check file size is reasonable */
     if (file_stat.st_size > TOML_MAX_FILE_SIZE) {
-        set_error(ERR_CONFIG_INVALID, "Configuration file too large: %ld bytes", file_stat.st_size);
+        set_error(ERR_CONFIG_INVALID, "Configuration file too large: %ld bytes",
+                  (long)file_stat.st_size);
+        goto fail;
+    }
+
+    return fd;
+
+fail:
+    close(fd);
+    return -1;
+}
+
+/* Validate configuration file security (path-level check for callers that do
+ * not read the file themselves; config_load keeps and uses the fd instead) */
+static int validate_config_file_security(const char *config_path) {
+    int fd = open_config_validated(config_path);
+    if (fd < 0) {
         return -1;
     }
-    
+    close(fd);
     return 0;
+}
+
+/* Validate the destination of a config write (cfg-symlink-01): the final
+ * path, if present, must be a real regular file we own — never a symlink —
+ * and the parent directory must be a non-symlink directory owned by us that
+ * nobody else can write. The directory check is what makes the temp+rename
+ * in config_save sound: rename() gives no O_NOFOLLOW-style protection, so
+ * the only defense is ensuring no other principal can plant or retarget
+ * names inside the directory between our checks and the rename. */
+static int validate_config_write_destination(const char *config_path) {
+    char dir[MAX_PATH_LEN];
+    struct stat st;
+    const char *slash;
+
+    /* Final path: allow "absent" (first save), refuse symlinks and files we
+     * don't own. lstat (not stat) so the link itself is what we judge. */
+    if (lstat(config_path, &st) == 0) {
+        if (S_ISLNK(st.st_mode)) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing to write config through a symlink: %s", config_path);
+            return -1;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Config path exists but is not a regular file: %s", config_path);
+            return -1;
+        }
+        if (st.st_uid != getuid()) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing to overwrite a config file owned by another user: %s", config_path);
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Cannot examine config path: %s", config_path);
+        return -1;
+    }
+
+    /* Parent directory: must be ours, a real directory, and not writable by
+     * group/others (a foreign-writable directory defeats every per-file
+     * check above) */
+    slash = strrchr(config_path, '/');
+    if (slash) {
+        size_t dir_len = (size_t)(slash - config_path);
+        if (dir_len == 0) {
+            dir_len = 1; /* config directly under "/" — keep the root slash */
+        }
+        if (dir_len >= sizeof(dir)) {
+            set_error(ERR_INVALID_ARGS, "Config directory path too long");
+            return -1;
+        }
+        memcpy(dir, config_path, dir_len);
+        dir[dir_len] = '\0';
+    } else {
+        strcpy(dir, ".");
+    }
+
+    if (lstat(dir, &st) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Cannot examine config directory: %s", dir);
+        return -1;
+    }
+    if (S_ISLNK(st.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Config directory is a symlink; refusing to write into it: %s", dir);
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED, "Config directory is not a directory: %s", dir);
+        return -1;
+    }
+    if (st.st_uid != getuid()) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Config directory not owned by current user: %s", dir);
+        return -1;
+    }
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Config directory is writable by group/others: %s", dir);
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Copy src to dst without following symlinks on either side, creating dst
+ * O_EXCL with mode 0600 (cfg-symlink-01). utils' copy_file() open()s both
+ * paths plainly, which follows symlinks; for config backups both ends are
+ * attacker-influenceable names, so this local variant is used instead. */
+static int copy_file_nofollow(const char *src_path, const char *dst_path) {
+    struct stat st;
+    char buf[4096];
+    int sfd, dfd;
+    ssize_t n;
+
+    sfd = open(src_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (sfd < 0) {
+        set_system_error(ERR_FILE_IO, "Cannot open backup source (symlink?): %s", src_path);
+        return -1;
+    }
+    if (fstat(sfd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        set_error(ERR_FILE_IO, "Backup source is not a regular file: %s", src_path);
+        close(sfd);
+        return -1;
+    }
+
+    /* O_EXCL never follows a symlink and fails if the name exists at all, so
+     * a pre-planted backup destination cannot redirect the write. */
+    dfd = open(dst_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (dfd < 0) {
+        set_system_error(ERR_FILE_IO, "Cannot create backup file: %s", dst_path);
+        close(sfd);
+        return -1;
+    }
+
+    while ((n = read(sfd, buf, sizeof(buf))) != 0) {
+        ssize_t off = 0;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            goto fail;
+        }
+        while (off < n) {
+            ssize_t w = write(dfd, buf + off, (size_t)(n - off));
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                goto fail;
+            }
+            off += w;
+        }
+    }
+
+    close(sfd);
+    if (close(dfd) != 0) {
+        unlink(dst_path);
+        set_system_error(ERR_FILE_IO, "Failed to finalize backup file: %s", dst_path);
+        return -1;
+    }
+    return 0;
+
+fail:
+    set_system_error(ERR_FILE_IO, "Failed to copy backup: %s -> %s", src_path, dst_path);
+    close(sfd);
+    close(dfd);
+    unlink(dst_path);
+    return -1;
 }
 
 /* Create config directory with secure permissions */
@@ -804,9 +1117,17 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             char temp_str[256];
             bool temp_bool;
             
-            /* Parse account ID from section name */
+            /* Parse account ID from section name. Count a bad section as
+             * skipped-on-load (not just logged): config_save refuses to
+             * rewrite when sections were skipped, so a section with a
+             * non-canonical id ("accounts.01") or an out-of-range id is
+             * surfaced to the user instead of being silently erased by the
+             * next save (int-id-01/02). */
             if (parse_account_id_from_section(sections[i], &account_id) != 0) {
-                log_warning("Invalid account section name: %s", sections[i]);
+                ctx->accounts_skipped_on_load++;
+                display_warning("Invalid account section [%s] was skipped: the id must be "
+                                "a canonical decimal in 1..%u (no leading zeros or signs).",
+                                sections[i], UINT32_MAX);
                 continue;
             }
             
@@ -832,6 +1153,21 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                 /* Use name as description if not provided */
                 safe_strncpy(account.description, account.name, sizeof(account.description));
                 clear_error();
+            }
+
+            /* The description is printed raw by list/status/whoami. Today
+             * toml_get_string's own sanitize pass happens to strip control
+             * and non-ASCII bytes, but that is a retrieval-layer detail of
+             * another module — the config layer must guarantee for itself
+             * that nothing it hands to display can drive the terminal
+             * (tty-escape). The description is display-only, so strip here
+             * at the trust boundary instead of rejecting the account; the
+             * identity-bearing name is instead *rejected* by
+             * validate_account_security below if it is unsafe. */
+            if (sanitize_tty_text(account.description)) {
+                display_warning("Account '%s' (id %u): removed terminal control bytes "
+                                "from description.",
+                                account.name[0] ? account.name : "?", account_id);
             }
 
             if (toml_get_string(doc, sections[i], "preferred_scope", temp_str, sizeof(temp_str)) == 0) {
@@ -930,24 +1266,143 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
 
 /* Parse account ID from section name like "accounts.1" */
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id) {
-    const char *dot_pos;
+    const char *dot_pos, *id_str;
     char *endptr;
     unsigned long parsed_id;
-    
+
     if (!section_name || !account_id) return -1;
-    
+
     dot_pos = strchr(section_name, '.');
     if (!dot_pos || dot_pos == section_name + strlen(section_name) - 1) {
         return -1;
     }
-    
-    parsed_id = strtoul(dot_pos + 1, &endptr, 10);
-    if (*endptr != '\0' || parsed_id == 0 || parsed_id > UINT32_MAX) {
+    id_str = dot_pos + 1;
+
+    /* Canonical decimal only (int-id-01/02). Bare strtoul also accepts
+     * leading whitespace and a sign — "-4294967295" wraps to 1 via unsigned
+     * conversion — and leading zeros let "accounts.01" alias "accounts.1",
+     * so two visually distinct sections could collide on one id. Requiring
+     * [1-9][0-9]* gives every id exactly one on-disk spelling. */
+    if (*id_str < '1' || *id_str > '9') {
         return -1;
     }
-    
+    for (const char *p = id_str + 1; *p; p++) {
+        if (!isdigit((unsigned char)*p)) {
+            return -1;
+        }
+    }
+
+    /* Range-check before narrowing: an id like 4294967296 must be rejected,
+     * not truncated to 0/onto another account. errno catches overflow past
+     * ULONG_MAX (where strtoul clamps and the > UINT32_MAX test alone would
+     * still fire on LP64 but not on ILP32). */
+    errno = 0;
+    parsed_id = strtoul(id_str, &endptr, 10);
+    if (errno != 0 || *endptr != '\0' || parsed_id == 0 || parsed_id > UINT32_MAX) {
+        return -1;
+    }
+
     *account_id = (uint32_t)parsed_id;
     return 0;
+}
+
+/* Decode one UTF-8 sequence starting at s, writing the codepoint to *cp_out
+ * and returning the number of bytes consumed, or 0 if the sequence is
+ * malformed. Deliberately strict: overlong encodings and surrogates are
+ * rejected, because an overlong form (e.g. 0xE0 0x80 0x9B) is exactly how a
+ * C1 terminal control sneaks past a naive byte filter into a lenient
+ * terminal decoder. NUL and stray continuation bytes fail the
+ * (b & 0xC0) == 0x80 test, so NUL-terminated strings need no length bound. */
+static size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
+    unsigned char b0 = s[0];
+
+    if (b0 < 0x80) {
+        *cp_out = b0;
+        return 1;
+    }
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        if ((s[1] & 0xC0) != 0x80) return 0;
+        *cp_out = ((uint32_t)(b0 & 0x1F) << 6) | (s[1] & 0x3F);
+        return 2;
+    }
+    if (b0 >= 0xE0 && b0 <= 0xEF) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
+        if (b0 == 0xE0 && s[1] < 0xA0) return 0;              /* overlong */
+        if (b0 == 0xED && s[1] >= 0xA0) return 0;             /* surrogate */
+        *cp_out = ((uint32_t)(b0 & 0x0F) << 12) |
+                  ((uint32_t)(s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        return 3;
+    }
+    if (b0 >= 0xF0 && b0 <= 0xF4) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return 0;
+        if (b0 == 0xF0 && s[1] < 0x90) return 0;              /* overlong */
+        if (b0 == 0xF4 && s[1] > 0x8F) return 0;              /* > U+10FFFF */
+        *cp_out = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
+                  ((uint32_t)(s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        return 4;
+    }
+    return 0; /* 0x80-0xC1 lead (bare continuation/overlong) or 0xF5+ */
+}
+
+/* True if the codepoint is safe to echo to a terminal. C0 controls
+ * (including ESC 0x1B and CR), DEL 0x7F, and C1 controls U+0080-U+009F
+ * (0x9B is a one-byte CSI) can move the cursor, recolor output, or
+ * \r-overwrite the line — enough for a hostile config field to render
+ * itself as "[CURRENT] trusted-account" in list/status/whoami output. */
+static bool tty_safe_codepoint(uint32_t cp) {
+    return cp >= 0x20 && cp != 0x7F && !(cp >= 0x80 && cp <= 0x9F);
+}
+
+/* tty-escape policy for untrusted strings that reach the terminal, applied
+ * at the trust boundary (config load) rather than in the display layer:
+ * keep only well-formed UTF-8 whose codepoints pass tty_safe_codepoint().
+ * Dropped: C0 controls, DEL, C1 controls whether spelled as a raw
+ * 0x80-0x9F byte or as their two-byte UTF-8 form (0xC2 0x80-0x9F), and any
+ * byte that is not part of a well-formed sequence — malformed bytes are
+ * exactly where raw C1 controls hide in non-UTF-8 data, and a terminal in a
+ * legacy single-byte locale interprets them directly. Legitimate multi-byte
+ * UTF-8 (accented letters, CJK, emoji) passes through byte-identical.
+ *
+ * sanitize_tty_text strips in place (display-only fields); returns true if
+ * anything was removed. text_is_tty_safe merely reports (identity-bearing
+ * fields, where silent rewriting would change which key/socket paths the
+ * name maps to). */
+static bool sanitize_tty_text(char *text) {
+    unsigned char *src = (unsigned char *)text;
+    unsigned char *dst = (unsigned char *)text;
+    bool modified = false;
+
+    while (*src) {
+        uint32_t cp;
+        size_t len = utf8_decode(src, &cp);
+        if (len == 0) {
+            src++; /* malformed byte: drop it and resync */
+            modified = true;
+        } else if (!tty_safe_codepoint(cp)) {
+            src += len;
+            modified = true;
+        } else {
+            if (dst != src) memmove(dst, src, len);
+            dst += len;
+            src += len;
+        }
+    }
+    *dst = '\0';
+    return modified;
+}
+
+static bool text_is_tty_safe(const char *text) {
+    const unsigned char *p = (const unsigned char *)text;
+
+    while (*p) {
+        uint32_t cp;
+        size_t len = utf8_decode(p, &cp);
+        if (len == 0 || !tty_safe_codepoint(cp)) {
+            return false;
+        }
+        p += len;
+    }
+    return true;
 }
 
 /* Validate account security */
@@ -965,7 +1420,37 @@ static int validate_account_security(const account_t *account) {
         set_error(ERR_ACCOUNT_INVALID, "Invalid account name: %s", account->name);
         return -1;
     }
-    
+
+    /* validate_name rejects C0 controls and DEL but deliberately permits
+     * bytes >= 0x80 so international names work — and that range is exactly
+     * where C1 terminal controls (0x9B one-byte CSI, ...) live. The name is
+     * echoed raw by list/status/whoami, so additionally require well-formed
+     * UTF-8 free of C1 controls (tty-escape). Unlike the display-only
+     * description, the name is rejected rather than silently rewritten:
+     * it keys the SSH/GPG isolation paths, so a rewrite would change which
+     * GNUPGHOME/agent socket the account maps to.
+     *
+     * Known limitation (locale-unicode-identity-2): no Unicode NFC/NFD
+     * normalization is performed — "é" (U+00E9) and "e" + combining accent
+     * (U+0065 U+0301) are treated as distinct names and produce distinct
+     * isolation paths. Only byte-wise plus ASCII case-insensitive
+     * uniqueness is guaranteed; proper normalization needs Unicode tables
+     * we won't take a dependency for. */
+    if (!text_is_tty_safe(account->name)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Account name contains terminal control bytes or malformed UTF-8");
+        return -1;
+    }
+
+    /* The description is sanitized (stripped) at config load; anything that
+     * still carries control bytes here came from a programmatic caller, so
+     * fail closed rather than let it reach the terminal (tty-escape). */
+    if (!text_is_tty_safe(account->description)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Account description contains terminal control bytes or malformed UTF-8");
+        return -1;
+    }
+
     if (!validate_email(account->email)) {
         set_error(ERR_ACCOUNT_INVALID, "Invalid email address: %s", account->email);
         return -1;

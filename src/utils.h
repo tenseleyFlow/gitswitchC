@@ -107,21 +107,27 @@ typedef int (*command_runner_fn)(const char *const argv[],
 /* Install a runner; returns the previous one (NULL means the default). */
 command_runner_fn run_set_runner(command_runner_fn fn);
 
-/* Run argv[0] (resolved via PATH by execvp), argv NULL-terminated, through the
- * active runner. Returns 0 iff the child spawned and exited 0. opts/result may
- * be NULL. */
+/* Run argv[0] (pinned to an absolute path via the sanitized PATH walk in
+ * find_command_path, then execv'd), argv NULL-terminated, through the active
+ * runner. Returns 0 iff the child spawned and exited 0. opts/result may be
+ * NULL. If argv[0] cannot be resolved from a trusted directory, fails closed
+ * before forking (result->spawned stays false). */
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result);
 
-/* The real fork+execvp implementation; normally reached via run_argv(). */
+/* The real fork+execv implementation; normally reached via run_argv(). */
 int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result);
 
 /* True if an executable named `command` is found in PATH. */
 bool command_exists(const char *command);
 
 /**
- * Resolve the absolute path of an executable found in PATH by walking $PATH
- * entries and testing X_OK — no shell involved. Portable across Linux, macOS,
- * and the BSDs. Returns 0 and writes the path into buf on success; -1 otherwise.
+ * Resolve the absolute path of an executable by walking $PATH — no shell
+ * involved. Supply-chain hardened (PS-1/PS-2): only absolute, non-world-
+ * writable directories may supply a binary (relative/"."/empty entries and
+ * o+w dirs are skipped), and the resolved file must be a regular, non-world-
+ * writable executable. A `name` containing a slash bypasses the PATH walk but
+ * must pass the same checks. Portable across Linux, macOS, and the BSDs.
+ * Returns 0 and writes the path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
 bool process_is_running(pid_t pid);

@@ -370,7 +370,10 @@ int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size)
         return -1;
     }
     
-    file = fopen(file_path, "r");
+    /* "e" = O_CLOEXEC on every fopen here: belt-and-braces with the child fd
+     * sweep in run_argv, so a file held open across a spawn can never leak
+     * into a long-lived git/gpg/ssh child (fd-CLOEXEC finding). */
+    file = fopen(file_path, "re");
     if (!file) {
         set_system_error(ERR_FILE_IO, "Failed to open file for reading: %s", file_path);
         return -1;
@@ -407,7 +410,7 @@ int write_string_to_file(const char *file_path, const char *content, mode_t mode
         return -1;
     }
     
-    file = fopen(file_path, "w");
+    file = fopen(file_path, "we");
     if (!file) {
         set_system_error(ERR_FILE_IO, "Failed to open file for writing: %s", file_path);
         return -1;
@@ -443,13 +446,13 @@ int copy_file(const char *src_path, const char *dst_path) {
         return -1;
     }
     
-    src = fopen(src_path, "rb");
+    src = fopen(src_path, "rbe");
     if (!src) {
         set_system_error(ERR_FILE_IO, "Failed to open source file: %s", src_path);
         return -1;
     }
     
-    dst = fopen(dst_path, "wb");
+    dst = fopen(dst_path, "wbe");
     if (!dst) {
         set_system_error(ERR_FILE_IO, "Failed to open destination file: %s", dst_path);
         fclose(src);
@@ -544,6 +547,38 @@ static void set_nonblock(int fd) {
     }
 }
 
+/* Close every descriptor >= lowfd in the forked child before exec (fd-CLOEXEC).
+ * Without this, any fd the parent left open without O_CLOEXEC — a config or
+ * backup FILE*, the isolated-home lock, a stray dup — leaks into every git/
+ * gpg/ssh child, where a long-lived agent could hold it (and whatever it
+ * guards) open indefinitely. Runs post-fork, pre-exec, so only plain syscalls
+ * are used. */
+static void child_close_fds_from(int lowfd) {
+#if defined(__linux__) && defined(SYS_close_range)
+    /* close_range(2) is Linux >= 5.9. Invoke via syscall(): the libc wrapper
+     * only exists in glibc >= 2.34, and building against newer kernel headers
+     * than the running kernel is common — on ENOSYS fall through to the loop. */
+    if (syscall(SYS_close_range, (unsigned int)lowfd, ~0U, 0U) == 0) {
+        return;
+    }
+#elif defined(__FreeBSD__)
+    /* FreeBSD has closefrom(2) since 8.0, well before our 12.2 floor. Other
+     * BSDs and macOS take the portable loop below. */
+    closefrom(lowfd);
+    return;
+#endif
+    /* Portable fallback (macOS has neither call): close(2) on an unused fd is
+     * harmless (EBADF). Cap the sweep — sysconf can report "unlimited" or a
+     * raised RLIMIT_NOFILE in the millions, and this runs on every spawn. */
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 65536) {
+        maxfd = 65536;
+    }
+    for (long fd = lowfd; fd < maxfd; fd++) {
+        (void)close((int)fd);
+    }
+}
+
 int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
     run_opts_t no_opts;
     run_result_t local;
@@ -557,6 +592,21 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     if (!argv || !argv[0]) {
         set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
+        return -1;
+    }
+
+    /* PS-1/PS-2: pin the helper to an absolute path resolved through the
+     * sanitized PATH walk in find_command_path() and exec exactly that path
+     * with execv() below. execvp()'s own PATH search would happily pick a
+     * shadowing "git"/"ssh-add" out of a relative or world-writable PATH
+     * entry — and since `gitswitch resume` runs from every interactive shell
+     * startup, that is arbitrary code execution with the user's keys in
+     * scope. Resolving in the parent also yields a real error message instead
+     * of a bare 127. */
+    char exec_path[MAX_PATH_LEN];
+    if (find_command_path(argv[0], exec_path, sizeof(exec_path)) != 0) {
+        set_error(ERR_SYSTEM_CALL,
+                  "run_argv: '%s' not found in any trusted PATH directory", argv[0]);
         return -1;
     }
 
@@ -600,6 +650,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (out_pipe[1] >= 0) close(out_pipe[1]);
         if (devnull >= 0) close(devnull);
 
+        /* fd-CLOEXEC: the explicit closes above only cover our own pipes;
+         * sweep everything else the parent had open so the child starts with
+         * just stdin/stdout/stderr. Nothing in this codebase intentionally
+         * hands an fd to a child (SSH_AUTH_SOCK etc. are paths, not fds). */
+        child_close_fds_from(3);
+
         if (opts->extra_env) {
             for (size_t i = 0; opts->extra_env[i]; i++) {
                 const char *e = opts->extra_env[i];
@@ -616,8 +672,10 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             }
         }
 
-        execvp(argv[0], (char *const *)argv);
-        _exit(127); /* exec failed (e.g. command not found) */
+        /* execv, not execvp: the path was pinned pre-fork; re-searching PATH
+         * here would reopen the PS-1 window between resolve and exec. */
+        execv(exec_path, (char *const *)argv);
+        _exit(127); /* exec failed (e.g. binary vanished after resolution) */
     }
 
     /* ---- parent ---- */
@@ -714,6 +772,49 @@ int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *res
     return g_runner(argv, opts, result);
 }
 
+/* PS-1/PS-2 PATH supply-chain defense: every trusted helper (git, gpg,
+ * ssh-add, ssh-agent, gpgconf, ...) is resolved through these checks before it
+ * is executed, and `gitswitch resume` runs from every interactive shell
+ * startup — so a shadowing binary in a hostile PATH entry would otherwise run
+ * automatically with the user's keys in scope.
+ *
+ * A directory may supply an executable only if it is an absolute path to a
+ * real directory that is not world-writable. Relative entries (".", "", "bin")
+ * resolve against the CWD — inside a freshly cloned repo that is attacker
+ * territory. World-writable dirs are rejected even with the sticky bit set:
+ * sticky only stops deleting other users' files, anyone can still CREATE a
+ * shadowing "git" there. User-owned prefixes like ~/.local/bin, Homebrew's
+ * /opt/homebrew/bin, or Nix profiles are 0755-or-tighter and keep working. */
+static bool exec_dir_is_trusted(const char *dir) {
+    struct stat st;
+
+    if (dir[0] != '/') {
+        return false;
+    }
+    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return false;
+    }
+    if (st.st_mode & S_IWOTH) {
+        return false;
+    }
+    return true;
+}
+
+/* The resolved binary itself must be a regular file (access(X_OK) alone would
+ * happily "find" a directory named git) and not world-writable — a o+w binary
+ * in an otherwise sane directory is just as replaceable as a o+w directory. */
+static bool exec_candidate_is_trusted(const char *path) {
+    struct stat st;
+
+    if (stat(path, &st) != 0) {
+        return false;
+    }
+    if (!S_ISREG(st.st_mode) || (st.st_mode & S_IWOTH)) {
+        return false;
+    }
+    return access(path, X_OK) == 0;
+}
+
 int find_command_path(const char *name, char *buf, size_t size) {
     const char *path_env;
     const char *p;
@@ -722,13 +823,27 @@ int find_command_path(const char *name, char *buf, size_t size) {
         return -1;
     }
 
-    /* An absolute/relative path with a slash: test it directly, no PATH search. */
+    /* A name containing a slash is used directly, no PATH search — but only
+     * if absolute ("./git" or "bin/git" would resolve against the CWD, which
+     * is exactly the hole this function closes) and only out of a trusted
+     * directory, same rules as a PATH entry. */
     if (strchr(name, '/')) {
-        if (access(name, X_OK) == 0) {
-            if (safe_strncpy(buf, name, size) != 0) return -1;
-            return 0;
+        char dir[MAX_PATH_LEN];
+        const char *slash = strrchr(name, '/');
+        /* Keep the leading '/' when the binary sits directly under the root. */
+        size_t dirlen = (slash == name) ? 1 : (size_t)(slash - name);
+
+        if (name[0] != '/' || dirlen >= sizeof(dir)) {
+            return -1;
         }
-        return -1;
+        memcpy(dir, name, dirlen);
+        dir[dirlen] = '\0';
+
+        if (!exec_dir_is_trusted(dir) || !exec_candidate_is_trusted(name)) {
+            return -1;
+        }
+        if (safe_strncpy(buf, name, size) != 0) return -1;
+        return 0;
     }
 
     path_env = getenv("PATH");
@@ -736,22 +851,25 @@ int find_command_path(const char *name, char *buf, size_t size) {
         path_env = "/usr/local/bin:/usr/bin:/bin";
     }
 
-    /* Walk colon-separated PATH entries, testing <dir>/<name> for X_OK. */
+    /* Walk colon-separated PATH entries, testing <dir>/<name> in each trusted
+     * directory. Untrusted entries are skipped, not fatal: a stray "." or o+w
+     * dir in PATH must not hide the real /usr/bin/git behind it. An empty
+     * entry historically means the CWD — refused, not honored. */
     p = path_env;
     while (*p) {
         const char *colon = strchr(p, ':');
         size_t dirlen = colon ? (size_t)(colon - p) : strlen(p);
+        char dir[MAX_PATH_LEN];
         char candidate[MAX_PATH_LEN];
-        const char *dir = p;
-        size_t dl = dirlen;
 
-        if (dl == 0) { dir = "."; dl = 1; } /* empty entry => current dir */
-
-        if (dl + 1 + strlen(name) + 1 <= sizeof(candidate)) {
-            memcpy(candidate, dir, dl);
-            candidate[dl] = '/';
-            strcpy(candidate + dl + 1, name);
-            if (access(candidate, X_OK) == 0) {
+        if (dirlen > 0 && dirlen < sizeof(dir) &&
+            dirlen + 1 + strlen(name) + 1 <= sizeof(candidate)) {
+            memcpy(dir, p, dirlen);
+            dir[dirlen] = '\0';
+            memcpy(candidate, dir, dirlen);
+            candidate[dirlen] = '/';
+            strcpy(candidate + dirlen + 1, name);
+            if (exec_dir_is_trusted(dir) && exec_candidate_is_trusted(candidate)) {
                 if (safe_strncpy(buf, candidate, size) != 0) return -1;
                 return 0;
             }
@@ -967,7 +1085,7 @@ int generate_random_string(char *buffer, size_t buffer_size, const char *charset
         return -1;
     }
     
-    urandom = fopen("/dev/urandom", "rb");
+    urandom = fopen("/dev/urandom", "rbe");
     if (!urandom) {
         set_system_error(ERR_FILE_IO, "Failed to open /dev/urandom");
         return -1;
