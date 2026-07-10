@@ -612,6 +612,37 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_d
     }
     signals_scratch_unregister(temp_path); /* renamed away: nothing to clean */
 
+    /* AR-05 L11: per POSIX a rename() is only durable once the directory
+     * holding the new entry is itself fsynced. toml_write_file already
+     * fsyncs the payload, but without this a crash right after a
+     * reported-successful save could silently revert the directory entry to
+     * the pre-rename config (lost-but-acknowledged update; never a torn
+     * file). Best-effort: the live system sees the new file either way, so
+     * failure only warns. O_NOFOLLOW matches the dir opens above. */
+    {
+        char dir_path[MAX_PATH_LEN];
+        const char *slash = strrchr(config_path, '/');
+        if (slash && (size_t)(slash - config_path) < sizeof(dir_path)) {
+            size_t dir_len = (size_t)(slash - config_path);
+            if (dir_len == 0) dir_len = 1; /* config directly under "/" */
+            memcpy(dir_path, config_path, dir_len);
+            dir_path[dir_len] = '\0';
+            int dfd = open(dir_path,
+                           O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+            if (dfd >= 0) {
+                if (fsync(dfd) != 0) {
+                    log_warning("Could not fsync config directory %s: saved "
+                                "config may not survive an immediate crash",
+                                dir_path);
+                }
+                close(dfd);
+            } else {
+                log_warning("Could not open config directory %s to fsync it",
+                            dir_path);
+            }
+        }
+    }
+
     log_info("Configuration saved successfully to: %s", config_path);
     config_update_resume_hint(ctx);
     return 0;

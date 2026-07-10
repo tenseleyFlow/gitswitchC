@@ -298,6 +298,48 @@ TEST(rejects_duplicate_key_in_section) {
     toml_cleanup_document(&doc);
 }
 
+/* AR-05 L10: a repeated table header must be rejected like a repeated key,
+ * not silently merged. Merging collapsed an apparent second account into the
+ * first and let an appended duplicate block inject keys (ssh_key, ssh_host)
+ * into an existing section with no diagnostics — the duplicate-KEY guard
+ * only fires when the two blocks share a literal key name. */
+TEST(rejects_duplicate_section_header) {
+    toml_document_t doc;
+    /* Non-overlapping keys: the old parser merged this with no error. */
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "[accounts.1]\n"
+        "description = \"injected via appended duplicate table\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
+
+    /* Same for a repeated [settings] block. */
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "[settings]\n"
+        "active_account = \"alice\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
+
+    /* Positive control: DISTINCT sections still parse. */
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "[accounts.2]\n"
+        "name = \"bob\"\n"
+        "email = \"b@b.com\"\n", &doc), 0);
+    toml_cleanup_document(&doc);
+}
+
 /* Write→read round-trip with a bracket-heavy description: the injection guard
  * used to count these data brackets and refuse to reload a config the tool
  * had just written (toml F1). */
@@ -482,6 +524,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(max_accounts_plus_settings_fit_and_round_trip);
     RUN_TEST(empty_config_reports_targeted_error);
     RUN_TEST(rejects_duplicate_key_in_section);
+    RUN_TEST(rejects_duplicate_section_header);
     RUN_TEST(bracket_heavy_value_round_trips);
     RUN_TEST(rejects_relative_ssh_key);
     RUN_TEST(accepts_anchored_ssh_key);

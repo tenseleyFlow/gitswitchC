@@ -11,20 +11,43 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev cppcheck flawfinder
-      - name: No-shell gate (no popen/system in src)
+        # rpm: gives distcheck a real rpmbuild so the archive-satisfies-its-
+        # own-spec lane (AR-05 L17) actually runs instead of skipping.
+        run: sudo apt-get update && sudo apt-get install -y cppcheck flawfinder rpm
+      # Fast textual tripwire only — headers included, but whitespace variants,
+      # function-pointer indirection, and macro wrapping evade a grep. The
+      # authoritative gate is the symbol check on the built binary below
+      # (AR-05 L8).
+      - name: No-shell gate (source tripwire)
         run: |
-          if grep -rn -e 'popen(' -e 'system(' src/*.c; then
+          if grep -rn -e 'popen(' -e 'system(' src/*.c src/*.h; then
             echo "ERROR: shell-based process execution reintroduced in src/" >&2
             exit 1
           fi
-      - name: Build + test (ASan/UBSan)
-        run: make BUILD_TYPE=debug test
+      - name: Build + test (ASan/UBSan, warnings-as-errors)
+        run: make BUILD_TYPE=debug WERROR=1 test
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-      - name: Release build (FORTIFY/RELRO)
-        run: make clean && make BUILD_TYPE=release
+      - name: Release build (FORTIFY/RELRO, warnings-as-errors)
+        run: make clean && make BUILD_TYPE=release WERROR=1
+      # AR-05 L8: symbol-level no-shell gate. An undefined-symbol reference to
+      # system()/popen() in the linked binary catches ANY call path — headers,
+      # whitespace variants, function pointers — that the textual tripwire
+      # above cannot. This is the regression gate for the v1.7.0
+      # shell-injection fix.
+      - name: No-shell gate (binary symbols)
+        run: |
+          if nm -D --undefined-only build/bin/gitswitch | grep -E '(^| )(system|popen)(@|$)'; then
+            echo "ERROR: release binary references system()/popen()" >&2
+            exit 1
+          fi
+      # AR-05 L3: run REAL Valgrind against the release binaries. The
+      # qa-contract-test below only proves the recipe's failure plumbing via
+      # a shim; without this step no actual memory checking ever executed in
+      # the pipeline.
+      - name: Memory check (Valgrind, release)
+        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release memcheck
       - name: Source distribution self-check
         run: make distcheck
       - name: Static analysis (cppcheck)
@@ -51,16 +74,15 @@ jobs:
             # git: the git_ops perf tests prove availability via a PATH walk
             # and assert no subprocess spawn — they need a real git binary,
             # which the Linux/macOS runners ship but this VM does not.
-            sudo pkg install -y gmake gcc openssl git
-            gmake BUILD_TYPE=release
-            gmake BUILD_TYPE=release test
+            sudo pkg install -y gmake gcc git
+            gmake BUILD_TYPE=release WERROR=1
+            gmake BUILD_TYPE=release WERROR=1 test
 
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: brew install openssl@3
-      - name: Build + test (ASan/UBSan)
-        run: make BUILD_TYPE=debug test
-      - name: Release build
-        run: make clean && make BUILD_TYPE=release
+      - name: Build + test (ASan/UBSan, warnings-as-errors)
+        run: make BUILD_TYPE=debug WERROR=1 test
+      - name: Release build (warnings-as-errors)
+        run: make clean && make BUILD_TYPE=release WERROR=1

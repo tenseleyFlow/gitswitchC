@@ -33,10 +33,27 @@ UNAME_S := $(shell uname -s)
 
 # Compiler and flags
 CC = gcc
+# Compiler family, needed before the flag set: macOS 'gcc' is clang, and a
+# few spellings/diagnostics differ (see the clang block further down).
+CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -c clang)
+
+# -Wstrict-aliasing=3 (the -Wall default), not =2: level 2 is documented as
+# "aggressive, quick, not too precise" and flags the canonical POSIX
+# sockaddr_un -> sockaddr cast at -O2 even through an intermediate void*
+# (gcc 13 on the CI runners) — a false positive WERROR turns into a build
+# break. Level 3 keeps the real dereference-based aliasing analysis. clang
+# only understands the bare spelling (the =N levels are gcc-specific and an
+# unknown-warning-option error under -Werror).
+ifneq ($(CC_IS_CLANG),0)
+    STRICT_ALIASING_FLAG = -Wstrict-aliasing
+else
+    STRICT_ALIASING_FLAG = -Wstrict-aliasing=3
+endif
+
 CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
          -Wmissing-prototypes -Wold-style-definition -Wredundant-decls \
          -Wbad-function-cast -Wnested-externs -Winit-self \
-         -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=2 \
+         -Wshadow -Wwrite-strings -Wcast-align $(STRICT_ALIASING_FLAG) \
          -Wmissing-include-dirs -Wformat=2 -Winit-self \
          -Wswitch-default -Wunused -Werror-implicit-function-declaration \
          $(VERSION_FLAGS)
@@ -45,11 +62,15 @@ CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
 ifeq ($(UNAME_S),Linux)
     # GCC-specific warnings
     CFLAGS += -Wlogical-op -Wdate-time
-    # Linux-specific security flags
+    # Linux-specific security flags. -fPIE/-pie are REQUESTED, not inherited:
+    # relying on the host compiler's default-PIE meant non-mainstream
+    # toolchains (vanilla upstream gcc, older cross compilers) shipped
+    # ASLR-defeating non-PIE release binaries with all QA green (AR-05 L9).
+    # distcheck now asserts the staged binary is ET_DYN with RELRO+NOW.
     SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
                           -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection -fcf-protection \
+                            -fstack-clash-protection -fcf-protection -fPIE -pie \
                             -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 
@@ -57,43 +78,68 @@ ifeq ($(UNAME_S),Darwin)
     # macOS-specific security flags (no cf-protection, stack-clash-protection, or Linux linker flags)
     SECURITY_FLAGS_DEBUG = -fstack-protector-strong
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
-    # macOS OpenSSL paths (Homebrew)
-    OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null)
-    ifneq ($(OPENSSL_PREFIX),)
-        INCLUDES += -I$(OPENSSL_PREFIX)/include
-        LDFLAGS += -L$(OPENSSL_PREFIX)/lib
-    endif
 endif
 
 ifeq ($(UNAME_S),FreeBSD)
     # GCC-specific warnings (GCC from ports)
     CFLAGS += -Wlogical-op -Wdate-time
-    # FreeBSD security flags (ELF linker supports relro/now/noexecstack)
+    # FreeBSD security flags (ELF linker supports relro/now/noexecstack).
+    # -fPIE/-pie requested explicitly — the ports gcc used in CI does not
+    # default to PIE (AR-05 L9).
     SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
                           -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection -fcf-protection \
+                            -fstack-clash-protection -fcf-protection -fPIE -pie \
                             -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 
 # Debug/Release configurations
 DEBUG_FLAGS = -g -O0 -DDEBUG -Wp,-U_FORTIFY_SOURCE -fsanitize=address -fsanitize=undefined \
               -fno-omit-frame-pointer -Wpedantic $(SECURITY_FLAGS_DEBUG)
-RELEASE_FLAGS = -O2 -DNDEBUG -s $(SECURITY_FLAGS_RELEASE)
+# -s (strip) lives in RELEASE_LDFLAGS, not here: it is a link-only flag, and
+# CFLAGS feeds the compile step too, where clang errors on it as an unused
+# command-line argument under WERROR (gcc silently ignores it).
+RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_FLAGS_RELEASE)
 
 # Default to debug build
 BUILD_TYPE ?= debug
 ifeq ($(BUILD_TYPE),release)
     CFLAGS += $(RELEASE_FLAGS)
+    LDFLAGS += -s
 else
     CFLAGS += $(DEBUG_FLAGS)
+endif
+
+# Warnings-as-errors knob. CI passes WERROR=1 so the ~20 -W flags above gate
+# merges instead of scrolling past in build logs (AR-05 L7: only
+# -Werror-implicit-function-declaration was fatal, so new -Wshadow/-Wformat=2
+# class diagnostics merged silently). Local builds stay non-Werror so a new
+# compiler's novel warnings never block development.
+ifeq ($(WERROR),1)
+    CFLAGS += -Werror
+endif
+
+# clang-specific silencing (macOS 'gcc' is clang; WERROR promoted both of
+# these long-standing diagnostics to hard errors):
+# - -Wgnu-zero-variadic-macro-arguments: the ##__VA_ARGS__ comma-pasting GNU
+#   extension in error.h's logging macros is deliberate (-std=gnu11).
+# - -Wformat-nonliteral (clang's -Wformat=2 variant): fires on the bounded
+#   vsnprintf wrappers in error.c/display.c whose fmt comes from internal
+#   callers (same sites triaged for the AR-05 L1 flawfinder baseline); gcc's
+#   -Wformat=2 does not flag va_list forwarding.
+# (CC_IS_CLANG is computed above, before the base CFLAGS.)
+ifneq ($(CC_IS_CLANG),0)
+    CFLAGS += -Wno-gnu-zero-variadic-macro-arguments -Wno-format-nonliteral
 endif
 
 # Include directories
 INCLUDES = -I$(SRCDIR)
 
-# Libraries
-LIBS = -lssl -lcrypto
+# Libraries. No crypto library: randomness comes from /dev/urandom and the
+# SHA256/MD5 strings in ssh_manager.c only parse `ssh-keygen -l` output, so
+# the old -lssl -lcrypto linkage was a phantom dependency that put
+# libssl/libcrypto DT_NEEDED entries in every shipped binary (AR-05 M2).
+LIBS =
 
 # Optional GNU readline: gives the interactive add/edit prompts line editing
 # and TAB path completion. Auto-detected; build still works without it (the
@@ -167,8 +213,25 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
+# BUILD_TYPE stamp: debug and release share build/obj and build/bin, but
+# their flag sets differ radically (ASan/UBSan -O0 vs stripped NDEBUG -O2)
+# and BUILD_TYPE is invisible to the dependency graph. Without the stamp,
+# `make BUILD_TYPE=release` followed by `make BUILD_TYPE=debug test` printed
+# "Nothing to be done" and ran the "sanitizer" suite against uninstrumented
+# release objects — silently fake QA results (AR-05 M3). The recipe rewrites
+# the stamp only when the recorded type differs, so crossing BUILD_TYPE (and
+# only that) forces a full rebuild.
+BUILDTYPE_STAMP = $(OBJDIR)/.buildtype
+$(BUILDTYPE_STAMP): buildtype-force | $(OBJDIR)
+	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "$(BUILD_TYPE)" ]; then \
+		echo "$(BUILD_TYPE)" > $(BUILDTYPE_STAMP); \
+	fi
+
+.PHONY: buildtype-force
+buildtype-force:
+
 # Compile source files
-$(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) | $(OBJDIR)
+$(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling $<..."
 	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -204,7 +267,7 @@ uninstall:
 	@echo "Uninstall complete"
 
 # Test compilation
-$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(TESTDIR)/test.h $(HEADERS) | $(OBJDIR)
+$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(TESTDIR)/test.h $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
 	$(CC) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) -c $< -o $@
 
@@ -254,12 +317,17 @@ format:
 		echo "clang-format not installed - skipping formatting"; \
 	fi
 
-# Security scan
+# Security scan. --error-level=4: the codebase has zero level-5 constructs
+# expressible in its style, so the old level-5 gate was green by construction
+# (AR-05 L1). Every pre-existing level-4 hit was triaged and carries an
+# inline "Flawfinder: ignore" with its rationale, so a NEW level-4 use of a
+# strcpy/format/exec-class function now fails this target until it is either
+# fixed or explicitly annotated.
 .PHONY: security-scan
 security-scan:
 	@echo "Running security scan..."
 	@if command -v flawfinder >/dev/null 2>&1; then \
-		flawfinder --error-level=5 $(SRCDIR); \
+		flawfinder --error-level=4 $(SRCDIR); \
 	else \
 		echo "flawfinder not installed - skipping security scan"; \
 	fi
@@ -297,16 +365,9 @@ memcheck:
 	fi
 endif
 
-# Documentation generation
-.PHONY: docs
-docs:
-	@echo "Generating documentation..."
-	@mkdir -p $(DOCDIR)
-	@if command -v doxygen >/dev/null 2>&1; then \
-		doxygen Doxyfile; \
-	else \
-		echo "doxygen not installed - skipping documentation generation"; \
-	fi
+# No docs target: it invoked `doxygen Doxyfile` against a Doxyfile that never
+# existed in the repo or the dist manifest — failing for anyone with doxygen
+# installed and false-succeeding (empty docs/) for everyone else (AR-05 L4).
 
 # Clean targets
 .PHONY: clean
@@ -360,7 +421,6 @@ deps:
 	@command -v clang-format >/dev/null 2>&1 && echo "   clang-format" || echo "   clang-format - for formatting"
 	@command -v valgrind >/dev/null 2>&1 && echo "   valgrind" || echo "   valgrind - for memory checking"
 	@command -v flawfinder >/dev/null 2>&1 && echo "   flawfinder" || echo "   flawfinder - for security scanning"
-	@command -v doxygen >/dev/null 2>&1 && echo "   doxygen" || echo "   doxygen - for documentation"
 
 # Help target
 .PHONY: help
@@ -380,7 +440,6 @@ help:
 	@echo "  analyze      Run static analysis"
 	@echo "  security-scan Run security scan"
 	@echo "  memcheck     Run memory checker (requires a clean release build)"
-	@echo "  docs         Generate documentation"
 	@echo "  deps         Check dependencies"
 	@echo "  info         Show build information"
 	@echo "  dev          Quick development cycle (clean + debug + test)"
@@ -405,22 +464,20 @@ DIST_ARCHIVE = $(DIST_ROOT).tar.gz
 DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
 .PHONY: dist distcheck qa-contract-test rpm
+# Archive COMMITTED VCS content, not the live working tree: the old cp -R of
+# the manifest directories shipped any stray file nested inside src/, tests/,
+# or completions/ (editor backups, experiment files, test-run droppings), so
+# release tarballs were not reproducible from a tag and could leak unreviewed
+# content (AR-05 L5). git archive draws from HEAD, which also inherently
+# excludes VCS state, build products, cores, logs, and prior archives.
 dist:
 	@echo "Creating distribution tarball..."
-	@set -eu; \
-	tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/gitswitch-dist.XXXXXX"); \
-	trap 'rm -rf "$$tmp"' 0; \
-	trap 'exit 1' 1 2 3 15; \
-	mkdir "$$tmp/$(DIST_ROOT)"; \
-	cp -R $(DIST_MANIFEST) "$$tmp/$(DIST_ROOT)/"; \
-	tar -C "$$tmp" -czf "$$tmp/$(DIST_ARCHIVE)" \
-		--exclude='.git' --exclude='.git/*' \
-		--exclude='.omx' --exclude='.omx/*' \
-		--exclude='build' --exclude='build/*' \
-		--exclude='*.o' --exclude='*.core' --exclude='core' --exclude='core.*' \
-		--exclude='valgrind*.log' --exclude='*.tar.gz' \
-		"$(DIST_ROOT)"; \
-	mv "$$tmp/$(DIST_ARCHIVE)" "$(CURDIR)/$(DIST_ARCHIVE)"
+	@git rev-parse --git-dir >/dev/null 2>&1 || \
+		{ echo "ERROR: dist builds from committed VCS content and requires a git checkout" >&2; exit 1; }
+	@if ! git diff-index --quiet HEAD -- $(DIST_MANIFEST) 2>/dev/null; then \
+		echo "WARNING: working tree differs from HEAD for manifest paths; the archive contains committed content only" >&2; \
+	fi
+	git archive --prefix=$(DIST_ROOT)/ -o $(DIST_ARCHIVE) HEAD -- $(DIST_MANIFEST)
 
 distcheck: dist
 	@sh tests/test_dist.sh "$(CURDIR)/$(DIST_ARCHIVE)" "$(DIST_ROOT)" \

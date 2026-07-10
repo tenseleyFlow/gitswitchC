@@ -59,8 +59,8 @@ if PATH="$shim_dir:$PATH" QA_TOOL_EXIT=72 QA_ARG_LOG="$arg_log" \
     "$make_cmd" -C "$root" security-scan >"$out" 2>&1; then
     fail "security-scan succeeded after an installed flawfinder failed"
 fi
-grep -F -- "--error-level=5" "$arg_log" >/dev/null ||
-    fail "security-scan did not configure flawfinder findings as fatal"
+grep -F -- "--error-level=4" "$arg_log" >/dev/null ||
+    fail "security-scan did not configure flawfinder findings as fatal at level 4 (AR-05 L1)"
 if grep -F "not installed" "$out" >/dev/null; then
     fail "security-scan misreported an installed failing flawfinder as absent"
 fi
@@ -82,6 +82,33 @@ grep -F -- "--error-exitcode=99" "$arg_log" >/dev/null ||
 if grep -F "not installed" "$out" >/dev/null; then
     fail "memcheck misreported an installed failing valgrind as absent"
 fi
+
+# AR-05 L16: the other direction — each QA tool GENUINELY ABSENT from PATH
+# must take the explicit skip branch: exit 0 and print the "not installed"
+# banner (AR-04 L3 acceptance). Previously only the installed-but-failing
+# direction was tested, so a regression that turned a missing optional tool
+# into a build failure shipped undetected (CI installs the tools, hiding it).
+# Build a curated PATH holding just what make's parse-time $(shell) calls and
+# the recipes need, with cppcheck/flawfinder/valgrind nowhere on it. The
+# release prerequisites were built above, so nothing needs a compiler.
+make_abs=$(command -v "$make_cmd" 2>/dev/null || printf '%s' "$make_cmd")
+notools_dir=$tmp/notools
+mkdir "$notools_dir"
+for basic in sh uname git wc tr grep sed printf echo cat mkdir rm touch \
+             head tail sort expr test; do
+    basic_path=$(command -v "$basic" 2>/dev/null) || continue
+    case $basic_path in /*) ln -s "$basic_path" "$notools_dir/$basic" ;; esac
+done
+for pair in "analyze:cppcheck" "security-scan:flawfinder" "memcheck:valgrind"; do
+    absent_target=${pair%%:*}
+    absent_tool=${pair##*:}
+    if ! PATH="$notools_dir" "$make_abs" -C "$root" BUILD_TYPE=release \
+        "$absent_target" >"$out" 2>&1; then
+        fail "$absent_target failed with $absent_tool genuinely absent from PATH"
+    fi
+    grep -F "not installed" "$out" >/dev/null ||
+        fail "$absent_target did not print its skip banner with $absent_tool absent"
+done
 
 mkdir "$tmp/empty-tests"
 if "$make_cmd" -C "$root" TESTDIR="$tmp/empty-tests" test >"$out" 2>&1; then

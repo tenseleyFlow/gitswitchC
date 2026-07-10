@@ -635,7 +635,7 @@ TEST(current_account_accepts_longest_bindable_name_without_truncation) {
     (void)unlink(sock);
 }
 
-TEST(current_account_waits_for_manager_lock) {
+TEST(current_account_fails_fast_when_manager_lock_held) {
     typedef struct {
         int rc;
         int present;
@@ -695,32 +695,46 @@ TEST(current_account_waits_for_manager_lock) {
     CHECK_EQ_INT(test_read_exact(ready_pipe[0], &ready, 1), 0);
     CHECK_EQ_INT(ready, 'R');
 
+    /* AR-05 H2: discovery must NOT wait for the writer lock — a switch holds
+     * it across the interactive ssh-add passphrase prompt, so a blocking
+     * reader froze every read-only command and shell tab-completion for
+     * unbounded human latency. The query must complete promptly WITH THE
+     * LOCK STILL HELD, reporting contention (rc=-1, present=false) so
+     * accounts_detect_current serves the saved-account fallback instead. */
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = result_pipe[0];
     pfd.events = POLLIN;
-    do {
-        poll_rc = poll(&pfd, 1, 150);
-    } while (poll_rc < 0 && errno == EINTR);
-    CHECK_EQ_INT(poll_rc, 0); /* query must still be blocked */
-
-    CHECK_EQ_INT(flock(lock_fd, LOCK_UN), 0);
-    close(lock_fd);
-    lock_fd = -1;
     do {
         poll_rc = poll(&pfd, 1, 2000);
     } while (poll_rc < 0 && errno == EINTR);
     CHECK(poll_rc > 0 && (pfd.revents & POLLIN) != 0);
     if (poll_rc > 0 && (pfd.revents & POLLIN) != 0) {
         CHECK_EQ_INT(test_read_exact(result_pipe[0], &result, sizeof(result)), 0);
-        CHECK_EQ_INT(result.rc, 0);
-        CHECK_EQ_INT(result.present, 1);
-        CHECK_STR_EQ(result.name, "locked");
+        CHECK_EQ_INT(result.rc, -1);
+        CHECK_EQ_INT(result.present, 0);
+        CHECK(result.name[0] == '\0');
     } else {
         (void)kill(child, SIGKILL);
     }
     CHECK_EQ_INT(waitpid(child, &status, 0), child);
     child = -1;
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* Once the writer releases the lock, the same query must succeed and
+     * attribute the live socket — contention degrades discovery, never
+     * disables it. */
+    CHECK_EQ_INT(flock(lock_fd, LOCK_UN), 0);
+    close(lock_fd);
+    lock_fd = -1;
+    {
+        bool present_after = false;
+        char name_after[MAX_NAME_LEN];
+        CHECK_EQ_INT(ssh_manager_get_current_account(name_after,
+                                                     sizeof(name_after),
+                                                     &present_after), 0);
+        CHECK(present_after);
+        CHECK_STR_EQ(name_after, "locked");
+    }
 
 cleanup:
     if (lock_fd >= 0) {
@@ -1363,7 +1377,7 @@ int main(int argc, char **argv) {
     RUN_TEST(current_account_reports_absent_and_valid_live_socket);
     RUN_TEST(current_account_rejects_unsafe_malformed_and_stale_state);
     RUN_TEST(current_account_accepts_longest_bindable_name_without_truncation);
-    RUN_TEST(current_account_waits_for_manager_lock);
+    RUN_TEST(current_account_fails_fast_when_manager_lock_held);
     RUN_TEST(fresh_agent_retarget_failure_reaps_and_restores_environment);
     RUN_TEST(fresh_agent_environment_failure_reaps_and_restores_partial_mutation);
     RUN_TEST(fresh_agent_aborts_when_orphan_cleanup_is_incomplete);

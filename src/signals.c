@@ -94,9 +94,12 @@ static void guard_handler(int sig) {
         return;
     }
 
-    /* Second signal while the rollback is already running: stay deferred.
-     * The emergency exit below would abandon git_config_restore mid-way and
-     * permanently leave the aborted account's identity written (AR-02 #2).
+    /* Second signal while a critical mutation window is open — a rollback,
+     * the deferred previous-account teardown, or the forward SSH/GPG/git
+     * activation of a switch (AR-05 M4): stay deferred. The emergency exit
+     * below would abandon git_config_restore mid-way and permanently leave
+     * the aborted account's identity written (AR-02 #2), or strand a
+     * half-activated identity plus a live key-holding agent (M4).
      * The rollback is bounded work (a handful of local git execs) and its
      * interactive children (e.g. a re-prompting ssh-add) keep their default
      * dispositions, so Ctrl-C still kills THEM — liveness is preserved

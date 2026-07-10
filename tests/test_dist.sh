@@ -44,12 +44,13 @@ case $prefix in
     *) fail "PREFIX must be absolute: $prefix" ;;
 esac
 
-checkout_test_count=0
-for source in tests/test_*.c; do
-    [ -f "$source" ] || continue
-    checkout_test_count=$((checkout_test_count + 1))
-done
-[ "$checkout_test_count" -gt 0 ] || fail "no checkout C tests discovered"
+# Count COMMITTED tests via git ls-files, not the live filesystem: dist now
+# archives HEAD (AR-05 L5), so an untracked stray under tests/ must neither
+# ship nor skew this baseline — with a filesystem count, the same dirty tree
+# was counted on both sides and contamination was undetectable.
+git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checkout"
+checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
+[ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-distcheck.XXXXXX")
 
@@ -102,7 +103,28 @@ done
 
 "$make_cmd" -C "$source_root" clean
 "$make_cmd" -C "$source_root" BUILD_TYPE=release all
-version_output=$("$source_root/build/bin/gitswitch" --version)
+
+# AR-05 L9: assert the hardening properties the Makefile claims. PIE and
+# RELRO/NOW were previously inherited from the host toolchain's defaults with
+# no post-build check, so a non-default-PIE compiler could ship an
+# ASLR-defeating binary with QA green.
+release_bin=$source_root/build/bin/gitswitch
+if command -v readelf >/dev/null 2>&1; then
+    readelf -h "$release_bin" | grep -Eq 'Type:[[:space:]]+DYN' ||
+        fail "release binary is not PIE (ET_DYN)"
+    readelf -d "$release_bin" | grep -Eq 'BIND_NOW|FLAGS(_1)?.*\bNOW\b' ||
+        fail "release binary lacks BIND_NOW"
+    readelf -l "$release_bin" | grep -q 'GNU_RELRO' ||
+        fail "release binary lacks GNU_RELRO"
+    # -W: without wide mode readelf truncates long names to "[...]", hiding
+    # __stack_chk_fail entirely.
+    readelf -W --dyn-syms "$release_bin" | grep -q '__stack_chk_fail' ||
+        fail "release binary lacks stack-protector instrumentation"
+else
+    printf 'distcheck: readelf not available - hardening assertions skipped\n'
+fi
+
+version_output=$("$release_bin" --version)
 case $version_output in
     *" $expected_version ("*) ;;
     *) fail "binary version '$version_output' does not contain VERSION '$expected_version'" ;;
@@ -119,5 +141,36 @@ stage=$tmp/stage
 [ -f "$stage$prefix/share/fish/vendor_completions.d/gitswitch.fish" ] ||
     fail "installed fish completion missing"
 
-printf 'distcheck: PASS (%s C tests, version %s, complete staged install)\n' \
-    "$checkout_test_count" "$expected_version"
+# AR-05 L17: the H4 manifest fix exists because the source archive once could
+# not satisfy its own RPM spec (%install ran make install against missing
+# completions). When rpmbuild is available, prove the archive still can:
+# build the RPM from the archive + extracted spec in an isolated _topdir.
+# --nodeps: BuildRequires resolution needs an rpmdb that non-RPM CI hosts do
+# not have; the property under test is the spec's %build/%install/%files
+# contract against the archive, not dependency metadata. Absence is recorded
+# explicitly, never misreported as an executed success.
+if command -v rpmbuild >/dev/null 2>&1; then
+    rpmtop=$tmp/rpmbuild
+    mkdir -p "$rpmtop/BUILD" "$rpmtop/RPMS" "$rpmtop/SOURCES" \
+        "$rpmtop/SPECS" "$rpmtop/SRPMS"
+    cp "$archive" "$rpmtop/SOURCES/"
+    cp "$source_root/gitswitcher.spec" "$rpmtop/SPECS/"
+    if ! rpmbuild --define "_topdir $rpmtop" --nodeps -ba \
+        "$rpmtop/SPECS/gitswitcher.spec" >"$tmp/rpmbuild.log" 2>&1; then
+        tail -40 "$tmp/rpmbuild.log" >&2
+        fail "source archive cannot satisfy gitswitcher.spec under rpmbuild"
+    fi
+    rpm_count=0
+    for built_rpm in "$rpmtop"/RPMS/*/*.rpm; do
+        [ -f "$built_rpm" ] || continue
+        rpm_count=$((rpm_count + 1))
+    done
+    [ "$rpm_count" -ge 1 ] || fail "rpmbuild reported success but produced no binary RPM"
+    rpm_status="rpmbuild OK"
+else
+    printf 'distcheck: rpmbuild not available - RPM build skipped\n'
+    rpm_status="rpmbuild skipped"
+fi
+
+printf 'distcheck: PASS (%s C tests, version %s, complete staged install, %s)\n' \
+    "$checkout_test_count" "$expected_version" "$rpm_status"

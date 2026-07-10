@@ -202,7 +202,7 @@ int expand_path(const char *path, char *expanded_path, size_t path_size) {
             set_error(ERR_INVALID_ARGS, "Path too long for buffer");
             return -1;
         }
-        strcpy(expanded_path, path);
+        strcpy(expanded_path, path); /* Flawfinder: ignore — length-checked above */
     }
     
     return 0;
@@ -226,7 +226,7 @@ int get_home_directory(char *home_path, size_t path_size) {
         return -1;
     }
     
-    strcpy(home_path, home);
+    strcpy(home_path, home); /* Flawfinder: ignore — length-checked above */
     return 0;
 }
 
@@ -248,11 +248,11 @@ int join_path(char *result, size_t result_size, const char *base, const char *co
         return -1;
     }
     
-    strcpy(result, base);
+    strcpy(result, base); /* Flawfinder: ignore — length-checked above */
     if (needs_separator) {
         strcat(result, "/");
     }
-    strcat(result, component);
+    strcat(result, component); /* Flawfinder: ignore — length-checked above */
     
     return 0;
 }
@@ -891,17 +891,37 @@ int runtime_state_lock_acquire(void) {
         close(parent_fd);
         return -1;
     }
-    lock_fd = lock_private_file_at(dir_fd, ".lock");
+    /* Non-blocking (AR-05 L13): the holder keeps this lock across ssh-add
+     * passphrase and GPG pinentry prompts — unbounded human latency. Within
+     * one HOME the non-blocking config lock in main.c fails fast first, but
+     * a second gitswitch sharing XDG_RUNTIME_DIR under a DIFFERENT HOME
+     * bypasses that outer lock and used to hang here silently, with no
+     * message and no bound — the exact indefinite-prompt-holder hazard the
+     * config lock was made non-blocking to avoid (AR-03 L10). Fail fast with
+     * the same actionable message instead. */
+    lock_fd = try_lock_private_file_at(dir_fd, ".lock");
     if (lock_fd < 0) {
+        bool contended = errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+        contended = contended || errno == EAGAIN;
+#endif
         close(dir_fd);
         close(parent_fd);
-        set_system_error(ERR_FILE_IO, "Cannot open shared runtime lock: %s",
-                         lock_dir);
+        if (contended) {
+            set_error(ERR_FILE_IO,
+                      "Another gitswitch holds the shared runtime lock "
+                      "(possibly waiting at a passphrase/PIN prompt); try "
+                      "again after that command finishes");
+        } else {
+            set_system_error(ERR_FILE_IO, "Cannot open shared runtime lock: %s",
+                             lock_dir);
+        }
         return -1;
     }
 
-    /* flock may have blocked while a same-uid process renamed/replaced either
-     * path.  Keep both descriptors pinned for the lock lifetime and refuse an
+    /* A same-uid process may have renamed/replaced either path between the
+     * opens and the (non-blocking) flock succeeding.  Keep both descriptors
+     * pinned for the lock lifetime and refuse an
      * acquisition whose public namespace no longer resolves to those inodes;
      * otherwise a later contender could lock a replacement .lock and enter a
      * supposedly serialized transaction concurrently. */
@@ -1219,11 +1239,11 @@ int backup_file(const char *file_path, const char *backup_suffix) {
 }
 
 bool file_is_readable(const char *file_path) {
-    return file_path && access(file_path, R_OK) == 0;
+    return file_path && access(file_path, R_OK) == 0; /* Flawfinder: ignore — advisory readability probe, not an auth decision */
 }
 
 bool file_is_writable(const char *file_path) {
-    return file_path && access(file_path, W_OK) == 0;
+    return file_path && access(file_path, W_OK) == 0; /* Flawfinder: ignore — advisory writability probe, not an auth decision */
 }
 
 size_t get_file_size(const char *file_path) {
@@ -1433,7 +1453,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
         /* execv, not execvp: the path was pinned pre-fork; re-searching PATH
          * here would reopen the PS-1 window between resolve and exec. */
-        execv(exec_path, (char *const *)argv);
+        execv(exec_path, (char *const *)argv); /* Flawfinder: ignore — argv exec of a pre-pinned path; no shell */
         _exit(127); /* exec failed (e.g. binary vanished after resolution) */
     }
 
@@ -1604,7 +1624,7 @@ static bool exec_candidate_is_trusted(const char *path) {
     if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IWGRP | S_IWOTH))) {
         return false;
     }
-    return access(path, X_OK) == 0;
+    return access(path, X_OK) == 0; /* Flawfinder: ignore — advisory post-stat probe; exec re-validates */
 }
 
 /* Process-lifetime memo for find_command_path (AR-02 #24): one switch
@@ -1696,7 +1716,7 @@ int find_command_path(const char *name, char *buf, size_t size) {
             dir[dirlen] = '\0';
             memcpy(candidate, dir, dirlen);
             candidate[dirlen] = '/';
-            strcpy(candidate + dirlen + 1, name);
+            strcpy(candidate + dirlen + 1, name); /* Flawfinder: ignore — bounds proven by dirlen+name checks above */
             if (exec_dir_is_trusted(dir) && exec_candidate_is_trusted(candidate)) {
                 if (g_cmd_memo_pathenv && g_cmd_memo_used < CMD_MEMO_SLOTS &&
                     strlen(name) < CMD_MEMO_NAME_LEN) {
@@ -1749,7 +1769,7 @@ int get_env_var(const char *name, char *buffer, size_t buffer_size) {
         return -1;
     }
     
-    strcpy(buffer, value);
+    strcpy(buffer, value); /* Flawfinder: ignore — length-checked above */
     return 0;
 }
 

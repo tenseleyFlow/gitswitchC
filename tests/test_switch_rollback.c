@@ -102,9 +102,11 @@ static bool refuse_session_agent_reap(pid_t pid, const char *socket_arg) {
 }
 
 /* Minimal fake config store so git_set_config's read-back verification sees
- * what was "written". Only the two identity keys matter to these tests. */
+ * what was "written": the two identity keys, plus core.sshcommand since
+ * git_configure_ssh round-trips its write too (AR-05 M5). */
 static char g_store_name[MAX_NAME_LEN];
 static char g_store_email[MAX_EMAIL_LEN];
+static char g_store_sshcmd[MAX_PATH_LEN * 2];
 
 /* git_ops.c deliberately keeps this test-only cache reset out of its public
  * header. Identity-sensitive cases below need a fresh snapshot/read-back view. */
@@ -158,6 +160,8 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
             snprintf(opts->out, opts->out_size, "%s\n", g_store_name);
         } else if (is_config_read(argv, "user.email") && g_store_email[0]) {
             snprintf(opts->out, opts->out_size, "%s\n", g_store_email);
+        } else if (is_config_read(argv, "core.sshcommand") && g_store_sshcmd[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_sshcmd);
         }
     }
 
@@ -183,9 +187,13 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         }
     } else if (is_config_write(argv, "user.email")) {
         safe_strncpy(g_store_email, argv[4], sizeof(g_store_email));
+    } else if (is_config_write(argv, "core.sshcommand")) {
+        safe_strncpy(g_store_sshcmd, argv[4], sizeof(g_store_sshcmd));
     } else if (is_config_read(argv, "user.name") && !g_store_name[0]) {
         exit_code = 1; /* not set: git reports failure */
     } else if (is_config_read(argv, "user.email") && !g_store_email[0]) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "core.sshcommand") && !g_store_sshcmd[0]) {
         exit_code = 1;
     }
 
@@ -421,6 +429,7 @@ static void seed_previous_git_identity(void) {
     git_ops_test_reset_caches();
     safe_strncpy(g_store_name, "Previous Name", sizeof(g_store_name));
     safe_strncpy(g_store_email, "prev@example.com", sizeof(g_store_email));
+    g_store_sshcmd[0] = '\0';
     /* The fake runner does not synthesize the binary `git config --list -z`
      * stream. Make the snapshot take its supported per-key fallback instead. */
     g_fail_list_config = true;

@@ -163,13 +163,16 @@ TEST(git_configure_ssh_rejects_single_quote_in_keypath) {
         CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_PATH);
     }
 
-    /* Control: a benign existing key path still configures core.sshCommand. */
+    /* Control: a benign existing key path still configures core.sshCommand.
+     * Two execs: the write plus the AR-05 M5 read-back verification, which
+     * must round-trip through git (reads are never served from this
+     * process's own writes). */
     memset(&acct, 0, sizeof(acct));
     acct.ssh_enabled = true;
     safe_strncpy(acct.ssh_key_path, ok_path, sizeof(acct.ssh_key_path));
     fk_execs = 0;
     CHECK_EQ_INT(git_configure_ssh(&acct, GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 1);
+    CHECK_EQ_INT(fk_execs, 2);
     int idx = fk_find("--global", "core.sshcommand");
     CHECK(idx >= 0);
     if (idx >= 0) {

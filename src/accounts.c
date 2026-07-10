@@ -517,8 +517,15 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
 
         /* Prove the host-alias sink is readable and policy-compliant before
-         * arming rollback. The actual writer remains the final commit. */
-        if (ssh_user_config_preflight(account) != 0) {
+         * arming rollback. The actual writer remains the final commit.
+         * Skipped on resume for the same reason write_git is forced false:
+         * ~/.ssh/config is persistent state the original switch already
+         * wrote, so resume has no business reading or rewriting it — and the
+         * preflight's symlink refusal (correct for an interactive switch)
+         * otherwise aborted resume BEFORE agent restoration for every
+         * dotfile-managed ~/.ssh/config (chezmoi/stow/yadm), re-failing on
+         * each login shell (AR-05 M1). */
+        if (!ctx->config.resuming && ssh_user_config_preflight(account) != 0) {
             runtime_state_lock_release(runtime_lock_fd);
             return -1;
         }
@@ -575,6 +582,20 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                                        prev_gpg_present, false, ssh_dirty, false,
                                        runtime_lock_fd);
         }
+
+        /* AR-05 M4: the FORWARD mutation window (SSH agent spawn/repoint, GPG
+         * `current` retarget, git identity write) needs the same second-signal
+         * deferral the rollback and deferred-teardown blocks already get. A
+         * second directed signal here used to take the handler's emergency
+         * exit: no git_config_restore, no deactivate_runtime_isolation —
+         * current.sock/GNUPGHOME left on the NEW account while git named the
+         * OLD one, plus a daemonized ssh-agent holding the freshly-decrypted
+         * key leaked until reboot. With the flag up, the repeat signal instead
+         * forwards to the in-flight child (killing a stuck ssh-add/pinentry
+         * prompt), the blocked step fails or returns, and the mainline reaches
+         * its signals_pending() checkpoint and runs abort_failed_switch —
+         * which re-arms and then clears the flag itself before returning. */
+        signals_rollback_begin();
 
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
@@ -704,6 +725,11 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             gpg_ok = g_session.gpg_active;
         }
 
+        /* Forward mutations are complete and mutually consistent (runtime and
+         * git identity both name the new account), so the M4 deferral window
+         * closes here; the deferred-teardown block below re-arms its own. */
+        signals_rollback_end();
+
         /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
          * switch back (git config, when written, was just written — restore it
          * too; on resume nothing was written, so nothing to restore). */
@@ -749,8 +775,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
          * refuses or fails, it has made no durable change and the ordinary
          * Git/runtime rollback is sufficient. There is deliberately no SSH
          * config rollback writer, so a concurrent replacement can never be
-         * adopted and overwritten on an abort. */
-        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
+         * adopted and overwritten on an abort. Skipped on resume: the managed
+         * block survived the reboot with the rest of ~/.ssh/config, and
+         * rewriting a persistent user file once per boot added a fallible
+         * commit/rollback surface to a path that restores only boot-volatile
+         * runtime state (AR-05 M1). */
+        if (!ctx->config.resuming &&
+            account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
             strlen(account->ssh_host_alias) > 0 &&
             ssh_configure_host_alias(&switch_target) != 0) {
             char detail[sizeof(g_last_error.message)];

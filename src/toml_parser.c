@@ -197,6 +197,25 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         /* Parse section header */
         if (c == '[') {
             if (parse_section_header(&state, section_name) == 0) {
+                /* Reject a repeated table header per the TOML spec (AR-05
+                 * L10), matching the duplicate-KEY rejection below. Silently
+                 * merging meant two [accounts.1] blocks collapsed into one
+                 * account (an apparent second account dropped) and an
+                 * appended duplicate block could inject keys (ssh_key,
+                 * ssh_host, ...) into an existing section with zero
+                 * diagnostics. The writer emits each section once, so this
+                 * only fires on hand edits — where a line-anchored error is
+                 * the diagnostic the user needs. Only the parse path checks:
+                 * find_or_create_section stays fetch-or-create for the
+                 * writer/setter paths. */
+                if (find_section(doc, section_name)) {
+                    char dup_msg[sizeof(state.error_message)];
+                    snprintf(dup_msg, sizeof(dup_msg),
+                             "Duplicate section [%s] (TOML forbids defining "
+                             "a table twice)", section_name);
+                    set_parser_error(&state, dup_msg);
+                    break;
+                }
                 current_section = find_or_create_section(doc, section_name);
                 if (!current_section) {
                     set_parser_error(&state, "Failed to create section");

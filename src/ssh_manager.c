@@ -43,9 +43,12 @@
 #include "signals.h"
 
 /* Internal helper functions */
-static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...);
+/* merge_stderr is int, not bool: the parameter anchors va_start, and C11
+ * makes va_start on a type that undergoes default argument promotion
+ * (bool -> int) undefined behavior — clang rejects it under -Wvarargs. */
+static int ssh_run(char *output, size_t output_size, int merge_stderr, ...);
 static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          bool merge_stderr, ...);
+                          int merge_stderr, ...);
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path);
 static int setup_ssh_environment(ssh_config_t *ssh_config);
@@ -166,7 +169,12 @@ static void ssh_env_snapshot_discard(ssh_env_snapshot_t *snapshot) {
  * absolute path or the descriptor-pinned launch form's final component so
  * sidecars created by either version remain reapable. Requiring the complete
  * option value, rather than a substring anywhere in the command line, avoids
- * signaling an agent whose unrelated argument merely mentions the socket. */
+ * signaling an agent whose unrelated argument merely mentions the socket.
+ *
+ * Guarded to the platforms whose reaper calls it (Linux procfs, FreeBSD
+ * sysctl argv). macOS uses counted_argv_is_our_ssh_agent instead, so an
+ * unguarded definition is an unused-function error there under clang+WERROR. */
+#if defined(__linux__) || defined(__FreeBSD__)
 static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
                                   const char *expected_sock) {
     bool expect_socket = false;
@@ -216,6 +224,7 @@ static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
     }
     return matched_socket && !expect_socket;
 }
+#endif /* __linux__ || __FreeBSD__ */
 
 #ifdef __APPLE__
 /* KERN_PROCARGS2 includes the environment after argv. Parse exactly the argc
@@ -539,6 +548,18 @@ static void reap_unrecorded_agent(pid_t pid, const char *socket_arg,
  * arbitrary file elsewhere (AR-03 L6). */
 static int lock_agent_dir(int dir_fd) {
     return lock_private_file_at(dir_fd, ".lock");
+}
+
+/* Non-blocking variant for READ-ONLY discovery. A switch holds the agent-dir
+ * lock across the interactive ssh-add passphrase prompt (unbounded human
+ * latency), and discovery runs on EVERY invocation via config_load ->
+ * accounts_detect_current — so a blocking lock here froze `gitswitch
+ * list`/`status` and shell tab-completion until the prompt was answered
+ * (AR-05 H2). Readers that fail to acquire must fall back to saved state,
+ * exactly as main.c's config lock is non-blocking for the same reason
+ * (AR-03 L10); only genuine writers (start/reap/reset) may block. */
+static int try_lock_agent_dir(int dir_fd) {
+    return try_lock_private_file_at(dir_fd, ".lock");
 }
 
 static void unlock_agent_dir(int fd) {
@@ -1312,9 +1333,44 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
     }
     log_debug("SSH agent stopped");
     
-    /* Clean up socket file */
+    /* Clean up socket file. AR-05 L15: this was the file's lone
+     * absolute-path, symlink-following unlink() — reachable from
+     * ssh_manager_cleanup's rollback paths with no agent-dir lock held and
+     * no namespace re-validation, while every other socket mutation goes
+     * through the pinned descriptor precisely because the runtime dir can
+     * live in world-writable sticky /tmp. Route it through the same
+     * validated, locked dir fd and unlinkat() the leaf component. The lock
+     * helpers re-enter cleanly when a caller already holds the agent-dir
+     * lock (per-process refcount), so the locked in-file caller is safe.
+     * Best-effort like before: a failure here only leaves a stale socket. */
     if (strlen(ssh_config->agent_socket_path) > 0) {
-        if (unlink(ssh_config->agent_socket_path) == 0) {
+        char socket_dir[MAX_PATH_LEN];
+        const char *slash = strrchr(ssh_config->agent_socket_path, '/');
+        bool removed = false;
+        if (slash && slash != ssh_config->agent_socket_path &&
+            *(slash + 1) != '\0' &&
+            (size_t)(slash - ssh_config->agent_socket_path) < sizeof(socket_dir)) {
+            const char *socket_name = slash + 1;
+            size_t dir_len = (size_t)(slash - ssh_config->agent_socket_path);
+            bool absent = false;
+            memcpy(socket_dir, ssh_config->agent_socket_path, dir_len);
+            socket_dir[dir_len] = '\0';
+            int dir_fd = open_isolated_agent_socket_dir(socket_dir,
+                                                        sizeof(socket_dir),
+                                                        false, &absent);
+            if (dir_fd >= 0) {
+                int lock_fd = lock_agent_dir(dir_fd);
+                if (lock_fd >= 0) {
+                    if (verify_socket_dir_namespace(dir_fd, socket_dir) == 0 &&
+                        unlinkat(dir_fd, socket_name, 0) == 0) {
+                        removed = true;
+                    }
+                    unlock_agent_dir(lock_fd);
+                }
+                close(dir_fd);
+            }
+        }
+        if (removed) {
             log_debug("Removed SSH agent socket: %s", ssh_config->agent_socket_path);
         } else {
             log_debug("Could not remove SSH agent socket (may already be gone)");
@@ -1858,7 +1914,7 @@ int ssh_test_connection(const account_t *account, const char *host) {
  * the child's stderr is left attached to the terminal so ssh-add's "Identity
  * added" message still reaches the user (preserving prior behavior). Trailing
  * newline in captured stdout is trimmed. Returns 0 iff the child exits 0. */
-static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...) {
+static int ssh_run(char *output, size_t output_size, int merge_stderr, ...) {
     const char *argv[16];
     size_t n = 0;
     va_list ap;
@@ -1900,7 +1956,7 @@ static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...) {
  * relative socket argument only after fchdir()ing to the validated directory;
  * a concurrent rename/replacement of its public pathname cannot redirect it. */
 static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          bool merge_stderr, ...) {
+                          int merge_stderr, ...) {
     const char *argv[16];
     size_t n = 0;
     va_list ap;
@@ -2296,7 +2352,10 @@ static int probe_ssh_agent_socket(const char *path, bool *reachable) {
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     safe_strncpy(addr.sun_path, path, sizeof(addr.sun_path));
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+    /* Cast through void*: the direct sockaddr_un->sockaddr cast trips
+     * -Wstrict-aliasing=2 on gcc 13 at -O2 (the CI release toolchain), which
+     * WERROR promotes to an error. Same idiom as the test suites. */
+    if (connect(fd, (struct sockaddr *)(void *)&addr, sizeof(addr)) == 0) {
         *reachable = true;
         close(fd);
         return 0;
@@ -2429,10 +2488,25 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
         return -1;
     }
 
-    lock_fd = lock_agent_dir(dir_fd);
+    /* Discovery is a pure read: never wait on a writer that may be parked at
+     * an interactive prompt for minutes. On contention return an error so
+     * accounts_detect_current serves the persisted saved-account fallback
+     * instead of hanging every read-only command (AR-05 H2). */
+    lock_fd = try_lock_agent_dir(dir_fd);
     if (lock_fd < 0) {
-        set_system_error(ERR_FILE_IO,
-                         "Failed to lock SSH agent directory: %s", socket_dir);
+        bool contended = errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+        contended = contended || errno == EAGAIN;
+#endif
+        if (contended) {
+            set_error(ERR_FILE_IO,
+                      "SSH agent directory is busy (another gitswitch is "
+                      "mid-operation): %s", socket_dir);
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to lock SSH agent directory: %s",
+                             socket_dir);
+        }
         close(dir_fd);
         return -1;
     }

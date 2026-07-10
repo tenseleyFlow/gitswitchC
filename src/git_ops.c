@@ -233,13 +233,54 @@ static int git_list_config_z(git_scope_t scope, char *buf, size_t size, size_t *
     return 0;
 }
 
-static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         out[i].key = g_managed_keys[i];
         out[i].present = false;
         out[i].value_unknown = false;
         out[i].value[0] = '\0';
     }
+}
+
+/* Apply a complete, untruncated `--list -z` capture to the kv array and seed
+ * the exec cache from it. Shared by the snapshot path (git_capture_keys) and
+ * the status probe (git_probe_keys, AR-05 L14). */
+static void git_apply_config_listing(git_scope_t scope, const char *list,
+                                     size_t list_len,
+                                     git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+    int s = cfg_scope_index(scope);
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        cfg_z_result_t zr = parse_config_z_value(list, list_len,
+                                                 g_managed_keys[i],
+                                                 out[i].value,
+                                                 sizeof(out[i].value));
+        if (zr == CFG_Z_TOO_LONG) {
+            /* The key IS present; only its value is beyond what we can
+             * hold (necessarily a foreign writer — everything gitswitch
+             * writes fits GIT_CFG_VALUE_MAX). Recording it absent is the
+             * AR-03 M1 bug: git_clear_config would elide a real --unset
+             * (the foreign SSH identity survives the switch) and the
+             * rollback would --unset the user's original value. Degrade
+             * to CFG_UNKNOWN/present so nothing is elided or served. */
+            out[i].present = true;
+            out[i].value_unknown = true;
+            cfg_cache_store(s, (int)i, CFG_UNKNOWN, true, "");
+            continue;
+        }
+        out[i].present = (zr == CFG_Z_FOUND);
+        /* AR-02 #15: the complete listing is an authoritative read of
+         * every managed key — presence AND proven absence — so seed the
+         * exec cache instead of discarding it. git_clear_config (run by
+         * the very next step of a global switch) then elides the --unset
+         * execs this listing just proved were no-ops, and reads of
+         * present values are served without a spawn. */
+        cfg_cache_store(s, (int)i, CFG_READBACK, out[i].present,
+                        out[i].value);
+    }
+}
+
+static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+    git_init_kv(out);
 
     /* Fast path: one `git config --list -z` exec instead of one per key. Fall
      * back to per-key reads if the listing failed or looks truncated (buffer
@@ -249,35 +290,7 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
     size_t list_len = 0;
     if (git_list_config_z(scope, list, sizeof(list), &list_len) == 0 &&
         list_len < sizeof(list) - 1) {
-        int s = cfg_scope_index(scope);
-        for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-            cfg_z_result_t zr = parse_config_z_value(list, list_len,
-                                                     g_managed_keys[i],
-                                                     out[i].value,
-                                                     sizeof(out[i].value));
-            if (zr == CFG_Z_TOO_LONG) {
-                /* The key IS present; only its value is beyond what we can
-                 * hold (necessarily a foreign writer — everything gitswitch
-                 * writes fits GIT_CFG_VALUE_MAX). Recording it absent is the
-                 * AR-03 M1 bug: git_clear_config would elide a real --unset
-                 * (the foreign SSH identity survives the switch) and the
-                 * rollback would --unset the user's original value. Degrade
-                 * to CFG_UNKNOWN/present so nothing is elided or served. */
-                out[i].present = true;
-                out[i].value_unknown = true;
-                cfg_cache_store(s, (int)i, CFG_UNKNOWN, true, "");
-                continue;
-            }
-            out[i].present = (zr == CFG_Z_FOUND);
-            /* AR-02 #15: the complete listing is an authoritative read of
-             * every managed key — presence AND proven absence — so seed the
-             * exec cache instead of discarding it. git_clear_config (run by
-             * the very next step of a global switch) then elides the --unset
-             * execs this listing just proved were no-ops, and reads of
-             * present values are served without a spawn. */
-            cfg_cache_store(s, (int)i, CFG_READBACK, out[i].present,
-                            out[i].value);
-        }
+        git_apply_config_listing(scope, list, list_len, out);
         return;
     }
 
@@ -300,6 +313,28 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
             out[i].value[0] = '\0';
         }
     }
+}
+
+/* Status-path probe (AR-05 L14): ONE listing exec per scope, and a FAILED
+ * listing simply reports the scope absent. The per-key fallback above exists
+ * to protect the rollback snapshot from a truncated listing; for a read-only
+ * status probe it turned a scope with no readable config (e.g. --local
+ * outside a repo, or no ~/.gitconfig) into six extra guaranteed-miss execs.
+ * A truncated listing (data exists but exceeds the buffer) still defers to
+ * git_capture_keys for correctness. */
+static void git_probe_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+    git_init_kv(out);
+
+    char list[16384];
+    size_t list_len = 0;
+    if (git_list_config_z(scope, list, sizeof(list), &list_len) != 0) {
+        return; /* scope has no readable config: everything stays absent */
+    }
+    if (list_len >= sizeof(list) - 1) {
+        git_capture_keys(scope, out);
+        return;
+    }
+    git_apply_config_listing(scope, list, list_len, out);
 }
 
 static void git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KEY_COUNT]) {
@@ -431,11 +466,18 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         git_set_config_value(GIT_CONFIG_COMMIT_GPGSIGN, "false", scope);
     }
     
-    /* Configure SSH if enabled */
+    /* Configure SSH if enabled. AR-05 M5: SSH identity is NOT optional for
+     * an account that declares ssh_enabled. core.sshCommand carries
+     * IdentitiesOnly=yes, so the configured key bypasses the isolated agent
+     * and is authoritative for every fetch/push — the old warn-only path
+     * left the PREVIOUS account's core.sshCommand live while the switch
+     * printed success: silent wrong-identity pushes. Unlike the GPG branch
+     * above (compensated by accounts.c's hard-failing
+     * gpg_configure_git_signing), nothing downstream re-writes or verifies
+     * this key, so fail here and let accounts_switch roll the switch back. */
     if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
         if (git_configure_ssh(account, scope) != 0) {
-            log_warning("Failed to configure SSH for git");
-            /* Don't fail completely, SSH config is optional */
+            return -1;
         }
     } else {
         /* Clear SSH configuration */
@@ -466,52 +508,78 @@ int git_set_config(const account_t *account, git_scope_t scope) {
 
 /* Get current git configuration */
 int git_get_current_config(git_current_config_t *config) {
-    char name[MAX_NAME_LEN] = {0};
-    char email[MAX_EMAIL_LEN] = {0};
-    char signing_key[MAX_KEY_ID_LEN] = {0};
-    char gpg_sign[16] = {0};
-    
     if (!config) {
         set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
         return -1;
     }
-    
+
     /* Initialize structure */
     memset(config, 0, sizeof(git_current_config_t));
     config->valid = false;
-    
-    /* Try to get user.name */
-    if (git_get_config_value(GIT_CONFIG_USER_NAME, name, sizeof(name), GIT_SCOPE_LOCAL) == 0) {
-        config->scope = GIT_SCOPE_LOCAL;
-    } else if (git_get_config_value(GIT_CONFIG_USER_NAME, name, sizeof(name), GIT_SCOPE_GLOBAL) == 0) {
-        config->scope = GIT_SCOPE_GLOBAL;
-    } else if (git_get_config_value(GIT_CONFIG_USER_NAME, name, sizeof(name), GIT_SCOPE_SYSTEM) == 0) {
-        config->scope = GIT_SCOPE_SYSTEM;
-    } else {
+
+    /* AR-05 L14: resolve the scope with ONE `git config <scope> --list -z`
+     * exec per probed scope (git_capture_keys' fast path) instead of up to
+     * three per-key user.name probes plus one exec each for email/
+     * signingkey/gpgsign — 4-6 sequential fork+execs per `gitswitch status`,
+     * with the guaranteed-miss probes never cached (the exec cache only
+     * stores positive observations). The listing also seeds the cache with
+     * presence AND proven absence, so any follow-up read spawns nothing.
+     * Semantics preserved: a scope counts only when user.name is present
+     * with a representable value (a too-long foreign value failed the old
+     * per-key read the same way), and email/signingkey/gpgsign come from
+     * that same scope. */
+    static const git_scope_t probe_order[] = {
+        GIT_SCOPE_LOCAL, GIT_SCOPE_GLOBAL, GIT_SCOPE_SYSTEM
+    };
+    git_kv_t kv[GIT_MANAGED_KEY_COUNT];
+    const int k_name = cfg_key_index(GIT_CONFIG_USER_NAME);
+    const int k_email = cfg_key_index(GIT_CONFIG_USER_EMAIL);
+    const int k_signkey = cfg_key_index(GIT_CONFIG_USER_SIGNINGKEY);
+    const int k_gpgsign = cfg_key_index(GIT_CONFIG_COMMIT_GPGSIGN);
+    bool found = false;
+
+    if (k_name < 0 || k_email < 0 || k_signkey < 0 || k_gpgsign < 0) {
+        set_error(ERR_INVALID_ARGS, "Managed git key set is incomplete");
+        return -1;
+    }
+
+    for (size_t i = 0; i < sizeof(probe_order) / sizeof(probe_order[0]); i++) {
+        /* Outside a repo, --local cannot have config: skip its probe (and
+         * the guaranteed listing failure) entirely. rev-parse is cached, and
+         * the status path pays it anyway. */
+        if (probe_order[i] == GIT_SCOPE_LOCAL && !git_is_repository()) {
+            continue;
+        }
+        git_probe_keys(probe_order[i], kv);
+        if (kv[k_name].present && !kv[k_name].value_unknown) {
+            config->scope = probe_order[i];
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
         set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.name configured");
         return -1;
     }
-    
-    /* Get user.email from same scope */
-    if (git_get_config_value(GIT_CONFIG_USER_EMAIL, email, sizeof(email), config->scope) != 0) {
+
+    /* user.email must come from the same scope */
+    if (!kv[k_email].present || kv[k_email].value_unknown) {
         set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
         return -1;
     }
-    
-    /* Copy basic configuration */
-    safe_strncpy(config->name, name, sizeof(config->name));
-    safe_strncpy(config->email, email, sizeof(config->email));
-    
-    /* Get GPG configuration if available */
-    if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, signing_key, sizeof(signing_key), config->scope) == 0) {
-        safe_strncpy(config->signing_key, signing_key, sizeof(config->signing_key));
+
+    safe_strncpy(config->name, kv[k_name].value, sizeof(config->name));
+    safe_strncpy(config->email, kv[k_email].value, sizeof(config->email));
+
+    /* GPG configuration, if available in that scope */
+    if (kv[k_signkey].present && !kv[k_signkey].value_unknown) {
+        safe_strncpy(config->signing_key, kv[k_signkey].value,
+                     sizeof(config->signing_key));
     }
-    
-    /* Check if GPG signing is enabled */
-    if (git_get_config_value(GIT_CONFIG_COMMIT_GPGSIGN, gpg_sign, sizeof(gpg_sign), config->scope) == 0) {
-        config->gpg_signing_enabled = (strcmp(gpg_sign, "true") == 0);
+    if (kv[k_gpgsign].present && !kv[k_gpgsign].value_unknown) {
+        config->gpg_signing_enabled = (strcmp(kv[k_gpgsign].value, "true") == 0);
     }
-    
+
     config->valid = true;
     return 0;
 }
@@ -951,7 +1019,21 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set SSH command configuration");
         return -1;
     }
-    
+
+    /* AR-05 M5: round-trip the value through git, matching the user.name/
+     * user.email verification in git_set_config. Reads are never served
+     * from this process's own writes (only CFG_READBACK entries), so this
+     * genuinely re-execs git and proves the authoritative SSH identity is
+     * the one just written. */
+    char readback[sizeof(ssh_command)];
+    if (git_get_config_value(GIT_CONFIG_CORE_SSHCOMMAND, readback,
+                             sizeof(readback), scope) != 0 ||
+        strcmp(readback, ssh_command) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Could not read back core.sshCommand to verify it");
+        return -1;
+    }
+
     return 0;
 }
 

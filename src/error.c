@@ -136,7 +136,7 @@ void set_error_context(error_code_t code, const char *file, int line,
     /* Format the error message */
     if (fmt) {
         va_start(args, fmt);
-        vsnprintf(g_last_error.message, sizeof(g_last_error.message), fmt, args);
+        vsnprintf(g_last_error.message, sizeof(g_last_error.message), fmt, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
         va_end(args);
     } else {
         strncpy(g_last_error.message, error_code_to_string(code), 
@@ -166,7 +166,7 @@ void set_system_error_context(error_code_t code, const char *file, int line,
     /* Format the error message */
     if (fmt) {
         va_start(args, fmt);
-        vsnprintf(g_last_error.message, sizeof(g_last_error.message), fmt, args);
+        vsnprintf(g_last_error.message, sizeof(g_last_error.message), fmt, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
         va_end(args);
     } else {
         strncpy(g_last_error.message, error_code_to_string(code), 
@@ -227,7 +227,7 @@ void log_message(log_level_t level, const char *file, int line,
     
     /* Format the message */
     va_start(args, fmt);
-    vsnprintf(message, sizeof(message), fmt, args);
+    vsnprintf(message, sizeof(message), fmt, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
     va_end(args);
     
     /* Get timestamp */
@@ -396,7 +396,7 @@ int safe_snprintf(char *buffer, size_t buffer_size, const char *fmt, ...) {
     }
     
     va_start(args, fmt);
-    result = vsnprintf(buffer, buffer_size, fmt, args);
+    result = vsnprintf(buffer, buffer_size, fmt, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
     va_end(args);
     
     if (result < 0) {
