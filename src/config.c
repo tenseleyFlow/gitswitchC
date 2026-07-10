@@ -282,15 +282,43 @@ int config_resume_hint_path(char *buf, size_t size) {
 }
 
 /* Create or remove the resume-hint marker so the shell integration knows
- * whether a boot-time resume is worth attempting. Cheap and best-effort. */
+ * whether a boot-time resume is worth attempting. The marker's CONTENT records
+ * the active account's boot-volatile runtime needs as a space-separated token
+ * set ("ssh", "gpg", or "none"), so the shell snippet can skip the per-shell
+ * ssh-add liveness probe entirely for an SSH-less active account — otherwise a
+ * GPG-only or identity-only account made every new interactive shell spawn
+ * ssh-add (exit 2) plus a `gitswitch resume` in perpetuity (AR-02 #23). Cheap
+ * and best-effort. */
 static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     char hint[MAX_PATH_LEN];
     if (config_resume_hint_path(hint, sizeof(hint)) != 0) return;
-    if (ctx->config.active_account[0] != '\0') {
-        FILE *f = fopen(hint, "w");
-        if (f) fclose(f);
-    } else {
+    if (ctx->config.active_account[0] == '\0') {
         unlink(hint);
+        return;
+    }
+
+    /* Resolve the active account to read its ssh/gpg flags. If it can't be
+     * found (shouldn't happen — it was just saved), fall back to the
+     * conservative "ssh gpg" so the snippet still probes rather than wrongly
+     * skipping a needed resume. */
+    bool wants_ssh = true, wants_gpg = true;
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strcmp(ctx->accounts[i].name, ctx->config.active_account) == 0) {
+            wants_ssh = ctx->accounts[i].ssh_enabled &&
+                        ctx->accounts[i].ssh_key_path[0] != '\0';
+            wants_gpg = ctx->accounts[i].gpg_enabled &&
+                        ctx->accounts[i].gpg_key_id[0] != '\0';
+            break;
+        }
+    }
+
+    FILE *f = fopen(hint, "w");
+    if (f) {
+        if (wants_ssh && wants_gpg)      fputs("ssh gpg\n", f);
+        else if (wants_ssh)              fputs("ssh\n", f);
+        else if (wants_gpg)              fputs("gpg\n", f);
+        else                             fputs("none\n", f);
+        fclose(f);
     }
 }
 

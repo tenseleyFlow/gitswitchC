@@ -125,6 +125,28 @@ TEST(init_succeeds_and_emits_full_snippet) {
     remove_tree(rt);
 }
 
+/* AR-02 #23: the init snippet must gate the per-shell resume probe on the
+ * hint file's recorded runtime needs, not just its existence, so an SSH-less
+ * active account never spawns a doomed ssh-add + resume on every shell. Assert
+ * the content-driven branching is emitted: it reads the hint into
+ * __gitswitch_needs and has a GPG-only arm that probes the GNUPGHOME symlink
+ * with a builtin `test -d` instead of ssh-add. */
+TEST(init_snippet_gates_probe_on_hint_content) {
+    char rt[256], out_path[4352], cmd[9000], out[8192];
+
+    if (!make_temp_dir(rt, sizeof(rt))) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(out_path, sizeof(out_path), "%s/init.out", rt);
+    snprintf(cmd, sizeof(cmd),
+             "XDG_RUNTIME_DIR='%s' '%s' init bash >'%s' 2>/dev/null", rt, g_bin, out_path);
+    CHECK_EQ_INT(run_shell(cmd), 0);
+
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "__gitswitch_needs") != NULL);      /* reads the hint content */
+    CHECK(strstr(out, "*gpg*)") != NULL);                 /* GPG-only arm exists */
+    CHECK(strstr(out, "-d '") != NULL);                   /* builtin symlink test, not ssh-add */
+    remove_tree(rt);
+}
+
 /* With stdout closed every write fails; before the SIPW-1 fix `init` ignored
  * printf results and still exited 0, handing eval a truncated/empty script
  * with a success status. */
@@ -422,6 +444,7 @@ TEST_MAIN_BEGIN()
         return 1;
     }
     RUN_TEST(init_succeeds_and_emits_full_snippet);
+    RUN_TEST(init_snippet_gates_probe_on_hint_content);
     RUN_TEST(init_fails_when_stdout_is_closed);
     RUN_TEST(init_fails_on_enospc);
     RUN_TEST(resume_gpg_only_noops_silently_when_state_live);

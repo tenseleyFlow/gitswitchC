@@ -638,13 +638,35 @@ static int handle_init_command(const char *shell) {
          * since a no-op resume never creates the socket the probe looks for. */
         printf("if status is-interactive\n");
         if (have_hint) {
-            /* Only probe/resume when there's a saved account to resume. */
+            /* Only probe/resume when there's a saved account to resume, and
+             * pick the probe by the account's recorded runtime needs (the
+             * hint file's content) so an SSH-less active account never spawns
+             * a doomed ssh-add + resume on every shell (AR-02 #23). Empty or
+             * unrecognized content (a pre-#23 hint written before this field
+             * existed) falls back to the ssh-add probe — same behavior as
+             * before, no regression on the first post-upgrade shell. */
             printf("    if test -e '%s'\n", hint_path);
-            printf("        env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
-            printf("        if test $status -gt 1\n");
-            printf("            gitswitch resume >/dev/null\n");
-            printf("        end\n");
-            printf("    end\n");
+            printf("        read -l __gitswitch_needs < '%s'\n", hint_path);
+            printf("        switch \"$__gitswitch_needs\"\n");
+            printf("            case '' '*ssh*'\n");
+            printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
+            printf("                if test $status -gt 1\n");
+            printf("                    gitswitch resume >/dev/null\n");
+            printf("                end\n");
+            if (have_gpg_home) {
+                /* GPG-only account: the GNUPGHOME `current` symlink is
+                 * boot-volatile (XDG_RUNTIME_DIR), so its absence is the
+                 * liveness test — a builtin test, no spawn, unlike ssh-add. */
+                printf("            case '*gpg*'\n");
+                printf("                if not test -d '%s'\n", gpg_home);
+                printf("                    gitswitch resume >/dev/null\n");
+                printf("                end\n");
+            }
+            /* 'none' (identity-only): git config is persistent, nothing to
+             * restore — no probe, no resume. */
+            printf("        end\n");            /* close switch */
+            printf("        set -e __gitswitch_needs\n");
+            printf("    end\n");                /* close `if test -e <hint>` */
         } else {
             printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
             printf("    if test $status -gt 1\n");
@@ -681,12 +703,26 @@ static int handle_init_command(const char *shell) {
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
         if (have_hint) {
-            /* Only probe/resume when there's a saved account to resume. */
+            /* Pick the probe by the account's recorded runtime needs (hint
+             * file content) so an SSH-less active account never spawns a
+             * doomed ssh-add + resume every shell (AR-02 #23). Empty/unknown
+             * content (a pre-#23 hint) falls back to the ssh-add probe. read
+             * and case are shell builtins — no extra process. */
             printf("    if [ -e '%s' ]; then\n", hint_path);
-            printf("        SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
-            printf("        if [ $? -gt 1 ]; then\n");
-            printf("            gitswitch resume >/dev/null\n");
-            printf("        fi\n");
+            printf("        IFS= read -r __gitswitch_needs < '%s' 2>/dev/null || __gitswitch_needs=ssh\n", hint_path);
+            printf("        case \"$__gitswitch_needs\" in\n");
+            printf("        ''|*ssh*)\n");
+            printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
+            printf("            [ $? -gt 1 ] && gitswitch resume >/dev/null ;;\n");
+            if (have_gpg_home) {
+                /* GPG-only: the boot-volatile GNUPGHOME symlink's absence is
+                 * the liveness test — a builtin, no ssh-add spawn. */
+                printf("        *gpg*)\n");
+                printf("            [ -d '%s' ] || gitswitch resume >/dev/null ;;\n", gpg_home);
+            }
+            /* 'none' (identity-only): nothing to restore. */
+            printf("        esac\n");
+            printf("        unset __gitswitch_needs\n");
             printf("    fi ;;\n");
         } else {
             printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
@@ -889,36 +925,16 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
         }
     }
 
+    /* ssh_manager_reset already drops the stable current.sock link (under its
+     * per-dir lock) when it targets the account being reset. The redundant
+     * unlocked readlink/compare/unlink that used to live here raced a
+     * concurrent same-account re-switch: reset reaped the agent and unlinked
+     * current.sock under the lock, unlocked, the re-switch installed a fresh
+     * agent and re-pointed current.sock, and then this now-unlocked block
+     * deleted that freshly-installed live link — leaving a working agent with
+     * a dangling SSH_AUTH_SOCK (AR-02 #11). Removed; the locked cleanup in
+     * ssh_manager_reset is the single source of truth. */
     ssh_manager_reset(target);
-
-    /* ssh_manager_reset(<name>) kills that account's agent and unlinks its
-     * ssh-agent.<name>.sock + pid sidecar, but leaves the stable current.sock
-     * symlink behind — if it pointed at the account just reset, integrated
-     * shells keep exporting SSH_AUTH_SOCK at a dead socket. Mirror the GPG
-     * side's dangling-symlink cleanup: drop current.sock only when its target
-     * names this account's socket, so a link at some other account's live
-     * agent is left intact. Idempotent by construction (once the link is gone
-     * readlink fails and we do nothing), so it composes safely should
-     * ssh_manager_reset learn to do this cleanup itself (F3). */
-    if (target) {
-        char link_path[MAX_PATH_LEN];
-        char link_target[MAX_PATH_LEN];
-        char expected[MAX_PATH_LEN];
-        if (ssh_manager_get_auth_sock_path(link_path, sizeof(link_path)) == 0) {
-            ssize_t len = readlink(link_path, link_target, sizeof(link_target) - 1);
-            if (len > 0 && (size_t)len < sizeof(link_target) - 1) {
-                const char *base;
-                link_target[len] = '\0';
-                base = strrchr(link_target, '/');
-                base = base ? base + 1 : link_target;
-                if ((size_t)snprintf(expected, sizeof(expected),
-                                     "ssh-agent.%s.sock", target) < sizeof(expected) &&
-                    strcmp(base, expected) == 0) {
-                    unlink(link_path);
-                }
-            }
-        }
-    }
 
     gpg_manager_reset(target);
 
