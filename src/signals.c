@@ -1,7 +1,7 @@
 /* Signal guarding for the account-switch critical section (SIG-01, SIG-02).
  * See signals.h for the design rationale. Everything reachable from the
  * handler is restricted to the POSIX async-signal-safe set: sig_atomic_t
- * stores, unlink(), signal(), raise().
+ * stores, unlink(), signal(), raise(), kill().
  */
 
 /* glibc wants a POSIX feature macro for sigaction; FreeBSD gates SA_RESTART
@@ -37,6 +37,23 @@ static volatile sig_atomic_t g_pending_signal = 0;
  * identity — the exact half-applied state the rollback exists to undo
  * (AR-02 #2). Set/cleared only in normal context. */
 static volatile sig_atomic_t g_rollback_in_progress = 0;
+
+/* AR-03 L8: the pid of the subprocess run_argv is currently blocked on, or 0.
+ * Published right after fork() and cleared right after waitpid() so the
+ * handler can kill() a child the rollback is wedged behind (a re-prompting
+ * ssh-add reading a passphrase that will never come). sig_atomic_t is the
+ * only type the handler may read while the mainline writes it; pid_t is int
+ * on every platform we build for — the static assert makes that assumption
+ * fail loudly rather than truncate a pid. */
+static volatile sig_atomic_t g_child_pid = 0;
+_Static_assert(sizeof(sig_atomic_t) >= sizeof(pid_t),
+               "pid_t must fit in sig_atomic_t for the L8 child-pid publication");
+
+/* The child pid the handler already forwarded a signal to. A repeat signal
+ * against the SAME still-in-flight child escalates to SIGKILL — the polite
+ * forward is enough for anything with default dispositions (all our
+ * interactive children), the escalation covers a wrapper that ignores it. */
+static volatile sig_atomic_t g_child_signaled = 0;
 
 /* Saved dispositions so signals_guard_end() restores exactly what was there
  * (default action, or an outer SIG_IGN we chose not to override). */
@@ -83,8 +100,29 @@ static void guard_handler(int sig) {
      * The rollback is bounded work (a handful of local git execs) and its
      * interactive children (e.g. a re-prompting ssh-add) keep their default
      * dispositions, so Ctrl-C still kills THEM — liveness is preserved
-     * without sacrificing restore atomicity. */
+     * without sacrificing restore atomicity.
+     *
+     * A PROCESS-TARGETED kill is the exception (AR-03 L8): it never reaches
+     * the child's terminal group, so a rollback blocked at an ssh-add
+     * passphrase read would defer it forever. Forward the signal to the
+     * in-flight child (kill() is async-signal-safe) so the blocker dies and
+     * the rollback PROCEEDS — every restore step is per-key/best-effort, so
+     * the sequence still runs to completion and the mainline dispatches the
+     * pending signal at the end. Signal the child's PID, not its pgid: our
+     * children share this process group (no setpgid at spawn), so a group
+     * kill would loop the signal back at us and any sibling; the recorded
+     * pid is exactly the process that is blocked. If the same child survives
+     * a repeat signal (something ignoring SIGTERM), escalate to SIGKILL. */
     if (g_rollback_in_progress) {
+        pid_t child = (pid_t)g_child_pid;
+        if (child > 0) {
+            if ((pid_t)g_child_signaled == child) {
+                (void)kill(child, SIGKILL);
+            } else {
+                g_child_signaled = (sig_atomic_t)child;
+                (void)kill(child, sig);
+            }
+        }
         return;
     }
 
@@ -103,6 +141,24 @@ void signals_rollback_begin(void) {
 
 void signals_rollback_end(void) {
     g_rollback_in_progress = 0;
+}
+
+void signals_child_spawned(pid_t pid) {
+    if (pid > 0) {
+        g_child_pid = (sig_atomic_t)pid;
+    }
+}
+
+void signals_child_reaped(void) {
+    /* Clear the pid FIRST: once waitpid() has reaped, the kernel may reuse
+     * the pid, and a handler firing between reap and this store must not
+     * kill() a stranger. The window is the few instructions between waitpid
+     * returning and this call — and the handler only consults the pid when a
+     * repeat signal lands mid-rollback — so the residual race is accepted.
+     * Then retire the escalation latch so the next child (which could
+     * legitimately be handed the same pid) starts back at the polite step. */
+    g_child_pid = 0;
+    g_child_signaled = 0;
 }
 
 int signals_guard_begin(void) {

@@ -28,6 +28,19 @@
  *     further signals stay recorded until the restore completes and the
  *     mainline dispatches. Interactive children spawned by the rollback keep
  *     default dispositions, so Ctrl-C still interrupts them.
+ *   - That rollback deferral is BOUNDED, not absolute (AR-03 L8): a
+ *     PROCESS-TARGETED kill never reaches the child's terminal group, so a
+ *     rollback blocked at a re-prompting ssh-add passphrase read used to
+ *     defer `kill -TERM <pid>` forever — unkillable short of SIGKILL, with
+ *     the identity left half-rolled-back. Now run_argv publishes the
+ *     in-flight child pid (signals_child_spawned/reaped, a single
+ *     sig_atomic_t store), and a further guarded signal inside the rollback
+ *     window forwards that signal to the CHILD's pid via kill() (which is
+ *     async-signal-safe), escalating to SIGKILL if the same child survives a
+ *     repeat. Killing the blocker makes the rollback PROCEED — every restore
+ *     step is already per-key/best-effort, so the sequence still runs to
+ *     completion and the mainline dispatches normally; this is not a return
+ *     of the emergency exit mid-restore.
  *   - Signals whose disposition is SIG_IGN at guard time stay ignored (so a
  *     nohup'd run keeps ignoring SIGHUP), matching sigaction(2) convention.
  */
@@ -36,6 +49,7 @@
 #define SIGNALS_H
 
 #include <stdbool.h>
+#include <sys/types.h>
 
 /**
  * Install the deferring handler for SIGINT/SIGTERM/SIGHUP and clear any
@@ -63,6 +77,19 @@ void signals_guard_end(void);
  */
 void signals_rollback_begin(void);
 void signals_rollback_end(void);
+
+/**
+ * Publish / retract the in-flight subprocess (AR-03 L8). run_argv's spawn
+ * path calls signals_child_spawned(pid) right after fork() returns in the
+ * parent and signals_child_reaped() right after waitpid() reaps, so the
+ * handler can kill() the child that a blocked rollback is waiting on (see the
+ * bounded-deferral bullet above). Both are single sig_atomic_t stores —
+ * cheap, lock-free, and safe against the handler observing a torn value.
+ * Publishing outside the rollback window is harmless: the handler only
+ * consults the pid when a second guarded signal lands during rollback.
+ */
+void signals_child_spawned(pid_t pid);
+void signals_child_reaped(void);
 
 /** True if a guarded signal arrived since signals_guard_begin(). */
 bool signals_pending(void);

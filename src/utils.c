@@ -30,6 +30,7 @@
 
 #include "utils.h"
 #include "error.h"
+#include "signals.h"
 
 /* Static variables for terminal state management */
 static struct termios g_original_termios;
@@ -681,6 +682,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     /* ---- parent ---- */
     result->spawned = true;
+    /* AR-03 L8: publish the in-flight child so the signal handler can kill()
+     * it if a rollback wedges behind an interactive prompt (see signals.h). */
+    signals_child_spawned(pid);
     if (want_in) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
     void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
@@ -762,6 +766,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     int status = 0;
     pid_t w;
     do { w = waitpid(pid, &status, 0); } while (w < 0 && errno == EINTR);
+    /* Retract immediately after the reap: past this point the pid is free for
+     * kernel reuse, and the handler must not signal a stranger (AR-03 L8). */
+    signals_child_reaped();
     signal(SIGPIPE, old_sigpipe);
 
     if (w < 0) {
