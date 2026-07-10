@@ -894,11 +894,21 @@ static int parse_section_header(toml_parser_state_t *state, char *section_name) 
     skip_whitespace(state);
     
     /* Parse section name */
-    while (!is_at_end(state) && current_char(state) != ']' && 
+    while (!is_at_end(state) && current_char(state) != ']' &&
            name_pos < TOML_MAX_SECTION_LEN - 1) {
-        char c = advance_char(state);
-        
-        if (isalnum(c) || c == '.' || c == '_' || c == '-') {
+        char c = current_char(state);
+
+        /* Stop at trailing whitespace and let the skip_whitespace + ']' below
+         * consume it (AR-06 F71): leading whitespace after '[' was already
+         * accepted by the skip above, but a trailing space (`[settings ]`) hit
+         * the isalnum check and was a fatal error — an asymmetry. Interior
+         * whitespace (`[set tings]`) still fails at the ']' match. */
+        if (c == ' ' || c == '\t') {
+            break;
+        }
+        c = advance_char(state);
+
+        if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-') {
             section_name[name_pos++] = c;
         } else {
             set_parser_error(state, "Invalid character in section name");
@@ -1061,12 +1071,19 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
 
 /* Parse boolean value true/false */
 static int parse_boolean_value(toml_parser_state_t *state, bool *value) {
-    if (strncmp(&state->input[state->position], "true", 4) == 0) {
+    /* Bound the compare by the bytes actually remaining (AR-06 F69): the input
+     * is not guaranteed NUL-terminated at input_length, so a bare strncmp of 4
+     * or 5 bytes near the end over-read the heap (ASAN-confirmed). A literal
+     * that can't fit in the remainder simply isn't a match. */
+    size_t remaining = state->input_length - state->position;
+    if (remaining >= 4 && strncmp(&state->input[state->position], "true", 4) == 0) {
         state->position += 4;
+        state->column_number += 4; /* AR-06 F72: keep column in sync (no newline) */
         *value = true;
         return 0;
-    } else if (strncmp(&state->input[state->position], "false", 5) == 0) {
+    } else if (remaining >= 5 && strncmp(&state->input[state->position], "false", 5) == 0) {
         state->position += 5;
+        state->column_number += 5; /* AR-06 F72 */
         *value = false;
         return 0;
     } else {
