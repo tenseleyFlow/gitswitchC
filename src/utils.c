@@ -1022,6 +1022,45 @@ bool validate_name(const char *name) {
     return false;
 }
 
+/* Shared strict UTF-8 decoding and terminal-safety policy — moved here from
+ * config.c so the TOML parser's raw-buffer charset gate can apply the same
+ * rules instead of rejecting every byte >= 0x80 (AR-02 #6). See utils.h for
+ * the full rationale. */
+size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
+    unsigned char b0 = s[0];
+
+    if (b0 < 0x80) {
+        *cp_out = b0;
+        return 1;
+    }
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        if ((s[1] & 0xC0) != 0x80) return 0;
+        *cp_out = ((uint32_t)(b0 & 0x1F) << 6) | (s[1] & 0x3F);
+        return 2;
+    }
+    if (b0 >= 0xE0 && b0 <= 0xEF) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
+        if (b0 == 0xE0 && s[1] < 0xA0) return 0;              /* overlong */
+        if (b0 == 0xED && s[1] >= 0xA0) return 0;             /* surrogate */
+        *cp_out = ((uint32_t)(b0 & 0x0F) << 12) |
+                  ((uint32_t)(s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        return 3;
+    }
+    if (b0 >= 0xF0 && b0 <= 0xF4) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return 0;
+        if (b0 == 0xF0 && s[1] < 0x90) return 0;              /* overlong */
+        if (b0 == 0xF4 && s[1] > 0x8F) return 0;              /* > U+10FFFF */
+        *cp_out = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
+                  ((uint32_t)(s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        return 4;
+    }
+    return 0; /* 0x80-0xC1 lead (bare continuation/overlong) or 0xF5+ */
+}
+
+bool tty_safe_codepoint(uint32_t cp) {
+    return cp >= 0x20 && cp != 0x7F && !(cp >= 0x80 && cp <= 0x9F);
+}
+
 bool validate_key_id(const char *key_id) {
     if (!key_id || strlen(key_id) == 0 || strlen(key_id) >= MAX_KEY_ID_LEN) {
         return false;

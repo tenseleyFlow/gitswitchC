@@ -199,6 +199,105 @@ TEST(accepts_anchored_ssh_key) {
     toml_cleanup_document(&doc);
 }
 
+/* AR-02 #6: well-formed UTF-8 in values must parse and round-trip through
+ * toml_get_string byte-identical. Pre-fix, the raw-buffer charset gate
+ * rejected every byte >= 0x80, so one accented character (accepted by the
+ * interactive add and written verbatim by toml_write_file) bricked the whole
+ * config on the next load. */
+TEST(utf8_value_parses_and_round_trips) {
+    toml_document_t doc;
+    char buf[64];
+    /* "Jos\xC3\xA9 Work" — José, 2-byte UTF-8; plus a 3-byte CJK char. */
+    const char *cfg =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"Jos\xC3\xA9 \xE4\xBB\x95\xE4\xBA\x8B\"\n"
+        "email = \"a@b.com\"\n";
+    CHECK_EQ_INT(parse(cfg, &doc), 0);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, "Jos\xC3\xA9 \xE4\xBB\x95\xE4\xBA\x8B");
+    toml_cleanup_document(&doc);
+}
+
+/* The gate stays strict about what >= 0x80 may BE: raw C1 bytes (malformed as
+ * UTF-8), 2-byte-encoded C1 controls, and overlong encodings (the C1-smuggling
+ * vector the strict decoder exists for) are all still whole-file rejections. */
+TEST(safe_characters_reject_c1_and_overlong_utf8) {
+    /* Raw C1 byte 0x9B (one-byte CSI). */
+    char raw_c1[] = { 'a', (char)0x9B, 'b', '\0' };
+    CHECK(!toml_validate_safe_characters(raw_c1, 3));
+    /* 2-byte UTF-8 form of U+009B: 0xC2 0x9B. */
+    char enc_c1[] = { 'a', (char)0xC2, (char)0x9B, 'b', '\0' };
+    CHECK(!toml_validate_safe_characters(enc_c1, 4));
+    /* Overlong 3-byte encoding of U+009B: 0xE0 0x82 0x9B. */
+    char overlong3[] = { 'a', (char)0xE0, (char)0x82, (char)0x9B, 'b', '\0' };
+    CHECK(!toml_validate_safe_characters(overlong3, 5));
+    /* Bare continuation byte. */
+    char bare_cont[] = { 'a', (char)0x80, 'b', '\0' };
+    CHECK(!toml_validate_safe_characters(bare_cont, 3));
+    /* Well-formed 2-byte é still passes. */
+    char ok_utf8[] = { 'J', 'o', 's', (char)0xC3, (char)0xA9, '\0' };
+    CHECK(toml_validate_safe_characters(ok_utf8, 5));
+}
+
+/* AR-02 #6: the read-path sanitizer must pass valid UTF-8 through untouched
+ * (it used to strip every byte >= 0x80, so "José" retrieved as "Jos") while
+ * still dropping C0/C1 controls and malformed bytes. */
+TEST(sanitize_preserves_utf8_strips_controls) {
+    char out[64];
+    /* é passes through byte-identical. */
+    CHECK_EQ_INT(toml_sanitize_string("Jos\xC3\xA9", out, sizeof(out)), 0);
+    CHECK_STR_EQ(out, "Jos\xC3\xA9");
+    /* Newline and raw C1 byte are dropped; the quote is dropped too. */
+    CHECK_EQ_INT(toml_sanitize_string("a\nb\x9B\"c", out, sizeof(out)), 0);
+    CHECK_STR_EQ(out, "abc");
+    /* 2-byte-encoded C1 control is dropped as a unit. */
+    CHECK_EQ_INT(toml_sanitize_string("a\xC2\x9B" "b", out, sizeof(out)), 0);
+    CHECK_STR_EQ(out, "ab");
+}
+
+/* AR-02 #7: absolute key paths outside the old /home,/Users,/tmp allowlist
+ * (NFS /export/home, systemd-homed /var/home, ...) are legitimate and must
+ * load — pre-fix, ONE such path was a fatal whole-config failure taking every
+ * unrelated account with it. Ownership/permission enforcement happens at use
+ * (validate_account_security, ssh_validate_key_file), not by path prefix. */
+TEST(accepts_non_allowlisted_absolute_ssh_key) {
+    toml_document_t doc;
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "ssh_key = \"/export/home/alice/.ssh/id_ed25519\"\n", &doc), 0);
+    toml_cleanup_document(&doc);
+}
+
+/* Traversal is a property of the path, not its prefix, and stays fatal —
+ * including the backslash-resynthesis spelling: ".\./id" contains no ".."
+ * substring, but the sanitizer strips the backslash and would hand callers
+ * "../id", which is why validation runs on the SANITIZED bytes (AR-02 #29). */
+TEST(rejects_traversal_and_resynthesized_traversal_ssh_key) {
+    toml_document_t doc;
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "ssh_key = \"/home/alice/../../etc/key\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "ssh_key = \"/home/alice/.\\\\./id_ed25519\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(parses_valid_config);
@@ -213,4 +312,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(bracket_heavy_value_round_trips);
     RUN_TEST(rejects_relative_ssh_key);
     RUN_TEST(accepts_anchored_ssh_key);
+    RUN_TEST(utf8_value_parses_and_round_trips);
+    RUN_TEST(safe_characters_reject_c1_and_overlong_utf8);
+    RUN_TEST(sanitize_preserves_utf8_strips_controls);
+    RUN_TEST(accepts_non_allowlisted_absolute_ssh_key);
+    RUN_TEST(rejects_traversal_and_resynthesized_traversal_ssh_key);
 TEST_MAIN_END()

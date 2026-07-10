@@ -1322,52 +1322,9 @@ static int parse_account_id_from_section(const char *section_name, uint32_t *acc
     return 0;
 }
 
-/* Decode one UTF-8 sequence starting at s, writing the codepoint to *cp_out
- * and returning the number of bytes consumed, or 0 if the sequence is
- * malformed. Deliberately strict: overlong encodings and surrogates are
- * rejected, because an overlong form (e.g. 0xE0 0x80 0x9B) is exactly how a
- * C1 terminal control sneaks past a naive byte filter into a lenient
- * terminal decoder. NUL and stray continuation bytes fail the
- * (b & 0xC0) == 0x80 test, so NUL-terminated strings need no length bound. */
-static size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
-    unsigned char b0 = s[0];
-
-    if (b0 < 0x80) {
-        *cp_out = b0;
-        return 1;
-    }
-    if (b0 >= 0xC2 && b0 <= 0xDF) {
-        if ((s[1] & 0xC0) != 0x80) return 0;
-        *cp_out = ((uint32_t)(b0 & 0x1F) << 6) | (s[1] & 0x3F);
-        return 2;
-    }
-    if (b0 >= 0xE0 && b0 <= 0xEF) {
-        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
-        if (b0 == 0xE0 && s[1] < 0xA0) return 0;              /* overlong */
-        if (b0 == 0xED && s[1] >= 0xA0) return 0;             /* surrogate */
-        *cp_out = ((uint32_t)(b0 & 0x0F) << 12) |
-                  ((uint32_t)(s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-        return 3;
-    }
-    if (b0 >= 0xF0 && b0 <= 0xF4) {
-        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return 0;
-        if (b0 == 0xF0 && s[1] < 0x90) return 0;              /* overlong */
-        if (b0 == 0xF4 && s[1] > 0x8F) return 0;              /* > U+10FFFF */
-        *cp_out = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
-                  ((uint32_t)(s[2] & 0x3F) << 6) | (s[3] & 0x3F);
-        return 4;
-    }
-    return 0; /* 0x80-0xC1 lead (bare continuation/overlong) or 0xF5+ */
-}
-
-/* True if the codepoint is safe to echo to a terminal. C0 controls
- * (including ESC 0x1B and CR), DEL 0x7F, and C1 controls U+0080-U+009F
- * (0x9B is a one-byte CSI) can move the cursor, recolor output, or
- * \r-overwrite the line — enough for a hostile config field to render
- * itself as "[CURRENT] trusted-account" in list/status/whoami output. */
-static bool tty_safe_codepoint(uint32_t cp) {
-    return cp >= 0x20 && cp != 0x7F && !(cp >= 0x80 && cp <= 0x9F);
-}
+/* utf8_decode and tty_safe_codepoint moved to utils.c so the TOML parser's
+ * raw-buffer charset gate shares the exact same strict decoding policy as
+ * this trust boundary (AR-02 #6). Declared in utils.h. */
 
 /* tty-escape policy for untrusted strings that reach the terminal, applied
  * at the trust boundary (config load) rather than in the display layer:

@@ -507,76 +507,125 @@ int toml_validate_gitswitch_schema(const toml_document_t *doc) {
     return 0;
 }
 
-/* Security validation: Check for safe characters only */
+/* Security validation: Check for safe characters only.
+ *
+ * UTF-8-aware (AR-02 #6): this gate runs on the raw file buffer before any
+ * parsing, and it used to reject every byte >= 0x80 — so one accented
+ * character in a name (which validate_name and the interactive add happily
+ * accept, and toml_write_file writes verbatim) bricked the ENTIRE config on
+ * the next load, unreachable even by `gitswitch remove`. Well-formed
+ * multi-byte UTF-8 with terminal-safe codepoints now passes; what stays
+ * rejected is exactly the dangerous residue: C0 controls (other than
+ * \n\r\t), DEL, raw C1 bytes (malformed as UTF-8), C1 controls in their
+ * 2-byte form, and overlong/surrogate encodings (utf8_decode is strict) —
+ * the terminal-escape-smuggling vectors the old byte filter was after. */
 bool toml_validate_safe_characters(const char *input, size_t length) {
     if (!input) return false;
-    
-    for (size_t i = 0; i < length; i++) {
+
+    size_t i = 0;
+    while (i < length) {
         unsigned char c = (unsigned char)input[i];
-        
-        /* Allow printable ASCII, newlines, tabs, and carriage returns */
-        if (!(c >= 32 && c <= 126) && c != '\n' && c != '\r' && c != '\t') {
+
+        /* Printable ASCII, newlines, tabs, and carriage returns */
+        if ((c >= 32 && c <= 126) || c == '\n' || c == '\r' || c == '\t') {
+            i++;
+            continue;
+        }
+        if (c < 0x80) {
+            /* Other C0 control or DEL — includes an embedded NUL, which also
+             * means a multi-byte sequence can never run past `length` below
+             * (the buffer is NUL-terminated at input[length]). */
             log_warning("Unsafe character found at position %zu: 0x%02x", i, c);
             return false;
         }
+
+        uint32_t cp;
+        size_t len = utf8_decode((const unsigned char *)input + i, &cp);
+        if (len == 0 || !tty_safe_codepoint(cp)) {
+            log_warning("Malformed or unsafe UTF-8 sequence at position %zu: 0x%02x", i, c);
+            return false;
+        }
+        i += len;
     }
-    
+
     return true;
 }
 
-/* Sanitize string value */
+/* Sanitize string value. Strips what a value must never carry into callers:
+ * C0 controls (incl. newline/CR — the ~/.ssh/config IdentityFile sink and
+ * core.sshCommand depend on values staying single-line), DEL, quotes and
+ * backslashes (quote-breakout in single-quoted emissions), raw C1 bytes, and
+ * malformed/overlong UTF-8. Well-formed multi-byte UTF-8 with terminal-safe
+ * codepoints passes through byte-identical (AR-02 #6) — previously every
+ * byte >= 0x80 was dropped, so "José" retrieved as "Jos" and no non-ASCII
+ * value could ever round-trip. */
 int toml_sanitize_string(const char *input, char *output, size_t output_size) {
     size_t input_len, output_pos = 0;
-    
+
     if (!input || !output || output_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_sanitize_string");
         return -1;
     }
-    
+
     input_len = strlen(input);
-    
-    for (size_t i = 0; i < input_len && output_pos < output_size - 1; i++) {
-        char c = input[i];
-        
-        /* Remove or escape potentially dangerous characters */
+
+    for (size_t i = 0; i < input_len && output_pos < output_size - 1; ) {
+        unsigned char c = (unsigned char)input[i];
+
         if (c >= 32 && c <= 126 && c != '"' && c != '\\') {
-            output[output_pos++] = c;
+            output[output_pos++] = (char)c;
+            i++;
+        } else if (c == '\t') {
+            output[output_pos++] = (char)c;
+            i++;
+        } else if (c >= 0x80) {
+            uint32_t cp;
+            size_t len = utf8_decode((const unsigned char *)input + i, &cp);
+            if (len > 0 && tty_safe_codepoint(cp) &&
+                output_pos + len <= output_size - 1) {
+                memcpy(output + output_pos, input + i, len);
+                output_pos += len;
+                i += len;
+            } else {
+                /* Malformed byte, C1 control, or a sequence that won't fit
+                 * whole — drop it (never emit a partial sequence). */
+                i += (len > 0) ? len : 1;
+            }
+        } else {
+            i++; /* C0 control or DEL: drop */
         }
-        /* Allow some whitespace */
-        else if (c == ' ' || c == '\t') {
-            output[output_pos++] = c;
-        }
-        /* Skip other characters */
     }
-    
+
     output[output_pos] = '\0';
     return 0;
 }
 
-/* Validate file path for security */
+/* Validate file path for security. Property-based, not location-based
+ * (AR-02 #7): this used to allowlist /home, /Users, and /tmp prefixes, which
+ * rejected every legitimate enterprise home layout (/export/home NFS,
+ * /var/home systemd-homed, /data, ...) — and because it runs inside schema
+ * validation, one such path was a fatal WHOLE-config load failure taking
+ * every unrelated account down with it. A prefix list adds no protection the
+ * real guards don't already provide: the schema caller requires the path to
+ * be '/'- or '~'-anchored (CWD-independent), validate_account_security
+ * lstats/permission-checks it at load, and ssh_validate_key_file enforces
+ * ownership and mode before any key is actually handed to an agent. What
+ * remains here are the structural properties of a sane key path. */
 bool toml_validate_file_path(const char *path) {
     if (!path || strlen(path) == 0) return true; /* Empty path is allowed */
-    
+
     /* Check for directory traversal attempts */
     if (strstr(path, "..") != NULL) {
         log_warning("Directory traversal attempt in path: %s", path);
         return false;
     }
-    
-    /* Check for absolute paths outside user home */
-    if (path[0] == '/' && !string_starts_with(path, "/home/") &&
-        !string_starts_with(path, "/Users/") &&
-        !string_starts_with(path, "/tmp/")) {
-        log_warning("Suspicious absolute path: %s", path);
-        return false;
-    }
-    
+
     /* Check path length */
     if (strlen(path) > 256) {
         log_warning("Path too long: %zu characters", strlen(path));
         return false;
     }
-    
+
     return true;
 }
 

@@ -5,6 +5,7 @@
 
 #include <sys/types.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <time.h>
 
 #include "gitswitch.h"
@@ -150,6 +151,28 @@ bool validate_email(const char *email);
 bool validate_name(const char *name);
 bool validate_key_id(const char *key_id);
 bool validate_file_path(const char *path);
+
+/**
+ * UTF-8 / terminal-safety utilities (shared by the config trust boundary and
+ * the TOML parser's charset gate, so both layers apply the SAME strict
+ * decoding policy — AR-02 #6).
+ *
+ * utf8_decode: decode one UTF-8 sequence starting at s, writing the codepoint
+ * to *cp_out and returning the number of bytes consumed, or 0 if the sequence
+ * is malformed. Deliberately strict: overlong encodings and surrogates are
+ * rejected, because an overlong form (e.g. 0xE0 0x80 0x9B) is exactly how a
+ * C1 terminal control sneaks past a naive byte filter into a lenient terminal
+ * decoder. NUL and stray continuation bytes fail the (b & 0xC0) == 0x80 test,
+ * so NUL-terminated strings need no length bound.
+ *
+ * tty_safe_codepoint: true if the codepoint is safe to echo to a terminal.
+ * C0 controls (including ESC 0x1B and CR), DEL 0x7F, and C1 controls
+ * U+0080-U+009F (0x9B is a one-byte CSI) can move the cursor, recolor output,
+ * or \r-overwrite the line — enough for a hostile config field to render
+ * itself as "[CURRENT] trusted-account" in list/status/whoami output.
+ */
+size_t utf8_decode(const unsigned char *s, uint32_t *cp_out);
+bool tty_safe_codepoint(uint32_t cp);
 
 /**
  * Security utilities
