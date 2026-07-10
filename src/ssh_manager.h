@@ -18,12 +18,17 @@ typedef enum {
 typedef struct {
     ssh_agent_mode_t mode;
     char agent_socket_path[MAX_PATH_LEN];
+    char agent_socket_arg[MAX_PATH_LEN]; /* exact -a argument used to start it */
     pid_t agent_pid;
     bool agent_owned;      /* Whether we started this agent */
-    bool key_already_loaded; /* Reused a live agent that already holds the key;
-                              * caller can skip ssh_add_key (avoids a passphrase
-                              * re-prompt on re-switching to the active account) */
+    bool key_already_loaded; /* The isolated agent already holds the account key;
+                              * reuse avoids a passphrase re-prompt. */
 } ssh_config_t;
+
+typedef int (*ssh_setenv_fn)(const char *name, const char *value, int overwrite);
+typedef bool (*ssh_reap_fn)(pid_t pid, const char *socket_arg);
+typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
+typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);
 
 /* Function prototypes */
 
@@ -35,7 +40,7 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode);
 /**
  * Cleanup SSH manager, stopping owned agents
  */
-void ssh_manager_cleanup(ssh_config_t *ssh_config);
+int ssh_manager_cleanup(ssh_config_t *ssh_config);
 
 /**
  * Switch to account's SSH configuration with proper isolation
@@ -51,6 +56,20 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account);
  * Returns socket path and PID for cleanup
  */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account);
+
+/**
+ * Replace the environment setter used by the SSH runtime commit and return
+ * the previous function. This is a deterministic test seam; pass NULL to
+ * restore libc setenv. Runtime rollback itself is not routed through the seam.
+ */
+ssh_setenv_fn ssh_manager_set_setenv_fn(ssh_setenv_fn fn);
+
+/* Deterministic failure/race seams used by the adversarial runtime tests. */
+ssh_reap_fn ssh_manager_set_reap_fn(ssh_reap_fn fn);
+ssh_pid_commit_hook_fn ssh_manager_set_pid_commit_hook_fn(
+    ssh_pid_commit_hook_fn fn);
+ssh_namespace_commit_hook_fn ssh_manager_set_namespace_commit_hook_fn(
+    ssh_namespace_commit_hook_fn fn);
 
 /**
  * Stop SSH agent (only if we own it)
@@ -98,6 +117,19 @@ int ssh_test_connection(const account_t *account, const char *host);
  * Returns 0 on success, -1 if the computed path would overflow buf.
  */
 int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size);
+
+/**
+ * Inspect the stable isolated-agent entry point and return its account name.
+ * The private SSH runtime directory is inspected under the manager lock, and
+ * current.sock must be a stable symlink to an exact same-directory
+ * ssh-agent.<name>.sock entry backed by a live, user-owned 0600 socket.
+ *
+ * Returns 0 with `*present == false` when the managed directory or current.sock
+ * is absent. Returns 0 with `*present == true` and a NUL-terminated name for a
+ * valid live account. Unsafe, malformed, stale, changed, or truncated state is
+ * an error and returns -1 without publishing a name.
+ */
+int ssh_manager_get_current_account(char *name, size_t name_size, bool *present);
 
 /**
  * Tear down isolated SSH agents (kill by recorded PID and remove sockets/PID

@@ -12,6 +12,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <errno.h>
@@ -32,9 +33,58 @@
 #include "error.h"
 #include "signals.h"
 
+/* Linux, macOS, and FreeBSD can pin a directory descriptor without following
+ * a replaced final-component symlink. Other platforms fail closed rather than
+ * attempt a pathname chmod that could be redirected after validation. */
+#if defined(O_NOFOLLOW) && defined(O_DIRECTORY)
+#define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 1
+#else
+#define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 0
+#endif
+
 /* Static variables for terminal state management */
 static struct termios g_original_termios;
 static bool g_echo_disabled = false;
+
+#define RUNTIME_LOCK_CONTEXTS 8
+#define PRIVATE_LOCK_INODES 64
+#define PRIVATE_LOCK_CONTEXTS 64
+
+typedef struct {
+    bool active;
+    dev_t dev;
+    ino_t ino;
+    int fd;
+    unsigned refs;
+} private_lock_inode_t;
+
+typedef struct {
+    bool active;
+    int token_fd;
+    dev_t token_dev;
+    ino_t token_ino;
+    size_t parent_slot;
+    size_t leaf_slot;
+    size_t file_slot;
+} private_lock_context_t;
+
+typedef struct {
+    bool active;
+    int lock_fd;
+    int parent_fd;
+    int dir_fd;
+    dev_t parent_dev;
+    ino_t parent_ino;
+    dev_t dir_dev;
+    ino_t dir_ino;
+    char parent_path[MAX_PATH_LEN];
+    char child_name[64];
+} runtime_lock_context_t;
+static runtime_lock_context_t g_runtime_locks[RUNTIME_LOCK_CONTEXTS];
+static private_lock_inode_t g_private_lock_inodes[PRIVATE_LOCK_INODES];
+static private_lock_context_t g_private_lock_contexts[PRIVATE_LOCK_CONTEXTS];
+static pid_t g_private_lock_pid;
+static pid_t g_runtime_lock_pid;
 
 /* String utilities */
 
@@ -262,14 +312,14 @@ int create_directory_recursive(const char *path, mode_t mode) {
 }
 
 int ensure_private_dir(const char *path) {
-    struct stat st;
+    struct stat path_st;
 
     if (!path || !*path) {
         set_error(ERR_INVALID_ARGS, "NULL path to ensure_private_dir");
         return -1;
     }
 
-    if (lstat(path, &st) != 0) {
+    if (lstat(path, &path_st) != 0) {
         if (errno != ENOENT) {
             set_system_error(ERR_FILE_IO, "Cannot stat directory: %s", path);
             return -1;
@@ -279,7 +329,7 @@ int ensure_private_dir(const char *path) {
         if (create_directory_recursive(path, 0700) != 0) {
             return -1;
         }
-        if (lstat(path, &st) != 0) {
+        if (lstat(path, &path_st) != 0) {
             set_system_error(ERR_FILE_IO, "Cannot stat created directory: %s", path);
             return -1;
         }
@@ -287,22 +337,644 @@ int ensure_private_dir(const char *path) {
 
     /* Must be a real directory (lstat does not follow symlinks), owned by us,
      * with no group/other access — refuse a hostile pre-created/redirected dir. */
-    if (S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode)) {
+    if (S_ISLNK(path_st.st_mode) || !S_ISDIR(path_st.st_mode)) {
         set_error(ERR_PERMISSION_DENIED, "Refusing to use non-directory/symlink path: %s", path);
         return -1;
     }
-    if (st.st_uid != getuid()) {
+    if (path_st.st_uid != getuid()) {
         set_error(ERR_PERMISSION_DENIED, "Directory not owned by current user: %s", path);
         return -1;
     }
-    if (st.st_mode & 077) {
-        /* Tighten if we can; refuse if it then still isn't private. */
-        if (chmod(path, 0700) != 0 || (lstat(path, &st) == 0 && (st.st_mode & 077))) {
+
+#if GITSWITCH_HAVE_DIRECTORY_NOFOLLOW
+    int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot open private directory safely: %s", path);
+        return -1;
+    }
+
+    struct stat fd_st;
+    if (fstat(fd, &fd_st) != 0) {
+        close(fd);
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot verify private directory: %s", path);
+        return -1;
+    }
+    if (!S_ISDIR(fd_st.st_mode) || fd_st.st_uid != getuid() ||
+        fd_st.st_dev != path_st.st_dev || fd_st.st_ino != path_st.st_ino) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Private directory changed while being verified: %s", path);
+        return -1;
+    }
+
+    if ((fd_st.st_mode & 077) != 0) {
+        if (fchmod(fd, 0700) != 0 || fstat(fd, &fd_st) != 0 ||
+            !S_ISDIR(fd_st.st_mode) || fd_st.st_uid != getuid() ||
+            (fd_st.st_mode & 077) != 0) {
+            close(fd);
             set_error(ERR_PERMISSION_DENIED, "Directory has unsafe permissions: %s", path);
             return -1;
         }
     }
+
+    struct stat final_st;
+    if (lstat(path, &final_st) != 0 || !S_ISDIR(final_st.st_mode) ||
+        final_st.st_dev != fd_st.st_dev || final_st.st_ino != fd_st.st_ino) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Private directory changed while being secured: %s", path);
+        return -1;
+    }
+    close(fd);
+#else
+    if ((path_st.st_mode & 077) != 0) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Directory permissions are unsafe and this platform cannot "
+                  "tighten them without following paths: %s", path);
+        return -1;
+    }
+#endif
     return 0;
+}
+
+static bool same_fs_identity(const struct stat *a, const struct stat *b) {
+    return a && b && a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static int open_directory_nofollow(const char *path, struct stat *opened) {
+    int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = open(path, flags);
+    if (fd < 0 || fstat(fd, opened) != 0 || !S_ISDIR(opened->st_mode)) {
+        int saved_errno = errno;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
+int open_runtime_parent(char *path, size_t path_size) {
+    const char *xdg = getenv("XDG_RUNTIME_DIR");
+    struct stat before;
+    struct stat opened;
+    struct stat after;
+    bool use_xdg = false;
+    int fd;
+
+    if (!path || path_size == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid runtime-parent output buffer");
+        return -1;
+    }
+
+    if (xdg && *xdg) {
+        if (lstat(xdg, &before) == 0) {
+            use_xdg = true;
+        } else if (errno != ENOENT) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect XDG_RUNTIME_DIR: %s", xdg);
+            return -1;
+        }
+    }
+
+    if (use_xdg) {
+        if (!S_ISDIR(before.st_mode) || S_ISLNK(before.st_mode) ||
+            before.st_uid != getuid() || (before.st_mode & 077) != 0) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "XDG_RUNTIME_DIR must be a private self-owned directory: %s",
+                      xdg);
+            return -1;
+        }
+        if (safe_strncpy(path, xdg, path_size) != 0) {
+            set_error(ERR_INVALID_PATH, "XDG_RUNTIME_DIR path is too long");
+            return -1;
+        }
+        fd = open_directory_nofollow(path, &opened);
+        if (fd < 0 || opened.st_uid != getuid() ||
+            (opened.st_mode & 077) != 0 || !same_fs_identity(&before, &opened)) {
+            if (fd >= 0) close(fd);
+            set_error(ERR_PERMISSION_DENIED,
+                      "XDG_RUNTIME_DIR changed or is unsafe: %s", path);
+            return -1;
+        }
+        if (lstat(path, &after) != 0 || !S_ISDIR(after.st_mode) ||
+            !same_fs_identity(&opened, &after)) {
+            close(fd);
+            set_error(ERR_PERMISSION_DENIED,
+                      "XDG_RUNTIME_DIR changed while being opened: %s", path);
+            return -1;
+        }
+        return fd;
+    }
+
+    if (safe_strncpy(path, "/tmp", path_size) != 0) {
+        set_error(ERR_INVALID_PATH, "Temporary runtime-parent path is too long");
+        return -1;
+    }
+    fd = open_directory_nofollow(path, &opened);
+    if (fd < 0) {
+        set_system_error(ERR_FILE_IO, "Cannot open runtime parent: %s", path);
+        return -1;
+    }
+    return fd;
+}
+
+int open_private_subdir_at(int parent_fd, const char *name, bool create,
+                           bool *absent) {
+    struct stat opened;
+    struct stat entry;
+    int flags = O_RDONLY;
+    int fd;
+
+    if (absent) *absent = false;
+    if (parent_fd < 0 || !name || !*name || strchr(name, '/') ||
+        strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid private runtime subdirectory");
+        return -1;
+    }
+    if (create && mkdirat(parent_fd, name, 0700) != 0 && errno != EEXIST) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot create private runtime subdirectory: %s", name);
+        return -1;
+    }
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    fd = openat(parent_fd, name, flags);
+    if (fd < 0) {
+        if (!create && errno == ENOENT && absent) {
+            *absent = true;
+            return -1;
+        }
+        /* O_NOFOLLOW reports a terminal symlink differently across kernels:
+         * Linux/macOS use ELOOP or ENOTDIR, while FreeBSD returns EMLINK. */
+        if (errno == ELOOP || errno == ENOTDIR || errno == EMLINK) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing non-directory/symlink runtime subdirectory: %s",
+                      name);
+            return -1;
+        }
+        set_system_error(ERR_FILE_IO,
+                         "Cannot open private runtime subdirectory: %s", name);
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0 || !S_ISDIR(opened.st_mode) ||
+        opened.st_uid != getuid()) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Runtime subdirectory is not a self-owned directory: %s", name);
+        return -1;
+    }
+    if ((opened.st_mode & 077) != 0) {
+        if (!create || fchmod(fd, 0700) != 0 || fstat(fd, &opened) != 0 ||
+            !S_ISDIR(opened.st_mode) || opened.st_uid != getuid() ||
+            (opened.st_mode & 077) != 0) {
+            close(fd);
+            set_error(ERR_PERMISSION_DENIED,
+                      "Runtime subdirectory permissions are unsafe: %s", name);
+            return -1;
+        }
+    }
+    if (fstatat(parent_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISDIR(entry.st_mode) || !same_fs_identity(&opened, &entry)) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Runtime subdirectory changed while being opened: %s", name);
+        return -1;
+    }
+    return fd;
+}
+
+static bool private_lock_fd_has_identity(int fd, dev_t dev, ino_t ino) {
+    struct stat st;
+    return fd >= 0 && fstat(fd, &st) == 0 && st.st_dev == dev && st.st_ino == ino;
+}
+
+static int private_lock_dup_cloexec(int fd) {
+    int copy = dup(fd);
+    if (copy >= 0 && fcntl(copy, F_SETFD, FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
+        close(copy);
+        errno = saved_errno;
+        return -1;
+    }
+    return copy;
+}
+
+/* flock state is inherited across fork because parent and child initially
+ * share the same open descriptions.  The child must discard that inherited
+ * bookkeeping before trying to acquire anything: treating it as reentrant
+ * ownership would let the child enter while the parent still holds the lock.
+ * Identity checks avoid closing an unrelated descriptor if test/application
+ * code closed and reused an exposed token before its first post-fork acquire. */
+static void private_lock_prepare_process(void) {
+    pid_t pid = getpid();
+
+    if (g_private_lock_pid == 0) {
+        g_private_lock_pid = pid;
+        return;
+    }
+    if (g_private_lock_pid == pid) return;
+
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        private_lock_context_t *ctx = &g_private_lock_contexts[i];
+        if (ctx->active &&
+            private_lock_fd_has_identity(ctx->token_fd, ctx->token_dev,
+                                         ctx->token_ino)) {
+            close(ctx->token_fd);
+        }
+    }
+    for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
+        private_lock_inode_t *inode = &g_private_lock_inodes[i];
+        if (inode->active &&
+            private_lock_fd_has_identity(inode->fd, inode->dev, inode->ino)) {
+            close(inode->fd);
+        }
+    }
+    memset(g_private_lock_contexts, 0, sizeof(g_private_lock_contexts));
+    memset(g_private_lock_inodes, 0, sizeof(g_private_lock_inodes));
+    g_private_lock_pid = pid;
+}
+
+static int private_lock_inode_acquire(int owned_fd, bool nonblocking,
+                                      size_t *slot_out) {
+    struct stat st;
+    int operation = LOCK_EX | (nonblocking ? LOCK_NB : 0);
+
+    if (fstat(owned_fd, &st) != 0) {
+        int saved_errno = errno;
+        close(owned_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
+        private_lock_inode_t *inode = &g_private_lock_inodes[i];
+        if (inode->active && inode->dev == st.st_dev && inode->ino == st.st_ino) {
+            close(owned_fd);
+            inode->refs++;
+            *slot_out = i;
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
+        private_lock_inode_t *inode = &g_private_lock_inodes[i];
+        if (!inode->active) {
+            if (flock(owned_fd, operation) != 0) {
+                int saved_errno = errno;
+                close(owned_fd);
+                errno = saved_errno;
+                return -1;
+            }
+            inode->active = true;
+            inode->dev = st.st_dev;
+            inode->ino = st.st_ino;
+            inode->fd = owned_fd;
+            inode->refs = 1;
+            *slot_out = i;
+            return 0;
+        }
+    }
+    close(owned_fd);
+    errno = EMFILE;
+    return -1;
+}
+
+static void private_lock_inode_release(size_t slot) {
+    private_lock_inode_t *inode;
+
+    if (slot >= PRIVATE_LOCK_INODES) return;
+    inode = &g_private_lock_inodes[slot];
+    if (!inode->active || inode->refs == 0) return;
+    inode->refs--;
+    if (inode->refs == 0) {
+        (void)flock(inode->fd, LOCK_UN);
+        close(inode->fd);
+        memset(inode, 0, sizeof(*inode));
+    }
+}
+
+static int lock_private_file_at_mode(int dir_fd, const char *name,
+                                     bool nonblocking) {
+    struct stat opened;
+    struct stat entry;
+    struct stat leaf;
+    int flags = O_RDWR | O_CREAT;
+    int dir_flags = O_RDONLY;
+    int parent_fd = -1;
+    int leaf_fd = -1;
+    int file_fd = -1;
+    int token_fd = -1;
+    size_t parent_slot = PRIVATE_LOCK_INODES;
+    size_t leaf_slot = PRIVATE_LOCK_INODES;
+    size_t file_slot = PRIVATE_LOCK_INODES;
+    size_t context_slot = PRIVATE_LOCK_CONTEXTS;
+
+    if (dir_fd < 0 || !name || !*name || strchr(name, '/')) {
+        set_error(ERR_INVALID_ARGS, "Invalid private lock file");
+        return -1;
+    }
+    private_lock_prepare_process();
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        if (!g_private_lock_contexts[i].active) {
+            context_slot = i;
+            break;
+        }
+    }
+    if (context_slot == PRIVATE_LOCK_CONTEXTS) {
+        errno = EMFILE;
+        return -1;
+    }
+#ifdef O_DIRECTORY
+    dir_flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+    dir_flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    dir_flags |= O_NOFOLLOW;
+#endif
+    parent_fd = openat(dir_fd, "..", dir_flags);
+    leaf_fd = private_lock_dup_cloexec(dir_fd);
+    if (parent_fd < 0 || leaf_fd < 0 || fstat(leaf_fd, &leaf) != 0 ||
+        !S_ISDIR(leaf.st_mode)) {
+        int saved_errno = errno;
+        if (parent_fd >= 0) close(parent_fd);
+        if (leaf_fd >= 0) close(leaf_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    /* One global order for every participant prevents ABBA deadlocks.  Parent
+     * is the namespace anchor: a replacement leaf beneath that same parent
+     * cannot enter until the old leaf's holder releases this lock. */
+    if (private_lock_inode_acquire(parent_fd, nonblocking, &parent_slot) != 0) {
+        close(leaf_fd);
+        return -1;
+    }
+    parent_fd = -1;
+    if (private_lock_inode_acquire(leaf_fd, nonblocking, &leaf_slot) != 0) {
+        private_lock_inode_release(parent_slot);
+        return -1;
+    }
+    leaf_fd = -1;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    file_fd = openat(dir_fd, name, flags, 0600);
+    if (file_fd < 0) {
+        goto fail;
+    }
+    if (fstat(file_fd, &opened) != 0) {
+        goto fail;
+    }
+    if (!S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+        opened.st_nlink != 1) {
+        errno = EACCES;
+        goto fail;
+    }
+    if (fchmod(file_fd, 0600) != 0) {
+        goto fail;
+    }
+    if (private_lock_inode_acquire(file_fd, nonblocking, &file_slot) != 0) {
+        file_fd = -1; /* acquire consumes the descriptor on every outcome */
+        goto fail;
+    }
+    file_fd = -1;
+    if (fstatat(dir_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(entry.st_mode) || !same_fs_identity(&opened, &entry)) {
+        errno = EACCES;
+        goto fail;
+    }
+    token_fd = private_lock_dup_cloexec(g_private_lock_inodes[file_slot].fd);
+    if (token_fd < 0) goto fail;
+
+    g_private_lock_contexts[context_slot].active = true;
+    g_private_lock_contexts[context_slot].token_fd = token_fd;
+    g_private_lock_contexts[context_slot].token_dev = opened.st_dev;
+    g_private_lock_contexts[context_slot].token_ino = opened.st_ino;
+    g_private_lock_contexts[context_slot].parent_slot = parent_slot;
+    g_private_lock_contexts[context_slot].leaf_slot = leaf_slot;
+    g_private_lock_contexts[context_slot].file_slot = file_slot;
+    return token_fd;
+
+fail: {
+        int saved_errno = errno;
+        if (file_fd >= 0) close(file_fd);
+        if (token_fd >= 0) close(token_fd);
+        private_lock_inode_release(file_slot);
+        private_lock_inode_release(leaf_slot);
+        private_lock_inode_release(parent_slot);
+        errno = saved_errno;
+        return -1;
+    }
+}
+
+int lock_private_file_at(int dir_fd, const char *name) {
+    return lock_private_file_at_mode(dir_fd, name, false);
+}
+
+int try_lock_private_file_at(int dir_fd, const char *name) {
+    return lock_private_file_at_mode(dir_fd, name, true);
+}
+
+void unlock_private_file(int token_fd) {
+    private_lock_prepare_process();
+    if (token_fd < 0) return;
+
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        private_lock_context_t *ctx = &g_private_lock_contexts[i];
+        if (ctx->active && ctx->token_fd == token_fd) {
+            size_t parent_slot = ctx->parent_slot;
+            size_t leaf_slot = ctx->leaf_slot;
+            size_t file_slot = ctx->file_slot;
+            close(ctx->token_fd);
+            memset(ctx, 0, sizeof(*ctx));
+            private_lock_inode_release(file_slot);
+            private_lock_inode_release(leaf_slot);
+            private_lock_inode_release(parent_slot);
+            return;
+        }
+    }
+
+    /* Opaque tokens are valid only while registered in this process.  An
+     * inherited token can be closed and its descriptor number reused before
+     * the first post-fork release.  Acting on an unknown number here would
+     * unlock/close that unrelated resource, so stale tokens are a no-op. */
+}
+
+static void runtime_lock_prepare_process(void) {
+    pid_t pid = getpid();
+
+    /* Reset the generic registry first, before opening anything that could
+     * reuse a descriptor number closed explicitly by post-fork caller code. */
+    private_lock_prepare_process();
+    if (g_runtime_lock_pid == 0) {
+        g_runtime_lock_pid = pid;
+        return;
+    }
+    if (g_runtime_lock_pid == pid) return;
+
+    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
+        runtime_lock_context_t *ctx = &g_runtime_locks[i];
+        if (!ctx->active) continue;
+        if (private_lock_fd_has_identity(ctx->dir_fd, ctx->dir_dev,
+                                         ctx->dir_ino)) {
+            close(ctx->dir_fd);
+        }
+        if (private_lock_fd_has_identity(ctx->parent_fd, ctx->parent_dev,
+                                         ctx->parent_ino)) {
+            close(ctx->parent_fd);
+        }
+    }
+    memset(g_runtime_locks, 0, sizeof(g_runtime_locks));
+    g_runtime_lock_pid = pid;
+}
+
+int runtime_state_lock_acquire(void) {
+    char runtime_parent[MAX_PATH_LEN];
+    char lock_dir[MAX_PATH_LEN];
+    const char *child_name;
+    int parent_fd = -1;
+    int dir_fd = -1;
+    int lock_fd = -1;
+    int written;
+
+    runtime_lock_prepare_process();
+    parent_fd = open_runtime_parent(runtime_parent, sizeof(runtime_parent));
+    if (parent_fd < 0) {
+        return -1;
+    }
+    if (strcmp(runtime_parent, "/tmp") != 0) {
+        child_name = "gitswitch-runtime";
+    } else {
+        static char fallback_name[64];
+        if ((size_t)snprintf(fallback_name, sizeof(fallback_name),
+                             "gitswitch-runtime-%d", getuid()) >=
+            sizeof(fallback_name)) {
+            close(parent_fd);
+            set_error(ERR_INVALID_PATH, "Shared runtime lock name is too long");
+            return -1;
+        }
+        child_name = fallback_name;
+    }
+    written = snprintf(lock_dir, sizeof(lock_dir), "%s/%s",
+                       runtime_parent, child_name);
+    if (written < 0 || (size_t)written >= sizeof(lock_dir)) {
+        close(parent_fd);
+        set_error(ERR_INVALID_PATH, "Shared runtime lock path is too long");
+        return -1;
+    }
+    dir_fd = open_private_subdir_at(parent_fd, child_name, true, NULL);
+    if (dir_fd < 0) {
+        close(parent_fd);
+        return -1;
+    }
+    lock_fd = lock_private_file_at(dir_fd, ".lock");
+    if (lock_fd < 0) {
+        close(dir_fd);
+        close(parent_fd);
+        set_system_error(ERR_FILE_IO, "Cannot open shared runtime lock: %s",
+                         lock_dir);
+        return -1;
+    }
+
+    /* flock may have blocked while a same-uid process renamed/replaced either
+     * path.  Keep both descriptors pinned for the lock lifetime and refuse an
+     * acquisition whose public namespace no longer resolves to those inodes;
+     * otherwise a later contender could lock a replacement .lock and enter a
+     * supposedly serialized transaction concurrently. */
+    struct stat parent_st;
+    struct stat parent_path_st;
+    struct stat dir_st;
+    struct stat dir_entry_st;
+    if (fstat(parent_fd, &parent_st) != 0 || fstat(dir_fd, &dir_st) != 0 ||
+        lstat(runtime_parent, &parent_path_st) != 0 ||
+        !same_fs_identity(&parent_st, &parent_path_st) ||
+        fstatat(parent_fd, child_name, &dir_entry_st,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_fs_identity(&dir_st, &dir_entry_st)) {
+        unlock_private_file(lock_fd);
+        close(dir_fd);
+        close(parent_fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Shared runtime lock namespace changed during acquisition");
+        return -1;
+    }
+
+    for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
+        if (!g_runtime_locks[i].active) {
+            g_runtime_locks[i].active = true;
+            g_runtime_locks[i].lock_fd = lock_fd;
+            g_runtime_locks[i].parent_fd = parent_fd;
+            g_runtime_locks[i].dir_fd = dir_fd;
+            g_runtime_locks[i].parent_dev = parent_st.st_dev;
+            g_runtime_locks[i].parent_ino = parent_st.st_ino;
+            g_runtime_locks[i].dir_dev = dir_st.st_dev;
+            g_runtime_locks[i].dir_ino = dir_st.st_ino;
+            safe_strncpy(g_runtime_locks[i].parent_path, runtime_parent,
+                         sizeof(g_runtime_locks[i].parent_path));
+            safe_strncpy(g_runtime_locks[i].child_name, child_name,
+                         sizeof(g_runtime_locks[i].child_name));
+            return lock_fd;
+        }
+    }
+    unlock_private_file(lock_fd);
+    close(dir_fd);
+    close(parent_fd);
+    set_error(ERR_SYSTEM_CALL, "Too many nested shared runtime locks");
+    return -1;
+}
+
+void runtime_state_lock_release(int fd) {
+    runtime_lock_prepare_process();
+    if (fd >= 0) {
+        for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
+            if (g_runtime_locks[i].active && g_runtime_locks[i].lock_fd == fd) {
+                /* Retained descriptors are deliberately closed only after the
+                 * critical section; release also performs a final namespace
+                 * check as diagnostic hardening, though its void API cannot
+                 * surface a late replacement to the caller. */
+                struct stat pinned_parent;
+                struct stat named_parent;
+                struct stat pinned_dir;
+                struct stat named_dir;
+                (void)fstat(g_runtime_locks[i].parent_fd, &pinned_parent);
+                (void)lstat(g_runtime_locks[i].parent_path, &named_parent);
+                (void)fstat(g_runtime_locks[i].dir_fd, &pinned_dir);
+                (void)fstatat(g_runtime_locks[i].parent_fd,
+                              g_runtime_locks[i].child_name, &named_dir,
+                              AT_SYMLINK_NOFOLLOW);
+                unlock_private_file(fd);
+                close(g_runtime_locks[i].dir_fd);
+                close(g_runtime_locks[i].parent_fd);
+                memset(&g_runtime_locks[i], 0, sizeof(g_runtime_locks[i]));
+                return;
+            }
+        }
+        unlock_private_file(fd);
+    }
 }
 
 int atomic_symlink(const char *target, const char *linkpath) {
@@ -329,6 +1001,34 @@ int atomic_symlink(const char *target, const char *linkpath) {
     return 0;
 }
 
+int atomic_symlink_at(int dir_fd, const char *target, const char *link_name) {
+    char tmp[MAX_NAME_LEN + 64];
+
+    if (dir_fd < 0 || !target || !link_name || !*link_name ||
+        strchr(link_name, '/')) {
+        set_error(ERR_INVALID_ARGS, "Invalid atomic symlink arguments");
+        return -1;
+    }
+    if ((size_t)snprintf(tmp, sizeof(tmp), ".%s.tmp.%d", link_name,
+                         (int)getpid()) >= sizeof(tmp)) {
+        set_error(ERR_INVALID_PATH, "Symlink temp name too long");
+        return -1;
+    }
+    (void)unlinkat(dir_fd, tmp, 0);
+    if (symlinkat(target, dir_fd, tmp) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to create symlink: %s", link_name);
+        return -1;
+    }
+    if (renameat(dir_fd, tmp, dir_fd, link_name) != 0) {
+        int saved_errno = errno;
+        (void)unlinkat(dir_fd, tmp, 0);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO, "Failed to install symlink: %s", link_name);
+        return -1;
+    }
+    return 0;
+}
+
 int get_file_permissions(const char *path, mode_t *mode) {
     struct stat st;
     
@@ -343,20 +1043,6 @@ int get_file_permissions(const char *path, mode_t *mode) {
     }
     
     *mode = st.st_mode & 07777; /* Only permission bits */
-    return 0;
-}
-
-int set_file_permissions(const char *path, mode_t mode) {
-    if (!path) {
-        set_error(ERR_INVALID_ARGS, "NULL path to set_file_permissions");
-        return -1;
-    }
-    
-    if (chmod(path, mode) != 0) {
-        set_system_error(ERR_PERMISSION_DENIED, "Failed to set permissions on: %s", path);
-        return -1;
-    }
-    
     return 0;
 }
 
@@ -416,6 +1102,14 @@ int write_string_to_file(const char *file_path, const char *content, mode_t mode
         set_system_error(ERR_FILE_IO, "Failed to open file for writing: %s", file_path);
         return -1;
     }
+
+    /* Apply the requested mode to the descriptor we actually opened. A
+     * pathname chmod after fclose could affect a replacement file instead. */
+    if (fchmod(fileno(file), mode) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED, "Failed to set permissions on: %s", file_path);
+        fclose(file);
+        return -1;
+    }
     
     content_len = strlen(content);
     bytes_written = fwrite(content, 1, content_len, file);
@@ -426,13 +1120,11 @@ int write_string_to_file(const char *file_path, const char *content, mode_t mode
         return -1;
     }
     
-    fclose(file);
-    
-    /* Set file permissions */
-    if (set_file_permissions(file_path, mode) != 0) {
+    if (fclose(file) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to close file after writing: %s", file_path);
         return -1;
     }
-    
+
     return 0;
 }
 
@@ -441,6 +1133,7 @@ int copy_file(const char *src_path, const char *dst_path) {
     char buffer[4096];
     size_t bytes;
     int result = 0;
+    struct stat src_stat;
     
     if (!src_path || !dst_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to copy_file");
@@ -459,6 +1152,14 @@ int copy_file(const char *src_path, const char *dst_path) {
         fclose(src);
         return -1;
     }
+
+    /* Capture metadata from the same source object whose bytes are copied. */
+    if (fstat(fileno(src), &src_stat) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
+        fclose(src);
+        fclose(dst);
+        return -1;
+    }
     
     while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
         if (fwrite(buffer, 1, bytes, dst) != bytes) {
@@ -472,18 +1173,31 @@ int copy_file(const char *src_path, const char *dst_path) {
         set_system_error(ERR_FILE_IO, "Error reading source file: %s", src_path);
         result = -1;
     }
-    
-    fclose(src);
-    fclose(dst);
-    
-    /* Copy permissions from source to destination */
+
+    if (result == 0 && fflush(dst) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to flush destination file: %s", dst_path);
+        result = -1;
+    }
+
+    /* Pin the destination descriptor while applying ordinary permission bits;
+     * never propagate set-id or sticky bits from a copied input. */
     if (result == 0) {
-        struct stat src_stat;
-        if (stat(src_path, &src_stat) == 0) {
-            chmod(dst_path, src_stat.st_mode);
+        if (fchmod(fileno(dst), src_stat.st_mode & 0777) != 0) {
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Failed to set destination permissions: %s", dst_path);
+            result = -1;
         }
     }
-    
+
+    if (fclose(src) != 0 && result == 0) {
+        set_system_error(ERR_FILE_IO, "Failed to close source file: %s", src_path);
+        result = -1;
+    }
+    if (fclose(dst) != 0 && result == 0) {
+        set_system_error(ERR_FILE_IO, "Failed to close destination file: %s", dst_path);
+        result = -1;
+    }
+
     return result;
 }
 
@@ -597,10 +1311,24 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         return -1;
     }
 
+    /* Some helpers can consume sensitive state only through a pathname (for
+     * example GNUPGHOME). Let callers pin that directory before fork and make
+     * the child enter the descriptor-backed directory, so a same-uid namespace
+     * replacement cannot redirect the helper between validation and exec. */
+    if (opts->use_cwd_fd) {
+        struct stat cwd_st;
+        if (opts->cwd_fd < 0 || fstat(opts->cwd_fd, &cwd_st) != 0 ||
+            !S_ISDIR(cwd_st.st_mode)) {
+            set_error(ERR_INVALID_ARGS,
+                      "run_argv: cwd_fd is not an open directory");
+            return -1;
+        }
+    }
+
     /* PS-1/PS-2: pin the helper to an absolute path resolved through the
      * sanitized PATH walk in find_command_path() and exec exactly that path
      * with execv() below. execvp()'s own PATH search would happily pick a
-     * shadowing "git"/"ssh-add" out of a relative or world-writable PATH
+     * shadowing "git"/"ssh-add" out of a relative or group/world-writable PATH
      * entry — and since `gitswitch resume` runs from every interactive shell
      * startup, that is arbitrary code execution with the user's keys in
      * scope. Resolving in the parent also yields a real error message instead
@@ -638,6 +1366,28 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     if (pid == 0) {
         /* ---- child ---- */
+        int child_cwd_fd = -1;
+
+        /* Preserve a pinned working-directory descriptor before touching
+         * stdio.  If the parent began with fd 0/1/2 closed, cwd_fd can occupy
+         * one of those numbers and the dup2 setup below would otherwise
+         * destroy it before fchdir(). */
+        if (opts->use_cwd_fd) {
+#ifdef F_DUPFD_CLOEXEC
+            child_cwd_fd = fcntl(opts->cwd_fd, F_DUPFD_CLOEXEC, 3);
+#else
+            child_cwd_fd = fcntl(opts->cwd_fd, F_DUPFD, 3);
+            if (child_cwd_fd >= 0 &&
+                fcntl(child_cwd_fd, F_SETFD, FD_CLOEXEC) != 0) {
+                close(child_cwd_fd);
+                child_cwd_fd = -1;
+            }
+#endif
+            if (child_cwd_fd < 0) {
+                _exit(126);
+            }
+        }
+
         int devnull = open("/dev/null", O_RDWR);
         if (want_in) { dup2(in_pipe[0], STDIN_FILENO); }
         else if (devnull >= 0) { dup2(devnull, STDIN_FILENO); }
@@ -651,6 +1401,13 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (out_pipe[0] >= 0) close(out_pipe[0]);
         if (out_pipe[1] >= 0) close(out_pipe[1]);
         if (devnull >= 0) close(devnull);
+
+        if (opts->use_cwd_fd) {
+            if (fchdir(child_cwd_fd) != 0) {
+                _exit(126);
+            }
+            close(child_cwd_fd);
+        }
 
         /* fd-CLOEXEC: the explicit closes above only cover our own pipes;
          * sweep everything else the parent had open so the child starts with
@@ -700,6 +1457,15 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     char rdbuf[4096];
     if (infd >= 0) set_nonblock(infd);
     if (outfd >= 0) set_nonblock(outfd);
+
+    /* A provided zero-length buffer means "send no bytes, then EOF". Leaving
+     * the pipe open would make poll() report it writable forever: write(...,
+     * 0) returns zero, advances nothing, and a child such as cat keeps waiting
+     * for EOF. Close before the poll loop, without touching opts->input. */
+    if (infd >= 0 && opts->input_len == 0) {
+        close(infd);
+        infd = -1;
+    }
 
     while (infd >= 0 || outfd >= 0) {
         struct pollfd pfds[2];
@@ -803,12 +1569,13 @@ int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *res
  * automatically with the user's keys in scope.
  *
  * A directory may supply an executable only if it is an absolute path to a
- * real directory that is not world-writable. Relative entries (".", "", "bin")
+ * real directory that is not group- or world-writable. Relative entries (".", "", "bin")
  * resolve against the CWD — inside a freshly cloned repo that is attacker
- * territory. World-writable dirs are rejected even with the sticky bit set:
- * sticky only stops deleting other users' files, anyone can still CREATE a
- * shadowing "git" there. User-owned prefixes like ~/.local/bin, Homebrew's
- * /opt/homebrew/bin, or Nix profiles are 0755-or-tighter and keep working. */
+ * territory. Writable dirs are rejected even with the sticky bit set: sticky
+ * only stops deleting other users' files, while a writable group member can
+ * still replace or create a shadowing helper. User-owned prefixes like
+ * ~/.local/bin, Homebrew's /opt/homebrew/bin, or Nix profiles are
+ * 0755-or-tighter and keep working. */
 static bool exec_dir_is_trusted(const char *dir) {
     struct stat st;
 
@@ -818,22 +1585,23 @@ static bool exec_dir_is_trusted(const char *dir) {
     if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
         return false;
     }
-    if (st.st_mode & S_IWOTH) {
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
         return false;
     }
     return true;
 }
 
 /* The resolved binary itself must be a regular file (access(X_OK) alone would
- * happily "find" a directory named git) and not world-writable — a o+w binary
- * in an otherwise sane directory is just as replaceable as a o+w directory. */
+ * happily "find" a directory named git) and not group- or world-writable — a
+ * writable binary in an otherwise sane directory is just as replaceable as a
+ * writable directory. */
 static bool exec_candidate_is_trusted(const char *path) {
     struct stat st;
 
     if (stat(path, &st) != 0) {
         return false;
     }
-    if (!S_ISREG(st.st_mode) || (st.st_mode & S_IWOTH)) {
+    if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IWGRP | S_IWOTH))) {
         return false;
     }
     return access(path, X_OK) == 0;
@@ -911,8 +1679,9 @@ int find_command_path(const char *name, char *buf, size_t size) {
     }
 
     /* Walk colon-separated PATH entries, testing <dir>/<name> in each trusted
-     * directory. Untrusted entries are skipped, not fatal: a stray "." or o+w
-     * dir in PATH must not hide the real /usr/bin/git behind it. An empty
+     * directory. Untrusted entries are skipped, not fatal: a stray "." or
+     * group/world-writable dir in PATH must not hide the real /usr/bin/git
+     * behind it. An empty
      * entry historically means the CWD — refused, not honored. */
     p = path_env;
     while (*p) {

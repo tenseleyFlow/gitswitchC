@@ -4,6 +4,7 @@
 #define GPG_MANAGER_H
 
 #include "gitswitch.h"
+#include <dirent.h>
 
 /* GPG management modes */
 typedef enum {
@@ -20,6 +21,21 @@ typedef struct {
     bool signing_enabled;
     bool home_owned;       /* Whether we created this GNUPGHOME */
 } gpg_config_t;
+
+/* Narrow dependency seams for deterministic filesystem-race/error tests. The
+ * defaults are libc readdir() and no pre-open callback, respectively. */
+typedef struct dirent *(*gpg_readdir_fn)(DIR *dir);
+typedef void (*gpg_agent_conf_preopen_fn)(const char *path);
+typedef int (*gpg_agent_conf_precommit_fn)(int home_fd,
+                                            const char *temp_name);
+typedef int (*gpg_retarget_commit_hook_fn)(int base_fd);
+gpg_readdir_fn gpg_manager_set_readdir_fn(gpg_readdir_fn fn);
+gpg_agent_conf_preopen_fn
+gpg_manager_set_agent_conf_preopen_fn(gpg_agent_conf_preopen_fn fn);
+gpg_agent_conf_precommit_fn
+gpg_manager_set_agent_conf_precommit_fn(gpg_agent_conf_precommit_fn fn);
+gpg_retarget_commit_hook_fn
+gpg_manager_set_retarget_commit_hook_fn(gpg_retarget_commit_hook_fn fn);
 
 /* Function prototypes */
 
@@ -134,6 +150,34 @@ int gpg_manager_reset(const char *account);
  */
 int gpg_manager_retarget_current(const char *real_home);
 int gpg_manager_drop_current(void);
+
+/**
+ * Read the stable isolated-GPG target under the manager lock after validating
+ * the private base and the exact managed child. Missing base/link is ordinary
+ * success with `*present == false`; unsafe, malformed, dangling, or unreadable
+ * state fails closed. On success with `*present == true`, `target` contains a
+ * live private per-account home.
+ */
+int gpg_manager_snapshot_current(char *target, size_t size, bool *present);
+
+/**
+ * Report whether `current` names this account's exact live private home.
+ * Missing state or a different valid managed account returns 0 with
+ * `*live == false`; unsafe/malformed state and lock failures return -1.
+ */
+int gpg_manager_current_is_live_for_account(const char *account, bool *live);
+
+/**
+ * Compare and conditionally restore the stable target while holding the same
+ * manager lock. NULL/empty `expected_target` means the link is expected to be
+ * absent; NULL/empty `restore_target` means remove it. A compare conflict is
+ * ordinary success with `*changed == false` and leaves the later writer's
+ * state untouched. A match completes the requested restore and sets
+ * `*changed == true`; unsafe/unmanaged state fails closed.
+ */
+int gpg_manager_restore_current_if(const char *expected_target,
+                                   const char *restore_target,
+                                   bool *changed);
 
 /**
  * Process-lifetime memo of key ids whose secret-key presence a gpg spawn

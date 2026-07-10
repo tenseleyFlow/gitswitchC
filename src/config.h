@@ -71,13 +71,14 @@ int config_resume_hint_path(char *buf, size_t size);
 
 /**
  * Acquire an exclusive cross-process lock for a mutating config cycle without
- * waiting for a current holder. Returns an open fd holding flock(LOCK_EX) on
- * <config_dir>/.config.lock, to be held across the whole load-modify-save so
- * concurrent add/edit/remove/switch cannot lost-update each other. Close the fd
- * to release. Returns -1 on failure with errno preserved (EAGAIN/EWOULDBLOCK
- * means another process holds the lock).
+ * waiting for a current holder. Returns an opaque lock token retaining the
+ * config parent, directory, and legacy .config.lock inode across the whole
+ * load-modify-save cycle so concurrent writers cannot split their lock domain
+ * by replacing a pathname. Release it with config_write_unlock(). Returns -1
+ * on failure with errno preserved (EAGAIN/EWOULDBLOCK means contention).
  */
 int config_write_lock(void);
+void config_write_unlock(int token_fd);
 
 /**
  * Create default configuration file

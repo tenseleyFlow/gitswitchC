@@ -218,6 +218,11 @@ $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) |
 # the test link (it defines main), so its command handlers are only reachable
 # end-to-end through the binary itself.
 .PHONY: test
+ifeq ($(strip $(TEST_SOURCES)),)
+test:
+	@echo "ERROR: no C tests discovered under $(TESTDIR)/ (expected test_*.c)" >&2
+	@exit 1
+else
 test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@echo "Running tests..."
 	@for test in $(TEST_TARGETS); do \
@@ -225,56 +230,90 @@ test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 		$$test || exit 1; \
 	done
 	@echo "All tests passed!"
+endif
 
 # Static analysis
 .PHONY: analyze
 analyze:
 	@echo "Running static analysis..."
-	@command -v cppcheck >/dev/null 2>&1 && \
-		cppcheck --enable=all --std=c11 --suppress=missingIncludeSystem $(SRCDIR) || \
-		echo "cppcheck not found - skipping static analysis"
+	@if command -v cppcheck >/dev/null 2>&1; then \
+		cppcheck --enable=warning,performance,portability \
+			--error-exitcode=1 --std=c11 \
+			--suppress=missingIncludeSystem $(SRCDIR); \
+	else \
+		echo "cppcheck not installed - skipping static analysis"; \
+	fi
 
 # Code formatting
 .PHONY: format
 format:
 	@echo "Formatting code..."
-	@command -v clang-format >/dev/null 2>&1 && \
-		clang-format -i $(SOURCES) $(HEADERS) || \
-		echo "clang-format not found - skipping formatting"
+	@if command -v clang-format >/dev/null 2>&1; then \
+		clang-format -i $(SOURCES) $(HEADERS); \
+	else \
+		echo "clang-format not installed - skipping formatting"; \
+	fi
 
 # Security scan
 .PHONY: security-scan
 security-scan:
 	@echo "Running security scan..."
-	@command -v flawfinder >/dev/null 2>&1 && \
-		flawfinder $(SRCDIR) || \
-		echo "flawfinder not found - skipping security scan"
+	@if command -v flawfinder >/dev/null 2>&1; then \
+		flawfinder --error-level=5 $(SRCDIR); \
+	else \
+		echo "flawfinder not installed - skipping security scan"; \
+	fi
 
-# Memory check (requires valgrind)
+# Memory check (requires Valgrind and a clean BUILD_TYPE=release build). ASan
+# instrumentation and Valgrind must not be combined in the same binary.
+MEMCHECK_TARGETS = $(BINDIR)/test_runner $(BINDIR)/test_security
+
 .PHONY: memcheck
-memcheck: $(BINDIR)/$(TARGET)
+ifeq ($(BUILD_TYPE),release)
+memcheck: $(BINDIR)/$(TARGET) $(MEMCHECK_TARGETS)
 	@echo "Running memory check..."
-	@command -v valgrind >/dev/null 2>&1 && \
+	@set -e; \
+	if command -v valgrind >/dev/null 2>&1; then \
+		for target in $(MEMCHECK_TARGETS); do \
+			echo "Valgrind: $$target"; \
+			valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
+				--track-origins=yes --error-exitcode=99 \
+				--log-file=valgrind-%p.log "$$target"; \
+		done; \
+		echo "Valgrind: $(BINDIR)/$(TARGET) --help"; \
 		valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all \
-		--track-origins=yes --verbose --log-file=valgrind.log \
-		$(BINDIR)/$(TARGET) --help || \
-		echo "valgrind not found - skipping memory check"
+			--track-origins=yes --error-exitcode=99 \
+			--log-file=valgrind-%p.log $(BINDIR)/$(TARGET) --help; \
+	else \
+		echo "valgrind not installed - skipping memory check"; \
+	fi
+else
+memcheck:
+	@if command -v valgrind >/dev/null 2>&1; then \
+		echo "ERROR: memcheck requires a clean BUILD_TYPE=release build (ASan and Valgrind are incompatible)" >&2; \
+		exit 2; \
+	else \
+		echo "valgrind not installed - skipping memory check"; \
+	fi
+endif
 
 # Documentation generation
 .PHONY: docs
 docs:
 	@echo "Generating documentation..."
 	@mkdir -p $(DOCDIR)
-	@command -v doxygen >/dev/null 2>&1 && \
-		doxygen Doxyfile || \
-		echo "doxygen not found - skipping documentation generation"
+	@if command -v doxygen >/dev/null 2>&1; then \
+		doxygen Doxyfile; \
+	else \
+		echo "doxygen not installed - skipping documentation generation"; \
+	fi
 
 # Clean targets
 .PHONY: clean
 clean:
 	@echo "Cleaning build files..."
 	rm -rf $(BUILDDIR)
-	rm -f valgrind.log
+	rm -f valgrind*.log
 	rm -f *.core core.*
 
 .PHONY: distclean
@@ -340,12 +379,14 @@ help:
 	@echo "  format       Format source code"
 	@echo "  analyze      Run static analysis"
 	@echo "  security-scan Run security scan"
-	@echo "  memcheck     Run memory checker"
+	@echo "  memcheck     Run memory checker (requires a clean release build)"
 	@echo "  docs         Generate documentation"
 	@echo "  deps         Check dependencies"
 	@echo "  info         Show build information"
 	@echo "  dev          Quick development cycle (clean + debug + test)"
 	@echo "  dist         Create distribution tarball"
+	@echo "  distcheck    Build, test, and stage-install the source tarball"
+	@echo "  qa-contract-test Verify QA failure and cleanup contracts"
 	@echo "  rpm          Build RPM package"
 	@echo "  help         Show this help"
 	@echo ""
@@ -357,24 +398,43 @@ help:
 # RPM package building
 PACKAGE = gitswitcher
 RPM_VERSION = $(VERSION)
+DIST_ROOT = $(PACKAGE)-$(RPM_VERSION)
+DIST_ARCHIVE = $(DIST_ROOT).tar.gz
+# Reviewed allowlist. Copying only these entries inherently excludes VCS/OMX
+# state, build products, cores, logs, and previously generated archives.
+DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
-.PHONY: dist rpm
-dist: clean
+.PHONY: dist distcheck qa-contract-test rpm
+dist:
 	@echo "Creating distribution tarball..."
-	tar czf $(PACKAGE)-$(RPM_VERSION).tar.gz \
-		--exclude='.git*' \
-		--exclude='*.o' \
-		--exclude='build' \
-		--exclude='*.core' \
-		--exclude='valgrind.log' \
-		--transform 's,^,$(PACKAGE)-$(RPM_VERSION)/,' \
-		src/ *.md Makefile $(PACKAGE).spec
+	@set -eu; \
+	tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/gitswitch-dist.XXXXXX"); \
+	trap 'rm -rf "$$tmp"' 0; \
+	trap 'exit 1' 1 2 3 15; \
+	mkdir "$$tmp/$(DIST_ROOT)"; \
+	cp -R $(DIST_MANIFEST) "$$tmp/$(DIST_ROOT)/"; \
+	tar -C "$$tmp" -czf "$$tmp/$(DIST_ARCHIVE)" \
+		--exclude='.git' --exclude='.git/*' \
+		--exclude='.omx' --exclude='.omx/*' \
+		--exclude='build' --exclude='build/*' \
+		--exclude='*.o' --exclude='*.core' --exclude='core' --exclude='core.*' \
+		--exclude='valgrind*.log' --exclude='*.tar.gz' \
+		"$(DIST_ROOT)"; \
+	mv "$$tmp/$(DIST_ARCHIVE)" "$(CURDIR)/$(DIST_ARCHIVE)"
+
+distcheck: dist
+	@sh tests/test_dist.sh "$(CURDIR)/$(DIST_ARCHIVE)" "$(DIST_ROOT)" \
+		"$(PREFIX)" "$(MAKE_COMMAND)"
+
+qa-contract-test:
+	@sh tests/test_qa.sh "$(CURDIR)" "$(MAKE_COMMAND)"
 
 rpm: dist
 	@echo "Building RPM package..."
 	@command -v rpmbuild >/dev/null 2>&1 || (echo "rpmbuild not available - install rpm-build package" && exit 1)
-	mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-	cp $(PACKAGE)-$(RPM_VERSION).tar.gz ~/rpmbuild/SOURCES/
+	mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES \
+		~/rpmbuild/SPECS ~/rpmbuild/SRPMS
+	cp $(DIST_ARCHIVE) ~/rpmbuild/SOURCES/
 	cp $(PACKAGE).spec ~/rpmbuild/SPECS/
 	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
 	@echo "RPM packages created in ~/rpmbuild/RPMS/"

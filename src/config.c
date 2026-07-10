@@ -15,13 +15,26 @@
 #include <errno.h>
 #include <ctype.h>
 
-/* Linux, macOS and FreeBSD all provide O_NOFOLLOW; keep a guard for exotic
- * libcs so the file still compiles there. Refusing symlinks is load-bearing
- * for the config reader/writer (cfg-symlink-01/02), so every open below is
- * additionally paired with an explicit lstat()/fstat() check rather than
- * relying on the flag alone. */
+/* Linux, macOS and FreeBSD provide both flags. Record their availability
+ * before supplying compile-only fallbacks so directory setup can use a
+ * descriptor-pinned no-follow path on supported platforms. */
+#ifndef GITSWITCH_HAVE_DIRECTORY_NOFOLLOW
+# if defined(O_NOFOLLOW) && defined(O_DIRECTORY)
+#  define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 1
+# else
+#  define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 0
+# endif
+#endif
+
+/* Keep guards for exotic libcs so the file still compiles there. Refusing
+ * symlinks is load-bearing for the config reader/writer (cfg-symlink-01/02),
+ * so every open below is additionally paired with explicit lstat()/fstat()
+ * checks rather than relying on a flag alone. */
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
 #endif
 
 #include "accounts.h"
@@ -266,25 +279,105 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
  * failure with errno preserved; callers must treat that as fatal for a mutating
  * command — proceeding unlocked reopens the lost-update race (AR-02 #17,
  * AR-03 L10). */
+static bool config_metadata_same_file(const struct stat *a, const struct stat *b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static bool config_metadata_dir_is_safe(const struct stat *st) {
+    return S_ISDIR(st->st_mode) && st->st_uid == getuid() &&
+           (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static bool config_metadata_file_is_safe(const struct stat *st,
+                                         bool require_private_mode) {
+    mode_t mode = st->st_mode & 0777;
+
+    if (!S_ISREG(st->st_mode) || st->st_uid != getuid() || st->st_nlink != 1) {
+        return false;
+    }
+    if (require_private_mode) {
+        return mode == PERM_USER_RW;
+    }
+    /* Older resume markers were created by fopen() and commonly inherited
+     * 0644 from the user's umask. Reading the marker is harmless; only reject
+     * modes that let another principal alter it. A successful refresh
+     * replaces the legacy inode with a fresh 0600 file below. */
+    return (mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static int config_lock_reject(int token_fd, const char *lockpath) {
+    if (token_fd >= 0) unlock_private_file(token_fd);
+    set_error(ERR_PERMISSION_DENIED,
+              "Config lock is not a stable, private regular file: %s",
+              lockpath);
+    errno = EACCES;
+    return -1;
+}
+
 int config_write_lock(void) {
     char dir[MAX_PATH_LEN];
     char lockpath[MAX_PATH_LEN];
+    struct stat dir_identity;
+    struct stat before;
+    struct stat after;
+    int dir_fd = -1;
+    int token_fd = -1;
+
     errno = 0; /* Never misclassify a validation failure using stale errno. */
     if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
     if (create_config_directory_secure(dir) != 0) return -1;
+    if (lstat(dir, &dir_identity) != 0 ||
+        !config_metadata_dir_is_safe(&dir_identity)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Config directory is not a stable private directory: %s", dir);
+        errno = EACCES;
+        return -1;
+    }
     if ((size_t)snprintf(lockpath, sizeof(lockpath), "%s/.config.lock", dir) >= sizeof(lockpath)) {
         errno = ENAMETOOLONG;
         return -1;
     }
-    int fd = open(lockpath, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-    if (fd < 0) return -1;
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        int lock_errno = errno;
-        close(fd);
-        errno = lock_errno;
+
+    /* Reject hostile legacy metadata before entering the shared lock helper.
+     * The helper repeats descriptor-level validation and acquires, in order,
+     * the pinned parent directory, this leaf directory, and the legacy lock
+     * file. Keeping all three locked for the returned token's lifetime means
+     * replacing .config.lock (or the whole gitswitch directory) cannot create
+     * a second lock domain after this function returns. */
+    if (lstat(lockpath, &before) == 0) {
+        if (!config_metadata_file_is_safe(&before, true)) {
+            return config_lock_reject(-1, lockpath);
+        }
+    } else if (errno != ENOENT) {
         return -1;
     }
-    return fd;
+
+    dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fstat(dir_fd, &after) != 0 ||
+        !config_metadata_dir_is_safe(&after) ||
+        !config_metadata_same_file(&dir_identity, &after)) {
+        if (dir_fd >= 0) close(dir_fd);
+        return config_lock_reject(-1, lockpath);
+    }
+
+    token_fd = try_lock_private_file_at(dir_fd, ".config.lock");
+    close(dir_fd);
+    if (token_fd < 0) return -1;
+
+    /* The helper pins and locks the original namespace. The public path must
+     * still select that validated directory before the caller mutates state;
+     * a hostile replacement is a hard failure, never a successful lock on an
+     * unreachable inode. */
+    if (lstat(dir, &after) != 0 ||
+        !config_metadata_dir_is_safe(&after) ||
+        !config_metadata_same_file(&dir_identity, &after)) {
+        return config_lock_reject(token_fd, lockpath);
+    }
+    return token_fd;
+}
+
+void config_write_unlock(int token_fd) {
+    unlock_private_file(token_fd);
 }
 
 /* Compute the resume-hint marker path (<config_dir>/.resume-hint). */
@@ -305,9 +398,28 @@ int config_resume_hint_path(char *buf, size_t size) {
  * ssh-add (exit 2) plus a `gitswitch resume` in perpetuity (AR-02 #23). Cheap
  * and best-effort. */
 static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
+    const char *content;
+    char dir[MAX_PATH_LEN];
     char hint[MAX_PATH_LEN];
+    char temp[MAX_PATH_LEN];
+    struct stat dir_identity;
+    struct stat before;
+    struct stat temp_identity;
+    struct stat after;
+    bool existed = false;
+    int fd = -1;
+
+    if (get_config_directory(dir, sizeof(dir)) != 0 ||
+        create_config_directory_secure(dir) != 0 ||
+        lstat(dir, &dir_identity) != 0 ||
+        !config_metadata_dir_is_safe(&dir_identity)) {
+        log_warning("Cannot safely update the resume hint: config directory is unavailable");
+        return;
+    }
     if (config_resume_hint_path(hint, sizeof(hint)) != 0) return;
     if (ctx->config.active_account[0] == '\0') {
+        /* unlink() removes only the directory entry and never follows a final
+         * symlink, so reset cannot alter a symlink target. */
         unlink(hint);
         return;
     }
@@ -327,14 +439,103 @@ static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
         }
     }
 
-    FILE *f = fopen(hint, "w");
-    if (f) {
-        if (wants_ssh && wants_gpg)      fputs("ssh gpg\n", f);
-        else if (wants_ssh)              fputs("ssh\n", f);
-        else if (wants_gpg)              fputs("gpg\n", f);
-        else                             fputs("none\n", f);
-        fclose(f);
+    if (wants_ssh && wants_gpg)      content = "ssh gpg\n";
+    else if (wants_ssh)              content = "ssh\n";
+    else if (wants_gpg)              content = "gpg\n";
+    else                             content = "none\n";
+
+    /* Never open the destination for writing. Capture its exact identity (or
+     * absence), build a fresh 0600 inode beside it, then verify that neither
+     * the destination nor its private directory changed before rename. */
+    if (lstat(hint, &before) == 0) {
+        existed = true;
+        if (!config_metadata_file_is_safe(&before, false)) {
+            log_warning("Refusing to replace unsafe resume hint metadata: %s", hint);
+            return;
+        }
+    } else if (errno != ENOENT) {
+        log_warning("Cannot inspect resume hint before update: %s", hint);
+        return;
     }
+    if ((size_t)snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", hint) >= sizeof(temp)) {
+        log_warning("Resume hint temporary path is too long");
+        return;
+    }
+
+    fd = mkstemp(temp);
+    if (fd < 0) {
+        log_warning("Cannot create temporary resume hint: %s", hint);
+        return;
+    }
+    (void)signals_scratch_register(temp);
+    if (fchmod(fd, PERM_USER_RW) != 0 ||
+        fstat(fd, &temp_identity) != 0 ||
+        !config_metadata_file_is_safe(&temp_identity, true)) {
+        log_warning("Cannot secure temporary resume hint: %s", temp);
+        goto hint_fail;
+    }
+
+    size_t total = 0;
+    size_t length = strlen(content);
+    while (total < length) {
+        ssize_t n = write(fd, content + total, length - total);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            log_warning("Cannot write temporary resume hint: %s", temp);
+            goto hint_fail;
+        }
+    }
+    if (fsync(fd) != 0) {
+        log_warning("Cannot flush temporary resume hint: %s", temp);
+        goto hint_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        log_warning("Cannot finalize temporary resume hint: %s", temp);
+        goto hint_fail;
+    }
+    fd = -1;
+
+    if (lstat(temp, &after) != 0 ||
+        !config_metadata_file_is_safe(&after, true) ||
+        !config_metadata_same_file(&temp_identity, &after) ||
+        lstat(dir, &after) != 0 ||
+        !config_metadata_dir_is_safe(&after) ||
+        !config_metadata_same_file(&dir_identity, &after)) {
+        log_warning("Resume hint metadata changed before installation: %s", hint);
+        goto hint_fail;
+    }
+    if (lstat(hint, &after) == 0) {
+        if (!existed || !config_metadata_file_is_safe(&after, false) ||
+            !config_metadata_same_file(&before, &after)) {
+            log_warning("Resume hint changed before update; refusing replacement: %s", hint);
+            goto hint_fail;
+        }
+    } else if (existed || errno != ENOENT) {
+        log_warning("Resume hint changed before update; refusing replacement: %s", hint);
+        goto hint_fail;
+    }
+
+    if (rename(temp, hint) != 0) {
+        log_warning("Cannot install resume hint atomically: %s", hint);
+        goto hint_fail;
+    }
+    signals_scratch_unregister(temp);
+
+    if (lstat(hint, &after) != 0 ||
+        !config_metadata_file_is_safe(&after, true) ||
+        !config_metadata_same_file(&temp_identity, &after)) {
+        log_warning("Cannot verify installed resume hint: %s", hint);
+    }
+    return;
+
+hint_fail:
+    if (fd >= 0) close(fd);
+    unlink(temp);
+    signals_scratch_unregister(temp);
 }
 
 /* Shared atomic-write tail for config_save and config_save_active_account:
@@ -1235,25 +1436,142 @@ fail:
 
 /* Create config directory with secure permissions */
 static int create_config_directory_secure(const char *config_dir) {
-    if (!path_exists(config_dir)) {
+    struct stat path_st;
+
+    if (!config_dir || config_dir[0] == '\0') {
+        set_error(ERR_INVALID_ARGS, "Invalid configuration directory path");
+        return -1;
+    }
+
+    /* Inspect the final component without following it. Parent symlinks (for
+     * example a user-managed ~/.config link) remain supported deliberately;
+     * only the final gitswitch component is subject to this policy. */
+    if (lstat(config_dir, &path_st) != 0) {
+        if (errno != ENOENT) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
         if (create_directory_recursive(config_dir, PERM_USER_RWX) != 0) {
+            return -1;
+        }
+        if (lstat(config_dir, &path_st) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect created configuration directory: %s",
+                             config_dir);
             return -1;
         }
         log_info("Created configuration directory: %s", config_dir);
     }
-    
-    /* Verify directory permissions */
-    mode_t dir_mode;
-    if (get_file_permissions(config_dir, &dir_mode) == 0) {
-        if ((dir_mode & 077) != 0) {
-            /* Directory has group/other permissions - fix it */
-            if (set_file_permissions(config_dir, PERM_USER_RWX) != 0) {
-                return -1;
-            }
-            log_warning("Fixed configuration directory permissions");
-        }
+
+    if (S_ISLNK(path_st.st_mode) || !S_ISDIR(path_st.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing non-directory or symlinked configuration directory: %s",
+                  config_dir);
+        return -1;
     }
-    
+
+#if GITSWITCH_HAVE_DIRECTORY_NOFOLLOW
+    /* Pin the verified final directory before correcting its mode. O_NOFOLLOW
+     * prevents a final-component swap to a symlink; fstat plus the identity
+     * comparison also detects replacement by a different real directory. */
+    int fd = open(config_dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot open configuration directory safely: %s",
+                         config_dir);
+        return -1;
+    }
+
+    struct stat fd_st;
+    if (fstat(fd, &fd_st) != 0) {
+        close(fd);
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot verify configuration directory: %s",
+                         config_dir);
+        return -1;
+    }
+    if (!S_ISDIR(fd_st.st_mode) || fd_st.st_dev != path_st.st_dev ||
+        fd_st.st_ino != path_st.st_ino) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration directory changed while being verified: %s",
+                  config_dir);
+        return -1;
+    }
+
+    if ((fd_st.st_mode & 077) != 0) {
+        if (fchmod(fd, PERM_USER_RWX) != 0) {
+            close(fd);
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Failed to secure configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
+        if (fstat(fd, &fd_st) != 0) {
+            close(fd);
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Cannot verify secured configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
+        if (!S_ISDIR(fd_st.st_mode) || (fd_st.st_mode & 077) != 0) {
+            close(fd);
+            set_error(ERR_PERMISSION_DENIED,
+                      "Configuration directory permissions remain unsafe: %s",
+                      config_dir);
+            return -1;
+        }
+        log_warning("Fixed configuration directory permissions");
+    }
+
+    /* Ensure the pathname still names the descriptor we verified. */
+    struct stat final_st;
+    if (lstat(config_dir, &final_st) != 0) {
+        close(fd);
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot re-check configuration directory: %s",
+                         config_dir);
+        return -1;
+    }
+    if (!S_ISDIR(final_st.st_mode) || final_st.st_dev != fd_st.st_dev ||
+        final_st.st_ino != fd_st.st_ino) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration directory changed while being secured: %s",
+                  config_dir);
+        return -1;
+    }
+    close(fd);
+#else
+    /* Without a descriptor-based no-follow open, a pathname chmod could be
+     * redirected between validation and mutation. Newly-created directories
+     * already use 0700; fail closed for a loose pre-existing directory. */
+    if ((path_st.st_mode & 077) != 0) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration directory permissions are unsafe and this "
+                  "platform cannot tighten them without following paths: %s",
+                  config_dir);
+        return -1;
+    }
+
+    struct stat final_st;
+    if (lstat(config_dir, &final_st) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot re-check configuration directory: %s",
+                         config_dir);
+        return -1;
+    }
+    if (!S_ISDIR(final_st.st_mode) || final_st.st_dev != path_st.st_dev ||
+        final_st.st_ino != path_st.st_ino) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration directory changed while being secured: %s",
+                  config_dir);
+        return -1;
+    }
+#endif
+
     return 0;
 }
 

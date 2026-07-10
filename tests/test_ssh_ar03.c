@@ -33,6 +33,7 @@
 #include "error.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -96,6 +97,23 @@ static int bind_sock(const char *path, mode_t mode) {
     return chmod(path, mode);
 }
 
+static int bind_sock_for_runner(const char *path, mode_t mode,
+                                const run_opts_t *opts) {
+    int saved_cwd;
+    int rc;
+
+    if (!opts || !opts->use_cwd_fd) return bind_sock(path, mode);
+    saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
+    if (saved_cwd < 0 || fchdir(opts->cwd_fd) != 0) {
+        if (saved_cwd >= 0) close(saved_cwd);
+        return -1;
+    }
+    rc = bind_sock(path, mode);
+    if (fchdir(saved_cwd) != 0) rc = -1;
+    close(saved_cwd);
+    return rc;
+}
+
 /* Scratch XDG_RUNTIME_DIR + the gitswitch-ssh dir under it. */
 static int make_xdg_agent_dir(char *dir_out, size_t size) {
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswar03XXXXXX");
@@ -151,7 +169,7 @@ static int fake_csh_agent_runner(const char *const argv[], const run_opts_t *opt
         const char *sock = argv_sock_path(argv);
         g_agent_start_attempts++;
         g_agent_argv_had_dash_s = argv_has(argv, "-s");
-        if (!sock || bind_sock(sock, 0600) != 0) return -1;
+        if (!sock || bind_sock_for_runner(sock, 0600, opts) != 0) return -1;
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size,
                      "setenv SSH_AUTH_SOCK %s;\n"
@@ -209,7 +227,7 @@ static int fake_badperm_agent_runner(const char *const argv[], const run_opts_t 
     if (strcmp(argv[0], "ssh-agent") == 0) {
         const char *sock = argv_sock_path(argv);
         g_agent_start_attempts++;
-        if (!sock || bind_sock(sock, 0644) != 0) return -1;
+        if (!sock || bind_sock_for_runner(sock, 0644, opts) != 0) return -1;
         if (opts && opts->out) {
             /* PID far above any pid_max: reap_ssh_agent's identity check can
              * never find (let alone signal) a real process behind it. */

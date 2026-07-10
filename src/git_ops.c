@@ -554,7 +554,8 @@ int git_validate_repository(void) {
     }
     
     /* Check if repository is bare */
-    if (git_run(output, sizeof(output), "rev-parse", "--is-bare-repository", NULL) == 0) {
+    if (git_run(output, sizeof(output), "rev-parse", "--is-bare-repository",
+                (const char *)NULL) == 0) {
         trim_whitespace(output);
         if (strcmp(output, "true") == 0) {
             set_error(ERR_GIT_REPOSITORY_INVALID, "Repository is bare");
@@ -563,7 +564,8 @@ int git_validate_repository(void) {
     }
     
     /* Check repository health - verify we can read HEAD */
-    if (git_run(output, sizeof(output), "rev-parse", "--verify", "HEAD", NULL) != 0) {
+    if (git_run(output, sizeof(output), "rev-parse", "--verify", "HEAD",
+                (const char *)NULL) != 0) {
         /* This is OK for new repositories with no commits */
         log_debug("Repository has no commits yet (new repository)");
     }
@@ -712,7 +714,8 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
 
     log_debug("Setting git config: %s = %s (%s)", key, value, scope_flag);
 
-    if (git_run(output, sizeof(output), "config", scope_flag, key, value, NULL) != 0) {
+    if (git_run(output, sizeof(output), "config", scope_flag, key, value,
+                (const char *)NULL) != 0) {
         /* The key's on-disk state is now uncertain; never skip/serve it. */
         cfg_cache_store(s, k, CFG_UNKNOWN, false, "");
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git config %s: %s", key, output);
@@ -860,7 +863,8 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
     log_debug("Unsetting git config: %s (%s)", key, scope_flag);
 
     /* Ignore errors as the key might not exist */
-    git_run(output, sizeof(output), "config", scope_flag, "--unset", key, NULL);
+    git_run(output, sizeof(output), "config", scope_flag, "--unset", key,
+            (const char *)NULL);
 
     /* Unset is best-effort by contract (errors ignored above), so "absent" is
      * the strongest post-state we can record either way. */
@@ -884,7 +888,8 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
         return -1;
     }
 
-    if (git_run(output, output_size, "config", scope_flag, "--list", NULL) != 0) {
+    if (git_run(output, output_size, "config", scope_flag, "--list",
+                (const char *)NULL) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to list git configuration");
         return -1;
     }
@@ -993,7 +998,8 @@ bool git_is_repository(void) {
     }
 
     /* Use git rev-parse --git-dir to check for repository */
-    bool is_repo = (git_run(output, sizeof(output), "rev-parse", "--git-dir", NULL) == 0);
+    bool is_repo = (git_run(output, sizeof(output), "rev-parse", "--git-dir",
+                            (const char *)NULL) == 0);
 
     if (have_cwd && safe_strncpy(g_repo_cache.cwd, cwd, sizeof(g_repo_cache.cwd)) == 0) {
         g_repo_cache.known = true;
@@ -1012,7 +1018,8 @@ int git_get_repo_root(char *path, size_t path_size) {
         return -1;
     }
     
-    if (git_run(output, sizeof(output), "rev-parse", "--show-toplevel", NULL) != 0) {
+    if (git_run(output, sizeof(output), "rev-parse", "--show-toplevel",
+                (const char *)NULL) != 0) {
         set_error(ERR_GIT_NOT_REPOSITORY, "Not in a git repository");
         return -1;
     }
@@ -1125,4 +1132,3 @@ static bool is_valid_git_config_value(const char *value) {
 }
 
 /* Backup git config if needed */
-

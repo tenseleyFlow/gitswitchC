@@ -27,10 +27,12 @@
 #include "accounts.h"
 #include "git_ops.h"
 #include "signals.h"
+#include "ssh_manager.h"
 #include "utils.h"
 #include "error.h"
 
 #include <signal.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +54,12 @@ static char g_gpg_link[512];   /* <xdg>/gitswitch-gpg/current */
  * symlink pointing at a real (empty) home dir. Returns 0 on success. */
 static int setup_runtime_dir(void) {
     char path[512];
+
+    /* Some SSH rollback cases intentionally leave a restored session active.
+     * Later GPG cases may clear it on platforms where gpg is installed, which
+     * made the signal tests accidentally depend on the hosted tool matrix.
+     * Start every case from a clean process session before changing XDG. */
+    if (accounts_session_cleanup() != 0) return -1;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_XXXXXX");
     if (!mkdtemp(g_xdg)) return -1;
@@ -83,12 +91,24 @@ static bool symlink_present(const char *path) {
 /* Behavior knobs for the fake runner. */
 static bool g_fail_user_name_set;   /* fail `git config <scope> user.name X` */
 static bool g_raise_on_user_name;   /* raise SIGINT during that same command */
+static bool g_fail_list_config;     /* force snapshot's per-key fallback */
+static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
 static FILE *g_log;                 /* when set, every argv is logged here */
+
+static bool refuse_session_agent_reap(pid_t pid, const char *socket_arg) {
+    (void)pid;
+    (void)socket_arg;
+    return false;
+}
 
 /* Minimal fake config store so git_set_config's read-back verification sees
  * what was "written". Only the two identity keys matter to these tests. */
 static char g_store_name[MAX_NAME_LEN];
 static char g_store_email[MAX_EMAIL_LEN];
+
+/* git_ops.c deliberately keeps this test-only cache reset out of its public
+ * header. Identity-sensitive cases below need a fresh snapshot/read-back view. */
+void git_ops_test_reset_caches(void);
 
 /* True for the 5-element write form {git, config, <scope>, <key>, value}
  * (the --unset form has "--unset" at argv[3], so it never matches). */
@@ -103,6 +123,19 @@ static bool is_config_read(const char *const argv[], const char *key) {
     return argv[0] && argv[1] && argv[2] && argv[3] && !argv[4] &&
            strcmp(argv[0], "git") == 0 && strcmp(argv[1], "config") == 0 &&
            strcmp(argv[3], key) == 0;
+}
+
+static bool is_config_list(const char *const argv[]) {
+    if (!argv[0] || !argv[1] || strcmp(argv[0], "git") != 0 ||
+        strcmp(argv[1], "config") != 0) {
+        return false;
+    }
+    for (size_t i = 2; argv[i]; i++) {
+        if (strcmp(argv[i], "--list") == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static int fake_runner(const char *const argv[], const run_opts_t *opts,
@@ -128,7 +161,16 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         }
     }
 
-    if (is_config_write(argv, "user.name")) {
+    if (g_fail_list_config && is_config_list(argv)) {
+        exit_code = 1;
+    } else if (is_config_write(argv, "user.name")) {
+        if (g_retarget_gpg_on_user_name) {
+            unlink(g_gpg_link);
+            if (symlink(g_retarget_gpg_on_user_name, g_gpg_link) != 0) {
+                exit_code = 1;
+            }
+            g_retarget_gpg_on_user_name = NULL;
+        }
         if (g_raise_on_user_name) {
             g_raise_on_user_name = false; /* once */
             if (g_log) { fprintf(g_log, "MARK-RAISE\n"); fflush(g_log); }
@@ -178,13 +220,31 @@ static int bind_fake_agent_socket(const char *path) {
     return chmod(path, 0600);
 }
 
+static int bind_fake_agent_socket_for_runner(const char *path,
+                                             const run_opts_t *opts) {
+    int saved_cwd;
+    int rc;
+
+    if (!opts || !opts->use_cwd_fd) {
+        return bind_fake_agent_socket(path);
+    }
+    saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
+    if (saved_cwd < 0 || fchdir(opts->cwd_fd) != 0) {
+        if (saved_cwd >= 0) close(saved_cwd);
+        return -1;
+    }
+    rc = bind_fake_agent_socket(path);
+    if (fchdir(saved_cwd) != 0) rc = -1;
+    close(saved_cwd);
+    return rc;
+}
+
 /* Extends fake_runner with a working fake ssh-agent (binds the -a socket) and
  * a happy ssh-add, so accounts_switch can walk the full SSH activation and
  * the rollback can genuinely re-start the previous account's agent. git
  * handling is delegated to fake_runner. The reported agent PID is far above
  * any platform's pid_max so the later teardown's reaper can never find — let
- * alone signal — a real process behind it (the BSD/macOS fallback verifies by
- * liveness only). */
+ * alone signal — a real process behind it. */
 #define FAKE_AGENT_PID 1073741824
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
@@ -204,7 +264,7 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             memset(result, 0, sizeof(*result));
             result->spawned = true;
         }
-        if (bind_fake_agent_socket(sock) != 0) return -1;
+        if (bind_fake_agent_socket_for_runner(sock, opts) != 0) return -1;
         if (opts && opts->out && opts->out_size > 0) {
             snprintf(opts->out, opts->out_size,
                      "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
@@ -225,6 +285,102 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
     return fake_runner(argv, opts, result);
 }
 
+static const char g_concurrent_config_content[] =
+    "Host concurrently-replaced\n  IdentityFile /tmp/id_concurrent\n";
+static char g_concurrent_config_path[1024];
+static bool g_replace_config_on_user_name;
+static bool g_replace_config_with_symlink_on_user_name;
+
+static int replace_ssh_config_concurrently(void) {
+    char replacement_path[1100];
+    FILE *f;
+    bool write_failed;
+
+    if ((size_t)snprintf(replacement_path, sizeof(replacement_path), "%s.concurrent",
+                         g_concurrent_config_path) >= sizeof(replacement_path)) {
+        return -1;
+    }
+    f = fopen(replacement_path, "w");
+    if (!f) {
+        return -1;
+    }
+    write_failed = fputs(g_concurrent_config_content, f) == EOF;
+    if (fclose(f) != 0) {
+        write_failed = true;
+    }
+    if (write_failed) {
+        unlink(replacement_path);
+        return -1;
+    }
+    if (chmod(replacement_path, 0640) != 0 ||
+        rename(replacement_path, g_concurrent_config_path) != 0) {
+        unlink(replacement_path);
+        return -1;
+    }
+    return 0;
+}
+
+static int replace_ssh_config_with_symlink(void) {
+    char target_path[1100];
+    char link_path[1100];
+    FILE *f;
+    bool write_failed;
+
+    if ((size_t)snprintf(target_path, sizeof(target_path), "%s.target",
+                         g_concurrent_config_path) >= sizeof(target_path) ||
+        (size_t)snprintf(link_path, sizeof(link_path), "%s.concurrent-link",
+                         g_concurrent_config_path) >= sizeof(link_path)) {
+        return -1;
+    }
+    f = fopen(target_path, "w");
+    if (!f) return -1;
+    write_failed = fputs(g_concurrent_config_content, f) == EOF;
+    if (fclose(f) != 0) write_failed = true;
+    if (write_failed) {
+        (void)unlink(target_path);
+        return -1;
+    }
+    if (chmod(target_path, 0640) != 0 || symlink(target_path, link_path) != 0 ||
+        rename(link_path, g_concurrent_config_path) != 0) {
+        (void)unlink(link_path);
+        (void)unlink(target_path);
+        return -1;
+    }
+    return 0;
+}
+
+/* Replace ~/.ssh/config during the reversible Git step, after preflight but
+ * before the host-alias writer's final commit. A failing Git write must never
+ * be followed by an alias write or rollback rewrite, so the replacement wins. */
+static int concurrent_config_runner(const char *const argv[],
+                                    const run_opts_t *opts,
+                                    run_result_t *result) {
+    if (g_replace_config_on_user_name && is_config_write(argv, "user.name")) {
+        g_replace_config_on_user_name = false;
+        if (replace_ssh_config_concurrently() != 0) {
+            if (result) {
+                memset(result, 0, sizeof(*result));
+                result->spawned = true;
+                result->exit_code = 1;
+            }
+            return -1;
+        }
+    }
+    if (g_replace_config_with_symlink_on_user_name &&
+        is_config_write(argv, "user.name")) {
+        g_replace_config_with_symlink_on_user_name = false;
+        if (replace_ssh_config_with_symlink() != 0) {
+            if (result) {
+                memset(result, 0, sizeof(*result));
+                result->spawned = true;
+                result->exit_code = 1;
+            }
+            return -1;
+        }
+    }
+    return ssh_git_runner(argv, opts, result);
+}
+
 /* ---- ctx factory ---------------------------------------------------------- */
 
 /* One SSH/GPG-disabled account with global preferred scope (avoids both real
@@ -243,6 +399,34 @@ static gitswitch_ctx_t make_ctx(void) {
                  sizeof(ctx.config.config_path));
     return ctx;
 }
+
+/* Add the pre-switch account that owns the saved/current metadata. Runtime
+ * capabilities are enabled by individual cases only when they are relevant. */
+static account_t *add_previous_account(gitswitch_ctx_t *ctx) {
+    account_t *prev = &ctx->accounts[1];
+    memset(prev, 0, sizeof(*prev));
+    prev->id = 2;
+    safe_strncpy(prev->name, "prev", sizeof(prev->name));
+    safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
+    safe_strncpy(prev->description, "previous account", sizeof(prev->description));
+    prev->preferred_scope = GIT_SCOPE_GLOBAL;
+    ctx->account_count = 2;
+    ctx->current_account = prev;
+    safe_strncpy(ctx->config.active_account, prev->name,
+                 sizeof(ctx->config.active_account));
+    return prev;
+}
+
+static void seed_previous_git_identity(void) {
+    git_ops_test_reset_caches();
+    safe_strncpy(g_store_name, "Previous Name", sizeof(g_store_name));
+    safe_strncpy(g_store_email, "prev@example.com", sizeof(g_store_email));
+    /* The fake runner does not synthesize the binary `git config --list -z`
+     * stream. Make the snapshot take its supported per-key fallback instead. */
+    g_fail_list_config = true;
+}
+
+static int write_fake_key(const char *path);
 
 /* ---- tests ---------------------------------------------------------------- */
 
@@ -287,6 +471,47 @@ TEST(successful_switch_still_tears_down_previous_isolation) {
     /* Target has SSH/GPG disabled: the previous entry points must be gone. */
     CHECK(!symlink_present(g_ssh_sock));
     CHECK(!symlink_present(g_gpg_link));
+}
+
+/* AR-04 transaction closeout: Git has already been committed when teardown of
+ * a disabled target's previous runtime runs. If that teardown cannot acquire
+ * the SSH lock, the command must fail and roll Git plus the GPG stable link
+ * back to the previous account instead of publishing a mixed identity. */
+TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
+    char lock_path[512];
+    char gpg_target[512];
+    ssize_t n;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-ssh/.lock", g_xdg);
+    CHECK_EQ_INT(mkdir(lock_path, 0700), 0); /* open(O_CREAT) must fail */
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *prev_account = add_previous_account(&ctx);
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+
+    command_runner_fn previous_runner = run_set_runner(fake_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == prev_account);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(symlink_present(g_ssh_sock));
+    n = readlink(g_gpg_link, gpg_target, sizeof(gpg_target) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        gpg_target[n] = '\0';
+        CHECK(strstr(gpg_target, "/prevhome") != NULL);
+    }
+    CHECK(strstr(get_last_error()->message,
+                 "Failed to deactivate previous runtime state") != NULL);
 }
 
 /* AR-02 #12: a switch to an SSH-enabled target whose SSH setup fails at
@@ -347,6 +572,158 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     CHECK(symlink_present(g_gpg_link));
 }
 
+/* A repeated switch used to call accounts_session_cleanup() before taking its
+ * rollback snapshot or validating the next target. Consequently, a malformed
+ * second target could stop the first switch's owned agent and return early
+ * with current.sock dangling. The read-only failure must leave both the
+ * in-process session and its published live socket untouched. */
+TEST(repeated_switch_validation_failure_keeps_live_session) {
+    char first_key[512];
+    char target[512];
+    ssize_t target_len;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *first = &ctx.accounts[0];
+    snprintf(first_key, sizeof(first_key), "%s/key_first", g_xdg);
+    CHECK_EQ_INT(write_fake_key(first_key), 0);
+    first->ssh_enabled = true;
+    safe_strncpy(first->ssh_key_path, first_key,
+                 sizeof(first->ssh_key_path));
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_fail_list_config = true;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    signals_guard_end();
+
+    target_len = readlink(g_ssh_sock, target, sizeof(target) - 1);
+    CHECK(target_len > 0);
+    if (target_len > 0) {
+        target[target_len] = '\0';
+        CHECK(path_exists(target));
+    }
+
+    account_t *broken = &ctx.accounts[1];
+    memset(broken, 0, sizeof(*broken));
+    broken->id = 2;
+    safe_strncpy(broken->name, "broken", sizeof(broken->name));
+    safe_strncpy(broken->email, "broken@example.com", sizeof(broken->email));
+    safe_strncpy(broken->description, "invalid second target",
+                 sizeof(broken->description));
+    broken->preferred_scope = GIT_SCOPE_GLOBAL;
+    broken->ssh_enabled = true;
+    safe_strncpy(broken->ssh_key_path, "/definitely/missing/gitswitch-key",
+                 sizeof(broken->ssh_key_path));
+    ctx.account_count = 2;
+
+    CHECK_EQ_INT(accounts_switch(&ctx, "broken"), -1);
+    CHECK(ctx.current_account == first);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+
+    target_len = readlink(g_ssh_sock, target, sizeof(target) - 1);
+    CHECK(target_len > 0);
+    if (target_len > 0) {
+        target[target_len] = '\0';
+        CHECK(path_exists(target));
+    }
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+}
+
+/* If guarded cleanup of the prior owned agent cannot prove it dead, a
+ * repeated switch must stop immediately. The old live session is still the
+ * only truthful state: retain its PID/socket/environment and leave both the
+ * caller's active-account metadata and current.sock untouched for retry. */
+TEST(repeated_switch_reap_failure_preserves_live_session) {
+    char first_key[512];
+    char second_key[512];
+    char first_target[512];
+    char target_after[512];
+    char auth_sock_before[512];
+    char agent_pid_before[64];
+    ssize_t first_len;
+    ssize_t after_len;
+    ssh_reap_fn previous_reap;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *first = &ctx.accounts[0];
+    snprintf(first_key, sizeof(first_key), "%s/key_first", g_xdg);
+    CHECK_EQ_INT(write_fake_key(first_key), 0);
+    first->ssh_enabled = true;
+    safe_strncpy(first->ssh_key_path, first_key,
+                 sizeof(first->ssh_key_path));
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_fail_list_config = true;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    signals_guard_end();
+
+    first_len = readlink(g_ssh_sock, first_target, sizeof(first_target) - 1);
+    CHECK(first_len > 0);
+    if (first_len > 0) first_target[first_len] = '\0';
+    CHECK(first_len > 0 && path_exists(first_target));
+    safe_strncpy(auth_sock_before, getenv("SSH_AUTH_SOCK"),
+                 sizeof(auth_sock_before));
+    safe_strncpy(agent_pid_before, getenv("SSH_AGENT_PID"),
+                 sizeof(agent_pid_before));
+
+    account_t *second = &ctx.accounts[1];
+    memset(second, 0, sizeof(*second));
+    second->id = 2;
+    safe_strncpy(second->name, "second", sizeof(second->name));
+    safe_strncpy(second->email, "second@example.com", sizeof(second->email));
+    safe_strncpy(second->description, "valid second target",
+                 sizeof(second->description));
+    second->preferred_scope = GIT_SCOPE_GLOBAL;
+    second->ssh_enabled = true;
+    snprintf(second_key, sizeof(second_key), "%s/key_second", g_xdg);
+    CHECK_EQ_INT(write_fake_key(second_key), 0);
+    safe_strncpy(second->ssh_key_path, second_key,
+                 sizeof(second->ssh_key_path));
+    ctx.account_count = 2;
+
+    previous_reap = ssh_manager_set_reap_fn(refuse_session_agent_reap);
+    CHECK_EQ_INT(accounts_switch(&ctx, "second"), -1);
+    ssh_manager_set_reap_fn(previous_reap);
+
+    CHECK(ctx.current_account == first);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(getenv("SSH_AUTH_SOCK"), auth_sock_before);
+    CHECK_STR_EQ(getenv("SSH_AGENT_PID"), agent_pid_before);
+    after_len = readlink(g_ssh_sock, target_after, sizeof(target_after) - 1);
+    CHECK_EQ_INT((int)after_len, (int)first_len);
+    if (after_len > 0) {
+        target_after[after_len] = '\0';
+        CHECK_STR_EQ(target_after, first_target);
+        CHECK(path_exists(target_after));
+    }
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+}
+
 /* Write a private-key-shaped 0600 file so ssh_validate_key_file accepts it. */
 static int write_fake_key(const char *path) {
     FILE *f = fopen(path, "w");
@@ -355,6 +732,47 @@ static int write_fake_key(const char *path) {
           "-----END OPENSSH PRIVATE KEY-----\n", f);
     if (fclose(f) != 0) return -1;
     return chmod(path, 0600);
+}
+
+/* M2 at the accounts_switch boundary: a non-link current.sock cannot be
+ * replaced atomically. The SSH manager's commit-point failure must propagate
+ * before Git or active metadata changes, while unrelated GPG state survives. */
+TEST(ssh_stable_link_obstruction_aborts_integrated_switch) {
+    char key_path[512];
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(unlink(g_ssh_sock), 0);
+    CHECK_EQ_INT(mkdir(g_ssh_sock, 0700), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *target = &ctx.accounts[0];
+    account_t *prev_account = add_previous_account(&ctx);
+    snprintf(key_path, sizeof(key_path), "%s/key_target", g_xdg);
+    CHECK_EQ_INT(write_fake_key(key_path), 0);
+    target->ssh_enabled = true;
+    safe_strncpy(target->ssh_key_path, key_path, sizeof(target->ssh_key_path));
+
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == prev_account);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(is_directory(g_ssh_sock));
+    CHECK(symlink_present(g_gpg_link));
 }
 
 /* AR-02 #30: the rollback branch that RE-STARTS the previous account's SSH
@@ -467,12 +885,10 @@ static int setup_alias_ctx(gitswitch_ctx_t *ctx, const char *alias) {
     return 0;
 }
 
-/* A failed switch must put ~/.ssh/config back byte-for-byte: the target's
- * host-alias rewrite installed its managed block before the git-config write
- * failed, and the previous account has NO alias of its own — so the accidental
- * revert-via-restore-switch never fires and, pre-fix, the aborted account's
- * IdentityFile block survived the rollback permanently. */
-TEST(failed_switch_reverts_host_alias_rewrite) {
+/* The alias writer is the final commit, so a Git failure must leave the
+ * existing SSH config byte-for-byte untouched without invoking a rollback
+ * writer at all. */
+TEST(failed_switch_never_rewrites_existing_ssh_config) {
     static const char user_content[] =
         "Host personal\n  IdentityFile /tmp/id_personal\n";
     char home[600], saved_home[4096], cfg_path[700], after[4096];
@@ -512,18 +928,16 @@ TEST(failed_switch_reverts_host_alias_rewrite) {
     setenv("HOME", saved_home, 1);
 
     CHECK_EQ_INT(rc, -1);
-    /* The pre-switch bytes are back — the aborted account's managed block
-     * (and its IdentityFile line) must not survive the rollback. */
+    /* No alias write ran before the failing Git step. */
     after[0] = '\0';
     CHECK(read_file_to_string(cfg_path, after, sizeof(after)) >= 0);
     CHECK_STR_EQ(after, user_content);
     CHECK(strstr(after, "gitswitch") == NULL);
 }
 
-/* Same rollback when NO ~/.ssh/config existed pre-switch: the rewrite created
- * the file wholesale, so the rollback must remove it entirely rather than
- * leave a gitswitch-born config forcing the aborted account's key. */
-TEST(failed_switch_removes_ssh_config_it_created) {
+/* With no pre-existing config, a failed reversible step must not create one
+ * and then depend on a racy unlink during rollback. */
+TEST(failed_switch_never_creates_ssh_config) {
     char home[600], saved_home[4096], cfg_path[700];
     struct stat st;
 
@@ -550,7 +964,200 @@ TEST(failed_switch_removes_ssh_config_it_created) {
     setenv("HOME", saved_home, 1);
 
     CHECK_EQ_INT(rc, -1);
-    CHECK(lstat(cfg_path, &st) != 0); /* created by the switch: must be gone */
+    CHECK(lstat(cfg_path, &st) != 0); /* alias commit never ran */
+}
+
+/* A same-user replacement during a failing Git step must win. Neither an
+ * early alias write nor a rollback restore is allowed to erase newer data. */
+TEST(failed_switch_preserves_concurrent_ssh_config_replacement) {
+    static const char original_content[] =
+        "Host original\n  IdentityFile /tmp/id_original\n";
+    char home[600], saved_home[4096], cfg_path[700], after[4096];
+    FILE *f;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_fake_home(home, sizeof(home),
+                                 saved_home, sizeof(saved_home)), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh", home);
+    CHECK_EQ_INT(mkdir(cfg_path, 0700), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    f = fopen(cfg_path, "w");
+    CHECK(f != NULL);
+    if (f) {
+        fputs(original_content, f);
+        fclose(f);
+    }
+    CHECK_EQ_INT(chmod(cfg_path, 0600), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    account_t *before_current = ctx.current_account;
+
+    seed_previous_git_identity();
+    safe_strncpy(g_concurrent_config_path, cfg_path,
+                 sizeof(g_concurrent_config_path));
+    g_replace_config_on_user_name = true;
+    g_fail_user_name_set = true;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(concurrent_config_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_fail_user_name_set = false;
+    g_fail_list_config = false;
+    g_replace_config_on_user_name = false;
+    setenv("HOME", saved_home, 1);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == before_current);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    after[0] = '\0';
+    CHECK(read_file_to_string(cfg_path, after, sizeof(after)) >= 0);
+    CHECK_STR_EQ(after, g_concurrent_config_content);
+    CHECK(strstr(after, "Host original") == NULL);
+}
+
+/* A replacement can arrive after the early no-follow preflight but before the
+ * final alias commit. The writer must reject that symlink, the transaction
+ * must roll back Git/runtime state, and no rollback path may touch the link or
+ * its target. This closes both former inode-marking and restore-rename races. */
+TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back) {
+    static const char original_content[] =
+        "Host original\n  IdentityFile /tmp/id_original\n";
+    char home[600], saved_home[4096], cfg_path[700], target_path[1100];
+    char after[4096], link_target[1100];
+    struct stat st;
+    FILE *f;
+    ssize_t n;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_fake_home(home, sizeof(home),
+                                 saved_home, sizeof(saved_home)), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh", home);
+    CHECK_EQ_INT(mkdir(cfg_path, 0700), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    f = fopen(cfg_path, "w");
+    CHECK(f != NULL);
+    if (f) {
+        fputs(original_content, f);
+        fclose(f);
+    }
+    CHECK_EQ_INT(chmod(cfg_path, 0600), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    account_t *before_current = ctx.current_account;
+
+    seed_previous_git_identity();
+    safe_strncpy(g_concurrent_config_path, cfg_path,
+                 sizeof(g_concurrent_config_path));
+    snprintf(target_path, sizeof(target_path), "%s.target", cfg_path);
+    g_replace_config_with_symlink_on_user_name = true;
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(concurrent_config_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+    g_replace_config_with_symlink_on_user_name = false;
+    setenv("HOME", saved_home, 1);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == before_current);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK_EQ_INT(lstat(cfg_path, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    n = readlink(cfg_path, link_target, sizeof(link_target) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        link_target[n] = '\0';
+        CHECK_STR_EQ(link_target, target_path);
+    }
+    after[0] = '\0';
+    CHECK(read_file_to_string(target_path, after, sizeof(after)) >= 0);
+    CHECK_STR_EQ(after, g_concurrent_config_content);
+    CHECK_EQ_INT(stat(target_path, &st), 0);
+    CHECK_EQ_INT(st.st_mode & 0777, 0640);
+    CHECK(strstr(get_last_error()->message,
+                 "Failed to commit SSH host alias") != NULL);
+}
+
+/* AR-04 M4: a symlinked ~/.ssh/config is outside gitswitch's managed-file
+ * policy. Refuse it during account-layer preflight, before SSH/Git/active
+ * state changes, and leave both link and target untouched. */
+TEST(symlinked_ssh_config_fails_before_switch_mutation) {
+    static const char target_content[] =
+        "Host personal\n  IdentityFile /tmp/id_personal\n";
+    char home[600], saved_home[4096], ssh_dir[700], cfg_path[700];
+    char target_path[700], after[4096], link_target[700];
+    struct stat st;
+    ssize_t n;
+    FILE *f;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_fake_home(home, sizeof(home),
+                                 saved_home, sizeof(saved_home)), 0);
+    snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
+    CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
+    snprintf(target_path, sizeof(target_path), "%s/dotfiles_ssh_config", g_xdg);
+    f = fopen(target_path, "w");
+    CHECK(f != NULL);
+    if (f) {
+        fputs(target_content, f);
+        fclose(f);
+    }
+    CHECK_EQ_INT(chmod(target_path, 0640), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    CHECK_EQ_INT(symlink(target_path, cfg_path), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    account_t *before_current = ctx.current_account;
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn prev = run_set_runner(ssh_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(prev);
+    setenv("HOME", saved_home, 1);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == before_current);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_EQ_INT(lstat(cfg_path, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    n = readlink(cfg_path, link_target, sizeof(link_target) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        link_target[n] = '\0';
+        CHECK_STR_EQ(link_target, target_path);
+    }
+    after[0] = '\0';
+    CHECK(read_file_to_string(target_path, after, sizeof(after)) >= 0);
+    CHECK_STR_EQ(after, target_content);
+    CHECK_EQ_INT(stat(target_path, &st), 0);
+    CHECK_EQ_INT(st.st_mode & 0777, 0640);
+    CHECK(strstr(get_last_error()->message, "SSH config is a symlink") != NULL);
 }
 
 /* ---- AR-03 T1: the GPG half of the failed-switch rollback ---------------- */
@@ -580,6 +1187,46 @@ static int gpg_git_runner(const char *const argv[], const run_opts_t *opts,
         return 0;
     }
     return fake_runner(argv, opts, result);
+}
+
+/* M2 at the accounts_switch boundary for GPG: an obstructing non-symlink at
+ * `current` makes the stable-home commit fail. That failure must abort before
+ * Git/active state changes and must not disturb the independent SSH link. */
+TEST(gpg_stable_link_obstruction_aborts_integrated_switch) {
+    if (!command_exists("gpg")) {
+        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(unlink(g_gpg_link), 0);
+    CHECK_EQ_INT(mkdir(g_gpg_link, 0700), 0);
+    setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *target = &ctx.accounts[0];
+    account_t *prev_account = add_previous_account(&ctx);
+    target->gpg_enabled = true;
+    safe_strncpy(target->gpg_key_id, "FEEDFACE01234567",
+                 sizeof(target->gpg_key_id));
+
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(gpg_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == prev_account);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(is_directory(g_gpg_link));
+    CHECK(symlink_present(g_ssh_sock));
 }
 
 /* Mirror of failed_switch_restarts_previous_accounts_agent for the GPG side
@@ -641,6 +1288,57 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
         base = strrchr(target, '/');
         base = base ? base + 1 : target;
         CHECK_STR_EQ(base, "prevhome");
+    }
+}
+
+/* A failed transaction may share XDG_RUNTIME_DIR with a later writer whose
+ * HOME gives it a different outer config lock. Rollback must compare the
+ * current link with its own installed target before restoring the snapshot;
+ * otherwise it overwrites the later writer with `prevhome`. */
+TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
+    char later_home[512];
+    char target[512];
+    ssize_t n;
+
+    if (!command_exists("gpg")) {
+        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
+    snprintf(later_home, sizeof(later_home), "%s/gitswitch-gpg/later", g_xdg);
+    CHECK_EQ_INT(mkdir(later_home, 0700), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *tgt = &ctx.accounts[0];
+    account_t *prev = add_previous_account(&ctx);
+    prev->gpg_enabled = true;
+    safe_strncpy(prev->gpg_key_id, "0123456789ABCDEF",
+                 sizeof(prev->gpg_key_id));
+    tgt->gpg_enabled = true;
+    safe_strncpy(tgt->gpg_key_id, "FEEDFACE01234567",
+                 sizeof(tgt->gpg_key_id));
+
+    seed_previous_git_identity();
+    g_retarget_gpg_on_user_name = later_home;
+    g_fail_user_name_set = true;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(gpg_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_retarget_gpg_on_user_name = NULL;
+    g_fail_user_name_set = false;
+    g_fail_list_config = false;
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+
+    CHECK_EQ_INT(rc, -1);
+    n = readlink(g_gpg_link, target, sizeof(target) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        target[n] = '\0';
+        CHECK_STR_EQ(target, later_home);
     }
 }
 
@@ -743,11 +1441,20 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(failed_git_config_keeps_previous_runtime_isolation);
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
+    RUN_TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg);
     RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
+    RUN_TEST(repeated_switch_validation_failure_keeps_live_session);
+    RUN_TEST(repeated_switch_reap_failure_preserves_live_session);
+    RUN_TEST(ssh_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_restarts_previous_accounts_agent);
-    RUN_TEST(failed_switch_reverts_host_alias_rewrite);
-    RUN_TEST(failed_switch_removes_ssh_config_it_created);
+    RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);
+    RUN_TEST(failed_switch_never_creates_ssh_config);
+    RUN_TEST(failed_switch_preserves_concurrent_ssh_config_replacement);
+    RUN_TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back);
+    RUN_TEST(symlinked_ssh_config_fails_before_switch_mutation);
+    RUN_TEST(gpg_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_retargets_gpg_current_to_previous_home);
+    RUN_TEST(failed_switch_does_not_overwrite_later_gpg_writer);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()

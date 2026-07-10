@@ -11,9 +11,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 /* Recording runner: captures the argv vector instead of executing anything. */
 static char rec_argv[16][512];
@@ -121,6 +125,476 @@ static void remove_test_dir(const char *dir, const char *tool, const char *marke
     rmdir(dir);
 }
 
+/* Permission changes must apply to the object already opened, not a pathname
+ * that could name something else by the time chmod runs. These functional
+ * checks also preserve the helpers' exact-mode and copy-mode contracts. */
+TEST(file_helpers_apply_descriptor_permissions) {
+    char root[] = "/tmp/gs_file_mode_XXXXXX";
+    char src[512], dst[512], content[64];
+    struct stat st;
+
+    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(src, sizeof(src), "%s/source", root);
+    snprintf(dst, sizeof(dst), "%s/destination", root);
+
+    CHECK_EQ_INT(write_string_to_file(src, "pinned permissions\n", 0640), 0);
+    CHECK_EQ_INT(stat(src, &st), 0);
+    CHECK_EQ_INT(st.st_mode & 0777, 0640);
+
+    CHECK_EQ_INT(copy_file(src, dst), 0);
+    CHECK_EQ_INT(stat(dst, &st), 0);
+    CHECK_EQ_INT(st.st_mode & 0777, 0640);
+    CHECK(read_file_to_string(dst, content, sizeof(content)) >= 0);
+    CHECK_STR_EQ(content, "pinned permissions\n");
+
+    unlink(dst);
+    unlink(src);
+    rmdir(root);
+}
+
+TEST(ensure_private_dir_pins_leaf_and_rejects_symlink) {
+    char root[] = "/tmp/gs_private_dir_XXXXXX";
+    char private_dir[512], link_path[512];
+    struct stat st;
+
+    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(private_dir, sizeof(private_dir), "%s/private", root);
+    snprintf(link_path, sizeof(link_path), "%s/link", root);
+
+    CHECK_EQ_INT(mkdir(private_dir, 0700), 0);
+    CHECK_EQ_INT(chmod(private_dir, 0777), 0);
+    CHECK_EQ_INT(ensure_private_dir(private_dir), 0);
+    CHECK_EQ_INT(lstat(private_dir, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK_EQ_INT(st.st_mode & 0777, 0700);
+
+    CHECK_EQ_INT(symlink(private_dir, link_path), 0);
+    CHECK_EQ_INT(ensure_private_dir(link_path), -1);
+    clear_error();
+
+    unlink(link_path);
+    rmdir(private_dir);
+    rmdir(root);
+}
+
+TEST(runtime_state_lock_serializes_shared_xdg_writers) {
+    char runtime[] = "/tmp/gs_runtime_lock_XXXXXX";
+    char lock_dir[512], lock_path[512];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+    struct pollfd pfd;
+    int pipefd[2] = {-1, -1};
+    int parent_lock = -1;
+    pid_t child = -1;
+    int status = 0;
+    char marker = '\0';
+    int poll_rc;
+
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    parent_lock = runtime_state_lock_acquire();
+    CHECK(parent_lock >= 0);
+    CHECK_EQ_INT(pipe(pipefd), 0);
+    if (parent_lock < 0 || pipefd[0] < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int child_lock;
+
+        close(pipefd[0]);
+        close(parent_lock); /* drop the inherited reference to the parent lock */
+        child_lock = runtime_state_lock_acquire();
+        if (child_lock < 0) _exit(2);
+        if (write(pipefd[1], "L", 1) != 1) _exit(3);
+        runtime_state_lock_release(child_lock);
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
+    close(pipefd[1]);
+    pipefd[1] = -1;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = pipefd[0];
+    pfd.events = POLLIN;
+    do {
+        poll_rc = poll(&pfd, 1, 150);
+    } while (poll_rc < 0 && errno == EINTR);
+    CHECK_EQ_INT(poll_rc, 0);
+
+    runtime_state_lock_release(parent_lock);
+    parent_lock = -1;
+    do {
+        poll_rc = poll(&pfd, 1, 2000);
+    } while (poll_rc < 0 && errno == EINTR);
+    CHECK(poll_rc > 0 && (pfd.revents & POLLIN) != 0);
+    if (poll_rc > 0 && (pfd.revents & POLLIN) != 0) {
+        CHECK_EQ_INT(read(pipefd[0], &marker, 1), 1);
+        CHECK_EQ_INT(marker, 'L');
+    } else {
+        (void)kill(child, SIGKILL);
+    }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+cleanup:
+    if (parent_lock >= 0) runtime_state_lock_release(parent_lock);
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (pipefd[0] >= 0) close(pipefd[0]);
+    if (pipefd[1] >= 0) close(pipefd[1]);
+    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-runtime/.lock", runtime);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    (void)unlink(lock_path);
+    (void)rmdir(lock_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
+TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir) {
+    char runtime[] = "/tmp/gs_runtime_unsafe_XXXXXX";
+    char real_dir[512], link_path[512];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+
+    CHECK_EQ_INT(chmod(runtime, 0755), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    CHECK_EQ_INT(runtime_state_lock_acquire(), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    clear_error();
+
+    CHECK_EQ_INT(chmod(runtime, 0700), 0);
+    snprintf(real_dir, sizeof(real_dir), "%s/real", runtime);
+    snprintf(link_path, sizeof(link_path), "%s/link", runtime);
+    CHECK_EQ_INT(mkdir(real_dir, 0700), 0);
+    CHECK_EQ_INT(symlink(real_dir, link_path), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", link_path, 1), 0);
+    CHECK_EQ_INT(runtime_state_lock_acquire(), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    clear_error();
+
+    (void)unlink(link_path);
+    (void)rmdir(real_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
+/* A waiter pins the original runtime directory before blocking on its lock.
+ * Replacing the public directory while it waits must make acquisition fail;
+ * accepting either namespace would split writers across two different locks. */
+TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting) {
+    char runtime[] = "/tmp/gs_runtime_swap_XXXXXX";
+    char lock_dir[512], moved_dir[512], old_lock[640], new_lock[640];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+    struct timespec settle = { .tv_sec = 0, .tv_nsec = 300000000 };
+    int ready[2] = {-1, -1};
+    int parent_lock = -1;
+    pid_t child = -1;
+    int status = 0;
+    char marker;
+
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK_EQ_INT(chmod(runtime, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    snprintf(moved_dir, sizeof(moved_dir), "%s/gitswitch-runtime.old", runtime);
+    snprintf(old_lock, sizeof(old_lock), "%s/.lock", moved_dir);
+    snprintf(new_lock, sizeof(new_lock), "%s/.lock", lock_dir);
+
+    parent_lock = runtime_state_lock_acquire();
+    CHECK(parent_lock >= 0);
+    CHECK_EQ_INT(pipe(ready), 0);
+    if (parent_lock < 0 || ready[0] < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int child_lock;
+        close(ready[0]);
+        close(parent_lock);
+        if (write(ready[1], "R", 1) != 1) _exit(9);
+        child_lock = runtime_state_lock_acquire();
+        if (child_lock >= 0) {
+            runtime_state_lock_release(child_lock);
+            _exit(2);
+        }
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
+    close(ready[1]);
+    ready[1] = -1;
+    CHECK_EQ_INT(read(ready[0], &marker, 1), 1);
+    CHECK_EQ_INT(marker, 'R');
+    (void)nanosleep(&settle, NULL);
+
+    CHECK_EQ_INT(rename(lock_dir, moved_dir), 0);
+    CHECK_EQ_INT(mkdir(lock_dir, 0700), 0);
+    runtime_state_lock_release(parent_lock);
+    parent_lock = -1;
+
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+cleanup:
+    if (parent_lock >= 0) runtime_state_lock_release(parent_lock);
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (ready[0] >= 0) close(ready[0]);
+    if (ready[1] >= 0) close(ready[1]);
+    (void)unlink(new_lock);
+    (void)rmdir(lock_dir);
+    (void)unlink(old_lock);
+    (void)rmdir(moved_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
+/* A contender created after the public leaf is replaced must still serialize
+ * behind the original holder.  The pinned parent-directory lock is the stable
+ * namespace anchor shared by both the old and replacement leaves. */
+TEST(runtime_state_lock_serializes_after_leaf_replacement) {
+    char runtime[] = "/tmp/gs_runtime_postswap_XXXXXX";
+    char lock_dir[512], moved_dir[512], old_lock[640], new_lock[640];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+    struct pollfd pfd;
+    int entered[2] = {-1, -1};
+    int parent_lock = -1;
+    pid_t child = -1;
+    int status = 0;
+    int poll_rc;
+    char marker = '\0';
+
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    snprintf(moved_dir, sizeof(moved_dir), "%s/gitswitch-runtime.old", runtime);
+    snprintf(old_lock, sizeof(old_lock), "%s/.lock", moved_dir);
+    snprintf(new_lock, sizeof(new_lock), "%s/.lock", lock_dir);
+
+    parent_lock = runtime_state_lock_acquire();
+    CHECK(parent_lock >= 0);
+    CHECK_EQ_INT(rename(lock_dir, moved_dir), 0);
+    CHECK_EQ_INT(mkdir(lock_dir, 0700), 0);
+    CHECK_EQ_INT(pipe(entered), 0);
+    if (parent_lock < 0 || entered[0] < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int child_lock;
+
+        close(entered[0]);
+        close(parent_lock);
+        child_lock = runtime_state_lock_acquire();
+        if (child_lock < 0) _exit(2);
+        if (write(entered[1], "L", 1) != 1) _exit(3);
+        runtime_state_lock_release(child_lock);
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
+    close(entered[1]);
+    entered[1] = -1;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = entered[0];
+    pfd.events = POLLIN;
+    do {
+        poll_rc = poll(&pfd, 1, 150);
+    } while (poll_rc < 0 && errno == EINTR);
+    CHECK_EQ_INT(poll_rc, 0);
+
+    runtime_state_lock_release(parent_lock);
+    parent_lock = -1;
+    do {
+        poll_rc = poll(&pfd, 1, 2000);
+    } while (poll_rc < 0 && errno == EINTR);
+    CHECK(poll_rc > 0 && (pfd.revents & POLLIN) != 0);
+    if (poll_rc > 0 && (pfd.revents & POLLIN) != 0) {
+        CHECK_EQ_INT(read(entered[0], &marker, 1), 1);
+        CHECK_EQ_INT(marker, 'L');
+    } else {
+        (void)kill(child, SIGKILL);
+    }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+cleanup:
+    if (parent_lock >= 0) runtime_state_lock_release(parent_lock);
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (entered[0] >= 0) close(entered[0]);
+    if (entered[1] >= 0) close(entered[1]);
+    (void)unlink(new_lock);
+    (void)rmdir(lock_dir);
+    (void)unlink(old_lock);
+    (void)rmdir(moved_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
+/* Opaque lock tokens inherited across fork may be closed and their numeric fd
+ * reused before the child releases them.  Releasing stale bookkeeping must
+ * never close the unrelated replacement descriptor. */
+TEST(private_lock_release_ignores_reused_inherited_token) {
+    char root[] = "/tmp/gs_private_lock_fork_XXXXXX";
+    int dir_fd = -1;
+    int token = -1;
+    pid_t child = -1;
+    int status = 0;
+
+    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+    token = lock_private_file_at(dir_fd, ".test-lock");
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int replacement;
+
+        close(token);
+        replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (replacement < 0) _exit(2);
+        if (replacement != token) {
+            if (dup2(replacement, token) != token) _exit(3);
+            close(replacement);
+        }
+        unlock_private_file(token);
+        _exit(fcntl(token, F_GETFD) >= 0 ? 0 : 4);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        child = -1;
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+
+cleanup:
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (token >= 0) unlock_private_file(token);
+    if (dir_fd >= 0) close(dir_fd);
+    {
+        char lock_path[512];
+        snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
+        (void)unlink(lock_path);
+    }
+    (void)rmdir(root);
+}
+
+/* runtime_state_lock keeps additional parent/leaf descriptors internally.
+ * A post-fork reset must identity-check those numbers too: the child can close
+ * and reuse every inherited fd before its first runtime-lock API call. */
+TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
+    char runtime[] = "/tmp/gs_runtime_fdreuse_XXXXXX";
+    char lock_dir[512], lock_path[512];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+    int parent_lock = -1;
+    pid_t child = -1;
+    int status = 0;
+
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    parent_lock = runtime_state_lock_acquire();
+    CHECK(parent_lock >= 3);
+    if (parent_lock < 3) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int replacements[256];
+        int count = 0;
+
+        for (int fd = 3; fd <= parent_lock; fd++) close(fd);
+        while (count < (int)(sizeof(replacements) / sizeof(replacements[0]))) {
+            int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+            if (fd < 0) _exit(2);
+            if (fd > parent_lock) {
+                close(fd);
+                break;
+            }
+            replacements[count++] = fd;
+        }
+        if (count == 0) _exit(3);
+        runtime_state_lock_release(parent_lock);
+        for (int i = 0; i < count; i++) {
+            if (fcntl(replacements[i], F_GETFD) < 0) _exit(4);
+        }
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        child = -1;
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+
+cleanup:
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (parent_lock >= 0) runtime_state_lock_release(parent_lock);
+    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-runtime/.lock", runtime);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    (void)unlink(lock_path);
+    (void)rmdir(lock_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
 /* A shadow binary in a world-writable PATH entry must not resolve, and must
  * not hide the real binary in the standard dirs behind it. */
 TEST(find_command_path_skips_world_writable_dir) {
@@ -145,6 +619,89 @@ TEST(find_command_path_skips_world_writable_dir) {
     restore_path();
     unlink(echo_shadow);
     remove_test_dir(wwdir, tool, marker);
+}
+
+/* AR-04 M5: group write permission is enough to make either a PATH directory
+ * or the candidate helper mutable by someone other than the invoking user.
+ * Exercise both common group-write modes and retain positive controls for
+ * ordinary private/user and system-style permissions. */
+TEST(find_command_path_rejects_group_writable_components) {
+    char d770[256], d775[256], f770dir[256], f775dir[256];
+    char ok700dir[256], ok755dir[256];
+    char d770tool[512], d775tool[512], f770tool[512], f775tool[512];
+    char ok700tool[512], ok755tool[512];
+    char marker[6][512], buf[512], path[512];
+
+    if (make_test_dir(d770, sizeof(d770), 0770) != 0 ||
+        make_test_dir(d775, sizeof(d775), 0775) != 0 ||
+        make_test_dir(f770dir, sizeof(f770dir), 0755) != 0 ||
+        make_test_dir(f775dir, sizeof(f775dir), 0755) != 0 ||
+        make_test_dir(ok700dir, sizeof(ok700dir), 0700) != 0 ||
+        make_test_dir(ok755dir, sizeof(ok755dir), 0755) != 0) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+
+    snprintf(marker[0], sizeof(marker[0]), "%s/marker", d770);
+    snprintf(marker[1], sizeof(marker[1]), "%s/marker", d775);
+    snprintf(marker[2], sizeof(marker[2]), "%s/marker", f770dir);
+    snprintf(marker[3], sizeof(marker[3]), "%s/marker", f775dir);
+    snprintf(marker[4], sizeof(marker[4]), "%s/marker", ok700dir);
+    snprintf(marker[5], sizeof(marker[5]), "%s/marker", ok755dir);
+    CHECK_EQ_INT(install_fake_tool(d770, "gs_fake_dir770", marker[0],
+                                   d770tool, sizeof(d770tool)), 0);
+    CHECK_EQ_INT(install_fake_tool(d775, "gs_fake_dir775", marker[1],
+                                   d775tool, sizeof(d775tool)), 0);
+    CHECK_EQ_INT(install_fake_tool(f770dir, "gs_fake_file770", marker[2],
+                                   f770tool, sizeof(f770tool)), 0);
+    CHECK_EQ_INT(chmod(f770tool, 0770), 0);
+    CHECK_EQ_INT(install_fake_tool(f775dir, "gs_fake_file775", marker[3],
+                                   f775tool, sizeof(f775tool)), 0);
+    CHECK_EQ_INT(chmod(f775tool, 0775), 0);
+    CHECK_EQ_INT(install_fake_tool(ok700dir, "gs_fake_ok700", marker[4],
+                                   ok700tool, sizeof(ok700tool)), 0);
+    CHECK_EQ_INT(chmod(ok700tool, 0700), 0);
+    CHECK_EQ_INT(install_fake_tool(ok755dir, "gs_fake_ok755", marker[5],
+                                   ok755tool, sizeof(ok755tool)), 0);
+
+    save_path();
+
+    snprintf(path, sizeof(path), "%s", d770);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_dir770", buf, sizeof(buf)), -1);
+    CHECK(!command_exists("gs_fake_dir770")); /* same lookup used by doctor */
+    CHECK_EQ_INT(find_command_path(d770tool, buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", d775);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_dir775", buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", f770dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_file770", buf, sizeof(buf)), -1);
+    CHECK_EQ_INT(find_command_path(f770tool, buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", f775dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_file775", buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", ok700dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_ok700", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, ok700tool);
+
+    snprintf(path, sizeof(path), "%s", ok755dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_ok755", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, ok755tool);
+
+    restore_path();
+    remove_test_dir(d770, d770tool, marker[0]);
+    remove_test_dir(d775, d775tool, marker[1]);
+    remove_test_dir(f770dir, f770tool, marker[2]);
+    remove_test_dir(f775dir, f775tool, marker[3]);
+    remove_test_dir(ok700dir, ok700tool, marker[4]);
+    remove_test_dir(ok755dir, ok755tool, marker[5]);
 }
 
 /* Relative ("."), bare-name ("bin"), and empty ("::") PATH entries all resolve
@@ -244,6 +801,30 @@ TEST(run_argv_never_executes_from_world_writable_dir) {
     remove_test_dir(okdir, oktool, okmarker);
 }
 
+TEST(run_argv_never_executes_group_writable_helper) {
+    char dir[256], tool[512], marker[512];
+    run_result_t res;
+    const char *argv[] = {"gs_fake_group_writable_tool", NULL};
+
+    if (make_test_dir(dir, sizeof(dir), 0755) != 0) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    snprintf(marker, sizeof(marker), "%s/marker", dir);
+    CHECK_EQ_INT(install_fake_tool(dir, "gs_fake_group_writable_tool", marker,
+                                   tool, sizeof(tool)), 0);
+    CHECK_EQ_INT(chmod(tool, 0770), 0);
+
+    save_path();
+    setenv("PATH", dir, 1);
+    CHECK_EQ_INT(run_argv(argv, NULL, &res), -1);
+    CHECK(!res.spawned);
+    CHECK(!path_exists(marker));
+    restore_path();
+
+    remove_test_dir(dir, tool, marker);
+}
+
 #if defined(__linux__)
 /* fd-CLOEXEC acceptance: a child spawned via run_argv must see nothing beyond
  * stdin/stdout/stderr, even when the parent deliberately leaked a non-CLOEXEC
@@ -306,10 +887,20 @@ TEST_MAIN_BEGIN()
     RUN_TEST(find_command_path_rejects_metachars);
     RUN_TEST(find_command_path_finds_real_binary);
     RUN_TEST(command_exists_basic);
+    RUN_TEST(file_helpers_apply_descriptor_permissions);
+    RUN_TEST(ensure_private_dir_pins_leaf_and_rejects_symlink);
+    RUN_TEST(runtime_state_lock_serializes_shared_xdg_writers);
+    RUN_TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir);
+    RUN_TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting);
+    RUN_TEST(runtime_state_lock_serializes_after_leaf_replacement);
+    RUN_TEST(private_lock_release_ignores_reused_inherited_token);
+    RUN_TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers);
     RUN_TEST(find_command_path_skips_world_writable_dir);
+    RUN_TEST(find_command_path_rejects_group_writable_components);
     RUN_TEST(find_command_path_skips_relative_and_empty_entries);
     RUN_TEST(find_command_path_allows_user_owned_absolute_dir);
     RUN_TEST(run_argv_never_executes_from_world_writable_dir);
+    RUN_TEST(run_argv_never_executes_group_writable_helper);
 #if defined(__linux__)
     RUN_TEST(run_argv_child_sees_only_std_fds);
 #endif
