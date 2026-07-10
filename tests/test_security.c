@@ -177,7 +177,12 @@ TEST(ensure_private_dir_pins_leaf_and_rejects_symlink) {
     rmdir(root);
 }
 
-TEST(runtime_state_lock_serializes_shared_xdg_writers) {
+/* AR-05 L13: the runtime lock is non-blocking — a contender while another
+ * writer holds it must be EXCLUDED IMMEDIATELY (fail fast with a contention
+ * error) instead of waiting behind an unbounded passphrase/PIN prompt, and
+ * must acquire normally once the holder releases. Mutual exclusion is what
+ * matters: no two writers ever hold it concurrently. */
+TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast) {
     char runtime[] = "/tmp/gs_runtime_lock_XXXXXX";
     char lock_dir[512], lock_path[512];
     char saved_xdg[MAX_PATH_LEN] = "";
@@ -208,35 +213,51 @@ TEST(runtime_state_lock_serializes_shared_xdg_writers) {
         close(pipefd[0]);
         close(parent_lock); /* drop the inherited reference to the parent lock */
         child_lock = runtime_state_lock_acquire();
-        if (child_lock < 0) _exit(2);
-        if (write(pipefd[1], "L", 1) != 1) _exit(3);
-        runtime_state_lock_release(child_lock);
+        if (child_lock >= 0) {
+            /* Acquired concurrently with the live holder: exclusion broken. */
+            runtime_state_lock_release(child_lock);
+            (void)write(pipefd[1], "X", 1);
+            _exit(2);
+        }
+        if (write(pipefd[1], "B", 1) != 1) _exit(3);
         _exit(0);
     }
     if (child < 0) goto cleanup;
     close(pipefd[1]);
     pipefd[1] = -1;
 
+    /* The contender must resolve promptly WHILE the lock is still held —
+     * a 2s silence means it blocked (the old behavior). */
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = pipefd[0];
     pfd.events = POLLIN;
-    do {
-        poll_rc = poll(&pfd, 1, 150);
-    } while (poll_rc < 0 && errno == EINTR);
-    CHECK_EQ_INT(poll_rc, 0);
-
-    runtime_state_lock_release(parent_lock);
-    parent_lock = -1;
     do {
         poll_rc = poll(&pfd, 1, 2000);
     } while (poll_rc < 0 && errno == EINTR);
     CHECK(poll_rc > 0 && (pfd.revents & POLLIN) != 0);
     if (poll_rc > 0 && (pfd.revents & POLLIN) != 0) {
         CHECK_EQ_INT(read(pipefd[0], &marker, 1), 1);
-        CHECK_EQ_INT(marker, 'L');
+        CHECK_EQ_INT(marker, 'B');
     } else {
         (void)kill(child, SIGKILL);
     }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* Once the holder releases, a fresh contender must acquire. */
+    runtime_state_lock_release(parent_lock);
+    parent_lock = -1;
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int child_lock = runtime_state_lock_acquire();
+        if (child_lock < 0) _exit(2);
+        runtime_state_lock_release(child_lock);
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
     CHECK_EQ_INT(waitpid(child, &status, 0), child);
     child = -1;
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -378,10 +399,13 @@ cleanup:
     }
 }
 
-/* A contender created after the public leaf is replaced must still serialize
- * behind the original holder.  The pinned parent-directory lock is the stable
- * namespace anchor shared by both the old and replacement leaves. */
-TEST(runtime_state_lock_serializes_after_leaf_replacement) {
+/* A contender created after the public leaf is replaced must still be
+ * excluded by the original holder.  The pinned parent-directory lock is the
+ * stable namespace anchor shared by both the old and replacement leaves —
+ * accepting the replacement leaf would split writers across two locks. With
+ * the non-blocking acquisition (AR-05 L13) exclusion now manifests as an
+ * immediate contention failure rather than a wait. */
+TEST(runtime_state_lock_excludes_contender_after_leaf_replacement) {
     char runtime[] = "/tmp/gs_runtime_postswap_XXXXXX";
     char lock_dir[512], moved_dir[512], old_lock[640], new_lock[640];
     char saved_xdg[MAX_PATH_LEN] = "";
@@ -419,35 +443,52 @@ TEST(runtime_state_lock_serializes_after_leaf_replacement) {
         close(entered[0]);
         close(parent_lock);
         child_lock = runtime_state_lock_acquire();
-        if (child_lock < 0) _exit(2);
-        if (write(entered[1], "L", 1) != 1) _exit(3);
-        runtime_state_lock_release(child_lock);
+        if (child_lock >= 0) {
+            /* Entered concurrently via the replacement leaf: anchor broken. */
+            runtime_state_lock_release(child_lock);
+            (void)write(entered[1], "X", 1);
+            _exit(2);
+        }
+        if (write(entered[1], "B", 1) != 1) _exit(3);
         _exit(0);
     }
     if (child < 0) goto cleanup;
     close(entered[1]);
     entered[1] = -1;
 
+    /* The contender must be rejected promptly while the original holder is
+     * live — silence means it blocked (old behavior) or entered concurrently. */
     memset(&pfd, 0, sizeof(pfd));
     pfd.fd = entered[0];
     pfd.events = POLLIN;
-    do {
-        poll_rc = poll(&pfd, 1, 150);
-    } while (poll_rc < 0 && errno == EINTR);
-    CHECK_EQ_INT(poll_rc, 0);
-
-    runtime_state_lock_release(parent_lock);
-    parent_lock = -1;
     do {
         poll_rc = poll(&pfd, 1, 2000);
     } while (poll_rc < 0 && errno == EINTR);
     CHECK(poll_rc > 0 && (pfd.revents & POLLIN) != 0);
     if (poll_rc > 0 && (pfd.revents & POLLIN) != 0) {
         CHECK_EQ_INT(read(entered[0], &marker, 1), 1);
-        CHECK_EQ_INT(marker, 'L');
+        CHECK_EQ_INT(marker, 'B');
     } else {
         (void)kill(child, SIGKILL);
     }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* After the holder releases, a fresh contender must acquire (via the
+     * replacement leaf, which is now the live public namespace). */
+    runtime_state_lock_release(parent_lock);
+    parent_lock = -1;
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int child_lock = runtime_state_lock_acquire();
+        if (child_lock < 0) _exit(2);
+        runtime_state_lock_release(child_lock);
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
     CHECK_EQ_INT(waitpid(child, &status, 0), child);
     child = -1;
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -889,10 +930,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(command_exists_basic);
     RUN_TEST(file_helpers_apply_descriptor_permissions);
     RUN_TEST(ensure_private_dir_pins_leaf_and_rejects_symlink);
-    RUN_TEST(runtime_state_lock_serializes_shared_xdg_writers);
+    RUN_TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast);
     RUN_TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir);
     RUN_TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting);
-    RUN_TEST(runtime_state_lock_serializes_after_leaf_replacement);
+    RUN_TEST(runtime_state_lock_excludes_contender_after_leaf_replacement);
     RUN_TEST(private_lock_release_ignores_reused_inherited_token);
     RUN_TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers);
     RUN_TEST(find_command_path_skips_world_writable_dir);
