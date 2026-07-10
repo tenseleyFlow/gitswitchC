@@ -415,22 +415,20 @@ DIST_ARCHIVE = $(DIST_ROOT).tar.gz
 DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
 .PHONY: dist distcheck qa-contract-test rpm
+# Archive COMMITTED VCS content, not the live working tree: the old cp -R of
+# the manifest directories shipped any stray file nested inside src/, tests/,
+# or completions/ (editor backups, experiment files, test-run droppings), so
+# release tarballs were not reproducible from a tag and could leak unreviewed
+# content (AR-05 L5). git archive draws from HEAD, which also inherently
+# excludes VCS state, build products, cores, logs, and prior archives.
 dist:
 	@echo "Creating distribution tarball..."
-	@set -eu; \
-	tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/gitswitch-dist.XXXXXX"); \
-	trap 'rm -rf "$$tmp"' 0; \
-	trap 'exit 1' 1 2 3 15; \
-	mkdir "$$tmp/$(DIST_ROOT)"; \
-	cp -R $(DIST_MANIFEST) "$$tmp/$(DIST_ROOT)/"; \
-	tar -C "$$tmp" -czf "$$tmp/$(DIST_ARCHIVE)" \
-		--exclude='.git' --exclude='.git/*' \
-		--exclude='.omx' --exclude='.omx/*' \
-		--exclude='build' --exclude='build/*' \
-		--exclude='*.o' --exclude='*.core' --exclude='core' --exclude='core.*' \
-		--exclude='valgrind*.log' --exclude='*.tar.gz' \
-		"$(DIST_ROOT)"; \
-	mv "$$tmp/$(DIST_ARCHIVE)" "$(CURDIR)/$(DIST_ARCHIVE)"
+	@git rev-parse --git-dir >/dev/null 2>&1 || \
+		{ echo "ERROR: dist builds from committed VCS content and requires a git checkout" >&2; exit 1; }
+	@if ! git diff-index --quiet HEAD -- $(DIST_MANIFEST) 2>/dev/null; then \
+		echo "WARNING: working tree differs from HEAD for manifest paths; the archive contains committed content only" >&2; \
+	fi
+	git archive --prefix=$(DIST_ROOT)/ -o $(DIST_ARCHIVE) HEAD -- $(DIST_MANIFEST)
 
 distcheck: dist
 	@sh tests/test_dist.sh "$(CURDIR)/$(DIST_ARCHIVE)" "$(DIST_ROOT)" \

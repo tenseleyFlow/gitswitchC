@@ -44,12 +44,13 @@ case $prefix in
     *) fail "PREFIX must be absolute: $prefix" ;;
 esac
 
-checkout_test_count=0
-for source in tests/test_*.c; do
-    [ -f "$source" ] || continue
-    checkout_test_count=$((checkout_test_count + 1))
-done
-[ "$checkout_test_count" -gt 0 ] || fail "no checkout C tests discovered"
+# Count COMMITTED tests via git ls-files, not the live filesystem: dist now
+# archives HEAD (AR-05 L5), so an untracked stray under tests/ must neither
+# ship nor skew this baseline — with a filesystem count, the same dirty tree
+# was counted on both sides and contamination was undetectable.
+git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checkout"
+checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
+[ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-distcheck.XXXXXX")
 
