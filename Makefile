@@ -33,10 +33,15 @@ UNAME_S := $(shell uname -s)
 
 # Compiler and flags
 CC = gcc
+# -Wstrict-aliasing=3 (the -Wall default), not =2: level 2 is documented as
+# "aggressive, quick, not too precise" and flags the canonical POSIX
+# sockaddr_un -> sockaddr cast at -O2 even through an intermediate void*
+# (gcc 13 on the CI runners) — a false positive WERROR turns into a build
+# break. Level 3 keeps the real dereference-based aliasing analysis.
 CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
          -Wmissing-prototypes -Wold-style-definition -Wredundant-decls \
          -Wbad-function-cast -Wnested-externs -Winit-self \
-         -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=2 \
+         -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=3 \
          -Wmissing-include-dirs -Wformat=2 -Winit-self \
          -Wswitch-default -Wunused -Werror-implicit-function-declaration \
          $(VERSION_FLAGS)
@@ -98,14 +103,17 @@ ifeq ($(WERROR),1)
     CFLAGS += -Werror
 endif
 
-# clang flags the deliberate ##__VA_ARGS__ comma-pasting GNU extension in
-# error.h's logging macros as -Wgnu-zero-variadic-macro-arguments under
-# -Wpedantic (macOS 'gcc' is clang; WERROR promoted the long-standing noise
-# to a hard error). The extension is intentional — the build is -std=gnu11 —
-# so silence clang's style objection; gcc has no such warning.
+# clang-specific silencing (macOS 'gcc' is clang; WERROR promoted both of
+# these long-standing diagnostics to hard errors):
+# - -Wgnu-zero-variadic-macro-arguments: the ##__VA_ARGS__ comma-pasting GNU
+#   extension in error.h's logging macros is deliberate (-std=gnu11).
+# - -Wformat-nonliteral (clang's -Wformat=2 variant): fires on the bounded
+#   vsnprintf wrappers in error.c/display.c whose fmt comes from internal
+#   callers (same sites triaged for the AR-05 L1 flawfinder baseline); gcc's
+#   -Wformat=2 does not flag va_list forwarding.
 CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -c clang)
 ifneq ($(CC_IS_CLANG),0)
-    CFLAGS += -Wno-gnu-zero-variadic-macro-arguments
+    CFLAGS += -Wno-gnu-zero-variadic-macro-arguments -Wno-format-nonliteral
 endif
 
 # Include directories
