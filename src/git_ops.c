@@ -22,6 +22,8 @@
 static int git_run(char *output, size_t output_size, ...);
 static int validate_git_installation(void);
 static bool is_valid_git_config_value(const char *value);
+static int git_set_config_value_impl(const char *key, const char *value,
+                                     git_scope_t scope, bool skip_validation);
 static int git_get_config_value_ex(const char *key, char *value,
                                    size_t value_size, git_scope_t scope,
                                    bool *value_too_long);
@@ -337,7 +339,13 @@ static void git_probe_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT
     git_apply_config_listing(scope, list, list_len, out);
 }
 
-static void git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KEY_COUNT]) {
+/* Returns the number of managed keys that could NOT be restored (0 = clean
+ * rollback). AR-06 F04: the old version discarded every set/unset result, so a
+ * rollback that git actually rejected still reported success and left a mixed
+ * identity. Values are restored with validation skipped because they came from
+ * git's own snapshot. Keys uncapturable at snapshot time count as failures. */
+static int git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KEY_COUNT]) {
+    int failures = 0;
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         if (in[i].value_unknown) {
             /* Present before the switch but too long to snapshot: writing
@@ -347,14 +355,27 @@ static void git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KE
              * silently pretending the rollback was complete (AR-03 M1). */
             log_warning("Not restoring %s: pre-switch value was too long to snapshot",
                         in[i].key);
+            /* Not counted as a failure: this is the deliberate non-destructive
+             * choice (AR-03 M1) — a truncated write-back or a --unset would be
+             * worse. F04 targets SWALLOWED git rejections of capturable values,
+             * below, not this known-and-warned limitation. */
             continue;
         }
         if (in[i].present) {
-            git_set_config_value(in[i].key, in[i].value, scope);
+            if (git_set_config_value_impl(in[i].key, in[i].value, scope, true) != 0) {
+                log_warning("Rollback failed to restore %s: %s",
+                            in[i].key, get_last_error()->message);
+                failures++;
+            }
         } else {
-            git_unset_config_value(in[i].key, scope);
+            if (git_unset_config_value(in[i].key, scope) != 0) {
+                log_warning("Rollback failed to clear %s: %s",
+                            in[i].key, get_last_error()->message);
+                failures++;
+            }
         }
     }
+    return failures;
 }
 
 int git_config_snapshot(git_scope_t scope) {
@@ -369,16 +390,27 @@ int git_config_snapshot(git_scope_t scope) {
 }
 
 int git_config_restore(void) {
+    int failures = 0;
     if (!g_git_snapshot.valid) {
         return 0;
     }
     log_info("Rolling back git configuration after a failed switch");
     /* Restore local first (it was cleared earliest), then the primary scope. */
     if (g_git_snapshot.local_also) {
-        git_restore_keys(GIT_SCOPE_LOCAL, g_git_snapshot.local);
+        failures += git_restore_keys(GIT_SCOPE_LOCAL, g_git_snapshot.local);
     }
-    git_restore_keys(g_git_snapshot.scope, g_git_snapshot.primary);
+    failures += git_restore_keys(g_git_snapshot.scope, g_git_snapshot.primary);
     g_git_snapshot.valid = false;
+    /* AR-06 F04: an incomplete rollback must not masquerade as clean. Surface
+     * it to the user (the switch already failed; this warns their identity may
+     * be partially reverted) and report it to the caller. */
+    if (failures > 0) {
+        fprintf(stderr,
+                "gitswitch: [!!] git rollback incomplete — %d config key(s) could "
+                "not be restored; check `git config --list` for a mixed identity\n",
+                failures);
+        return -1;
+    }
     return 0;
 }
 
@@ -742,7 +774,17 @@ int git_test_config(const account_t *account, git_scope_t scope) {
 }
 
 /* Set single git configuration value */
-int git_set_config_value(const char *key, const char *value, git_scope_t scope) {
+/* skip_validation is set ONLY by the rollback restore path (AR-06 F04): the
+ * value being written came verbatim from git's own `--list -z` snapshot, so it
+ * is by construction representable (git stored it, e.g. a multi-line user.name
+ * or a leading-'-' value — both of which is_valid_git_config_value rejects).
+ * The old gate silently refused to restore them, and because git_restore_keys
+ * discarded the error, a failed switch left the new account's name over the
+ * user's original — a chimera identity the tool exists to prevent. On the argv
+ * exec path the value never reaches a shell, so bypassing the gate for a
+ * git-sourced value is safe. Normal (user-driven) writes keep the gate. */
+static int git_set_config_value_impl(const char *key, const char *value,
+                                     git_scope_t scope, bool skip_validation) {
     char output[256];
     const char *scope_flag;
 
@@ -753,7 +795,7 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
 
     /* Belt-and-suspenders only: argv execution means the value is never parsed
      * by a shell, so this is no longer the security boundary. */
-    if (!is_valid_git_config_value(value)) {
+    if (!skip_validation && !is_valid_git_config_value(value)) {
         set_error(ERR_INVALID_ARGS, "Invalid characters in git config value");
         return -1;
     }
@@ -792,6 +834,10 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
 
     cfg_cache_store(s, k, CFG_WRITTEN, true, value);
     return 0;
+}
+
+int git_set_config_value(const char *key, const char *value, git_scope_t scope) {
+    return git_set_config_value_impl(key, value, scope, false);
 }
 
 /* Get single git configuration value.
@@ -930,15 +976,40 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
 
     log_debug("Unsetting git config: %s (%s)", key, scope_flag);
 
-    /* Ignore errors as the key might not exist */
-    git_run(output, sizeof(output), "config", scope_flag, "--unset", key,
-            (const char *)NULL);
+    /* --unset-all, not --unset (AR-06 F03): `git config --unset` exits 5 and
+     * removes NOTHING when the key holds multiple values (hand edits, another
+     * tool's --add, an include.path file contributing a second record). A stale
+     * multi-valued local core.sshCommand then survived a global switch and,
+     * being local scope, shadowed the freshly written global one — pushes kept
+     * using the old SSH identity while the switch reported success. --unset-all
+     * removes every value atomically. */
+    {
+        run_opts_t opts;
+        run_result_t res;
+        const char *argv[] = {"git", "config", scope_flag, "--unset-all", key, NULL};
+        memset(&opts, 0, sizeof(opts));
+        opts.out = output;
+        opts.out_size = sizeof(output);
+        opts.merge_stderr = true;
+        run_argv(argv, &opts, &res);
 
-    /* Unset is best-effort by contract (errors ignored above), so "absent" is
-     * the strongest post-state we can record either way. */
-    cfg_cache_store(s, k, CFG_WRITTEN, false, "");
-
-    return 0;
+        /* exit 0 = removed; exit 5 with --unset-all = the key did not exist.
+         * Both prove the key is now absent, so caching CFG_WRITTEN/absent is
+         * correct and lets a later duplicate unset be elided (AR-02 #15). Any
+         * OTHER status (git error, or death-by-signal -> exit_code -1) means the
+         * unset may NOT have happened: record CFG_UNKNOWN so a later corrective
+         * unset in this process is not wrongly elided (AR-06 F03 cache
+         * poisoning), and surface the failure to the caller. */
+        if (res.exit_code == 0 || res.exit_code == 5) {
+            cfg_cache_store(s, k, CFG_WRITTEN, false, "");
+            return 0;
+        }
+        cfg_cache_store(s, k, CFG_UNKNOWN, true, "");
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to unset git config %s (%s): %s", key, scope_flag,
+                  output[0] ? output : "unknown error");
+        return -1;
+    }
 }
 
 /* List all git configuration values */
