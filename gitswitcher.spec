@@ -51,6 +51,9 @@ install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 
 %files
 /usr/local/bin/gitswitch
+/usr/local/share/bash-completion/completions/gitswitch
+/usr/local/share/zsh/site-functions/_gitswitch
+/usr/local/share/fish/vendor_completions.d/gitswitch.fish
 %{_docdir}/%{name}/README.md
 
 %changelog

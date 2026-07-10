@@ -2,6 +2,26 @@
 #
 # Completes subcommands, options, and — for the switch/edit/remove positions —
 # the live account names reported by `gitswitch list --names`.
+#
+# NOTE: account names may contain spaces, parentheses, and other shell
+# metacharacters (see validate_name in the source). We therefore read them into
+# an array one-per-line and prefix-match with [[ ]], and never feed them through
+# `compgen -W`, which word-splits AND re-expands its wordlist — the latter would
+# execute a name like `$(...)` on TAB and mangle any name containing a space.
+
+# Populate COMPREPLY with the live account names that prefix-match "$cur",
+# quoting each candidate so names with spaces complete as a single word.
+_gitswitch_complete_accounts() {
+    local cur=$1 name
+    local -a names=()
+    mapfile -t names < <(gitswitch list --names 2>/dev/null)
+    local n
+    for n in "${names[@]}"; do
+        if [[ -z $cur || $n == "$cur"* ]]; then
+            COMPREPLY+=("$(printf '%q' "$n")")
+        fi
+    done
+}
 
 _gitswitch() {
     local cur prev words cword
@@ -15,13 +35,9 @@ _gitswitch() {
     local subcommands="add edit list ls remove rm delete status doctor health config init resume reset"
     local options="--global --local --dry-run --yes --names --verbose --debug --color --no-color --help --version"
 
-    # `gitswitch list --names` is the machine-readable account list. Suppress
-    # errors so completion degrades to nothing rather than spewing on a broken
-    # config or missing binary.
-    local accounts
-    accounts=$(gitswitch list --names 2>/dev/null)
+    COMPREPLY=()
 
-    # Options complete anywhere.
+    # Options complete anywhere. These are fixed literals, so compgen -W is safe.
     if [[ $cur == -* ]]; then
         COMPREPLY=($(compgen -W "$options" -- "$cur"))
         return
@@ -29,16 +45,12 @@ _gitswitch() {
 
     # Argument to the command in the previous position.
     case "$prev" in
-        edit|remove|rm|delete)
-            COMPREPLY=($(compgen -W "$accounts" -- "$cur"))
+        edit|remove|rm|delete|reset)
+            _gitswitch_complete_accounts "$cur"
             return
             ;;
         init)
             COMPREPLY=($(compgen -W "fish bash zsh sh dash ksh" -- "$cur"))
-            return
-            ;;
-        reset)
-            COMPREPLY=($(compgen -W "$accounts" -- "$cur"))
             return
             ;;
     esac
@@ -53,7 +65,9 @@ _gitswitch() {
     done
 
     if [[ -z $seen_cmd ]]; then
-        COMPREPLY=($(compgen -W "$subcommands $accounts" -- "$cur"))
+        # Subcommands (safe literals) plus live account names.
+        COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
+        _gitswitch_complete_accounts "$cur"
     fi
 }
 
