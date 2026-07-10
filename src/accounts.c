@@ -22,6 +22,7 @@
 #include "ssh_manager.h"
 #include "gpg_manager.h"
 #include "prompt.h"
+#include "signals.h"
 
 /* Active session state - tracks SSH/GPG resources for proper cleanup */
 typedef struct {
@@ -120,6 +121,77 @@ static void deactivate_runtime_isolation(bool ssh, bool gpg) {
     }
 }
 
+/* F4: after a failed switch has torn down the runtime isolation, put the
+ * PREVIOUSLY-active account's isolation back so the user is not left with git
+ * identity rolled back but no working SSH agent / GPG keyring behind it.
+ *
+ *   - SSH: starting the new account's agent already reaped the previous one
+ *     (ssh_start_isolated_agent kills every other gitswitch agent), so restore
+ *     means re-activating: restart the agent and reload the key. This may
+ *     legitimately re-prompt for a passphrase — annoying, but strictly better
+ *     than silently leaving no agent at all. Best-effort: a restore failure
+ *     only warns (the rollback of the git identity already succeeded).
+ *   - GPG: isolated homes persist on disk (only the stable `current` symlink
+ *     moves), so restore is just re-pointing the symlink at the captured
+ *     pre-switch target. Fail closed: if the old target vanished, leave the
+ *     symlink absent rather than point shells at a missing keyring. */
+static void restore_previous_isolation(const account_t *prev,
+                                       const char *prev_gpg_home,
+                                       bool ssh_torn_down, bool gpg_torn_down) {
+    if (ssh_torn_down && prev &&
+        prev->ssh_enabled && strlen(prev->ssh_key_path) > 0) {
+        printf("  [..] Restoring SSH agent for previous account: %s\n", prev->name);
+        memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
+        if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) == 0 &&
+            ssh_switch_account(&g_session.ssh_config, prev) == 0) {
+            g_session.ssh_active = true;
+            printf("  [OK] Previous SSH agent restored\n");
+        } else {
+            log_warning("Could not restore SSH agent for previous account: %s",
+                        prev->name);
+        }
+    }
+
+    if (gpg_torn_down && prev_gpg_home && prev_gpg_home[0] != '\0' &&
+        is_directory(prev_gpg_home)) {
+        char gpg_link[MAX_PATH_LEN];
+        if (gpg_manager_get_home_path(gpg_link, sizeof(gpg_link)) == 0 &&
+            atomic_symlink(prev_gpg_home, gpg_link) == 0) {
+            log_info("Restored GNUPGHOME symlink to previous account home");
+        }
+    }
+}
+
+/* Common exit path for a switch that failed — or was interrupted by a signal —
+ * after mutations began. Restores the pre-switch state in dependency order
+ * (git identity first, then runtime isolation), cleans scratch files, drops
+ * the signal guard, and finally re-raises a pending signal so the process
+ * still reports death-by-signal. Returns -1 so callers can
+ * `return abort_failed_switch(...)` (callers set their own error afterwards;
+ * on the signal path the dispatch terminates the process instead). */
+static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
+                               bool git_written, bool ssh_dirty, bool gpg_dirty) {
+    if (git_written) {
+        git_config_restore();
+    }
+    /* Undo the new account's half-applied SSH/GPG activation: leaving
+     * current.sock / GNUPGHOME pointed at the new account while the git
+     * identity reverts is exactly the mixed identity the tool prevents. */
+    deactivate_runtime_isolation(ssh_dirty, gpg_dirty);
+    /* ...and put the previous account's runtime state back (F4). */
+    restore_previous_isolation(prev, prev_gpg_home, ssh_dirty, gpg_dirty);
+    /* SIG-02: drop any registered scratch temp files. */
+    signals_scratch_cleanup();
+    signals_guard_end();
+    if (signals_pending()) {
+        fprintf(stderr, "\ngitswitch: interrupted — switch rolled back, previous identity kept\n");
+        set_error(ERR_SYSTEM_CALL, "Switch interrupted by signal %d",
+                  signals_pending_signal());
+        signals_dispatch_pending(); /* terminates via the signal's default action */
+    }
+    return -1;
+}
+
 /* Switch to specified account with SSH isolation and validation */
 int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *account;
@@ -207,10 +279,37 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
      * activate SSH and GPG (recoverable mutations), and write git config LAST.
      * git config is snapshotted up front and restored on failure; on that same
      * failure the SSH/GPG runtime state activated in steps 2-3 is also torn
-     * down (deactivate_runtime_isolation), so a failed switch reverts the git
-     * identity AND doesn't leave current.sock / GNUPGHOME pointing at the
-     * new account — no half-applied, mismatched identity. */
+     * down and the previous account's isolation is restored
+     * (abort_failed_switch), so a failed switch reverts the git identity AND
+     * doesn't leave current.sock / GNUPGHOME pointing at the new account — no
+     * half-applied, mismatched identity.
+     *
+     * SIG-01: the whole mutation window is guarded against SIGINT/SIGTERM/
+     * SIGHUP (Ctrl-C at the ssh-add passphrase or GPG pinentry prompt is a
+     * normal path). The handler only records the signal; we check between
+     * durable steps and run the same rollback as an explicit failure, so a
+     * signal can no longer leave user.name=new/user.email=old or repointed
+     * SSH/GPG state without the matching git identity. */
     if (!ctx->config.dry_run) {
+        /* The previously-active account (detected at startup) and the current
+         * GNUPGHOME symlink target, captured before any mutation so a failed
+         * switch can restore them (F4). */
+        const account_t *prev_account = ctx->current_account;
+        char prev_gpg_home[MAX_PATH_LEN] = "";
+        {
+            char gpg_link[MAX_PATH_LEN];
+            if (gpg_manager_get_home_path(gpg_link, sizeof(gpg_link)) == 0) {
+                ssize_t n = readlink(gpg_link, prev_gpg_home, sizeof(prev_gpg_home) - 1);
+                prev_gpg_home[(n > 0) ? (size_t)n : 0] = '\0';
+            }
+        }
+        /* Mutation tracking for rollback: `dirty` means the runtime state was
+         * (or may have been) repointed at the NEW account; `deferred` means
+         * the target has SSH/GPG disabled and the teardown of the PREVIOUS
+         * account's state is postponed past the point of no return (F4). */
+        bool ssh_dirty = false, gpg_dirty = false;
+        bool ssh_teardown_deferred = false, gpg_teardown_deferred = false;
+
         /* --- 1. Validate availability up front (no mutation yet) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             char expanded_key[MAX_PATH_LEN];
@@ -229,14 +328,37 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             }
         }
 
+        /* Nothing durable has been touched yet, so a signal up to here could
+         * simply kill us. From this point on, mutations begin: guard. */
+        signals_guard_begin();
+
+        /* SIG-02: register the config-save temp path (written by the
+         * save-after-switch step in main()). It is the one scratch path whose
+         * name this file can compute; the mkstemp-based scratch files are
+         * registered at their creation sites (hook points in signals.h).
+         * Unlinking a not-yet-created path on teardown is harmless. */
+        {
+            char cfg_tmp[MAX_PATH_LEN];
+            if ((size_t)snprintf(cfg_tmp, sizeof(cfg_tmp), "%s.tmp.%d",
+                                 ctx->config.config_path, (int)getpid())
+                < sizeof(cfg_tmp)) {
+                signals_scratch_register(cfg_tmp);
+            }
+        }
+
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             log_info("Setting up SSH isolation for account: %s", account->name);
+            /* Starting the new agent reaps the previous account's agent, so
+             * the runtime SSH state is dirty from the first attempt on. */
+            ssh_dirty = true;
             memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
             if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0 ||
                 ssh_switch_account(&g_session.ssh_config, account) != 0) {
                 printf("  [!!] SSH key failed to load\n");
                 ssh_manager_cleanup(&g_session.ssh_config);
+                abort_failed_switch(prev_account, prev_gpg_home,
+                                    false, ssh_dirty, false);
                 set_error(ERR_SSH_KEY_LOAD_FAILED,
                           "Failed to set up SSH for account: %s", account->name);
                 return -1;
@@ -262,9 +384,19 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 }
             }
         } else {
-            /* Target has no SSH: tear down any live gitswitch agent + current.sock
-             * so shells stop authenticating as the previously-active account. */
-            deactivate_runtime_isolation(true, false);
+            /* Target has no SSH: the live gitswitch agent + current.sock must
+             * be torn down so shells stop authenticating as the previously-
+             * active account — but NOT yet. Defer it past the git-config
+             * write (the point of no return) so a switch that fails there
+             * leaves the previous account's agent working (F4). */
+            ssh_teardown_deferred = true;
+        }
+
+        /* A signal during SSH activation: the previous agent may already be
+         * gone and current.sock repointed — roll back and restore it. */
+        if (signals_pending()) {
+            return abort_failed_switch(prev_account, prev_gpg_home,
+                                       false, ssh_dirty, false);
         }
 
         /* --- 3. GPG isolated home (mutation; fatal on failure) --- */
@@ -276,35 +408,46 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 printf("  [!!] GPG key failed to activate\n");
                 gpg_manager_cleanup(&g_session.gpg_config);
                 /* Roll back the SSH activation from step 2 so we don't leave
-                 * current.sock pointing at this account with no matching GPG. */
-                deactivate_runtime_isolation(g_session.ssh_active, false);
+                 * current.sock pointing at this account with no matching GPG.
+                 * The GNUPGHOME symlink is only retargeted on gpg_switch_account
+                 * success, so the GPG side is still clean here. */
+                abort_failed_switch(prev_account, prev_gpg_home,
+                                    false, ssh_dirty, false);
                 set_error(ERR_GPG_KEY_FAILED,
                           "Failed to set up GPG for account: %s", account->name);
                 return -1;
             }
+            /* gpg_switch_account retargeted the stable GNUPGHOME symlink. */
+            gpg_dirty = true;
             g_session.gpg_active = true;
         } else {
-            /* Target has no GPG: drop the stable GNUPGHOME symlink so shells
-             * stop signing/using the previous account's keyring. */
-            deactivate_runtime_isolation(false, true);
+            /* Target has no GPG: the stable GNUPGHOME symlink must be dropped
+             * so shells stop signing/using the previous account's keyring —
+             * deferred past the point of no return, like the SSH side (F4). */
+            gpg_teardown_deferred = true;
+        }
+
+        /* A signal during GPG activation (Ctrl-C at the pinentry prompt is
+         * the classic case): SSH/GPG may already point at the new account
+         * while git still names the old one — roll back before that mismatch
+         * can outlive the process. */
+        if (signals_pending()) {
+            return abort_failed_switch(prev_account, prev_gpg_home,
+                                       false, ssh_dirty, gpg_dirty);
         }
 
         /* --- 4. git config LAST, snapshotted for rollback --- */
         git_config_snapshot(scope);
         if (git_set_config(account, scope) != 0) {
-            git_config_restore();
-            /* Also undo the SSH/GPG activation from steps 2-3: leaving
-             * current.sock / GNUPGHOME pointed at this account while the git
-             * identity reverts to the previous one is exactly the mixed
-             * identity the tool exists to prevent. */
-            deactivate_runtime_isolation(g_session.ssh_active, g_session.gpg_active);
+            abort_failed_switch(prev_account, prev_gpg_home,
+                                true, ssh_dirty, gpg_dirty);
             set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
             return -1;
         }
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
             if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
-                git_config_restore();
-                deactivate_runtime_isolation(g_session.ssh_active, g_session.gpg_active);
+                abort_failed_switch(prev_account, prev_gpg_home,
+                                    true, ssh_dirty, gpg_dirty);
                 set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
                 return -1;
             }
@@ -320,9 +463,37 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
         printf("  [OK] Git config set (%s scope)\n", scope_str);
 
+        /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
+         * switch back (git config was just written, so restore it too). */
+        if (signals_pending()) {
+            return abort_failed_switch(prev_account, prev_gpg_home,
+                                       true, ssh_dirty, gpg_dirty);
+        }
+
+        /* Point of no return: the new identity is fully applied and
+         * consistent. NOW run the teardown deferred from steps 2-3 — only
+         * once the switch is known-good may the previous account's agent /
+         * keyring entry point be dropped (F4). */
+        if (ssh_teardown_deferred) {
+            deactivate_runtime_isolation(true, false);
+        }
+        if (gpg_teardown_deferred) {
+            deactivate_runtime_isolation(false, true);
+        }
+
         /* Read-back validation is best-effort (warn only). */
         if (git_test_config(account, scope) != 0) {
             log_warning("Git configuration validation failed: %s", get_last_error()->message);
+        }
+
+        signals_scratch_cleanup();
+        signals_guard_end();
+        /* A signal that slipped in after the checkpoint above: the switch is
+         * fully applied, so honor the all-or-nothing contract by completing
+         * normally (main() still records the new active account) instead of
+         * dying between "identity applied" and "state persisted". */
+        if (signals_pending()) {
+            log_warning("Signal received after the switch completed; finishing normally");
         }
     } else {
         printf("  [--] DRY RUN: Would set git config (%s scope)\n", scope_str);
