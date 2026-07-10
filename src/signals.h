@@ -22,6 +22,12 @@
  *     the git rollback by design — running git from a handler is not
  *     async-signal-safe — so the escape hatch trades atomicity for liveness
  *     only when the user insists twice.
+ *   - EXCEPT while the rollback itself is running (signals_rollback_begin/
+ *     end): the emergency exit there would abandon git_config_restore mid-way
+ *     and permanently persist the aborted account's identity (AR-02 #2), so
+ *     further signals stay recorded until the restore completes and the
+ *     mainline dispatches. Interactive children spawned by the rollback keep
+ *     default dispositions, so Ctrl-C still interrupts them.
  *   - Signals whose disposition is SIG_IGN at guard time stay ignored (so a
  *     nohup'd run keeps ignoring SIGHUP), matching sigaction(2) convention.
  */
@@ -47,6 +53,16 @@ int signals_guard_begin(void);
  * the already-applied switch (success path).
  */
 void signals_guard_end(void);
+
+/**
+ * Mark the failed-switch rollback window. Between begin and end, the handler
+ * defers even a second guarded signal (no emergency exit) so the multi-exec
+ * git_config_restore can never be abandoned half-done (AR-02 #2). Callers
+ * must pair these around the whole rollback sequence, before dispatching any
+ * pending signal.
+ */
+void signals_rollback_begin(void);
+void signals_rollback_end(void);
 
 /** True if a guarded signal arrived since signals_guard_begin(). */
 bool signals_pending(void);

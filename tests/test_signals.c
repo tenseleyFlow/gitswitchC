@@ -145,6 +145,48 @@ TEST(second_signal_is_emergency_exit_and_drops_scratch) {
     unlink(scratch); /* in case the child failed */
 }
 
+/* AR-02 #2: a second signal arriving while the failed-switch ROLLBACK is
+ * running must NOT take the emergency exit — dying mid-git_config_restore
+ * persists the aborted account's identity. Inside the rollback window the
+ * signal stays deferred; once the window closes the mainline dispatches it
+ * with the correct death-by-signal status. Exit code 10/11/12 mark the
+ * specific failure mode. */
+TEST(second_signal_during_rollback_is_deferred) {
+    char marker[128];
+    int status = 0;
+    pid_t pid;
+
+    /* Stands in for "the rest of git_config_restore": pre-fix the child died
+     * at the second raise and never created it; post-fix the whole window
+     * completes first, so the marker must exist. */
+    snprintf(marker, sizeof(marker), "/tmp/gsw_rollback_done.%d", (int)getpid());
+    unlink(marker);
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        FILE *f;
+        signals_guard_begin();
+        raise(SIGINT);                     /* the signal that aborted the switch */
+        if (!signals_pending()) _exit(10); /* first signal must defer */
+        signals_rollback_begin();
+        raise(SIGINT);                     /* second: pre-fix this killed us HERE */
+        if (!signals_pending()) _exit(11); /* must still be recorded, not lost */
+        f = fopen(marker, "w");            /* "restore completed" evidence */
+        if (f) fclose(f);
+        signals_rollback_end();
+        signals_dispatch_pending();        /* rollback done: now die correctly */
+        _exit(12);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status));            /* still reports death-by-signal */
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
+    CHECK(path_exists(marker));            /* ...but only AFTER the window closed */
+
+    unlink(marker);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(guard_defers_first_signal);
@@ -154,4 +196,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(scratch_registry_rejects_invalid);
     RUN_TEST(dispatch_terminates_with_deferred_signal);
     RUN_TEST(second_signal_is_emergency_exit_and_drops_scratch);
+    RUN_TEST(second_signal_during_rollback_is_deferred);
 TEST_MAIN_END()

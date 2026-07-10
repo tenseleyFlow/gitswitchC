@@ -171,6 +171,11 @@ static void restore_previous_isolation(const account_t *prev,
  * on the signal path the dispatch terminates the process instead). */
 static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
                                bool git_written, bool ssh_dirty, bool gpg_dirty) {
+    /* AR-02 #2: a second guarded signal during this rollback used to take the
+     * handler's emergency-kill branch and die mid-git_config_restore, leaving
+     * a chimera (or fully-new) identity persisted. Defer the emergency exit
+     * until the whole restore sequence has completed. */
+    signals_rollback_begin();
     if (git_written) {
         git_config_restore();
     }
@@ -182,6 +187,7 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
     restore_previous_isolation(prev, prev_gpg_home, ssh_dirty, gpg_dirty);
     /* SIG-02: drop any registered scratch temp files. */
     signals_scratch_cleanup();
+    signals_rollback_end();
     signals_guard_end();
     if (signals_pending()) {
         fprintf(stderr, "\ngitswitch: interrupted — switch rolled back, previous identity kept\n");

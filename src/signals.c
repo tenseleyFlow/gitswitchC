@@ -31,6 +31,13 @@ static const int g_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
  * guaranteed readable/writable atomically with respect to a signal handler. */
 static volatile sig_atomic_t g_pending_signal = 0;
 
+/* Nonzero while the mainline is running the failed-switch rollback. The
+ * handler's second-signal emergency exit must not fire in that window: dying
+ * mid-git_config_restore (up to 12 sequential git execs) persists a chimera
+ * identity — the exact half-applied state the rollback exists to undo
+ * (AR-02 #2). Set/cleared only in normal context. */
+static volatile sig_atomic_t g_rollback_in_progress = 0;
+
 /* Saved dispositions so signals_guard_end() restores exactly what was there
  * (default action, or an outer SIG_IGN we chose not to override). */
 static struct sigaction g_saved_actions[GUARDED_SIGNAL_COUNT];
@@ -70,6 +77,17 @@ static void guard_handler(int sig) {
         return;
     }
 
+    /* Second signal while the rollback is already running: stay deferred.
+     * The emergency exit below would abandon git_config_restore mid-way and
+     * permanently leave the aborted account's identity written (AR-02 #2).
+     * The rollback is bounded work (a handful of local git execs) and its
+     * interactive children (e.g. a re-prompting ssh-add) keep their default
+     * dispositions, so Ctrl-C still kills THEM — liveness is preserved
+     * without sacrificing restore atomicity. */
+    if (g_rollback_in_progress) {
+        return;
+    }
+
     /* Second signal while one is pending: the user insists (or the first was
      * swallowed by a stuck child prompt). Do the only teardown that is safe
      * here — drop registered scratch files — then die with the correct
@@ -77,6 +95,14 @@ static void guard_handler(int sig) {
     scratch_unlink_all();
     (void)signal(sig, SIG_DFL);
     (void)raise(sig);
+}
+
+void signals_rollback_begin(void) {
+    g_rollback_in_progress = 1;
+}
+
+void signals_rollback_end(void) {
+    g_rollback_in_progress = 0;
 }
 
 int signals_guard_begin(void) {
