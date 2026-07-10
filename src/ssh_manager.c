@@ -1156,19 +1156,12 @@ int ssh_manager_reset(const char *account) {
     char socket_dir[MAX_PATH_LEN];
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
 
-    if (!account || !*account) {
-        /* All: reuse the orphan reaper (kills every recorded PID, unlinks
-         * sockets/pids/current.sock). */
-        kill_orphaned_gitswitch_agents(NULL);
-        return 0;
-    }
-
-    /* The account name becomes a path component in the socket/pid filenames we
-     * unlink below. Every loaded account already passed validate_name, so this
-     * is unreachable in practice — but guard it anyway, symmetrically with
-     * gpg_manager_reset(), so a crafted name can never escape socket_dir. */
-    if (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
-        account[0] == '.') {
+    /* Validate the name up front (the single-account branch uses it as a path
+     * component). Every loaded account already passed validate_name, so this is
+     * unreachable in practice — but guard it symmetrically with gpg_manager_reset(). */
+    if (account && *account &&
+        (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
+         account[0] == '.')) {
         set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
         return -1;
     }
@@ -1181,6 +1174,24 @@ int ssh_manager_reset(const char *account) {
         if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid()) >= sizeof(socket_dir)) {
             return -1;
         }
+    }
+
+    /* Take the per-dir lock for the whole reap/unlink sequence. Without it, this
+     * writer races a concurrent ssh_start_isolated_agent (which holds the same
+     * lock): we would reap its freshly-started agent and unlink current.sock
+     * while its switch reports success. lock_agent_dir returns -1 if the dir
+     * doesn't exist yet — in that case there is nothing to reset, so proceeding
+     * without a lock is harmless (all operations below are no-ops on a missing
+     * dir). kill_orphaned_gitswitch_agents deliberately does NOT self-lock
+     * because ssh_start_isolated_agent already calls it under this same lock. */
+    int lock_fd = lock_agent_dir(socket_dir);
+
+    if (!account || !*account) {
+        /* All: reuse the orphan reaper (kills every recorded PID, unlinks
+         * sockets/pids/current.sock). */
+        kill_orphaned_gitswitch_agents(NULL);
+        unlock_agent_dir(lock_fd);
+        return 0;
     }
 
     char pid_path[MAX_PATH_LEN];
@@ -1200,6 +1211,7 @@ int ssh_manager_reset(const char *account) {
     if ((size_t)snprintf(sock_path, sizeof(sock_path), "%s/ssh-agent.%s.sock", socket_dir, account) < sizeof(sock_path)) {
         unlink(sock_path);
     }
+    unlock_agent_dir(lock_fd);
     return 0;
 }
 
