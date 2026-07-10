@@ -22,12 +22,29 @@
 static int git_run(char *output, size_t output_size, ...);
 static int validate_git_installation(void);
 static bool is_valid_git_config_value(const char *value);
+static int git_get_config_value_ex(const char *key, char *value,
+                                   size_t value_size, git_scope_t scope,
+                                   bool *value_too_long);
 
 /* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
+
+/* Value capacity for the snapshot and the exec cache below. Sized for the
+ * largest value gitswitch itself writes: git_configure_ssh's core.sshCommand
+ * is ~85 bytes of fixed ssh options plus a single-quoted key path of up to
+ * MAX_PATH_LEN. The old 512-byte cap could not hold gitswitch's OWN value for
+ * a long key path, and the drop was then recorded as "proven absent" — the
+ * AR-03 M1 bug. Stack note: the two aggregates using this are file-scope
+ * statics (.bss, ~127 KB total), not stack; the one per-call buffer this size
+ * is git_get_config_value_ex's capture (~4 KB frame at shallow depth). */
+#define GIT_CFG_VALUE_MAX (MAX_PATH_LEN + 128)
+
 typedef struct {
     const char *key;
-    char value[512];
+    char value[GIT_CFG_VALUE_MAX];
     bool present;
+    bool value_unknown; /* present, but the value exceeded value[] (a foreign
+                         * writer): restore must neither write back a
+                         * truncated copy nor --unset the user's original. */
 } git_kv_t;
 
 #define GIT_MANAGED_KEY_COUNT 6
@@ -79,7 +96,7 @@ typedef enum {
 static struct {
     cfg_state_t state;
     bool present;      /* false => key known absent (after our own --unset) */
-    char value[512];
+    char value[GIT_CFG_VALUE_MAX];
 } g_cfg_cache[GIT_SCOPE_COUNT][GIT_MANAGED_KEY_COUNT];
 
 static bool g_git_validated;                 /* perf-1: git-available check ran */
@@ -110,9 +127,11 @@ static int cfg_key_index(const char *key) {
     return -1;
 }
 
-/* Record a cache entry; values too long to cache degrade to CFG_UNKNOWN
- * (never truncate — a truncated cached value could satisfy or suppress the
- * wrong operation later). */
+/* Record a cache entry; a present value too long to cache degrades to
+ * CFG_UNKNOWN with present kept TRUE. Never truncate — a truncated cached
+ * value could satisfy or suppress the wrong operation later — and never
+ * record the key absent: "proven absent" is exactly what lets
+ * git_unset_config_value elide a --unset that is in fact real (AR-03 M1). */
 static void cfg_cache_store(int s, int k, cfg_state_t state, bool present,
                             const char *value) {
     if (s < 0 || k < 0) {
@@ -120,7 +139,7 @@ static void cfg_cache_store(int s, int k, cfg_state_t state, bool present,
     }
     if (present && strlen(value) >= sizeof(g_cfg_cache[s][k].value)) {
         g_cfg_cache[s][k].state = CFG_UNKNOWN;
-        g_cfg_cache[s][k].present = false;
+        g_cfg_cache[s][k].present = true;
         g_cfg_cache[s][k].value[0] = '\0';
         return;
     }
@@ -140,19 +159,30 @@ void git_ops_test_reset_caches(void) {
     g_git_validated = false;
 }
 
-/* Extract the value of a lowercased key from `git config --list` output
- * (lines of the form "key=value"). Returns the LAST occurrence, matching git's
- * last-wins resolution. Returns true and fills out[] if found. */
 /* Parse a value out of `git config --list -z` output. The listing is a series
  * of NUL-terminated records, each "key\nvalue" (the value itself may contain
  * newlines — that's the whole point of -z over plain --list, which would let a
  * value's embedded newline masquerade as a record boundary and truncate the
  * snapshot). `buf`/`len` are binary (the buffer holds embedded NULs), so we
- * work by length rather than strlen. Last match wins. */
-static bool parse_config_z_value(const char *buf, size_t len, const char *key,
-                                 char *out, size_t out_size) {
+ * work by length rather than strlen. Last match wins, matching git's own
+ * resolution.
+ *
+ * Tri-state result: found-but-too-long is NOT absent. The pre-fix bool
+ * conflated the two, so an overlong (foreign) value was snapshotted and
+ * cache-seeded as proven-absent — git_clear_config then elided a real --unset
+ * and git_config_restore --unset the user's original value (AR-03 M1). */
+typedef enum {
+    CFG_Z_ABSENT = 0, /* no record carries the key */
+    CFG_Z_FOUND,      /* key found; out[] holds its (last-wins) value */
+    CFG_Z_TOO_LONG    /* key PRESENT, but its value cannot fit out[] —
+                       * treat as present with an unknown value, never absent */
+} cfg_z_result_t;
+
+static cfg_z_result_t parse_config_z_value(const char *buf, size_t len,
+                                           const char *key,
+                                           char *out, size_t out_size) {
     size_t key_len = strlen(key);
-    bool found = false;
+    cfg_z_result_t result = CFG_Z_ABSENT;
     size_t pos = 0;
     while (pos < len) {
         size_t rec_start = pos;
@@ -170,11 +200,17 @@ static bool parse_config_z_value(const char *buf, size_t len, const char *key,
             if (val_len < out_size) {
                 memcpy(out, val, val_len);
                 out[val_len] = '\0';
-                found = true; /* keep scanning: last wins */
+                result = CFG_Z_FOUND; /* keep scanning: last wins */
+            } else {
+                /* Clear any earlier occurrence's copy: last wins, and the
+                 * winner is uncapturable — a stale earlier value must not
+                 * leak out alongside TOO_LONG. */
+                out[0] = '\0';
+                result = CFG_Z_TOO_LONG;
             }
         }
     }
-    return found;
+    return result;
 }
 
 /* Run `git config <scope> --list -z`, capturing the NUL-delimited listing into
@@ -201,6 +237,7 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         out[i].key = g_managed_keys[i];
         out[i].present = false;
+        out[i].value_unknown = false;
         out[i].value[0] = '\0';
     }
 
@@ -214,10 +251,24 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
         list_len < sizeof(list) - 1) {
         int s = cfg_scope_index(scope);
         for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-            if (parse_config_z_value(list, list_len, g_managed_keys[i],
-                                     out[i].value, sizeof(out[i].value))) {
+            cfg_z_result_t zr = parse_config_z_value(list, list_len,
+                                                     g_managed_keys[i],
+                                                     out[i].value,
+                                                     sizeof(out[i].value));
+            if (zr == CFG_Z_TOO_LONG) {
+                /* The key IS present; only its value is beyond what we can
+                 * hold (necessarily a foreign writer — everything gitswitch
+                 * writes fits GIT_CFG_VALUE_MAX). Recording it absent is the
+                 * AR-03 M1 bug: git_clear_config would elide a real --unset
+                 * (the foreign SSH identity survives the switch) and the
+                 * rollback would --unset the user's original value. Degrade
+                 * to CFG_UNKNOWN/present so nothing is elided or served. */
                 out[i].present = true;
+                out[i].value_unknown = true;
+                cfg_cache_store(s, (int)i, CFG_UNKNOWN, true, "");
+                continue;
             }
+            out[i].present = (zr == CFG_Z_FOUND);
             /* AR-02 #15: the complete listing is an authoritative read of
              * every managed key — presence AND proven absence — so seed the
              * exec cache instead of discarding it. git_clear_config (run by
@@ -231,8 +282,19 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
     }
 
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        if (git_get_config_value(g_managed_keys[i], out[i].value, sizeof(out[i].value), scope) == 0) {
+        bool too_long = false;
+        if (git_get_config_value_ex(g_managed_keys[i], out[i].value,
+                                    sizeof(out[i].value), scope,
+                                    &too_long) == 0) {
             out[i].present = true;
+        } else if (too_long) {
+            /* Same degradation as the -z path: present, value unknown. The
+             * pre-fix code never asked, so a truncated per-key read was
+             * snapshotted absent (or worse, a silently truncated value was
+             * stored present and written back on rollback — AR-03 M1). */
+            out[i].present = true;
+            out[i].value_unknown = true;
+            out[i].value[0] = '\0';
         } else {
             out[i].present = false;
             out[i].value[0] = '\0';
@@ -242,6 +304,16 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
 
 static void git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KEY_COUNT]) {
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (in[i].value_unknown) {
+            /* Present before the switch but too long to snapshot: writing
+             * value[] back would install a truncated corruption and --unset
+             * would destroy the user's original — leaving whatever is there
+             * now is the only non-destructive option, so say so instead of
+             * silently pretending the rollback was complete (AR-03 M1). */
+            log_warning("Not restoring %s: pre-switch value was too long to snapshot",
+                        in[i].key);
+            continue;
+        }
         if (in[i].present) {
             git_set_config_value(in[i].key, in[i].value, scope);
         } else {
@@ -651,16 +723,32 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
     return 0;
 }
 
-/* Get single git configuration value */
-int git_get_config_value(const char *key, char *value, size_t value_size, git_scope_t scope) {
-    char output[512];
+/* Get single git configuration value.
+ *
+ * The _ex form additionally reports "present but too long": git exited 0 for
+ * the key, but either the capture itself overflowed (run_result_t.out_truncated
+ * — the pre-fix code never checked it, so a silently truncated value was
+ * stored as the real one, AR-03 M1) or the full value would not fit the
+ * caller's buffer. rc is still -1 either way; *value_too_long lets
+ * git_capture_keys tell an uncapturable value apart from a genuinely absent
+ * key instead of snapshotting it absent. */
+static int git_get_config_value_ex(const char *key, char *value,
+                                   size_t value_size, git_scope_t scope,
+                                   bool *value_too_long) {
+    /* Big enough for any value we can cache, plus git's trailing newline —
+     * anything larger trips out_truncated below rather than silent loss. */
+    char output[GIT_CFG_VALUE_MAX + 8];
     const char *scope_flag;
-    
+
+    if (value_too_long) {
+        *value_too_long = false;
+    }
+
     if (!key || !value || value_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to git_get_config_value");
         return -1;
     }
-    
+
     scope_flag = git_scope_to_flag(scope);
     if (!scope_flag) {
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
@@ -684,8 +772,31 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
         return 0;
     }
 
-    if (git_run(output, sizeof(output), "config", scope_flag, key, NULL) != 0) {
+    /* Direct run_argv (not git_run) so run_result_t.out_truncated is visible
+     * — git_run discards the result struct. */
+    const char *argv[] = { "git", "config", scope_flag, key, NULL };
+    run_opts_t opts;
+    run_result_t res;
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &res) != 0) {
         /* Config value not found - this is not always an error */
+        value[0] = '\0';
+        return -1;
+    }
+
+    /* git exited 0, so the key IS present; a truncated capture means its
+     * value is longer than anything gitswitch itself writes. Never report
+     * that as absent, and never trust the partial bytes — the entry can only
+     * be cached as "present, value unknown" (AR-03 M1). */
+    if (res.out_truncated) {
+        cfg_cache_store(s, k, CFG_UNKNOWN, true, "");
+        if (value_too_long) {
+            *value_too_long = true;
+        }
         value[0] = '\0';
         return -1;
     }
@@ -694,14 +805,25 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
     trim_whitespace(output);
     /* safe_strncpy writes nothing and returns -1 when the value is too long for
      * the caller's buffer. Propagate that as failure (and NUL the buffer) so
-     * callers can't read an uninitialized stack buffer while we report success. */
+     * callers can't read an uninitialized stack buffer while we report success.
+     * The FULL value was still observed here, so it is cacheable regardless of
+     * the caller's buffer size. */
     if (safe_strncpy(value, output, value_size) != 0) {
+        cfg_cache_store(s, k, CFG_READBACK, true, output);
+        if (value_too_long) {
+            *value_too_long = true;
+        }
         value[0] = '\0';
         return -1;
     }
 
     cfg_cache_store(s, k, CFG_READBACK, true, value);
     return 0;
+}
+
+/* Get single git configuration value */
+int git_get_config_value(const char *key, char *value, size_t value_size, git_scope_t scope) {
+    return git_get_config_value_ex(key, value, value_size, scope, NULL);
 }
 
 /* Unset git configuration value */
