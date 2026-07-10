@@ -154,8 +154,10 @@ TEST(git_configure_ssh_rejects_single_quote_in_keypath) {
         int rc = git_configure_ssh(&acct, GIT_SCOPE_GLOBAL);
         CHECK_EQ_INT(rc, -1);
         /* Rejected BEFORE any subprocess: nothing may be written to git
-         * config (and hence nothing derived from this path can ever land in
-         * ~/.ssh/config either). */
+         * config. This covers ONLY the core.sshCommand sink — the
+         * ~/.ssh/config IdentityFile sink is a separate write site with its
+         * own guard, exercised by host_alias_write_rejects_newline_key_path
+         * in test_ssh_reuse.c (AR-02 #10). */
         CHECK_EQ_INT(fk_execs, 0);
         CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_PATH);
     }

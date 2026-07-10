@@ -152,6 +152,13 @@ bool validate_name(const char *name);
 bool validate_key_id(const char *key_id);
 bool validate_file_path(const char *path);
 
+/* True if an SSH key path is free of quote/control bytes and thus safe for
+ * BOTH injection-sensitive sinks it reaches: git's shell-interpolated
+ * core.sshCommand and the ~/.ssh/config "IdentityFile <path>" line. Every
+ * sink calls this itself immediately before writing (AR-02 #10) — see the
+ * ssh-1 rationale at the definition in utils.c. */
+bool is_safe_ssh_key_path(const char *path);
+
 /**
  * UTF-8 / terminal-safety utilities (shared by the config trust boundary and
  * the TOML parser's charset gate, so both layers apply the SAME strict

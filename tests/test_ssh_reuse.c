@@ -258,9 +258,61 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
 }
 
+/* AR-02 #10: ssh_configure_host_alias writes "IdentityFile <path>" into
+ * ~/.ssh/config; a newline in the path would inject an arbitrary ssh_config
+ * directive (ProxyCommand => code execution on connect). The sink must refuse
+ * such a path ITSELF — its only prior protection was the TOML-load sanitizer
+ * stripping newlines, which a future non-TOML population path would bypass.
+ * Drives the function directly with a hand-built account (exactly the bypass
+ * the audit's PoC used) under a scratch HOME. */
+TEST(host_alias_write_rejects_newline_key_path) {
+    char home[128], cfg_path[256], buf[4096];
+    account_t acct;
+    FILE *f;
+    size_t n;
+
+    snprintf(home, sizeof(home), "/tmp/gswsshalias_XXXXXX");
+    CHECK(mkdtemp(home) != NULL);
+    setenv("HOME", home, 1);
+
+    memset(&acct, 0, sizeof(acct));
+    acct.ssh_enabled = true;
+    snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), "github.com-work");
+    snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path),
+             "%s/key\nProxyCommand touch PWNED", home);
+
+    CHECK_EQ_INT(ssh_configure_host_alias(&acct), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_PATH);
+
+    /* Nothing may have been written: no config at all, or at least no
+     * ProxyCommand line derived from the hostile path. */
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    f = fopen(cfg_path, "r");
+    if (f) {
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        CHECK(strstr(buf, "ProxyCommand") == NULL);
+    }
+
+    /* Control: a clean path writes the managed block with the IdentityFile. */
+    snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path), "%s/key_ok", home);
+    CHECK_EQ_INT(ssh_configure_host_alias(&acct), 0);
+    f = fopen(cfg_path, "r");
+    CHECK(f != NULL);
+    if (f) {
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        CHECK(strstr(buf, "IdentityFile") != NULL);
+        CHECK(strstr(buf, "key_ok") != NULL);
+    }
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ssh_fingerprint_reuse_adopts_matching_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
     RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
+    RUN_TEST(host_alias_write_rejects_newline_key_path);
 TEST_MAIN_END()

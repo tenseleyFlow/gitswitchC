@@ -823,6 +823,25 @@ static bool exec_candidate_is_trusted(const char *path) {
     return access(path, X_OK) == 0;
 }
 
+/* Process-lifetime memo for find_command_path (AR-02 #24): one switch
+ * resolves the same handful of helpers (git, ssh-add, gpg, ...) ~16 times —
+ * init-time probes plus every run_argv spawn — and each resolution walks the
+ * trusted-PATH at ~3 syscalls per entry, ~550 redundant stat/access calls per
+ * switch. Sub-millisecond warm, but each stat is a network round trip on cold
+ * NFS/autofs PATH entries. Keyed on the exact PATH string so an intra-process
+ * PATH change (tests do this) drops the cache. Positive results only: a miss
+ * usually aborts the command anyway, and caching one could outlive a
+ * transient failure. Single-threaded, like the other utils caches. */
+#define CMD_MEMO_SLOTS 16
+#define CMD_MEMO_NAME_LEN 32
+typedef struct {
+    char name[CMD_MEMO_NAME_LEN];
+    char path[MAX_PATH_LEN];
+} cmd_memo_slot_t;
+static cmd_memo_slot_t g_cmd_memo[CMD_MEMO_SLOTS];
+static size_t g_cmd_memo_used = 0;
+static char *g_cmd_memo_pathenv = NULL;
+
 int find_command_path(const char *name, char *buf, size_t size) {
     const char *path_env;
     const char *p;
@@ -859,6 +878,22 @@ int find_command_path(const char *name, char *buf, size_t size) {
         path_env = "/usr/local/bin:/usr/bin:/bin";
     }
 
+    /* Memo lookup, valid only while PATH is byte-identical to the PATH the
+     * cache was filled under. Staleness within one short-lived process (a
+     * memoized binary deleted mid-run) is the same resolve-to-exec TOCTOU
+     * window that already exists for a single call. */
+    if (!g_cmd_memo_pathenv || strcmp(g_cmd_memo_pathenv, path_env) != 0) {
+        free(g_cmd_memo_pathenv);
+        g_cmd_memo_pathenv = strdup(path_env);
+        g_cmd_memo_used = 0;
+    } else {
+        for (size_t i = 0; i < g_cmd_memo_used; i++) {
+            if (strcmp(g_cmd_memo[i].name, name) == 0) {
+                return safe_strncpy(buf, g_cmd_memo[i].path, size);
+            }
+        }
+    }
+
     /* Walk colon-separated PATH entries, testing <dir>/<name> in each trusted
      * directory. Untrusted entries are skipped, not fatal: a stray "." or o+w
      * dir in PATH must not hide the real /usr/bin/git behind it. An empty
@@ -878,6 +913,14 @@ int find_command_path(const char *name, char *buf, size_t size) {
             candidate[dirlen] = '/';
             strcpy(candidate + dirlen + 1, name);
             if (exec_dir_is_trusted(dir) && exec_candidate_is_trusted(candidate)) {
+                if (g_cmd_memo_pathenv && g_cmd_memo_used < CMD_MEMO_SLOTS &&
+                    strlen(name) < CMD_MEMO_NAME_LEN) {
+                    cmd_memo_slot_t *slot = &g_cmd_memo[g_cmd_memo_used];
+                    if (safe_strncpy(slot->name, name, sizeof(slot->name)) == 0 &&
+                        safe_strncpy(slot->path, candidate, sizeof(slot->path)) == 0) {
+                        g_cmd_memo_used++;
+                    }
+                }
                 if (safe_strncpy(buf, candidate, size) != 0) return -1;
                 return 0;
             }
@@ -1020,6 +1063,35 @@ bool validate_name(const char *name) {
     }
 
     return false;
+}
+
+/* ssh-1 (shared; moved from git_ops.c for AR-02 #10): the account SSH key
+ * path ends up in two security-sensitive sinks, and EACH sink must apply this
+ * check itself rather than assume the other (or the TOML-load sanitizer)
+ * already did:
+ *
+ *  1. core.sshCommand — the ONE git config value git hands to /bin/sh. The
+ *     path is wrapped in single quotes; inside '...' the shell treats every
+ *     byte literally EXCEPT a single quote, which ends the quote and lets a
+ *     crafted path smuggle extra ssh options (-oProxyCommand=..., i.e.
+ *     arbitrary code on the next fetch). Guarded in git_configure_ssh.
+ *  2. ~/.ssh/config — the same path is emitted as an "IdentityFile <path>"
+ *     line by the host-alias support. There, a \n or \r starts a new line,
+ *     i.e. injects an arbitrary ssh_config keyword (ProxyCommand again), and
+ *     a quote breaks the directive's tokenization. Guarded in
+ *     ssh_configure_host_alias.
+ *
+ * So reject both quote characters and every control byte (\n and \r included)
+ * up front, before the path is probed or written anywhere. A real SSH key
+ * path never needs any of these. */
+bool is_safe_ssh_key_path(const char *path) {
+    for (const char *p = path; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x7f || c == '\'' || c == '"') {
+            return false;
+        }
+    }
+    return true;
 }
 
 /* Shared strict UTF-8 decoding and terminal-safety policy — moved here from

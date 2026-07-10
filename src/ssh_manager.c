@@ -40,8 +40,6 @@
 static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...);
 static int setup_ssh_environment(ssh_config_t *ssh_config);
 static int create_isolated_agent_socket_dir(char *socket_dir, size_t socket_dir_size);
-static bool is_ssh_agent_running(pid_t pid);
-static int kill_ssh_agent_gracefully(pid_t pid);
 static int validate_ssh_agent_socket(const char *socket_path);
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
 static void kill_orphaned_gitswitch_agents(const char *keep_account);
@@ -112,30 +110,77 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
 #endif
 }
 
-/* Verify a recorded PID is our agent (holding `sock`) and SIGTERM it. On Linux,
- * pin the process with a pidfd BEFORE verifying+signaling so a PID recycled in
- * the check-then-signal window (CONC-4 TOCTOU) cannot receive the signal — the
- * pidfd refers to a specific process instance, not a reusable number. Where
- * pidfd is unavailable (older kernels, non-Linux) fall back to a plain kill
- * guarded by the identity check. */
-static void reap_ssh_agent(pid_t pid, const char *sock) {
+/* Wait up to `total_ms` for `pid` to disappear. ssh-agent daemonizes (it is
+ * reparented to init, not our child), so kill(pid, 0) flips to ESRCH as soon
+ * as init reaps it — no waitpid involved. The common case exits within the
+ * first poll interval. */
+static bool wait_pid_gone(pid_t pid, int total_ms) {
+    for (int waited = 0; waited < total_ms; waited += 50) {
+        if (kill(pid, 0) != 0) {
+            return true;
+        }
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; /* 50ms */
+        nanosleep(&ts, NULL);
+    }
+    return kill(pid, 0) != 0;
+}
+
+/* Verify a recorded PID is our agent (holding `sock`), SIGTERM it, confirm
+ * death, and escalate to SIGKILL if it lingers (AR-02 #20 — a single fired-
+ * and-forgotten SIGTERM let a stopped/stuck agent survive teardown holding
+ * the decrypted key, while both callers unlinked its sidecar immediately,
+ * leaving it permanently unreapable). Returns true when the recorded agent is
+ * GONE — killed and confirmed dead, already dead, or the PID isn't our agent
+ * at all (stale record, safe to drop) — so callers may remove the sidecar.
+ * Returns false when our agent is still alive despite SIGKILL (e.g. wedged in
+ * uninterruptible I/O): the caller must then KEEP the sidecar so a future run
+ * can retry the reap.
+ *
+ * On Linux, pin the process with a pidfd BEFORE verifying+signaling so a PID
+ * recycled in the check-then-signal window (CONC-4 TOCTOU) cannot receive
+ * either signal — the pidfd refers to a specific process instance, not a
+ * reusable number. Where pidfd is unavailable (older kernels, non-Linux) fall
+ * back to plain kill guarded by the identity check, re-verified before the
+ * SIGKILL escalation. */
+static bool reap_ssh_agent(pid_t pid, const char *sock) {
     if (pid <= 1) {
-        return;
+        return true;
     }
 #if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
     int pidfd = (int)syscall(SYS_pidfd_open, (long)pid, 0L);
     if (pidfd >= 0) {
+        bool gone = true;
         if (pid_is_our_ssh_agent(pid, sock)) {
             syscall(SYS_pidfd_send_signal, (long)pidfd, (long)SIGTERM, (void *)0, 0L);
+            gone = wait_pid_gone(pid, 500);
+            if (!gone) {
+                log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",
+                            (long)pid);
+                syscall(SYS_pidfd_send_signal, (long)pidfd, (long)SIGKILL, (void *)0, 0L);
+                gone = wait_pid_gone(pid, 500);
+            }
         }
         close(pidfd);
-        return;
+        return gone;
     }
     /* pidfd_open unsupported/failed (ENOSYS on <5.3): fall through. */
 #endif
     if (pid_is_our_ssh_agent(pid, sock)) {
-        kill(pid, SIGTERM);
+        if (kill(pid, SIGTERM) != 0) {
+            return kill(pid, 0) != 0; /* raced its exit, or EPERM (not ours) */
+        }
+        bool gone = wait_pid_gone(pid, 500);
+        /* Re-verify identity before the harder signal: without a pidfd the
+         * PID could have been recycled during the wait. */
+        if (!gone && pid_is_our_ssh_agent(pid, sock)) {
+            log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",
+                        (long)pid);
+            kill(pid, SIGKILL);
+            gone = wait_pid_gone(pid, 500);
+        }
+        return gone;
     }
+    return true; /* recorded PID is not our agent: the record itself is garbage */
 }
 
 /* Acquire an exclusive, blocking flock on <dir>/.lock, serializing the
@@ -246,17 +291,19 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
     ssh_config->agent_pid = -1;
     ssh_config->agent_owned = false;
     
-    /* Validate SSH is available */
-    if (!command_exists("ssh")) {
-        set_error(ERR_SSH_NOT_FOUND, "SSH command not found in PATH");
-        return -1;
-    }
-    
+    /* Validate the binaries this manager actually execs are available:
+     * ssh-agent and ssh-add. `ssh` itself is deliberately NOT probed here
+     * (AR-02 #24): only the best-effort connection test uses it — which
+     * degrades gracefully through run_argv's own resolution failure — and
+     * the boot-time resume path never execs it at all, so a missing `ssh`
+     * was hard-failing resumes it could never affect. The probes themselves
+     * are near-free now that find_command_path memoizes: the same resolution
+     * is reused by every subsequent run_argv spawn. */
     if (!command_exists("ssh-agent")) {
         set_error(ERR_SSH_AGENT_NOT_FOUND, "ssh-agent command not found in PATH");
         return -1;
     }
-    
+
     if (!command_exists("ssh-add")) {
         set_error(ERR_SSH_AGENT_NOT_FOUND, "ssh-add command not found in PATH");
         return -1;
@@ -472,14 +519,22 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         ssh_config->agent_owned = true;
         ssh_config->key_already_loaded = true;
 
-        /* Recover the PID from the sidecar so cleanup/stop can still target it. */
+        /* Recover the PID from the sidecar so cleanup/stop can still target
+         * it — but only after verifying it is genuinely OUR agent on this
+         * socket (AR-02 #18). The sidecar can be stale (crash, reboot on a
+         * /tmp-preserving distro) with its PID since recycled; trusting it
+         * blindly would mark an unrelated process agent_owned=true and feed
+         * it into the kill path later. The socket itself was already
+         * fingerprint-verified, so a rejected PID only costs precise
+         * stop-by-pid targeting, not the reuse. */
         char pid_path[MAX_PATH_LEN];
         if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid",
                              socket_dir, account->name) < sizeof(pid_path)) {
             FILE *pf = fopen(pid_path, "r");
             if (pf) {
                 long pid = 0;
-                if (fscanf(pf, "%ld", &pid) == 1 && pid > 1) {
+                if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
+                    pid_is_our_ssh_agent((pid_t)pid, socket_path)) {
                     ssh_config->agent_pid = (pid_t)pid;
                 }
                 fclose(pf);
@@ -611,12 +666,16 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
     }
     
     log_info("Stopping SSH agent (PID: %d)", ssh_config->agent_pid);
-    
-    /* Try graceful shutdown first */
-    if (kill_ssh_agent_gracefully(ssh_config->agent_pid) == 0) {
-        log_debug("SSH agent stopped gracefully");
+
+    /* Route through the same hardened reaper as every other kill path
+     * (AR-02 #19): identity-verify the PID (comm + our socket in argv) and
+     * pidfd-pin it before signaling, so a recorded PID that was recycled to
+     * an unrelated same-uid process — or to the user's own login ssh-agent —
+     * is never signaled. The old path gated only on kill(pid, 0) liveness. */
+    if (reap_ssh_agent(ssh_config->agent_pid, ssh_config->agent_socket_path)) {
+        log_debug("SSH agent stopped");
     } else {
-        log_warning("Failed to stop SSH agent gracefully");
+        log_warning("SSH agent did not exit after SIGTERM/SIGKILL");
     }
     
     /* Clean up socket file */
@@ -852,6 +911,18 @@ int ssh_configure_host_alias(const account_t *account) {
         return -1;
     }
     if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
+        return -1;
+    }
+    /* The expanded path is written below as an "IdentityFile <path>" line; a
+     * newline/CR in it would inject an arbitrary ssh_config directive
+     * (ProxyCommand => code execution on the next connect). This sink used to
+     * rely entirely on the TOML-load sanitizer having stripped such bytes — an
+     * incidental, load-time-only defense — so guard the write site itself
+     * (AR-02 #10). */
+    if (!is_safe_ssh_key_path(expanded_key_path)) {
+        set_error(ERR_INVALID_PATH,
+                  "SSH key path contains an illegal character (quote/control): %s",
+                  expanded_key_path);
         return -1;
     }
 
@@ -1102,53 +1173,11 @@ static int create_isolated_agent_socket_dir(char *socket_dir, size_t socket_dir_
     return 0;
 }
 
-/* Check if SSH agent is running */
-static bool is_ssh_agent_running(pid_t pid) {
-    if (pid <= 0) {
-        return false;
-    }
-    
-    /* Use kill(pid, 0) to test if process exists */
-    return (kill(pid, 0) == 0);
-}
-
-/* Kill SSH agent gracefully */
-static int kill_ssh_agent_gracefully(pid_t pid) {
-    if (pid <= 0) {
-        return -1;
-    }
-    
-    if (!is_ssh_agent_running(pid)) {
-        log_debug("SSH agent (PID: %d) not running", pid);
-        return 0;
-    }
-    
-    /* Send SIGTERM first */
-    if (kill(pid, SIGTERM) != 0) {
-        set_system_error(ERR_SYSTEM_CALL, "Failed to send SIGTERM to SSH agent");
-        return -1;
-    }
-    
-    /* Wait a bit for graceful shutdown */
-    for (int i = 0; i < 10; i++) {
-        if (!is_ssh_agent_running(pid)) {
-            return 0;
-        }
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
-        nanosleep(&ts, NULL);
-    }
-    
-    /* Force kill if still running */
-    if (is_ssh_agent_running(pid)) {
-        log_warning("SSH agent did not respond to SIGTERM, sending SIGKILL");
-        if (kill(pid, SIGKILL) != 0) {
-            set_system_error(ERR_SYSTEM_CALL, "Failed to send SIGKILL to SSH agent");
-            return -1;
-        }
-    }
-    
-    return 0;
-}
+/* kill_ssh_agent_gracefully and its bare-liveness is_ssh_agent_running are
+ * gone (AR-02 #19): they SIGTERM'd/SIGKILL'd a recorded PID on nothing more
+ * than kill(pid, 0) — the exact blind kill reap_ssh_agent was hardened
+ * against. ssh_stop_agent now routes through reap_ssh_agent, which identity-
+ * verifies and pidfd-pins the PID and already escalates with death polling. */
 
 /* Validate SSH agent socket */
 static int validate_ssh_agent_socket(const char *socket_path) {
@@ -1298,15 +1327,24 @@ int ssh_manager_reset(const char *account) {
     bool have_sock = (size_t)snprintf(sock_path, sizeof(sock_path),
                                       "%s/ssh-agent.%s.sock", socket_dir, account) < sizeof(sock_path);
     if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid", socket_dir, account) < sizeof(pid_path)) {
+        /* Drop the sidecar only once the agent is confirmed gone (AR-02 #20)
+         * — it is the only record a future run can retry the reap against. */
+        bool agent_gone = true;
         FILE *pf = fopen(pid_path, "r");
         if (pf) {
             long pid = 0;
             if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 && have_sock) {
-                reap_ssh_agent((pid_t)pid, sock_path);
+                agent_gone = reap_ssh_agent((pid_t)pid, sock_path);
+                if (!agent_gone) {
+                    log_warning("ssh-agent PID %ld survived teardown; keeping "
+                                "its sidecar for a future reap", pid);
+                }
             }
             fclose(pf);
         }
-        unlink(pid_path);
+        if (agent_gone) {
+            unlink(pid_path);
+        }
     }
     if (have_sock) {
         /* F3: if the stable current.sock symlink points at the account we're
@@ -1388,20 +1426,51 @@ static void kill_orphaned_gitswitch_agents(const char *keep_account) {
             char sock_full[MAX_PATH_LEN];
             int sw = snprintf(sock_full, sizeof(sock_full), "%s/%.*ssock",
                               socket_dir, (int)(nlen - 3), name);
-            /* Reap the recorded agent PID, then drop the sidecar. */
+            /* Reap the recorded agent PID; drop the sidecar only once the
+             * agent is confirmed gone (AR-02 #20). Unlinking it while the
+             * agent survives (stopped/wedged, still holding the decrypted
+             * key) would erase the only record any future gitswitch run has
+             * to retry the reap against. An unopenable/unparseable sidecar
+             * is garbage either way and is dropped. */
+            bool agent_gone = true;
             FILE *pf = fopen(full, "r");
             if (pf) {
                 long pid = 0;
                 if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
                     sw > 0 && (size_t)sw < sizeof(sock_full)) {
-                    reap_ssh_agent((pid_t)pid, sock_full);
-                    log_debug("Reaped orphaned ssh-agent PID %ld", pid);
+                    agent_gone = reap_ssh_agent((pid_t)pid, sock_full);
+                    if (agent_gone) {
+                        log_debug("Reaped orphaned ssh-agent PID %ld", pid);
+                    } else {
+                        log_warning("ssh-agent PID %ld survived teardown; keeping "
+                                    "its sidecar for a future reap", pid);
+                    }
                 }
                 fclose(pf);
             }
-            unlink(full);
+            if (agent_gone) {
+                unlink(full);
+            }
         } else {
-            /* Stale socket (ssh-agent.<name>.sock or current.sock). */
+            /* Stale socket (ssh-agent.<name>.sock or current.sock). But do
+             * not churn a current.sock that already targets the account we
+             * are keeping (AR-02 #18): the reuse path would recreate it via
+             * atomic_symlink moments later, and a shell reading
+             * SSH_AUTH_SOCK=current.sock in that unlink-to-recreate window
+             * gets ENOENT and silently loses agent access for that session. */
+            if (keep_sock[0] && strcmp(name, "current.sock") == 0) {
+                char target[MAX_PATH_LEN];
+                ssize_t tn = readlink(full, target, sizeof(target) - 1);
+                if (tn > 0) {
+                    const char *base;
+                    target[tn] = '\0';
+                    base = strrchr(target, '/');
+                    base = base ? base + 1 : target;
+                    if (strcmp(base, keep_sock) == 0) {
+                        continue;
+                    }
+                }
+            }
             unlink(full);
         }
     }

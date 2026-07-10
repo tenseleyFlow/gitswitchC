@@ -747,30 +747,13 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
     return 0;
 }
 
-/* ssh-1: the account SSH key path ends up in two security-sensitive sinks:
- *
- *  1. core.sshCommand — the ONE git config value git hands to /bin/sh. The
- *     path is wrapped in single quotes below; inside '...' the shell treats
- *     every byte literally EXCEPT a single quote, which ends the quote and
- *     lets a crafted path smuggle extra ssh options (-oProxyCommand=…, i.e.
- *     arbitrary code on the next fetch).
- *  2. ~/.ssh/config — the same account key path is emitted verbatim as an
- *     "IdentityFile <path>" line by the host-alias support. There, a \n or
- *     \r starts a new line, i.e. injects an arbitrary ssh_config keyword
- *     (ProxyCommand again), and a quote breaks the directive's tokenization.
- *
- * So reject both quote characters and every control byte (\n and \r included)
- * up front, before the path is probed or written anywhere. A real SSH key
- * path never needs any of these. */
-static bool is_safe_ssh_key_path(const char *path) {
-    for (const char *p = path; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c < 0x20 || c == 0x7f || c == '\'' || c == '"') {
-            return false;
-        }
-    }
-    return true;
-}
+/* ssh-1: is_safe_ssh_key_path now lives in utils.c so BOTH of the key path's
+ * injection-sensitive sinks apply it themselves: this file's core.sshCommand
+ * (below) and ssh_manager.c's ~/.ssh/config IdentityFile write. It used to be
+ * static here and guard only core.sshCommand, while comments claimed coverage
+ * of the IdentityFile sink too — that sink was in fact protected only by the
+ * TOML-load sanitizer stripping newlines/quotes, an incidental, load-time-only
+ * defense (AR-02 #10). */
 
 /* Configure SSH command for git operations */
 int git_configure_ssh(const account_t *account, git_scope_t scope) {
