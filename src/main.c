@@ -23,6 +23,7 @@
 /* Long-only options (no short form). Values above 0xff avoid colliding with
  * ASCII short options handled by getopt_long. */
 #define OPT_SSH_AGENT_INFO 0x100
+#define OPT_NAMES 0x101
 
 static void print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
@@ -30,8 +31,9 @@ static void print_usage(const char *prog_name) {
     printf("Safe git identity switching with actual git configuration management\n");
     printf("\nCommands:\n");
     printf("  add                  Add new account interactively\n");
+    printf("  edit <account>       Edit an existing account interactively\n");
     printf("  list, ls             List all configured accounts\n");
-    printf("  remove <account>     Remove specified account\n");
+    printf("  remove, rm, delete <account>  Remove specified account\n");
     printf("  status               Show current account status\n");
     printf("  doctor, health       Run comprehensive health check\n");
     printf("  config               Show configuration file information\n");
@@ -43,6 +45,8 @@ static void print_usage(const char *prog_name) {
     printf("  --global, -g         Use global git scope\n");
     printf("  --local, -l          Use local git scope (default)\n");
     printf("  --dry-run, -n        Show what would be done without executing\n");
+    printf("  --yes, -y            Assume 'yes' to confirmation prompts (remove/reset)\n");
+    printf("  --names              With 'list': print only account names (one per line)\n");
     printf("  --verbose, -V        Enable verbose output\n");
     printf("  --debug, -d          Enable debug logging\n");
     printf("  --color, -c          Force color output\n");
@@ -51,10 +55,12 @@ static void print_usage(const char *prog_name) {
     printf("  --version, -v        Show version information\n");
     printf("\nExamples:\n");
     printf("  %s add                    # Add new account interactively\n", prog_name);
+    printf("  %s edit work              # Edit the 'work' account\n", prog_name);
     printf("  %s list                   # List all accounts\n", prog_name);
+    printf("  %s list --names           # Print just account names (for scripts/completion)\n", prog_name);
     printf("  %s 1                      # Switch to account ID 1\n", prog_name);
     printf("  %s work                   # Switch to account matching 'work'\n", prog_name);
-    printf("  %s remove 2               # Remove account ID 2\n", prog_name);
+    printf("  %s remove 2 --yes         # Remove account ID 2 without confirmation\n", prog_name);
     printf("  %s doctor                 # Run health check\n", prog_name);
     printf("\nKey Features:\n");
     printf("- Secure TOML configuration management\n");
@@ -71,7 +77,9 @@ static void print_version(void) {
     printf("%s %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
 }
 static int handle_add_command(gitswitch_ctx_t *ctx);
+static int handle_edit_command(gitswitch_ctx_t *ctx, const char *identifier);
 static int handle_list_command(gitswitch_ctx_t *ctx);
+static int handle_list_names(gitswitch_ctx_t *ctx);
 static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier);
 static int handle_status_command(gitswitch_ctx_t *ctx);
 static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier);
@@ -96,6 +104,8 @@ int main(int argc, char *argv[]) {
     bool dry_run = false;
     bool force_global = false;
     bool force_local = false;
+    bool assume_yes = false;
+    bool names_only = false;
     int exit_code = EXIT_SUCCESS;
     
     static struct option long_options[] = {
@@ -108,6 +118,8 @@ int main(int argc, char *argv[]) {
         {"dry-run", no_argument, 0, 'n'},
         {"global", no_argument, 0, 'g'},
         {"local", no_argument, 0, 'l'},
+        {"yes", no_argument, 0, 'y'},
+        {"names", no_argument, 0, OPT_NAMES},
         /* Compat alias for the Python gitswitch era. Dispatches to `init`
          * with shell auto-detected from $SHELL so stale rc lines keep working. */
         {"ssh-agent-info", no_argument, 0, OPT_SSH_AGENT_INFO},
@@ -125,7 +137,7 @@ int main(int argc, char *argv[]) {
     }
     
     /* Parse command line options */
-    while ((opt = getopt_long(argc, argv, "hvcCVdngl", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hvcCVdngly", long_options, NULL)) != -1) {
         switch (opt) {
             case 'h':
                 show_help = true;
@@ -151,6 +163,12 @@ int main(int argc, char *argv[]) {
                 break;
             case 'l':
                 force_local = true;
+                break;
+            case 'y':
+                assume_yes = true;
+                break;
+            case OPT_NAMES:
+                names_only = true;
                 break;
             case OPT_SSH_AGENT_INFO: {
                 int rc = handle_init_command(detect_shell_from_env());
@@ -207,6 +225,7 @@ int main(int argc, char *argv[]) {
     ctx.config.dry_run = dry_run;
     ctx.config.force_global = force_global;
     ctx.config.force_local = force_local;
+    ctx.config.assume_yes = assume_yes;
     ctx.config.verbose = should_log(LOG_LEVEL_DEBUG);
     
     /* Parse command and arguments */
@@ -243,8 +262,17 @@ int main(int argc, char *argv[]) {
         }
     } else if (strcmp(command, "add") == 0) {
         exit_code = handle_add_command(&ctx);
+    } else if (strcmp(command, "edit") == 0) {
+        if (!arg1) {
+            display_error("Missing account identifier", "Usage: gitswitch edit <account>");
+            exit_code = EXIT_FAILURE;
+        } else {
+            exit_code = handle_edit_command(&ctx, arg1);
+        }
     } else if (strcmp(command, "list") == 0 || strcmp(command, "ls") == 0) {
-        exit_code = handle_list_command(&ctx);
+        /* `list --names` is a plumbing mode: one account name per line, no
+         * decoration, for shell-completion scripts to consume. */
+        exit_code = names_only ? handle_list_names(&ctx) : handle_list_command(&ctx);
     } else if (strcmp(command, "remove") == 0 || strcmp(command, "rm") == 0 || strcmp(command, "delete") == 0) {
         if (!arg1) {
             display_error("Missing account identifier", "Usage: gitswitch remove <account>");
@@ -270,9 +298,10 @@ int main(int argc, char *argv[]) {
     /* Save configuration only for commands that modify accounts */
     bool should_save = false;
     if (command && exit_code == EXIT_SUCCESS && !dry_run) {
-        if (strcmp(command, "add") == 0 || 
-            strcmp(command, "remove") == 0 || 
-            strcmp(command, "rm") == 0 || 
+        if (strcmp(command, "add") == 0 ||
+            strcmp(command, "edit") == 0 ||
+            strcmp(command, "remove") == 0 ||
+            strcmp(command, "rm") == 0 ||
             strcmp(command, "delete") == 0) {
             should_save = true;
         } else if (strcmp(command, "list") != 0 &&
@@ -324,10 +353,29 @@ static int handle_add_command(gitswitch_ctx_t *ctx) {
     return EXIT_SUCCESS;
 }
 
+static int handle_edit_command(gitswitch_ctx_t *ctx, const char *identifier) {
+    if (!ctx || !identifier) return EXIT_FAILURE;
+
+    if (accounts_edit_interactive(ctx, identifier) != 0) {
+        display_error("Failed to edit account", get_last_error()->message);
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 static int handle_list_command(gitswitch_ctx_t *ctx) {
     if (!ctx) return EXIT_FAILURE;
-    
+
     return accounts_list(ctx) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+/* Plumbing for shell completion: one account name per line, nothing else. */
+static int handle_list_names(gitswitch_ctx_t *ctx) {
+    if (!ctx) return EXIT_FAILURE;
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        printf("%s\n", ctx->accounts[i].name);
+    }
+    return EXIT_SUCCESS;
 }
 
 static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier) {
@@ -672,17 +720,20 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
 
     /* This is the most destructive operation (it wipes exported secret-key
      * copies), so require a typed 'yes' — matching remove and stronger than a
-     * bare 'y', which is easy to hit by muscle memory. */
-    printf("Type 'yes' to continue: ");
-    fflush(stdout);
-    if (!fgets(resp, sizeof(resp), stdin)) {
-        printf("Reset cancelled.\n");
-        return EXIT_SUCCESS;
-    }
-    resp[strcspn(resp, "\n")] = '\0';
-    if (strcmp(resp, "yes") != 0) {
-        printf("Reset cancelled.\n");
-        return EXIT_SUCCESS;
+     * bare 'y', which is easy to hit by muscle memory. --yes skips the prompt
+     * for scripting. */
+    if (!ctx->config.assume_yes) {
+        printf("Type 'yes' to continue: ");
+        fflush(stdout);
+        if (!fgets(resp, sizeof(resp), stdin)) {
+            printf("Reset cancelled.\n");
+            return EXIT_SUCCESS;
+        }
+        resp[strcspn(resp, "\n")] = '\0';
+        if (strcmp(resp, "yes") != 0) {
+            printf("Reset cancelled.\n");
+            return EXIT_SUCCESS;
+        }
     }
 
     ssh_manager_reset(target);

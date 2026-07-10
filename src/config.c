@@ -543,12 +543,37 @@ account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
         return match;
     }
     if (match_count > 1) {
+        /* Show the matching candidates so the user can disambiguate. */
+        char cands[256];
+        size_t off = 0;
+        for (size_t i = 0; i < ctx->account_count && off < sizeof(cands) - 1; i++) {
+            if (strstr(ctx->accounts[i].name, identifier) ||
+                strstr(ctx->accounts[i].description, identifier)) {
+                off += (size_t)snprintf(cands + off, sizeof(cands) - off, "%s%s",
+                                        off ? ", " : "", ctx->accounts[i].name);
+            }
+        }
         set_error(ERR_ACCOUNT_NOT_FOUND,
-                  "Ambiguous identifier '%s' matches %zu accounts; use the exact name or numeric id",
-                  identifier, match_count);
+                  "Ambiguous identifier '%s' matches: %s (use the exact name or numeric id)",
+                  identifier, cands);
         return NULL;
     }
 
+    /* No match at all — list what IS available as a hint. */
+    {
+        char avail[256];
+        size_t off = 0;
+        for (size_t i = 0; i < ctx->account_count && off < sizeof(avail) - 1; i++) {
+            off += (size_t)snprintf(avail + off, sizeof(avail) - off, "%s%s",
+                                    off ? ", " : "", ctx->accounts[i].name);
+        }
+        if (ctx->account_count == 0) {
+            set_error(ERR_ACCOUNT_NOT_FOUND, "No accounts configured; run 'gitswitch add'");
+        } else {
+            set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: '%s'. Available: %s",
+                      identifier, avail);
+        }
+    }
     return NULL;
 }
 

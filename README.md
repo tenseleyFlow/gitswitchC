@@ -9,8 +9,9 @@ Usage: gitswitch [OPTIONS] [COMMAND] [ARGS]
 
 Commands:
   add                  Add new account interactively
+  edit <account>       Edit an existing account interactively
   list, ls             List all configured accounts
-  remove <account>     Remove specified account
+  remove, rm, delete <account>  Remove specified account
   status               Show current account status
   doctor, health       Run comprehensive health check
   config               Show configuration file information
@@ -23,6 +24,8 @@ Options:
   --global, -g         Use global git scope
   --local, -l          Use local git scope (default)
   --dry-run, -n        Show what would be done without executing
+  --yes, -y            Assume 'yes' to confirmation prompts (remove/reset)
+  --names              With 'list': print only account names (one per line)
   --verbose, -V        Enable verbose output
   --debug, -d          Enable debug logging
   --color, -c          Force color output
@@ -32,12 +35,25 @@ Options:
 
 Examples:
   gitswitch add                    # Add new account interactively
+  gitswitch edit work              # Edit the 'work' account
   gitswitch list                   # List all accounts
+  gitswitch list --names           # Print just account names (scripts/completion)
   gitswitch 1                      # Switch to account ID 1
   gitswitch work                   # Switch to account matching 'work'
-  gitswitch remove 2               # Remove account ID 2
+  gitswitch remove 2 --yes         # Remove account ID 2 without confirmation
   gitswitch doctor                 # Run health check
 ```
+
+When built against GNU readline (auto-detected by the Makefile), the interactive
+`add`/`edit` prompts get line editing, and the SSH key path prompt gets TAB
+filename completion. Without readline the prompts fall back to plain input.
+
+### command-line completion
+
+`make install` ships bash, zsh, and fish completion scripts (also under
+`completions/`). They complete subcommands, options, and — for the switch,
+`edit`, `remove`, and `reset` positions — your live account names, sourced from
+`gitswitch list --names`.
 
 ## shell integration
 

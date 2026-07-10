@@ -38,6 +38,11 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_add_interactive(gitswitch_ctx_t *ctx);
 
 /**
+ * Edit an existing account interactively (prompts default to current values)
+ */
+int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier);
+
+/**
  * Remove account with confirmation
  * - Shows account details
  * - Prompts for confirmation

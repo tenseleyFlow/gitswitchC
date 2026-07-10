@@ -80,6 +80,7 @@ typedef struct {
     bool resuming;       /* set during boot-time `resume`: skip the blocking,
                           * purely-informational SSH connection test so the
                           * login shell prompt isn't stalled on a network RTT */
+    bool assume_yes;     /* --yes: skip interactive confirmation prompts */
 } config_t;
 
 /* Application context */
