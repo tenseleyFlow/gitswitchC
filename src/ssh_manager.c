@@ -31,7 +31,7 @@ static bool is_ssh_agent_running(pid_t pid);
 static int kill_ssh_agent_gracefully(pid_t pid);
 static int validate_ssh_agent_socket(const char *socket_path);
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
-static void kill_orphaned_gitswitch_agents(void);
+static void kill_orphaned_gitswitch_agents(const char *keep_account);
 
 /* Best-effort check that a PID recorded in a sidecar still belongs to an
  * ssh-agent before we SIGTERM it. Sidecars can outlive their agent (crash,
@@ -90,6 +90,31 @@ static void unlock_agent_dir(int fd) {
         flock(fd, LOCK_UN);
         close(fd);
     }
+}
+
+/* True if an ssh-agent is answering on `sock` AND already holds at least one
+ * identity (`ssh-add -l` exits 0). Since agent sockets are named per account
+ * (ssh-agent.<name>.sock), a live socket for the target account means its own
+ * agent with its own key — so reusing it is safe and skips a passphrase
+ * re-prompt. exit 1 (no identities) / 2 (no agent) both yield false. */
+static bool ssh_socket_has_identity(const char *sock) {
+    char envbuf[MAX_PATH_LEN + 20];
+    char out[1024];
+    const char *env[2] = { NULL, NULL };
+    const char *argv[] = { "ssh-add", "-l", NULL };
+    run_opts_t opts;
+    run_result_t res;
+
+    if ((size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s", sock) >= sizeof(envbuf)) {
+        return false;
+    }
+    env[0] = envbuf;
+    memset(&opts, 0, sizeof(opts));
+    opts.out = out;
+    opts.out_size = sizeof(out);
+    opts.stderr_to_devnull = true;
+    opts.extra_env = env;
+    return run_argv(argv, &opts, &res) == 0;
 }
 
 
@@ -231,9 +256,11 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
             if (ssh_start_isolated_agent(ssh_config, account) != 0) {
                 return -1; /* Error already set */
             }
-            
-            /* Add key to isolated agent */
-            if (ssh_add_key(ssh_config, expanded_key_path) != 0) {
+
+            /* Add key to isolated agent — unless we reused a live agent that
+             * already holds it (skips a passphrase re-prompt). */
+            if (!ssh_config->key_already_loaded &&
+                ssh_add_key(ssh_config, expanded_key_path) != 0) {
                 set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to load key into isolated SSH agent");
                 return -1;
             }
@@ -290,22 +317,61 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     }
 
     int rc = -1;
+    ssh_config->key_already_loaded = false;
 
-    /* Kill any orphaned gitswitch agents from previous runs */
-    kill_orphaned_gitswitch_agents();
-
-    /* Stop any existing agent we own */
-    if (ssh_config->agent_owned && ssh_config->agent_pid > 0) {
-        log_debug("Stopping existing SSH agent");
-        ssh_stop_agent(ssh_config);
-    }
-
-    /* Build socket path and check for stale sockets */
+    /* Build this account's per-account socket path up front. */
     if ((size_t)snprintf(socket_path, sizeof(socket_path),
                         "%s/ssh-agent.%s.sock",
                         socket_dir, account->name) >= sizeof(socket_path)) {
         set_error(ERR_INVALID_ARGS, "SSH socket path too long");
         goto done;
+    }
+
+    /* Reuse fast path: if this account's agent is already alive and holds its
+     * key, adopt it instead of killing and restarting (which forces a fresh
+     * ssh-add and, for a passphrase-protected key, a PIN/passphrase re-prompt
+     * on every re-switch to the already-active account). We still reap every
+     * OTHER account's agent so only this one stays live. */
+    if (validate_ssh_agent_socket(socket_path) == 0 && ssh_socket_has_identity(socket_path)) {
+        log_info("Reusing live SSH agent for account: %s", account->name);
+        safe_strncpy(ssh_config->agent_socket_path, socket_path,
+                     sizeof(ssh_config->agent_socket_path));
+        ssh_config->agent_owned = true;
+        ssh_config->key_already_loaded = true;
+
+        /* Recover the PID from the sidecar so cleanup/stop can still target it. */
+        char pid_path[MAX_PATH_LEN];
+        if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid",
+                             socket_dir, account->name) < sizeof(pid_path)) {
+            FILE *pf = fopen(pid_path, "r");
+            if (pf) {
+                long pid = 0;
+                if (fscanf(pf, "%ld", &pid) == 1 && pid > 1) {
+                    ssh_config->agent_pid = (pid_t)pid;
+                }
+                fclose(pf);
+            }
+        }
+
+        kill_orphaned_gitswitch_agents(account->name); /* reap others, keep this */
+        (void)setup_ssh_environment(ssh_config);
+
+        if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
+                            "%s/current.sock", socket_dir) < sizeof(symlink_path)) {
+            atomic_symlink(socket_path, symlink_path);
+        }
+        rc = 0;
+        goto done;
+    }
+
+    /* Kill any orphaned gitswitch agents from previous runs (including a stale
+     * agent for this same account, which we're about to replace). */
+    kill_orphaned_gitswitch_agents(NULL);
+
+    /* Stop any existing agent we own */
+    if (ssh_config->agent_owned && ssh_config->agent_pid > 0) {
+        log_debug("Stopping existing SSH agent");
+        ssh_stop_agent(ssh_config);
     }
 
     /* Remove stale socket if it exists */
@@ -1036,7 +1102,7 @@ int ssh_manager_reset(const char *account) {
     if (!account || !*account) {
         /* All: reuse the orphan reaper (kills every recorded PID, unlinks
          * sockets/pids/current.sock). */
-        kill_orphaned_gitswitch_agents();
+        kill_orphaned_gitswitch_agents(NULL);
         return 0;
     }
 
@@ -1073,12 +1139,22 @@ int ssh_manager_reset(const char *account) {
 /* Kill orphaned gitswitch ssh-agents from previous runs and remove stale
  * sockets. Shell-free: agents are reaped precisely by the PID recorded in their
  * sidecar (ssh-agent.<name>.pid) rather than a pkill pattern match, and stale
- * sockets are unlinked via readdir. Only operates inside our own 0700 dir. */
-static void kill_orphaned_gitswitch_agents(void) {
+ * sockets are unlinked via readdir. Only operates inside our own 0700 dir.
+ * If keep_account is non-NULL, that account's live agent + sidecar are left
+ * intact (used when reusing it), while every other account is still reaped. */
+static void kill_orphaned_gitswitch_agents(const char *keep_account) {
     char socket_dir[MAX_PATH_LEN];
+    char keep_pid[MAX_NAME_LEN + 16];
+    char keep_sock[MAX_NAME_LEN + 16];
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     DIR *d;
     struct dirent *ent;
+
+    keep_pid[0] = keep_sock[0] = '\0';
+    if (keep_account && *keep_account) {
+        snprintf(keep_pid, sizeof(keep_pid), "ssh-agent.%s.pid", keep_account);
+        snprintf(keep_sock, sizeof(keep_sock), "ssh-agent.%s.sock", keep_account);
+    }
 
     if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
         if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "%s/gitswitch-ssh", runtime_dir) >= sizeof(socket_dir)) {
@@ -1101,6 +1177,10 @@ static void kill_orphaned_gitswitch_agents(void) {
         char full[MAX_PATH_LEN];
 
         if (strncmp(name, "ssh-agent.", 10) != 0 && strcmp(name, "current.sock") != 0) {
+            continue;
+        }
+        /* Preserve the account we're reusing (its live agent + sidecar). */
+        if (keep_pid[0] && (strcmp(name, keep_pid) == 0 || strcmp(name, keep_sock) == 0)) {
             continue;
         }
         if ((size_t)snprintf(full, sizeof(full), "%s/%s", socket_dir, name) >= sizeof(full)) {
