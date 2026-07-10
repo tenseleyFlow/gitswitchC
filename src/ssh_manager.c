@@ -43,9 +43,12 @@
 #include "signals.h"
 
 /* Internal helper functions */
-static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...);
+/* merge_stderr is int, not bool: the parameter anchors va_start, and C11
+ * makes va_start on a type that undergoes default argument promotion
+ * (bool -> int) undefined behavior — clang rejects it under -Wvarargs. */
+static int ssh_run(char *output, size_t output_size, int merge_stderr, ...);
 static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          bool merge_stderr, ...);
+                          int merge_stderr, ...);
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path);
 static int setup_ssh_environment(ssh_config_t *ssh_config);
@@ -1905,7 +1908,7 @@ int ssh_test_connection(const account_t *account, const char *host) {
  * the child's stderr is left attached to the terminal so ssh-add's "Identity
  * added" message still reaches the user (preserving prior behavior). Trailing
  * newline in captured stdout is trimmed. Returns 0 iff the child exits 0. */
-static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...) {
+static int ssh_run(char *output, size_t output_size, int merge_stderr, ...) {
     const char *argv[16];
     size_t n = 0;
     va_list ap;
@@ -1947,7 +1950,7 @@ static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...) {
  * relative socket argument only after fchdir()ing to the validated directory;
  * a concurrent rename/replacement of its public pathname cannot redirect it. */
 static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          bool merge_stderr, ...) {
+                          int merge_stderr, ...) {
     const char *argv[16];
     size_t n = 0;
     va_list ap;
