@@ -769,10 +769,13 @@ static bool resume_already_applied(const account_t *acct) {
 
 /* Re-activate the last-active account, recorded in config across reboots. This
  * is what `gitswitch init` auto-runs on the first login after a boot (when the
- * runtime SSH socket is gone), and is also usable manually. It is a thin wrapper
- * over a normal switch, so it reloads the SSH key, reasserts git identity, and
- * rebuilds the isolated GPG home + symlinks. A no-op (success) when there is no
- * saved account or it no longer exists, so it can never break a login shell. */
+ * runtime SSH socket is gone), and is also usable manually. It restores only
+ * the boot-volatile runtime state — reloads the SSH key into a fresh agent and
+ * rebuilds the isolated GPG home + symlinks. It deliberately does NOT touch
+ * git config: that is persistent, already correct from the original switch,
+ * and the login shell's cwd is rarely the repo a local-scope write would need
+ * (AR-02 #8). A no-op (success) when there is no saved account or it no longer
+ * exists, so it can never break a login shell. */
 static int handle_resume_command(gitswitch_ctx_t *ctx) {
     account_t *acct;
 

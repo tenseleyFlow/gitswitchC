@@ -232,43 +232,54 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         g_session.gnupghome_saved = true;
     }
 
+    /* Boot-time resume restores only the boot-volatile runtime state (SSH
+     * agent, GNUPGHOME `current` symlink). The git config the original switch
+     * wrote is persistent and survived the reboot, so resume must neither
+     * resolve a scope nor rewrite git config — doing so made the shipped
+     * default (local scope) hard-fail whenever the login shell wasn't inside
+     * the original repo, leaving no agent restored and re-spawning a failing
+     * resume before every prompt (AR-02 #8). */
+    bool write_git = !ctx->config.resuming;
+
     /* Determine git scope. Explicit --global/--local override the account
      * preference. Writing an identity GLOBALLY affects every repository on the
      * machine, so we never silently promote local->global outside a repo:
      * require explicit consent (interactive prompt) or the --global flag. */
     git_scope_t scope = account->preferred_scope;
-    if (ctx->config.force_global) {
-        scope = GIT_SCOPE_GLOBAL;
-    } else if (ctx->config.force_local) {
-        scope = GIT_SCOPE_LOCAL;
-    }
-    if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
-        if (isatty(STDIN_FILENO)) {
-            char resp[16];
-            printf("Not in a git repository. Write %s's identity to your GLOBAL git\n"
-                   "config (affects every repository on this machine)? [y/N]: ",
-                   account->name);
-            fflush(stdout);
-            if (fgets(resp, sizeof(resp), stdin) && (resp[0] == 'y' || resp[0] == 'Y')) {
-                scope = GIT_SCOPE_GLOBAL;
+    if (write_git) {
+        if (ctx->config.force_global) {
+            scope = GIT_SCOPE_GLOBAL;
+        } else if (ctx->config.force_local) {
+            scope = GIT_SCOPE_LOCAL;
+        }
+        if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
+            if (isatty(STDIN_FILENO)) {
+                char resp[16];
+                printf("Not in a git repository. Write %s's identity to your GLOBAL git\n"
+                       "config (affects every repository on this machine)? [y/N]: ",
+                       account->name);
+                fflush(stdout);
+                if (fgets(resp, sizeof(resp), stdin) && (resp[0] == 'y' || resp[0] == 'Y')) {
+                    scope = GIT_SCOPE_GLOBAL;
+                } else {
+                    set_error(ERR_GIT_NOT_REPOSITORY,
+                              "Switch aborted: not in a git repository (pass --global to write global config)");
+                    return -1;
+                }
             } else {
                 set_error(ERR_GIT_NOT_REPOSITORY,
-                          "Switch aborted: not in a git repository (pass --global to write global config)");
+                          "Not in a git repository; pass --global to write global config, or run inside a repo");
                 return -1;
             }
-        } else {
-            set_error(ERR_GIT_NOT_REPOSITORY,
-                      "Not in a git repository; pass --global to write global config, or run inside a repo");
+        }
+
+        /* Initialize git operations if not already done */
+        if (git_ops_init() != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED, "Failed to initialize git operations");
             return -1;
         }
     }
     scope_str = (scope == GIT_SCOPE_LOCAL) ? "local" : "global";
-
-    /* Initialize git operations if not already done */
-    if (git_ops_init() != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to initialize git operations");
-        return -1;
-    }
 
     /* Show what we're doing */
     printf("Switching to account: %s <%s>\n", account->name, account->email);
@@ -320,7 +331,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 return -1;
             }
         }
-        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+        /* Skipped on resume: gpg_switch_account revalidates the key inside the
+         * isolated home (re-importing from the system keyring if the home was
+         * wiped by the reboot), so this probe adds only login latency there —
+         * and a login shell may still carry GNUPGHOME pointing at the not-yet-
+         * recreated isolated home, which would make this "system keyring"
+         * check look inside the missing home and wrongly hard-fail the resume. */
+        if (write_git && account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
             if (validate_gpg_key_availability(account->gpg_key_id) != 0) {
                 set_error(ERR_GPG_KEY_NOT_FOUND,
                           "GPG key not found in keyring: %s", account->gpg_key_id);
@@ -437,37 +454,44 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
 
         /* --- 4. git config LAST, snapshotted for rollback --- */
-        git_config_snapshot(scope);
-        if (git_set_config(account, scope) != 0) {
-            abort_failed_switch(prev_account, prev_gpg_home,
-                                true, ssh_dirty, gpg_dirty);
-            set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
-            return -1;
-        }
-        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-            if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
+        if (write_git) {
+            git_config_snapshot(scope);
+            if (git_set_config(account, scope) != 0) {
                 abort_failed_switch(prev_account, prev_gpg_home,
                                     true, ssh_dirty, gpg_dirty);
-                set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
+                set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
                 return -1;
             }
-            gpg_ok = true;
-            /* gpg_configure_git_signing sets commit.gpgsign to the account's
-             * preference, which may be OFF. Don't claim signing is enabled
-             * when we just disabled it — report the actual state. */
-            if (account->gpg_signing_enabled) {
-                printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
-            } else {
-                printf("  [OK] GPG key configured, signing disabled (key: %s)\n", account->gpg_key_id);
+            if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+                if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
+                    abort_failed_switch(prev_account, prev_gpg_home,
+                                        true, ssh_dirty, gpg_dirty);
+                    set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
+                    return -1;
+                }
+                gpg_ok = true;
+                /* gpg_configure_git_signing sets commit.gpgsign to the account's
+                 * preference, which may be OFF. Don't claim signing is enabled
+                 * when we just disabled it — report the actual state. */
+                if (account->gpg_signing_enabled) {
+                    printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
+                } else {
+                    printf("  [OK] GPG key configured, signing disabled (key: %s)\n", account->gpg_key_id);
+                }
             }
+            printf("  [OK] Git config set (%s scope)\n", scope_str);
+        } else {
+            /* Resume: git config was never touched, so the runtime activation
+             * above completed the restore. */
+            gpg_ok = g_session.gpg_active;
         }
-        printf("  [OK] Git config set (%s scope)\n", scope_str);
 
         /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
-         * switch back (git config was just written, so restore it too). */
+         * switch back (git config, when written, was just written — restore it
+         * too; on resume nothing was written, so nothing to restore). */
         if (signals_pending()) {
             return abort_failed_switch(prev_account, prev_gpg_home,
-                                       true, ssh_dirty, gpg_dirty);
+                                       write_git, ssh_dirty, gpg_dirty);
         }
 
         /* Point of no return: the new identity is fully applied and
@@ -481,8 +505,10 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             deactivate_runtime_isolation(false, true);
         }
 
-        /* Read-back validation is best-effort (warn only). */
-        if (git_test_config(account, scope) != 0) {
+        /* Read-back validation is best-effort (warn only). Skipped on resume:
+         * no git config was written, and the login shell's cwd is usually not
+         * the repo the original local-scope write targeted. */
+        if (write_git && git_test_config(account, scope) != 0) {
             log_warning("Git configuration validation failed: %s", get_last_error()->message);
         }
 
@@ -505,17 +531,21 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
     }
 
-    /* Test SSH functionality if enabled (basic validation) */
-    if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 && !ssh_ok) {
-        if (test_ssh_key_functionality(account) != 0) {
-            log_warning("SSH key test failed for account: %s", account->name);
+    /* Test SSH/GPG functionality if enabled (basic validation). Skipped on
+     * resume: the runtime activation above already proved both, and the GPG
+     * fallback probes the system keyring, which a login shell's stale
+     * GNUPGHOME can misdirect (see the step-1 comment). */
+    if (!ctx->config.resuming) {
+        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 && !ssh_ok) {
+            if (test_ssh_key_functionality(account) != 0) {
+                log_warning("SSH key test failed for account: %s", account->name);
+            }
         }
-    }
 
-    /* Test GPG functionality if enabled */
-    if (account->gpg_enabled && strlen(account->gpg_key_id) > 0 && !gpg_ok) {
-        if (test_gpg_key_functionality(account) != 0) {
-            log_warning("GPG key test failed for account: %s", account->name);
+        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0 && !gpg_ok) {
+            if (test_gpg_key_functionality(account) != 0) {
+                log_warning("GPG key test failed for account: %s", account->name);
+            }
         }
     }
 
