@@ -59,8 +59,8 @@ if PATH="$shim_dir:$PATH" QA_TOOL_EXIT=72 QA_ARG_LOG="$arg_log" \
     "$make_cmd" -C "$root" security-scan >"$out" 2>&1; then
     fail "security-scan succeeded after an installed flawfinder failed"
 fi
-grep -F -- "--error-level=5" "$arg_log" >/dev/null ||
-    fail "security-scan did not configure flawfinder findings as fatal"
+grep -F -- "--error-level=4" "$arg_log" >/dev/null ||
+    fail "security-scan did not configure flawfinder findings as fatal at level 4 (AR-05 L1)"
 if grep -F "not installed" "$out" >/dev/null; then
     fail "security-scan misreported an installed failing flawfinder as absent"
 fi

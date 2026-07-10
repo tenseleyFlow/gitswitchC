@@ -268,12 +268,17 @@ format:
 		echo "clang-format not installed - skipping formatting"; \
 	fi
 
-# Security scan
+# Security scan. --error-level=4: the codebase has zero level-5 constructs
+# expressible in its style, so the old level-5 gate was green by construction
+# (AR-05 L1). Every pre-existing level-4 hit was triaged and carries an
+# inline "Flawfinder: ignore" with its rationale, so a NEW level-4 use of a
+# strcpy/format/exec-class function now fails this target until it is either
+# fixed or explicitly annotated.
 .PHONY: security-scan
 security-scan:
 	@echo "Running security scan..."
 	@if command -v flawfinder >/dev/null 2>&1; then \
-		flawfinder --error-level=5 $(SRCDIR); \
+		flawfinder --error-level=4 $(SRCDIR); \
 	else \
 		echo "flawfinder not installed - skipping security scan"; \
 	fi

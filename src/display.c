@@ -172,7 +172,7 @@ void display_status(const char *level, const char *message, ...) {
     
     /* Format the message */
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args);
+    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
     va_end(args);
     
     /* Select icon and color based on level */
@@ -211,7 +211,7 @@ void display_error(const char *context, const char *message, ...) {
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args);
+    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
     va_end(args);
     
     /* Don't display if message is empty */
@@ -232,7 +232,7 @@ void display_warning(const char *message, ...) {
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args);
+    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
     va_end(args);
     
     display_status("warning", "%s", formatted_message);
@@ -246,7 +246,7 @@ void display_success(const char *message, ...) {
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args);
+    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
     va_end(args);
     
     display_status("success", "%s", formatted_message);
@@ -260,7 +260,7 @@ void display_info(const char *message, ...) {
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args);
+    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
     va_end(args);
     
     display_status("info", "%s", formatted_message);

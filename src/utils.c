@@ -202,7 +202,7 @@ int expand_path(const char *path, char *expanded_path, size_t path_size) {
             set_error(ERR_INVALID_ARGS, "Path too long for buffer");
             return -1;
         }
-        strcpy(expanded_path, path);
+        strcpy(expanded_path, path); /* Flawfinder: ignore — length-checked above */
     }
     
     return 0;
@@ -226,7 +226,7 @@ int get_home_directory(char *home_path, size_t path_size) {
         return -1;
     }
     
-    strcpy(home_path, home);
+    strcpy(home_path, home); /* Flawfinder: ignore — length-checked above */
     return 0;
 }
 
@@ -248,11 +248,11 @@ int join_path(char *result, size_t result_size, const char *base, const char *co
         return -1;
     }
     
-    strcpy(result, base);
+    strcpy(result, base); /* Flawfinder: ignore — length-checked above */
     if (needs_separator) {
         strcat(result, "/");
     }
-    strcat(result, component);
+    strcat(result, component); /* Flawfinder: ignore — length-checked above */
     
     return 0;
 }
@@ -1219,11 +1219,11 @@ int backup_file(const char *file_path, const char *backup_suffix) {
 }
 
 bool file_is_readable(const char *file_path) {
-    return file_path && access(file_path, R_OK) == 0;
+    return file_path && access(file_path, R_OK) == 0; /* Flawfinder: ignore — advisory readability probe, not an auth decision */
 }
 
 bool file_is_writable(const char *file_path) {
-    return file_path && access(file_path, W_OK) == 0;
+    return file_path && access(file_path, W_OK) == 0; /* Flawfinder: ignore — advisory writability probe, not an auth decision */
 }
 
 size_t get_file_size(const char *file_path) {
@@ -1433,7 +1433,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
         /* execv, not execvp: the path was pinned pre-fork; re-searching PATH
          * here would reopen the PS-1 window between resolve and exec. */
-        execv(exec_path, (char *const *)argv);
+        execv(exec_path, (char *const *)argv); /* Flawfinder: ignore — argv exec of a pre-pinned path; no shell */
         _exit(127); /* exec failed (e.g. binary vanished after resolution) */
     }
 
@@ -1604,7 +1604,7 @@ static bool exec_candidate_is_trusted(const char *path) {
     if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IWGRP | S_IWOTH))) {
         return false;
     }
-    return access(path, X_OK) == 0;
+    return access(path, X_OK) == 0; /* Flawfinder: ignore — advisory post-stat probe; exec re-validates */
 }
 
 /* Process-lifetime memo for find_command_path (AR-02 #24): one switch
@@ -1696,7 +1696,7 @@ int find_command_path(const char *name, char *buf, size_t size) {
             dir[dirlen] = '\0';
             memcpy(candidate, dir, dirlen);
             candidate[dirlen] = '/';
-            strcpy(candidate + dirlen + 1, name);
+            strcpy(candidate + dirlen + 1, name); /* Flawfinder: ignore — bounds proven by dirlen+name checks above */
             if (exec_dir_is_trusted(dir) && exec_candidate_is_trusted(candidate)) {
                 if (g_cmd_memo_pathenv && g_cmd_memo_used < CMD_MEMO_SLOTS &&
                     strlen(name) < CMD_MEMO_NAME_LEN) {
@@ -1749,7 +1749,7 @@ int get_env_var(const char *name, char *buffer, size_t buffer_size) {
         return -1;
     }
     
-    strcpy(buffer, value);
+    strcpy(buffer, value); /* Flawfinder: ignore — length-checked above */
     return 0;
 }
 
