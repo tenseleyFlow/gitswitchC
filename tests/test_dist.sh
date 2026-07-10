@@ -141,5 +141,36 @@ stage=$tmp/stage
 [ -f "$stage$prefix/share/fish/vendor_completions.d/gitswitch.fish" ] ||
     fail "installed fish completion missing"
 
-printf 'distcheck: PASS (%s C tests, version %s, complete staged install)\n' \
-    "$checkout_test_count" "$expected_version"
+# AR-05 L17: the H4 manifest fix exists because the source archive once could
+# not satisfy its own RPM spec (%install ran make install against missing
+# completions). When rpmbuild is available, prove the archive still can:
+# build the RPM from the archive + extracted spec in an isolated _topdir.
+# --nodeps: BuildRequires resolution needs an rpmdb that non-RPM CI hosts do
+# not have; the property under test is the spec's %build/%install/%files
+# contract against the archive, not dependency metadata. Absence is recorded
+# explicitly, never misreported as an executed success.
+if command -v rpmbuild >/dev/null 2>&1; then
+    rpmtop=$tmp/rpmbuild
+    mkdir -p "$rpmtop/BUILD" "$rpmtop/RPMS" "$rpmtop/SOURCES" \
+        "$rpmtop/SPECS" "$rpmtop/SRPMS"
+    cp "$archive" "$rpmtop/SOURCES/"
+    cp "$source_root/gitswitcher.spec" "$rpmtop/SPECS/"
+    if ! rpmbuild --define "_topdir $rpmtop" --nodeps -ba \
+        "$rpmtop/SPECS/gitswitcher.spec" >"$tmp/rpmbuild.log" 2>&1; then
+        tail -40 "$tmp/rpmbuild.log" >&2
+        fail "source archive cannot satisfy gitswitcher.spec under rpmbuild"
+    fi
+    rpm_count=0
+    for built_rpm in "$rpmtop"/RPMS/*/*.rpm; do
+        [ -f "$built_rpm" ] || continue
+        rpm_count=$((rpm_count + 1))
+    done
+    [ "$rpm_count" -ge 1 ] || fail "rpmbuild reported success but produced no binary RPM"
+    rpm_status="rpmbuild OK"
+else
+    printf 'distcheck: rpmbuild not available - RPM build skipped\n'
+    rpm_status="rpmbuild skipped"
+fi
+
+printf 'distcheck: PASS (%s C tests, version %s, complete staged install, %s)\n' \
+    "$checkout_test_count" "$expected_version" "$rpm_status"

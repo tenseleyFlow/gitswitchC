@@ -11,7 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y cppcheck flawfinder
+        # rpm: gives distcheck a real rpmbuild so the archive-satisfies-its-
+        # own-spec lane (AR-05 L17) actually runs instead of skipping.
+        run: sudo apt-get update && sudo apt-get install -y cppcheck flawfinder rpm
       # Fast textual tripwire only — headers included, but whitespace variants,
       # function-pointer indirection, and macro wrapping evade a grep. The
       # authoritative gate is the symbol check on the built binary below
