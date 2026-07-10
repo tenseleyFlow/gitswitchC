@@ -45,11 +45,15 @@ CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
 ifeq ($(UNAME_S),Linux)
     # GCC-specific warnings
     CFLAGS += -Wlogical-op -Wdate-time
-    # Linux-specific security flags
+    # Linux-specific security flags. -fPIE/-pie are REQUESTED, not inherited:
+    # relying on the host compiler's default-PIE meant non-mainstream
+    # toolchains (vanilla upstream gcc, older cross compilers) shipped
+    # ASLR-defeating non-PIE release binaries with all QA green (AR-05 L9).
+    # distcheck now asserts the staged binary is ET_DYN with RELRO+NOW.
     SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
                           -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection -fcf-protection \
+                            -fstack-clash-protection -fcf-protection -fPIE -pie \
                             -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 
@@ -62,11 +66,13 @@ endif
 ifeq ($(UNAME_S),FreeBSD)
     # GCC-specific warnings (GCC from ports)
     CFLAGS += -Wlogical-op -Wdate-time
-    # FreeBSD security flags (ELF linker supports relro/now/noexecstack)
+    # FreeBSD security flags (ELF linker supports relro/now/noexecstack).
+    # -fPIE/-pie requested explicitly — the ports gcc used in CI does not
+    # default to PIE (AR-05 L9).
     SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection -fcf-protection \
                           -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection -fcf-protection \
+                            -fstack-clash-protection -fcf-protection -fPIE -pie \
                             -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 

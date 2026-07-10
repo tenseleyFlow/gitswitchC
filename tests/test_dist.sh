@@ -103,7 +103,28 @@ done
 
 "$make_cmd" -C "$source_root" clean
 "$make_cmd" -C "$source_root" BUILD_TYPE=release all
-version_output=$("$source_root/build/bin/gitswitch" --version)
+
+# AR-05 L9: assert the hardening properties the Makefile claims. PIE and
+# RELRO/NOW were previously inherited from the host toolchain's defaults with
+# no post-build check, so a non-default-PIE compiler could ship an
+# ASLR-defeating binary with QA green.
+release_bin=$source_root/build/bin/gitswitch
+if command -v readelf >/dev/null 2>&1; then
+    readelf -h "$release_bin" | grep -Eq 'Type:[[:space:]]+DYN' ||
+        fail "release binary is not PIE (ET_DYN)"
+    readelf -d "$release_bin" | grep -Eq 'BIND_NOW|FLAGS(_1)?.*\bNOW\b' ||
+        fail "release binary lacks BIND_NOW"
+    readelf -l "$release_bin" | grep -q 'GNU_RELRO' ||
+        fail "release binary lacks GNU_RELRO"
+    # -W: without wide mode readelf truncates long names to "[...]", hiding
+    # __stack_chk_fail entirely.
+    readelf -W --dyn-syms "$release_bin" | grep -q '__stack_chk_fail' ||
+        fail "release binary lacks stack-protector instrumentation"
+else
+    printf 'distcheck: readelf not available - hardening assertions skipped\n'
+fi
+
+version_output=$("$release_bin" --version)
 case $version_output in
     *" $expected_version ("*) ;;
     *) fail "binary version '$version_output' does not contain VERSION '$expected_version'" ;;
