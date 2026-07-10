@@ -1500,11 +1500,15 @@ int ssh_validate_key_file(const char *key_path) {
         return -1;
     }
     
-    /* Check permissions - should be 600 (readable only by owner) */
+    /* Reject only group/other access, matching OpenSSH's own private-key policy
+     * (AR-06 F28). The old exact `!= 0600` check rejected 0400 — a read-only
+     * private key, a common and recommended hardening that ssh/ssh-add accept —
+     * and blocked the switch. Owner-only modes (0400, 0600, 0700) are fine; any
+     * group/other bit is not. */
     key_mode = key_stat.st_mode & 0777;
-    if (key_mode != 0600) {
-        set_error(ERR_SSH_KEY_PERMISSIONS, 
-                  "SSH key file has unsafe permissions: %o (should be 600): %s",
+    if ((key_mode & 077) != 0) {
+        set_error(ERR_SSH_KEY_PERMISSIONS,
+                  "SSH key file has unsafe permissions: %o (group/other access not allowed): %s",
                   key_mode, key_path);
         return -1;
     }
