@@ -23,12 +23,16 @@
 #include "utils.h"
 #include "error.h"
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Fingerprints: the fake agent holds KEYA; accounts point at keyA or keyB. */
@@ -258,9 +262,114 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
 }
 
+/* AR-02 #10: ssh_configure_host_alias writes "IdentityFile <path>" into
+ * ~/.ssh/config; a newline in the path would inject an arbitrary ssh_config
+ * directive (ProxyCommand => code execution on connect). The sink must refuse
+ * such a path ITSELF — its only prior protection was the TOML-load sanitizer
+ * stripping newlines, which a future non-TOML population path would bypass.
+ * Drives the function directly with a hand-built account (exactly the bypass
+ * the audit's PoC used) under a scratch HOME. */
+TEST(host_alias_write_rejects_newline_key_path) {
+    char home[128], cfg_path[256], buf[4096];
+    account_t acct;
+    FILE *f;
+    size_t n;
+
+    snprintf(home, sizeof(home), "/tmp/gswsshalias_XXXXXX");
+    CHECK(mkdtemp(home) != NULL);
+    setenv("HOME", home, 1);
+
+    memset(&acct, 0, sizeof(acct));
+    acct.ssh_enabled = true;
+    snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), "github.com-work");
+    snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path),
+             "%s/key\nProxyCommand touch PWNED", home);
+
+    CHECK_EQ_INT(ssh_configure_host_alias(&acct), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_PATH);
+
+    /* Nothing may have been written: no config at all, or at least no
+     * ProxyCommand line derived from the hostile path. */
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    f = fopen(cfg_path, "r");
+    if (f) {
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        CHECK(strstr(buf, "ProxyCommand") == NULL);
+    }
+
+    /* Control: a clean path writes the managed block with the IdentityFile. */
+    snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path), "%s/key_ok", home);
+    CHECK_EQ_INT(ssh_configure_host_alias(&acct), 0);
+    f = fopen(cfg_path, "r");
+    CHECK(f != NULL);
+    if (f) {
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        CHECK(strstr(buf, "IdentityFile") != NULL);
+        CHECK(strstr(buf, "key_ok") != NULL);
+    }
+}
+
+#if defined(__linux__)
+/* AR-02 test menu (ranks 19/20): a sidecar PID that now belongs to a NON-agent
+ * same-uid process — the classic PID-recycle scenario — must never be
+ * signaled by the teardown path. reap_ssh_agent's identity check (comm +
+ * exact socket in argv, /proc-based, hence Linux-only) must refuse it, keep
+ * the bystander alive, and drop the sidecar as garbage. */
+TEST(reset_never_signals_bystander_pid_in_sidecar) {
+    char dir[128], pid_path[256], sock_path[256];
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000000 }; /* 100ms */
+    FILE *pf;
+    pid_t pid;
+    int status = 0;
+
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
+    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
+    setenv("XDG_RUNTIME_DIR", g_xdg, 1);
+    snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg);
+    CHECK_EQ_INT(mkdir(dir, 0700), 0);
+
+    /* The bystander: our own forked child, parked on pause(). Its comm is
+     * this test binary, not "ssh-agent", so the identity check must refuse. */
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        for (;;) pause();
+    }
+
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    snprintf(sock_path, sizeof(sock_path), "%s/ssh-agent.work.sock", dir);
+    pf = fopen(pid_path, "w");
+    CHECK(pf != NULL);
+    if (pf) {
+        fprintf(pf, "%d\n", (int)pid);
+        fclose(pf);
+    }
+
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    nanosleep(&ts, NULL); /* let any (wrongly) sent signal land */
+
+    CHECK_EQ_INT(kill(pid, 0), 0);          /* bystander untouched */
+    CHECK(!path_exists(pid_path));          /* garbage record dropped */
+    CHECK(!path_exists(sock_path));
+
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+}
+#endif
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ssh_fingerprint_reuse_adopts_matching_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
     RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
+    RUN_TEST(host_alias_write_rejects_newline_key_path);
+#if defined(__linux__)
+    RUN_TEST(reset_never_signals_bystander_pid_in_sidecar);
+#endif
 TEST_MAIN_END()

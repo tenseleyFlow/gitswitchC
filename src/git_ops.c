@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 
 #include "git_ops.h"
+#include "gpg_manager.h"
 #include "error.h"
 #include "utils.h"
 #include "display.h"
@@ -211,11 +212,20 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
     size_t list_len = 0;
     if (git_list_config_z(scope, list, sizeof(list), &list_len) == 0 &&
         list_len < sizeof(list) - 1) {
+        int s = cfg_scope_index(scope);
         for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
             if (parse_config_z_value(list, list_len, g_managed_keys[i],
                                      out[i].value, sizeof(out[i].value))) {
                 out[i].present = true;
             }
+            /* AR-02 #15: the complete listing is an authoritative read of
+             * every managed key — presence AND proven absence — so seed the
+             * exec cache instead of discarding it. git_clear_config (run by
+             * the very next step of a global switch) then elides the --unset
+             * execs this listing just proved were no-ops, and reads of
+             * present values are served without a spawn. */
+            cfg_cache_store(s, (int)i, CFG_READBACK, out[i].present,
+                            out[i].value);
         }
         return;
     }
@@ -566,14 +576,22 @@ int git_test_config(const account_t *account, git_scope_t scope) {
             log_warning("GPG signing is configured but not enabled");
         }
 
-        /* Test GPG key availability (system keyring, no shell) */
-        const char *gpg_argv[] = {"gpg", "--list-secret-keys", account->gpg_key_id, NULL};
-        run_opts_t gpg_opts;
-        memset(&gpg_opts, 0, sizeof(gpg_opts));
-        gpg_opts.stderr_to_devnull = true;
-        if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
-            set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s", account->gpg_key_id);
-            return -1;
+        /* Test GPG key availability (no shell). Which keyring gpg consults is
+         * decided by GNUPGHOME — by the time a switch validates itself that is
+         * already the account's isolated home, not the system keyring the old
+         * comment claimed. Skipped entirely when a gpg spawn earlier in this
+         * process already proved the key's presence, which on the switch path
+         * is always true (AR-02 #14). */
+        if (!gpg_manager_key_available_cached(account->gpg_key_id)) {
+            const char *gpg_argv[] = {"gpg", "--list-secret-keys", account->gpg_key_id, NULL};
+            run_opts_t gpg_opts;
+            memset(&gpg_opts, 0, sizeof(gpg_opts));
+            gpg_opts.stderr_to_devnull = true;
+            if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
+                set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s", account->gpg_key_id);
+                return -1;
+            }
+            gpg_manager_note_key_available(account->gpg_key_id);
         }
     }
 
@@ -702,13 +720,18 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
         return -1;
     }
 
-    /* Skip a duplicate unset only when this process already unset the key
-     * itself (same provable-no-op reasoning as the duplicate-write skip). */
+    /* Skip an unset the cache proves is a no-op: this process already unset
+     * the key itself (CFG_WRITTEN/absent — the original duplicate-unset
+     * skip), or a complete --list -z snapshot observed the key absent
+     * (CFG_READBACK/absent, seeded by git_capture_keys — AR-02 #15: the
+     * global-switch clear-local step used to blindly re-exec six unsets the
+     * snapshot one exec earlier had just proved unnecessary). */
     int s = cfg_scope_index(scope);
     int k = cfg_key_index(key);
-    if (s >= 0 && k >= 0 && g_cfg_cache[s][k].state == CFG_WRITTEN &&
-        !g_cfg_cache[s][k].present) {
-        log_debug("Skipping git config --unset %s: already unset by this process", key);
+    if (s >= 0 && k >= 0 && !g_cfg_cache[s][k].present &&
+        (g_cfg_cache[s][k].state == CFG_WRITTEN ||
+         g_cfg_cache[s][k].state == CFG_READBACK)) {
+        log_debug("Skipping git config --unset %s: known absent in this process", key);
         return 0;
     }
 
@@ -747,30 +770,13 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
     return 0;
 }
 
-/* ssh-1: the account SSH key path ends up in two security-sensitive sinks:
- *
- *  1. core.sshCommand — the ONE git config value git hands to /bin/sh. The
- *     path is wrapped in single quotes below; inside '...' the shell treats
- *     every byte literally EXCEPT a single quote, which ends the quote and
- *     lets a crafted path smuggle extra ssh options (-oProxyCommand=…, i.e.
- *     arbitrary code on the next fetch).
- *  2. ~/.ssh/config — the same account key path is emitted verbatim as an
- *     "IdentityFile <path>" line by the host-alias support. There, a \n or
- *     \r starts a new line, i.e. injects an arbitrary ssh_config keyword
- *     (ProxyCommand again), and a quote breaks the directive's tokenization.
- *
- * So reject both quote characters and every control byte (\n and \r included)
- * up front, before the path is probed or written anywhere. A real SSH key
- * path never needs any of these. */
-static bool is_safe_ssh_key_path(const char *path) {
-    for (const char *p = path; *p; p++) {
-        unsigned char c = (unsigned char)*p;
-        if (c < 0x20 || c == 0x7f || c == '\'' || c == '"') {
-            return false;
-        }
-    }
-    return true;
-}
+/* ssh-1: is_safe_ssh_key_path now lives in utils.c so BOTH of the key path's
+ * injection-sensitive sinks apply it themselves: this file's core.sshCommand
+ * (below) and ssh_manager.c's ~/.ssh/config IdentityFile write. It used to be
+ * static here and guard only core.sshCommand, while comments claimed coverage
+ * of the IdentityFile sink too — that sink was in fact protected only by the
+ * TOML-load sanitizer stripping newlines/quotes, an incidental, load-time-only
+ * defense (AR-02 #10). */
 
 /* Configure SSH command for git operations */
 int git_configure_ssh(const account_t *account, git_scope_t scope) {

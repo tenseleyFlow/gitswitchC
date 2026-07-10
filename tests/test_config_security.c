@@ -9,6 +9,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "config.h"
+#include "signals.h"
 #include "error.h"
 #include <string.h>
 #include <stdio.h>
@@ -237,6 +238,86 @@ TEST(load_skips_out_of_range_id_section) {
     CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
 }
 
+/* AR-02 #5: an over-long name is schema-valid (TOML allows values up to 511
+ * bytes; MAX_NAME_LEN is 256), so the whole-file parse succeeds and only the
+ * per-field toml_get_string copy fails. That failure used to `continue`
+ * WITHOUT counting the section as skipped, so config_save's refuse-to-rewrite
+ * guard read zero and the next save (e.g. `remove <other>`) permanently
+ * erased the over-long account's section. */
+TEST(load_counts_overlong_name_as_skipped_and_save_preserves_it) {
+    char cfg[1024];
+    char longname[300];
+    char dir[128], path[256];
+    char after[1024];
+    gitswitch_ctx_t ctx;
+    FILE *f;
+    size_t n;
+
+    memset(longname, 'N', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    snprintf(cfg, sizeof(cfg),
+             "[settings]\n"
+             "default_scope = \"local\"\n"
+             "[accounts.1]\n"
+             "name = \"%s\"\n"
+             "email = \"long@b.com\"\n"
+             "\n"
+             "[accounts.2]\n"
+             "name = \"alice\"\n"
+             "email = \"a@b.com\"\n",
+             longname);
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);          /* alice still loads */
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1); /* pre-fix: 0 */
+
+    /* The save must refuse the rewrite (returns 0 but preserves the file),
+     * keeping the over-long section on disk for the user to repair. */
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    f = fopen(path, "r");
+    CHECK(f != NULL);
+    n = f ? fread(after, 1, sizeof(after) - 1, f) : 0;
+    if (f) fclose(f);
+    after[n] = '\0';
+    CHECK(strstr(after, longname) != NULL);      /* pre-fix: erased */
+}
+
+/* ---- AR-02 #27: config_save's own scratch registration ---- */
+
+TEST(config_save_registers_and_unregisters_its_temp) {
+    /* config_save registers "<path>.tmp.<pid>" for signal cleanup for exactly
+     * the span the temp exists (the registration accounts_switch used to make
+     * never covered the real save — it ran after the registry was torn down).
+     * After a completed save the slot must be RELEASED: a stale registration
+     * would let a later emergency cleanup unlink an unrelated file that
+     * happens to be recreated at that name. */
+    char dir[128], path[256], tmp[512];
+    gitswitch_ctx_t ctx;
+    FILE *f;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
+    ctx.account_count = 1;
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+
+    /* Recreate a file at the temp's deterministic name and run the scratch
+     * cleanup: an unreleased registration would delete it. */
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    f = fopen(tmp, "w");
+    CHECK(f != NULL);
+    if (f) fclose(f);
+    signals_scratch_cleanup();
+    CHECK(access(tmp, F_OK) == 0); /* untouched: registration was released */
+    unlink(tmp);
+}
+
 /* ---- tty-escape: control bytes must not survive to display fields ---- */
 
 TEST(load_strips_cr_from_description) {
@@ -300,6 +381,17 @@ TEST(add_rejects_c1_and_malformed_utf8_in_name) {
     fill_account(&a, 1, "work\x9B" "31m", "w@x.com", "d");     /* bare C1 byte */
     CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
 
+    /* AR-02 #28: the OVERLONG spellings of the same C1 CSI (U+009B) — the
+     * exact smuggling vector utf8_decode's strictness exists to stop, and
+     * previously exercised by no test. 3-byte: E0 82 9B; 4-byte: F0 80 82 9B.
+     * A lenient decoder normalizes either back to 0x9B and the terminal
+     * executes it; the strict decoder must call both malformed. */
+    fill_account(&a, 1, "work\xE0\x82\x9B" "31m", "w@x.com", "d");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+
+    fill_account(&a, 1, "work\xF0\x80\x82\x9B" "31m", "w@x.com", "d");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+
     fill_account(&a, 1, "caf\xC3\xA9", "w@x.com", "d");        /* plain UTF-8 "café" */
     CHECK_EQ_INT(config_add_account(&ctx, &a), 0);
     CHECK_EQ_INT(ctx.account_count, 1);
@@ -312,6 +404,13 @@ TEST(add_rejects_escape_in_description) {
     memset(&ctx, 0, sizeof(ctx));
 
     fill_account(&a, 1, "work", "w@x.com", "ok\x1B[31mred");   /* raw ESC */
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+
+    /* Overlong-encoded C1 controls in the description (AR-02 #28): the add
+     * path fails closed on them just like the raw/2-byte forms. */
+    fill_account(&a, 1, "work", "w@x.com", "ok\xE0\x82\x9B" "31m");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+    fill_account(&a, 1, "work", "w@x.com", "ok\xF0\x80\x82\x9B" "31m");
     CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
 
     fill_account(&a, 1, "work", "w@x.com", "caf\xC3\xA9 \xE2\x98\x95"); /* "café ☕" */
@@ -440,6 +539,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(find_account_rejects_out_of_range_and_noncanonical_ids);
     RUN_TEST(load_skips_leading_zero_id_section);
     RUN_TEST(load_skips_out_of_range_id_section);
+    RUN_TEST(load_counts_overlong_name_as_skipped_and_save_preserves_it);
+    RUN_TEST(config_save_registers_and_unregisters_its_temp);
     RUN_TEST(load_strips_cr_from_description);
     RUN_TEST(load_rejects_raw_c1_byte_in_file);
     RUN_TEST(add_rejects_c1_and_malformed_utf8_in_name);

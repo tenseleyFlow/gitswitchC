@@ -25,6 +25,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "accounts.h"
+#include "git_ops.h"
 #include "utils.h"
 #include "error.h"
 
@@ -32,8 +33,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -152,6 +155,66 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
     return exit_code == 0 ? 0 : -1;
 }
 
+/* ---- git+ssh runner for the SSH-restart rollback test (AR-02 #30) -------- */
+
+/* Bind a real (unserved) 0600 unix socket so validate_ssh_agent_socket sees a
+ * genuine socket inode. Returns 0 on success. */
+static int bind_fake_agent_socket(const char *path) {
+    struct sockaddr_un addr;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0 || strlen(path) >= sizeof(addr.sun_path)) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd); /* the socket inode persists; nobody needs to accept() */
+    return chmod(path, 0600);
+}
+
+/* Extends fake_runner with a working fake ssh-agent (binds the -a socket) and
+ * a happy ssh-add, so accounts_switch can walk the full SSH activation and
+ * the rollback can genuinely re-start the previous account's agent. git
+ * handling is delegated to fake_runner. The reported agent PID is far above
+ * any platform's pid_max so the later teardown's reaper can never find — let
+ * alone signal — a real process behind it (the BSD/macOS fallback verifies by
+ * liveness only). */
+#define FAKE_AGENT_PID 1073741824
+static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
+                          run_result_t *result) {
+    if (strcmp(argv[0], "ssh-agent") == 0 && argv[1] &&
+        strcmp(argv[1], "-a") == 0 && argv[2]) {
+        if (g_log) { fprintf(g_log, "ssh-agent -a %s\n", argv[2]); fflush(g_log); }
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+        }
+        if (bind_fake_agent_socket(argv[2]) != 0) return -1;
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
+                     "SSH_AGENT_PID=%d; export SSH_AGENT_PID;\n",
+                     argv[2], FAKE_AGENT_PID);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-add") == 0 || strcmp(argv[0], "ssh-keygen") == 0) {
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+        }
+        if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+        return 0;
+    }
+    return fake_runner(argv, opts, result);
+}
+
 /* ---- ctx factory ---------------------------------------------------------- */
 
 /* One SSH/GPG-disabled account with global preferred scope (avoids both real
@@ -213,6 +276,140 @@ TEST(successful_switch_still_tears_down_previous_isolation) {
     CHECK(!symlink_present(g_gpg_link));
 }
 
+/* AR-02 #12: a switch to an SSH-enabled target whose SSH setup fails at
+ * ssh_manager_init — which only PATH-probes ssh-agent/ssh-add and touches no
+ * agent — must NOT tear down the previous account's runtime isolation. The
+ * pre-fix code marked the SSH state dirty before init ran, so this pure
+ * lookup failure reaped the previous account's healthy agent and unlinked
+ * current.sock for a switch that never started. */
+TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
+    char key_path[512], emptybin[512], saved_path[4096];
+    const char *env_path;
+    FILE *kf;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *a = &ctx.accounts[0];
+    a->ssh_enabled = true;
+    /* A real 0600 private-key-shaped file so the step-1 key validation
+     * (stat/mode/header — no PATH involved) passes and the switch reaches
+     * ssh_manager_init. */
+    snprintf(key_path, sizeof(key_path), "%s/key_ed25519", g_xdg);
+    kf = fopen(key_path, "w");
+    CHECK(kf != NULL);
+    if (kf) {
+        fputs("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n"
+              "-----END OPENSSH PRIVATE KEY-----\n", kf);
+        fclose(kf);
+    }
+    CHECK_EQ_INT(chmod(key_path, 0600), 0);
+    safe_strncpy(a->ssh_key_path, key_path, sizeof(a->ssh_key_path));
+
+    /* Warm the process-wide git-availability cache BEFORE crippling PATH, so
+     * the switch fails exactly at ssh_manager_init's ssh-agent probe and not
+     * earlier at git_ops_init. */
+    CHECK_EQ_INT(git_ops_init(), 0);
+
+    /* Cripple PATH: an empty (but trusted) dir makes command_exists fail for
+     * ssh-agent/ssh-add without any agent operation being attempted. */
+    env_path = getenv("PATH");
+    snprintf(saved_path, sizeof(saved_path), "%s", env_path ? env_path : "");
+    snprintf(emptybin, sizeof(emptybin), "%s/emptybin", g_xdg);
+    CHECK_EQ_INT(mkdir(emptybin, 0755), 0);
+    setenv("PATH", emptybin, 1);
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn prev = run_set_runner(fake_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(prev);
+    setenv("PATH", saved_path, 1);
+
+    CHECK_EQ_INT(rc, -1);
+    /* The previous account's entry points were never disturbed and must
+     * survive; pre-fix the abort path reaped them. */
+    CHECK(symlink_present(g_ssh_sock));
+    CHECK(symlink_present(g_gpg_link));
+}
+
+/* Write a private-key-shaped 0600 file so ssh_validate_key_file accepts it. */
+static int write_fake_key(const char *path) {
+    FILE *f = fopen(path, "w");
+    if (!f) return -1;
+    fputs("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n"
+          "-----END OPENSSH PRIVATE KEY-----\n", f);
+    if (fclose(f) != 0) return -1;
+    return chmod(path, 0600);
+}
+
+/* AR-02 #30: the rollback branch that RE-STARTS the previous account's SSH
+ * agent after a failed switch — starting the new account's agent has already
+ * reaped it, so a symlink restore is not enough — was never exercised by any
+ * test. Previous account "prev" is active; the switch to SSH-enabled
+ * "testacct" activates a (fake) agent, then fails at the git-config write;
+ * the rollback must leave current.sock pointing at a live agent socket for
+ * "prev", not at the aborted target and not dangling. */
+TEST(failed_switch_restarts_previous_accounts_agent) {
+    char key_prev[512], key_target[512], target[512];
+    ssize_t n;
+    const char *base;
+
+    /* The real ssh-agent/ssh-add must be findable for ssh_manager_init's
+     * probes (the runner fakes the spawns themselves). */
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *tgt = &ctx.accounts[0];
+    account_t *prev = &ctx.accounts[1];
+    memset(prev, 0, sizeof(*prev));
+    prev->id = 2;
+    safe_strncpy(prev->name, "prev", sizeof(prev->name));
+    safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
+    safe_strncpy(prev->description, "previous account", sizeof(prev->description));
+    prev->preferred_scope = GIT_SCOPE_GLOBAL;
+    ctx.account_count = 2;
+    ctx.current_account = prev;
+
+    snprintf(key_prev, sizeof(key_prev), "%s/key_prev", g_xdg);
+    snprintf(key_target, sizeof(key_target), "%s/key_target", g_xdg);
+    CHECK_EQ_INT(write_fake_key(key_prev), 0);
+    CHECK_EQ_INT(write_fake_key(key_target), 0);
+    prev->ssh_enabled = true;
+    safe_strncpy(prev->ssh_key_path, key_prev, sizeof(prev->ssh_key_path));
+    tgt->ssh_enabled = true;
+    safe_strncpy(tgt->ssh_key_path, key_target, sizeof(tgt->ssh_key_path));
+
+    g_fail_user_name_set = true; /* fail exactly at the git-config write */
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn prev_runner = run_set_runner(ssh_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(prev_runner);
+    g_fail_user_name_set = false;
+
+    CHECK_EQ_INT(rc, -1);
+
+    /* current.sock must point at prev's re-started agent socket, and that
+     * socket must actually exist — a symlink-only "restore" (or none) leaves
+     * the user with git identity rolled back but no working agent. */
+    n = readlink(g_ssh_sock, target, sizeof(target) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        target[n] = '\0';
+        base = strrchr(target, '/');
+        base = base ? base + 1 : target;
+        CHECK_STR_EQ(base, "ssh-agent.prev.sock");
+        CHECK(path_exists(target));
+    }
+}
+
 /* SIG-01: a SIGINT during the git-config write must be deferred, the rollback
  * must run (restore commands appear in the log AFTER the signal), and the
  * process must then die by SIGINT. Without the guard the raise() kills the
@@ -272,5 +469,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(failed_git_config_keeps_previous_runtime_isolation);
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
+    RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
+    RUN_TEST(failed_switch_restarts_previous_accounts_agent);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()

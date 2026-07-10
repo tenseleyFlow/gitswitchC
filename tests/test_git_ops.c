@@ -10,6 +10,7 @@
 #include "utils.h"
 #include "error.h"
 #include "git_ops.h"
+#include "gpg_manager.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -154,8 +155,10 @@ TEST(git_configure_ssh_rejects_single_quote_in_keypath) {
         int rc = git_configure_ssh(&acct, GIT_SCOPE_GLOBAL);
         CHECK_EQ_INT(rc, -1);
         /* Rejected BEFORE any subprocess: nothing may be written to git
-         * config (and hence nothing derived from this path can ever land in
-         * ~/.ssh/config either). */
+         * config. This covers ONLY the core.sshCommand sink — the
+         * ~/.ssh/config IdentityFile sink is a separate write site with its
+         * own guard, exercised by host_alias_write_rejects_newline_key_path
+         * in test_ssh_reuse.c (AR-02 #10). */
         CHECK_EQ_INT(fk_execs, 0);
         CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_PATH);
     }
@@ -379,10 +382,58 @@ TEST(rollback_z_parser_survives_embedded_newline) {
     CHECK(zfk_find_set("user.name") < 0);
     CHECK(!zfk_was_unset("user.name"));
 
-    /* Keys absent from the listing were snapshotted absent => unset on restore. */
+    /* Keys absent from the listing were snapshotted absent AND seeded into
+     * the exec cache as proven-absent (AR-02 #15); nothing wrote them after
+     * the snapshot, so the restore's unsets are provable no-ops and are
+     * elided rather than exec'd. (restore_unsets_keys_written_after_snapshot
+     * covers the case where a forward write makes the unset real.) */
+    CHECK(!zfk_was_unset("user.signingkey"));
+    CHECK(!zfk_was_unset("commit.gpgsign"));
+    CHECK(!zfk_was_unset("gpg.program"));
+}
+
+/* AR-02 #15: the snapshot's complete -z listing seeds the exec cache, so
+ * git_clear_config — run one exec later by every global switch inside a repo
+ * — elides the --unset calls the listing just proved were unnecessary and
+ * execs only the keys actually present. */
+TEST(snapshot_seeds_cache_and_clear_elides_proven_absent) {
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_clear_config(GIT_SCOPE_GLOBAL), 0);
+
+    run_set_runner(prev);
+
+    /* Present in the listing: really unset. */
+    CHECK(zfk_was_unset("user.name"));
+    CHECK(zfk_was_unset("user.email"));
+    CHECK(zfk_was_unset("core.sshcommand"));
+    /* Proven absent by the listing: elided (pre-fix all six exec'd). */
+    CHECK(!zfk_was_unset("user.signingkey"));
+    CHECK(!zfk_was_unset("commit.gpgsign"));
+    CHECK(!zfk_was_unset("gpg.program"));
+    CHECK_EQ_INT(zfk_unsets, 3);
+}
+
+/* Correctness guard on the elision: a key the snapshot saw absent but that a
+ * later write re-created must still be genuinely unset — only PROVABLE
+ * no-ops may be skipped. */
+TEST(restore_unsets_keys_written_after_snapshot) {
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    /* Forward switch writes a key the listing showed absent... */
+    CHECK_EQ_INT(git_set_config_value("user.signingkey", "AAAA1111BBBB2222",
+                                      GIT_SCOPE_GLOBAL), 0);
+    /* ...so the rollback's unset of it is real and must exec. */
+    CHECK_EQ_INT(git_config_restore(), 0);
+
+    run_set_runner(prev);
     CHECK(zfk_was_unset("user.signingkey"));
-    CHECK(zfk_was_unset("commit.gpgsign"));
-    CHECK(zfk_was_unset("gpg.program"));
 }
 
 /* ---- perf-2: git_test_config reuses git_set_config's read-back ---------- */
@@ -417,6 +468,38 @@ TEST(git_test_config_reuses_switch_readback) {
     run_set_runner(prev);
 }
 
+/* AR-02 #14: git_test_config's GPG availability probe must be skipped when a
+ * gpg spawn earlier in this process already proved the key present. The fake
+ * runner refuses every non-git argv, so a gpg spawn here FAILS the check —
+ * the post-memo success is only reachable via the skip. */
+TEST(git_test_config_skips_gpg_probe_when_key_seen) {
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    account_t acct;
+
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "GPG User", sizeof(acct.name));
+    safe_strncpy(acct.email, "gpg@example.com", sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "0123FEED4567BEEF", sizeof(acct.gpg_key_id));
+
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+
+    /* Key not yet proven by any gpg spawn: the probe runs, the fake runner
+     * refuses it, the check fails — proving the probe is still reachable
+     * when nothing vouches for the key. */
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    /* Once proven (as every real switch does before its read-back validation),
+     * the probe is skipped and the identical call succeeds with no gpg exec. */
+    gpg_manager_note_key_available(acct.gpg_key_id);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), 0);
+
+    run_set_runner(prev);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(git_configure_ssh_rejects_single_quote_in_keypath);
@@ -424,5 +507,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_is_repository_caches_result);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
+    RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);
+    RUN_TEST(restore_unsets_keys_written_after_snapshot);
     RUN_TEST(git_test_config_reuses_switch_readback);
+    RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()

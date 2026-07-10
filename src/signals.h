@@ -22,6 +22,12 @@
  *     the git rollback by design — running git from a handler is not
  *     async-signal-safe — so the escape hatch trades atomicity for liveness
  *     only when the user insists twice.
+ *   - EXCEPT while the rollback itself is running (signals_rollback_begin/
+ *     end): the emergency exit there would abandon git_config_restore mid-way
+ *     and permanently persist the aborted account's identity (AR-02 #2), so
+ *     further signals stay recorded until the restore completes and the
+ *     mainline dispatches. Interactive children spawned by the rollback keep
+ *     default dispositions, so Ctrl-C still interrupts them.
  *   - Signals whose disposition is SIG_IGN at guard time stay ignored (so a
  *     nohup'd run keeps ignoring SIGHUP), matching sigaction(2) convention.
  */
@@ -48,6 +54,16 @@ int signals_guard_begin(void);
  */
 void signals_guard_end(void);
 
+/**
+ * Mark the failed-switch rollback window. Between begin and end, the handler
+ * defers even a second guarded signal (no emergency exit) so the multi-exec
+ * git_config_restore can never be abandoned half-done (AR-02 #2). Callers
+ * must pair these around the whole rollback sequence, before dispatching any
+ * pending signal.
+ */
+void signals_rollback_begin(void);
+void signals_rollback_end(void);
+
 /** True if a guarded signal arrived since signals_guard_begin(). */
 bool signals_pending(void);
 
@@ -71,13 +87,14 @@ void signals_dispatch_pending(void);
  * context publishes a slot only after the path is fully copied, so the
  * handler can never observe a half-written entry.
  *
- * Adoption hook points for files owned by other remediation tickets (add a
- * register/unregister pair around the temp file's lifetime; the table and
- * handler here already do the rest):
- *   - src/config.c  config_save():              "<config_path>.tmp.<pid>"
+ * Adopters register around the temp file's lifetime; the table and handler
+ * here do the rest. Registration is only effective while a guard is active:
+ *   - src/config.c config_save() registers "<config_path>.tmp.<pid>" itself,
+ *     and main() holds a guard across the save-after-switch (AR-02 #27).
+ * Remaining hook point:
  *   - src/ssh_manager.c ssh_configure_host_alias(): the mkstemp-resolved
- *     "~/.ssh/config.gitswitch.XXXXXX" path
- *   - src/git_ops.c: any future temp-then-rename write
+ *     "~/.ssh/config.gitswitch.XXXXXX" path (created inside accounts_switch's
+ *     guarded window, where its error paths already unlink it)
  */
 
 /**

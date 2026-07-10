@@ -30,6 +30,7 @@
 #include "error.h"
 #include "utils.h"
 #include "display.h"
+#include "signals.h"
 
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
@@ -252,7 +253,9 @@ fail_buffer:
  * lost-update each other. The atomic temp+rename in config_save only prevents a
  * torn file, not a lost update: two processes that each load, mutate, and rename
  * would have the second silently discard the first's changes. Close the fd to
- * release. Returns -1 on failure (caller may proceed best-effort). */
+ * release. Returns -1 on failure; callers must treat that as fatal for a
+ * mutating command — proceeding unlocked reopens the lost-update race
+ * (AR-02 #17). */
 int config_write_lock(void) {
     char dir[MAX_PATH_LEN];
     char lockpath[MAX_PATH_LEN];
@@ -280,15 +283,43 @@ int config_resume_hint_path(char *buf, size_t size) {
 }
 
 /* Create or remove the resume-hint marker so the shell integration knows
- * whether a boot-time resume is worth attempting. Cheap and best-effort. */
+ * whether a boot-time resume is worth attempting. The marker's CONTENT records
+ * the active account's boot-volatile runtime needs as a space-separated token
+ * set ("ssh", "gpg", or "none"), so the shell snippet can skip the per-shell
+ * ssh-add liveness probe entirely for an SSH-less active account — otherwise a
+ * GPG-only or identity-only account made every new interactive shell spawn
+ * ssh-add (exit 2) plus a `gitswitch resume` in perpetuity (AR-02 #23). Cheap
+ * and best-effort. */
 static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     char hint[MAX_PATH_LEN];
     if (config_resume_hint_path(hint, sizeof(hint)) != 0) return;
-    if (ctx->config.active_account[0] != '\0') {
-        FILE *f = fopen(hint, "w");
-        if (f) fclose(f);
-    } else {
+    if (ctx->config.active_account[0] == '\0') {
         unlink(hint);
+        return;
+    }
+
+    /* Resolve the active account to read its ssh/gpg flags. If it can't be
+     * found (shouldn't happen — it was just saved), fall back to the
+     * conservative "ssh gpg" so the snippet still probes rather than wrongly
+     * skipping a needed resume. */
+    bool wants_ssh = true, wants_gpg = true;
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (strcmp(ctx->accounts[i].name, ctx->config.active_account) == 0) {
+            wants_ssh = ctx->accounts[i].ssh_enabled &&
+                        ctx->accounts[i].ssh_key_path[0] != '\0';
+            wants_gpg = ctx->accounts[i].gpg_enabled &&
+                        ctx->accounts[i].gpg_key_id[0] != '\0';
+            break;
+        }
+    }
+
+    FILE *f = fopen(hint, "w");
+    if (f) {
+        if (wants_ssh && wants_gpg)      fputs("ssh gpg\n", f);
+        else if (wants_ssh)              fputs("ssh\n", f);
+        else if (wants_gpg)              fputs("gpg\n", f);
+        else                             fputs("none\n", f);
+        fclose(f);
     }
 }
 
@@ -356,6 +387,12 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
         }
         close(tfd);
     }
+    /* SIG-02 (AR-02 #27): register the temp for signal cleanup for the span
+     * it exists. Only effective while a guard handler is installed (main()
+     * holds one across the save-after-switch); otherwise it is an inert no-op
+     * — the atomic temp+rename below protects the real file either way, this
+     * only prevents an orphaned .tmp when a signal lands mid-save. */
+    signals_scratch_register(temp_path);
 
     /* Initialize TOML document */
     toml_init_document(&toml_doc);
@@ -385,16 +422,19 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
      * content is never observable with looser permissions) */
     if (toml_write_file(&toml_doc, temp_path) != 0) {
         unlink(temp_path); /* don't leave a stale/partial .tmp behind */
+        signals_scratch_unregister(temp_path);
         goto cleanup;
     }
 
     /* Atomic move from temp to final location */
     if (rename(temp_path, config_path) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, 
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
                         "Failed to move temporary config file to final location");
         unlink(temp_path);
+        signals_scratch_unregister(temp_path);
         goto cleanup;
     }
+    signals_scratch_unregister(temp_path); /* renamed away: nothing to clean */
     
     log_info("Configuration saved successfully to: %s", config_path);
     config_update_resume_hint(ctx);
@@ -1136,14 +1176,28 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             account.id = account_id;
             account.preferred_scope = GIT_SCOPE_LOCAL; /* Default */
             
-            /* Load required fields */
+            /* Load required fields. Skipped, not dropped: toml_get_string
+             * fails here both for a MISSING field and for a value too long
+             * for the destination (e.g. a name over MAX_NAME_LEN — schema-
+             * valid, so the whole-file parse succeeded), and either way the
+             * in-memory set is now an incomplete view of the file. Without
+             * the skip count, config_save's refuse-to-rewrite guard read
+             * zero and the very next save permanently erased this section
+             * (AR-02 #5). Warn on stderr so the cause is visible. */
             if (toml_get_string(doc, sections[i], "name", account.name, sizeof(account.name)) != 0) {
-                log_error("Account %u missing required 'name' field", account_id);
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account section [%s] was skipped: 'name' is missing or "
+                                "too long (max %d bytes). Fix it in the config file.",
+                                sections[i], MAX_NAME_LEN - 1);
                 continue;
             }
-            
+
             if (toml_get_string(doc, sections[i], "email", account.email, sizeof(account.email)) != 0) {
-                log_error("Account %u missing required 'email' field", account_id);
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account section [%s] ('%s') was skipped: 'email' is "
+                                "missing or too long (max %d bytes). Fix it in the config file.",
+                                sections[i], account.name[0] ? account.name : "?",
+                                MAX_EMAIL_LEN - 1);
                 continue;
             }
             
@@ -1306,52 +1360,9 @@ static int parse_account_id_from_section(const char *section_name, uint32_t *acc
     return 0;
 }
 
-/* Decode one UTF-8 sequence starting at s, writing the codepoint to *cp_out
- * and returning the number of bytes consumed, or 0 if the sequence is
- * malformed. Deliberately strict: overlong encodings and surrogates are
- * rejected, because an overlong form (e.g. 0xE0 0x80 0x9B) is exactly how a
- * C1 terminal control sneaks past a naive byte filter into a lenient
- * terminal decoder. NUL and stray continuation bytes fail the
- * (b & 0xC0) == 0x80 test, so NUL-terminated strings need no length bound. */
-static size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
-    unsigned char b0 = s[0];
-
-    if (b0 < 0x80) {
-        *cp_out = b0;
-        return 1;
-    }
-    if (b0 >= 0xC2 && b0 <= 0xDF) {
-        if ((s[1] & 0xC0) != 0x80) return 0;
-        *cp_out = ((uint32_t)(b0 & 0x1F) << 6) | (s[1] & 0x3F);
-        return 2;
-    }
-    if (b0 >= 0xE0 && b0 <= 0xEF) {
-        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
-        if (b0 == 0xE0 && s[1] < 0xA0) return 0;              /* overlong */
-        if (b0 == 0xED && s[1] >= 0xA0) return 0;             /* surrogate */
-        *cp_out = ((uint32_t)(b0 & 0x0F) << 12) |
-                  ((uint32_t)(s[1] & 0x3F) << 6) | (s[2] & 0x3F);
-        return 3;
-    }
-    if (b0 >= 0xF0 && b0 <= 0xF4) {
-        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return 0;
-        if (b0 == 0xF0 && s[1] < 0x90) return 0;              /* overlong */
-        if (b0 == 0xF4 && s[1] > 0x8F) return 0;              /* > U+10FFFF */
-        *cp_out = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
-                  ((uint32_t)(s[2] & 0x3F) << 6) | (s[3] & 0x3F);
-        return 4;
-    }
-    return 0; /* 0x80-0xC1 lead (bare continuation/overlong) or 0xF5+ */
-}
-
-/* True if the codepoint is safe to echo to a terminal. C0 controls
- * (including ESC 0x1B and CR), DEL 0x7F, and C1 controls U+0080-U+009F
- * (0x9B is a one-byte CSI) can move the cursor, recolor output, or
- * \r-overwrite the line — enough for a hostile config field to render
- * itself as "[CURRENT] trusted-account" in list/status/whoami output. */
-static bool tty_safe_codepoint(uint32_t cp) {
-    return cp >= 0x20 && cp != 0x7F && !(cp >= 0x80 && cp <= 0x9F);
-}
+/* utf8_decode and tty_safe_codepoint moved to utils.c so the TOML parser's
+ * raw-buffer charset gate shares the exact same strict decoding policy as
+ * this trust boundary (AR-02 #6). Declared in utils.h. */
 
 /* tty-escape policy for untrusted strings that reach the terminal, applied
  * at the trust boundary (config load) rather than in the display layer:

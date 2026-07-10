@@ -113,10 +113,9 @@ static void deactivate_runtime_isolation(bool ssh, bool gpg) {
         g_session.ssh_active = false;
     }
     if (gpg) {
-        char home_symlink[MAX_PATH_LEN];
-        if (gpg_manager_get_home_path(home_symlink, sizeof(home_symlink)) == 0) {
-            unlink(home_symlink); /* drop the `current` symlink, not its target */
-        }
+        /* Locked drop: a bare unlink here raced a concurrent switch's
+         * retarget and could delete its freshly-installed link (AR-02 #9). */
+        gpg_manager_drop_current();
         g_session.gpg_active = false;
     }
 }
@@ -154,9 +153,8 @@ static void restore_previous_isolation(const account_t *prev,
 
     if (gpg_torn_down && prev_gpg_home && prev_gpg_home[0] != '\0' &&
         is_directory(prev_gpg_home)) {
-        char gpg_link[MAX_PATH_LEN];
-        if (gpg_manager_get_home_path(gpg_link, sizeof(gpg_link)) == 0 &&
-            atomic_symlink(prev_gpg_home, gpg_link) == 0) {
+        /* Locked retarget (AR-02 #9), same rationale as the drop above. */
+        if (gpg_manager_retarget_current(prev_gpg_home) == 0) {
             log_info("Restored GNUPGHOME symlink to previous account home");
         }
     }
@@ -171,6 +169,11 @@ static void restore_previous_isolation(const account_t *prev,
  * on the signal path the dispatch terminates the process instead). */
 static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
                                bool git_written, bool ssh_dirty, bool gpg_dirty) {
+    /* AR-02 #2: a second guarded signal during this rollback used to take the
+     * handler's emergency-kill branch and die mid-git_config_restore, leaving
+     * a chimera (or fully-new) identity persisted. Defer the emergency exit
+     * until the whole restore sequence has completed. */
+    signals_rollback_begin();
     if (git_written) {
         git_config_restore();
     }
@@ -182,6 +185,7 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
     restore_previous_isolation(prev, prev_gpg_home, ssh_dirty, gpg_dirty);
     /* SIG-02: drop any registered scratch temp files. */
     signals_scratch_cleanup();
+    signals_rollback_end();
     signals_guard_end();
     if (signals_pending()) {
         fprintf(stderr, "\ngitswitch: interrupted — switch rolled back, previous identity kept\n");
@@ -232,43 +236,54 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         g_session.gnupghome_saved = true;
     }
 
+    /* Boot-time resume restores only the boot-volatile runtime state (SSH
+     * agent, GNUPGHOME `current` symlink). The git config the original switch
+     * wrote is persistent and survived the reboot, so resume must neither
+     * resolve a scope nor rewrite git config — doing so made the shipped
+     * default (local scope) hard-fail whenever the login shell wasn't inside
+     * the original repo, leaving no agent restored and re-spawning a failing
+     * resume before every prompt (AR-02 #8). */
+    bool write_git = !ctx->config.resuming;
+
     /* Determine git scope. Explicit --global/--local override the account
      * preference. Writing an identity GLOBALLY affects every repository on the
      * machine, so we never silently promote local->global outside a repo:
      * require explicit consent (interactive prompt) or the --global flag. */
     git_scope_t scope = account->preferred_scope;
-    if (ctx->config.force_global) {
-        scope = GIT_SCOPE_GLOBAL;
-    } else if (ctx->config.force_local) {
-        scope = GIT_SCOPE_LOCAL;
-    }
-    if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
-        if (isatty(STDIN_FILENO)) {
-            char resp[16];
-            printf("Not in a git repository. Write %s's identity to your GLOBAL git\n"
-                   "config (affects every repository on this machine)? [y/N]: ",
-                   account->name);
-            fflush(stdout);
-            if (fgets(resp, sizeof(resp), stdin) && (resp[0] == 'y' || resp[0] == 'Y')) {
-                scope = GIT_SCOPE_GLOBAL;
+    if (write_git) {
+        if (ctx->config.force_global) {
+            scope = GIT_SCOPE_GLOBAL;
+        } else if (ctx->config.force_local) {
+            scope = GIT_SCOPE_LOCAL;
+        }
+        if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
+            if (isatty(STDIN_FILENO)) {
+                char resp[16];
+                printf("Not in a git repository. Write %s's identity to your GLOBAL git\n"
+                       "config (affects every repository on this machine)? [y/N]: ",
+                       account->name);
+                fflush(stdout);
+                if (fgets(resp, sizeof(resp), stdin) && (resp[0] == 'y' || resp[0] == 'Y')) {
+                    scope = GIT_SCOPE_GLOBAL;
+                } else {
+                    set_error(ERR_GIT_NOT_REPOSITORY,
+                              "Switch aborted: not in a git repository (pass --global to write global config)");
+                    return -1;
+                }
             } else {
                 set_error(ERR_GIT_NOT_REPOSITORY,
-                          "Switch aborted: not in a git repository (pass --global to write global config)");
+                          "Not in a git repository; pass --global to write global config, or run inside a repo");
                 return -1;
             }
-        } else {
-            set_error(ERR_GIT_NOT_REPOSITORY,
-                      "Not in a git repository; pass --global to write global config, or run inside a repo");
+        }
+
+        /* Initialize git operations if not already done */
+        if (git_ops_init() != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED, "Failed to initialize git operations");
             return -1;
         }
     }
     scope_str = (scope == GIT_SCOPE_LOCAL) ? "local" : "global";
-
-    /* Initialize git operations if not already done */
-    if (git_ops_init() != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to initialize git operations");
-        return -1;
-    }
 
     /* Show what we're doing */
     printf("Switching to account: %s <%s>\n", account->name, account->email);
@@ -320,7 +335,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 return -1;
             }
         }
-        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+        /* Skipped on resume: gpg_switch_account revalidates the key inside the
+         * isolated home (re-importing from the system keyring if the home was
+         * wiped by the reboot), so this probe adds only login latency there —
+         * and a login shell may still carry GNUPGHOME pointing at the not-yet-
+         * recreated isolated home, which would make this "system keyring"
+         * check look inside the missing home and wrongly hard-fail the resume. */
+        if (write_git && account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
             if (validate_gpg_key_availability(account->gpg_key_id) != 0) {
                 set_error(ERR_GPG_KEY_NOT_FOUND,
                           "GPG key not found in keyring: %s", account->gpg_key_id);
@@ -329,32 +350,37 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
 
         /* Nothing durable has been touched yet, so a signal up to here could
-         * simply kill us. From this point on, mutations begin: guard. */
+         * simply kill us. From this point on, mutations begin: guard.
+         *
+         * The config-save temp file is NOT registered here: the save-after-
+         * switch step in main() runs after this function has already torn the
+         * guard and scratch registry down, so a registration here never
+         * covered it (AR-02 #27). config_save registers its own temp path,
+         * and main() holds a guard across the save so that registration has a
+         * live handler behind it. */
         signals_guard_begin();
-
-        /* SIG-02: register the config-save temp path (written by the
-         * save-after-switch step in main()). It is the one scratch path whose
-         * name this file can compute; the mkstemp-based scratch files are
-         * registered at their creation sites (hook points in signals.h).
-         * Unlinking a not-yet-created path on teardown is harmless. */
-        {
-            char cfg_tmp[MAX_PATH_LEN];
-            if ((size_t)snprintf(cfg_tmp, sizeof(cfg_tmp), "%s.tmp.%d",
-                                 ctx->config.config_path, (int)getpid())
-                < sizeof(cfg_tmp)) {
-                signals_scratch_register(cfg_tmp);
-            }
-        }
 
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             log_info("Setting up SSH isolation for account: %s", account->name);
-            /* Starting the new agent reaps the previous account's agent, so
-             * the runtime SSH state is dirty from the first attempt on. */
-            ssh_dirty = true;
             memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
-            if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0 ||
-                ssh_switch_account(&g_session.ssh_config, account) != 0) {
+            /* ssh_manager_init only probes PATH for ssh-agent/ssh-add — it
+             * touches no agent, so its failure must NOT mark the runtime SSH
+             * state dirty: the abort path would then reap the previous
+             * account's healthy, untouched agent (and its best-effort restart
+             * can't re-prompt a passphrase) for a switch that never started
+             * (AR-02 #12). Dirty begins with ssh_switch_account, whose agent
+             * start reaps every other gitswitch agent from its first attempt. */
+            if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0) {
+                printf("  [!!] SSH key failed to load\n");
+                abort_failed_switch(prev_account, prev_gpg_home,
+                                    false, false, false);
+                set_error(ERR_SSH_KEY_LOAD_FAILED,
+                          "Failed to set up SSH for account: %s", account->name);
+                return -1;
+            }
+            ssh_dirty = true;
+            if (ssh_switch_account(&g_session.ssh_config, account) != 0) {
                 printf("  [!!] SSH key failed to load\n");
                 ssh_manager_cleanup(&g_session.ssh_config);
                 abort_failed_switch(prev_account, prev_gpg_home,
@@ -367,19 +393,27 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             g_session.ssh_active = true;
             printf("  [OK] SSH key loaded\n");
 
-            /* Connection test is best-effort (network) and never fatal, so we
-             * skip it entirely on the boot-time resume path — it would only
-             * stall the login shell prompt on a network round trip (up to the
-             * ssh ConnectTimeout when github.com is filtered/offline) for a
-             * result that just picks a status line. */
-            if (!ctx->config.resuming) {
+            /* Connection test is best-effort (network) and never fatal, and it
+             * blocks the whole switch on a live round trip (up to the 5s ssh
+             * ConnectTimeout, plus unbounded DNS, when the host is filtered/
+             * offline) for a result that only picks a status line. So it is
+             * skipped wherever it can't tell the user anything new (AR-02 #16):
+             *   - the boot-time resume path — it would stall the login prompt;
+             *   - a re-switch to the already-active account (reuse fast path):
+             *     the agent was just fingerprint-verified to hold this exact
+             *     key, so the probe re-proves a liveness we already have.
+             * The github.com fallback for alias-less accounts is additionally
+             * gated behind --verbose: it hardcodes a host the account never
+             * named, so by default only a configured host alias is probed. */
+            if (!ctx->config.resuming && !g_session.ssh_config.key_already_loaded) {
                 if (strlen(account->ssh_host_alias) > 0) {
                     if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
                         printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
                     } else {
                         printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
                     }
-                } else if (ssh_test_connection(account, "git@github.com") == 0) {
+                } else if (ctx->config.verbose &&
+                           ssh_test_connection(account, "git@github.com") == 0) {
                     printf("  [OK] SSH connection verified (github.com)\n");
                 }
             }
@@ -437,37 +471,44 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
 
         /* --- 4. git config LAST, snapshotted for rollback --- */
-        git_config_snapshot(scope);
-        if (git_set_config(account, scope) != 0) {
-            abort_failed_switch(prev_account, prev_gpg_home,
-                                true, ssh_dirty, gpg_dirty);
-            set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
-            return -1;
-        }
-        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-            if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
+        if (write_git) {
+            git_config_snapshot(scope);
+            if (git_set_config(account, scope) != 0) {
                 abort_failed_switch(prev_account, prev_gpg_home,
                                     true, ssh_dirty, gpg_dirty);
-                set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
+                set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
                 return -1;
             }
-            gpg_ok = true;
-            /* gpg_configure_git_signing sets commit.gpgsign to the account's
-             * preference, which may be OFF. Don't claim signing is enabled
-             * when we just disabled it — report the actual state. */
-            if (account->gpg_signing_enabled) {
-                printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
-            } else {
-                printf("  [OK] GPG key configured, signing disabled (key: %s)\n", account->gpg_key_id);
+            if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+                if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
+                    abort_failed_switch(prev_account, prev_gpg_home,
+                                        true, ssh_dirty, gpg_dirty);
+                    set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
+                    return -1;
+                }
+                gpg_ok = true;
+                /* gpg_configure_git_signing sets commit.gpgsign to the account's
+                 * preference, which may be OFF. Don't claim signing is enabled
+                 * when we just disabled it — report the actual state. */
+                if (account->gpg_signing_enabled) {
+                    printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
+                } else {
+                    printf("  [OK] GPG key configured, signing disabled (key: %s)\n", account->gpg_key_id);
+                }
             }
+            printf("  [OK] Git config set (%s scope)\n", scope_str);
+        } else {
+            /* Resume: git config was never touched, so the runtime activation
+             * above completed the restore. */
+            gpg_ok = g_session.gpg_active;
         }
-        printf("  [OK] Git config set (%s scope)\n", scope_str);
 
         /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
-         * switch back (git config was just written, so restore it too). */
+         * switch back (git config, when written, was just written — restore it
+         * too; on resume nothing was written, so nothing to restore). */
         if (signals_pending()) {
             return abort_failed_switch(prev_account, prev_gpg_home,
-                                       true, ssh_dirty, gpg_dirty);
+                                       write_git, ssh_dirty, gpg_dirty);
         }
 
         /* Point of no return: the new identity is fully applied and
@@ -481,8 +522,10 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             deactivate_runtime_isolation(false, true);
         }
 
-        /* Read-back validation is best-effort (warn only). */
-        if (git_test_config(account, scope) != 0) {
+        /* Read-back validation is best-effort (warn only). Skipped on resume:
+         * no git config was written, and the login shell's cwd is usually not
+         * the repo the original local-scope write targeted. */
+        if (write_git && git_test_config(account, scope) != 0) {
             log_warning("Git configuration validation failed: %s", get_last_error()->message);
         }
 
@@ -505,17 +548,21 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
     }
 
-    /* Test SSH functionality if enabled (basic validation) */
-    if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 && !ssh_ok) {
-        if (test_ssh_key_functionality(account) != 0) {
-            log_warning("SSH key test failed for account: %s", account->name);
+    /* Test SSH/GPG functionality if enabled (basic validation). Skipped on
+     * resume: the runtime activation above already proved both, and the GPG
+     * fallback probes the system keyring, which a login shell's stale
+     * GNUPGHOME can misdirect (see the step-1 comment). */
+    if (!ctx->config.resuming) {
+        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 && !ssh_ok) {
+            if (test_ssh_key_functionality(account) != 0) {
+                log_warning("SSH key test failed for account: %s", account->name);
+            }
         }
-    }
 
-    /* Test GPG functionality if enabled */
-    if (account->gpg_enabled && strlen(account->gpg_key_id) > 0 && !gpg_ok) {
-        if (test_gpg_key_functionality(account) != 0) {
-            log_warning("GPG key test failed for account: %s", account->name);
+        if (account->gpg_enabled && strlen(account->gpg_key_id) > 0 && !gpg_ok) {
+            if (test_gpg_key_functionality(account) != 0) {
+                log_warning("GPG key test failed for account: %s", account->name);
+            }
         }
     }
 
@@ -1182,6 +1229,12 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
         return -1;
     }
 
+    /* A gpg spawn earlier in this process already proved this key's presence
+     * — don't fork gpg again just to re-ask (AR-02 #14). */
+    if (gpg_manager_key_available_cached(gpg_key_id)) {
+        return 0;
+    }
+
     /* Look up the key in the system keyring, no shell. */
     const char *argv[] = {"gpg", "--list-secret-keys", gpg_key_id, NULL};
     run_opts_t opts;
@@ -1193,6 +1246,7 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
         return -1;
     }
 
+    gpg_manager_note_key_available(gpg_key_id);
     return 0;
 }
 

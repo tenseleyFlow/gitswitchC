@@ -21,6 +21,7 @@
 #include "git_ops.h"
 #include "ssh_manager.h"
 #include "gpg_manager.h"
+#include "signals.h"
 
 /* Long-only options (no short form). Values above 0xff avoid colliding with
  * ASCII short options handled by getopt_long. */
@@ -215,23 +216,35 @@ int main(int argc, char *argv[]) {
         return rc;
     }
 
-    /* For commands that read-modify-write the config (add/edit/remove and a
-     * bare-account switch that updates active_account), hold an exclusive
-     * cross-process lock across the WHOLE load->mutate->save cycle so two
-     * concurrent invocations can't lost-update each other. Acquire it before
-     * config_init so the load itself happens under the lock. Read-only commands
-     * (list/status/doctor/config/resume/reset) don't take it. Best-effort: if
-     * the lock can't be taken we still proceed rather than block the user. */
+    /* For commands that mutate shared state, hold an exclusive cross-process
+     * lock across the WHOLE load->mutate->save cycle. That is not just the
+     * config read-modify-writers (add/edit/remove, a bare-account switch that
+     * updates active_account): `resume` runs the full mutating accounts_switch
+     * (SSH agent retarget, GPG symlink retarget, git config write) and `reset`
+     * kills agents and retargets/deletes runtime symlinks, so both must be
+     * serialized against a concurrent switch or the final state splits git
+     * identity from the live SSH/GPG runtime (AR-02 #1: tmux-restore shells
+     * running resume while another shell switches). Acquire before config_init
+     * so the load itself happens under the lock. Only genuinely read-only
+     * commands (list/status/doctor/config) skip it. Fail closed on lock
+     * failure: silently proceeding unlocked would reopen the exact lost-update
+     * and split-identity races the lock exists to prevent (AR-02 #17). */
     int config_lock_fd = -1;
     {
         const char *c = (optind < argc) ? argv[optind] : NULL;
         bool read_only = (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
-            strcmp(c, "health") == 0 || strcmp(c, "config") == 0 ||
-            strcmp(c, "resume") == 0 || strcmp(c, "reset") == 0;
+            strcmp(c, "health") == 0 || strcmp(c, "config") == 0;
         if (!read_only) {
             config_lock_fd = config_write_lock();
+            if (config_lock_fd < 0) {
+                display_error("Could not acquire the gitswitch config lock",
+                              "another gitswitch may be stuck or the config "
+                              "directory is not writable; try again");
+                error_cleanup();
+                return EXIT_FAILURE;
+            }
         }
     }
 
@@ -344,12 +357,22 @@ int main(int argc, char *argv[]) {
          * durable, so it is intentionally excluded above to avoid backup churn. */
         
         if (should_save) {
-            log_debug("Saving configuration after %s command (account_count=%zu)", 
+            log_debug("Saving configuration after %s command (account_count=%zu)",
                      command, ctx.account_count);
+            /* SIG-02 (AR-02 #27): hold the deferring guard across the save so
+             * config_save's scratch registration of its temp file has a live
+             * handler behind it — a signal mid-save then defers instead of
+             * orphaning accounts.toml.tmp.<pid>. The command's work is already
+             * fully applied at this point, so (matching accounts_switch's
+             * success path) a deferred signal is not re-raised: the process
+             * finishes persisting and exits normally moments later. */
+            signals_guard_begin();
             if (config_save(&ctx, ctx.config.config_path) != 0) {
                 display_warning("Failed to save configuration changes");
                 /* Don't fail the command, just warn */
             }
+            signals_scratch_cleanup();
+            signals_guard_end();
         }
     }
     
@@ -626,13 +649,35 @@ static int handle_init_command(const char *shell) {
          * since a no-op resume never creates the socket the probe looks for. */
         printf("if status is-interactive\n");
         if (have_hint) {
-            /* Only probe/resume when there's a saved account to resume. */
+            /* Only probe/resume when there's a saved account to resume, and
+             * pick the probe by the account's recorded runtime needs (the
+             * hint file's content) so an SSH-less active account never spawns
+             * a doomed ssh-add + resume on every shell (AR-02 #23). Empty or
+             * unrecognized content (a pre-#23 hint written before this field
+             * existed) falls back to the ssh-add probe — same behavior as
+             * before, no regression on the first post-upgrade shell. */
             printf("    if test -e '%s'\n", hint_path);
-            printf("        env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
-            printf("        if test $status -gt 1\n");
-            printf("            gitswitch resume >/dev/null\n");
-            printf("        end\n");
-            printf("    end\n");
+            printf("        read -l __gitswitch_needs < '%s'\n", hint_path);
+            printf("        switch \"$__gitswitch_needs\"\n");
+            printf("            case '' '*ssh*'\n");
+            printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
+            printf("                if test $status -gt 1\n");
+            printf("                    gitswitch resume >/dev/null\n");
+            printf("                end\n");
+            if (have_gpg_home) {
+                /* GPG-only account: the GNUPGHOME `current` symlink is
+                 * boot-volatile (XDG_RUNTIME_DIR), so its absence is the
+                 * liveness test — a builtin test, no spawn, unlike ssh-add. */
+                printf("            case '*gpg*'\n");
+                printf("                if not test -d '%s'\n", gpg_home);
+                printf("                    gitswitch resume >/dev/null\n");
+                printf("                end\n");
+            }
+            /* 'none' (identity-only): git config is persistent, nothing to
+             * restore — no probe, no resume. */
+            printf("        end\n");            /* close switch */
+            printf("        set -e __gitswitch_needs\n");
+            printf("    end\n");                /* close `if test -e <hint>` */
         } else {
             printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
             printf("    if test $status -gt 1\n");
@@ -669,12 +714,26 @@ static int handle_init_command(const char *shell) {
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
         if (have_hint) {
-            /* Only probe/resume when there's a saved account to resume. */
+            /* Pick the probe by the account's recorded runtime needs (hint
+             * file content) so an SSH-less active account never spawns a
+             * doomed ssh-add + resume every shell (AR-02 #23). Empty/unknown
+             * content (a pre-#23 hint) falls back to the ssh-add probe. read
+             * and case are shell builtins — no extra process. */
             printf("    if [ -e '%s' ]; then\n", hint_path);
-            printf("        SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
-            printf("        if [ $? -gt 1 ]; then\n");
-            printf("            gitswitch resume >/dev/null\n");
-            printf("        fi\n");
+            printf("        IFS= read -r __gitswitch_needs < '%s' 2>/dev/null || __gitswitch_needs=ssh\n", hint_path);
+            printf("        case \"$__gitswitch_needs\" in\n");
+            printf("        ''|*ssh*)\n");
+            printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
+            printf("            [ $? -gt 1 ] && gitswitch resume >/dev/null ;;\n");
+            if (have_gpg_home) {
+                /* GPG-only: the boot-volatile GNUPGHOME symlink's absence is
+                 * the liveness test — a builtin, no ssh-add spawn. */
+                printf("        *gpg*)\n");
+                printf("            [ -d '%s' ] || gitswitch resume >/dev/null ;;\n", gpg_home);
+            }
+            /* 'none' (identity-only): nothing to restore. */
+            printf("        esac\n");
+            printf("        unset __gitswitch_needs\n");
             printf("    fi ;;\n");
         } else {
             printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
@@ -757,10 +816,13 @@ static bool resume_already_applied(const account_t *acct) {
 
 /* Re-activate the last-active account, recorded in config across reboots. This
  * is what `gitswitch init` auto-runs on the first login after a boot (when the
- * runtime SSH socket is gone), and is also usable manually. It is a thin wrapper
- * over a normal switch, so it reloads the SSH key, reasserts git identity, and
- * rebuilds the isolated GPG home + symlinks. A no-op (success) when there is no
- * saved account or it no longer exists, so it can never break a login shell. */
+ * runtime SSH socket is gone), and is also usable manually. It restores only
+ * the boot-volatile runtime state — reloads the SSH key into a fresh agent and
+ * rebuilds the isolated GPG home + symlinks. It deliberately does NOT touch
+ * git config: that is persistent, already correct from the original switch,
+ * and the login shell's cwd is rarely the repo a local-scope write would need
+ * (AR-02 #8). A no-op (success) when there is no saved account or it no longer
+ * exists, so it can never break a login shell. */
 static int handle_resume_command(gitswitch_ctx_t *ctx) {
     account_t *acct;
 
@@ -830,9 +892,12 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
     return EXIT_SUCCESS;
 }
 
-/* Tear down isolated SSH/GPG state: kill the per-account agents and delete the
- * isolated GPG homes (wiping the exported secret-key copies on disk). With an
- * account argument, only that account; otherwise all. Destructive — confirmed. */
+/* Tear down isolated SSH/GPG state: kill the per-account agents and delete
+ * (unlink) the isolated GPG homes holding the exported secret-key copies. On
+ * the default memory-backed storage that destroys the bytes; on the
+ * GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may remain forensically
+ * recoverable after deletion (AR-02 #26). With an account argument, only that
+ * account; otherwise all. Destructive — confirmed. */
 static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     char resp[16];
     const char *target = NULL;
@@ -856,10 +921,10 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
                "homes, removing every on-disk secret-key copy.\n");
     }
 
-    /* This is the most destructive operation (it wipes exported secret-key
-     * copies), so require a typed 'yes' — matching remove and stronger than a
-     * bare 'y', which is easy to hit by muscle memory. --yes skips the prompt
-     * for scripting. */
+    /* This is the most destructive operation (it deletes the exported
+     * secret-key copies), so require a typed 'yes' — matching remove and
+     * stronger than a bare 'y', which is easy to hit by muscle memory. --yes
+     * skips the prompt for scripting. */
     if (!ctx->config.assume_yes) {
         printf("Type 'yes' to continue: ");
         fflush(stdout);
@@ -874,36 +939,16 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
         }
     }
 
+    /* ssh_manager_reset already drops the stable current.sock link (under its
+     * per-dir lock) when it targets the account being reset. The redundant
+     * unlocked readlink/compare/unlink that used to live here raced a
+     * concurrent same-account re-switch: reset reaped the agent and unlinked
+     * current.sock under the lock, unlocked, the re-switch installed a fresh
+     * agent and re-pointed current.sock, and then this now-unlocked block
+     * deleted that freshly-installed live link — leaving a working agent with
+     * a dangling SSH_AUTH_SOCK (AR-02 #11). Removed; the locked cleanup in
+     * ssh_manager_reset is the single source of truth. */
     ssh_manager_reset(target);
-
-    /* ssh_manager_reset(<name>) kills that account's agent and unlinks its
-     * ssh-agent.<name>.sock + pid sidecar, but leaves the stable current.sock
-     * symlink behind — if it pointed at the account just reset, integrated
-     * shells keep exporting SSH_AUTH_SOCK at a dead socket. Mirror the GPG
-     * side's dangling-symlink cleanup: drop current.sock only when its target
-     * names this account's socket, so a link at some other account's live
-     * agent is left intact. Idempotent by construction (once the link is gone
-     * readlink fails and we do nothing), so it composes safely should
-     * ssh_manager_reset learn to do this cleanup itself (F3). */
-    if (target) {
-        char link_path[MAX_PATH_LEN];
-        char link_target[MAX_PATH_LEN];
-        char expected[MAX_PATH_LEN];
-        if (ssh_manager_get_auth_sock_path(link_path, sizeof(link_path)) == 0) {
-            ssize_t len = readlink(link_path, link_target, sizeof(link_target) - 1);
-            if (len > 0 && (size_t)len < sizeof(link_target) - 1) {
-                const char *base;
-                link_target[len] = '\0';
-                base = strrchr(link_target, '/');
-                base = base ? base + 1 : link_target;
-                if ((size_t)snprintf(expected, sizeof(expected),
-                                     "ssh-agent.%s.sock", target) < sizeof(expected) &&
-                    strcmp(base, expected) == 0) {
-                    unlink(link_path);
-                }
-            }
-        }
-    }
 
     gpg_manager_reset(target);
 

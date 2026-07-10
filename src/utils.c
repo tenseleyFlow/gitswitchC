@@ -589,6 +589,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->term_signal = 0;
     result->spawned = false;
     result->out_len = 0;
+    result->out_truncated = false;
 
     if (!argv || !argv[0]) {
         set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
@@ -687,6 +688,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     int infd = want_in ? in_pipe[1] : -1;
     int outfd = want_out ? out_pipe[0] : -1;
     size_t in_off = 0, out_off = 0;
+    /* Function-scope (not loop-scope) so it can be scrubbed after the loop:
+     * captured child stdout transits this buffer, and for the GPG secret-key
+     * export that is unencrypted private-key material — the caller scrubs its
+     * own copy, but these bytes would otherwise stay resident in this frame
+     * after return (AR-02 #25). */
+    char rdbuf[4096];
     if (infd >= 0) set_nonblock(infd);
     if (outfd >= 0) set_nonblock(outfd);
 
@@ -722,16 +729,22 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         }
 
         if (out_idx >= 0 && (pfds[out_idx].revents & (POLLIN | POLLERR | POLLHUP))) {
-            char buf[4096];
-            ssize_t r = read(outfd, buf, sizeof(buf));
+            ssize_t r = read(outfd, rdbuf, sizeof(rdbuf));
             if (r > 0) {
+                size_t cp = 0;
                 if (out_off < opts->out_size - 1) {
                     size_t space = opts->out_size - 1 - out_off;
-                    size_t cp = ((size_t)r < space) ? (size_t)r : space;
-                    memcpy(opts->out + out_off, buf, cp);
+                    cp = ((size_t)r < space) ? (size_t)r : space;
+                    memcpy(opts->out + out_off, rdbuf, cp);
                     out_off += cp;
                 }
-                /* keep draining even when the capture buffer is full */
+                /* Bytes beyond the capture buffer are still drained (so the
+                 * child never blocks) but LOST — record that, so callers that
+                 * feed `out` onward can refuse the incomplete copy instead of
+                 * silently processing corrupt data (AR-02 #4). */
+                if (cp < (size_t)r) {
+                    result->out_truncated = true;
+                }
             } else if (r == 0) {
                 close(outfd); outfd = -1;
             } else if (r < 0 && errno != EAGAIN && errno != EINTR) {
@@ -739,7 +752,11 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             }
         }
     }
-    if (want_out) opts->out[out_off] = '\0';
+    if (want_out) {
+        opts->out[out_off] = '\0';
+        /* Drop the transit copy of the child's output (AR-02 #25). */
+        secure_zero_memory(rdbuf, sizeof(rdbuf));
+    }
     result->out_len = out_off;
 
     int status = 0;
@@ -815,6 +832,25 @@ static bool exec_candidate_is_trusted(const char *path) {
     return access(path, X_OK) == 0;
 }
 
+/* Process-lifetime memo for find_command_path (AR-02 #24): one switch
+ * resolves the same handful of helpers (git, ssh-add, gpg, ...) ~16 times —
+ * init-time probes plus every run_argv spawn — and each resolution walks the
+ * trusted-PATH at ~3 syscalls per entry, ~550 redundant stat/access calls per
+ * switch. Sub-millisecond warm, but each stat is a network round trip on cold
+ * NFS/autofs PATH entries. Keyed on the exact PATH string so an intra-process
+ * PATH change (tests do this) drops the cache. Positive results only: a miss
+ * usually aborts the command anyway, and caching one could outlive a
+ * transient failure. Single-threaded, like the other utils caches. */
+#define CMD_MEMO_SLOTS 16
+#define CMD_MEMO_NAME_LEN 32
+typedef struct {
+    char name[CMD_MEMO_NAME_LEN];
+    char path[MAX_PATH_LEN];
+} cmd_memo_slot_t;
+static cmd_memo_slot_t g_cmd_memo[CMD_MEMO_SLOTS];
+static size_t g_cmd_memo_used = 0;
+static char *g_cmd_memo_pathenv = NULL;
+
 int find_command_path(const char *name, char *buf, size_t size) {
     const char *path_env;
     const char *p;
@@ -851,6 +887,22 @@ int find_command_path(const char *name, char *buf, size_t size) {
         path_env = "/usr/local/bin:/usr/bin:/bin";
     }
 
+    /* Memo lookup, valid only while PATH is byte-identical to the PATH the
+     * cache was filled under. Staleness within one short-lived process (a
+     * memoized binary deleted mid-run) is the same resolve-to-exec TOCTOU
+     * window that already exists for a single call. */
+    if (!g_cmd_memo_pathenv || strcmp(g_cmd_memo_pathenv, path_env) != 0) {
+        free(g_cmd_memo_pathenv);
+        g_cmd_memo_pathenv = strdup(path_env);
+        g_cmd_memo_used = 0;
+    } else {
+        for (size_t i = 0; i < g_cmd_memo_used; i++) {
+            if (strcmp(g_cmd_memo[i].name, name) == 0) {
+                return safe_strncpy(buf, g_cmd_memo[i].path, size);
+            }
+        }
+    }
+
     /* Walk colon-separated PATH entries, testing <dir>/<name> in each trusted
      * directory. Untrusted entries are skipped, not fatal: a stray "." or o+w
      * dir in PATH must not hide the real /usr/bin/git behind it. An empty
@@ -870,6 +922,14 @@ int find_command_path(const char *name, char *buf, size_t size) {
             candidate[dirlen] = '/';
             strcpy(candidate + dirlen + 1, name);
             if (exec_dir_is_trusted(dir) && exec_candidate_is_trusted(candidate)) {
+                if (g_cmd_memo_pathenv && g_cmd_memo_used < CMD_MEMO_SLOTS &&
+                    strlen(name) < CMD_MEMO_NAME_LEN) {
+                    cmd_memo_slot_t *slot = &g_cmd_memo[g_cmd_memo_used];
+                    if (safe_strncpy(slot->name, name, sizeof(slot->name)) == 0 &&
+                        safe_strncpy(slot->path, candidate, sizeof(slot->path)) == 0) {
+                        g_cmd_memo_used++;
+                    }
+                }
                 if (safe_strncpy(buf, candidate, size) != 0) return -1;
                 return 0;
             }
@@ -1012,6 +1072,74 @@ bool validate_name(const char *name) {
     }
 
     return false;
+}
+
+/* ssh-1 (shared; moved from git_ops.c for AR-02 #10): the account SSH key
+ * path ends up in two security-sensitive sinks, and EACH sink must apply this
+ * check itself rather than assume the other (or the TOML-load sanitizer)
+ * already did:
+ *
+ *  1. core.sshCommand — the ONE git config value git hands to /bin/sh. The
+ *     path is wrapped in single quotes; inside '...' the shell treats every
+ *     byte literally EXCEPT a single quote, which ends the quote and lets a
+ *     crafted path smuggle extra ssh options (-oProxyCommand=..., i.e.
+ *     arbitrary code on the next fetch). Guarded in git_configure_ssh.
+ *  2. ~/.ssh/config — the same path is emitted as an "IdentityFile <path>"
+ *     line by the host-alias support. There, a \n or \r starts a new line,
+ *     i.e. injects an arbitrary ssh_config keyword (ProxyCommand again), and
+ *     a quote breaks the directive's tokenization. Guarded in
+ *     ssh_configure_host_alias.
+ *
+ * So reject both quote characters and every control byte (\n and \r included)
+ * up front, before the path is probed or written anywhere. A real SSH key
+ * path never needs any of these. */
+bool is_safe_ssh_key_path(const char *path) {
+    for (const char *p = path; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x7f || c == '\'' || c == '"') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Shared strict UTF-8 decoding and terminal-safety policy — moved here from
+ * config.c so the TOML parser's raw-buffer charset gate can apply the same
+ * rules instead of rejecting every byte >= 0x80 (AR-02 #6). See utils.h for
+ * the full rationale. */
+size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
+    unsigned char b0 = s[0];
+
+    if (b0 < 0x80) {
+        *cp_out = b0;
+        return 1;
+    }
+    if (b0 >= 0xC2 && b0 <= 0xDF) {
+        if ((s[1] & 0xC0) != 0x80) return 0;
+        *cp_out = ((uint32_t)(b0 & 0x1F) << 6) | (s[1] & 0x3F);
+        return 2;
+    }
+    if (b0 >= 0xE0 && b0 <= 0xEF) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
+        if (b0 == 0xE0 && s[1] < 0xA0) return 0;              /* overlong */
+        if (b0 == 0xED && s[1] >= 0xA0) return 0;             /* surrogate */
+        *cp_out = ((uint32_t)(b0 & 0x0F) << 12) |
+                  ((uint32_t)(s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+        return 3;
+    }
+    if (b0 >= 0xF0 && b0 <= 0xF4) {
+        if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return 0;
+        if (b0 == 0xF0 && s[1] < 0x90) return 0;              /* overlong */
+        if (b0 == 0xF4 && s[1] > 0x8F) return 0;              /* > U+10FFFF */
+        *cp_out = ((uint32_t)(b0 & 0x07) << 18) | ((uint32_t)(s[1] & 0x3F) << 12) |
+                  ((uint32_t)(s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+        return 4;
+    }
+    return 0; /* 0x80-0xC1 lead (bare continuation/overlong) or 0xF5+ */
+}
+
+bool tty_safe_codepoint(uint32_t cp) {
+    return cp >= 0x20 && cp != 0x7F && !(cp >= 0x80 && cp <= 0x9F);
 }
 
 bool validate_key_id(const char *key_id) {
