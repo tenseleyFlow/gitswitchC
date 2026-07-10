@@ -43,7 +43,7 @@ void display_header(const char *title);
 /**
  * Print status message with appropriate color and icon
  */
-void display_status(const char *level, const char *message, ...);
+void display_status(const char *level, const char *message, ...) GS_PRINTF_FMT(2, 3);
 
 /* These functions will be implemented in later phases
 void display_current_status(const git_current_config_t *config);
@@ -70,22 +70,22 @@ void display_clear_line(void);
 /**
  * Print error message with context
  */
-void display_error(const char *context, const char *message, ...);
+void display_error(const char *context, const char *message, ...) GS_PRINTF_FMT(2, 3);
 
 /**
  * Print warning message
  */
-void display_warning(const char *message, ...);
+void display_warning(const char *message, ...) GS_PRINTF_FMT(1, 2);
 
 /**
  * Print success message
  */
-void display_success(const char *message, ...);
+void display_success(const char *message, ...) GS_PRINTF_FMT(1, 2);
 
 /**
  * Print info message
  */
-void display_info(const char *message, ...);
+void display_info(const char *message, ...) GS_PRINTF_FMT(1, 2);
 
 /**
  * Format and colorize text based on content type

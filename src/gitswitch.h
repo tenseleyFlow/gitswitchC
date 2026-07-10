@@ -18,6 +18,16 @@
 #endif
 #define GITSWITCH_NAME "gitswitch-c"
 
+/* printf-style format checking for our variadic diagnostics (AR-06 F09
+ * residual): lets -Wformat catch a caller that ever passes runtime data as the
+ * format string (the CWE-134 class) or mismatches a conversion, at compile
+ * time. fmt_idx/va_idx are 1-based argument positions. No-op on non-GNU C. */
+#if defined(__GNUC__)
+#define GS_PRINTF_FMT(fmt_idx, va_idx) __attribute__((format(printf, fmt_idx, va_idx)))
+#else
+#define GS_PRINTF_FMT(fmt_idx, va_idx)
+#endif
+
 /* Configuration constants */
 #define MAX_PATH_LEN 4096
 #define MAX_NAME_LEN 256

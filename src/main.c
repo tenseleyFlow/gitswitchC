@@ -274,7 +274,7 @@ int main(int argc, char *argv[]) {
     /* Initialize configuration system */
     log_info("Initializing gitswitch-c configuration system");
     if (config_init(&ctx) != 0) {
-        display_error("Configuration initialization failed", get_last_error()->message);
+        display_error("Configuration initialization failed", "%s", get_last_error()->message);
         error_cleanup();
         return EXIT_CONFIG_ERROR;
     }
@@ -420,7 +420,7 @@ int main(int argc, char *argv[]) {
                  * discarded (add/edit) or while active_account went stale
                  * for the next boot's resume (switch). */
                 display_error("Failed to save configuration changes",
-                              get_last_error()->message);
+                              "%s", get_last_error()->message);
                 exit_code = EXIT_FAILURE;
             }
             signals_scratch_cleanup();
@@ -471,12 +471,12 @@ static int handle_add_command(gitswitch_ctx_t *ctx) {
      * "Account added successfully!" at exit 0 — helps nobody. Fail up front
      * with the reason instead. */
     if (config_check_rewritable(ctx) != 0) {
-        display_error("Cannot add an account right now", get_last_error()->message);
+        display_error("Cannot add an account right now", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
     if (accounts_add_interactive(ctx) != 0) {
-        display_error("Failed to add account", get_last_error()->message);
+        display_error("Failed to add account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
@@ -495,12 +495,12 @@ static int handle_edit_command(gitswitch_ctx_t *ctx, const char *identifier) {
 
     /* AR-03 M9: same up-front refusal as `add` — see handle_add_command. */
     if (config_check_rewritable(ctx) != 0) {
-        display_error("Cannot edit an account right now", get_last_error()->message);
+        display_error("Cannot edit an account right now", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
     if (accounts_edit_interactive(ctx, identifier) != 0) {
-        display_error("Failed to edit account", get_last_error()->message);
+        display_error("Failed to edit account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
@@ -528,7 +528,7 @@ static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier) {
      * (A remove here could only ever target a HEALTHY account anyway: the
      * skipped ones aren't in memory to be found.) */
     if (config_check_rewritable(ctx) != 0) {
-        display_error("Cannot remove an account right now", get_last_error()->message);
+        display_error("Cannot remove an account right now", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
@@ -552,7 +552,7 @@ static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier) {
     }
 
     if (accounts_remove(ctx, identifier) != 0) {
-        display_error("Failed to remove account", get_last_error()->message);
+        display_error("Failed to remove account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
     
@@ -573,7 +573,7 @@ static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier) {
     }
 
     if (accounts_switch(ctx, identifier) != 0) {
-        display_error("Failed to switch account", get_last_error()->message);
+        display_error("Failed to switch account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
@@ -619,7 +619,7 @@ static int handle_doctor_command(gitswitch_ctx_t *ctx) {
     if (config_validate(ctx) == 0) {
         display_success("Configuration validation passed");
     } else {
-        display_error("Configuration validation failed", get_last_error()->message);
+        display_error("Configuration validation failed", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
     
@@ -657,7 +657,7 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
                     display_success("Default configuration created");
                     printf("Please edit the file to add your accounts.\n");
                 } else {
-                    display_error("Failed to create default configuration", get_last_error()->message);
+                    display_error("Failed to create default configuration", "%s", get_last_error()->message);
                     return EXIT_FAILURE;
                 }
             }
