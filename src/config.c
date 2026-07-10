@@ -864,15 +864,31 @@ int config_create_default(const char *config_path) {
         return -1;
     }
 
-    /* Write default template */
-    if (fwrite(default_config_template, 1, strlen(default_config_template), file) != 
+    /* Write default template. On failure unlink the final path (AR-06 F18): the
+     * old path left a truncated accounts.toml behind that bricked every later
+     * command (unlike the fdopen-failure path just above, which unlinks). */
+    if (fwrite(default_config_template, 1, strlen(default_config_template), file) !=
         strlen(default_config_template)) {
         set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to write default config content");
         fclose(file);
+        unlink(config_path);
         return -1;
     }
-    
-    fclose(file);
+
+    /* Durable, CHECKED close (AR-06 F18): stdio buffers the write, so ENOSPC/EIO
+     * often surface only at flush/close. The old bare fclose could report
+     * success with a truncated config. */
+    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to flush default config to disk");
+        fclose(file);
+        unlink(config_path);
+        return -1;
+    }
+    if (fclose(file) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to close default config file");
+        unlink(config_path);
+        return -1;
+    }
 
     log_info("Created default configuration file: %s", config_path);
     return 0;

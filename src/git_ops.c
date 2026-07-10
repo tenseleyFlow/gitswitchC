@@ -570,6 +570,39 @@ int git_set_config(const account_t *account, git_scope_t scope) {
 }
 
 /* Get current git configuration */
+/* Read the EFFECTIVE (merged) config with a single scope-flag-less
+ * `git config --list -z` — git resolves per-KEY precedence (local > global >
+ * system) internally, so this reports the values a commit would actually use.
+ * Read-only status path: does not seed the scope-keyed exec cache. Keys not
+ * present stay absent; a too-long value is marked present/value_unknown. */
+static void git_read_effective_keys(git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+    char list[16384];
+    run_opts_t opts;
+    run_result_t res;
+    const char *argv[] = { "git", "config", "--list", "-z", NULL };
+
+    git_init_kv(out);
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    opts.out = list;
+    opts.out_size = sizeof(list);
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &res) != 0 || res.out_truncated) {
+        return; /* leave all absent: a truncated/failed read must not lie */
+    }
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        cfg_z_result_t zr = parse_config_z_value(list, res.out_len,
+                                                 g_managed_keys[i],
+                                                 out[i].value, sizeof(out[i].value));
+        if (zr == CFG_Z_TOO_LONG) {
+            out[i].present = true;
+            out[i].value_unknown = true;
+        } else {
+            out[i].present = (zr == CFG_Z_FOUND);
+        }
+    }
+}
+
 int git_get_current_config(git_current_config_t *config) {
     if (!config) {
         set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
@@ -625,22 +658,35 @@ int git_get_current_config(git_current_config_t *config) {
         return -1;
     }
 
-    /* user.email must come from the same scope */
-    if (!kv[k_email].present || kv[k_email].value_unknown) {
+    /* Resolve email/signingkey/gpgsign from the EFFECTIVE (merged) config, not
+     * from user.name's scope (AR-06 F21). Git resolves each key independently:
+     * a repo that overrides only user.email locally would otherwise report the
+     * GLOBAL email (with a false "matches account"), and a split where user.name
+     * is global but user.email is local reported "No git configuration found".
+     * The name scope above stays as the reported Configuration Scope label. */
+    git_kv_t eff[GIT_MANAGED_KEY_COUNT];
+    git_read_effective_keys(eff);
+
+    if (!eff[k_email].present || eff[k_email].value_unknown) {
         set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
         return -1;
     }
 
-    safe_strncpy(config->name, kv[k_name].value, sizeof(config->name));
-    safe_strncpy(config->email, kv[k_email].value, sizeof(config->email));
+    /* Prefer the effective name too (identical to the name-scope value in the
+     * common case, since the probe order matches git's precedence). */
+    if (eff[k_name].present && !eff[k_name].value_unknown) {
+        safe_strncpy(config->name, eff[k_name].value, sizeof(config->name));
+    } else {
+        safe_strncpy(config->name, kv[k_name].value, sizeof(config->name));
+    }
+    safe_strncpy(config->email, eff[k_email].value, sizeof(config->email));
 
-    /* GPG configuration, if available in that scope */
-    if (kv[k_signkey].present && !kv[k_signkey].value_unknown) {
-        safe_strncpy(config->signing_key, kv[k_signkey].value,
+    if (eff[k_signkey].present && !eff[k_signkey].value_unknown) {
+        safe_strncpy(config->signing_key, eff[k_signkey].value,
                      sizeof(config->signing_key));
     }
-    if (kv[k_gpgsign].present && !kv[k_gpgsign].value_unknown) {
-        config->gpg_signing_enabled = (strcmp(kv[k_gpgsign].value, "true") == 0);
+    if (eff[k_gpgsign].present && !eff[k_gpgsign].value_unknown) {
+        config->gpg_signing_enabled = (strcmp(eff[k_gpgsign].value, "true") == 0);
     }
 
     config->valid = true;
