@@ -55,6 +55,12 @@ static char g_gpg_link[512];   /* <xdg>/gitswitch-gpg/current */
 static int setup_runtime_dir(void) {
     char path[512];
 
+    /* Some SSH rollback cases intentionally leave a restored session active.
+     * Later GPG cases may clear it on platforms where gpg is installed, which
+     * made the signal tests accidentally depend on the hosted tool matrix.
+     * Start every case from a clean process session before changing XDG. */
+    if (accounts_session_cleanup() != 0) return -1;
+
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_XXXXXX");
     if (!mkdtemp(g_xdg)) return -1;
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
