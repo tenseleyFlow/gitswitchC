@@ -316,16 +316,9 @@ memcheck:
 	fi
 endif
 
-# Documentation generation
-.PHONY: docs
-docs:
-	@echo "Generating documentation..."
-	@mkdir -p $(DOCDIR)
-	@if command -v doxygen >/dev/null 2>&1; then \
-		doxygen Doxyfile; \
-	else \
-		echo "doxygen not installed - skipping documentation generation"; \
-	fi
+# No docs target: it invoked `doxygen Doxyfile` against a Doxyfile that never
+# existed in the repo or the dist manifest — failing for anyone with doxygen
+# installed and false-succeeding (empty docs/) for everyone else (AR-05 L4).
 
 # Clean targets
 .PHONY: clean
@@ -379,7 +372,6 @@ deps:
 	@command -v clang-format >/dev/null 2>&1 && echo "   clang-format" || echo "   clang-format - for formatting"
 	@command -v valgrind >/dev/null 2>&1 && echo "   valgrind" || echo "   valgrind - for memory checking"
 	@command -v flawfinder >/dev/null 2>&1 && echo "   flawfinder" || echo "   flawfinder - for security scanning"
-	@command -v doxygen >/dev/null 2>&1 && echo "   doxygen" || echo "   doxygen - for documentation"
 
 # Help target
 .PHONY: help
@@ -399,7 +391,6 @@ help:
 	@echo "  analyze      Run static analysis"
 	@echo "  security-scan Run security scan"
 	@echo "  memcheck     Run memory checker (requires a clean release build)"
-	@echo "  docs         Generate documentation"
 	@echo "  deps         Check dependencies"
 	@echo "  info         Show build information"
 	@echo "  dev          Quick development cycle (clean + debug + test)"
