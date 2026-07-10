@@ -491,12 +491,14 @@ static int handle_init_command(const char *shell) {
          * (exit > 1 means no agent reachable) rather than `test -S`, because a
          * stale socket file left behind after a reboot — common on macOS, which
          * doesn't wipe /tmp — passes a plain -S test and would silently skip
-         * resume. Interactive-gated so pinentry has a user; the notice explains
-         * the PIN prompt that follows (pinentry draws on the TTY directly). */
+         * resume. Interactive-gated so pinentry has a user. The "restoring your
+         * account" notice is printed by `resume` itself (on stderr, past the
+         * stdout suppression) only when it actually has an account to restore —
+         * echoing it here would nag on every shell when there is nothing saved,
+         * since a no-op resume never creates the socket the probe looks for. */
         printf("if status is-interactive\n");
         printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
         printf("    if test $status -gt 1\n");
-        printf("        echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
         printf("        gitswitch resume >/dev/null\n");
         printf("    end\n");
         printf("end\n");
@@ -524,11 +526,12 @@ static int handle_init_command(const char *shell) {
          * (exit > 1 means no agent reachable) rather than `test -S`, because a
          * stale socket file left behind after a reboot — common on macOS, which
          * doesn't wipe /tmp — passes a plain -S test and would silently skip
-         * resume. Interactive-gated so pinentry has a user. */
+         * resume. Interactive-gated so pinentry has a user. The notice comes
+         * from `resume` itself (stderr) only when there is an account to
+         * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
         printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
         printf("    if [ $? -gt 1 ]; then\n");
-        printf("        echo \"gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\" >&2\n");
         printf("        gitswitch resume >/dev/null\n");
         printf("    fi ;;\n");
         printf("esac\n");
@@ -567,6 +570,15 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
                   ctx->config.active_account);
         return EXIT_SUCCESS;
     }
+
+    /* On stderr (the `init` snippet suppresses stdout), and only once we know
+     * there is something to resume: the snippet re-runs resume on every shell
+     * where the agent probe fails, and a machine with no saved account would
+     * otherwise see this notice before every prompt. Printed ahead of the
+     * switch so it explains the GPG PIN prompt that may follow (pinentry
+     * draws on the TTY directly). */
+    fprintf(stderr,
+            "gitswitch: restoring your last account (you may be prompted for your GPG PIN)...\n");
 
     if (accounts_switch(ctx, ctx->config.active_account) != 0) {
         /* Emitted to stderr (not the suppressed stdout) so a failed login-time
