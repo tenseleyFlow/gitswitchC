@@ -23,7 +23,9 @@
  * format string (the CWE-134 class) or mismatches a conversion, at compile
  * time. fmt_idx/va_idx are 1-based argument positions. No-op on non-GNU C. */
 #if defined(__GNUC__)
-#define GS_PRINTF_FMT(fmt_idx, va_idx) __attribute__((format(printf, fmt_idx, va_idx)))
+/* The 'printf' below is the compiler's format archetype, not a printf CALL;
+ * flawfinder's format matcher flags it, so the ignore sits on the same line. */
+#define GS_PRINTF_FMT(fmt_idx, va_idx) __attribute__((format(printf, fmt_idx, va_idx))) /* flawfinder: ignore */
 #else
 #define GS_PRINTF_FMT(fmt_idx, va_idx)
 #endif

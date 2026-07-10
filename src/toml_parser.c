@@ -75,8 +75,11 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     
     /* Security: Check file size limit */
     if (file_stat.st_size > TOML_MAX_FILE_SIZE) {
-        set_error(ERR_CONFIG_INVALID, "Configuration file too large: %ld bytes (max: %d)", 
-                  file_stat.st_size, TOML_MAX_FILE_SIZE);
+        /* Cast to long: off_t is long long on macOS/clang (Wformat error under
+         * -Werror) but long on Linux; the value is bounded small here (just
+         * over the max), so no truncation. Mirrors config.c's size check. */
+        set_error(ERR_CONFIG_INVALID, "Configuration file too large: %ld bytes (max: %d)",
+                  (long)file_stat.st_size, TOML_MAX_FILE_SIZE);
         return -1;
     }
     
