@@ -323,8 +323,11 @@ TEST(config_save_registers_and_unregisters_its_temp) {
 TEST(load_strips_cr_from_description) {
     /* The classic line-overwrite spoof: an escape-decoded \r renders
      * "[CURRENT] trusted" over the real row. Locks the layered guarantee —
-     * whichever of the TOML retrieval sanitizer or the config-load strip
-     * handles it, no CR may reach the loaded description. */
+     * whichever layer handles it, no CR may reach the loaded description.
+     * Since AR-03 M6 the handling layer is toml_get_string, which REFUSES a
+     * value sanitization would alter instead of repairing it, so the loader
+     * takes its description-absent fallback (name) rather than receiving a
+     * stripped spelling that the next save would silently persist. */
     const char *cfg =
         "[settings]\n"
         "default_scope = \"local\"\n"
@@ -343,7 +346,7 @@ TEST(load_strips_cr_from_description) {
     CHECK_EQ_INT(ctx.account_count, 1);
     if (ctx.account_count == 1) {
         CHECK(strchr(ctx.accounts[0].description, '\r') == NULL);
-        CHECK_STR_EQ(ctx.accounts[0].description, "evil[CURRENT] trusted");
+        CHECK_STR_EQ(ctx.accounts[0].description, "alice"); /* name fallback */
     }
 }
 
