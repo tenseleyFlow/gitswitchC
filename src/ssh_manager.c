@@ -19,16 +19,21 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/un.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <poll.h>
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
 #ifdef __linux__
 #include <sys/syscall.h>
+#endif
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/sysctl.h>
 #endif
 
 #include "ssh_manager.h"
@@ -43,7 +48,182 @@ static int setup_ssh_environment(ssh_config_t *ssh_config);
 static int create_isolated_agent_socket_dir(char *socket_dir, size_t socket_dir_size);
 static int validate_ssh_agent_socket(const char *socket_path);
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
-static void kill_orphaned_gitswitch_agents(const char *keep_account);
+static int kill_orphaned_gitswitch_agents(const char *keep_account);
+
+typedef struct {
+    char *auth_sock;
+    char *agent_pid;
+} ssh_env_snapshot_t;
+
+/* Narrow dependency seam for exercising partial setenv failures. Production
+ * always uses libc setenv; tests can replace it temporarily and must restore
+ * the returned previous function. Snapshot rollback deliberately keeps using
+ * libc directly so an injected failure cannot disable recovery itself. */
+static ssh_setenv_fn g_ssh_setenv = setenv;
+
+ssh_setenv_fn ssh_manager_set_setenv_fn(ssh_setenv_fn fn) {
+    ssh_setenv_fn previous = g_ssh_setenv;
+    g_ssh_setenv = fn ? fn : setenv;
+    return previous;
+}
+
+/* setup_ssh_environment mutates the process environment before the stable
+ * current.sock link is committed. Preserve the old values so a failed commit
+ * does not leave this process pointed at an account it rejected. */
+static int ssh_env_snapshot_take(ssh_env_snapshot_t *snapshot) {
+    const char *value;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    value = getenv("SSH_AUTH_SOCK");
+    if (value) {
+        snapshot->auth_sock = strdup(value);
+        if (!snapshot->auth_sock) {
+            set_error(ERR_MEMORY_ALLOCATION, "Failed to snapshot SSH_AUTH_SOCK");
+            return -1;
+        }
+    }
+    value = getenv("SSH_AGENT_PID");
+    if (value) {
+        snapshot->agent_pid = strdup(value);
+        if (!snapshot->agent_pid) {
+            free(snapshot->auth_sock);
+            snapshot->auth_sock = NULL;
+            set_error(ERR_MEMORY_ALLOCATION, "Failed to snapshot SSH_AGENT_PID");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void ssh_env_snapshot_restore(ssh_env_snapshot_t *snapshot) {
+    if (snapshot->auth_sock) {
+        (void)setenv("SSH_AUTH_SOCK", snapshot->auth_sock, 1);
+    } else {
+        (void)unsetenv("SSH_AUTH_SOCK");
+    }
+    if (snapshot->agent_pid) {
+        (void)setenv("SSH_AGENT_PID", snapshot->agent_pid, 1);
+    } else {
+        (void)unsetenv("SSH_AGENT_PID");
+    }
+    free(snapshot->auth_sock);
+    free(snapshot->agent_pid);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static void ssh_env_snapshot_discard(ssh_env_snapshot_t *snapshot) {
+    free(snapshot->auth_sock);
+    free(snapshot->agent_pid);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+/* Return true only for a NUL-separated argv whose executable is ssh-agent and
+ * whose `-a` value is the exact managed socket. Requiring the option/value
+ * pair, rather than a substring anywhere in the command line, avoids adopting
+ * or signaling another ssh-agent whose unrelated argument merely mentions the
+ * same path. */
+static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
+                                  const char *expected_sock) {
+    bool expect_socket = false;
+    bool matched_socket = false;
+    size_t offset = 0;
+    size_t index = 0;
+
+    if (!argv || argv_len == 0 || !expected_sock || !*expected_sock) {
+        return false;
+    }
+
+    while (offset < argv_len) {
+        const char *token = argv + offset;
+        size_t token_len = strnlen(token, argv_len - offset);
+        if (token_len == argv_len - offset) {
+            return false; /* truncated/non-terminated process arguments */
+        }
+        if (token_len == 0) {
+            offset++;
+            continue;
+        }
+
+        if (index == 0) {
+            const char *basename = strrchr(token, '/');
+            basename = basename ? basename + 1 : token;
+            if (strcmp(basename, "ssh-agent") != 0) {
+                return false;
+            }
+        } else if (expect_socket) {
+            if (strcmp(token, expected_sock) != 0) {
+                return false;
+            }
+            matched_socket = true;
+            expect_socket = false;
+        } else if (strcmp(token, "-a") == 0) {
+            if (matched_socket) {
+                return false; /* ambiguous duplicate socket option */
+            }
+            expect_socket = true;
+        }
+
+        index++;
+        offset += token_len + 1;
+    }
+    return matched_socket && !expect_socket;
+}
+
+#ifdef __APPLE__
+/* KERN_PROCARGS2 includes the environment after argv. Parse exactly the argc
+ * entries reported by the kernel so an environment variable that happens to
+ * contain "-a" and a managed socket can never authorize signaling a process.
+ * Empty argv entries still count toward argc, as they do in the kernel's
+ * flattened representation. */
+static bool counted_argv_is_our_ssh_agent(const char *argv, size_t argv_len,
+                                          int argc,
+                                          const char *expected_sock) {
+    bool expect_socket = false;
+    bool matched_socket = false;
+    size_t offset = 0;
+
+    if (!argv || argv_len == 0 || argc <= 0 ||
+        !expected_sock || !*expected_sock) {
+        return false;
+    }
+
+    for (int index = 0; index < argc; index++) {
+        const char *token;
+        size_t token_len;
+
+        if (offset >= argv_len) {
+            return false;
+        }
+        token = argv + offset;
+        token_len = strnlen(token, argv_len - offset);
+        if (token_len == argv_len - offset) {
+            return false; /* truncated/non-terminated argv entry */
+        }
+
+        if (index == 0) {
+            const char *basename = strrchr(token, '/');
+            basename = basename ? basename + 1 : token;
+            if (strcmp(basename, "ssh-agent") != 0) {
+                return false;
+            }
+        } else if (expect_socket) {
+            if (strcmp(token, expected_sock) != 0) {
+                return false;
+            }
+            matched_socket = true;
+            expect_socket = false;
+        } else if (strcmp(token, "-a") == 0) {
+            if (matched_socket) {
+                return false; /* ambiguous duplicate socket option */
+            }
+            expect_socket = true;
+        }
+
+        offset += token_len + 1;
+    }
+    return matched_socket && !expect_socket;
+}
+#endif
 
 /* Best-effort check that a PID recorded in a sidecar still belongs to OUR
  * ssh-agent before we SIGTERM it. Sidecars can outlive their agent (crash,
@@ -51,12 +231,10 @@ static void kill_orphaned_gitswitch_agents(const char *keep_account);
  * PID, a blind kill would terminate an unrelated process. Checking only that
  * the PID is *an* ssh-agent is not enough: the recycled PID may belong to the
  * user's OWN login/session ssh-agent (comm is also "ssh-agent"), and killing it
- * drops every key they had loaded. So on Linux we require BOTH comm=="ssh-agent"
- * AND that our exact per-account socket path (which we passed as `ssh-agent -a
- * <expected_sock>`) appears among the process's argv — proving it's the agent we
- * started, not a same-uid impostor. Where /proc is unavailable (BSD/macOS) we
- * cannot verify argv cheaply and fall back to a liveness check; the per-dir lock
- * and pid-scoped sidecars shrink the window that produces stale sidecars. */
+ * drops every key they had loaded. Require BOTH the ssh-agent executable and
+ * our exact `-a <expected_sock>` argv pair. Linux exposes argv through procfs;
+ * Darwin and FreeBSD expose it through their native process sysctl APIs. Any
+ * unavailable, truncated, or unparseable identity fails closed. */
 static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
     if (pid <= 1) {
         return false;
@@ -79,7 +257,7 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
         return false;
     }
 
-    /* Require our exact socket path in the process's argv to defeat PID reuse. */
+    /* Require our exact socket option in the process's argv to defeat PID reuse. */
     if (!expected_sock || !*expected_sock) {
         return false;
     }
@@ -89,25 +267,85 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
         return false;
     }
     char cmd[4096];
-    ssize_t n = read(fd, cmd, sizeof(cmd) - 1);
+    ssize_t n = read(fd, cmd, sizeof(cmd));
     close(fd);
     if (n <= 0) {
         return false;
     }
-    /* /proc/<pid>/cmdline is NUL-separated argv; require an exact token match. */
-    size_t exp_len = strlen(expected_sock);
-    for (ssize_t i = 0; i < n; ) {
-        const char *tok = cmd + i;
-        size_t tlen = strnlen(tok, (size_t)(n - i));
-        if (tlen == exp_len && memcmp(tok, expected_sock, exp_len) == 0) {
-            return true;
-        }
-        i += (ssize_t)tlen + 1;
+    return argv_is_our_ssh_agent(cmd, (size_t)n, expected_sock);
+#elif defined(__APPLE__)
+    /* KERN_PROCARGS2 begins with argc, then the executable path, alignment
+     * NULs, the NUL-separated argv vector, then the environment. A fixed
+     * buffer is unsafe here: when argv+environment exceeds it, XNU may not
+     * return the prefix containing argc/executable/argv. KERN_ARGMAX is the
+     * kernel's upper bound for the complete process argument area. */
+    int argmax_mib[2] = {CTL_KERN, KERN_ARGMAX};
+    int process_mib[3] = {CTL_KERN, KERN_PROCARGS2, (int)pid};
+    int argmax = 0;
+    int argc = 0;
+    size_t argmax_len = sizeof(argmax);
+    char *process_args;
+    bool matched;
+
+    if (sysctl(argmax_mib, 2, &argmax, &argmax_len, NULL, 0) != 0 ||
+        argmax_len != sizeof(argmax) || argmax <= (int)sizeof(int)) {
+        return false;
     }
-    return false;
+    size_t process_args_len = (size_t)argmax;
+    process_args = malloc(process_args_len);
+    if (!process_args) {
+        return false;
+    }
+    if (sysctl(process_mib, 3, process_args, &process_args_len, NULL, 0) != 0 ||
+        process_args_len <= sizeof(argc)) {
+        free(process_args);
+        return false;
+    }
+    memcpy(&argc, process_args, sizeof(argc));
+    if (argc <= 0) {
+        free(process_args);
+        return false;
+    }
+    size_t offset = sizeof(int);
+    size_t executable_len = strnlen(process_args + offset,
+                                    process_args_len - offset);
+    if (executable_len == 0 || executable_len == process_args_len - offset) {
+        free(process_args);
+        return false;
+    }
+    const char *executable = process_args + offset;
+    const char *executable_basename = strrchr(executable, '/');
+    executable_basename = executable_basename ? executable_basename + 1
+                                              : executable;
+    if (strcmp(executable_basename, "ssh-agent") != 0) {
+        free(process_args);
+        return false;
+    }
+    offset += executable_len + 1;
+    while (offset < process_args_len && process_args[offset] == '\0') {
+        offset++;
+    }
+    matched = offset < process_args_len &&
+              counted_argv_is_our_ssh_agent(process_args + offset,
+                                             process_args_len - offset,
+                                             argc, expected_sock);
+    free(process_args);
+    return matched;
+#elif defined(__FreeBSD__)
+    /* FreeBSD's KERN_PROC_ARGS result is already a flattened NUL-separated
+     * argv vector for the requested PID. */
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ARGS, (int)pid};
+    char process_args[4096];
+    size_t process_args_len = sizeof(process_args);
+    if (sysctl(mib, 4, process_args, &process_args_len, NULL, 0) != 0) {
+        return false;
+    }
+    return argv_is_our_ssh_agent(process_args, process_args_len, expected_sock);
 #else
+    /* Unknown platforms have no proven PID ownership mechanism here. Never
+     * turn mere liveness into authority to signal the process. */
     (void)expected_sock;
-    return (kill(pid, 0) == 0);
+    return false;
 #endif
 }
 
@@ -539,11 +777,14 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
             return -1;
     }
     
-    /* Configure host alias if specified */
+    /* A requested alias is part of the account's SSH routing contract. If the
+     * managed block cannot be installed safely, fail the switch so the account
+     * layer rolls back the agent/runtime commit instead of claiming success
+     * with stale user SSH configuration. */
     if (strlen(account->ssh_host_alias) > 0) {
         if (ssh_configure_host_alias(account) != 0) {
             log_warning("Failed to configure SSH host alias: %s", account->ssh_host_alias);
-            /* Don't fail completely for host alias issues */
+            return -1;
         }
     }
     
@@ -557,6 +798,10 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     char socket_dir[MAX_PATH_LEN];
     char socket_path[MAX_PATH_LEN];
     char symlink_path[MAX_PATH_LEN];
+    char pid_path[MAX_PATH_LEN] = "";
+    ssh_env_snapshot_t env_snapshot;
+    bool env_snapshot_taken = false;
+    bool pid_recorded = false;
 
     if (!ssh_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
@@ -580,6 +825,7 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     }
 
     int rc = -1;
+    memset(&env_snapshot, 0, sizeof(env_snapshot));
     ssh_config->key_already_loaded = false;
 
     /* Build this account's per-account socket path up front. Guard against the
@@ -617,11 +863,12 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         expand_path(account->ssh_key_path, reuse_key_path, sizeof(reuse_key_path)) == 0;
     if (validate_ssh_agent_socket(socket_path) == 0 && have_reuse_key &&
         ssh_socket_has_key(socket_path, reuse_key_path)) {
-        log_info("Reusing live SSH agent for account: %s", account->name);
-        safe_strncpy(ssh_config->agent_socket_path, socket_path,
-                     sizeof(ssh_config->agent_socket_path));
-        ssh_config->agent_owned = true;
-        ssh_config->key_already_loaded = true;
+        ssh_config_t adopted = *ssh_config;
+        safe_strncpy(adopted.agent_socket_path, socket_path,
+                     sizeof(adopted.agent_socket_path));
+        adopted.agent_pid = -1;
+        adopted.agent_owned = true;
+        adopted.key_already_loaded = true;
 
         /* Recover the PID from the sidecar so cleanup/stop can still target
          * it — but only after verifying it is genuinely OUR agent on this
@@ -631,7 +878,6 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
          * it into the kill path later. The socket itself was already
          * fingerprint-verified, so a rejected PID only costs precise
          * stop-by-pid targeting, not the reuse. */
-        char pid_path[MAX_PATH_LEN];
         if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid",
                              socket_dir, account->name) < sizeof(pid_path)) {
             FILE *pf = fopen(pid_path, "r");
@@ -639,26 +885,63 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
                 long pid = 0;
                 if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
                     pid_is_our_ssh_agent((pid_t)pid, socket_path)) {
-                    ssh_config->agent_pid = (pid_t)pid;
+                    adopted.agent_pid = (pid_t)pid;
                 }
                 fclose(pf);
             }
         }
 
-        kill_orphaned_gitswitch_agents(account->name); /* reap others, keep this */
-        (void)setup_ssh_environment(ssh_config);
-
-        if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
-                            "%s/current.sock", socket_dir) < sizeof(symlink_path)) {
-            atomic_symlink(socket_path, symlink_path);
+        /* Enforce one-account isolation before publishing this reused agent.
+         * Cleanup failures are retained-state failures, not warnings: adopting
+         * this agent while another managed listener cannot be classified or
+         * reaped would violate the isolation promise. Running this before the
+         * environment/link commit also leaves the prior stable link untouched
+         * on failure. */
+        if (kill_orphaned_gitswitch_agents(account->name) != 0) {
+            goto done;
         }
+
+        /* The stable link is the commit point. Environment and retarget errors
+         * remain fatal and restore the caller's environment; the account-level
+         * transaction restores any previous runtime that the successful orphan
+         * cleanup above had to retire. */
+        if (ssh_env_snapshot_take(&env_snapshot) != 0) {
+            goto done;
+        }
+        env_snapshot_taken = true;
+        if (setup_ssh_environment(&adopted) != 0) {
+            ssh_env_snapshot_restore(&env_snapshot);
+            env_snapshot_taken = false;
+            set_error(ERR_SSH_AGENT_START_FAILED,
+                      "Failed to set up SSH environment for reused agent");
+            goto done;
+        }
+        if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
+                             "%s/current.sock", socket_dir) >= sizeof(symlink_path)) {
+            ssh_env_snapshot_restore(&env_snapshot);
+            env_snapshot_taken = false;
+            set_error(ERR_INVALID_PATH, "Stable SSH socket path too long");
+            goto done;
+        }
+        if (atomic_symlink(socket_path, symlink_path) != 0) {
+            ssh_env_snapshot_restore(&env_snapshot);
+            env_snapshot_taken = false;
+            goto done;
+        }
+
+        ssh_env_snapshot_discard(&env_snapshot);
+        env_snapshot_taken = false;
+        *ssh_config = adopted;
+        log_info("Reusing live SSH agent for account: %s", account->name);
         rc = 0;
         goto done;
     }
 
     /* Kill any orphaned gitswitch agents from previous runs (including a stale
      * agent for this same account, which we're about to replace). */
-    kill_orphaned_gitswitch_agents(NULL);
+    if (kill_orphaned_gitswitch_agents(NULL) != 0) {
+        goto done;
+    }
 
     /* Stop any existing agent we own */
     if (ssh_config->agent_owned && ssh_config->agent_pid > 0) {
@@ -729,7 +1012,6 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
      * outlive every future cleanup holding the account's decrypted key. If we
      * can't record it, stop the agent and fail the switch. */
     {
-        char pid_path[MAX_PATH_LEN];
         bool recorded = false;
         if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid",
                              socket_dir, account->name) < sizeof(pid_path)) {
@@ -743,34 +1025,76 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
                 close(pfd);
             }
         }
+        pid_recorded = recorded;
         if (!recorded) {
             set_system_error(ERR_FILE_IO, "Failed to record SSH agent PID; stopping agent");
             ssh_stop_agent(ssh_config);
+            if (pid_path[0]) {
+                (void)unlink(pid_path);
+            }
             goto done;
         }
     }
 
-    /* Set up environment */
+    /* Set up the process environment, but retain its prior values until the
+     * stable-link commit succeeds so any failure is fully reversible. */
+    if (ssh_env_snapshot_take(&env_snapshot) != 0) {
+        goto fresh_commit_failed;
+    }
+    env_snapshot_taken = true;
     if (setup_ssh_environment(ssh_config) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to set up SSH environment");
-        goto done;
+        goto fresh_commit_failed;
     }
 
+    /* Atomically (re)point the stable current.sock at this agent's socket. It
+     * is required, not warning-only: shells use this path, so without it the
+     * new agent is not an active account. */
+    if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
+                         "%s/current.sock", socket_dir) >= sizeof(symlink_path)) {
+        set_error(ERR_INVALID_PATH, "Stable SSH socket path too long");
+        goto fresh_commit_failed;
+    }
+    if (atomic_symlink(socket_path, symlink_path) != 0) {
+        goto fresh_commit_failed;
+    }
+    log_debug("Created symlink: %s -> %s", symlink_path, socket_path);
+
+    ssh_env_snapshot_discard(&env_snapshot);
+    env_snapshot_taken = false;
     log_info("Isolated SSH agent started successfully (PID: %d, Socket: %s)",
              ssh_config->agent_pid, ssh_config->agent_socket_path);
 
-    /* Atomically (re)point the stable current.sock at this agent's socket. */
-    if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
-                        "%s/current.sock", socket_dir) < sizeof(symlink_path)) {
-        if (atomic_symlink(socket_path, symlink_path) == 0) {
-            log_debug("Created symlink: %s -> %s", symlink_path, socket_path);
+    rc = 0;
+    goto done;
+
+fresh_commit_failed:
+    if (env_snapshot_taken) {
+        ssh_env_snapshot_restore(&env_snapshot);
+        env_snapshot_taken = false;
+    }
+    if (ssh_config->agent_owned) {
+        bool agent_gone = reap_ssh_agent(ssh_config->agent_pid, socket_path);
+        if (agent_gone) {
+            if (pid_recorded) {
+                (void)unlink(pid_path);
+            }
+            (void)unlink(socket_path);
         } else {
-            log_warning("Failed to create socket symlink: %s", strerror(errno));
+            /* Preserve the sidecar/socket when a process survives: deleting
+             * its only targeting information would make a future retry
+             * impossible and leak a key-holding agent until reboot. */
+            log_warning("SSH agent survived failed stable-link commit; keeping sidecar for retry");
         }
     }
-
-    rc = 0;
+    ssh_config->agent_pid = -1;
+    ssh_config->agent_owned = false;
+    ssh_config->key_already_loaded = false;
+    ssh_config->agent_socket_path[0] = '\0';
 done:
+    if (env_snapshot_taken) {
+        ssh_env_snapshot_discard(&env_snapshot);
+    }
     unlock_agent_dir(lock_fd);
     return rc;
 }
@@ -989,6 +1313,112 @@ static bool valid_ssh_host_alias(const char *alias) {
     return true;
 }
 
+/* Read ~/.ssh/config without following its final component. The lstat/open/
+ * fstat identity check closes the obvious symlink swap between policy check
+ * and read; the caller re-checks the same inode immediately before rename. */
+static int read_ssh_config_nofollow(const char *path, char *buf, size_t size,
+                                    bool *existed, struct stat *identity) {
+    struct stat before;
+    struct stat opened;
+    size_t used = 0;
+    int fd;
+
+    *existed = false;
+    memset(identity, 0, sizeof(*identity));
+    buf[0] = '\0';
+
+    if (lstat(path, &before) != 0) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO, "Cannot inspect SSH config: %s", path);
+        return -1;
+    }
+    if (S_ISLNK(before.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing to update symlinked SSH config: %s", path);
+        return -1;
+    }
+    if (!S_ISREG(before.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing to update non-regular SSH config: %s", path);
+        return -1;
+    }
+
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        set_system_error(ERR_FILE_IO, "Failed to open SSH config safely: %s", path);
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode) ||
+        opened.st_dev != before.st_dev || opened.st_ino != before.st_ino) {
+        close(fd);
+        set_error(ERR_FILE_IO, "SSH config changed while it was being opened: %s", path);
+        return -1;
+    }
+
+    while (used < size - 1) {
+        ssize_t n = read(fd, buf + used, size - 1 - used);
+        if (n > 0) {
+            used += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        close(fd);
+        set_system_error(ERR_FILE_IO, "Failed to read SSH config: %s", path);
+        return -1;
+    }
+    if (used == size - 1) {
+        char extra;
+        ssize_t n;
+        do {
+            n = read(fd, &extra, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n != 0) {
+            close(fd);
+            if (n < 0) {
+                set_system_error(ERR_FILE_IO, "Failed to read SSH config: %s", path);
+            } else {
+                set_error(ERR_FILE_IO, "SSH config too large to update safely");
+            }
+            return -1;
+        }
+    }
+    close(fd);
+    buf[used] = '\0';
+    *existed = true;
+    *identity = opened;
+    return 0;
+}
+
+/* Refuse to rename over a path whose final component changed after the safe
+ * read. For a previously absent config, any newly-created entry is a conflict;
+ * for an existing config, only the exact regular-file inode may be replaced. */
+static int ssh_config_recheck_before_rename(const char *path, bool existed,
+                                            const struct stat *identity) {
+    struct stat now;
+
+    if (lstat(path, &now) != 0) {
+        if (!existed && errno == ENOENT) {
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO, "SSH config changed before update: %s", path);
+        return -1;
+    }
+    if (!existed || !S_ISREG(now.st_mode) ||
+        now.st_dev != identity->st_dev || now.st_ino != identity->st_ino) {
+        set_error(ERR_FILE_IO,
+                  "SSH config changed before update; refusing to replace it: %s", path);
+        return -1;
+    }
+    return 0;
+}
+
 /* Configure an SSH host alias in ~/.ssh/config. The block is delimited by
  * gitswitch markers and rewritten idempotently (no unbounded appending), and
  * deliberately does NOT weaken host-key checking. Written atomically at 0600. */
@@ -1004,6 +1434,8 @@ int ssh_configure_host_alias(const account_t *account) {
     /* buf + fresh managed block: markers, Host line, IdentityFile path. */
     char newbuf[sizeof(buf) + MAX_PATH_LEN + 2 * (MAX_NAME_LEN + 32) + 64];
     const char *home = getenv("HOME");
+    struct stat config_identity;
+    bool config_existed;
     int fd;
     FILE *out;
 
@@ -1057,15 +1489,11 @@ int ssh_configure_host_alias(const account_t *account) {
      * managed block for this alias, which we splice out. */
     buf[0] = '\0';
     orig[0] = '\0';
-    if (path_exists(ssh_config_path)) {
-        if (get_file_size(ssh_config_path) >= sizeof(buf)) {
-            set_error(ERR_FILE_IO, "SSH config too large to update safely");
-            return -1;
-        }
-        if (read_file_to_string(ssh_config_path, buf, sizeof(buf)) < 0) {
-            set_error(ERR_FILE_IO, "Failed to read SSH config");
-            return -1;
-        }
+    if (read_ssh_config_nofollow(ssh_config_path, buf, sizeof(buf),
+                                 &config_existed, &config_identity) != 0) {
+        return -1;
+    }
+    if (config_existed) {
         memcpy(orig, buf, strlen(buf) + 1);
         char *bstart = strstr(buf, begin_marker);
         if (bstart) {
@@ -1164,6 +1592,12 @@ int ssh_configure_host_alias(const account_t *account) {
         unlink(tmp_path);
         signals_scratch_unregister(tmp_path);
         set_system_error(ERR_FILE_IO, "Failed to write SSH config");
+        return -1;
+    }
+    if (ssh_config_recheck_before_rename(ssh_config_path, config_existed,
+                                         &config_identity) != 0) {
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
         return -1;
     }
     if (rename(tmp_path, ssh_config_path) != 0) {
@@ -1276,7 +1710,7 @@ static int setup_ssh_environment(ssh_config_t *ssh_config) {
     }
     
     /* Set SSH_AUTH_SOCK */
-    if (setenv("SSH_AUTH_SOCK", ssh_config->agent_socket_path, 1) != 0) {
+    if (g_ssh_setenv("SSH_AUTH_SOCK", ssh_config->agent_socket_path, 1) != 0) {
         set_system_error(ERR_SYSTEM_CALL, "Failed to set SSH_AUTH_SOCK");
         return -1;
     }
@@ -1285,7 +1719,7 @@ static int setup_ssh_environment(ssh_config_t *ssh_config) {
     if (ssh_config->agent_pid > 0) {
         char pid_str[32];
         snprintf(pid_str, sizeof(pid_str), "%d", ssh_config->agent_pid);
-        if (setenv("SSH_AGENT_PID", pid_str, 1) != 0) {
+        if (g_ssh_setenv("SSH_AGENT_PID", pid_str, 1) != 0) {
             set_system_error(ERR_SYSTEM_CALL, "Failed to set SSH_AGENT_PID");
             return -1;
         }
@@ -1453,8 +1887,254 @@ static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) 
     return 0;
 }
 
+/* Classify whether a sidecar-less socket path still has a live listener.
+ * Merely finding the filesystem socket is insufficient: a dead ssh-agent
+ * leaves the inode behind. A successful nonblocking connect proves a listener
+ * is reachable; ECONNREFUSED/ENOENT proves the artifact is stale. Every other
+ * outcome is indeterminate and therefore fail-closed. */
+static int probe_ssh_agent_socket(const char *path, bool *reachable) {
+    struct stat st;
+    struct sockaddr_un addr;
+    struct pollfd pfd;
+    socklen_t err_len;
+    int fd;
+    int flags;
+    int socket_error = 0;
+
+    *reachable = false;
+    if (lstat(path, &st) != 0) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO, "Cannot inspect sidecar-less SSH socket: %s", path);
+        return -1;
+    }
+    if (!S_ISSOCK(st.st_mode)) {
+        return 0; /* provably not a live UNIX-domain socket */
+    }
+    if (strlen(path) >= sizeof(addr.sun_path)) {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot probe overlong sidecar-less SSH socket: %s", path);
+        return -1;
+    }
+
+    fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot create probe for sidecar-less SSH socket: %s", path);
+        return -1;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
+        (flags = fcntl(fd, F_GETFL, 0)) < 0 ||
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK) != 0) {
+        close(fd);
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot configure probe for sidecar-less SSH socket: %s", path);
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    safe_strncpy(addr.sun_path, path, sizeof(addr.sun_path));
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+        *reachable = true;
+        close(fd);
+        return 0;
+    }
+    if (errno == ECONNREFUSED || errno == ENOENT) {
+        close(fd);
+        return 0;
+    }
+    if (errno != EINPROGRESS && errno != EAGAIN && errno != EWOULDBLOCK) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_SSH_AGENT_FAILED,
+                         "Cannot prove sidecar-less SSH socket is unreachable: %s", path);
+        return -1;
+    }
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    int poll_rc;
+    do {
+        poll_rc = poll(&pfd, 1, 100);
+    } while (poll_rc < 0 && errno == EINTR);
+    if (poll_rc <= 0) {
+        int saved_errno = poll_rc < 0 ? errno : ETIMEDOUT;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_SSH_AGENT_FAILED,
+                         "Timed out probing sidecar-less SSH socket: %s", path);
+        return -1;
+    }
+
+    err_len = sizeof(socket_error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &err_len) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_SSH_AGENT_FAILED,
+                         "Cannot finish probing sidecar-less SSH socket: %s", path);
+        return -1;
+    }
+    close(fd);
+    if (socket_error == 0) {
+        *reachable = true;
+        return 0;
+    }
+    if (socket_error == ECONNREFUSED || socket_error == ENOENT) {
+        return 0;
+    }
+    errno = socket_error;
+    set_system_error(ERR_SSH_AGENT_FAILED,
+                     "Cannot prove sidecar-less SSH socket is unreachable: %s", path);
+    return -1;
+}
+
+/* Read a PID sidecar without following or accepting a swapped final
+ * component. Missing is reported as 1; a validated PID as 0; every state in
+ * which reset cannot prove what it is targeting is an error and leaves the
+ * sidecar in place for inspection/retry. */
+static int read_ssh_agent_pid(const char *path, pid_t *pid_out) {
+    struct stat before;
+    struct stat opened;
+    char buf[64];
+    size_t used = 0;
+    int fd;
+
+    if (lstat(path, &before) != 0) {
+        if (errno == ENOENT) {
+            return 1;
+        }
+        set_system_error(ERR_FILE_IO, "Cannot inspect SSH agent PID sidecar: %s", path);
+        return -1;
+    }
+    if (!S_ISREG(before.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing non-regular SSH agent PID sidecar: %s", path);
+        return -1;
+    }
+
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        set_system_error(ERR_FILE_IO, "Cannot open SSH agent PID sidecar safely: %s", path);
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode) ||
+        opened.st_dev != before.st_dev || opened.st_ino != before.st_ino) {
+        close(fd);
+        set_error(ERR_FILE_IO, "SSH agent PID sidecar changed while opening: %s", path);
+        return -1;
+    }
+    while (used < sizeof(buf) - 1) {
+        ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
+        if (n > 0) {
+            used += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        close(fd);
+        set_system_error(ERR_FILE_IO, "Cannot read SSH agent PID sidecar: %s", path);
+        return -1;
+    }
+    if (used == sizeof(buf) - 1) {
+        char extra;
+        ssize_t n;
+        do {
+            n = read(fd, &extra, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n != 0) {
+            close(fd);
+            set_error(ERR_FILE_IO, "SSH agent PID sidecar is too large: %s", path);
+            return -1;
+        }
+    }
+    close(fd);
+    buf[used] = '\0';
+
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(buf, &end, 10);
+    while (end && isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (errno != 0 || end == buf || !end || *end != '\0' || parsed <= 1 ||
+        (long)(pid_t)parsed != parsed) {
+        set_error(ERR_FILE_IO, "Invalid SSH agent PID sidecar; retained for retry: %s", path);
+        return -1;
+    }
+    *pid_out = (pid_t)parsed;
+    return 0;
+}
+
+static int unlink_ssh_reset_path(const char *path, const char *description) {
+    if (unlink(path) == 0 || errno == ENOENT) {
+        return 0;
+    }
+    set_system_error(ERR_FILE_IO, "Failed to remove %s: %s", description, path);
+    return -1;
+}
+
+/* Inspect current.sock without following it. Missing is success with
+ * matches=false; a non-symlink or unreadable/truncated link is a cleanup
+ * failure because reset cannot truthfully claim that the stable entry point
+ * is in a known state. */
+static int ssh_current_matches_socket(const char *current, const char *socket,
+                                      bool *matches) {
+    struct stat st;
+    char target[MAX_PATH_LEN];
+    ssize_t n;
+
+    *matches = false;
+    if (lstat(current, &st) != 0) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO, "Cannot inspect stable SSH socket: %s", current);
+        return -1;
+    }
+    if (!S_ISLNK(st.st_mode)) {
+        set_error(ERR_FILE_IO, "Stable SSH socket is not a symlink: %s", current);
+        return -1;
+    }
+    n = readlink(current, target, sizeof(target) - 1);
+    if (n < 0) {
+        set_system_error(ERR_FILE_IO, "Cannot read stable SSH socket: %s", current);
+        return -1;
+    }
+    if ((size_t)n == sizeof(target) - 1) {
+        set_error(ERR_INVALID_PATH, "Stable SSH socket target is too long: %s", current);
+        return -1;
+    }
+    target[n] = '\0';
+    *matches = strcmp(target, socket) == 0;
+    return 0;
+}
+
+static int ssh_reset_incomplete(void) {
+    char detail[sizeof(g_last_error.message)];
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    if (detail[0]) {
+        set_error(ERR_FILE_IO,
+                  "SSH reset incomplete; retained state for retry: %s", detail);
+    } else {
+        set_error(ERR_FILE_IO,
+                  "SSH reset incomplete; retained remaining state for retry");
+    }
+    return -1;
+}
+
 /* Tear down isolated SSH agents: one account, or all when account is NULL.
- * Kills the agent(s) by recorded PID and removes their sockets/sidecars. */
+ * Kills the agent(s) by recorded PID and removes their sockets/sidecars. Every
+ * lock, identity/reap, and relevant unlink failure is fatal to the caller;
+ * missing owned state remains idempotent success. */
 int ssh_manager_reset(const char *account) {
     char socket_dir[MAX_PATH_LEN];
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
@@ -1471,10 +2151,12 @@ int ssh_manager_reset(const char *account) {
 
     if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
         if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "%s/gitswitch-ssh", runtime_dir) >= sizeof(socket_dir)) {
+            set_error(ERR_INVALID_PATH, "SSH agent directory path too long");
             return -1;
         }
     } else {
         if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid()) >= sizeof(socket_dir)) {
+            set_error(ERR_INVALID_PATH, "SSH agent directory path too long");
             return -1;
         }
     }
@@ -1494,70 +2176,91 @@ int ssh_manager_reset(const char *account) {
         return -1;
     }
 
-    /* Take the per-dir lock for the whole reap/unlink sequence. Without it, this
-     * writer races a concurrent ssh_start_isolated_agent (which holds the same
-     * lock): we would reap its freshly-started agent and unlink current.sock
-     * while its switch reports success. lock_agent_dir returns -1 if the dir
-     * vanished since the check above — in that case there is nothing to reset,
-     * so proceeding without a lock is harmless (all operations below are
-     * no-ops on a missing dir). kill_orphaned_gitswitch_agents deliberately
-     * does NOT self-lock because ssh_start_isolated_agent already calls it
-     * under this same lock. */
+    /* A validated existing base must never be mutated unlocked. A failed lock
+     * is actionable retained state, not evidence that the base disappeared. */
     int lock_fd = lock_agent_dir(socket_dir);
+    if (lock_fd < 0) {
+        set_system_error(ERR_FILE_IO, "Failed to lock SSH agent directory: %s", socket_dir);
+        return -1;
+    }
 
     if (!account || !*account) {
-        /* All: reuse the orphan reaper (kills every recorded PID, unlinks
-         * sockets/pids/current.sock). */
-        kill_orphaned_gitswitch_agents(NULL);
+        int all_rc = kill_orphaned_gitswitch_agents(NULL);
         unlock_agent_dir(lock_fd);
-        return 0;
+        return all_rc == 0 ? 0 : ssh_reset_incomplete();
     }
 
     char pid_path[MAX_PATH_LEN];
     char sock_path[MAX_PATH_LEN];
-    bool have_sock = (size_t)snprintf(sock_path, sizeof(sock_path),
-                                      "%s/ssh-agent.%s.sock", socket_dir, account) < sizeof(sock_path);
-    if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid", socket_dir, account) < sizeof(pid_path)) {
-        /* Drop the sidecar only once the agent is confirmed gone (AR-02 #20)
-         * — it is the only record a future run can retry the reap against. */
-        bool agent_gone = true;
-        FILE *pf = fopen(pid_path, "r");
-        if (pf) {
-            long pid = 0;
-            if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 && have_sock) {
-                agent_gone = reap_ssh_agent((pid_t)pid, sock_path);
-                if (!agent_gone) {
-                    log_warning("ssh-agent PID %ld survived teardown; keeping "
-                                "its sidecar for a future reap", pid);
-                }
-            }
-            fclose(pf);
-        }
-        if (agent_gone) {
-            unlink(pid_path);
+    char current[MAX_PATH_LEN];
+    bool current_matches = false;
+    bool failed = false;
+    bool can_remove_runtime = true;
+    pid_t pid = -1;
+
+    if ((size_t)snprintf(sock_path, sizeof(sock_path),
+                         "%s/ssh-agent.%s.sock", socket_dir, account) >= sizeof(sock_path) ||
+        (size_t)snprintf(pid_path, sizeof(pid_path),
+                         "%s/ssh-agent.%s.pid", socket_dir, account) >= sizeof(pid_path) ||
+        (size_t)snprintf(current, sizeof(current),
+                         "%s/current.sock", socket_dir) >= sizeof(current)) {
+        set_error(ERR_INVALID_PATH, "SSH reset artifact path too long");
+        unlock_agent_dir(lock_fd);
+        return -1;
+    }
+
+    int pid_rc = read_ssh_agent_pid(pid_path, &pid);
+    if (pid_rc < 0) {
+        failed = true;
+        can_remove_runtime = false;
+    } else if (pid_rc == 0) {
+        if (!reap_ssh_agent(pid, sock_path)) {
+            set_error(ERR_SSH_AGENT_FAILED,
+                      "SSH agent PID %ld survived teardown; retained for retry",
+                      (long)pid);
+            failed = true;
+            can_remove_runtime = false;
+        } else if (unlink_ssh_reset_path(pid_path, "SSH agent PID sidecar") != 0) {
+            failed = true;
         }
     }
-    if (have_sock) {
-        /* F3: if the stable current.sock symlink points at the account we're
-         * resetting, drop it too — otherwise shells keep SSH_AUTH_SOCK pointing
-         * at the socket we just removed (a dangling link), mirroring the GPG
-         * side's dangling-symlink cleanup. current.sock is an absolute symlink
-         * to the per-account socket (see ssh_start_isolated_agent). */
-        char current[MAX_PATH_LEN];
-        if ((size_t)snprintf(current, sizeof(current), "%s/current.sock", socket_dir) < sizeof(current)) {
-            char target[MAX_PATH_LEN];
-            ssize_t tn = readlink(current, target, sizeof(target) - 1);
-            if (tn > 0) {
-                target[tn] = '\0';
-                if (strcmp(target, sock_path) == 0) {
-                    unlink(current);
-                }
-            }
+
+    /* A missing sidecar is idempotent only when the socket is absent or
+     * provably stale. Apply the same proof after a recorded PID was classified
+     * dead/not-ours: a stale sidecar can coexist with a different live agent
+     * on the managed socket, so reap_ssh_agent()==true alone is insufficient
+     * authority to unlink the runtime entry point. */
+    if (can_remove_runtime) {
+        bool reachable = false;
+        if (probe_ssh_agent_socket(sock_path, &reachable) != 0) {
+            failed = true;
+            can_remove_runtime = false;
+        } else if (reachable) {
+            set_error(ERR_SSH_AGENT_FAILED,
+                      "Reachable SSH agent socket has no safely matched PID; "
+                      "retained for retry: %s", sock_path);
+            failed = true;
+            can_remove_runtime = false;
         }
-        unlink(sock_path);
     }
+
+    if (can_remove_runtime) {
+        /* Inspect the stable link before removing its target, then delete the
+         * target first. If socket removal fails, retain current.sock so the
+         * still-live/inspectable runtime entry point is not destroyed. */
+        if (ssh_current_matches_socket(current, sock_path, &current_matches) != 0) {
+            failed = true;
+        }
+        if (unlink_ssh_reset_path(sock_path, "SSH agent socket") != 0) {
+            failed = true;
+        } else if (current_matches &&
+                   unlink_ssh_reset_path(current, "stable SSH socket") != 0) {
+            failed = true;
+        }
+    }
+
     unlock_agent_dir(lock_fd);
-    return 0;
+    return failed ? ssh_reset_incomplete() : 0;
 }
 
 /* Kill orphaned gitswitch ssh-agents from previous runs and remove stale
@@ -1566,13 +2269,14 @@ int ssh_manager_reset(const char *account) {
  * sockets are unlinked via readdir. Only operates inside our own 0700 dir.
  * If keep_account is non-NULL, that account's live agent + sidecar are left
  * intact (used when reusing it), while every other account is still reaped. */
-static void kill_orphaned_gitswitch_agents(const char *keep_account) {
+static int kill_orphaned_gitswitch_agents(const char *keep_account) {
     char socket_dir[MAX_PATH_LEN];
     char keep_pid[MAX_NAME_LEN + 16];
     char keep_sock[MAX_NAME_LEN + 16];
     const char *runtime_dir = getenv("XDG_RUNTIME_DIR");
     DIR *d;
     struct dirent *ent;
+    bool failed = false;
 
     keep_pid[0] = keep_sock[0] = '\0';
     if (keep_account && *keep_account) {
@@ -1582,11 +2286,13 @@ static void kill_orphaned_gitswitch_agents(const char *keep_account) {
 
     if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
         if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "%s/gitswitch-ssh", runtime_dir) >= sizeof(socket_dir)) {
-            return;
+            set_error(ERR_INVALID_PATH, "SSH agent directory path too long");
+            return -1;
         }
     } else {
         if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid()) >= sizeof(socket_dir)) {
-            return;
+            set_error(ERR_INVALID_PATH, "SSH agent directory path too long");
+            return -1;
         }
     }
 
@@ -1594,84 +2300,217 @@ static void kill_orphaned_gitswitch_agents(const char *keep_account) {
      * ssh_start_isolated_agent the dir was just created/validated, but the
      * reset path reaches here too, and opendir on its own would happily
      * follow a planted symlink and unlink "ssh-agent.*" names elsewhere. */
-    if (agent_dir_is_safe(socket_dir) != 0) {
-        return; /* absent, or unsafe to touch: never scan/unlink under it */
+    int dir_safe = agent_dir_is_safe(socket_dir);
+    if (dir_safe > 0) {
+        return 0;
+    }
+    if (dir_safe < 0) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing to clean unsafe SSH agent directory: %s", socket_dir);
+        return -1;
     }
 
     d = opendir(socket_dir);
     if (!d) {
-        return; /* nothing to clean up */
+        set_system_error(ERR_FILE_IO, "Cannot enumerate SSH agent directory: %s", socket_dir);
+        return -1;
     }
 
-    while ((ent = readdir(d)) != NULL) {
+    /* Pass 1: process sidecars first. A sidecar is removed only after its PID
+     * is safely classified/reaped. Failed or malformed sidecars remain, which
+     * lets pass 2 retain the corresponding socket as retry evidence. */
+    for (;;) {
+        errno = 0;
+        ent = readdir(d);
+        if (!ent) {
+            if (errno != 0) {
+                set_system_error(ERR_FILE_IO,
+                                 "Failed while enumerating SSH PID sidecars: %s",
+                                 socket_dir);
+                failed = true;
+            }
+            break;
+        }
         const char *name = ent->d_name;
         size_t nlen = strlen(name);
         char full[MAX_PATH_LEN];
 
-        if (strncmp(name, "ssh-agent.", 10) != 0 && strcmp(name, "current.sock") != 0) {
+        if (strncmp(name, "ssh-agent.", 10) != 0 ||
+            nlen <= 4 || strcmp(name + nlen - 4, ".pid") != 0) {
             continue;
         }
-        /* Preserve the account we're reusing (its live agent + sidecar). */
-        if (keep_pid[0] && (strcmp(name, keep_pid) == 0 || strcmp(name, keep_sock) == 0)) {
+        if (keep_pid[0] && strcmp(name, keep_pid) == 0) {
             continue;
         }
         if ((size_t)snprintf(full, sizeof(full), "%s/%s", socket_dir, name) >= sizeof(full)) {
+            set_error(ERR_INVALID_PATH, "SSH cleanup artifact path too long: %s", name);
+            failed = true;
             continue;
         }
 
-        if (nlen > 4 && strcmp(name + nlen - 4, ".pid") == 0) {
-            /* The socket this agent was started on (ssh-agent.<name>.sock),
-             * used to confirm the recorded PID is genuinely our agent. */
-            char sock_full[MAX_PATH_LEN];
-            int sw = snprintf(sock_full, sizeof(sock_full), "%s/%.*ssock",
-                              socket_dir, (int)(nlen - 3), name);
-            /* Reap the recorded agent PID; drop the sidecar only once the
-             * agent is confirmed gone (AR-02 #20). Unlinking it while the
-             * agent survives (stopped/wedged, still holding the decrypted
-             * key) would erase the only record any future gitswitch run has
-             * to retry the reap against. An unopenable/unparseable sidecar
-             * is garbage either way and is dropped. */
-            bool agent_gone = true;
-            FILE *pf = fopen(full, "r");
-            if (pf) {
-                long pid = 0;
-                if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
-                    sw > 0 && (size_t)sw < sizeof(sock_full)) {
-                    agent_gone = reap_ssh_agent((pid_t)pid, sock_full);
-                    if (agent_gone) {
-                        log_debug("Reaped orphaned ssh-agent PID %ld", pid);
-                    } else {
-                        log_warning("ssh-agent PID %ld survived teardown; keeping "
-                                    "its sidecar for a future reap", pid);
-                    }
-                }
-                fclose(pf);
+        /* The socket this agent was started on (ssh-agent.<name>.sock), used
+         * to confirm the recorded PID is genuinely our agent. */
+        char sock_full[MAX_PATH_LEN];
+        int sw = snprintf(sock_full, sizeof(sock_full), "%s/%.*ssock",
+                          socket_dir, (int)(nlen - 3), name);
+        if (sw <= 0 || (size_t)sw >= sizeof(sock_full)) {
+            set_error(ERR_INVALID_PATH, "SSH cleanup socket path too long: %s", name);
+            failed = true;
+            continue;
+        }
+
+        pid_t pid = -1;
+        int pid_rc = read_ssh_agent_pid(full, &pid);
+        if (pid_rc != 0) {
+            if (pid_rc > 0) {
+                set_error(ERR_FILE_IO,
+                          "SSH PID sidecar disappeared during cleanup: %s", full);
             }
-            if (agent_gone) {
-                unlink(full);
-            }
-        } else {
-            /* Stale socket (ssh-agent.<name>.sock or current.sock). But do
-             * not churn a current.sock that already targets the account we
-             * are keeping (AR-02 #18): the reuse path would recreate it via
-             * atomic_symlink moments later, and a shell reading
-             * SSH_AUTH_SOCK=current.sock in that unlink-to-recreate window
-             * gets ENOENT and silently loses agent access for that session. */
-            if (keep_sock[0] && strcmp(name, "current.sock") == 0) {
-                char target[MAX_PATH_LEN];
-                ssize_t tn = readlink(full, target, sizeof(target) - 1);
-                if (tn > 0) {
-                    const char *base;
-                    target[tn] = '\0';
-                    base = strrchr(target, '/');
-                    base = base ? base + 1 : target;
-                    if (strcmp(base, keep_sock) == 0) {
-                        continue;
-                    }
-                }
-            }
-            unlink(full);
+            failed = true;
+            continue;
+        }
+        if (!reap_ssh_agent(pid, sock_full)) {
+            set_error(ERR_SSH_AGENT_FAILED,
+                      "SSH agent PID %ld survived teardown; retained for retry",
+                      (long)pid);
+            failed = true;
+            continue;
+        }
+        log_debug("Reaped orphaned ssh-agent PID %ld", (long)pid);
+        if (unlink_ssh_reset_path(full, "SSH agent PID sidecar") != 0) {
+            failed = true;
         }
     }
-    closedir(d);
+    if (closedir(d) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to close SSH agent directory: %s", socket_dir);
+        failed = true;
+    }
+
+    /* Pass 2: remove sockets and other managed artifacts only when no sidecar
+     * remains for that socket. This preserves the full retry tuple when an
+     * agent could not be confirmed dead. current.sock is handled last. */
+    d = opendir(socket_dir);
+    if (!d) {
+        set_system_error(ERR_FILE_IO, "Cannot re-enumerate SSH agent directory: %s", socket_dir);
+        return -1;
+    }
+    for (;;) {
+        errno = 0;
+        ent = readdir(d);
+        if (!ent) {
+            if (errno != 0) {
+                set_system_error(ERR_FILE_IO,
+                                 "Failed while enumerating SSH agent sockets: %s",
+                                 socket_dir);
+                failed = true;
+            }
+            break;
+        }
+        const char *name = ent->d_name;
+        size_t nlen = strlen(name);
+        char full[MAX_PATH_LEN];
+
+        if (strncmp(name, "ssh-agent.", 10) != 0 ||
+            (nlen > 4 && strcmp(name + nlen - 4, ".pid") == 0)) {
+            continue;
+        }
+        if (keep_sock[0] && strcmp(name, keep_sock) == 0) {
+            continue;
+        }
+        if ((size_t)snprintf(full, sizeof(full), "%s/%s", socket_dir, name) >= sizeof(full)) {
+            set_error(ERR_INVALID_PATH, "SSH cleanup artifact path too long: %s", name);
+            failed = true;
+            continue;
+        }
+
+        if (nlen > 5 && strcmp(name + nlen - 5, ".sock") == 0) {
+            char pid_full[MAX_PATH_LEN];
+            int pw = snprintf(pid_full, sizeof(pid_full), "%s/%.*spid",
+                              socket_dir, (int)(nlen - 4), name);
+            struct stat pst;
+            if (pw <= 0 || (size_t)pw >= sizeof(pid_full)) {
+                set_error(ERR_INVALID_PATH, "SSH cleanup PID path too long: %s", name);
+                failed = true;
+                continue;
+            }
+            if (lstat(pid_full, &pst) == 0) {
+                continue; /* survivor/invalid sidecar: retain its socket */
+            }
+            if (errno != ENOENT) {
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot inspect SSH cleanup sidecar: %s", pid_full);
+                failed = true;
+                continue;
+            }
+
+            /* No sidecar: remove only a socket proven dead/unreachable. A
+             * reachable listener cannot be reaped safely without its PID, and
+             * an indeterminate probe is equally non-destructive. */
+            bool reachable = false;
+            if (probe_ssh_agent_socket(full, &reachable) != 0) {
+                failed = true;
+                continue;
+            }
+            if (reachable) {
+                set_error(ERR_SSH_AGENT_FAILED,
+                          "Live SSH agent socket has no PID sidecar; retained for retry: %s",
+                          full);
+                failed = true;
+                continue;
+            }
+        }
+        if (unlink_ssh_reset_path(full, "SSH agent artifact") != 0) {
+            failed = true;
+        }
+    }
+    if (closedir(d) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to close SSH agent directory: %s", socket_dir);
+        failed = true;
+    }
+
+    /* Remove current.sock only when it does not still name a retained live
+     * artifact. The reuse path's kept account remains untouched; an all-reset
+     * failure likewise keeps a usable stable entry point for the retry. */
+    char current[MAX_PATH_LEN];
+    if ((size_t)snprintf(current, sizeof(current), "%s/current.sock", socket_dir) >= sizeof(current)) {
+        set_error(ERR_INVALID_PATH, "Stable SSH socket path too long during cleanup");
+        return -1;
+    }
+    struct stat cst;
+    if (lstat(current, &cst) == 0) {
+        bool retain_current = false;
+        if (S_ISLNK(cst.st_mode)) {
+            char target[MAX_PATH_LEN];
+            ssize_t tn = readlink(current, target, sizeof(target) - 1);
+            if (tn < 0) {
+                set_system_error(ERR_FILE_IO, "Cannot read stable SSH socket: %s", current);
+                failed = true;
+                retain_current = true;
+            } else if ((size_t)tn == sizeof(target) - 1) {
+                set_error(ERR_INVALID_PATH, "Stable SSH socket target is too long: %s", current);
+                failed = true;
+                retain_current = true;
+            } else {
+                const char *base;
+                struct stat tst;
+                target[tn] = '\0';
+                base = strrchr(target, '/');
+                base = base ? base + 1 : target;
+                if (keep_sock[0] && strcmp(base, keep_sock) == 0) {
+                    retain_current = true;
+                } else if (failed && lstat(target, &tst) == 0) {
+                    retain_current = true;
+                }
+            }
+        }
+        if (!retain_current &&
+            unlink_ssh_reset_path(current, "stable SSH socket") != 0) {
+            failed = true;
+        }
+    } else if (errno != ENOENT) {
+        set_system_error(ERR_FILE_IO, "Cannot inspect stable SSH socket: %s", current);
+        failed = true;
+    }
+
+    return failed ? -1 : 0;
 }

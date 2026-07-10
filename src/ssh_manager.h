@@ -25,6 +25,8 @@ typedef struct {
                               * re-prompt on re-switching to the active account) */
 } ssh_config_t;
 
+typedef int (*ssh_setenv_fn)(const char *name, const char *value, int overwrite);
+
 /* Function prototypes */
 
 /**
@@ -51,6 +53,13 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account);
  * Returns socket path and PID for cleanup
  */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account);
+
+/**
+ * Replace the environment setter used by the SSH runtime commit and return
+ * the previous function. This is a deterministic test seam; pass NULL to
+ * restore libc setenv. Runtime rollback itself is not routed through the seam.
+ */
+ssh_setenv_fn ssh_manager_set_setenv_fn(ssh_setenv_fn fn);
 
 /**
  * Stop SSH agent (only if we own it)

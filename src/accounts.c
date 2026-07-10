@@ -10,8 +10,17 @@
 #include <string.h>
 #include <strings.h>
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
 
 #include "accounts.h"
 #include "config.h"
@@ -107,18 +116,47 @@ void accounts_session_cleanup(void) {
  * rolling back a failed switch. Removing the symlink makes integrated shells
  * fall back to the default agent/keyring rather than silently keep using the
  * old account — the exact mismatch this guards against. */
-static void deactivate_runtime_isolation(bool ssh, bool gpg) {
+static int deactivate_runtime_isolation(bool ssh, bool gpg) {
+    char ssh_error[sizeof(g_last_error.message)] = "";
+    char gpg_error[sizeof(g_last_error.message)] = "";
+    int rc = 0;
+
     if (ssh) {
         /* Reaps every gitswitch agent and removes current.sock. */
-        ssh_manager_reset(NULL);
+        if (ssh_manager_reset(NULL) != 0) {
+            snprintf(ssh_error, sizeof(ssh_error), "%s",
+                     get_last_error()->message[0] ? get_last_error()->message
+                                                  : "unknown SSH teardown error");
+            rc = -1;
+        }
         g_session.ssh_active = false;
     }
     if (gpg) {
         /* Locked drop: a bare unlink here raced a concurrent switch's
          * retarget and could delete its freshly-installed link (AR-02 #9). */
-        gpg_manager_drop_current();
+        if (gpg_manager_drop_current() != 0) {
+            snprintf(gpg_error, sizeof(gpg_error), "%s",
+                     get_last_error()->message[0] ? get_last_error()->message
+                                                  : "unknown GPG teardown error");
+            rc = -1;
+        }
         g_session.gpg_active = false;
     }
+
+    if (rc != 0) {
+        if (ssh_error[0] && gpg_error[0]) {
+            set_error(ERR_SYSTEM_CALL,
+                      "Runtime deactivation incomplete (SSH: %s; GPG: %s)",
+                      ssh_error, gpg_error);
+        } else if (ssh_error[0]) {
+            set_error(ERR_SYSTEM_CALL,
+                      "Runtime deactivation incomplete (SSH: %s)", ssh_error);
+        } else {
+            set_error(ERR_SYSTEM_CALL,
+                      "Runtime deactivation incomplete (GPG: %s)", gpg_error);
+        }
+    }
+    return rc;
 }
 
 /* F4: after a failed switch has torn down the runtime isolation, put the
@@ -140,10 +178,16 @@ static void restore_previous_isolation(const account_t *prev,
                                        bool ssh_torn_down, bool gpg_torn_down) {
     if (ssh_torn_down && prev &&
         prev->ssh_enabled && strlen(prev->ssh_key_path) > 0) {
+        account_t runtime_target = *prev;
+
+        /* ~/.ssh/config was never changed on a failed transaction: the alias
+         * writer is the final success commit. Restore only the agent/key here
+         * so rollback cannot rewrite a concurrent user's config update. */
+        runtime_target.ssh_host_alias[0] = '\0';
         printf("  [..] Restoring SSH agent for previous account: %s\n", prev->name);
         memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
         if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) == 0 &&
-            ssh_switch_account(&g_session.ssh_config, prev) == 0) {
+            ssh_switch_account(&g_session.ssh_config, &runtime_target) == 0) {
             g_session.ssh_active = true;
             printf("  [OK] Previous SSH agent restored\n");
         } else {
@@ -161,120 +205,101 @@ static void restore_previous_isolation(const account_t *prev,
     }
 }
 
-/* M4: pre-switch snapshot of ~/.ssh/config. Step 2's ssh_switch_account
- * durably rewrites the managed host-alias block (ssh_configure_host_alias)
- * when the target names an alias, but abort_failed_switch had no notion of
- * that file mutation: the block was reverted only as an accident of a
- * successful restore-switch — and only when the PREVIOUS account had an alias
- * of its own — so a failed switch could permanently leave the new account's
- * IdentityFile forced on a shared alias while reporting "previous identity
- * kept". Capture the file's exact pre-switch bytes (or its absence) so the
- * abort path can restore it directly, including removing a file the rewrite
- * created wholesale. The 64 KB cap matches ssh_configure_host_alias's own
- * whole-file slurp limit: a file too large to snapshot is also a file the
- * switch refuses to mutate, so skipping the capture there loses nothing. */
-typedef struct {
-    bool taken;                 /* pre-switch state captured; restore is armed */
-    bool existed;               /* the file existed before the switch */
-    mode_t mode;                /* its pre-switch permission bits */
-    char path[MAX_PATH_LEN];    /* $HOME/.ssh/config as seen at snapshot time */
-    char content[65536];        /* pre-switch bytes (valid when existed) */
-} ssh_user_config_snapshot_t;
-
-static ssh_user_config_snapshot_t g_ssh_cfg_snap;
-
-static void ssh_user_config_snapshot(const account_t *account) {
-    struct stat st;
+/* M4: validate ~/.ssh/config before any runtime/Git mutation, but do not
+ * rewrite it yet. The managed alias block is committed only after every step
+ * that can still trigger rollback has succeeded, which removes the unsafe
+ * check-then-rename restoration path entirely. The final writer repeats these
+ * no-follow and identity checks immediately before its atomic rename. */
+static int ssh_user_config_preflight(const account_t *account) {
+    enum { SSH_CONFIG_MAX_BYTES = 65535 };
+    char path[MAX_PATH_LEN];
+    char chunk[4096];
+    struct stat before;
+    struct stat opened;
     const char *home = getenv("HOME");
+    size_t total = 0;
+    int fd;
 
-    memset(&g_ssh_cfg_snap, 0, sizeof(g_ssh_cfg_snap));
-
-    /* The switch only rewrites ~/.ssh/config when its SSH step runs AND the
-     * target names a host alias — otherwise there is nothing to arm. */
     if (!account || !account->ssh_enabled ||
         strlen(account->ssh_key_path) == 0 ||
         strlen(account->ssh_host_alias) == 0) {
-        return;
+        return 0;
     }
-    if (!home || !*home ||
-        (size_t)snprintf(g_ssh_cfg_snap.path, sizeof(g_ssh_cfg_snap.path),
-                         "%s/.ssh/config", home) >= sizeof(g_ssh_cfg_snap.path)) {
-        return;
+    if (!home || !*home) {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot preflight ~/.ssh/config: HOME is not set");
+        return -1;
     }
-    if (lstat(g_ssh_cfg_snap.path, &st) != 0) {
-        /* Absent pre-switch: the rewrite would create it; restore = remove. */
-        g_ssh_cfg_snap.existed = false;
-        g_ssh_cfg_snap.taken = true;
-        return;
+    if ((size_t)snprintf(path, sizeof(path), "%s/.ssh/config", home) >=
+        sizeof(path)) {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot preflight ~/.ssh/config: path is too long");
+        return -1;
     }
-    if (!S_ISREG(st.st_mode) ||
-        (size_t)st.st_size >= sizeof(g_ssh_cfg_snap.content) ||
-        read_file_to_string(g_ssh_cfg_snap.path, g_ssh_cfg_snap.content,
-                            sizeof(g_ssh_cfg_snap.content)) < 0) {
-        /* Unsnapshottable (symlink/huge/unreadable): ssh_configure_host_alias
-         * refuses the same files, so the switch cannot mutate them either. */
-        return;
+    if (lstat(path, &before) != 0) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect SSH config before switch: %s", path);
+        return -1;
     }
-    g_ssh_cfg_snap.mode = st.st_mode & 0777;
-    g_ssh_cfg_snap.existed = true;
-    g_ssh_cfg_snap.taken = true;
-}
-
-/* Put ~/.ssh/config back to its snapshotted pre-switch state. Best-effort like
- * the rest of the rollback (a failure only warns — the git identity restore
- * already succeeded); atomic mkstemp+rename like the writer, so a signal or
- * crash mid-restore can never leave a half-written ~/.ssh/config. */
-static void ssh_user_config_restore(void) {
-    char tmp_path[MAX_PATH_LEN];
-    bool write_ok;
-    FILE *out;
-    int fd;
-
-    if (!g_ssh_cfg_snap.taken) {
-        return;
+    if (S_ISLNK(before.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing to switch: SSH config is a symlink: %s", path);
+        return -1;
     }
-    g_ssh_cfg_snap.taken = false;
-
-    if (!g_ssh_cfg_snap.existed) {
-        /* No config existed before the switch: the alias rewrite created the
-         * whole file, so restore means removing it — leaving a gitswitch-born
-         * block behind a rolled-back switch is exactly the M4 defect. */
-        (void)unlink(g_ssh_cfg_snap.path);
-        return;
+    if (!S_ISREG(before.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing to switch: SSH config is not a regular file: %s", path);
+        return -1;
+    }
+    if (before.st_size < 0 || (size_t)before.st_size > SSH_CONFIG_MAX_BYTES) {
+        set_error(ERR_FILE_IO,
+                  "Refusing to switch: SSH config is too large to update safely: %s",
+                  path);
+        return -1;
     }
 
-    if ((size_t)snprintf(tmp_path, sizeof(tmp_path), "%s.gitswitch.XXXXXX",
-                         g_ssh_cfg_snap.path) >= sizeof(tmp_path)) {
-        log_warning("Could not restore pre-switch ~/.ssh/config (path too long)");
-        return;
-    }
-    fd = mkstemp(tmp_path);
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
-        log_warning("Could not restore pre-switch ~/.ssh/config (temp create failed)");
-        return;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot open SSH config safely before switch: %s", path);
+        return -1;
     }
-    /* SIG-02: covered by the emergency handler while it exists. */
-    signals_scratch_register(tmp_path);
-    out = fdopen(fd, "w");
-    if (!out) {
+    if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode) ||
+        opened.st_dev != before.st_dev || opened.st_ino != before.st_ino) {
         close(fd);
-        unlink(tmp_path);
-        signals_scratch_unregister(tmp_path);
-        log_warning("Could not restore pre-switch ~/.ssh/config (temp open failed)");
-        return;
+        set_error(ERR_FILE_IO,
+                  "SSH config changed while it was being preflighted: %s", path);
+        return -1;
     }
-    /* Restore the pre-switch permission bits too — the writer forces 0600,
-     * which may not be what the user's file carried. */
-    write_ok = (fchmod(fd, g_ssh_cfg_snap.mode) == 0) &&
-               (fputs(g_ssh_cfg_snap.content, out) != EOF);
-    if (fclose(out) != 0) {
-        write_ok = false;
+    for (;;) {
+        ssize_t n = read(fd, chunk, sizeof(chunk));
+        if (n > 0) {
+            total += (size_t)n;
+            if (total > SSH_CONFIG_MAX_BYTES) {
+                close(fd);
+                set_error(ERR_FILE_IO,
+                          "SSH config grew too large while being preflighted: %s",
+                          path);
+                return -1;
+            }
+            continue;
+        }
+        if (n == 0) {
+            break;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        close(fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot read SSH config safely before switch: %s", path);
+        return -1;
     }
-    if (!write_ok || rename(tmp_path, g_ssh_cfg_snap.path) != 0) {
-        unlink(tmp_path);
-        log_warning("Could not restore pre-switch ~/.ssh/config");
-    }
-    signals_scratch_unregister(tmp_path);
+    close(fd);
+    return 0;
 }
 
 /* Common exit path for a switch that failed — or was interrupted by a signal —
@@ -294,13 +319,6 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
     if (git_written) {
         git_config_restore();
     }
-    /* M4: revert the durable ~/.ssh/config host-alias rewrite to its exact
-     * pre-switch bytes (or remove a file the rewrite created). Done before
-     * restore_previous_isolation so that path's own alias write — which only
-     * runs when the previous account has an alias AND its key reloads — is a
-     * byte-identical re-write on top of already-correct content, not the sole
-     * (and conditional) mechanism reverting the block. */
-    ssh_user_config_restore();
     /* Undo the new account's half-applied SSH/GPG activation: leaving
      * current.sock / GNUPGHOME pointed at the new account while the git
      * identity reverts is exactly the mixed identity the tool prevents. */
@@ -414,14 +432,12 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
 
     /* If not in dry-run mode, actually perform the switch.
      *
-     * Ordering matters for safety: validate availability first (read-only), then
-     * activate SSH and GPG (recoverable mutations), and write git config LAST.
-     * git config is snapshotted up front and restored on failure; on that same
-     * failure the SSH/GPG runtime state activated in steps 2-3 is also torn
-     * down and the previous account's isolation is restored
-     * (abort_failed_switch), so a failed switch reverts the git identity AND
-     * doesn't leave current.sock / GNUPGHOME pointing at the new account — no
-     * half-applied, mismatched identity.
+     * Ordering matters for safety: validate availability first (read-only),
+     * then activate SSH/GPG and write the snapshotted Git identity as
+     * recoverable mutations. Required teardown follows, and the atomic
+     * ~/.ssh/config host-alias rewrite is the final fallible commit. On any
+     * earlier failure the Git/runtime state is restored; because the alias
+     * writer has not run yet, rollback never needs to replace a user file.
      *
      * SIG-01: the whole mutation window is guarded against SIGINT/SIGTERM/
      * SIGHUP (Ctrl-C at the ssh-add passphrase or GPG pinentry prompt is a
@@ -496,12 +512,23 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
          * its own temp path under the guard this function leaves armed. */
         signals_guard_begin();
 
-        /* M4: arm the ~/.ssh/config restore before anything can rewrite it.
-         * No-op unless the target's SSH step will touch the managed block. */
-        ssh_user_config_snapshot(account);
+        /* Prove the host-alias sink is readable and policy-compliant before
+         * mutation. The actual alias write is deliberately delayed until the
+         * final commit, so no rollback path ever rewrites this user file. */
+        if (ssh_user_config_preflight(account) != 0) {
+            abort_failed_switch(prev_account, prev_gpg_home,
+                                false, false, false);
+            return -1;
+        }
 
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
+            account_t runtime_target = switch_target;
+
+            /* Agent/key activation must not touch ~/.ssh/config yet. The
+             * atomic host-alias write is the transaction's final fallible
+             * commit, after Git and deferred teardown are known-good. */
+            runtime_target.ssh_host_alias[0] = '\0';
             log_info("Setting up SSH isolation for account: %s", account->name);
             memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
             /* ssh_manager_init only probes PATH for ssh-agent/ssh-add — it
@@ -520,7 +547,7 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 return -1;
             }
             ssh_dirty = true;
-            if (ssh_switch_account(&g_session.ssh_config, &switch_target) != 0) {
+            if (ssh_switch_account(&g_session.ssh_config, &runtime_target) != 0) {
                 printf("  [!!] SSH key failed to load\n");
                 ssh_manager_cleanup(&g_session.ssh_config);
                 abort_failed_switch(prev_account, prev_gpg_home,
@@ -532,31 +559,6 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             ssh_ok = true;
             g_session.ssh_active = true;
             printf("  [OK] SSH key loaded\n");
-
-            /* Connection test is best-effort (network) and never fatal, and it
-             * blocks the whole switch on a live round trip (up to the 5s ssh
-             * ConnectTimeout, plus unbounded DNS, when the host is filtered/
-             * offline) for a result that only picks a status line. So it is
-             * skipped wherever it can't tell the user anything new (AR-02 #16):
-             *   - the boot-time resume path — it would stall the login prompt;
-             *   - a re-switch to the already-active account (reuse fast path):
-             *     the agent was just fingerprint-verified to hold this exact
-             *     key, so the probe re-proves a liveness we already have.
-             * The github.com fallback for alias-less accounts is additionally
-             * gated behind --verbose: it hardcodes a host the account never
-             * named, so by default only a configured host alias is probed. */
-            if (!ctx->config.resuming && !g_session.ssh_config.key_already_loaded) {
-                if (strlen(account->ssh_host_alias) > 0) {
-                    if (ssh_test_connection(&switch_target, account->ssh_host_alias) == 0) {
-                        printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
-                    } else {
-                        printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
-                    }
-                } else if (ctx->config.verbose &&
-                           ssh_test_connection(&switch_target, "git@github.com") == 0) {
-                    printf("  [OK] SSH connection verified (github.com)\n");
-                }
-            }
         } else {
             /* Target has no SSH: the live gitswitch agent + current.sock must
              * be torn down so shells stop authenticating as the previously-
@@ -610,7 +612,7 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                                        false, ssh_dirty, gpg_dirty);
         }
 
-        /* --- 4. git config LAST, snapshotted for rollback --- */
+        /* --- 4. Git identity (snapshotted and reversible) --- */
         if (write_git) {
             git_config_snapshot(scope);
             if (git_set_config(account, scope) != 0) {
@@ -651,12 +653,6 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                                        write_git, ssh_dirty, gpg_dirty);
         }
 
-        /* Point of no return: the new identity is fully applied and
-         * consistent. The switch is keeping its host-alias rewrite, so the
-         * M4 restore must disarm — from here on ~/.ssh/config's new managed
-         * block is the correct durable state, not something to roll back. */
-        g_ssh_cfg_snap.taken = false;
-
         /* NOW run the teardown deferred from steps 2-3 — only once the switch
          * is known-good may the previous account's agent / keyring entry
          * point be dropped (F4). L7: the reap is multi-step (identify,
@@ -666,13 +662,70 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
          * behind the just-applied new git identity. Same deferral the failed-
          * switch rollback gets. */
         signals_rollback_begin();
-        if (ssh_teardown_deferred) {
-            deactivate_runtime_isolation(true, false);
-        }
-        if (gpg_teardown_deferred) {
-            deactivate_runtime_isolation(false, true);
-        }
+        int deactivation_rc = deactivate_runtime_isolation(
+            ssh_teardown_deferred, gpg_teardown_deferred);
         signals_rollback_end();
+        if (deactivation_rc != 0) {
+            char detail[sizeof(g_last_error.message)];
+            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            ssh_dirty = ssh_dirty || ssh_teardown_deferred;
+            gpg_dirty = gpg_dirty || gpg_teardown_deferred;
+            abort_failed_switch(prev_account, prev_gpg_home,
+                                write_git, ssh_dirty, gpg_dirty);
+            set_error(ERR_SYSTEM_CALL,
+                      "Failed to deactivate previous runtime state while switching to '%s': %s",
+                      account->name, detail[0] ? detail : "unknown teardown error");
+            return -1;
+        }
+
+        /* Successful deferred teardown is also a mutation rollback must
+         * restore if the final host-alias commit now fails. */
+        ssh_dirty = ssh_dirty || ssh_teardown_deferred;
+        gpg_dirty = gpg_dirty || gpg_teardown_deferred;
+
+        /* Final fallible commit: only now install the managed host-alias
+         * block. The writer uses a no-follow read plus atomic rename; if it
+         * refuses or fails, it has made no durable change and the ordinary
+         * Git/runtime rollback is sufficient. There is deliberately no SSH
+         * config rollback writer, so a concurrent replacement can never be
+         * adopted and overwritten on an abort. */
+        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
+            strlen(account->ssh_host_alias) > 0 &&
+            ssh_configure_host_alias(&switch_target) != 0) {
+            char detail[sizeof(g_last_error.message)];
+            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            abort_failed_switch(prev_account, prev_gpg_home,
+                                write_git, ssh_dirty, gpg_dirty);
+            set_error(ERR_FILE_IO,
+                      "Failed to commit SSH host alias for account '%s': %s",
+                      account->name,
+                      detail[0] ? detail : "unknown SSH config error");
+            return -1;
+        }
+
+        /* Point of no return: identity, required teardown, and the optional
+         * host alias are all committed. The connection probe is best-effort
+         * and cannot roll the transaction back. It is skipped on resume,
+         * agent reuse, or a pending signal; alias-less github.com probing also
+         * remains verbose-only (AR-02 #16). */
+        if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
+            !ctx->config.resuming &&
+            !g_session.ssh_config.key_already_loaded && !signals_pending()) {
+            if (strlen(account->ssh_host_alias) > 0) {
+                if (ssh_test_connection(&switch_target,
+                                        account->ssh_host_alias) == 0) {
+                    printf("  [OK] SSH connection verified (%s)\n",
+                           account->ssh_host_alias);
+                } else {
+                    printf("  [--] SSH connection test skipped (%s unreachable)\n",
+                           account->ssh_host_alias);
+                }
+            } else if (ctx->config.verbose &&
+                       ssh_test_connection(&switch_target,
+                                           "git@github.com") == 0) {
+                printf("  [OK] SSH connection verified (github.com)\n");
+            }
+        }
 
         /* Read-back validation is best-effort (warn only). Skipped on resume:
          * no git config was written, and the login shell's cwd is usually not
@@ -751,19 +804,42 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     return 0;
 }
 
+/* Fields whose persisted value must agree with the live Git/SSH/GPG state.
+ * Description is intentionally excluded: it is metadata-only and safe to
+ * update while the account is active. */
+static bool account_live_fields_equal(const account_t *a, const account_t *b) {
+    return a && b &&
+           strcmp(a->name, b->name) == 0 &&
+           strcmp(a->email, b->email) == 0 &&
+           a->preferred_scope == b->preferred_scope &&
+           a->ssh_enabled == b->ssh_enabled &&
+           strcmp(a->ssh_key_path, b->ssh_key_path) == 0 &&
+           strcmp(a->ssh_host_alias, b->ssh_host_alias) == 0 &&
+           a->gpg_enabled == b->gpg_enabled &&
+           a->gpg_signing_enabled == b->gpg_signing_enabled &&
+           strcmp(a->gpg_key_id, b->gpg_key_id) == 0;
+}
+
 /* Shared interactive add/edit flow. `existing` is NULL for add, or points at
  * the account being edited (in which case every prompt shows the current value
  * as the default and an empty answer keeps it). Routes all input through
  * prompt_line so readline builds get line editing and TAB path completion. */
 static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     account_t acct;
+    account_t original;
     char input[512];
     char expanded_path[MAX_PATH_LEN];
     bool edit = (existing != NULL);
+    bool editing_active = false;
 
     if (edit) {
-        acct = *existing;
+        original = *existing;
+        acct = original;
+        editing_active = (existing == ctx->current_account) ||
+                         (ctx->config.active_account[0] != '\0' &&
+                          strcmp(ctx->config.active_account, original.name) == 0);
     } else {
+        memset(&original, 0, sizeof(original));
         memset(&acct, 0, sizeof(acct));
         acct.id = get_next_available_id(ctx);
         acct.preferred_scope = ctx->config.default_scope;
@@ -986,11 +1062,20 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
                 return -1;
             }
         }
-        *existing = acct;
-        if (strcmp(ctx->config.active_account, existing->name) != 0 &&
-            existing == ctx->current_account) {
-            safe_strncpy(ctx->config.active_account, acct.name, sizeof(ctx->config.active_account));
+
+        /* Updating live-affecting fields in place would persist a different
+         * identity while Git and name-keyed runtime resources remain on the
+         * old one. Until there is a true cross-subsystem edit transaction,
+         * fail closed and keep the original struct byte-for-byte. */
+        if (editing_active && !account_live_fields_equal(&original, &acct)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Cannot change live fields for active account '%s'; "
+                      "switch away or reset it, then rerun edit",
+                      original.name);
+            return -1;
         }
+
+        *existing = acct;
         printf("[OK]: Account updated.\n");
         return 0;
     }
@@ -1032,6 +1117,16 @@ int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *account;
     char input[64];
+    char account_name[MAX_NAME_LEN];
+    char ssh_error[sizeof(g_last_error.message)] = "";
+    char gpg_error[sizeof(g_last_error.message)] = "";
+    uint32_t account_id;
+    uint32_t current_id = 0;
+    bool had_current;
+    bool was_current;
+    bool was_active;
+    int ssh_rc;
+    int gpg_rc;
     
     if (!ctx || !identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_remove");
@@ -1073,22 +1168,68 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         }
     }
     
-    /* Clear current account if it's the one being removed */
-    if (ctx->current_account == account) {
-        ctx->current_account = NULL;
+    if (safe_strncpy(account_name, account->name, sizeof(account_name)) != 0) {
+        return -1;
     }
-
-    /* Drop the persisted boot-resume target if it names this account, so a later
-     * resume can't re-activate a deleted (or, worse, a wrongly-matched) account. */
-    if (strcmp(ctx->config.active_account, account->name) == 0) {
-        ctx->config.active_account[0] = '\0';
+    account_id = account->id;
+    had_current = (ctx->current_account != NULL);
+    if (had_current) {
+        current_id = ctx->current_account->id;
     }
+    was_current = (ctx->current_account == account);
+    was_active = (strcmp(ctx->config.active_account, account_name) == 0);
 
-    uint32_t account_id = account->id;
+    /* Tear down while the account name still exists as a retry handle. Both
+     * managers are attempted; any failure retains the account/current/active
+     * state so `remove` or targeted `reset` can be retried safely. */
+    ssh_rc = ssh_manager_reset(account_name);
+    if (ssh_rc != 0) {
+        snprintf(ssh_error, sizeof(ssh_error), "%s",
+                 get_last_error()->message[0] ? get_last_error()->message
+                                              : "unknown SSH teardown error");
+    }
+    gpg_rc = gpg_manager_reset(account_name);
+    if (gpg_rc != 0) {
+        snprintf(gpg_error, sizeof(gpg_error), "%s",
+                 get_last_error()->message[0] ? get_last_error()->message
+                                              : "unknown GPG teardown error");
+    }
+    if (ssh_rc != 0 || gpg_rc != 0) {
+        if (ssh_rc != 0) {
+            fprintf(stderr, "gitswitch: SSH cleanup failed for '%s': %s\n",
+                    account_name, ssh_error);
+        }
+        if (gpg_rc != 0) {
+            fprintf(stderr, "gitswitch: GPG cleanup failed for '%s': %s\n",
+                    account_name, gpg_error);
+        }
+        set_error(ERR_SYSTEM_CALL,
+                  "Runtime cleanup failed for account '%s'; account retained for retry",
+                  account_name);
+        return -1;
+    }
     
-    /* Remove account */
+    /* Only a complete teardown permits deleting the configuration handle. */
     if (config_remove_account(ctx, account_id) != 0) {
         return -1;
+    }
+
+    if (was_current || !had_current) {
+        ctx->current_account = NULL;
+    } else {
+        /* config_remove_account compacts ctx->accounts. A pointer to a later
+         * account therefore moves even when the removed account was inactive;
+         * re-resolve by stable ID instead of leaving a stale array pointer. */
+        ctx->current_account = NULL;
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            if (ctx->accounts[i].id == current_id) {
+                ctx->current_account = &ctx->accounts[i];
+                break;
+            }
+        }
+    }
+    if (was_active) {
+        ctx->config.active_account[0] = '\0';
     }
     
     printf("[OK]: Account removed successfully.\n");
@@ -1603,10 +1744,14 @@ int accounts_detect_current(gitswitch_ctx_t *ctx) {
     char target_path[MAX_PATH_LEN];
     ssize_t len;
     const char *runtime_dir;
-    const char *account_name_start;
-    const char *account_name_end;
+    const char *basename;
     char account_name[MAX_NAME_LEN];
+    size_t basename_len;
+    size_t prefix_len;
+    size_t suffix_len;
     size_t name_len;
+    static const char prefix[] = "ssh-agent.";
+    static const char suffix[] = ".sock";
 
     if (!ctx) {
         return -1;
@@ -1626,7 +1771,7 @@ int accounts_detect_current(gitswitch_ctx_t *ctx) {
 
     if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
                          "%s/gitswitch-ssh/current.sock", runtime_dir) >= sizeof(symlink_path)) {
-        return -1;
+        return detect_current_from_saved(ctx);
     }
 
     /* Read symlink target */
@@ -1637,27 +1782,31 @@ int accounts_detect_current(gitswitch_ctx_t *ctx) {
     }
     target_path[len] = '\0';
 
-    /* Parse account name from target: ssh-agent.<name>.sock */
-    account_name_start = strstr(target_path, "ssh-agent.");
-    if (!account_name_start) {
+    /* Parse only the basename and require the terminal suffix. Account names
+     * may legitimately contain ".sock"; searching for its first occurrence
+     * truncated those names and suppressed the saved-state fallback. */
+    basename = strrchr(target_path, '/');
+    basename = basename ? basename + 1 : target_path;
+    basename_len = strlen(basename);
+    prefix_len = strlen(prefix);
+    suffix_len = strlen(suffix);
+    if (basename_len <= prefix_len + suffix_len ||
+        strncmp(basename, prefix, prefix_len) != 0) {
         log_debug("Symlink target doesn't match expected format: %s", target_path);
-        return -1;
+        return detect_current_from_saved(ctx);
     }
-    account_name_start += strlen("ssh-agent.");
-
-    account_name_end = strstr(account_name_start, ".sock");
-    if (!account_name_end) {
+    if (strcmp(basename + basename_len - suffix_len, suffix) != 0) {
         log_debug("Symlink target missing .sock suffix: %s", target_path);
-        return -1;
+        return detect_current_from_saved(ctx);
     }
 
-    name_len = (size_t)(account_name_end - account_name_start);
+    name_len = basename_len - prefix_len - suffix_len;
     if (name_len == 0 || name_len >= sizeof(account_name)) {
         log_debug("Invalid account name length in symlink target");
-        return -1;
+        return detect_current_from_saved(ctx);
     }
 
-    memcpy(account_name, account_name_start, name_len);
+    memcpy(account_name, basename + prefix_len, name_len);
     account_name[name_len] = '\0';
 
     /* Find matching account */
@@ -1670,5 +1819,5 @@ int accounts_detect_current(gitswitch_ctx_t *ctx) {
     }
 
     log_debug("No matching account found for name: %s", account_name);
-    return -1;
+    return detect_current_from_saved(ctx);
 }
