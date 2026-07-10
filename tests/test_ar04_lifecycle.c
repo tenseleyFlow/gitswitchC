@@ -570,6 +570,7 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
 TEST(remove_failure_retains_account_and_attempts_other_manager) {
     char home[256], runtime[256], shims[512], path[1024], target[1024];
     char output[1024], contents[8192];
+    struct stat link_st;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
@@ -583,10 +584,16 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     CHECK_EQ_INT(mkdir_private(path), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg/current", runtime);
     CHECK_EQ_INT(symlink("missing", path), 0);
+    CHECK_EQ_INT(lstat(path, &link_st), 0);
+    CHECK(S_ISLNK(link_st.st_mode));
 
     snprintf(output, sizeof(output), "%s/remove.out", runtime);
     CHECK(run_remove(home, runtime, shims, "work", output) != 0);
-    CHECK(access(path, F_OK) != 0); /* GPG reset still attempted. */
+    /* GPG reset still attempted: gpg_manager_reset unlinks the dangling
+     * `current` link, so the LINK must be gone. access() follows symlinks
+     * and returned -1 either way — a tautological witness (AR-05 M6). */
+    errno = 0;
+    CHECK(lstat(path, &link_st) != 0 && errno == ENOENT);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"work\"") != NULL);

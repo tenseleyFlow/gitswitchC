@@ -242,6 +242,7 @@ static int run_targeted_reset(const char *home, const char *runtime,
 TEST(reset_ssh_failure_preserves_retry_state_and_attempts_gpg) {
     char home[PATH_MAX], runtime[PATH_MAX], path[PATH_MAX], target[PATH_MAX];
     char output[PATH_MAX], contents[8192];
+    struct stat link_st;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
@@ -253,17 +254,24 @@ TEST(reset_ssh_failure_preserves_retry_state_and_attempts_gpg) {
     CHECK_EQ_INT(symlink(target, path), 0);
 
     /* A dangling GPG current link is a deterministic witness that the GPG
-     * manager was still attempted after SSH failed. */
+     * manager was still attempted after SSH failed: gpg_manager_reset lstat()s
+     * it, sees a symlink, and unlinks it. Prove the LINK itself exists before
+     * the run and is gone after — access() follows symlinks, so it returned
+     * -1 for the dangling link whether or not the second manager ever ran,
+     * making the old witness a tautology (AR-05 M6). */
     CHECK_EQ_INT(join_path(path, sizeof(path), runtime, "/gitswitch-gpg"), 0);
     CHECK_EQ_INT(mkdir_private(path), 0);
     CHECK_EQ_INT(join_path(path, sizeof(path), runtime,
                            "/gitswitch-gpg/current"), 0);
     CHECK_EQ_INT(symlink("missing", path), 0);
+    CHECK_EQ_INT(lstat(path, &link_st), 0);
+    CHECK(S_ISLNK(link_st.st_mode));
 
     CHECK_EQ_INT(join_path(output, sizeof(output), runtime, "/reset.out"), 0);
     CHECK(run_reset(home, runtime, output) != 0);
     assert_retry_state_preserved(home);
-    CHECK(access(path, F_OK) != 0);
+    errno = 0;
+    CHECK(lstat(path, &link_st) != 0 && errno == ENOENT);
     slurp(output, contents, sizeof(contents));
     CHECK_EQ_INT(substring_count(contents, "gitswitch: SSH reset failed:"), 1);
     CHECK(strstr(contents, "Reset all gitswitch SSH/GPG state") == NULL);
