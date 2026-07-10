@@ -1021,6 +1021,37 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
             return EXIT_FAILURE;
         }
         target = acct->name;
+    }
+
+    /* Reset deletes secret-key material, so it is exactly the command a
+     * cautious user previews with --dry-run first — and neither
+     * ssh_manager_reset nor gpg_manager_reset checks dry_run themselves, so
+     * this is the single gate (AR-05 H1). Stop before the confirmation
+     * prompt, the runtime lock, and both managers. active_account is left
+     * untouched on purpose: nothing was destroyed, so the saved resume
+     * pointer must keep naming the still-live state. (Clearing it here while
+     * main()'s !dry_run save gate skips the persist is how the pre-fix code
+     * re-armed auto-resume of torn-down state.) */
+    if (ctx->config.dry_run) {
+        display_info("DRY RUN MODE - No actual changes will be made");
+        if (target) {
+            printf("Would kill the SSH/GPG agents and delete the isolated GPG home for\n"
+                   "'%s', removing its on-disk secret-key copy.\n", target);
+        } else {
+            printf("Would kill ALL gitswitch SSH/GPG agents and delete ALL isolated GPG\n"
+                   "homes, removing every on-disk secret-key copy.\n");
+        }
+        if ((!target || strcmp(ctx->config.active_account, target) == 0) &&
+            ctx->config.active_account[0] != '\0') {
+            printf("Would clear the saved active account '%s' and remove the resume\n"
+                   "hint, so login shells stop auto-resuming it.\n",
+                   ctx->config.active_account);
+        }
+        display_success("DRY RUN complete - no changes were made");
+        return EXIT_SUCCESS;
+    }
+
+    if (target) {
         printf("This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
                "'%s', removing its on-disk secret-key copy.\n", target);
     } else {
