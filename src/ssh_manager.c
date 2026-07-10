@@ -1675,6 +1675,178 @@ static int ssh_config_recheck_before_rename(const char *path, bool existed,
 /* Configure an SSH host alias in ~/.ssh/config. The block is delimited by
  * gitswitch markers and rewritten idempotently (no unbounded appending), and
  * deliberately does NOT weaken host-key checking. Written atomically at 0600. */
+/* Splice a prior "# >>> gitswitch <alias> >>>" managed block out of `buf` in
+ * place (AR-06 F15 factored this out of ssh_configure_host_alias so removal can
+ * reuse it). Handles a malformed (unterminated) block by dropping only the
+ * recognizably-ours lines, never truncating user content below it. No-op when
+ * no block is present. */
+static void ssh_splice_managed_block(char *buf, const char *begin_marker,
+                                     const char *end_marker, const char *alias) {
+    char *bstart = strstr(buf, begin_marker);
+    if (!bstart) {
+        return;
+    }
+    /* back up to the start of the begin-marker line */
+    char *line_start = bstart;
+    while (line_start > buf && line_start[-1] != '\n') line_start--;
+    char *bend = strstr(bstart, end_marker);
+    if (bend) {
+        char *after = strchr(bend, '\n');
+        after = after ? after + 1 : bend + strlen(bend);
+        memmove(line_start, after, strlen(after) + 1);
+    } else {
+        /* Malformed block: begin marker with no end marker. Drop only the
+         * lines that are recognizably ours — the marker line, our
+         * "Host <alias>" line, and the indented options under it — and keep
+         * everything after (preserving user bytes is the safe direction). */
+        char *p = strchr(line_start, '\n');
+        p = p ? p + 1 : line_start + strlen(line_start);
+        char hostline[MAX_NAME_LEN + 8];
+        int hn = snprintf(hostline, sizeof(hostline), "Host %s", alias);
+        if (hn > 0 && (size_t)hn < sizeof(hostline) &&
+            strncmp(p, hostline, (size_t)hn) == 0 &&
+            (p[hn] == '\n' || p[hn] == '\0')) {
+            char *q = strchr(p, '\n');
+            p = q ? q + 1 : p + strlen(p);
+            while (*p == ' ' || *p == '\t') { /* our option lines */
+                q = strchr(p, '\n');
+                p = q ? q + 1 : p + strlen(p);
+            }
+        }
+        memmove(line_start, p, strlen(p) + 1);
+    }
+}
+
+/* Atomically install `content` as ~/.ssh/config at 0600, with the AR-06 F10
+ * checked-write + fsync discipline and the pre-rename recheck. `tmp_template` is
+ * a mkstemp template under the same dir. Shared by configure and remove. */
+static int ssh_write_config_atomic(const char *tmp_template,
+                                   const char *ssh_config_path,
+                                   const char *content,
+                                   bool config_existed,
+                                   const struct stat *config_identity) {
+    char tmp_path[MAX_PATH_LEN];
+    int fd;
+    FILE *out;
+
+    if ((size_t)snprintf(tmp_path, sizeof(tmp_path), "%s", tmp_template) >= sizeof(tmp_path)) {
+        set_error(ERR_INVALID_PATH, "SSH config temp path too long");
+        return -1;
+    }
+    fd = mkstemp(tmp_path);
+    if (fd < 0) {
+        set_system_error(ERR_FILE_IO, "Failed to create temp SSH config");
+        return -1;
+    }
+    (void)signals_scratch_register(tmp_path);
+    if (fchmod(fd, 0600) != 0) {
+        close(fd);
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to secure temp SSH config");
+        return -1;
+    }
+    out = fdopen(fd, "w");
+    if (!out) {
+        close(fd);
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to open temp SSH config");
+        return -1;
+    }
+    /* Checked, durable write (AR-06 F10): a bare fputs whose error is ignored
+     * can silently install a truncated prefix of the user's config on ENOSPC. */
+    if (fputs(content, out) == EOF ||
+        fflush(out) != 0 || ferror(out) || fsync(fileno(out)) != 0) {
+        fclose(out);
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to write SSH config");
+        return -1;
+    }
+    if (fclose(out) != 0) {
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to write SSH config");
+        return -1;
+    }
+    if (ssh_config_recheck_before_rename(ssh_config_path, config_existed,
+                                         config_identity) != 0) {
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
+        return -1;
+    }
+    if (rename(tmp_path, ssh_config_path) != 0) {
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to install SSH config");
+        return -1;
+    }
+    signals_scratch_unregister(tmp_path); /* temp renamed away: record done */
+    return 0;
+}
+
+/* Remove the managed host-alias block for `alias` from ~/.ssh/config (AR-06
+ * F15). Account removal (and alias edits) used to leave a permanent
+ * "Host <alias>" stanza routing git traffic to the removed account's key, since
+ * nothing ever deleted a managed block. No-op if the config or the block is
+ * absent. Returns 0 on success (including no-op), -1 on I/O failure. */
+int ssh_remove_host_alias(const char *alias) {
+    char ssh_config_dir[MAX_PATH_LEN];
+    char ssh_config_path[MAX_PATH_LEN];
+    char tmp_template[MAX_PATH_LEN];
+    char begin_marker[MAX_NAME_LEN + 32];
+    char end_marker[MAX_NAME_LEN + 32];
+    char buf[65536];
+    char orig[65536];
+    const char *home = getenv("HOME");
+    struct stat config_identity;
+    bool config_existed;
+
+    if (!alias || !*alias) {
+        return 0;
+    }
+    if (!home || !*home) {
+        set_error(ERR_INVALID_PATH, "HOME not set");
+        return -1;
+    }
+    if (!valid_ssh_host_alias(alias)) {
+        set_error(ERR_INVALID_ARGS, "Invalid SSH host alias: %s", alias);
+        return -1;
+    }
+    if ((size_t)snprintf(ssh_config_dir, sizeof(ssh_config_dir), "%s/.ssh", home) >= sizeof(ssh_config_dir) ||
+        (size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config", ssh_config_dir) >= sizeof(ssh_config_path) ||
+        (size_t)snprintf(tmp_template, sizeof(tmp_template), "%s/config.gitswitch.XXXXXX", ssh_config_dir) >= sizeof(tmp_template)) {
+        set_error(ERR_INVALID_PATH, "SSH config path too long");
+        return -1;
+    }
+
+    snprintf(begin_marker, sizeof(begin_marker), "# >>> gitswitch %s >>>", alias);
+    snprintf(end_marker, sizeof(end_marker), "# <<< gitswitch %s <<<", alias);
+
+    buf[0] = '\0';
+    orig[0] = '\0';
+    if (read_ssh_config_nofollow(ssh_config_path, buf, sizeof(buf),
+                                 &config_existed, &config_identity) != 0) {
+        return -1;
+    }
+    if (!config_existed) {
+        return 0; /* nothing to remove */
+    }
+    memcpy(orig, buf, strlen(buf) + 1);
+    ssh_splice_managed_block(buf, begin_marker, end_marker, alias);
+    if (strcmp(buf, orig) == 0) {
+        return 0; /* no managed block for this alias */
+    }
+
+    if (ssh_write_config_atomic(tmp_template, ssh_config_path, buf,
+                                config_existed, &config_identity) != 0) {
+        return -1;
+    }
+    log_info("Removed SSH host alias block: %s", alias);
+    return 0;
+}
+
 int ssh_configure_host_alias(const account_t *account) {
     char ssh_config_dir[MAX_PATH_LEN];
     char ssh_config_path[MAX_PATH_LEN];
@@ -1689,8 +1861,6 @@ int ssh_configure_host_alias(const account_t *account) {
     const char *home = getenv("HOME");
     struct stat config_identity;
     bool config_existed;
-    int fd;
-    FILE *out;
 
     if (!account || strlen(account->ssh_host_alias) == 0) {
         return 0; /* Nothing to configure */
@@ -1748,45 +1918,10 @@ int ssh_configure_host_alias(const account_t *account) {
     }
     if (config_existed) {
         memcpy(orig, buf, strlen(buf) + 1);
-        char *bstart = strstr(buf, begin_marker);
-        if (bstart) {
-            char *bend = strstr(bstart, end_marker);
-            /* back up to the start of the begin-marker line */
-            char *line_start = bstart;
-            while (line_start > buf && line_start[-1] != '\n') line_start--;
-            if (bend) {
-                char *after = strchr(bend, '\n');
-                after = after ? after + 1 : bend + strlen(bend);
-                memmove(line_start, after, strlen(after) + 1);
-            } else {
-                /* Malformed block: begin marker with no end marker. The old
-                 * behavior truncated from the marker — which silently
-                 * destroyed every USER stanza below the damaged block once
-                 * the rename installed the result (AR-03 T5). Instead drop
-                 * only the lines that are recognizably ours — the marker
-                 * line, our "Host <alias>" line, and the indented options
-                 * under it — and keep everything after: when in doubt about
-                 * attribution, preserving user bytes is the safe direction
-                 * (the worst case is a leftover stanza the user can see,
-                 * never lost content). */
-                char *p = strchr(line_start, '\n');
-                p = p ? p + 1 : line_start + strlen(line_start);
-                char hostline[MAX_NAME_LEN + 8];
-                int hn = snprintf(hostline, sizeof(hostline), "Host %s",
-                                  account->ssh_host_alias);
-                if (hn > 0 && (size_t)hn < sizeof(hostline) &&
-                    strncmp(p, hostline, (size_t)hn) == 0 &&
-                    (p[hn] == '\n' || p[hn] == '\0')) {
-                    char *q = strchr(p, '\n');
-                    p = q ? q + 1 : p + strlen(p);
-                    while (*p == ' ' || *p == '\t') { /* our option lines */
-                        q = strchr(p, '\n');
-                        p = q ? q + 1 : p + strlen(p);
-                    }
-                }
-                memmove(line_start, p, strlen(p) + 1);
-            }
-        }
+        /* Splice out any prior managed block for this alias (AR-06 F15 factored
+         * this into ssh_splice_managed_block, shared with ssh_remove_host_alias;
+         * malformed-block handling preserves user content — AR-03 T5). */
+        ssh_splice_managed_block(buf, begin_marker, end_marker, account->ssh_host_alias);
     }
 
     /* Assemble the final content and skip the whole write when it is
@@ -1809,73 +1944,13 @@ int ssh_configure_host_alias(const account_t *account) {
         return 0;
     }
 
-    /* Write existing content + a fresh managed block, atomically at 0600.
-     * mkstemp creates a fresh unique file (no collision with a concurrent
-     * writer) and returns its fd; fchmod guarantees 0600 regardless of the
-     * platform's mkstemp default. */
-    fd = mkstemp(tmp_path);
-    if (fd < 0) {
-        set_system_error(ERR_FILE_IO, "Failed to create temp SSH config");
+    /* Install atomically at 0600 via the shared writer (AR-06 F15 factored the
+     * mkstemp + checked-write/fsync + recheck + rename dance out so remove can
+     * reuse it). */
+    if (ssh_write_config_atomic(tmp_path, ssh_config_path, newbuf,
+                                config_existed, &config_identity) != 0) {
         return -1;
     }
-    /* mkstemp resolved the XXXXXX: register the temp with the emergency-
-     * signal scratch table so a second Ctrl-C mid-write unlinks it instead
-     * of stranding ~/.ssh/config.gitswitch.XXXXXX — this was the "remaining
-     * hook point" acknowledged in signals.h (AR-03 L9). A failed
-     * registration (full table) is tolerable: every exit path below still
-     * unlinks the temp itself. */
-    (void)signals_scratch_register(tmp_path);
-    if (fchmod(fd, 0600) != 0) {
-        close(fd);
-        unlink(tmp_path);
-        signals_scratch_unregister(tmp_path);
-        set_system_error(ERR_FILE_IO, "Failed to secure temp SSH config");
-        return -1;
-    }
-    out = fdopen(fd, "w");
-    if (!out) {
-        close(fd);
-        unlink(tmp_path);
-        signals_scratch_unregister(tmp_path);
-        set_system_error(ERR_FILE_IO, "Failed to open temp SSH config");
-        return -1;
-    }
-    /* Durable, CHECKED write (AR-06 F10). A bare fputs whose return was ignored
-     * was the last unchecked payload writer in the tree: when the payload
-     * exceeds the stdio buffer, fputs flushes to the fd, and on ENOSPC/EDQUOT/
-     * EIO glibc latches the stream error and DISCARDS the unwritten tail — the
-     * later fclose then returns 0, so a truncated PREFIX of the user's
-     * ~/.ssh/config was atomically renamed over the complete original while the
-     * switch reported success. Check fputs + flush + ferror + fsync before the
-     * rename so a partial write is reported and the temp is discarded; fsync
-     * also makes the temp durable so a crash right after rename can't zero it. */
-    if (fputs(newbuf, out) == EOF ||
-        fflush(out) != 0 || ferror(out) || fsync(fileno(out)) != 0) {
-        fclose(out);
-        unlink(tmp_path);
-        signals_scratch_unregister(tmp_path);
-        set_system_error(ERR_FILE_IO, "Failed to write SSH config");
-        return -1;
-    }
-    if (fclose(out) != 0) {
-        unlink(tmp_path);
-        signals_scratch_unregister(tmp_path);
-        set_system_error(ERR_FILE_IO, "Failed to write SSH config");
-        return -1;
-    }
-    if (ssh_config_recheck_before_rename(ssh_config_path, config_existed,
-                                         &config_identity) != 0) {
-        unlink(tmp_path);
-        signals_scratch_unregister(tmp_path);
-        return -1;
-    }
-    if (rename(tmp_path, ssh_config_path) != 0) {
-        unlink(tmp_path);
-        signals_scratch_unregister(tmp_path);
-        set_system_error(ERR_FILE_IO, "Failed to install SSH config");
-        return -1;
-    }
-    signals_scratch_unregister(tmp_path); /* temp renamed away: record done */
 
     log_info("SSH host alias configured: %s -> %s", account->ssh_host_alias, expanded_key_path);
     return 0;

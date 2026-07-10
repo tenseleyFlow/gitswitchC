@@ -105,6 +105,13 @@ int ssh_validate_key_file(const char *key_path);
 int ssh_configure_host_alias(const account_t *account);
 
 /**
+ * Remove the managed host-alias block for `alias` from ~/.ssh/config (AR-06
+ * F15). No-op if the config or the block is absent. Returns 0 on success
+ * (including no-op), -1 on I/O failure.
+ */
+int ssh_remove_host_alias(const char *alias);
+
+/**
  * Test SSH connection to verify authentication
  */
 int ssh_test_connection(const account_t *account, const char *host);

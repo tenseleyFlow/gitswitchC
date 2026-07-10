@@ -740,6 +740,68 @@ TEST(host_alias_write_rejects_newline_key_path) {
     }
 }
 
+/* AR-06 F15: a configured host-alias block used to leak forever — account
+ * removal never cleaned ~/.ssh/config. ssh_remove_host_alias must excise
+ * exactly the named managed block, leave unrelated managed blocks and
+ * user-authored content intact, and no-op when the block or config is absent. */
+TEST(host_alias_removal_excises_only_named_block) {
+    char home[128], cfg_path[256], buf[4096];
+    account_t work, personal;
+    FILE *f;
+    size_t n;
+
+    snprintf(home, sizeof(home), "/tmp/gswsshrm_XXXXXX");
+    CHECK(mkdtemp(home) != NULL);
+    setenv("HOME", home, 1);
+
+    /* Seed a user-authored stanza first so we can prove it survives. */
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh", home);
+    CHECK_EQ_INT(mkdir(cfg_path, 0700), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    f = fopen(cfg_path, "w");
+    CHECK(f != NULL);
+    if (f) {
+        fputs("Host example\n    HostName example.com\n", f);
+        fclose(f);
+    }
+
+    memset(&work, 0, sizeof(work));
+    work.ssh_enabled = true;
+    snprintf(work.ssh_host_alias, sizeof(work.ssh_host_alias), "github.com-work");
+    snprintf(work.ssh_key_path, sizeof(work.ssh_key_path), "%s/key_work", home);
+    CHECK_EQ_INT(ssh_configure_host_alias(&work), 0);
+
+    memset(&personal, 0, sizeof(personal));
+    personal.ssh_enabled = true;
+    snprintf(personal.ssh_host_alias, sizeof(personal.ssh_host_alias),
+             "github.com-personal");
+    snprintf(personal.ssh_key_path, sizeof(personal.ssh_key_path),
+             "%s/key_personal", home);
+    CHECK_EQ_INT(ssh_configure_host_alias(&personal), 0);
+
+    /* Remove only the work alias. */
+    CHECK_EQ_INT(ssh_remove_host_alias("github.com-work"), 0);
+
+    f = fopen(cfg_path, "r");
+    CHECK(f != NULL);
+    if (f) {
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        CHECK(strstr(buf, "github.com-work") == NULL);      /* excised */
+        CHECK(strstr(buf, "key_work") == NULL);
+        CHECK(strstr(buf, "github.com-personal") != NULL);  /* preserved */
+        CHECK(strstr(buf, "key_personal") != NULL);
+        CHECK(strstr(buf, "HostName example.com") != NULL); /* user content */
+    }
+
+    /* Idempotent: removing again (block now absent) is a clean no-op. */
+    CHECK_EQ_INT(ssh_remove_host_alias("github.com-work"), 0);
+    /* Removing against a nonexistent config is also a clean no-op. */
+    unlink(cfg_path);
+    CHECK_EQ_INT(ssh_remove_host_alias("github.com-personal"), 0);
+}
+
 #if defined(__linux__)
 /* AR-02 test menu (ranks 19/20): a sidecar PID that now belongs to a NON-agent
  * same-uid process — the classic PID-recycle scenario — must never be
@@ -804,6 +866,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(pid_sidecar_rejects_temp_path_inode_swap);
     RUN_TEST(stop_agent_reap_failure_preserves_retry_handle);
     RUN_TEST(host_alias_write_rejects_newline_key_path);
+    RUN_TEST(host_alias_removal_excises_only_named_block);
 #if defined(__linux__)
     RUN_TEST(reset_never_signals_bystander_pid_in_sidecar);
 #endif

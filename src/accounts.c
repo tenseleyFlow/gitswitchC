@@ -1296,6 +1296,11 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (safe_strncpy(account_name, account->name, sizeof(account_name)) != 0) {
         return -1;
     }
+    /* Capture the managed SSH host alias before teardown so it can be removed
+     * from ~/.ssh/config after the account is gone (AR-06 F15). */
+    char removed_alias[MAX_NAME_LEN];
+    removed_alias[0] = '\0';
+    safe_strncpy(removed_alias, account->ssh_host_alias, sizeof(removed_alias));
     account_id = account->id;
     had_current = (ctx->current_account != NULL);
     if (had_current) {
@@ -1361,7 +1366,16 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (was_active) {
         ctx->config.active_account[0] = '\0';
     }
-    
+
+    /* Remove the managed ~/.ssh/config host-alias block so git traffic no
+     * longer routes to the deleted account's key (AR-06 F15). Best-effort: the
+     * account is already gone from config, so a failure here only leaves a
+     * stale (visible) stanza — warn rather than fail the whole removal. */
+    if (removed_alias[0] != '\0' && ssh_remove_host_alias(removed_alias) != 0) {
+        log_warning("Could not remove ~/.ssh/config host-alias block for '%s': %s",
+                    removed_alias, get_last_error()->message);
+    }
+
     printf("[OK]: Account removed successfully.\n");
     return 0;
 }
