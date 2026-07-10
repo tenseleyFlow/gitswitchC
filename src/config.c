@@ -1138,14 +1138,28 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             account.id = account_id;
             account.preferred_scope = GIT_SCOPE_LOCAL; /* Default */
             
-            /* Load required fields */
+            /* Load required fields. Skipped, not dropped: toml_get_string
+             * fails here both for a MISSING field and for a value too long
+             * for the destination (e.g. a name over MAX_NAME_LEN — schema-
+             * valid, so the whole-file parse succeeded), and either way the
+             * in-memory set is now an incomplete view of the file. Without
+             * the skip count, config_save's refuse-to-rewrite guard read
+             * zero and the very next save permanently erased this section
+             * (AR-02 #5). Warn on stderr so the cause is visible. */
             if (toml_get_string(doc, sections[i], "name", account.name, sizeof(account.name)) != 0) {
-                log_error("Account %u missing required 'name' field", account_id);
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account section [%s] was skipped: 'name' is missing or "
+                                "too long (max %d bytes). Fix it in the config file.",
+                                sections[i], MAX_NAME_LEN - 1);
                 continue;
             }
-            
+
             if (toml_get_string(doc, sections[i], "email", account.email, sizeof(account.email)) != 0) {
-                log_error("Account %u missing required 'email' field", account_id);
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account section [%s] ('%s') was skipped: 'email' is "
+                                "missing or too long (max %d bytes). Fix it in the config file.",
+                                sections[i], account.name[0] ? account.name : "?",
+                                MAX_EMAIL_LEN - 1);
                 continue;
             }
             
