@@ -894,6 +894,17 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
         return -1;
     }
 
+    /* Identity of the link this call just installed, captured before any
+     * post-install verification so EVERY failure path below can revert it.
+     * The readback-verification block used to return -1 without unlinking —
+     * the lone exception among the three post-install checks — so a failed
+     * retarget could leave the shell-facing `current` entry point already
+     * moved while gpg_switch_account reported failure (AR-05 L12). */
+    struct stat installed;
+    bool have_installed =
+        fstatat(base_fd, "current", &installed, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISLNK(installed.st_mode) && installed.st_uid == getuid();
+
     /* The atomic rename is not the end of the trust decision: a same-uid
      * process can replace the public base immediately after the pre-commit
      * validation. Capture the link inode we installed, run the deterministic
@@ -903,6 +914,17 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
         strcmp(committed_target, real_home) != 0 ||
         fstatat(base_fd, "current", &committed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISLNK(committed.st_mode) || committed.st_uid != getuid()) {
+        /* Mirror the sibling failure blocks: if `current` is still the exact
+         * link this call installed, remove it so a reported-failure retarget
+         * never leaves the stable entry point moved. dev/ino-guarded so a
+         * racing same-uid writer's replacement is never clobbered. */
+        struct stat now;
+        if (have_installed &&
+            fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) == 0 &&
+            now.st_dev == installed.st_dev && now.st_ino == installed.st_ino &&
+            S_ISLNK(now.st_mode)) {
+            (void)unlinkat(base_fd, "current", 0);
+        }
         set_error(ERR_FILE_IO,
                   "Cannot verify committed GNUPGHOME link: %s", link_path);
         return -1;
