@@ -541,6 +541,18 @@ static int lock_agent_dir(int dir_fd) {
     return lock_private_file_at(dir_fd, ".lock");
 }
 
+/* Non-blocking variant for READ-ONLY discovery. A switch holds the agent-dir
+ * lock across the interactive ssh-add passphrase prompt (unbounded human
+ * latency), and discovery runs on EVERY invocation via config_load ->
+ * accounts_detect_current — so a blocking lock here froze `gitswitch
+ * list`/`status` and shell tab-completion until the prompt was answered
+ * (AR-05 H2). Readers that fail to acquire must fall back to saved state,
+ * exactly as main.c's config lock is non-blocking for the same reason
+ * (AR-03 L10); only genuine writers (start/reap/reset) may block. */
+static int try_lock_agent_dir(int dir_fd) {
+    return try_lock_private_file_at(dir_fd, ".lock");
+}
+
 static void unlock_agent_dir(int fd) {
     if (fd >= 0) unlock_private_file(fd);
 }
@@ -2429,10 +2441,25 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
         return -1;
     }
 
-    lock_fd = lock_agent_dir(dir_fd);
+    /* Discovery is a pure read: never wait on a writer that may be parked at
+     * an interactive prompt for minutes. On contention return an error so
+     * accounts_detect_current serves the persisted saved-account fallback
+     * instead of hanging every read-only command (AR-05 H2). */
+    lock_fd = try_lock_agent_dir(dir_fd);
     if (lock_fd < 0) {
-        set_system_error(ERR_FILE_IO,
-                         "Failed to lock SSH agent directory: %s", socket_dir);
+        bool contended = errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+        contended = contended || errno == EAGAIN;
+#endif
+        if (contended) {
+            set_error(ERR_FILE_IO,
+                      "SSH agent directory is busy (another gitswitch is "
+                      "mid-operation): %s", socket_dir);
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to lock SSH agent directory: %s",
+                             socket_dir);
+        }
         close(dir_fd);
         return -1;
     }
