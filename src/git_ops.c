@@ -431,11 +431,18 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         git_set_config_value(GIT_CONFIG_COMMIT_GPGSIGN, "false", scope);
     }
     
-    /* Configure SSH if enabled */
+    /* Configure SSH if enabled. AR-05 M5: SSH identity is NOT optional for
+     * an account that declares ssh_enabled. core.sshCommand carries
+     * IdentitiesOnly=yes, so the configured key bypasses the isolated agent
+     * and is authoritative for every fetch/push — the old warn-only path
+     * left the PREVIOUS account's core.sshCommand live while the switch
+     * printed success: silent wrong-identity pushes. Unlike the GPG branch
+     * above (compensated by accounts.c's hard-failing
+     * gpg_configure_git_signing), nothing downstream re-writes or verifies
+     * this key, so fail here and let accounts_switch roll the switch back. */
     if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
         if (git_configure_ssh(account, scope) != 0) {
-            log_warning("Failed to configure SSH for git");
-            /* Don't fail completely, SSH config is optional */
+            return -1;
         }
     } else {
         /* Clear SSH configuration */
@@ -951,7 +958,21 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set SSH command configuration");
         return -1;
     }
-    
+
+    /* AR-05 M5: round-trip the value through git, matching the user.name/
+     * user.email verification in git_set_config. Reads are never served
+     * from this process's own writes (only CFG_READBACK entries), so this
+     * genuinely re-execs git and proves the authoritative SSH identity is
+     * the one just written. */
+    char readback[sizeof(ssh_command)];
+    if (git_get_config_value(GIT_CONFIG_CORE_SSHCOMMAND, readback,
+                             sizeof(readback), scope) != 0 ||
+        strcmp(readback, ssh_command) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Could not read back core.sshCommand to verify it");
+        return -1;
+    }
+
     return 0;
 }
 
