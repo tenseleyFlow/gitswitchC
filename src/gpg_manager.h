@@ -115,11 +115,33 @@ int gpg_set_environment(const gpg_config_t *gpg_config);
 int gpg_manager_get_home_path(char *buf, size_t size);
 
 /**
- * Tear down isolated GPG homes (kill per-home gpg-agents and delete the homes,
- * wiping on-disk secret-key copies). Resets a single account when `account` is
- * non-NULL, or all accounts when NULL. Returns 0 on success.
+ * Tear down isolated GPG homes (kill per-home gpg-agents and delete the
+ * homes, removing the on-disk secret-key copies). Deletion is unlink, not a
+ * secure overwrite: on the default memory-backed storage that destroys the
+ * bytes, but on the GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may
+ * remain forensically recoverable (AR-02 #26). Resets a single account when
+ * `account` is non-NULL, or all accounts when NULL. Returns 0 on success.
  */
 int gpg_manager_reset(const char *account);
+
+/**
+ * Atomically (re)point the stable GNUPGHOME `current` symlink at `real_home`,
+ * or drop it entirely — both under the GPG base dir's cross-process lock so
+ * neither can interleave with gpg_manager_reset's dangling-link cleanup
+ * (AR-02 #9). Used by the switch's rollback/teardown paths; the forward
+ * switch retargets internally via the same locked path. Non-fatal helpers:
+ * both return 0 on success, -1 otherwise.
+ */
+int gpg_manager_retarget_current(const char *real_home);
+int gpg_manager_drop_current(void);
+
+/**
+ * Process-lifetime memo of key ids whose secret-key presence a gpg spawn
+ * already proved this run, so later availability sanity checks (e.g.
+ * git_test_config's read-back probe) can skip a redundant spawn (AR-02 #14).
+ */
+void gpg_manager_note_key_available(const char *key_id);
+bool gpg_manager_key_available_cached(const char *key_id);
 
 /**
  * Return true if `gpg --with-colons` output contains a secret key (sec/ssb)

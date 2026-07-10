@@ -10,6 +10,7 @@
 #include "utils.h"
 #include "error.h"
 #include "git_ops.h"
+#include "gpg_manager.h"
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -419,6 +420,38 @@ TEST(git_test_config_reuses_switch_readback) {
     run_set_runner(prev);
 }
 
+/* AR-02 #14: git_test_config's GPG availability probe must be skipped when a
+ * gpg spawn earlier in this process already proved the key present. The fake
+ * runner refuses every non-git argv, so a gpg spawn here FAILS the check —
+ * the post-memo success is only reachable via the skip. */
+TEST(git_test_config_skips_gpg_probe_when_key_seen) {
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    account_t acct;
+
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "GPG User", sizeof(acct.name));
+    safe_strncpy(acct.email, "gpg@example.com", sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "0123FEED4567BEEF", sizeof(acct.gpg_key_id));
+
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+
+    /* Key not yet proven by any gpg spawn: the probe runs, the fake runner
+     * refuses it, the check fails — proving the probe is still reachable
+     * when nothing vouches for the key. */
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    /* Once proven (as every real switch does before its read-back validation),
+     * the probe is skipped and the identical call succeeds with no gpg exec. */
+    gpg_manager_note_key_available(acct.gpg_key_id);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), 0);
+
+    run_set_runner(prev);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(git_configure_ssh_rejects_single_quote_in_keypath);
@@ -427,4 +460,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(git_test_config_reuses_switch_readback);
+    RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()

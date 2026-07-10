@@ -104,9 +104,13 @@ rebuilding its isolated GPG home.
 > secret key into a per-account `GNUPGHOME` under `$XDG_RUNTIME_DIR/gitswitch-gpg/`
 > (or `/tmp/gitswitch-gpg-<uid>/`). These homes **persist** so switching back
 > doesn't re-prompt for your PIN — meaning a copy of each account's private key
-> stays on disk (mode 0700). Run `gitswitch reset` to kill the agents and delete
-> all isolated homes (wiping those copies), or `gitswitch reset <account>` for
-> one. They are also cleared when `$XDG_RUNTIME_DIR` is wiped at reboot.
+> stays in that directory (mode 0700). Run `gitswitch reset` to kill the agents
+> and delete all isolated homes, or `gitswitch reset <account>` for one. They
+> are also cleared when `$XDG_RUNTIME_DIR` is wiped at reboot. gitswitch
+> refuses to place these homes on non-memory-backed storage unless you opt in
+> with `GITSWITCH_ALLOW_TMP_GPG=1`; note that on that opt-in path deletion is a
+> plain unlink, so the key bytes may remain recoverable from the disk until
+> overwritten — true erasure is only guaranteed on tmpfs-backed storage.
 
 > **Migrating from the Python gitswitch?** The old `gitswitch --ssh-agent-info`
 > invocation still works as a compat alias that auto-detects your shell from

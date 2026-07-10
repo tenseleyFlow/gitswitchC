@@ -892,9 +892,12 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
     return EXIT_SUCCESS;
 }
 
-/* Tear down isolated SSH/GPG state: kill the per-account agents and delete the
- * isolated GPG homes (wiping the exported secret-key copies on disk). With an
- * account argument, only that account; otherwise all. Destructive — confirmed. */
+/* Tear down isolated SSH/GPG state: kill the per-account agents and delete
+ * (unlink) the isolated GPG homes holding the exported secret-key copies. On
+ * the default memory-backed storage that destroys the bytes; on the
+ * GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may remain forensically
+ * recoverable after deletion (AR-02 #26). With an account argument, only that
+ * account; otherwise all. Destructive — confirmed. */
 static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     char resp[16];
     const char *target = NULL;
@@ -918,10 +921,10 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
                "homes, removing every on-disk secret-key copy.\n");
     }
 
-    /* This is the most destructive operation (it wipes exported secret-key
-     * copies), so require a typed 'yes' — matching remove and stronger than a
-     * bare 'y', which is easy to hit by muscle memory. --yes skips the prompt
-     * for scripting. */
+    /* This is the most destructive operation (it deletes the exported
+     * secret-key copies), so require a typed 'yes' — matching remove and
+     * stronger than a bare 'y', which is easy to hit by muscle memory. --yes
+     * skips the prompt for scripting. */
     if (!ctx->config.assume_yes) {
         printf("Type 'yes' to continue: ");
         fflush(stdout);

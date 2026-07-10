@@ -113,10 +113,9 @@ static void deactivate_runtime_isolation(bool ssh, bool gpg) {
         g_session.ssh_active = false;
     }
     if (gpg) {
-        char home_symlink[MAX_PATH_LEN];
-        if (gpg_manager_get_home_path(home_symlink, sizeof(home_symlink)) == 0) {
-            unlink(home_symlink); /* drop the `current` symlink, not its target */
-        }
+        /* Locked drop: a bare unlink here raced a concurrent switch's
+         * retarget and could delete its freshly-installed link (AR-02 #9). */
+        gpg_manager_drop_current();
         g_session.gpg_active = false;
     }
 }
@@ -154,9 +153,8 @@ static void restore_previous_isolation(const account_t *prev,
 
     if (gpg_torn_down && prev_gpg_home && prev_gpg_home[0] != '\0' &&
         is_directory(prev_gpg_home)) {
-        char gpg_link[MAX_PATH_LEN];
-        if (gpg_manager_get_home_path(gpg_link, sizeof(gpg_link)) == 0 &&
-            atomic_symlink(prev_gpg_home, gpg_link) == 0) {
+        /* Locked retarget (AR-02 #9), same rationale as the drop above. */
+        if (gpg_manager_retarget_current(prev_gpg_home) == 0) {
             log_info("Restored GNUPGHOME symlink to previous account home");
         }
     }
@@ -1231,6 +1229,12 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
         return -1;
     }
 
+    /* A gpg spawn earlier in this process already proved this key's presence
+     * — don't fork gpg again just to re-ask (AR-02 #14). */
+    if (gpg_manager_key_available_cached(gpg_key_id)) {
+        return 0;
+    }
+
     /* Look up the key in the system keyring, no shell. */
     const char *argv[] = {"gpg", "--list-secret-keys", gpg_key_id, NULL};
     run_opts_t opts;
@@ -1242,6 +1246,7 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
         return -1;
     }
 
+    gpg_manager_note_key_available(gpg_key_id);
     return 0;
 }
 

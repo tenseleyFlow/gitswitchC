@@ -2,14 +2,15 @@
  * Implements per-account GNUPGHOME environments to prevent GPG key mixing
  */
 
-/* _XOPEN_SOURCE 700 (implies POSIX.1-2008) exposes nftw()/FTW_* from <ftw.h>
- * on glibc, which _POSIX_C_SOURCE alone does not. Scope it to Linux: on macOS
- * and the BSDs nftw is visible in the default namespace, and defining
- * _XOPEN_SOURCE there puts the headers into strict X/Open mode, which hides
- * the u_int/u_char typedefs that <sys/mount.h>/<sys/ucred.h> (needed below
- * for the tmpfs check) rely on — the same trap documented in ssh_manager.c. */
+/* _GNU_SOURCE exposes both nftw()/FTW_* from <ftw.h> (X/Open) and flock()/
+ * LOCK_EX from <sys/file.h> (BSD) on glibc — _XOPEN_SOURCE 700 alone would
+ * give us nftw while HIDING flock, needed for the per-dir lock (AR-02 #9).
+ * Scope it to Linux: on macOS and the BSDs both are visible in the default
+ * namespace, and defining strict feature macros there hides the u_int/u_char
+ * typedefs that <sys/mount.h>/<sys/ucred.h> (needed below for the tmpfs
+ * check) rely on — the same trap documented in ssh_manager.c. */
 #ifdef __linux__
-#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 #endif
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -38,13 +40,52 @@
 
 /* Internal helper functions */
 static int gpg_get_base_dir(char *buf, size_t size);
-static int update_current_symlink(const char *real_home);
 static int create_isolated_gnupg_home_dir(const char *gnupg_home);
 static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
                           const char *env_out[2]);
 static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ...);
-static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id);
+static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id,
+                                        char *colons, size_t colons_size,
+                                        bool *colons_valid);
 static int setup_gpg_agent_config(const char *gnupg_home);
+
+/* Process-lifetime memo of GPG key ids whose secret-key presence a gpg spawn
+ * already proved this run (AR-02 #14). A single GPG switch used to spawn gpg
+ * 4-6 times re-proving the same key — the up-front availability probe, the
+ * import idempotency check, the signing-capability test, and git_test_config's
+ * read-back check each ran their own listing. The memo lets the later sanity
+ * checks reuse the earlier proof. Deliberately coarse: it says "a keyring this
+ * process consulted holds the secret key", which is exactly the availability
+ * question those redundant spawns re-asked; the strict per-home validation on
+ * the switch path still runs against the isolated home itself. Same
+ * short-lived, single-threaded caching assumptions as git_ops.c's exec caches. */
+#define GPG_SEEN_KEYS_MAX 8
+static char g_seen_keys[GPG_SEEN_KEYS_MAX][MAX_KEY_ID_LEN];
+static size_t g_seen_key_count;
+
+void gpg_manager_note_key_available(const char *key_id) {
+    if (!key_id || !*key_id || strlen(key_id) >= MAX_KEY_ID_LEN ||
+        gpg_manager_key_available_cached(key_id)) {
+        return;
+    }
+    if (g_seen_key_count < GPG_SEEN_KEYS_MAX) {
+        safe_strncpy(g_seen_keys[g_seen_key_count], key_id,
+                     sizeof(g_seen_keys[0]));
+        g_seen_key_count++;
+    }
+}
+
+bool gpg_manager_key_available_cached(const char *key_id) {
+    if (!key_id) {
+        return false;
+    }
+    for (size_t i = 0; i < g_seen_key_count; i++) {
+        if (strcmp(g_seen_keys[i], key_id) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 /* Initialize GPG manager with specified mode */
 int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode) {
@@ -117,6 +158,9 @@ void gpg_manager_cleanup(gpg_config_t *gpg_config) {
 
 /* Switch to account's GPG configuration with complete isolation */
 int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
+    char colons[4096];
+    bool colons_valid = false;
+
     if (!gpg_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_switch_account");
         return -1;
@@ -156,8 +200,12 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
              * follow-up validation — it would just re-run the same
              * `gpg --list-secret-keys`, spawning another gpg (and agent). Only
              * when the copy fails do we validate, to see if a prior switch
-             * already left the key in the isolated home. */
-            if (copy_key_from_system_keyring(gpg_config, account->gpg_key_id) != 0) {
+             * already left the key in the isolated home. On the already-
+             * present path the probe's colons listing is kept so the signing
+             * test below needs no spawn of its own (AR-02 #14). */
+            if (copy_key_from_system_keyring(gpg_config, account->gpg_key_id,
+                                             colons, sizeof(colons),
+                                             &colons_valid) != 0) {
                 log_warning("Failed to copy GPG key to isolated environment: %s",
                            get_last_error()->message);
                 if (gpg_validate_key(gpg_config, account->gpg_key_id) != 0) {
@@ -192,9 +240,17 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
         }
     }
     
-    /* Test GPG signing if enabled */
+    /* Test GPG signing if enabled. When the idempotency probe above already
+     * captured this key's colons listing, answer from it — gpg_test_signing
+     * would spawn gpg only to re-run the identical listing (AR-02 #14). */
     if (account->gpg_signing_enabled) {
-        if (gpg_test_signing(gpg_config, account->gpg_key_id) != 0) {
+        int sign_rc;
+        if (colons_valid) {
+            sign_rc = gpg_colons_have_sign_capability(colons) ? 0 : -1;
+        } else {
+            sign_rc = gpg_test_signing(gpg_config, account->gpg_key_id);
+        }
+        if (sign_rc != 0) {
             log_warning("GPG signing test failed for key: %s", account->gpg_key_id);
             /* Don't fail completely, just warn */
         } else {
@@ -206,7 +262,7 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
      * a shell exporting GNUPGHOME=<base>/current follows the switch. Done last,
      * after the key is imported and validated. Isolated mode only; non-fatal. */
     if (gpg_config->mode == GPG_MODE_ISOLATED && strlen(gpg_config->gnupg_home) > 0) {
-        update_current_symlink(gpg_config->gnupg_home);
+        gpg_manager_retarget_current(gpg_config->gnupg_home);
     }
 
     log_info("Successfully switched to GPG configuration for account: %s", account->name);
@@ -334,30 +390,90 @@ int gpg_manager_get_home_path(char *buf, size_t size) {
     return 0;
 }
 
+/* Acquire an exclusive, blocking flock on <base>/.lock, serializing every
+ * writer of the GPG runtime state — the `current` symlink retarget/drop and
+ * gpg_manager_reset's enumeration + dangling-link cleanup — against each
+ * other across processes (AR-02 #9: an unlocked reset's cleanup could TOCTOU
+ * a concurrent switch and unlink the live link it had just installed).
+ * Mirrors ssh_manager.c's lock_agent_dir. Returns the held fd, or -1 (base
+ * absent/unlockable — callers proceed unlocked, matching the SSH side, since
+ * a missing base means there is no runtime state to race over). Dotfile names
+ * cannot collide with an account home: validate_name rejects a leading '.'. */
+static int lock_gpg_dir(const char *base) {
+    char lock_path[MAX_PATH_LEN];
+    if ((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock", base) >= sizeof(lock_path)) {
+        return -1;
+    }
+    int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void unlock_gpg_dir(int fd) {
+    if (fd >= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
 /* Point the stable <base>/current symlink at the active account's real
  * GNUPGHOME so a shell that exports GNUPGHOME=<base>/current (via
  * `gitswitch init`) transparently follows each switch. Mirrors the SSH
- * current.sock retargeting in ssh_manager.c. Non-fatal on failure. */
-static int update_current_symlink(const char *real_home) {
+ * current.sock retargeting in ssh_manager.c. Held under the per-dir lock so
+ * the retarget cannot interleave with a concurrent reset's dangling-link
+ * cleanup (AR-02 #9). Non-fatal on failure. */
+int gpg_manager_retarget_current(const char *real_home) {
+    char base[MAX_PATH_LEN];
     char link_path[MAX_PATH_LEN];
+    int lock_fd;
+    int rc;
 
     if (!real_home || strlen(real_home) == 0) {
         return -1;
     }
 
-    if (gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
+    if (gpg_get_base_dir(base, sizeof(base)) != 0 ||
+        gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
         return -1;
     }
 
+    lock_fd = lock_gpg_dir(base);
+
     /* Atomically retarget (temp symlink + rename) so a follower never sees a
      * missing or half-updated link. */
-    if (atomic_symlink(real_home, link_path) != 0) {
+    rc = atomic_symlink(real_home, link_path);
+    unlock_gpg_dir(lock_fd);
+    if (rc != 0) {
         log_warning("Failed to create GNUPGHOME symlink %s -> %s",
                     link_path, real_home);
         return -1;
     }
 
     log_debug("Created GNUPGHOME symlink: %s -> %s", link_path, real_home);
+    return 0;
+}
+
+/* Drop the stable `current` symlink (switching to a GPG-less account, or
+ * rolling one back). Locked for the same reason as the retarget: an unlocked
+ * unlink could delete the fresh link a concurrent switch just installed. */
+int gpg_manager_drop_current(void) {
+    char base[MAX_PATH_LEN];
+    char link_path[MAX_PATH_LEN];
+    int lock_fd;
+
+    if (gpg_get_base_dir(base, sizeof(base)) != 0 ||
+        gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
+        return -1;
+    }
+    lock_fd = lock_gpg_dir(base);
+    unlink(link_path); /* drop the `current` symlink, not its target */
+    unlock_gpg_dir(lock_fd);
     return 0;
 }
 
@@ -391,11 +507,16 @@ static void gpg_kill_and_remove_home(const char *home) {
 }
 
 /* Tear down isolated GPG homes: one account, or all when account is NULL.
- * Kills the per-home gpg-agents and deletes the homes (wiping the on-disk
- * secret-key copies), then drops the stable `current` symlink if it dangles. */
+ * Kills the per-home gpg-agents and deletes (unlinks) the homes, then drops
+ * the stable `current` symlink if it dangles. NB: deletion is remove(), not a
+ * secure overwrite — on the memory-backed storage the create path requires by
+ * default, unlinking genuinely destroys the bytes, but on the explicitly
+ * opted-in non-tmpfs path (GITSWITCH_ALLOW_TMP_GPG) the secret-key bytes may
+ * remain recoverable on disk after deletion (AR-02 #26). */
 int gpg_manager_reset(const char *account) {
     char base[MAX_PATH_LEN];
     char current[MAX_PATH_LEN];
+    int lock_fd;
 
     if (gpg_get_base_dir(base, sizeof(base)) != 0) {
         return -1;
@@ -427,8 +548,16 @@ int gpg_manager_reset(const char *account) {
         return -1;
     }
 
+    /* Hold the per-dir lock across the whole kill/remove sequence AND the
+     * dangling-symlink cleanup below, so a concurrent switch's locked
+     * retarget cannot interleave: without it, reset could read a dangling
+     * `current`, the switch could install a fresh live link, and reset's
+     * unlink would then delete that freshly-installed link (AR-02 #9). */
+    lock_fd = lock_gpg_dir(base);
+
     if (account && *account) {
         char home[MAX_PATH_LEN];
+        struct stat hst;
         /* The account name becomes a path component under a directory we then
          * recursively delete. Reject anything that isn't a safe single
          * component so `reset ..` (or a crafted name) can't escape base and
@@ -436,12 +565,25 @@ int gpg_manager_reset(const char *account) {
         if (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
             account[0] == '.') {
             set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
+            unlock_gpg_dir(lock_fd);
             return -1;
         }
         if ((size_t)snprintf(home, sizeof(home), "%s/%s", base, account) >= sizeof(home)) {
+            unlock_gpg_dir(lock_fd);
             return -1;
         }
-        if (path_exists(home)) {
+        /* lstat, not path_exists: a symlinked home must be refused, exactly
+         * like the all-accounts branch skips symlinked entries. Following it
+         * would run `gpgconf --kill all` with GNUPGHOME set through the link
+         * — e.g. at the user's real ~/.gnupg, killing their login gpg-agent
+         * (AR-02 #21). The absent case is simply nothing to reset. */
+        if (lstat(home, &hst) == 0) {
+            if (S_ISLNK(hst.st_mode)) {
+                set_error(ERR_PERMISSION_DENIED,
+                          "Refusing to reset: isolated GPG home is a symlink: %s", home);
+                unlock_gpg_dir(lock_fd);
+                return -1;
+            }
             gpg_kill_and_remove_home(home);
         }
     } else {
@@ -450,7 +592,9 @@ int gpg_manager_reset(const char *account) {
             struct dirent *ent;
             while ((ent = readdir(d)) != NULL) {
                 char home[MAX_PATH_LEN];
-                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0 ||
+                /* Dotfiles cover "."/".." plus our own .lock; account homes
+                 * can never start with '.' (validate_name rejects it). */
+                if (ent->d_name[0] == '.' ||
                     strcmp(ent->d_name, "current") == 0) {
                     continue;
                 }
@@ -479,6 +623,7 @@ int gpg_manager_reset(const char *account) {
             }
         }
     }
+    unlock_gpg_dir(lock_fd);
     return 0;
 }
 
@@ -627,8 +772,9 @@ int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id) {
         set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found: %s", key_id);
         return -1;
     }
-    
+
     log_debug("GPG key validation passed: %s", key_id);
+    gpg_manager_note_key_available(key_id);
     return 0;
 }
 
@@ -752,6 +898,7 @@ int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
     }
 
     log_debug("Signing capability confirmed for key: %s", key_id);
+    gpg_manager_note_key_available(key_id);
     return 0;
 }
 
@@ -892,15 +1039,23 @@ static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ..
     return run_argv(argv, &opts, &res);
 }
 
-/* Copy GPG key from system keyring to isolated environment */
-static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id) {
+/* Copy GPG key from system keyring to isolated environment.
+ *
+ * The idempotency probe runs `--with-colons` and, when the key is already
+ * present, hands the listing back via colons/colons_valid so the caller's
+ * signing-capability test can parse it instead of spawning another gpg for
+ * the identical question (AR-02 #14). On the import path (key not yet in the
+ * isolated home) colons_valid stays false — a listing from before the import
+ * would prove nothing about it. */
+static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id,
+                                        char *colons, size_t colons_size,
+                                        bool *colons_valid) {
     /* Generous heap capacity for the armored export: a multi-subkey RSA-4096
      * key armors to ~15 KB and photo-ID-bearing keys to far more, so the old
      * fixed 8 KB stack buffer routinely truncated real keys — and run_argv's
      * silent cap then fed the corrupt armor straight to `gpg --import`
      * (AR-02 #4). Truncation is detected and refused explicitly below. */
     enum { KEY_DATA_CAP = 512 * 1024 };
-    char check_output[1024];
     char import_diag[1024];
     char envbuf[MAX_PATH_LEN + 16];
     const char *env[2];
@@ -908,20 +1063,25 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
     run_opts_t opts;
     run_result_t res;
 
-    if (!gpg_config || !key_id) {
+    if (!gpg_config || !key_id || !colons || !colons_valid) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to copy_key_from_system_keyring");
         return -1;
     }
+    *colons_valid = false;
 
     log_debug("Copying GPG key from system keyring: %s", key_id);
 
     /* Idempotency: if the secret key is already present in the isolated home
      * (e.g. switching back to an account whose home persists from an earlier
      * switch), skip the export/import. The export step prompts the system
-     * agent's PIN, so skipping it avoids a PIN prompt on every switch. */
-    if (gpg_run(gpg_config, check_output, sizeof(check_output),
-                "gpg", "--list-secret-keys", key_id, NULL) == 0) {
+     * agent's PIN, so skipping it avoids a PIN prompt on every switch. The
+     * probe asks with --with-colons so its output doubles as the caller's
+     * signing-capability evidence (AR-02 #14). */
+    if (gpg_run(gpg_config, colons, colons_size,
+                "gpg", "--list-secret-keys", "--with-colons", key_id, NULL) == 0) {
         log_debug("Secret key already present in isolated home; skipping import: %s", key_id);
+        *colons_valid = true;
+        gpg_manager_note_key_available(key_id);
         return 0;
     }
 
@@ -988,6 +1148,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
     secure_zero_memory(key_data, KEY_DATA_CAP);
     free(key_data);
     log_info("Successfully copied GPG key to isolated environment: %s", key_id);
+    gpg_manager_note_key_available(key_id);
     return 0;
 }
 

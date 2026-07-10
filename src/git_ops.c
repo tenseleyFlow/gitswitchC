@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 
 #include "git_ops.h"
+#include "gpg_manager.h"
 #include "error.h"
 #include "utils.h"
 #include "display.h"
@@ -566,14 +567,22 @@ int git_test_config(const account_t *account, git_scope_t scope) {
             log_warning("GPG signing is configured but not enabled");
         }
 
-        /* Test GPG key availability (system keyring, no shell) */
-        const char *gpg_argv[] = {"gpg", "--list-secret-keys", account->gpg_key_id, NULL};
-        run_opts_t gpg_opts;
-        memset(&gpg_opts, 0, sizeof(gpg_opts));
-        gpg_opts.stderr_to_devnull = true;
-        if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
-            set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s", account->gpg_key_id);
-            return -1;
+        /* Test GPG key availability (no shell). Which keyring gpg consults is
+         * decided by GNUPGHOME — by the time a switch validates itself that is
+         * already the account's isolated home, not the system keyring the old
+         * comment claimed. Skipped entirely when a gpg spawn earlier in this
+         * process already proved the key's presence, which on the switch path
+         * is always true (AR-02 #14). */
+        if (!gpg_manager_key_available_cached(account->gpg_key_id)) {
+            const char *gpg_argv[] = {"gpg", "--list-secret-keys", account->gpg_key_id, NULL};
+            run_opts_t gpg_opts;
+            memset(&gpg_opts, 0, sizeof(gpg_opts));
+            gpg_opts.stderr_to_devnull = true;
+            if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
+                set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s", account->gpg_key_id);
+                return -1;
+            }
+            gpg_manager_note_key_available(account->gpg_key_id);
         }
     }
 
