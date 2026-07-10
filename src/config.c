@@ -7,6 +7,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -163,6 +165,30 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
 
     log_info("Configuration loaded successfully: %zu accounts", ctx->account_count);
     return 0;
+}
+
+/* Acquire an exclusive, cross-process lock for a mutating config cycle. Returns
+ * an open fd holding flock(LOCK_EX) on <config_dir>/.config.lock; hold it across
+ * the whole load-modify-save so concurrent add/edit/remove/switch cannot
+ * lost-update each other. The atomic temp+rename in config_save only prevents a
+ * torn file, not a lost update: two processes that each load, mutate, and rename
+ * would have the second silently discard the first's changes. Close the fd to
+ * release. Returns -1 on failure (caller may proceed best-effort). */
+int config_write_lock(void) {
+    char dir[MAX_PATH_LEN];
+    char lockpath[MAX_PATH_LEN];
+    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
+    if (create_config_directory_secure(dir) != 0) return -1;
+    if ((size_t)snprintf(lockpath, sizeof(lockpath), "%s/.config.lock", dir) >= sizeof(lockpath)) {
+        return -1;
+    }
+    int fd = open(lockpath, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
 }
 
 /* Compute the resume-hint marker path (<config_dir>/.resume-hint). */
@@ -851,8 +877,31 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                 clear_error();
             }
             
+            /* Reject duplicate name (case-insensitive) or id against already-
+             * loaded accounts. config_add_account enforces this for the
+             * interactive path, but the load path bypassed it entirely — and a
+             * hand-edited accounts.toml is fully user-controlled. Two accounts
+             * sharing a name would share one GNUPGHOME (<base>/<name>) and one
+             * ssh-agent.<name>.sock, silently collapsing the very isolation the
+             * tool exists to provide; a shared id breaks id-based lookup. Skip
+             * (not drop) so config_save refuses to rewrite and erase the file. */
+            bool dup = false;
+            for (size_t j = 0; j < ctx->account_count; j++) {
+                if (ctx->accounts[j].id == account.id ||
+                    strcasecmp(ctx->accounts[j].name, account.name) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account '%s' (id %u) duplicates the name or id of an "
+                                "earlier account and was skipped; names and ids must be "
+                                "unique because SSH/GPG isolation is keyed by them.",
+                                account.name[0] ? account.name : "?", account_id);
+            }
             /* Validate and add account */
-            if (validate_account_security(&account) == 0) {
+            else if (validate_account_security(&account) == 0) {
                 if (ctx->account_count < MAX_ACCOUNTS) {
                     ctx->accounts[ctx->account_count] = account;
                     ctx->account_count++;

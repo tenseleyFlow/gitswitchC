@@ -213,6 +213,26 @@ int main(int argc, char *argv[]) {
         return rc;
     }
 
+    /* For commands that read-modify-write the config (add/edit/remove and a
+     * bare-account switch that updates active_account), hold an exclusive
+     * cross-process lock across the WHOLE load->mutate->save cycle so two
+     * concurrent invocations can't lost-update each other. Acquire it before
+     * config_init so the load itself happens under the lock. Read-only commands
+     * (list/status/doctor/config/resume/reset) don't take it. Best-effort: if
+     * the lock can't be taken we still proceed rather than block the user. */
+    int config_lock_fd = -1;
+    {
+        const char *c = (optind < argc) ? argv[optind] : NULL;
+        bool read_only = (c == NULL) ||
+            strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
+            strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
+            strcmp(c, "health") == 0 || strcmp(c, "config") == 0 ||
+            strcmp(c, "resume") == 0 || strcmp(c, "reset") == 0;
+        if (!read_only) {
+            config_lock_fd = config_write_lock();
+        }
+    }
+
     /* Initialize configuration system */
     log_info("Initializing gitswitch-c configuration system");
     if (config_init(&ctx) != 0) {
@@ -331,6 +351,13 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    /* Release the config write-lock now that load+mutate+save is done (harmless
+     * no-op for read-only commands that never took it; the OS would also drop it
+     * at exit). */
+    if (config_lock_fd >= 0) {
+        close(config_lock_fd);
+    }
+
     /* Note: We intentionally do NOT clean up SSH agents on exit.
      * The agent should persist so subsequent git commands can use it.
      * Cleanup happens at the start of the next account switch. */
