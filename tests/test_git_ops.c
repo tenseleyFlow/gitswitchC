@@ -266,6 +266,125 @@ TEST(git_set_config_value_skips_duplicate_managed_write) {
     run_set_runner(prev);
 }
 
+/* ---- rollback snapshot: -z listing survives embedded newlines ----------- */
+/* Regression lock for the `git config --list -z` snapshot fix: with plain
+ * --list, a managed value containing a newline masqueraded as a record
+ * boundary, truncating that value in the rollback snapshot AND corrupting the
+ * records after it. The -z parser (parse_config_z_value) must keep the full
+ * value and still attribute the NEXT record to the right key. */
+
+static char zfk_set_key[16][64], zfk_set_val[16][1024];
+static int zfk_sets;
+static char zfk_unset_key[16][64];
+static int zfk_unsets;
+static int zfk_fallback_reads; /* per-key reads => the -z fast path was NOT used */
+
+static int zfk_runner(const char *const argv[], const run_opts_t *opts,
+                      run_result_t *result) {
+    /* The -z listing under test: user.name's value spans two lines. The
+     * second line deliberately looks like the start of another record. */
+    static const char listing[] =
+        "user.name\nAlpha\nBeta"          "\0"
+        "user.email\nreal@x.com"          "\0"
+        "core.sshcommand\nssh -i /k -o IdentitiesOnly=yes" "\0";
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+
+    if (strcmp(argv[0], "git") != 0 || !argv[1]) return 1;
+
+    if (strcmp(argv[1], "rev-parse") == 0) {
+        return 1; /* not a repository: snapshot covers the global scope only */
+    }
+
+    if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
+        if (strcmp(argv[3], "--list") == 0 && argv[4] && strcmp(argv[4], "-z") == 0) {
+            size_t n = sizeof(listing) - 1; /* keep interior NULs, drop trailing */
+            if (opts && opts->out && opts->out_size > n) {
+                memcpy(opts->out, listing, n);
+                opts->out[n] = '\0';
+                if (result) result->out_len = n;
+                return 0;
+            }
+            return 1;
+        }
+        if (strcmp(argv[3], "--unset") == 0 && argv[4]) {
+            if (zfk_unsets < 16) {
+                snprintf(zfk_unset_key[zfk_unsets], sizeof(zfk_unset_key[0]), "%s", argv[4]);
+            }
+            zfk_unsets++;
+            return 0;
+        }
+        if (argv[4]) { /* set */
+            if (zfk_sets < 16) {
+                snprintf(zfk_set_key[zfk_sets], sizeof(zfk_set_key[0]), "%s", argv[3]);
+                snprintf(zfk_set_val[zfk_sets], sizeof(zfk_set_val[0]), "%s", argv[4]);
+            }
+            zfk_sets++;
+            return 0;
+        }
+        zfk_fallback_reads++; /* per-key read: only the pre-fix fallback path */
+        return 1;
+    }
+
+    return 1;
+}
+
+static int zfk_find_set(const char *key) {
+    for (int i = 0; i < zfk_sets && i < 16; i++) {
+        if (strcmp(zfk_set_key[i], key) == 0) return i;
+    }
+    return -1;
+}
+
+static bool zfk_was_unset(const char *key) {
+    for (int i = 0; i < zfk_unsets && i < 16; i++) {
+        if (strcmp(zfk_unset_key[i], key) == 0) return true;
+    }
+    return false;
+}
+
+TEST(rollback_z_parser_survives_embedded_newline) {
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+
+    run_set_runner(prev);
+
+    /* The snapshot came from the one-exec -z listing, not per-key reads. */
+    CHECK_EQ_INT(zfk_fallback_reads, 0);
+
+    /* The record AFTER the multiline value is attributed correctly and
+     * restored verbatim — a newline-splitting parser would have read "Beta"
+     * as a (separator-less) record and desynced from here on. */
+    int ie = zfk_find_set("user.email");
+    CHECK(ie >= 0);
+    if (ie >= 0) CHECK_STR_EQ(zfk_set_val[ie], "real@x.com");
+    int is = zfk_find_set("core.sshcommand");
+    CHECK(is >= 0);
+    if (is >= 0) CHECK_STR_EQ(zfk_set_val[is], "ssh -i /k -o IdentitiesOnly=yes");
+
+    /* user.name was captured PRESENT with its full two-line value: restore
+     * offers it to git_set_config_value, whose control-character validation
+     * refuses the exec — so there is neither a user.name write nor a
+     * user.name --unset. A parser truncating at the newline would instead
+     * emit `git config --global user.name Alpha`; one that lost the record
+     * would emit `--unset user.name`. Both are the bug. */
+    CHECK(zfk_find_set("user.name") < 0);
+    CHECK(!zfk_was_unset("user.name"));
+
+    /* Keys absent from the listing were snapshotted absent => unset on restore. */
+    CHECK(zfk_was_unset("user.signingkey"));
+    CHECK(zfk_was_unset("commit.gpgsign"));
+    CHECK(zfk_was_unset("gpg.program"));
+}
+
 /* ---- perf-2: git_test_config reuses git_set_config's read-back ---------- */
 
 TEST(git_test_config_reuses_switch_readback) {
@@ -304,5 +423,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_ops_init_spawns_no_subprocess);
     RUN_TEST(git_is_repository_caches_result);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
+    RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(git_test_config_reuses_switch_readback);
 TEST_MAIN_END()

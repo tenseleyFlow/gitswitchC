@@ -321,6 +321,115 @@ TEST(add_rejects_escape_in_description) {
     }
 }
 
+/* ---- hostile account rejected by validate_account_security -------------- */
+
+TEST(config_validate_rejects_hostile_account) {
+    char dir[128], key[256], missing[256];
+    gitswitch_ctx_t ctx;
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(key, sizeof(key), "%s/id_ed25519", dir);
+    snprintf(missing, sizeof(missing), "%s/no_such_key", dir);
+    CHECK_EQ_INT(write_config(key, "KEY", 3), 0); /* creates it 0600 */
+
+    /* Baseline: a well-formed account with a 0600 key validates. */
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&ctx.accounts[0], 1, "work", "w@x.com", "day job");
+    ctx.accounts[0].ssh_enabled = true;
+    strncpy(ctx.accounts[0].ssh_key_path, key, sizeof(ctx.accounts[0].ssh_key_path) - 1);
+    ctx.account_count = 1;
+    CHECK_EQ_INT(config_validate(&ctx), 0);
+
+    /* Group/other-readable private key: refused (an attacker who can read
+     * the key doesn't need the agent isolation we set up around it). */
+    CHECK_EQ_INT(chmod(key, 0644), 0);
+    CHECK_EQ_INT(config_validate(&ctx), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_INVALID);
+    CHECK_EQ_INT(chmod(key, 0600), 0);
+
+    /* Nonexistent key path: refused, not deferred to a runtime ssh failure. */
+    strncpy(ctx.accounts[0].ssh_key_path, missing, sizeof(ctx.accounts[0].ssh_key_path) - 1);
+    CHECK_EQ_INT(config_validate(&ctx), -1);
+    strncpy(ctx.accounts[0].ssh_key_path, key, sizeof(ctx.accounts[0].ssh_key_path) - 1);
+
+    /* Traversal name: it becomes the GNUPGHOME/agent-socket path component. */
+    strncpy(ctx.accounts[0].name, "../evil", sizeof(ctx.accounts[0].name) - 1);
+    CHECK_EQ_INT(config_validate(&ctx), -1);
+    strncpy(ctx.accounts[0].name, "work", sizeof(ctx.accounts[0].name) - 1);
+
+    /* Non-hex GPG key id: reaches gpg/git argv, so hex-only is enforced. */
+    ctx.accounts[0].gpg_enabled = true;
+    strncpy(ctx.accounts[0].gpg_key_id, "DEADBEEF;id", sizeof(ctx.accounts[0].gpg_key_id) - 1);
+    CHECK_EQ_INT(config_validate(&ctx), -1);
+
+    /* And the same gates hold on the add path (the API accounts.c uses). */
+    account_t bad;
+    gitswitch_ctx_t fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    fill_account(&bad, 1, "work", "w@x.com", "d");
+    bad.gpg_enabled = true;
+    strncpy(bad.gpg_key_id, "$(rm -rf ~)", sizeof(bad.gpg_key_id) - 1);
+    CHECK_EQ_INT(config_add_account(&fresh, &bad), -1);
+    CHECK_EQ_INT(fresh.account_count, 0);
+}
+
+/* ---- duplicate name/id guards (isolation is keyed by them) --------------- */
+
+TEST(dup_name_id_rejected_on_load) {
+    /* Two accounts sharing a name would share one GNUPGHOME (<base>/<name>)
+     * and one ssh-agent.<name>.sock — the isolation would silently collapse.
+     * The load path must keep only the FIRST and count the rest as skipped
+     * (so config_save refuses to rewrite and erase them). Matching is
+     * case-insensitive: the derived paths land on case-insensitive
+     * filesystems too. */
+    const char *cfg =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"Alice\"\n"
+        "email = \"first@x.com\"\n"
+        "[accounts.2]\n"
+        "name = \"alice\"\n"          /* case-insensitive dup of accounts.1 */
+        "email = \"second@x.com\"\n"
+        "[accounts.3]\n"
+        "name = \"bob\"\n"
+        "email = \"b@x.com\"\n";
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 2);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    if (ctx.account_count == 2) {
+        /* First occurrence wins, byte-for-byte. */
+        CHECK_STR_EQ(ctx.accounts[0].name, "Alice");
+        CHECK_STR_EQ(ctx.accounts[0].email, "first@x.com");
+        CHECK_STR_EQ(ctx.accounts[1].name, "bob");
+    }
+
+    /* Duplicate ids cannot even be spelled in a file anymore (a repeated
+     * [accounts.1] merges into one section; non-canonical alias spellings are
+     * rejected — see load_skips_leading_zero_id_section). The id guard is
+     * enforced at the API every mutating command uses: */
+    gitswitch_ctx_t api;
+    account_t a;
+    memset(&api, 0, sizeof(api));
+    fill_account(&a, 1, "work", "w@x.com", "d");
+    CHECK_EQ_INT(config_add_account(&api, &a), 0);
+    fill_account(&a, 1, "other", "o@x.com", "d");   /* same id, new name */
+    CHECK_EQ_INT(config_add_account(&api, &a), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_EXISTS);
+    fill_account(&a, 2, "WORK", "o@x.com", "d");    /* new id, dup name (case) */
+    CHECK_EQ_INT(config_add_account(&api, &a), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_EXISTS);
+    fill_account(&a, 2, "other", "o@x.com", "d");   /* both unique: fine */
+    CHECK_EQ_INT(config_add_account(&api, &a), 0);
+    CHECK_EQ_INT(api.account_count, 2);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(load_accepts_regular_file);
@@ -335,4 +444,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(load_rejects_raw_c1_byte_in_file);
     RUN_TEST(add_rejects_c1_and_malformed_utf8_in_name);
     RUN_TEST(add_rejects_escape_in_description);
+    RUN_TEST(config_validate_rejects_hostile_account);
+    RUN_TEST(dup_name_id_rejected_on_load);
 TEST_MAIN_END()
