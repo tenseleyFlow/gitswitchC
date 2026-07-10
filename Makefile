@@ -241,9 +241,26 @@ $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
 	@echo "Build complete: $@"
 
-# Install target
+# Install target.
+#
+# install does NOT depend on $(BINDIR)/$(TARGET): making it a build trigger
+# meant `make install` with no BUILD_TYPE (the default, 'debug') flipped the
+# .buildtype stamp and rebuilt the WHOLE tree as a debug/ASan binary, then
+# installed THAT — even right after `make release`. That silently shipped an
+# unhardened, ASan-linked binary from `sudo make install`, the RPM %install
+# step, and every downstream packager (AR-06 F01). install now packages
+# exactly the binary already built, and refuses to run if none exists, so the
+# caller must build explicitly first (`make release` / `make`). BUILD_TYPE is
+# irrelevant here — no rebuild happens.
 .PHONY: install
-install: $(BINDIR)/$(TARGET)
+install:
+	@if [ ! -x "$(BINDIR)/$(TARGET)" ]; then \
+		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
+		exit 1; \
+	fi
+	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "release" ]; then \
+		echo "Warning: installing a '`cat $(BUILDTYPE_STAMP) 2>/dev/null`' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
+	fi
 	@echo "Installing $(TARGET)..."
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 $(BINDIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)

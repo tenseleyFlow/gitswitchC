@@ -45,7 +45,11 @@ make BUILD_TYPE=release VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
 # it, and completions installed there are inert (bash-completion only scans
 # /usr/share/bash-completion/completions, and Fedora zsh's fpath omits
 # /usr/local/share/zsh/site-functions) (AR-05 L6).
-make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
+# BUILD_TYPE=release: install no longer rebuilds (AR-06 F01 decoupled install
+# from the build, so it just packages the binary %build produced), but pass it
+# explicitly so the stamp/binary contract is unambiguous and a clean chroot
+# never repackages a debug/ASan binary.
+make install BUILD_TYPE=release DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
 # Install documentation
 install -d %{buildroot}%{_docdir}/%{name}
