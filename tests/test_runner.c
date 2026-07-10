@@ -12,6 +12,7 @@
 #include <stdint.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <limits.h>
 
 /* Run the zero-input edge in a disposable process. Before AR-04 L1 the
  * nested run_argv() polls forever, so the parent must bound the wait and reap
@@ -167,7 +168,11 @@ TEST(run_passes_extra_env) {
 
 TEST(run_uses_pinned_child_working_directory) {
     char dir[] = "/tmp/gswrunpwd_XXXXXX";
-    char canonical_dir[512];
+    /* PATH_MAX: glibc's fortified realpath (__realpath_chk) aborts the whole
+     * process if the destination is smaller, regardless of the actual
+     * resolved length — only visible in release builds (_FORTIFY_SOURCE=2),
+     * which is exactly what the AR-05 L3 CI memcheck lane now runs. */
+    char canonical_dir[PATH_MAX];
     char out[512];
     char expected[512];
     char parent_before[512];
@@ -205,7 +210,7 @@ TEST(run_uses_pinned_child_working_directory) {
  * before installing its stdout pipe or the pinned fchdir silently fails. */
 TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio) {
     char dir[] = "/tmp/gswrunstdio_XXXXXX";
-    char canonical_dir[512];
+    char canonical_dir[PATH_MAX]; /* see run_uses_pinned_child_working_directory */
     char expected[512];
     pid_t child;
     int status = 0;

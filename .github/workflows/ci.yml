@@ -25,6 +25,12 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       - name: Release build (FORTIFY/RELRO)
         run: make clean && make BUILD_TYPE=release
+      # AR-05 L3: run REAL Valgrind against the release binaries. The
+      # qa-contract-test below only proves the recipe's failure plumbing via
+      # a shim; without this step no actual memory checking ever executed in
+      # the pipeline.
+      - name: Memory check (Valgrind, release)
+        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release memcheck
       - name: Source distribution self-check
         run: make distcheck
       - name: Static analysis (cppcheck)
