@@ -33,15 +33,27 @@ UNAME_S := $(shell uname -s)
 
 # Compiler and flags
 CC = gcc
+# Compiler family, needed before the flag set: macOS 'gcc' is clang, and a
+# few spellings/diagnostics differ (see the clang block further down).
+CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -c clang)
+
 # -Wstrict-aliasing=3 (the -Wall default), not =2: level 2 is documented as
 # "aggressive, quick, not too precise" and flags the canonical POSIX
 # sockaddr_un -> sockaddr cast at -O2 even through an intermediate void*
 # (gcc 13 on the CI runners) — a false positive WERROR turns into a build
-# break. Level 3 keeps the real dereference-based aliasing analysis.
+# break. Level 3 keeps the real dereference-based aliasing analysis. clang
+# only understands the bare spelling (the =N levels are gcc-specific and an
+# unknown-warning-option error under -Werror).
+ifneq ($(CC_IS_CLANG),0)
+    STRICT_ALIASING_FLAG = -Wstrict-aliasing
+else
+    STRICT_ALIASING_FLAG = -Wstrict-aliasing=3
+endif
+
 CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
          -Wmissing-prototypes -Wold-style-definition -Wredundant-decls \
          -Wbad-function-cast -Wnested-externs -Winit-self \
-         -Wshadow -Wwrite-strings -Wcast-align -Wstrict-aliasing=3 \
+         -Wshadow -Wwrite-strings -Wcast-align $(STRICT_ALIASING_FLAG) \
          -Wmissing-include-dirs -Wformat=2 -Winit-self \
          -Wswitch-default -Wunused -Werror-implicit-function-declaration \
          $(VERSION_FLAGS)
@@ -111,7 +123,7 @@ endif
 #   vsnprintf wrappers in error.c/display.c whose fmt comes from internal
 #   callers (same sites triaged for the AR-05 L1 flawfinder baseline); gcc's
 #   -Wformat=2 does not flag va_list forwarding.
-CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -c clang)
+# (CC_IS_CLANG is computed above, before the base CFLAGS.)
 ifneq ($(CC_IS_CLANG),0)
     CFLAGS += -Wno-gnu-zero-variadic-macro-arguments -Wno-format-nonliteral
 endif
