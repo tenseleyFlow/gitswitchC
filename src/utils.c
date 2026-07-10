@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -874,6 +875,15 @@ bool validate_name(const char *name) {
         if (c == '/' || c == '\\' || c < 0x20 || c == 0x7f) {
             return false;
         }
+    }
+
+    /* Reserve "current": the per-account GNUPGHOME is <base>/<name>, and the
+     * stable GPG symlink the shell integration exports is <base>/current. An
+     * account literally named "current" would create a real directory there,
+     * so the symlink could never be installed/retargeted and every other
+     * account's switch would silently keep pointing GNUPGHOME at this one. */
+    if (strcasecmp(name, "current") == 0) {
+        return false;
     }
 
     /* Name should contain at least one non-whitespace character */
