@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -41,6 +42,102 @@ static struct {
     git_kv_t local[GIT_MANAGED_KEY_COUNT];
     bool valid;
 } g_git_snapshot;
+
+/* ---- Process-scoped exec caches (perf-1..4) ------------------------------
+ *
+ * A single switch used to spawn the same git subprocesses several times over:
+ * `git --version` on every init, `git rev-parse --git-dir` from every caller
+ * that asked "am I in a repo?", the post-switch name/email read-back twice
+ * (git_set_config's verify and then git_test_config), and the GPG keys
+ * written twice (git_configure_gpg and gpg_manager's
+ * gpg_configure_git_signing). On the login-shell resume hot path each exec is
+ * a fork+execvp round trip, so these are cached for the process lifetime.
+ *
+ * Invalidation assumptions (documented deliberately — the caches trade a
+ * sliver of staleness for the exec reduction, and only where it cannot change
+ * the outcome of a switch):
+ *  - The CLI is short-lived and single-threaded; a concurrent external
+ *    `git config` edit mid-switch was already a lost race before the caches.
+ *  - Repo-ness is keyed by cwd (getcwd is one syscall, not a fork), so a
+ *    future chdir cannot be served a stale answer; a .git appearing or
+ *    vanishing under an unchanged cwd mid-process is not a supported flow.
+ *  - Config entries are only trusted in two provable states: a value THIS
+ *    process successfully wrote (safe to skip an identical re-write — the
+ *    second exec could only repeat the first), and a value actually read back
+ *    from git (safe to serve to a later read). A write never satisfies a
+ *    read: git_set_config's read-back verification must observe git itself,
+ *    not our own write buffer, or the verify would be a self-fulfilling no-op.
+ */
+typedef enum {
+    CFG_UNKNOWN = 0,  /* nothing cacheable known; always exec */
+    CFG_WRITTEN,      /* we set/unset this key ourselves (skip duplicate writes only) */
+    CFG_READBACK      /* value observed in `git config` output (may serve reads) */
+} cfg_state_t;
+
+#define GIT_SCOPE_COUNT 3
+static struct {
+    cfg_state_t state;
+    bool present;      /* false => key known absent (after our own --unset) */
+    char value[512];
+} g_cfg_cache[GIT_SCOPE_COUNT][GIT_MANAGED_KEY_COUNT];
+
+static bool g_git_validated;                 /* perf-1: git-available check ran */
+static struct {                              /* perf-4: repo-ness of cwd */
+    bool known;
+    bool is_repo;
+    char cwd[MAX_PATH_LEN];
+} g_repo_cache;
+
+/* Map to cache indices; -1 when the key/scope is not cacheable. */
+static int cfg_scope_index(git_scope_t scope) {
+    switch (scope) {
+        case GIT_SCOPE_LOCAL:  return 0;
+        case GIT_SCOPE_GLOBAL: return 1;
+        case GIT_SCOPE_SYSTEM: return 2;
+        default: return -1;
+    }
+}
+
+static int cfg_key_index(const char *key) {
+    for (int i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        /* git config keys are case-insensitive; callers use lowercase
+         * constants but don't rely on it. */
+        if (strcasecmp(key, g_managed_keys[i]) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Record a cache entry; values too long to cache degrade to CFG_UNKNOWN
+ * (never truncate — a truncated cached value could satisfy or suppress the
+ * wrong operation later). */
+static void cfg_cache_store(int s, int k, cfg_state_t state, bool present,
+                            const char *value) {
+    if (s < 0 || k < 0) {
+        return;
+    }
+    if (present && strlen(value) >= sizeof(g_cfg_cache[s][k].value)) {
+        g_cfg_cache[s][k].state = CFG_UNKNOWN;
+        g_cfg_cache[s][k].present = false;
+        g_cfg_cache[s][k].value[0] = '\0';
+        return;
+    }
+    g_cfg_cache[s][k].state = state;
+    g_cfg_cache[s][k].present = present;
+    safe_strncpy(g_cfg_cache[s][k].value, present ? value : "",
+                 sizeof(g_cfg_cache[s][k].value));
+}
+
+/* Test seam: unit tests exercise first-call behavior of the caches above, so
+ * they need a reset between cases. Deliberately NOT in git_ops.h — the public
+ * API surface is unchanged; tests declare this prototype locally. */
+void git_ops_test_reset_caches(void);
+void git_ops_test_reset_caches(void) {
+    memset(g_cfg_cache, 0, sizeof(g_cfg_cache));
+    memset(&g_repo_cache, 0, sizeof(g_repo_cache));
+    g_git_validated = false;
+}
 
 /* Extract the value of a lowercased key from `git config --list` output
  * (lines of the form "key=value"). Returns the LAST occurrence, matching git's
@@ -507,13 +604,32 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
         return -1;
     }
 
+    /* perf-3: on a GPG switch, user.signingkey and commit.gpgsign are written
+     * once by git_configure_gpg and again (same values) by gpg_manager's
+     * gpg_configure_git_signing. Skip a write ONLY when this process already
+     * ran the identical write successfully — re-execing it could only repeat
+     * the first result, so the config outcome is provably unchanged. A value
+     * merely read back (CFG_READBACK) never suppresses a write: e.g. on a
+     * multi-valued key the read succeeds but the write would fail, and that
+     * failure must surface. */
+    int s = cfg_scope_index(scope);
+    int k = cfg_key_index(key);
+    if (s >= 0 && k >= 0 && g_cfg_cache[s][k].state == CFG_WRITTEN &&
+        g_cfg_cache[s][k].present && strcmp(g_cfg_cache[s][k].value, value) == 0) {
+        log_debug("Skipping git config %s: identical value already written by this process", key);
+        return 0;
+    }
+
     log_debug("Setting git config: %s = %s (%s)", key, value, scope_flag);
 
     if (git_run(output, sizeof(output), "config", scope_flag, key, value, NULL) != 0) {
+        /* The key's on-disk state is now uncertain; never skip/serve it. */
+        cfg_cache_store(s, k, CFG_UNKNOWN, false, "");
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git config %s: %s", key, output);
         return -1;
     }
 
+    cfg_cache_store(s, k, CFG_WRITTEN, true, value);
     return 0;
 }
 
@@ -532,13 +648,30 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
-    
+
+    /* perf-2: after git_set_config's read-back verification, git_test_config
+     * re-read the exact same user.name/user.email — two more execs per switch
+     * for values git reported moments earlier in this process. Serve reads
+     * from values previously OBSERVED in git output (CFG_READBACK only; our
+     * own writes never satisfy a read, so read-back verification still
+     * genuinely round-trips through git). Only positive observations are
+     * cached: a failed read can mean "absent" or "git broke", and caching the
+     * ambiguity would be guessing. */
+    int s = cfg_scope_index(scope);
+    int k = cfg_key_index(key);
+    if (s >= 0 && k >= 0 && g_cfg_cache[s][k].state == CFG_READBACK &&
+        g_cfg_cache[s][k].present &&
+        strlen(g_cfg_cache[s][k].value) < value_size) {
+        memcpy(value, g_cfg_cache[s][k].value, strlen(g_cfg_cache[s][k].value) + 1);
+        return 0;
+    }
+
     if (git_run(output, sizeof(output), "config", scope_flag, key, NULL) != 0) {
         /* Config value not found - this is not always an error */
         value[0] = '\0';
         return -1;
     }
-    
+
     /* Remove trailing newline */
     trim_whitespace(output);
     /* safe_strncpy writes nothing and returns -1 when the value is too long for
@@ -549,6 +682,7 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
         return -1;
     }
 
+    cfg_cache_store(s, k, CFG_READBACK, true, value);
     return 0;
 }
 
@@ -568,10 +702,24 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
         return -1;
     }
 
+    /* Skip a duplicate unset only when this process already unset the key
+     * itself (same provable-no-op reasoning as the duplicate-write skip). */
+    int s = cfg_scope_index(scope);
+    int k = cfg_key_index(key);
+    if (s >= 0 && k >= 0 && g_cfg_cache[s][k].state == CFG_WRITTEN &&
+        !g_cfg_cache[s][k].present) {
+        log_debug("Skipping git config --unset %s: already unset by this process", key);
+        return 0;
+    }
+
     log_debug("Unsetting git config: %s (%s)", key, scope_flag);
 
     /* Ignore errors as the key might not exist */
     git_run(output, sizeof(output), "config", scope_flag, "--unset", key, NULL);
+
+    /* Unset is best-effort by contract (errors ignored above), so "absent" is
+     * the strongest post-state we can record either way. */
+    cfg_cache_store(s, k, CFG_WRITTEN, false, "");
 
     return 0;
 }
@@ -599,38 +747,60 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
     return 0;
 }
 
+/* ssh-1: the account SSH key path ends up in two security-sensitive sinks:
+ *
+ *  1. core.sshCommand — the ONE git config value git hands to /bin/sh. The
+ *     path is wrapped in single quotes below; inside '...' the shell treats
+ *     every byte literally EXCEPT a single quote, which ends the quote and
+ *     lets a crafted path smuggle extra ssh options (-oProxyCommand=…, i.e.
+ *     arbitrary code on the next fetch).
+ *  2. ~/.ssh/config — the same account key path is emitted verbatim as an
+ *     "IdentityFile <path>" line by the host-alias support. There, a \n or
+ *     \r starts a new line, i.e. injects an arbitrary ssh_config keyword
+ *     (ProxyCommand again), and a quote breaks the directive's tokenization.
+ *
+ * So reject both quote characters and every control byte (\n and \r included)
+ * up front, before the path is probed or written anywhere. A real SSH key
+ * path never needs any of these. */
+static bool is_safe_ssh_key_path(const char *path) {
+    for (const char *p = path; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 0x20 || c == 0x7f || c == '\'' || c == '"') {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Configure SSH command for git operations */
 int git_configure_ssh(const account_t *account, git_scope_t scope) {
     char ssh_command[MAX_PATH_LEN * 2];
     char expanded_key_path[MAX_PATH_LEN];
-    
+
     if (!account || !account->ssh_enabled || strlen(account->ssh_key_path) == 0) {
         return 0; /* Nothing to configure */
     }
-    
+
     /* Expand SSH key path */
     if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
         set_error(ERR_INVALID_PATH, "Failed to expand SSH key path: %s", account->ssh_key_path);
         return -1;
     }
-    
-    /* Verify SSH key file exists and has correct permissions */
-    if (!path_exists(expanded_key_path)) {
-        set_error(ERR_SSH_KEY_NOT_FOUND, "SSH key file not found: %s", expanded_key_path);
+
+    /* Reject injection-capable characters BEFORE touching the filesystem:
+     * whether such a path exists is irrelevant — it must never reach
+     * core.sshCommand or an ~/.ssh/config IdentityFile line (see
+     * is_safe_ssh_key_path above for the exact break-out routes). */
+    if (!is_safe_ssh_key_path(expanded_key_path)) {
+        set_error(ERR_INVALID_PATH,
+                  "SSH key path contains an illegal character (quote/control): %s",
+                  expanded_key_path);
         return -1;
     }
 
-    /* core.sshCommand is the one value git executes through /bin/sh, so the
-     * key path below is wrapped in single quotes. Inside '...' the shell
-     * treats every byte literally EXCEPT a single quote, which ends the quote
-     * and would let a crafted path inject extra ssh options (e.g.
-     * -oProxyCommand=…, i.e. arbitrary code on the next fetch). Reject a path
-     * containing a single quote (or a control char/newline) so the quoting
-     * cannot be broken. A real SSH key path never needs these. */
-    if (strpbrk(expanded_key_path, "'\n\r") != NULL) {
-        set_error(ERR_INVALID_PATH,
-                  "SSH key path contains an illegal character (quote/newline): %s",
-                  expanded_key_path);
+    /* Verify SSH key file exists and has correct permissions */
+    if (!path_exists(expanded_key_path)) {
+        set_error(ERR_SSH_KEY_NOT_FOUND, "SSH key file not found: %s", expanded_key_path);
         return -1;
     }
 
@@ -676,16 +846,33 @@ int git_configure_gpg(const account_t *account, git_scope_t scope) {
     return 0;
 }
 
-/* Check if current directory is a git repository */
+/* Check if current directory is a git repository.
+ *
+ * perf-4: a single switch asks this several times (scope resolution, the
+ * config snapshot, and git_set_config's clear-local decision), and each ask
+ * was a `git rev-parse --git-dir` fork+exec. The answer for a given cwd
+ * cannot change mid-switch, so cache it per process, keyed by cwd — the key
+ * costs one getcwd() syscall and guarantees a future chdir is never served
+ * the previous directory's answer. If getcwd() itself fails we skip the cache
+ * entirely and exec (fail closed on the cache, not the answer). */
 bool git_is_repository(void) {
     char output[256];
-    
-    /* Use git rev-parse --git-dir to check for repository */
-    if (git_run(output, sizeof(output), "rev-parse", "--git-dir", NULL) == 0) {
-        return true;
+    char cwd[MAX_PATH_LEN];
+    bool have_cwd = (getcwd(cwd, sizeof(cwd)) != NULL);
+
+    if (have_cwd && g_repo_cache.known && strcmp(cwd, g_repo_cache.cwd) == 0) {
+        return g_repo_cache.is_repo;
     }
-    
-    return false;
+
+    /* Use git rev-parse --git-dir to check for repository */
+    bool is_repo = (git_run(output, sizeof(output), "rev-parse", "--git-dir", NULL) == 0);
+
+    if (have_cwd && safe_strncpy(g_repo_cache.cwd, cwd, sizeof(g_repo_cache.cwd)) == 0) {
+        g_repo_cache.known = true;
+        g_repo_cache.is_repo = is_repo;
+    }
+
+    return is_repo;
 }
 
 /* Get repository root directory */
@@ -753,30 +940,28 @@ static int git_run(char *output, size_t output_size, ...) {
     return run_argv(argv, &opts, &res);
 }
 
-/* Validate git installation */
+/* Validate git installation.
+ *
+ * perf-1: this runs on every switch AND on the boot-time `resume` that gates
+ * the login shell prompt, and it used to fork+exec `git --version` each time
+ * just to strstr the banner. command_exists() is a pure $PATH walk with
+ * access(X_OK) — no subprocess — and proves the same thing we act on: an
+ * executable git. A pathological non-git `git` binary still fails closed at
+ * the first real `git config` invocation (every git_run result is checked).
+ * Cached per process: only a positive answer is cached, so a transient PATH
+ * problem is re-probed, and git appearing/vanishing mid-process is not a
+ * supported flow. */
 static int validate_git_installation(void) {
-    char version_output[256];
-    
-    /* Check if git is available */
+    if (g_git_validated) {
+        return 0;
+    }
+
     if (!command_exists("git")) {
         set_error(ERR_SYSTEM_REQUIREMENT, "Git is not installed or not in PATH");
         return -1;
     }
-    
-    /* Get git version */
-    if (git_run(version_output, sizeof(version_output), "--version", NULL) != 0) {
-        set_error(ERR_SYSTEM_REQUIREMENT, "Failed to get git version");
-        return -1;
-    }
-    
-    log_debug("Git version: %s", version_output);
-    
-    /* Basic version check - require git 2.0+ */
-    if (!strstr(version_output, "git version ")) {
-        set_error(ERR_SYSTEM_REQUIREMENT, "Unexpected git version output");
-        return -1;
-    }
-    
+
+    g_git_validated = true;
     return 0;
 }
 
