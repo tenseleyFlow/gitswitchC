@@ -163,9 +163,4 @@ bool toml_check_injection_patterns(const char *input, size_t length);
  */
 void toml_cleanup_document(toml_document_t *doc);
 
-/**
- * Get last parser error message
- */
-const char *toml_get_error_message(const toml_parser_state_t *state);
-
 #endif /* TOML_PARSER_H */
