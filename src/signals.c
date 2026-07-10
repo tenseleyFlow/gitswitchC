@@ -138,6 +138,29 @@ static void guard_handler(int sig) {
     (void)raise(sig);
 }
 
+void signals_reset_for_child(void) {
+    /* AR-06 F76: reset the guarded signals to their default disposition in a
+     * freshly-forked child before it execs. Between fork and execv the child
+     * still carries the parent's guard_handler; a signal delivered in that
+     * window (e.g. a terminal SIGINT to the whole process group) would run the
+     * guard — which only RECORDS the signal and returns — instead of
+     * terminating, so the exec'd helper started already "interrupted" and the
+     * signal was swallowed. execve resets caught handlers to default, but only
+     * AT exec; this closes the pre-exec window. Also unblock them in case the
+     * guard left any masked. Single-threaded child, so this is safe. */
+    sigset_t guarded;
+    sigemptyset(&guarded);
+    for (size_t i = 0; i < GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction dfl;
+        memset(&dfl, 0, sizeof(dfl));
+        dfl.sa_handler = SIG_DFL;
+        sigemptyset(&dfl.sa_mask);
+        sigaction(g_guarded_signals[i], &dfl, NULL);
+        sigaddset(&guarded, g_guarded_signals[i]);
+    }
+    sigprocmask(SIG_UNBLOCK, &guarded, NULL);
+}
+
 void signals_rollback_begin(void) {
     g_rollback_in_progress = 1;
 }
