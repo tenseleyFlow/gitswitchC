@@ -721,32 +721,62 @@ static int handle_init_command(const char *shell) {
          * since a no-op resume never creates the socket the probe looks for. */
         printf("if status is-interactive\n");
         if (have_hint) {
-            /* Only probe/resume when there's a saved account to resume, and
-             * pick the probe by the account's recorded runtime needs (the
-             * hint file's content) so an SSH-less active account never spawns
-             * a doomed ssh-add + resume on every shell (AR-02 #23). Empty or
-             * unrecognized content (a pre-#23 hint written before this field
-             * existed) falls back to the ssh-add probe — same behavior as
-             * before, no regression on the first post-upgrade shell. */
+            /* Only probe/resume when there's a saved account to resume. Exact
+             * cases avoid the old overlapping wildcard bug where "ssh gpg"
+             * matched the SSH arm first and never checked GPG. Unknown legacy
+             * content is treated conservatively as requiring both runtimes. */
             printf("    if test -e '%s'\n", hint_path);
             printf("        read -l __gitswitch_needs < '%s'\n", hint_path);
             printf("        switch \"$__gitswitch_needs\"\n");
-            printf("            case '' '*ssh*'\n");
+            printf("            case none\n");
+            printf("            case ssh\n");
             printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
             printf("                if test $status -gt 1\n");
             printf("                    gitswitch resume >/dev/null\n");
             printf("                end\n");
             if (have_gpg_home) {
-                /* GPG-only account: the GNUPGHOME `current` symlink is
-                 * boot-volatile (XDG_RUNTIME_DIR), so its absence is the
-                 * liveness test — a builtin test, no spawn, unlike ssh-add. */
-                printf("            case '*gpg*'\n");
+                printf("            case gpg\n");
                 printf("                if not test -d '%s'\n", gpg_home);
                 printf("                    gitswitch resume >/dev/null\n");
                 printf("                end\n");
+            } else {
+                printf("            case gpg\n");
+                printf("                gitswitch resume >/dev/null\n");
             }
-            /* 'none' (identity-only): git config is persistent, nothing to
-             * restore — no probe, no resume. */
+            printf("            case 'ssh gpg'\n");
+            printf("                set -l __gitswitch_resume 0\n");
+            printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
+            printf("                if test $status -gt 1\n");
+            printf("                    set __gitswitch_resume 1\n");
+            printf("                end\n");
+            if (have_gpg_home) {
+                printf("                if not test -d '%s'\n", gpg_home);
+                printf("                    set __gitswitch_resume 1\n");
+                printf("                end\n");
+            } else {
+                printf("                set __gitswitch_resume 1\n");
+            }
+            printf("                if test $__gitswitch_resume -eq 1\n");
+            printf("                    gitswitch resume >/dev/null\n");
+            printf("                end\n");
+            printf("                set -e __gitswitch_resume\n");
+            printf("            case '*'\n");
+            printf("                set -l __gitswitch_resume 0\n");
+            printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
+            printf("                if test $status -gt 1\n");
+            printf("                    set __gitswitch_resume 1\n");
+            printf("                end\n");
+            if (have_gpg_home) {
+                printf("                if not test -d '%s'\n", gpg_home);
+                printf("                    set __gitswitch_resume 1\n");
+                printf("                end\n");
+            } else {
+                printf("                set __gitswitch_resume 1\n");
+            }
+            printf("                if test $__gitswitch_resume -eq 1\n");
+            printf("                    gitswitch resume >/dev/null\n");
+            printf("                end\n");
+            printf("                set -e __gitswitch_resume\n");
             printf("        end\n");            /* close switch */
             printf("        set -e __gitswitch_needs\n");
             printf("    end\n");                /* close `if test -e <hint>` */
@@ -786,24 +816,43 @@ static int handle_init_command(const char *shell) {
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
         if (have_hint) {
-            /* Pick the probe by the account's recorded runtime needs (hint
-             * file content) so an SSH-less active account never spawns a
-             * doomed ssh-add + resume every shell (AR-02 #23). Empty/unknown
-             * content (a pre-#23 hint) falls back to the ssh-add probe. read
-             * and case are shell builtins — no extra process. */
+            /* Exact cases keep combined accounts from being swallowed by the
+             * SSH branch. Empty/unknown legacy content probes both runtimes. */
             printf("    if [ -e '%s' ]; then\n", hint_path);
-            printf("        IFS= read -r __gitswitch_needs < '%s' 2>/dev/null || __gitswitch_needs=ssh\n", hint_path);
+            printf("        IFS= read -r __gitswitch_needs < '%s' 2>/dev/null || __gitswitch_needs=\n", hint_path);
             printf("        case \"$__gitswitch_needs\" in\n");
-            printf("        ''|*ssh*)\n");
+            printf("        none) : ;;\n");
+            printf("        ssh)\n");
             printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
             printf("            [ $? -gt 1 ] && gitswitch resume >/dev/null ;;\n");
             if (have_gpg_home) {
-                /* GPG-only: the boot-volatile GNUPGHOME symlink's absence is
-                 * the liveness test — a builtin, no ssh-add spawn. */
-                printf("        *gpg*)\n");
+                printf("        gpg)\n");
                 printf("            [ -d '%s' ] || gitswitch resume >/dev/null ;;\n", gpg_home);
+            } else {
+                printf("        gpg) gitswitch resume >/dev/null ;;\n");
             }
-            /* 'none' (identity-only): nothing to restore. */
+            printf("        'ssh gpg')\n");
+            printf("            __gitswitch_resume=0\n");
+            printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
+            printf("            [ $? -gt 1 ] && __gitswitch_resume=1\n");
+            if (have_gpg_home) {
+                printf("            [ -d '%s' ] || __gitswitch_resume=1\n", gpg_home);
+            } else {
+                printf("            __gitswitch_resume=1\n");
+            }
+            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || gitswitch resume >/dev/null\n");
+            printf("            unset __gitswitch_resume ;;\n");
+            printf("        *)\n");
+            printf("            __gitswitch_resume=0\n");
+            printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
+            printf("            [ $? -gt 1 ] && __gitswitch_resume=1\n");
+            if (have_gpg_home) {
+                printf("            [ -d '%s' ] || __gitswitch_resume=1\n", gpg_home);
+            } else {
+                printf("            __gitswitch_resume=1\n");
+            }
+            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || gitswitch resume >/dev/null\n");
+            printf("            unset __gitswitch_resume ;;\n");
             printf("        esac\n");
             printf("        unset __gitswitch_needs\n");
             printf("    fi ;;\n");
@@ -973,6 +1022,10 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
 static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     char resp[16];
     const char *target = NULL;
+    char ssh_error[sizeof(g_last_error.message)] = "";
+    char gpg_error[sizeof(g_last_error.message)] = "";
+    int ssh_rc;
+    int gpg_rc;
 
     if (!ctx) return EXIT_FAILURE;
 
@@ -1020,9 +1073,35 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
      * deleted that freshly-installed live link — leaving a working agent with
      * a dangling SSH_AUTH_SOCK (AR-02 #11). Removed; the locked cleanup in
      * ssh_manager_reset is the single source of truth. */
-    ssh_manager_reset(target);
+    ssh_rc = ssh_manager_reset(target);
+    if (ssh_rc != 0) {
+        snprintf(ssh_error, sizeof(ssh_error), "%s",
+                 get_last_error()->message[0] ? get_last_error()->message
+                                              : "unknown SSH teardown error");
+    }
 
-    gpg_manager_reset(target);
+    /* Always attempt GPG teardown even after an SSH error: independent
+     * resources should be cleaned as far as safely possible, while the saved
+     * account remains the retry handle until both managers succeed. */
+    gpg_rc = gpg_manager_reset(target);
+    if (gpg_rc != 0) {
+        snprintf(gpg_error, sizeof(gpg_error), "%s",
+                 get_last_error()->message[0] ? get_last_error()->message
+                                              : "unknown GPG teardown error");
+    }
+
+    if (ssh_rc != 0 || gpg_rc != 0) {
+        if (ssh_rc != 0) {
+            fprintf(stderr, "gitswitch: SSH reset failed: %s\n", ssh_error);
+        }
+        if (gpg_rc != 0) {
+            fprintf(stderr, "gitswitch: GPG reset failed: %s\n", gpg_error);
+        }
+        fprintf(stderr,
+                "gitswitch: reset failed; retry metadata was preserved\n");
+        set_error(ERR_SYSTEM_CALL, "SSH/GPG reset did not complete");
+        return EXIT_FAILURE;
+    }
 
     /* When the reset covered the saved active account (or everything), clear
      * the persisted active_account: main()'s settings-only save then records

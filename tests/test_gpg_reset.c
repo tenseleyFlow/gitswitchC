@@ -54,6 +54,35 @@ static int null_runner(const char *const argv[], const run_opts_t *opts,
     return 0;
 }
 
+static const char *extra_env_value(const run_opts_t *opts, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    if (!opts || !opts->extra_env) return NULL;
+    for (size_t i = 0; opts->extra_env[i]; i++) {
+        if (strncmp(opts->extra_env[i], prefix, prefix_len) == 0) {
+            return opts->extra_env[i] + prefix_len;
+        }
+    }
+    return NULL;
+}
+
+/* Deterministically fail gpgconf for every home, or only for a home whose
+ * path ends in /bad. This exercises the manager's retry-preservation and
+ * all-home aggregation without relying on chmod behavior under root. */
+static bool g_fail_only_bad_home;
+static int failing_gpgconf_runner(const char *const argv[], const run_opts_t *opts,
+                                  run_result_t *result) {
+    const char *home = extra_env_value(opts, "GNUPGHOME=");
+    bool fail = !g_fail_only_bad_home || (home && strstr(home, "/bad") != NULL);
+    (void)argv;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = fail ? 9 : 0;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    return fail ? -1 : 0;
+}
+
 /* Fresh scratch XDG_RUNTIME_DIR; returns 0 on success. */
 static int make_xdg(char *dir, size_t size) {
     snprintf(dir, size, "/tmp/gswgpgrst_XXXXXX");
@@ -73,7 +102,7 @@ static int touch(const char *path) {
 /* A crafted account name must never become a deletable path component that
  * escapes <base>. The victim dir sits exactly where "../victim" would land. */
 TEST(gpg_manager_reset_rejects_traversal) {
-    char xdg[128], base[256], home[512], victim[256], marker[512], keep[512];
+    char xdg[128], base[256], home[512], victim[256], marker[512], keep[1024];
     command_runner_fn prev;
 
     CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
@@ -118,7 +147,7 @@ TEST(gpg_manager_reset_rejects_traversal) {
  * enumeration/deletion happens under it: nftw would follow the symlinked base
  * as an intermediate path component even with FTW_PHYS. */
 TEST(gpg_manager_reset_refuses_symlinked_base) {
-    char xdg[128], realbase[256], link_path[256], acct[512], marker[512];
+    char xdg[128], realbase[256], link_path[256], acct[512], marker[1024];
     struct stat st;
     command_runner_fn prev;
 
@@ -250,6 +279,166 @@ TEST(gpg_manager_reset_blocks_on_base_lock) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+/* AR-04 H3: an existing validated base is never mutated without its lock. A
+ * directory at .lock makes open/flock fail deterministically on every uid. */
+TEST(gpg_manager_reset_fails_closed_when_lock_unavailable) {
+    char xdg[128], base[256], lock_path[320], home[320], marker[384];
+    char current[320];
+    struct stat st;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(lock_path, sizeof(lock_path), "%s/.lock", base);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(lock_path, 0700), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    prev = run_set_runner(null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1); /* pre-fix: 0, unlocked delete */
+    run_set_runner(prev);
+
+    CHECK(path_exists(marker));
+    CHECK_EQ_INT(lstat(current, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+}
+
+/* A failed gpgconf means the agent stop was not confirmed. Keep the complete
+ * home and stable link so a later reset still has an exact retry target. */
+TEST(gpg_manager_reset_retains_home_when_agent_stop_fails) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    struct stat st;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    g_fail_only_bad_home = false;
+    prev = run_set_runner(failing_gpgconf_runner);
+    CHECK_EQ_INT(gpg_manager_reset("work"), -1); /* pre-fix: 0 + home deleted */
+    run_set_runner(prev);
+
+    CHECK(path_exists(marker));
+    CHECK_EQ_INT(lstat(current, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+}
+
+TEST(gpg_manager_reset_reports_recursive_removal_failure) {
+    char xdg[128], base[256], home[320], marker[384];
+    command_runner_fn prev;
+
+    if (geteuid() == 0) {
+        fprintf(stderr, "  (skip: root bypasses directory write permissions)\n");
+        return;
+    }
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(chmod(home, 0500), 0); /* remove(marker) must fail */
+
+    prev = run_set_runner(null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("work"), -1); /* pre-fix: 0 */
+    run_set_runner(prev);
+
+    CHECK(path_exists(marker));
+    CHECK_EQ_INT(chmod(home, 0700), 0);
+}
+
+/* All-home reset remains progressive: one failure is reported, but it does
+ * not prevent independent homes from being stopped and removed. */
+TEST(gpg_manager_reset_all_aggregates_failures_and_continues) {
+    char xdg[128], base[256], good[320], bad[320];
+    char good_marker[384], bad_marker[384], current[320];
+    struct stat st;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(good, sizeof(good), "%s/good", base);
+    snprintf(bad, sizeof(bad), "%s/bad", base);
+    snprintf(good_marker, sizeof(good_marker), "%s/private.key", good);
+    snprintf(bad_marker, sizeof(bad_marker), "%s/private.key", bad);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(good, 0700), 0);
+    CHECK_EQ_INT(mkdir(bad, 0700), 0);
+    CHECK_EQ_INT(touch(good_marker), 0);
+    CHECK_EQ_INT(touch(bad_marker), 0);
+    CHECK_EQ_INT(symlink(bad, current), 0);
+
+    g_fail_only_bad_home = true;
+    prev = run_set_runner(failing_gpgconf_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(prev);
+
+    CHECK(!path_exists(good));
+    CHECK(path_exists(bad_marker));
+    CHECK_EQ_INT(lstat(current, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+}
+
+TEST(gpg_manager_reset_reports_stable_link_cleanup_failure) {
+    char xdg[128], base[256], current[320];
+    struct stat st;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(current, 0700), 0); /* not a readable/removable symlink */
+
+    prev = run_set_runner(null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1); /* pre-fix: 0 */
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(lstat(current, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+}
+
+/* A stable link to an existing directory outside the managed base is corrupt
+ * state, not a live managed home. Full reset removes the link itself without
+ * traversing or altering the external target. */
+TEST(gpg_manager_reset_all_drops_external_live_target) {
+    char xdg[128], base[256], current[320], external[256], marker[320];
+    struct stat st;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(external, sizeof(external), "%s/external-gnupg", xdg);
+    snprintf(marker, sizeof(marker), "%s/keep", external);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(symlink(external, current), 0);
+
+    prev = run_set_runner(null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(lstat(current, &st), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK(path_exists(marker));
+}
+
 /* Test-local mirror of the manager's tmpfs probe, so the assertions below can
  * adapt to where the suite happens to run instead of hard-assuming /tmp is
  * tmpfs (it isn't on FreeBSD/macOS CI) or the workspace is disk (it usually is). */
@@ -318,5 +507,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_manager_reset_refuses_symlinked_base);
     RUN_TEST(gpg_manager_reset_single_account_refuses_symlinked_home);
     RUN_TEST(gpg_manager_reset_blocks_on_base_lock);
+    RUN_TEST(gpg_manager_reset_fails_closed_when_lock_unavailable);
+    RUN_TEST(gpg_manager_reset_retains_home_when_agent_stop_fails);
+    RUN_TEST(gpg_manager_reset_reports_recursive_removal_failure);
+    RUN_TEST(gpg_manager_reset_all_aggregates_failures_and_continues);
+    RUN_TEST(gpg_manager_reset_reports_stable_link_cleanup_failure);
+    RUN_TEST(gpg_manager_reset_all_drops_external_live_target);
     RUN_TEST(create_isolated_home_refuses_persistent_xdg_base);
 TEST_MAIN_END()

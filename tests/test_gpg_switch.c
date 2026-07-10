@@ -106,6 +106,53 @@ TEST(repeat_isolated_switch_spawns_gpg_once) {
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
 }
 
+/* AR-04 M2: the stable `current` path is the commit point. A directory there
+ * cannot be atomically replaced by a symlink, so the prepared home remains
+ * reusable but the switch must fail without publishing active key/env state. */
+TEST(isolated_switch_fails_when_current_cannot_be_retargeted) {
+    char xdg[128], base[256], current[320], home[320];
+    struct stat st;
+    gpg_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+
+    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
+    CHECK(mkdtemp(xdg) != NULL);
+    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    setenv("XDG_RUNTIME_DIR", xdg, 1);
+    setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
+    setenv("GNUPGHOME", "/before/gpg-home", 1);
+
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(current, sizeof(current), "%s/current", base);
+    snprintf(home, sizeof(home), "%s/work", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(current, 0700), 0); /* rename-over-directory fails */
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = GPG_MODE_ISOLATED;
+    memset(&acct, 0, sizeof(acct));
+    snprintf(acct.name, sizeof(acct.name), "work");
+    snprintf(acct.email, sizeof(acct.email), "w@x.com");
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    snprintf(acct.gpg_key_id, sizeof(acct.gpg_key_id), "FEEDFACE01234567");
+
+    g_gpg_execs = 0;
+    prev = run_set_runner(counting_runner);
+    CHECK_EQ_INT(gpg_switch_account(&cfg, &acct), -1); /* pre-fix: 0 */
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(lstat(current, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK(path_exists(home));              /* prepared state is reusable */
+    CHECK(cfg.current_key_id[0] == '\0'); /* rejected account not published */
+    CHECK(!cfg.signing_enabled);
+    CHECK_STR_EQ(getenv("GNUPGHOME"), "/before/gpg-home");
+
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+}
+
 /* ---- AR-02 #4 at the switch level: truncated exports never import -------- */
 
 static bool g_import_ran;
@@ -535,6 +582,7 @@ TEST(gpg_test_signing_treats_truncated_listing_as_inconclusive) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(repeat_isolated_switch_spawns_gpg_once);
+    RUN_TEST(isolated_switch_fails_when_current_cannot_be_retargeted);
     RUN_TEST(truncated_secret_key_export_is_never_imported);
     RUN_TEST(first_time_import_is_directional_and_isolated);
     RUN_TEST(first_time_import_runs_under_base_lock);

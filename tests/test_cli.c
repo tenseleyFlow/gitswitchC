@@ -127,12 +127,11 @@ TEST(init_succeeds_and_emits_full_snippet) {
     remove_tree(rt);
 }
 
-/* AR-02 #23: the init snippet must gate the per-shell resume probe on the
- * hint file's recorded runtime needs, not just its existence, so an SSH-less
- * active account never spawns a doomed ssh-add + resume on every shell. Assert
- * the content-driven branching is emitted: it reads the hint into
- * __gitswitch_needs and has a GPG-only arm that probes the GNUPGHOME symlink
- * with a builtin `test -d` instead of ssh-add. */
+/* AR-02 #23 / AR-04 M1: the init snippet must gate the per-shell resume probe
+ * on the hint file's exact recorded runtime needs, not just its existence, so
+ * a GPG-only account avoids ssh-add while a combined account checks both
+ * resources. Assert both exact arms are emitted; a wildcard GPG arm would
+ * swallow "ssh gpg" before the combined probe can run. */
 TEST(init_snippet_gates_probe_on_hint_content) {
     char rt[256], out_path[4352], cmd[9000], out[8192];
 
@@ -144,7 +143,9 @@ TEST(init_snippet_gates_probe_on_hint_content) {
 
     slurp(out_path, out, sizeof(out));
     CHECK(strstr(out, "__gitswitch_needs") != NULL);      /* reads the hint content */
-    CHECK(strstr(out, "*gpg*)") != NULL);                 /* GPG-only arm exists */
+    CHECK(strstr(out, "        gpg)") != NULL);           /* exact GPG-only arm */
+    CHECK(strstr(out, "        'ssh gpg')") != NULL);     /* exact combined arm */
+    CHECK(strstr(out, "*gpg*)") == NULL);                 /* no overlapping wildcard */
     CHECK(strstr(out, "-d '") != NULL);                   /* builtin symlink test, not ssh-add */
     remove_tree(rt);
 }
@@ -424,26 +425,32 @@ static const char *two_ssh_accounts_config(void) {
 /* Lay out a fake agent dir: per-account socket files for work/other and
  * current.sock -> work's socket. Returns 0 on success. */
 static int setup_agent_dir(const char *rt, char *cur_link, size_t cur_size) {
-    char dir[4352], sock[4352];
+    char dir[512], sock[768];
     FILE *f;
+    int n;
 
-    snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", rt);
+    n = snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", rt);
+    if (n < 0 || (size_t)n >= sizeof(dir)) return -1;
     if (mkdir(dir, 0700) != 0) return -1;
 
-    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    n = snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    if (n < 0 || (size_t)n >= sizeof(sock)) return -1;
     f = fopen(sock, "w");
     if (!f) return -1;
     fclose(f);
     if (chmod(sock, 0600) != 0) return -1;
 
-    snprintf(sock, sizeof(sock), "%s/ssh-agent.other.sock", dir);
+    n = snprintf(sock, sizeof(sock), "%s/ssh-agent.other.sock", dir);
+    if (n < 0 || (size_t)n >= sizeof(sock)) return -1;
     f = fopen(sock, "w");
     if (!f) return -1;
     fclose(f);
     if (chmod(sock, 0600) != 0) return -1;
 
-    snprintf(cur_link, cur_size, "%s/current.sock", dir);
-    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    n = snprintf(cur_link, cur_size, "%s/current.sock", dir);
+    if (n < 0 || (size_t)n >= cur_size) return -1;
+    n = snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
+    if (n < 0 || (size_t)n >= sizeof(sock)) return -1;
     return symlink(sock, cur_link);
 }
 
@@ -808,7 +815,7 @@ TEST(add_after_uint32_max_id_does_not_wrap_to_zero) {
  * was dropped while add still reported success), re-prompting each time. */
 TEST(add_reprompts_invalid_host_alias_until_valid) {
     char home[256], rt[256], stdin_path[4352], out_path[4352];
-    char key_path[4352], toml_path[4352], toml[8192], script[2048];
+    char key_path[512], toml_path[4352], toml[8192], script[1024];
     char long_alias[321];
     int rc;
 
@@ -852,8 +859,8 @@ TEST(add_reprompts_invalid_host_alias_until_valid) {
  * pre-fix it saved the account and the very next invocation dropped it. */
 TEST(add_refuses_ssh_key_path_over_256_chars) {
     char home[256], rt[256], stdin_path[4352], out_path[4352];
-    char dir_a[4352], dir_b[4352], key_path[4352];
-    char toml_path[4352], toml[8192], out[8192], script[2048], seg[130];
+    char dir_a[512], dir_b[768], key_path[1024];
+    char toml_path[4352], toml[8192], out[8192], script[1280], seg[130];
     int rc;
 
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
@@ -1073,7 +1080,7 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
  * the command must exit nonzero — pre-fix it warned and exited 0, so scripted
  * callers could not detect that active_account went stale. */
 TEST(switch_save_failure_exits_nonzero) {
-    char home[256], rt[256], cmd[16384], dir[4352], lock[4352], err_path[4352];
+    char home[256], rt[256], cmd[16384], dir[512], lock[640], err_path[512];
     char buf[8192];
     int rc;
 
