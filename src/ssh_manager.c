@@ -1836,7 +1836,23 @@ int ssh_configure_host_alias(const account_t *account) {
         set_system_error(ERR_FILE_IO, "Failed to open temp SSH config");
         return -1;
     }
-    fputs(newbuf, out);
+    /* Durable, CHECKED write (AR-06 F10). A bare fputs whose return was ignored
+     * was the last unchecked payload writer in the tree: when the payload
+     * exceeds the stdio buffer, fputs flushes to the fd, and on ENOSPC/EDQUOT/
+     * EIO glibc latches the stream error and DISCARDS the unwritten tail — the
+     * later fclose then returns 0, so a truncated PREFIX of the user's
+     * ~/.ssh/config was atomically renamed over the complete original while the
+     * switch reported success. Check fputs + flush + ferror + fsync before the
+     * rename so a partial write is reported and the temp is discarded; fsync
+     * also makes the temp durable so a crash right after rename can't zero it. */
+    if (fputs(newbuf, out) == EOF ||
+        fflush(out) != 0 || ferror(out) || fsync(fileno(out)) != 0) {
+        fclose(out);
+        unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to write SSH config");
+        return -1;
+    }
     if (fclose(out) != 0) {
         unlink(tmp_path);
         signals_scratch_unregister(tmp_path);
