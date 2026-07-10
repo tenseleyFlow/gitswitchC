@@ -583,6 +583,20 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                                        runtime_lock_fd);
         }
 
+        /* AR-05 M4: the FORWARD mutation window (SSH agent spawn/repoint, GPG
+         * `current` retarget, git identity write) needs the same second-signal
+         * deferral the rollback and deferred-teardown blocks already get. A
+         * second directed signal here used to take the handler's emergency
+         * exit: no git_config_restore, no deactivate_runtime_isolation —
+         * current.sock/GNUPGHOME left on the NEW account while git named the
+         * OLD one, plus a daemonized ssh-agent holding the freshly-decrypted
+         * key leaked until reboot. With the flag up, the repeat signal instead
+         * forwards to the in-flight child (killing a stuck ssh-add/pinentry
+         * prompt), the blocked step fails or returns, and the mainline reaches
+         * its signals_pending() checkpoint and runs abort_failed_switch —
+         * which re-arms and then clears the flag itself before returning. */
+        signals_rollback_begin();
+
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             account_t runtime_target = switch_target;
@@ -710,6 +724,11 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
              * above completed the restore. */
             gpg_ok = g_session.gpg_active;
         }
+
+        /* Forward mutations are complete and mutually consistent (runtime and
+         * git identity both name the new account), so the M4 deferral window
+         * closes here; the deferred-teardown block below re-arms its own. */
+        signals_rollback_end();
 
         /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
          * switch back (git config, when written, was just written — restore it
