@@ -215,23 +215,35 @@ int main(int argc, char *argv[]) {
         return rc;
     }
 
-    /* For commands that read-modify-write the config (add/edit/remove and a
-     * bare-account switch that updates active_account), hold an exclusive
-     * cross-process lock across the WHOLE load->mutate->save cycle so two
-     * concurrent invocations can't lost-update each other. Acquire it before
-     * config_init so the load itself happens under the lock. Read-only commands
-     * (list/status/doctor/config/resume/reset) don't take it. Best-effort: if
-     * the lock can't be taken we still proceed rather than block the user. */
+    /* For commands that mutate shared state, hold an exclusive cross-process
+     * lock across the WHOLE load->mutate->save cycle. That is not just the
+     * config read-modify-writers (add/edit/remove, a bare-account switch that
+     * updates active_account): `resume` runs the full mutating accounts_switch
+     * (SSH agent retarget, GPG symlink retarget, git config write) and `reset`
+     * kills agents and retargets/deletes runtime symlinks, so both must be
+     * serialized against a concurrent switch or the final state splits git
+     * identity from the live SSH/GPG runtime (AR-02 #1: tmux-restore shells
+     * running resume while another shell switches). Acquire before config_init
+     * so the load itself happens under the lock. Only genuinely read-only
+     * commands (list/status/doctor/config) skip it. Fail closed on lock
+     * failure: silently proceeding unlocked would reopen the exact lost-update
+     * and split-identity races the lock exists to prevent (AR-02 #17). */
     int config_lock_fd = -1;
     {
         const char *c = (optind < argc) ? argv[optind] : NULL;
         bool read_only = (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
-            strcmp(c, "health") == 0 || strcmp(c, "config") == 0 ||
-            strcmp(c, "resume") == 0 || strcmp(c, "reset") == 0;
+            strcmp(c, "health") == 0 || strcmp(c, "config") == 0;
         if (!read_only) {
             config_lock_fd = config_write_lock();
+            if (config_lock_fd < 0) {
+                display_error("Could not acquire the gitswitch config lock",
+                              "another gitswitch may be stuck or the config "
+                              "directory is not writable; try again");
+                error_cleanup();
+                return EXIT_FAILURE;
+            }
         }
     }
 

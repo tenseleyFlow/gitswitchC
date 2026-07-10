@@ -252,7 +252,9 @@ fail_buffer:
  * lost-update each other. The atomic temp+rename in config_save only prevents a
  * torn file, not a lost update: two processes that each load, mutate, and rename
  * would have the second silently discard the first's changes. Close the fd to
- * release. Returns -1 on failure (caller may proceed best-effort). */
+ * release. Returns -1 on failure; callers must treat that as fatal for a
+ * mutating command — proceeding unlocked reopens the lost-update race
+ * (AR-02 #17). */
 int config_write_lock(void) {
     char dir[MAX_PATH_LEN];
     char lockpath[MAX_PATH_LEN];
