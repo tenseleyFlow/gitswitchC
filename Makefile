@@ -83,6 +83,15 @@ else
     CFLAGS += $(DEBUG_FLAGS)
 endif
 
+# Warnings-as-errors knob. CI passes WERROR=1 so the ~20 -W flags above gate
+# merges instead of scrolling past in build logs (AR-05 L7: only
+# -Werror-implicit-function-declaration was fatal, so new -Wshadow/-Wformat=2
+# class diagnostics merged silently). Local builds stay non-Werror so a new
+# compiler's novel warnings never block development.
+ifeq ($(WERROR),1)
+    CFLAGS += -Werror
+endif
+
 # Include directories
 INCLUDES = -I$(SRCDIR)
 

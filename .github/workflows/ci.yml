@@ -18,13 +18,13 @@ jobs:
             echo "ERROR: shell-based process execution reintroduced in src/" >&2
             exit 1
           fi
-      - name: Build + test (ASan/UBSan)
-        run: make BUILD_TYPE=debug test
+      - name: Build + test (ASan/UBSan, warnings-as-errors)
+        run: make BUILD_TYPE=debug WERROR=1 test
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-      - name: Release build (FORTIFY/RELRO)
-        run: make clean && make BUILD_TYPE=release
+      - name: Release build (FORTIFY/RELRO, warnings-as-errors)
+        run: make clean && make BUILD_TYPE=release WERROR=1
       # AR-05 L3: run REAL Valgrind against the release binaries. The
       # qa-contract-test below only proves the recipe's failure plumbing via
       # a shim; without this step no actual memory checking ever executed in
@@ -58,14 +58,14 @@ jobs:
             # and assert no subprocess spawn — they need a real git binary,
             # which the Linux/macOS runners ship but this VM does not.
             sudo pkg install -y gmake gcc git
-            gmake BUILD_TYPE=release
-            gmake BUILD_TYPE=release test
+            gmake BUILD_TYPE=release WERROR=1
+            gmake BUILD_TYPE=release WERROR=1 test
 
   macos:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build + test (ASan/UBSan)
-        run: make BUILD_TYPE=debug test
-      - name: Release build
-        run: make clean && make BUILD_TYPE=release
+      - name: Build + test (ASan/UBSan, warnings-as-errors)
+        run: make BUILD_TYPE=debug WERROR=1 test
+      - name: Release build (warnings-as-errors)
+        run: make clean && make BUILD_TYPE=release WERROR=1
