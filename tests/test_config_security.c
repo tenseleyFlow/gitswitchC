@@ -9,6 +9,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "config.h"
+#include "signals.h"
 #include "error.h"
 #include <string.h>
 #include <stdio.h>
@@ -285,6 +286,38 @@ TEST(load_counts_overlong_name_as_skipped_and_save_preserves_it) {
     CHECK(strstr(after, longname) != NULL);      /* pre-fix: erased */
 }
 
+/* ---- AR-02 #27: config_save's own scratch registration ---- */
+
+TEST(config_save_registers_and_unregisters_its_temp) {
+    /* config_save registers "<path>.tmp.<pid>" for signal cleanup for exactly
+     * the span the temp exists (the registration accounts_switch used to make
+     * never covered the real save — it ran after the registry was torn down).
+     * After a completed save the slot must be RELEASED: a stale registration
+     * would let a later emergency cleanup unlink an unrelated file that
+     * happens to be recreated at that name. */
+    char dir[128], path[256], tmp[512];
+    gitswitch_ctx_t ctx;
+    FILE *f;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
+    ctx.account_count = 1;
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+
+    /* Recreate a file at the temp's deterministic name and run the scratch
+     * cleanup: an unreleased registration would delete it. */
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+    f = fopen(tmp, "w");
+    CHECK(f != NULL);
+    if (f) fclose(f);
+    signals_scratch_cleanup();
+    CHECK(access(tmp, F_OK) == 0); /* untouched: registration was released */
+    unlink(tmp);
+}
+
 /* ---- tty-escape: control bytes must not survive to display fields ---- */
 
 TEST(load_strips_cr_from_description) {
@@ -489,6 +522,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(load_skips_leading_zero_id_section);
     RUN_TEST(load_skips_out_of_range_id_section);
     RUN_TEST(load_counts_overlong_name_as_skipped_and_save_preserves_it);
+    RUN_TEST(config_save_registers_and_unregisters_its_temp);
     RUN_TEST(load_strips_cr_from_description);
     RUN_TEST(load_rejects_raw_c1_byte_in_file);
     RUN_TEST(add_rejects_c1_and_malformed_utf8_in_name);

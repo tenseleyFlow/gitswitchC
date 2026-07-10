@@ -21,6 +21,7 @@
 #include "git_ops.h"
 #include "ssh_manager.h"
 #include "gpg_manager.h"
+#include "signals.h"
 
 /* Long-only options (no short form). Values above 0xff avoid colliding with
  * ASCII short options handled by getopt_long. */
@@ -356,12 +357,22 @@ int main(int argc, char *argv[]) {
          * durable, so it is intentionally excluded above to avoid backup churn. */
         
         if (should_save) {
-            log_debug("Saving configuration after %s command (account_count=%zu)", 
+            log_debug("Saving configuration after %s command (account_count=%zu)",
                      command, ctx.account_count);
+            /* SIG-02 (AR-02 #27): hold the deferring guard across the save so
+             * config_save's scratch registration of its temp file has a live
+             * handler behind it — a signal mid-save then defers instead of
+             * orphaning accounts.toml.tmp.<pid>. The command's work is already
+             * fully applied at this point, so (matching accounts_switch's
+             * success path) a deferred signal is not re-raised: the process
+             * finishes persisting and exits normally moments later. */
+            signals_guard_begin();
             if (config_save(&ctx, ctx.config.config_path) != 0) {
                 display_warning("Failed to save configuration changes");
                 /* Don't fail the command, just warn */
             }
+            signals_scratch_cleanup();
+            signals_guard_end();
         }
     }
     

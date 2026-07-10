@@ -25,6 +25,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "accounts.h"
+#include "git_ops.h"
 #include "utils.h"
 #include "error.h"
 
@@ -213,6 +214,64 @@ TEST(successful_switch_still_tears_down_previous_isolation) {
     CHECK(!symlink_present(g_gpg_link));
 }
 
+/* AR-02 #12: a switch to an SSH-enabled target whose SSH setup fails at
+ * ssh_manager_init — which only PATH-probes ssh-agent/ssh-add and touches no
+ * agent — must NOT tear down the previous account's runtime isolation. The
+ * pre-fix code marked the SSH state dirty before init ran, so this pure
+ * lookup failure reaped the previous account's healthy agent and unlinked
+ * current.sock for a switch that never started. */
+TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
+    char key_path[512], emptybin[512], saved_path[4096];
+    const char *env_path;
+    FILE *kf;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *a = &ctx.accounts[0];
+    a->ssh_enabled = true;
+    /* A real 0600 private-key-shaped file so the step-1 key validation
+     * (stat/mode/header — no PATH involved) passes and the switch reaches
+     * ssh_manager_init. */
+    snprintf(key_path, sizeof(key_path), "%s/key_ed25519", g_xdg);
+    kf = fopen(key_path, "w");
+    CHECK(kf != NULL);
+    if (kf) {
+        fputs("-----BEGIN OPENSSH PRIVATE KEY-----\nx\n"
+              "-----END OPENSSH PRIVATE KEY-----\n", kf);
+        fclose(kf);
+    }
+    CHECK_EQ_INT(chmod(key_path, 0600), 0);
+    safe_strncpy(a->ssh_key_path, key_path, sizeof(a->ssh_key_path));
+
+    /* Warm the process-wide git-availability cache BEFORE crippling PATH, so
+     * the switch fails exactly at ssh_manager_init's ssh-agent probe and not
+     * earlier at git_ops_init. */
+    CHECK_EQ_INT(git_ops_init(), 0);
+
+    /* Cripple PATH: an empty (but trusted) dir makes command_exists fail for
+     * ssh-agent/ssh-add without any agent operation being attempted. */
+    env_path = getenv("PATH");
+    snprintf(saved_path, sizeof(saved_path), "%s", env_path ? env_path : "");
+    snprintf(emptybin, sizeof(emptybin), "%s/emptybin", g_xdg);
+    CHECK_EQ_INT(mkdir(emptybin, 0755), 0);
+    setenv("PATH", emptybin, 1);
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn prev = run_set_runner(fake_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(prev);
+    setenv("PATH", saved_path, 1);
+
+    CHECK_EQ_INT(rc, -1);
+    /* The previous account's entry points were never disturbed and must
+     * survive; pre-fix the abort path reaped them. */
+    CHECK(symlink_present(g_ssh_sock));
+    CHECK(symlink_present(g_gpg_link));
+}
+
 /* SIG-01: a SIGINT during the git-config write must be deferred, the rollback
  * must run (restore commands appear in the log AFTER the signal), and the
  * process must then die by SIGINT. Without the guard the raise() kills the
@@ -272,5 +331,6 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(failed_git_config_keeps_previous_runtime_isolation);
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
+    RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()

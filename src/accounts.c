@@ -352,32 +352,37 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         }
 
         /* Nothing durable has been touched yet, so a signal up to here could
-         * simply kill us. From this point on, mutations begin: guard. */
+         * simply kill us. From this point on, mutations begin: guard.
+         *
+         * The config-save temp file is NOT registered here: the save-after-
+         * switch step in main() runs after this function has already torn the
+         * guard and scratch registry down, so a registration here never
+         * covered it (AR-02 #27). config_save registers its own temp path,
+         * and main() holds a guard across the save so that registration has a
+         * live handler behind it. */
         signals_guard_begin();
-
-        /* SIG-02: register the config-save temp path (written by the
-         * save-after-switch step in main()). It is the one scratch path whose
-         * name this file can compute; the mkstemp-based scratch files are
-         * registered at their creation sites (hook points in signals.h).
-         * Unlinking a not-yet-created path on teardown is harmless. */
-        {
-            char cfg_tmp[MAX_PATH_LEN];
-            if ((size_t)snprintf(cfg_tmp, sizeof(cfg_tmp), "%s.tmp.%d",
-                                 ctx->config.config_path, (int)getpid())
-                < sizeof(cfg_tmp)) {
-                signals_scratch_register(cfg_tmp);
-            }
-        }
 
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             log_info("Setting up SSH isolation for account: %s", account->name);
-            /* Starting the new agent reaps the previous account's agent, so
-             * the runtime SSH state is dirty from the first attempt on. */
-            ssh_dirty = true;
             memset(&g_session.ssh_config, 0, sizeof(g_session.ssh_config));
-            if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0 ||
-                ssh_switch_account(&g_session.ssh_config, account) != 0) {
+            /* ssh_manager_init only probes PATH for ssh-agent/ssh-add — it
+             * touches no agent, so its failure must NOT mark the runtime SSH
+             * state dirty: the abort path would then reap the previous
+             * account's healthy, untouched agent (and its best-effort restart
+             * can't re-prompt a passphrase) for a switch that never started
+             * (AR-02 #12). Dirty begins with ssh_switch_account, whose agent
+             * start reaps every other gitswitch agent from its first attempt. */
+            if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0) {
+                printf("  [!!] SSH key failed to load\n");
+                abort_failed_switch(prev_account, prev_gpg_home,
+                                    false, false, false);
+                set_error(ERR_SSH_KEY_LOAD_FAILED,
+                          "Failed to set up SSH for account: %s", account->name);
+                return -1;
+            }
+            ssh_dirty = true;
+            if (ssh_switch_account(&g_session.ssh_config, account) != 0) {
                 printf("  [!!] SSH key failed to load\n");
                 ssh_manager_cleanup(&g_session.ssh_config);
                 abort_failed_switch(prev_account, prev_gpg_home,
@@ -390,19 +395,27 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             g_session.ssh_active = true;
             printf("  [OK] SSH key loaded\n");
 
-            /* Connection test is best-effort (network) and never fatal, so we
-             * skip it entirely on the boot-time resume path — it would only
-             * stall the login shell prompt on a network round trip (up to the
-             * ssh ConnectTimeout when github.com is filtered/offline) for a
-             * result that just picks a status line. */
-            if (!ctx->config.resuming) {
+            /* Connection test is best-effort (network) and never fatal, and it
+             * blocks the whole switch on a live round trip (up to the 5s ssh
+             * ConnectTimeout, plus unbounded DNS, when the host is filtered/
+             * offline) for a result that only picks a status line. So it is
+             * skipped wherever it can't tell the user anything new (AR-02 #16):
+             *   - the boot-time resume path — it would stall the login prompt;
+             *   - a re-switch to the already-active account (reuse fast path):
+             *     the agent was just fingerprint-verified to hold this exact
+             *     key, so the probe re-proves a liveness we already have.
+             * The github.com fallback for alias-less accounts is additionally
+             * gated behind --verbose: it hardcodes a host the account never
+             * named, so by default only a configured host alias is probed. */
+            if (!ctx->config.resuming && !g_session.ssh_config.key_already_loaded) {
                 if (strlen(account->ssh_host_alias) > 0) {
                     if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
                         printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
                     } else {
                         printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
                     }
-                } else if (ssh_test_connection(account, "git@github.com") == 0) {
+                } else if (ctx->config.verbose &&
+                           ssh_test_connection(account, "git@github.com") == 0) {
                     printf("  [OK] SSH connection verified (github.com)\n");
                 }
             }

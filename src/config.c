@@ -30,6 +30,7 @@
 #include "error.h"
 #include "utils.h"
 #include "display.h"
+#include "signals.h"
 
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
@@ -386,6 +387,12 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
         }
         close(tfd);
     }
+    /* SIG-02 (AR-02 #27): register the temp for signal cleanup for the span
+     * it exists. Only effective while a guard handler is installed (main()
+     * holds one across the save-after-switch); otherwise it is an inert no-op
+     * — the atomic temp+rename below protects the real file either way, this
+     * only prevents an orphaned .tmp when a signal lands mid-save. */
+    signals_scratch_register(temp_path);
 
     /* Initialize TOML document */
     toml_init_document(&toml_doc);
@@ -415,16 +422,19 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
      * content is never observable with looser permissions) */
     if (toml_write_file(&toml_doc, temp_path) != 0) {
         unlink(temp_path); /* don't leave a stale/partial .tmp behind */
+        signals_scratch_unregister(temp_path);
         goto cleanup;
     }
 
     /* Atomic move from temp to final location */
     if (rename(temp_path, config_path) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, 
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
                         "Failed to move temporary config file to final location");
         unlink(temp_path);
+        signals_scratch_unregister(temp_path);
         goto cleanup;
     }
+    signals_scratch_unregister(temp_path); /* renamed away: nothing to clean */
     
     log_info("Configuration saved successfully to: %s", config_path);
     config_update_resume_hint(ctx);

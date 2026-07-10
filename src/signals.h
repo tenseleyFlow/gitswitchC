@@ -87,13 +87,14 @@ void signals_dispatch_pending(void);
  * context publishes a slot only after the path is fully copied, so the
  * handler can never observe a half-written entry.
  *
- * Adoption hook points for files owned by other remediation tickets (add a
- * register/unregister pair around the temp file's lifetime; the table and
- * handler here already do the rest):
- *   - src/config.c  config_save():              "<config_path>.tmp.<pid>"
+ * Adopters register around the temp file's lifetime; the table and handler
+ * here do the rest. Registration is only effective while a guard is active:
+ *   - src/config.c config_save() registers "<config_path>.tmp.<pid>" itself,
+ *     and main() holds a guard across the save-after-switch (AR-02 #27).
+ * Remaining hook point:
  *   - src/ssh_manager.c ssh_configure_host_alias(): the mkstemp-resolved
- *     "~/.ssh/config.gitswitch.XXXXXX" path
- *   - src/git_ops.c: any future temp-then-rename write
+ *     "~/.ssh/config.gitswitch.XXXXXX" path (created inside accounts_switch's
+ *     guarded window, where its error paths already unlink it)
  */
 
 /**
