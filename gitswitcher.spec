@@ -40,18 +40,23 @@ Features:
 make BUILD_TYPE=release VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
 
 %install
-# Install to buildroot
-make install DESTDIR=%{buildroot}
+# PREFIX=%{_prefix}: RPM content belongs under /usr, not the Makefile's
+# /usr/local default — /usr/local is reserved for the sysadmin, rpmlint flags
+# it, and completions installed there are inert (bash-completion only scans
+# /usr/share/bash-completion/completions, and Fedora zsh's fpath omits
+# /usr/local/share/zsh/site-functions) (AR-05 L6).
+make install DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
 # Install documentation
 install -d %{buildroot}%{_docdir}/%{name}
 install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
 
 %files
-/usr/local/bin/gitswitch
-/usr/local/share/bash-completion/completions/gitswitch
-/usr/local/share/zsh/site-functions/_gitswitch
-/usr/local/share/fish/vendor_completions.d/gitswitch.fish
+%license LICENSE
+%{_bindir}/gitswitch
+%{_datadir}/bash-completion/completions/gitswitch
+%{_datadir}/zsh/site-functions/_gitswitch
+%{_datadir}/fish/vendor_completions.d/gitswitch.fish
 %{_docdir}/%{name}/README.md
 
 %changelog
