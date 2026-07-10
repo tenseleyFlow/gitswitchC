@@ -10,12 +10,10 @@ Source0:        %{name}-%{version}.tar.gz
 # BuildArch is not specified to allow building on all architectures including aarch64
 BuildRequires:  gcc
 BuildRequires:  make
-BuildRequires:  openssl-devel
 
 %global debug_package %{nil}
 Requires:       git
 Requires:       openssh-clients
-Requires:       openssl
 
 %description
 gitswitcher is a secure Git identity and SSH/GPG key management tool that enables

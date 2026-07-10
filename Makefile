@@ -57,12 +57,6 @@ ifeq ($(UNAME_S),Darwin)
     # macOS-specific security flags (no cf-protection, stack-clash-protection, or Linux linker flags)
     SECURITY_FLAGS_DEBUG = -fstack-protector-strong
     SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
-    # macOS OpenSSL paths (Homebrew)
-    OPENSSL_PREFIX := $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null)
-    ifneq ($(OPENSSL_PREFIX),)
-        INCLUDES += -I$(OPENSSL_PREFIX)/include
-        LDFLAGS += -L$(OPENSSL_PREFIX)/lib
-    endif
 endif
 
 ifeq ($(UNAME_S),FreeBSD)
@@ -92,8 +86,11 @@ endif
 # Include directories
 INCLUDES = -I$(SRCDIR)
 
-# Libraries
-LIBS = -lssl -lcrypto
+# Libraries. No crypto library: randomness comes from /dev/urandom and the
+# SHA256/MD5 strings in ssh_manager.c only parse `ssh-keygen -l` output, so
+# the old -lssl -lcrypto linkage was a phantom dependency that put
+# libssl/libcrypto DT_NEEDED entries in every shipped binary (AR-05 M2).
+LIBS =
 
 # Optional GNU readline: gives the interactive add/edit prompts line editing
 # and TAB path completion. Auto-detected; build still works without it (the

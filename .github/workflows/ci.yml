@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev cppcheck flawfinder
+        run: sudo apt-get update && sudo apt-get install -y cppcheck flawfinder
       - name: No-shell gate (no popen/system in src)
         run: |
           if grep -rn -e 'popen(' -e 'system(' src/*.c; then
@@ -51,7 +51,7 @@ jobs:
             # git: the git_ops perf tests prove availability via a PATH walk
             # and assert no subprocess spawn — they need a real git binary,
             # which the Linux/macOS runners ship but this VM does not.
-            sudo pkg install -y gmake gcc openssl git
+            sudo pkg install -y gmake gcc git
             gmake BUILD_TYPE=release
             gmake BUILD_TYPE=release test
 
@@ -59,7 +59,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - run: brew install openssl@3
       - name: Build + test (ASan/UBSan)
         run: make BUILD_TYPE=debug test
       - name: Release build
