@@ -3,6 +3,8 @@
 #ifndef SSH_MANAGER_H
 #define SSH_MANAGER_H
 
+#include <sys/types.h> /* pid_t: don't rely on the includer's chain for it */
+
 #include "gitswitch.h"
 
 /* SSH agent management modes */
