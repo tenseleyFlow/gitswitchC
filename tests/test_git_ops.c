@@ -281,6 +281,8 @@ static int zfk_sets;
 static char zfk_unset_key[16][64];
 static int zfk_unsets;
 static int zfk_fallback_reads; /* per-key reads => the -z fast path was NOT used */
+static const char *zfk_listing_override; /* non-NULL => serve this listing */
+static size_t zfk_listing_override_len;  /* instead of the embedded default */
 
 static int zfk_runner(const char *const argv[], const run_opts_t *opts,
                       run_result_t *result) {
@@ -305,9 +307,14 @@ static int zfk_runner(const char *const argv[], const run_opts_t *opts,
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
         if (strcmp(argv[3], "--list") == 0 && argv[4] && strcmp(argv[4], "-z") == 0) {
+            const char *lst = listing;
             size_t n = sizeof(listing) - 1; /* keep interior NULs, drop trailing */
+            if (zfk_listing_override) {
+                lst = zfk_listing_override;
+                n = zfk_listing_override_len;
+            }
             if (opts && opts->out && opts->out_size > n) {
-                memcpy(opts->out, listing, n);
+                memcpy(opts->out, lst, n);
                 opts->out[n] = '\0';
                 if (result) result->out_len = n;
                 return 0;
@@ -348,6 +355,14 @@ static bool zfk_was_unset(const char *key) {
         if (strcmp(zfk_unset_key[i], key) == 0) return true;
     }
     return false;
+}
+
+static int zfk_count_unsets(const char *key) {
+    int c = 0;
+    for (int i = 0; i < zfk_unsets && i < 16; i++) {
+        if (strcmp(zfk_unset_key[i], key) == 0) c++;
+    }
+    return c;
 }
 
 TEST(rollback_z_parser_survives_embedded_newline) {
@@ -436,6 +451,106 @@ TEST(restore_unsets_keys_written_after_snapshot) {
     CHECK(zfk_was_unset("user.signingkey"));
 }
 
+/* ---- AR-03 M1: overlong values must never snapshot as proven-absent ----- */
+/* gitswitch itself writes core.sshCommand values past 512 bytes (~85 bytes of
+ * fixed ssh options plus a single-quoted key path of up to MAX_PATH_LEN), and
+ * a foreign tool can write one of any length. The pre-fix 512-byte value caps
+ * turned "present but long" into found=false: the snapshot recorded
+ * present=false, the exec cache was seeded proven-absent, git_clear_config
+ * elided the --unset (the foreign SSH identity silently survived the switch),
+ * and a failed switch's git_config_restore --unset the user's original value. */
+
+static char blk_listing[8192]; /* bespoke -z listings, built per test */
+static size_t blk_listing_len;
+
+static void blk_add(const char *key, const char *val) {
+    size_t kl = strlen(key), vl = strlen(val);
+    memcpy(blk_listing + blk_listing_len, key, kl);
+    blk_listing_len += kl;
+    blk_listing[blk_listing_len++] = '\n';
+    memcpy(blk_listing + blk_listing_len, val, vl);
+    blk_listing_len += vl;
+    blk_listing[blk_listing_len++] = '\0';
+}
+
+TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim) {
+    /* Longer than the old 512-byte cap but within what gitswitch itself
+     * writes: must round-trip at full fidelity — the clear really unsets it
+     * and the rollback restores the ORIGINAL bytes, not a truncation. */
+    static char val[601];
+    memset(val, 'k', sizeof(val) - 1);
+    val[sizeof(val) - 1] = '\0';
+    memcpy(val, "ssh -i /", 8); /* shaped like the value gitswitch emits */
+
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    blk_listing_len = 0;
+    blk_add("user.name", "Real Name");
+    blk_add("user.email", "real@x.com");
+    blk_add("core.sshcommand", val);
+    zfk_listing_override = blk_listing;
+    zfk_listing_override_len = blk_listing_len;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    /* The clear must exec a real --unset: pre-fix the seeded cache claimed
+     * the PRESENT key was proven absent and elided it. */
+    CHECK_EQ_INT(git_clear_config(GIT_SCOPE_GLOBAL), 0);
+    CHECK(zfk_was_unset("core.sshcommand"));
+    /* A failed switch's rollback restores the original value verbatim —
+     * pre-fix the snapshot said present=false, so the restore left the key
+     * unset (and the per-key fallback would have written back a silently
+     * truncated copy instead). */
+    CHECK_EQ_INT(git_config_restore(), 0);
+    int is = zfk_find_set("core.sshcommand");
+    CHECK(is >= 0);
+    if (is >= 0) CHECK_STR_EQ(zfk_set_val[is], val);
+
+    run_set_runner(prev);
+    zfk_listing_override = NULL;
+    CHECK_EQ_INT(zfk_fallback_reads, 0); /* served by the -z fast path */
+}
+
+TEST(oversize_foreign_sshcommand_degrades_to_present_unknown) {
+    /* Longer than ANY value gitswitch writes (past MAX_PATH_LEN plus the ssh
+     * option overhead): uncapturable, but the key is still PRESENT. The clear
+     * must exec its --unset (no proven-absent elision), and the rollback must
+     * leave the key alone — a truncated write-back and a destructive --unset
+     * are both corruption. */
+    static char val[MAX_PATH_LEN + 600];
+    memset(val, 'k', sizeof(val) - 1);
+    val[sizeof(val) - 1] = '\0';
+
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    blk_listing_len = 0;
+    blk_add("user.name", "Real Name");
+    blk_add("user.email", "real@x.com");
+    blk_add("core.sshcommand", val);
+    zfk_listing_override = blk_listing;
+    zfk_listing_override_len = blk_listing_len;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_clear_config(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(zfk_count_unsets("core.sshcommand"), 1);
+
+    CHECK_EQ_INT(git_config_restore(), 0);
+    /* Value unknown: no corrupt write-back... */
+    CHECK(zfk_find_set("core.sshcommand") < 0);
+    /* ...and no second, destructive --unset of the user's original. */
+    CHECK_EQ_INT(zfk_count_unsets("core.sshcommand"), 1);
+    /* Keys that DID fit still round-trip normally. */
+    int in = zfk_find_set("user.name");
+    int ie = zfk_find_set("user.email");
+    CHECK(in >= 0 && ie >= 0);
+    if (in >= 0) CHECK_STR_EQ(zfk_set_val[in], "Real Name");
+    if (ie >= 0) CHECK_STR_EQ(zfk_set_val[ie], "real@x.com");
+
+    run_set_runner(prev);
+    zfk_listing_override = NULL;
+}
+
 /* ---- perf-2: git_test_config reuses git_set_config's read-back ---------- */
 
 TEST(git_test_config_reuses_switch_readback) {
@@ -509,6 +624,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);
     RUN_TEST(restore_unsets_keys_written_after_snapshot);
+    RUN_TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim);
+    RUN_TEST(oversize_foreign_sshcommand_degrades_to_present_unknown);
     RUN_TEST(git_test_config_reuses_switch_readback);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()

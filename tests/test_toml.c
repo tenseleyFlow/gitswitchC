@@ -69,12 +69,13 @@ TEST(get_string_rejects_value_too_long_for_dest) {
 /* toml_check_injection_patterns is now only a structural (nesting/DoS) guard:
  * shell metacharacters are ordinary data under argv-based execution, so they
  * must NOT be rejected here (that only corrupted valid configs). It still
- * returns false on excessive bracket nesting. */
+ * returns false on excessive bracket nesting (the flood must exceed
+ * TOML_MAX_SECTIONS, which M7 raised to 65). */
 TEST(injection_patterns_structural_only) {
     CHECK(toml_check_injection_patterns("x$(whoami)", 10));
     CHECK(toml_check_injection_patterns("a`id`b", 6));
     CHECK(toml_check_injection_patterns("clean value 123", 15));
-    char nested[64];
+    char nested[TOML_MAX_SECTIONS + 32];
     memset(nested, '[', sizeof(nested) - 1);
     nested[sizeof(nested) - 1] = '\0';
     CHECK(!toml_check_injection_patterns(nested, sizeof(nested) - 1));
@@ -114,8 +115,12 @@ TEST(rejects_control_char_in_string) {
 
 /* A value containing a double quote is written escaped so the file re-parses
  * cleanly instead of bricking the config (regression guard for unescaped
- * write). The reader's sanitizer separately strips the quote, so we assert the
- * file parses and the key is retrievable — not byte-identity. */
+ * write). Retrieval is a different story since M6: the sanitizer would strip
+ * the quote, so toml_get_string must now FAIL rather than silently hand back
+ * mutated bytes (pre-fix it returned 0 with `Work GmbH`, desyncing every
+ * name-keyed resource — sockets, GNUPGHOME, active_account — on first
+ * reload). The file itself must still parse: the failure is per-value, and
+ * config.c's loader turns it into a counted skip, never whole-file loss. */
 TEST(quote_in_value_round_trips) {
     toml_document_t doc;
     toml_init_document(&doc);
@@ -131,9 +136,166 @@ TEST(quote_in_value_round_trips) {
     toml_init_document(&doc2);
     CHECK_EQ_INT(toml_parse_file(path, &doc2), 0); /* must NOT fail to parse */
     char buf[64];
-    CHECK_EQ_INT(toml_get_string(&doc2, "accounts.1", "name", buf, sizeof(buf)), 0);
+    CHECK_EQ_INT(toml_get_string(&doc2, "accounts.1", "name", buf, sizeof(buf)), -1);
     toml_cleanup_document(&doc2);
     remove(path);
+}
+
+/* M6: toml_get_string is the single choke point for values the sanitizer
+ * would alter — it must FAIL (like its too-long case) instead of silently
+ * stripping bytes. validate_name admits `"`, the writer escapes it
+ * faithfully, the parser unescapes it; pre-fix the getter then dropped it,
+ * so disk and memory disagreed at first reload and the stripped spelling
+ * was persisted by the next save. */
+TEST(get_string_fails_when_sanitization_would_alter_value) {
+    toml_document_t doc;
+    char buf[64];
+    int rc = parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"Jane \\\"Work\\\"\"\n"
+        "email = \"a@b.com\"\n", &doc);
+    CHECK_EQ_INT(rc, 0); /* the FILE stays loadable; only the value fails */
+    memset(buf, 'X', sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", buf, sizeof(buf)), -1);
+    /* Fail closed: the caller's buffer must not retain the altered bytes the
+     * sanitizer produced on the way to detecting the mismatch. */
+    CHECK_STR_EQ(buf, "");
+    /* A value the sanitizer passes through byte-identical is unaffected. */
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "email", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, "a@b.com");
+    toml_cleanup_document(&doc);
+}
+
+/* M5 (writer half): toml_set_string used to ignore safe_strncpy's failure on
+ * a value >= TOML_MAX_VALUE_LEN, leaving value="" with is_set=true — so
+ * config_save persisted `ssh_key = ""` at exit 0, silently erasing the key
+ * from the account. It must propagate the failure and leave no ghost key. */
+TEST(set_string_rejects_overlong_value_instead_of_erasing) {
+    toml_document_t doc;
+    char big[TOML_MAX_VALUE_LEN + 64];
+    memset(big, 'a', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "ssh_key", big), -1);
+    /* No half-created `ssh_key = ""` may remain behind the failure. */
+    CHECK(doc.section_count == 0 || doc.sections[0].key_count == 0);
+    /* Overwriting an existing key with an overlong value must also fail
+     * loudly (pre-fix: returned 0 while silently keeping the old value). */
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "ssh_key", "/ok/key"), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "ssh_key", big), -1);
+    CHECK_STR_EQ(doc.sections[0].keys[0].value, "/ok/key");
+    toml_cleanup_document(&doc);
+}
+
+/* M5 (loader half): a 257-511 char ssh_key passed the writer's cap, so it can
+ * be the tool's OWN prior output — the schema's path-length failure must skip
+ * that one account, not brick the entire config (pre-fix, every command died
+ * until the file was hand-edited). The skipped section stays enumerable so
+ * config.c's accounts_skipped_on_load guard sees it and refuses the next
+ * save: skip must never become silent erasure. */
+TEST(overlong_ssh_key_skips_account_not_whole_file) {
+    toml_document_t doc;
+    char longpath[302];
+    char src[1024];
+    char buf[64];
+    longpath[0] = '/';
+    memset(longpath + 1, 'a', sizeof(longpath) - 2);
+    longpath[sizeof(longpath) - 1] = '\0'; /* 301 chars: > 256, < 512 */
+    snprintf(src, sizeof(src),
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "ssh_key = \"%s\"\n"
+        "[accounts.2]\n"
+        "name = \"bob\"\n"
+        "email = \"b@b.com\"\n", longpath);
+    CHECK_EQ_INT(parse(src, &doc), 0); /* pre-fix: -1, whole file bricked */
+    /* The poisoned account reads as absent, so the loader skips it whole
+     * instead of loading it with a silently different ssh_key. */
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", buf, sizeof(buf)), -1);
+    /* The healthy account is unaffected. */
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.2", "name", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, "bob");
+    /* Still enumerable: the data-loss guard depends on seeing the section. */
+    char sections[TOML_MAX_SECTIONS][TOML_MAX_SECTION_LEN];
+    size_t n = 0;
+    CHECK_EQ_INT(toml_get_sections(&doc, sections, TOML_MAX_SECTIONS, &n), 0);
+    CHECK_EQ_INT((int)n, 3);
+    toml_cleanup_document(&doc);
+}
+
+/* M7: TOML_MAX_SECTIONS(32) contradicted MAX_ACCOUNTS(64) — config_save
+ * writes [settings] first, so only 31 accounts fit; the 32nd reported
+ * success in memory and silently never reached disk, and a hand-config with
+ * 32+ sections failed to load. All 64 accounts plus settings must fit and
+ * round-trip. */
+TEST(max_accounts_plus_settings_fit_and_round_trip) {
+    /* ~600KB each after the M7 bump: static keeps them off the test stack. */
+    static toml_document_t doc, doc2;
+    char sec[32], name[32], email[64], buf[64];
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"), 0);
+    int failed_sets = 0;
+    for (int i = 1; i <= MAX_ACCOUNTS; i++) {
+        snprintf(sec, sizeof(sec), "accounts.%d", i);
+        snprintf(name, sizeof(name), "user%d", i);
+        snprintf(email, sizeof(email), "u%d@example.com", i);
+        if (toml_set_string(&doc, sec, "name", name) != 0) failed_sets++;
+        if (toml_set_string(&doc, sec, "email", email) != 0) failed_sets++;
+    }
+    CHECK_EQ_INT(failed_sets, 0); /* pre-fix: fails from the 32nd section on */
+    char path[] = "/tmp/gitswitch_toml_maxacct_test.toml";
+    CHECK_EQ_INT(toml_write_file(&doc, path), 0);
+    chmod(path, 0600); /* toml_parse_file requires 0600, like config_save sets */
+    toml_cleanup_document(&doc);
+
+    toml_init_document(&doc2);
+    CHECK_EQ_INT(toml_parse_file(path, &doc2), 0);
+    CHECK_EQ_INT((int)doc2.section_count, MAX_ACCOUNTS + 1);
+    CHECK_EQ_INT(toml_get_string(&doc2, "accounts.64", "name", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, "user64");
+    toml_cleanup_document(&doc2);
+    remove(path);
+}
+
+/* L13: a 0-byte accounts.toml (crashed editor, interrupted copy) bricked
+ * every command with the internal "Invalid arguments to toml_parse_string" —
+ * indistinguishable from a gitswitch bug. It must fail with a targeted
+ * diagnostic that names the actual problem. */
+TEST(empty_config_reports_targeted_error) {
+    char path[] = "/tmp/gitswitch_toml_empty_test.toml";
+    FILE *f = fopen(path, "w");
+    CHECK(f != NULL);
+    if (f) fclose(f);
+    chmod(path, 0600);
+    toml_document_t doc;
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_parse_file(path, &doc), -1); /* still fails closed... */
+    /* ...but says WHAT is wrong, not "Invalid arguments". */
+    CHECK(strstr(get_last_error()->message, "empty") != NULL);
+    toml_cleanup_document(&doc);
+    remove(path);
+}
+
+/* L14: duplicate keys in a section were silently accepted first-wins, so a
+ * hand-appended `email = ...` override was dead with no diagnostic. TOML
+ * requires an error; reject with a line-anchored parse error (see the parser
+ * comment for why reject beats last-wins here). */
+TEST(rejects_duplicate_key_in_section) {
+    toml_document_t doc;
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "email = \"override@b.com\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
 }
 
 /* Write→read round-trip with a bracket-heavy description: the injection guard
@@ -279,8 +441,10 @@ TEST(accepts_non_allowlisted_absolute_ssh_key) {
 
 /* Traversal is a property of the path, not its prefix, and stays fatal —
  * including the backslash-resynthesis spelling: ".\./id" contains no ".."
- * substring, but the sanitizer strips the backslash and would hand callers
- * "../id", which is why validation runs on the SANITIZED bytes (AR-02 #29). */
+ * substring, but sanitizing it resynthesizes "../id" (AR-02 #29). Since M6
+ * the schema enforces sanitized == raw for ssh_key, so any byte the
+ * sanitizer would touch is rejected outright, which subsumes the old
+ * validate-the-sanitized-bytes defense. */
 TEST(rejects_traversal_and_resynthesized_traversal_ssh_key) {
     toml_document_t doc;
     CHECK_EQ_INT(parse(
@@ -312,6 +476,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(safe_characters_reject_control);
     RUN_TEST(rejects_control_char_in_string);
     RUN_TEST(quote_in_value_round_trips);
+    RUN_TEST(get_string_fails_when_sanitization_would_alter_value);
+    RUN_TEST(set_string_rejects_overlong_value_instead_of_erasing);
+    RUN_TEST(overlong_ssh_key_skips_account_not_whole_file);
+    RUN_TEST(max_accounts_plus_settings_fit_and_round_trip);
+    RUN_TEST(empty_config_reports_targeted_error);
+    RUN_TEST(rejects_duplicate_key_in_section);
     RUN_TEST(bracket_heavy_value_round_trips);
     RUN_TEST(rejects_relative_ssh_key);
     RUN_TEST(accepts_anchored_ssh_key);

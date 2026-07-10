@@ -35,6 +35,7 @@
 #include "error.h"
 #include "utils.h"
 #include "display.h"
+#include "signals.h"
 
 /* Internal helper functions */
 static int ssh_run(char *output, size_t output_size, bool merge_stderr, ...);
@@ -112,15 +113,26 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
 
 /* Wait up to `total_ms` for `pid` to disappear. ssh-agent daemonizes (it is
  * reparented to init, not our child), so kill(pid, 0) flips to ESRCH as soon
- * as init reaps it — no waitpid involved. The common case exits within the
- * first poll interval. */
+ * as init reaps it — no waitpid involved. Poll with exponential backoff
+ * (1ms doubling to a 50ms cap) inside the same total budget: the very first
+ * liveness check runs before the just-signaled agent has even been scheduled,
+ * so a fixed 50ms interval used to stack ~50ms of dead time per reaped agent
+ * — all of it under the held agent-dir lock (AR-03 L19). A healthy agent
+ * exits within the first millisecond or two. */
 static bool wait_pid_gone(pid_t pid, int total_ms) {
-    for (int waited = 0; waited < total_ms; waited += 50) {
+    int waited = 0;
+    int delay = 1;
+    while (waited < total_ms) {
         if (kill(pid, 0) != 0) {
             return true;
         }
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = 50000000 }; /* 50ms */
+        int slice = delay < total_ms - waited ? delay : total_ms - waited;
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = slice * 1000000L };
         nanosleep(&ts, NULL);
+        waited += slice;
+        if (delay < 50) {
+            delay = delay * 2 < 50 ? delay * 2 : 50;
+        }
     }
     return kill(pid, 0) != 0;
 }
@@ -183,16 +195,76 @@ static bool reap_ssh_agent(pid_t pid, const char *sock) {
     return true; /* recorded PID is not our agent: the record itself is garbage */
 }
 
+/* Best-effort teardown of a just-spawned agent that failed the post-spawn
+ * checks (output parse, socket validation) BEFORE its PID sidecar was
+ * written. Such an agent is invisible to the sidecar-driven reaper forever,
+ * so it either dies here or holds the account's decrypted key until reboot
+ * (AR-03 H1). When the parsed PID is unknown (unparseable output), fall back
+ * to scanning /proc for an ssh-agent whose argv carries our exact socket
+ * path — the same identity proof pid_is_our_ssh_agent demands of sidecar
+ * PIDs. Where /proc is unavailable (BSD/macOS) no safe scan exists; unlinking
+ * the socket at least guarantees no future run can validate/adopt the
+ * orphan, and -s (see the spawn site) makes the PID-less case unreachable
+ * there in practice. */
+static void reap_unrecorded_agent(pid_t pid, const char *sock) {
+    if (pid > 1) {
+        reap_ssh_agent(pid, sock);
+    }
+#ifdef __linux__
+    else {
+        DIR *d = opendir("/proc");
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                char *end = NULL;
+                long scan = strtol(ent->d_name, &end, 10);
+                if (end && *end == '\0' && scan > 1 &&
+                    pid_is_our_ssh_agent((pid_t)scan, sock)) {
+                    reap_ssh_agent((pid_t)scan, sock);
+                }
+            }
+            closedir(d);
+        }
+    }
+#endif
+    unlink(sock);
+}
+
+/* Guard the agent socket base before scanning/locking/unlinking under it.
+ * When XDG_RUNTIME_DIR is unset the base is the predictable
+ * /tmp/gitswitch-ssh-<uid> in world-writable, sticky /tmp, so a co-located
+ * user could pre-create it — or swap it for a symlink — and steer the
+ * unlinks and the .lock open somewhere else entirely. The create path
+ * already enforces this shape via ensure_private_dir(); the reset/orphan-
+ * reap paths were asymmetric with the hardened gpg_manager_reset (AR-03 L6).
+ * lstat (no follow) and refuse a symlink, a non-dir, a foreign owner, or any
+ * group/other access. Returns 0 = safe, 1 = absent (nothing to do there),
+ * -1 = unsafe (fail closed). */
+static int agent_dir_is_safe(const char *dir) {
+    struct stat st;
+    if (lstat(dir, &st) != 0) {
+        return 1;
+    }
+    if (S_ISLNK(st.st_mode) || !S_ISDIR(st.st_mode) ||
+        st.st_uid != getuid() || (st.st_mode & 077) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /* Acquire an exclusive, blocking flock on <dir>/.lock, serializing the
  * reap/start/symlink sequence against other gitswitch processes sharing this
  * directory. Returns the held fd (>=0) or -1; pass it to unlock_agent_dir when
- * the critical section ends. The lock is advisory but every writer takes it. */
+ * the critical section ends. The lock is advisory but every writer takes it.
+ * O_NOFOLLOW: the lock lives in a dir an attacker can pre-create under /tmp;
+ * never follow a planted symlink to open (and flock, holding it open) an
+ * arbitrary file elsewhere (AR-03 L6). */
 static int lock_agent_dir(const char *dir) {
     char lock_path[MAX_PATH_LEN];
     if ((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock", dir) >= sizeof(lock_path)) {
         return -1;
     }
-    int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) {
         return -1;
     }
@@ -242,12 +314,21 @@ static int ssh_key_fingerprint(const char *key_path, char *buf, size_t size) {
     return i > 0 ? 0 : -1;
 }
 
-/* True if an ssh-agent is answering on `sock` AND already holds the key at
- * `key_path` specifically (matched by fingerprint), so adopting it is safe and
- * skips a passphrase re-prompt. A live agent holding a *different* key — e.g.
- * after `gitswitch edit` changed the key path — returns false so the caller
- * loads the current key. If the fingerprint can't be determined we fall back to
- * false (load the key) rather than risk reusing a stale one. */
+/* True if an ssh-agent is answering on `sock` AND holds EXACTLY the key at
+ * `key_path` — one identity, fingerprint compared as a whole token — so
+ * adopting it is safe and skips a passphrase re-prompt. Presence alone is not
+ * enough (AR-03 M2): a foreign key injected into the per-account agent
+ * (`SSH_AUTH_SOCK=current.sock ssh-add ~/.ssh/other_key`) would ride along
+ * into the "isolated" session and let a push authenticate as the wrong
+ * identity, so any extra identity refuses the reuse — the caller then kills
+ * and restarts, loading only the account's key. A live agent holding a
+ * *different* key — e.g. after `gitswitch edit` changed the key path — is
+ * refused for the same reason. The agent is probed FIRST and the expected
+ * fingerprint computed only once the probe answers (AR-03 L18): a stale
+ * socket (dead agent) is the common miss, and running ssh-keygen before
+ * knowing the agent is alive wasted a fork+exec on every such miss. Anything
+ * indeterminate falls back to false (restart + load) rather than risk
+ * adopting the wrong agent. */
 static bool ssh_socket_has_key(const char *sock, const char *key_path) {
     char want_fp[256];
     char envbuf[MAX_PATH_LEN + 20];
@@ -257,9 +338,6 @@ static bool ssh_socket_has_key(const char *sock, const char *key_path) {
     run_opts_t opts;
     run_result_t res;
 
-    if (ssh_key_fingerprint(key_path, want_fp, sizeof(want_fp)) != 0) {
-        return false;
-    }
     if ((size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s", sock) >= sizeof(envbuf)) {
         return false;
     }
@@ -272,7 +350,32 @@ static bool ssh_socket_has_key(const char *sock, const char *key_path) {
     if (run_argv(argv, &opts, &res) != 0) {
         return false; /* exit 1 (no identities) / 2 (no agent) */
     }
-    return strstr(out, want_fp) != NULL;
+    if (ssh_key_fingerprint(key_path, want_fp, sizeof(want_fp)) != 0) {
+        return false;
+    }
+
+    /* Each `ssh-add -l` line is "<bits> <fingerprint> <comment> (<type>)".
+     * Token-compare field 2 of every line: a substring search would accept a
+     * prefix of a longer fingerprint or a match buried in a multi-key
+     * listing. Adopt only a single-identity agent whose one fingerprint is
+     * exactly ours. */
+    int identities = 0;
+    bool ours = false;
+    char *saveptr = NULL;
+    for (char *line = strtok_r(out, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        char *fsave = NULL;
+        char *field = strtok_r(line, " \t", &fsave);          /* bits */
+        field = field ? strtok_r(NULL, " \t", &fsave) : NULL; /* fingerprint */
+        if (!field) {
+            continue; /* blank line: not an identity */
+        }
+        identities++;
+        if (strcmp(field, want_fp) == 0) {
+            ours = true;
+        }
+    }
+    return identities == 1 && ours;
 }
 
 
@@ -499,8 +602,9 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         goto done;
     }
 
-    /* Reuse fast path: if this account's agent is already alive and holds THIS
-     * key (matched by fingerprint), adopt it instead of killing and restarting
+    /* Reuse fast path: if this account's agent is already alive and holds
+     * EXACTLY this key (single identity, fingerprint token match — see
+     * ssh_socket_has_key), adopt it instead of killing and restarting
      * (which forces a fresh ssh-add and, for a passphrase-protected key, a
      * PIN/passphrase re-prompt on every re-switch to the already-active
      * account). Matching the specific key means that after `gitswitch edit`
@@ -571,10 +675,16 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         }
     }
 
-    /* Start ssh-agent on the per-account socket (no shell). Capture its stdout
-     * (the eval script) only; stderr stays on the terminal. */
+    /* Start ssh-agent on the per-account socket (no shell). `-s` pins the
+     * output to Bourne syntax: without it ssh-agent guesses the format from
+     * the inherited $SHELL, and a csh/tcsh login shell made it emit
+     * `setenv SSH_AUTH_SOCK ...` lines the (deliberately Bourne-only) parser
+     * below cannot read — so every switch failed AFTER the agent was already
+     * alive but BEFORE its PID sidecar existed, leaking one unreapable
+     * key-holding agent per attempt (AR-03 H1). Capture its stdout (the eval
+     * script) only; stderr stays on the terminal. */
     log_debug("Starting SSH agent on socket: %s", socket_path);
-    if (ssh_run(output, sizeof(output), false, "ssh-agent", "-a", socket_path, NULL) != 0) {
+    if (ssh_run(output, sizeof(output), false, "ssh-agent", "-s", "-a", socket_path, NULL) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to start SSH agent");
         goto done;
     }
@@ -588,6 +698,13 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
      * use it directly and keep only the parsed PID. */
     if (parse_ssh_agent_output(output, ssh_config) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to parse ssh-agent output");
+        /* The agent is typically already alive and bound to socket_path here,
+         * but its PID sidecar does not exist yet, so the sidecar-driven
+         * reaper could never find it: reap it now while we still know the
+         * socket it was started on, or it holds the key until reboot
+         * (AR-03 H1). The parsed PID may be unknown on this path. */
+        reap_unrecorded_agent(ssh_config->agent_pid, socket_path);
+        ssh_config->agent_pid = -1;
         goto done;
     }
     safe_strncpy(ssh_config->agent_socket_path, socket_path,
@@ -596,6 +713,10 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     /* Validate the agent is working */
     if (validate_ssh_agent_socket(ssh_config->agent_socket_path) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "SSH agent socket validation failed");
+        /* Same pre-sidecar leak shape as the parse failure above, but the
+         * parsed PID is known here, so the reap targets it directly. */
+        reap_unrecorded_agent(ssh_config->agent_pid, socket_path);
+        ssh_config->agent_pid = -1;
         goto done;
     }
 
@@ -878,7 +999,10 @@ int ssh_configure_host_alias(const account_t *account) {
     char expanded_key_path[MAX_PATH_LEN];
     char begin_marker[MAX_NAME_LEN + 32];
     char end_marker[MAX_NAME_LEN + 32];
-    char buf[65536];
+    char buf[65536];   /* on-disk content, prior managed block spliced out */
+    char orig[65536];  /* untouched on-disk content (identical-rewrite check) */
+    /* buf + fresh managed block: markers, Host line, IdentityFile path. */
+    char newbuf[sizeof(buf) + MAX_PATH_LEN + 2 * (MAX_NAME_LEN + 32) + 64];
     const char *home = getenv("HOME");
     int fd;
     FILE *out;
@@ -932,6 +1056,7 @@ int ssh_configure_host_alias(const account_t *account) {
     /* Load the existing config (if any), preserving all bytes except a prior
      * managed block for this alias, which we splice out. */
     buf[0] = '\0';
+    orig[0] = '\0';
     if (path_exists(ssh_config_path)) {
         if (get_file_size(ssh_config_path) >= sizeof(buf)) {
             set_error(ERR_FILE_IO, "SSH config too large to update safely");
@@ -941,6 +1066,7 @@ int ssh_configure_host_alias(const account_t *account) {
             set_error(ERR_FILE_IO, "Failed to read SSH config");
             return -1;
         }
+        memcpy(orig, buf, strlen(buf) + 1);
         char *bstart = strstr(buf, begin_marker);
         if (bstart) {
             char *bend = strstr(bstart, end_marker);
@@ -952,9 +1078,54 @@ int ssh_configure_host_alias(const account_t *account) {
                 after = after ? after + 1 : bend + strlen(bend);
                 memmove(line_start, after, strlen(after) + 1);
             } else {
-                *line_start = '\0'; /* malformed: truncate from the marker */
+                /* Malformed block: begin marker with no end marker. The old
+                 * behavior truncated from the marker — which silently
+                 * destroyed every USER stanza below the damaged block once
+                 * the rename installed the result (AR-03 T5). Instead drop
+                 * only the lines that are recognizably ours — the marker
+                 * line, our "Host <alias>" line, and the indented options
+                 * under it — and keep everything after: when in doubt about
+                 * attribution, preserving user bytes is the safe direction
+                 * (the worst case is a leftover stanza the user can see,
+                 * never lost content). */
+                char *p = strchr(line_start, '\n');
+                p = p ? p + 1 : line_start + strlen(line_start);
+                char hostline[MAX_NAME_LEN + 8];
+                int hn = snprintf(hostline, sizeof(hostline), "Host %s",
+                                  account->ssh_host_alias);
+                if (hn > 0 && (size_t)hn < sizeof(hostline) &&
+                    strncmp(p, hostline, (size_t)hn) == 0 &&
+                    (p[hn] == '\n' || p[hn] == '\0')) {
+                    char *q = strchr(p, '\n');
+                    p = q ? q + 1 : p + strlen(p);
+                    while (*p == ' ' || *p == '\t') { /* our option lines */
+                        q = strchr(p, '\n');
+                        p = q ? q + 1 : p + strlen(p);
+                    }
+                }
+                memmove(line_start, p, strlen(p) + 1);
             }
         }
+    }
+
+    /* Assemble the final content and skip the whole write when it is
+     * byte-identical to what is already on disk: the mkstemp+rename below
+     * otherwise churned ~/.ssh/config's inode and mtime on every switch and
+     * every boot-time resume — breaking hard links and waking dotfile-sync
+     * watchers — for a no-op (AR-03 L16). */
+    int need = snprintf(newbuf, sizeof(newbuf),
+                        "%s%s%s\nHost %s\n  IdentityFile %s\n  IdentitiesOnly yes\n%s\n",
+                        buf,
+                        (buf[0] != '\0' && buf[strlen(buf) - 1] != '\n') ? "\n" : "",
+                        begin_marker, account->ssh_host_alias,
+                        expanded_key_path, end_marker);
+    if (need < 0 || (size_t)need >= sizeof(newbuf)) {
+        set_error(ERR_FILE_IO, "SSH config too large to update safely");
+        return -1;
+    }
+    if (strcmp(newbuf, orig) == 0) {
+        log_debug("SSH host alias block already current; skipping rewrite");
+        return 0;
     }
 
     /* Write existing content + a fresh managed block, atomically at 0600.
@@ -966,9 +1137,17 @@ int ssh_configure_host_alias(const account_t *account) {
         set_system_error(ERR_FILE_IO, "Failed to create temp SSH config");
         return -1;
     }
+    /* mkstemp resolved the XXXXXX: register the temp with the emergency-
+     * signal scratch table so a second Ctrl-C mid-write unlinks it instead
+     * of stranding ~/.ssh/config.gitswitch.XXXXXX — this was the "remaining
+     * hook point" acknowledged in signals.h (AR-03 L9). A failed
+     * registration (full table) is tolerable: every exit path below still
+     * unlinks the temp itself. */
+    (void)signals_scratch_register(tmp_path);
     if (fchmod(fd, 0600) != 0) {
         close(fd);
         unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
         set_system_error(ERR_FILE_IO, "Failed to secure temp SSH config");
         return -1;
     }
@@ -976,28 +1155,24 @@ int ssh_configure_host_alias(const account_t *account) {
     if (!out) {
         close(fd);
         unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
         set_system_error(ERR_FILE_IO, "Failed to open temp SSH config");
         return -1;
     }
-    fputs(buf, out);
-    if (buf[0] != '\0' && buf[strlen(buf) - 1] != '\n') {
-        fputc('\n', out);
-    }
-    fprintf(out, "%s\n", begin_marker);
-    fprintf(out, "Host %s\n", account->ssh_host_alias);
-    fprintf(out, "  IdentityFile %s\n", expanded_key_path);
-    fprintf(out, "  IdentitiesOnly yes\n");
-    fprintf(out, "%s\n", end_marker);
+    fputs(newbuf, out);
     if (fclose(out) != 0) {
         unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
         set_system_error(ERR_FILE_IO, "Failed to write SSH config");
         return -1;
     }
     if (rename(tmp_path, ssh_config_path) != 0) {
         unlink(tmp_path);
+        signals_scratch_unregister(tmp_path);
         set_system_error(ERR_FILE_IO, "Failed to install SSH config");
         return -1;
     }
+    signals_scratch_unregister(tmp_path); /* temp renamed away: record done */
 
     log_info("SSH host alias configured: %s -> %s", account->ssh_host_alias, expanded_key_path);
     return 0;
@@ -1304,14 +1479,30 @@ int ssh_manager_reset(const char *account) {
         }
     }
 
+    /* Guard the base before locking/scanning/unlinking under it (AR-03 L6):
+     * a symlinked, foreign, or group/other-accessible dir at the predictable
+     * /tmp name must fail closed, exactly like gpg_manager_reset. Absent
+     * means there is simply nothing to reset. */
+    int dir_safe = agent_dir_is_safe(socket_dir);
+    if (dir_safe > 0) {
+        return 0;
+    }
+    if (dir_safe < 0) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing to reset: SSH agent dir is a symlink, foreign-owned, "
+                  "or not private: %s", socket_dir);
+        return -1;
+    }
+
     /* Take the per-dir lock for the whole reap/unlink sequence. Without it, this
      * writer races a concurrent ssh_start_isolated_agent (which holds the same
      * lock): we would reap its freshly-started agent and unlink current.sock
      * while its switch reports success. lock_agent_dir returns -1 if the dir
-     * doesn't exist yet — in that case there is nothing to reset, so proceeding
-     * without a lock is harmless (all operations below are no-ops on a missing
-     * dir). kill_orphaned_gitswitch_agents deliberately does NOT self-lock
-     * because ssh_start_isolated_agent already calls it under this same lock. */
+     * vanished since the check above — in that case there is nothing to reset,
+     * so proceeding without a lock is harmless (all operations below are
+     * no-ops on a missing dir). kill_orphaned_gitswitch_agents deliberately
+     * does NOT self-lock because ssh_start_isolated_agent already calls it
+     * under this same lock. */
     int lock_fd = lock_agent_dir(socket_dir);
 
     if (!account || !*account) {
@@ -1397,6 +1588,14 @@ static void kill_orphaned_gitswitch_agents(const char *keep_account) {
         if ((size_t)snprintf(socket_dir, sizeof(socket_dir), "/tmp/gitswitch-ssh-%d", getuid()) >= sizeof(socket_dir)) {
             return;
         }
+    }
+
+    /* Same base-dir guard as ssh_manager_reset (AR-03 L6): when the caller is
+     * ssh_start_isolated_agent the dir was just created/validated, but the
+     * reset path reaches here too, and opendir on its own would happily
+     * follow a planted symlink and unlink "ssh-agent.*" names elsewhere. */
+    if (agent_dir_is_safe(socket_dir) != 0) {
+        return; /* absent, or unsafe to touch: never scan/unlink under it */
     }
 
     d = opendir(socket_dir);

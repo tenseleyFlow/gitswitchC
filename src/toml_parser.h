@@ -12,7 +12,13 @@
 #define TOML_MAX_KEY_LEN 64
 #define TOML_MAX_VALUE_LEN 512
 #define TOML_MAX_SECTION_LEN 64
-#define TOML_MAX_SECTIONS 32
+/* One section per account plus the always-written [settings] section. This
+ * must be at least MAX_ACCOUNTS (64, gitswitch.h) + 1: at the old value of 32
+ * config_add_account reported success for the 32nd account while config_save
+ * could never persist it (main.c treats save failure as a warning), and a
+ * hand-written 32+-section config failed to load outright (AR-03 M7). The
+ * relationship is pinned by a _Static_assert in toml_parser.c. */
+#define TOML_MAX_SECTIONS 65
 #define TOML_MAX_KEYS_PER_SECTION 16
 #define TOML_MAX_FILE_SIZE (64 * 1024)  /* 64KB max config file */
 
@@ -37,7 +43,11 @@ typedef struct {
     char name[TOML_MAX_SECTION_LEN];
     toml_keyvalue_t keys[TOML_MAX_KEYS_PER_SECTION];
     size_t key_count;
-    bool is_set;
+    bool is_set;    /* Cleared by schema validation when the section is
+                     * skipped-on-load (AR-03 M5): the getters then treat it
+                     * as absent, while toml_get_sections still enumerates it
+                     * (so config.c counts it in accounts_skipped_on_load and
+                     * config_save refuses to rewrite — skip, never erase). */
 } toml_section_t;
 
 /* TOML document structure */
@@ -122,9 +132,11 @@ int toml_write_file(const toml_document_t *doc, const char *file_path);
 
 
 /**
- * Validate TOML document structure for our specific config schema
+ * Validate TOML document structure for our specific config schema.
+ * Non-const: an account section whose ssh_key is over-long is marked
+ * skipped (is_set cleared) instead of failing the whole document (AR-03 M5).
  */
-int toml_validate_gitswitch_schema(const toml_document_t *doc);
+int toml_validate_gitswitch_schema(toml_document_t *doc);
 
 
 /**

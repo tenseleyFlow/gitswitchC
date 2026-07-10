@@ -15,11 +15,14 @@
 #include "error.h"
 #include "utils.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* A raised SIGINT inside the guard must be recorded, not kill the process —
@@ -187,6 +190,176 @@ TEST(second_signal_during_rollback_is_deferred) {
     unlink(marker);
 }
 
+/* Reap `pid` with a deadline. Returns true and fills *status if it exited
+ * within `budget_ms`; on timeout SIGKILLs it (and reaps) and returns false.
+ * The L8 tests need this: the pre-fix failure mode is precisely "unkillable
+ * until SIGKILL", which would otherwise hang the harness for the full length
+ * of the blocking grandchild's sleep. */
+static bool wait_child_bounded(pid_t pid, int *status, int budget_ms) {
+    int waited = 0;
+    while (waited < budget_ms) {
+        pid_t w = waitpid(pid, status, WNOHANG);
+        if (w == pid) return true;
+        if (w < 0 && errno != EINTR) break;
+        struct timespec ts = { 0, 50 * 1000 * 1000 }; /* 50 ms */
+        nanosleep(&ts, NULL);
+        waited += 50;
+    }
+    (void)kill(pid, SIGKILL);
+    (void)waitpid(pid, status, 0);
+    return false;
+}
+
+/* AR-03 L8: a targeted SIGTERM arriving while the rollback window is blocked
+ * on a child must not be deferred forever. The child process simulates the
+ * wedged rollback: first signal pending, rollback window open, run_argv
+ * blocked in waitpid() on an exec'd `sleep 30` (default dispositions, like a
+ * real ssh-add; a process-targeted kill never reaches it via the TTY group).
+ * The harness delivers the second, targeted SIGTERM: the handler must forward
+ * it to the published child pid so the rollback PROCEEDS to completion (the
+ * marker file — AR-02 #2 stays intact) and the process then dies by the
+ * deferred signal. Pre-fix the second signal was swallowed and the child sat
+ * in waitpid for the full 30 s — the bounded reaper turns that into a FAIL
+ * instead of a hang. Exit codes 10-15 mark the specific failure mode. */
+TEST(second_signal_during_rollback_kills_blocking_child) {
+    char marker[128], b;
+    int status = 0, sync[2];
+    pid_t pid;
+    bool exited;
+
+    snprintf(marker, sizeof(marker), "/tmp/gsw_rollback_unblocked.%d", (int)getpid());
+    unlink(marker);
+    /* Exec barrier: the write end is CLOEXEC, so the harness's read() below
+     * sees EOF exactly when the grandchild's exec has replaced the inherited
+     * guard handler with default dispositions. Signaling before that point
+     * would be swallowed by the grandchild's inherited rollback deferral —
+     * a fork-to-exec window that is microseconds in run_argv but must not
+     * flake the test. */
+    CHECK_EQ_INT(pipe(sync), 0);
+    CHECK(fcntl(sync[1], F_SETFD, FD_CLOEXEC) == 0);
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        pid_t child, w;
+        int cst = 0;
+        FILE *f;
+
+        close(sync[0]);
+        signals_guard_begin();
+        raise(SIGTERM);                    /* the signal that aborted the switch */
+        if (!signals_pending()) _exit(10);
+        signals_rollback_begin();
+
+        /* Stand-in for the rollback's interactive ssh-add: exec resets it to
+         * default dispositions, and it outlives the whole test budget. */
+        child = fork();
+        if (child < 0) _exit(13);
+        if (child == 0) {
+            execlp("sleep", "sleep", "30", (char *)NULL);
+            _exit(127);
+        }
+        signals_child_spawned(child);
+        close(sync[1]); /* grandchild's CLOEXEC copy is now the last writer */
+
+        /* run_argv's blocking reap — pre-fix, stuck here for 30 s. */
+        do { w = waitpid(child, &cst, 0); } while (w < 0 && errno == EINTR);
+        signals_child_reaped();
+        if (w != child) _exit(14);
+        /* The handler must have forwarded OUR signal, not something else. */
+        if (!WIFSIGNALED(cst) || WTERMSIG(cst) != SIGTERM) _exit(15);
+        if (!signals_pending()) _exit(11); /* deferred signal must survive */
+
+        f = fopen(marker, "w");            /* "rollback ran to completion" */
+        if (f) fclose(f);
+        signals_rollback_end();
+        signals_dispatch_pending();        /* rollback done: die correctly */
+        _exit(12);
+    }
+
+    close(sync[1]);
+    CHECK_EQ_INT((int)read(sync[0], &b, 1), 0); /* EOF: sleep is exec'd */
+    close(sync[0]);
+    CHECK_EQ_INT(kill(pid, SIGTERM), 0);   /* the targeted second signal */
+
+    exited = wait_child_bounded(pid, &status, 8000);
+    CHECK(exited);                          /* pre-fix: deferred forever */
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
+    CHECK(path_exists(marker));             /* restore finished BEFORE dying */
+
+    unlink(marker);
+}
+
+/* L8 escalation: if the published child ignores the forwarded signal (a
+ * wrapper that traps SIGTERM), a repeat signal against the SAME child must
+ * escalate to SIGKILL rather than politely re-forwarding forever. The
+ * grandchild here skips exec and sets SIGTERM to SIG_IGN before blocking. */
+TEST(rollback_child_kill_escalates_to_sigkill) {
+    int status = 0, sync[2];
+    pid_t pid;
+    bool exited;
+
+    CHECK_EQ_INT(pipe(sync), 0);
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        pid_t child, w;
+        int cst = 0;
+
+        close(sync[0]);
+        signals_guard_begin();
+        raise(SIGTERM);
+        if (!signals_pending()) _exit(10);
+        signals_rollback_begin();
+
+        child = fork();
+        if (child < 0) _exit(13);
+        if (child == 0) {
+            /* No exec, so shed the inherited guard handler explicitly, then
+             * ignore the polite signal — only SIGKILL ends this early. The
+             * lifetime is BOUNDED (not an infinite pause loop) so a
+             * regression that stops the escalation leaks this process for
+             * 30 s at most instead of wedging the harness's output pipe. */
+            signal(SIGINT, SIG_DFL);
+            signal(SIGHUP, SIG_DFL);
+            signal(SIGTERM, SIG_IGN);
+            sleep(30); /* an ignored SIGTERM does not even interrupt this */
+            _exit(0);
+        }
+        signals_child_spawned(child);
+        (void)!write(sync[1], "r", 1);
+        close(sync[1]);
+
+        do { w = waitpid(child, &cst, 0); } while (w < 0 && errno == EINTR);
+        signals_child_reaped();
+        if (w != child) _exit(14);
+        if (!WIFSIGNALED(cst) || WTERMSIG(cst) != SIGKILL) _exit(15);
+
+        signals_rollback_end();
+        signals_dispatch_pending();
+        _exit(12);
+    }
+
+    close(sync[1]);
+    { char b; CHECK_EQ_INT((int)read(sync[0], &b, 1), 1); }
+    close(sync[0]);
+    CHECK_EQ_INT(kill(pid, SIGTERM), 0);   /* forwarded politely — ignored */
+    {   /* let the first handler pass land before insisting */
+        struct timespec ts = { 0, 300 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    CHECK_EQ_INT(kill(pid, SIGTERM), 0);   /* same child still up: SIGKILL */
+
+    exited = wait_child_bounded(pid, &status, 8000);
+    CHECK(exited);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(guard_defers_first_signal);
@@ -197,4 +370,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(dispatch_terminates_with_deferred_signal);
     RUN_TEST(second_signal_is_emergency_exit_and_drops_scratch);
     RUN_TEST(second_signal_during_rollback_is_deferred);
+    RUN_TEST(second_signal_during_rollback_kills_blocking_child);
+    RUN_TEST(rollback_child_kill_escalates_to_sigkill);
 TEST_MAIN_END()

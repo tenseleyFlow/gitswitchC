@@ -34,8 +34,32 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
  * - Creates backup of existing config
  * - Writes updated configuration
  * - Validates written file
+ * Returns -1 (with the error set) when it REFUSES to rewrite because the load
+ * skipped account sections or found unrecognized ones (AR-03 M9): the refusal
+ * must be distinguishable from success or callers report "saved" for a change
+ * that was silently discarded.
  */
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
+
+/**
+ * Fail-closed gate shared by config_save and the mutating-command handlers
+ * (AR-03 M8/M9): returns 0 when the in-memory account set is a complete view
+ * of the on-disk file, or -1 (with the error set to the reason) when sections
+ * were skipped or unrecognized at load time — a full rewrite would silently
+ * erase them. Check it BEFORE interactive add/edit/remove work so the user is
+ * refused with the reason up front, not after answering every prompt.
+ */
+int config_check_rewritable(const gitswitch_ctx_t *ctx);
+
+/**
+ * Persist ONLY settings.active_account (AR-03 M9): parses the on-disk file and
+ * writes it back with just that one key updated, so a switch (or a reset that
+ * cleared the active account) can record its result even when the load skipped
+ * account sections — the write-back re-emits every parsed section, including
+ * skipped and unrecognized ones, instead of rebuilding from the in-memory view
+ * the way config_save does. Falls back to config_save when no file exists yet.
+ */
+int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path);
 
 /**
  * Write the path of the "resume hint" marker into buf. The marker exists iff
@@ -46,10 +70,12 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
 int config_resume_hint_path(char *buf, size_t size);
 
 /**
- * Acquire an exclusive cross-process lock for a mutating config cycle.
- * Returns an open fd holding flock(LOCK_EX) on <config_dir>/.config.lock, to be
- * held across the whole load-modify-save so concurrent add/edit/remove/switch
- * cannot lost-update each other. Close the fd to release. Returns -1 on failure.
+ * Acquire an exclusive cross-process lock for a mutating config cycle without
+ * waiting for a current holder. Returns an open fd holding flock(LOCK_EX) on
+ * <config_dir>/.config.lock, to be held across the whole load-modify-save so
+ * concurrent add/edit/remove/switch cannot lost-update each other. Close the fd
+ * to release. Returns -1 on failure with errno preserved (EAGAIN/EWOULDBLOCK
+ * means another process holds the lock).
  */
 int config_write_lock(void);
 

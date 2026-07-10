@@ -3,6 +3,7 @@
 #include "gitswitch.h"
 #include "utils.h"
 #include "error.h"
+#include <signal.h>
 #include <string.h>
 
 TEST(run_echo_captures_stdout) {
@@ -111,6 +112,19 @@ TEST(run_reports_output_truncation) {
     CHECK_EQ_INT((long)res.out_len, 4);
 }
 
+/* AR-03 L21: a helper killed by a signal must be reported as death-by-signal
+ * (return -1, exit_code -1, term_signal set) and never as a normal exit — a
+ * regression here would let a SIGKILLed git/gpg/ssh helper read as success
+ * with the suite green. */
+TEST(run_reports_death_by_signal) {
+    const char *argv[] = {"sh", "-c", "kill -TERM $$", NULL};
+    run_result_t res;
+    CHECK_EQ_INT(run_argv(argv, NULL, &res), -1);
+    CHECK(res.spawned);
+    CHECK_EQ_INT(res.exit_code, -1);
+    CHECK_EQ_INT(res.term_signal, SIGTERM);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(run_echo_captures_stdout);
@@ -121,4 +135,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_passes_extra_env);
     RUN_TEST(run_empty_argv_fails);
     RUN_TEST(run_reports_output_truncation);
+    RUN_TEST(run_reports_death_by_signal);
 TEST_MAIN_END()

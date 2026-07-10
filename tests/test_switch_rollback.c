@@ -26,6 +26,7 @@
 #include "gitswitch.h"
 #include "accounts.h"
 #include "git_ops.h"
+#include "signals.h"
 #include "utils.h"
 #include "error.h"
 
@@ -187,19 +188,28 @@ static int bind_fake_agent_socket(const char *path) {
 #define FAKE_AGENT_PID 1073741824
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
-    if (strcmp(argv[0], "ssh-agent") == 0 && argv[1] &&
-        strcmp(argv[1], "-a") == 0 && argv[2]) {
-        if (g_log) { fprintf(g_log, "ssh-agent -a %s\n", argv[2]); fflush(g_log); }
+    if (strcmp(argv[0], "ssh-agent") == 0) {
+        /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
+         * explicit -s ahead of it, so the socket is no longer argv[2]. */
+        const char *sock = NULL;
+        for (size_t i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "-a") == 0 && argv[i + 1]) {
+                sock = argv[i + 1];
+                break;
+            }
+        }
+        if (!sock) return -1;
+        if (g_log) { fprintf(g_log, "ssh-agent -a %s\n", sock); fflush(g_log); }
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
         }
-        if (bind_fake_agent_socket(argv[2]) != 0) return -1;
+        if (bind_fake_agent_socket(sock) != 0) return -1;
         if (opts && opts->out && opts->out_size > 0) {
             snprintf(opts->out, opts->out_size,
                      "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
                      "SSH_AGENT_PID=%d; export SSH_AGENT_PID;\n",
-                     argv[2], FAKE_AGENT_PID);
+                     sock, FAKE_AGENT_PID);
             if (result) result->out_len = strlen(opts->out);
         }
         return 0;
@@ -269,6 +279,9 @@ TEST(successful_switch_still_tears_down_previous_isolation) {
     command_runner_fn prev = run_set_runner(fake_runner);
     int rc = accounts_switch(&ctx, "testacct");
     run_set_runner(prev);
+    /* M3: a successful switch leaves the guard armed for main()'s save;
+     * mimic main() and drop it so this test process isn't left guarded. */
+    signals_guard_end();
 
     CHECK_EQ_INT(rc, 0);
     /* Target has SSH/GPG disabled: the previous entry points must be gone. */
@@ -410,6 +423,267 @@ TEST(failed_switch_restarts_previous_accounts_agent) {
     }
 }
 
+/* ---- AR-03 M4: the durable ~/.ssh/config rewrite is rolled back ---------- */
+
+/* Point HOME at a fresh dir under the fake runtime dir so the switch's
+ * host-alias rewrite targets a throwaway ~/.ssh/config. Returns the previous
+ * HOME value via saved (caller restores). */
+static int setup_fake_home(char *home, size_t home_size,
+                           char *saved, size_t saved_size) {
+    const char *old = getenv("HOME");
+    snprintf(saved, saved_size, "%s", old ? old : "");
+    snprintf(home, home_size, "%s/home", g_xdg);
+    if (mkdir(home, 0700) != 0) return -1;
+    setenv("HOME", home, 1);
+    return 0;
+}
+
+/* Build the two-account (prev active, SSH-enabled target) ctx the alias tests
+ * share; target gets `alias`. Returns 0 on success. */
+static int setup_alias_ctx(gitswitch_ctx_t *ctx, const char *alias) {
+    char key_prev[512], key_target[512];
+    account_t *tgt = &ctx->accounts[0];
+    account_t *prev = &ctx->accounts[1];
+
+    memset(prev, 0, sizeof(*prev));
+    prev->id = 2;
+    safe_strncpy(prev->name, "prev", sizeof(prev->name));
+    safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
+    safe_strncpy(prev->description, "previous account", sizeof(prev->description));
+    prev->preferred_scope = GIT_SCOPE_GLOBAL;
+    ctx->account_count = 2;
+    ctx->current_account = prev;
+
+    snprintf(key_prev, sizeof(key_prev), "%s/key_prev", g_xdg);
+    snprintf(key_target, sizeof(key_target), "%s/key_target", g_xdg);
+    if (write_fake_key(key_prev) != 0 || write_fake_key(key_target) != 0) {
+        return -1;
+    }
+    prev->ssh_enabled = true;
+    safe_strncpy(prev->ssh_key_path, key_prev, sizeof(prev->ssh_key_path));
+    tgt->ssh_enabled = true;
+    safe_strncpy(tgt->ssh_key_path, key_target, sizeof(tgt->ssh_key_path));
+    safe_strncpy(tgt->ssh_host_alias, alias, sizeof(tgt->ssh_host_alias));
+    return 0;
+}
+
+/* A failed switch must put ~/.ssh/config back byte-for-byte: the target's
+ * host-alias rewrite installed its managed block before the git-config write
+ * failed, and the previous account has NO alias of its own — so the accidental
+ * revert-via-restore-switch never fires and, pre-fix, the aborted account's
+ * IdentityFile block survived the rollback permanently. */
+TEST(failed_switch_reverts_host_alias_rewrite) {
+    static const char user_content[] =
+        "Host personal\n  IdentityFile /tmp/id_personal\n";
+    char home[600], saved_home[4096], cfg_path[700], after[4096];
+    FILE *f;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_fake_home(home, sizeof(home),
+                                 saved_home, sizeof(saved_home)), 0);
+
+    /* A pre-existing user config with a stanza and no gitswitch block. */
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh", home);
+    CHECK_EQ_INT(mkdir(cfg_path, 0700), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    f = fopen(cfg_path, "w");
+    CHECK(f != NULL);
+    if (f) {
+        fputs(user_content, f);
+        fclose(f);
+    }
+    CHECK_EQ_INT(chmod(cfg_path, 0600), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+
+    g_fail_user_name_set = true; /* fail exactly at the git-config write */
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn prev_runner = run_set_runner(ssh_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(prev_runner);
+    g_fail_user_name_set = false;
+    setenv("HOME", saved_home, 1);
+
+    CHECK_EQ_INT(rc, -1);
+    /* The pre-switch bytes are back — the aborted account's managed block
+     * (and its IdentityFile line) must not survive the rollback. */
+    after[0] = '\0';
+    CHECK(read_file_to_string(cfg_path, after, sizeof(after)) >= 0);
+    CHECK_STR_EQ(after, user_content);
+    CHECK(strstr(after, "gitswitch") == NULL);
+}
+
+/* Same rollback when NO ~/.ssh/config existed pre-switch: the rewrite created
+ * the file wholesale, so the rollback must remove it entirely rather than
+ * leave a gitswitch-born config forcing the aborted account's key. */
+TEST(failed_switch_removes_ssh_config_it_created) {
+    char home[600], saved_home[4096], cfg_path[700];
+    struct stat st;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_fake_home(home, sizeof(home),
+                                 saved_home, sizeof(saved_home)), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+
+    g_fail_user_name_set = true;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn prev_runner = run_set_runner(ssh_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(prev_runner);
+    g_fail_user_name_set = false;
+    setenv("HOME", saved_home, 1);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(lstat(cfg_path, &st) != 0); /* created by the switch: must be gone */
+}
+
+/* ---- AR-03 T1: the GPG half of the failed-switch rollback ---------------- */
+
+/* A real `sec` line whose capability field contains 's' (same shape as
+ * test_gpg_switch.c's). Answering every secret-key listing with it satisfies
+ * both the up-front availability probe and the isolated-home idempotency
+ * check, so the switch reaches the git-config write without a real gpg. */
+#define SEC_SIGN "sec:-:4096:1:FEEDFACE01234567:1700000000:::-:::scESC:::+:::23::0:\n"
+
+static int gpg_git_runner(const char *const argv[], const run_opts_t *opts,
+                          run_result_t *result) {
+    if (strncmp(argv[0], "gpg", 3) == 0) {
+        bool listing = false;
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+        }
+        if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+        for (int i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "--list-secret-keys") == 0) listing = true;
+        }
+        if (listing && opts && opts->out) {
+            snprintf(opts->out, opts->out_size, "%s", SEC_SIGN);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    return fake_runner(argv, opts, result);
+}
+
+/* Mirror of failed_switch_restarts_previous_accounts_agent for the GPG side
+ * (AR-03 T1): a gpg-enabled switch retargets the stable GNUPGHOME `current`
+ * symlink at the TARGET's isolated home before the git-config write; when that
+ * write fails, the rollback must retarget `current` back at the PREVIOUS
+ * account's home — the branch of restore_previous_isolation no test ran. */
+TEST(failed_switch_retargets_gpg_current_to_previous_home) {
+    char target[512];
+    ssize_t n;
+    const char *base;
+
+    /* gpg_manager_init PATH-probes the real gpg binary (the runner fakes the
+     * spawns themselves). */
+    if (!command_exists("gpg")) {
+        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    /* The fake runtime dir lives under /tmp: opt out of the tmpfs fail-closed
+     * guard so the test is independent of where /tmp is mounted. */
+    setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *tgt = &ctx.accounts[0];
+    account_t *prev = &ctx.accounts[1];
+    memset(prev, 0, sizeof(*prev));
+    prev->id = 2;
+    safe_strncpy(prev->name, "prev", sizeof(prev->name));
+    safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
+    safe_strncpy(prev->description, "previous account", sizeof(prev->description));
+    prev->preferred_scope = GIT_SCOPE_GLOBAL;
+    prev->gpg_enabled = true;
+    safe_strncpy(prev->gpg_key_id, "0123456789ABCDEF", sizeof(prev->gpg_key_id));
+    ctx.account_count = 2;
+    ctx.current_account = prev;
+
+    tgt->gpg_enabled = true;
+    safe_strncpy(tgt->gpg_key_id, "FEEDFACE01234567", sizeof(tgt->gpg_key_id));
+
+    g_fail_user_name_set = true; /* fail exactly at the git-config write */
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn prev_runner = run_set_runner(gpg_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(prev_runner);
+    g_fail_user_name_set = false;
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+
+    CHECK_EQ_INT(rc, -1);
+
+    /* `current` must resolve back to the previous account's home — not dangle,
+     * and not stay at the aborted target's freshly-created home. */
+    n = readlink(g_gpg_link, target, sizeof(target) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        target[n] = '\0';
+        base = strrchr(target, '/');
+        base = base ? base + 1 : target;
+        CHECK_STR_EQ(base, "prevhome");
+    }
+}
+
+/* ---- AR-03 M3: guard continuity through the post-switch window ------------ */
+
+/* A signal landing AFTER the switch completed but BEFORE main() persists the
+ * new active_account must be deferred, and main()'s re-arm around config_save
+ * must not discard it. Pre-fix, accounts_switch dropped the guard on its
+ * success path, so the raise() below killed the child with the new identity
+ * applied and the old active_account persisted — the split state boot resume
+ * then reactivates. The child mimics main()'s exact post-switch sequence. */
+TEST(deferred_signal_survives_post_switch_window) {
+    int status = 0;
+    pid_t pid;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        gitswitch_ctx_t ctx = make_ctx();
+        g_fail_user_name_set = false;
+        g_raise_on_user_name = false;
+        g_log = NULL;
+        run_set_runner(fake_runner);
+        if (accounts_switch(&ctx, "testacct") != 0) _exit(8);
+        /* Ctrl-C in the tip-block/config-save gap. Pre-fix: default action,
+         * child dies here by SIGINT. */
+        raise(SIGINT);
+        if (!signals_pending()) _exit(7);
+        /* main()'s re-arm around config_save: a no-op re-begin while active —
+         * it must NOT reset the deferred signal. */
+        signals_guard_begin();
+        if (!signals_pending() || signals_pending_signal() != SIGINT) _exit(6);
+        signals_guard_end();
+        _exit(0);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+}
+
 /* SIG-01: a SIGINT during the git-config write must be deferred, the rollback
  * must run (restore commands appear in the log AFTER the signal), and the
  * process must then die by SIGINT. Without the guard the raise() kills the
@@ -471,5 +745,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
     RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
     RUN_TEST(failed_switch_restarts_previous_accounts_agent);
+    RUN_TEST(failed_switch_reverts_host_alias_rewrite);
+    RUN_TEST(failed_switch_removes_ssh_config_it_created);
+    RUN_TEST(failed_switch_retargets_gpg_current_to_previous_home);
+    RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()

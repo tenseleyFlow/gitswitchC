@@ -15,6 +15,12 @@
 #include "error.h"
 #include "utils.h"
 
+/* Every account gets one section and config_save always writes [settings]
+ * first; if this ever regresses the writer reports success for accounts that
+ * silently never reach disk (AR-03 M7). */
+_Static_assert(TOML_MAX_SECTIONS >= MAX_ACCOUNTS + 1,
+               "TOML_MAX_SECTIONS must fit every account plus [settings]");
+
 /* Internal parsing helper functions */
 static int parse_section_header(toml_parser_state_t *state, char *section_name);
 static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv);
@@ -142,8 +148,21 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
     char section_name[TOML_MAX_SECTION_LEN] = ""; /* Default to root section */
     toml_section_t *current_section = NULL;
     
-    if (!toml_string || !doc || length == 0) {
+    if (!toml_string || !doc) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_parse_string");
+        return -1;
+    }
+
+    /* A 0-byte config is a real-world state (crashed editor, interrupted
+     * copy, truncated restore), not a programming error: reporting it as
+     * "Invalid arguments" made every command look like a gitswitch bug with
+     * no way out short of reading the source (AR-03 L13). Still fail closed
+     * — an empty file has no [settings] section — but name the actual
+     * problem and the remedy. */
+    if (length == 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Configuration file is empty (0 bytes); delete it and gitswitch "
+                  "will recreate the default, or restore it from a backup");
         return -1;
     }
     
@@ -205,6 +224,26 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
             
             toml_keyvalue_t *kv = &current_section->keys[current_section->key_count];
             if (parse_key_value_pair(&state, kv) == 0) {
+                /* Reject duplicate keys per the TOML spec (AR-03 L14) rather
+                 * than pick a winner. First-wins (the old behavior) made a
+                 * hand-appended `email = ...` override silently dead;
+                 * last-wins would give the file a meaning that depends on a
+                 * nonstandard tiebreak of ours — bad for an identity-bearing
+                 * config where "which email signs my commits?" must have
+                 * exactly one answer. The writer never emits duplicates
+                 * (toml_set_string overwrites in place), so this only fires
+                 * on hand edits, where a line-anchored parse error is the
+                 * diagnostic the user needs. find_key scans only the
+                 * key_count committed entries, so it cannot match the pair
+                 * just parsed into the uncommitted slot. */
+                if (find_key(current_section, kv->key)) {
+                    char dup_msg[sizeof(state.error_message)];
+                    snprintf(dup_msg, sizeof(dup_msg),
+                             "Duplicate key '%s' in section [%s] (TOML forbids "
+                             "defining a key twice)", kv->key, current_section->name);
+                    set_parser_error(&state, dup_msg);
+                    break;
+                }
                 current_section->key_count++;
             }
             continue;
@@ -255,8 +294,11 @@ int toml_get_string(const toml_document_t *doc, const char *section,
     }
 
     sec = find_section((toml_document_t *)doc, section);
-    if (!sec) {
-        /* Section not found - return silently, caller handles missing data */
+    if (!sec || !sec->is_set) {
+        /* Section not found — or schema-invalidated (is_set cleared, AR-03
+         * M5): a skipped-on-load account must read as absent in every field
+         * so the loader skips it whole instead of loading a partial account.
+         * Return silently, caller handles missing data. */
         return -1;
     }
 
@@ -280,8 +322,27 @@ int toml_get_string(const toml_document_t *doc, const char *section,
         return -1;
     }
 
-    /* Sanitize the value before returning */
-    return toml_sanitize_string(kv->value, value, value_size);
+    /* Reject, like the too-long case above, when sanitization would ALTER
+     * the value (AR-03 M6): this getter is the campaign's single choke
+     * point for byte fidelity. validate_name admits '"', the writer escapes
+     * it faithfully and the parser unescapes it — silently stripping it
+     * here meant disk and memory disagreed at first reload, desyncing every
+     * name-keyed resource (agent socket, GNUPGHOME, active_account) and
+     * persisting the mutated spelling on the next save. Callers now get the
+     * on-disk bytes verbatim or an error, never a repaired value. */
+    if (toml_sanitize_string(kv->value, value, value_size) != 0) {
+        return -1;
+    }
+    if (strcmp(value, kv->value) != 0) {
+        value[0] = '\0'; /* fail closed: don't hand back the altered bytes */
+        set_error(ERR_CONFIG_INVALID,
+                  "Value for %s.%s contains characters that cannot round-trip "
+                  "(quote, backslash, control byte, or malformed UTF-8); refusing "
+                  "to silently alter it — fix the value in the config file",
+                  section, key);
+        return -1;
+    }
+    return 0;
 }
 
 /* Get integer value from TOML document */
@@ -303,8 +364,9 @@ int toml_get_integer(const toml_document_t *doc, const char *section,
     }
 
     sec = find_section((toml_document_t *)doc, section);
-    if (!sec) {
-        /* Section not found - return silently, caller handles missing data */
+    if (!sec || !sec->is_set) {
+        /* Not found, or schema-invalidated (see toml_get_string) - return
+         * silently, caller handles missing data */
         return -1;
     }
 
@@ -313,7 +375,7 @@ int toml_get_integer(const toml_document_t *doc, const char *section,
         /* Key not found - return silently, caller handles missing data */
         return -1;
     }
-    
+
     if (kv->type != TOML_TYPE_INTEGER) {
         set_error(ERR_CONFIG_INVALID, "Key %s.%s is not an integer", section, key);
         return -1;
@@ -353,8 +415,9 @@ int toml_get_boolean(const toml_document_t *doc, const char *section,
     }
 
     sec = find_section((toml_document_t *)doc, section);
-    if (!sec) {
-        /* Section not found - return silently, caller handles missing data */
+    if (!sec || !sec->is_set) {
+        /* Not found, or schema-invalidated (see toml_get_string) - return
+         * silently, caller handles missing data */
         return -1;
     }
 
@@ -363,7 +426,7 @@ int toml_get_boolean(const toml_document_t *doc, const char *section,
         /* Key not found - return silently, caller handles missing data */
         return -1;
     }
-    
+
     if (kv->type != TOML_TYPE_BOOLEAN) {
         set_error(ERR_CONFIG_INVALID, "Key %s.%s is not a boolean", section, key);
         return -1;
@@ -373,19 +436,28 @@ int toml_get_boolean(const toml_document_t *doc, const char *section,
     return 0;
 }
 
-/* Validate TOML document structure for gitswitch schema */
-int toml_validate_gitswitch_schema(const toml_document_t *doc) {
+/* Validate TOML document structure for gitswitch schema.
+ *
+ * Failure granularity matters here (AR-03 M5): this runs inside
+ * toml_parse_string, so a `return -1` bricks the ENTIRE config — every
+ * account, every command — until the file is hand-edited. That is the right
+ * response to attack-shaped input (traversal, unsanitizable bytes) but not
+ * to a value the tool's own writer used to produce: those mark just their
+ * section skipped (is_set cleared) so the rest of the config still loads,
+ * the getters treat the section as absent, and config.c's
+ * accounts_skipped_on_load guard keeps the next save from erasing it. */
+int toml_validate_gitswitch_schema(toml_document_t *doc) {
     if (!doc) {
         set_error(ERR_INVALID_ARGS, "NULL document to validate");
         return -1;
     }
-    
+
     /* Check for required sections */
     bool has_settings = false;
     bool has_accounts = false;
-    
+
     for (size_t i = 0; i < doc->section_count; i++) {
-        const toml_section_t *section = &doc->sections[i];
+        toml_section_t *section = &doc->sections[i];
         
         if (strcmp(section->name, "settings") == 0) {
             has_settings = true;
@@ -416,10 +488,11 @@ int toml_validate_gitswitch_schema(const toml_document_t *doc) {
         
         if (string_starts_with(section->name, "accounts.")) {
             has_accounts = true;
-            
+
             /* Validate account section */
             bool has_name = false, has_email = false;
-            
+            bool skip_section = false;
+
             for (size_t j = 0; j < section->key_count; j++) {
                 const toml_keyvalue_t *kv = &section->keys[j];
                 
@@ -444,15 +517,45 @@ int toml_validate_gitswitch_schema(const toml_document_t *doc) {
                         set_error(ERR_CONFIG_INVALID, "ssh_key must be a string");
                         return -1;
                     }
-                    /* Validate the SANITIZED bytes — the exact value callers
-                     * receive from toml_get_string. Validating kv->value
-                     * directly lets `.\./id_rsa` pass (no ".." substring)
-                     * while sanitization strips the backslash, resynthesizing
-                     * "../id_rsa" and bypassing the traversal guard. */
                     char sanitized[MAX_PATH_LEN];
                     if (strlen(kv->value) > 0) {
+                        /* Reject a value the sanitizer would ALTER: since M6,
+                         * toml_get_string refuses to hand such a value to
+                         * callers at all, so admitting it here would load an
+                         * account whose ssh_key then reads as "absent" —
+                         * silent identity mutation. This also keeps the
+                         * backslash-resynthesis traversal spelling fatal:
+                         * `.\./id_rsa` has no ".." substring, but stripping
+                         * the backslash resynthesizes "../id_rsa", so any
+                         * byte the sanitizer touches is treated as hostile
+                         * (AR-02 #29). Past this check, sanitized bytes ==
+                         * raw bytes, so the guards below see exactly what
+                         * callers would receive. */
                         if (toml_sanitize_string(kv->value, sanitized, sizeof(sanitized)) != 0 ||
-                            !toml_validate_file_path(sanitized)) {
+                            strcmp(sanitized, kv->value) != 0) {
+                            set_error(ERR_CONFIG_INVALID,
+                                      "SSH key path contains characters that cannot "
+                                      "round-trip: %s", kv->value);
+                            return -1;
+                        }
+                        /* Over-long path: skip THIS account, not the file
+                         * (AR-03 M5). The writer historically accepted up to
+                         * TOML_MAX_VALUE_LEN-1 (511) bytes, so a 257-511
+                         * char ssh_key can be gitswitch's own prior output —
+                         * failing the whole parse bricked every command over
+                         * one account's field. The path-length cap is
+                         * checked before toml_validate_file_path because
+                         * that guard folds length and traversal together and
+                         * only traversal deserves the whole-file response. */
+                        if (strlen(kv->value) > 256) {
+                            log_warning("Account section [%s]: ssh_key is %zu bytes "
+                                        "(max 256); skipping this account, the rest "
+                                        "of the config still loads",
+                                        section->name, strlen(kv->value));
+                            skip_section = true;
+                            break;
+                        }
+                        if (!toml_validate_file_path(kv->value)) {
                             set_error(ERR_CONFIG_INVALID, "Invalid SSH key path: %s", kv->value);
                             return -1;
                         }
@@ -464,7 +567,7 @@ int toml_validate_gitswitch_schema(const toml_document_t *doc) {
                          * (expanded against HOME by expand_path downstream)
                          * are both CWD-independent. gpg_key is exempt: it is
                          * a key ID, not a filesystem path. */
-                        if (sanitized[0] != '/' && sanitized[0] != '~') {
+                        if (kv->value[0] != '/' && kv->value[0] != '~') {
                             set_error(ERR_CONFIG_INVALID,
                                       "ssh_key must be an absolute or ~-anchored path, not relative: %s",
                                       kv->value);
@@ -485,8 +588,20 @@ int toml_validate_gitswitch_schema(const toml_document_t *doc) {
                 }
             }
             
+            if (skip_section) {
+                /* Hide the section from the getters but keep it enumerable:
+                 * toml_get_sections must still report it so config.c's
+                 * loader counts it in accounts_skipped_on_load and
+                 * config_save refuses to rewrite the file — a skip must
+                 * never decay into silent erasure. toml_write_file likewise
+                 * still emits its keys, so a document written back preserves
+                 * the section byte-for-byte for the user to fix. */
+                section->is_set = false;
+                continue;
+            }
+
             if (!has_name || !has_email) {
-                set_error(ERR_CONFIG_INVALID, "Account section %s missing required name or email", 
+                set_error(ERR_CONFIG_INVALID, "Account section %s missing required name or email",
                           section->name);
                 return -1;
             }
@@ -1068,13 +1183,33 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_set_string");
         return -1;
     }
-    
+
+    /* Bound-check BEFORE mutating the document (AR-03 M5, writer half).
+     * safe_strncpy fails without writing on an oversized source, and this
+     * function used to ignore that: a >= TOML_MAX_VALUE_LEN value left the
+     * key freshly created with value="" and is_set=true, so config_save
+     * wrote `ssh_key = ""` to disk and exited 0 — the account's key silently
+     * erased by the very save that claimed success. Checking up front also
+     * means a failed set leaves no half-built key behind. */
+    if (strlen(key_name) >= TOML_MAX_KEY_LEN) {
+        set_error(ERR_CONFIG_INVALID, "Key name too long for %s (max %d bytes): %s",
+                  section_name, TOML_MAX_KEY_LEN - 1, key_name);
+        return -1;
+    }
+    if (strlen(value) >= TOML_MAX_VALUE_LEN) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Value for %s.%s is too long (%zu bytes, max %d); refusing to "
+                  "store it truncated or empty",
+                  section_name, key_name, strlen(value), TOML_MAX_VALUE_LEN - 1);
+        return -1;
+    }
+
     /* Find or create section */
     section = find_or_create_section(doc, section_name);
     if (!section) {
         return -1;
     }
-    
+
     /* Find or create key */
     kv = find_key(section, key_name);
     if (!kv) {
@@ -1083,17 +1218,23 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
             set_error(ERR_CONFIG_INVALID, "Too many key-value pairs in section: %s", section_name);
             return -1;
         }
-        
+
         kv = &section->keys[section->key_count];
-        safe_strncpy(kv->key, key_name, sizeof(kv->key));
+        /* Cannot fail after the length check above, but stay fail-closed:
+         * the copy runs before key_count++ so a failure leaves no ghost key. */
+        if (safe_strncpy(kv->key, key_name, sizeof(kv->key)) != 0) {
+            return -1;
+        }
         section->key_count++;
     }
-    
-    /* Set string value */
+
+    /* Set string value; propagate the copy result instead of assuming it. */
+    if (safe_strncpy(kv->value, value, sizeof(kv->value)) != 0) {
+        return -1;
+    }
     kv->type = TOML_TYPE_STRING;
-    safe_strncpy(kv->value, value, sizeof(kv->value));
     kv->is_set = true;
-    
+
     return 0;
 }
 
@@ -1107,13 +1248,22 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_set_boolean");
         return -1;
     }
-    
+
+    /* Same up-front bound as toml_set_string: an oversized key name used to
+     * leave a ghost key with key="" behind (safe_strncpy fails without
+     * writing) while still reporting success. */
+    if (strlen(key_name) >= TOML_MAX_KEY_LEN) {
+        set_error(ERR_CONFIG_INVALID, "Key name too long for %s (max %d bytes): %s",
+                  section_name, TOML_MAX_KEY_LEN - 1, key_name);
+        return -1;
+    }
+
     /* Find or create section */
     section = find_or_create_section(doc, section_name);
     if (!section) {
         return -1;
     }
-    
+
     /* Find or create key */
     kv = find_key(section, key_name);
     if (!kv) {
@@ -1122,17 +1272,21 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
             set_error(ERR_CONFIG_INVALID, "Too many key-value pairs in section: %s", section_name);
             return -1;
         }
-        
+
         kv = &section->keys[section->key_count];
-        safe_strncpy(kv->key, key_name, sizeof(kv->key));
+        if (safe_strncpy(kv->key, key_name, sizeof(kv->key)) != 0) {
+            return -1; /* copy precedes key_count++: no ghost key on failure */
+        }
         section->key_count++;
     }
-    
-    /* Set boolean value */
+
+    /* Set boolean value ("true"/"false" always fits; propagate anyway). */
+    if (safe_strncpy(kv->value, value ? "true" : "false", sizeof(kv->value)) != 0) {
+        return -1;
+    }
     kv->type = TOML_TYPE_BOOLEAN;
-    safe_strncpy(kv->value, value ? "true" : "false", sizeof(kv->value));
     kv->is_set = true;
-    
+
     return 0;
 }
 

@@ -129,27 +129,21 @@ int config_init(gitswitch_ctx_t *ctx) {
     }
 }
 
-/* Load configuration from TOML file */
-int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
-    toml_document_t toml_doc;
-    char scope_str[32];
+/* Read config_path through a validated fd and parse it into doc
+ * (cfg-symlink-01/02). The old flow validated the path with stat() and then
+ * had the parser fopen() the path a second time, so a symlinked accounts.toml
+ * passed validation against its target and, worse, the file validated and the
+ * file parsed could differ (TOCTOU). Parsing the bytes read from the validated
+ * fd removes the second path lookup entirely. Shared by config_load and the
+ * settings-only write-back (config_save_active_account), which must edit the
+ * on-disk document rather than rebuild it (AR-03 M9). The caller owns doc
+ * cleanup on both success and failure. */
+static int config_read_document(const char *config_path, toml_document_t *doc) {
     char *buffer = NULL;
     struct stat fst;
     size_t file_size, total = 0;
     int fd;
 
-    if (!ctx || !config_path) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
-        return -1;
-    }
-
-    /* Open with O_NOFOLLOW and validate the fd, then read and parse from that
-     * same fd (cfg-symlink-01/02). The old flow validated the path with
-     * stat() and then had the parser fopen() the path a second time, so a
-     * symlinked accounts.toml passed validation against its target and,
-     * worse, the file validated and the file parsed could differ (TOCTOU).
-     * Parsing the bytes read from the validated fd removes the second
-     * path lookup entirely. */
     fd = open_config_validated(config_path);
     if (fd < 0) {
         return -1;
@@ -190,9 +184,8 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
     }
 
     /* Parse TOML configuration */
-    toml_init_document(&toml_doc);
-    if (toml_parse_string(buffer, file_size, &toml_doc) != 0) {
-        toml_cleanup_document(&toml_doc);
+    toml_init_document(doc);
+    if (toml_parse_string(buffer, file_size, doc) != 0) {
         goto fail_buffer;
     }
 
@@ -200,7 +193,28 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
      * copy on the heap (mirrors toml_parse_file's cleanup discipline). */
     secure_zero_memory(buffer, file_size + 1);
     free(buffer);
-    buffer = NULL;
+    return 0;
+
+fail_buffer:
+    secure_zero_memory(buffer, file_size + 1);
+    free(buffer);
+    return -1;
+}
+
+/* Load configuration from TOML file */
+int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
+    toml_document_t toml_doc;
+    char scope_str[32];
+
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
+        return -1;
+    }
+
+    if (config_read_document(config_path, &toml_doc) != 0) {
+        toml_cleanup_document(&toml_doc);
+        return -1;
+    }
 
     /* Load settings section */
     if (toml_get_string(&toml_doc, "settings", "default_scope",
@@ -238,36 +252,36 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
 
     log_info("Configuration loaded successfully: %zu accounts", ctx->account_count);
     return 0;
-
-fail_buffer:
-    if (buffer) {
-        secure_zero_memory(buffer, file_size + 1);
-        free(buffer);
-    }
-    return -1;
 }
 
 /* Acquire an exclusive, cross-process lock for a mutating config cycle. Returns
  * an open fd holding flock(LOCK_EX) on <config_dir>/.config.lock; hold it across
  * the whole load-modify-save so concurrent add/edit/remove/switch cannot
- * lost-update each other. The atomic temp+rename in config_save only prevents a
- * torn file, not a lost update: two processes that each load, mutate, and rename
- * would have the second silently discard the first's changes. Close the fd to
- * release. Returns -1 on failure; callers must treat that as fatal for a
- * mutating command — proceeding unlocked reopens the lost-update race
- * (AR-02 #17). */
+ * lost-update each other. The acquisition is deliberately nonblocking: the
+ * holder may be stopped indefinitely at an interactive prompt, so waiting here
+ * can hang another command (including login-time resume) with no useful bound.
+ * The atomic temp+rename in config_save only prevents a torn file, not a lost
+ * update: two processes that each load, mutate, and rename would have the second
+ * silently discard the first's changes. Close the fd to release. Returns -1 on
+ * failure with errno preserved; callers must treat that as fatal for a mutating
+ * command — proceeding unlocked reopens the lost-update race (AR-02 #17,
+ * AR-03 L10). */
 int config_write_lock(void) {
     char dir[MAX_PATH_LEN];
     char lockpath[MAX_PATH_LEN];
+    errno = 0; /* Never misclassify a validation failure using stale errno. */
     if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
     if (create_config_directory_secure(dir) != 0) return -1;
     if ((size_t)snprintf(lockpath, sizeof(lockpath), "%s/.config.lock", dir) >= sizeof(lockpath)) {
+        errno = ENAMETOOLONG;
         return -1;
     }
     int fd = open(lockpath, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
-    if (flock(fd, LOCK_EX) != 0) {
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int lock_errno = errno;
         close(fd);
+        errno = lock_errno;
         return -1;
     }
     return fd;
@@ -323,27 +337,12 @@ static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     }
 }
 
-/* Save configuration to TOML file */
-int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
-    toml_document_t toml_doc;
+/* Shared atomic-write tail for config_save and config_save_active_account:
+ * validate the destination, back up the existing file, write doc to a fresh
+ * 0600 temp, rename it into place, refresh the resume hint. */
+static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_document_t *doc,
+                                        const char *config_path) {
     char temp_path[MAX_PATH_LEN];
-    int result = -1;
-    
-    if (!ctx || !config_path) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save");
-        return -1;
-    }
-
-    /* Refuse to rewrite the file when the load dropped one or more account
-     * sections: the in-memory set is an incomplete view, and a full rewrite
-     * would silently erase the skipped accounts. Preserve the on-disk file
-     * (including those sections) and tell the user to fix them first. */
-    if (ctx->accounts_skipped_on_load > 0) {
-        display_warning("Not saving config: %zu account(s) failed to load and would be lost. "
-                        "Fix them in %s (or their key files/permissions), then retry.",
-                        ctx->accounts_skipped_on_load, config_path);
-        return 0;
-    }
 
     /* Refuse to write through or next to a symlink (cfg-symlink-01). rename()
      * would replace a symlinked accounts.toml with a real file, but the
@@ -394,9 +393,91 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
      * only prevents an orphaned .tmp when a signal lands mid-save. */
     signals_scratch_register(temp_path);
 
+    /* Write to temporary file first (already created 0600 above, so the
+     * content is never observable with looser permissions) */
+    if (toml_write_file(doc, temp_path) != 0) {
+        unlink(temp_path); /* don't leave a stale/partial .tmp behind */
+        signals_scratch_unregister(temp_path);
+        return -1;
+    }
+
+    /* Atomic move from temp to final location */
+    if (rename(temp_path, config_path) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                        "Failed to move temporary config file to final location");
+        unlink(temp_path);
+        signals_scratch_unregister(temp_path);
+        return -1;
+    }
+    signals_scratch_unregister(temp_path); /* renamed away: nothing to clean */
+
+    log_info("Configuration saved successfully to: %s", config_path);
+    config_update_resume_hint(ctx);
+    return 0;
+}
+
+/* Fail-closed gate for full-config rewrites (AR-03 M8/M9): the on-disk file
+ * may hold more than the in-memory view — account sections the load skipped
+ * (bad key permissions, an unloadable field) and sections we don't model at
+ * all (a typo'd [account.3], custom sections). config_save rebuilds from
+ * settings + in-memory accounts only, so a rewrite while any exist would
+ * silently erase them. Public so the add/edit/remove handlers can refuse
+ * BEFORE their interactive work instead of discarding it at save time. */
+int config_check_rewritable(const gitswitch_ctx_t *ctx) {
+    if (!ctx) {
+        set_error(ERR_INVALID_ARGS, "NULL context to config_check_rewritable");
+        return -1;
+    }
+    if (ctx->accounts_skipped_on_load == 0 && ctx->unknown_sections_on_load == 0) {
+        return 0;
+    }
+    if (ctx->accounts_skipped_on_load > 0 && ctx->unknown_sections_on_load > 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "%zu account section(s) failed to load and %zu unrecognized section(s) "
+                  "exist in %s; rewriting the file would erase them. Fix them (or the "
+                  "accounts' key files/permissions), then retry.",
+                  ctx->accounts_skipped_on_load, ctx->unknown_sections_on_load,
+                  ctx->config.config_path);
+    } else if (ctx->accounts_skipped_on_load > 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "%zu account section(s) failed to load and would be lost by a rewrite "
+                  "of %s. Fix them (or their key files/permissions), then retry.",
+                  ctx->accounts_skipped_on_load, ctx->config.config_path);
+    } else {
+        set_error(ERR_CONFIG_INVALID,
+                  "%zu unrecognized section(s) in %s would be lost by a rewrite "
+                  "(gitswitch only understands [settings] and [accounts.<id>]). "
+                  "Fix or remove them, then retry.",
+                  ctx->unknown_sections_on_load, ctx->config.config_path);
+    }
+    return -1;
+}
+
+/* Save configuration to TOML file */
+int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
+    toml_document_t toml_doc;
+    int result = -1;
+
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save");
+        return -1;
+    }
+
+    /* Refuse to rewrite the file when the load produced an incomplete view:
+     * a full rewrite would silently erase the skipped/unknown sections.
+     * Preserve the on-disk file and tell the user to fix them first. The
+     * refusal returns -1, NOT the old 0 (AR-03 M9): an undifferentiated
+     * success return made add/edit report "Account added successfully!"
+     * at exit 0 while the change was discarded — scripted callers had no
+     * way to detect the silent drop. */
+    if (config_check_rewritable(ctx) != 0) {
+        display_warning("Not saving config: %s", get_last_error()->message);
+        return -1;
+    }
+
     /* Initialize TOML document */
     toml_init_document(&toml_doc);
-    
+
     /* Add/update settings section */
     if (toml_set_string(&toml_doc, "settings", "default_scope",
                         config_scope_to_string(ctx->config.default_scope)) != 0) {
@@ -417,30 +498,68 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
         goto cleanup;
     }
     log_debug("After saving accounts, TOML doc has %zu sections", toml_doc.section_count);
-    
-    /* Write to temporary file first (already created 0600 above, so the
-     * content is never observable with looser permissions) */
-    if (toml_write_file(&toml_doc, temp_path) != 0) {
-        unlink(temp_path); /* don't leave a stale/partial .tmp behind */
-        signals_scratch_unregister(temp_path);
-        goto cleanup;
-    }
 
-    /* Atomic move from temp to final location */
-    if (rename(temp_path, config_path) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED,
-                        "Failed to move temporary config file to final location");
-        unlink(temp_path);
-        signals_scratch_unregister(temp_path);
-        goto cleanup;
-    }
-    signals_scratch_unregister(temp_path); /* renamed away: nothing to clean */
-    
-    log_info("Configuration saved successfully to: %s", config_path);
-    config_update_resume_hint(ctx);
-    result = 0;
+    result = config_write_document_atomic(ctx, &toml_doc, config_path);
 
 cleanup:
+    toml_cleanup_document(&toml_doc);
+    return result;
+}
+
+/* Persist only settings.active_account via parse -> edit -> write-back of the
+ * on-disk document (AR-03 M9). The full config_save is (correctly) refused
+ * when the load skipped sections — but a switch between the HEALTHY accounts
+ * must still record active_account, or the next boot's resume restores the
+ * wrong identity while the switch reported success. The write-back path is
+ * safe where the rebuild is not: toml_write_file re-emits every parsed
+ * section, including schema-skipped account sections (their keys stay set;
+ * only the section's is_set is cleared) and unrecognized sections, so nothing
+ * the loader couldn't model is lost. Comments are not preserved — same as
+ * every existing save path. */
+int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path) {
+    toml_document_t toml_doc;
+    int result;
+
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save_active_account");
+        return -1;
+    }
+
+    /* No file yet: nothing to preserve, and the write-back needs a document
+     * to edit — the full rebuild is both safe and required to create one. */
+    if (!path_exists(config_path)) {
+        return config_save(ctx, config_path);
+    }
+
+    if (config_read_document(config_path, &toml_doc) != 0) {
+        toml_cleanup_document(&toml_doc);
+        return -1;
+    }
+
+    /* Keys before the first section header parse into a section with an empty
+     * name; toml_write_file would emit that as a bare "[]" header the next
+     * load then rejects. Refuse rather than corrupt (the loader already warned
+     * about the unrecognized section; the user has to fix the file anyway). */
+    for (size_t i = 0; i < toml_doc.section_count; i++) {
+        if (toml_doc.sections[i].name[0] == '\0' && toml_doc.sections[i].key_count > 0) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Config file %s has keys before its first [section] header; "
+                      "they cannot be written back faithfully — fix the file first",
+                      config_path);
+            toml_cleanup_document(&toml_doc);
+            return -1;
+        }
+    }
+
+    /* An empty active_account (e.g. after `reset`) is stored as "" — there is
+     * no key-removal primitive, and the loader treats "" as "none saved". */
+    if (toml_set_string(&toml_doc, "settings", "active_account",
+                        ctx->config.active_account) != 0) {
+        toml_cleanup_document(&toml_doc);
+        return -1;
+    }
+
+    result = config_write_document_atomic(ctx, &toml_doc, config_path);
     toml_cleanup_document(&toml_doc);
     return result;
 }
@@ -1138,25 +1257,53 @@ static int create_config_directory_secure(const char *config_dir) {
     return 0;
 }
 
+/* Tri-state fetch for one account field. toml_get_string returns -1 both for
+ * an ABSENT key and for a present value it refuses to hand over (too long for
+ * the destination, or bytes its sanitizer would alter — AR-03 M6). The two
+ * must not be conflated: "absent" takes the field's benign default, while
+ * "present but unloadable" means the in-memory account is no longer a
+ * faithful view of the file — treating it as absent silently drops the field
+ * and the next full save persists the default over the user's bytes. The
+ * getter sets an error exactly in its refusal cases and stays silent for
+ * absent keys, so the error state disambiguates. */
+typedef enum {
+    FIELD_ABSENT = 0,
+    FIELD_LOADED,
+    FIELD_UNLOADABLE
+} field_state_t;
+
+static field_state_t get_account_field(const toml_document_t *doc, const char *section,
+                                       const char *key, char *out, size_t out_size) {
+    clear_error();
+    if (toml_get_string(doc, section, key, out, out_size) == 0) {
+        return FIELD_LOADED;
+    }
+    if (get_last_error()->code == ERR_SUCCESS) {
+        return FIELD_ABSENT;
+    }
+    return FIELD_UNLOADABLE;
+}
+
 /* Load accounts from TOML document */
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc) {
     char sections[TOML_MAX_SECTIONS][TOML_MAX_SECTION_LEN];
     size_t section_count;
-    
+
     if (toml_get_sections(doc, sections, TOML_MAX_SECTIONS, &section_count) != 0) {
         set_error(ERR_CONFIG_INVALID, "Failed to get sections from TOML document");
         return -1;
     }
-    
+
     ctx->account_count = 0;
-    
+
     for (size_t i = 0; i < section_count; i++) {
         if (string_starts_with(sections[i], "accounts.")) {
             account_t account;
             uint32_t account_id;
             char temp_str[256];
             bool temp_bool;
-            
+            field_state_t fs;
+
             /* Parse account ID from section name. Count a bad section as
              * skipped-on-load (not just logged): config_save refuses to
              * rewrite when sections were skipped, so a section with a
@@ -1170,70 +1317,106 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                                 sections[i], UINT32_MAX);
                 continue;
             }
-            
+
             /* Initialize account */
             memset(&account, 0, sizeof(account));
             account.id = account_id;
             account.preferred_scope = GIT_SCOPE_LOCAL; /* Default */
-            
-            /* Load required fields. Skipped, not dropped: toml_get_string
-             * fails here both for a MISSING field and for a value too long
-             * for the destination (e.g. a name over MAX_NAME_LEN — schema-
-             * valid, so the whole-file parse succeeded), and either way the
-             * in-memory set is now an incomplete view of the file. Without
-             * the skip count, config_save's refuse-to-rewrite guard read
-             * zero and the very next save permanently erased this section
-             * (AR-02 #5). Warn on stderr so the cause is visible. */
-            if (toml_get_string(doc, sections[i], "name", account.name, sizeof(account.name)) != 0) {
+
+            /* Load required fields. Skipped, not dropped: whether the field
+             * is MISSING or present-but-refused by the getter (a name over
+             * MAX_NAME_LEN, or bytes that cannot round-trip — both schema-
+             * valid, so the whole-file parse succeeded), the in-memory set
+             * is now an incomplete view of the file. Without the skip count,
+             * config_save's refuse-to-rewrite guard read zero and the very
+             * next save permanently erased this section (AR-02 #5). Warn on
+             * stderr with the getter's own reason so the ACTUAL cause —
+             * missing vs too long vs unrepresentable bytes — is visible. */
+            fs = get_account_field(doc, sections[i], "name", account.name, sizeof(account.name));
+            if (fs != FIELD_LOADED) {
                 ctx->accounts_skipped_on_load++;
-                display_warning("Account section [%s] was skipped: 'name' is missing or "
-                                "too long (max %d bytes). Fix it in the config file.",
-                                sections[i], MAX_NAME_LEN - 1);
+                if (fs == FIELD_ABSENT) {
+                    display_warning("Account section [%s] was skipped: 'name' is missing. "
+                                    "Fix it in the config file.", sections[i]);
+                } else {
+                    display_warning("Account section [%s] was skipped: %s",
+                                    sections[i], get_last_error()->message);
+                }
                 continue;
             }
 
-            if (toml_get_string(doc, sections[i], "email", account.email, sizeof(account.email)) != 0) {
+            fs = get_account_field(doc, sections[i], "email", account.email, sizeof(account.email));
+            if (fs != FIELD_LOADED) {
                 ctx->accounts_skipped_on_load++;
-                display_warning("Account section [%s] ('%s') was skipped: 'email' is "
-                                "missing or too long (max %d bytes). Fix it in the config file.",
-                                sections[i], account.name[0] ? account.name : "?",
-                                MAX_EMAIL_LEN - 1);
+                if (fs == FIELD_ABSENT) {
+                    display_warning("Account section [%s] ('%s') was skipped: 'email' is "
+                                    "missing. Fix it in the config file.",
+                                    sections[i], account.name);
+                } else {
+                    display_warning("Account section [%s] ('%s') was skipped: %s",
+                                    sections[i], account.name, get_last_error()->message);
+                }
                 continue;
             }
-            
-            /* Load optional fields - clear errors after each since missing optional fields are not errors */
-            if (toml_get_string(doc, sections[i], "description",
-                               account.description, sizeof(account.description)) != 0) {
+
+            /* Optional fields: absent is fine (benign default), but a value
+             * that EXISTS and cannot be loaded faithfully skips the whole
+             * account (counted, like name/email above). The old code treated
+             * both outcomes as "absent", so an unloadable description
+             * silently became the name — and the next save persisted that
+             * fallback over the user's bytes — while an unloadable ssh_host
+             * silently dropped the alias that decides which ~/.ssh/config
+             * Host entry a switch rewrites. */
+            fs = get_account_field(doc, sections[i], "description",
+                                   account.description, sizeof(account.description));
+            if (fs == FIELD_ABSENT) {
                 /* Use name as description if not provided */
                 safe_strncpy(account.description, account.name, sizeof(account.description));
-                clear_error();
+            } else if (fs == FIELD_UNLOADABLE) {
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account '%s' (id %u) was skipped: %s",
+                                account.name, account_id, get_last_error()->message);
+                continue;
             }
 
             /* The description is printed raw by list/status/whoami. Today
-             * toml_get_string's own sanitize pass happens to strip control
-             * and non-ASCII bytes, but that is a retrieval-layer detail of
-             * another module — the config layer must guarantee for itself
+             * toml_get_string's own round-trip check refuses control and
+             * non-ASCII-hostile bytes, but that is a retrieval-layer detail
+             * of another module — the config layer must guarantee for itself
              * that nothing it hands to display can drive the terminal
              * (tty-escape). The description is display-only, so strip here
-             * at the trust boundary instead of rejecting the account; the
-             * identity-bearing name is instead *rejected* by
-             * validate_account_security below if it is unsafe. */
+             * at the trust boundary; the identity-bearing name is instead
+             * *rejected* by validate_account_security below if it is unsafe. */
             if (sanitize_tty_text(account.description)) {
                 display_warning("Account '%s' (id %u): removed terminal control bytes "
                                 "from description.",
                                 account.name[0] ? account.name : "?", account_id);
             }
 
-            if (toml_get_string(doc, sections[i], "preferred_scope", temp_str, sizeof(temp_str)) == 0) {
+            fs = get_account_field(doc, sections[i], "preferred_scope", temp_str, sizeof(temp_str));
+            if (fs == FIELD_LOADED) {
                 account.preferred_scope = config_parse_scope(temp_str);
-            } else {
-                clear_error();
+            } else if (fs == FIELD_UNLOADABLE) {
+                /* Falling back to the local default would silently change
+                 * WHICH git config (repo vs user-wide) a switch writes. */
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account '%s' (id %u) was skipped: %s",
+                                account.name, account_id, get_last_error()->message);
+                continue;
             }
 
             /* SSH configuration */
-            if (toml_get_string(doc, sections[i], "ssh_key",
-                               account.ssh_key_path, sizeof(account.ssh_key_path)) == 0 &&
-                strlen(account.ssh_key_path) > 0) {
+            fs = get_account_field(doc, sections[i], "ssh_key",
+                                   account.ssh_key_path, sizeof(account.ssh_key_path));
+            if (fs == FIELD_UNLOADABLE) {
+                /* Loading the account WITHOUT its key would switch git
+                 * identity while leaving the previous account's agent live. */
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account '%s' (id %u) was skipped: %s",
+                                account.name, account_id, get_last_error()->message);
+                continue;
+            }
+            if (fs == FIELD_LOADED && strlen(account.ssh_key_path) > 0) {
                 account.ssh_enabled = true;
 
                 /* Expand path if needed */
@@ -1243,18 +1426,26 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                 }
 
                 /* Optional SSH host alias */
-                if (toml_get_string(doc, sections[i], "ssh_host",
-                                   account.ssh_host_alias, sizeof(account.ssh_host_alias)) != 0) {
-                    clear_error();
+                fs = get_account_field(doc, sections[i], "ssh_host",
+                                       account.ssh_host_alias, sizeof(account.ssh_host_alias));
+                if (fs == FIELD_UNLOADABLE) {
+                    ctx->accounts_skipped_on_load++;
+                    display_warning("Account '%s' (id %u) was skipped: %s",
+                                    account.name, account_id, get_last_error()->message);
+                    continue;
                 }
-            } else {
-                clear_error();
             }
 
             /* GPG configuration */
-            if (toml_get_string(doc, sections[i], "gpg_key",
-                               account.gpg_key_id, sizeof(account.gpg_key_id)) == 0 &&
-                strlen(account.gpg_key_id) > 0) {
+            fs = get_account_field(doc, sections[i], "gpg_key",
+                                   account.gpg_key_id, sizeof(account.gpg_key_id));
+            if (fs == FIELD_UNLOADABLE) {
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account '%s' (id %u) was skipped: %s",
+                                account.name, account_id, get_last_error()->message);
+                continue;
+            }
+            if (fs == FIELD_LOADED && strlen(account.gpg_key_id) > 0) {
                 account.gpg_enabled = true;
 
                 /* GPG signing preference */
@@ -1263,10 +1454,8 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                 } else {
                     account.gpg_signing_enabled = temp_bool;
                 }
-            } else {
-                clear_error();
             }
-            
+
             /* Reject duplicate name (case-insensitive) or id against already-
              * loaded accounts. config_add_account enforces this for the
              * interactive path, but the load path bypassed it entirely — and a
@@ -1311,9 +1500,22 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                                 "skipped: %s", account.name[0] ? account.name : "?",
                                 account_id, get_last_error()->message);
             }
+        } else if (strcmp(sections[i], "settings") != 0) {
+            /* AR-03 M8: a section we don't model — a typo'd [account.3] or
+             * [Accounts.3], a custom section, keys before the first header —
+             * is invisible to config_save's rebuild (settings + in-memory
+             * accounts only), so the next full save would silently delete it
+             * and five saves later the rotating backups age out too. Count
+             * it so the refuse-to-rewrite guard covers it exactly like a
+             * skipped account section. */
+            ctx->unknown_sections_on_load++;
+            display_warning("Unrecognized section [%s] in the config file (gitswitch only "
+                            "understands [settings] and [accounts.<id>]). It is preserved, "
+                            "but account changes are blocked until you fix or remove it.",
+                            sections[i]);
         }
     }
-    
+
     log_info("Loaded %zu accounts from configuration", ctx->account_count);
     return 0;
 }
@@ -1416,19 +1618,46 @@ static bool text_is_tty_safe(const char *text) {
     return true;
 }
 
+/* Reject a value that cannot survive the config round trip: since AR-03 M6,
+ * toml_get_string FAILS (rather than repairs) any value its sanitizer would
+ * alter — a quote, backslash, control byte, or malformed UTF-8. The writer
+ * escapes such bytes faithfully, so without this write-side gate gitswitch
+ * could persist a name or description that its own next load then refuses to
+ * hand back, skipping the account it just created. Refuse at the API every
+ * add/edit passes through instead, naming the field. */
+static int validate_field_roundtrips(const char *field_name, const char *value) {
+    char sanitized[MAX_DESC_LEN];
+
+    if (toml_sanitize_string(value, sanitized, sizeof(sanitized)) != 0 ||
+        strcmp(sanitized, value) != 0) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Account %s contains characters that cannot round-trip through "
+                  "the config file (quote, backslash, or control byte): %s",
+                  field_name, value);
+        return -1;
+    }
+    return 0;
+}
+
 /* Validate account security */
 static int validate_account_security(const account_t *account) {
     char expanded_path[MAX_PATH_LEN];
-    mode_t file_mode;
-    
+    struct stat key_stat;
+
     if (!account) {
         set_error(ERR_INVALID_ARGS, "NULL account to validate");
         return -1;
     }
-    
+
     /* Validate required fields */
     if (!validate_name(account->name)) {
         set_error(ERR_ACCOUNT_INVALID, "Invalid account name: %s", account->name);
+        return -1;
+    }
+
+    if (validate_field_roundtrips("name", account->name) != 0 ||
+        validate_field_roundtrips("description", account->description) != 0 ||
+        validate_field_roundtrips("SSH host alias", account->ssh_host_alias) != 0) {
         return -1;
     }
 
@@ -1473,20 +1702,33 @@ static int validate_account_security(const account_t *account) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid SSH key path: %s", account->ssh_key_path);
             return -1;
         }
-        
-        if (!path_exists(expanded_path)) {
+
+        /* M5 (write entry, config half): the loader skips any account whose
+         * persisted ssh_key exceeds 256 chars, so admitting a longer path
+         * through this gate — which every add/edit/load passes — would save
+         * an account this same tool then refuses to load back. accounts.c's
+         * prompts enforce the identical cap interactively; this covers the
+         * programmatic path, and the ~-stored key whose $HOME expansion
+         * pushes the persisted absolute path past the cap. */
+        if (strlen(expanded_path) > 256) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "SSH key path too long (%zu chars, max 256): %s",
+                      strlen(expanded_path), expanded_path);
+            return -1;
+        }
+
+        /* One stat answers both the existence and the permission question
+         * (AR-03 L17: this was a back-to-back path_exists +
+         * get_file_permissions, two stats of the same path). Must be 600. */
+        if (stat(expanded_path, &key_stat) != 0) {
             set_error(ERR_ACCOUNT_INVALID, "SSH key file not found: %s", expanded_path);
             return -1;
         }
-        
-        /* Check SSH key file permissions - must be 600 */
-        if (get_file_permissions(expanded_path, &file_mode) == 0) {
-            if ((file_mode & 077) != 0) {
-                set_error(ERR_ACCOUNT_INVALID, 
-                          "SSH key file has unsafe permissions: %o (should be 600)", 
-                          file_mode & 0777);
-                return -1;
-            }
+        if ((key_stat.st_mode & 077) != 0) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "SSH key file has unsafe permissions: %o (should be 600)",
+                      key_stat.st_mode & 0777);
+            return -1;
         }
     }
     

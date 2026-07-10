@@ -69,6 +69,36 @@ TEST(validate_name_accepts_ordinary_display_names) {
     CHECK(validate_name("currently")); /* only exactly "current" is reserved */
 }
 
+/* AR-03 L1: account_t.email is email[MAX_EMAIL_LEN], so it stores at most
+ * MAX_EMAIL_LEN-1 chars plus the NUL. validate_email used `>` and admitted an
+ * exactly-320-char address that the downstream safe_strncpy then refused —
+ * add aborted with a misleading error, edit silently kept the old email. The
+ * validator must reject at >=, matching validate_name's bound. */
+TEST(validate_email_enforces_storable_bound) {
+    char email[MAX_EMAIL_LEN + 2];
+    const char *domain = "@example.com";
+    size_t dlen = strlen(domain);
+    size_t local;
+
+    /* Longest storable address (MAX_EMAIL_LEN - 1 chars) is accepted... */
+    local = MAX_EMAIL_LEN - 1 - dlen;
+    memset(email, 'a', local);
+    memcpy(email + local, domain, dlen + 1);
+    CHECK(validate_email(email));
+
+    /* ...an exactly-MAX_EMAIL_LEN-char one is rejected (it cannot be stored). */
+    local = MAX_EMAIL_LEN - dlen;
+    memset(email, 'a', local);
+    memcpy(email + local, domain, dlen + 1);
+    CHECK(!validate_email(email));
+
+    /* Ordinary sanity on both sides of the boundary logic. */
+    CHECK(validate_email("user@example.com"));
+    CHECK(!validate_email("not-an-email"));
+    CHECK(!validate_email(""));
+    CHECK(!validate_email(NULL));
+}
+
 TEST(validate_key_id_is_hex_only) {
     /* Plain and 0x-prefixed hex are accepted (gpg prints and accepts both). */
     CHECK(validate_key_id("DEADBEEFCAFE1234"));
@@ -98,5 +128,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(validate_name_rejects_path_traversal_and_seps);
     RUN_TEST(validate_name_rejects_control_chars_and_reserved);
     RUN_TEST(validate_name_accepts_ordinary_display_names);
+    RUN_TEST(validate_email_enforces_storable_bound);
     RUN_TEST(validate_key_id_is_hex_only);
 TEST_MAIN_END()

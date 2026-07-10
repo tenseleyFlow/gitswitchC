@@ -226,22 +226,45 @@ int main(int argc, char *argv[]) {
      * identity from the live SSH/GPG runtime (AR-02 #1: tmux-restore shells
      * running resume while another shell switches). Acquire before config_init
      * so the load itself happens under the lock. Only genuinely read-only
-     * commands (list/status/doctor/config) skip it. Fail closed on lock
-     * failure: silently proceeding unlocked would reopen the exact lost-update
-     * and split-identity races the lock exists to prevent (AR-02 #17). */
+     * commands (list/status/doctor) skip it; `config` can create accounts.toml,
+     * so it belongs to the locked class too (AR-03 L11). Acquisition is
+     * nonblocking because the holder may be waiting indefinitely at a prompt;
+     * an arbitrary retry window would only turn a clear contention result back
+     * into login/command latency (AR-03 L10). Fail closed on other lock errors:
+     * silently proceeding unlocked would reopen the exact lost-update and
+     * split-identity races the lock exists to prevent (AR-02 #17). */
     int config_lock_fd = -1;
     {
         const char *c = (optind < argc) ? argv[optind] : NULL;
         bool read_only = (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
-            strcmp(c, "health") == 0 || strcmp(c, "config") == 0;
+            strcmp(c, "health") == 0;
         if (!read_only) {
             config_lock_fd = config_write_lock();
             if (config_lock_fd < 0) {
-                display_error("Could not acquire the gitswitch config lock",
-                              "another gitswitch may be stuck or the config "
-                              "directory is not writable; try again");
+                int lock_errno = errno;
+                bool contended = lock_errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+                contended = contended || lock_errno == EAGAIN;
+#endif
+
+                /* Shell integration invokes resume during login. A concurrent
+                 * switch already owns serialization and will leave a coherent
+                 * result, so this redundant restore is a successful no-op and
+                 * must not delay or alarm every newly opened shell. */
+                if (contended && c && strcmp(c, "resume") == 0) {
+                    error_cleanup();
+                    return EXIT_SUCCESS;
+                }
+                if (contended) {
+                    display_error("Another gitswitch holds the config lock",
+                                  "try again after that command finishes");
+                } else {
+                    display_error("Could not acquire the gitswitch config lock",
+                                  "the config directory or lock is unavailable; "
+                                  "check permissions and try again");
+                }
                 error_cleanup();
                 return EXIT_FAILURE;
             }
@@ -332,6 +355,7 @@ int main(int argc, char *argv[]) {
     
     /* Save configuration only for commands that modify accounts */
     bool should_save = false;
+    bool settings_only_save = false;
     if (command && exit_code == EXIT_SUCCESS && !dry_run) {
         if (strcmp(command, "add") == 0 ||
             strcmp(command, "edit") == 0 ||
@@ -346,36 +370,59 @@ int main(int argc, char *argv[]) {
                    strcmp(command, "health") != 0 &&
                    strcmp(command, "config") != 0 &&
                    strcmp(command, "init") != 0 &&
-                   strcmp(command, "resume") != 0 &&
-                   strcmp(command, "reset") != 0) {
-            /* A switch: the only durable change is active_account, so save
-             * only when it actually changed. Re-switching to the current
-             * account rewrites nothing, so we skip the save (and its backup). */
+                   strcmp(command, "resume") != 0) {
+            /* A switch — or a reset that cleared the saved active account —
+             * changes only settings.active_account, so save only when it
+             * actually changed (a re-switch to the current account rewrites
+             * nothing, skipping the save and its backup churn), and persist
+             * it via the targeted settings-only write-back (AR-03 M9): the
+             * full rebuild is refused whenever the load skipped sections,
+             * but switching between the HEALTHY accounts must still record
+             * active_account or the next boot resumes the wrong identity. */
             should_save = (strcmp(prev_active, ctx.config.active_account) != 0);
+            settings_only_save = true;
         }
         /* `resume` re-activates the already-saved account and changes nothing
          * durable, so it is intentionally excluded above to avoid backup churn. */
-        
+
         if (should_save) {
             log_debug("Saving configuration after %s command (account_count=%zu)",
                      command, ctx.account_count);
             /* SIG-02 (AR-02 #27): hold the deferring guard across the save so
              * config_save's scratch registration of its temp file has a live
              * handler behind it — a signal mid-save then defers instead of
-             * orphaning accounts.toml.tmp.<pid>. The command's work is already
-             * fully applied at this point, so (matching accounts_switch's
-             * success path) a deferred signal is not re-raised: the process
+             * orphaning accounts.toml.tmp.<pid>. After a switch the guard is
+             * ALREADY armed: accounts_switch's success path leaves it up so
+             * the stretch between "identity applied" and this save is never
+             * signal-killable (M3) — this begin is then a no-op re-begin that
+             * preserves any deferred signal. For add/edit/remove it arms
+             * fresh. The command's work is already fully applied at this
+             * point, so a deferred signal is not re-raised: the process
              * finishes persisting and exits normally moments later. */
             signals_guard_begin();
-            if (config_save(&ctx, ctx.config.config_path) != 0) {
-                display_warning("Failed to save configuration changes");
-                /* Don't fail the command, just warn */
+            int save_rc = settings_only_save
+                ? config_save_active_account(&ctx, ctx.config.config_path)
+                : config_save(&ctx, ctx.config.config_path);
+            if (save_rc != 0) {
+                /* AR-03 M9: a failed persist after a mutating command must
+                 * surface in the exit code. The old warn-and-exit-0 path let
+                 * scripted callers see success while the change was silently
+                 * discarded (add/edit) or while active_account went stale
+                 * for the next boot's resume (switch). */
+                display_error("Failed to save configuration changes",
+                              get_last_error()->message);
+                exit_code = EXIT_FAILURE;
             }
             signals_scratch_cleanup();
-            signals_guard_end();
         }
     }
-    
+
+    /* M3: drop the guard a successful switch left armed (see above). Done
+     * unconditionally — it also closes the save-path guard, and it is an
+     * idempotent no-op for every command that never armed one. */
+    signals_guard_end();
+
+
     /* Release the config write-lock now that load+mutate+save is done (harmless
      * no-op for read-only commands that never took it; the OS would also drop it
      * at exit). */
@@ -396,17 +443,34 @@ int main(int argc, char *argv[]) {
 
 static int handle_add_command(gitswitch_ctx_t *ctx) {
     if (!ctx) return EXIT_FAILURE;
-    
+
+    /* AR-03 M9: refuse BEFORE the interactive work. The save at the end of
+     * main() is refused whenever the load skipped or failed to recognize
+     * sections (rewriting would erase them), so collecting a full account's
+     * worth of answers only to discard them — while pre-fix still printing
+     * "Account added successfully!" at exit 0 — helps nobody. Fail up front
+     * with the reason instead. */
+    if (config_check_rewritable(ctx) != 0) {
+        display_error("Cannot add an account right now", get_last_error()->message);
+        return EXIT_FAILURE;
+    }
+
     if (accounts_add_interactive(ctx) != 0) {
         display_error("Failed to add account", get_last_error()->message);
         return EXIT_FAILURE;
     }
-    
+
     return EXIT_SUCCESS;
 }
 
 static int handle_edit_command(gitswitch_ctx_t *ctx, const char *identifier) {
     if (!ctx || !identifier) return EXIT_FAILURE;
+
+    /* AR-03 M9: same up-front refusal as `add` — see handle_add_command. */
+    if (config_check_rewritable(ctx) != 0) {
+        display_error("Cannot edit an account right now", get_last_error()->message);
+        return EXIT_FAILURE;
+    }
 
     if (accounts_edit_interactive(ctx, identifier) != 0) {
         display_error("Failed to edit account", get_last_error()->message);
@@ -432,7 +496,15 @@ static int handle_list_names(gitswitch_ctx_t *ctx) {
 
 static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier) {
     if (!ctx || !identifier) return EXIT_FAILURE;
-    
+
+    /* AR-03 M9: refuse before the confirmation prompt — see handle_add_command.
+     * (A remove here could only ever target a HEALTHY account anyway: the
+     * skipped ones aren't in memory to be found.) */
+    if (config_check_rewritable(ctx) != 0) {
+        display_error("Cannot remove an account right now", get_last_error()->message);
+        return EXIT_FAILURE;
+    }
+
     if (accounts_remove(ctx, identifier) != 0) {
         display_error("Failed to remove account", get_last_error()->message);
         return EXIT_FAILURE;
@@ -951,6 +1023,17 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     ssh_manager_reset(target);
 
     gpg_manager_reset(target);
+
+    /* When the reset covered the saved active account (or everything), clear
+     * the persisted active_account: main()'s settings-only save then records
+     * the clear and removes the .resume-hint marker (AR-03 T4). Leaving them
+     * in place made every subsequent login shell probe and auto-resume the
+     * account the user just tore down — silently re-spawning the agents and
+     * re-importing the GPG secret key that this command exists to delete. A
+     * targeted reset of a NON-active account changes neither. */
+    if (!target || strcmp(ctx->config.active_account, target) == 0) {
+        ctx->config.active_account[0] = '\0';
+    }
 
     if (target) {
         display_success("Reset gitswitch state for: %s", target);

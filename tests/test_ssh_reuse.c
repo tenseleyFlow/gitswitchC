@@ -205,25 +205,36 @@ static int fake_quoting_agent_runner(const char *const argv[],
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (strcmp(argv[0], "ssh-agent") == 0 && argv[1] &&
-        strcmp(argv[1], "-a") == 0 && argv[2]) {
+    if (strcmp(argv[0], "ssh-agent") == 0) {
+        /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
+         * explicit -s ahead of it, so the socket is no longer argv[2]. */
+        const char *sock = NULL;
+        for (size_t i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "-a") == 0 && argv[i + 1]) {
+                sock = argv[i + 1];
+                break;
+            }
+        }
         struct sockaddr_un addr;
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0 || strlen(argv[2]) >= sizeof(addr.sun_path)) return -1;
+        if (!sock || fd < 0 || strlen(sock) >= sizeof(addr.sun_path)) {
+            if (fd >= 0) close(fd);
+            return -1;
+        }
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        strcpy(addr.sun_path, argv[2]);
+        strcpy(addr.sun_path, sock);
         if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
             close(fd);
             return -1;
         }
         close(fd);
-        if (chmod(argv[2], 0600) != 0) return -1;
+        if (chmod(sock, 0600) != 0) return -1;
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size,
                      "SSH_AUTH_SOCK=\"%s\"; export SSH_AUTH_SOCK;\n"
                      "SSH_AGENT_PID=12345; export SSH_AGENT_PID;\n"
-                     "echo Agent pid 12345;\n", argv[2]);
+                     "echo Agent pid 12345;\n", sock);
             if (result) result->out_len = strlen(opts->out);
         }
         return 0;
