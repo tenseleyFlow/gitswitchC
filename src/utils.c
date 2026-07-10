@@ -891,17 +891,37 @@ int runtime_state_lock_acquire(void) {
         close(parent_fd);
         return -1;
     }
-    lock_fd = lock_private_file_at(dir_fd, ".lock");
+    /* Non-blocking (AR-05 L13): the holder keeps this lock across ssh-add
+     * passphrase and GPG pinentry prompts — unbounded human latency. Within
+     * one HOME the non-blocking config lock in main.c fails fast first, but
+     * a second gitswitch sharing XDG_RUNTIME_DIR under a DIFFERENT HOME
+     * bypasses that outer lock and used to hang here silently, with no
+     * message and no bound — the exact indefinite-prompt-holder hazard the
+     * config lock was made non-blocking to avoid (AR-03 L10). Fail fast with
+     * the same actionable message instead. */
+    lock_fd = try_lock_private_file_at(dir_fd, ".lock");
     if (lock_fd < 0) {
+        bool contended = errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+        contended = contended || errno == EAGAIN;
+#endif
         close(dir_fd);
         close(parent_fd);
-        set_system_error(ERR_FILE_IO, "Cannot open shared runtime lock: %s",
-                         lock_dir);
+        if (contended) {
+            set_error(ERR_FILE_IO,
+                      "Another gitswitch holds the shared runtime lock "
+                      "(possibly waiting at a passphrase/PIN prompt); try "
+                      "again after that command finishes");
+        } else {
+            set_system_error(ERR_FILE_IO, "Cannot open shared runtime lock: %s",
+                             lock_dir);
+        }
         return -1;
     }
 
-    /* flock may have blocked while a same-uid process renamed/replaced either
-     * path.  Keep both descriptors pinned for the lock lifetime and refuse an
+    /* A same-uid process may have renamed/replaced either path between the
+     * opens and the (non-blocking) flock succeeding.  Keep both descriptors
+     * pinned for the lock lifetime and refuse an
      * acquisition whose public namespace no longer resolves to those inodes;
      * otherwise a later contender could lock a replacement .lock and enter a
      * supposedly serialized transaction concurrently. */
