@@ -382,10 +382,58 @@ TEST(rollback_z_parser_survives_embedded_newline) {
     CHECK(zfk_find_set("user.name") < 0);
     CHECK(!zfk_was_unset("user.name"));
 
-    /* Keys absent from the listing were snapshotted absent => unset on restore. */
+    /* Keys absent from the listing were snapshotted absent AND seeded into
+     * the exec cache as proven-absent (AR-02 #15); nothing wrote them after
+     * the snapshot, so the restore's unsets are provable no-ops and are
+     * elided rather than exec'd. (restore_unsets_keys_written_after_snapshot
+     * covers the case where a forward write makes the unset real.) */
+    CHECK(!zfk_was_unset("user.signingkey"));
+    CHECK(!zfk_was_unset("commit.gpgsign"));
+    CHECK(!zfk_was_unset("gpg.program"));
+}
+
+/* AR-02 #15: the snapshot's complete -z listing seeds the exec cache, so
+ * git_clear_config — run one exec later by every global switch inside a repo
+ * — elides the --unset calls the listing just proved were unnecessary and
+ * execs only the keys actually present. */
+TEST(snapshot_seeds_cache_and_clear_elides_proven_absent) {
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_clear_config(GIT_SCOPE_GLOBAL), 0);
+
+    run_set_runner(prev);
+
+    /* Present in the listing: really unset. */
+    CHECK(zfk_was_unset("user.name"));
+    CHECK(zfk_was_unset("user.email"));
+    CHECK(zfk_was_unset("core.sshcommand"));
+    /* Proven absent by the listing: elided (pre-fix all six exec'd). */
+    CHECK(!zfk_was_unset("user.signingkey"));
+    CHECK(!zfk_was_unset("commit.gpgsign"));
+    CHECK(!zfk_was_unset("gpg.program"));
+    CHECK_EQ_INT(zfk_unsets, 3);
+}
+
+/* Correctness guard on the elision: a key the snapshot saw absent but that a
+ * later write re-created must still be genuinely unset — only PROVABLE
+ * no-ops may be skipped. */
+TEST(restore_unsets_keys_written_after_snapshot) {
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    /* Forward switch writes a key the listing showed absent... */
+    CHECK_EQ_INT(git_set_config_value("user.signingkey", "AAAA1111BBBB2222",
+                                      GIT_SCOPE_GLOBAL), 0);
+    /* ...so the rollback's unset of it is real and must exec. */
+    CHECK_EQ_INT(git_config_restore(), 0);
+
+    run_set_runner(prev);
     CHECK(zfk_was_unset("user.signingkey"));
-    CHECK(zfk_was_unset("commit.gpgsign"));
-    CHECK(zfk_was_unset("gpg.program"));
 }
 
 /* ---- perf-2: git_test_config reuses git_set_config's read-back ---------- */
@@ -459,6 +507,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_is_repository_caches_result);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
+    RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);
+    RUN_TEST(restore_unsets_keys_written_after_snapshot);
     RUN_TEST(git_test_config_reuses_switch_readback);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()

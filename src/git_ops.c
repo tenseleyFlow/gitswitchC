@@ -212,11 +212,20 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
     size_t list_len = 0;
     if (git_list_config_z(scope, list, sizeof(list), &list_len) == 0 &&
         list_len < sizeof(list) - 1) {
+        int s = cfg_scope_index(scope);
         for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
             if (parse_config_z_value(list, list_len, g_managed_keys[i],
                                      out[i].value, sizeof(out[i].value))) {
                 out[i].present = true;
             }
+            /* AR-02 #15: the complete listing is an authoritative read of
+             * every managed key — presence AND proven absence — so seed the
+             * exec cache instead of discarding it. git_clear_config (run by
+             * the very next step of a global switch) then elides the --unset
+             * execs this listing just proved were no-ops, and reads of
+             * present values are served without a spawn. */
+            cfg_cache_store(s, (int)i, CFG_READBACK, out[i].present,
+                            out[i].value);
         }
         return;
     }
@@ -711,13 +720,18 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
         return -1;
     }
 
-    /* Skip a duplicate unset only when this process already unset the key
-     * itself (same provable-no-op reasoning as the duplicate-write skip). */
+    /* Skip an unset the cache proves is a no-op: this process already unset
+     * the key itself (CFG_WRITTEN/absent — the original duplicate-unset
+     * skip), or a complete --list -z snapshot observed the key absent
+     * (CFG_READBACK/absent, seeded by git_capture_keys — AR-02 #15: the
+     * global-switch clear-local step used to blindly re-exec six unsets the
+     * snapshot one exec earlier had just proved unnecessary). */
     int s = cfg_scope_index(scope);
     int k = cfg_key_index(key);
-    if (s >= 0 && k >= 0 && g_cfg_cache[s][k].state == CFG_WRITTEN &&
-        !g_cfg_cache[s][k].present) {
-        log_debug("Skipping git config --unset %s: already unset by this process", key);
+    if (s >= 0 && k >= 0 && !g_cfg_cache[s][k].present &&
+        (g_cfg_cache[s][k].state == CFG_WRITTEN ||
+         g_cfg_cache[s][k].state == CFG_READBACK)) {
+        log_debug("Skipping git config --unset %s: known absent in this process", key);
         return 0;
     }
 
