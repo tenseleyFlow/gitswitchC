@@ -25,12 +25,14 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       - name: Release build (FORTIFY/RELRO)
         run: make clean && make BUILD_TYPE=release
+      - name: Source distribution self-check
+        run: make distcheck
       - name: Static analysis (cppcheck)
         run: make analyze
-        continue-on-error: true
       - name: Security scan (flawfinder)
         run: make security-scan
-        continue-on-error: true
+      - name: QA negative-path contracts
+        run: make qa-contract-test
 
   freebsd:
     runs-on: ubuntu-latest
