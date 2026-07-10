@@ -167,6 +167,7 @@ TEST(run_passes_extra_env) {
 
 TEST(run_uses_pinned_child_working_directory) {
     char dir[] = "/tmp/gswrunpwd_XXXXXX";
+    char canonical_dir[512];
     char out[512];
     char expected[512];
     char parent_before[512];
@@ -178,6 +179,7 @@ TEST(run_uses_pinned_child_working_directory) {
 
     CHECK(getcwd(parent_before, sizeof(parent_before)) != NULL);
     CHECK(mkdtemp(dir) != NULL);
+    CHECK(realpath(dir, canonical_dir) != NULL);
     CHECK_EQ_INT(chmod(dir, 0700), 0);
     dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     CHECK(dir_fd >= 0);
@@ -189,7 +191,7 @@ TEST(run_uses_pinned_child_working_directory) {
     opts.use_cwd_fd = true;
     CHECK_EQ_INT(run_argv(argv, &opts, &res), 0);
     CHECK(res.spawned);
-    CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected), "%s\n", dir), 0);
+    CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected), "%s\n", canonical_dir), 0);
     CHECK_STR_EQ(out, expected);
 
     CHECK(getcwd(parent_after, sizeof(parent_after)) != NULL);
@@ -203,13 +205,15 @@ TEST(run_uses_pinned_child_working_directory) {
  * before installing its stdout pipe or the pinned fchdir silently fails. */
 TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio) {
     char dir[] = "/tmp/gswrunstdio_XXXXXX";
+    char canonical_dir[512];
     char expected[512];
     pid_t child;
     int status = 0;
 
     CHECK(mkdtemp(dir) != NULL);
+    CHECK(realpath(dir, canonical_dir) != NULL);
     CHECK_EQ_INT(chmod(dir, 0700), 0);
-    CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected), "%s\n", dir), 0);
+    CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected), "%s\n", canonical_dir), 0);
 
     fflush(NULL);
     child = fork();

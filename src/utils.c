@@ -526,7 +526,9 @@ int open_private_subdir_at(int parent_fd, const char *name, bool create,
             *absent = true;
             return -1;
         }
-        if (errno == ELOOP || errno == ENOTDIR) {
+        /* O_NOFOLLOW reports a terminal symlink differently across kernels:
+         * Linux/macOS use ELOOP or ENOTDIR, while FreeBSD returns EMLINK. */
+        if (errno == ELOOP || errno == ENOTDIR || errno == EMLINK) {
             set_error(ERR_PERMISSION_DENIED,
                       "Refusing non-directory/symlink runtime subdirectory: %s",
                       name);
