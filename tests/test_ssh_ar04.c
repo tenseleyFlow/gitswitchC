@@ -13,10 +13,13 @@
 #include "error.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -28,6 +31,40 @@
 
 static char g_xdg[64]; /* keep AF_UNIX paths below sun_path's small cap */
 static int g_runner_calls;
+
+static int test_write_exact(int fd, const void *buf, size_t len) {
+    const unsigned char *p = buf;
+
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n > 0) {
+            p += (size_t)n;
+            len -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int test_read_exact(int fd, void *buf, size_t len) {
+    unsigned char *p = buf;
+
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n > 0) {
+            p += (size_t)n;
+            len -= (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 #ifdef __APPLE__
 static const char *g_test_executable_path;
@@ -243,6 +280,44 @@ static int bind_socket(const char *path) {
     return chmod(path, 0600);
 }
 
+static int bind_socket_for_runner(const char *path, const run_opts_t *opts) {
+    int saved_cwd;
+    int rc;
+
+    if (!opts || !opts->use_cwd_fd) return bind_socket(path);
+    saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
+    if (saved_cwd < 0 || fchdir(opts->cwd_fd) != 0) {
+        if (saved_cwd >= 0) close(saved_cwd);
+        return -1;
+    }
+    rc = bind_socket(path);
+    if (fchdir(saved_cwd) != 0) rc = -1;
+    close(saved_cwd);
+    return rc;
+}
+
+static int listen_socket(const char *path) {
+    struct sockaddr_un addr;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    if (fd < 0 || strlen(path) >= sizeof(addr.sun_path)) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+    if (bind(fd, (struct sockaddr *)(void *)&addr, sizeof(addr)) != 0 ||
+        chmod(path, 0600) != 0 || listen(fd, 8) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        (void)unlink(path);
+        errno = saved_errno;
+        return -1;
+    }
+    return fd;
+}
+
 static bool unix_socket_bind_available(const char *agent_dir) {
     char probe[192];
     snprintf(probe, sizeof(probe), "%s/probe.sock", agent_dir);
@@ -269,7 +344,7 @@ static int fake_agent_runner(const char *const argv[], const run_opts_t *opts,
 
     if (strcmp(argv[0], "ssh-agent") == 0) {
         const char *sock = agent_socket_arg(argv);
-        if (!sock || bind_socket(sock) != 0) return -1;
+        if (!sock || bind_socket_for_runner(sock, opts) != 0) return -1;
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size,
                      "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
@@ -317,6 +392,38 @@ static int setup_runtime(char *agent_dir, size_t size) {
         return -1;
     }
     return mkdir(agent_dir, 0700);
+}
+
+static int make_live_current(const char *agent_dir, const char *account,
+                             char *sock, size_t sock_size,
+                             char *current, size_t current_size) {
+    int listener;
+
+    if ((size_t)snprintf(sock, sock_size, "%s/ssh-agent.%s.sock",
+                         agent_dir, account) >= sock_size ||
+        (size_t)snprintf(current, current_size, "%s/current.sock",
+                         agent_dir) >= current_size) {
+        return -1;
+    }
+    listener = listen_socket(sock);
+    if (listener < 0) {
+        return -1;
+    }
+    if (symlink(sock, current) != 0) {
+        close(listener);
+        (void)unlink(sock);
+        return -1;
+    }
+    return listener;
+}
+
+static void check_current_account_rejected(void) {
+    char name[MAX_NAME_LEN] = "unchanged";
+    bool present = true;
+
+    CHECK_EQ_INT(ssh_manager_get_current_account(name, sizeof(name), &present), -1);
+    CHECK(!present);
+    CHECK(name[0] == '\0');
 }
 
 static int write_text_file(const char *path, const char *text) {
@@ -402,6 +509,235 @@ static void make_account(account_t *account) {
     snprintf(account->email, sizeof(account->email), "w@x.com");
     account->ssh_enabled = true;
     snprintf(account->ssh_key_path, sizeof(account->ssh_key_path), "%s/key", g_xdg);
+}
+
+TEST(current_account_reports_absent_and_valid_live_socket) {
+    char agent_dir[128], sock[192], current[192], name[MAX_NAME_LEN];
+    bool present = true;
+    int listener;
+
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    name[0] = 'x';
+    CHECK_EQ_INT(ssh_manager_get_current_account(name, sizeof(name), &present), 0);
+    CHECK(!present);
+    CHECK(name[0] == '\0');
+
+    listener = make_live_current(agent_dir, "alice.sock.work",
+                                 sock, sizeof(sock), current, sizeof(current));
+    CHECK(listener >= 0);
+    if (listener < 0) return;
+
+    CHECK_EQ_INT(ssh_manager_get_current_account(name, sizeof(name), &present), 0);
+    CHECK(present);
+    CHECK_STR_EQ(name, "alice.sock.work");
+
+    close(listener);
+    (void)unlink(current);
+    (void)unlink(sock);
+}
+
+TEST(current_account_rejects_unsafe_malformed_and_stale_state) {
+    char agent_dir[128], current[192], sock[192], target[MAX_PATH_LEN];
+    char *long_target;
+    int listener;
+
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
+
+    CHECK_EQ_INT(chmod(agent_dir, 0755), 0);
+    check_current_account_rejected();
+    CHECK_EQ_INT(chmod(agent_dir, 0700), 0);
+
+    CHECK_EQ_INT(write_text_file(current, "not a symlink\n"), 0);
+    check_current_account_rejected();
+    CHECK_EQ_INT(unlink(current), 0);
+
+    CHECK_EQ_INT(symlink("ssh-agent.work.sock", current), 0);
+    check_current_account_rejected();
+    CHECK_EQ_INT(unlink(current), 0);
+
+    snprintf(target, sizeof(target), "%s/nested/ssh-agent.work.sock", agent_dir);
+    CHECK_EQ_INT(symlink(target, current), 0);
+    check_current_account_rejected();
+    CHECK_EQ_INT(unlink(current), 0);
+
+    CHECK_EQ_INT(bind_socket(sock), 0); /* socket inode with no live listener */
+    CHECK_EQ_INT(symlink(sock, current), 0);
+    check_current_account_rejected();
+    CHECK_EQ_INT(unlink(current), 0);
+    CHECK_EQ_INT(unlink(sock), 0);
+
+    listener = make_live_current(agent_dir, "work", sock, sizeof(sock),
+                                 current, sizeof(current));
+    CHECK(listener >= 0);
+    if (listener >= 0) {
+        CHECK_EQ_INT(chmod(sock, 0660), 0);
+        check_current_account_rejected();
+        close(listener);
+        (void)unlink(current);
+        (void)unlink(sock);
+    }
+
+    /* Exercise the readlink-cap rejection where the host filesystem permits a
+     * target this large. Hosts with a smaller native symlink cap reject the
+     * fixture before the API can observe it. */
+    long_target = malloc(MAX_PATH_LEN);
+    CHECK(long_target != NULL);
+    if (long_target) {
+        memset(long_target, 'x', MAX_PATH_LEN - 1);
+        long_target[0] = '/';
+        long_target[MAX_PATH_LEN - 1] = '\0';
+        if (symlink(long_target, current) == 0) {
+            check_current_account_rejected();
+            (void)unlink(current);
+        }
+        free(long_target);
+    }
+}
+
+TEST(current_account_accepts_longest_bindable_name_without_truncation) {
+    char agent_dir[128], sock[192], current[192];
+    char account[MAX_NAME_LEN], actual[MAX_NAME_LEN], short_output[MAX_NAME_LEN];
+    size_t socket_limit = sizeof(((struct sockaddr_un *)0)->sun_path) - 1;
+    size_t fixed_len;
+    size_t account_len;
+    bool present = true;
+    int listener;
+
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    fixed_len = strlen(agent_dir) + strlen("/ssh-agent.") + strlen(".sock");
+    CHECK(fixed_len < socket_limit);
+    if (fixed_len >= socket_limit) return;
+    account_len = socket_limit - fixed_len;
+    CHECK(account_len > 0 && account_len < sizeof(account));
+    if (account_len >= sizeof(account)) return;
+    memset(account, 'a', account_len);
+    account[account_len] = '\0';
+
+    listener = make_live_current(agent_dir, account, sock, sizeof(sock),
+                                 current, sizeof(current));
+    CHECK(listener >= 0);
+    if (listener < 0) return;
+    CHECK_EQ_INT(strlen(sock), socket_limit);
+
+    CHECK_EQ_INT(ssh_manager_get_current_account(short_output, account_len,
+                                                  &present), -1);
+    CHECK(!present);
+    CHECK(short_output[0] == '\0');
+
+    CHECK_EQ_INT(ssh_manager_get_current_account(actual, sizeof(actual), &present), 0);
+    CHECK(present);
+    CHECK_STR_EQ(actual, account);
+
+    close(listener);
+    (void)unlink(current);
+    (void)unlink(sock);
+}
+
+TEST(current_account_waits_for_manager_lock) {
+    typedef struct {
+        int rc;
+        int present;
+        char name[MAX_NAME_LEN];
+    } query_result_t;
+    char agent_dir[128], sock[192], current[192], lock_path[192];
+    int ready_pipe[2] = {-1, -1};
+    int result_pipe[2] = {-1, -1};
+    int listener = -1;
+    int lock_fd = -1;
+    pid_t child = -1;
+    char ready = '\0';
+    struct pollfd pfd;
+    query_result_t result;
+    int status = 0;
+    int poll_rc;
+
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    listener = make_live_current(agent_dir, "locked", sock, sizeof(sock),
+                                 current, sizeof(current));
+    CHECK(listener >= 0);
+    if (listener < 0) return;
+    snprintf(lock_path, sizeof(lock_path), "%s/.lock", agent_dir);
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    CHECK(lock_fd >= 0);
+    CHECK(lock_fd >= 0 && flock(lock_fd, LOCK_EX) == 0);
+    CHECK_EQ_INT(pipe(ready_pipe), 0);
+    CHECK_EQ_INT(pipe(result_pipe), 0);
+    if (lock_fd < 0 || ready_pipe[0] < 0 || result_pipe[0] < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        bool child_present = false;
+
+        close(ready_pipe[0]);
+        close(result_pipe[0]);
+        close(lock_fd);
+        if (test_write_exact(ready_pipe[1], "R", 1) != 0) _exit(2);
+        memset(&result, 0, sizeof(result));
+        result.rc = ssh_manager_get_current_account(result.name,
+                                                     sizeof(result.name),
+                                                     &child_present);
+        result.present = child_present ? 1 : 0;
+        if (test_write_exact(result_pipe[1], &result, sizeof(result)) != 0) {
+            _exit(2);
+        }
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
+
+    close(ready_pipe[1]);
+    ready_pipe[1] = -1;
+    close(result_pipe[1]);
+    result_pipe[1] = -1;
+    CHECK_EQ_INT(test_read_exact(ready_pipe[0], &ready, 1), 0);
+    CHECK_EQ_INT(ready, 'R');
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = result_pipe[0];
+    pfd.events = POLLIN;
+    do {
+        poll_rc = poll(&pfd, 1, 150);
+    } while (poll_rc < 0 && errno == EINTR);
+    CHECK_EQ_INT(poll_rc, 0); /* query must still be blocked */
+
+    CHECK_EQ_INT(flock(lock_fd, LOCK_UN), 0);
+    close(lock_fd);
+    lock_fd = -1;
+    do {
+        poll_rc = poll(&pfd, 1, 2000);
+    } while (poll_rc < 0 && errno == EINTR);
+    CHECK(poll_rc > 0 && (pfd.revents & POLLIN) != 0);
+    if (poll_rc > 0 && (pfd.revents & POLLIN) != 0) {
+        CHECK_EQ_INT(test_read_exact(result_pipe[0], &result, sizeof(result)), 0);
+        CHECK_EQ_INT(result.rc, 0);
+        CHECK_EQ_INT(result.present, 1);
+        CHECK_STR_EQ(result.name, "locked");
+    } else {
+        (void)kill(child, SIGKILL);
+    }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+cleanup:
+    if (lock_fd >= 0) {
+        (void)flock(lock_fd, LOCK_UN);
+        close(lock_fd);
+    }
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    for (size_t i = 0; i < 2; i++) {
+        if (ready_pipe[i] >= 0) close(ready_pipe[i]);
+        if (result_pipe[i] >= 0) close(result_pipe[i]);
+    }
+    close(listener);
+    (void)unlink(current);
+    (void)unlink(sock);
 }
 
 TEST(fresh_agent_retarget_failure_reaps_and_restores_environment) {
@@ -1024,6 +1360,10 @@ int main(int argc, char **argv) {
     (void)argv;
 #endif
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(current_account_reports_absent_and_valid_live_socket);
+    RUN_TEST(current_account_rejects_unsafe_malformed_and_stale_state);
+    RUN_TEST(current_account_accepts_longest_bindable_name_without_truncation);
+    RUN_TEST(current_account_waits_for_manager_lock);
     RUN_TEST(fresh_agent_retarget_failure_reaps_and_restores_environment);
     RUN_TEST(fresh_agent_environment_failure_reaps_and_restores_partial_mutation);
     RUN_TEST(fresh_agent_aborts_when_orphan_cleanup_is_incomplete);

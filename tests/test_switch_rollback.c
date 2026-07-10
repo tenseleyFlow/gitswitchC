@@ -27,10 +27,12 @@
 #include "accounts.h"
 #include "git_ops.h"
 #include "signals.h"
+#include "ssh_manager.h"
 #include "utils.h"
 #include "error.h"
 
 #include <signal.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -84,7 +86,14 @@ static bool symlink_present(const char *path) {
 static bool g_fail_user_name_set;   /* fail `git config <scope> user.name X` */
 static bool g_raise_on_user_name;   /* raise SIGINT during that same command */
 static bool g_fail_list_config;     /* force snapshot's per-key fallback */
+static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
 static FILE *g_log;                 /* when set, every argv is logged here */
+
+static bool refuse_session_agent_reap(pid_t pid, const char *socket_arg) {
+    (void)pid;
+    (void)socket_arg;
+    return false;
+}
 
 /* Minimal fake config store so git_set_config's read-back verification sees
  * what was "written". Only the two identity keys matter to these tests. */
@@ -149,6 +158,13 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
     if (g_fail_list_config && is_config_list(argv)) {
         exit_code = 1;
     } else if (is_config_write(argv, "user.name")) {
+        if (g_retarget_gpg_on_user_name) {
+            unlink(g_gpg_link);
+            if (symlink(g_retarget_gpg_on_user_name, g_gpg_link) != 0) {
+                exit_code = 1;
+            }
+            g_retarget_gpg_on_user_name = NULL;
+        }
         if (g_raise_on_user_name) {
             g_raise_on_user_name = false; /* once */
             if (g_log) { fprintf(g_log, "MARK-RAISE\n"); fflush(g_log); }
@@ -198,6 +214,25 @@ static int bind_fake_agent_socket(const char *path) {
     return chmod(path, 0600);
 }
 
+static int bind_fake_agent_socket_for_runner(const char *path,
+                                             const run_opts_t *opts) {
+    int saved_cwd;
+    int rc;
+
+    if (!opts || !opts->use_cwd_fd) {
+        return bind_fake_agent_socket(path);
+    }
+    saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
+    if (saved_cwd < 0 || fchdir(opts->cwd_fd) != 0) {
+        if (saved_cwd >= 0) close(saved_cwd);
+        return -1;
+    }
+    rc = bind_fake_agent_socket(path);
+    if (fchdir(saved_cwd) != 0) rc = -1;
+    close(saved_cwd);
+    return rc;
+}
+
 /* Extends fake_runner with a working fake ssh-agent (binds the -a socket) and
  * a happy ssh-add, so accounts_switch can walk the full SSH activation and
  * the rollback can genuinely re-start the previous account's agent. git
@@ -223,7 +258,7 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
             memset(result, 0, sizeof(*result));
             result->spawned = true;
         }
-        if (bind_fake_agent_socket(sock) != 0) return -1;
+        if (bind_fake_agent_socket_for_runner(sock, opts) != 0) return -1;
         if (opts && opts->out && opts->out_size > 0) {
             snprintf(opts->out, opts->out_size,
                      "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
@@ -385,6 +420,8 @@ static void seed_previous_git_identity(void) {
     g_fail_list_config = true;
 }
 
+static int write_fake_key(const char *path);
+
 /* ---- tests ---------------------------------------------------------------- */
 
 /* F4: a switch that fails AT the git-config step must leave the previous
@@ -527,6 +564,158 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
      * survive; pre-fix the abort path reaped them. */
     CHECK(symlink_present(g_ssh_sock));
     CHECK(symlink_present(g_gpg_link));
+}
+
+/* A repeated switch used to call accounts_session_cleanup() before taking its
+ * rollback snapshot or validating the next target. Consequently, a malformed
+ * second target could stop the first switch's owned agent and return early
+ * with current.sock dangling. The read-only failure must leave both the
+ * in-process session and its published live socket untouched. */
+TEST(repeated_switch_validation_failure_keeps_live_session) {
+    char first_key[512];
+    char target[512];
+    ssize_t target_len;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *first = &ctx.accounts[0];
+    snprintf(first_key, sizeof(first_key), "%s/key_first", g_xdg);
+    CHECK_EQ_INT(write_fake_key(first_key), 0);
+    first->ssh_enabled = true;
+    safe_strncpy(first->ssh_key_path, first_key,
+                 sizeof(first->ssh_key_path));
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_fail_list_config = true;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    signals_guard_end();
+
+    target_len = readlink(g_ssh_sock, target, sizeof(target) - 1);
+    CHECK(target_len > 0);
+    if (target_len > 0) {
+        target[target_len] = '\0';
+        CHECK(path_exists(target));
+    }
+
+    account_t *broken = &ctx.accounts[1];
+    memset(broken, 0, sizeof(*broken));
+    broken->id = 2;
+    safe_strncpy(broken->name, "broken", sizeof(broken->name));
+    safe_strncpy(broken->email, "broken@example.com", sizeof(broken->email));
+    safe_strncpy(broken->description, "invalid second target",
+                 sizeof(broken->description));
+    broken->preferred_scope = GIT_SCOPE_GLOBAL;
+    broken->ssh_enabled = true;
+    safe_strncpy(broken->ssh_key_path, "/definitely/missing/gitswitch-key",
+                 sizeof(broken->ssh_key_path));
+    ctx.account_count = 2;
+
+    CHECK_EQ_INT(accounts_switch(&ctx, "broken"), -1);
+    CHECK(ctx.current_account == first);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+
+    target_len = readlink(g_ssh_sock, target, sizeof(target) - 1);
+    CHECK(target_len > 0);
+    if (target_len > 0) {
+        target[target_len] = '\0';
+        CHECK(path_exists(target));
+    }
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+}
+
+/* If guarded cleanup of the prior owned agent cannot prove it dead, a
+ * repeated switch must stop immediately. The old live session is still the
+ * only truthful state: retain its PID/socket/environment and leave both the
+ * caller's active-account metadata and current.sock untouched for retry. */
+TEST(repeated_switch_reap_failure_preserves_live_session) {
+    char first_key[512];
+    char second_key[512];
+    char first_target[512];
+    char target_after[512];
+    char auth_sock_before[512];
+    char agent_pid_before[64];
+    ssize_t first_len;
+    ssize_t after_len;
+    ssh_reap_fn previous_reap;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *first = &ctx.accounts[0];
+    snprintf(first_key, sizeof(first_key), "%s/key_first", g_xdg);
+    CHECK_EQ_INT(write_fake_key(first_key), 0);
+    first->ssh_enabled = true;
+    safe_strncpy(first->ssh_key_path, first_key,
+                 sizeof(first->ssh_key_path));
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_fail_list_config = true;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    signals_guard_end();
+
+    first_len = readlink(g_ssh_sock, first_target, sizeof(first_target) - 1);
+    CHECK(first_len > 0);
+    if (first_len > 0) first_target[first_len] = '\0';
+    CHECK(first_len > 0 && path_exists(first_target));
+    safe_strncpy(auth_sock_before, getenv("SSH_AUTH_SOCK"),
+                 sizeof(auth_sock_before));
+    safe_strncpy(agent_pid_before, getenv("SSH_AGENT_PID"),
+                 sizeof(agent_pid_before));
+
+    account_t *second = &ctx.accounts[1];
+    memset(second, 0, sizeof(*second));
+    second->id = 2;
+    safe_strncpy(second->name, "second", sizeof(second->name));
+    safe_strncpy(second->email, "second@example.com", sizeof(second->email));
+    safe_strncpy(second->description, "valid second target",
+                 sizeof(second->description));
+    second->preferred_scope = GIT_SCOPE_GLOBAL;
+    second->ssh_enabled = true;
+    snprintf(second_key, sizeof(second_key), "%s/key_second", g_xdg);
+    CHECK_EQ_INT(write_fake_key(second_key), 0);
+    safe_strncpy(second->ssh_key_path, second_key,
+                 sizeof(second->ssh_key_path));
+    ctx.account_count = 2;
+
+    previous_reap = ssh_manager_set_reap_fn(refuse_session_agent_reap);
+    CHECK_EQ_INT(accounts_switch(&ctx, "second"), -1);
+    ssh_manager_set_reap_fn(previous_reap);
+
+    CHECK(ctx.current_account == first);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(getenv("SSH_AUTH_SOCK"), auth_sock_before);
+    CHECK_STR_EQ(getenv("SSH_AGENT_PID"), agent_pid_before);
+    after_len = readlink(g_ssh_sock, target_after, sizeof(target_after) - 1);
+    CHECK_EQ_INT((int)after_len, (int)first_len);
+    if (after_len > 0) {
+        target_after[after_len] = '\0';
+        CHECK_STR_EQ(target_after, first_target);
+        CHECK(path_exists(target_after));
+    }
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
 }
 
 /* Write a private-key-shaped 0600 file so ssh_validate_key_file accepts it. */
@@ -1096,6 +1285,57 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
     }
 }
 
+/* A failed transaction may share XDG_RUNTIME_DIR with a later writer whose
+ * HOME gives it a different outer config lock. Rollback must compare the
+ * current link with its own installed target before restoring the snapshot;
+ * otherwise it overwrites the later writer with `prevhome`. */
+TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
+    char later_home[512];
+    char target[512];
+    ssize_t n;
+
+    if (!command_exists("gpg")) {
+        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
+        return;
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
+    snprintf(later_home, sizeof(later_home), "%s/gitswitch-gpg/later", g_xdg);
+    CHECK_EQ_INT(mkdir(later_home, 0700), 0);
+
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *tgt = &ctx.accounts[0];
+    account_t *prev = add_previous_account(&ctx);
+    prev->gpg_enabled = true;
+    safe_strncpy(prev->gpg_key_id, "0123456789ABCDEF",
+                 sizeof(prev->gpg_key_id));
+    tgt->gpg_enabled = true;
+    safe_strncpy(tgt->gpg_key_id, "FEEDFACE01234567",
+                 sizeof(tgt->gpg_key_id));
+
+    seed_previous_git_identity();
+    g_retarget_gpg_on_user_name = later_home;
+    g_fail_user_name_set = true;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    command_runner_fn previous_runner = run_set_runner(gpg_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_retarget_gpg_on_user_name = NULL;
+    g_fail_user_name_set = false;
+    g_fail_list_config = false;
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+
+    CHECK_EQ_INT(rc, -1);
+    n = readlink(g_gpg_link, target, sizeof(target) - 1);
+    CHECK(n > 0);
+    if (n > 0) {
+        target[n] = '\0';
+        CHECK_STR_EQ(target, later_home);
+    }
+}
+
 /* ---- AR-03 M3: guard continuity through the post-switch window ------------ */
 
 /* A signal landing AFTER the switch completed but BEFORE main() persists the
@@ -1197,6 +1437,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
     RUN_TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg);
     RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
+    RUN_TEST(repeated_switch_validation_failure_keeps_live_session);
+    RUN_TEST(repeated_switch_reap_failure_preserves_live_session);
     RUN_TEST(ssh_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_restarts_previous_accounts_agent);
     RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);
@@ -1206,6 +1448,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(symlinked_ssh_config_fails_before_switch_mutation);
     RUN_TEST(gpg_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_retargets_gpg_current_to_previous_home);
+    RUN_TEST(failed_switch_does_not_overwrite_later_gpg_writer);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()

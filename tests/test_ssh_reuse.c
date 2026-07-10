@@ -23,6 +23,8 @@
 #include "utils.h"
 #include "error.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,6 +42,95 @@
 #define FP_B "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
 static int g_agent_start_attempts; /* execs of ssh-agent (i.e. reuse REFUSED) */
+static const char *g_pid_link_to_plant;
+static const char *g_pid_link_target;
+static bool g_replace_dir_on_key_probe;
+static bool g_replace_dir_on_agent_start;
+static bool g_key_load_used_pinned_socket;
+static char g_moved_agent_dir[256];
+static char g_xdg[64]; /* short: the socket path must fit sun_path (~108) */
+
+static int replace_agent_dir_namespace(void) {
+    char live[256];
+
+    if ((size_t)snprintf(live, sizeof(live), "%s/gitswitch-ssh", g_xdg) >=
+            sizeof(live) ||
+        (size_t)snprintf(g_moved_agent_dir, sizeof(g_moved_agent_dir),
+                         "%s/gitswitch-ssh.pinned", g_xdg) >=
+            sizeof(g_moved_agent_dir)) {
+        return -1;
+    }
+    if (rename(live, g_moved_agent_dir) != 0 || mkdir(live, 0700) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int replace_agent_dir_after_commit(int dir_fd) {
+    (void)dir_fd;
+    return replace_agent_dir_namespace();
+}
+
+static int with_runner_cwd(const run_opts_t *opts,
+                           int (*operation)(const char *),
+                           const char *path) {
+    int saved_cwd = -1;
+    int rc;
+
+    if (!opts || !opts->use_cwd_fd) {
+        return operation(path);
+    }
+    saved_cwd = open(".", O_RDONLY | O_CLOEXEC);
+    if (saved_cwd < 0 || fchdir(opts->cwd_fd) != 0) {
+        if (saved_cwd >= 0) close(saved_cwd);
+        return -1;
+    }
+    rc = operation(path);
+    if (fchdir(saved_cwd) != 0) rc = -1;
+    close(saved_cwd);
+    return rc;
+}
+
+static int bind_and_chmod_socket(const char *path) {
+    struct sockaddr_un addr;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+
+    if (fd < 0 || strlen(path) >= sizeof(addr.sun_path)) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strcpy(addr.sun_path, path);
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return chmod(path, 0600);
+}
+
+static bool refuse_agent_reap(pid_t pid, const char *socket_arg) {
+    (void)pid;
+    (void)socket_arg;
+    return false;
+}
+
+static int swap_pid_temp_path(int dir_fd, const char *temp_name) {
+    static const char replacement[] = "replacement\n";
+    int fd;
+
+    if (unlinkat(dir_fd, temp_name, 0) != 0) return -1;
+    fd = openat(dir_fd, temp_name,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    if (write(fd, replacement, sizeof(replacement) - 1) !=
+        (ssize_t)(sizeof(replacement) - 1)) {
+        close(fd);
+        return -1;
+    }
+    return close(fd);
+}
 
 static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
                            run_result_t *result) {
@@ -62,6 +153,10 @@ static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
 
     /* ssh-add -l (against the socket in opts->extra_env): agent holds keyA. */
     if (strcmp(argv[0], "ssh-add") == 0 && argv[1] && strcmp(argv[1], "-l") == 0) {
+        if (g_replace_dir_on_key_probe) {
+            g_replace_dir_on_key_probe = false;
+            if (replace_agent_dir_namespace() != 0) return -1;
+        }
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size, "256 %s agent-key (ED25519)\n", FP_A);
             if (result) result->out_len = strlen(opts->out);
@@ -82,8 +177,6 @@ static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
 
 /* Scratch runtime dir + a real 0600 unix socket standing in for the agent.
  * Returns 0 on success; sock_out receives the per-account socket path. */
-static char g_xdg[64]; /* short: the socket path must fit sun_path (~108) */
-
 static int setup_agent_socket(const char *account, char *sock_out, size_t size) {
     char dir[128];
     struct sockaddr_un addr;
@@ -140,6 +233,7 @@ TEST(ssh_fingerprint_reuse_adopts_matching_key) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
+    CHECK_EQ_INT(setenv("SSH_AGENT_PID", "99999", 1), 0);
 
     g_agent_start_attempts = 0;
     prev = run_set_runner(fake_ssh_runner);
@@ -148,6 +242,9 @@ TEST(ssh_fingerprint_reuse_adopts_matching_key) {
 
     CHECK_EQ_INT(rc, 0);
     CHECK(cfg.key_already_loaded);       /* caller skips ssh_add_key */
+    CHECK(!cfg.agent_owned);             /* no verified PID => never claim ownership */
+    CHECK_EQ_INT(cfg.agent_pid, -1);
+    CHECK(getenv("SSH_AGENT_PID") == NULL);
     CHECK_EQ_INT(g_agent_start_attempts, 0); /* no restart, no re-prompt */
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK(path_exists(sock));            /* the live agent was not reaped */
@@ -215,21 +312,17 @@ static int fake_quoting_agent_runner(const char *const argv[],
                 break;
             }
         }
-        struct sockaddr_un addr;
-        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (!sock || fd < 0 || strlen(sock) >= sizeof(addr.sun_path)) {
-            if (fd >= 0) close(fd);
+        if (!sock) return -1;
+        if (g_replace_dir_on_agent_start) {
+            g_replace_dir_on_agent_start = false;
+            if (replace_agent_dir_namespace() != 0) return -1;
+        }
+        if (with_runner_cwd(opts, bind_and_chmod_socket, sock) != 0) return -1;
+        if (g_pid_link_to_plant && g_pid_link_target &&
+            symlink(g_pid_link_target, g_pid_link_to_plant) != 0) {
+            (void)unlink(sock);
             return -1;
         }
-        memset(&addr, 0, sizeof(addr));
-        addr.sun_family = AF_UNIX;
-        strcpy(addr.sun_path, sock);
-        if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
-            close(fd);
-            return -1;
-        }
-        close(fd);
-        if (chmod(sock, 0600) != 0) return -1;
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size,
                      "SSH_AUTH_SOCK=\"%s\"; export SSH_AUTH_SOCK;\n"
@@ -238,6 +331,22 @@ static int fake_quoting_agent_runner(const char *const argv[],
             if (result) result->out_len = strlen(opts->out);
         }
         return 0;
+    }
+    if (strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
+        strcmp(argv[1], "-l") != 0) {
+        const char *sock_env = NULL;
+        if (opts && opts->extra_env) {
+            for (size_t i = 0; opts->extra_env[i]; i++) {
+                if (strncmp(opts->extra_env[i], "SSH_AUTH_SOCK=", 14) == 0) {
+                    sock_env = opts->extra_env[i] + 14;
+                    break;
+                }
+            }
+        }
+        g_key_load_used_pinned_socket = opts && opts->use_cwd_fd &&
+            opts->cwd_fd >= 0 && sock_env &&
+            strcmp(sock_env, "ssh-agent.work.sock") == 0;
+        return g_key_load_used_pinned_socket ? 0 : -1;
     }
     /* No reusable socket exists in this test, so ssh-keygen/ssh-add answers
      * are irrelevant; succeed quietly. */
@@ -271,6 +380,313 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     CHECK_EQ_INT(rc, 0);
     CHECK(strchr(cfg.agent_socket_path, '"') == NULL); /* quotes stripped */
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
+    CHECK(g_key_load_used_pinned_socket);
+}
+
+/* The final public namespace check must run after current.sock is committed.
+ * A same-uid replacement at that exact breakpoint is a failed transaction;
+ * the pinned agent, PID sidecar, and link are cleaned from the moved inode. */
+TEST(fresh_commit_revalidates_public_agent_directory) {
+    char public_dir[256];
+    char public_current[384];
+    char moved_sock[384];
+    char moved_pid[384];
+    char moved_current[384];
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev_runner;
+    ssh_namespace_commit_hook_fn prev_hook;
+
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
+    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
+    snprintf(public_dir, sizeof(public_dir), "%s/gitswitch-ssh", g_xdg);
+    snprintf(public_current, sizeof(public_current), "%s/current.sock",
+             public_dir);
+
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    prev_hook = ssh_manager_set_namespace_commit_hook_fn(
+        replace_agent_dir_after_commit);
+    prev_runner = run_set_runner(fake_quoting_agent_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+    run_set_runner(prev_runner);
+    ssh_manager_set_namespace_commit_hook_fn(prev_hook);
+
+    snprintf(moved_sock, sizeof(moved_sock),
+             "%s/ssh-agent.work.sock", g_moved_agent_dir);
+    snprintf(moved_pid, sizeof(moved_pid),
+             "%s/ssh-agent.work.pid", g_moved_agent_dir);
+    snprintf(moved_current, sizeof(moved_current),
+             "%s/current.sock", g_moved_agent_dir);
+    CHECK(!path_exists(public_current));
+    CHECK(!path_exists(moved_sock));
+    CHECK(!path_exists(moved_pid));
+    CHECK(!path_exists(moved_current));
+    CHECK(!cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, -1);
+}
+
+/* A planted symlink at the account socket path must never be treated as an
+ * agent socket merely because its target is a valid self-owned 0600 socket. */
+TEST(ssh_reuse_refuses_symlinked_agent_socket) {
+    char sock[256], external[256];
+    struct stat st;
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    snprintf(external, sizeof(external), "%s/external-agent.sock", g_xdg);
+    CHECK_EQ_INT(rename(sock, external), 0);
+    CHECK_EQ_INT(symlink(external, sock), 0);
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_agent_start_attempts = 0;
+    prev = run_set_runner(fake_ssh_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(g_agent_start_attempts, 1);
+    CHECK(!cfg.key_already_loaded);
+    CHECK_EQ_INT(lstat(external, &st), 0);
+    CHECK(S_ISSOCK(st.st_mode));
+    CHECK(lstat(sock, &st) != 0 && errno == ENOENT);
+}
+
+/* Reuse reads its PID record as untrusted runtime state. A symlinked sidecar
+ * is an error, not a path to fopen and not a reason to mutate its target. */
+TEST(ssh_reuse_refuses_symlinked_pid_sidecar) {
+    char sock[256], pid_path[256], victim[256], content[64];
+    struct stat st;
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    snprintf(pid_path, sizeof(pid_path),
+             "%s/gitswitch-ssh/ssh-agent.work.pid", g_xdg);
+    snprintf(victim, sizeof(victim), "%s/precious", g_xdg);
+    CHECK_EQ_INT(write_string_to_file(victim, "424242\n", 0600), 0);
+    CHECK_EQ_INT(symlink(victim, pid_path), 0);
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_agent_start_attempts = 0;
+    prev = run_set_runner(fake_ssh_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(g_agent_start_attempts, 0);
+    CHECK_EQ_INT(lstat(pid_path, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK_EQ_INT(read_file_to_string(victim, content, sizeof(content)), 7);
+    CHECK_STR_EQ(content, "424242\n");
+    CHECK(path_exists(sock));
+}
+
+/* The fresh-start sidecar commit uses temp+rename inside the pinned agent
+ * directory. Plant a symlink after orphan cleanup but before the write: the
+ * link itself must be atomically replaced and its target left untouched. */
+TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
+    char dir[128], pid_path[256], victim[256], content[64];
+    struct stat st;
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
+    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
+    snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg);
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+    snprintf(victim, sizeof(victim), "%s/precious", g_xdg);
+    CHECK_EQ_INT(write_string_to_file(victim, "keep\n", 0600), 0);
+
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_pid_link_to_plant = pid_path;
+    g_pid_link_target = victim;
+    prev = run_set_runner(fake_quoting_agent_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), 0);
+    run_set_runner(prev);
+    g_pid_link_to_plant = NULL;
+    g_pid_link_target = NULL;
+
+    CHECK_EQ_INT(read_file_to_string(victim, content, sizeof(content)), 5);
+    CHECK_STR_EQ(content, "keep\n");
+    CHECK_EQ_INT(lstat(pid_path, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK_EQ_INT(st.st_mode & 0777, 0600);
+    CHECK_EQ_INT(read_file_to_string(pid_path, content, sizeof(content)), 6);
+    CHECK_STR_EQ(content, "12345\n");
+}
+
+/* Reuse must stay inside the directory inode it pinned. Replacing the public
+ * gitswitch-ssh pathname during the ssh-add probe must abort without reaping
+ * the still-live socket in the renamed pinned directory or publishing state
+ * into the replacement namespace. */
+TEST(reuse_aborts_on_agent_directory_namespace_replacement) {
+    char moved_sock[384];
+    char moved_current[384];
+    char public_sock[384];
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(setup_agent_socket("work", public_sock,
+                                    sizeof(public_sock)), 0);
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_replace_dir_on_key_probe = true;
+    prev = run_set_runner(fake_ssh_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+    run_set_runner(prev);
+    g_replace_dir_on_key_probe = false;
+
+    snprintf(moved_sock, sizeof(moved_sock),
+             "%s/ssh-agent.work.sock", g_moved_agent_dir);
+    snprintf(moved_current, sizeof(moved_current),
+             "%s/current.sock", g_moved_agent_dir);
+    CHECK(path_exists(moved_sock));
+    CHECK(!path_exists(moved_current));
+    CHECK(!path_exists(public_sock));
+    CHECK(!cfg.agent_owned);
+}
+
+/* A fresh agent is started with a relative -a argument and a pinned cwd.
+ * Even when the public directory pathname is replaced inside the runner, no
+ * socket/sidecar/link may be split across the two namespaces and success may
+ * not be reported through a public path that names the replacement. */
+TEST(fresh_start_aborts_and_cleans_on_namespace_replacement) {
+    char public_dir[256];
+    char public_sock[384];
+    char moved_sock[384];
+    char moved_pid[384];
+    char moved_current[384];
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
+    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
+    snprintf(public_dir, sizeof(public_dir), "%s/gitswitch-ssh", g_xdg);
+    snprintf(public_sock, sizeof(public_sock),
+             "%s/ssh-agent.work.sock", public_dir);
+
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_replace_dir_on_agent_start = true;
+    prev = run_set_runner(fake_quoting_agent_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+    run_set_runner(prev);
+    g_replace_dir_on_agent_start = false;
+
+    snprintf(moved_sock, sizeof(moved_sock),
+             "%s/ssh-agent.work.sock", g_moved_agent_dir);
+    snprintf(moved_pid, sizeof(moved_pid),
+             "%s/ssh-agent.work.pid", g_moved_agent_dir);
+    snprintf(moved_current, sizeof(moved_current),
+             "%s/current.sock", g_moved_agent_dir);
+    CHECK(!path_exists(public_sock));
+    CHECK(!path_exists(moved_sock));
+    CHECK(!path_exists(moved_pid));
+    CHECK(!path_exists(moved_current));
+    CHECK(!cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, -1);
+}
+
+/* The deterministic PID temp name is attacker-visible. Replace it after the
+ * writer fsyncs its opened fd but before renameat: the replacement must not be
+ * installed as the sidecar or deleted as if it were the writer's inode. */
+TEST(pid_sidecar_rejects_temp_path_inode_swap) {
+    char dir[256];
+    char temp_path[384];
+    char pid_path[384];
+    char content[64];
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev_runner;
+    ssh_pid_commit_hook_fn prev_hook;
+
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
+    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
+    snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg);
+    snprintf(temp_path, sizeof(temp_path),
+             "%s/.ssh-agent.work.pid.tmp.%d", dir, (int)getpid());
+    snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
+
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    prev_hook = ssh_manager_set_pid_commit_hook_fn(swap_pid_temp_path);
+    prev_runner = run_set_runner(fake_quoting_agent_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+    run_set_runner(prev_runner);
+    ssh_manager_set_pid_commit_hook_fn(prev_hook);
+
+    CHECK(!path_exists(pid_path));
+    CHECK_EQ_INT(read_file_to_string(temp_path, content, sizeof(content)), 12);
+    CHECK_STR_EQ(content, "replacement\n");
+    CHECK(!cfg.agent_owned);
+}
+
+/* A failed reaper is retained state, not a warning. stop must leave the PID,
+ * ownership, socket, and exported environment intact for a later retry. */
+TEST(stop_agent_reap_failure_preserves_retry_handle) {
+    char sock[256];
+    ssh_config_t cfg;
+    ssh_reap_fn prev_reap;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    safe_strncpy(cfg.agent_socket_path, sock, sizeof(cfg.agent_socket_path));
+    safe_strncpy(cfg.agent_socket_arg, "ssh-agent.work.sock",
+                 sizeof(cfg.agent_socket_arg));
+    cfg.agent_pid = 12345;
+    cfg.agent_owned = true;
+    CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", sock, 1), 0);
+    CHECK_EQ_INT(setenv("SSH_AGENT_PID", "12345", 1), 0);
+
+    prev_reap = ssh_manager_set_reap_fn(refuse_agent_reap);
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), -1);
+    ssh_manager_set_reap_fn(prev_reap);
+
+    CHECK(cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, 12345);
+    CHECK_STR_EQ(cfg.agent_socket_path, sock);
+    CHECK_STR_EQ(cfg.agent_socket_arg, "ssh-agent.work.sock");
+    CHECK(path_exists(sock));
+    CHECK_STR_EQ(getenv("SSH_AUTH_SOCK"), sock);
+    CHECK_STR_EQ(getenv("SSH_AGENT_PID"), "12345");
+
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
 }
 
 /* AR-02 #10: ssh_configure_host_alias writes "IdentityFile <path>" into
@@ -379,6 +795,14 @@ TEST_MAIN_BEGIN()
     RUN_TEST(ssh_fingerprint_reuse_adopts_matching_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
     RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
+    RUN_TEST(fresh_commit_revalidates_public_agent_directory);
+    RUN_TEST(ssh_reuse_refuses_symlinked_agent_socket);
+    RUN_TEST(ssh_reuse_refuses_symlinked_pid_sidecar);
+    RUN_TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink);
+    RUN_TEST(reuse_aborts_on_agent_directory_namespace_replacement);
+    RUN_TEST(fresh_start_aborts_and_cleans_on_namespace_replacement);
+    RUN_TEST(pid_sidecar_rejects_temp_path_inode_swap);
+    RUN_TEST(stop_agent_reap_failure_preserves_retry_handle);
     RUN_TEST(host_alias_write_rejects_newline_key_path);
 #if defined(__linux__)
     RUN_TEST(reset_never_signals_bystander_pid_in_sidecar);

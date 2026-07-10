@@ -128,7 +128,7 @@ int accounts_health_check(const gitswitch_ctx_t *ctx);
  * - Cleans up isolated GPG home if created
  * Call this before program exit or when switching accounts
  */
-void accounts_session_cleanup(void);
+int accounts_session_cleanup(void);
 
 /**
  * Detect current account from SSH socket symlink
