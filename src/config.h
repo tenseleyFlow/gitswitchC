@@ -94,10 +94,10 @@ int config_create_default(const char *config_path);
 int config_validate(const gitswitch_ctx_t *ctx);
 
 /**
- * Get configuration file path
- * - Checks environment variables
- * - Falls back to default location
- * - Creates directories if needed
+ * Get the configuration file path (<config dir>/accounts.toml).
+ * Builds the path only — it does NOT read environment variables and does NOT
+ * create any directory (AR-06 F53: the old doc claimed both). Directory
+ * creation is config_init/config_create_default's job.
  */
 int config_get_path(char *path_buffer, size_t buffer_size);
 

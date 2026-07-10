@@ -185,6 +185,15 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    /* AR-06 F62: --global and --local are contradictory. Silently letting
+     * --global win hid a user's mistake and could write the wrong scope; fail
+     * with a clear message instead. */
+    if (force_global && force_local) {
+        fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
+        error_cleanup();
+        return EXIT_FAILURE;
+    }
+
     /* Initialize display system */
     if (display_init(force_color, no_color) != 0) {
         log_error("Failed to initialize display system");
