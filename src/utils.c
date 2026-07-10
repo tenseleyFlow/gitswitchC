@@ -1015,7 +1015,11 @@ bool validate_email(const char *email) {
     static regex_t regex;
     static bool compiled = false;
 
-    if (!email || strlen(email) > MAX_EMAIL_LEN) {
+    /* >= not >: account_t.email[MAX_EMAIL_LEN] stores at most MAX_EMAIL_LEN-1
+     * chars plus the NUL, so an exactly-MAX_EMAIL_LEN-char address would pass
+     * here only to have the copy into the account fail (AR-03 L1). Matches
+     * validate_name's bound. */
+    if (!email || strlen(email) >= MAX_EMAIL_LEN) {
         return false;
     }
 
