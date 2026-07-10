@@ -1324,9 +1324,44 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
     }
     log_debug("SSH agent stopped");
     
-    /* Clean up socket file */
+    /* Clean up socket file. AR-05 L15: this was the file's lone
+     * absolute-path, symlink-following unlink() — reachable from
+     * ssh_manager_cleanup's rollback paths with no agent-dir lock held and
+     * no namespace re-validation, while every other socket mutation goes
+     * through the pinned descriptor precisely because the runtime dir can
+     * live in world-writable sticky /tmp. Route it through the same
+     * validated, locked dir fd and unlinkat() the leaf component. The lock
+     * helpers re-enter cleanly when a caller already holds the agent-dir
+     * lock (per-process refcount), so the locked in-file caller is safe.
+     * Best-effort like before: a failure here only leaves a stale socket. */
     if (strlen(ssh_config->agent_socket_path) > 0) {
-        if (unlink(ssh_config->agent_socket_path) == 0) {
+        char socket_dir[MAX_PATH_LEN];
+        const char *slash = strrchr(ssh_config->agent_socket_path, '/');
+        bool removed = false;
+        if (slash && slash != ssh_config->agent_socket_path &&
+            *(slash + 1) != '\0' &&
+            (size_t)(slash - ssh_config->agent_socket_path) < sizeof(socket_dir)) {
+            const char *socket_name = slash + 1;
+            size_t dir_len = (size_t)(slash - ssh_config->agent_socket_path);
+            bool absent = false;
+            memcpy(socket_dir, ssh_config->agent_socket_path, dir_len);
+            socket_dir[dir_len] = '\0';
+            int dir_fd = open_isolated_agent_socket_dir(socket_dir,
+                                                        sizeof(socket_dir),
+                                                        false, &absent);
+            if (dir_fd >= 0) {
+                int lock_fd = lock_agent_dir(dir_fd);
+                if (lock_fd >= 0) {
+                    if (verify_socket_dir_namespace(dir_fd, socket_dir) == 0 &&
+                        unlinkat(dir_fd, socket_name, 0) == 0) {
+                        removed = true;
+                    }
+                    unlock_agent_dir(lock_fd);
+                }
+                close(dir_fd);
+            }
+        }
+        if (removed) {
             log_debug("Removed SSH agent socket: %s", ssh_config->agent_socket_path);
         } else {
             log_debug("Could not remove SSH agent socket (may already be gone)");
