@@ -103,6 +103,12 @@ typedef struct {
      * invisible to it: rewriting while any exist would silently delete them
      * (AR-03 M8). Gated exactly like accounts_skipped_on_load. */
     size_t unknown_sections_on_load;
+    /* Number of KEYS inside otherwise-recognized [settings]/[accounts.<id>]
+     * sections that gitswitch does not model — a typo (ssh_kye), or a key
+     * written by a newer version after a downgrade. config_save re-emits only
+     * modeled keys, so such a key is silently dropped by the next full save
+     * (AR-06 F02). Gated exactly like unknown_sections_on_load. */
+    size_t unknown_keys_on_load;
 } gitswitch_ctx_t;
 
 /* Function prototypes */
