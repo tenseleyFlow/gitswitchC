@@ -931,14 +931,33 @@ bool validate_name(const char *name) {
     if (!name || strlen(name) == 0 || strlen(name) >= MAX_NAME_LEN) {
         return false;
     }
-    
+
+    /* The account name doubles as a filesystem path component (the isolated
+     * GNUPGHOME <base>/<name> and the ssh-agent.<name>.sock socket) as well as
+     * the git user.name. So it must stay a single, safe path component while
+     * still allowing ordinary display names with spaces and parentheses
+     * ("Jane Doe (Work)"). Reject path separators and traversal, control
+     * characters, and a leading '-'/'.' (option-like / hidden / '..'). */
+    if (name[0] == '-' || name[0] == '.') {
+        return false;
+    }
+    if (strstr(name, "..") != NULL) {
+        return false;
+    }
+    for (const char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+
     /* Name should contain at least one non-whitespace character */
     for (const char *p = name; *p; p++) {
         if (!isspace((unsigned char)*p)) {
             return true;
         }
     }
-    
+
     return false;
 }
 

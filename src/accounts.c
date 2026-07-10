@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -259,7 +260,14 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 return -1;
             }
             gpg_ok = true;
-            printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
+            /* gpg_configure_git_signing sets commit.gpgsign to the account's
+             * preference, which may be OFF. Don't claim signing is enabled
+             * when we just disabled it — report the actual state. */
+            if (account->gpg_signing_enabled) {
+                printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
+            } else {
+                printf("  [OK] GPG key configured, signing disabled (key: %s)\n", account->gpg_key_id);
+            }
         }
         printf("  [OK] Git config set (%s scope)\n", scope_str);
 
@@ -404,93 +412,109 @@ int accounts_add_interactive(gitswitch_ctx_t *ctx) {
         safe_strncpy(new_account.description, new_account.name, sizeof(new_account.description));
     }
     
-    /* Get SSH key configuration */
-    printf("SSH Key Path (optional, press Enter to skip): ");
-    fflush(stdout);
-    
-    if (fgets(input, sizeof(input), stdin)) {
+    /* Get SSH key configuration. Re-prompt on a bad path instead of silently
+     * dropping SSH: a typo previously scrolled past a one-line error and
+     * produced an account that never loads a key (auth failures later). Empty
+     * input explicitly skips SSH. */
+    while (1) {
+        printf("SSH Key Path (optional, press Enter to skip): ");
+        fflush(stdout);
+
+        if (!fgets(input, sizeof(input), stdin)) break;
         input[strcspn(input, "\n")] = '\0';
         trim_whitespace(input);
-        
-        if (strlen(input) > 0) {
-            /* Expand and validate path */
-            if (expand_path(input, expanded_path, sizeof(expanded_path)) == 0) {
-                if (path_exists(expanded_path)) {
-                    if (validate_ssh_key_security(expanded_path) == 0) {
-                        safe_strncpy(new_account.ssh_key_path, expanded_path, sizeof(new_account.ssh_key_path));
-                        new_account.ssh_enabled = true;
-                        printf("[OK]: SSH key validated: %s\n", expanded_path);
-                        
-                        /* Optional SSH host alias */
-                        printf("SSH Host Alias (optional, e.g., github.com-work): ");
-                        fflush(stdout);
-                        
-                        if (fgets(input, sizeof(input), stdin)) {
-                            input[strcspn(input, "\n")] = '\0';
-                            trim_whitespace(input);
-                            
-                            if (strlen(input) > 0) {
-                                safe_strncpy(new_account.ssh_host_alias, input, sizeof(new_account.ssh_host_alias));
-                            }
-                        }
-                    } else {
-                        printf("[ERROR]: SSH key validation failed. Continuing without SSH key.\n");
-                    }
-                } else {
-                    printf("[ERROR]: SSH key file not found: %s\n", expanded_path);
-                }
-            } else {
-                printf("[ERROR]: Invalid SSH key path: %s\n", input);
+
+        if (strlen(input) == 0) break; /* skip SSH */
+
+        if (expand_path(input, expanded_path, sizeof(expanded_path)) != 0) {
+            printf("[ERROR]: Invalid SSH key path: %s (try again, or Enter to skip)\n", input);
+            continue;
+        }
+        if (!path_exists(expanded_path)) {
+            printf("[ERROR]: SSH key file not found: %s (try again, or Enter to skip)\n", expanded_path);
+            continue;
+        }
+        if (validate_ssh_key_security(expanded_path) != 0) {
+            printf("[ERROR]: SSH key failed validation: %s (try again, or Enter to skip)\n", expanded_path);
+            continue;
+        }
+
+        safe_strncpy(new_account.ssh_key_path, expanded_path, sizeof(new_account.ssh_key_path));
+        new_account.ssh_enabled = true;
+        printf("[OK]: SSH key validated: %s\n", expanded_path);
+
+        /* Optional SSH host alias */
+        printf("SSH Host Alias (optional, e.g., github.com-work): ");
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            input[strcspn(input, "\n")] = '\0';
+            trim_whitespace(input);
+            if (strlen(input) > 0) {
+                safe_strncpy(new_account.ssh_host_alias, input, sizeof(new_account.ssh_host_alias));
             }
         }
+        break;
     }
-    
-    /* Get GPG key configuration */
-    printf("GPG Key ID (optional, press Enter to skip): ");
-    fflush(stdout);
-    
-    if (fgets(input, sizeof(input), stdin)) {
+
+    /* Get GPG key configuration. Re-prompt on a bad/unavailable key rather than
+     * silently dropping GPG; Enter skips. */
+    while (1) {
+        printf("GPG Key ID (optional, press Enter to skip): ");
+        fflush(stdout);
+
+        if (!fgets(input, sizeof(input), stdin)) break;
         input[strcspn(input, "\n")] = '\0';
         trim_whitespace(input);
-        
-        if (strlen(input) > 0) {
-            if (validate_key_id(input)) {
-                if (validate_gpg_key_availability(input) == 0) {
-                    safe_strncpy(new_account.gpg_key_id, input, sizeof(new_account.gpg_key_id));
-                    new_account.gpg_enabled = true;
-                    printf("[OK]: GPG key validated: %s\n", input);
-                    
-                    /* Ask about GPG signing */
-                    printf("Enable GPG signing for commits? (y/N): ");
-                    fflush(stdout);
-                    
-                    if (fgets(input, sizeof(input), stdin)) {
-                        input[strcspn(input, "\n")] = '\0';
-                        trim_whitespace(input);
-                        
-                        new_account.gpg_signing_enabled = (tolower(input[0]) == 'y');
-                    }
-                } else {
-                    printf("[ERROR]: GPG key validation failed. Continuing without GPG key.\n");
-                }
-            } else {
-                printf("[ERROR]: Invalid GPG key ID format: %s\n", input);
-            }
+
+        if (strlen(input) == 0) break; /* skip GPG */
+
+        if (!validate_key_id(input)) {
+            printf("[ERROR]: Invalid GPG key ID format: %s (try again, or Enter to skip)\n", input);
+            continue;
         }
+        if (validate_gpg_key_availability(input) != 0) {
+            printf("[ERROR]: GPG key not found in keyring: %s (try again, or Enter to skip)\n", input);
+            continue;
+        }
+
+        safe_strncpy(new_account.gpg_key_id, input, sizeof(new_account.gpg_key_id));
+        new_account.gpg_enabled = true;
+        printf("[OK]: GPG key validated: %s\n", input);
+
+        /* Ask about GPG signing */
+        printf("Enable GPG signing for commits? (y/N): ");
+        fflush(stdout);
+        if (fgets(input, sizeof(input), stdin)) {
+            input[strcspn(input, "\n")] = '\0';
+            trim_whitespace(input);
+            new_account.gpg_signing_enabled = (tolower((unsigned char)input[0]) == 'y');
+        }
+        break;
     }
-    
-    /* Get preferred scope */
-    printf("Preferred Git Scope (local/global) [%s]: ", 
-           config_scope_to_string(new_account.preferred_scope));
-    fflush(stdout);
-    
-    if (fgets(input, sizeof(input), stdin)) {
+
+    /* Get preferred scope. Validate the answer and re-prompt on anything that
+     * isn't clearly local/global, instead of silently coercing a typo like
+     * 'Global' or 'golbal' to local. Enter keeps the shown default. */
+    while (1) {
+        printf("Preferred Git Scope (local/global) [%s]: ",
+               config_scope_to_string(new_account.preferred_scope));
+        fflush(stdout);
+
+        if (!fgets(input, sizeof(input), stdin)) break;
         input[strcspn(input, "\n")] = '\0';
         trim_whitespace(input);
-        
-        if (strlen(input) > 0) {
-            new_account.preferred_scope = config_parse_scope(input);
+
+        if (strlen(input) == 0) break; /* keep default */
+        if (strcasecmp(input, "local") == 0 || strcasecmp(input, "l") == 0) {
+            new_account.preferred_scope = GIT_SCOPE_LOCAL;
+            break;
         }
+        if (strcasecmp(input, "global") == 0 || strcasecmp(input, "g") == 0) {
+            new_account.preferred_scope = GIT_SCOPE_GLOBAL;
+            break;
+        }
+        printf("[ERROR]: Please enter 'local' or 'global' (or Enter for %s).\n",
+               config_scope_to_string(new_account.preferred_scope));
     }
     
     /* Basic validation */
