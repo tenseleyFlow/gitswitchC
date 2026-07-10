@@ -419,6 +419,14 @@ int main(int argc, char *argv[]) {
              * point, so a deferred signal is not re-raised: the process
              * finishes persisting and exits normally moments later. */
             signals_guard_begin();
+            /* AR-06 F27: also DEFER the second-signal emergency exit across the
+             * save, like the rollback and deferred-teardown windows. Without
+             * this, two rapid signals here took the handler's emergency exit
+             * mid-config_save and persisted a mixed identity that auto-resume
+             * then made durable. The save is bounded, non-interactive work (no
+             * children to wedge at a prompt), so deferring is safe; the deferred
+             * signal is dispatched once the state is fully persisted. */
+            signals_rollback_begin();
             int save_rc = settings_only_save
                 ? config_save_active_account(&ctx, ctx.config.config_path)
                 : config_save(&ctx, ctx.config.config_path);
@@ -433,6 +441,7 @@ int main(int argc, char *argv[]) {
                 exit_code = EXIT_FAILURE;
             }
             signals_scratch_cleanup();
+            signals_rollback_end();
         }
     }
 
