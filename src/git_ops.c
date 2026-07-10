@@ -194,7 +194,24 @@ static cfg_z_result_t parse_config_z_value(const char *buf, size_t len,
 
         const char *rec = buf + rec_start;
         const char *nl = memchr(rec, '\n', rec_len);
-        if (!nl) continue; /* no key/value separator — skip */
+        if (!nl) {
+            /* No key/value separator. `git config --list -z` emits an
+             * implicit-boolean key (e.g. `[commit]\n\tgpgsign`, which git
+             * defines as true) as "commit.gpgsign\0" with NO newline. Such a
+             * key IS present (AR-06 F19); the old blanket skip returned it
+             * ABSENT, so git_clear_config elided the --unset and a `true`
+             * boolean survived a switch to a non-signing account. Its bare
+             * value ("true") cannot be round-tripped by `git config <key>
+             * <value>` (writing "" flips --bool semantics to an error), so
+             * treat it as present-but-uncapturable — the same value_unknown
+             * state CFG_Z_TOO_LONG carries — which makes the caller UNSET it
+             * rather than elide. */
+            if (rec_len == key_len && memcmp(rec, key, key_len) == 0) {
+                out[0] = '\0';
+                result = CFG_Z_TOO_LONG;
+            }
+            continue;
+        }
         size_t k_len = (size_t)(nl - rec);
         if (k_len == key_len && memcmp(rec, key, key_len) == 0) {
             const char *val = nl + 1;
@@ -493,9 +510,23 @@ int git_set_config(const account_t *account, git_scope_t scope) {
             /* Don't fail completely, GPG is optional */
         }
     } else {
-        /* Disable GPG signing */
-        git_unset_config_value(GIT_CONFIG_USER_SIGNINGKEY, scope);
-        git_set_config_value(GIT_CONFIG_COMMIT_GPGSIGN, "false", scope);
+        /* Disable GPG signing. Check both writes (AR-06 F20): unlike the
+         * gpg_enabled branch — compensated by accounts.c's hard-failing
+         * gpg_configure_git_signing — nothing downstream re-writes or verifies
+         * these, so a silently failed commit.gpgsign=false left the PREVIOUS
+         * account's signing ON while the switch reported success, and every
+         * commit kept getting signed with the wrong key. Fail so accounts_switch
+         * rolls the switch back, mirroring the SSH branch below. A key that was
+         * already absent is not a failure (git_unset_config_value returns 0 on
+         * exit 5). */
+        if (git_unset_config_value(GIT_CONFIG_USER_SIGNINGKEY, scope) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear user.signingkey");
+            return -1;
+        }
+        if (git_set_config_value(GIT_CONFIG_COMMIT_GPGSIGN, "false", scope) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED, "Failed to disable commit.gpgsign");
+            return -1;
+        }
     }
     
     /* Configure SSH if enabled. AR-05 M5: SSH identity is NOT optional for
