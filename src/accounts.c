@@ -408,7 +408,15 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             scope = GIT_SCOPE_LOCAL;
         }
         if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
-            if (isatty(STDIN_FILENO)) {
+            if (ctx->config.dry_run) {
+                /* AR-06 F44: a preview must not run the interactive
+                 * global-scope consent prompt (or abort) — nothing is being
+                 * written. State what a real switch would require and preview
+                 * the local scope the account actually prefers. */
+                printf("Note: not in a git repository — a real switch would prompt to write\n"
+                       "      %s's identity to your GLOBAL git config, or require --global.\n",
+                       account->name);
+            } else if (isatty(STDIN_FILENO)) {
                 char resp[16];
                 printf("Not in a git repository. Write %s's identity to your GLOBAL git\n"
                        "config (affects every repository on this machine)? [y/N]: ",
@@ -853,8 +861,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             printf("  [--] DRY RUN: Would load SSH key\n");
         }
+        /* AR-06 F44: report the signing state accurately. A GPG account
+         * enables commit signing; a non-GPG account DISABLES it (git_set_config
+         * writes commit.gpgsign=false), which the old preview never mentioned. */
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-            printf("  [--] DRY RUN: Would enable GPG signing\n");
+            printf("  [--] DRY RUN: Would enable GPG commit signing\n");
+        } else {
+            printf("  [--] DRY RUN: Would disable GPG commit signing\n");
         }
     }
 
