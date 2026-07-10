@@ -456,6 +456,20 @@ int toml_validate_gitswitch_schema(const toml_document_t *doc) {
                             set_error(ERR_CONFIG_INVALID, "Invalid SSH key path: %s", kv->value);
                             return -1;
                         }
+                        /* Require an anchored path: a bare relative ssh_key
+                         * resolves against whatever directory gitswitch was
+                         * invoked from, so which key gets loaded would depend
+                         * on the CWD — an attacker-plantable "keys/id_rsa" in
+                         * a shared directory could silently win. '/' and '~'
+                         * (expanded against HOME by expand_path downstream)
+                         * are both CWD-independent. gpg_key is exempt: it is
+                         * a key ID, not a filesystem path. */
+                        if (sanitized[0] != '/' && sanitized[0] != '~') {
+                            set_error(ERR_CONFIG_INVALID,
+                                      "ssh_key must be an absolute or ~-anchored path, not relative: %s",
+                                      kv->value);
+                            return -1;
+                        }
                     }
                 }
                 
@@ -579,38 +593,64 @@ bool toml_validate_file_path(const char *path) {
 bool toml_check_injection_patterns(const char *input, size_t length) {
     if (!input) return false;
 
-    /* Check for excessive nesting or repetition */
+    /* Count '[' only in structural positions. Brackets inside quoted string
+     * values are ordinary data that toml_write_file emits verbatim, so
+     * counting them made this guard reject configs the writer itself produced
+     * (a bracket-heavy description bricked the config on the next reload).
+     * Brackets in comments are likewise inert. Structural '[' only appears in
+     * section headers, which the parser caps at TOML_MAX_SECTIONS anyway, so
+     * exceeding that here is only ever pathological input ("[[[[[..."). */
     size_t bracket_count = 0;
+    bool in_string = false;
+    bool in_comment = false;
     for (size_t i = 0; i < length; i++) {
-        if (input[i] == '[') {
+        char c = input[i];
+
+        if (in_string) {
+            if (c == '\\' && i + 1 < length) {
+                i++; /* skip the escaped char so \" does not end the string */
+            } else if (c == '"' || c == '\n') {
+                /* A raw newline cannot occur inside a TOML basic string (the
+                 * parser rejects it), so treat it as terminating — an
+                 * unterminated quote must not blind this guard to structural
+                 * brackets in the rest of the file. */
+                in_string = false;
+            }
+            continue;
+        }
+        if (in_comment) {
+            if (c == '\n') in_comment = false;
+            continue;
+        }
+        if (c == '"') { in_string = true; continue; }
+        if (c == '#') { in_comment = true; continue; }
+        if (c == '[') {
             bracket_count++;
-            if (bracket_count > 32) {
+            if (bracket_count > TOML_MAX_SECTIONS) {
                 log_warning("Excessive bracket nesting detected");
                 return false;
             }
         }
     }
-    
+
     return true;
 }
 
 /* Internal helper functions implementation continues... */
 
 /* Find section in document */
+/* No logging here: this runs on the hot config-load path (once per key
+ * lookup), and per-iteration log_debug calls dominated load time; callers
+ * already report a miss where it matters. */
 static toml_section_t *find_section(toml_document_t *doc, const char *section_name) {
     if (!doc || !section_name) return NULL;
-    
-    log_debug("Finding section '%s' among %zu sections", section_name, doc->section_count);
-    
+
     for (size_t i = 0; i < doc->section_count; i++) {
-        log_debug("  Section %zu: '%s'", i, doc->sections[i].name);
         if (strcmp(doc->sections[i].name, section_name) == 0) {
-            log_debug("  Found matching section!");
             return &doc->sections[i];
         }
     }
-    
-    log_debug("  Section '%s' not found", section_name);
+
     return NULL;
 }
 
@@ -643,20 +683,16 @@ static toml_section_t *find_or_create_section(toml_document_t *doc, const char *
 }
 
 /* Find key in section */
+/* No logging: hot path, see find_section. */
 static toml_keyvalue_t *find_key(toml_section_t *section, const char *key_name) {
     if (!section || !key_name) return NULL;
-    
-    log_debug("Finding key '%s' in section with %zu keys", key_name, section->key_count);
-    
+
     for (size_t i = 0; i < section->key_count; i++) {
-        log_debug("  Key %zu: '%s' = '%s' (is_set=%d)", i, section->keys[i].key, section->keys[i].value, section->keys[i].is_set);
         if (strcmp(section->keys[i].key, key_name) == 0) {
-            log_debug("  Found matching key! is_set=%d", section->keys[i].is_set);
             return &section->keys[i];
         }
     }
-    
-    log_debug("  Key '%s' not found", key_name);
+
     return NULL;
 }
 
