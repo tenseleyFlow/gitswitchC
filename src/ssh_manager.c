@@ -169,7 +169,12 @@ static void ssh_env_snapshot_discard(ssh_env_snapshot_t *snapshot) {
  * absolute path or the descriptor-pinned launch form's final component so
  * sidecars created by either version remain reapable. Requiring the complete
  * option value, rather than a substring anywhere in the command line, avoids
- * signaling an agent whose unrelated argument merely mentions the socket. */
+ * signaling an agent whose unrelated argument merely mentions the socket.
+ *
+ * Guarded to the platforms whose reaper calls it (Linux procfs, FreeBSD
+ * sysctl argv). macOS uses counted_argv_is_our_ssh_agent instead, so an
+ * unguarded definition is an unused-function error there under clang+WERROR. */
+#if defined(__linux__) || defined(__FreeBSD__)
 static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
                                   const char *expected_sock) {
     bool expect_socket = false;
@@ -219,6 +224,7 @@ static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
     }
     return matched_socket && !expect_socket;
 }
+#endif /* __linux__ || __FreeBSD__ */
 
 #ifdef __APPLE__
 /* KERN_PROCARGS2 includes the environment after argv. Parse exactly the argc
