@@ -257,24 +257,31 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
 /* Acquire an exclusive, cross-process lock for a mutating config cycle. Returns
  * an open fd holding flock(LOCK_EX) on <config_dir>/.config.lock; hold it across
  * the whole load-modify-save so concurrent add/edit/remove/switch cannot
- * lost-update each other. The atomic temp+rename in config_save only prevents a
- * torn file, not a lost update: two processes that each load, mutate, and rename
- * would have the second silently discard the first's changes. Close the fd to
- * release. Returns -1 on failure; callers must treat that as fatal for a
- * mutating command — proceeding unlocked reopens the lost-update race
- * (AR-02 #17). */
+ * lost-update each other. The acquisition is deliberately nonblocking: the
+ * holder may be stopped indefinitely at an interactive prompt, so waiting here
+ * can hang another command (including login-time resume) with no useful bound.
+ * The atomic temp+rename in config_save only prevents a torn file, not a lost
+ * update: two processes that each load, mutate, and rename would have the second
+ * silently discard the first's changes. Close the fd to release. Returns -1 on
+ * failure with errno preserved; callers must treat that as fatal for a mutating
+ * command — proceeding unlocked reopens the lost-update race (AR-02 #17,
+ * AR-03 L10). */
 int config_write_lock(void) {
     char dir[MAX_PATH_LEN];
     char lockpath[MAX_PATH_LEN];
+    errno = 0; /* Never misclassify a validation failure using stale errno. */
     if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
     if (create_config_directory_secure(dir) != 0) return -1;
     if ((size_t)snprintf(lockpath, sizeof(lockpath), "%s/.config.lock", dir) >= sizeof(lockpath)) {
+        errno = ENAMETOOLONG;
         return -1;
     }
     int fd = open(lockpath, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
-    if (flock(fd, LOCK_EX) != 0) {
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        int lock_errno = errno;
         close(fd);
+        errno = lock_errno;
         return -1;
     }
     return fd;

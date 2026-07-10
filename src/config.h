@@ -70,10 +70,12 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
 int config_resume_hint_path(char *buf, size_t size);
 
 /**
- * Acquire an exclusive cross-process lock for a mutating config cycle.
- * Returns an open fd holding flock(LOCK_EX) on <config_dir>/.config.lock, to be
- * held across the whole load-modify-save so concurrent add/edit/remove/switch
- * cannot lost-update each other. Close the fd to release. Returns -1 on failure.
+ * Acquire an exclusive cross-process lock for a mutating config cycle without
+ * waiting for a current holder. Returns an open fd holding flock(LOCK_EX) on
+ * <config_dir>/.config.lock, to be held across the whole load-modify-save so
+ * concurrent add/edit/remove/switch cannot lost-update each other. Close the fd
+ * to release. Returns -1 on failure with errno preserved (EAGAIN/EWOULDBLOCK
+ * means another process holds the lock).
  */
 int config_write_lock(void);
 

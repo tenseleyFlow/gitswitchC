@@ -508,16 +508,21 @@ TEST(reset_other_account_keeps_current_sock) {
     remove_tree(rt);
 }
 
-/* ---------- AR-02 #1/#17: config-lock serialization ---------- */
+/* ---------- AR-02 #1/#17 + AR-03 L10/L11: config-lock behavior ---------- */
 
-/* Mutating commands (reset here; switch/resume take the same path) must block
- * on the cross-process config write lock; read-only commands must not take it.
- * A child holds the lock and writes its "done" marker only after a generous
- * delay: a reset that genuinely blocks returns only after the marker exists,
- * while `list` completes while the lock is still held. This is the practical
- * two-process serialization check for the split-identity race the lock closes. */
-TEST(mutating_commands_block_on_config_lock_readonly_dont) {
-    char home[256], rt[256], lockpath[4352], held[4352], done[4352], cmd[16384];
+/* Mutating commands must fail fast on cross-process config-lock contention;
+ * waiting is unbounded because the holder may be stopped at an interactive
+ * prompt. `resume` is launched implicitly by shell startup, so contention is
+ * instead a silent successful no-op. Genuinely read-only commands still skip
+ * the lock, while `config` must take it because it can create accounts.toml.
+ *
+ * The child releases early when the parent writes `release`; the timeout keeps
+ * this test from deadlocking against the pre-L10 blocking implementation and
+ * provides fail-before evidence for the new assertions. */
+TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont) {
+    char home[256], rt[256], lockpath[4352], config_path[4352];
+    char held[4352], done[4352], release[4352], out_path[4352];
+    char cmd[16384], out[8192];
     pid_t pid;
     int status = 0, waited = 0, rc;
 
@@ -527,21 +532,28 @@ TEST(mutating_commands_block_on_config_lock_readonly_dont) {
     }
     CHECK_EQ_INT(write_config(home, two_ssh_accounts_config()), 0);
     snprintf(lockpath, sizeof(lockpath), "%s/.config/gitswitch/.config.lock", home);
+    snprintf(config_path, sizeof(config_path), "%s/.config/gitswitch/accounts.toml", home);
     snprintf(held, sizeof(held), "%s/lock-held", rt);
     snprintf(done, sizeof(done), "%s/lock-done", rt);
+    snprintf(release, sizeof(release), "%s/lock-release", rt);
+    snprintf(out_path, sizeof(out_path), "%s/command.out", rt);
 
     fflush(NULL);
     pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
-        struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+        int child_waited = 0;
         FILE *m;
         int fd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
         if (fd < 0 || flock(fd, LOCK_EX) != 0) _exit(9);
         m = fopen(held, "w");
         if (!m) _exit(9);
         fclose(m);
-        nanosleep(&ts, NULL);
+        while (access(release, F_OK) != 0 && child_waited < 5000) {
+            nanosleep(&ts, NULL);
+            child_waited += 10;
+        }
         m = fopen(done, "w");   /* written BEFORE releasing the lock */
         if (!m) _exit(9);
         fclose(m);
@@ -565,13 +577,44 @@ TEST(mutating_commands_block_on_config_lock_readonly_dont) {
     CHECK_EQ_INT(rc, 0);
     CHECK(access(done, F_OK) != 0); /* returned before the holder released */
 
-    /* Mutating: reset blocks until the holder releases. */
+    /* Shell-startup resume: contention is a silent successful no-op. */
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y reset >/dev/null 2>&1",
-             home, rt, g_bin);
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' resume >'%s' 2>&1",
+             home, rt, g_bin, out_path);
     rc = run_shell(cmd);
     CHECK_EQ_INT(rc, 0);
-    CHECK(access(done, F_OK) == 0); /* only reachable after the lock dropped */
+    CHECK(access(done, F_OK) != 0);
+    /* Debug builds emit their normal logger-init line; "silent" here means no
+     * user-facing contention diagnostic. Release builds emit nothing. */
+    CHECK(strstr(slurp(out_path, out, sizeof(out)), "config lock") == NULL);
+
+    /* Ordinary mutating commands report contention and return immediately. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y reset >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK(rc != 0);
+    CHECK(access(done, F_OK) != 0);
+    CHECK(strstr(slurp(out_path, out, sizeof(out)),
+                 "Another gitswitch holds the config lock") != NULL);
+
+    /* `config` is not purely read-only: when the file is absent it offers to
+     * create it. It must therefore contend instead of writing outside the
+     * lock, and the piped confirmation must remain unconsumed. */
+    CHECK_EQ_INT(unlink(config_path), 0);
+    snprintf(cmd, sizeof(cmd),
+             "printf 'y\\n' | HOME='%s' XDG_RUNTIME_DIR='%s' '%s' config >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK(rc != 0);
+    CHECK(access(done, F_OK) != 0);
+    CHECK(access(config_path, F_OK) != 0);
+    CHECK(strstr(slurp(out_path, out, sizeof(out)),
+                 "Another gitswitch holds the config lock") != NULL);
+
+    FILE *m = fopen(release, "w");
+    CHECK(m != NULL);
+    if (m) fclose(m);
 
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -1091,7 +1134,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(resume_never_blocks_reading_stdin);
     RUN_TEST(reset_account_removes_current_sock_pointing_at_it);
     RUN_TEST(reset_other_account_keeps_current_sock);
-    RUN_TEST(mutating_commands_block_on_config_lock_readonly_dont);
+    RUN_TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont);
     RUN_TEST(utf8_account_name_cli_round_trip);
     RUN_TEST(no_color_output_contains_no_escape_bytes);
     RUN_TEST(add_after_uint32_max_id_does_not_wrap_to_zero);

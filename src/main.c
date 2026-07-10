@@ -226,22 +226,45 @@ int main(int argc, char *argv[]) {
      * identity from the live SSH/GPG runtime (AR-02 #1: tmux-restore shells
      * running resume while another shell switches). Acquire before config_init
      * so the load itself happens under the lock. Only genuinely read-only
-     * commands (list/status/doctor/config) skip it. Fail closed on lock
-     * failure: silently proceeding unlocked would reopen the exact lost-update
-     * and split-identity races the lock exists to prevent (AR-02 #17). */
+     * commands (list/status/doctor) skip it; `config` can create accounts.toml,
+     * so it belongs to the locked class too (AR-03 L11). Acquisition is
+     * nonblocking because the holder may be waiting indefinitely at a prompt;
+     * an arbitrary retry window would only turn a clear contention result back
+     * into login/command latency (AR-03 L10). Fail closed on other lock errors:
+     * silently proceeding unlocked would reopen the exact lost-update and
+     * split-identity races the lock exists to prevent (AR-02 #17). */
     int config_lock_fd = -1;
     {
         const char *c = (optind < argc) ? argv[optind] : NULL;
         bool read_only = (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
-            strcmp(c, "health") == 0 || strcmp(c, "config") == 0;
+            strcmp(c, "health") == 0;
         if (!read_only) {
             config_lock_fd = config_write_lock();
             if (config_lock_fd < 0) {
-                display_error("Could not acquire the gitswitch config lock",
-                              "another gitswitch may be stuck or the config "
-                              "directory is not writable; try again");
+                int lock_errno = errno;
+                bool contended = lock_errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+                contended = contended || lock_errno == EAGAIN;
+#endif
+
+                /* Shell integration invokes resume during login. A concurrent
+                 * switch already owns serialization and will leave a coherent
+                 * result, so this redundant restore is a successful no-op and
+                 * must not delay or alarm every newly opened shell. */
+                if (contended && c && strcmp(c, "resume") == 0) {
+                    error_cleanup();
+                    return EXIT_SUCCESS;
+                }
+                if (contended) {
+                    display_error("Another gitswitch holds the config lock",
+                                  "try again after that command finishes");
+                } else {
+                    display_error("Could not acquire the gitswitch config lock",
+                                  "the config directory or lock is unavailable; "
+                                  "check permissions and try again");
+                }
                 error_cleanup();
                 return EXIT_FAILURE;
             }
