@@ -97,6 +97,28 @@ void accounts_session_cleanup(void) {
     log_debug("Session cleanup complete");
 }
 
+/* Deactivate the runtime SSH and/or GPG isolation so the stable entry points
+ * (current.sock symlink, GNUPGHOME `current` symlink) no longer point at an
+ * account. Used when switching to an account that has SSH/GPG disabled (so the
+ * previous account's agent/home doesn't stay live behind the switch) and when
+ * rolling back a failed switch. Removing the symlink makes integrated shells
+ * fall back to the default agent/keyring rather than silently keep using the
+ * old account — the exact mismatch this guards against. */
+static void deactivate_runtime_isolation(bool ssh, bool gpg) {
+    if (ssh) {
+        /* Reaps every gitswitch agent and removes current.sock. */
+        ssh_manager_reset(NULL);
+        g_session.ssh_active = false;
+    }
+    if (gpg) {
+        char home_symlink[MAX_PATH_LEN];
+        if (gpg_manager_get_home_path(home_symlink, sizeof(home_symlink)) == 0) {
+            unlink(home_symlink); /* drop the `current` symlink, not its target */
+        }
+        g_session.gpg_active = false;
+    }
+}
+
 /* Switch to specified account with SSH isolation and validation */
 int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *account;
@@ -182,8 +204,11 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
      *
      * Ordering matters for safety: validate availability first (read-only), then
      * activate SSH and GPG (recoverable mutations), and write git config LAST.
-     * git config is snapshotted up front and restored on any failure, so a
-     * partial switch can never leave a half-applied identity. */
+     * git config is snapshotted up front and restored on failure; on that same
+     * failure the SSH/GPG runtime state activated in steps 2-3 is also torn
+     * down (deactivate_runtime_isolation), so a failed switch reverts the git
+     * identity AND doesn't leave current.sock / GNUPGHOME pointing at the
+     * new account — no half-applied, mismatched identity. */
     if (!ctx->config.dry_run) {
         /* --- 1. Validate availability up front (no mutation yet) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
@@ -229,6 +254,10 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             } else if (ssh_test_connection(account, "git@github.com") == 0) {
                 printf("  [OK] SSH connection verified (github.com)\n");
             }
+        } else {
+            /* Target has no SSH: tear down any live gitswitch agent + current.sock
+             * so shells stop authenticating as the previously-active account. */
+            deactivate_runtime_isolation(true, false);
         }
 
         /* --- 3. GPG isolated home (mutation; fatal on failure) --- */
@@ -239,23 +268,36 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 gpg_switch_account(&g_session.gpg_config, account) != 0) {
                 printf("  [!!] GPG key failed to activate\n");
                 gpg_manager_cleanup(&g_session.gpg_config);
+                /* Roll back the SSH activation from step 2 so we don't leave
+                 * current.sock pointing at this account with no matching GPG. */
+                deactivate_runtime_isolation(g_session.ssh_active, false);
                 set_error(ERR_GPG_KEY_FAILED,
                           "Failed to set up GPG for account: %s", account->name);
                 return -1;
             }
             g_session.gpg_active = true;
+        } else {
+            /* Target has no GPG: drop the stable GNUPGHOME symlink so shells
+             * stop signing/using the previous account's keyring. */
+            deactivate_runtime_isolation(false, true);
         }
 
         /* --- 4. git config LAST, snapshotted for rollback --- */
         git_config_snapshot(scope);
         if (git_set_config(account, scope) != 0) {
             git_config_restore();
+            /* Also undo the SSH/GPG activation from steps 2-3: leaving
+             * current.sock / GNUPGHOME pointed at this account while the git
+             * identity reverts to the previous one is exactly the mixed
+             * identity the tool exists to prevent. */
+            deactivate_runtime_isolation(g_session.ssh_active, g_session.gpg_active);
             set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
             return -1;
         }
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
             if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
                 git_config_restore();
+                deactivate_runtime_isolation(g_session.ssh_active, g_session.gpg_active);
                 set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
                 return -1;
             }
