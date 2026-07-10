@@ -77,6 +77,9 @@ typedef struct {
     bool color_output;
     bool force_global;   /* --global: write global scope (and consent to it outside a repo) */
     bool force_local;    /* --local:  force local scope */
+    bool resuming;       /* set during boot-time `resume`: skip the blocking,
+                          * purely-informational SSH connection test so the
+                          * login shell prompt isn't stalled on a network RTT */
 } config_t;
 
 /* Application context */

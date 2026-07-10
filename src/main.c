@@ -606,6 +606,11 @@ static int handle_init_command(const char *shell) {
 static int handle_resume_command(gitswitch_ctx_t *ctx) {
     if (!ctx) return EXIT_FAILURE;
 
+    /* Mark this as a resume so accounts_switch skips the blocking SSH
+     * connection test — this runs from the login shell and must not stall the
+     * prompt on a network round trip. */
+    ctx->config.resuming = true;
+
     if (ctx->config.active_account[0] == '\0') {
         log_debug("No saved account to resume");
         return EXIT_SUCCESS;

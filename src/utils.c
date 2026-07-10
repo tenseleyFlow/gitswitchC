@@ -890,14 +890,23 @@ bool validate_key_id(const char *key_id) {
     if (!key_id || strlen(key_id) == 0 || strlen(key_id) >= MAX_KEY_ID_LEN) {
         return false;
     }
-    
-    /* Key ID should be hexadecimal */
-    for (const char *p = key_id; *p; p++) {
+
+    /* Accept the common "0x" prefix that `gpg -k` and keyservers display —
+     * gpg itself accepts a 0x-prefixed key id, so rejecting it only tripped up
+     * users pasting the id exactly as shown. The remainder must be hex. */
+    const char *p = key_id;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+    if (*p == '\0') {
+        return false; /* "0x" with no digits */
+    }
+    for (; *p; p++) {
         if (!isxdigit((unsigned char)*p)) {
             return false;
         }
     }
-    
+
     return true;
 }
 

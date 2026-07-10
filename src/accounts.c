@@ -244,15 +244,21 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             g_session.ssh_active = true;
             printf("  [OK] SSH key loaded\n");
 
-            /* Connection test is best-effort (network) and never fatal. */
-            if (strlen(account->ssh_host_alias) > 0) {
-                if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
-                    printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
-                } else {
-                    printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
+            /* Connection test is best-effort (network) and never fatal, so we
+             * skip it entirely on the boot-time resume path — it would only
+             * stall the login shell prompt on a network round trip (up to the
+             * ssh ConnectTimeout when github.com is filtered/offline) for a
+             * result that just picks a status line. */
+            if (!ctx->config.resuming) {
+                if (strlen(account->ssh_host_alias) > 0) {
+                    if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
+                        printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
+                    } else {
+                        printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
+                    }
+                } else if (ssh_test_connection(account, "git@github.com") == 0) {
+                    printf("  [OK] SSH connection verified (github.com)\n");
                 }
-            } else if (ssh_test_connection(account, "git@github.com") == 0) {
-                printf("  [OK] SSH connection verified (github.com)\n");
             }
         } else {
             /* Target has no SSH: tear down any live gitswitch agent + current.sock
