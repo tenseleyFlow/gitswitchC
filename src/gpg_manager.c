@@ -40,14 +40,19 @@
 
 /* Internal helper functions */
 static int gpg_get_base_dir(char *buf, size_t size);
+static int gpg_prepare_base_dir(char *base, size_t size);
+static int gpg_retarget_current_locked(const char *real_home);
 static int create_isolated_gnupg_home_dir(const char *gnupg_home);
 static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
                           const char *env_out[2]);
-static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ...);
+static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
+                   char *output, size_t output_size, ...);
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id,
                                         char *colons, size_t colons_size,
                                         bool *colons_valid);
 static int setup_gpg_agent_config(const char *gnupg_home);
+static int lock_gpg_dir(const char *base);
+static void unlock_gpg_dir(int fd);
 
 /* Process-lifetime memo of GPG key ids whose secret-key presence a gpg spawn
  * already proved this run (AR-02 #14). A single GPG switch used to spawn gpg
@@ -160,40 +165,64 @@ void gpg_manager_cleanup(gpg_config_t *gpg_config) {
 int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
     char colons[4096];
     bool colons_valid = false;
+    int lock_fd = -1;
+    int rc = -1;
 
     if (!gpg_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_switch_account");
         return -1;
     }
-    
+
     /* Skip if GPG not enabled for account */
     if (!account->gpg_enabled || strlen(account->gpg_key_id) == 0) {
         log_debug("GPG not enabled for account: %s", account->name);
         return 0;
     }
-    
+
     log_info("Switching to GPG configuration for account: %s", account->name);
     log_debug("Account GPG key ID: %s", account->gpg_key_id);
-    
+
     /* Handle different GPG modes */
     switch (gpg_config->mode) {
         case GPG_MODE_SYSTEM:
             /* Just validate key exists in system keyring */
             if (gpg_validate_key(gpg_config, account->gpg_key_id) != 0) {
-                set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found in system keyring: %s", 
+                set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found in system keyring: %s",
                          account->gpg_key_id);
-                return -1;
+                goto out;
             }
             break;
-            
-        case GPG_MODE_ISOLATED:
+
+        case GPG_MODE_ISOLATED: {
+            /* Establish the base first so there is a lock file to take, then
+             * hold <base>/.lock across the WHOLE create+import sequence and
+             * the final `current` retarget, mirroring ssh_start_isolated_agent
+             * (AR-03 L12). Only the retarget used to be locked: a concurrent
+             * `gitswitch reset` — same uid but a divergent $HOME defeats the
+             * coarse .config.lock while a shared XDG_RUNTIME_DIR still lands
+             * both on this base — could remove_tree() the home BETWEEN the
+             * import and the retarget, leaving a dangling `current` behind a
+             * switch that reported success. Fail closed if the lock cannot be
+             * taken: proceeding unlocked would reopen exactly that window. */
+            char base[MAX_PATH_LEN];
+            if (gpg_prepare_base_dir(base, sizeof(base)) != 0) {
+                set_error(ERR_GPG_KEY_FAILED, "Failed to create isolated GPG environment: %s",
+                         get_last_error()->message);
+                goto out;
+            }
+            lock_fd = lock_gpg_dir(base);
+            if (lock_fd < 0) {
+                set_system_error(ERR_FILE_IO, "Failed to lock GPG base directory: %s", base);
+                goto out;
+            }
+
             /* Create isolated GNUPGHOME for account */
             if (gpg_create_isolated_home(gpg_config, account) != 0) {
-                set_error(ERR_GPG_KEY_FAILED, "Failed to create isolated GPG environment: %s", 
+                set_error(ERR_GPG_KEY_FAILED, "Failed to create isolated GPG environment: %s",
                          get_last_error()->message);
-                return -1;
+                goto out;
             }
-            
+
             /* Copy key from system keyring to isolated environment. On success
              * the key is provably present in the isolated home (the copy step
              * either found it already there or imported it), so we skip the
@@ -211,35 +240,36 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
                 if (gpg_validate_key(gpg_config, account->gpg_key_id) != 0) {
                     set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available in isolated environment: %s",
                              account->gpg_key_id);
-                    return -1;
+                    goto out;
                 }
             }
             break;
-            
+        }
+
         case GPG_MODE_SHARED:
             /* Validate key exists and switch to it */
             if (gpg_validate_key(gpg_config, account->gpg_key_id) != 0) {
                 set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found: %s", account->gpg_key_id);
-                return -1;
+                goto out;
             }
             break;
-            
+
         default:
             set_error(ERR_INVALID_ARGS, "Invalid GPG mode: %d", gpg_config->mode);
-            return -1;
+            goto out;
     }
-    
+
     /* Update GPG configuration */
     safe_strncpy(gpg_config->current_key_id, account->gpg_key_id, sizeof(gpg_config->current_key_id));
     gpg_config->signing_enabled = account->gpg_signing_enabled;
-    
+
     /* Set environment variable if using isolated mode */
     if (gpg_config->mode == GPG_MODE_ISOLATED) {
         if (gpg_set_environment(gpg_config) != 0) {
             log_warning("Failed to set GPG environment variable: %s", get_last_error()->message);
         }
     }
-    
+
     /* Test GPG signing if enabled. When the idempotency probe above already
      * captured this key's colons listing, answer from it — gpg_test_signing
      * would spawn gpg only to re-run the identical listing (AR-02 #14). */
@@ -260,13 +290,20 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
 
     /* Retarget the stable GNUPGHOME symlink to this account's now-ready home so
      * a shell exporting GNUPGHOME=<base>/current follows the switch. Done last,
-     * after the key is imported and validated. Isolated mode only; non-fatal. */
+     * after the key is imported and validated, and still under the lock taken
+     * before the home was created (AR-03 L12) — the locked helper, not the
+     * public wrapper, which would flock the same lock file on a second fd and
+     * self-deadlock. Isolated mode only; non-fatal. */
     if (gpg_config->mode == GPG_MODE_ISOLATED && strlen(gpg_config->gnupg_home) > 0) {
-        gpg_manager_retarget_current(gpg_config->gnupg_home);
+        gpg_retarget_current_locked(gpg_config->gnupg_home);
     }
 
     log_info("Successfully switched to GPG configuration for account: %s", account->name);
-    return 0;
+    rc = 0;
+
+out:
+    unlock_gpg_dir(lock_fd);
+    return rc;
 }
 
 /* Best-effort check whether `path` lives on a memory-backed filesystem
@@ -315,6 +352,32 @@ static bool base_is_memory_backed(const char *base) {
     }
 }
 
+/* Process-lifetime memo of base_is_memory_backed(), keyed by the base path
+ * (AR-03 L20). The probe walks statfs over the base's nearest existing
+ * ancestor, and gpg_get_base_dir + gpg_create_isolated_home together re-ran it
+ * on every call — 4-6 ancestor walks per GPG switch — because the old
+ * warn-once latch only latched when the answer was BAD; the good/tmpfs path
+ * re-probed forever. A mount's memory-backed-ness cannot change under us for
+ * a fixed path within one short-lived invocation (the base, once created by
+ * ensure_private_dir, stays on the mount the first probe saw), so one answer
+ * per base path is authoritative. Keyed rather than a bare boolean because
+ * the base path itself CAN change within a process when XDG_RUNTIME_DIR
+ * changes (the test suite does exactly that); a stale answer for a different
+ * base would defeat the no-persistent-disk fail-closed guard. Same
+ * single-threaded, process-lifetime caching assumptions as g_seen_keys. */
+static bool base_memory_backed_cached(const char *base) {
+    static int cached = -1; /* -1 unknown; else the 0/1 answer for cached_base */
+    static char cached_base[MAX_PATH_LEN];
+
+    if (cached < 0 || strcmp(cached_base, base) != 0) {
+        if (safe_strncpy(cached_base, base, sizeof(cached_base)) != 0) {
+            return base_is_memory_backed(base); /* unkeyable: answer uncached */
+        }
+        cached = base_is_memory_backed(base) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
 /* Compute the base directory that holds per-account isolated GNUPGHOMEs and the
  * stable `current` symlink. Two-way like the SSH side: prefer XDG_RUNTIME_DIR,
  * else /tmp/gitswitch-gpg-<uid>. There is deliberately no HOME fallback: that
@@ -342,13 +405,17 @@ static int gpg_get_base_dir(char *buf, size_t size) {
          * export XDG_RUNTIME_DIR or accept the risk knowingly. Probes the
          * actual base (nearest existing ancestor when absent), not a hardcoded
          * "/tmp": the base could be a distinct persistent mount under a tmpfs
-         * /tmp (AR-02 #22). The create path (gpg_create_isolated_home)
-         * additionally refuses to write secret material to any non-memory-
-         * backed base unless the user opts in. */
+         * /tmp (AR-02 #22). The probe result is memoized per base path
+         * (AR-03 L20): this function runs 4-6 times per switch, and the
+         * statfs ancestor walk used to repeat on every call whenever the
+         * answer was GOOD (the warn latch below only stops repeat WARNINGS).
+         * The create path (gpg_prepare_base_dir) additionally refuses to
+         * write secret material to any non-memory-backed base unless the
+         * user opts in, sharing the same memoized answer. */
         written = snprintf(buf, size, "/tmp/gitswitch-gpg-%d", getuid());
         static bool warned = false;
         if (!warned && written > 0 && (size_t)written < size &&
-            !base_is_memory_backed(buf)) {
+            !base_memory_backed_cached(buf)) {
             warned = true;
             display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
                             "%s, which is not memory-backed. Exported "
@@ -422,34 +489,30 @@ static void unlock_gpg_dir(int fd) {
     }
 }
 
-/* Point the stable <base>/current symlink at the active account's real
- * GNUPGHOME so a shell that exports GNUPGHOME=<base>/current (via
- * `gitswitch init`) transparently follows each switch. Mirrors the SSH
- * current.sock retargeting in ssh_manager.c. Held under the per-dir lock so
- * the retarget cannot interleave with a concurrent reset's dangling-link
- * cleanup (AR-02 #9). Non-fatal on failure. */
-int gpg_manager_retarget_current(const char *real_home) {
-    char base[MAX_PATH_LEN];
+/* Core of the `current` retarget; the CALLER must hold the base dir's lock.
+ * Re-checks that the target home still exists (is a real directory) before
+ * installing the link (AR-03 L12): the home was validated when it was
+ * created/imported, but a reset — a concurrent one before the create+import
+ * lock existed, or simply an earlier `gitswitch reset` on the rollback path —
+ * may have remove_tree'd it since. Installing the link anyway would point
+ * every `gitswitch init` shell at a missing keyring while the switch reports
+ * success; fail closed and leave the link alone instead. */
+static int gpg_retarget_current_locked(const char *real_home) {
     char link_path[MAX_PATH_LEN];
-    int lock_fd;
-    int rc;
 
-    if (!real_home || strlen(real_home) == 0) {
+    if (gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
         return -1;
     }
 
-    if (gpg_get_base_dir(base, sizeof(base)) != 0 ||
-        gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
+    if (!is_directory(real_home)) {
+        log_warning("Not retargeting GNUPGHOME symlink: home is missing: %s",
+                    real_home);
         return -1;
     }
-
-    lock_fd = lock_gpg_dir(base);
 
     /* Atomically retarget (temp symlink + rename) so a follower never sees a
      * missing or half-updated link. */
-    rc = atomic_symlink(real_home, link_path);
-    unlock_gpg_dir(lock_fd);
-    if (rc != 0) {
+    if (atomic_symlink(real_home, link_path) != 0) {
         log_warning("Failed to create GNUPGHOME symlink %s -> %s",
                     link_path, real_home);
         return -1;
@@ -457,6 +520,34 @@ int gpg_manager_retarget_current(const char *real_home) {
 
     log_debug("Created GNUPGHOME symlink: %s -> %s", link_path, real_home);
     return 0;
+}
+
+/* Point the stable <base>/current symlink at the active account's real
+ * GNUPGHOME so a shell that exports GNUPGHOME=<base>/current (via
+ * `gitswitch init`) transparently follows each switch. Mirrors the SSH
+ * current.sock retargeting in ssh_manager.c. Held under the per-dir lock so
+ * the retarget cannot interleave with a concurrent reset's dangling-link
+ * cleanup (AR-02 #9). The forward switch does NOT come through here: it
+ * retargets via gpg_retarget_current_locked under the lock it already holds
+ * across create+import (AR-03 L12) — flock on a second fd for the same lock
+ * file would self-deadlock. Non-fatal on failure. */
+int gpg_manager_retarget_current(const char *real_home) {
+    char base[MAX_PATH_LEN];
+    int lock_fd;
+    int rc;
+
+    if (!real_home || strlen(real_home) == 0) {
+        return -1;
+    }
+
+    if (gpg_get_base_dir(base, sizeof(base)) != 0) {
+        return -1;
+    }
+
+    lock_fd = lock_gpg_dir(base);
+    rc = gpg_retarget_current_locked(real_home);
+    unlock_gpg_dir(lock_fd);
+    return rc;
 }
 
 /* Drop the stable `current` symlink (switching to a GPG-less account, or
@@ -627,6 +718,54 @@ int gpg_manager_reset(const char *account) {
     return 0;
 }
 
+/* Compute, policy-check, and create the base directory for isolated
+ * GNUPGHOMEs (shared with the stable `current` symlink path so the two never
+ * disagree). Split out of gpg_create_isolated_home so gpg_switch_account can
+ * establish the base — and take its lock — BEFORE the create+import sequence
+ * that lock must cover (AR-03 L12); the create path below then re-runs it
+ * idempotently (the memory-backed probe is memoized, ensure_private_dir is a
+ * create-or-verify). Returns 0 with the base path in `base`. */
+static int gpg_prepare_base_dir(char *base, size_t size) {
+    if (gpg_get_base_dir(base, size) != 0) {
+        return -1;
+    }
+
+    /* Refuse to export secret-key material onto persistent disk, wherever the
+     * base came from. XDG_RUNTIME_DIR is only USUALLY a tmpfs — rootless
+     * containers, NFS-homed logins, or a hand-exported disk path are not — and
+     * the /tmp fallback (or even a bind/quota mount at exactly the base path
+     * under a tmpfs /tmp) can be persistent too, so probe the actual computed
+     * base rather than trusting its source or a hardcoded parent (AR-02 #3,
+     * #22; probe memoized per base path — AR-03 L20). Fail closed unless the
+     * user explicitly opts in with GITSWITCH_ALLOW_TMP_GPG=1 (or, better,
+     * points XDG_RUNTIME_DIR at a tmpfs); on opt-in, remind them once per
+     * process what they accepted. */
+    if (!base_memory_backed_cached(base)) {
+        const char *optin = getenv("GITSWITCH_ALLOW_TMP_GPG");
+        if (!optin || strcmp(optin, "1") != 0) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing to write GPG secret keys to non-memory-backed %s. "
+                      "Set XDG_RUNTIME_DIR to a tmpfs, or GITSWITCH_ALLOW_TMP_GPG=1 "
+                      "to accept on-disk secret-key persistence.", base);
+            return -1;
+        }
+        static bool warned_optin = false;
+        if (!warned_optin) {
+            warned_optin = true;
+            display_warning("GITSWITCH_ALLOW_TMP_GPG=1: writing GPG secret keys to "
+                            "non-memory-backed %s; they may remain recoverable on "
+                            "disk after deletion.", base);
+        }
+    }
+
+    /* Create + verify the base directory (real, user-owned, 0700; not a
+     * symlink or a dir pre-created by another user in a shared /tmp). */
+    if (ensure_private_dir(base) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 /* Create isolated GNUPGHOME for account */
 int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account) {
     char gnupg_base_dir[MAX_PATH_LEN];
@@ -637,45 +776,12 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
         return -1;
     }
 
-    /* Determine base directory for isolated GNUPGHOME (shared with the stable
-     * `current` symlink path so the two never disagree). */
-    if (gpg_get_base_dir(gnupg_base_dir, sizeof(gnupg_base_dir)) != 0) {
+    /* Base: computed, policy-checked (no persistent disk without opt-in), and
+     * created 0700 — see gpg_prepare_base_dir. */
+    if (gpg_prepare_base_dir(gnupg_base_dir, sizeof(gnupg_base_dir)) != 0) {
         return -1;
     }
 
-    /* Refuse to export secret-key material onto persistent disk, wherever the
-     * base came from. XDG_RUNTIME_DIR is only USUALLY a tmpfs — rootless
-     * containers, NFS-homed logins, or a hand-exported disk path are not — and
-     * the /tmp fallback (or even a bind/quota mount at exactly the base path
-     * under a tmpfs /tmp) can be persistent too, so probe the actual computed
-     * base rather than trusting its source or a hardcoded parent (AR-02 #3,
-     * #22). Fail closed unless the user explicitly opts in with
-     * GITSWITCH_ALLOW_TMP_GPG=1 (or, better, points XDG_RUNTIME_DIR at a
-     * tmpfs); on opt-in, remind them once per process what they accepted. */
-    if (!base_is_memory_backed(gnupg_base_dir)) {
-        const char *optin = getenv("GITSWITCH_ALLOW_TMP_GPG");
-        if (!optin || strcmp(optin, "1") != 0) {
-            set_error(ERR_PERMISSION_DENIED,
-                      "Refusing to write GPG secret keys to non-memory-backed %s. "
-                      "Set XDG_RUNTIME_DIR to a tmpfs, or GITSWITCH_ALLOW_TMP_GPG=1 "
-                      "to accept on-disk secret-key persistence.", gnupg_base_dir);
-            return -1;
-        }
-        static bool warned_optin = false;
-        if (!warned_optin) {
-            warned_optin = true;
-            display_warning("GITSWITCH_ALLOW_TMP_GPG=1: writing GPG secret keys to "
-                            "non-memory-backed %s; they may remain recoverable on "
-                            "disk after deletion.", gnupg_base_dir);
-        }
-    }
-
-    /* Create + verify the base directory (real, user-owned, 0700; not a
-     * symlink or a dir pre-created by another user in a shared /tmp). */
-    if (ensure_private_dir(gnupg_base_dir) != 0) {
-        return -1;
-    }
-    
     /* Create account-specific GNUPGHOME */
     if (safe_snprintf(gnupg_home, sizeof(gnupg_home), "%s/%s", gnupg_base_dir, account->name) != 0) {
         set_error(ERR_INVALID_PATH, "GNUPGHOME path too long");
@@ -715,10 +821,10 @@ int gpg_import_key(gpg_config_t *gpg_config, const char *key_source) {
 
     /* Import from a key file, or fetch by id from the keyserver. */
     if (path_exists(key_source)) {
-        result = gpg_run(gpg_config, output, sizeof(output),
+        result = gpg_run(gpg_config, NULL, output, sizeof(output),
                          "gpg", "--import", key_source, NULL);
     } else {
-        result = gpg_run(gpg_config, output, sizeof(output),
+        result = gpg_run(gpg_config, NULL, output, sizeof(output),
                          "gpg", "--keyserver", "hkps://keys.openpgp.org",
                          "--recv-keys", key_source, NULL);
     }
@@ -739,7 +845,7 @@ int gpg_export_public_key(gpg_config_t *gpg_config, const char *key_id,
         return -1;
     }
 
-    return gpg_run(gpg_config, output, output_size,
+    return gpg_run(gpg_config, NULL, output, output_size,
                    "gpg", "--armor", "--export", key_id, NULL);
 }
 
@@ -750,7 +856,7 @@ int gpg_list_keys(gpg_config_t *gpg_config, char *output, size_t output_size) {
         return -1;
     }
     
-    return gpg_run(gpg_config, output, output_size,
+    return gpg_run(gpg_config, NULL, output, output_size,
                    "gpg", "--list-keys", "--with-colons", NULL);
 }
 
@@ -766,7 +872,7 @@ int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id) {
 
     log_debug("Validating GPG key: %s", key_id);
 
-    result = gpg_run(gpg_config, output, sizeof(output),
+    result = gpg_run(gpg_config, NULL, output, sizeof(output),
                      "gpg", "--list-secret-keys", key_id, NULL);
     if (result != 0) {
         set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found: %s", key_id);
@@ -876,6 +982,7 @@ bool gpg_colons_have_sign_capability(const char *colons) {
  * sufficient — real signing is exercised when the user actually commits. */
 int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
     char output[4096];
+    run_result_t res;
     int result;
 
     if (!gpg_config || !key_id) {
@@ -885,7 +992,7 @@ int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
 
     log_debug("Verifying signing capability for key: %s", key_id);
 
-    result = gpg_run(gpg_config, output, sizeof(output),
+    result = gpg_run(gpg_config, &res, output, sizeof(output),
                      "gpg", "--list-secret-keys", "--with-colons", key_id, NULL);
     if (result != 0) {
         set_error(ERR_GPG_SIGNING_FAILED, "No secret key available for signing: %s", key_id);
@@ -893,6 +1000,19 @@ int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
     }
 
     if (!gpg_colons_have_sign_capability(output)) {
+        /* A truncated capture is INCOMPLETE evidence, not proof of absence
+         * (AR-03 L4): a large multi-uid/multi-subkey key can armor its
+         * signing `ssb` record past the capture buffer, into the dropped
+         * tail. The listing's exit 0 already proved the secret key is
+         * present, and this capability check is advisory — real signing is
+         * exercised when the user actually commits — so treat truncation as
+         * inconclusive rather than report a spurious failure. */
+        if (res.out_truncated) {
+            log_debug("Signing-capability listing truncated for key %s; "
+                      "treating as inconclusive, not a failure", key_id);
+            gpg_manager_note_key_available(key_id);
+            return 0;
+        }
         set_error(ERR_GPG_SIGNING_FAILED, "Key has no signing-capable secret key: %s", key_id);
         return -1;
     }
@@ -1006,8 +1126,12 @@ static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_s
 
 /* Run `gpg`/argv (NULL-terminated varargs, argv[0] is the first vararg), no
  * shell, with GNUPGHOME set from cfg in isolated mode. Captures merged
- * stdout+stderr. Returns 0 iff the child exits 0. */
-static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ...) {
+ * stdout+stderr. Returns 0 iff the child exits 0. res_out (optional, may be
+ * NULL) receives the full run_result_t — callers that parse the capture as
+ * evidence must check its out_truncated flag, since a truncated listing is
+ * INCOMPLETE, not authoritative (AR-03 L4). */
+static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
+                   char *output, size_t output_size, ...) {
     const char *argv[24];
     size_t n = 0;
     va_list ap;
@@ -1036,7 +1160,7 @@ static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ..
     gpg_build_env(cfg, envbuf, sizeof(envbuf), env);
     if (env[0]) opts.extra_env = env;
 
-    return run_argv(argv, &opts, &res);
+    return run_argv(argv, &opts, res_out ? res_out : &res);
 }
 
 /* Copy GPG key from system keyring to isolated environment.
@@ -1077,10 +1201,18 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
      * agent's PIN, so skipping it avoids a PIN prompt on every switch. The
      * probe asks with --with-colons so its output doubles as the caller's
      * signing-capability evidence (AR-02 #14). */
-    if (gpg_run(gpg_config, colons, colons_size,
+    if (gpg_run(gpg_config, &res, colons, colons_size,
                 "gpg", "--list-secret-keys", "--with-colons", key_id, NULL) == 0) {
         log_debug("Secret key already present in isolated home; skipping import: %s", key_id);
-        *colons_valid = true;
+        /* Hand the listing back as signing evidence only when the capture is
+         * complete (AR-03 L4). Exit 0 alone proves the key is present, so
+         * skipping the import stays correct either way — but a TRUNCATED
+         * listing may have dropped the very `ssb` record that carries the
+         * signing capability, and treating it as authoritative made the
+         * caller warn "GPG signing test failed" for perfectly good big keys.
+         * Left invalid, the caller re-asks via gpg_test_signing, which does
+         * its own truncation handling. */
+        *colons_valid = !res.out_truncated;
         gpg_manager_note_key_available(key_id);
         return 0;
     }
