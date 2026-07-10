@@ -181,11 +181,9 @@ TEST(ssh_fingerprint_reuse_rejects_different_key) {
     CHECK(!path_exists(sock));
 }
 
-/* T1 (AR-01-T1, separate ticket): parse_ssh_agent_output must unwrap a quoted
- * SSH_AUTH_SOCK="..." value and cap the socket length. The fix has NOT landed
- * in this branch's ssh_manager.c (the parser still copies the quotes, so this
- * test fails today by design). Flip to #if 1 when AR-01-T1 merges. */
-#if 0 /* enable when AR-01-T1 lands */
+/* T1 (AR-01-T1): parse_ssh_agent_output must unwrap a quoted
+ * SSH_AUTH_SOCK="..." value, the way some ssh-agent builds and wrappers
+ * report paths containing spaces/parens. Locks the T1 quoted-socket fix. */
 
 /* Runner variant whose fake ssh-agent SUCCEEDS: it binds a real socket at the
  * requested -a path and reports it QUOTED, the way some ssh-agent builds and
@@ -255,13 +253,10 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     CHECK(strchr(cfg.agent_socket_path, '"') == NULL); /* quotes stripped */
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
 }
-#endif /* AR-01-T1 */
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ssh_fingerprint_reuse_adopts_matching_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
-#if 0 /* enable when AR-01-T1 lands */
     RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
-#endif
 TEST_MAIN_END()
