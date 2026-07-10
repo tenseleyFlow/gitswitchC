@@ -381,6 +381,17 @@ TEST(add_rejects_c1_and_malformed_utf8_in_name) {
     fill_account(&a, 1, "work\x9B" "31m", "w@x.com", "d");     /* bare C1 byte */
     CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
 
+    /* AR-02 #28: the OVERLONG spellings of the same C1 CSI (U+009B) — the
+     * exact smuggling vector utf8_decode's strictness exists to stop, and
+     * previously exercised by no test. 3-byte: E0 82 9B; 4-byte: F0 80 82 9B.
+     * A lenient decoder normalizes either back to 0x9B and the terminal
+     * executes it; the strict decoder must call both malformed. */
+    fill_account(&a, 1, "work\xE0\x82\x9B" "31m", "w@x.com", "d");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+
+    fill_account(&a, 1, "work\xF0\x80\x82\x9B" "31m", "w@x.com", "d");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+
     fill_account(&a, 1, "caf\xC3\xA9", "w@x.com", "d");        /* plain UTF-8 "café" */
     CHECK_EQ_INT(config_add_account(&ctx, &a), 0);
     CHECK_EQ_INT(ctx.account_count, 1);
@@ -393,6 +404,13 @@ TEST(add_rejects_escape_in_description) {
     memset(&ctx, 0, sizeof(ctx));
 
     fill_account(&a, 1, "work", "w@x.com", "ok\x1B[31mred");   /* raw ESC */
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+
+    /* Overlong-encoded C1 controls in the description (AR-02 #28): the add
+     * path fails closed on them just like the raw/2-byte forms. */
+    fill_account(&a, 1, "work", "w@x.com", "ok\xE0\x82\x9B" "31m");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
+    fill_account(&a, 1, "work", "w@x.com", "ok\xF0\x80\x82\x9B" "31m");
     CHECK_EQ_INT(config_add_account(&ctx, &a), -1);
 
     fill_account(&a, 1, "work", "w@x.com", "caf\xC3\xA9 \xE2\x98\x95"); /* "café ☕" */

@@ -103,7 +103,88 @@ TEST(repeat_isolated_switch_spawns_gpg_once) {
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
 }
 
+/* ---- AR-02 #4 at the switch level: truncated exports never import -------- */
+
+static bool g_import_ran;
+
+/* Key absent from every keyring; the export "succeeds" but overflows the
+ * capture (out_truncated) — exactly what a multi-subkey RSA-4096 armor did to
+ * the old fixed 8 KB buffer. The import must never see those bytes. */
+static int truncating_export_runner(const char *const argv[],
+                                    const run_opts_t *opts,
+                                    run_result_t *result) {
+    bool is_export = false, is_import = false, is_listing = false;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+
+    if (strcmp(argv[0], "gpg") == 0) {
+        for (int i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "--export-secret-keys") == 0) is_export = true;
+            if (strcmp(argv[i], "--import") == 0) is_import = true;
+            if (strcmp(argv[i], "--list-secret-keys") == 0) is_listing = true;
+        }
+    }
+    if (is_import) {
+        g_import_ran = true;
+        return 0;
+    }
+    if (is_export) {
+        if (opts && opts->out && opts->out_size > 0) {
+            size_t fill = opts->out_size - 1;
+            memset(opts->out, 'A', fill);
+            opts->out[fill] = '\0';
+            if (result) {
+                result->out_len = fill;
+                result->out_truncated = true; /* capture is INCOMPLETE */
+            }
+        }
+        return 0;
+    }
+    if (is_listing) {
+        if (result) result->exit_code = 2;
+        return -1; /* key present nowhere */
+    }
+    return 0; /* gpgconf etc. */
+}
+
+TEST(truncated_secret_key_export_is_never_imported) {
+    char xdg[128];
+    gpg_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+    int rc;
+
+    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
+    CHECK(mkdtemp(xdg) != NULL);
+    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    setenv("XDG_RUNTIME_DIR", xdg, 1);
+    setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = GPG_MODE_ISOLATED;
+    memset(&acct, 0, sizeof(acct));
+    snprintf(acct.name, sizeof(acct.name), "bigkey");
+    snprintf(acct.email, sizeof(acct.email), "b@x.com");
+    acct.gpg_enabled = true;
+    snprintf(acct.gpg_key_id, sizeof(acct.gpg_key_id), "DDDDEEEEFFFF0000");
+
+    g_import_ran = false;
+    prev = run_set_runner(truncating_export_runner);
+    rc = gpg_switch_account(&cfg, &acct);
+    run_set_runner(prev);
+
+    /* The switch fails closed rather than importing corrupt armor. */
+    CHECK_EQ_INT(rc, -1);
+    CHECK(!g_import_ran);
+
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(repeat_isolated_switch_spawns_gpg_once);
+    RUN_TEST(truncated_secret_key_export_is_never_imported);
 TEST_MAIN_END()

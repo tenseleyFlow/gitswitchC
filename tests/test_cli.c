@@ -24,9 +24,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 /* Absolute path to the binary under test (execution may happen after chdir). */
@@ -266,6 +268,74 @@ TEST(resume_gpg_only_attempts_restore_after_boot_wipe) {
     remove_tree(rt);
 }
 
+/* AR-02 #13: the two must-resume safety guards in resume_already_applied.
+ * The no-op fast path may only engage when the live GNUPGHOME `current`
+ * symlink points at THIS account's real home; a stale link left at some OTHER
+ * account's home, or a dangling link after `gitswitch reset`, must not
+ * suppress the restore. Both assert the restore is attempted (the "restoring"
+ * stderr notice), like resume_gpg_only_attempts_restore_after_boot_wipe. */
+TEST(resume_gpg_only_restores_when_current_points_at_other_account) {
+    char home[256], rt[256], path[4352], target[4352], cmd[16384];
+    char cfg[1024], err[8192], err_path[4352];
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+
+    /* `current` resolves to a REAL isolated home — but a different account's. */
+    snprintf(path, sizeof(path), "%s/gitswitch-gpg", rt);
+    CHECK_EQ_INT(mkdir(path, 0700), 0);
+    snprintf(target, sizeof(target), "%s/gitswitch-gpg/otheracct", rt);
+    CHECK_EQ_INT(mkdir(target, 0700), 0);
+    snprintf(path, sizeof(path), "%s/gitswitch-gpg/current", rt);
+    CHECK_EQ_INT(symlink(target, path), 0);
+
+    snprintf(err_path, sizeof(err_path), "%s/resume.err", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' resume </dev/null >/dev/null 2>'%s'",
+             home, rt, g_bin, err_path);
+    (void)run_shell(cmd); /* the switch itself fails (no real key): irrelevant */
+
+    slurp(err_path, err, sizeof(err));
+    CHECK(strstr(err, "restoring") != NULL); /* must NOT silently no-op */
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+TEST(resume_gpg_only_restores_when_current_dangles) {
+    char home[256], rt[256], path[4352], target[4352], cmd[16384];
+    char cfg[1024], err[8192], err_path[4352];
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+
+    /* `current` names this account's home, but the home is GONE — the state
+     * `gitswitch reset gpgonly` leaves behind. */
+    snprintf(path, sizeof(path), "%s/gitswitch-gpg", rt);
+    CHECK_EQ_INT(mkdir(path, 0700), 0);
+    snprintf(target, sizeof(target), "%s/gitswitch-gpg/gpgonly", rt);
+    snprintf(path, sizeof(path), "%s/gitswitch-gpg/current", rt);
+    CHECK_EQ_INT(symlink(target, path), 0); /* dangling: target never created */
+
+    snprintf(err_path, sizeof(err_path), "%s/resume.err", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' resume </dev/null >/dev/null 2>'%s'",
+             home, rt, g_bin, err_path);
+    (void)run_shell(cmd);
+
+    slurp(err_path, err, sizeof(err));
+    CHECK(strstr(err, "restoring") != NULL);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 /* Resume must never read stdin. Repro of the F2 hang: local-scope account,
  * cwd not a git repo, stdin a TTY — before the fix accounts_switch printed its
  * global-scope consent prompt to the suppressed stdout and blocked on fgets,
@@ -438,6 +508,130 @@ TEST(reset_other_account_keeps_current_sock) {
     remove_tree(rt);
 }
 
+/* ---------- AR-02 #1/#17: config-lock serialization ---------- */
+
+/* Mutating commands (reset here; switch/resume take the same path) must block
+ * on the cross-process config write lock; read-only commands must not take it.
+ * A child holds the lock and writes its "done" marker only after a generous
+ * delay: a reset that genuinely blocks returns only after the marker exists,
+ * while `list` completes while the lock is still held. This is the practical
+ * two-process serialization check for the split-identity race the lock closes. */
+TEST(mutating_commands_block_on_config_lock_readonly_dont) {
+    char home[256], rt[256], lockpath[4352], held[4352], done[4352], cmd[16384];
+    pid_t pid;
+    int status = 0, waited = 0, rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, two_ssh_accounts_config()), 0);
+    snprintf(lockpath, sizeof(lockpath), "%s/.config/gitswitch/.config.lock", home);
+    snprintf(held, sizeof(held), "%s/lock-held", rt);
+    snprintf(done, sizeof(done), "%s/lock-done", rt);
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct timespec ts = { .tv_sec = 2, .tv_nsec = 0 };
+        FILE *m;
+        int fd = open(lockpath, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        if (fd < 0 || flock(fd, LOCK_EX) != 0) _exit(9);
+        m = fopen(held, "w");
+        if (!m) _exit(9);
+        fclose(m);
+        nanosleep(&ts, NULL);
+        m = fopen(done, "w");   /* written BEFORE releasing the lock */
+        if (!m) _exit(9);
+        fclose(m);
+        flock(fd, LOCK_UN);
+        close(fd);
+        _exit(0);
+    }
+
+    while (access(held, F_OK) != 0 && waited < 5000) {
+        struct timespec ts = { .tv_sec = 0, .tv_nsec = 10000000 };
+        nanosleep(&ts, NULL);
+        waited += 10;
+    }
+    CHECK(access(held, F_OK) == 0);
+
+    /* Read-only: list completes while the lock is held (it must not take it). */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' list >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    CHECK(access(done, F_OK) != 0); /* returned before the holder released */
+
+    /* Mutating: reset blocks until the holder releases. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y reset >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    CHECK(access(done, F_OK) == 0); /* only reachable after the lock dropped */
+
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+/* ---------- AR-02 #6 end-to-end: UTF-8 names must not brick the config ---- */
+
+/* An accented account name written to accounts.toml must survive the whole
+ * CLI round trip: list shows it, remove deletes it, and no command fails the
+ * whole-config load. Pre-fix the raw-buffer charset gate rejected every byte
+ * >= 0x80, so one such name made every invocation exit 2 — including the
+ * remove that could have deleted it. */
+TEST(utf8_account_name_cli_round_trip) {
+    char home[256], rt[256], cmd[16384], out_path[4352], out[8192];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"Jos\xC3\xA9 Work\"\n"
+        "email = \"jose@example.com\"\n"
+        "\n"
+        "[accounts.2]\n"
+        "name = \"plain\"\n"
+        "email = \"p@example.com\"\n"), 0);
+
+    snprintf(out_path, sizeof(out_path), "%s/list.out", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' list >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "Jos\xC3\xA9 Work") != NULL); /* byte-identical, not "Jos" */
+
+    /* The tool itself can remove the accented account (pre-fix it could not
+     * even load the file to try). */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y remove 1 >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    snprintf(out_path, sizeof(out_path), "%s/.config/gitswitch/accounts.toml", home);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "Jos\xC3\xA9") == NULL);
+    CHECK(strstr(out, "plain") != NULL); /* the other account survived the save */
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 TEST_MAIN_BEGIN()
     if (resolve_binary() != 0) {
         fprintf(stderr, "RESULT FAIL: cannot locate gitswitch binary\n");
@@ -449,7 +643,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(init_fails_on_enospc);
     RUN_TEST(resume_gpg_only_noops_silently_when_state_live);
     RUN_TEST(resume_gpg_only_attempts_restore_after_boot_wipe);
+    RUN_TEST(resume_gpg_only_restores_when_current_points_at_other_account);
+    RUN_TEST(resume_gpg_only_restores_when_current_dangles);
     RUN_TEST(resume_never_blocks_reading_stdin);
     RUN_TEST(reset_account_removes_current_sock_pointing_at_it);
     RUN_TEST(reset_other_account_keeps_current_sock);
+    RUN_TEST(mutating_commands_block_on_config_lock_readonly_dont);
+    RUN_TEST(utf8_account_name_cli_round_trip);
 TEST_MAIN_END()

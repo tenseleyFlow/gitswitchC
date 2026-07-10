@@ -233,6 +233,9 @@ TEST(safe_characters_reject_c1_and_overlong_utf8) {
     /* Overlong 3-byte encoding of U+009B: 0xE0 0x82 0x9B. */
     char overlong3[] = { 'a', (char)0xE0, (char)0x82, (char)0x9B, 'b', '\0' };
     CHECK(!toml_validate_safe_characters(overlong3, 5));
+    /* Overlong 4-byte encoding of U+009B: 0xF0 0x80 0x82 0x9B (AR-02 #28). */
+    char overlong4[] = { 'a', (char)0xF0, (char)0x80, (char)0x82, (char)0x9B, 'b', '\0' };
+    CHECK(!toml_validate_safe_characters(overlong4, 6));
     /* Bare continuation byte. */
     char bare_cont[] = { 'a', (char)0x80, 'b', '\0' };
     CHECK(!toml_validate_safe_characters(bare_cont, 3));
