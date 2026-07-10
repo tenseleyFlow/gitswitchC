@@ -1095,8 +1095,11 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
      * key_data now holds unencrypted armored private-key material, so every
      * exit below must scrub it (secure_zero_memory) before freeing — a plain
      * free would leave the key in heap memory for a later allocation, core
-     * dump, or memory-disclosure bug to recover. Export stderr stays
-     * discarded: stdout IS the key, so merging would corrupt it. */
+     * dump, or memory-disclosure bug to recover. (The same bytes also transit
+     * run_argv_real's read buffer; that copy is scrubbed there — AR-02 #25 —
+     * so this scrub genuinely closes the exposure rather than half of it.)
+     * Export stderr stays discarded: stdout IS the key, so merging would
+     * corrupt it. */
     {
         const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys", key_id, NULL};
         memset(&opts, 0, sizeof(opts));

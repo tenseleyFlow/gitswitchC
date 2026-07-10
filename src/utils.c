@@ -688,6 +688,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     int infd = want_in ? in_pipe[1] : -1;
     int outfd = want_out ? out_pipe[0] : -1;
     size_t in_off = 0, out_off = 0;
+    /* Function-scope (not loop-scope) so it can be scrubbed after the loop:
+     * captured child stdout transits this buffer, and for the GPG secret-key
+     * export that is unencrypted private-key material — the caller scrubs its
+     * own copy, but these bytes would otherwise stay resident in this frame
+     * after return (AR-02 #25). */
+    char rdbuf[4096];
     if (infd >= 0) set_nonblock(infd);
     if (outfd >= 0) set_nonblock(outfd);
 
@@ -723,14 +729,13 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         }
 
         if (out_idx >= 0 && (pfds[out_idx].revents & (POLLIN | POLLERR | POLLHUP))) {
-            char buf[4096];
-            ssize_t r = read(outfd, buf, sizeof(buf));
+            ssize_t r = read(outfd, rdbuf, sizeof(rdbuf));
             if (r > 0) {
                 size_t cp = 0;
                 if (out_off < opts->out_size - 1) {
                     size_t space = opts->out_size - 1 - out_off;
                     cp = ((size_t)r < space) ? (size_t)r : space;
-                    memcpy(opts->out + out_off, buf, cp);
+                    memcpy(opts->out + out_off, rdbuf, cp);
                     out_off += cp;
                 }
                 /* Bytes beyond the capture buffer are still drained (so the
@@ -747,7 +752,11 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             }
         }
     }
-    if (want_out) opts->out[out_off] = '\0';
+    if (want_out) {
+        opts->out[out_off] = '\0';
+        /* Drop the transit copy of the child's output (AR-02 #25). */
+        secure_zero_memory(rdbuf, sizeof(rdbuf));
+    }
     result->out_len = out_off;
 
     int status = 0;
