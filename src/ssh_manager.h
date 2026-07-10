@@ -18,6 +18,9 @@ typedef struct {
     char agent_socket_path[MAX_PATH_LEN];
     pid_t agent_pid;
     bool agent_owned;      /* Whether we started this agent */
+    bool key_already_loaded; /* Reused a live agent that already holds the key;
+                              * caller can skip ssh_add_key (avoids a passphrase
+                              * re-prompt on re-switching to the active account) */
 } ssh_config_t;
 
 /* Function prototypes */

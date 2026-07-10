@@ -34,10 +34,6 @@
 static struct termios g_original_termios;
 static bool g_echo_disabled = false;
 
-/* Cleanup handlers registry */
-static void (*g_cleanup_handlers[16])(void);
-static size_t g_cleanup_handler_count = 0;
-
 /* String utilities */
 
 char *trim_whitespace(char *str) {
@@ -126,14 +122,24 @@ int expand_path(const char *path, char *expanded_path, size_t path_size) {
     /* Handle tilde expansion */
     if (path[0] == '~') {
         char home_path[MAX_PATH_LEN];
-        
+
+        /* Only the current user's home is supported: "~" and "~/...". A
+         * "~user/..." form is rejected rather than silently mis-expanded to
+         * "$HOME/user/..." (which produced confusing "not found" paths and,
+         * if such a path happened to exist, could load the wrong key). */
+        if (path[1] != '\0' && path[1] != '/') {
+            set_error(ERR_INVALID_ARGS,
+                      "~user paths are not supported; use an absolute path or ~/: %s", path);
+            return -1;
+        }
+
         if (get_home_directory(home_path, sizeof(home_path)) != 0) {
             return -1;
         }
-        
-        /* Handle ~/path and ~/ cases */
+
+        /* Handle ~/path and ~ cases */
         const char *rest = (path[1] == '/') ? path + 2 : path + 1;
-        
+
         if (snprintf(expanded_path, path_size, "%s/%s", home_path, rest) >= (int)path_size) {
             set_error(ERR_INVALID_ARGS, "Expanded path too long");
             return -1;
@@ -633,6 +639,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
         if (poll(pfds, (nfds_t)n, -1) < 0) {
             if (errno == EINTR) continue;
+            /* Close both pipe ends before bailing: leaving infd open means a
+             * child reading stdin (e.g. `gpg --import`) never sees EOF, and
+             * the waitpid() below would then block forever. Closing also lets
+             * a child blocked writing a full pipe get SIGPIPE and exit. */
+            if (infd >= 0) { close(infd); infd = -1; }
+            if (outfd >= 0) { close(outfd); outfd = -1; }
             break;
         }
 
@@ -756,97 +768,6 @@ bool command_exists(const char *command) {
     return find_command_path(command, path, sizeof(path)) == 0;
 }
 
-pid_t start_background_process(const char *command, char *pidfile_path) {
-    pid_t pid;
-    FILE *pidfile;
-    
-    if (!command) {
-        set_error(ERR_INVALID_ARGS, "NULL command to start_background_process");
-        return -1;
-    }
-    
-    pid = fork();
-    if (pid == -1) {
-        set_system_error(ERR_SYSTEM_CALL, "Failed to fork process");
-        return -1;
-    }
-    
-    if (pid == 0) {
-        /* Child process */
-        setsid(); /* Create new session */
-        
-        /* Redirect standard streams */
-        if (!freopen("/dev/null", "r", stdin)) {
-            /* Failed to redirect stdin, but continue */
-        }
-        if (!freopen("/dev/null", "w", stdout)) {
-            /* Failed to redirect stdout, but continue */
-        }
-        if (!freopen("/dev/null", "w", stderr)) {
-            /* Failed to redirect stderr, but continue */
-        }
-        
-        /* Execute command */
-        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
-        _exit(127); /* If exec fails */
-    }
-    
-    /* Parent process */
-    if (pidfile_path) {
-        pidfile = fopen(pidfile_path, "w");
-        if (pidfile) {
-            fprintf(pidfile, "%d\n", pid);
-            fclose(pidfile);
-        }
-    }
-    
-    return pid;
-}
-
-int kill_process_by_pidfile(const char *pidfile_path) {
-    FILE *pidfile;
-    pid_t pid;
-    
-    if (!pidfile_path) {
-        set_error(ERR_INVALID_ARGS, "NULL pidfile path");
-        return -1;
-    }
-    
-    pidfile = fopen(pidfile_path, "r");
-    if (!pidfile) {
-        set_system_error(ERR_FILE_IO, "Failed to open pidfile: %s", pidfile_path);
-        return -1;
-    }
-    
-    if (fscanf(pidfile, "%d", &pid) != 1) {
-        set_error(ERR_FILE_IO, "Failed to read PID from file: %s", pidfile_path);
-        fclose(pidfile);
-        return -1;
-    }
-    
-    fclose(pidfile);
-    
-    if (pid <= 0) {
-        set_error(ERR_INVALID_ARGS, "Invalid PID in file: %d", pid);
-        return -1;
-    }
-    
-    if (kill(pid, SIGTERM) != 0) {
-        if (errno == ESRCH) {
-            /* Process doesn't exist - clean up pidfile */
-            unlink(pidfile_path);
-            return 0;
-        }
-        set_system_error(ERR_SYSTEM_CALL, "Failed to kill process %d", pid);
-        return -1;
-    }
-    
-    /* Clean up pidfile */
-    unlink(pidfile_path);
-    
-    return 0;
-}
-
 bool process_is_running(pid_t pid) {
     if (pid <= 0) return false;
     return kill(pid, 0) == 0;
@@ -908,37 +829,60 @@ int unset_env_var(const char *name) {
 /* Validation utilities */
 
 bool validate_email(const char *email) {
-    regex_t regex;
-    int result;
-    
+    /* Compile the constant pattern once and reuse it. This is called 2N+ times
+     * per config load (schema + security validation per account, plus on
+     * switch), on the every-shell init/resume path, so recompiling the same
+     * regex each time was pure waste. Single-threaded, so a static cache is safe. */
+    static regex_t regex;
+    static bool compiled = false;
+
     if (!email || strlen(email) > MAX_EMAIL_LEN) {
         return false;
     }
-    
-    /* Basic email regex - not RFC compliant but good enough for git configs */
-    const char *pattern = "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$";
-    
-    result = regcomp(&regex, pattern, REG_EXTENDED);
-    if (result) return false;
-    
-    result = regexec(&regex, email, 0, NULL, 0);
-    regfree(&regex);
-    
-    return result == 0;
+
+    if (!compiled) {
+        /* Basic email regex - not RFC compliant but good enough for git configs */
+        const char *pattern = "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$";
+        if (regcomp(&regex, pattern, REG_EXTENDED) != 0) {
+            return false;
+        }
+        compiled = true;
+    }
+
+    return regexec(&regex, email, 0, NULL, 0) == 0;
 }
 
 bool validate_name(const char *name) {
     if (!name || strlen(name) == 0 || strlen(name) >= MAX_NAME_LEN) {
         return false;
     }
-    
+
+    /* The account name doubles as a filesystem path component (the isolated
+     * GNUPGHOME <base>/<name> and the ssh-agent.<name>.sock socket) as well as
+     * the git user.name. So it must stay a single, safe path component while
+     * still allowing ordinary display names with spaces and parentheses
+     * ("Jane Doe (Work)"). Reject path separators and traversal, control
+     * characters, and a leading '-'/'.' (option-like / hidden / '..'). */
+    if (name[0] == '-' || name[0] == '.') {
+        return false;
+    }
+    if (strstr(name, "..") != NULL) {
+        return false;
+    }
+    for (const char *p = name; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '/' || c == '\\' || c < 0x20 || c == 0x7f) {
+            return false;
+        }
+    }
+
     /* Name should contain at least one non-whitespace character */
     for (const char *p = name; *p; p++) {
         if (!isspace((unsigned char)*p)) {
             return true;
         }
     }
-    
+
     return false;
 }
 
@@ -946,14 +890,23 @@ bool validate_key_id(const char *key_id) {
     if (!key_id || strlen(key_id) == 0 || strlen(key_id) >= MAX_KEY_ID_LEN) {
         return false;
     }
-    
-    /* Key ID should be hexadecimal */
-    for (const char *p = key_id; *p; p++) {
+
+    /* Accept the common "0x" prefix that `gpg -k` and keyservers display —
+     * gpg itself accepts a 0x-prefixed key id, so rejecting it only tripped up
+     * users pasting the id exactly as shown. The remainder must be hex. */
+    const char *p = key_id;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+    }
+    if (*p == '\0') {
+        return false; /* "0x" with no digits */
+    }
+    for (; *p; p++) {
         if (!isxdigit((unsigned char)*p)) {
             return false;
         }
     }
-    
+
     return true;
 }
 
@@ -1289,28 +1242,6 @@ int safe_munlock(void *ptr, size_t size) {
     (void)size;
     return 0;
 #endif
-}
-
-/* Cleanup utilities */
-
-void cleanup_temporary_files(void) {
-    /* Implementation would clean up any temporary files created */
-    log_debug("Cleaning up temporary files");
-}
-
-int register_cleanup_handler(void (*handler)(void)) {
-    if (!handler) {
-        set_error(ERR_INVALID_ARGS, "NULL handler to register_cleanup_handler");
-        return -1;
-    }
-    
-    if (g_cleanup_handler_count >= sizeof(g_cleanup_handlers) / sizeof(g_cleanup_handlers[0])) {
-        set_error(ERR_INVALID_ARGS, "Too many cleanup handlers registered");
-        return -1;
-    }
-    
-    g_cleanup_handlers[g_cleanup_handler_count++] = handler;
-    return 0;
 }
 
 /* Debug utilities */

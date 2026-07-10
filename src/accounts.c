@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <ctype.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -20,6 +21,7 @@
 #include "git_ops.h"
 #include "ssh_manager.h"
 #include "gpg_manager.h"
+#include "prompt.h"
 
 /* Active session state - tracks SSH/GPG resources for proper cleanup */
 typedef struct {
@@ -94,6 +96,28 @@ void accounts_session_cleanup(void) {
     /* Clear session state */
     memset(&g_session, 0, sizeof(g_session));
     log_debug("Session cleanup complete");
+}
+
+/* Deactivate the runtime SSH and/or GPG isolation so the stable entry points
+ * (current.sock symlink, GNUPGHOME `current` symlink) no longer point at an
+ * account. Used when switching to an account that has SSH/GPG disabled (so the
+ * previous account's agent/home doesn't stay live behind the switch) and when
+ * rolling back a failed switch. Removing the symlink makes integrated shells
+ * fall back to the default agent/keyring rather than silently keep using the
+ * old account — the exact mismatch this guards against. */
+static void deactivate_runtime_isolation(bool ssh, bool gpg) {
+    if (ssh) {
+        /* Reaps every gitswitch agent and removes current.sock. */
+        ssh_manager_reset(NULL);
+        g_session.ssh_active = false;
+    }
+    if (gpg) {
+        char home_symlink[MAX_PATH_LEN];
+        if (gpg_manager_get_home_path(home_symlink, sizeof(home_symlink)) == 0) {
+            unlink(home_symlink); /* drop the `current` symlink, not its target */
+        }
+        g_session.gpg_active = false;
+    }
 }
 
 /* Switch to specified account with SSH isolation and validation */
@@ -181,8 +205,11 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
      *
      * Ordering matters for safety: validate availability first (read-only), then
      * activate SSH and GPG (recoverable mutations), and write git config LAST.
-     * git config is snapshotted up front and restored on any failure, so a
-     * partial switch can never leave a half-applied identity. */
+     * git config is snapshotted up front and restored on failure; on that same
+     * failure the SSH/GPG runtime state activated in steps 2-3 is also torn
+     * down (deactivate_runtime_isolation), so a failed switch reverts the git
+     * identity AND doesn't leave current.sock / GNUPGHOME pointing at the
+     * new account — no half-applied, mismatched identity. */
     if (!ctx->config.dry_run) {
         /* --- 1. Validate availability up front (no mutation yet) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
@@ -218,16 +245,26 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             g_session.ssh_active = true;
             printf("  [OK] SSH key loaded\n");
 
-            /* Connection test is best-effort (network) and never fatal. */
-            if (strlen(account->ssh_host_alias) > 0) {
-                if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
-                    printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
-                } else {
-                    printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
+            /* Connection test is best-effort (network) and never fatal, so we
+             * skip it entirely on the boot-time resume path — it would only
+             * stall the login shell prompt on a network round trip (up to the
+             * ssh ConnectTimeout when github.com is filtered/offline) for a
+             * result that just picks a status line. */
+            if (!ctx->config.resuming) {
+                if (strlen(account->ssh_host_alias) > 0) {
+                    if (ssh_test_connection(account, account->ssh_host_alias) == 0) {
+                        printf("  [OK] SSH connection verified (%s)\n", account->ssh_host_alias);
+                    } else {
+                        printf("  [--] SSH connection test skipped (%s unreachable)\n", account->ssh_host_alias);
+                    }
+                } else if (ssh_test_connection(account, "git@github.com") == 0) {
+                    printf("  [OK] SSH connection verified (github.com)\n");
                 }
-            } else if (ssh_test_connection(account, "git@github.com") == 0) {
-                printf("  [OK] SSH connection verified (github.com)\n");
             }
+        } else {
+            /* Target has no SSH: tear down any live gitswitch agent + current.sock
+             * so shells stop authenticating as the previously-active account. */
+            deactivate_runtime_isolation(true, false);
         }
 
         /* --- 3. GPG isolated home (mutation; fatal on failure) --- */
@@ -238,28 +275,48 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                 gpg_switch_account(&g_session.gpg_config, account) != 0) {
                 printf("  [!!] GPG key failed to activate\n");
                 gpg_manager_cleanup(&g_session.gpg_config);
+                /* Roll back the SSH activation from step 2 so we don't leave
+                 * current.sock pointing at this account with no matching GPG. */
+                deactivate_runtime_isolation(g_session.ssh_active, false);
                 set_error(ERR_GPG_KEY_FAILED,
                           "Failed to set up GPG for account: %s", account->name);
                 return -1;
             }
             g_session.gpg_active = true;
+        } else {
+            /* Target has no GPG: drop the stable GNUPGHOME symlink so shells
+             * stop signing/using the previous account's keyring. */
+            deactivate_runtime_isolation(false, true);
         }
 
         /* --- 4. git config LAST, snapshotted for rollback --- */
         git_config_snapshot(scope);
         if (git_set_config(account, scope) != 0) {
             git_config_restore();
+            /* Also undo the SSH/GPG activation from steps 2-3: leaving
+             * current.sock / GNUPGHOME pointed at this account while the git
+             * identity reverts to the previous one is exactly the mixed
+             * identity the tool exists to prevent. */
+            deactivate_runtime_isolation(g_session.ssh_active, g_session.gpg_active);
             set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
             return -1;
         }
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
             if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
                 git_config_restore();
+                deactivate_runtime_isolation(g_session.ssh_active, g_session.gpg_active);
                 set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
                 return -1;
             }
             gpg_ok = true;
-            printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
+            /* gpg_configure_git_signing sets commit.gpgsign to the account's
+             * preference, which may be OFF. Don't claim signing is enabled
+             * when we just disabled it — report the actual state. */
+            if (account->gpg_signing_enabled) {
+                printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
+            } else {
+                printf("  [OK] GPG key configured, signing disabled (key: %s)\n", account->gpg_key_id);
+            }
         }
         printf("  [OK] Git config set (%s scope)\n", scope_str);
 
@@ -318,220 +375,246 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     return 0;
 }
 
-/* Add new account interactively with basic validation */
-int accounts_add_interactive(gitswitch_ctx_t *ctx) {
-    account_t new_account;
+/* Shared interactive add/edit flow. `existing` is NULL for add, or points at
+ * the account being edited (in which case every prompt shows the current value
+ * as the default and an empty answer keeps it). Routes all input through
+ * prompt_line so readline builds get line editing and TAB path completion. */
+static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
+    account_t acct;
     char input[512];
     char expanded_path[MAX_PATH_LEN];
-    
-    if (!ctx) {
-        set_error(ERR_INVALID_ARGS, "NULL context to accounts_add_interactive");
-        return -1;
+    bool edit = (existing != NULL);
+
+    if (edit) {
+        acct = *existing;
+    } else {
+        memset(&acct, 0, sizeof(acct));
+        acct.id = get_next_available_id(ctx);
+        acct.preferred_scope = ctx->config.default_scope;
     }
-    
-    if (ctx->account_count >= MAX_ACCOUNTS) {
-        set_error(ERR_ACCOUNT_EXISTS, "Maximum number of accounts reached: %d", MAX_ACCOUNTS);
-        return -1;
-    }
-    
-    /* Initialize new account */
-    memset(&new_account, 0, sizeof(new_account));
-    new_account.id = get_next_available_id(ctx);
-    new_account.preferred_scope = ctx->config.default_scope;
-    
+
     printf("\n┌─────────────────────────────────────┐\n");
-    printf("│          Add New Account            │\n");
+    printf("│ %-35s │\n", edit ? "Edit Account" : "Add New Account");
     printf("└─────────────────────────────────────┘\n\n");
-    
-    /* Get account name */
-    do {
-        printf("Account Name: ");
-        fflush(stdout);
-        
-        if (!fgets(input, sizeof(input), stdin)) {
+
+    /* Name */
+    while (1) {
+        if (edit) printf("Account Name [%s]: ", acct.name);
+        else      printf("Account Name: ");
+        if (prompt_line("", input, sizeof(input), false) != 0 && !edit) {
             set_error(ERR_FILE_IO, "Failed to read account name");
             return -1;
         }
-        
-        input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
-        
-        if (!validate_name(input)) {
+        if (strlen(input) == 0) {
+            if (edit) break;            /* keep current */
             printf("[ERROR]: Invalid name. Please enter a non-empty name.\n");
             continue;
         }
-        
-        safe_strncpy(new_account.name, input, sizeof(new_account.name));
+        if (!validate_name(input)) {
+            printf("[ERROR]: Invalid name (no '/', '\\', '..', or control chars).\n");
+            continue;
+        }
+        safe_strncpy(acct.name, input, sizeof(acct.name));
         break;
-    } while (1);
-    
-    /* Get email address */
-    do {
-        printf("Email Address: ");
-        fflush(stdout);
-        
-        if (!fgets(input, sizeof(input), stdin)) {
+    }
+
+    /* Email */
+    while (1) {
+        if (edit) printf("Email Address [%s]: ", acct.email);
+        else      printf("Email Address: ");
+        if (prompt_line("", input, sizeof(input), false) != 0 && !edit) {
             set_error(ERR_FILE_IO, "Failed to read email address");
             return -1;
         }
-        
-        input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
-        
+        if (strlen(input) == 0) {
+            if (edit) break;
+            printf("[ERROR]: Invalid email address format.\n");
+            continue;
+        }
         if (!validate_email(input)) {
             printf("[ERROR]: Invalid email address format.\n");
             continue;
         }
-        
-        safe_strncpy(new_account.email, input, sizeof(new_account.email));
+        safe_strncpy(acct.email, input, sizeof(acct.email));
         break;
-    } while (1);
-    
-    /* Get description */
-    printf("Description (optional): ");
-    fflush(stdout);
-    
-    if (fgets(input, sizeof(input), stdin)) {
-        input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
-        
-        if (strlen(input) > 0) {
-            safe_strncpy(new_account.description, input, sizeof(new_account.description));
-        } else {
-            safe_strncpy(new_account.description, new_account.name, sizeof(new_account.description));
-        }
-    } else {
-        safe_strncpy(new_account.description, new_account.name, sizeof(new_account.description));
     }
-    
-    /* Get SSH key configuration */
-    printf("SSH Key Path (optional, press Enter to skip): ");
-    fflush(stdout);
-    
-    if (fgets(input, sizeof(input), stdin)) {
-        input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
-        
-        if (strlen(input) > 0) {
-            /* Expand and validate path */
-            if (expand_path(input, expanded_path, sizeof(expanded_path)) == 0) {
-                if (path_exists(expanded_path)) {
-                    if (validate_ssh_key_security(expanded_path) == 0) {
-                        safe_strncpy(new_account.ssh_key_path, expanded_path, sizeof(new_account.ssh_key_path));
-                        new_account.ssh_enabled = true;
-                        printf("[OK]: SSH key validated: %s\n", expanded_path);
-                        
-                        /* Optional SSH host alias */
-                        printf("SSH Host Alias (optional, e.g., github.com-work): ");
-                        fflush(stdout);
-                        
-                        if (fgets(input, sizeof(input), stdin)) {
-                            input[strcspn(input, "\n")] = '\0';
-                            trim_whitespace(input);
-                            
-                            if (strlen(input) > 0) {
-                                safe_strncpy(new_account.ssh_host_alias, input, sizeof(new_account.ssh_host_alias));
-                            }
-                        }
-                    } else {
-                        printf("[ERROR]: SSH key validation failed. Continuing without SSH key.\n");
-                    }
-                } else {
-                    printf("[ERROR]: SSH key file not found: %s\n", expanded_path);
-                }
-            } else {
-                printf("[ERROR]: Invalid SSH key path: %s\n", input);
-            }
-        }
+
+    /* Description */
+    if (edit) printf("Description [%s]: ", acct.description);
+    else      printf("Description (optional): ");
+    if (prompt_line("", input, sizeof(input), false) == 0 && strlen(input) > 0) {
+        safe_strncpy(acct.description, input, sizeof(acct.description));
+    } else if (!edit) {
+        safe_strncpy(acct.description, acct.name, sizeof(acct.description));
     }
-    
-    /* Get GPG key configuration */
-    printf("GPG Key ID (optional, press Enter to skip): ");
-    fflush(stdout);
-    
-    if (fgets(input, sizeof(input), stdin)) {
-        input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
-        
-        if (strlen(input) > 0) {
-            if (validate_key_id(input)) {
-                if (validate_gpg_key_availability(input) == 0) {
-                    safe_strncpy(new_account.gpg_key_id, input, sizeof(new_account.gpg_key_id));
-                    new_account.gpg_enabled = true;
-                    printf("[OK]: GPG key validated: %s\n", input);
-                    
-                    /* Ask about GPG signing */
-                    printf("Enable GPG signing for commits? (y/N): ");
-                    fflush(stdout);
-                    
-                    if (fgets(input, sizeof(input), stdin)) {
-                        input[strcspn(input, "\n")] = '\0';
-                        trim_whitespace(input);
-                        
-                        new_account.gpg_signing_enabled = (tolower(input[0]) == 'y');
-                    }
-                } else {
-                    printf("[ERROR]: GPG key validation failed. Continuing without GPG key.\n");
-                }
-            } else {
-                printf("[ERROR]: Invalid GPG key ID format: %s\n", input);
-            }
+
+    /* SSH key. Empty keeps current (edit) or skips (add); 'none' disables.
+     * Re-prompt on a bad path rather than silently dropping SSH. */
+    while (1) {
+        if (edit && acct.ssh_enabled)
+            printf("SSH Key Path [%s] (Enter to keep, 'none' to disable): ", acct.ssh_key_path);
+        else
+            printf("SSH Key Path (optional, Enter to skip): ");
+        if (prompt_line("", input, sizeof(input), true) != 0) break;
+
+        if (strlen(input) == 0) break;                 /* keep/skip */
+        if (strcmp(input, "none") == 0) {              /* disable */
+            acct.ssh_enabled = false;
+            acct.ssh_key_path[0] = '\0';
+            acct.ssh_host_alias[0] = '\0';
+            break;
         }
-    }
-    
-    /* Get preferred scope */
-    printf("Preferred Git Scope (local/global) [%s]: ", 
-           config_scope_to_string(new_account.preferred_scope));
-    fflush(stdout);
-    
-    if (fgets(input, sizeof(input), stdin)) {
-        input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
-        
-        if (strlen(input) > 0) {
-            new_account.preferred_scope = config_parse_scope(input);
+        if (expand_path(input, expanded_path, sizeof(expanded_path)) != 0) {
+            printf("[ERROR]: Invalid SSH key path: %s (try again, or Enter to skip)\n", input);
+            continue;
         }
+        if (!path_exists(expanded_path)) {
+            printf("[ERROR]: SSH key file not found: %s (try again, or Enter to skip)\n", expanded_path);
+            continue;
+        }
+        if (validate_ssh_key_security(expanded_path) != 0) {
+            printf("[ERROR]: SSH key failed validation: %s (try again, or Enter to skip)\n", expanded_path);
+            continue;
+        }
+        safe_strncpy(acct.ssh_key_path, expanded_path, sizeof(acct.ssh_key_path));
+        acct.ssh_enabled = true;
+        printf("[OK]: SSH key validated: %s\n", expanded_path);
+
+        if (edit && acct.ssh_host_alias[0])
+            printf("SSH Host Alias [%s] (Enter to keep): ", acct.ssh_host_alias);
+        else
+            printf("SSH Host Alias (optional, e.g., github.com-work): ");
+        if (prompt_line("", input, sizeof(input), false) == 0 && strlen(input) > 0) {
+            safe_strncpy(acct.ssh_host_alias, input, sizeof(acct.ssh_host_alias));
+        }
+        break;
     }
-    
-    /* Basic validation */
-    if (!validate_name(new_account.name) || !validate_email(new_account.email)) {
+
+    /* GPG key. Same empty/'none' semantics as SSH. */
+    while (1) {
+        if (edit && acct.gpg_enabled)
+            printf("GPG Key ID [%s] (Enter to keep, 'none' to disable): ", acct.gpg_key_id);
+        else
+            printf("GPG Key ID (optional, Enter to skip): ");
+        if (prompt_line("", input, sizeof(input), false) != 0) break;
+
+        if (strlen(input) == 0) break;
+        if (strcmp(input, "none") == 0) {
+            acct.gpg_enabled = false;
+            acct.gpg_key_id[0] = '\0';
+            acct.gpg_signing_enabled = false;
+            break;
+        }
+        if (!validate_key_id(input)) {
+            printf("[ERROR]: Invalid GPG key ID format: %s (try again, or Enter to skip)\n", input);
+            continue;
+        }
+        if (validate_gpg_key_availability(input) != 0) {
+            printf("[ERROR]: GPG key not found in keyring: %s (try again, or Enter to skip)\n", input);
+            continue;
+        }
+        safe_strncpy(acct.gpg_key_id, input, sizeof(acct.gpg_key_id));
+        acct.gpg_enabled = true;
+        printf("[OK]: GPG key validated: %s\n", input);
+
+        printf("Enable GPG signing for commits? (y/N)%s: ",
+               (edit && acct.gpg_signing_enabled) ? " [Y]" : "");
+        if (prompt_line("", input, sizeof(input), false) == 0 && strlen(input) > 0) {
+            acct.gpg_signing_enabled = (tolower((unsigned char)input[0]) == 'y');
+        }
+        break;
+    }
+
+    /* Preferred scope. Validate; empty keeps the shown default. */
+    while (1) {
+        printf("Preferred Git Scope (local/global) [%s]: ",
+               config_scope_to_string(acct.preferred_scope));
+        if (prompt_line("", input, sizeof(input), false) != 0) break;
+        if (strlen(input) == 0) break;
+        if (strcasecmp(input, "local") == 0 || strcasecmp(input, "l") == 0) {
+            acct.preferred_scope = GIT_SCOPE_LOCAL; break;
+        }
+        if (strcasecmp(input, "global") == 0 || strcasecmp(input, "g") == 0) {
+            acct.preferred_scope = GIT_SCOPE_GLOBAL; break;
+        }
+        printf("[ERROR]: Please enter 'local' or 'global' (or Enter for %s).\n",
+               config_scope_to_string(acct.preferred_scope));
+    }
+
+    if (!validate_name(acct.name) || !validate_email(acct.email)) {
         printf("[ERROR]: Account validation failed: Invalid name or email\n");
         return -1;
     }
-    
-    /* Confirmation */
+
+    /* Summary + confirm (--yes skips the prompt). */
     printf("\nAccount Summary:\n");
-    printf("   ID: %u\n", new_account.id);
-    printf("   Name: %s\n", new_account.name);
-    printf("   Email: %s\n", new_account.email);
-    printf("   Description: %s\n", new_account.description);
-    printf("   Scope: %s\n", config_scope_to_string(new_account.preferred_scope));
-    printf("   SSH: %s\n", new_account.ssh_enabled ? "[ENABLED]" : "[DISABLED]");
-    printf("   GPG: %s\n", new_account.gpg_enabled ? "[ENABLED]" : "[DISABLED]");
-    
-    printf("\nAdd this account? (y/N): ");
-    fflush(stdout);
-    
-    if (!fgets(input, sizeof(input), stdin)) {
-        set_error(ERR_FILE_IO, "Failed to read confirmation");
+    printf("   ID: %u\n", acct.id);
+    printf("   Name: %s\n", acct.name);
+    printf("   Email: %s\n", acct.email);
+    printf("   Description: %s\n", acct.description);
+    printf("   Scope: %s\n", config_scope_to_string(acct.preferred_scope));
+    printf("   SSH: %s\n", acct.ssh_enabled ? "[ENABLED]" : "[DISABLED]");
+    printf("   GPG: %s\n", acct.gpg_enabled ? "[ENABLED]" : "[DISABLED]");
+
+    if (!ctx->config.assume_yes) {
+        printf("\n%s this account? (y/N): ", edit ? "Save changes to" : "Add");
+        if (prompt_line("", input, sizeof(input), false) != 0 || tolower((unsigned char)input[0]) != 'y') {
+            printf("%s cancelled.\n", edit ? "Edit" : "Account creation");
+            return -1;
+        }
+    }
+
+    if (edit) {
+        /* If the name changed, make sure it doesn't collide with another
+         * account (config_add_account's dup check would reject the account's
+         * own unchanged name, so we check by-hand here and write in place). */
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            if (&ctx->accounts[i] != existing &&
+                strcasecmp(ctx->accounts[i].name, acct.name) == 0) {
+                set_error(ERR_ACCOUNT_EXISTS, "Account named '%s' already exists", acct.name);
+                return -1;
+            }
+        }
+        *existing = acct;
+        if (strcmp(ctx->config.active_account, existing->name) != 0 &&
+            existing == ctx->current_account) {
+            safe_strncpy(ctx->config.active_account, acct.name, sizeof(ctx->config.active_account));
+        }
+        printf("[OK]: Account updated.\n");
+        return 0;
+    }
+
+    if (config_add_account(ctx, &acct) != 0) {
         return -1;
     }
-    
-    input[strcspn(input, "\n")] = '\0';
-    trim_whitespace(input);
-    
-    if (tolower(input[0]) != 'y') {
-        printf("Account creation cancelled.\n");
-        return -1;
-    }
-    
-    /* Add account to context */
-    if (config_add_account(ctx, &new_account) != 0) {
-        return -1;
-    }
-    
     printf("[OK]: Account added successfully!\n");
     return 0;
+}
+
+/* Add new account interactively with basic validation */
+int accounts_add_interactive(gitswitch_ctx_t *ctx) {
+    if (!ctx) {
+        set_error(ERR_INVALID_ARGS, "NULL context to accounts_add_interactive");
+        return -1;
+    }
+    if (ctx->account_count >= MAX_ACCOUNTS) {
+        set_error(ERR_ACCOUNT_EXISTS, "Maximum number of accounts reached: %d", MAX_ACCOUNTS);
+        return -1;
+    }
+    return add_or_edit_account(ctx, NULL);
+}
+
+/* Edit an existing account interactively. */
+int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
+    if (!ctx || !identifier) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_edit_interactive");
+        return -1;
+    }
+    account_t *account = config_find_account(ctx, identifier);
+    if (!account) {
+        return -1; /* error already set with candidate list */
+    }
+    return add_or_edit_account(ctx, account);
 }
 
 /* Remove account with confirmation and cleanup */
@@ -559,22 +642,24 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     printf("Email: %s\n", account->email);
     printf("Description: %s\n", account->description);
     
-    /* Confirmation */
-    printf("\n[WARN]: This will permanently remove the account from configuration.\n");
-    printf("Are you sure? (type 'yes' to confirm): ");
-    fflush(stdout);
-    
-    if (!fgets(input, sizeof(input), stdin)) {
-        set_error(ERR_FILE_IO, "Failed to read confirmation");
-        return -1;
-    }
-    
-    input[strcspn(input, "\n")] = '\0';
-    trim_whitespace(input);
-    
-    if (strcmp(input, "yes") != 0) {
-        printf("Account removal cancelled.\n");
-        return 0;
+    /* Confirmation (--yes skips it for scripting). */
+    if (!ctx->config.assume_yes) {
+        printf("\n[WARN]: This will permanently remove the account from configuration.\n");
+        printf("Are you sure? (type 'yes' to confirm): ");
+        fflush(stdout);
+
+        if (!fgets(input, sizeof(input), stdin)) {
+            set_error(ERR_FILE_IO, "Failed to read confirmation");
+            return -1;
+        }
+
+        input[strcspn(input, "\n")] = '\0';
+        trim_whitespace(input);
+
+        if (strcmp(input, "yes") != 0) {
+            printf("Account removal cancelled.\n");
+            return 0;
+        }
     }
     
     /* Clear current account if it's the one being removed */

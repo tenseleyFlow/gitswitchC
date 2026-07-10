@@ -17,6 +17,9 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <ftw.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 
 #include "gpg_manager.h"
 #include "error.h"
@@ -138,18 +141,21 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
                 return -1;
             }
             
-            /* Copy key from system keyring to isolated environment */
+            /* Copy key from system keyring to isolated environment. On success
+             * the key is provably present in the isolated home (the copy step
+             * either found it already there or imported it), so we skip the
+             * follow-up validation — it would just re-run the same
+             * `gpg --list-secret-keys`, spawning another gpg (and agent). Only
+             * when the copy fails do we validate, to see if a prior switch
+             * already left the key in the isolated home. */
             if (copy_key_from_system_keyring(gpg_config, account->gpg_key_id) != 0) {
-                log_warning("Failed to copy GPG key to isolated environment: %s", 
+                log_warning("Failed to copy GPG key to isolated environment: %s",
                            get_last_error()->message);
-                /* Continue anyway - maybe key is already there */
-            }
-            
-            /* Validate key is available in isolated environment */
-            if (gpg_validate_key(gpg_config, account->gpg_key_id) != 0) {
-                set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available in isolated environment: %s", 
-                         account->gpg_key_id);
-                return -1;
+                if (gpg_validate_key(gpg_config, account->gpg_key_id) != 0) {
+                    set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available in isolated environment: %s",
+                             account->gpg_key_id);
+                    return -1;
+                }
             }
             break;
             
@@ -216,6 +222,31 @@ static int gpg_get_base_dir(char *buf, size_t size) {
     if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {
         written = snprintf(buf, size, "%s/gitswitch-gpg", runtime_dir);
     } else {
+        /* Fallback: XDG_RUNTIME_DIR is unset (cron, minimal login, some SSH
+         * sessions). /tmp is a tmpfs on most Linux desktops, but on many
+         * servers and default FreeBSD it is persistent disk — where the
+         * isolated home's exported secret keys would then live, contradicting
+         * this function's own no-persistent-disk intent. Warn once (per
+         * process) when we can't confirm the fallback is memory-backed, so the
+         * user can export XDG_RUNTIME_DIR or accept the risk knowingly. */
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            bool tmpfs = false;
+#ifdef __linux__
+            struct statfs sfs;
+            if (statfs("/tmp", &sfs) == 0 && (unsigned long)sfs.f_type == 0x01021994UL /* TMPFS_MAGIC */) {
+                tmpfs = true;
+            }
+#endif
+            if (!tmpfs) {
+                display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
+                                "/tmp/gitswitch-gpg-%d, which may be persistent disk. Exported "
+                                "secret keys could remain recoverable after exit. Set "
+                                "XDG_RUNTIME_DIR to a memory-backed dir to avoid this.",
+                                getuid());
+            }
+        }
         written = snprintf(buf, size, "/tmp/gitswitch-gpg-%d", getuid());
     }
 
@@ -320,6 +351,15 @@ int gpg_manager_reset(const char *account) {
 
     if (account && *account) {
         char home[MAX_PATH_LEN];
+        /* The account name becomes a path component under a directory we then
+         * recursively delete. Reject anything that isn't a safe single
+         * component so `reset ..` (or a crafted name) can't escape base and
+         * wipe, e.g., the whole runtime dir. */
+        if (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
+            account[0] == '.') {
+            set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
+            return -1;
+        }
         if ((size_t)snprintf(home, sizeof(home), "%s/%s", base, account) >= sizeof(home)) {
             return -1;
         }
@@ -767,7 +807,11 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
         return 0;
     }
 
-    /* Export the secret key from the SYSTEM keyring (no GNUPGHOME override). */
+    /* Export the secret key from the SYSTEM keyring (no GNUPGHOME override).
+     * key_data now holds unencrypted armored private-key material, so every
+     * exit below must scrub it (secure_zero_memory) before returning — a plain
+     * return would leave the key on the stack for a later frame, core dump, or
+     * memory-disclosure bug to recover. */
     {
         const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys", key_id, NULL};
         memset(&opts, 0, sizeof(opts));
@@ -775,6 +819,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
         opts.out_size = sizeof(key_data);
         opts.stderr_to_devnull = true;
         if (run_argv(export_argv, &opts, &res) != 0 || res.out_len == 0) {
+            secure_zero_memory(key_data, sizeof(key_data));
             set_error(ERR_GPG_KEY_NOT_FOUND, "Failed to export GPG key from system keyring");
             return -1;
         }
@@ -790,11 +835,13 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
         opts.stderr_to_devnull = true;
         if (env[0]) opts.extra_env = env;
         if (run_argv(import_argv, &opts, NULL) != 0) {
+            secure_zero_memory(key_data, sizeof(key_data));
             set_error(ERR_GPG_KEY_FAILED, "Failed to import GPG key into isolated environment");
             return -1;
         }
     }
 
+    secure_zero_memory(key_data, sizeof(key_data));
     log_info("Successfully copied GPG key to isolated environment: %s", key_id);
     return 0;
 }

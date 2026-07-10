@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -15,6 +16,7 @@
 #include "toml_parser.h"
 #include "error.h"
 #include "utils.h"
+#include "display.h"
 
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
@@ -163,6 +165,28 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
     return 0;
 }
 
+/* Compute the resume-hint marker path (<config_dir>/.resume-hint). */
+int config_resume_hint_path(char *buf, size_t size) {
+    char dir[MAX_PATH_LEN];
+    if (!buf || size == 0) return -1;
+    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
+    if ((size_t)snprintf(buf, size, "%s/.resume-hint", dir) >= size) return -1;
+    return 0;
+}
+
+/* Create or remove the resume-hint marker so the shell integration knows
+ * whether a boot-time resume is worth attempting. Cheap and best-effort. */
+static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
+    char hint[MAX_PATH_LEN];
+    if (config_resume_hint_path(hint, sizeof(hint)) != 0) return;
+    if (ctx->config.active_account[0] != '\0') {
+        FILE *f = fopen(hint, "w");
+        if (f) fclose(f);
+    } else {
+        unlink(hint);
+    }
+}
+
 /* Save configuration to TOML file */
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     toml_document_t toml_doc;
@@ -173,16 +197,31 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save");
         return -1;
     }
-    
+
+    /* Refuse to rewrite the file when the load dropped one or more account
+     * sections: the in-memory set is an incomplete view, and a full rewrite
+     * would silently erase the skipped accounts. Preserve the on-disk file
+     * (including those sections) and tell the user to fix them first. */
+    if (ctx->accounts_skipped_on_load > 0) {
+        display_warning("Not saving config: %zu account(s) failed to load and would be lost. "
+                        "Fix them in %s (or their key files/permissions), then retry.",
+                        ctx->accounts_skipped_on_load, config_path);
+        return 0;
+    }
+
     /* Create backup if file exists */
     if (path_exists(config_path)) {
         if (config_backup(config_path) != 0) {
             log_warning("Failed to create backup before saving config");
         }
     }
-    
-    /* Create temporary file path for atomic write */
-    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s.tmp", config_path) >= sizeof(temp_path)) {
+
+    /* Create temporary file path for atomic write. Include the pid so two
+     * concurrent gitswitch processes never share a temp file — a shared
+     * deterministic name lets one process truncate/rewrite the temp while the
+     * other is mid-write, so the loser's rename() installs a partial config. */
+    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s.tmp.%d", config_path, (int)getpid())
+        >= sizeof(temp_path)) {
         set_error(ERR_INVALID_ARGS, "Temporary file path too long");
         return -1;
     }
@@ -232,8 +271,9 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     }
     
     log_info("Configuration saved successfully to: %s", config_path);
+    config_update_resume_hint(ctx);
     result = 0;
-    
+
 cleanup:
     toml_cleanup_document(&toml_doc);
     return result;
@@ -350,10 +390,19 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
         return -1;
     }
     
-    /* Check for duplicate IDs */
+    /* Check for duplicate IDs and names. All per-account isolation state is
+     * keyed by name — GNUPGHOME <base>/<name>, ssh-agent.<name>.sock,
+     * active_account, current-account detection — so two accounts sharing a
+     * name would share one GPG home and socket, defeating the isolation the
+     * tool exists to provide. Names are matched case-insensitively because the
+     * paths they build live on case-insensitive filesystems too. */
     for (size_t i = 0; i < ctx->account_count; i++) {
         if (ctx->accounts[i].id == account->id) {
             set_error(ERR_ACCOUNT_EXISTS, "Account with ID %u already exists", account->id);
+            return -1;
+        }
+        if (strcasecmp(ctx->accounts[i].name, account->name) == 0) {
+            set_error(ERR_ACCOUNT_EXISTS, "Account named '%s' already exists", account->name);
             return -1;
         }
     }
@@ -494,12 +543,37 @@ account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
         return match;
     }
     if (match_count > 1) {
+        /* Show the matching candidates so the user can disambiguate. */
+        char cands[256];
+        size_t off = 0;
+        for (size_t i = 0; i < ctx->account_count && off < sizeof(cands) - 1; i++) {
+            if (strstr(ctx->accounts[i].name, identifier) ||
+                strstr(ctx->accounts[i].description, identifier)) {
+                off += (size_t)snprintf(cands + off, sizeof(cands) - off, "%s%s",
+                                        off ? ", " : "", ctx->accounts[i].name);
+            }
+        }
         set_error(ERR_ACCOUNT_NOT_FOUND,
-                  "Ambiguous identifier '%s' matches %zu accounts; use the exact name or numeric id",
-                  identifier, match_count);
+                  "Ambiguous identifier '%s' matches: %s (use the exact name or numeric id)",
+                  identifier, cands);
         return NULL;
     }
 
+    /* No match at all — list what IS available as a hint. */
+    {
+        char avail[256];
+        size_t off = 0;
+        for (size_t i = 0; i < ctx->account_count && off < sizeof(avail) - 1; i++) {
+            off += (size_t)snprintf(avail + off, sizeof(avail) - off, "%s%s",
+                                    off ? ", " : "", ctx->accounts[i].name);
+        }
+        if (ctx->account_count == 0) {
+            set_error(ERR_ACCOUNT_NOT_FOUND, "No accounts configured; run 'gitswitch add'");
+        } else {
+            set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: '%s'. Available: %s",
+                      identifier, avail);
+        }
+    }
     return NULL;
 }
 
@@ -785,9 +859,18 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                     log_debug("Loaded account: %s (%s)", account.name, account.description);
                 } else {
                     log_error("Too many accounts, skipping account %u", account_id);
+                    ctx->accounts_skipped_on_load++;
                 }
             } else {
-                log_error("Account %u failed security validation", account_id);
+                /* Skipped, not dropped: record it so config_save refuses to
+                 * rewrite the file and silently erase this section. Warn on
+                 * stderr (not just the log filter) so the transient cause —
+                 * e.g. an unmounted key path or a key chmod'd to 644 — is
+                 * visible rather than turning into quiet data loss. */
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account '%s' (id %u) in the config failed validation and was "
+                                "skipped: %s", account.name[0] ? account.name : "?",
+                                account_id, get_last_error()->message);
             }
         }
     }

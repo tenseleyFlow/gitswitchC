@@ -38,6 +38,14 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
 
 /**
+ * Write the path of the "resume hint" marker into buf. The marker exists iff
+ * there is a saved active account worth resuming after boot; the shell
+ * integration tests for it so a machine that has never switched doesn't spawn
+ * `gitswitch resume` on every interactive shell. Returns 0 on success.
+ */
+int config_resume_hint_path(char *buf, size_t size);
+
+/**
  * Create default configuration file
  */
 int config_create_default(const char *config_path);

@@ -5,6 +5,10 @@
 PROJECT_NAME = gitswitch-c
 TARGET = gitswitch
 
+# Install prefix (override for packaging, e.g. PREFIX=/usr). DESTDIR is honored
+# on top of it for staged installs.
+PREFIX ?= /usr/local
+
 # Version: the VERSION file is the single source of truth for the release
 # number, so the binary stamp is deterministic and identical in git checkouts
 # and source tarballs. A VERSION= env override is honored for one-off builds.
@@ -90,12 +94,45 @@ INCLUDES = -I$(SRCDIR)
 
 # Libraries
 LIBS = -lssl -lcrypto
-# Note: TOML parsing library will be added (e.g., -ltoml or embedded parser)
+
+# Optional GNU readline: gives the interactive add/edit prompts line editing
+# and TAB path completion. Auto-detected; build still works without it (the
+# prompt module falls back to fgets). Override with READLINE=0 to force off.
+#
+# GNU readline isn't on the default search path everywhere: on macOS it's a
+# keg-only Homebrew formula, and on the BSDs it lives under /usr/local. Probe
+# with those hints so the feature engages there too instead of silently
+# degrading. The same hints are added to the real build flags when detected.
+READLINE ?= auto
+READLINE_HINT_CFLAGS :=
+READLINE_HINT_LIBS :=
+READLINE_BREW_PREFIX := $(shell brew --prefix readline 2>/dev/null)
+ifneq ($(READLINE_BREW_PREFIX),)
+  READLINE_HINT_CFLAGS += -I$(READLINE_BREW_PREFIX)/include
+  READLINE_HINT_LIBS += -L$(READLINE_BREW_PREFIX)/lib
+endif
+ifneq ($(wildcard /usr/local/include/readline/readline.h),)
+  READLINE_HINT_CFLAGS += -I/usr/local/include
+  READLINE_HINT_LIBS += -L/usr/local/lib
+endif
+ifeq ($(READLINE),auto)
+  READLINE_OK := $(shell echo 'int main(void){return 0;}' \
+                  | $(CC) $(READLINE_HINT_CFLAGS) -include stdio.h -include readline/readline.h \
+                    -xc - $(READLINE_HINT_LIBS) -lreadline -o /dev/null >/dev/null 2>&1 && echo 1)
+else ifeq ($(READLINE),0)
+  READLINE_OK :=
+else
+  READLINE_OK := 1
+endif
+ifeq ($(READLINE_OK),1)
+  CFLAGS += -DHAVE_READLINE $(READLINE_HINT_CFLAGS)
+  LIBS += $(READLINE_HINT_LIBS) -lreadline
+endif
 
 # Source files (Phase 2 - Configuration Management)
 PHASE2_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/error.c $(SRCDIR)/utils.c \
                  $(SRCDIR)/display.c $(SRCDIR)/toml_parser.c $(SRCDIR)/config.c \
-                 $(SRCDIR)/accounts.c
+                 $(SRCDIR)/accounts.c $(SRCDIR)/prompt.c
 
 # Source files (Phase 3 - Git Operations)
 PHASE3_SOURCES = $(PHASE2_SOURCES) $(SRCDIR)/git_ops.c
@@ -142,15 +179,25 @@ $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 .PHONY: install
 install: $(BINDIR)/$(TARGET)
 	@echo "Installing $(TARGET)..."
-	install -d $(DESTDIR)/usr/local/bin
-	install -m 755 $(BINDIR)/$(TARGET) $(DESTDIR)/usr/local/bin/$(TARGET)
+	install -d $(DESTDIR)$(PREFIX)/bin
+	install -m 755 $(BINDIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	@echo "Installing shell completions..."
+	install -d $(DESTDIR)$(PREFIX)/share/bash-completion/completions
+	install -m 644 completions/gitswitch.bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(TARGET)
+	install -d $(DESTDIR)$(PREFIX)/share/zsh/site-functions
+	install -m 644 completions/gitswitch.zsh $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(TARGET)
+	install -d $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d
+	install -m 644 completions/gitswitch.fish $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/$(TARGET).fish
 	@echo "Installation complete"
 
 # Uninstall target
 .PHONY: uninstall
 uninstall:
 	@echo "Uninstalling $(TARGET)..."
-	rm -f $(DESTDIR)/usr/local/bin/$(TARGET)
+	rm -f $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	rm -f $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(TARGET)
+	rm -f $(DESTDIR)$(PREFIX)/share/zsh/site-functions/_$(TARGET)
+	rm -f $(DESTDIR)$(PREFIX)/share/fish/vendor_completions.d/$(TARGET).fish
 	@echo "Uninstall complete"
 
 # Test compilation

@@ -77,6 +77,10 @@ typedef struct {
     bool color_output;
     bool force_global;   /* --global: write global scope (and consent to it outside a repo) */
     bool force_local;    /* --local:  force local scope */
+    bool resuming;       /* set during boot-time `resume`: skip the blocking,
+                          * purely-informational SSH connection test so the
+                          * login shell prompt isn't stalled on a network RTT */
+    bool assume_yes;     /* --yes: skip interactive confirmation prompts */
 } config_t;
 
 /* Application context */
@@ -85,6 +89,12 @@ typedef struct {
     account_t accounts[MAX_ACCOUNTS];
     size_t account_count;
     account_t *current_account;
+    /* Number of account sections present in the config file that were dropped
+     * at load time because they failed validation (e.g. an SSH key on an
+     * unmounted path, or wrong permissions). When non-zero the in-memory set
+     * is an incomplete view of the file, so config_save must NOT rewrite the
+     * file — doing so would silently erase the dropped accounts. */
+    size_t accounts_skipped_on_load;
 } gitswitch_ctx_t;
 
 /* Function prototypes */

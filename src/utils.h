@@ -124,8 +124,6 @@ bool command_exists(const char *command);
  * and the BSDs. Returns 0 and writes the path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
-pid_t start_background_process(const char *command, char *pidfile_path);
-int kill_process_by_pidfile(const char *pidfile_path);
 bool process_is_running(pid_t pid);
 
 /**
@@ -193,12 +191,6 @@ void *safe_memset(void *ptr, int value, size_t size);
 void *safe_memcpy(void *dest, const void *src, size_t size);
 int safe_mlock(void *ptr, size_t size);
 int safe_munlock(void *ptr, size_t size);
-
-/**
- * Cleanup utilities
- */
-void cleanup_temporary_files(void);
-int register_cleanup_handler(void (*handler)(void));
 
 /**
  * Debug utilities

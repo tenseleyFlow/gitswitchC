@@ -6,6 +6,7 @@
 #include "utils.h"
 #include "error.h"
 #include "ssh_manager.h"
+#include "git_ops.h"
 #include <string.h>
 
 /* Recording runner: captures the argv vector instead of executing anything. */
@@ -70,10 +71,35 @@ TEST(command_exists_basic) {
     CHECK(!command_exists("gitswitch_no_such_command_xyz"));
 }
 
+/* git config values are written via argv (no shell), so a legitimate display
+ * name with spaces and parentheses must be ACCEPTED (regression for the switch
+ * that failed on "Jane Doe (Work)"). git_set_config_value validates before it
+ * invokes the runner, so an accepted value reaches the recording runner. */
+TEST(git_config_value_allows_parenthesized_name) {
+    command_runner_fn prev = run_set_runner(recording_runner);
+    int rc = git_set_config_value("user.name", "Jane Doe (Work)", GIT_SCOPE_GLOBAL);
+    run_set_runner(prev);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_STR_EQ(rec_argv[rec_argc - 1], "Jane Doe (Work)"); /* intact, one argv element */
+}
+
+/* But genuinely unsafe values are still rejected before the runner runs: a
+ * leading '-' (git could read it as an option) and control characters. */
+TEST(git_config_value_rejects_dangerous) {
+    command_runner_fn prev = run_set_runner(recording_runner);
+    int rc_dash = git_set_config_value("user.name", "-oProxyCommand=x", GIT_SCOPE_GLOBAL);
+    int rc_ctrl = git_set_config_value("user.name", "a\nb", GIT_SCOPE_GLOBAL);
+    run_set_runner(prev);
+    CHECK_EQ_INT(rc_dash, -1);
+    CHECK_EQ_INT(rc_ctrl, -1);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(ssh_add_key_path_is_one_argv_element);
     RUN_TEST(find_command_path_rejects_metachars);
     RUN_TEST(find_command_path_finds_real_binary);
     RUN_TEST(command_exists_basic);
+    RUN_TEST(git_config_value_allows_parenthesized_name);
+    RUN_TEST(git_config_value_rejects_dangerous);
 TEST_MAIN_END()

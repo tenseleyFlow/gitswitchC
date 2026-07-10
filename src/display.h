@@ -45,16 +45,6 @@ void display_header(const char *title);
  */
 void display_status(const char *level, const char *message, ...);
 
-/**
- * Print account information in formatted table
- */
-void display_account(const account_t *account, bool is_current);
-
-/**
- * Print accounts list in formatted table
- */
-void display_accounts_list(const gitswitch_ctx_t *ctx);
-
 /* These functions will be implemented in later phases
 void display_current_status(const git_current_config_t *config);
 void display_ssh_status(const ssh_config_t *ssh_config);
@@ -66,22 +56,6 @@ void display_validation_results(const account_validation_t *validation);
  * Print health check results
  */
 void display_health_check(const gitswitch_ctx_t *ctx);
-
-/**
- * Display interactive account selection menu
- * Returns selected account ID or 0 if cancelled
- */
-uint32_t display_account_menu(const gitswitch_ctx_t *ctx);
-
-/**
- * Prompt user for account information during add/edit
- */
-int display_prompt_account_info(account_t *account, bool is_edit);
-
-/**
- * Confirm dangerous operations (account removal, etc.)
- */
-bool display_confirm(const char *message, ...);
 
 /**
  * Display progress indicator for long operations
@@ -135,25 +109,8 @@ int display_get_input(const char *prompt, char *buffer, size_t buffer_size,
 int display_get_password(const char *prompt, char *buffer, size_t buffer_size);
 
 /**
- * Show help text for command or general usage
- */
-void display_help(const char *command);
-
-/**
- * Display version and build information
- */
-void display_version(void);
-
-/**
  * Print configuration file location and status
  */
 void display_config_info(const gitswitch_ctx_t *ctx);
-
-/**
- * Format table with proper column alignment
- */
-void display_table_header(const char **headers, const int *widths, int columns);
-void display_table_row(const char **values, const int *widths, int columns);
-void display_table_separator(const int *widths, int columns);
 
 #endif /* DISPLAY_H */

@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "toml_parser.h"
 #include "error.h"
@@ -443,9 +444,18 @@ int toml_validate_gitswitch_schema(const toml_document_t *doc) {
                         set_error(ERR_CONFIG_INVALID, "ssh_key must be a string");
                         return -1;
                     }
-                    if (strlen(kv->value) > 0 && !toml_validate_file_path(kv->value)) {
-                        set_error(ERR_CONFIG_INVALID, "Invalid SSH key path: %s", kv->value);
-                        return -1;
+                    /* Validate the SANITIZED bytes — the exact value callers
+                     * receive from toml_get_string. Validating kv->value
+                     * directly lets `.\./id_rsa` pass (no ".." substring)
+                     * while sanitization strips the backslash, resynthesizing
+                     * "../id_rsa" and bypassing the traversal guard. */
+                    char sanitized[MAX_PATH_LEN];
+                    if (strlen(kv->value) > 0) {
+                        if (toml_sanitize_string(kv->value, sanitized, sizeof(sanitized)) != 0 ||
+                            !toml_validate_file_path(sanitized)) {
+                            set_error(ERR_CONFIG_INVALID, "Invalid SSH key path: %s", kv->value);
+                            return -1;
+                        }
                     }
                 }
                 
@@ -556,21 +566,19 @@ bool toml_validate_file_path(const char *path) {
     return true;
 }
 
-/* Check for TOML injection patterns */
+/* Structural sanity check on the raw config buffer.
+ *
+ * This used to also reject any file containing shell metacharacters ("$(",
+ * backtick, "${", "\x", "\u"). That was a relic of a shell-based execution
+ * model: every subprocess now runs via run_argv (execvp, no shell), so those
+ * substrings carry no injection risk here — while they legitimately appear in
+ * names, descriptions, and passphrases, so the scan only corrupted valid
+ * configs. Per-field validation plus argv execution is the real boundary; the
+ * one remaining shell-interpolated sink (core.sshCommand) is guarded at its
+ * own call site. We keep only the cheap nesting/DoS guard. */
 bool toml_check_injection_patterns(const char *input, size_t length) {
-    const char *dangerous_patterns[] = {
-        "$(", "`", "${", "\\x", "\\u", NULL
-    };
-    
     if (!input) return false;
-    
-    for (int i = 0; dangerous_patterns[i] != NULL; i++) {
-        if (strstr(input, dangerous_patterns[i]) != NULL) {
-            log_warning("Potentially dangerous pattern found: %s", dangerous_patterns[i]);
-            return false;
-        }
-    }
-    
+
     /* Check for excessive nesting or repetition */
     size_t bracket_count = 0;
     for (size_t i = 0; i < length; i++) {
@@ -799,11 +807,19 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
                     set_parser_error(state, "Invalid escape sequence");
                     return -1;
             }
+        } else if ((unsigned char)c < 0x20) {
+            /* TOML basic strings may not contain literal control characters
+             * (newline, CR, tab, ...); they must be escaped. Rejecting them
+             * here keeps the validated value identical to the byte string
+             * toml_get_string later hands to callers, so schema validation
+             * cannot be bypassed by smuggling in a raw newline. */
+            set_parser_error(state, "Control character in string value");
+            return -1;
         } else {
             value[value_pos++] = c;
         }
     }
-    
+
     value[value_pos] = '\0';
 
     /* Stopped because the value buffer filled, with more content before the
@@ -1035,15 +1051,38 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
     return 0;
 }
 
+/* Emit a TOML basic-string value, escaping the bytes that parse_string_value
+ * treats specially on read. Without this a value containing '"' or '\' round-
+ * trips to a file that the parser then rejects (unbalanced quote / bad escape),
+ * bricking the config until it is hand-edited. Mirror the read-side escape
+ * table exactly. Returns <0 on write error. */
+static int write_escaped_string_value(FILE *file, const char *key, const char *value) {
+    if (fprintf(file, "%s = \"", key) < 0) return -1;
+    for (const char *p = value; *p; p++) {
+        int rc;
+        switch (*p) {
+            case '\\': rc = fputs("\\\\", file); break;
+            case '"':  rc = fputs("\\\"", file); break;
+            case '\n': rc = fputs("\\n", file); break;
+            case '\r': rc = fputs("\\r", file); break;
+            case '\t': rc = fputs("\\t", file); break;
+            default:   rc = fputc((unsigned char)*p, file);
+        }
+        if (rc < 0) return -1;
+    }
+    if (fputs("\"\n", file) < 0) return -1;
+    return 0;
+}
+
 /* Write document to file */
 int toml_write_file(const toml_document_t *doc, const char *file_path) {
     FILE *file;
-    
+
     if (!doc || !file_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_write_file");
         return -1;
     }
-    
+
     file = fopen(file_path, "w");
     if (!file) {
         set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to open file for writing: %s", file_path);
@@ -1069,7 +1108,7 @@ int toml_write_file(const toml_document_t *doc, const char *file_path) {
             
             switch (kv->type) {
                 case TOML_TYPE_STRING:
-                    if (fprintf(file, "%s = \"%s\"\n", kv->key, kv->value) < 0) {
+                    if (write_escaped_string_value(file, kv->key, kv->value) < 0) {
                         fclose(file);
                         set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to write string value");
                         return -1;
@@ -1096,8 +1135,20 @@ int toml_write_file(const toml_document_t *doc, const char *file_path) {
             fprintf(file, "\n");
         }
     }
-    
-    fclose(file);
+
+    /* Durably close: stdio buffers writes, so ENOSPC/EIO/quota failures often
+     * surface only at the final flush. Flush + fsync + a *checked* fclose so a
+     * truncated temp file is reported as failure and never renamed over the
+     * real config by config_save. */
+    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to flush config to disk");
+        fclose(file);
+        return -1;
+    }
+    if (fclose(file) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to close config file");
+        return -1;
+    }
     return 0;
 }
 
