@@ -600,7 +600,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     /* PS-1/PS-2: pin the helper to an absolute path resolved through the
      * sanitized PATH walk in find_command_path() and exec exactly that path
      * with execv() below. execvp()'s own PATH search would happily pick a
-     * shadowing "git"/"ssh-add" out of a relative or world-writable PATH
+     * shadowing "git"/"ssh-add" out of a relative or group/world-writable PATH
      * entry — and since `gitswitch resume` runs from every interactive shell
      * startup, that is arbitrary code execution with the user's keys in
      * scope. Resolving in the parent also yields a real error message instead
@@ -700,6 +700,15 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     char rdbuf[4096];
     if (infd >= 0) set_nonblock(infd);
     if (outfd >= 0) set_nonblock(outfd);
+
+    /* A provided zero-length buffer means "send no bytes, then EOF". Leaving
+     * the pipe open would make poll() report it writable forever: write(...,
+     * 0) returns zero, advances nothing, and a child such as cat keeps waiting
+     * for EOF. Close before the poll loop, without touching opts->input. */
+    if (infd >= 0 && opts->input_len == 0) {
+        close(infd);
+        infd = -1;
+    }
 
     while (infd >= 0 || outfd >= 0) {
         struct pollfd pfds[2];
@@ -803,12 +812,13 @@ int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *res
  * automatically with the user's keys in scope.
  *
  * A directory may supply an executable only if it is an absolute path to a
- * real directory that is not world-writable. Relative entries (".", "", "bin")
+ * real directory that is not group- or world-writable. Relative entries (".", "", "bin")
  * resolve against the CWD — inside a freshly cloned repo that is attacker
- * territory. World-writable dirs are rejected even with the sticky bit set:
- * sticky only stops deleting other users' files, anyone can still CREATE a
- * shadowing "git" there. User-owned prefixes like ~/.local/bin, Homebrew's
- * /opt/homebrew/bin, or Nix profiles are 0755-or-tighter and keep working. */
+ * territory. Writable dirs are rejected even with the sticky bit set: sticky
+ * only stops deleting other users' files, while a writable group member can
+ * still replace or create a shadowing helper. User-owned prefixes like
+ * ~/.local/bin, Homebrew's /opt/homebrew/bin, or Nix profiles are
+ * 0755-or-tighter and keep working. */
 static bool exec_dir_is_trusted(const char *dir) {
     struct stat st;
 
@@ -818,22 +828,23 @@ static bool exec_dir_is_trusted(const char *dir) {
     if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
         return false;
     }
-    if (st.st_mode & S_IWOTH) {
+    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
         return false;
     }
     return true;
 }
 
 /* The resolved binary itself must be a regular file (access(X_OK) alone would
- * happily "find" a directory named git) and not world-writable — a o+w binary
- * in an otherwise sane directory is just as replaceable as a o+w directory. */
+ * happily "find" a directory named git) and not group- or world-writable — a
+ * writable binary in an otherwise sane directory is just as replaceable as a
+ * writable directory. */
 static bool exec_candidate_is_trusted(const char *path) {
     struct stat st;
 
     if (stat(path, &st) != 0) {
         return false;
     }
-    if (!S_ISREG(st.st_mode) || (st.st_mode & S_IWOTH)) {
+    if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IWGRP | S_IWOTH))) {
         return false;
     }
     return access(path, X_OK) == 0;
@@ -911,8 +922,9 @@ int find_command_path(const char *name, char *buf, size_t size) {
     }
 
     /* Walk colon-separated PATH entries, testing <dir>/<name> in each trusted
-     * directory. Untrusted entries are skipped, not fatal: a stray "." or o+w
-     * dir in PATH must not hide the real /usr/bin/git behind it. An empty
+     * directory. Untrusted entries are skipped, not fatal: a stray "." or
+     * group/world-writable dir in PATH must not hide the real /usr/bin/git
+     * behind it. An empty
      * entry historically means the CWD — refused, not honored. */
     p = path_env;
     while (*p) {

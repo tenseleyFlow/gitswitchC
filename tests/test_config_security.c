@@ -53,6 +53,29 @@ static size_t slurp(const char *path, char *buf, size_t size) {
     return n;
 }
 
+static int join_path(char *dest, size_t size, const char *base,
+                     const char *suffix) {
+    size_t base_len = strlen(base);
+    size_t suffix_len = strlen(suffix);
+
+    if (base_len >= size || suffix_len > size - base_len - 1) {
+        return -1;
+    }
+    memcpy(dest, base, base_len);
+    memcpy(dest + base_len, suffix, suffix_len + 1);
+    return 0;
+}
+
+static void save_home_env(char *buf, size_t size) {
+    const char *home = getenv("HOME");
+    snprintf(buf, size, "%s", home ? home : "");
+}
+
+static void restore_home_env(const char *saved) {
+    if (saved[0] != '\0') setenv("HOME", saved, 1);
+    else unsetenv("HOME");
+}
+
 static void fill_account(account_t *a, uint32_t id, const char *name,
                          const char *email, const char *desc) {
     memset(a, 0, sizeof(*a));
@@ -96,6 +119,160 @@ TEST(load_rejects_symlinked_config) {
     memset(&ctx, 0, sizeof(ctx));
     CHECK_EQ_INT(config_load(&ctx, link), -1);
     CHECK_EQ_INT(ctx.account_count, 0);
+}
+
+/* ---- AR-04 L2: the final config-directory component is no-follow -------- */
+
+static void check_symlinked_config_directory_refused(mode_t target_mode) {
+    char home[128], saved_home[512];
+    char dotconfig[256], target[256], link[256], sentinel[512];
+    char accounts[512], linked_accounts[512], lock[512], hint[512];
+    char before[128], after[128];
+    struct stat link_st, target_st;
+    gitswitch_ctx_t ctx;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(target, sizeof(target), "%s/config-target", home);
+    CHECK_EQ_INT(join_path(link, sizeof(link), dotconfig, "/gitswitch"), 0);
+    snprintf(sentinel, sizeof(sentinel), "%s/sentinel", target);
+    snprintf(accounts, sizeof(accounts), "%s/accounts.toml", target);
+    snprintf(linked_accounts, sizeof(linked_accounts), "%s/accounts.toml", link);
+    snprintf(lock, sizeof(lock), "%s/.config.lock", target);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", target);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(target, target_mode), 0);
+    CHECK_EQ_INT(chmod(target, target_mode), 0); /* do not let umask alter the case */
+    CHECK_EQ_INT(write_config(sentinel, "target-content\n", 15), 0);
+    CHECK(slurp(sentinel, before, sizeof(before)) > 0);
+    CHECK_EQ_INT(symlink(target, link), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init(&ctx), -1);
+
+    /* Every mutating entry point that prepares the directory must refuse too;
+     * no config, lock, or resume marker may appear through the link. */
+    int lock_fd = config_write_lock();
+    CHECK_EQ_INT(lock_fd, -1);
+    if (lock_fd >= 0) close(lock_fd);
+    CHECK_EQ_INT(config_create_default(linked_accounts), -1);
+
+    CHECK_EQ_INT(lstat(link, &link_st), 0);
+    CHECK(S_ISLNK(link_st.st_mode));
+    CHECK_EQ_INT(stat(target, &target_st), 0);
+    CHECK_EQ_INT((long)(target_st.st_mode & 0777), (long)target_mode);
+    CHECK(slurp(sentinel, after, sizeof(after)) > 0);
+    CHECK_STR_EQ(after, before);
+    CHECK(access(accounts, F_OK) != 0);
+    CHECK(access(lock, F_OK) != 0);
+    CHECK(access(hint, F_OK) != 0);
+
+    restore_home_env(saved_home);
+}
+
+TEST(config_init_rejects_symlinked_final_directory_without_mutation) {
+    check_symlinked_config_directory_refused(0755);
+    check_symlinked_config_directory_refused(0700);
+}
+
+TEST(config_init_rejects_nondirectory_final_components) {
+    char home[128], saved_home[512], dotconfig[256], final[256];
+    char before[64], after[64];
+    struct stat st;
+    gitswitch_ctx_t ctx;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    CHECK_EQ_INT(join_path(final, sizeof(final), dotconfig, "/gitswitch"), 0);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(write_config(final, "not-a-directory\n", 16), 0);
+    CHECK(slurp(final, before, sizeof(before)) > 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init(&ctx), -1);
+    CHECK_EQ_INT(lstat(final, &st), 0);
+    CHECK(S_ISREG(st.st_mode));
+    CHECK(slurp(final, after, sizeof(after)) > 0);
+    CHECK_STR_EQ(after, before);
+
+    CHECK_EQ_INT(unlink(final), 0);
+    CHECK_EQ_INT(mkfifo(final, 0600), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init(&ctx), -1);
+    CHECK_EQ_INT(lstat(final, &st), 0);
+    CHECK(S_ISFIFO(st.st_mode));
+
+    restore_home_env(saved_home);
+}
+
+TEST(config_init_secures_real_or_absent_final_directory) {
+    char home[128], saved_home[512], dotconfig[256], final[256];
+    struct stat st;
+    gitswitch_ctx_t ctx;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    CHECK_EQ_INT(join_path(final, sizeof(final), dotconfig, "/gitswitch"), 0);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(final, 0755), 0);
+    CHECK_EQ_INT(chmod(final, 0755), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init(&ctx), 0);
+    CHECK_EQ_INT(lstat(final, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK_EQ_INT((long)(st.st_mode & 0777), 0700);
+
+    /* Absent final component (and parent) is still created normally. */
+    char home2[128], final2[256];
+    CHECK_EQ_INT(make_scratch_dir(home2, sizeof(home2)), 0);
+    CHECK_EQ_INT(setenv("HOME", home2, 1), 0);
+    snprintf(final2, sizeof(final2), "%s/.config/gitswitch", home2);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init(&ctx), 0);
+    CHECK_EQ_INT(lstat(final2, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK_EQ_INT((long)(st.st_mode & 0777), 0700);
+
+    restore_home_env(saved_home);
+}
+
+TEST(config_init_preserves_symlinked_parent_policy) {
+    char home[128], saved_home[512], parent[256], parent_link[256];
+    char final[512], accounts[512];
+    struct stat st;
+    gitswitch_ctx_t ctx;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(parent, sizeof(parent), "%s/config-parent", home);
+    snprintf(parent_link, sizeof(parent_link), "%s/.config", home);
+    snprintf(final, sizeof(final), "%s/gitswitch", parent);
+    CHECK_EQ_INT(join_path(accounts, sizeof(accounts), final,
+                           "/accounts.toml"), 0);
+    CHECK_EQ_INT(mkdir(parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(final, 0755), 0);
+    CHECK_EQ_INT(chmod(final, 0755), 0);
+    CHECK_EQ_INT(write_config(accounts, valid_config, strlen(valid_config)), 0);
+    CHECK_EQ_INT(symlink(parent, parent_link), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_init(&ctx), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_EQ_INT(lstat(parent_link, &st), 0);
+    CHECK(S_ISLNK(st.st_mode));
+    CHECK_EQ_INT(lstat(final, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK_EQ_INT((long)(st.st_mode & 0777), 0700);
+
+    restore_home_env(saved_home);
 }
 
 /* ---- cfg-symlink-01: write + backup path ---- */
@@ -764,6 +941,10 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(load_accepts_regular_file);
     RUN_TEST(load_rejects_symlinked_config);
+    RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
+    RUN_TEST(config_init_rejects_nondirectory_final_components);
+    RUN_TEST(config_init_secures_real_or_absent_final_directory);
+    RUN_TEST(config_init_preserves_symlinked_parent_policy);
     RUN_TEST(save_refuses_symlinked_config_path);
     RUN_TEST(backup_refuses_symlinked_source);
     RUN_TEST(save_and_reload_regular_path_roundtrip);

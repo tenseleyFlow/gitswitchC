@@ -15,13 +15,26 @@
 #include <errno.h>
 #include <ctype.h>
 
-/* Linux, macOS and FreeBSD all provide O_NOFOLLOW; keep a guard for exotic
- * libcs so the file still compiles there. Refusing symlinks is load-bearing
- * for the config reader/writer (cfg-symlink-01/02), so every open below is
- * additionally paired with an explicit lstat()/fstat() check rather than
- * relying on the flag alone. */
+/* Linux, macOS and FreeBSD provide both flags. Record their availability
+ * before supplying compile-only fallbacks so directory setup can use a
+ * descriptor-pinned no-follow path on supported platforms. */
+#ifndef GITSWITCH_HAVE_DIRECTORY_NOFOLLOW
+# if defined(O_NOFOLLOW) && defined(O_DIRECTORY)
+#  define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 1
+# else
+#  define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 0
+# endif
+#endif
+
+/* Keep guards for exotic libcs so the file still compiles there. Refusing
+ * symlinks is load-bearing for the config reader/writer (cfg-symlink-01/02),
+ * so every open below is additionally paired with explicit lstat()/fstat()
+ * checks rather than relying on a flag alone. */
 #ifndef O_NOFOLLOW
 #define O_NOFOLLOW 0
+#endif
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
 #endif
 
 #include "accounts.h"
@@ -1235,25 +1248,171 @@ fail:
 
 /* Create config directory with secure permissions */
 static int create_config_directory_secure(const char *config_dir) {
-    if (!path_exists(config_dir)) {
+    struct stat path_st;
+
+    if (!config_dir || config_dir[0] == '\0') {
+        set_error(ERR_INVALID_ARGS, "Invalid configuration directory path");
+        return -1;
+    }
+
+    /* Inspect the final component without following it. Parent symlinks (for
+     * example a user-managed ~/.config link) remain supported deliberately;
+     * only the final gitswitch component is subject to this policy. */
+    if (lstat(config_dir, &path_st) != 0) {
+        if (errno != ENOENT) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
         if (create_directory_recursive(config_dir, PERM_USER_RWX) != 0) {
+            return -1;
+        }
+        if (lstat(config_dir, &path_st) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect created configuration directory: %s",
+                             config_dir);
             return -1;
         }
         log_info("Created configuration directory: %s", config_dir);
     }
-    
-    /* Verify directory permissions */
-    mode_t dir_mode;
-    if (get_file_permissions(config_dir, &dir_mode) == 0) {
-        if ((dir_mode & 077) != 0) {
-            /* Directory has group/other permissions - fix it */
-            if (set_file_permissions(config_dir, PERM_USER_RWX) != 0) {
-                return -1;
-            }
-            log_warning("Fixed configuration directory permissions");
-        }
+
+    if (S_ISLNK(path_st.st_mode) || !S_ISDIR(path_st.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing non-directory or symlinked configuration directory: %s",
+                  config_dir);
+        return -1;
     }
-    
+
+#if GITSWITCH_HAVE_DIRECTORY_NOFOLLOW
+    /* Pin the verified final directory before correcting its mode. O_NOFOLLOW
+     * prevents a final-component swap to a symlink; fstat plus the identity
+     * comparison also detects replacement by a different real directory. */
+    int fd = open(config_dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot open configuration directory safely: %s",
+                         config_dir);
+        return -1;
+    }
+
+    struct stat fd_st;
+    if (fstat(fd, &fd_st) != 0) {
+        close(fd);
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot verify configuration directory: %s",
+                         config_dir);
+        return -1;
+    }
+    if (!S_ISDIR(fd_st.st_mode) || fd_st.st_dev != path_st.st_dev ||
+        fd_st.st_ino != path_st.st_ino) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration directory changed while being verified: %s",
+                  config_dir);
+        return -1;
+    }
+
+    if ((fd_st.st_mode & 077) != 0) {
+        if (fchmod(fd, PERM_USER_RWX) != 0) {
+            close(fd);
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Failed to secure configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
+        if (fstat(fd, &fd_st) != 0) {
+            close(fd);
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Cannot verify secured configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
+        if (!S_ISDIR(fd_st.st_mode) || (fd_st.st_mode & 077) != 0) {
+            close(fd);
+            set_error(ERR_PERMISSION_DENIED,
+                      "Configuration directory permissions remain unsafe: %s",
+                      config_dir);
+            return -1;
+        }
+        log_warning("Fixed configuration directory permissions");
+    }
+
+    /* Ensure the pathname still names the descriptor we verified. */
+    struct stat final_st;
+    if (lstat(config_dir, &final_st) != 0) {
+        close(fd);
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot re-check configuration directory: %s",
+                         config_dir);
+        return -1;
+    }
+    if (!S_ISDIR(final_st.st_mode) || final_st.st_dev != fd_st.st_dev ||
+        final_st.st_ino != fd_st.st_ino) {
+        close(fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration directory changed while being secured: %s",
+                  config_dir);
+        return -1;
+    }
+    close(fd);
+#else
+    /* Exotic-platform fallback: there is no portable atomic no-follow chmod.
+     * Re-check the final component immediately before and after chmod and
+     * refuse any identity/type change. A swap inside the lstat/chmod window is
+     * the residual boundary on platforms lacking O_NOFOLLOW+O_DIRECTORY. */
+    if ((path_st.st_mode & 077) != 0) {
+        struct stat before_chmod;
+        struct stat after_chmod;
+        if (lstat(config_dir, &before_chmod) != 0 ||
+            !S_ISDIR(before_chmod.st_mode) ||
+            before_chmod.st_dev != path_st.st_dev ||
+            before_chmod.st_ino != path_st.st_ino) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Configuration directory changed while being verified: %s",
+                      config_dir);
+            return -1;
+        }
+        if (chmod(config_dir, PERM_USER_RWX) != 0) {
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Failed to secure configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
+        if (lstat(config_dir, &after_chmod) != 0) {
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Cannot verify secured configuration directory: %s",
+                             config_dir);
+            return -1;
+        }
+        if (!S_ISDIR(after_chmod.st_mode) ||
+            after_chmod.st_dev != before_chmod.st_dev ||
+            after_chmod.st_ino != before_chmod.st_ino ||
+            (after_chmod.st_mode & 077) != 0) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Configuration directory changed or remains unsafe: %s",
+                      config_dir);
+            return -1;
+        }
+        log_warning("Fixed configuration directory permissions");
+    }
+
+    struct stat final_st;
+    if (lstat(config_dir, &final_st) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot re-check configuration directory: %s",
+                         config_dir);
+        return -1;
+    }
+    if (!S_ISDIR(final_st.st_mode) || final_st.st_dev != path_st.st_dev ||
+        final_st.st_ino != path_st.st_ino) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration directory changed while being secured: %s",
+                  config_dir);
+        return -1;
+    }
+#endif
+
     return 0;
 }
 

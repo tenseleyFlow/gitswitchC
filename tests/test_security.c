@@ -147,6 +147,89 @@ TEST(find_command_path_skips_world_writable_dir) {
     remove_test_dir(wwdir, tool, marker);
 }
 
+/* AR-04 M5: group write permission is enough to make either a PATH directory
+ * or the candidate helper mutable by someone other than the invoking user.
+ * Exercise both common group-write modes and retain positive controls for
+ * ordinary private/user and system-style permissions. */
+TEST(find_command_path_rejects_group_writable_components) {
+    char d770[256], d775[256], f770dir[256], f775dir[256];
+    char ok700dir[256], ok755dir[256];
+    char d770tool[512], d775tool[512], f770tool[512], f775tool[512];
+    char ok700tool[512], ok755tool[512];
+    char marker[6][512], buf[512], path[512];
+
+    if (make_test_dir(d770, sizeof(d770), 0770) != 0 ||
+        make_test_dir(d775, sizeof(d775), 0775) != 0 ||
+        make_test_dir(f770dir, sizeof(f770dir), 0755) != 0 ||
+        make_test_dir(f775dir, sizeof(f775dir), 0755) != 0 ||
+        make_test_dir(ok700dir, sizeof(ok700dir), 0700) != 0 ||
+        make_test_dir(ok755dir, sizeof(ok755dir), 0755) != 0) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+
+    snprintf(marker[0], sizeof(marker[0]), "%s/marker", d770);
+    snprintf(marker[1], sizeof(marker[1]), "%s/marker", d775);
+    snprintf(marker[2], sizeof(marker[2]), "%s/marker", f770dir);
+    snprintf(marker[3], sizeof(marker[3]), "%s/marker", f775dir);
+    snprintf(marker[4], sizeof(marker[4]), "%s/marker", ok700dir);
+    snprintf(marker[5], sizeof(marker[5]), "%s/marker", ok755dir);
+    CHECK_EQ_INT(install_fake_tool(d770, "gs_fake_dir770", marker[0],
+                                   d770tool, sizeof(d770tool)), 0);
+    CHECK_EQ_INT(install_fake_tool(d775, "gs_fake_dir775", marker[1],
+                                   d775tool, sizeof(d775tool)), 0);
+    CHECK_EQ_INT(install_fake_tool(f770dir, "gs_fake_file770", marker[2],
+                                   f770tool, sizeof(f770tool)), 0);
+    CHECK_EQ_INT(chmod(f770tool, 0770), 0);
+    CHECK_EQ_INT(install_fake_tool(f775dir, "gs_fake_file775", marker[3],
+                                   f775tool, sizeof(f775tool)), 0);
+    CHECK_EQ_INT(chmod(f775tool, 0775), 0);
+    CHECK_EQ_INT(install_fake_tool(ok700dir, "gs_fake_ok700", marker[4],
+                                   ok700tool, sizeof(ok700tool)), 0);
+    CHECK_EQ_INT(chmod(ok700tool, 0700), 0);
+    CHECK_EQ_INT(install_fake_tool(ok755dir, "gs_fake_ok755", marker[5],
+                                   ok755tool, sizeof(ok755tool)), 0);
+
+    save_path();
+
+    snprintf(path, sizeof(path), "%s", d770);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_dir770", buf, sizeof(buf)), -1);
+    CHECK(!command_exists("gs_fake_dir770")); /* same lookup used by doctor */
+    CHECK_EQ_INT(find_command_path(d770tool, buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", d775);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_dir775", buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", f770dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_file770", buf, sizeof(buf)), -1);
+    CHECK_EQ_INT(find_command_path(f770tool, buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", f775dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_file775", buf, sizeof(buf)), -1);
+
+    snprintf(path, sizeof(path), "%s", ok700dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_ok700", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, ok700tool);
+
+    snprintf(path, sizeof(path), "%s", ok755dir);
+    setenv("PATH", path, 1);
+    CHECK_EQ_INT(find_command_path("gs_fake_ok755", buf, sizeof(buf)), 0);
+    CHECK_STR_EQ(buf, ok755tool);
+
+    restore_path();
+    remove_test_dir(d770, d770tool, marker[0]);
+    remove_test_dir(d775, d775tool, marker[1]);
+    remove_test_dir(f770dir, f770tool, marker[2]);
+    remove_test_dir(f775dir, f775tool, marker[3]);
+    remove_test_dir(ok700dir, ok700tool, marker[4]);
+    remove_test_dir(ok755dir, ok755tool, marker[5]);
+}
+
 /* Relative ("."), bare-name ("bin"), and empty ("::") PATH entries all resolve
  * against the CWD — inside a cloned repo that is attacker territory, so they
  * are refused. An explicit relative path with a slash is refused too. */
@@ -244,6 +327,30 @@ TEST(run_argv_never_executes_from_world_writable_dir) {
     remove_test_dir(okdir, oktool, okmarker);
 }
 
+TEST(run_argv_never_executes_group_writable_helper) {
+    char dir[256], tool[512], marker[512];
+    run_result_t res;
+    const char *argv[] = {"gs_fake_group_writable_tool", NULL};
+
+    if (make_test_dir(dir, sizeof(dir), 0755) != 0) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    snprintf(marker, sizeof(marker), "%s/marker", dir);
+    CHECK_EQ_INT(install_fake_tool(dir, "gs_fake_group_writable_tool", marker,
+                                   tool, sizeof(tool)), 0);
+    CHECK_EQ_INT(chmod(tool, 0770), 0);
+
+    save_path();
+    setenv("PATH", dir, 1);
+    CHECK_EQ_INT(run_argv(argv, NULL, &res), -1);
+    CHECK(!res.spawned);
+    CHECK(!path_exists(marker));
+    restore_path();
+
+    remove_test_dir(dir, tool, marker);
+}
+
 #if defined(__linux__)
 /* fd-CLOEXEC acceptance: a child spawned via run_argv must see nothing beyond
  * stdin/stdout/stderr, even when the parent deliberately leaked a non-CLOEXEC
@@ -307,9 +414,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(find_command_path_finds_real_binary);
     RUN_TEST(command_exists_basic);
     RUN_TEST(find_command_path_skips_world_writable_dir);
+    RUN_TEST(find_command_path_rejects_group_writable_components);
     RUN_TEST(find_command_path_skips_relative_and_empty_entries);
     RUN_TEST(find_command_path_allows_user_owned_absolute_dir);
     RUN_TEST(run_argv_never_executes_from_world_writable_dir);
+    RUN_TEST(run_argv_never_executes_group_writable_helper);
 #if defined(__linux__)
     RUN_TEST(run_argv_child_sees_only_std_fds);
 #endif

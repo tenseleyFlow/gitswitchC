@@ -127,11 +127,12 @@ bool command_exists(const char *command);
 
 /**
  * Resolve the absolute path of an executable by walking $PATH — no shell
- * involved. Supply-chain hardened (PS-1/PS-2): only absolute, non-world-
- * writable directories may supply a binary (relative/"."/empty entries and
- * o+w dirs are skipped), and the resolved file must be a regular, non-world-
- * writable executable. A `name` containing a slash bypasses the PATH walk but
- * must pass the same checks. Portable across Linux, macOS, and the BSDs.
+ * involved. Supply-chain hardened (PS-1/PS-2): only absolute directories with
+ * no group/other write bits may supply a binary (relative/"."/empty and
+ * group/world-writable entries are skipped), and the resolved file must be a
+ * regular executable with the same write-bit restriction. A `name` containing
+ * a slash bypasses the PATH walk but must pass the same checks. Portable across
+ * Linux, macOS, and the BSDs.
  * Returns 0 and writes the path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
