@@ -6,7 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <getopt.h>
+#include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -540,10 +542,33 @@ static const char *detect_shell_from_env(void) {
     return slash ? slash + 1 : shell;
 }
 
+/* Finish a shell-snippet emit: the output of `gitswitch init` is consumed by
+ * `eval "$(gitswitch init bash)"`, so a short write (EPIPE, ENOSPC, closed fd)
+ * that truncates the snippet mid-construct — an `if` with no `fi`, or an
+ * SSH_AUTH_SOCK assignment whose existence guard got cut off — would still be
+ * eval'd as-is by the shell. stdio latches every write failure in the stream
+ * error flag, so flush and check it here and fail the whole command instead of
+ * returning success for half a script. Nothing further is written to stdout
+ * after this check, so a detected failure never appends a partial line (SIPW-1). */
+static int finish_snippet_emit(void) {
+    if (fflush(stdout) != 0 || ferror(stdout)) {
+        fprintf(stderr, "gitswitch: failed to write shell integration snippet: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 /* Emit shell-integration snippet for `shell` on stdout. The snippet sets
  * SSH_AUTH_SOCK to the stable gitswitch symlink, guarded by a socket test so
  * sourcing before the first switch (or after /tmp is wiped) is silent. */
 static int handle_init_command(const char *shell) {
+    /* A consumer that stops reading (e.g. `gitswitch init | head`) must surface
+     * as EPIPE through the stream error flag checked in finish_snippet_emit,
+     * not kill us with SIGPIPE before we can report the failure. Not restored:
+     * both callers return from main() immediately after this function (SIPW-1). */
+    signal(SIGPIPE, SIG_IGN);
+
     char sock_path[MAX_PATH_LEN];
     if (ssh_manager_get_auth_sock_path(sock_path, sizeof(sock_path)) != 0) {
         fprintf(stderr, "gitswitch: failed to compute SSH_AUTH_SOCK path: %s\n",
@@ -624,7 +649,7 @@ static int handle_init_command(const char *shell) {
             printf("end\n");
             printf("set -e __gitswitch_gnupghome\n");
         }
-        return EXIT_SUCCESS;
+        return finish_snippet_emit();
     }
 
     if (strcmp(shell, "bash") == 0 || strcmp(shell, "zsh") == 0 ||
@@ -663,13 +688,69 @@ static int handle_init_command(const char *shell) {
             printf("[ -d \"$__gitswitch_gnupghome\" ] && export GNUPGHOME=\"$__gitswitch_gnupghome\"\n");
             printf("unset __gitswitch_gnupghome\n");
         }
-        return EXIT_SUCCESS;
+        return finish_snippet_emit();
     }
 
     fprintf(stderr,
             "gitswitch: unsupported shell '%s' (supported: fish, bash, zsh, sh, dash, ksh)\n",
             shell);
     return EXIT_FAILURE;
+}
+
+/* True when the saved account's per-boot runtime state is already live, so
+ * `resume` can no-op silently. The shell snippet can only probe the SSH agent
+ * socket, but a GPG-only account never creates one (its switch tears the SSH
+ * side down), so without this check every interactive shell would re-run the
+ * whole switch and re-print the restore notice for such accounts (F2).
+ * - SSH accounts: never "already applied" here — the snippet's ssh-add probe
+ *   IS the liveness test, and when it fails a real re-switch is needed.
+ * - GPG-only accounts: live iff the stable GNUPGHOME `current` symlink points
+ *   at THIS account's isolated home and that home still exists. The symlink
+ *   lives under XDG_RUNTIME_DIR (wiped per boot on Linux) or /tmp; where /tmp
+ *   survives a reboot (macOS/BSD), the home it points at survived with it, so
+ *   skipping the re-switch there is still correct.
+ * - Identity-only accounts: git config is persistent, nothing boot-volatile
+ *   exists to restore, so resume is always a silent no-op.
+ * Every "can't tell" case returns false (resume runs) — a redundant resume is
+ * an annoyance, a wrongly-skipped one leaves the user without their agent. */
+static bool resume_already_applied(const account_t *acct) {
+    bool wants_ssh = acct->ssh_enabled && acct->ssh_key_path[0] != '\0';
+    bool wants_gpg = acct->gpg_enabled && acct->gpg_key_id[0] != '\0';
+
+    if (wants_ssh) {
+        return false;
+    }
+
+    if (wants_gpg) {
+        char link_path[MAX_PATH_LEN];
+        char target[MAX_PATH_LEN];
+        struct stat st;
+        const char *base;
+        ssize_t len;
+
+        if (gpg_manager_get_home_path(link_path, sizeof(link_path)) != 0) {
+            return false;
+        }
+        len = readlink(link_path, target, sizeof(target) - 1);
+        if (len <= 0 || (size_t)len >= sizeof(target) - 1) {
+            return false; /* absent (fresh boot) or possibly truncated */
+        }
+        target[len] = '\0';
+
+        /* Each switch points <base>/current at <base>/<account-name>; a stale
+         * link left at some OTHER account's home must not suppress the resume. */
+        base = strrchr(target, '/');
+        base = base ? base + 1 : target;
+        if (strcmp(base, acct->name) != 0) {
+            return false;
+        }
+
+        /* stat() follows the symlink: a dangling link (home deleted, e.g. by
+         * `gitswitch reset`) means the state is gone and a resume is needed. */
+        return stat(link_path, &st) == 0 && S_ISDIR(st.st_mode);
+    }
+
+    return true;
 }
 
 /* Re-activate the last-active account, recorded in config across reboots. This
@@ -679,6 +760,8 @@ static int handle_init_command(const char *shell) {
  * rebuilds the isolated GPG home + symlinks. A no-op (success) when there is no
  * saved account or it no longer exists, so it can never break a login shell. */
 static int handle_resume_command(gitswitch_ctx_t *ctx) {
+    account_t *acct;
+
     if (!ctx) return EXIT_FAILURE;
 
     /* Mark this as a resume so accounts_switch skips the blocking SSH
@@ -691,10 +774,36 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
         return EXIT_SUCCESS;
     }
 
-    if (!config_find_account(ctx, ctx->config.active_account)) {
+    acct = config_find_account(ctx, ctx->config.active_account);
+    if (!acct) {
         log_debug("Saved account no longer exists, skipping resume: %s",
                   ctx->config.active_account);
         return EXIT_SUCCESS;
+    }
+
+    /* Already live this boot: exit silently before the notice below. The shell
+     * snippet re-invokes resume whenever its ssh-add probe fails, which for a
+     * GPG-only account is EVERY interactive shell — re-running the switch and
+     * nagging on each one is exactly the F2 bug. */
+    if (resume_already_applied(acct)) {
+        log_debug("Runtime state for '%s' already live; resume is a no-op",
+                  ctx->config.active_account);
+        return EXIT_SUCCESS;
+    }
+
+    /* Resume must never read stdin: the init snippet invokes it on every
+     * interactive shell with stdin attached to the user's TTY and stdout
+     * suppressed, so any prompt inside the switch (e.g. the global-scope
+     * consent question in accounts_switch) would invisibly block the shell
+     * waiting for input the user doesn't know it wants. Point stdin at
+     * /dev/null so those paths see a non-TTY and fail closed with a printed
+     * error instead of hanging the login; pinentry/ssh passphrase prompts are
+     * unaffected (they talk to the TTY directly, not stdin). Fail closed if we
+     * can't detach (F2). */
+    if (!freopen("/dev/null", "r", stdin)) {
+        fprintf(stderr, "gitswitch: cannot detach stdin for resume: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
     }
 
     /* On stderr (the `init` snippet suppresses stdout), and only once we know
@@ -764,6 +873,36 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     }
 
     ssh_manager_reset(target);
+
+    /* ssh_manager_reset(<name>) kills that account's agent and unlinks its
+     * ssh-agent.<name>.sock + pid sidecar, but leaves the stable current.sock
+     * symlink behind — if it pointed at the account just reset, integrated
+     * shells keep exporting SSH_AUTH_SOCK at a dead socket. Mirror the GPG
+     * side's dangling-symlink cleanup: drop current.sock only when its target
+     * names this account's socket, so a link at some other account's live
+     * agent is left intact. Idempotent by construction (once the link is gone
+     * readlink fails and we do nothing), so it composes safely should
+     * ssh_manager_reset learn to do this cleanup itself (F3). */
+    if (target) {
+        char link_path[MAX_PATH_LEN];
+        char link_target[MAX_PATH_LEN];
+        char expected[MAX_PATH_LEN];
+        if (ssh_manager_get_auth_sock_path(link_path, sizeof(link_path)) == 0) {
+            ssize_t len = readlink(link_path, link_target, sizeof(link_target) - 1);
+            if (len > 0 && (size_t)len < sizeof(link_target) - 1) {
+                const char *base;
+                link_target[len] = '\0';
+                base = strrchr(link_target, '/');
+                base = base ? base + 1 : link_target;
+                if ((size_t)snprintf(expected, sizeof(expected),
+                                     "ssh-agent.%s.sock", target) < sizeof(expected) &&
+                    strcmp(base, expected) == 0) {
+                    unlink(link_path);
+                }
+            }
+        }
+    }
+
     gpg_manager_reset(target);
 
     if (target) {

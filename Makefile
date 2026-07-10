@@ -210,9 +210,12 @@ $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) |
 	@echo "Linking test $@..."
 	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LIBS)
 
-# Build and run tests
+# Build and run tests. The main binary is a dependency because the CLI-level
+# tests (tests/test_cli.c) exec build/bin/gitswitch: main.c is excluded from
+# the test link (it defines main), so its command handlers are only reachable
+# end-to-end through the binary itself.
 .PHONY: test
-test: $(TEST_TARGETS)
+test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@echo "Running tests..."
 	@for test in $(TEST_TARGETS); do \
 		echo "Running $$test..."; \
