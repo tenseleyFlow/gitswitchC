@@ -144,11 +144,13 @@ void display_header(const char *title) {
     }
     printf("┐\n");
     
-    /* Title line */
-    printf("│%*s%s%s%*s│\n", 
+    /* Title line. No bare COLOR_RESET here: display_colorize already appends
+     * the reset when color is on, and with color off it returns the plain
+     * text — an unconditional reset would inject a raw ESC[0m into
+     * --no-color/piped output (AR-03 L15). */
+    printf("│%*s%s%*s│\n",
            padding, "",
            display_colorize(title, "header"),
-           COLOR_RESET,
            total_width - title_len - padding - 2, "");
     
     /* Bottom border */

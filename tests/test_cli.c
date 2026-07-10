@@ -632,6 +632,53 @@ TEST(utf8_account_name_cli_round_trip) {
     remove_tree(rt);
 }
 
+/* AR-03 L15: with color disabled (piped stdout, or explicit --no-color) no
+ * raw ANSI escape byte may reach the stream. display_header used to append an
+ * unconditional COLOR_RESET, so every banner leaked ESC[0m into pipes —
+ * display_colorize owns the reset now, and it emits nothing with color off. */
+TEST(no_color_output_contains_no_escape_bytes) {
+    char home[256], rt[256], cmd[16384], out_path[4352], out[8192];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+
+    /* No accounts: the bare invocation renders the welcome banner via
+     * display_header. stdout is a file, so color auto-disables. */
+    snprintf(out_path, sizeof(out_path), "%s/welcome.out", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "Welcome") != NULL); /* the banner actually rendered */
+    CHECK(strchr(out, '\x1b') == NULL);
+
+    /* Same guarantee under explicit --no-color with an account listed. */
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"plain\"\n"
+        "email = \"p@example.com\"\n"), 0);
+    snprintf(out_path, sizeof(out_path), "%s/list.out", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --no-color list >'%s' 2>&1",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "plain") != NULL);
+    CHECK(strchr(out, '\x1b') == NULL);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 TEST_MAIN_BEGIN()
     if (resolve_binary() != 0) {
         fprintf(stderr, "RESULT FAIL: cannot locate gitswitch binary\n");
@@ -650,4 +697,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reset_other_account_keeps_current_sock);
     RUN_TEST(mutating_commands_block_on_config_lock_readonly_dont);
     RUN_TEST(utf8_account_name_cli_round_trip);
+    RUN_TEST(no_color_output_contains_no_escape_bytes);
 TEST_MAIN_END()
