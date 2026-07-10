@@ -2,7 +2,16 @@
  * Implements per-account SSH agents to prevent key leakage between accounts
  */
 
-#define _POSIX_C_SOURCE 200809L
+/* flock()/LOCK_EX are BSD extensions, not POSIX. On macOS they need
+ * _DARWIN_C_SOURCE; on the BSDs they need the default fully-visible namespace,
+ * so defining _POSIX_C_SOURCE there (strict POSIX) hides them and the build
+ * fails. glibc still exposes flock under _POSIX_C_SOURCE, so keep it on Linux
+ * for the other POSIX APIs this file relies on. */
+#if defined(__APPLE__)
+#  define _DARWIN_C_SOURCE 1
+#elif defined(__linux__)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -92,19 +101,56 @@ static void unlock_agent_dir(int fd) {
     }
 }
 
-/* True if an ssh-agent is answering on `sock` AND already holds at least one
- * identity (`ssh-add -l` exits 0). Since agent sockets are named per account
- * (ssh-agent.<name>.sock), a live socket for the target account means its own
- * agent with its own key — so reusing it is safe and skips a passphrase
- * re-prompt. exit 1 (no identities) / 2 (no agent) both yield false. */
-static bool ssh_socket_has_identity(const char *sock) {
-    char envbuf[MAX_PATH_LEN + 20];
+/* Copy the SHA256:... fingerprint token of the key at `key_path` into `buf`.
+ * Uses `ssh-keygen -lf`, which reads the fingerprint from the key's public
+ * portion without needing the passphrase. Returns 0 on success. */
+static int ssh_key_fingerprint(const char *key_path, char *buf, size_t size) {
     char out[1024];
+    const char *argv[] = { "ssh-keygen", "-lf", key_path, NULL };
+    run_opts_t opts;
+    run_result_t res;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = out;
+    opts.out_size = sizeof(out);
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &res) != 0) {
+        return -1;
+    }
+
+    /* Output: "<bits> SHA256:<hash> <comment> (<type>)". Extract the token
+     * that starts with "SHA256:" (or "MD5:" on legacy setups). */
+    const char *fp = strstr(out, "SHA256:");
+    if (!fp) fp = strstr(out, "MD5:");
+    if (!fp) return -1;
+
+    size_t i = 0;
+    while (fp[i] && fp[i] != ' ' && fp[i] != '\t' && fp[i] != '\n' && i + 1 < size) {
+        buf[i] = fp[i];
+        i++;
+    }
+    buf[i] = '\0';
+    return i > 0 ? 0 : -1;
+}
+
+/* True if an ssh-agent is answering on `sock` AND already holds the key at
+ * `key_path` specifically (matched by fingerprint), so adopting it is safe and
+ * skips a passphrase re-prompt. A live agent holding a *different* key — e.g.
+ * after `gitswitch edit` changed the key path — returns false so the caller
+ * loads the current key. If the fingerprint can't be determined we fall back to
+ * false (load the key) rather than risk reusing a stale one. */
+static bool ssh_socket_has_key(const char *sock, const char *key_path) {
+    char want_fp[256];
+    char envbuf[MAX_PATH_LEN + 20];
+    char out[2048];
     const char *env[2] = { NULL, NULL };
     const char *argv[] = { "ssh-add", "-l", NULL };
     run_opts_t opts;
     run_result_t res;
 
+    if (ssh_key_fingerprint(key_path, want_fp, sizeof(want_fp)) != 0) {
+        return false;
+    }
     if ((size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s", sock) >= sizeof(envbuf)) {
         return false;
     }
@@ -114,7 +160,10 @@ static bool ssh_socket_has_identity(const char *sock) {
     opts.out_size = sizeof(out);
     opts.stderr_to_devnull = true;
     opts.extra_env = env;
-    return run_argv(argv, &opts, &res) == 0;
+    if (run_argv(argv, &opts, &res) != 0) {
+        return false; /* exit 1 (no identities) / 2 (no agent) */
+    }
+    return strstr(out, want_fp) != NULL;
 }
 
 
@@ -327,12 +376,20 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         goto done;
     }
 
-    /* Reuse fast path: if this account's agent is already alive and holds its
-     * key, adopt it instead of killing and restarting (which forces a fresh
-     * ssh-add and, for a passphrase-protected key, a PIN/passphrase re-prompt
-     * on every re-switch to the already-active account). We still reap every
-     * OTHER account's agent so only this one stays live. */
-    if (validate_ssh_agent_socket(socket_path) == 0 && ssh_socket_has_identity(socket_path)) {
+    /* Reuse fast path: if this account's agent is already alive and holds THIS
+     * key (matched by fingerprint), adopt it instead of killing and restarting
+     * (which forces a fresh ssh-add and, for a passphrase-protected key, a
+     * PIN/passphrase re-prompt on every re-switch to the already-active
+     * account). Matching the specific key means that after `gitswitch edit`
+     * changes the key path, the stale agent is NOT reused and the new key gets
+     * loaded. We still reap every OTHER account's agent so only this one stays
+     * live. The key path is expanded (~ etc.) for the fingerprint lookup. */
+    char reuse_key_path[MAX_PATH_LEN];
+    bool have_reuse_key =
+        account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
+        expand_path(account->ssh_key_path, reuse_key_path, sizeof(reuse_key_path)) == 0;
+    if (validate_ssh_agent_socket(socket_path) == 0 && have_reuse_key &&
+        ssh_socket_has_key(socket_path, reuse_key_path)) {
         log_info("Reusing live SSH agent for account: %s", account->name);
         safe_strncpy(ssh_config->agent_socket_path, socket_path,
                      sizeof(ssh_config->agent_socket_path));
@@ -1104,6 +1161,16 @@ int ssh_manager_reset(const char *account) {
          * sockets/pids/current.sock). */
         kill_orphaned_gitswitch_agents(NULL);
         return 0;
+    }
+
+    /* The account name becomes a path component in the socket/pid filenames we
+     * unlink below. Every loaded account already passed validate_name, so this
+     * is unreachable in practice — but guard it anyway, symmetrically with
+     * gpg_manager_reset(), so a crafted name can never escape socket_dir. */
+    if (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
+        account[0] == '.') {
+        set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
+        return -1;
     }
 
     if (runtime_dir && *runtime_dir && path_exists(runtime_dir)) {

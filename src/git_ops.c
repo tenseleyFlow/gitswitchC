@@ -45,28 +45,58 @@ static struct {
 /* Extract the value of a lowercased key from `git config --list` output
  * (lines of the form "key=value"). Returns the LAST occurrence, matching git's
  * last-wins resolution. Returns true and fills out[] if found. */
-static bool parse_config_list_value(const char *list, const char *key,
-                                    char *out, size_t out_size) {
+/* Parse a value out of `git config --list -z` output. The listing is a series
+ * of NUL-terminated records, each "key\nvalue" (the value itself may contain
+ * newlines — that's the whole point of -z over plain --list, which would let a
+ * value's embedded newline masquerade as a record boundary and truncate the
+ * snapshot). `buf`/`len` are binary (the buffer holds embedded NULs), so we
+ * work by length rather than strlen. Last match wins. */
+static bool parse_config_z_value(const char *buf, size_t len, const char *key,
+                                 char *out, size_t out_size) {
     size_t key_len = strlen(key);
     bool found = false;
-    const char *line = list;
-    while (line && *line) {
-        const char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
-        /* Match "key=" at line start */
-        if (line_len > key_len && line[key_len] == '=' &&
-            strncmp(line, key, key_len) == 0) {
-            const char *val = line + key_len + 1;
-            size_t val_len = line_len - key_len - 1;
+    size_t pos = 0;
+    while (pos < len) {
+        size_t rec_start = pos;
+        while (pos < len && buf[pos] != '\0') pos++;
+        size_t rec_len = pos - rec_start;
+        if (pos < len) pos++; /* step over the record's NUL terminator */
+
+        const char *rec = buf + rec_start;
+        const char *nl = memchr(rec, '\n', rec_len);
+        if (!nl) continue; /* no key/value separator — skip */
+        size_t k_len = (size_t)(nl - rec);
+        if (k_len == key_len && memcmp(rec, key, key_len) == 0) {
+            const char *val = nl + 1;
+            size_t val_len = rec_len - k_len - 1;
             if (val_len < out_size) {
                 memcpy(out, val, val_len);
                 out[val_len] = '\0';
                 found = true; /* keep scanning: last wins */
             }
         }
-        line = eol ? eol + 1 : NULL;
     }
     return found;
+}
+
+/* Run `git config <scope> --list -z`, capturing the NUL-delimited listing into
+ * buf and its byte length into *out_len. Returns 0 on success. Kept local (not
+ * via git_list_config) so the binary, -z output and its true length stay
+ * intact — git_list_config's public contract is a plain C string. */
+static int git_list_config_z(git_scope_t scope, char *buf, size_t size, size_t *out_len) {
+    const char *scope_flag = git_scope_to_flag(scope);
+    if (!scope_flag) return -1;
+    const char *argv[] = { "git", "config", scope_flag, "--list", "-z", NULL };
+    run_opts_t opts;
+    run_result_t res;
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    opts.out = buf;
+    opts.out_size = size;
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &res) != 0) return -1;
+    *out_len = res.out_len;
+    return 0;
 }
 
 static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
@@ -76,16 +106,17 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
         out[i].value[0] = '\0';
     }
 
-    /* Fast path: one `git config --list` exec instead of one per key. Fall
+    /* Fast path: one `git config --list -z` exec instead of one per key. Fall
      * back to per-key reads if the listing failed or looks truncated (buffer
      * full) — a truncated list could miss a pre-existing value and corrupt the
      * rollback snapshot, so correctness wins over the extra execs. */
     char list[16384];
-    if (git_list_config(scope, list, sizeof(list)) == 0 &&
-        strlen(list) < sizeof(list) - 1) {
+    size_t list_len = 0;
+    if (git_list_config_z(scope, list, sizeof(list), &list_len) == 0 &&
+        list_len < sizeof(list) - 1) {
         for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-            if (parse_config_list_value(list, g_managed_keys[i],
-                                        out[i].value, sizeof(out[i].value))) {
+            if (parse_config_z_value(list, list_len, g_managed_keys[i],
+                                     out[i].value, sizeof(out[i].value))) {
                 out[i].present = true;
             }
         }

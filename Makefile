@@ -98,18 +98,35 @@ LIBS = -lssl -lcrypto
 # Optional GNU readline: gives the interactive add/edit prompts line editing
 # and TAB path completion. Auto-detected; build still works without it (the
 # prompt module falls back to fgets). Override with READLINE=0 to force off.
+#
+# GNU readline isn't on the default search path everywhere: on macOS it's a
+# keg-only Homebrew formula, and on the BSDs it lives under /usr/local. Probe
+# with those hints so the feature engages there too instead of silently
+# degrading. The same hints are added to the real build flags when detected.
 READLINE ?= auto
+READLINE_HINT_CFLAGS :=
+READLINE_HINT_LIBS :=
+READLINE_BREW_PREFIX := $(shell brew --prefix readline 2>/dev/null)
+ifneq ($(READLINE_BREW_PREFIX),)
+  READLINE_HINT_CFLAGS += -I$(READLINE_BREW_PREFIX)/include
+  READLINE_HINT_LIBS += -L$(READLINE_BREW_PREFIX)/lib
+endif
+ifneq ($(wildcard /usr/local/include/readline/readline.h),)
+  READLINE_HINT_CFLAGS += -I/usr/local/include
+  READLINE_HINT_LIBS += -L/usr/local/lib
+endif
 ifeq ($(READLINE),auto)
   READLINE_OK := $(shell echo 'int main(void){return 0;}' \
-                  | $(CC) -include stdio.h -include readline/readline.h -xc - -lreadline -o /dev/null >/dev/null 2>&1 && echo 1)
+                  | $(CC) $(READLINE_HINT_CFLAGS) -include stdio.h -include readline/readline.h \
+                    -xc - $(READLINE_HINT_LIBS) -lreadline -o /dev/null >/dev/null 2>&1 && echo 1)
 else ifeq ($(READLINE),0)
   READLINE_OK :=
 else
   READLINE_OK := 1
 endif
 ifeq ($(READLINE_OK),1)
-  CFLAGS += -DHAVE_READLINE
-  LIBS += -lreadline
+  CFLAGS += -DHAVE_READLINE $(READLINE_HINT_CFLAGS)
+  LIBS += $(READLINE_HINT_LIBS) -lreadline
 endif
 
 # Source files (Phase 2 - Configuration Management)
