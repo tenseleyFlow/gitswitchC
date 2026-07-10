@@ -96,12 +96,16 @@ endif
 # Debug/Release configurations
 DEBUG_FLAGS = -g -O0 -DDEBUG -Wp,-U_FORTIFY_SOURCE -fsanitize=address -fsanitize=undefined \
               -fno-omit-frame-pointer -Wpedantic $(SECURITY_FLAGS_DEBUG)
-RELEASE_FLAGS = -O2 -DNDEBUG -s $(SECURITY_FLAGS_RELEASE)
+# -s (strip) lives in RELEASE_LDFLAGS, not here: it is a link-only flag, and
+# CFLAGS feeds the compile step too, where clang errors on it as an unused
+# command-line argument under WERROR (gcc silently ignores it).
+RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_FLAGS_RELEASE)
 
 # Default to debug build
 BUILD_TYPE ?= debug
 ifeq ($(BUILD_TYPE),release)
     CFLAGS += $(RELEASE_FLAGS)
+    LDFLAGS += -s
 else
     CFLAGS += $(DEBUG_FLAGS)
 endif
