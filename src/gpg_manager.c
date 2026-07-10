@@ -68,6 +68,7 @@ static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
                                         int base_fd, const char *base,
                                         int *home_fd_out);
 static int gpg_validate_pinned_home(const gpg_pinned_home_t *home);
+static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_validate_key_pinned(gpg_config_t *gpg_config,
                                    const gpg_pinned_home_t *home,
                                    const char *key_id);
@@ -2265,7 +2266,13 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         return -1;
     }
 
-    /* Export the secret key from the SYSTEM keyring (no GNUPGHOME override).
+    /* Export the secret key from the SYSTEM keyring. GNUPGHOME is overridden to
+     * the user's REAL keyring home (AR-06 F05/F06): `gitswitch init` exports
+     * GNUPGHOME=<base>/current into interactive shells, and a bare export would
+     * inherit that managed value and read the previously-active account's
+     * isolated home — where a different account's key does not exist — failing
+     * closed with a misleading "key not found". gpg_user_source_home() rejects a
+     * managed GNUPGHOME and falls back to $HOME/.gnupg.
      * key_data now holds unencrypted armored private-key material, so every
      * exit below must scrub it (secure_zero_memory) before freeing — a plain
      * free would leave the key in heap memory for a later allocation, core
@@ -2276,10 +2283,18 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
      * corrupt it. */
     {
         const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys", key_id, NULL};
+        char source_home[MAX_PATH_LEN];
+        char source_env_str[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
+        const char *export_env[2] = {NULL, NULL};
         memset(&opts, 0, sizeof(opts));
         opts.out = key_data;
         opts.out_size = KEY_DATA_CAP;
         opts.stderr_to_devnull = true;
+        if (gpg_user_source_home(source_home, sizeof(source_home)) == 0) {
+            snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
+            export_env[0] = source_env_str;
+            opts.extra_env = export_env;
+        }
         if (run_argv(export_argv, &opts, &res) != 0 || res.out_len == 0) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
@@ -2412,6 +2427,16 @@ static int gpg_user_source_home(char *buf, size_t size) {
         return -1;
     }
     return ((size_t)snprintf(buf, size, "%s/.gnupg", home) < size) ? 0 : -1;
+}
+
+/* Public wrapper (AR-06 F05/F06): callers outside this TU (accounts.c's
+ * system-keyring availability probe) need the same real-home resolution the
+ * export path uses, so they can override an inherited managed GNUPGHOME. */
+int gpg_manager_system_keyring_home(char *buf, size_t size) {
+    if (!buf || size == 0) {
+        return -1;
+    }
+    return gpg_user_source_home(buf, size);
 }
 
 /* Set up gpg-agent.conf for the isolated environment.

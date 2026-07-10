@@ -1713,10 +1713,15 @@ static int validate_ssh_key_security(const char *ssh_key_path) {
 }
 
 /* Validate GPG key availability.
- * Deliberately checks the *system* keyring (no GNUPGHOME override): this is the
- * fallback sanity check run from accounts_switch() when the isolated GPG path
- * did not already confirm the key (gpg_ok), and during health checks. The
- * isolated-home validation lives in gpg_validate_key()/gpg_test_signing(). */
+ * Checks the *system* keyring — but with an explicit GNUPGHOME override to the
+ * user's REAL keyring home (AR-06 F05/F06). `gitswitch init` exports
+ * GNUPGHOME=<base>/current into interactive shells; without the override this
+ * probe would inherit that managed value and list the previously-active
+ * account's isolated home, hard-failing every cross-account switch with a
+ * misleading "key not found". This is the fallback sanity check run from
+ * accounts_switch() when the isolated GPG path did not already confirm the key
+ * (gpg_ok), and during health checks. The isolated-home validation lives in
+ * gpg_validate_key()/gpg_test_signing(). */
 static int validate_gpg_key_availability(const char *gpg_key_id) {
     if (!gpg_key_id) {
         return -1;
@@ -1731,8 +1736,16 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
     /* Look up the key in the system keyring, no shell. */
     const char *argv[] = {"gpg", "--list-secret-keys", gpg_key_id, NULL};
     run_opts_t opts;
+    char source_home[MAX_PATH_LEN];
+    char source_env_str[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
+    const char *source_env[2] = {NULL, NULL};
     memset(&opts, 0, sizeof(opts));
     opts.stderr_to_devnull = true;
+    if (gpg_manager_system_keyring_home(source_home, sizeof(source_home)) == 0) {
+        snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
+        source_env[0] = source_env_str;
+        opts.extra_env = source_env;
+    }
 
     if (run_argv(argv, &opts, NULL) != 0) {
         log_debug("GPG key %s not found in keyring", gpg_key_id);

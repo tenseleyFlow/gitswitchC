@@ -372,6 +372,7 @@ static char   g_imp_base[600];              /* <xdg>/gitswitch-gpg */
 static char   g_imp_home[700];
 static int    g_imp_import_count;
 static bool   g_imp_export_had_gnupghome;
+static char   g_imp_export_gnupghome[600];  /* GNUPGHOME override at export; "" = absent */
 static char   g_imp_import_gnupghome[600];  /* GNUPGHOME value at import; "" = absent */
 static bool   g_imp_import_used_pinned_home;
 static char   g_imp_import_stdin[512];
@@ -415,8 +416,10 @@ static int import_flow_runner(const char *const argv[], const run_opts_t *opts,
         return -1; /* not in the isolated home: forces the export/import path */
     }
     if (is_export) {
-        g_imp_export_had_gnupghome =
-            env_lookup(opts ? opts->extra_env : NULL, "GNUPGHOME=") != NULL;
+        const char *egh = env_lookup(opts ? opts->extra_env : NULL, "GNUPGHOME=");
+        g_imp_export_had_gnupghome = egh != NULL;
+        snprintf(g_imp_export_gnupghome, sizeof(g_imp_export_gnupghome),
+                 "%s", egh ? egh : "");
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size, "%s", FAKE_ARMOR);
             if (result) result->out_len = strlen(opts->out);
@@ -469,6 +472,16 @@ static int run_first_time_import(char *home_expect, size_t home_expect_size) {
     command_runner_fn prev;
     int rc;
 
+    char managed_gnupghome[700];
+    char *prev_home = getenv("HOME");
+    char *prev_gnupghome = getenv("GNUPGHOME");
+    char saved_home[600] = "";
+    char saved_gnupghome[600] = "";
+    bool had_home = prev_home != NULL;
+    bool had_gnupghome = prev_gnupghome != NULL;
+    if (had_home) snprintf(saved_home, sizeof(saved_home), "%s", prev_home);
+    if (had_gnupghome) snprintf(saved_gnupghome, sizeof(saved_gnupghome), "%s", prev_gnupghome);
+
     snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
     if (!mkdtemp(xdg) || chmod(xdg, 0700) != 0) return -99;
     setenv("XDG_RUNTIME_DIR", xdg, 1);
@@ -477,6 +490,14 @@ static int run_first_time_import(char *home_expect, size_t home_expect_size) {
     snprintf(g_imp_base, sizeof(g_imp_base), "%s/gitswitch-gpg", xdg);
     snprintf(home_expect, home_expect_size, "%s/imp", g_imp_base);
     snprintf(g_imp_home, sizeof(g_imp_home), "%s", home_expect);
+
+    /* AR-06 F05/F06 precondition: an integrated shell exports a gitswitch-
+     * managed GNUPGHOME (<base>/current). The system-keyring export must NOT
+     * inherit it — it must resolve to the real keyring instead. HOME is set so
+     * the fallback ($HOME/.gnupg) is deterministic. */
+    setenv("HOME", xdg, 1);
+    snprintf(managed_gnupghome, sizeof(managed_gnupghome), "%s/current", g_imp_base);
+    setenv("GNUPGHOME", managed_gnupghome, 1);
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = GPG_MODE_ISOLATED;
@@ -488,7 +509,8 @@ static int run_first_time_import(char *home_expect, size_t home_expect_size) {
     snprintf(acct.gpg_key_id, sizeof(acct.gpg_key_id), "AABBCCDD00112233");
 
     g_imp_import_count = 0;
-    g_imp_export_had_gnupghome = true; /* must be proven false */
+    g_imp_export_had_gnupghome = false;
+    g_imp_export_gnupghome[0] = '\0';
     g_imp_import_gnupghome[0] = '\0';
     g_imp_import_used_pinned_home = false;
     g_imp_import_stdin_len = 0;
@@ -499,6 +521,10 @@ static int run_first_time_import(char *home_expect, size_t home_expect_size) {
     run_set_runner(prev);
 
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    /* Restore HOME/GNUPGHOME so this shared helper doesn't leak the managed
+     * value (or a soon-to-be-removed /tmp HOME) into later tests. */
+    if (had_home) setenv("HOME", saved_home, 1); else unsetenv("HOME");
+    if (had_gnupghome) setenv("GNUPGHOME", saved_gnupghome, 1); else unsetenv("GNUPGHOME");
     return rc;
 }
 
@@ -512,8 +538,12 @@ TEST(first_time_import_is_directional_and_isolated) {
     CHECK_STR_EQ(g_imp_import_gnupghome, ".");
     CHECK(g_imp_import_used_pinned_home);
 
-    /* ...the export read the SYSTEM keyring (no GNUPGHOME override)... */
-    CHECK(!g_imp_export_had_gnupghome);
+    /* ...the export read the SYSTEM keyring via an EXPLICIT GNUPGHOME override
+     * that resolves away from the gitswitch-managed home the shell exported
+     * (AR-06 F05/F06): the old code passed no override and would have inherited
+     * <base>/current, reading the wrong keyring and failing closed. */
+    CHECK(g_imp_export_had_gnupghome);
+    CHECK(strstr(g_imp_export_gnupghome, "gitswitch-gpg") == NULL);
 
     /* ...and the import's stdin is byte-for-byte the exported armor. */
     CHECK_EQ_INT((long)g_imp_import_stdin_len, (long)strlen(FAKE_ARMOR));
