@@ -85,6 +85,12 @@ typedef struct {
     account_t accounts[MAX_ACCOUNTS];
     size_t account_count;
     account_t *current_account;
+    /* Number of account sections present in the config file that were dropped
+     * at load time because they failed validation (e.g. an SSH key on an
+     * unmounted path, or wrong permissions). When non-zero the in-memory set
+     * is an incomplete view of the file, so config_save must NOT rewrite the
+     * file — doing so would silently erase the dropped accounts. */
+    size_t accounts_skipped_on_load;
 } gitswitch_ctx_t;
 
 /* Function prototypes */
