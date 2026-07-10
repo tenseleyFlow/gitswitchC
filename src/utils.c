@@ -589,6 +589,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->term_signal = 0;
     result->spawned = false;
     result->out_len = 0;
+    result->out_truncated = false;
 
     if (!argv || !argv[0]) {
         set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
@@ -725,13 +726,20 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             char buf[4096];
             ssize_t r = read(outfd, buf, sizeof(buf));
             if (r > 0) {
+                size_t cp = 0;
                 if (out_off < opts->out_size - 1) {
                     size_t space = opts->out_size - 1 - out_off;
-                    size_t cp = ((size_t)r < space) ? (size_t)r : space;
+                    cp = ((size_t)r < space) ? (size_t)r : space;
                     memcpy(opts->out + out_off, buf, cp);
                     out_off += cp;
                 }
-                /* keep draining even when the capture buffer is full */
+                /* Bytes beyond the capture buffer are still drained (so the
+                 * child never blocks) but LOST — record that, so callers that
+                 * feed `out` onward can refuse the incomplete copy instead of
+                 * silently processing corrupt data (AR-02 #4). */
+                if (cp < (size_t)r) {
+                    result->out_truncated = true;
+                }
             } else if (r == 0) {
                 close(outfd); outfd = -1;
             } else if (r < 0 && errno != EAGAIN && errno != EINTR) {

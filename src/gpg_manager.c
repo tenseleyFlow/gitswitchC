@@ -894,10 +894,17 @@ static int gpg_run(const gpg_config_t *cfg, char *output, size_t output_size, ..
 
 /* Copy GPG key from system keyring to isolated environment */
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const char *key_id) {
-    char key_data[8192];
+    /* Generous heap capacity for the armored export: a multi-subkey RSA-4096
+     * key armors to ~15 KB and photo-ID-bearing keys to far more, so the old
+     * fixed 8 KB stack buffer routinely truncated real keys — and run_argv's
+     * silent cap then fed the corrupt armor straight to `gpg --import`
+     * (AR-02 #4). Truncation is detected and refused explicitly below. */
+    enum { KEY_DATA_CAP = 512 * 1024 };
     char check_output[1024];
+    char import_diag[1024];
     char envbuf[MAX_PATH_LEN + 16];
     const char *env[2];
+    char *key_data;
     run_opts_t opts;
     run_result_t res;
 
@@ -918,41 +925,68 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config, const ch
         return 0;
     }
 
+    key_data = malloc(KEY_DATA_CAP);
+    if (!key_data) {
+        set_error(ERR_MEMORY_ALLOCATION, "Failed to allocate GPG export buffer");
+        return -1;
+    }
+
     /* Export the secret key from the SYSTEM keyring (no GNUPGHOME override).
      * key_data now holds unencrypted armored private-key material, so every
-     * exit below must scrub it (secure_zero_memory) before returning — a plain
-     * return would leave the key on the stack for a later frame, core dump, or
-     * memory-disclosure bug to recover. */
+     * exit below must scrub it (secure_zero_memory) before freeing — a plain
+     * free would leave the key in heap memory for a later allocation, core
+     * dump, or memory-disclosure bug to recover. Export stderr stays
+     * discarded: stdout IS the key, so merging would corrupt it. */
     {
         const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys", key_id, NULL};
         memset(&opts, 0, sizeof(opts));
         opts.out = key_data;
-        opts.out_size = sizeof(key_data);
+        opts.out_size = KEY_DATA_CAP;
         opts.stderr_to_devnull = true;
         if (run_argv(export_argv, &opts, &res) != 0 || res.out_len == 0) {
-            secure_zero_memory(key_data, sizeof(key_data));
+            secure_zero_memory(key_data, KEY_DATA_CAP);
+            free(key_data);
             set_error(ERR_GPG_KEY_NOT_FOUND, "Failed to export GPG key from system keyring");
+            return -1;
+        }
+        /* An incomplete armor must never reach the import: gpg would reject
+         * it ('Invalid packet', zero keys processed) and the whole switch
+         * would abort with a misleading key-not-found error (AR-02 #4). */
+        if (res.out_truncated) {
+            secure_zero_memory(key_data, KEY_DATA_CAP);
+            free(key_data);
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key export for %s exceeds %d bytes; refusing to "
+                      "import a truncated key", key_id, (int)KEY_DATA_CAP);
             return -1;
         }
     }
 
-    /* Import into the isolated GNUPGHOME by feeding the key on stdin. */
+    /* Import into the isolated GNUPGHOME by feeding the key on stdin. Capture
+     * merged stdout+stderr so a failure surfaces gpg's real diagnostic
+     * instead of a generic message with the cause thrown away (AR-02 #4). */
     {
         const char *import_argv[] = {"gpg", "--batch", "--import", NULL};
         gpg_build_env(gpg_config, envbuf, sizeof(envbuf), env);
         memset(&opts, 0, sizeof(opts));
         opts.input = key_data;
         opts.input_len = res.out_len;
-        opts.stderr_to_devnull = true;
+        opts.out = import_diag;
+        opts.out_size = sizeof(import_diag);
+        opts.merge_stderr = true;
         if (env[0]) opts.extra_env = env;
         if (run_argv(import_argv, &opts, NULL) != 0) {
-            secure_zero_memory(key_data, sizeof(key_data));
-            set_error(ERR_GPG_KEY_FAILED, "Failed to import GPG key into isolated environment");
+            secure_zero_memory(key_data, KEY_DATA_CAP);
+            free(key_data);
+            set_error(ERR_GPG_KEY_FAILED,
+                      "Failed to import GPG key into isolated environment: %s",
+                      import_diag);
             return -1;
         }
     }
 
-    secure_zero_memory(key_data, sizeof(key_data));
+    secure_zero_memory(key_data, KEY_DATA_CAP);
+    free(key_data);
     log_info("Successfully copied GPG key to isolated environment: %s", key_id);
     return 0;
 }

@@ -94,10 +94,14 @@ typedef struct {
 
 /* Result of a child invocation. */
 typedef struct {
-    int    exit_code;    /* WEXITSTATUS on normal exit; -1 if killed by signal or spawn failed */
-    int    term_signal;  /* signal number if killed by signal, else 0 */
-    bool   spawned;      /* true if the child actually started */
-    size_t out_len;      /* bytes captured into out (excluding the NUL) */
+    int    exit_code;     /* WEXITSTATUS on normal exit; -1 if killed by signal or spawn failed */
+    int    term_signal;   /* signal number if killed by signal, else 0 */
+    bool   spawned;       /* true if the child actually started */
+    size_t out_len;       /* bytes captured into out (excluding the NUL) */
+    bool   out_truncated; /* true if the child wrote more than out could hold —
+                           * the capture is INCOMPLETE, not just short. Callers
+                           * feeding `out` onward (e.g. a gpg key export into an
+                           * import) must treat this as an error (AR-02 #4). */
 } run_result_t;
 
 /* Pluggable runner (tests install a recording fake via run_set_runner). */
