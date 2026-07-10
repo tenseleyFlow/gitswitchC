@@ -501,7 +501,9 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
             input[strcspn(input, "\n")] = '\0';
             trim_whitespace(input);
             
-            if (tolower(input[0]) == 'y') {
+            /* Cast to unsigned char first: passing a plain (possibly signed)
+             * char to a ctype function is UB for negative values (mem-2). */
+            if (tolower((unsigned char)input[0]) == 'y') {
                 if (config_create_default(ctx->config.config_path) == 0) {
                     display_success("Default configuration created");
                     printf("Please edit the file to add your accounts.\n");
