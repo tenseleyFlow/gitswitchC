@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <time.h>
 #include <dirent.h>
 #include <ctype.h>
@@ -32,8 +33,65 @@ static int validate_ssh_agent_socket(const char *socket_path);
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
 static void kill_orphaned_gitswitch_agents(void);
 
-/* Global SSH configuration for cleanup */
-static ssh_config_t *g_active_ssh_config = NULL;
+/* Best-effort check that a PID recorded in a sidecar still belongs to an
+ * ssh-agent before we SIGTERM it. Sidecars can outlive their agent (crash,
+ * logout, reboot on a /tmp-preserving distro); once the kernel recycles that
+ * PID to an unrelated same-uid process (editor, browser, build), a blind kill
+ * would terminate it. On Linux we confirm via /proc/<pid>/comm. Where /proc is
+ * unavailable we cannot verify cheaply, so we fall back to the previous
+ * behavior (treat a live PID as reapable) — the per-dir lock and pid-scoped
+ * temp files below shrink the window that produces stale sidecars. */
+static bool pid_is_ssh_agent(pid_t pid) {
+    if (pid <= 1) {
+        return false;
+    }
+#ifdef __linux__
+    char path[64];
+    char comm[64];
+    snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return false; /* no such process (or no /proc entry) — don't kill */
+    }
+    bool is_agent = false;
+    if (fgets(comm, sizeof(comm), f)) {
+        comm[strcspn(comm, "\n")] = '\0';
+        is_agent = (strcmp(comm, "ssh-agent") == 0);
+    }
+    fclose(f);
+    return is_agent;
+#else
+    return (kill(pid, 0) == 0);
+#endif
+}
+
+/* Acquire an exclusive, blocking flock on <dir>/.lock, serializing the
+ * reap/start/symlink sequence against other gitswitch processes sharing this
+ * directory. Returns the held fd (>=0) or -1; pass it to unlock_agent_dir when
+ * the critical section ends. The lock is advisory but every writer takes it. */
+static int lock_agent_dir(const char *dir) {
+    char lock_path[MAX_PATH_LEN];
+    if ((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock", dir) >= sizeof(lock_path)) {
+        return -1;
+    }
+    int fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    if (flock(fd, LOCK_EX) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void unlock_agent_dir(int fd) {
+    if (fd >= 0) {
+        flock(fd, LOCK_UN);
+        close(fd);
+    }
+}
+
 
 /* Initialize SSH manager */
 int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
@@ -93,9 +151,11 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
             return -1;
     }
     
-    /* Register for cleanup */
-    g_active_ssh_config = ssh_config;
-    
+    /* NB: the started agent is intentionally left running after this process
+     * exits — shells export SSH_AUTH_SOCK=<dir>/current.sock and must keep
+     * reaching it — so there is deliberately no atexit/signal teardown here.
+     * A half-configured agent from a failed switch is reaped inline on the
+     * error paths (ssh_manager_cleanup) instead. */
     log_info("SSH manager initialized successfully");
     return 0;
 }
@@ -112,11 +172,6 @@ void ssh_manager_cleanup(ssh_config_t *ssh_config) {
     if (ssh_config->agent_owned && ssh_config->agent_pid > 0) {
         log_info("Stopping owned SSH agent (PID: %d)", ssh_config->agent_pid);
         ssh_stop_agent(ssh_config);
-    }
-    
-    /* Clear global reference */
-    if (g_active_ssh_config == ssh_config) {
-        g_active_ssh_config = NULL;
     }
     
     /* Clear sensitive data */
@@ -211,6 +266,7 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     char output[1024];
     char socket_dir[MAX_PATH_LEN];
     char socket_path[MAX_PATH_LEN];
+    char symlink_path[MAX_PATH_LEN];
 
     if (!ssh_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
@@ -218,6 +274,22 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     }
 
     log_info("Starting isolated SSH agent for account: %s", account->name);
+
+    /* Create secure socket directory first, then take an exclusive lock on it
+     * for the whole reap/start/symlink sequence. Without this, two concurrent
+     * gitswitch invocations race: one's reaper SIGTERMs the agent the other
+     * just started and unlinks its socket + current.sock, so shells briefly
+     * see a dangling current.sock and one switch fails to load its key. */
+    if (create_isolated_agent_socket_dir(socket_dir, sizeof(socket_dir)) != 0) {
+        return -1;
+    }
+    int lock_fd = lock_agent_dir(socket_dir);
+    if (lock_fd < 0) {
+        set_system_error(ERR_FILE_IO, "Failed to lock SSH agent directory");
+        return -1;
+    }
+
+    int rc = -1;
 
     /* Kill any orphaned gitswitch agents from previous runs */
     kill_orphaned_gitswitch_agents();
@@ -228,17 +300,12 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         ssh_stop_agent(ssh_config);
     }
 
-    /* Create secure socket directory */
-    if (create_isolated_agent_socket_dir(socket_dir, sizeof(socket_dir)) != 0) {
-        return -1;
-    }
-
     /* Build socket path and check for stale sockets */
     if ((size_t)snprintf(socket_path, sizeof(socket_path),
                         "%s/ssh-agent.%s.sock",
                         socket_dir, account->name) >= sizeof(socket_path)) {
         set_error(ERR_INVALID_ARGS, "SSH socket path too long");
-        return -1;
+        goto done;
     }
 
     /* Remove stale socket if it exists */
@@ -246,7 +313,7 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         log_debug("Removing stale SSH agent socket: %s", socket_path);
         if (unlink(socket_path) != 0) {
             set_system_error(ERR_FILE_IO, "Failed to remove stale SSH socket");
-            return -1;
+            goto done;
         }
     }
 
@@ -255,54 +322,61 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     log_debug("Starting SSH agent on socket: %s", socket_path);
     if (ssh_run(output, sizeof(output), false, "ssh-agent", "-a", socket_path, NULL) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to start SSH agent");
-        return -1;
+        goto done;
     }
-    
+
     /* Parse ssh-agent output to get socket and PID */
     if (parse_ssh_agent_output(output, ssh_config) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to parse ssh-agent output");
-        return -1;
+        goto done;
     }
-    
+
     /* Validate the agent is working */
     if (validate_ssh_agent_socket(ssh_config->agent_socket_path) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "SSH agent socket validation failed");
-        return -1;
+        goto done;
     }
-    
+
     /* Mark as owned */
     ssh_config->agent_owned = true;
 
-    /* Record the agent PID in a sidecar file so a later invocation can reap this
-     * agent precisely by PID (instead of a pkill pattern match). */
+    /* Record the agent PID in a sidecar file so a later invocation can reap
+     * this agent precisely by PID. This is FATAL on failure: the reaper only
+     * kills PIDs it finds in sidecars, so an agent with no record would
+     * outlive every future cleanup holding the account's decrypted key. If we
+     * can't record it, stop the agent and fail the switch. */
     {
         char pid_path[MAX_PATH_LEN];
+        bool recorded = false;
         if ((size_t)snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.%s.pid",
                              socket_dir, account->name) < sizeof(pid_path)) {
             int pfd = open(pid_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
             if (pfd >= 0) {
                 char pidbuf[32];
                 int len = snprintf(pidbuf, sizeof(pidbuf), "%d\n", (int)ssh_config->agent_pid);
-                if (len > 0) {
-                    ssize_t wr = write(pfd, pidbuf, (size_t)len);
-                    (void)wr;
+                if (len > 0 && write(pfd, pidbuf, (size_t)len) == (ssize_t)len) {
+                    recorded = true;
                 }
                 close(pfd);
             }
+        }
+        if (!recorded) {
+            set_system_error(ERR_FILE_IO, "Failed to record SSH agent PID; stopping agent");
+            ssh_stop_agent(ssh_config);
+            goto done;
         }
     }
 
     /* Set up environment */
     if (setup_ssh_environment(ssh_config) != 0) {
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to set up SSH environment");
-        return -1;
+        goto done;
     }
-    
+
     log_info("Isolated SSH agent started successfully (PID: %d, Socket: %s)",
              ssh_config->agent_pid, ssh_config->agent_socket_path);
 
     /* Atomically (re)point the stable current.sock at this agent's socket. */
-    char symlink_path[MAX_PATH_LEN];
     if ((size_t)snprintf(symlink_path, sizeof(symlink_path),
                         "%s/current.sock", socket_dir) < sizeof(symlink_path)) {
         if (atomic_symlink(socket_path, symlink_path) == 0) {
@@ -312,7 +386,10 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         }
     }
 
-    return 0;
+    rc = 0;
+done:
+    unlock_agent_dir(lock_fd);
+    return rc;
 }
 
 /* Stop SSH agent */
@@ -556,7 +633,11 @@ int ssh_configure_host_alias(const account_t *account) {
 
     if ((size_t)snprintf(ssh_config_dir, sizeof(ssh_config_dir), "%s/.ssh", home) >= sizeof(ssh_config_dir) ||
         (size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config", ssh_config_dir) >= sizeof(ssh_config_path) ||
-        (size_t)snprintf(tmp_path, sizeof(tmp_path), "%s/config.gitswitch.tmp", ssh_config_dir) >= sizeof(tmp_path)) {
+        /* Unique temp template for mkstemp — never a fixed name. A shared
+         * name let a concurrent writer's unlink()-and-recreate orphan this
+         * process's in-progress temp, so our rename() could install the other
+         * writer's partial file over the user's whole ~/.ssh/config. */
+        (size_t)snprintf(tmp_path, sizeof(tmp_path), "%s/config.gitswitch.XXXXXX", ssh_config_dir) >= sizeof(tmp_path)) {
         set_error(ERR_INVALID_PATH, "SSH config path too long");
         return -1;
     }
@@ -598,15 +679,20 @@ int ssh_configure_host_alias(const account_t *account) {
         }
     }
 
-    /* Write existing content + a fresh managed block, atomically at 0600. */
-    fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    /* Write existing content + a fresh managed block, atomically at 0600.
+     * mkstemp creates a fresh unique file (no collision with a concurrent
+     * writer) and returns its fd; fchmod guarantees 0600 regardless of the
+     * platform's mkstemp default. */
+    fd = mkstemp(tmp_path);
     if (fd < 0) {
-        unlink(tmp_path); /* clear a stale temp, then retry once */
-        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-        if (fd < 0) {
-            set_system_error(ERR_FILE_IO, "Failed to create temp SSH config");
-            return -1;
-        }
+        set_system_error(ERR_FILE_IO, "Failed to create temp SSH config");
+        return -1;
+    }
+    if (fchmod(fd, 0600) != 0) {
+        close(fd);
+        unlink(tmp_path);
+        set_system_error(ERR_FILE_IO, "Failed to secure temp SSH config");
+        return -1;
     }
     out = fdopen(fd, "w");
     if (!out) {
@@ -970,7 +1056,8 @@ int ssh_manager_reset(const char *account) {
         FILE *pf = fopen(pid_path, "r");
         if (pf) {
             long pid = 0;
-            if (fscanf(pf, "%ld", &pid) == 1 && pid > 1) {
+            if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
+                pid_is_ssh_agent((pid_t)pid)) {
                 kill((pid_t)pid, SIGTERM);
             }
             fclose(pf);
@@ -1025,7 +1112,8 @@ static void kill_orphaned_gitswitch_agents(void) {
             FILE *pf = fopen(full, "r");
             if (pf) {
                 long pid = 0;
-                if (fscanf(pf, "%ld", &pid) == 1 && pid > 1) {
+                if (fscanf(pf, "%ld", &pid) == 1 && pid > 1 &&
+                    pid_is_ssh_agent((pid_t)pid)) {
                     kill((pid_t)pid, SIGTERM);
                     log_debug("Reaped orphaned ssh-agent PID %ld", pid);
                 }
