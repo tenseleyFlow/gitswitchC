@@ -298,6 +298,33 @@ static void git_apply_config_listing(git_scope_t scope, const char *list,
     }
 }
 
+/* Per-key snapshot reads, the correctness fallback when a `--list -z` listing
+ * failed or was truncated. Factored out (AR-06 F57) so git_probe_keys' truncated
+ * branch can reach it WITHOUT re-running git_capture_keys' listing exec (which,
+ * being truncated once, is guaranteed to truncate again). */
+static void git_capture_keys_per_key(git_scope_t scope,
+                                     git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        bool too_long = false;
+        if (git_get_config_value_ex(g_managed_keys[i], out[i].value,
+                                    sizeof(out[i].value), scope,
+                                    &too_long) == 0) {
+            out[i].present = true;
+        } else if (too_long) {
+            /* Present-but-indeterminate: value too long to capture, OR git
+             * could not be run cleanly (AR-06 F56). Either way, record it
+             * present/value-unknown so rollback leaves it alone instead of
+             * --unsetting a value that may exist (AR-03 M1). */
+            out[i].present = true;
+            out[i].value_unknown = true;
+            out[i].value[0] = '\0';
+        } else {
+            out[i].present = false;
+            out[i].value[0] = '\0';
+        }
+    }
+}
+
 static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
     git_init_kv(out);
 
@@ -313,25 +340,7 @@ static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COU
         return;
     }
 
-    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        bool too_long = false;
-        if (git_get_config_value_ex(g_managed_keys[i], out[i].value,
-                                    sizeof(out[i].value), scope,
-                                    &too_long) == 0) {
-            out[i].present = true;
-        } else if (too_long) {
-            /* Same degradation as the -z path: present, value unknown. The
-             * pre-fix code never asked, so a truncated per-key read was
-             * snapshotted absent (or worse, a silently truncated value was
-             * stored present and written back on rollback — AR-03 M1). */
-            out[i].present = true;
-            out[i].value_unknown = true;
-            out[i].value[0] = '\0';
-        } else {
-            out[i].present = false;
-            out[i].value[0] = '\0';
-        }
-    }
+    git_capture_keys_per_key(scope, out);
 }
 
 /* Status-path probe (AR-05 L14): ONE listing exec per scope, and a FAILED
@@ -350,7 +359,10 @@ static void git_probe_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT
         return; /* scope has no readable config: everything stays absent */
     }
     if (list_len >= sizeof(list) - 1) {
-        git_capture_keys(scope, out);
+        /* Truncated listing: go straight to per-key reads. Calling
+         * git_capture_keys here would re-run the identical (still-truncated)
+         * listing exec first (AR-06 F57). */
+        git_capture_keys_per_key(scope, out);
         return;
     }
     git_apply_config_listing(scope, list, list_len, out);
@@ -370,7 +382,8 @@ static int git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KEY
              * would destroy the user's original — leaving whatever is there
              * now is the only non-destructive option, so say so instead of
              * silently pretending the rollback was complete (AR-03 M1). */
-            log_warning("Not restoring %s: pre-switch value was too long to snapshot",
+            log_warning("Not restoring %s: pre-switch value could not be "
+                        "snapshotted (too long, or git config read failed)",
                         in[i].key);
             /* Not counted as a failure: this is the deliberate non-destructive
              * choice (AR-03 M1) — a truncated write-back or a --unset would be
@@ -721,63 +734,10 @@ int git_clear_config(git_scope_t scope) {
     return 0;
 }
 
-/* Validate git repository */
-int git_validate_repository(void) {
-    char output[256];
-    
-    if (!git_is_repository()) {
-        set_error(ERR_GIT_NOT_REPOSITORY, "Current directory is not a git repository");
-        return -1;
-    }
-    
-    /* Check if repository is bare */
-    if (git_run(output, sizeof(output), "rev-parse", "--is-bare-repository",
-                (const char *)NULL) == 0) {
-        trim_whitespace(output);
-        if (strcmp(output, "true") == 0) {
-            set_error(ERR_GIT_REPOSITORY_INVALID, "Repository is bare");
-            return -1;
-        }
-    }
-    
-    /* Check repository health - verify we can read HEAD */
-    if (git_run(output, sizeof(output), "rev-parse", "--verify", "HEAD",
-                (const char *)NULL) != 0) {
-        /* This is OK for new repositories with no commits */
-        log_debug("Repository has no commits yet (new repository)");
-    }
-    
-    return 0;
-}
-
-/* Get git configuration scope */
-git_scope_t git_get_config_scope(const char *config_key) {
-    char value[512];
-    
-    if (!config_key) {
-        return GIT_SCOPE_GLOBAL; /* Default fallback */
-    }
-    
-    /* Try local scope first if we're in a repository */
-    if (git_is_repository()) {
-        if (git_get_config_value(config_key, value, sizeof(value), GIT_SCOPE_LOCAL) == 0) {
-            return GIT_SCOPE_LOCAL;
-        }
-    }
-    
-    /* Try global scope */
-    if (git_get_config_value(config_key, value, sizeof(value), GIT_SCOPE_GLOBAL) == 0) {
-        return GIT_SCOPE_GLOBAL;
-    }
-    
-    /* Try system scope */
-    if (git_get_config_value(config_key, value, sizeof(value), GIT_SCOPE_SYSTEM) == 0) {
-        return GIT_SCOPE_SYSTEM;
-    }
-    
-    /* Default to global if not found */
-    return GIT_SCOPE_GLOBAL;
-}
+/* AR-06 F59: git_validate_repository() and git_get_config_scope() were removed
+ * here — both were public API with zero callers anywhere in the tree (dead
+ * code, and git_get_config_scope's system-scope arm implied a scope model the
+ * rest of git_ops does not use). */
 
 /* Test git configuration */
 int git_test_config(const account_t *account, git_scope_t scope) {
@@ -977,8 +937,21 @@ static int git_get_config_value_ex(const char *key, char *value,
     opts.out_size = sizeof(output);
     opts.stderr_to_devnull = true;
     if (run_argv(argv, &opts, &res) != 0) {
-        /* Config value not found - this is not always an error */
+        /* AR-06 F56: distinguish "git ran and the key is genuinely absent"
+         * (a clean exit 1 from `git config --get`) from "git could not be run"
+         * (spawn failure, killed by signal, or an unexpected non-1 exit such as
+         * a bad config file). Only the former is truly absent. The latter leaves
+         * the key's presence UNKNOWN — reporting it absent would let the rollback
+         * snapshot record it absent and then --unset the user's pre-existing
+         * value on a transient failure. Flag it value-unknown (non-destructive),
+         * exactly like a too-long value. */
+        bool clean_absent = (res.spawned && res.term_signal == 0 &&
+                             res.exit_code == 1);
         value[0] = '\0';
+        if (!clean_absent && value_too_long) {
+            cfg_cache_store(s, k, CFG_UNKNOWN, true, "");
+            *value_too_long = true;
+        }
         return -1;
     }
 
@@ -995,8 +968,16 @@ static int git_get_config_value_ex(const char *key, char *value,
         return -1;
     }
 
-    /* Remove trailing newline */
-    trim_whitespace(output);
+    /* AR-06 F58: strip ONLY the single trailing newline git appends, not all
+     * surrounding whitespace. trim_whitespace() ate legitimate leading/trailing
+     * spaces in a quoted config value, so the rollback wrote back a corrupted
+     * (whitespace-stripped) value. Embedded newlines and edge spaces survive. */
+    {
+        size_t olen = strlen(output);
+        if (olen > 0 && output[olen - 1] == '\n') {
+            output[--olen] = '\0';
+        }
+    }
     /* safe_strncpy writes nothing and returns -1 when the value is too long for
      * the caller's buffer. Propagate that as failure (and NUL the buffer) so
      * callers can't read an uninitialized stack buffer while we report success.

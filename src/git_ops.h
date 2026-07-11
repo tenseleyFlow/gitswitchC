@@ -71,19 +71,8 @@ int git_config_snapshot(git_scope_t scope);
  */
 int git_config_restore(void);
 
-/**
- * Validate git repository
- * - Checks if current directory is a git repository
- * - Verifies repository is not bare
- * - Checks repository health
- */
-int git_validate_repository(void);
-
-/**
- * Get git configuration scope (local, global, system)
- * Returns the scope where the configuration is currently set
- */
-git_scope_t git_get_config_scope(const char *config_key);
+/* AR-06 F59: git_validate_repository() and git_get_config_scope() were removed
+ * — dead public API with zero callers. */
 
 /**
  * Test git configuration
