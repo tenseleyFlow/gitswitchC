@@ -880,11 +880,36 @@ static int gpg_read_current_locked(int base_fd, const char *base,
  * may have remove_tree'd it since. Installing the link anyway would point
  * every `gitswitch init` shell at a missing keyring while the switch reports
  * success; fail closed and leave the link alone instead. */
+/* AR-06 F41: revert a failed retarget without destroying the previous entry
+ * point. The atomic rename already replaced `current`, so a bare unlink would
+ * leave every GNUPGHOME=<base>/current shell dangling while the caller (seeing
+ * failure with gpg_dirty=false) never restores it. Instead, when `current` is
+ * still the exact link this call installed, put back the target that was there
+ * before the retarget (or drop it if there was none). dev/ino-guarded so a
+ * racing same-uid writer's replacement is never clobbered. */
+static void gpg_revert_retarget(int base_fd, const struct stat *installed,
+                                bool prev_existed, const char *prev_target) {
+    struct stat now;
+
+    if (fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) != 0 ||
+        now.st_dev != installed->st_dev || now.st_ino != installed->st_ino ||
+        !S_ISLNK(now.st_mode)) {
+        return; /* someone else owns `current` now; leave their state */
+    }
+    if (prev_existed) {
+        (void)atomic_symlink_at(base_fd, prev_target, "current");
+    } else {
+        (void)unlinkat(base_fd, "current", 0);
+    }
+}
+
 static int gpg_retarget_current_locked(int base_fd, const char *base,
                                        const char *real_home) {
     char link_path[MAX_PATH_LEN];
     char committed_target[MAX_PATH_LEN];
+    char prev_target[MAX_PATH_LEN];
     struct stat committed;
+    bool prev_existed;
     int live_rc;
 
     if (!gpg_target_is_managed_child(base, real_home)) {
@@ -906,6 +931,12 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
     if (gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0) {
         return -1;
     }
+
+    /* Capture the target `current` names right now, before the atomic rename
+     * overwrites it, so a failed retarget can restore it (AR-06 F41). A
+     * malformed/absent link means there is nothing to restore. */
+    prev_existed = (gpg_read_current_locked(base_fd, base, prev_target,
+                                            sizeof(prev_target)) == 0);
 
     /* Atomically retarget (temp symlink + rename) so a follower never sees a
      * missing or half-updated link. */
@@ -935,38 +966,22 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
         strcmp(committed_target, real_home) != 0 ||
         fstatat(base_fd, "current", &committed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISLNK(committed.st_mode) || committed.st_uid != getuid()) {
-        /* Mirror the sibling failure blocks: if `current` is still the exact
-         * link this call installed, remove it so a reported-failure retarget
-         * never leaves the stable entry point moved. dev/ino-guarded so a
-         * racing same-uid writer's replacement is never clobbered. */
-        struct stat now;
-        if (have_installed &&
-            fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) == 0 &&
-            now.st_dev == installed.st_dev && now.st_ino == installed.st_ino &&
-            S_ISLNK(now.st_mode)) {
-            (void)unlinkat(base_fd, "current", 0);
+        /* Restore the pre-retarget target so a reported-failure retarget never
+         * leaves the stable entry point moved OR destroyed (AR-06 F41). */
+        if (have_installed) {
+            gpg_revert_retarget(base_fd, &installed, prev_existed, prev_target);
         }
         set_error(ERR_FILE_IO,
                   "Cannot verify committed GNUPGHOME link: %s", link_path);
         return -1;
     }
     if (g_retarget_commit_hook && g_retarget_commit_hook(base_fd) != 0) {
-        struct stat now;
         set_error(ERR_FILE_IO, "GPG retarget commit hook failed");
-        if (fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) == 0 &&
-            now.st_dev == committed.st_dev && now.st_ino == committed.st_ino &&
-            S_ISLNK(now.st_mode)) {
-            (void)unlinkat(base_fd, "current", 0);
-        }
+        gpg_revert_retarget(base_fd, &committed, prev_existed, prev_target);
         return -1;
     }
     if (gpg_live_private_home(base_fd, base, real_home) != 0) {
-        struct stat now;
-        if (fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) == 0 &&
-            now.st_dev == committed.st_dev && now.st_ino == committed.st_ino &&
-            S_ISLNK(now.st_mode)) {
-            (void)unlinkat(base_fd, "current", 0);
-        }
+        gpg_revert_retarget(base_fd, &committed, prev_existed, prev_target);
         return -1;
     }
 

@@ -345,8 +345,14 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
     }
     /* Undo the new account's half-applied SSH/GPG activation: leaving
      * current.sock / GNUPGHOME pointed at the new account while the git
-     * identity reverts is exactly the mixed identity the tool prevents. */
-    deactivate_runtime_isolation(ssh_dirty, false);
+     * identity reverts is exactly the mixed identity the tool prevents. AR-06
+     * F42: surface a teardown failure (a surviving new-account agent) instead
+     * of discarding it — rollback is best-effort (the durable git identity was
+     * already restored), so warn rather than abort. */
+    if (deactivate_runtime_isolation(ssh_dirty, false) != 0) {
+        log_warning("Incomplete rollback of the new account's SSH state: %s",
+                    get_last_error()->message);
+    }
     /* Restore GPG with compare-and-swap semantics so rollback cannot clobber
      * a later writer, then reactivate the previous SSH agent (F4). */
     restore_previous_gpg_isolation(prev_gpg_home, prev_gpg_present, gpg_dirty);
