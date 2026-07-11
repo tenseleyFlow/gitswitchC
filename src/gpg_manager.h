@@ -67,23 +67,9 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account);
 int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account);
 
 /**
- * Import GPG key from file or keyserver
- * - Supports ASCII-armored and binary key formats
- * - Validates key after import
- * - Sets trust level appropriately
+ * AR-06 F61: gpg_import_key(), gpg_export_public_key() and gpg_list_keys()
+ * were removed — dead public API with zero callers.
  */
-int gpg_import_key(gpg_config_t *gpg_config, const char *key_source);
-
-/**
- * Export GPG public key for backup/sharing
- */
-int gpg_export_public_key(gpg_config_t *gpg_config, const char *key_id, 
-                          char *output, size_t output_size);
-
-/**
- * List available GPG keys
- */
-int gpg_list_keys(gpg_config_t *gpg_config, char *output, size_t output_size);
 
 /**
  * Validate GPG key exists and is usable
@@ -107,13 +93,8 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
  */
 int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id);
 
-/**
- * Generate new GPG key for account
- * - Creates key with account name and email
- * - Uses secure key parameters
- * - Exports public key for verification
- */
-int gpg_generate_key(gpg_config_t *gpg_config, const account_t *account);
+/* AR-06 F61: gpg_generate_key() was removed — dead public API with zero
+ * callers. */
 
 /**
  * Set environment variables for GPG operation
