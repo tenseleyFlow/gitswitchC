@@ -38,7 +38,12 @@ jobs:
       # shell-injection fix.
       - name: No-shell gate (binary symbols)
         run: |
-          if nm -D --undefined-only build/bin/gitswitch | grep -E '(^| )(system|popen)(@|$)'; then
+          # AR-06 F34: fail loudly if the binary is missing or nm errors, so a
+          # path/name change cannot silently disarm the gate (an empty pipe used
+          # to grep-miss and pass vacuously).
+          test -x build/bin/gitswitch || { echo "ERROR: release binary build/bin/gitswitch missing or not executable" >&2; exit 1; }
+          syms=$(nm -D --undefined-only build/bin/gitswitch) || { echo "ERROR: nm failed on release binary" >&2; exit 1; }
+          if printf '%s\n' "$syms" | grep -E '(^| )(system|popen)(@|$)'; then
             echo "ERROR: release binary references system()/popen()" >&2
             exit 1
           fi

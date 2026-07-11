@@ -3,7 +3,10 @@ Version:        1.8.0
 Release:        1%{?dist}
 Summary:        Secure Git identity and SSH/GPG key management tool for seamless account switching
 
-License:        GPL-3.0
+# AR-06 F40: 'GPL-3.0' is a deprecated SPDX identifier; the current form is
+# GPL-3.0-or-later (the LICENSE ships the standard "version 3 or any later
+# version" notice).
+License:        GPL-3.0-or-later
 URL:            https://github.com/tenseleyFlow/gitswitchC
 Source0:        %{name}-%{version}.tar.gz
 
@@ -51,17 +54,16 @@ make BUILD_TYPE=release VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
 # never repackages a debug/ASan binary.
 make install BUILD_TYPE=release DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
-# Install documentation
-install -d %{buildroot}%{_docdir}/%{name}
-install -m 644 README.md %{buildroot}%{_docdir}/%{name}/
-
 %files
 %license LICENSE
+# AR-06 F40: %doc owns the docdir tree it installs README into, so the
+# %{_docdir}/%{name} directory is no longer unowned (the prior manual
+# install + bare file listing left the parent dir unpackaged).
+%doc README.md
 %{_bindir}/gitswitch
 %{_datadir}/bash-completion/completions/gitswitch
 %{_datadir}/zsh/site-functions/_gitswitch
 %{_datadir}/fish/vendor_completions.d/gitswitch.fish
-%{_docdir}/%{name}/README.md
 
 %changelog
 * Thu Jul 09 2026 mfw <espadonne@outlook.com> - 1.8.0-1
