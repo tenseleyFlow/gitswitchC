@@ -34,7 +34,7 @@ static const char *valid_config =
 /* Create a fresh 0700 scratch directory for one test. */
 static int make_scratch_dir(char *dir, size_t size) {
     snprintf(dir, size, "/tmp/gswcfgtest.XXXXXX");
-    return mkdtemp(dir) ? 0 : -1;
+    return ts_mkdtemp(dir) ? 0 : -1;
 }
 
 /* Write content to path with the 0600 mode the loader requires. */

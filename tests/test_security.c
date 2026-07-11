@@ -101,7 +101,7 @@ static void restore_path(void) {
 /* mkdtemp + explicit chmod (not umask-clipped); returns 0 on success. */
 static int make_test_dir(char *out, size_t out_size, mode_t mode) {
     char tmpl[] = "/tmp/gs_sec_XXXXXX";
-    if (!mkdtemp(tmpl)) return -1;
+    if (!ts_mkdtemp(tmpl)) return -1;
     if (chmod(tmpl, mode) != 0) return -1;
     snprintf(out, out_size, "%s", tmpl);
     return 0;
@@ -133,7 +133,7 @@ TEST(file_helpers_apply_descriptor_permissions) {
     char src[512], dst[512], content[64];
     struct stat st;
 
-    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
     snprintf(src, sizeof(src), "%s/source", root);
     snprintf(dst, sizeof(dst), "%s/destination", root);
 
@@ -157,7 +157,7 @@ TEST(ensure_private_dir_pins_leaf_and_rejects_symlink) {
     char private_dir[512], link_path[512];
     struct stat st;
 
-    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
     snprintf(private_dir, sizeof(private_dir), "%s/private", root);
     snprintf(link_path, sizeof(link_path), "%s/link", root);
 
@@ -197,7 +197,7 @@ TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast) {
     int poll_rc;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     parent_lock = runtime_state_lock_acquire();
     CHECK(parent_lock >= 0);
@@ -290,7 +290,7 @@ TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir) {
     bool had_xdg = old_xdg && *old_xdg;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
 
     CHECK_EQ_INT(chmod(runtime, 0755), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
@@ -335,7 +335,7 @@ TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting) {
     char marker;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(chmod(runtime, 0700), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
@@ -420,7 +420,7 @@ TEST(runtime_state_lock_excludes_contender_after_leaf_replacement) {
     char marker = '\0';
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
     snprintf(moved_dir, sizeof(moved_dir), "%s/gitswitch-runtime.old", runtime);
@@ -523,7 +523,7 @@ TEST(private_lock_release_ignores_reused_inherited_token) {
     pid_t child = -1;
     int status = 0;
 
-    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
     dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     CHECK(dir_fd >= 0);
     if (dir_fd < 0) goto cleanup;
@@ -582,7 +582,7 @@ TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
     int status = 0;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     parent_lock = runtime_state_lock_acquire();
     CHECK(parent_lock >= 3);

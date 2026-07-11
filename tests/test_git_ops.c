@@ -141,7 +141,7 @@ TEST(git_configure_ssh_rejects_single_quote_in_keypath) {
     command_runner_fn prev;
 
     snprintf(dir, sizeof(dir), "/tmp/gsw_gitops_XXXXXX");
-    CHECK(mkdtemp(dir) != NULL);
+    CHECK(ts_mkdtemp(dir) != NULL);
     snprintf(quote_path, sizeof(quote_path), "%s/k'ey", dir);
     snprintf(dquote_path, sizeof(dquote_path), "%s/k\"ey", dir);
     /* A single FILE NAME (no '/' after the newline, so it is creatable) that

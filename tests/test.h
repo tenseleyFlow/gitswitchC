@@ -11,10 +11,71 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 static int ts_tests_run = 0;
 static int ts_tests_failed = 0;
 static int ts_current_fail = 0; /* per-test failure flag */
+
+/* AR-06 F81: unit suites mkdtemp() one or more /tmp fixtures per test and most
+ * never removed the tree, leaking ~186 dirs per full run (tens of thousands
+ * accumulate over a development cycle). ts_mkdtemp() is a drop-in mkdtemp()
+ * that records each created directory and, on first use, registers an atexit
+ * sweep that recursively removes them when the suite process exits. Tests that
+ * already rmdir their own fixtures still work — the depth-first removal is
+ * best-effort and ignores already-gone paths. static inline keeps suites that
+ * create no fixtures from tripping -Wunused-function under -Werror. */
+#define TS_MAX_TMPDIRS 1024
+static char ts_tmpdirs[TS_MAX_TMPDIRS][96];
+static int ts_tmpdir_count = 0;
+
+static inline void ts_rm_rf(const char *path) {
+    DIR *d = opendir(path);
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+                continue;
+            }
+            char child[4096];
+            if ((size_t)snprintf(child, sizeof(child), "%s/%s", path,
+                                 e->d_name) < sizeof(child)) {
+                struct stat st;
+                if (lstat(child, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    ts_rm_rf(child);
+                } else {
+                    unlink(child);
+                }
+            }
+        }
+        closedir(d);
+    }
+    rmdir(path);
+}
+
+static inline void ts_cleanup_tmpdirs(void) {
+    for (int i = 0; i < ts_tmpdir_count; i++) {
+        ts_rm_rf(ts_tmpdirs[i]);
+    }
+    ts_tmpdir_count = 0;
+}
+
+static inline char *ts_mkdtemp(char *tmpl) {
+    char *r = mkdtemp(tmpl);
+    if (r) {
+        if (ts_tmpdir_count == 0) {
+            atexit(ts_cleanup_tmpdirs);
+        }
+        if (ts_tmpdir_count < TS_MAX_TMPDIRS &&
+            strlen(r) < sizeof(ts_tmpdirs[0])) {
+            snprintf(ts_tmpdirs[ts_tmpdir_count++], sizeof(ts_tmpdirs[0]),
+                     "%s", r);
+        }
+    }
+    return r;
+}
 
 #define TEST(name) static void name(void)
 

@@ -183,7 +183,7 @@ TEST(run_uses_pinned_child_working_directory) {
     int dir_fd;
 
     CHECK(getcwd(parent_before, sizeof(parent_before)) != NULL);
-    CHECK(mkdtemp(dir) != NULL);
+    CHECK(ts_mkdtemp(dir) != NULL);
     CHECK(realpath(dir, canonical_dir) != NULL);
     CHECK_EQ_INT(chmod(dir, 0700), 0);
     dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -215,7 +215,7 @@ TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio) {
     pid_t child;
     int status = 0;
 
-    CHECK(mkdtemp(dir) != NULL);
+    CHECK(ts_mkdtemp(dir) != NULL);
     CHECK(realpath(dir, canonical_dir) != NULL);
     CHECK_EQ_INT(chmod(dir, 0700), 0);
     CHECK_EQ_INT(safe_snprintf(expected, sizeof(expected), "%s\n", canonical_dir), 0);

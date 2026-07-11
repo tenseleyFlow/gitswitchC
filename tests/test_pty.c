@@ -74,7 +74,7 @@ static int resolve_binary(void) {
  * sandbox roots stay tiny. */
 static const char *make_temp_dir(char *buf, size_t size) {
     snprintf(buf, size, "/tmp/gswpty-XXXXXX");
-    if (!mkdtemp(buf)) {
+    if (!ts_mkdtemp(buf)) {
         return NULL;
     }
     return buf;

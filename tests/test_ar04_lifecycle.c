@@ -37,7 +37,7 @@ static int resolve_binary(void) {
 
 static int make_temp_dir(char *buf, size_t size) {
     if (snprintf(buf, size, "/tmp/gitswitch-ar04-life-XXXXXX") < 0 ||
-        !mkdtemp(buf)) {
+        !ts_mkdtemp(buf)) {
         return -1;
     }
     return 0;
