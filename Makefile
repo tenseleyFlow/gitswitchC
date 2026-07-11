@@ -11,14 +11,24 @@ PREFIX ?= /usr/local
 
 # Version: the VERSION file is the single source of truth for the release
 # number, so the binary stamp is deterministic and identical in git checkouts
-# and source tarballs. A VERSION= env override is honored for one-off builds.
-# COMMIT is the short git hash (or "unknown" outside a checkout) for traceability.
-VERSION ?= $(shell cat VERSION 2>/dev/null)
-ifeq ($(strip $(VERSION)),)
-    VERSION := unknown
+# and source tarballs. Freeze defaults at parse time: recursive ?= shell
+# expressions used to re-run cat/git every time VERSION_FLAGS or the build
+# fingerprint expanded. Explicit environment/command-line values are frozen
+# too, but never probe the checkout (AR-07 L25).
+ifeq ($(origin VERSION),undefined)
+    VERSION := $(shell cat VERSION 2>/dev/null)
+else
+    override VERSION := $(VERSION)
 endif
-COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-VERSION_FLAGS = -DGITSWITCH_VERSION=\"$(VERSION)\" -DGITSWITCH_COMMIT=\"$(COMMIT)\"
+ifeq ($(strip $(VERSION)),)
+    override VERSION := unknown
+endif
+ifeq ($(origin COMMIT),undefined)
+    COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+else
+    override COMMIT := $(COMMIT)
+endif
+VERSION_FLAGS := -DGITSWITCH_VERSION=\"$(VERSION)\" -DGITSWITCH_COMMIT=\"$(COMMIT)\"
 
 # Directories
 SRCDIR = src
@@ -226,6 +236,14 @@ HEADERS = $(wildcard $(SRCDIR)/*.h)
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
+DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
+
+# Let each translation unit describe its real header graph. -MP keeps a stale
+# dependency file usable long enough to re-run the compiler after a header is
+# removed/renamed, where the missing include is then reported authoritatively.
+# CPPFLAGS is included explicitly so standard caller-provided preprocessor
+# inputs participate in both compilation and the build fingerprint.
+DEPFLAGS ?= -MMD -MP
 
 # Default target
 .PHONY: all
@@ -238,35 +256,66 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
-# Build-config stamp: debug and release share build/obj and build/bin, but
-# their flag sets differ radically (ASan/UBSan -O0 vs stripped NDEBUG -O2)
-# and BUILD_TYPE is invisible to the dependency graph. Without the stamp,
-# `make BUILD_TYPE=release` followed by `make BUILD_TYPE=debug test` printed
-# "Nothing to be done" and ran the "sanitizer" suite against uninstrumented
-# release objects — silently fake QA results (AR-05 M3). The recipe rewrites
-# the stamp only when the recorded config differs, forcing a full rebuild.
+# Build-config stamp: objects/tests share build/obj and build/bin across every
+# configuration. Record every effective compile/link input, not just the build
+# type and metadata: otherwise READLINE, compiler, flag, library, or platform
+# changes can reuse incompatible objects and make tests falsely green (AR-07
+# M34). The first line retains BUILD_TYPE before `|` for the install guard.
 #
-# The stamp also carries VERSION and COMMIT (AR-06 F11): those feed -D macros
-# baked into every object via CFLAGS, but objects depend only on sources,
-# headers, and this stamp — so a VERSION bump or new commits changed the -D
-# values while `make` reported nothing to do and the binary kept reporting the
-# stale version. Folding them into the stamp makes any change force the rebuild
-# exactly like a BUILD_TYPE cross. Field 1 stays BUILD_TYPE so the install
-# guard can read it with a simple prefix check.
+# A make-exported value reaches the shell as data rather than recipe syntax,
+# so command-line flags containing quotes/metacharacters cannot alter this
+# recipe. The temporary file is compared byte-for-byte and the real stamp is
+# replaced only on change, preserving true no-op incremental builds.
 BUILDTYPE_STAMP = $(OBJDIR)/.buildconfig
-BUILD_STAMP_CONTENT = $(BUILD_TYPE)|$(VERSION)|$(COMMIT)
+define BUILD_STAMP_CONTENT
+$(BUILD_TYPE)|buildconfig-v2
+version=$(VERSION)
+commit=$(COMMIT)
+cc=$(CC)
+cc_is_clang=$(CC_IS_CLANG)
+cppflags=$(CPPFLAGS)
+cflags=$(CFLAGS)
+includes=$(INCLUDES)
+depflags=$(DEPFLAGS)
+ldflags=$(LDFLAGS)
+libs=$(LIBS)
+readline_request=$(READLINE)
+readline_effective=$(READLINE_OK)
+readline_hint_cflags=$(READLINE_HINT_CFLAGS)
+readline_hint_libs=$(READLINE_HINT_LIBS)
+platform_os=$(UNAME_S)
+platform_arch=$(UNAME_M)
+cf_protection=$(CF_PROTECTION)
+security_cflags_debug=$(SECURITY_CFLAGS_DEBUG)
+security_ldflags_debug=$(SECURITY_LDFLAGS_DEBUG)
+security_cflags_release=$(SECURITY_CFLAGS_RELEASE)
+security_ldflags_release=$(SECURITY_LDFLAGS_RELEASE)
+target=$(TARGET)
+sources=$(SOURCES)
+objects=$(OBJECTS)
+source_dir=$(SRCDIR)
+test_dir=$(TESTDIR)
+endef
+export GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
 $(BUILDTYPE_STAMP): buildtype-force | $(OBJDIR)
-	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "$(BUILD_STAMP_CONTENT)" ]; then \
-		echo "$(BUILD_STAMP_CONTENT)" > $(BUILDTYPE_STAMP); \
-	fi
+	@set -e; \
+	tmp="$@.tmp.$$$$"; \
+	trap 'rm -f "$$tmp"' 0 1 2 3 15; \
+	printf '%s\n' "$$GITSWITCH_BUILD_CONFIG" >"$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then \
+		rm -f "$$tmp"; \
+	else \
+		mv -f "$$tmp" "$@"; \
+	fi; \
+	trap - 0 1 2 3 15
 
 .PHONY: buildtype-force
 buildtype-force:
 
 # Compile source files
-$(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
+$(OBJDIR)/%.o: $(SRCDIR)/%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling $<..."
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 # Link main executable
 $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
@@ -318,14 +367,19 @@ uninstall:
 	@echo "Uninstall complete"
 
 # Test compilation
-$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(TESTDIR)/test.h $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
+$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
-	$(CC) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) -c $< -o $@
 
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+# Dependency files are optional on the first build and authoritative
+# thereafter. Keep this after `all` so an included -MP compatibility target
+# can never become Make's accidental default goal.
+-include $(DEPFILES)
 
 # Build and run tests. The main binary is a dependency because the CLI-level
 # tests (tests/test_cli.c) exec build/bin/gitswitch: main.c is excluded from
@@ -525,9 +579,18 @@ PACKAGE = gitswitcher
 # developer builds may still override VERSION, but dist/RPM metadata may not be
 # mixed with that live value. Command-line overrides are deliberately ignored
 # for RELEASE_COMMIT/RELEASE_VERSION/DIST_ROOT so the archive contract cannot
-# be renamed away from the VERSION committed at HEAD.
-override RELEASE_COMMIT := $(shell git rev-parse --verify HEAD^{commit} 2>/dev/null)
-override RELEASE_VERSION := $(shell git show $(RELEASE_COMMIT):VERSION 2>/dev/null)
+# be renamed away from the VERSION committed at HEAD. Resolve these only for a
+# goal that consumes release metadata; ordinary builds otherwise paid for two
+# unrelated Git processes on every Make invocation (AR-07 L25).
+RELEASE_METADATA_GOALS = release-manifest-check dist distcheck \
+	release-contract-test rpm
+ifneq ($(strip $(filter $(RELEASE_METADATA_GOALS),$(MAKECMDGOALS))),)
+    override RELEASE_COMMIT := $(shell git rev-parse --verify HEAD^{commit} 2>/dev/null)
+    override RELEASE_VERSION := $(shell git show $(RELEASE_COMMIT):VERSION 2>/dev/null)
+else
+    override RELEASE_COMMIT :=
+    override RELEASE_VERSION :=
+endif
 RPM_VERSION = $(RELEASE_VERSION)
 override DIST_ROOT := $(PACKAGE)-$(RELEASE_VERSION)
 DIST_ARCHIVE ?= $(DIST_ROOT).tar.gz
@@ -603,6 +666,7 @@ endif
 
 qa-contract-test:
 	@sh tests/test_qa.sh "$(CURDIR)" "$(MAKE_COMMAND)"
+	@sh tests/test_ar07_build.sh "$(CURDIR)" "$(MAKE_COMMAND)"
 
 # AR-06 F32: the SIG-01/SIG-02/F4 end-to-end signal-interruption repro was
 # tracked but executed by nothing (not `make test`, not CI). Wire it in against
