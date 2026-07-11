@@ -31,6 +31,8 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       - name: Release build (FORTIFY/RELRO, warnings-as-errors)
         run: make clean && make BUILD_TYPE=release WERROR=1
+      - name: Release artifact hardening (built + staged)
+        run: make BUILD_TYPE=release release-artifact-test
       # AR-05 L8: symbol-level no-shell gate. An undefined-symbol reference to
       # system()/popen() in the linked binary catches ANY call path — headers,
       # whitespace variants, function pointers — that the textual tripwire
@@ -55,6 +57,8 @@ jobs:
         run: sudo apt-get install -y valgrind && make BUILD_TYPE=release memcheck
       - name: Source distribution self-check
         run: make distcheck
+      - name: Release input consistency and dirty-tree refusal
+        run: make release-contract-test
       - name: Static analysis (cppcheck)
         run: make analyze
       - name: Security scan (flawfinder)
@@ -68,6 +72,11 @@ jobs:
       # window is caught in CI.
       - name: Signal-interruption repro (SIG-01/SIG-02/F4)
         run: make BUILD_TYPE=release sig-repro-test
+      - name: Linux clang release build + hardening
+        run: |
+          make clean
+          make CC=clang BUILD_TYPE=release WERROR=1
+          make CC=clang BUILD_TYPE=release release-artifact-test
 
   freebsd:
     runs-on: ubuntu-latest
@@ -86,9 +95,14 @@ jobs:
             # git: the git_ops perf tests prove availability via a PATH walk
             # and assert no subprocess spawn — they need a real git binary,
             # which the Linux/macOS runners ship but this VM does not.
-            sudo pkg install -y gmake gcc git
+            sudo pkg install -y gmake gcc git binutils
+            readelf_tool=$(command -v readelf || command -v llvm-readelf || command -v greadelf)
+            test -n "$readelf_tool"
+            "$readelf_tool" -h /bin/sh >/dev/null
+            export READELF="$readelf_tool"
             gmake BUILD_TYPE=release WERROR=1
             gmake BUILD_TYPE=release WERROR=1 test
+            gmake BUILD_TYPE=release release-artifact-test
 
   macos:
     runs-on: macos-latest
@@ -97,4 +111,7 @@ jobs:
       - name: Build + test (ASan/UBSan, warnings-as-errors)
         run: make BUILD_TYPE=debug WERROR=1 test
       - name: Release build (warnings-as-errors)
-        run: make clean && make BUILD_TYPE=release WERROR=1
+        run: |
+          make clean
+          make BUILD_TYPE=release WERROR=1
+          make BUILD_TYPE=release release-artifact-test
