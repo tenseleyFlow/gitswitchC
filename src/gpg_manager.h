@@ -87,6 +87,16 @@ typedef int (*gpg_rename_noreplace_fn)(int old_dir_fd, const char *old_name,
 typedef int (*gpg_setenv_fn)(const char *name, const char *value,
                              int overwrite);
 typedef int (*gpg_unsetenv_fn)(const char *name);
+/* Test seams around reset's two-pass cleanup. The predelete hook runs only
+ * after the complete home has passed its second validation and immediately
+ * before destructive traversal. The final hook runs after an all-home reset
+ * has removed `current` and immediately before the required final base scan. */
+typedef int (*gpg_cleanup_predelete_fn)(int home_fd);
+typedef int (*gpg_reset_final_hook_fn)(int base_fd);
+/* Deterministic mount-identity and managed-writer durability seams. NULL
+ * restores the native statx/fsid and fsync implementations. */
+typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
+typedef int (*gpg_agent_conf_sync_fn)(int fd, bool directory);
 gpg_readdir_fn gpg_manager_set_readdir_fn(gpg_readdir_fn fn);
 gpg_agent_conf_preopen_fn
 gpg_manager_set_agent_conf_preopen_fn(gpg_agent_conf_preopen_fn fn);
@@ -103,6 +113,20 @@ gpg_rename_noreplace_fn
 gpg_manager_set_rename_noreplace_fn(gpg_rename_noreplace_fn fn);
 gpg_setenv_fn gpg_manager_set_setenv_fn(gpg_setenv_fn fn);
 gpg_unsetenv_fn gpg_manager_set_unsetenv_fn(gpg_unsetenv_fn fn);
+gpg_cleanup_predelete_fn
+gpg_manager_set_cleanup_predelete_fn(gpg_cleanup_predelete_fn fn);
+gpg_reset_final_hook_fn
+gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn);
+gpg_mount_identity_probe_fn
+gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
+gpg_agent_conf_sync_fn
+gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
+
+/* Focused verification entry point for the otherwise-internal managed writer.
+ * It preserves the switch's existing best-effort policy while allowing tests
+ * to assert the writer's own sync-error return contract directly. */
+int gpg_manager_setup_agent_config_for_test(int home_fd,
+                                            const char *gnupg_home);
 
 /* Function prototypes */
 
@@ -214,7 +238,10 @@ int gpg_manager_system_keyring_home(char *buf, size_t size);
  * homes, removing the on-disk secret-key copies). Deletion is unlink, not a
  * secure overwrite: on the default memory-backed storage that destroys the
  * bytes, but on the GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may
- * remain forensically recoverable (AR-02 #26). Resets a single account when
+ * remain forensically recoverable (AR-02 #26). Cleanup fails closed and keeps
+ * the affected home when it cannot prove one mount boundary and one link per
+ * non-directory entry. A full reset also rejects unknown base entries and
+ * verifies that only its exact lock survives. Resets a single account when
  * `account` is non-NULL, or all accounts when NULL. Returns 0 on success.
  */
 int gpg_manager_reset(const char *account);
