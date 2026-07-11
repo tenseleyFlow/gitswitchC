@@ -38,26 +38,41 @@ static void set_parser_error(toml_parser_state_t *state, const char *message);
 static toml_section_t *find_section(toml_document_t *doc, const char *section_name);
 static toml_section_t *find_or_create_section(toml_document_t *doc, const char *section_name);
 static toml_keyvalue_t *find_key(toml_section_t *section, const char *key_name);
+static toml_document_init_hook_fn g_document_init_hook;
+
+toml_document_init_hook_fn toml_set_document_init_hook_fn(
+    toml_document_init_hook_fn fn) {
+    toml_document_init_hook_fn previous = g_document_init_hook;
+    g_document_init_hook = fn;
+    return previous;
+}
 
 /* Initialize TOML document structure */
 void toml_init_document(toml_document_t *doc) {
     if (!doc) return;
-    
+
     memset(doc, 0, sizeof(toml_document_t));
-    doc->is_valid = false;
-    doc->section_count = 0;
+    if (g_document_init_hook) {
+        g_document_init_hook(doc);
+    }
 }
 
 /* Parse TOML from file with comprehensive security validation */
 int toml_parse_file(const char *file_path, toml_document_t *doc) {
-    FILE *file;
+    FILE *file = NULL;
     struct stat file_stat;
     char *buffer = NULL;
-    size_t file_size;
+    size_t file_size = 0;
     size_t bytes_read;
     int result = -1;
+    bool delegated_to_string_parser = false;
     
-    if (!file_path || !doc) {
+    if (!doc) {
+        set_error(ERR_INVALID_ARGS, "NULL arguments to toml_parse_file");
+        return -1;
+    }
+    if (!file_path) {
+        toml_init_document(doc);
         set_error(ERR_INVALID_ARGS, "NULL arguments to toml_parse_file");
         return -1;
     }
@@ -65,13 +80,13 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     /* Security: Validate file path */
     if (!toml_validate_file_path(file_path)) {
         set_error(ERR_CONFIG_INVALID, "Invalid file path: %s", file_path);
-        return -1;
+        goto cleanup;
     }
     
     /* Get file statistics for security checks */
     if (stat(file_path, &file_stat) != 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot access config file: %s", file_path);
-        return -1;
+        goto cleanup;
     }
     
     /* Security: Check file size limit */
@@ -81,14 +96,14 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
          * over the max), so no truncation. Mirrors config.c's size check. */
         set_error(ERR_CONFIG_INVALID, "Configuration file too large: %ld bytes (max: %d)",
                   (long)file_stat.st_size, TOML_MAX_FILE_SIZE);
-        return -1;
+        goto cleanup;
     }
     
     /* Security: Check file permissions (should not be world-readable) */
     if (file_stat.st_mode & (S_IRGRP | S_IROTH)) {
         set_error(ERR_PERMISSION_DENIED, "Configuration file has unsafe permissions: %o", 
                   file_stat.st_mode & 0777);
-        return -1;
+        goto cleanup;
     }
     
     file_size = (size_t)file_stat.st_size;
@@ -97,14 +112,13 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     file = fopen(file_path, "r");
     if (!file) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Failed to open config file: %s", file_path);
-        return -1;
+        goto cleanup;
     }
     
     /* Allocate buffer for file content */
     buffer = safe_malloc(file_size + 1);
     if (!buffer) {
-        fclose(file);
-        return -1;
+        goto cleanup;
     }
     
     /* Read file content */
@@ -118,29 +132,32 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     fclose(file);
     file = NULL;
     
-    /* Security: Validate character set */
-    if (!toml_validate_safe_characters(buffer, file_size)) {
-        set_error(ERR_CONFIG_INVALID, "Configuration file contains unsafe characters");
-        goto cleanup;
-    }
-    
-    /* Security: Check for injection patterns */
-    if (!toml_check_injection_patterns(buffer, file_size)) {
-        set_error(ERR_CONFIG_INVALID, "Configuration file contains potentially malicious patterns");
-        goto cleanup;
-    }
-    
-    /* Store file path in document */
-    safe_strncpy(doc->file_path, file_path, sizeof(doc->file_path));
-    
-    /* Parse the TOML content */
+    /* The public string entry point owns raw-byte validation and the one full
+     * document initialization. File parsing delegates to it so the two APIs
+     * cannot drift into different character/injection policies (AR-07 L29). */
+    delegated_to_string_parser = true;
     result = toml_parse_string(buffer, file_size, doc);
+    if (result == 0 &&
+        safe_strncpy(doc->file_path, file_path, sizeof(doc->file_path)) != 0) {
+        set_error(ERR_CONFIG_INVALID, "Configuration file path is too long: %s",
+                  file_path);
+        doc->is_valid = false;
+        result = -1;
+    }
     
 cleanup:
     if (file) fclose(file);
     if (buffer) {
         secure_zero_memory(buffer, file_size + 1);
         free(buffer);
+    }
+
+    /* If failure happened before a buffer reached toml_parse_string, that
+     * parser could not establish the normal invalid/empty document state.
+     * Initialize it here exactly once so every public early-error path is
+     * safe to inspect and clean up. */
+    if (!delegated_to_string_parser) {
+        toml_init_document(doc);
     }
     
     return result;
@@ -152,7 +169,17 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
     char section_name[TOML_MAX_SECTION_LEN] = ""; /* Default to root section */
     toml_section_t *current_section = NULL;
     
-    if (!toml_string || !doc) {
+    if (!doc) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_parse_string");
+        return -1;
+    }
+
+    /* This is the sole full initialization owner for buffer parses. It must
+     * precede every content gate so invalid input leaves a safe, invalid
+     * document rather than stale caller data (AR-07 L27). */
+    toml_init_document(doc);
+
+    if (!toml_string) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_parse_string");
         return -1;
     }
@@ -169,6 +196,28 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
                   "will recreate the default, or restore it from a backup");
         return -1;
     }
+
+    if (length > TOML_MAX_FILE_SIZE) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Configuration buffer too large: %zu bytes (max: %d)",
+                  length, TOML_MAX_FILE_SIZE);
+        return -1;
+    }
+
+    /* Keep the complete raw-buffer trust boundary here, not only in the file
+     * wrapper. Callers that already hold validated descriptors use this API
+     * directly, so bypassing either gate would recreate the file/string
+     * policy split (AR-07 L29). */
+    if (!toml_validate_safe_characters(toml_string, length)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Configuration buffer contains unsafe characters");
+        return -1;
+    }
+    if (!toml_check_injection_patterns(toml_string, length)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Configuration buffer contains potentially malicious patterns");
+        return -1;
+    }
     
     /* Initialize parser state */
     memset(&state, 0, sizeof(state));
@@ -178,9 +227,6 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
     state.line_number = 1;
     state.column_number = 1;
     state.has_error = false;
-    
-    /* Initialize document */
-    toml_init_document(doc);
     
     /* Parse line by line */
     while (!is_at_end(&state) && !state.has_error) {
@@ -681,15 +727,16 @@ bool toml_validate_safe_characters(const char *input, size_t length) {
             continue;
         }
         if (c < 0x80) {
-            /* Other C0 control or DEL — includes an embedded NUL, which also
-             * means a multi-byte sequence can never run past `length` below
-             * (the buffer is NUL-terminated at input[length]). */
+            /* Other C0 control or DEL — includes an embedded NUL. Multi-byte
+             * reads below are independently bounded by the exact remaining
+             * length; input is not required to have a byte at input[length]. */
             log_warning("Unsafe character found at position %zu: 0x%02x", i, c);
             return false;
         }
 
         uint32_t cp;
-        size_t len = utf8_decode((const unsigned char *)input + i, &cp);
+        size_t len = utf8_decode((const unsigned char *)input + i,
+                                 length - i, &cp);
         if (len == 0 || !tty_safe_codepoint(cp)) {
             log_warning("Malformed or unsafe UTF-8 sequence at position %zu: 0x%02x", i, c);
             return false;
@@ -729,7 +776,8 @@ int toml_sanitize_string(const char *input, char *output, size_t output_size) {
             i++;
         } else if (c >= 0x80) {
             uint32_t cp;
-            size_t len = utf8_decode((const unsigned char *)input + i, &cp);
+            size_t len = utf8_decode((const unsigned char *)input + i,
+                                     input_len - i, &cp);
             if (len > 0 && tty_safe_codepoint(cp) &&
                 output_pos + len <= output_size - 1) {
                 memcpy(output + output_pos, input + i, len);

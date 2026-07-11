@@ -11,6 +11,14 @@
 /* Default configuration template */
 extern const char *default_config_template;
 
+/* Focused allocation seam for the large TOML document. The default is
+ * exactly malloc; test allocators must return free-compatible storage. Install
+ * a replacement only around a bounded single-threaded test and restore the
+ * returned prior function afterwards. */
+typedef void *(*config_document_malloc_fn)(size_t size);
+config_document_malloc_fn config_set_document_malloc_fn(
+    config_document_malloc_fn fn);
+
 /* Function prototypes */
 
 /**

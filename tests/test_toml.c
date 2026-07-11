@@ -8,7 +8,6 @@
 #include <sys/stat.h>
 
 static int parse(const char *s, toml_document_t *doc) {
-    toml_init_document(doc);
     return toml_parse_string(s, strlen(s), doc);
 }
 
@@ -133,7 +132,6 @@ TEST(quote_in_value_round_trips) {
     toml_cleanup_document(&doc);
 
     toml_document_t doc2;
-    toml_init_document(&doc2);
     CHECK_EQ_INT(toml_parse_file(path, &doc2), 0); /* must NOT fail to parse */
     char buf[64];
     CHECK_EQ_INT(toml_get_string(&doc2, "accounts.1", "name", buf, sizeof(buf)), -1);
@@ -254,7 +252,6 @@ TEST(max_accounts_plus_settings_fit_and_round_trip) {
     chmod(path, 0600); /* toml_parse_file requires 0600, like config_save sets */
     toml_cleanup_document(&doc);
 
-    toml_init_document(&doc2);
     CHECK_EQ_INT(toml_parse_file(path, &doc2), 0);
     CHECK_EQ_INT((int)doc2.section_count, MAX_ACCOUNTS + 1);
     CHECK_EQ_INT(toml_get_string(&doc2, "accounts.64", "name", buf, sizeof(buf)), 0);
@@ -274,7 +271,6 @@ TEST(empty_config_reports_targeted_error) {
     if (f) fclose(f);
     chmod(path, 0600);
     toml_document_t doc;
-    toml_init_document(&doc);
     CHECK_EQ_INT(toml_parse_file(path, &doc), -1); /* still fails closed... */
     /* ...but says WHAT is wrong, not "Invalid arguments". */
     CHECK(strstr(get_last_error()->message, "empty") != NULL);
@@ -392,7 +388,6 @@ TEST(bracket_heavy_value_round_trips) {
     toml_cleanup_document(&doc);
 
     toml_document_t doc2;
-    toml_init_document(&doc2);
     CHECK_EQ_INT(toml_parse_file(path, &doc2), 0); /* must NOT be rejected */
     char buf[64];
     CHECK_EQ_INT(toml_get_string(&doc2, "accounts.1", "description", buf, sizeof(buf)), 0);

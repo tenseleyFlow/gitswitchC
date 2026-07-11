@@ -58,6 +58,14 @@ typedef struct {
     bool is_valid;
 } toml_document_t;
 
+/* Focused initialization observer used by regression tests. The parser is
+ * single-threaded; install an observer only around a bounded test operation
+ * and restore the previous value afterwards. Returning the previous observer
+ * makes nesting safe. */
+typedef void (*toml_document_init_hook_fn)(toml_document_t *doc);
+toml_document_init_hook_fn toml_set_document_init_hook_fn(
+    toml_document_init_hook_fn fn);
+
 /* Parser state for security tracking */
 typedef struct {
     const char *input;
@@ -78,6 +86,8 @@ void toml_init_document(toml_document_t *doc);
 
 /**
  * Parse TOML from file with comprehensive security validation
+ * - Initializes and replaces *doc exactly once; callers must not pre-initialize
+ * - A non-NULL doc is left invalid but safe to clean up on every failure
  * - Validates file size limits
  * - Sanitizes all input
  * - Checks for malicious patterns
@@ -87,6 +97,8 @@ int toml_parse_file(const char *file_path, toml_document_t *doc);
 
 /**
  * Parse TOML from string buffer with security validation
+ * - Initializes and replaces *doc exactly once; callers must not pre-initialize
+ * - A non-NULL doc is left invalid but safe to clean up on every failure
  */
 int toml_parse_string(const char *toml_string, size_t length, toml_document_t *doc);
 

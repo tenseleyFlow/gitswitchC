@@ -161,15 +161,25 @@ int config_init_readonly(gitswitch_ctx_t *ctx) {
     return config_init_mode(ctx, false);
 }
 
+static config_document_malloc_fn g_config_document_malloc = malloc;
+
+config_document_malloc_fn config_set_document_malloc_fn(
+    config_document_malloc_fn fn) {
+    config_document_malloc_fn previous = g_config_document_malloc;
+    g_config_document_malloc = fn ? fn : malloc;
+    return previous;
+}
+
 /* AR-06 F48/F52/F73: toml_document_t is ~600 KiB (MAX_SECTIONS section structs
  * each carrying MAX_KEYS_PER_SECTION inline key/value buffers). Placing one on
  * the stack put a single frame within striking distance of the default 8 MiB
  * thread stack and blew past smaller ulimits outright. Every config path now
- * allocates the document on the heap via these helpers. calloc gives the same
- * zeroed state toml_init_document would; toml_cleanup_document is still called
- * on the contents before the block is freed. */
+ * allocates the document on the heap via these helpers. Allocation deliberately
+ * does not clear the block: toml_parse_string or the save-path initializer owns
+ * the one full initialization clear (AR-07 L27). Cleanup still securely clears
+ * the contents, including on read failures before parsing begins. */
 static toml_document_t *config_document_alloc(void) {
-    toml_document_t *doc = calloc(1, sizeof(*doc));
+    toml_document_t *doc = g_config_document_malloc(sizeof(*doc));
     if (!doc) {
         set_error(ERR_MEMORY_ALLOCATION, "Failed to allocate TOML document");
     }
@@ -228,18 +238,8 @@ static int config_read_document(const char *config_path, toml_document_t *doc) {
     }
     buffer[file_size] = '\0';
 
-    /* Same content vetting toml_parse_file applied before it parsed. */
-    if (!toml_validate_safe_characters(buffer, file_size)) {
-        set_error(ERR_CONFIG_INVALID, "Configuration file contains unsafe characters");
-        goto fail_buffer;
-    }
-    if (!toml_check_injection_patterns(buffer, file_size)) {
-        set_error(ERR_CONFIG_INVALID, "Configuration file contains potentially malicious patterns");
-        goto fail_buffer;
-    }
-
-    /* Parse TOML configuration */
-    toml_init_document(doc);
+    /* The parser entry point owns character/injection validation and the one
+     * document initialization, matching toml_parse_file exactly. */
     if (toml_parse_string(buffer, file_size, doc) != 0) {
         goto fail_buffer;
     }
@@ -1184,7 +1184,7 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         return -1;
     }
 
-    /* Initialize TOML document (heap-allocated; calloc already zeroed it). */
+    /* Initialize the heap-allocated TOML document exactly once. */
     toml_doc = config_document_alloc();
     if (!toml_doc) {
         return -1;
@@ -2610,21 +2610,25 @@ static int parse_account_id_from_section(const char *section_name, uint32_t *acc
 static bool sanitize_tty_text(char *text) {
     unsigned char *src = (unsigned char *)text;
     unsigned char *dst = (unsigned char *)text;
+    size_t remaining = strlen(text);
     bool modified = false;
 
-    while (*src) {
+    while (remaining > 0) {
         uint32_t cp;
-        size_t len = utf8_decode(src, &cp);
+        size_t len = utf8_decode(src, remaining, &cp);
         if (len == 0) {
             src++; /* malformed byte: drop it and resync */
+            remaining--;
             modified = true;
         } else if (!tty_safe_codepoint(cp)) {
             src += len;
+            remaining -= len;
             modified = true;
         } else {
             if (dst != src) memmove(dst, src, len);
             dst += len;
             src += len;
+            remaining -= len;
         }
     }
     *dst = '\0';
@@ -2633,14 +2637,16 @@ static bool sanitize_tty_text(char *text) {
 
 static bool text_is_tty_safe(const char *text) {
     const unsigned char *p = (const unsigned char *)text;
+    size_t remaining = strlen(text);
 
-    while (*p) {
+    while (remaining > 0) {
         uint32_t cp;
-        size_t len = utf8_decode(p, &cp);
+        size_t len = utf8_decode(p, remaining, &cp);
         if (len == 0 || !tty_safe_codepoint(cp)) {
             return false;
         }
         p += len;
+        remaining -= len;
     }
     return true;
 }

@@ -2697,7 +2697,12 @@ bool is_safe_ssh_key_path(const char *path) {
  * config.c so the TOML parser's raw-buffer charset gate can apply the same
  * rules instead of rejecting every byte >= 0x80 (AR-02 #6). See utils.h for
  * the full rationale. */
-size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
+size_t utf8_decode(const unsigned char *s, size_t available,
+                   uint32_t *cp_out) {
+    if (!s || !cp_out || available == 0) {
+        return 0;
+    }
+
     unsigned char b0 = s[0];
 
     if (b0 < 0x80) {
@@ -2705,11 +2710,13 @@ size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
         return 1;
     }
     if (b0 >= 0xC2 && b0 <= 0xDF) {
+        if (available < 2) return 0;
         if ((s[1] & 0xC0) != 0x80) return 0;
         *cp_out = ((uint32_t)(b0 & 0x1F) << 6) | (s[1] & 0x3F);
         return 2;
     }
     if (b0 >= 0xE0 && b0 <= 0xEF) {
+        if (available < 3) return 0;
         if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80) return 0;
         if (b0 == 0xE0 && s[1] < 0xA0) return 0;              /* overlong */
         if (b0 == 0xED && s[1] >= 0xA0) return 0;             /* surrogate */
@@ -2718,6 +2725,7 @@ size_t utf8_decode(const unsigned char *s, uint32_t *cp_out) {
         return 3;
     }
     if (b0 >= 0xF0 && b0 <= 0xF4) {
+        if (available < 4) return 0;
         if ((s[1] & 0xC0) != 0x80 || (s[2] & 0xC0) != 0x80 || (s[3] & 0xC0) != 0x80) return 0;
         if (b0 == 0xF0 && s[1] < 0x90) return 0;              /* overlong */
         if (b0 == 0xF4 && s[1] > 0x8F) return 0;              /* > U+10FFFF */
