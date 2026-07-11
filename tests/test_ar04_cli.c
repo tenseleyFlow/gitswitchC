@@ -135,11 +135,17 @@ static const char *slurp(const char *path, char *buf, size_t size) {
     return buf;
 }
 
+/* AR-06 F33: keep a crash/signal-kill distinguishable from an ordinary
+ * nonzero exit — -(1000+signal) for abnormal termination, -1 for a system()
+ * failure — so a broken binary can never satisfy a negative-path witness. */
 static int run_shell(const char *cmd) {
     int status = system(cmd);
 
-    if (status == -1 || !WIFEXITED(status)) {
+    if (status == -1) {
         return -1;
+    }
+    if (!WIFEXITED(status)) {
+        return WIFSIGNALED(status) ? -(1000 + WTERMSIG(status)) : -1;
     }
     return WEXITSTATUS(status);
 }

@@ -49,6 +49,16 @@ int prompt_line(const char *prompt, char *buf, size_t size, bool path_completion
     if (!fgets(buf, (int)size, stdin)) {
         return -1;
     }
+    /* AR-06 F66: a line longer than buf leaves fgets's unread tail (and the
+     * newline) in stdin; the NEXT prompt's fgets would then consume that
+     * leftover as its answer. When no newline made it into buf, drain the rest
+     * of the line so each prompt reads exactly one line. */
+    if (strchr(buf, '\n') == NULL) {
+        int c;
+        while ((c = getchar()) != '\n' && c != EOF) {
+            /* discard the overflow */
+        }
+    }
     buf[strcspn(buf, "\n")] = '\0';
 
     char *trimmed = trim_whitespace(buf);

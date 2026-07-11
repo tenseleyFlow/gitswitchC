@@ -12,12 +12,21 @@
 # Populate COMPREPLY with the live account names that prefix-match "$cur",
 # quoting each candidate so names with spaces complete as a single word.
 _gitswitch_complete_accounts() {
-    local cur=$1 name
+    local cur=$1 n
     local -a names=()
-    mapfile -t names < <(gitswitch list --names 2>/dev/null)
-    local n
+    # Read one name per line WITHOUT mapfile: mapfile is bash >= 4, but stock
+    # macOS ships bash 3.2, where it fails with a visible error (AR-06 F37).
+    while IFS= read -r n; do
+        names+=("$n")
+    done < <(gitswitch list --names 2>/dev/null)
+    # $cur carries readline's own backslash-escapes once a previous TAB has
+    # completed a name containing spaces/metacharacters (our printf '%q' output
+    # inserted them). Prefix-matching the raw, unescaped names against that
+    # escaped $cur matched nothing on the SECOND TAB (AR-06 F13). Strip the
+    # escapes for the comparison; the emitted candidate is still %q-quoted.
+    local dq=${cur//\\/}
     for n in "${names[@]}"; do
-        if [[ -z $cur || $n == "$cur"* ]]; then
+        if [[ -z $dq || $n == "$dq"* ]]; then
             COMPREPLY+=("$(printf '%q' "$n")")
         fi
     done

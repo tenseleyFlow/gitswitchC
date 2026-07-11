@@ -191,6 +191,11 @@ int unset_env_var(const char *name);
  */
 bool validate_email(const char *email);
 bool validate_name(const char *name);
+/* True if `name` collides with a command keyword or is purely numeric — such a
+ * name can never be switched to and must be refused at account creation/rename
+ * (AR-06 F26). Not folded into validate_name: that also gates loads and runtime
+ * teardown of already-existing accounts. */
+bool name_is_reserved_for_commands(const char *name);
 bool validate_key_id(const char *key_id);
 bool validate_file_path(const char *path);
 

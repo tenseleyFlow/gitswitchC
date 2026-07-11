@@ -185,6 +185,15 @@ int main(int argc, char *argv[]) {
         }
     }
     
+    /* AR-06 F62: --global and --local are contradictory. Silently letting
+     * --global win hid a user's mistake and could write the wrong scope; fail
+     * with a clear message instead. */
+    if (force_global && force_local) {
+        fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
+        error_cleanup();
+        return EXIT_FAILURE;
+    }
+
     /* Initialize display system */
     if (display_init(force_color, no_color) != 0) {
         log_error("Failed to initialize display system");
@@ -274,7 +283,7 @@ int main(int argc, char *argv[]) {
     /* Initialize configuration system */
     log_info("Initializing gitswitch-c configuration system");
     if (config_init(&ctx) != 0) {
-        display_error("Configuration initialization failed", get_last_error()->message);
+        display_error("Configuration initialization failed", "%s", get_last_error()->message);
         error_cleanup();
         return EXIT_CONFIG_ERROR;
     }
@@ -302,6 +311,11 @@ int main(int argc, char *argv[]) {
      * backup churn. */
     char prev_active[MAX_NAME_LEN];
     safe_strncpy(prev_active, ctx.config.active_account, sizeof(prev_active));
+    /* Snapshot the account count so a CANCELLED remove (user declined the
+     * confirmation — accounts_remove returns 0 having changed nothing) skips
+     * config_save and its backup/comment-destroying churn (AR-06 F25). A real
+     * remove decrements the count; a cancel leaves it untouched. */
+    size_t prev_account_count = ctx.account_count;
     
     /* Execute command */
     if (command == NULL) {
@@ -358,11 +372,16 @@ int main(int argc, char *argv[]) {
     bool settings_only_save = false;
     if (command && exit_code == EXIT_SUCCESS && !dry_run) {
         if (strcmp(command, "add") == 0 ||
-            strcmp(command, "edit") == 0 ||
-            strcmp(command, "remove") == 0 ||
-            strcmp(command, "rm") == 0 ||
-            strcmp(command, "delete") == 0) {
+            strcmp(command, "edit") == 0) {
             should_save = true;
+        } else if (strcmp(command, "remove") == 0 ||
+                   strcmp(command, "rm") == 0 ||
+                   strcmp(command, "delete") == 0) {
+            /* AR-06 F25: only persist when an account was actually removed. A
+             * declined confirmation returns success with the count unchanged;
+             * saving then would rewrite accounts.toml and churn a backup for a
+             * no-op, destroying user comments. */
+            should_save = (ctx.account_count != prev_account_count);
         } else if (strcmp(command, "list") != 0 &&
                    strcmp(command, "ls") != 0 &&
                    strcmp(command, "status") != 0 &&
@@ -400,6 +419,14 @@ int main(int argc, char *argv[]) {
              * point, so a deferred signal is not re-raised: the process
              * finishes persisting and exits normally moments later. */
             signals_guard_begin();
+            /* AR-06 F27: also DEFER the second-signal emergency exit across the
+             * save, like the rollback and deferred-teardown windows. Without
+             * this, two rapid signals here took the handler's emergency exit
+             * mid-config_save and persisted a mixed identity that auto-resume
+             * then made durable. The save is bounded, non-interactive work (no
+             * children to wedge at a prompt), so deferring is safe; the deferred
+             * signal is dispatched once the state is fully persisted. */
+            signals_rollback_begin();
             int save_rc = settings_only_save
                 ? config_save_active_account(&ctx, ctx.config.config_path)
                 : config_save(&ctx, ctx.config.config_path);
@@ -410,10 +437,11 @@ int main(int argc, char *argv[]) {
                  * discarded (add/edit) or while active_account went stale
                  * for the next boot's resume (switch). */
                 display_error("Failed to save configuration changes",
-                              get_last_error()->message);
+                              "%s", get_last_error()->message);
                 exit_code = EXIT_FAILURE;
             }
             signals_scratch_cleanup();
+            signals_rollback_end();
         }
     }
 
@@ -444,6 +472,16 @@ int main(int argc, char *argv[]) {
 static int handle_add_command(gitswitch_ctx_t *ctx) {
     if (!ctx) return EXIT_FAILURE;
 
+    /* AR-06 F24: add has no meaningful dry-run. The old code ran the full
+     * interactive flow, mutated the in-memory context, and printed "Account
+     * added successfully!" at exit 0 while main()'s !dry_run save gate silently
+     * discarded it. Refuse up front instead of feigning success. */
+    if (ctx->config.dry_run) {
+        display_info("DRY RUN MODE - No actual changes will be made");
+        display_error("Nothing to preview", "add has no dry-run mode; re-run without --dry-run to add an account");
+        return EXIT_FAILURE;
+    }
+
     /* AR-03 M9: refuse BEFORE the interactive work. The save at the end of
      * main() is refused whenever the load skipped or failed to recognize
      * sections (rewriting would erase them), so collecting a full account's
@@ -451,12 +489,12 @@ static int handle_add_command(gitswitch_ctx_t *ctx) {
      * "Account added successfully!" at exit 0 — helps nobody. Fail up front
      * with the reason instead. */
     if (config_check_rewritable(ctx) != 0) {
-        display_error("Cannot add an account right now", get_last_error()->message);
+        display_error("Cannot add an account right now", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
     if (accounts_add_interactive(ctx) != 0) {
-        display_error("Failed to add account", get_last_error()->message);
+        display_error("Failed to add account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
@@ -466,14 +504,21 @@ static int handle_add_command(gitswitch_ctx_t *ctx) {
 static int handle_edit_command(gitswitch_ctx_t *ctx, const char *identifier) {
     if (!ctx || !identifier) return EXIT_FAILURE;
 
+    /* AR-06 F24: edit has no meaningful dry-run either — see handle_add_command. */
+    if (ctx->config.dry_run) {
+        display_info("DRY RUN MODE - No actual changes will be made");
+        display_error("Nothing to preview", "edit has no dry-run mode; re-run without --dry-run to edit an account");
+        return EXIT_FAILURE;
+    }
+
     /* AR-03 M9: same up-front refusal as `add` — see handle_add_command. */
     if (config_check_rewritable(ctx) != 0) {
-        display_error("Cannot edit an account right now", get_last_error()->message);
+        display_error("Cannot edit an account right now", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
     if (accounts_edit_interactive(ctx, identifier) != 0) {
-        display_error("Failed to edit account", get_last_error()->message);
+        display_error("Failed to edit account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
@@ -501,12 +546,31 @@ static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier) {
      * (A remove here could only ever target a HEALTHY account anyway: the
      * skipped ones aren't in memory to be found.) */
     if (config_check_rewritable(ctx) != 0) {
-        display_error("Cannot remove an account right now", get_last_error()->message);
+        display_error("Cannot remove an account right now", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
+    /* AR-06 F07: accounts_remove tears down the SSH/GPG runtime (kills agents,
+     * deletes the isolated GPG home with its exported secret-key copy) with no
+     * dry_run check of its own — the exact destructive-preview hole AR-05 H1
+     * closed for `reset` only. Gate here, before the confirmation prompt, the
+     * runtime lock, and the manager teardown, mirroring handle_reset_command. */
+    if (ctx->config.dry_run) {
+        account_t *acct = config_find_account(ctx, identifier);
+        if (!acct) {
+            display_error("Account not found", "%s", identifier);
+            return EXIT_FAILURE;
+        }
+        display_info("DRY RUN MODE - No actual changes will be made");
+        printf("Would kill the SSH/GPG agents and delete the isolated GPG home for\n"
+               "'%s' (removing its on-disk secret-key copy), then remove the account\n"
+               "from %s.\n", acct->name, ctx->config.config_path);
+        display_success("DRY RUN complete - no changes were made");
+        return EXIT_SUCCESS;
+    }
+
     if (accounts_remove(ctx, identifier) != 0) {
-        display_error("Failed to remove account", get_last_error()->message);
+        display_error("Failed to remove account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
     
@@ -527,7 +591,7 @@ static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier) {
     }
 
     if (accounts_switch(ctx, identifier) != 0) {
-        display_error("Failed to switch account", get_last_error()->message);
+        display_error("Failed to switch account", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
 
@@ -573,7 +637,7 @@ static int handle_doctor_command(gitswitch_ctx_t *ctx) {
     if (config_validate(ctx) == 0) {
         display_success("Configuration validation passed");
     } else {
-        display_error("Configuration validation failed", get_last_error()->message);
+        display_error("Configuration validation failed", "%s", get_last_error()->message);
         return EXIT_FAILURE;
     }
     
@@ -588,6 +652,14 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
     
     if (!path_exists(ctx->config.config_path)) {
         display_warning("Configuration file does not exist");
+        /* AR-06 F23: don't prompt-and-create the real config under --dry-run. */
+        if (ctx->config.dry_run) {
+            display_info("DRY RUN MODE - No actual changes will be made");
+            printf("Would offer to create a default configuration at %s.\n",
+                   ctx->config.config_path);
+            display_success("DRY RUN complete - no changes were made");
+            return EXIT_SUCCESS;
+        }
         printf("Create default configuration? (y/N): ");
         fflush(stdout);
         
@@ -603,7 +675,7 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
                     display_success("Default configuration created");
                     printf("Please edit the file to add your accounts.\n");
                 } else {
-                    display_error("Failed to create default configuration", get_last_error()->message);
+                    display_error("Failed to create default configuration", "%s", get_last_error()->message);
                     return EXIT_FAILURE;
                 }
             }
@@ -674,9 +746,13 @@ static int handle_init_command(const char *shell) {
     }
 
     /* GPG home is best-effort: if it can't be computed we still emit the SSH
-     * wiring rather than failing the whole init. */
+     * wiring rather than failing the whole init. The _quiet variant is
+     * mandatory here: the plain one prints a not-memory-backed [WARN] to STDOUT
+     * on any host with XDG_RUNTIME_DIR unset and a disk-backed /tmp (stock
+     * macOS), and this stdout is eval'd by the shell — the warning would become
+     * `bash: [WARN]: command not found` at every prompt (AR-06 F08). */
     char gpg_home[MAX_PATH_LEN];
-    bool have_gpg_home = (gpg_manager_get_home_path(gpg_home, sizeof(gpg_home)) == 0);
+    bool have_gpg_home = (gpg_manager_get_home_path_quiet(gpg_home, sizeof(gpg_home)) == 0);
 
     /* The paths are emitted inside single-quoted shell assignments below; a
      * stray single quote would break out of the quoting, so refuse it. */
@@ -940,7 +1016,10 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
         return EXIT_SUCCESS;
     }
 
-    acct = config_find_account(ctx, ctx->config.active_account);
+    /* Exact-name resolution (AR-06 F22): the persisted active_account is a
+     * literal name; the id-first fuzzy matcher could resume a different account
+     * whose id equals a legacy all-digit name. */
+    acct = config_find_account_exact(ctx, ctx->config.active_account);
     if (!acct) {
         log_debug("Saved account no longer exists, skipping resume: %s",
                   ctx->config.active_account);

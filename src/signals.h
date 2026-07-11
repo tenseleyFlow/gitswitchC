@@ -79,6 +79,15 @@ void signals_rollback_begin(void);
 void signals_rollback_end(void);
 
 /**
+ * Reset the guarded signals to SIG_DFL (and unblock them) in a freshly-forked
+ * child, before it execs (AR-06 F76). Closes the window where the child still
+ * runs the parent's guard handler, which would swallow a signal instead of
+ * letting the child terminate. Async-signal-safe enough for our single-threaded
+ * fork; call it first thing in the child branch.
+ */
+void signals_reset_for_child(void);
+
+/**
  * Publish / retract the in-flight subprocess (AR-03 L8). run_argv's spawn
  * path calls signals_child_spawned(pid) right after fork() returns in the
  * parent and signals_child_reaped() right after waitpid() reaps, so the

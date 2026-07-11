@@ -18,6 +18,18 @@
 #endif
 #define GITSWITCH_NAME "gitswitch-c"
 
+/* printf-style format checking for our variadic diagnostics (AR-06 F09
+ * residual): lets -Wformat catch a caller that ever passes runtime data as the
+ * format string (the CWE-134 class) or mismatches a conversion, at compile
+ * time. fmt_idx/va_idx are 1-based argument positions. No-op on non-GNU C. */
+#if defined(__GNUC__)
+/* The 'printf' below is the compiler's format archetype, not a printf CALL;
+ * flawfinder's format matcher flags it, so the ignore sits on the same line. */
+#define GS_PRINTF_FMT(fmt_idx, va_idx) __attribute__((format(printf, fmt_idx, va_idx))) /* flawfinder: ignore */
+#else
+#define GS_PRINTF_FMT(fmt_idx, va_idx)
+#endif
+
 /* Configuration constants */
 #define MAX_PATH_LEN 4096
 #define MAX_NAME_LEN 256
@@ -103,6 +115,12 @@ typedef struct {
      * invisible to it: rewriting while any exist would silently delete them
      * (AR-03 M8). Gated exactly like accounts_skipped_on_load. */
     size_t unknown_sections_on_load;
+    /* Number of KEYS inside otherwise-recognized [settings]/[accounts.<id>]
+     * sections that gitswitch does not model — a typo (ssh_kye), or a key
+     * written by a newer version after a downgrade. config_save re-emits only
+     * modeled keys, so such a key is silently dropped by the next full save
+     * (AR-06 F02). Gated exactly like unknown_sections_on_load. */
+    size_t unknown_keys_on_load;
 } gitswitch_ctx_t;
 
 /* Function prototypes */

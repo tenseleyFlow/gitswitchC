@@ -92,10 +92,14 @@ static const char *slurp(const char *path, char *buf, size_t size) {
     return buf;
 }
 
+/* AR-06 F33: -(1000+signal) for a crash/signal-kill, -1 for a system()
+ * failure, so abnormal termination never passes as an ordinary nonzero exit. */
 static int run_shell(const char *cmd) {
     int status = system(cmd);
 
-    if (status == -1 || !WIFEXITED(status)) return -1;
+    if (status == -1) return -1;
+    if (!WIFEXITED(status))
+        return WIFSIGNALED(status) ? -(1000 + WTERMSIG(status)) : -1;
     return WEXITSTATUS(status);
 }
 

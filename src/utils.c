@@ -273,20 +273,22 @@ bool is_regular_file(const char *path) {
 }
 
 int create_directory_recursive(const char *path, mode_t mode) {
-    if (!path) {
-        set_error(ERR_INVALID_ARGS, "NULL path to create_directory_recursive");
+    if (!path || !*path) {
+        /* Reject an empty path too (AR-06 F78): the trailing-slash check below
+         * reads temp_path[len-1], an out-of-bounds stack read when len == 0. */
+        set_error(ERR_INVALID_ARGS, "NULL or empty path to create_directory_recursive");
         return -1;
     }
-    
+
     char temp_path[MAX_PATH_LEN];
     char *p = NULL;
     size_t len;
-    
+
     if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s", path) >= sizeof(temp_path)) {
         set_error(ERR_INVALID_ARGS, "Path too long");
         return -1;
     }
-    
+
     len = strlen(temp_path);
     if (temp_path[len - 1] == '/') {
         temp_path[len - 1] = '\0';
@@ -725,7 +727,13 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     }
     /* One global order for every participant prevents ABBA deadlocks.  Parent
      * is the namespace anchor: a replacement leaf beneath that same parent
-     * cannot enter until the old leaf's holder releases this lock. */
+     * cannot enter until the old leaf's holder releases this lock.  It MUST be
+     * exclusive (AR-06 F31 considered SHARED to decouple the sibling chains
+     * rooted at XDG_RUNTIME_DIR, but that breaks the leaf-replacement
+     * guarantee: after a leaf dir is renamed away and recreated the new leaf is
+     * a distinct inode, so the leaf/file locks below no longer serialize the old
+     * holder against a new locker — only this exclusive parent lock does, as
+     * config_lock_survives_post_acquisition_namespace_replacement proves). */
     if (private_lock_inode_acquire(parent_fd, nonblocking, &parent_slot) != 0) {
         close(leaf_fd);
         return -1;
@@ -974,18 +982,31 @@ void runtime_state_lock_release(int fd) {
             if (g_runtime_locks[i].active && g_runtime_locks[i].lock_fd == fd) {
                 /* Retained descriptors are deliberately closed only after the
                  * critical section; release also performs a final namespace
-                 * check as diagnostic hardening, though its void API cannot
-                 * surface a late replacement to the caller. */
+                 * check as diagnostic hardening. The void API cannot surface a
+                 * late replacement to the caller, but it CAN log it — the old
+                 * code computed these four stats and discarded every result, so
+                 * the "check" did nothing at all (AR-06 F77). Compare the pinned
+                 * (fd) inode against the currently-named (path) inode and warn
+                 * if the parent or the locked dir was swapped underneath us. */
                 struct stat pinned_parent;
                 struct stat named_parent;
                 struct stat pinned_dir;
                 struct stat named_dir;
-                (void)fstat(g_runtime_locks[i].parent_fd, &pinned_parent);
-                (void)lstat(g_runtime_locks[i].parent_path, &named_parent);
-                (void)fstat(g_runtime_locks[i].dir_fd, &pinned_dir);
-                (void)fstatat(g_runtime_locks[i].parent_fd,
-                              g_runtime_locks[i].child_name, &named_dir,
-                              AT_SYMLINK_NOFOLLOW);
+                bool have_pp = fstat(g_runtime_locks[i].parent_fd, &pinned_parent) == 0;
+                bool have_np = lstat(g_runtime_locks[i].parent_path, &named_parent) == 0;
+                bool have_pd = fstat(g_runtime_locks[i].dir_fd, &pinned_dir) == 0;
+                bool have_nd = fstatat(g_runtime_locks[i].parent_fd,
+                                       g_runtime_locks[i].child_name, &named_dir,
+                                       AT_SYMLINK_NOFOLLOW) == 0;
+                if ((have_pp && have_np &&
+                     (pinned_parent.st_dev != named_parent.st_dev ||
+                      pinned_parent.st_ino != named_parent.st_ino)) ||
+                    (have_pd && have_nd &&
+                     (pinned_dir.st_dev != named_dir.st_dev ||
+                      pinned_dir.st_ino != named_dir.st_ino))) {
+                    log_warning("runtime lock namespace for '%s' was replaced during "
+                                "the critical section", g_runtime_locks[i].child_name);
+                }
                 unlock_private_file(fd);
                 close(g_runtime_locks[i].dir_fd);
                 close(g_runtime_locks[i].parent_fd);
@@ -1093,9 +1114,12 @@ int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size)
         return -1;
     }
 
-    /* If we filled the buffer without reaching EOF, the file is larger than the
-     * caller's buffer — fail rather than silently returning a truncated copy. */
-    if (bytes_read == buffer_size - 1 && !feof(file)) {
+    /* If we filled the buffer, the file MIGHT be exactly buffer_size-1 bytes
+     * (a perfect fit) or larger. feof isn't set here — fread stopped at the
+     * byte limit without reading past the data — so the old `!feof` test
+     * wrongly rejected an exact-fit file (AR-06 F75). Probe one more byte:
+     * EOF means it fit exactly; any byte means it is genuinely too large. */
+    if (bytes_read == buffer_size - 1 && fgetc(file) != EOF) {
         set_error(ERR_FILE_IO, "File too large for buffer: %s", file_path);
         fclose(file);
         return -1;
@@ -1386,6 +1410,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     if (pid == 0) {
         /* ---- child ---- */
+        /* Drop the parent's guard handler first (AR-06 F76): until execv resets
+         * it, a signal delivered to this child would run guard_handler (which
+         * only records and returns), swallowing it and leaving the helper
+         * "pre-interrupted" instead of terminating normally. */
+        signals_reset_for_child();
+
         int child_cwd_fd = -1;
 
         /* Preserve a pinned working-directory descriptor before touching
@@ -1416,11 +1446,18 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (opts->merge_stderr) { dup2(STDOUT_FILENO, STDERR_FILENO); }
         else if (opts->stderr_to_devnull && devnull >= 0) { dup2(devnull, STDERR_FILENO); }
 
-        if (in_pipe[0] >= 0) close(in_pipe[0]);
-        if (in_pipe[1] >= 0) close(in_pipe[1]);
-        if (out_pipe[0] >= 0) close(out_pipe[0]);
-        if (out_pipe[1] >= 0) close(out_pipe[1]);
-        if (devnull >= 0) close(devnull);
+        /* Close the pipe/devnull fds only above the stdio range (AR-06 F30).
+         * When the parent starts with fd 0 or 1 closed, pipe()/open() hand
+         * those low numbers back, so after the dup2 dance fds 0/1/2 ARE the
+         * child's std streams — an unconditional close here closed the very
+         * stdin/stdout we just installed, corrupting the child. Anything in
+         * 0..2 is now a std stream we must keep; child_close_fds_from(3) below
+         * reaps every remaining fd at or above 3. */
+        if (in_pipe[0] > STDERR_FILENO) close(in_pipe[0]);
+        if (in_pipe[1] > STDERR_FILENO) close(in_pipe[1]);
+        if (out_pipe[0] > STDERR_FILENO) close(out_pipe[0]);
+        if (out_pipe[1] > STDERR_FILENO) close(out_pipe[1]);
+        if (devnull > STDERR_FILENO) close(devnull);
 
         if (opts->use_cwd_fd) {
             if (fchdir(child_cwd_fd) != 0) {
@@ -1829,6 +1866,36 @@ bool validate_email(const char *email) {
     }
 
     return regexec(&regex, email, 0, NULL, 0) == 0;
+}
+
+/* AR-06 F26: a new account name that collides with a command keyword or is
+ * purely numeric can never be switched to by name (the dispatcher matches the
+ * keyword, and a bare number is read as an account ID first), and completion
+ * would feed such a name straight back as a destructive command. Reject at the
+ * CREATION/rename path only — NOT in validate_name, which also gates loads and
+ * runtime teardown, so an already-created such account can still be reset/
+ * removed. Numeric = one or more ASCII digits with no other characters. */
+bool name_is_reserved_for_commands(const char *name) {
+    static const char *const keywords[] = {
+        "add", "edit", "list", "ls", "remove", "rm", "delete", "status",
+        "doctor", "health", "config", "init", "resume", "reset", NULL
+    };
+    if (!name || !*name) {
+        return false;
+    }
+    for (size_t i = 0; keywords[i]; i++) {
+        if (strcasecmp(name, keywords[i]) == 0) {
+            return true;
+        }
+    }
+    bool all_digits = true;
+    for (const char *p = name; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            all_digits = false;
+            break;
+        }
+    }
+    return all_digits;
 }
 
 bool validate_name(const char *name) {

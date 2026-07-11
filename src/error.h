@@ -7,6 +7,7 @@
 #include <stdarg.h>
 #include <errno.h>
 #include <stdbool.h>
+#include "gitswitch.h"  /* GS_PRINTF_FMT for the format-checked variadics */
 
 /* Error codes */
 typedef enum {
@@ -118,13 +119,13 @@ void error_cleanup(void);
  * Set error context with detailed information
  */
 void set_error_context(error_code_t code, const char *file, int line,
-                       const char *function, const char *fmt, ...);
+                       const char *function, const char *fmt, ...) GS_PRINTF_FMT(5, 6);
 
 /**
  * Set error context including system errno
  */
 void set_system_error_context(error_code_t code, const char *file, int line,
-                              const char *function, const char *fmt, ...);
+                              const char *function, const char *fmt, ...) GS_PRINTF_FMT(5, 6);
 
 /**
  * Get last error information
@@ -145,7 +146,7 @@ const char *error_code_to_string(error_code_t code);
  * Log message with context information
  */
 void log_message(log_level_t level, const char *file, int line,
-                 const char *function, const char *fmt, ...);
+                 const char *function, const char *fmt, ...) GS_PRINTF_FMT(5, 6);
 
 /**
  * Set logging level
@@ -188,7 +189,7 @@ void get_timestamp(char *buffer, size_t buffer_size);
  */
 int safe_strncpy(char *dest, const char *src, size_t dest_size);
 int safe_strncat(char *dest, const char *src, size_t dest_size);
-int safe_snprintf(char *buffer, size_t buffer_size, const char *fmt, ...);
+int safe_snprintf(char *buffer, size_t buffer_size, const char *fmt, ...) GS_PRINTF_FMT(3, 4);
 
 /**
  * Memory allocation functions that set error context on failure

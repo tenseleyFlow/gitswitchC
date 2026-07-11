@@ -510,6 +510,58 @@ TEST(load_skips_leading_zero_id_section) {
     CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
 }
 
+TEST(load_counts_unknown_keys_in_recognized_sections) {
+    /* AR-06 F02: a key gitswitch does not model, sitting inside an otherwise
+     * recognized [settings]/[accounts.N] section, is invisible to config_save's
+     * rebuild and would be silently erased by the next save. It must be counted
+     * so config_check_rewritable refuses the rewrite. */
+    const char *cfg =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "custom_flag = \"keepme\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "my_note = \"important\"\n";
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    /* The account still loads; the unknown keys are counted, not dropped. */
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 0);
+    CHECK_EQ_INT(ctx.unknown_sections_on_load, 0);
+    CHECK_EQ_INT(ctx.unknown_keys_on_load, 2);
+    /* A full rewrite is refused so the keys aren't erased. */
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+}
+
+TEST(load_accepts_only_modeled_keys) {
+    /* Control: a config with ONLY modeled keys must NOT be flagged. */
+    const char *cfg =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "active_account = \"alice\"\n"
+        "[accounts.1]\n"
+        "name = \"alice\"\n"
+        "email = \"a@b.com\"\n"
+        "description = \"d\"\n";
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.unknown_keys_on_load, 0);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), 0);
+}
+
 TEST(load_skips_out_of_range_id_section) {
     const char *cfg =
         "[settings]\n"
@@ -1131,8 +1183,37 @@ TEST(add_rejects_values_that_cannot_roundtrip) {
     CHECK_EQ_INT(ctx.account_count, 1);
 }
 
+/* AR-06 F46/F47: two saves in the same wall-clock second must not collide on
+ * the one-second-granularity backup name. The second config_backup must still
+ * succeed with a disambiguated name, leaving both backups on disk. */
+TEST(back_to_back_backups_in_same_second_both_persist) {
+    char dir[128], cfg[256];
+    DIR *d;
+    struct dirent *ent;
+    int backups = 0;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(cfg, sizeof(cfg), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(cfg, "x\n", 2), 0);
+
+    /* Same second (no sleep between): pre-fix the 2nd hit EEXIST and vanished. */
+    CHECK_EQ_INT(config_backup(cfg), 0);
+    CHECK_EQ_INT(config_backup(cfg), 0);
+
+    d = opendir(dir);
+    CHECK(d != NULL);
+    if (d) {
+        while ((ent = readdir(d)) != NULL) {
+            if (strstr(ent->d_name, "accounts.toml.backup.")) backups++;
+        }
+        closedir(d);
+    }
+    CHECK_EQ_INT(backups, 2); /* both backups survive */
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(back_to_back_backups_in_same_second_both_persist);
     RUN_TEST(load_accepts_regular_file);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
@@ -1146,6 +1227,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(save_and_reload_regular_path_roundtrip);
     RUN_TEST(find_account_rejects_out_of_range_and_noncanonical_ids);
     RUN_TEST(load_skips_leading_zero_id_section);
+    RUN_TEST(load_counts_unknown_keys_in_recognized_sections);
+    RUN_TEST(load_accepts_only_modeled_keys);
     RUN_TEST(load_skips_out_of_range_id_section);
     RUN_TEST(load_counts_overlong_name_as_skipped_and_save_preserves_it);
     RUN_TEST(config_save_registers_and_unregisters_its_temp);

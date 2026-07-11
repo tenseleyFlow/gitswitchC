@@ -131,6 +131,26 @@ int gpg_set_environment(const gpg_config_t *gpg_config);
 int gpg_manager_get_home_path(char *buf, size_t size);
 
 /**
+ * As gpg_manager_get_home_path, but suppresses the "not memory-backed" warning
+ * that would otherwise print to stdout. Used by `gitswitch init`, whose stdout
+ * is eval'd by the shell (AR-06 F08). Returns 0 on success, -1 on overflow.
+ */
+int gpg_manager_get_home_path_quiet(char *buf, size_t size);
+
+/**
+ * Resolve the user's REAL/system gpg home for operations documented to consult
+ * the system keyring (secret-key export, availability probe). Returns the
+ * configured $GNUPGHOME when it is NOT one of our managed isolated homes,
+ * otherwise $HOME/.gnupg. This exists because `gitswitch init` exports
+ * GNUPGHOME=<base>/current into interactive shells; a child that merely
+ * inherits it would read the previously-active account's isolated home instead
+ * of the real keyring and fail closed (AR-06 F05/F06). Callers pass the result
+ * as an explicit GNUPGHOME override so the inherited managed value can't
+ * misdirect them. Returns 0 on success, -1 on overflow or missing $HOME.
+ */
+int gpg_manager_system_keyring_home(char *buf, size_t size);
+
+/**
  * Tear down isolated GPG homes (kill per-home gpg-agents and delete the
  * homes, removing the on-disk secret-key copies). Deletion is unlink, not a
  * secure overwrite: on the default memory-backed storage that destroys the
@@ -139,6 +159,16 @@ int gpg_manager_get_home_path(char *buf, size_t size);
  * `account` is non-NULL, or all accounts when NULL. Returns 0 on success.
  */
 int gpg_manager_reset(const char *account);
+
+/**
+ * Report whether a safe isolated GPG home already exists for `account` (AR-06
+ * F17). The switch preflight uses this to treat the system keyring as a key
+ * source rather than a hard gate: a present isolated home may hold the only
+ * copy of the account's secret key, which gpg_switch_account probes
+ * authoritatively. A missing base or missing/unsafe home yields *present=false.
+ * Sets *present and returns 0; returns -1 only on a bad argument.
+ */
+int gpg_manager_isolated_home_present(const char *account, bool *present);
 
 /**
  * Atomically (re)point the stable GNUPGHOME `current` symlink at `real_home`,

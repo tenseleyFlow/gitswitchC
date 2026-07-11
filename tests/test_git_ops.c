@@ -50,6 +50,16 @@ static int fk_find(const char *scope, const char *key) {
     return -1;
 }
 
+/* A custom runner fully replaces run_argv, so — like the real run_argv_real —
+ * it must publish result->exit_code (WEXITSTATUS), not just a return value:
+ * git_unset_config_value now inspects res.exit_code to tell "removed"/"absent"
+ * (0/5) from a genuine failure (AR-06 F03). fk_ret() sets it at every exit. */
+static int fk_ret(run_result_t *result, int code) {
+    if (result) result->exit_code = code;
+    /* Mirror run_argv_real's return contract: 0 on clean exit, -1 otherwise. */
+    return code == 0 ? 0 : -1;
+}
+
 static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
                            run_result_t *result) {
     fk_execs++;
@@ -59,36 +69,39 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
     }
 
     if (strcmp(argv[0], "git") != 0 || !argv[1]) {
-        return 1;
+        return fk_ret(result, 1);
     }
 
     if (strcmp(argv[1], "rev-parse") == 0) {
-        return fk_is_repo ? 0 : 1;
+        return fk_ret(result, fk_is_repo ? 0 : 1);
     }
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
         const char *scope = argv[2];
 
-        if (strcmp(argv[3], "--unset") == 0 && argv[4]) {
+        /* Production emits --unset-all (AR-06 F03); accept the legacy spelling
+         * too so the fake stays robust. Removes ALL values of a (possibly
+         * multi-valued) key; exit 5 when the key does not exist. */
+        if ((strcmp(argv[3], "--unset-all") == 0 || strcmp(argv[3], "--unset") == 0) && argv[4]) {
             int i = fk_find(scope, argv[4]);
             if (i < 0) {
-                return 5; /* git: "you try to unset an option which does not exist" */
+                return fk_ret(result, 5); /* git: option does not exist */
             }
             fk_store[i].used = false;
-            return 0;
+            return fk_ret(result, 0);
         }
 
         if (argv[4]) { /* set */
             int i = fk_find(scope, argv[3]);
             if (i < 0) {
                 for (i = 0; i < FK_MAX && fk_store[i].used; i++) {}
-                if (i == FK_MAX) return 1;
+                if (i == FK_MAX) return fk_ret(result, 1);
             }
             snprintf(fk_store[i].scope, sizeof(fk_store[i].scope), "%s", scope);
             snprintf(fk_store[i].key, sizeof(fk_store[i].key), "%s", argv[3]);
             snprintf(fk_store[i].value, sizeof(fk_store[i].value), "%s", argv[4]);
             fk_store[i].used = true;
-            return 0;
+            return fk_ret(result, 0);
         }
 
         /* read */
@@ -97,16 +110,16 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
         }
         int i = fk_find(scope, argv[3]);
         if (i < 0) {
-            return 1;
+            return fk_ret(result, 1);
         }
         if (opts && opts->out && opts->out_size > 0) {
             snprintf(opts->out, opts->out_size, "%s\n", fk_store[i].value);
             if (result) result->out_len = strlen(opts->out);
         }
-        return 0;
+        return fk_ret(result, 0);
     }
 
-    return 1;
+    return fk_ret(result, 1);
 }
 
 /* ---- ssh-1: key path must never carry ssh_config / shell breakouts ------ */
@@ -302,10 +315,10 @@ static int zfk_runner(const char *const argv[], const run_opts_t *opts,
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (strcmp(argv[0], "git") != 0 || !argv[1]) return 1;
+    if (strcmp(argv[0], "git") != 0 || !argv[1]) return fk_ret(result, 1);
 
     if (strcmp(argv[1], "rev-parse") == 0) {
-        return 1; /* not a repository: snapshot covers the global scope only */
+        return fk_ret(result, 1); /* not a repository: snapshot covers global only */
     }
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
@@ -320,16 +333,16 @@ static int zfk_runner(const char *const argv[], const run_opts_t *opts,
                 memcpy(opts->out, lst, n);
                 opts->out[n] = '\0';
                 if (result) result->out_len = n;
-                return 0;
+                return fk_ret(result, 0);
             }
-            return 1;
+            return fk_ret(result, 1);
         }
-        if (strcmp(argv[3], "--unset") == 0 && argv[4]) {
+        if ((strcmp(argv[3], "--unset-all") == 0 || strcmp(argv[3], "--unset") == 0) && argv[4]) {
             if (zfk_unsets < 16) {
                 snprintf(zfk_unset_key[zfk_unsets], sizeof(zfk_unset_key[0]), "%s", argv[4]);
             }
             zfk_unsets++;
-            return 0;
+            return fk_ret(result, 0);
         }
         if (argv[4]) { /* set */
             if (zfk_sets < 16) {
@@ -337,13 +350,13 @@ static int zfk_runner(const char *const argv[], const run_opts_t *opts,
                 snprintf(zfk_set_val[zfk_sets], sizeof(zfk_set_val[0]), "%s", argv[4]);
             }
             zfk_sets++;
-            return 0;
+            return fk_ret(result, 0);
         }
         zfk_fallback_reads++; /* per-key read: only the pre-fix fallback path */
-        return 1;
+        return fk_ret(result, 1);
     }
 
-    return 1;
+    return fk_ret(result, 1);
 }
 
 static int zfk_find_set(const char *key) {
@@ -391,13 +404,15 @@ TEST(rollback_z_parser_survives_embedded_newline) {
     CHECK(is >= 0);
     if (is >= 0) CHECK_STR_EQ(zfk_set_val[is], "ssh -i /k -o IdentitiesOnly=yes");
 
-    /* user.name was captured PRESENT with its full two-line value: restore
-     * offers it to git_set_config_value, whose control-character validation
-     * refuses the exec — so there is neither a user.name write nor a
-     * user.name --unset. A parser truncating at the newline would instead
-     * emit `git config --global user.name Alpha`; one that lost the record
-     * would emit `--unset user.name`. Both are the bug. */
-    CHECK(zfk_find_set("user.name") < 0);
+    /* user.name was captured PRESENT with its full two-line value and is now
+     * RESTORED verbatim (AR-06 F04): the restore path skips is_valid_git_config
+     * _value for snapshot-sourced values, so git's own multi-line value round-
+     * trips instead of being silently dropped (which left the failed switch's
+     * name over the user's original). A parser truncating at the newline would
+     * instead restore just "Alpha"; one that lost the record would `--unset`. */
+    int in = zfk_find_set("user.name");
+    CHECK(in >= 0);
+    if (in >= 0) CHECK_STR_EQ(zfk_set_val[in], "Alpha\nBeta");
     CHECK(!zfk_was_unset("user.name"));
 
     /* Keys absent from the listing were snapshotted absent AND seeded into

@@ -94,10 +94,10 @@ int config_create_default(const char *config_path);
 int config_validate(const gitswitch_ctx_t *ctx);
 
 /**
- * Get configuration file path
- * - Checks environment variables
- * - Falls back to default location
- * - Creates directories if needed
+ * Get the configuration file path (<config dir>/accounts.toml).
+ * Builds the path only — it does NOT read environment variables and does NOT
+ * create any directory (AR-06 F53: the old doc claimed both). Directory
+ * creation is config_init/config_create_default's job.
  */
 int config_get_path(char *path_buffer, size_t buffer_size);
 
@@ -120,6 +120,13 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account);
  * Find account by ID or name/description
  */
 account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier);
+
+/**
+ * Find account by EXACT name only, for the boot-resume path (AR-06 F22): the
+ * persisted active_account is always an exact name and must not be re-resolved
+ * through config_find_account's id-first fuzzy matching.
+ */
+account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name);
 
 /**
  * Parse git scope from string

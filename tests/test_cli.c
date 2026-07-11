@@ -85,11 +85,19 @@ static int write_config(const char *home, const char *body) {
     return chmod(path, 0600);
 }
 
-/* Run a shell command; return the process exit code (or -1 on abnormal exit). */
+/* Run a shell command and return its exit code (0..255). AR-06 F33: a crash or
+ * signal-kill (SIGSEGV/SIGABRT/ASan abort) must NOT masquerade as an ordinary
+ * nonzero failure, or a negative-path `CHECK(rc != 0)` would pass on a broken
+ * binary. Distinguish the outcomes: -(1000+signal) for abnormal termination,
+ * -1 for a system() failure. Negative-path tests assert rc is a genuine
+ * failure exit code (1..125), never one of these sentinels. */
 static int run_shell(const char *cmd) {
     int status = system(cmd);
-    if (status == -1 || !WIFEXITED(status)) {
+    if (status == -1) {
         return -1;
+    }
+    if (!WIFEXITED(status)) {
+        return WIFSIGNALED(status) ? -(1000 + WTERMSIG(status)) : -1;
     }
     return WEXITSTATUS(status);
 }
@@ -164,7 +172,7 @@ TEST(init_fails_when_stdout_is_closed) {
               * supposed failure sink writable on some platforms. */
              "XDG_RUNTIME_DIR='%s' '%s' init bash 1</dev/null 2>/dev/null", rt, g_bin);
     rc = run_shell(cmd);
-    CHECK(rc != 0);
+    CHECK(rc > 0 && rc < 126);
     remove_tree(rt);
 }
 
@@ -182,7 +190,7 @@ TEST(init_fails_on_enospc) {
     snprintf(cmd, sizeof(cmd),
              "XDG_RUNTIME_DIR='%s' '%s' init bash >/dev/full 2>/dev/null", rt, g_bin);
     rc = run_shell(cmd);
-    CHECK(rc != 0);
+    CHECK(rc > 0 && rc < 126);
     remove_tree(rt);
 }
 
@@ -641,7 +649,7 @@ TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont) {
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y reset >'%s' 2>&1",
              home, rt, g_bin, out_path);
     rc = run_shell(cmd);
-    CHECK(rc != 0);
+    CHECK(rc > 0 && rc < 126);
     CHECK(access(done, F_OK) != 0);
     CHECK(strstr(slurp(out_path, out, sizeof(out)),
                  "Another gitswitch holds the config lock") != NULL);
@@ -654,7 +662,7 @@ TEST(mutating_commands_fail_fast_on_config_lock_readonly_dont) {
              "printf 'y\\n' | HOME='%s' XDG_RUNTIME_DIR='%s' '%s' config >'%s' 2>&1",
              home, rt, g_bin, out_path);
     rc = run_shell(cmd);
-    CHECK(rc != 0);
+    CHECK(rc > 0 && rc < 126);
     CHECK(access(done, F_OK) != 0);
     CHECK(access(config_path, F_OK) != 0);
     CHECK(strstr(slurp(out_path, out, sizeof(out)),
@@ -1084,7 +1092,7 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
         "newacct\nn@example.com\ndesc\n\n\n\n", stdin_path, sizeof(stdin_path)), 0);
     snprintf(out_path, sizeof(out_path), "%s/add.out", rt);
     rc = run_add(home, rt, stdin_path, out_path);
-    CHECK(rc != 0);                                /* pre-fix: 0 */
+    CHECK(rc > 0 && rc < 126);                                /* pre-fix: 0 */
     slurp(toml_path, buf, sizeof(buf));
     CHECK(strstr(buf, "newacct") == NULL);
     slurp(out_path, buf, sizeof(buf));
@@ -1094,7 +1102,8 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y remove good >/dev/null 2>&1",
              home, rt, g_bin);
-    CHECK(run_shell(cmd) != 0);
+    rc = run_shell(cmd);
+    CHECK(rc > 0 && rc < 126);
     slurp(toml_path, buf, sizeof(buf));
     CHECK(strstr(buf, "\"good\"") != NULL);        /* nothing was rewritten */
 
@@ -1157,7 +1166,7 @@ TEST(switch_save_failure_exits_nonzero) {
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y solo </dev/null >'%s' 2>&1",
              home, rt, g_bin, err_path);
     rc = run_shell(cmd);
-    CHECK(rc != 0);                                 /* pre-fix: 0 */
+    CHECK(rc > 0 && rc < 126);                                 /* pre-fix: 0 */
     slurp(err_path, buf, sizeof(buf));
     CHECK(strstr(buf, "Failed to save configuration changes") != NULL);
 

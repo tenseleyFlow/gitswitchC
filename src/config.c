@@ -92,6 +92,7 @@ static bool sanitize_tty_text(char *text);
 static bool text_is_tty_safe(const char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
+static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
@@ -224,6 +225,15 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
         return -1;
     }
 
+    /* AR-06 F49: these are cumulative counters that load_accounts_from_toml and
+     * count_unknown_keys only ever increment. A reload on an already-populated
+     * ctx (e.g. after a save, or a second config_load) would otherwise carry the
+     * previous load's counts forward and wrongly refuse a rewrite. Reset them
+     * for this fresh load. */
+    ctx->accounts_skipped_on_load = 0;
+    ctx->unknown_sections_on_load = 0;
+    ctx->unknown_keys_on_load = 0;
+
     if (config_read_document(config_path, &toml_doc) != 0) {
         toml_cleanup_document(&toml_doc);
         return -1;
@@ -254,6 +264,10 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
         toml_cleanup_document(&toml_doc);
         return -1;
     }
+
+    /* AR-06 F02: also detect unmodeled KEYS inside recognized sections, so a
+     * full rewrite is refused before it silently erases them. */
+    count_unknown_keys(ctx, &toml_doc);
 
     /* Store config path */
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
@@ -660,8 +674,30 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_check_rewritable");
         return -1;
     }
-    if (ctx->accounts_skipped_on_load == 0 && ctx->unknown_sections_on_load == 0) {
+    if (ctx->accounts_skipped_on_load == 0 && ctx->unknown_sections_on_load == 0 &&
+        ctx->unknown_keys_on_load == 0) {
         return 0;
+    }
+    /* AR-06 F02: unmodeled keys inside recognized sections are erased by a full
+     * rewrite too. Report them explicitly; they can coexist with the other two
+     * conditions, so handle them first. */
+    if (ctx->unknown_keys_on_load > 0 &&
+        ctx->accounts_skipped_on_load == 0 && ctx->unknown_sections_on_load == 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "%zu unrecognized key(s) inside recognized section(s) of %s would be lost "
+                  "by a rewrite (gitswitch re-emits only the keys it models). Remove or fix "
+                  "them, then retry.",
+                  ctx->unknown_keys_on_load, ctx->config.config_path);
+        return -1;
+    }
+    if (ctx->unknown_keys_on_load > 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "%zu account section(s) failed to load, %zu unrecognized section(s), and "
+                  "%zu unrecognized key(s) exist in %s; rewriting the file would erase them. "
+                  "Fix or remove them, then retry.",
+                  ctx->accounts_skipped_on_load, ctx->unknown_sections_on_load,
+                  ctx->unknown_keys_on_load, ctx->config.config_path);
+        return -1;
     }
     if (ctx->accounts_skipped_on_load > 0 && ctx->unknown_sections_on_load > 0) {
         set_error(ERR_CONFIG_INVALID,
@@ -837,15 +873,31 @@ int config_create_default(const char *config_path) {
         return -1;
     }
 
-    /* Write default template */
-    if (fwrite(default_config_template, 1, strlen(default_config_template), file) != 
+    /* Write default template. On failure unlink the final path (AR-06 F18): the
+     * old path left a truncated accounts.toml behind that bricked every later
+     * command (unlike the fdopen-failure path just above, which unlinks). */
+    if (fwrite(default_config_template, 1, strlen(default_config_template), file) !=
         strlen(default_config_template)) {
         set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to write default config content");
         fclose(file);
+        unlink(config_path);
         return -1;
     }
-    
-    fclose(file);
+
+    /* Durable, CHECKED close (AR-06 F18): stdio buffers the write, so ENOSPC/EIO
+     * often surface only at flush/close. The old bare fclose could report
+     * success with a truncated config. */
+    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to flush default config to disk");
+        fclose(file);
+        unlink(config_path);
+        return -1;
+    }
+    if (fclose(file) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to close default config file");
+        unlink(config_path);
+        return -1;
+    }
 
     log_info("Created default configuration file: %s", config_path);
     return 0;
@@ -1018,6 +1070,29 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
  * identity. Precedence: numeric id -> exact name -> exact email -> unambiguous
  * substring of name/description. A substring that matches more than one account
  * is rejected as ambiguous (rather than silently returning the first). */
+/* Exact-name lookup only (AR-06 F22). config.active_account is always stored as
+ * an exact account name, but config_find_account resolves numeric-ID FIRST — so
+ * a legacy all-digit account name (e.g. "2") persisted as the active account
+ * would resume a DIFFERENT account whose id is 2. The boot-resume path must
+ * resolve the persisted name literally, never through the id-first fuzzy
+ * matcher. */
+account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name) {
+    if (!ctx || !name || !*name) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        /* AR-06 F45: account-name uniqueness is enforced case-INsensitively
+         * (config_add_account), so the active-account resolve must match the
+         * same way. A hand-edited active_account differing only in case (e.g.
+         * "work" vs "Work") is still an unambiguous reference to the one
+         * account, and strcmp would wrongly fail the resume. */
+        if (strcasecmp(ctx->accounts[i].name, name) == 0) {
+            return &ctx->accounts[i];
+        }
+    }
+    return NULL;
+}
+
 account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
     char *endptr;
     unsigned long account_id;
@@ -1218,21 +1293,47 @@ int config_backup(const char *config_path) {
         snprintf(timestamp, sizeof(timestamp), "%ld", (long)now);
     }
     
-    /* Create backup path */
-    if ((size_t)snprintf(backup_path, sizeof(backup_path), "%s.backup.%s", 
-                        config_path, timestamp) >= sizeof(backup_path)) {
-        set_error(ERR_INVALID_ARGS, "Backup path too long");
-        return -1;
-    }
-    
     /* Copy without following symlinks on either end (cfg-symlink-01): a
      * symlinked accounts.toml would otherwise be read through (copying
      * another user's file into a backup we own), and the timestamped backup
      * name is predictable enough for an attacker to plant a symlink at it and
      * redirect the write. The destination is created O_EXCL with mode 0600,
-     * so no separate chmod (and no loose-permission window) is needed. */
-    if (copy_file_nofollow(config_path, backup_path) != 0) {
-        return -1;
+     * so no separate chmod (and no loose-permission window) is needed.
+     *
+     * AR-06 F46/F47: the backup name has one-second granularity, so two saves
+     * in the same second collided on the O_EXCL create — the second backup
+     * silently vanished (EEXIST), leaving the pre-change state un-backed-up for
+     * exactly the back-to-back edits most likely to need it. Disambiguate with
+     * an incrementing suffix until an unused name is found. */
+    {
+        int rc = -1;
+        for (int i = 0; i < 1000; i++) {
+            int need;
+            if (i == 0) {
+                need = snprintf(backup_path, sizeof(backup_path), "%s.backup.%s",
+                                config_path, timestamp);
+            } else {
+                need = snprintf(backup_path, sizeof(backup_path), "%s.backup.%s_%d",
+                                config_path, timestamp, i);
+            }
+            if (need < 0 || (size_t)need >= sizeof(backup_path)) {
+                set_error(ERR_INVALID_ARGS, "Backup path too long");
+                return -1;
+            }
+            errno = 0;
+            rc = copy_file_nofollow(config_path, backup_path);
+            if (rc == 0) {
+                break;
+            }
+            if (errno != EEXIST) {
+                return -1; /* a real I/O/permission failure, not a name clash */
+            }
+        }
+        if (rc != 0) {
+            set_error(ERR_FILE_IO,
+                      "Could not find a free backup name for %s", config_path);
+            return -1;
+        }
     }
 
     log_info("Created configuration backup: %s", backup_path);
@@ -1428,8 +1529,13 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path) {
      * a pre-planted backup destination cannot redirect the write. */
     dfd = open(dst_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (dfd < 0) {
+        /* Preserve the create errno (esp. EEXIST) across set_system_error/close
+         * so callers can distinguish a name collision from a real failure and
+         * retry with a fresh name (AR-06 F46/F47). */
+        int saved = errno;
         set_system_error(ERR_FILE_IO, "Cannot create backup file: %s", dst_path);
         close(sfd);
+        errno = saved;
         return -1;
     }
 
@@ -1634,6 +1740,58 @@ static field_state_t get_account_field(const toml_document_t *doc, const char *s
 }
 
 /* Load accounts from TOML document */
+/* AR-06 F02: is `key` one gitswitch models inside recognized `section`? Keys
+ * that aren't are re-emitted by nothing on the next config_save (which rebuilds
+ * from settings + the in-memory accounts), so an unmodeled key — a typo like
+ * `ssh_kye`, or a key a newer version wrote before a downgrade — is silently
+ * dropped. The set mirrors exactly what load_accounts_from_toml and the
+ * settings loader read. */
+static bool config_key_is_modeled(const char *section, const char *key) {
+    if (strcmp(section, "settings") == 0) {
+        return strcmp(key, "default_scope") == 0 ||
+               strcmp(key, "active_account") == 0;
+    }
+    /* An [accounts.<id>] section. */
+    static const char *const account_keys[] = {
+        "name", "email", "description", "preferred_scope",
+        "ssh_key", "ssh_host", "gpg_key", "gpg_signing_enabled", NULL
+    };
+    for (size_t i = 0; account_keys[i]; i++) {
+        if (strcmp(key, account_keys[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Count unmodeled keys inside recognized sections into unknown_keys_on_load and
+ * warn per key, so config_check_rewritable blocks a full rewrite that would
+ * erase them — symmetric with the AR-03 M8 unknown-SECTION treatment, one level
+ * down (AR-06 F02). Unknown SECTIONS are handled separately in
+ * load_accounts_from_toml. */
+static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc) {
+    for (size_t s = 0; s < doc->section_count; s++) {
+        const toml_section_t *sec = &doc->sections[s];
+        bool recognized = (strcmp(sec->name, "settings") == 0) ||
+                          string_starts_with(sec->name, "accounts.");
+        if (!recognized) {
+            continue; /* an unknown section: already counted elsewhere */
+        }
+        for (size_t k = 0; k < sec->key_count && k < TOML_MAX_KEYS_PER_SECTION; k++) {
+            if (!sec->keys[k].is_set) {
+                continue;
+            }
+            if (!config_key_is_modeled(sec->name, sec->keys[k].key)) {
+                ctx->unknown_keys_on_load++;
+                display_warning("Unrecognized key '%s' in section [%s] of the config file. "
+                                "It is preserved for now, but account changes are blocked "
+                                "until you remove it — a full save would erase it.",
+                                sec->keys[k].key, sec->name);
+            }
+        }
+    }
+}
+
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc) {
     char sections[TOML_MAX_SECTIONS][TOML_MAX_SECTION_LEN];
     size_t section_count;

@@ -1,9 +1,10 @@
 /* Minimal dependency-free test harness for gitswitch-c.
  *
  * Each test file defines tests with TEST(), registers them in main() via
- * RUN_TEST(), and returns the failure count as its exit code so the Makefile
- * `test` target fails the build on any failure. CHECK* macros are non-fatal
- * (they record a failure but let the rest of the test run). */
+ * RUN_TEST(), and exits 0 when every test passed or 1 if any failed (AR-06 F79:
+ * it is a boolean status, not the failure count), so the Makefile `test` target
+ * fails the build on any failure. CHECK* macros are non-fatal (they record a
+ * failure but let the rest of the test run). */
 #ifndef GITSWITCH_TEST_H
 #define GITSWITCH_TEST_H
 

@@ -7,6 +7,14 @@
 
 #include "gitswitch.h"
 
+/* AR-06 F29: the host-alias reader/writer once hard-capped ~/.ssh/config at
+ * 64 KiB and failed the whole switch for any account with an alias when the
+ * user's config was larger. The buffers are now heap-sized to the file; this
+ * ceiling only guards against a pathological/hostile giant file and is set well
+ * beyond any realistic ssh config. Shared by the writer (ssh_manager.c) and the
+ * switch preflight (accounts.c) so the two never disagree. */
+#define GITSWITCH_SSH_CONFIG_MAX_BYTES (8u * 1024u * 1024u)
+
 /* SSH agent management modes */
 typedef enum {
     SSH_AGENT_SYSTEM,      /* Use system SSH agent */
@@ -103,6 +111,13 @@ int ssh_validate_key_file(const char *key_path);
  * Set SSH host alias in ~/.ssh/config if specified
  */
 int ssh_configure_host_alias(const account_t *account);
+
+/**
+ * Remove the managed host-alias block for `alias` from ~/.ssh/config (AR-06
+ * F15). No-op if the config or the block is absent. Returns 0 on success
+ * (including no-op), -1 on I/O failure.
+ */
+int ssh_remove_host_alias(const char *alias);
 
 /**
  * Test SSH connection to verify authentication

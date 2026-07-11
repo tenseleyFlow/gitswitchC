@@ -2,3 +2,9 @@ build/*
 CLAUDE.md
 .fackr/
 .docs/
+.claude/
+# AR-06 F39: `make dist` writes gitswitcher-<version>.tar.gz into the tree;
+# never commit release tarballs (two historical ones were), and keep valgrind
+# logs from `make memcheck` out of git too.
+*.tar.gz
+valgrind-*.log

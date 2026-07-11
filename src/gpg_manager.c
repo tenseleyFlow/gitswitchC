@@ -38,6 +38,13 @@
 #include "git_ops.h"
 #include "signals.h"
 
+/* When set, gpg_get_base_dir suppresses the "XDG_RUNTIME_DIR unset / not
+ * memory-backed" display_warning. `gitswitch init` toggles this while it
+ * computes the GNUPGHOME path, because that warning goes to STDOUT and would
+ * otherwise be eval'd by the shell as a command (AR-06 F08). The warning still
+ * fires on a real switch (a separate process; the latch is per-process). */
+static bool g_gpg_suppress_base_warning = false;
+
 /* Internal helper functions */
 static int gpg_get_base_dir(char *buf, size_t size);
 static int gpg_prepare_base_dir(char *base, size_t size);
@@ -68,6 +75,7 @@ static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
                                         int base_fd, const char *base,
                                         int *home_fd_out);
 static int gpg_validate_pinned_home(const gpg_pinned_home_t *home);
+static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_validate_key_pinned(gpg_config_t *gpg_config,
                                    const gpg_pinned_home_t *home,
                                    const char *key_id);
@@ -526,8 +534,8 @@ static int gpg_get_base_dir(char *buf, size_t size) {
     written = snprintf(buf, size, "%s/%s", runtime_parent, child);
     if (strcmp(runtime_parent, "/tmp") == 0) {
         static bool warned = false;
-        if (!warned && written > 0 && (size_t)written < size &&
-            !base_memory_backed_cached(buf)) {
+        if (!warned && !g_gpg_suppress_base_warning && written > 0 &&
+            (size_t)written < size && !base_memory_backed_cached(buf)) {
             warned = true;
             display_warning("XDG_RUNTIME_DIR is unset; isolated GPG homes will use "
                             "%s, which is not memory-backed. Exported "
@@ -595,6 +603,19 @@ int gpg_manager_get_home_path(char *buf, size_t size) {
         return -1;
     }
     return 0;
+}
+
+/* Same as gpg_manager_get_home_path but suppresses the not-memory-backed
+ * stdout warning (AR-06 F08): `gitswitch init`'s stdout is a serialization
+ * boundary consumed by `eval`, so any diagnostic printed there becomes a bogus
+ * shell command. The warning is still emitted on real GPG operations. */
+int gpg_manager_get_home_path_quiet(char *buf, size_t size) {
+    bool prev = g_gpg_suppress_base_warning;
+    int rc;
+    g_gpg_suppress_base_warning = true;
+    rc = gpg_manager_get_home_path(buf, size);
+    g_gpg_suppress_base_warning = prev;
+    return rc;
 }
 
 /* Acquire an exclusive, blocking flock on <base>/.lock, serializing every
@@ -859,11 +880,36 @@ static int gpg_read_current_locked(int base_fd, const char *base,
  * may have remove_tree'd it since. Installing the link anyway would point
  * every `gitswitch init` shell at a missing keyring while the switch reports
  * success; fail closed and leave the link alone instead. */
+/* AR-06 F41: revert a failed retarget without destroying the previous entry
+ * point. The atomic rename already replaced `current`, so a bare unlink would
+ * leave every GNUPGHOME=<base>/current shell dangling while the caller (seeing
+ * failure with gpg_dirty=false) never restores it. Instead, when `current` is
+ * still the exact link this call installed, put back the target that was there
+ * before the retarget (or drop it if there was none). dev/ino-guarded so a
+ * racing same-uid writer's replacement is never clobbered. */
+static void gpg_revert_retarget(int base_fd, const struct stat *installed,
+                                bool prev_existed, const char *prev_target) {
+    struct stat now;
+
+    if (fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) != 0 ||
+        now.st_dev != installed->st_dev || now.st_ino != installed->st_ino ||
+        !S_ISLNK(now.st_mode)) {
+        return; /* someone else owns `current` now; leave their state */
+    }
+    if (prev_existed) {
+        (void)atomic_symlink_at(base_fd, prev_target, "current");
+    } else {
+        (void)unlinkat(base_fd, "current", 0);
+    }
+}
+
 static int gpg_retarget_current_locked(int base_fd, const char *base,
                                        const char *real_home) {
     char link_path[MAX_PATH_LEN];
     char committed_target[MAX_PATH_LEN];
+    char prev_target[MAX_PATH_LEN];
     struct stat committed;
+    bool prev_existed;
     int live_rc;
 
     if (!gpg_target_is_managed_child(base, real_home)) {
@@ -885,6 +931,12 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
     if (gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0) {
         return -1;
     }
+
+    /* Capture the target `current` names right now, before the atomic rename
+     * overwrites it, so a failed retarget can restore it (AR-06 F41). A
+     * malformed/absent link means there is nothing to restore. */
+    prev_existed = (gpg_read_current_locked(base_fd, base, prev_target,
+                                            sizeof(prev_target)) == 0);
 
     /* Atomically retarget (temp symlink + rename) so a follower never sees a
      * missing or half-updated link. */
@@ -914,38 +966,22 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
         strcmp(committed_target, real_home) != 0 ||
         fstatat(base_fd, "current", &committed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !S_ISLNK(committed.st_mode) || committed.st_uid != getuid()) {
-        /* Mirror the sibling failure blocks: if `current` is still the exact
-         * link this call installed, remove it so a reported-failure retarget
-         * never leaves the stable entry point moved. dev/ino-guarded so a
-         * racing same-uid writer's replacement is never clobbered. */
-        struct stat now;
-        if (have_installed &&
-            fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) == 0 &&
-            now.st_dev == installed.st_dev && now.st_ino == installed.st_ino &&
-            S_ISLNK(now.st_mode)) {
-            (void)unlinkat(base_fd, "current", 0);
+        /* Restore the pre-retarget target so a reported-failure retarget never
+         * leaves the stable entry point moved OR destroyed (AR-06 F41). */
+        if (have_installed) {
+            gpg_revert_retarget(base_fd, &installed, prev_existed, prev_target);
         }
         set_error(ERR_FILE_IO,
                   "Cannot verify committed GNUPGHOME link: %s", link_path);
         return -1;
     }
     if (g_retarget_commit_hook && g_retarget_commit_hook(base_fd) != 0) {
-        struct stat now;
         set_error(ERR_FILE_IO, "GPG retarget commit hook failed");
-        if (fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) == 0 &&
-            now.st_dev == committed.st_dev && now.st_ino == committed.st_ino &&
-            S_ISLNK(now.st_mode)) {
-            (void)unlinkat(base_fd, "current", 0);
-        }
+        gpg_revert_retarget(base_fd, &committed, prev_existed, prev_target);
         return -1;
     }
     if (gpg_live_private_home(base_fd, base, real_home) != 0) {
-        struct stat now;
-        if (fstatat(base_fd, "current", &now, AT_SYMLINK_NOFOLLOW) == 0 &&
-            now.st_dev == committed.st_dev && now.st_ino == committed.st_ino &&
-            S_ISLNK(now.st_mode)) {
-            (void)unlinkat(base_fd, "current", 0);
-        }
+        gpg_revert_retarget(base_fd, &committed, prev_existed, prev_target);
         return -1;
     }
 
@@ -1630,6 +1666,46 @@ reset_unlock:
     return 0;
 }
 
+/* AR-06 F17: report whether a safe isolated GPG home already exists for
+ * `account`. The switch preflight uses this to treat the system keyring as a
+ * key SOURCE, not a hard gate: when the isolated home is present, the account's
+ * secret key may live only there (e.g. the user deleted it from the system
+ * keyring after a prior switch), and gpg_switch_account probes that home
+ * authoritatively. A missing base or missing/unsafe child home reports
+ * *present=false so a first-time switch still requires the system keyring. */
+int gpg_manager_isolated_home_present(const char *account, bool *present) {
+    char base[MAX_PATH_LEN];
+    bool absent = false;
+    int base_fd;
+    struct stat st;
+
+    if (!account || !*account || !present) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid arguments to gpg_manager_isolated_home_present");
+        return -1;
+    }
+    *present = false;
+    if (!validate_name(account)) {
+        set_error(ERR_INVALID_ARGS, "Invalid account name: %s", account);
+        return -1;
+    }
+    if (gpg_get_base_dir(base, sizeof(base)) != 0) {
+        return -1;
+    }
+    base_fd = gpg_open_base_dir(base, sizeof(base), false, &absent);
+    if (base_fd < 0) {
+        /* No base yet is a normal first-run state, not an error. */
+        return absent ? 0 : -1;
+    }
+    if (fstatat(base_fd, account, &st, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISDIR(st.st_mode) && st.st_uid == getuid() &&
+        (st.st_mode & 077) == 0) {
+        *present = true;
+    }
+    close(base_fd);
+    return 0;
+}
+
 /* Compute, policy-check, and create the base directory for isolated
  * GNUPGHOMEs (shared with the stable `current` symlink path so the two never
  * disagree). Split out of gpg_create_isolated_home so gpg_switch_account can
@@ -2265,7 +2341,13 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         return -1;
     }
 
-    /* Export the secret key from the SYSTEM keyring (no GNUPGHOME override).
+    /* Export the secret key from the SYSTEM keyring. GNUPGHOME is overridden to
+     * the user's REAL keyring home (AR-06 F05/F06): `gitswitch init` exports
+     * GNUPGHOME=<base>/current into interactive shells, and a bare export would
+     * inherit that managed value and read the previously-active account's
+     * isolated home — where a different account's key does not exist — failing
+     * closed with a misleading "key not found". gpg_user_source_home() rejects a
+     * managed GNUPGHOME and falls back to $HOME/.gnupg.
      * key_data now holds unencrypted armored private-key material, so every
      * exit below must scrub it (secure_zero_memory) before freeing — a plain
      * free would leave the key in heap memory for a later allocation, core
@@ -2276,10 +2358,18 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
      * corrupt it. */
     {
         const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys", key_id, NULL};
+        char source_home[MAX_PATH_LEN];
+        char source_env_str[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
+        const char *export_env[2] = {NULL, NULL};
         memset(&opts, 0, sizeof(opts));
         opts.out = key_data;
         opts.out_size = KEY_DATA_CAP;
         opts.stderr_to_devnull = true;
+        if (gpg_user_source_home(source_home, sizeof(source_home)) == 0) {
+            snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
+            export_env[0] = source_env_str;
+            opts.extra_env = export_env;
+        }
         if (run_argv(export_argv, &opts, &res) != 0 || res.out_len == 0) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
@@ -2412,6 +2502,16 @@ static int gpg_user_source_home(char *buf, size_t size) {
         return -1;
     }
     return ((size_t)snprintf(buf, size, "%s/.gnupg", home) < size) ? 0 : -1;
+}
+
+/* Public wrapper (AR-06 F05/F06): callers outside this TU (accounts.c's
+ * system-keyring availability probe) need the same real-home resolution the
+ * export path uses, so they can override an inherited managed GNUPGHOME. */
+int gpg_manager_system_keyring_home(char *buf, size_t size) {
+    if (!buf || size == 0) {
+        return -1;
+    }
+    return gpg_user_source_home(buf, size);
 }
 
 /* Set up gpg-agent.conf for the isolated environment.

@@ -230,7 +230,10 @@ static void restore_previous_gpg_isolation(const char *prev_gpg_home,
  * check-then-rename restoration path entirely. The final writer repeats these
  * no-follow and identity checks immediately before its atomic rename. */
 static int ssh_user_config_preflight(const account_t *account) {
-    enum { SSH_CONFIG_MAX_BYTES = 65535 };
+    /* AR-06 F29: the writer now heap-sizes the config, so the preflight ceiling
+     * is the same generous shared limit rather than the old 64 KiB cap that
+     * failed the whole switch for any larger-but-valid config. */
+    const size_t SSH_CONFIG_MAX_BYTES = GITSWITCH_SSH_CONFIG_MAX_BYTES;
     char path[MAX_PATH_LEN];
     char chunk[4096];
     struct stat before;
@@ -342,8 +345,14 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
     }
     /* Undo the new account's half-applied SSH/GPG activation: leaving
      * current.sock / GNUPGHOME pointed at the new account while the git
-     * identity reverts is exactly the mixed identity the tool prevents. */
-    deactivate_runtime_isolation(ssh_dirty, false);
+     * identity reverts is exactly the mixed identity the tool prevents. AR-06
+     * F42: surface a teardown failure (a surviving new-account agent) instead
+     * of discarding it — rollback is best-effort (the durable git identity was
+     * already restored), so warn rather than abort. */
+    if (deactivate_runtime_isolation(ssh_dirty, false) != 0) {
+        log_warning("Incomplete rollback of the new account's SSH state: %s",
+                    get_last_error()->message);
+    }
     /* Restore GPG with compare-and-swap semantics so rollback cannot clobber
      * a later writer, then reactivate the previous SSH agent (F4). */
     restore_previous_gpg_isolation(prev_gpg_home, prev_gpg_present, gpg_dirty);
@@ -374,8 +383,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         return -1;
     }
 
-    /* Find the account */
-    account = config_find_account(ctx, identifier);
+    /* Find the account. On the boot-resume path the identifier is the persisted
+     * exact name, so resolve it literally (AR-06 F22) — the id-first fuzzy
+     * matcher could otherwise re-resolve a legacy all-digit name to a different
+     * account whose id matches. Interactive switches keep the fuzzy matcher. */
+    account = ctx->config.resuming
+        ? config_find_account_exact(ctx, identifier)
+        : config_find_account(ctx, identifier);
     if (!account) {
         set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: %s", identifier);
         return -1;
@@ -408,7 +422,15 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
             scope = GIT_SCOPE_LOCAL;
         }
         if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
-            if (isatty(STDIN_FILENO)) {
+            if (ctx->config.dry_run) {
+                /* AR-06 F44: a preview must not run the interactive
+                 * global-scope consent prompt (or abort) — nothing is being
+                 * written. State what a real switch would require and preview
+                 * the local scope the account actually prefers. */
+                printf("Note: not in a git repository — a real switch would prompt to write\n"
+                       "      %s's identity to your GLOBAL git config, or require --global.\n",
+                       account->name);
+            } else if (isatty(STDIN_FILENO)) {
                 char resp[16];
                 printf("Not in a git repository. Write %s's identity to your GLOBAL git\n"
                        "config (affects every repository on this machine)? [y/N]: ",
@@ -508,11 +530,24 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
          * recreated isolated home, which would make this "system keyring"
          * check look inside the missing home and wrongly hard-fail the resume. */
         if (write_git && account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+            /* AR-06 F17: the system keyring is a key SOURCE, not the sole gate.
+             * When an isolated home already exists for this account the key may
+             * live only there (e.g. removed from the system keyring after an
+             * earlier switch), and gpg_switch_account probes that home
+             * authoritatively. Only require the system keyring when no isolated
+             * home is present — preserving the pre-mutation fast-fail for a
+             * genuine first-time switch to a key that exists nowhere. */
             if (validate_gpg_key_availability(account->gpg_key_id) != 0) {
-                set_error(ERR_GPG_KEY_NOT_FOUND,
-                          "GPG key not found in keyring: %s", account->gpg_key_id);
-                runtime_state_lock_release(runtime_lock_fd);
-                return -1;
+                bool isolated_present = false;
+                if (gpg_manager_isolated_home_present(account->name,
+                                                      &isolated_present) != 0 ||
+                    !isolated_present) {
+                    set_error(ERR_GPG_KEY_NOT_FOUND,
+                              "GPG key not found in keyring: %s",
+                              account->gpg_key_id);
+                    runtime_state_lock_release(runtime_lock_fd);
+                    return -1;
+                }
             }
         }
 
@@ -853,8 +888,13 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
             printf("  [--] DRY RUN: Would load SSH key\n");
         }
+        /* AR-06 F44: report the signing state accurately. A GPG account
+         * enables commit signing; a non-GPG account DISABLES it (git_set_config
+         * writes commit.gpgsign=false), which the old preview never mentioned. */
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-            printf("  [--] DRY RUN: Would enable GPG signing\n");
+            printf("  [--] DRY RUN: Would enable GPG commit signing\n");
+        } else {
+            printf("  [--] DRY RUN: Would disable GPG commit signing\n");
         }
     }
 
@@ -936,7 +976,9 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
         acct = original;
         editing_active = (existing == ctx->current_account) ||
                          (ctx->config.active_account[0] != '\0' &&
-                          strcmp(ctx->config.active_account, original.name) == 0);
+                          /* AR-06 F45: case-insensitive to match the
+                           * case-insensitive name uniqueness invariant. */
+                          strcasecmp(ctx->config.active_account, original.name) == 0);
     } else {
         memset(&original, 0, sizeof(original));
         memset(&acct, 0, sizeof(acct));
@@ -1131,6 +1173,13 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
         printf("[ERROR]: Account validation failed: Invalid name or email\n");
         return -1;
     }
+    /* AR-06 F26: refuse a name that shadows a command keyword or is purely
+     * numeric — it could never be switched to by name. */
+    if (name_is_reserved_for_commands(acct.name)) {
+        printf("[ERROR]: '%s' is a reserved command keyword or a numeric ID and "
+               "cannot be used as an account name.\n", acct.name);
+        return -1;
+    }
 
     /* Summary + confirm (--yes skips the prompt). */
     printf("\nAccount Summary:\n");
@@ -1172,6 +1221,43 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
                       "switch away or reset it, then rerun edit",
                       original.name);
             return -1;
+        }
+
+        /* AR-06 F16: a non-active account's runtime resources are keyed by
+         * name (the isolated GNUPGHOME <base>/<name> holding an exported
+         * secret-key copy, and the per-account ssh-agent) and by alias (the
+         * managed ~/.ssh/config host stanza). Renaming/aliasing in place would
+         * orphan them under the old key, so a later targeted reset/remove under
+         * the new name would silently miss them. Retire the old identity before
+         * committing the rename. The active account can't reach here — its live
+         * fields (name included) are frozen by the guard above. */
+        bool name_changed = (strcmp(original.name, acct.name) != 0);
+        bool alias_changed =
+            (strcmp(original.ssh_host_alias, acct.ssh_host_alias) != 0);
+        if (name_changed) {
+            int rt_fd = runtime_state_lock_acquire();
+            if (rt_fd < 0) {
+                return -1;
+            }
+            int s_rc = ssh_manager_reset(original.name);
+            int g_rc = gpg_manager_reset(original.name);
+            runtime_state_lock_release(rt_fd);
+            if (s_rc != 0 || g_rc != 0) {
+                set_error(ERR_SYSTEM_CALL,
+                          "Cannot rename '%s' to '%s': runtime teardown of the "
+                          "old identity failed; the account is unchanged",
+                          original.name, acct.name);
+                return -1;
+            }
+        }
+        /* A changed alias orphans the old managed host-alias block (edit never
+         * rewrites it; only switch does, and switch now uses the new alias).
+         * Best-effort: a stale stanza is visible, not silent. */
+        if (alias_changed && original.ssh_host_alias[0] != '\0' &&
+            ssh_remove_host_alias(original.ssh_host_alias) != 0) {
+            log_warning("Could not remove stale ~/.ssh/config host-alias block "
+                        "for '%s': %s", original.ssh_host_alias,
+                        get_last_error()->message);
         }
 
         *existing = acct;
@@ -1271,13 +1357,21 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (safe_strncpy(account_name, account->name, sizeof(account_name)) != 0) {
         return -1;
     }
+    /* Capture the managed SSH host alias before teardown so it can be removed
+     * from ~/.ssh/config after the account is gone (AR-06 F15). */
+    char removed_alias[MAX_NAME_LEN];
+    removed_alias[0] = '\0';
+    safe_strncpy(removed_alias, account->ssh_host_alias, sizeof(removed_alias));
     account_id = account->id;
     had_current = (ctx->current_account != NULL);
     if (had_current) {
         current_id = ctx->current_account->id;
     }
     was_current = (ctx->current_account == account);
-    was_active = (strcmp(ctx->config.active_account, account_name) == 0);
+    /* AR-06 F45: case-insensitive, matching the name-uniqueness invariant, so
+     * removing the active account always clears active_account even when its
+     * persisted spelling differs only in case. */
+    was_active = (strcasecmp(ctx->config.active_account, account_name) == 0);
 
     /* Tear down while the account name still exists as a retry handle. Both
      * managers are attempted; any failure retains the account/current/active
@@ -1336,7 +1430,16 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (was_active) {
         ctx->config.active_account[0] = '\0';
     }
-    
+
+    /* Remove the managed ~/.ssh/config host-alias block so git traffic no
+     * longer routes to the deleted account's key (AR-06 F15). Best-effort: the
+     * account is already gone from config, so a failure here only leaves a
+     * stale (visible) stanza — warn rather than fail the whole removal. */
+    if (removed_alias[0] != '\0' && ssh_remove_host_alias(removed_alias) != 0) {
+        log_warning("Could not remove ~/.ssh/config host-alias block for '%s': %s",
+                    removed_alias, get_last_error()->message);
+    }
+
     printf("[OK]: Account removed successfully.\n");
     return 0;
 }
@@ -1700,10 +1803,15 @@ static int validate_ssh_key_security(const char *ssh_key_path) {
 }
 
 /* Validate GPG key availability.
- * Deliberately checks the *system* keyring (no GNUPGHOME override): this is the
- * fallback sanity check run from accounts_switch() when the isolated GPG path
- * did not already confirm the key (gpg_ok), and during health checks. The
- * isolated-home validation lives in gpg_validate_key()/gpg_test_signing(). */
+ * Checks the *system* keyring — but with an explicit GNUPGHOME override to the
+ * user's REAL keyring home (AR-06 F05/F06). `gitswitch init` exports
+ * GNUPGHOME=<base>/current into interactive shells; without the override this
+ * probe would inherit that managed value and list the previously-active
+ * account's isolated home, hard-failing every cross-account switch with a
+ * misleading "key not found". This is the fallback sanity check run from
+ * accounts_switch() when the isolated GPG path did not already confirm the key
+ * (gpg_ok), and during health checks. The isolated-home validation lives in
+ * gpg_validate_key()/gpg_test_signing(). */
 static int validate_gpg_key_availability(const char *gpg_key_id) {
     if (!gpg_key_id) {
         return -1;
@@ -1718,8 +1826,16 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
     /* Look up the key in the system keyring, no shell. */
     const char *argv[] = {"gpg", "--list-secret-keys", gpg_key_id, NULL};
     run_opts_t opts;
+    char source_home[MAX_PATH_LEN];
+    char source_env_str[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
+    const char *source_env[2] = {NULL, NULL};
     memset(&opts, 0, sizeof(opts));
     opts.stderr_to_devnull = true;
+    if (gpg_manager_system_keyring_home(source_home, sizeof(source_home)) == 0) {
+        snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
+        source_env[0] = source_env_str;
+        opts.extra_env = source_env;
+    }
 
     if (run_argv(argv, &opts, NULL) != 0) {
         log_debug("GPG key %s not found in keyring", gpg_key_id);
