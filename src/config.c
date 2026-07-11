@@ -2833,6 +2833,15 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         
         /* Save GPG configuration */
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+            /* The selector field is intentionally large enough for `0x` plus
+             * a 64-hex v5 fingerprint.  Validate the semantic digit bound at
+             * the persistence boundary as well as add/edit/load so an
+             * in-memory caller cannot write a file the next load rejects. */
+            if (!validate_key_id(account->gpg_key_id)) {
+                set_error(ERR_ACCOUNT_INVALID, "Invalid GPG key ID: %s",
+                          account->gpg_key_id);
+                return -1;
+            }
             toml_set_string(doc, section_name, "gpg_key", account->gpg_key_id);
             toml_set_boolean(doc, section_name, "gpg_signing_enabled", account->gpg_signing_enabled);
         }

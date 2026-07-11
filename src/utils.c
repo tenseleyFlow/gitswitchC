@@ -2741,19 +2741,24 @@ bool tty_safe_codepoint(uint32_t cp) {
 }
 
 bool validate_key_id(const char *key_id) {
-    if (!key_id || strlen(key_id) == 0 || strlen(key_id) >= MAX_KEY_ID_LEN) {
+    const char *p;
+    size_t digits;
+
+    if (!key_id || *key_id == '\0' ||
+        strlen(key_id) >= MAX_GPG_SELECTOR_LEN) {
         return false;
     }
 
     /* Accept the common "0x" prefix that `gpg -k` and keyservers display —
      * gpg itself accepts a 0x-prefixed key id, so rejecting it only tripped up
      * users pasting the id exactly as shown. The remainder must be hex. */
-    const char *p = key_id;
+    p = key_id;
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
         p += 2;
     }
-    if (*p == '\0') {
-        return false; /* "0x" with no digits */
+    digits = strlen(p);
+    if (digits == 0 || digits > MAX_GPG_FINGERPRINT_LEN - 1) {
+        return false;
     }
     for (; *p; p++) {
         if (!isxdigit((unsigned char)*p)) {

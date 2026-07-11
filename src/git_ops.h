@@ -39,7 +39,7 @@ typedef struct {
 typedef struct {
     char name[MAX_NAME_LEN];
     char email[MAX_EMAIL_LEN];
-    char signing_key[MAX_KEY_ID_LEN];
+    char signing_key[MAX_GPG_FINGERPRINT_LEN];
     bool gpg_signing_enabled;
     git_scope_t scope;
     git_config_origin_scope_t effective_name_scope;

@@ -1349,7 +1349,7 @@ int git_test_config(const account_t *account, git_scope_t scope) {
     
     /* Test GPG configuration if enabled */
     if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-        char signing_key[MAX_KEY_ID_LEN];
+        char signing_key[MAX_GPG_FINGERPRINT_LEN];
         char gpg_sign[16];
 
         if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, signing_key, sizeof(signing_key), scope) != 0 ||

@@ -629,6 +629,34 @@ TEST(git_test_config_reuses_switch_readback) {
     run_set_runner(prev);
 }
 
+TEST(v5_fingerprint_survives_git_current_config_snapshot) {
+    static const char v5_fingerprint[] =
+        "0123456789ABCDEF0123456789ABCDEF"
+        "0123456789ABCDEF0123456789ABCDEF";
+    git_current_config_t current;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+
+    CHECK_EQ_INT((int)strlen(v5_fingerprint), 64);
+    CHECK_EQ_INT(git_set_config_value("user.name", "V5 User",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value("user.email", "v5@example.test",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value("user.signingkey", v5_fingerprint,
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value("commit.gpgsign", "true",
+                                      GIT_SCOPE_GLOBAL), 0);
+    memset(&current, 0, sizeof(current));
+    CHECK_EQ_INT(git_get_current_config(&current), 0);
+    CHECK(current.valid);
+    CHECK_STR_EQ(current.signing_key, v5_fingerprint);
+    CHECK_EQ_INT((int)strlen(current.signing_key), 64);
+
+    run_set_runner(prev);
+}
+
 /* AR-02 #14: git_test_config's GPG availability probe must be skipped when a
  * gpg spawn earlier in this process already proved the key present. The fake
  * runner refuses every non-git argv, so a gpg spawn here FAILS the check —
@@ -736,5 +764,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim);
     RUN_TEST(oversize_foreign_sshcommand_restores_exactly);
     RUN_TEST(git_test_config_reuses_switch_readback);
+    RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()

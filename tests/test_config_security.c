@@ -437,6 +437,11 @@ TEST(save_and_reload_regular_path_roundtrip) {
      * installed file is 0600, reload it and find the account again. Save a
      * second time to exercise the (no-follow) backup branch too. */
     char dir[128], path[256];
+    static const char v5_fingerprint[] =
+        "0123456789ABCDEF0123456789ABCDEF"
+        "0123456789ABCDEF0123456789ABCDEF";
+    char prefixed_v5[MAX_GPG_SELECTOR_LEN];
+    char overlong[MAX_GPG_SELECTOR_LEN];
     gitswitch_ctx_t ctx, reloaded;
     struct stat st;
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
@@ -444,7 +449,22 @@ TEST(save_and_reload_regular_path_roundtrip) {
 
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
-    ctx.account_count = 1;
+    CHECK_EQ_INT((int)strlen(v5_fingerprint), 64);
+    CHECK(snprintf(ctx.accounts[0].gpg_key_id,
+                   sizeof(ctx.accounts[0].gpg_key_id), "%s",
+                   v5_fingerprint) <
+          (int)sizeof(ctx.accounts[0].gpg_key_id));
+    ctx.accounts[0].gpg_enabled = true;
+    ctx.accounts[0].gpg_signing_enabled = true;
+    fill_account(&ctx.accounts[1], 2, "bob", "b@b.com", "prefixed");
+    CHECK_EQ_INT(snprintf(prefixed_v5, sizeof(prefixed_v5), "0x%s",
+                          v5_fingerprint), 66);
+    CHECK_EQ_INT(snprintf(ctx.accounts[1].gpg_key_id,
+                          sizeof(ctx.accounts[1].gpg_key_id), "%s",
+                          prefixed_v5), 66);
+    ctx.accounts[1].gpg_enabled = true;
+    ctx.accounts[1].gpg_signing_enabled = false;
+    ctx.account_count = 2;
 
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     CHECK_EQ_INT(lstat(path, &st), 0);
@@ -455,10 +475,26 @@ TEST(save_and_reload_regular_path_roundtrip) {
 
     memset(&reloaded, 0, sizeof(reloaded));
     CHECK_EQ_INT(config_load(&reloaded, path), 0);
-    CHECK_EQ_INT(reloaded.account_count, 1);
-    if (reloaded.account_count == 1) {
+    CHECK_EQ_INT(reloaded.account_count, 2);
+    if (reloaded.account_count == 2) {
         CHECK_STR_EQ(reloaded.accounts[0].name, "alice");
+        CHECK_STR_EQ(reloaded.accounts[0].gpg_key_id, v5_fingerprint);
+        CHECK(reloaded.accounts[0].gpg_enabled);
+        CHECK(reloaded.accounts[0].gpg_signing_enabled);
+        CHECK_STR_EQ(reloaded.accounts[1].name, "bob");
+        CHECK_STR_EQ(reloaded.accounts[1].gpg_key_id, prefixed_v5);
+        CHECK(reloaded.accounts[1].gpg_enabled);
+        CHECK(!reloaded.accounts[1].gpg_signing_enabled);
     }
+
+    /* Persistence must refuse 65 fingerprint digits even though the selector
+     * field has room for a valid 0x-prefixed 64-digit value. */
+    memset(overlong, 'A', 65);
+    overlong[65] = '\0';
+    CHECK_EQ_INT(snprintf(ctx.accounts[1].gpg_key_id,
+                          sizeof(ctx.accounts[1].gpg_key_id), "%s",
+                          overlong), 65);
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
 }
 
 /* ---- int-id-02: identifier lookup must not wrap ---- */

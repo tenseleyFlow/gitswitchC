@@ -39,9 +39,6 @@ typedef struct {
     gpg_config_t gpg_config;
     bool ssh_active;
     bool gpg_active;
-    char original_gnupghome[MAX_PATH_LEN];
-    bool had_original_gnupghome;
-    bool gnupghome_saved;
 } active_session_t;
 
 /* Static session state - only one active session at a time */
@@ -81,6 +78,13 @@ static int validate_gpg_key_availability(const char *gpg_key_id);
 static int test_ssh_key_functionality(const account_t *account);
 static int test_gpg_key_functionality(const account_t *account);
 
+static bool gpg_session_cleanup_needed(void) {
+    return g_session.gpg_active ||
+           gpg_manager_runtime_restore_pending(&g_session.gpg_config) ||
+           g_session.gpg_config.environment_installed ||
+           g_session.gpg_config.current_key_id[0] != '\0';
+}
+
 /* Initialize accounts system */
 int accounts_init(gitswitch_ctx_t *ctx) {
     if (!ctx) {
@@ -100,9 +104,9 @@ int accounts_init(gitswitch_ctx_t *ctx) {
     return 0;
 }
 
-/* Clean up active session resources. If an owned SSH agent survives, retain
- * the complete session and environment as the retry handle; clearing any of
- * it would make the still-live identity untrackable and misreport success. */
+/* Clean up active session resources. If an owned SSH/GPG side effect survives,
+ * retain the complete session as its retry handle; clearing any of it would
+ * make the still-live identity/environment untrackable and misreport success. */
 int accounts_session_cleanup(void) {
     log_debug("Cleaning up active session resources");
 
@@ -117,22 +121,13 @@ int accounts_session_cleanup(void) {
     }
 
     /* Clean up GPG environment if we modified it */
-    if (g_session.gpg_active) {
+    if (gpg_session_cleanup_needed()) {
         log_info("Cleaning up GPG environment");
-        gpg_manager_cleanup(&g_session.gpg_config);
-        g_session.gpg_active = false;
-    }
-
-    /* Restore original GNUPGHOME environment variable */
-    if (g_session.gnupghome_saved) {
-        if (g_session.had_original_gnupghome) {
-            log_debug("Restoring original GNUPGHOME: %s", g_session.original_gnupghome);
-            setenv("GNUPGHOME", g_session.original_gnupghome, 1);
-        } else {
-            log_debug("Unsetting GNUPGHOME (was not set originally)");
-            unsetenv("GNUPGHOME");
+        if (gpg_manager_cleanup(&g_session.gpg_config) != 0) {
+            log_warning("Active GPG session survived cleanup; retaining session for retry");
+            return -1;
         }
-        g_session.gnupghome_saved = false;
+        g_session.gpg_active = false;
     }
 
     /* Clear session state */
@@ -238,19 +233,44 @@ static int restore_previous_gpg_isolation(const char *prev_gpg_home,
     if (!gpg_dirty) {
         return 0;
     }
+
+    /* A failed inner retarget owns its own exact publication/restore pair.
+     * Let the manager consume that retry record instead of reconstructing an
+     * expected target from partial outer state. It also restores GNUPGHOME in
+     * the same checked transaction and clears nothing on failure. */
+    if (gpg_manager_runtime_restore_pending(&g_session.gpg_config)) {
+        if (gpg_manager_cleanup(&g_session.gpg_config) != 0) {
+            log_warning("Could not finish the retained GPG rollback: %s",
+                        get_last_error()->message);
+            return -1;
+        }
+        g_session.gpg_active = false;
+        log_info("Finished the retained GPG runtime rollback");
+        return 0;
+    }
     if (g_session.gpg_active && g_session.gpg_config.gnupg_home[0] != '\0') {
         expected = g_session.gpg_config.gnupg_home;
     }
 
-    if (gpg_manager_restore_current_if(expected, restore, &changed) != 0) {
+    if (gpg_manager_restore_current_if(&g_session.gpg_config, expected,
+                                       restore, &changed) != 0) {
         log_warning("Could not restore the previous GPG runtime state safely: %s",
                     get_last_error()->message);
         return -1;
     } else if (!changed) {
+        /* The rejected transaction no longer owns current.  This is a
+         * successful compare-and-swap outcome: preserve the later writer and
+         * retire only our process-local environment/session state. */
         log_warning("GPG runtime state changed concurrently; leaving the later state untouched");
-        return -1;
     } else {
         log_info("Restored the previous GPG runtime state");
+    }
+
+    if (gpg_session_cleanup_needed() &&
+        gpg_manager_cleanup(&g_session.gpg_config) != 0) {
+        log_warning("GPG runtime was released but environment cleanup remains pending: %s",
+                    get_last_error()->message);
+        return -1;
     }
     g_session.gpg_active = false;
     return 0;
@@ -493,7 +513,7 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
     }
 
     if (!ctx->config.dry_run && write_git &&
-        git_test_config(account, scope) != 0) {
+        git_test_config(switch_target, scope) != 0) {
         log_warning("Git configuration validation failed: %s",
                     get_last_error()->message);
     }
@@ -766,27 +786,25 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         ssh_dirty = g_session.ssh_active;
         if (accounts_session_cleanup() != 0) {
             char detail[sizeof(g_last_error.message)];
-            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-            signals_guard_end();
-            runtime_state_lock_release(runtime_lock_fd);
-            set_error(ERR_SSH_AGENT_FAILED,
-                      "Cannot switch away from the active SSH session: %s",
-                      detail[0] ? detail : "agent teardown retained for retry");
-            return -1;
-        }
+            bool rollback_complete = true;
 
-        /* Cleanup restored the environment that predated the prior session.
-         * Preserve that baseline for this transaction's eventual cleanup. */
-        {
-            const char *orig = getenv("GNUPGHOME");
-            if (orig) {
-                safe_strncpy(g_session.original_gnupghome, orig,
-                             sizeof(g_session.original_gnupghome));
-                g_session.had_original_gnupghome = true;
-            } else {
-                g_session.had_original_gnupghome = false;
-            }
-            g_session.gnupghome_saved = true;
+            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            /* Cleanup is ordered SSH then GPG. A GPG restoration failure can
+             * therefore arrive after the previous agent was already reaped.
+             * Route through the central checked abort path so that exact SSH
+             * mutation is reactivated, while the untouched manager-owned GPG
+             * retry record remains in g_session for accounts_session_cleanup(). */
+            abort_failed_switch_checked(prev_account, prev_gpg_home,
+                                        prev_gpg_present, false, ssh_dirty,
+                                        false, runtime_lock_fd, true, false,
+                                        NULL, NULL, NULL,
+                                        &rollback_complete);
+            set_error(ERR_SYSTEM_CALL,
+                      "Cannot switch away from the active runtime session: %s%s",
+                      detail[0] ? detail : "cleanup retained for retry",
+                      rollback_complete ? "" :
+                          "; previous runtime reactivation is incomplete");
+            return -1;
         }
 
         /* A signal may have arrived while the previous owned agent was being
@@ -867,26 +885,74 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 
         /* --- 3. GPG isolated home (mutation; fatal on failure) --- */
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+            char activation_error[sizeof(g_last_error.message)] = "";
+            char cleanup_error[sizeof(g_last_error.message)] = "";
+            int activation_rc;
+            int cleanup_rc = 0;
+
             log_info("Setting up GPG isolation for account: %s", account->name);
             memset(&g_session.gpg_config, 0, sizeof(g_session.gpg_config));
-            if (gpg_manager_init(&g_session.gpg_config, GPG_MODE_ISOLATED) != 0 ||
-                gpg_switch_account(&g_session.gpg_config, account) != 0) {
+            activation_rc = gpg_manager_init(&g_session.gpg_config,
+                                             GPG_MODE_ISOLATED);
+            if (activation_rc == 0) {
+                activation_rc = gpg_switch_account(&g_session.gpg_config,
+                                                   account);
+            }
+            if (activation_rc != 0) {
+                safe_strncpy(activation_error, get_last_error()->message,
+                             sizeof(activation_error));
                 printf("  [!!] GPG key failed to activate\n");
-                gpg_manager_cleanup(&g_session.gpg_config);
+                cleanup_rc = gpg_manager_cleanup(&g_session.gpg_config);
+                if (cleanup_rc != 0) {
+                    safe_strncpy(cleanup_error, get_last_error()->message,
+                                 sizeof(cleanup_error));
+                }
+                g_session.gpg_active = gpg_session_cleanup_needed();
+                gpg_dirty =
+                    gpg_manager_runtime_restore_pending(&g_session.gpg_config);
                 /* Roll back the SSH activation from step 2 so we don't leave
                  * current.sock pointing at this account with no matching GPG.
-                 * The GNUPGHOME symlink is only retargeted on gpg_switch_account
-                 * success, so the GPG side is still clean here. */
+                 * A failed retarget may already have published current; its
+                 * retained manager record makes that fact explicit here. */
                 abort_failed_switch(prev_account, prev_gpg_home,
-                                    prev_gpg_present, false, ssh_dirty, false,
+                                    prev_gpg_present, false, ssh_dirty,
+                                    gpg_dirty,
                                     runtime_lock_fd);
-                set_error(ERR_GPG_KEY_FAILED,
-                          "Failed to set up GPG for account: %s", account->name);
+                if (cleanup_rc != 0 && gpg_session_cleanup_needed()) {
+                    set_error(ERR_GPG_KEY_FAILED,
+                              "Failed to set up GPG for account %s: %s; "
+                              "cleanup remains pending: %s",
+                              account->name,
+                              activation_error[0] ? activation_error
+                                                  : "unknown activation error",
+                              cleanup_error[0] ? cleanup_error
+                                               : "unknown cleanup error");
+                } else {
+                    set_error(ERR_GPG_KEY_FAILED,
+                              "Failed to set up GPG for account %s: %s",
+                              account->name,
+                              activation_error[0] ? activation_error
+                                                  : "unknown activation error");
+                }
                 return -1;
             }
             /* gpg_switch_account retargeted the stable GNUPGHOME symlink. */
             gpg_dirty = true;
             g_session.gpg_active = true;
+            /* From this point onward Git receives only the canonical primary
+             * fingerprint proven by the isolated-home activation. The saved
+             * account keeps the user's selector, but effective Git readback and
+             * later health checks must validate the resolved identity. */
+            if (safe_strncpy(switch_target.gpg_key_id,
+                             g_session.gpg_config.current_key_id,
+                             sizeof(switch_target.gpg_key_id)) != 0) {
+                abort_failed_switch(prev_account, prev_gpg_home,
+                                    prev_gpg_present, false, ssh_dirty,
+                                    gpg_dirty, runtime_lock_fd);
+                set_error(ERR_GPG_KEY_FAILED,
+                          "Canonical GPG fingerprint exceeds account runtime storage");
+                return -1;
+            }
         } else {
             /* Target has no GPG: the stable GNUPGHOME symlink must be dropped
              * so shells stop signing/using the previous account's keyring —
@@ -906,7 +972,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 
         /* --- 4. Git identity (preflight-snapshotted and reversible) --- */
         if (write_git) {
-            if (git_set_config(account, scope) != 0) {
+            if (git_set_config(&switch_target, scope) != 0) {
                 abort_failed_switch(prev_account, prev_gpg_home,
                                     prev_gpg_present, true, ssh_dirty, gpg_dirty,
                                     runtime_lock_fd);
@@ -914,7 +980,8 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                 return -1;
             }
             if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-                if (gpg_configure_git_signing(&g_session.gpg_config, account, scope) != 0) {
+                if (gpg_configure_git_signing(&g_session.gpg_config,
+                                              &switch_target, scope) != 0) {
                     abort_failed_switch(prev_account, prev_gpg_home,
                                         prev_gpg_present, true, ssh_dirty, gpg_dirty,
                                         runtime_lock_fd);
@@ -926,9 +993,11 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                  * preference, which may be OFF. Don't claim signing is enabled
                  * when we just disabled it — report the actual state. */
                 if (account->gpg_signing_enabled) {
-                    printf("  [OK] GPG signing enabled (key: %s)\n", account->gpg_key_id);
+                    printf("  [OK] GPG signing enabled (key: %s)\n",
+                           switch_target.gpg_key_id);
                 } else {
-                    printf("  [OK] GPG key configured, signing disabled (key: %s)\n", account->gpg_key_id);
+                    printf("  [OK] GPG key configured, signing disabled (key: %s)\n",
+                           switch_target.gpg_key_id);
                 }
             }
             printf("  [OK] Git config set (%s scope)\n", scope_str);

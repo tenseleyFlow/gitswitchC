@@ -35,7 +35,11 @@
 #define MAX_NAME_LEN 256
 #define MAX_EMAIL_LEN 320  /* RFC 5321 limit */
 #define MAX_DESC_LEN 512
-#define MAX_KEY_ID_LEN 64
+/* A user selector may carry the conventional 0x prefix plus a full OpenPGP v5
+ * fingerprint.  Resolved identities deliberately use the smaller canonical
+ * fingerprint contract: 64 hexadecimal digits plus NUL. */
+#define MAX_GPG_SELECTOR_LEN 67
+#define MAX_GPG_FINGERPRINT_LEN 65
 #define MAX_ACCOUNTS 64
 
 /* Default configuration paths */
@@ -75,7 +79,7 @@ typedef struct {
     /* GPG configuration */
     bool gpg_enabled;
     bool gpg_signing_enabled;
-    char gpg_key_id[MAX_KEY_ID_LEN];
+    char gpg_key_id[MAX_GPG_SELECTOR_LEN];
     
 } account_t;
 
