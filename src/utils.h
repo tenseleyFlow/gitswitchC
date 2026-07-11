@@ -115,8 +115,8 @@ time_t get_file_mtime(const char *file_path);
 /**
  * Process utilities
  *
- * All external commands are run via run_argv(), which spawns a child with
- * execvp() and an explicit argv vector — NO shell is involved, so command
+ * All external commands are run via run_argv(), which resolves a trusted
+ * absolute path and uses execv() with an explicit argv vector — NO shell is involved, so command
  * arguments (account names, key paths, etc.) can never be interpreted as shell
  * syntax. This is the structural defense against command injection.
  */
@@ -157,11 +157,43 @@ command_runner_fn run_set_runner(command_runner_fn fn);
  * find_command_path, then execv'd), argv NULL-terminated, through the active
  * runner. Returns 0 iff the child spawned and exited 0. opts/result may be
  * NULL. If argv[0] cannot be resolved from a trusted directory, fails closed
- * before forking (result->spawned stays false). */
+ * before forking (result->spawned stays false). Child setup/exec failures,
+ * incomplete stdin delivery, subprocess pipe errors, and a capture pipe held
+ * open by descendants are runner failures even if the direct child exits 0. */
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result);
 
 /* The real fork+execv implementation; normally reached via run_argv(). */
 int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result);
+
+/* Test-only child-FD cleanup selector. Production code must leave this at
+ * RUN_TEST_FD_CLOSE_AUTO; the default is zero so normal behavior is unchanged.
+ * Forced strategies are strict: BULK reports a child setup failure if its
+ * primitive cannot run, and SNAPSHOT fails in the parent if enumeration was
+ * incomplete. AUTO alone may fall back to another safe cleanup method. */
+typedef enum {
+    RUN_TEST_FD_CLOSE_AUTO = 0,
+    RUN_TEST_FD_CLOSE_SNAPSHOT,
+    RUN_TEST_FD_CLOSE_NUMERIC,
+    RUN_TEST_FD_CLOSE_BULK
+} run_test_fd_close_strategy_t;
+
+typedef enum {
+    RUN_TEST_FD_METHOD_NONE = 0,
+    RUN_TEST_FD_METHOD_BULK,
+    RUN_TEST_FD_METHOD_SNAPSHOT,
+    RUN_TEST_FD_METHOD_NUMERIC
+} run_test_fd_close_method_t;
+
+typedef struct {
+    run_test_fd_close_method_t method;
+    uint64_t close_syscalls;
+} run_test_fd_close_observation_t;
+
+int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy);
+bool run_test_fd_close_bulk_supported(void);
+void run_test_set_fd_close_observation(bool enabled);
+bool run_test_get_fd_close_observation(run_test_fd_close_observation_t *out);
+void run_test_set_bulk_close_failure(int system_errno);
 
 /* True if an executable named `command` is found in PATH. */
 bool command_exists(const char *command);

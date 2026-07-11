@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/file.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <poll.h>
 #include <errno.h>
 #include <pwd.h>
@@ -22,6 +23,7 @@
 #include <ctype.h>
 #include <signal.h>
 #include <regex.h>
+#include <limits.h>
 
 #if defined(__linux__)
 #include <sys/mman.h>
@@ -1299,11 +1301,221 @@ time_t get_file_mtime(const char *file_path) {
  * driven by poll() so an input+output pair cannot deadlock regardless of
  * payload size. The real child exit code is reported via WEXITSTATUS. */
 
-static void set_nonblock(int fd) {
+static int set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
-    if (fl != -1) {
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    if (fl == -1) return -1;
+    if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) == -1) return -1;
+    return 0;
+}
+
+typedef struct {
+    int *fds;
+    size_t count;
+    bool complete;
+} child_fd_snapshot_t;
+
+/* The runner's descriptors must never occupy 0/1/2 in the parent.  A caller is
+ * allowed to start with one of those slots closed; keeping our bookkeeping
+ * descriptors above stderr prevents the child-side stdio dup2 operations from
+ * accidentally overwriting the setup-status channel. */
+static int internal_fd_above_stdio(int fd) {
+    if (fd < 0) return -1;
+
+    if (fd <= STDERR_FILENO) {
+#ifdef F_DUPFD_CLOEXEC
+        int moved = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+#else
+        int moved = fcntl(fd, F_DUPFD, STDERR_FILENO + 1);
+        if (moved >= 0 && fcntl(moved, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved = errno;
+            close(moved);
+            errno = saved;
+            moved = -1;
+        }
+#endif
+        if (moved < 0) return -1;
+        close(fd);
+        return moved;
     }
+
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags < 0 || fcntl(fd, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        return -1;
+    }
+    return fd;
+}
+
+static int make_internal_pipe(int pipefd[2]) {
+    int raw[2] = {-1, -1};
+    if (pipe(raw) != 0) return -1;
+
+    int first = internal_fd_above_stdio(raw[0]);
+    if (first < 0) {
+        int saved = errno;
+        close(raw[0]);
+        close(raw[1]);
+        errno = saved;
+        return -1;
+    }
+    raw[0] = -1;
+
+    int second = internal_fd_above_stdio(raw[1]);
+    if (second < 0) {
+        int saved = errno;
+        close(first);
+        close(raw[1]);
+        errno = saved;
+        return -1;
+    }
+
+    pipefd[0] = first;
+    pipefd[1] = second;
+    return 0;
+}
+
+static int open_internal_devnull(void) {
+    int flags = O_RDWR;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = open("/dev/null", flags);
+    if (fd < 0) return -1;
+
+    int moved = internal_fd_above_stdio(fd);
+    if (moved < 0) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+    return moved;
+}
+
+/* On platforms without a close-range primitive, enumerate the descriptors
+ * that are actually open before fork.  The child can then close O(open-fds)
+ * entries rather than issuing one syscall for every value below OPEN_MAX.
+ * Allocation and directory traversal intentionally happen in the parent. */
+static child_fd_snapshot_t child_fd_snapshot_capture(void) {
+    child_fd_snapshot_t snapshot = {0};
+    const char *paths[] = {"/proc/self/fd", "/dev/fd", NULL};
+    DIR *dir = NULL;
+
+    for (size_t i = 0; paths[i]; i++) {
+        dir = opendir(paths[i]);
+        if (dir) break;
+    }
+    if (!dir) return snapshot;
+
+    size_t capacity = 16;
+    snapshot.fds = malloc(capacity * sizeof(*snapshot.fds));
+    if (!snapshot.fds) {
+        closedir(dir);
+        return snapshot;
+    }
+
+    int scan_fd = dirfd(dir);
+    struct dirent *entry;
+    int scan_errno = 0;
+    for (;;) {
+        /* POSIX distinguishes end-of-directory from failure through errno.
+         * Reset it immediately before readdir; strtol below also uses errno. */
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            scan_errno = errno;
+            break;
+        }
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(entry->d_name, &end, 10);
+        if (errno != 0 || !end || *end != '\0' || value < 3 ||
+            value > INT_MAX || value == scan_fd) {
+            continue;
+        }
+        if (snapshot.count == capacity) {
+            size_t next_capacity = capacity * 2;
+            int *next = realloc(snapshot.fds,
+                                next_capacity * sizeof(*snapshot.fds));
+            if (!next) {
+                free(snapshot.fds);
+                snapshot.fds = NULL;
+                snapshot.count = 0;
+                closedir(dir);
+                return snapshot;
+            }
+            snapshot.fds = next;
+            capacity = next_capacity;
+        }
+        snapshot.fds[snapshot.count++] = (int)value;
+    }
+    snapshot.complete = (scan_errno == 0);
+    closedir(dir);
+    return snapshot;
+}
+
+static bool child_bulk_close_available(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    /* Probe without touching the descriptor table: a supported syscall rejects
+     * the reversed range with EINVAL; old kernels report ENOSYS. */
+    errno = 0;
+    if (syscall(SYS_close_range, 1U, 0U, 0U) < 0 && errno == ENOSYS) {
+        return false;
+    }
+    return errno == EINVAL;
+#elif defined(__FreeBSD__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+/* Test-only strategy/observation seam.  Zero-initialized AUTO with observation
+ * disabled is the sole production mode, so normal callers neither emit nor
+ * consume the extra pre-exec status record. */
+static run_test_fd_close_strategy_t g_test_fd_close_strategy =
+    RUN_TEST_FD_CLOSE_AUTO;
+static bool g_test_fd_close_observation_enabled;
+static bool g_test_fd_close_observation_valid;
+static run_test_fd_close_observation_t g_test_fd_close_observation;
+static int g_test_bulk_close_failure_errno;
+
+int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
+    switch (strategy) {
+        case RUN_TEST_FD_CLOSE_AUTO:
+        case RUN_TEST_FD_CLOSE_SNAPSHOT:
+        case RUN_TEST_FD_CLOSE_NUMERIC:
+        case RUN_TEST_FD_CLOSE_BULK:
+            g_test_fd_close_strategy = strategy;
+            return 0;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+
+bool run_test_fd_close_bulk_supported(void) {
+    return child_bulk_close_available();
+}
+
+void run_test_set_fd_close_observation(bool enabled) {
+    g_test_fd_close_observation_enabled = enabled;
+    g_test_fd_close_observation_valid = false;
+    memset(&g_test_fd_close_observation, 0,
+           sizeof(g_test_fd_close_observation));
+}
+
+bool run_test_get_fd_close_observation(
+    run_test_fd_close_observation_t *out) {
+    if (!out) {
+        errno = EINVAL;
+        return false;
+    }
+    if (!g_test_fd_close_observation_valid) return false;
+    *out = g_test_fd_close_observation;
+    return true;
+}
+
+void run_test_set_bulk_close_failure(int system_errno) {
+    g_test_bulk_close_failure_errno = system_errno > 0 ? system_errno : 0;
 }
 
 /* Close every descriptor >= lowfd in the forked child before exec (fd-CLOEXEC).
@@ -1311,32 +1523,178 @@ static void set_nonblock(int fd) {
  * backup FILE*, the isolated-home lock, a stray dup — leaks into every git/
  * gpg/ssh child, where a long-lived agent could hold it (and whatever it
  * guards) open indefinitely. Runs post-fork, pre-exec, so only plain syscalls
- * are used. */
-static void child_close_fds_from(int lowfd) {
+ * are used.  `snapshot` was collected in the parent and supplies either the
+ * portable AUTO path or the strict test-selected snapshot path. */
+static int child_close_fds_from(
+    int lowfd, bool use_bulk_close, bool require_bulk_close,
+    const child_fd_snapshot_t *snapshot,
+    run_test_fd_close_observation_t *observation) {
+    memset(observation, 0, sizeof(*observation));
+
+    if (use_bulk_close) {
+        observation->method = RUN_TEST_FD_METHOD_BULK;
+        if (g_test_bulk_close_failure_errno != 0) {
+            errno = g_test_bulk_close_failure_errno;
+            if (require_bulk_close) return -1;
+        } else {
 #if defined(__linux__) && defined(SYS_close_range)
-    /* close_range(2) is Linux >= 5.9. Invoke via syscall(): the libc wrapper
-     * only exists in glibc >= 2.34, and building against newer kernel headers
-     * than the running kernel is common — on ENOSYS fall through to the loop. */
-    if (syscall(SYS_close_range, (unsigned int)lowfd, ~0U, 0U) == 0) {
-        return;
-    }
+            /* close_range(2) is Linux >= 5.9. Invoke via syscall(): the libc
+             * wrapper only exists in glibc >= 2.34, and newer headers with an
+             * older runtime kernel are common. */
+            observation->close_syscalls++;
+            if (syscall(SYS_close_range, (unsigned int)lowfd, ~0U, 0U) == 0) {
+                return 0;
+            }
+            if (require_bulk_close) return -1;
 #elif defined(__FreeBSD__)
-    /* FreeBSD has closefrom(2) since 8.0, well before our 12.2 floor. Other
-     * BSDs and macOS take the portable loop below. */
-    closefrom(lowfd);
-    return;
+            /* FreeBSD has closefrom(2) since 8.0, well before our 12.2 floor.
+             * Its void return means completing the call is success. */
+            observation->close_syscalls++;
+            closefrom(lowfd);
+            return 0;
+#else
+            errno = ENOTSUP;
+            if (require_bulk_close) return -1;
 #endif
+        }
+    }
+
+    if (snapshot && snapshot->complete) {
+        observation->method = RUN_TEST_FD_METHOD_SNAPSHOT;
+        for (size_t i = 0; i < snapshot->count; i++) {
+            if (snapshot->fds[i] >= lowfd) {
+                observation->close_syscalls++;
+                (void)close(snapshot->fds[i]);
+            }
+        }
+        return 0;
+    }
+
     /* Portable fallback (macOS has neither call): close(2) on an unused fd is
      * harmless (EBADF). Cap the sweep — sysconf can report "unlimited" or a
      * raised RLIMIT_NOFILE in the millions, and this runs on every spawn. */
+    observation->method = RUN_TEST_FD_METHOD_NUMERIC;
     long maxfd = sysconf(_SC_OPEN_MAX);
     if (maxfd < 0 || maxfd > 65536) {
         maxfd = 65536;
     }
     for (long fd = lowfd; fd < maxfd; fd++) {
+        observation->close_syscalls++;
         (void)close((int)fd);
     }
+    return 0;
 }
+
+typedef enum {
+    CHILD_STAGE_STDIO = 1,
+    CHILD_STAGE_CWD,
+    CHILD_STAGE_FD_CLOSE,
+    CHILD_STAGE_ENV,
+    CHILD_STAGE_EXEC
+} child_stage_t;
+
+typedef enum {
+    CHILD_STATUS_FAILURE = 1,
+    CHILD_STATUS_FD_CLOSE_OBSERVATION
+} child_status_kind_t;
+
+typedef struct {
+    int kind;
+    int stage;
+    int system_errno;
+    int fd_close_method;
+    uint64_t fd_close_syscalls;
+} child_status_t;
+
+static int child_write_status(int status_fd, const child_status_t *status) {
+    const char *bytes = (const char *)status;
+    size_t offset = 0;
+    while (offset < sizeof(*status)) {
+        ssize_t written = write(status_fd, bytes + offset,
+                                sizeof(*status) - offset);
+        if (written > 0) {
+            offset += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void child_report_failure(int status_fd, child_stage_t stage,
+                                 int system_errno, int exit_code) {
+    child_status_t status = {
+        .kind = CHILD_STATUS_FAILURE,
+        .stage = (int)stage,
+        .system_errno = system_errno
+    };
+    (void)child_write_status(status_fd, &status);
+    _exit(exit_code);
+}
+
+static int child_report_fd_close_observation(
+    int status_fd, const run_test_fd_close_observation_t *observation) {
+    child_status_t status = {
+        .kind = CHILD_STATUS_FD_CLOSE_OBSERVATION,
+        .fd_close_method = (int)observation->method,
+        .fd_close_syscalls = observation->close_syscalls
+    };
+    return child_write_status(status_fd, &status);
+}
+
+/* Returns 0 for the CLOEXEC EOF that proves exec succeeded, 1 for a complete
+ * child failure report, and -1 for a malformed/failed status read.  Optional
+ * observation messages can precede either EOF or a later setup failure. */
+static int read_child_status(
+    int fd, child_status_t *failure,
+    run_test_fd_close_observation_t *observation, bool *observation_valid) {
+    *observation_valid = false;
+    for (;;) {
+        child_status_t status = {0};
+        char *bytes = (char *)&status;
+        size_t offset = 0;
+        while (offset < sizeof(status)) {
+            ssize_t got = read(fd, bytes + offset, sizeof(status) - offset);
+            if (got > 0) {
+                offset += (size_t)got;
+            } else if (got == 0) {
+                if (offset == 0) return 0;
+                errno = EIO;
+                return -1;
+            } else if (errno != EINTR) {
+                return -1;
+            }
+        }
+
+        if (status.kind == CHILD_STATUS_FAILURE) {
+            *failure = status;
+            return 1;
+        }
+        if (status.kind == CHILD_STATUS_FD_CLOSE_OBSERVATION &&
+            status.fd_close_method >= RUN_TEST_FD_METHOD_BULK &&
+            status.fd_close_method <= RUN_TEST_FD_METHOD_NUMERIC) {
+            observation->method =
+                (run_test_fd_close_method_t)status.fd_close_method;
+            observation->close_syscalls = status.fd_close_syscalls;
+            *observation_valid = true;
+            continue;
+        }
+        errno = EPROTO;
+        return -1;
+    }
+}
+
+static int64_t monotonic_millis(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+#define RUNNER_POLL_SLICE_MS 50
+#define RUNNER_CAPTURE_GRACE_MS 250
+#define RUNNER_DRAIN_CHUNKS_PER_POLL 16
 
 int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
     run_opts_t no_opts;
@@ -1349,6 +1707,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->spawned = false;
     result->out_len = 0;
     result->out_truncated = false;
+    g_test_fd_close_observation_valid = false;
+    memset(&g_test_fd_close_observation, 0,
+           sizeof(g_test_fd_close_observation));
 
     if (!argv || !argv[0]) {
         set_error(ERR_INVALID_ARGS, "run_argv: empty argv");
@@ -1386,25 +1747,90 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
     bool want_in = (opts->input != NULL);
     bool want_out = (opts->out && opts->out_size > 0);
+    bool need_devnull = !want_in || !want_out ||
+                        (!opts->merge_stderr && opts->stderr_to_devnull);
     if (want_out) opts->out[0] = '\0';
 
+    bool use_bulk_close = false;
+    bool capture_fd_snapshot = false;
+    bool require_bulk_close = false;
+    switch (g_test_fd_close_strategy) {
+        case RUN_TEST_FD_CLOSE_AUTO:
+            use_bulk_close = child_bulk_close_available();
+            capture_fd_snapshot = !use_bulk_close;
+            break;
+        case RUN_TEST_FD_CLOSE_SNAPSHOT:
+            capture_fd_snapshot = true;
+            break;
+        case RUN_TEST_FD_CLOSE_NUMERIC:
+            break;
+        case RUN_TEST_FD_CLOSE_BULK:
+            use_bulk_close = true;
+            require_bulk_close = true;
+            break;
+        default:
+            /* Defensive equivalent of AUTO if memory corruption reaches this
+             * test-only selector. */
+            use_bulk_close = child_bulk_close_available();
+            capture_fd_snapshot = !use_bulk_close;
+            break;
+    }
+    child_fd_snapshot_t fd_snapshot = {0};
+    if (capture_fd_snapshot) {
+        fd_snapshot = child_fd_snapshot_capture();
+        if (g_test_fd_close_strategy == RUN_TEST_FD_CLOSE_SNAPSHOT &&
+            !fd_snapshot.complete) {
+            set_error(ERR_SYSTEM_CALL,
+                      "run_argv: forced child-FD snapshot is incomplete");
+            free(fd_snapshot.fds);
+            return -1;
+        }
+    }
+
+    int devnull = -1;
     int in_pipe[2] = {-1, -1};
     int out_pipe[2] = {-1, -1};
-    if (want_in && pipe(in_pipe) != 0) {
-        set_system_error(ERR_SYSTEM_CALL, "pipe() failed");
+    int status_pipe[2] = {-1, -1};
+    if (need_devnull && (devnull = open_internal_devnull()) < 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot acquire /dev/null for child stdio");
+        free(fd_snapshot.fds);
         return -1;
     }
-    if (want_out && pipe(out_pipe) != 0) {
-        set_system_error(ERR_SYSTEM_CALL, "pipe() failed");
+    if (want_in && make_internal_pipe(in_pipe) != 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot create child stdin pipe");
+        if (devnull >= 0) close(devnull);
+        free(fd_snapshot.fds);
+        return -1;
+    }
+    if (want_out && make_internal_pipe(out_pipe) != 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot create child stdout pipe");
+        if (devnull >= 0) close(devnull);
         if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        free(fd_snapshot.fds);
+        return -1;
+    }
+    if (make_internal_pipe(status_pipe) != 0) {
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot create child setup-status pipe");
+        if (devnull >= 0) close(devnull);
+        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        free(fd_snapshot.fds);
         return -1;
     }
 
     pid_t pid = fork();
     if (pid < 0) {
         set_system_error(ERR_SYSTEM_CALL, "fork() failed");
+        if (devnull >= 0) close(devnull);
         if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
         return -1;
     }
 
@@ -1416,6 +1842,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * "pre-interrupted" instead of terminating normally. */
         signals_reset_for_child();
 
+        int child_status_fd = status_pipe[1];
+        close(status_pipe[0]);
         int child_cwd_fd = -1;
 
         /* Preserve a pinned working-directory descriptor before touching
@@ -1434,43 +1862,95 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             }
 #endif
             if (child_cwd_fd < 0) {
-                _exit(126);
+                child_report_failure(child_status_fd, CHILD_STAGE_CWD,
+                                     errno, 126);
             }
         }
 
-        int devnull = open("/dev/null", O_RDWR);
-        if (want_in) { dup2(in_pipe[0], STDIN_FILENO); }
-        else if (devnull >= 0) { dup2(devnull, STDIN_FILENO); }
-        if (want_out) { dup2(out_pipe[1], STDOUT_FILENO); }
-        else if (devnull >= 0) { dup2(devnull, STDOUT_FILENO); }
-        if (opts->merge_stderr) { dup2(STDOUT_FILENO, STDERR_FILENO); }
-        else if (opts->stderr_to_devnull && devnull >= 0) { dup2(devnull, STDERR_FILENO); }
+        int stdin_source = want_in ? in_pipe[0] : devnull;
+        int stdout_source = want_out ? out_pipe[1] : devnull;
+        if (dup2(stdin_source, STDIN_FILENO) < 0) {
+            child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
+                                 errno, 126);
+        }
+        if (dup2(stdout_source, STDOUT_FILENO) < 0) {
+            child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
+                                 errno, 126);
+        }
+        if (opts->merge_stderr) {
+            if (dup2(STDOUT_FILENO, STDERR_FILENO) < 0) {
+                child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
+                                     errno, 126);
+            }
+        } else if (opts->stderr_to_devnull) {
+            if (dup2(devnull, STDERR_FILENO) < 0) {
+                child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
+                                     errno, 126);
+            }
+        }
 
         /* Close the pipe/devnull fds only above the stdio range (AR-06 F30).
          * When the parent starts with fd 0 or 1 closed, pipe()/open() hand
          * those low numbers back, so after the dup2 dance fds 0/1/2 ARE the
          * child's std streams — an unconditional close here closed the very
          * stdin/stdout we just installed, corrupting the child. Anything in
-         * 0..2 is now a std stream we must keep; child_close_fds_from(3) below
-         * reaps every remaining fd at or above 3. */
+         * 0..2 is now a std stream we must keep; child_close_fds_from(4) below
+         * reaps every remaining fd above the temporary status channel. */
         if (in_pipe[0] > STDERR_FILENO) close(in_pipe[0]);
         if (in_pipe[1] > STDERR_FILENO) close(in_pipe[1]);
         if (out_pipe[0] > STDERR_FILENO) close(out_pipe[0]);
         if (out_pipe[1] > STDERR_FILENO) close(out_pipe[1]);
-        if (devnull > STDERR_FILENO) close(devnull);
+        if (devnull > STDERR_FILENO && devnull != child_status_fd) close(devnull);
 
         if (opts->use_cwd_fd) {
             if (fchdir(child_cwd_fd) != 0) {
-                _exit(126);
+                child_report_failure(child_status_fd, CHILD_STAGE_CWD,
+                                     errno, 126);
             }
             close(child_cwd_fd);
+        }
+
+        /* Reserve fd 3 for the setup-status channel.  Keeping that one fd
+         * below the close-from boundary lets the child report failures through
+         * execv(), while FD_CLOEXEC turns successful exec into an EOF proof. */
+        if (child_status_fd != STDERR_FILENO + 1) {
+            if (dup2(child_status_fd, STDERR_FILENO + 1) < 0) {
+                child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
+                                     errno, 126);
+            }
+            close(child_status_fd);
+            child_status_fd = STDERR_FILENO + 1;
+        }
+        int status_flags = fcntl(child_status_fd, F_GETFD, 0);
+        if (status_flags < 0 ||
+            fcntl(child_status_fd, F_SETFD,
+                  status_flags | FD_CLOEXEC) != 0) {
+            child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
+                                 errno, 126);
         }
 
         /* fd-CLOEXEC: the explicit closes above only cover our own pipes;
          * sweep everything else the parent had open so the child starts with
          * just stdin/stdout/stderr. Nothing in this codebase intentionally
          * hands an fd to a child (SSH_AUTH_SOCK etc. are paths, not fds). */
-        child_close_fds_from(3);
+        run_test_fd_close_observation_t fd_close_observation;
+        if (child_close_fds_from(STDERR_FILENO + 2, use_bulk_close,
+                                 require_bulk_close, &fd_snapshot,
+                                 &fd_close_observation) != 0) {
+            int close_errno = errno;
+            if (g_test_fd_close_observation_enabled) {
+                (void)child_report_fd_close_observation(
+                    child_status_fd, &fd_close_observation);
+            }
+            child_report_failure(child_status_fd, CHILD_STAGE_FD_CLOSE,
+                                 close_errno, 126);
+        }
+        if (g_test_fd_close_observation_enabled &&
+            child_report_fd_close_observation(
+                child_status_fd, &fd_close_observation) != 0) {
+            child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
+                                 errno, 126);
+        }
 
         if (opts->extra_env) {
             for (size_t i = 0; opts->extra_env[i]; i++) {
@@ -1479,10 +1959,15 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                 if (eq) {
                     char key[256];
                     size_t klen = (size_t)(eq - e);
-                    if (klen < sizeof(key)) {
-                        memcpy(key, e, klen);
-                        key[klen] = '\0';
-                        setenv(key, eq + 1, 1);
+                    if (klen == 0 || klen >= sizeof(key)) {
+                        child_report_failure(child_status_fd,
+                                             CHILD_STAGE_ENV, EINVAL, 126);
+                    }
+                    memcpy(key, e, klen);
+                    key[klen] = '\0';
+                    if (setenv(key, eq + 1, 1) != 0) {
+                        child_report_failure(child_status_fd,
+                                             CHILD_STAGE_ENV, errno, 126);
                     }
                 }
             }
@@ -1491,29 +1976,75 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         /* execv, not execvp: the path was pinned pre-fork; re-searching PATH
          * here would reopen the PS-1 window between resolve and exec. */
         execv(exec_path, (char *const *)argv); /* Flawfinder: ignore — argv exec of a pre-pinned path; no shell */
-        _exit(127); /* exec failed (e.g. binary vanished after resolution) */
+        child_report_failure(child_status_fd, CHILD_STAGE_EXEC, errno, 127);
     }
 
     /* ---- parent ---- */
+    free(fd_snapshot.fds);
     result->spawned = true;
     /* AR-03 L8: publish the in-flight child so the signal handler can kill()
      * it if a rollback wedges behind an interactive prompt (see signals.h). */
     signals_child_spawned(pid);
+    if (devnull >= 0) close(devnull);
     if (want_in) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
+    close(status_pipe[1]);
+
+    child_status_t child_status = {0};
+    run_test_fd_close_observation_t child_fd_close_observation = {0};
+    bool child_fd_close_observation_valid = false;
+    int child_status_rc = read_child_status(
+        status_pipe[0], &child_status, &child_fd_close_observation,
+        &child_fd_close_observation_valid);
+    int child_status_errno = errno;
+    close(status_pipe[0]);
+    if (g_test_fd_close_observation_enabled &&
+        child_fd_close_observation_valid) {
+        g_test_fd_close_observation = child_fd_close_observation;
+        g_test_fd_close_observation_valid = true;
+    }
+
     void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
 
     int infd = want_in ? in_pipe[1] : -1;
     int outfd = want_out ? out_pipe[0] : -1;
     size_t in_off = 0, out_off = 0;
+    bool input_failed = false;
+    bool output_stalled = false;
+    bool io_failed = false;
+    bool nonblock_setup_failed = false;
+    int io_errno = 0;
     /* Function-scope (not loop-scope) so it can be scrubbed after the loop:
      * captured child stdout transits this buffer, and for the GPG secret-key
      * export that is unencrypted private-key material — the caller scrubs its
      * own copy, but these bytes would otherwise stay resident in this frame
      * after return (AR-02 #25). */
     char rdbuf[4096];
-    if (infd >= 0) set_nonblock(infd);
-    if (outfd >= 0) set_nonblock(outfd);
+    if (infd >= 0 && set_nonblock(infd) != 0) {
+        io_failed = true;
+        nonblock_setup_failed = true;
+        io_errno = errno;
+    }
+    if (!io_failed && outfd >= 0 && set_nonblock(outfd) != 0) {
+        io_failed = true;
+        nonblock_setup_failed = true;
+        io_errno = errno;
+    }
+    if (io_failed) {
+        /* A blocking endpoint would invalidate the poll-driven liveness
+         * contract. Close both directions so the child gets EOF/SIGPIPE, then
+         * use the normal wait/reap path before reporting the setup failure. */
+        if (infd >= 0) { close(infd); infd = -1; }
+        if (outfd >= 0) { close(outfd); outfd = -1; }
+        (void)kill(pid, SIGKILL);
+    }
+
+    /* A child-side report means no helper was successfully exec'd.  Close the
+     * data pipes now; the status payload is handled after the child is reaped. */
+    if (child_status_rc != 0) {
+        if (infd >= 0) { close(infd); infd = -1; }
+        if (outfd >= 0) { close(outfd); outfd = -1; }
+    }
 
     /* A provided zero-length buffer means "send no bytes, then EOF". Leaving
      * the pipe open would make poll() report it writable forever: write(...,
@@ -1524,13 +2055,43 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         infd = -1;
     }
 
+    int status = 0;
+    bool child_reaped = false;
+    bool wait_failed = false;
+    int wait_errno = 0;
+    int64_t capture_deadline = -1;
+
     while (infd >= 0 || outfd >= 0) {
+        int timeout_ms = RUNNER_POLL_SLICE_MS;
+        if (child_reaped && outfd >= 0) {
+            int64_t now = monotonic_millis();
+            if (now < 0) {
+                io_failed = true;
+                io_errno = errno;
+                close(outfd);
+                outfd = -1;
+                continue;
+            }
+            if (capture_deadline < 0) {
+                capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
+            }
+            int64_t remaining = capture_deadline - now;
+            if (remaining <= 0) {
+                output_stalled = true;
+                close(outfd);
+                outfd = -1;
+                continue;
+            }
+            if (remaining < timeout_ms) timeout_ms = (int)remaining;
+        }
+
         struct pollfd pfds[2];
         int n = 0, in_idx = -1, out_idx = -1;
         if (infd >= 0) { pfds[n].fd = infd; pfds[n].events = POLLOUT; in_idx = n++; }
         if (outfd >= 0) { pfds[n].fd = outfd; pfds[n].events = POLLIN; out_idx = n++; }
 
-        if (poll(pfds, (nfds_t)n, -1) < 0) {
+        int poll_rc = poll(pfds, (nfds_t)n, timeout_ms);
+        if (poll_rc < 0) {
             if (errno == EINTR) continue;
             /* Close both pipe ends before bailing: leaving infd open means a
              * child reading stdin (e.g. `gpg --import`) never sees EOF, and
@@ -1538,44 +2099,109 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
              * a child blocked writing a full pipe get SIGPIPE and exit. */
             if (infd >= 0) { close(infd); infd = -1; }
             if (outfd >= 0) { close(outfd); outfd = -1; }
+            io_failed = true;
+            io_errno = errno;
             break;
         }
 
-        if (in_idx >= 0 && (pfds[in_idx].revents & (POLLOUT | POLLERR | POLLHUP))) {
-            if (pfds[in_idx].revents & (POLLERR | POLLHUP)) {
-                close(infd); infd = -1;
-            } else {
+        if (poll_rc > 0 && in_idx >= 0 &&
+            (pfds[in_idx].revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL))) {
+            short revents = pfds[in_idx].revents;
+            if (revents & POLLOUT) {
                 ssize_t w = write(infd, opts->input + in_off, opts->input_len - in_off);
                 if (w > 0) {
                     in_off += (size_t)w;
                     if (in_off >= opts->input_len) { close(infd); infd = -1; }
-                } else if (w < 0 && errno != EAGAIN && errno != EINTR) {
+                } else if (w == 0 ||
+                           (w < 0 && errno != EAGAIN && errno != EINTR)) {
+                    if (in_off < opts->input_len) input_failed = true;
                     close(infd); infd = -1;
                 }
             }
+            if (infd >= 0 && (revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                if (in_off < opts->input_len) input_failed = true;
+                close(infd);
+                infd = -1;
+            }
         }
 
-        if (out_idx >= 0 && (pfds[out_idx].revents & (POLLIN | POLLERR | POLLHUP))) {
-            ssize_t r = read(outfd, rdbuf, sizeof(rdbuf));
-            if (r > 0) {
-                size_t cp = 0;
-                if (out_off < opts->out_size - 1) {
-                    size_t space = opts->out_size - 1 - out_off;
-                    cp = ((size_t)r < space) ? (size_t)r : space;
-                    memcpy(opts->out + out_off, rdbuf, cp);
-                    out_off += cp;
+        if (poll_rc > 0 && out_idx >= 0 &&
+            (pfds[out_idx].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))) {
+            short revents = pfds[out_idx].revents;
+            unsigned int chunks = 0;
+            while (chunks < RUNNER_DRAIN_CHUNKS_PER_POLL) {
+                ssize_t r = read(outfd, rdbuf, sizeof(rdbuf));
+                if (r > 0) {
+                    chunks++;
+                    size_t cp = 0;
+                    if (out_off < opts->out_size - 1) {
+                        size_t space = opts->out_size - 1 - out_off;
+                        cp = ((size_t)r < space) ? (size_t)r : space;
+                        memcpy(opts->out + out_off, rdbuf, cp);
+                        out_off += cp;
+                    }
+                    /* Bytes beyond the capture buffer are still drained (so
+                     * the child never blocks) but LOST — record that, so
+                     * callers can reject incomplete structured output. */
+                    if (cp < (size_t)r) result->out_truncated = true;
+                    continue;
                 }
-                /* Bytes beyond the capture buffer are still drained (so the
-                 * child never blocks) but LOST — record that, so callers that
-                 * feed `out` onward can refuse the incomplete copy instead of
-                 * silently processing corrupt data (AR-02 #4). */
-                if (cp < (size_t)r) {
-                    result->out_truncated = true;
+                if (r == 0) {
+                    close(outfd);
+                    outfd = -1;
+                } else if (errno == EAGAIN || errno == EINTR) {
+                    if (errno == EAGAIN && (revents & POLLHUP)) {
+                        close(outfd);
+                        outfd = -1;
+                    }
+                } else {
+                    io_failed = true;
+                    io_errno = errno;
+                    close(outfd);
+                    outfd = -1;
                 }
-            } else if (r == 0) {
-                close(outfd); outfd = -1;
-            } else if (r < 0 && errno != EAGAIN && errno != EINTR) {
-                close(outfd); outfd = -1;
+                break;
+            }
+            /* A continuously writing descendant can keep a nonblocking pipe
+             * readable forever.  The chunk budget deliberately yields here
+             * so waitpid(WNOHANG) and the post-exit deadline run every cycle. */
+        }
+
+        /* Finite polling lets us observe the direct child independently of
+         * capture EOF.  A background descendant may retain stdout forever;
+         * once the direct child is reaped, only a short drain grace remains. */
+        if (!child_reaped) {
+            pid_t waited;
+            do {
+                waited = waitpid(pid, &status, WNOHANG);
+            } while (waited < 0 && errno == EINTR);
+
+            if (waited == pid) {
+                child_reaped = true;
+                signals_child_reaped();
+                if (infd >= 0) {
+                    if (in_off < opts->input_len) input_failed = true;
+                    close(infd);
+                    infd = -1;
+                }
+                if (outfd >= 0) {
+                    int64_t now = monotonic_millis();
+                    if (now < 0) {
+                        io_failed = true;
+                        io_errno = errno;
+                        close(outfd);
+                        outfd = -1;
+                    } else {
+                        capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
+                    }
+                }
+            } else if (waited < 0) {
+                wait_failed = true;
+                wait_errno = errno;
+                signals_child_reaped();
+                if (infd >= 0) { close(infd); infd = -1; }
+                if (outfd >= 0) { close(outfd); outfd = -1; }
+                break;
             }
         }
     }
@@ -1586,23 +2212,92 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
     result->out_len = out_off;
 
-    int status = 0;
-    pid_t w;
-    do { w = waitpid(pid, &status, 0); } while (w < 0 && errno == EINTR);
-    /* Retract immediately after the reap: past this point the pid is free for
-     * kernel reuse, and the handler must not signal a stranger (AR-03 L8). */
-    signals_child_reaped();
+    if (!child_reaped && !wait_failed) {
+        pid_t waited;
+        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
+        if (waited == pid) {
+            child_reaped = true;
+        } else {
+            wait_failed = true;
+            wait_errno = errno;
+        }
+        /* Retract immediately after the reap: past this point the pid is free
+         * for kernel reuse, and the handler must not signal a stranger. */
+        signals_child_reaped();
+    }
     signal(SIGPIPE, old_sigpipe);
 
-    if (w < 0) {
+    if (child_reaped && WIFEXITED(status)) {
+        result->exit_code = WEXITSTATUS(status);
+    } else if (child_reaped && WIFSIGNALED(status)) {
+        result->term_signal = WTERMSIG(status);
+        result->exit_code = -1;
+    }
+
+    if (child_status_rc > 0) {
+        errno = child_status.system_errno;
+        switch ((child_stage_t)child_status.stage) {
+            case CHILD_STAGE_STDIO:
+                set_system_error(ERR_SYSTEM_CALL,
+                                 "run_argv: child stdio setup failed");
+                break;
+            case CHILD_STAGE_CWD:
+                set_system_error(ERR_SYSTEM_CALL,
+                                 "run_argv: child working-directory setup failed");
+                break;
+            case CHILD_STAGE_FD_CLOSE:
+                set_system_error(ERR_SYSTEM_CALL,
+                                 "run_argv: child descriptor cleanup failed");
+                break;
+            case CHILD_STAGE_ENV:
+                set_system_error(ERR_SYSTEM_CALL,
+                                 "run_argv: child environment setup failed");
+                break;
+            case CHILD_STAGE_EXEC:
+                set_system_error(ERR_SYSTEM_COMMAND_FAILED,
+                                 "run_argv: execv failed for '%s'", exec_path);
+                break;
+            default:
+                set_error(ERR_SYSTEM_CALL,
+                          "run_argv: child returned an unknown setup failure");
+                break;
+        }
+        return -1;
+    }
+    if (child_status_rc < 0) {
+        errno = child_status_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: child setup-status channel failed");
+        return -1;
+    }
+    if (wait_failed) {
+        errno = wait_errno;
         set_system_error(ERR_SYSTEM_CALL, "waitpid() failed");
         return -1;
     }
-    if (WIFEXITED(status)) {
-        result->exit_code = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        result->term_signal = WTERMSIG(status);
-        result->exit_code = -1;
+    if (io_failed) {
+        errno = io_errno;
+        if (nonblock_setup_failed) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot configure subprocess pipe as nonblocking");
+        } else {
+            set_system_error(ERR_SYSTEM_CALL,
+                             "run_argv: subprocess pipe I/O failed");
+        }
+        return -1;
+    }
+    if (input_failed) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "run_argv: child stdin closed before all input was delivered "
+                  "(%zu/%zu bytes)", in_off, opts->input_len);
+        return -1;
+    }
+    if (output_stalled) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "run_argv: captured stdout remained open after the direct "
+                  "child exited");
+        return -1;
     }
     return (result->spawned && result->exit_code == 0) ? 0 : -1;
 }
