@@ -101,7 +101,7 @@ static int write_account_config(const char *home, bool include_second,
         return -1;
     }
     if ((size_t)snprintf(path, sizeof(path), "%s/.resume-hint", config_dir) >=
-        sizeof(path) || write_text_mode(path, "legacy-before-image\n", 0600) != 0) {
+        sizeof(path) || write_text_mode(path, "none\n", 0600) != 0) {
         return -1;
     }
     if ((size_t)snprintf(path, sizeof(path), "%s/.config.lock", config_dir) >=
@@ -457,7 +457,7 @@ TEST(switch_save_failure_restores_git_config_active_and_exact_hint) {
     CHECK(strstr(contents, "active_account = \"new\"") == NULL);
     snprintf(path, sizeof(path), "%s/.resume-hint", config_dir);
     slurp(path, contents, sizeof(contents));
-    CHECK_STR_EQ(contents, "legacy-before-image\n");
+    CHECK_STR_EQ(contents, "none\n");
     snprintf(path, sizeof(path), "%s/.gitconfig", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "old@example.com") != NULL);
@@ -498,7 +498,7 @@ TEST(post_config_hint_failure_reverse_commits_every_switch_state) {
     CHECK(strstr(contents, "active_account = \"new\"") == NULL);
     snprintf(path, sizeof(path), "%s/.resume-hint", config_dir);
     slurp(path, contents, sizeof(contents));
-    CHECK_STR_EQ(contents, "legacy-before-image\n");
+    CHECK_STR_EQ(contents, "none\n");
     snprintf(path, sizeof(path), "%s/.gitconfig", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "old@example.com") != NULL);

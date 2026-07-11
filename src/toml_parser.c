@@ -610,6 +610,18 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         return -1;
                     }
                 }
+
+                /* active_account is a legacy migration source after AR-07
+                 * T12 moved live state into .resume-hint.  It remains modeled
+                 * so an older file can be read, but a present wrong-typed
+                 * value is never allowed to masquerade as "absent" and then
+                 * disappear on the next reconstructive save. */
+                if (strcmp(kv->key, "active_account") == 0 &&
+                    kv->type != TOML_TYPE_STRING) {
+                    set_error(ERR_CONFIG_INVALID,
+                              "settings.active_account must be a string");
+                    return -1;
+                }
             }
             
             if (!has_default_scope) {
@@ -624,6 +636,11 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
             /* Validate account section */
             bool has_name = false, has_email = false;
             bool skip_section = false;
+            bool has_nonempty_ssh_key = false;
+            bool has_ssh_host = false;
+            bool has_ssh_hostname = false;
+            bool has_nonempty_gpg_key = false;
+            bool has_gpg_signing_enabled = false;
 
             for (size_t j = 0; j < section->key_count; j++) {
                 const toml_keyvalue_t *kv = &section->keys[j];
@@ -643,6 +660,30 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         return -1;
                     }
                 }
+
+                if (strcmp(kv->key, "description") == 0 &&
+                    kv->type != TOML_TYPE_STRING) {
+                    set_error(ERR_CONFIG_INVALID,
+                              "%s.description must be a string",
+                              section->name);
+                    return -1;
+                }
+
+                if (strcmp(kv->key, "preferred_scope") == 0) {
+                    if (kv->type != TOML_TYPE_STRING) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "%s.preferred_scope must be a string",
+                                  section->name);
+                        return -1;
+                    }
+                    if (strcmp(kv->value, "local") != 0 &&
+                        strcmp(kv->value, "global") != 0) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "%s.preferred_scope must be 'local' or 'global'",
+                                  section->name);
+                        return -1;
+                    }
+                }
                 
                 if (strcmp(kv->key, "ssh_key") == 0) {
                     if (kv->type != TOML_TYPE_STRING) {
@@ -651,6 +692,7 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                     }
                     char sanitized[MAX_PATH_LEN];
                     if (strlen(kv->value) > 0) {
+                        has_nonempty_ssh_key = true;
                         /* Reject a value the sanitizer would ALTER: since M6,
                          * toml_get_string refuses to hand such a value to
                          * callers at all, so admitting it here would load an
@@ -709,6 +751,7 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                 }
 
                 if (strcmp(kv->key, "ssh_host") == 0) {
+                    has_ssh_host = true;
                     if (kv->type != TOML_TYPE_STRING) {
                         set_error(ERR_CONFIG_INVALID, "ssh_host must be a string");
                         return -1;
@@ -722,6 +765,7 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                 }
 
                 if (strcmp(kv->key, "ssh_hostname") == 0) {
+                    has_ssh_hostname = true;
                     if (kv->type != TOML_TYPE_STRING) {
                         set_error(ERR_CONFIG_INVALID,
                                   "ssh_hostname must be a string");
@@ -744,6 +788,17 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         set_error(ERR_CONFIG_INVALID, "Invalid GPG key ID: %s", kv->value);
                         return -1;
                     }
+                    has_nonempty_gpg_key = strlen(kv->value) > 0;
+                }
+
+                if (strcmp(kv->key, "gpg_signing_enabled") == 0) {
+                    has_gpg_signing_enabled = true;
+                    if (kv->type != TOML_TYPE_BOOLEAN) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "%s.gpg_signing_enabled must be a boolean",
+                                  section->name);
+                        return -1;
+                    }
                 }
             }
             
@@ -761,6 +816,31 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
 
             if (!has_name || !has_email) {
                 set_error(ERR_CONFIG_INVALID, "Account section %s missing required name or email",
+                          section->name);
+                return -1;
+            }
+
+
+            /* These keys are emitted only for an enabled subsystem.  A
+             * present dependent without its enabling key used to load as an
+             * innocuous disabled account and vanish on the next save.  Reject
+             * every such combination at admission with a field-specific
+             * diagnostic, before any in-memory mutation can be persisted. */
+            if (has_ssh_host && !has_nonempty_ssh_key) {
+                set_error(ERR_CONFIG_INVALID,
+                          "%s.ssh_host requires a non-empty ssh_key",
+                          section->name);
+                return -1;
+            }
+            if (has_ssh_hostname && !has_nonempty_ssh_key) {
+                set_error(ERR_CONFIG_INVALID,
+                          "%s.ssh_hostname requires a non-empty ssh_key",
+                          section->name);
+                return -1;
+            }
+            if (has_gpg_signing_enabled && !has_nonempty_gpg_key) {
+                set_error(ERR_CONFIG_INVALID,
+                          "%s.gpg_signing_enabled requires a non-empty gpg_key",
                           section->name);
                 return -1;
             }

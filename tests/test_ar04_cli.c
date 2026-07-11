@@ -352,14 +352,16 @@ TEST(targeted_reset_metadata_matches_active_account_scope) {
                            "/.config/gitswitch/.resume-hint"), 0);
     CHECK_EQ_INT(join_path(output, sizeof(output), runtime, "/reset.out"), 0);
 
-    /* Resetting the active account clears only the saved active marker and
-     * removes the resume hint; both account records remain. */
+    /* Resetting the active account installs an authoritative inactive
+     * tombstone; the legacy settings key may remain byte-identical but cannot
+     * be resurrected on reload. Both account records remain. */
     CHECK_EQ_INT(run_targeted_reset(home, runtime, "work", output), 0);
     slurp(config, contents, sizeof(contents));
-    CHECK(strstr(contents, "active_account = \"\"") != NULL);
+    CHECK(strstr(contents, "active_account = \"work\"") != NULL);
     CHECK(strstr(contents, "name = \"work\"") != NULL);
     CHECK(strstr(contents, "name = \"other\"") != NULL);
-    CHECK(access(hint, F_OK) != 0);
+    slurp(hint, contents, sizeof(contents));
+    CHECK_STR_EQ(contents, "none\ninactive=v1\n");
 
     /* Resetting an inactive account must not rewrite the active marker or its
      * exact retry hint. Recreate the starting document to exercise that arm. */

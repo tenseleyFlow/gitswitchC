@@ -474,11 +474,11 @@ static pty_proc_t g_p;
 
 /* 1. `--yes reset` must bypass the typed-'yes' confirmation entirely, clear
  *    the persisted active_account (so the next login can't auto-resurrect the
- *    state the user just destroyed — AR-03 T4), and remove the .resume-hint
- *    marker. */
+ *    state the user just destroyed — AR-03 T4), and install the explicit
+ *    inactive .resume-hint tombstone. */
 TEST(reset_yes_bypass_clears_active_state) {
     sandbox_t sb;
-    char cfg[16384];
+    char cfg[16384], hint[300];
     const char *argv[] = { "gitswitch", "-y", "reset", NULL };
 
     SKIP_IF_NO_PTY();
@@ -493,11 +493,13 @@ TEST(reset_yes_bypass_clears_active_state) {
     /* The confirmation prompt must never have been shown. */
     CHECK(strstr(g_p.out, "Type 'yes' to continue") == NULL);
 
-    /* active_account cleared in the persisted config; hint marker removed. */
+    /* The authoritative inactive tombstone leaves the legacy settings key
+     * byte-identical without allowing it to be resurrected. */
     CHECK(slurp(sb.cfg, cfg, sizeof(cfg)) > 0);
-    CHECK(strstr(cfg, "active_account = \"work\"") == NULL);
-    CHECK(strstr(cfg, "active_account = \"\"") != NULL);
-    CHECK(!resume_hint_exists(&sb));
+    CHECK(strstr(cfg, "active_account = \"work\"") != NULL);
+    snprintf(hint, sizeof(hint), "%s/.config/gitswitch/.resume-hint", sb.home);
+    CHECK(slurp(hint, cfg, sizeof(cfg)) > 0);
+    CHECK_STR_EQ(cfg, "none\ninactive=v1\n");
 
     pty_close(&g_p);
     sandbox_teardown(&sb);

@@ -100,6 +100,25 @@ static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc)
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
+static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
+                                     const char *config_path,
+                                     bool *state_installed);
+static bool config_metadata_same_file(const struct stat *a,
+                                      const struct stat *b);
+static bool config_metadata_dir_is_safe(const struct stat *st);
+static bool config_metadata_file_is_safe(const struct stat *st,
+                                         bool require_private_mode);
+
+typedef struct {
+    bool exists;
+    bool legacy_needs_only;
+    bool inactive_tombstone;
+    char needs[8];
+    char active_account[MAX_NAME_LEN];
+} config_active_state_t;
+
+static int config_read_active_state(const char *config_path,
+                                    config_active_state_t *state);
 
 /* Shared initializer. Preview-only commands use the non-creating form so
  * merely inspecting a fresh HOME cannot mkdir or chmod configuration state. */
@@ -164,12 +183,38 @@ int config_init_readonly(gitswitch_ctx_t *ctx) {
 }
 
 static config_document_malloc_fn g_config_document_malloc = malloc;
+static config_io_fault_fn g_config_io_fault;
+static config_backup_clock_fn g_config_backup_clock;
 
 config_document_malloc_fn config_set_document_malloc_fn(
     config_document_malloc_fn fn) {
     config_document_malloc_fn previous = g_config_document_malloc;
     g_config_document_malloc = fn ? fn : malloc;
     return previous;
+}
+
+config_io_fault_fn config_set_io_fault_fn(config_io_fault_fn fn) {
+    config_io_fault_fn previous = g_config_io_fault;
+    g_config_io_fault = fn;
+    return previous;
+}
+
+config_backup_clock_fn config_set_backup_clock_fn(
+    config_backup_clock_fn fn) {
+    config_backup_clock_fn previous = g_config_backup_clock;
+    g_config_backup_clock = fn;
+    return previous;
+}
+
+static bool config_io_fault(config_io_boundary_t boundary,
+                            const char *operation) {
+    if (!g_config_io_fault || !g_config_io_fault(boundary)) {
+        return false;
+    }
+    errno = EIO;
+    set_system_error(ERR_FILE_IO, "Injected config persistence failure: %s",
+                     operation);
+    return true;
 }
 
 /* AR-06 F48/F52/F73: toml_document_t is ~600 KiB (MAX_SECTIONS section structs
@@ -258,11 +303,246 @@ fail_buffer:
     return -1;
 }
 
+#define CONFIG_ACTIVE_STATE_MAX 1024U
+
+static bool config_state_needs_valid(const char *line, size_t length) {
+    return (length == 3 && memcmp(line, "ssh", 3) == 0) ||
+           (length == 3 && memcmp(line, "gpg", 3) == 0) ||
+           (length == 4 && memcmp(line, "none", 4) == 0) ||
+           (length == 7 && memcmp(line, "ssh gpg", 7) == 0);
+}
+
+/* Read the consolidated .resume-hint state without following either the leaf
+ * or an unsafe final config directory. Missing, zero-byte, and one-line state
+ * artifacts are admitted only as historical migration input. New artifacts
+ * are exactly two lines: an active record
+ *   <none|ssh|gpg|ssh gpg>\nactive=<validated account name>\n
+ * or the explicit inactive tombstone
+ *   none\ninactive=v1\n
+ * Any other bytes are a hard load error, never an implicit "no active state". */
+static int config_state_path_for_config(const char *config_path,
+                                        char *state_path,
+                                        size_t state_path_size) {
+    const char *slash;
+    size_t dir_length;
+
+    if (!config_path || !state_path || state_path_size == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid active-state path arguments");
+        return -1;
+    }
+    slash = strrchr(config_path, '/');
+    if (!slash) {
+        if ((size_t)snprintf(state_path, state_path_size, ".resume-hint") >=
+            state_path_size) {
+            set_error(ERR_INVALID_PATH, "Active-state path is too long");
+            return -1;
+        }
+        return 0;
+    }
+    dir_length = (size_t)(slash - config_path);
+    if (dir_length == 0) dir_length = 1;
+    if (dir_length + sizeof("/.resume-hint") > state_path_size) {
+        set_error(ERR_INVALID_PATH, "Active-state path is too long");
+        return -1;
+    }
+    memcpy(state_path, config_path, dir_length);
+    if (dir_length > 1 || state_path[0] != '/') {
+        state_path[dir_length++] = '/';
+    }
+    memcpy(state_path + dir_length, ".resume-hint",
+           sizeof(".resume-hint"));
+    return 0;
+}
+
+static int config_read_active_state(const char *config_path,
+                                    config_active_state_t *state) {
+    char hint[MAX_PATH_LEN];
+    char dir[MAX_PATH_LEN];
+    char buffer[CONFIG_ACTIVE_STATE_MAX + 1];
+    struct stat before;
+    struct stat opened;
+    struct stat after;
+    const char *first_newline;
+    const char *active;
+    size_t first_length;
+    size_t active_length;
+    size_t total = 0;
+    int fd = -1;
+
+    if (!state) {
+        set_error(ERR_INVALID_ARGS, "NULL active-state output");
+        return -1;
+    }
+    memset(state, 0, sizeof(*state));
+    if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0) {
+        return -1;
+    }
+    if (lstat(hint, &before) != 0) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect active-state artifact: %s", hint);
+        return -1;
+    }
+
+    if (safe_strncpy(dir, hint, sizeof(dir)) != 0) {
+        return -1;
+    }
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        if (safe_strncpy(dir, ".", sizeof(dir)) != 0) return -1;
+    } else if (slash == dir) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    if (lstat(dir, &after) != 0 || !config_metadata_dir_is_safe(&after)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Active-state parent is not a private owned directory: %s",
+                  dir);
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&before, false) || before.st_size < 0 ||
+        (uintmax_t)before.st_size > CONFIG_ACTIVE_STATE_MAX) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Active-state artifact is not a small stable owned file: %s",
+                  hint);
+        return -1;
+    }
+
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, false) ||
+        !config_metadata_same_file(&before, &opened)) {
+        int saved_errno = errno;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot open stable active-state artifact: %s", hint);
+        return -1;
+    }
+    while (total < (size_t)opened.st_size) {
+        ssize_t n = read(fd, buffer + total, (size_t)opened.st_size - total);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            set_error(ERR_FILE_IO,
+                      "Cannot read complete active-state artifact: %s", hint);
+            close(fd);
+            return -1;
+        }
+    }
+    if (fstat(fd, &after) != 0 ||
+        !config_metadata_same_file(&opened, &after) ||
+        after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
+        !config_metadata_same_file(&opened, &after)) {
+        close(fd);
+        set_error(ERR_FILE_IO,
+                  "Active-state artifact changed while being read: %s", hint);
+        return -1;
+    }
+    close(fd);
+    buffer[total] = '\0';
+
+    /* The first resume-hint implementation wrote a zero-byte marker. It still
+     * proves that the legacy settings.active_account was intentionally active,
+     * but carries no runtime-needs token. Admit it only as migration input; the
+     * next serialized state save replaces it with the versioned format. */
+    if (total == 0) {
+        state->exists = true;
+        state->legacy_needs_only = true;
+        return 0;
+    }
+
+    first_newline = memchr(buffer, '\n', total);
+    if (!first_newline) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: missing first newline",
+                  hint);
+        return -1;
+    }
+    first_length = (size_t)(first_newline - buffer);
+    if (!config_state_needs_valid(buffer, first_length)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: invalid runtime-needs token",
+                  hint);
+        return -1;
+    }
+    memcpy(state->needs, buffer, first_length);
+    state->needs[first_length] = '\0';
+    state->exists = true;
+    if ((size_t)(first_newline - buffer) + 1 == total) {
+        state->legacy_needs_only = true;
+        return 0;
+    }
+
+    /* Versioned inactive tombstone. Keeping the first line as "none" makes
+     * every already-generated shell snippet take its no-op arm, while the
+     * second line disambiguates a deliberate reset from a pre-state-artifact
+     * configuration whose legacy active_account must still migrate. */
+    if (first_length == 4 && memcmp(buffer, "none", 4) == 0 &&
+        total - ((size_t)(first_newline - buffer) + 1) ==
+            sizeof("inactive=v1\n") - 1 &&
+        memcmp(first_newline + 1, "inactive=v1\n",
+               sizeof("inactive=v1\n") - 1) == 0) {
+        state->inactive_tombstone = true;
+        return 0;
+    }
+
+    active = first_newline + 1;
+    if ((size_t)(active - buffer) + 7 > total ||
+        memcmp(active, "active=", 7) != 0 || buffer[total - 1] != '\n') {
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: expected active=<name>",
+                  hint);
+        return -1;
+    }
+    active += 7;
+    active_length = total - (size_t)(active - buffer) - 1;
+    if (active_length == 0 || active_length >= sizeof(state->active_account) ||
+        memchr(active, '\n', active_length) != NULL ||
+        memchr(active, '\r', active_length) != NULL) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: invalid active name length",
+                  hint);
+        return -1;
+    }
+    memcpy(state->active_account, active, active_length);
+    state->active_account[active_length] = '\0';
+    if (!validate_name(state->active_account) ||
+        !text_is_tty_safe(state->active_account)) {
+        memset(state->active_account, 0, sizeof(state->active_account));
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: unsafe active account name",
+                  hint);
+        return -1;
+    }
+    return 0;
+}
+
+static const char *config_account_runtime_needs(const account_t *account) {
+    bool wants_ssh;
+    bool wants_gpg;
+
+    if (!account) return NULL;
+    wants_ssh = account->ssh_enabled && account->ssh_key_path[0] != '\0';
+    wants_gpg = account->gpg_enabled && account->gpg_key_id[0] != '\0';
+    if (wants_ssh && wants_gpg) return "ssh gpg";
+    if (wants_ssh) return "ssh";
+    if (wants_gpg) return "gpg";
+    return "none";
+}
+
 /* Load configuration from TOML file. Preview-only callers skip live-runtime
  * discovery because its cross-process lock may create/chmod a lock inode. */
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
                             bool detect_runtime) {
     toml_document_t *toml_doc;
+    config_active_state_t active_state;
+    char legacy_active[MAX_NAME_LEN] = "";
     char scope_str[32];
 
     if (!ctx || !config_path) {
@@ -290,23 +570,40 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
     }
 
     /* Load settings section */
+    clear_error();
     if (toml_get_string(toml_doc, "settings", "default_scope",
-                        scope_str, sizeof(scope_str)) == 0) {
-        ctx->config.default_scope = config_parse_scope(scope_str);
-    } else {
-        log_warning("No default_scope found in settings, using local");
-        ctx->config.default_scope = GIT_SCOPE_LOCAL;
+                        scope_str, sizeof(scope_str)) != 0) {
+        /* The schema requires this key. A getter failure therefore means the
+         * present representation cannot be handed over faithfully, not a
+         * benign omission. Never normalize it into the local default. */
+        if (get_last_error()->code == ERR_SUCCESS) {
+            set_error(ERR_CONFIG_INVALID,
+                      "settings.default_scope is required");
+        }
+        config_document_free(toml_doc);
+        return -1;
     }
+    ctx->config.default_scope = config_parse_scope(scope_str);
 
     /* Last-active account for boot resume (optional; absent on older configs).
      * Sanitized like the other untrusted display fields; a name that needed
      * sanitizing can no longer match any (validated) account name, which is
      * the correct fail-closed outcome for resume. */
+    clear_error();
     if (toml_get_string(toml_doc, "settings", "active_account",
-                        ctx->config.active_account, sizeof(ctx->config.active_account)) != 0) {
-        ctx->config.active_account[0] = '\0';
-    } else if (sanitize_tty_text(ctx->config.active_account)) {
-        log_warning("Removed terminal control bytes from active_account setting");
+                        legacy_active, sizeof(legacy_active)) != 0) {
+        if (get_last_error()->code != ERR_SUCCESS) {
+            config_document_free(toml_doc);
+            return -1;
+        }
+        legacy_active[0] = '\0';
+    } else if (legacy_active[0] != '\0' &&
+               (!validate_name(legacy_active) ||
+                !text_is_tty_safe(legacy_active))) {
+        set_error(ERR_CONFIG_INVALID,
+                  "settings.active_account is not a safe account name");
+        config_document_free(toml_doc);
+        return -1;
     }
 
     /* Load accounts */
@@ -323,6 +620,66 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
 
     config_document_free(toml_doc);
+
+    /* A versioned tombstone is authoritative inactive state. Otherwise a
+     * two-line artifact supplies the active name directly, while every historic
+     * representation (no marker, the original zero-byte marker, or a one-line
+     * runtime-needs marker) migrates from settings.active_account. Reset writes
+     * the tombstone atomically, so absence can safely retain its pre-T12 meaning
+     * without resurrecting a post-T12 reset. */
+    if (config_read_active_state(config_path, &active_state) != 0) {
+        return -1;
+    }
+    if (active_state.exists && active_state.inactive_tombstone) {
+        ctx->config.active_account[0] = '\0';
+    } else if (active_state.exists && !active_state.legacy_needs_only) {
+        if (safe_strncpy(ctx->config.active_account,
+                         active_state.active_account,
+                         sizeof(ctx->config.active_account)) != 0) {
+            return -1;
+        }
+    } else if (legacy_active[0] != '\0') {
+        if (safe_strncpy(ctx->config.active_account, legacy_active,
+                         sizeof(ctx->config.active_account)) != 0) {
+            return -1;
+        }
+    } else if (active_state.exists) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Legacy active-state marker has no settings.active_account migration source");
+        return -1;
+    } else {
+        ctx->config.active_account[0] = '\0';
+    }
+    if (ctx->config.active_account[0] != '\0') {
+        account_t *state_account = config_find_account_exact(
+            ctx, ctx->config.active_account);
+        if (!state_account) {
+            if (ctx->accounts_skipped_on_load > 0) {
+                set_error(ERR_CONFIG_INVALID,
+                          "Active-state account '%s' could not be validated because account sections were skipped",
+                          ctx->config.active_account);
+                return -1;
+            }
+            /* A crash after accounts.toml removed/renamed the active account
+             * but before the state phase completed leaves a syntactically
+             * valid stale artifact. Resolve that state deterministically to
+             * inactive. Loading stays observational: read-only commands do
+             * not own the mutation lock, so cleanup is deferred to the next
+             * already-serialized active/full save. */
+            display_warning("Ignoring stale active-state account '%s': it is not present in %s",
+                            ctx->config.active_account, config_path);
+            ctx->config.active_account[0] = '\0';
+        } else if (active_state.exists &&
+                   !active_state.legacy_needs_only &&
+                   strcmp(active_state.needs,
+                          config_account_runtime_needs(state_account)) != 0) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Active-state runtime needs '%s' do not match account '%s' (expected '%s')",
+                      active_state.needs, ctx->config.active_account,
+                      config_account_runtime_needs(state_account));
+            return -1;
+        }
+    }
 
     /* Detect current account from SSH socket symlink for ordinary commands.
      * A dry-run remains observational and uses the persisted active_account
@@ -478,8 +835,8 @@ void config_resume_hint_snapshot_clear(
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
-int config_resume_hint_snapshot_capture(
-    config_resume_hint_snapshot_t *snapshot) {
+static int config_resume_hint_snapshot_capture_at(
+    const char *config_path, config_resume_hint_snapshot_t *snapshot) {
     char hint[MAX_PATH_LEN];
     struct stat before;
     struct stat opened;
@@ -488,12 +845,12 @@ int config_resume_hint_snapshot_capture(
     size_t total = 0;
     int fd = -1;
 
-    if (!snapshot) {
+    if (!config_path || !snapshot) {
         set_error(ERR_INVALID_ARGS, "NULL resume-hint snapshot");
         return -1;
     }
     config_resume_hint_snapshot_clear(snapshot);
-    if (config_resume_hint_path(hint, sizeof(hint)) != 0) {
+    if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0) {
         return -1;
     }
     if (lstat(hint, &before) != 0) {
@@ -571,7 +928,18 @@ int config_resume_hint_snapshot_capture(
     return 0;
 }
 
-int config_resume_hint_snapshot_restore(
+int config_resume_hint_snapshot_capture(
+    config_resume_hint_snapshot_t *snapshot) {
+    char config_path[MAX_PATH_LEN];
+
+    if (config_get_path(config_path, sizeof(config_path)) != 0) {
+        return -1;
+    }
+    return config_resume_hint_snapshot_capture_at(config_path, snapshot);
+}
+
+static int config_resume_hint_snapshot_restore_at(
+    const char *config_path,
     const config_resume_hint_snapshot_t *snapshot) {
     char dir[MAX_PATH_LEN];
     char hint[MAX_PATH_LEN];
@@ -583,13 +951,21 @@ int config_resume_hint_snapshot_restore(
     int dir_fd = -1;
     int fd = -1;
 
-    if (!snapshot || !snapshot->valid) {
+    if (!config_path || !snapshot || !snapshot->valid) {
         set_error(ERR_INVALID_ARGS, "Invalid resume-hint snapshot");
         return -1;
     }
-    if (get_config_directory(dir, sizeof(dir)) != 0 ||
-        config_resume_hint_path(hint, sizeof(hint)) != 0) {
+    if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0 ||
+        safe_strncpy(dir, hint, sizeof(dir)) != 0) {
         return -1;
+    }
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        if (safe_strncpy(dir, ".", sizeof(dir)) != 0) return -1;
+    } else if (slash == dir) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
     }
 
     if (lstat(dir, &dir_identity) != 0 ||
@@ -755,17 +1131,27 @@ restore_fail:
     return -1;
 }
 
-/* Create or remove the resume-hint marker so the shell integration knows
- * whether a boot-time resume is worth attempting. The marker's CONTENT records
- * the active account's boot-volatile runtime needs as a space-separated token
- * set ("ssh", "gpg", or "none"), so the shell snippet can skip the per-shell
- * ssh-add liveness probe entirely for an SSH-less active account — otherwise a
- * GPG-only or identity-only account made every new interactive shell spawn
- * ssh-add (exit 2) plus a `gitswitch resume` in perpetuity (AR-02 #23). This is
- * required transaction state: failure is reported so a CLI switch can roll
- * the matching Git/runtime/config state back. */
-static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
-    const char *content;
+int config_resume_hint_snapshot_restore(
+    const config_resume_hint_snapshot_t *snapshot) {
+    char config_path[MAX_PATH_LEN];
+
+    if (config_get_path(config_path, sizeof(config_path)) != 0) {
+        return -1;
+    }
+    return config_resume_hint_snapshot_restore_at(config_path, snapshot);
+}
+
+/* Atomically replace the consolidated active-state artifact. Its first line
+ * keeps the exact legacy runtime-needs contract consumed by generated shell
+ * code; its second line records either active=<name> or the versioned inactive
+ * tombstone that prevents a stale legacy settings key from being resurrected. */
+static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
+                                     const char *config_path,
+                                     bool *state_installed) {
+    config_active_state_t existing_state;
+    const account_t *active_account = NULL;
+    const char *needs;
+    char content[MAX_NAME_LEN + 32];
     char dir[MAX_PATH_LEN];
     char hint[MAX_PATH_LEN];
     char temp[MAX_PATH_LEN];
@@ -775,6 +1161,15 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     struct stat after;
     bool existed = false;
     int fd = -1;
+
+    if (state_installed) {
+        *state_installed = false;
+    }
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid arguments to active-state commit");
+        return -1;
+    }
 
     /* Deterministic commit-boundary fault injection for the CLI transaction
      * regression. The active config has already been atomically installed
@@ -786,58 +1181,83 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
         return -1;
     }
 
-    if (get_config_directory(dir, sizeof(dir)) != 0 ||
-        create_config_directory_secure(dir) != 0 ||
+    if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0 ||
+        safe_strncpy(dir, hint, sizeof(dir)) != 0) {
+        return -1;
+    }
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        if (safe_strncpy(dir, ".", sizeof(dir)) != 0) return -1;
+    } else if (slash == dir) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    if (create_config_directory_secure(dir) != 0 ||
         lstat(dir, &dir_identity) != 0 ||
         !config_metadata_dir_is_safe(&dir_identity)) {
         set_error(ERR_PERMISSION_DENIED,
                   "Cannot safely update the resume hint: config directory is unavailable");
         return -1;
     }
-    if (config_resume_hint_path(hint, sizeof(hint)) != 0) return -1;
+    if (config_read_active_state(config_path, &existing_state) != 0) {
+        return -1;
+    }
     if (ctx->config.active_account[0] == '\0') {
-        /* unlink() removes only the directory entry and never follows a final
-         * symlink, so reset cannot alter a symlink target. */
-        if (unlink(hint) != 0 && errno != ENOENT) {
-            set_system_error(ERR_FILE_IO,
-                             "Cannot remove obsolete resume hint: %s", hint);
+        if (safe_strncpy(content, "none\ninactive=v1\n",
+                         sizeof(content)) != 0) {
             return -1;
         }
-        {
-            int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
-                                   O_NOFOLLOW);
-            if (dir_fd < 0 || fsync(dir_fd) != 0) {
-                int saved_errno = errno;
-                if (dir_fd >= 0) close(dir_fd);
-                errno = saved_errno;
-                set_system_error(ERR_FILE_IO,
-                                 "Cannot durably remove obsolete resume hint");
-                return -1;
+        if (existing_state.exists && existing_state.inactive_tombstone) {
+            return 0;
+        }
+    } else {
+
+        /* Resolve with the same case-insensitive exact-name semantics used by
+         * config_load. Persisting a guessed conservative token for a genuinely
+         * absent account would make a successful save advertise an identity the
+         * just-written account model cannot resolve. */
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            if (strcasecmp(ctx->accounts[i].name,
+                           ctx->config.active_account) == 0) {
+                active_account = &ctx->accounts[i];
+                break;
             }
-            close(dir_fd);
         }
-        return 0;
-    }
 
-    /* Resolve the active account to read its ssh/gpg flags. If it can't be
-     * found (shouldn't happen — it was just saved), fall back to the
-     * conservative "ssh gpg" so the snippet still probes rather than wrongly
-     * skipping a needed resume. */
-    bool wants_ssh = true, wants_gpg = true;
-    for (size_t i = 0; i < ctx->account_count; i++) {
-        if (strcmp(ctx->accounts[i].name, ctx->config.active_account) == 0) {
-            wants_ssh = ctx->accounts[i].ssh_enabled &&
-                        ctx->accounts[i].ssh_key_path[0] != '\0';
-            wants_gpg = ctx->accounts[i].gpg_enabled &&
-                        ctx->accounts[i].gpg_key_id[0] != '\0';
-            break;
+        if (!validate_name(ctx->config.active_account) ||
+            !text_is_tty_safe(ctx->config.active_account)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Refusing to persist unsafe active account name");
+            return -1;
+        }
+        if (!active_account) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Refusing to persist missing active account '%s'",
+                      ctx->config.active_account);
+            return -1;
+        }
+        bool wants_ssh = active_account->ssh_enabled &&
+                         active_account->ssh_key_path[0] != '\0';
+        bool wants_gpg = active_account->gpg_enabled &&
+                         active_account->gpg_key_id[0] != '\0';
+        if (wants_ssh && wants_gpg)      needs = "ssh gpg";
+        else if (wants_ssh)              needs = "ssh";
+        else if (wants_gpg)              needs = "gpg";
+        else                             needs = "none";
+        if ((size_t)snprintf(content, sizeof(content), "%s\nactive=%s\n",
+                             needs, ctx->config.active_account) >= sizeof(content)) {
+            set_error(ERR_CONFIG_INVALID, "Active-state content is too long");
+            return -1;
+        }
+        if (existing_state.exists && !existing_state.legacy_needs_only &&
+            !existing_state.inactive_tombstone &&
+            strcmp(existing_state.needs, needs) == 0 &&
+            strcmp(existing_state.active_account,
+                   ctx->config.active_account) == 0) {
+            return 0;
         }
     }
-
-    if (wants_ssh && wants_gpg)      content = "ssh gpg\n";
-    else if (wants_ssh)              content = "ssh\n";
-    else if (wants_gpg)              content = "gpg\n";
-    else                             content = "none\n";
 
     /* Never open the destination for writing. Capture its exact identity (or
      * absence), build a fresh 0600 inode beside it, then verify that neither
@@ -866,6 +1286,10 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
         return -1;
     }
     (void)signals_scratch_register(temp);
+    if (config_io_fault(CONFIG_IO_STATE_AFTER_TEMP,
+                        "active-state temp creation")) {
+        goto hint_fail;
+    }
     if (fchmod(fd, PERM_USER_RW) != 0 ||
         fstat(fd, &temp_identity) != 0 ||
         !config_metadata_file_is_safe(&temp_identity, true)) {
@@ -888,9 +1312,17 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
             goto hint_fail;
         }
     }
-    if (fsync(fd) != 0) {
+    if (config_io_fault(CONFIG_IO_STATE_AFTER_WRITE,
+                        "active-state write") ||
+        config_io_fault(CONFIG_IO_STATE_BEFORE_FILE_SYNC,
+                        "active-state payload sync") ||
+        fsync(fd) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot flush temporary resume hint: %s", temp);
+        goto hint_fail;
+    }
+    if (config_io_fault(CONFIG_IO_STATE_BEFORE_CLOSE,
+                        "active-state close")) {
         goto hint_fail;
     }
     if (close(fd) != 0) {
@@ -926,12 +1358,16 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
         goto hint_fail;
     }
 
-    if (rename(temp, hint) != 0) {
+    if (config_io_fault(CONFIG_IO_STATE_BEFORE_RENAME,
+                        "active-state rename") || rename(temp, hint) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install resume hint atomically: %s", hint);
         goto hint_fail;
     }
     signals_scratch_unregister(temp);
+    if (state_installed) {
+        *state_installed = true;
+    }
 
     if (lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, true) ||
@@ -943,7 +1379,10 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     {
         int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
                                O_NOFOLLOW);
-        if (dir_fd < 0 || fsync(dir_fd) != 0) {
+        if (dir_fd < 0 ||
+            config_io_fault(CONFIG_IO_STATE_BEFORE_DIR_SYNC,
+                            "active-state directory sync") ||
+            fsync(dir_fd) != 0) {
             int saved_errno = errno;
             if (dir_fd >= 0) close(dir_fd);
             errno = saved_errno;
@@ -993,7 +1432,10 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
      * account-edit backups out of the bounded set. */
     if (make_backup && path_exists(config_path)) {
         if (config_backup(config_path) != 0) {
-            log_warning("Failed to create backup before saving config");
+            /* A successful save promises a durable, parseable recovery copy.
+             * If that promise cannot be established, the config replacement
+             * must not begin. */
+            return -1;
         }
     }
 
@@ -1095,7 +1537,8 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         }
     }
 
-    if (update_hint && config_update_resume_hint(ctx) != 0) {
+    if (update_hint &&
+        config_update_resume_hint(ctx, config_path, NULL) != 0) {
         return -1;
     }
     log_info("Configuration document committed to: %s", config_path);
@@ -1166,12 +1609,18 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
                             const char *config_path,
                             bool update_hint,
                             bool *config_installed) {
+    config_resume_hint_snapshot_t state_before = {0};
     toml_document_t *toml_doc;
+    bool document_installed = false;
+    bool state_installed = false;
     int result = -1;
 
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save");
         return -1;
+    }
+    if (config_installed) {
+        *config_installed = false;
     }
 
     /* Refuse to rewrite the file when the load produced an incomplete view:
@@ -1199,14 +1648,6 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         goto cleanup;
     }
 
-    /* Persist the last-active account for boot resume (when one is set) */
-    if (ctx->config.active_account[0] != '\0') {
-        if (toml_set_string(toml_doc, "settings", "active_account",
-                            ctx->config.active_account) != 0) {
-            goto cleanup;
-        }
-    }
-
     /* Add current accounts */
     log_debug("About to save accounts to TOML doc with %zu sections", toml_doc->section_count);
     if (save_accounts_to_toml(ctx, toml_doc) != 0) {
@@ -1214,11 +1655,58 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     }
     log_debug("After saving accounts, TOML doc has %zu sections", toml_doc->section_count);
 
+    /* Multi-file commit order: install the small state first under an exact
+     * before-image, then replace accounts.toml. If the config never installs,
+     * restore the state bytes exactly. If config rename does install but its
+     * directory sync reports uncertainty, retain matching new state so the two
+     * visible files never disagree about the installed account model. */
+    if (update_hint) {
+        if (config_resume_hint_snapshot_capture_at(config_path,
+                                                    &state_before) != 0) {
+            goto cleanup;
+        }
+        if (config_update_resume_hint(ctx, config_path,
+                                      &state_installed) != 0) {
+            if (state_installed) {
+                error_context_t state_error = *get_last_error();
+                if (config_resume_hint_snapshot_restore_at(config_path,
+                                                           &state_before) != 0) {
+                    char restore_error[sizeof(g_last_error.message)];
+                    safe_strncpy(restore_error, get_last_error()->message,
+                                 sizeof(restore_error));
+                    set_error(ERR_FILE_IO,
+                              "Active-state commit failed after installation (%s), and rollback failed (%s)",
+                              state_error.message, restore_error);
+                } else {
+                    g_last_error = state_error;
+                }
+            }
+            goto cleanup;
+        }
+    }
     result = config_write_document_atomic(ctx, toml_doc, config_path, true,
-                                          update_hint,
-                                          config_installed);
+                                          false, &document_installed);
+    if (config_installed) {
+        *config_installed = document_installed;
+    }
+    if (result != 0 && update_hint && state_installed &&
+        !document_installed) {
+        error_context_t write_error = *get_last_error();
+        if (config_resume_hint_snapshot_restore_at(config_path,
+                                                   &state_before) != 0) {
+            char restore_error[sizeof(g_last_error.message)];
+            safe_strncpy(restore_error, get_last_error()->message,
+                         sizeof(restore_error));
+            set_error(ERR_FILE_IO,
+                      "Config write failed before installation (%s), and active-state rollback failed (%s)",
+                      write_error.message, restore_error);
+        } else {
+            g_last_error = write_error;
+        }
+    }
 
 cleanup:
+    config_resume_hint_snapshot_clear(&state_before);
     config_document_free(toml_doc);
     return result;
 }
@@ -1227,23 +1715,13 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     return config_save_mode(ctx, config_path, true, NULL);
 }
 
-/* Persist only settings.active_account via parse -> edit -> write-back of the
- * on-disk document (AR-03 M9). The full config_save is (correctly) refused
- * when the load skipped sections — but a switch between the HEALTHY accounts
- * must still record active_account, or the next boot's resume restores the
- * wrong identity while the switch reported success. The write-back path is
- * safe where the rebuild is not: toml_write_file re-emits every parsed
- * section, including schema-skipped account sections (their keys stay set;
- * only the section's is_set is cleared) and unrecognized sections, so nothing
- * the loader couldn't model is lost. Comments are not preserved — same as
- * every existing save path. */
+/* Persist only the consolidated state artifact. This intentionally does not
+ * parse or replace accounts.toml: switch/reset state is orthogonal to the
+ * account schema and remains writable even when a healthy subset was loaded
+ * from a non-reconstructable config. */
 static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
                                            const char *config_path,
-                                           bool update_hint,
                                            bool *config_installed) {
-    toml_document_t *toml_doc;
-    int result;
-
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save_active_account");
         return -1;
@@ -1252,54 +1730,15 @@ static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
     /* No file yet: nothing to preserve, and the write-back needs a document
      * to edit — the full rebuild is both safe and required to create one. */
     if (!path_exists(config_path)) {
-        return config_save_mode(ctx, config_path, update_hint,
+        return config_save_mode(ctx, config_path, true,
                                 config_installed);
     }
-
-    toml_doc = config_document_alloc();
-    if (!toml_doc) {
-        return -1;
-    }
-
-    if (config_read_document(config_path, toml_doc) != 0) {
-        config_document_free(toml_doc);
-        return -1;
-    }
-
-    /* Keys before the first section header parse into a section with an empty
-     * name; toml_write_file would emit that as a bare "[]" header the next
-     * load then rejects. Refuse rather than corrupt (the loader already warned
-     * about the unrecognized section; the user has to fix the file anyway). */
-    for (size_t i = 0; i < toml_doc->section_count; i++) {
-        if (toml_doc->sections[i].name[0] == '\0' && toml_doc->sections[i].key_count > 0) {
-            set_error(ERR_CONFIG_INVALID,
-                      "Config file %s has keys before its first [section] header; "
-                      "they cannot be written back faithfully — fix the file first",
-                      config_path);
-            config_document_free(toml_doc);
-            return -1;
-        }
-    }
-
-    /* An empty active_account (e.g. after `reset`) is stored as "" — there is
-     * no key-removal primitive, and the loader treats "" as "none saved". */
-    if (toml_set_string(toml_doc, "settings", "active_account",
-                        ctx->config.active_account) != 0) {
-        config_document_free(toml_doc);
-        return -1;
-    }
-
-    /* Settings-only write-back: no backup (AR-06 F51). */
-    result = config_write_document_atomic(ctx, toml_doc, config_path, false,
-                                          update_hint,
-                                          config_installed);
-    config_document_free(toml_doc);
-    return result;
+    return config_update_resume_hint(ctx, config_path, config_installed);
 }
 
 int config_save_active_account(const gitswitch_ctx_t *ctx,
                                const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, true, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL);
 }
 
 int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
@@ -1311,84 +1750,183 @@ int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
         return -1;
     }
     *config_installed = false;
-    return config_save_active_account_mode(ctx, config_path, true,
+    return config_save_active_account_mode(ctx, config_path,
                                            config_installed);
 }
 
 int config_restore_active_account(const gitswitch_ctx_t *ctx,
                                   const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, false, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL);
 }
 
 /* Create default configuration file */
 int config_create_default(const char *config_path) {
-    FILE *file;
     char config_dir[MAX_PATH_LEN];
-    char *last_slash;
+    char temp_path[MAX_PATH_LEN];
+    const char *last_slash;
+    struct stat dir_identity;
+    struct stat temp_identity;
+    struct stat installed;
+    size_t total = 0;
+    size_t length = strlen(default_config_template);
+    int dir_fd = -1;
+    int fd = -1;
+    bool registered = false;
     
     if (!config_path) {
         set_error(ERR_INVALID_ARGS, "NULL config path to config_create_default");
         return -1;
     }
     
-    /* Extract directory from config path */
-    safe_strncpy(config_dir, config_path, sizeof(config_dir));
-    last_slash = strrchr(config_dir, '/');
-    if (last_slash) {
-        *last_slash = '\0';
+    last_slash = strrchr(config_path, '/');
+    if (!last_slash) {
+        if (safe_strncpy(config_dir, ".", sizeof(config_dir)) != 0) {
+            return -1;
+        }
+    } else {
+        size_t dir_length = (size_t)(last_slash - config_path);
+        if (dir_length == 0) dir_length = 1;
+        if (dir_length >= sizeof(config_dir)) {
+            set_error(ERR_INVALID_PATH, "Default config parent path is too long");
+            return -1;
+        }
+        memcpy(config_dir, config_path, dir_length);
+        config_dir[dir_length] = '\0';
     }
     
     /* Ensure directory exists */
     if (create_config_directory_secure(config_dir) != 0) {
         return -1;
     }
-    
-    /* Create the file with O_CREAT|O_EXCL (never follows symlinks) and mode
-     * 0600 directly, instead of fopen("w") + chmod afterwards: fopen would
-     * happily truncate-through an attacker-planted symlink, and the old
-     * create-then-chmod left a window where the file existed with the
-     * (potentially loose) umask permissions (cfg-symlink-01). */
-    int fd = open(config_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+
+    if (validate_config_write_destination(config_path) != 0) {
+        return -1;
+    }
+    if (lstat(config_path, &installed) == 0) {
+        errno = EEXIST;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Configuration file already exists: %s", config_path);
+        return -1;
+    }
+    if (errno != ENOENT || lstat(config_dir, &dir_identity) != 0 ||
+        !config_metadata_dir_is_safe(&dir_identity)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Default config parent is not a stable private directory: %s",
+                  config_dir);
+        return -1;
+    }
+    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s.create.XXXXXX",
+                         config_path) >= sizeof(temp_path)) {
+        set_error(ERR_INVALID_PATH, "Default config temporary path is too long");
+        return -1;
+    }
+    fd = mkstemp(temp_path);
     if (fd < 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to create config file: %s", config_path);
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to create default config temporary file");
         return -1;
     }
-    file = fdopen(fd, "w");
-    if (!file) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to open config file stream: %s", config_path);
-        close(fd);
-        unlink(config_path);
-        return -1;
+    if (signals_scratch_register(temp_path) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot register default config temporary file for cleanup");
+        goto default_fail;
     }
+    registered = true;
+    if (fchmod(fd, PERM_USER_RW) != 0 || fstat(fd, &temp_identity) != 0 ||
+        !config_metadata_file_is_safe(&temp_identity, true)) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to secure default config temporary file");
+        goto default_fail;
+    }
+    if (config_io_fault(CONFIG_IO_DEFAULT_AFTER_TEMP,
+                        "default config temp creation")) {
+        goto default_fail;
+    }
+    while (total < length) {
+        ssize_t n = write(fd, default_config_template + total, length - total);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            set_system_error(ERR_CONFIG_WRITE_FAILED,
+                             "Failed to write complete default config");
+            goto default_fail;
+        }
+    }
+    if (config_io_fault(CONFIG_IO_DEFAULT_AFTER_WRITE,
+                        "default config write") ||
+        config_io_fault(CONFIG_IO_DEFAULT_BEFORE_FILE_SYNC,
+                        "default config payload sync") || fsync(fd) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to sync default config payload");
+        goto default_fail;
+    }
+    if (config_io_fault(CONFIG_IO_DEFAULT_BEFORE_CLOSE,
+                        "default config close")) {
+        goto default_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to close default config temporary file");
+        goto default_fail;
+    }
+    fd = -1;
 
-    /* Write default template. On failure unlink the final path (AR-06 F18): the
-     * old path left a truncated accounts.toml behind that bricked every later
-     * command (unlike the fdopen-failure path just above, which unlinks). */
-    if (fwrite(default_config_template, 1, strlen(default_config_template), file) !=
-        strlen(default_config_template)) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to write default config content");
-        fclose(file);
-        unlink(config_path);
-        return -1;
+    if (lstat(temp_path, &installed) != 0 ||
+        !config_metadata_file_is_safe(&installed, true) ||
+        !config_metadata_same_file(&temp_identity, &installed) ||
+        (size_t)installed.st_size != length ||
+        lstat(config_dir, &installed) != 0 ||
+        !config_metadata_dir_is_safe(&installed) ||
+        !config_metadata_same_file(&dir_identity, &installed) ||
+        lstat(config_path, &installed) == 0 || errno != ENOENT) {
+        set_error(ERR_CONFIG_WRITE_FAILED,
+                  "Default config destination changed before installation");
+        goto default_fail;
     }
+    if (config_io_fault(CONFIG_IO_DEFAULT_BEFORE_RENAME,
+                        "default config rename") ||
+        rename(temp_path, config_path) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to install default config atomically");
+        goto default_fail;
+    }
+    signals_scratch_unregister(temp_path);
+    registered = false;
 
-    /* Durable, CHECKED close (AR-06 F18): stdio buffers the write, so ENOSPC/EIO
-     * often surface only at flush/close. The old bare fclose could report
-     * success with a truncated config. */
-    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to flush default config to disk");
-        fclose(file);
-        unlink(config_path);
+    if (lstat(config_path, &installed) != 0 ||
+        !config_metadata_file_is_safe(&installed, true) ||
+        !config_metadata_same_file(&temp_identity, &installed) ||
+        (size_t)installed.st_size != length) {
+        set_error(ERR_CONFIG_WRITE_FAILED,
+                  "Installed default config failed verification");
         return -1;
     }
-    if (fclose(file) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to close default config file");
-        unlink(config_path);
+    dir_fd = open(config_dir,
+                  O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 ||
+        config_io_fault(CONFIG_IO_DEFAULT_BEFORE_DIR_SYNC,
+                        "default config directory sync") ||
+        fsync(dir_fd) != 0) {
+        int saved_errno = errno;
+        if (dir_fd >= 0) close(dir_fd);
+        errno = saved_errno;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to sync default config directory");
         return -1;
     }
+    close(dir_fd);
 
     log_info("Created default configuration file: %s", config_path);
     return 0;
+
+default_fail:
+    if (fd >= 0) close(fd);
+    unlink(temp_path);
+    if (registered) signals_scratch_unregister(temp_path);
+    return -1;
 }
 
 /* Validate configuration structure */
@@ -1739,130 +2277,343 @@ const char *config_scope_to_string(git_scope_t scope) {
     }
 }
 
-static int prune_cmp(const void *a, const void *b) {
-    return strcmp((const char *)a, (const char *)b);
-}
+typedef struct {
+    char name[256];
+    bool legacy;
+    uint64_t seconds;
+    uint32_t nanoseconds;
+    uint64_t generation;
+} config_backup_entry_t;
 
-/* Keep only the newest `keep` timestamped backups of config_path; delete older
- * ones so they don't accumulate unbounded (each holds account metadata). The
- * "%Y%m%d_%H%M%S" timestamp sorts lexicographically == chronologically. */
-static void prune_old_backups(const char *config_path, size_t keep) {
-    char dir[MAX_PATH_LEN];
-    char prefix[MAX_PATH_LEN];
+#define CONFIG_BACKUP_SCAN_MAX 128U
+
+static int config_backup_split_path(const char *config_path, char *dir,
+                                    size_t dir_size, char *prefix,
+                                    size_t prefix_size) {
     const char *slash = strrchr(config_path, '/');
-    const char *base;
-    char names[64][256];
-    size_t n = 0, plen;
-    DIR *d;
-    struct dirent *e;
+    const char *base = config_path;
 
     if (slash) {
-        size_t dl = (size_t)(slash - config_path);
-        if (dl >= sizeof(dir)) return;
-        memcpy(dir, config_path, dl);
-        dir[dl] = '\0';
+        size_t dir_length = (size_t)(slash - config_path);
+        if (dir_length == 0) dir_length = 1;
+        if (dir_length >= dir_size) return -1;
+        memcpy(dir, config_path, dir_length);
+        dir[dir_length] = '\0';
         base = slash + 1;
-    } else {
-        strcpy(dir, ".");
-        base = config_path;
+    } else if (safe_strncpy(dir, ".", dir_size) != 0) {
+        return -1;
     }
-    if ((size_t)snprintf(prefix, sizeof(prefix), "%s.backup.", base) >= sizeof(prefix)) return;
-    plen = strlen(prefix);
-
-    d = opendir(dir);
-    if (!d) return;
-    while ((e = readdir(d)) != NULL && n < 64) {
-        if (strncmp(e->d_name, prefix, plen) == 0) {
-            snprintf(names[n], sizeof(names[n]), "%s", e->d_name);
-            n++;
-        }
+    if ((size_t)snprintf(prefix, prefix_size, "%s.backup.", base) >=
+        prefix_size) {
+        return -1;
     }
-    closedir(d);
-    if (n <= keep) return;
-
-    qsort(names, n, sizeof(names[0]), prune_cmp);
-    for (size_t i = 0; i < n - keep; i++) {
-        char full[MAX_PATH_LEN];
-        if ((size_t)snprintf(full, sizeof(full), "%s/%s", dir, names[i]) < sizeof(full)) {
-            unlink(full);
-        }
-    }
+    return 0;
 }
 
-/* Backup configuration file with timestamp */
+static bool config_parse_fixed_decimal(const char **cursor, size_t digits,
+                                       uint64_t *value) {
+    uint64_t parsed = 0;
+    const char *p = *cursor;
+
+    for (size_t i = 0; i < digits; i++) {
+        unsigned int digit;
+        if (p[i] < '0' || p[i] > '9') return false;
+        digit = (unsigned int)(p[i] - '0');
+        if (parsed > (UINT64_MAX - digit) / 10U) return false;
+        parsed = parsed * 10U + digit;
+    }
+    *cursor = p + digits;
+    *value = parsed;
+    return true;
+}
+
+static bool config_backup_parse_new(const char *suffix,
+                                    config_backup_entry_t *entry) {
+    const char *p = suffix;
+    uint64_t nanoseconds;
+
+    if (!config_parse_fixed_decimal(&p, 20, &entry->seconds) || *p++ != '.' ||
+        !config_parse_fixed_decimal(&p, 9, &nanoseconds) || *p++ != '.' ||
+        !config_parse_fixed_decimal(&p, 20, &entry->generation) || *p != '\0' ||
+        nanoseconds >= 1000000000ULL) {
+        return false;
+    }
+    entry->nanoseconds = (uint32_t)nanoseconds;
+    entry->legacy = false;
+    return true;
+}
+
+static bool config_backup_parse_legacy(const char *suffix,
+                                       config_backup_entry_t *entry) {
+    const char *p = suffix;
+    uint64_t date;
+    uint64_t clock;
+    uint64_t generation = 0;
+
+    if (!config_parse_fixed_decimal(&p, 8, &date) || *p++ != '_' ||
+        !config_parse_fixed_decimal(&p, 6, &clock)) {
+        return false;
+    }
+    if (*p == '_') {
+        const char *start = ++p;
+        while (*p >= '0' && *p <= '9') p++;
+        if (p == start || (size_t)(p - start) > 20) return false;
+        p = start;
+        if (!config_parse_fixed_decimal(&p,
+                                        (size_t)(strchr(start, '\0') - start),
+                                        &generation)) {
+            return false;
+        }
+    }
+    if (*p != '\0') return false;
+    entry->legacy = true;
+    entry->seconds = date * 1000000ULL + clock;
+    entry->nanoseconds = 0;
+    entry->generation = generation;
+    return true;
+}
+
+static int config_backup_entry_cmp(const void *left, const void *right) {
+    const config_backup_entry_t *a = left;
+    const config_backup_entry_t *b = right;
+
+    if (a->legacy != b->legacy) return a->legacy ? -1 : 1;
+    if (a->seconds != b->seconds) return a->seconds < b->seconds ? -1 : 1;
+    if (a->nanoseconds != b->nanoseconds) {
+        return a->nanoseconds < b->nanoseconds ? -1 : 1;
+    }
+    if (a->generation != b->generation) {
+        return a->generation < b->generation ? -1 : 1;
+    }
+    return strcmp(a->name, b->name);
+}
+
+static int config_backup_collect(const char *config_path,
+                                 config_backup_entry_t *entries,
+                                 size_t capacity, size_t *count,
+                                 char *dir, size_t dir_size) {
+    char prefix[256];
+    size_t prefix_length;
+    DIR *stream;
+    struct dirent *item;
+
+    *count = 0;
+    if (config_backup_split_path(config_path, dir, dir_size, prefix,
+                                 sizeof(prefix)) != 0) {
+        set_error(ERR_INVALID_PATH, "Backup directory or prefix is too long");
+        return -1;
+    }
+    prefix_length = strlen(prefix);
+    stream = opendir(dir);
+    if (!stream) {
+        set_system_error(ERR_FILE_IO, "Cannot enumerate config backups");
+        return -1;
+    }
+    while ((item = readdir(stream)) != NULL) {
+        config_backup_entry_t parsed = {0};
+        const char *suffix;
+        struct stat st;
+        if (strncmp(item->d_name, prefix, prefix_length) != 0) continue;
+        suffix = item->d_name + prefix_length;
+        if (!config_backup_parse_new(suffix, &parsed) &&
+            !config_backup_parse_legacy(suffix, &parsed)) {
+            continue; /* never delete an unrecognized same-prefix user file */
+        }
+        if (fstatat(dirfd(stream), item->d_name, &st,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !config_metadata_file_is_safe(&st, true)) {
+            closedir(stream);
+            set_error(ERR_PERMISSION_DENIED,
+                      "Config backup candidate is not a private owned regular file: %s",
+                      item->d_name);
+            return -1;
+        }
+        if (*count >= capacity ||
+            safe_strncpy(parsed.name, item->d_name,
+                         sizeof(parsed.name)) != 0) {
+            closedir(stream);
+            set_error(ERR_FILE_IO,
+                      "Too many configuration backups to rotate safely");
+            return -1;
+        }
+        entries[(*count)++] = parsed;
+    }
+    if (closedir(stream) != 0) {
+        set_system_error(ERR_FILE_IO, "Cannot close config backup directory");
+        return -1;
+    }
+    return 0;
+}
+
+static int config_backup_prune(const char *config_path, size_t keep) {
+    config_backup_entry_t entries[CONFIG_BACKUP_SCAN_MAX];
+    char dir[MAX_PATH_LEN];
+    size_t count;
+    int dir_fd;
+
+    if (config_backup_collect(config_path, entries,
+                              CONFIG_BACKUP_SCAN_MAX, &count,
+                              dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    if (count <= keep) return 0;
+    qsort(entries, count, sizeof(entries[0]), config_backup_entry_cmp);
+    dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0) {
+        set_system_error(ERR_FILE_IO, "Cannot pin config backup directory");
+        return -1;
+    }
+    for (size_t i = 0; i < count - keep; i++) {
+        struct stat st;
+        if (fstatat(dir_fd, entries[i].name, &st, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !config_metadata_file_is_safe(&st, true) ||
+            unlinkat(dir_fd, entries[i].name, 0) != 0) {
+            close(dir_fd);
+            set_error(ERR_FILE_IO,
+                      "Cannot safely prune old config backup: %s",
+                      entries[i].name);
+            return -1;
+        }
+    }
+    if (fsync(dir_fd) != 0) {
+        close(dir_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot durably prune config backups");
+        return -1;
+    }
+    close(dir_fd);
+    return 0;
+}
+
+static int config_backup_default_clock(uint64_t *seconds,
+                                       uint32_t *nanoseconds) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 || now.tv_sec < 0 ||
+        now.tv_nsec < 0 || now.tv_nsec >= 1000000000L) {
+        return -1;
+    }
+    *seconds = (uint64_t)now.tv_sec;
+    *nanoseconds = (uint32_t)now.tv_nsec;
+    return 0;
+}
+
+/* Backup configuration file with a persisted monotonic generation. */
 int config_backup(const char *config_path) {
+    config_backup_entry_t entries[CONFIG_BACKUP_SCAN_MAX];
+    toml_document_t *verify_doc = NULL;
     char backup_path[MAX_PATH_LEN];
-    char timestamp[32];
-    time_t now;
-    struct tm *tm_info;
-    
+    char dir[MAX_PATH_LEN];
+    uint64_t seconds;
+    uint32_t nanoseconds;
+    uint64_t generation = 0;
+    size_t count;
+    int dir_fd = -1;
+    int rc = -1;
+
     if (!config_path) {
         set_error(ERR_INVALID_ARGS, "NULL config path to config_backup");
         return -1;
     }
-    
     if (!path_exists(config_path)) {
         log_debug("Config file does not exist, no backup needed");
         return 0;
     }
-    
-    /* Generate timestamp */
-    time(&now);
-    tm_info = localtime(&now);
-    if (tm_info) {
-        strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
-    } else {
-        snprintf(timestamp, sizeof(timestamp), "%ld", (long)now);
+    if ((g_config_backup_clock ? g_config_backup_clock(&seconds, &nanoseconds)
+                               : config_backup_default_clock(&seconds,
+                                                             &nanoseconds)) != 0 ||
+        nanoseconds >= 1000000000U) {
+        set_error(ERR_FILE_IO, "Cannot obtain a valid config backup clock");
+        return -1;
     }
-    
-    /* Copy without following symlinks on either end (cfg-symlink-01): a
-     * symlinked accounts.toml would otherwise be read through (copying
-     * another user's file into a backup we own), and the timestamped backup
-     * name is predictable enough for an attacker to plant a symlink at it and
-     * redirect the write. The destination is created O_EXCL with mode 0600,
-     * so no separate chmod (and no loose-permission window) is needed.
-     *
-     * AR-06 F46/F47: the backup name has one-second granularity, so two saves
-     * in the same second collided on the O_EXCL create — the second backup
-     * silently vanished (EEXIST), leaving the pre-change state un-backed-up for
-     * exactly the back-to-back edits most likely to need it. Disambiguate with
-     * an incrementing suffix until an unused name is found. */
-    {
-        int rc = -1;
-        for (int i = 0; i < 1000; i++) {
-            int need;
-            if (i == 0) {
-                need = snprintf(backup_path, sizeof(backup_path), "%s.backup.%s",
-                                config_path, timestamp);
-            } else {
-                need = snprintf(backup_path, sizeof(backup_path), "%s.backup.%s_%d",
-                                config_path, timestamp, i);
-            }
-            if (need < 0 || (size_t)need >= sizeof(backup_path)) {
-                set_error(ERR_INVALID_ARGS, "Backup path too long");
+    if (config_backup_collect(config_path, entries,
+                              CONFIG_BACKUP_SCAN_MAX, &count,
+                              dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (entries[i].legacy) continue;
+        if (entries[i].seconds > seconds ||
+            (entries[i].seconds == seconds &&
+             entries[i].nanoseconds > nanoseconds)) {
+            if (entries[i].generation == UINT64_MAX) {
+                set_error(ERR_FILE_IO, "Config backup generation exhausted");
                 return -1;
             }
-            errno = 0;
-            rc = copy_file_nofollow(config_path, backup_path);
-            if (rc == 0) {
-                break;
+            seconds = entries[i].seconds;
+            nanoseconds = entries[i].nanoseconds;
+            generation = entries[i].generation + 1;
+        } else if (entries[i].seconds == seconds &&
+                   entries[i].nanoseconds == nanoseconds &&
+                   entries[i].generation >= generation) {
+            if (entries[i].generation == UINT64_MAX) {
+                set_error(ERR_FILE_IO, "Config backup generation exhausted");
+                return -1;
             }
-            if (errno != EEXIST) {
-                return -1; /* a real I/O/permission failure, not a name clash */
-            }
-        }
-        if (rc != 0) {
-            set_error(ERR_FILE_IO,
-                      "Could not find a free backup name for %s", config_path);
-            return -1;
+            generation = entries[i].generation + 1;
         }
     }
 
-    log_info("Created configuration backup: %s", backup_path);
+    for (;;) {
+        int needed = snprintf(backup_path, sizeof(backup_path),
+                              "%s.backup.%020llu.%09u.%020llu",
+                              config_path, (unsigned long long)seconds,
+                              nanoseconds,
+                              (unsigned long long)generation);
+        if (needed < 0 || (size_t)needed >= sizeof(backup_path)) {
+            set_error(ERR_INVALID_PATH, "Config backup path is too long");
+            return -1;
+        }
+        errno = 0;
+        if (copy_file_nofollow(config_path, backup_path) == 0) break;
+        if (errno != EEXIST || generation == UINT64_MAX) return -1;
+        generation++;
+    }
 
-    /* Keep the backup set bounded. */
-    prune_old_backups(config_path, 5);
+    dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 ||
+        config_io_fault(CONFIG_IO_BACKUP_BEFORE_DIR_SYNC,
+                        "config backup directory sync") ||
+        fsync(dir_fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot durably commit config backup directory");
+        goto backup_fail;
+    }
+    close(dir_fd);
+    dir_fd = -1;
+
+    if (config_io_fault(CONFIG_IO_BACKUP_BEFORE_REOPEN,
+                        "config backup reopen verification")) {
+        goto backup_fail;
+    }
+    verify_doc = config_document_alloc();
+    if (!verify_doc || config_read_document(backup_path, verify_doc) != 0) {
+        if (!verify_doc && get_last_error()->code == ERR_SUCCESS) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot allocate config backup verification document");
+        }
+        goto backup_fail;
+    }
+    config_document_free(verify_doc);
+    verify_doc = NULL;
+
+    if (config_backup_prune(config_path, 5) != 0) {
+        return -1;
+    }
+    log_info("Created durable configuration backup: %s", backup_path);
     return 0;
+
+backup_fail:
+    if (verify_doc) config_document_free(verify_doc);
+    if (dir_fd >= 0) close(dir_fd);
+    if (unlink(backup_path) == 0) {
+        int cleanup_fd = open(dir,
+                              O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        if (cleanup_fd >= 0) {
+            (void)fsync(cleanup_fd);
+            close(cleanup_fd);
+        }
+    }
+    return rc;
 }
 
 /* Internal helper functions implementation */
@@ -2073,22 +2824,33 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path) {
                 if (errno == EINTR) continue;
                 goto fail;
             }
+            if (w == 0) {
+                errno = EIO;
+                goto fail;
+            }
             off += w;
         }
     }
 
     close(sfd);
+    sfd = -1;
+    if (config_io_fault(CONFIG_IO_BACKUP_BEFORE_FILE_SYNC,
+                        "config backup payload sync") || fsync(dfd) != 0) {
+        goto fail;
+    }
     if (close(dfd) != 0) {
+        dfd = -1;
         unlink(dst_path);
         set_system_error(ERR_FILE_IO, "Failed to finalize backup file: %s", dst_path);
         return -1;
     }
+    dfd = -1;
     return 0;
 
 fail:
     set_system_error(ERR_FILE_IO, "Failed to copy backup: %s -> %s", src_path, dst_path);
-    close(sfd);
-    close(dfd);
+    if (sfd >= 0) close(sfd);
+    if (dfd >= 0) close(dfd);
     unlink(dst_path);
     return -1;
 }

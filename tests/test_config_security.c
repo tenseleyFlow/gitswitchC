@@ -1182,7 +1182,7 @@ TEST(settings_only_save_records_active_and_preserves_sections) {
      * success while active_account stayed stale, so the next boot's resume
      * restored the wrong identity. The write-back must keep BOTH problem
      * sections byte-for-byte-meaningful on disk. */
-    char longname[300], cfg[1024], after[2048];
+    char longname[300], cfg[1024], after[2048], hint[256], state[512];
     char dir[128], path[256];
     gitswitch_ctx_t ctx;
 
@@ -1202,6 +1202,7 @@ TEST(settings_only_save_records_active_and_preserves_sections) {
              longname);
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
     CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
 
     memset(&ctx, 0, sizeof(ctx));
@@ -1215,11 +1216,9 @@ TEST(settings_only_save_records_active_and_preserves_sections) {
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0); /* succeeds where config_save refuses */
 
     slurp(path, after, sizeof(after));
-    CHECK(strstr(after, "active_account = \"alice\"") != NULL); /* pre-fix: never persisted */
-    CHECK(strstr(after, longname) != NULL);                     /* skipped account intact */
-    CHECK(strstr(after, "[account.3]") != NULL);                /* unknown section intact */
-    CHECK(strstr(after, "typod") != NULL);
-    CHECK(strstr(after, "default_scope = \"local\"") != NULL);  /* other settings intact */
+    CHECK_STR_EQ(after, cfg); /* state-only persistence never replaces accounts */
+    CHECK(slurp(hint, state, sizeof(state)) > 0);
+    CHECK_STR_EQ(state, "none\nactive=alice\n");
 
     /* And the write-back result must load again with the same view. */
     gitswitch_ctx_t ctx2;
@@ -1254,7 +1253,7 @@ TEST(resume_hint_reflects_account_runtime_needs) {
     snprintf(path, sizeof(path), "%s/.config/gitswitch", dir);
     CHECK_EQ_INT(mkdir(path, 0700), 0);
     snprintf(hint, sizeof(hint), "%s/.config/gitswitch/.resume-hint", dir);
-    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", dir);
 
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
@@ -1264,7 +1263,7 @@ TEST(resume_hint_reflects_account_runtime_needs) {
     /* Identity-only: no boot-volatile state, the snippet must not probe. */
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     CHECK(slurp(hint, buf, sizeof(buf)) > 0);
-    CHECK_STR_EQ(buf, "none\n");
+    CHECK_STR_EQ(buf, "none\nactive=alice\n");
 
     /* SSH-only. */
     ctx.accounts[0].ssh_enabled = true;
@@ -1272,7 +1271,7 @@ TEST(resume_hint_reflects_account_runtime_needs) {
             sizeof(ctx.accounts[0].ssh_key_path) - 1);
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "ssh\n");
+    CHECK_STR_EQ(buf, "ssh\nactive=alice\n");
 
     /* SSH + GPG. */
     ctx.accounts[0].gpg_enabled = true;
@@ -1280,29 +1279,29 @@ TEST(resume_hint_reflects_account_runtime_needs) {
             sizeof(ctx.accounts[0].gpg_key_id) - 1);
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "ssh gpg\n");
+    CHECK_STR_EQ(buf, "ssh gpg\nactive=alice\n");
 
     /* GPG-only. */
     ctx.accounts[0].ssh_enabled = false;
     ctx.accounts[0].ssh_key_path[0] = '\0';
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "gpg\n");
+    CHECK_STR_EQ(buf, "gpg\nactive=alice\n");
 
-    /* An UNKNOWN active account (just-removed race) must fall back to the
-     * conservative "ssh gpg" so the snippet still probes rather than
-     * wrongly skipping a needed resume. */
+    /* An unknown active account is never advertised as a successful durable
+     * identity; retain the last coherent state instead. */
     strncpy(ctx.config.active_account, "ghost", sizeof(ctx.config.active_account) - 1);
-    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "ssh gpg\n");
+    CHECK_STR_EQ(buf, "gpg\nactive=alice\n");
 
-    /* Cleared active account (reset path): the marker must be REMOVED, or
-     * login shells keep probing/resuming state the user tore down. Exercised
-     * through the settings-only save, the path `reset` actually takes. */
+    /* Cleared active account (reset path): install the explicit inactive
+     * tombstone. Its first-line `none` keeps login-shell probes no-op while the
+     * second line prevents a stale legacy settings key from resurrecting. */
     ctx.config.active_account[0] = '\0';
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
-    CHECK(access(hint, F_OK) != 0);
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "none\ninactive=v1\n");
 
     if (old_home[0]) setenv("HOME", old_home, 1); else unsetenv("HOME");
 }
@@ -1361,7 +1360,7 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
 
     /* A safe existing marker is replaced, not truncated in place: readers
      * see either complete old or complete new content, never a partial file. */
-    CHECK_EQ_INT(chmod(hint, 0600), 0);
+    CHECK_EQ_INT(write_config(hint, "none\n", 5), 0);
     CHECK_EQ_INT(lstat(hint, &before), 0);
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     CHECK_EQ_INT(lstat(hint, &after), 0);
@@ -1369,7 +1368,7 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
     CHECK_EQ_INT((long)(after.st_mode & 0777), 0600);
     CHECK(before.st_dev != after.st_dev || before.st_ino != after.st_ino);
     CHECK(slurp(hint, buf, sizeof(buf)) > 0);
-    CHECK_STR_EQ(buf, "none\n");
+    CHECK_STR_EQ(buf, "none\nactive=alice\n");
 
     stream = opendir(config_dir);
     CHECK(stream != NULL);
@@ -1453,7 +1452,7 @@ TEST(back_to_back_backups_in_same_second_both_persist) {
 
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(cfg, sizeof(cfg), "%s/accounts.toml", dir);
-    CHECK_EQ_INT(write_config(cfg, "x\n", 2), 0);
+    CHECK_EQ_INT(write_config(cfg, valid_config, strlen(valid_config)), 0);
 
     /* Same second (no sleep between): pre-fix the 2nd hit EEXIST and vanished. */
     CHECK_EQ_INT(config_backup(cfg), 0);

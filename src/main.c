@@ -1402,8 +1402,8 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         }
         if ((!target || strcmp(ctx->config.active_account, target) == 0) &&
             ctx->config.active_account[0] != '\0') {
-            printf("Would clear the saved active account '%s' and remove the resume\n"
-                   "hint, so login shells stop auto-resuming it.\n",
+            printf("Would clear the saved active account '%s' and mark resume state\n"
+                   "inactive, so login shells stop auto-resuming it.\n",
                    ctx->config.active_account);
         }
         display_success("DRY RUN complete - no changes were made");
@@ -1488,10 +1488,11 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
 
     /* When the reset covered the saved active account (or everything), clear
      * the persisted active_account: main()'s settings-only save then records
-     * the clear and removes the .resume-hint marker (AR-03 T4). Leaving them
-     * in place made every subsequent login shell probe and auto-resume the
-     * account the user just tore down — silently re-spawning the agents and
-     * re-importing the GPG secret key that this command exists to delete. A
+     * the clear with an explicit inactive .resume-hint tombstone (AR-03 T4).
+     * Leaving active state in place made every subsequent login shell probe and
+     * auto-resume the account the user just tore down — silently re-spawning
+     * the agents and re-importing the GPG secret key that this command exists
+     * to delete. A
      * targeted reset of a NON-active account changes neither. */
     if (!target || strcmp(ctx->config.active_account, target) == 0) {
         ctx->config.active_account[0] = '\0';

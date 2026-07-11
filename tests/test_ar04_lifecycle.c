@@ -111,7 +111,13 @@ static int prepare_home(const char *home, const char *config_body) {
     snprintf(path, sizeof(path), "%s/.config/gitswitch", home);
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
-    return write_text(path, config_body, 0600);
+    if (write_text(path, config_body, 0600) != 0) return -1;
+
+    /* Historical active-only files predate the consolidated artifact. Remove
+     * state left by an earlier command in this reused HOME so this fixture
+     * exercises migration from settings.active_account itself. */
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
 }
 
 static const char *active_work_config(void) {
@@ -334,7 +340,10 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"renamed\"") != NULL);
     CHECK(strstr(contents, "email = \"new@example.com\"") != NULL);
-    CHECK(strstr(contents, "active_account = \"other\"") != NULL);
+    CHECK(strstr(contents, "active_account") == NULL);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
+    slurp(path, contents, sizeof(contents));
+    CHECK_STR_EQ(contents, "none\nactive=other\n");
 
     CHECK_EQ_INT(prepare_home(home, inactive_config), 0);
     snprintf(key, sizeof(key), "%s/inactive-key", runtime);
@@ -679,7 +688,10 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"work\"") == NULL);
-    CHECK(strstr(contents, "active_account = \"other\"") != NULL);
+    CHECK(strstr(contents, "active_account") == NULL);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
+    slurp(path, contents, sizeof(contents));
+    CHECK_STR_EQ(contents, "none\nactive=other\n");
     link_len = readlink(ssh_current, link_target, sizeof(link_target) - 1);
     CHECK(link_len > 0);
     if (link_len > 0) {
