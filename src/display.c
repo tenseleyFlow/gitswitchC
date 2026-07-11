@@ -84,7 +84,8 @@ const char *display_colorize(const char *text, const char *type) {
      * (all args are evaluated before printf runs). Keep this >= the most
      * colorize() results ever live in a single expression, or an earlier call's
      * buffer gets clobbered by a later one before printf reads it. */
-    static char colored_buffers[8][512];
+    enum { COLORED_BUFFER_SIZE = 512 };
+    static char colored_buffers[8][COLORED_BUFFER_SIZE];
     static int buffer_index = 0;
     char *colored_buffer;
     const char *color_code = "";
@@ -116,8 +117,21 @@ const char *display_colorize(const char *text, const char *type) {
     colored_buffer = colored_buffers[buffer_index];
     buffer_index = (buffer_index + 1) % (int)(sizeof(colored_buffers) / sizeof(colored_buffers[0]));
 
-    snprintf(colored_buffer, 512,
-             "%s%s%s", color_code, text, COLOR_RESET);
+    /* AR-06 F54/F55: reserve room for the trailing COLOR_RESET so it is NEVER
+     * the part that gets truncated. A long message that overran the 512-byte
+     * buffer used to lose its reset, leaving the terminal stuck in the color
+     * (and every following line miscolored). Bound the TEXT with a precision so
+     * the prefix color code and the reset always fit. */
+    {
+        size_t code_len = strlen(color_code);
+        size_t reset_len = strlen(COLOR_RESET);
+        int text_budget = (int)COLORED_BUFFER_SIZE - 1 - (int)code_len - (int)reset_len;
+        if (text_budget < 0) {
+            text_budget = 0;
+        }
+        snprintf(colored_buffer, COLORED_BUFFER_SIZE,
+                 "%s%.*s%s", color_code, text_budget, text, COLOR_RESET);
+    }
 
     return colored_buffer;
 }

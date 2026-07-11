@@ -1081,7 +1081,12 @@ account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name) {
         return NULL;
     }
     for (size_t i = 0; i < ctx->account_count; i++) {
-        if (strcmp(ctx->accounts[i].name, name) == 0) {
+        /* AR-06 F45: account-name uniqueness is enforced case-INsensitively
+         * (config_add_account), so the active-account resolve must match the
+         * same way. A hand-edited active_account differing only in case (e.g.
+         * "work" vs "Work") is still an unambiguous reference to the one
+         * account, and strcmp would wrongly fail the resume. */
+        if (strcasecmp(ctx->accounts[i].name, name) == 0) {
             return &ctx->accounts[i];
         }
     }

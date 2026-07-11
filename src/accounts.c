@@ -976,7 +976,9 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
         acct = original;
         editing_active = (existing == ctx->current_account) ||
                          (ctx->config.active_account[0] != '\0' &&
-                          strcmp(ctx->config.active_account, original.name) == 0);
+                          /* AR-06 F45: case-insensitive to match the
+                           * case-insensitive name uniqueness invariant. */
+                          strcasecmp(ctx->config.active_account, original.name) == 0);
     } else {
         memset(&original, 0, sizeof(original));
         memset(&acct, 0, sizeof(acct));
@@ -1366,7 +1368,10 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         current_id = ctx->current_account->id;
     }
     was_current = (ctx->current_account == account);
-    was_active = (strcmp(ctx->config.active_account, account_name) == 0);
+    /* AR-06 F45: case-insensitive, matching the name-uniqueness invariant, so
+     * removing the active account always clears active_account even when its
+     * persisted spelling differs only in case. */
+    was_active = (strcasecmp(ctx->config.active_account, account_name) == 0);
 
     /* Tear down while the account name still exists as a retry handle. Both
      * managers are attempted; any failure retains the account/current/active
