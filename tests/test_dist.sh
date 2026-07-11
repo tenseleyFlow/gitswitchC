@@ -52,7 +52,19 @@ git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checko
 checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
 [ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-distcheck.XXXXXX")
+# The executable-trust boundary rejects every helper below sticky /tmp even
+# when a deeper mktemp leaf is 0700.  Distcheck builds and runs every test
+# binary from its extraction tree, and several suites deliberately re-exec
+# their own binary; putting that tree under /tmp would make a valid production
+# rejection look like a test failure.  Use the operator's private HOME
+# ancestry intentionally (not TMPDIR, whose conventional default is /tmp).
+case ${HOME-} in
+    /*) ;;
+    *) fail "distcheck requires an absolute HOME for its trusted build root" ;;
+esac
+[ -d "$HOME" ] || fail "HOME is not a directory: $HOME"
+tmp=$(mktemp -d "$HOME/.gitswitch-distcheck.XXXXXX")
+chmod 0700 "$tmp" || fail "cannot make distcheck build root private"
 
 members=$tmp/archive-members.txt
 tar -tzf "$archive" >"$members"

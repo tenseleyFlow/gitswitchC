@@ -25,6 +25,10 @@
 #include <regex.h>
 #include <limits.h>
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/acl.h>
+#endif
+
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <linux/random.h>
@@ -432,8 +436,55 @@ static int open_directory_nofollow(const char *path, struct stat *opened) {
     return fd;
 }
 
+/* Normalize only lexical no-op components in XDG_RUNTIME_DIR.  In particular,
+ * do not call realpath(): the final component must remain visible to lstat so
+ * `link`, `link/`, and `link/.` all receive the same no-symlink decision.
+ * Parent traversal is rejected rather than normalized because `..` across an
+ * intermediate symlink has filesystem-dependent meaning. */
+static int normalize_runtime_path(const char *input, char *output,
+                                  size_t output_size) {
+    if (!input || input[0] != '/' || !output || output_size < 2) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t written = 1;
+    output[0] = '/';
+    const char *cursor = input + 1;
+    while (*cursor) {
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+
+        const char *component = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        size_t length = (size_t)(cursor - component);
+        if (length == 1 && component[0] == '.') continue;
+        if (length == 2 && component[0] == '.' && component[1] == '.') {
+            errno = EINVAL;
+            return -1;
+        }
+        if (written > 1) {
+            if (written + 1 >= output_size) {
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            output[written++] = '/';
+        }
+        if (length >= output_size - written) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(output + written, component, length);
+        written += length;
+    }
+    output[written] = '\0';
+    return 0;
+}
+
 int open_runtime_parent(char *path, size_t path_size) {
     const char *xdg = getenv("XDG_RUNTIME_DIR");
+    char normalized_xdg[MAX_PATH_LEN];
+    const char *configured_xdg = xdg;
     struct stat before;
     struct stat opened;
     struct stat after;
@@ -445,31 +496,55 @@ int open_runtime_parent(char *path, size_t path_size) {
         return -1;
     }
 
+    /* XDG Base Directory requires an absolute runtime path.  Reject a
+     * relative value before the first pathname operation: otherwise the same
+     * shell environment names a different runtime/lock namespace after every
+     * chdir(), and two gitswitch processes can believe they serialize through
+     * one lock while actually mutating different trees (AR-07 M44). */
+    if (xdg && *xdg && xdg[0] != '/') {
+        set_error(ERR_INVALID_PATH,
+                  "XDG_RUNTIME_DIR must be an absolute path: %s", xdg);
+        return -1;
+    }
     if (xdg && *xdg) {
-        if (lstat(xdg, &before) == 0) {
+        if (normalize_runtime_path(xdg, normalized_xdg,
+                                   sizeof(normalized_xdg)) != 0) {
+            set_error(ERR_INVALID_PATH,
+                      "XDG_RUNTIME_DIR has an unsafe or oversized path spelling: %s",
+                      xdg);
+            return -1;
+        }
+        configured_xdg = normalized_xdg;
+    }
+
+    if (xdg && *xdg) {
+        if (lstat(configured_xdg, &before) == 0) {
             use_xdg = true;
         } else if (errno != ENOENT) {
             set_system_error(ERR_FILE_IO,
-                             "Cannot inspect XDG_RUNTIME_DIR: %s", xdg);
+                             "Cannot inspect XDG_RUNTIME_DIR: %s",
+                             configured_xdg);
             return -1;
         }
     }
 
     if (use_xdg) {
         if (!S_ISDIR(before.st_mode) || S_ISLNK(before.st_mode) ||
-            before.st_uid != getuid() || (before.st_mode & 077) != 0) {
+            before.st_uid != getuid() ||
+            (before.st_mode & 0777) != PERM_USER_RWX) {
             set_error(ERR_PERMISSION_DENIED,
-                      "XDG_RUNTIME_DIR must be a private self-owned directory: %s",
-                      xdg);
+                      "XDG_RUNTIME_DIR must be an accessible 0700 self-owned directory: %s",
+                      configured_xdg);
             return -1;
         }
-        if (safe_strncpy(path, xdg, path_size) != 0) {
+        if (safe_strncpy(path, configured_xdg, path_size) != 0) {
             set_error(ERR_INVALID_PATH, "XDG_RUNTIME_DIR path is too long");
             return -1;
         }
         fd = open_directory_nofollow(path, &opened);
         if (fd < 0 || opened.st_uid != getuid() ||
-            (opened.st_mode & 077) != 0 || !same_fs_identity(&before, &opened)) {
+            (opened.st_mode & 0777) != PERM_USER_RWX ||
+            !same_fs_identity(&before, &opened)) {
             if (fd >= 0) close(fd);
             set_error(ERR_PERMISSION_DENIED,
                       "XDG_RUNTIME_DIR changed or is unsafe: %s", path);
@@ -485,16 +560,34 @@ int open_runtime_parent(char *path, size_t path_size) {
         return fd;
     }
 
+    /* /tmp is a symlink to /private/tmp on macOS.  Open its canonical target
+     * with O_NOFOLLOW, while retaining the literal /tmp spelling that callers
+     * use to select their uid-specific fallback layout. */
+    char *fallback = realpath("/tmp", NULL);
+    if (!fallback) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot resolve temporary runtime parent");
+        return -1;
+    }
     if (safe_strncpy(path, "/tmp", path_size) != 0) {
+        free(fallback);
         set_error(ERR_INVALID_PATH, "Temporary runtime-parent path is too long");
         return -1;
     }
-    fd = open_directory_nofollow(path, &opened);
+    fd = open_directory_nofollow(fallback, &opened);
+    free(fallback);
     if (fd < 0) {
         set_system_error(ERR_FILE_IO, "Cannot open runtime parent: %s", path);
         return -1;
     }
     return fd;
+}
+
+/* Configured XDG roots are required to be non-symlinks and are checked with
+ * lstat. The fixed /tmp fallback may itself be a platform symlink (Darwin), so
+ * namespace identity checks compare its followed target to the pinned fd. */
+static int runtime_parent_named_stat(const char *path, struct stat *st) {
+    return strcmp(path, "/tmp") == 0 ? stat(path, st) : lstat(path, st);
 }
 
 int open_private_subdir_at(int parent_fd, const char *name, bool create,
@@ -940,7 +1033,7 @@ int runtime_state_lock_acquire(void) {
     struct stat dir_st;
     struct stat dir_entry_st;
     if (fstat(parent_fd, &parent_st) != 0 || fstat(dir_fd, &dir_st) != 0 ||
-        lstat(runtime_parent, &parent_path_st) != 0 ||
+        runtime_parent_named_stat(runtime_parent, &parent_path_st) != 0 ||
         !same_fs_identity(&parent_st, &parent_path_st) ||
         fstatat(parent_fd, child_name, &dir_entry_st,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -995,7 +1088,9 @@ void runtime_state_lock_release(int fd) {
                 struct stat pinned_dir;
                 struct stat named_dir;
                 bool have_pp = fstat(g_runtime_locks[i].parent_fd, &pinned_parent) == 0;
-                bool have_np = lstat(g_runtime_locks[i].parent_path, &named_parent) == 0;
+                bool have_np = runtime_parent_named_stat(
+                                   g_runtime_locks[i].parent_path,
+                                   &named_parent) == 0;
                 bool have_pd = fstat(g_runtime_locks[i].dir_fd, &pinned_dir) == 0;
                 bool have_nd = fstatat(g_runtime_locks[i].parent_fd,
                                        g_runtime_locks[i].child_name, &named_dir,
@@ -1296,10 +1391,292 @@ time_t get_file_mtime(const char *file_path) {
 
 /* ---- Shell-free subprocess execution -------------------------------------
  *
- * run_argv_real spawns argv[0] via fork+execvp (no shell) with optional
+ * run_argv_real spawns argv[0] via fork plus verified executable launch (no
+ * shell) with optional
  * stdin input, stdout capture, extra environment, and stderr policy. I/O is
  * driven by poll() so an input+output pair cannot deadlock regardless of
  * payload size. The real child exit code is reported via WEXITSTATUS. */
+
+static int open_trusted_command(const char *name, char *resolved,
+                                size_t resolved_size,
+                                struct stat *file_stat);
+static int exec_open_canonical(const char *canonical,
+                               struct stat *file_stat);
+
+static bool exec_stat_identity_matches(const struct stat *expected,
+                                       const struct stat *observed) {
+    if (!expected || !observed ||
+        expected->st_dev != observed->st_dev ||
+        expected->st_ino != observed->st_ino ||
+        expected->st_uid != observed->st_uid ||
+        expected->st_gid != observed->st_gid ||
+        expected->st_mode != observed->st_mode ||
+        expected->st_size != observed->st_size) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return expected->st_mtimespec.tv_sec == observed->st_mtimespec.tv_sec &&
+           expected->st_mtimespec.tv_nsec == observed->st_mtimespec.tv_nsec &&
+           expected->st_ctimespec.tv_sec == observed->st_ctimespec.tv_sec &&
+           expected->st_ctimespec.tv_nsec == observed->st_ctimespec.tv_nsec;
+#else
+    return expected->st_mtim.tv_sec == observed->st_mtim.tv_sec &&
+           expected->st_mtim.tv_nsec == observed->st_mtim.tv_nsec &&
+           expected->st_ctim.tv_sec == observed->st_ctim.tv_sec &&
+           expected->st_ctim.tv_nsec == observed->st_ctim.tv_nsec;
+#endif
+}
+
+/* Reserve low child slots for status (3), the executable/script (4), and a
+ * script interpreter (5). Parent launch pins live at >=6 so stdio repair and
+ * the final dup2 layout cannot clobber them. */
+static int exec_fd_at_least(int fd, int minimum) {
+    if (fd < 0) return -1;
+    if (fd >= minimum) return fd;
+
+#ifdef F_DUPFD_CLOEXEC
+    int moved = fcntl(fd, F_DUPFD_CLOEXEC, minimum);
+#else
+    int moved = fcntl(fd, F_DUPFD, minimum);
+    if (moved >= 0 && fcntl(moved, F_SETFD, FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
+        close(moved);
+        errno = saved_errno;
+        moved = -1;
+    }
+#endif
+    if (moved >= 0) close(fd);
+    return moved;
+}
+
+#define EXEC_SHEBANG_LIMIT 256
+
+typedef enum {
+    EXEC_FORMAT_UNKNOWN = 0,
+    EXEC_FORMAT_BINARY,
+    EXEC_FORMAT_SCRIPT
+} exec_format_t;
+
+typedef struct {
+    bool is_script;
+    int interpreter_fd;
+    struct stat interpreter_identity;
+    char interpreter_path[MAX_PATH_LEN];
+    char interpreter_argv0[EXEC_SHEBANG_LIMIT];
+    char interpreter_arg[EXEC_SHEBANG_LIMIT];
+    bool has_interpreter_arg;
+    char script_fd_path[32];
+    char **script_argv;
+} trusted_script_launch_t;
+
+static bool exec_prefix_is_binary(const unsigned char *prefix, size_t size) {
+    static const unsigned char magics[][4] = {
+        {0x7f, 'E', 'L', 'F'}, /* ELF: Linux and FreeBSD */
+        {0xfe, 0xed, 0xfa, 0xce}, {0xce, 0xfa, 0xed, 0xfe},
+        {0xfe, 0xed, 0xfa, 0xcf}, {0xcf, 0xfa, 0xed, 0xfe},
+        {0xca, 0xfe, 0xba, 0xbe}, {0xbe, 0xba, 0xfe, 0xca},
+        {0xca, 0xfe, 0xba, 0xbf}, {0xbf, 0xba, 0xfe, 0xca}
+    };
+    if (!prefix || size < 4) return false;
+    for (size_t i = 0; i < sizeof(magics) / sizeof(magics[0]); i++) {
+        if (memcmp(prefix, magics[i], sizeof(magics[i])) == 0) return true;
+    }
+    return false;
+}
+
+static int exec_parse_format(int fd, exec_format_t *format,
+                             char *interpreter, size_t interpreter_size,
+                             char *argument, size_t argument_size,
+                             bool *has_argument) {
+    unsigned char prefix[EXEC_SHEBANG_LIMIT + 1];
+    ssize_t got;
+    do {
+        got = pread(fd, prefix, sizeof(prefix), 0);
+    } while (got < 0 && errno == EINTR);
+    if (got < 0) return -1;
+
+    size_t size = (size_t)got;
+    if (exec_prefix_is_binary(prefix, size)) {
+        *format = EXEC_FORMAT_BINARY;
+        return 0;
+    }
+    if (size < 2 || prefix[0] != '#' || prefix[1] != '!') {
+        errno = ENOEXEC;
+        return -1;
+    }
+
+    size_t line_end = 2;
+    while (line_end < size && prefix[line_end] != '\n') line_end++;
+    if (line_end == size && size == sizeof(prefix)) {
+        errno = E2BIG;
+        return -1;
+    }
+    for (size_t i = 2; i < line_end; i++) {
+        /* A NUL would truncate the C pathname after validation; other ASCII
+         * controls have no portable shebang meaning.  Permit only the two
+         * whitespace delimiters handled explicitly below. */
+        if ((prefix[i] < ' ' && prefix[i] != '\t') || prefix[i] == 0x7f) {
+            errno = EINVAL;
+            return -1;
+        }
+    }
+    while (line_end > 2 &&
+           (prefix[line_end - 1] == ' ' || prefix[line_end - 1] == '\t')) {
+        line_end--;
+    }
+    if (line_end > 2 && prefix[line_end - 1] == '\r') {
+        errno = EINVAL;
+        return -1;
+    }
+
+    size_t cursor = 2;
+    while (cursor < line_end &&
+           (prefix[cursor] == ' ' || prefix[cursor] == '\t')) {
+        cursor++;
+    }
+    size_t start = cursor;
+    while (cursor < line_end && prefix[cursor] != ' ' &&
+           prefix[cursor] != '\t' && prefix[cursor] != '\r') {
+        cursor++;
+    }
+    size_t length = cursor - start;
+    if (length == 0 || prefix[start] != '/' ||
+        length >= interpreter_size) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(interpreter, prefix + start, length);
+    interpreter[length] = '\0';
+
+    const char *base = strrchr(interpreter, '/');
+    if (base && strcmp(base + 1, "env") == 0) {
+        errno = EPERM;
+        return -1;
+    }
+
+    while (cursor < line_end &&
+           (prefix[cursor] == ' ' || prefix[cursor] == '\t')) {
+        cursor++;
+    }
+    *has_argument = cursor < line_end;
+    if (*has_argument) {
+        start = cursor;
+        while (cursor < line_end && prefix[cursor] != ' ' &&
+               prefix[cursor] != '\t' && prefix[cursor] != '\r') {
+            cursor++;
+        }
+        length = cursor - start;
+        while (cursor < line_end &&
+               (prefix[cursor] == ' ' || prefix[cursor] == '\t')) {
+            cursor++;
+        }
+        if (length == 0 || length >= argument_size || cursor != line_end) {
+            errno = EINVAL;
+            return -1;
+        }
+        memcpy(argument, prefix + start, length);
+        argument[length] = '\0';
+    } else if (argument_size > 0) {
+        argument[0] = '\0';
+    }
+    *format = EXEC_FORMAT_SCRIPT;
+    return 0;
+}
+
+static void trusted_script_launch_cleanup(trusted_script_launch_t *launch) {
+    if (!launch) return;
+    if (launch->interpreter_fd >= 0) close(launch->interpreter_fd);
+    free(launch->script_argv);
+    launch->interpreter_fd = -1;
+    launch->script_argv = NULL;
+}
+
+static int prepare_trusted_script_launch(
+    int exec_fd, const char *const argv[], trusted_script_launch_t *launch) {
+    exec_format_t format = EXEC_FORMAT_UNKNOWN;
+    memset(launch, 0, sizeof(*launch));
+    launch->interpreter_fd = -1;
+    if (exec_parse_format(exec_fd, &format, launch->interpreter_argv0,
+                          sizeof(launch->interpreter_argv0),
+                          launch->interpreter_arg,
+                          sizeof(launch->interpreter_arg),
+                          &launch->has_interpreter_arg) != 0) {
+        return -1;
+    }
+    if (format == EXEC_FORMAT_BINARY) return 0;
+
+    launch->interpreter_fd = open_trusted_command(
+        launch->interpreter_argv0, launch->interpreter_path,
+        sizeof(launch->interpreter_path), &launch->interpreter_identity);
+    if (launch->interpreter_fd < 0) return -1;
+
+    /* Also apply the env ban after canonicalization so a trusted symlink such
+     * as /private/bin/sh -> /usr/bin/env cannot reintroduce a PATH lookup. */
+    const char *canonical_base = strrchr(launch->interpreter_path, '/');
+    if (canonical_base && strcmp(canonical_base + 1, "env") == 0) {
+        trusted_script_launch_cleanup(launch);
+        errno = EPERM;
+        return -1;
+    }
+
+    exec_format_t interpreter_format = EXEC_FORMAT_UNKNOWN;
+    char unused_interpreter[EXEC_SHEBANG_LIMIT];
+    char unused_argument[EXEC_SHEBANG_LIMIT];
+    bool unused_has_argument = false;
+    if (exec_parse_format(launch->interpreter_fd, &interpreter_format,
+                          unused_interpreter, sizeof(unused_interpreter),
+                          unused_argument, sizeof(unused_argument),
+                          &unused_has_argument) != 0 ||
+        interpreter_format != EXEC_FORMAT_BINARY) {
+        trusted_script_launch_cleanup(launch);
+        errno = ENOEXEC;
+        return -1;
+    }
+
+#if defined(__linux__)
+    const char *fd_path = "/proc/self/fd/4";
+#elif defined(__FreeBSD__) || defined(__APPLE__)
+    const char *fd_path = "/dev/fd/4";
+#else
+    trusted_script_launch_cleanup(launch);
+    errno = ENOTSUP;
+    return -1;
+#endif
+    if (safe_strncpy(launch->script_fd_path, fd_path,
+                     sizeof(launch->script_fd_path)) != 0) {
+        trusted_script_launch_cleanup(launch);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    size_t original_argc = 0;
+    while (argv[original_argc]) {
+        if (original_argc > SIZE_MAX - 5) {
+            trusted_script_launch_cleanup(launch);
+            errno = E2BIG;
+            return -1;
+        }
+        original_argc++;
+    }
+    size_t capacity = original_argc + 4;
+    launch->script_argv = calloc(capacity, sizeof(*launch->script_argv));
+    if (!launch->script_argv) {
+        trusted_script_launch_cleanup(launch);
+        return -1;
+    }
+    size_t out = 0;
+    launch->script_argv[out++] = launch->interpreter_argv0;
+    if (launch->has_interpreter_arg) {
+        launch->script_argv[out++] = launch->interpreter_arg;
+    }
+    launch->script_argv[out++] = launch->script_fd_path;
+    for (size_t i = 1; i < original_argc; i++) {
+        launch->script_argv[out++] = (char *)argv[i];
+    }
+    launch->script_argv[out] = NULL;
+    launch->is_script = true;
+    return 0;
+}
 
 static int set_nonblock(int fd) {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -1477,6 +1854,7 @@ static bool g_test_fd_close_observation_enabled;
 static bool g_test_fd_close_observation_valid;
 static run_test_fd_close_observation_t g_test_fd_close_observation;
 static int g_test_bulk_close_failure_errno;
+static run_test_exec_resolved_hook_fn g_test_exec_resolved_hook;
 
 int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
     switch (strategy) {
@@ -1516,6 +1894,10 @@ bool run_test_get_fd_close_observation(
 
 void run_test_set_bulk_close_failure(int system_errno) {
     g_test_bulk_close_failure_errno = system_errno > 0 ? system_errno : 0;
+}
+
+void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook) {
+    g_test_exec_resolved_hook = hook;
 }
 
 /* Close every descriptor >= lowfd in the forked child before exec (fd-CLOEXEC).
@@ -1730,20 +2112,59 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         }
     }
 
-    /* PS-1/PS-2: pin the helper to an absolute path resolved through the
-     * sanitized PATH walk in find_command_path() and exec exactly that path
-     * with execv() below. execvp()'s own PATH search would happily pick a
-     * shadowing "git"/"ssh-add" out of a relative or group/world-writable PATH
-     * entry — and since `gitswitch resume` runs from every interactive shell
-     * startup, that is arbitrary code execution with the user's keys in
-     * scope. Resolving in the parent also yields a real error message instead
-     * of a bare 127. */
+    /* Resolve, verify, and OPEN the helper in the parent.  The descriptor —
+     * not this diagnostic pathname — is the launch authority.  It survives a
+     * rename/symlink swap after lookup and is rechecked in the child before
+     * fexecve (AR-07 M28). */
     char exec_path[MAX_PATH_LEN];
-    if (find_command_path(argv[0], exec_path, sizeof(exec_path)) != 0) {
+    struct stat exec_identity;
+    trusted_script_launch_t script_launch;
+    memset(&script_launch, 0, sizeof(script_launch));
+    script_launch.interpreter_fd = -1;
+    int exec_fd = open_trusted_command(argv[0], exec_path,
+                                       sizeof(exec_path), &exec_identity);
+    if (exec_fd < 0) {
         set_error(ERR_SYSTEM_CALL,
                   "run_argv: '%s' not found in any trusted PATH directory", argv[0]);
         return -1;
     }
+    if (prepare_trusted_script_launch(exec_fd, argv, &script_launch) != 0) {
+        int saved_errno = errno;
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "run_argv: rejected unsafe or unsupported executable format/shebang for '%s'",
+                         exec_path);
+        return -1;
+    }
+
+    int reserved_exec_fd = exec_fd_at_least(exec_fd, STDERR_FILENO + 4);
+    if (reserved_exec_fd < 0) {
+        int saved_errno = errno;
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = saved_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot pin trusted executable descriptor");
+        return -1;
+    }
+    exec_fd = reserved_exec_fd;
+    if (script_launch.is_script) {
+        int reserved_interpreter_fd = exec_fd_at_least(
+            script_launch.interpreter_fd, STDERR_FILENO + 4);
+        if (reserved_interpreter_fd < 0) {
+            int saved_errno = errno;
+            close(exec_fd);
+            trusted_script_launch_cleanup(&script_launch);
+            errno = saved_errno;
+            set_system_error(ERR_SYSTEM_CALL,
+                             "run_argv: cannot pin trusted shebang interpreter descriptor");
+            return -1;
+        }
+        script_launch.interpreter_fd = reserved_interpreter_fd;
+    }
+    if (g_test_exec_resolved_hook) g_test_exec_resolved_hook(exec_path);
 
     bool want_in = (opts->input != NULL);
     bool want_out = (opts->out && opts->out_size > 0);
@@ -1783,6 +2204,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             set_error(ERR_SYSTEM_CALL,
                       "run_argv: forced child-FD snapshot is incomplete");
             free(fd_snapshot.fds);
+            close(exec_fd);
+            trusted_script_launch_cleanup(&script_launch);
             return -1;
         }
     }
@@ -1795,6 +2218,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot acquire /dev/null for child stdio");
         free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
     if (want_in && make_internal_pipe(in_pipe) != 0) {
@@ -1802,6 +2227,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                          "run_argv: cannot create child stdin pipe");
         if (devnull >= 0) close(devnull);
         free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
     if (want_out && make_internal_pipe(out_pipe) != 0) {
@@ -1810,6 +2237,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (devnull >= 0) close(devnull);
         if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
         free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
     if (make_internal_pipe(status_pipe) != 0) {
@@ -1819,6 +2248,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
 
@@ -1831,12 +2262,14 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         close(status_pipe[0]);
         close(status_pipe[1]);
         free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
 
     if (pid == 0) {
         /* ---- child ---- */
-        /* Drop the parent's guard handler first (AR-06 F76): until execv resets
+        /* Drop the parent's guard handler first (AR-06 F76): until exec resets
          * it, a signal delivered to this child would run guard_handler (which
          * only records and returns), swallowing it and leaving the helper
          * "pre-interrupted" instead of terminating normally. */
@@ -1894,8 +2327,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * those low numbers back, so after the dup2 dance fds 0/1/2 ARE the
          * child's std streams — an unconditional close here closed the very
          * stdin/stdout we just installed, corrupting the child. Anything in
-         * 0..2 is now a std stream we must keep; child_close_fds_from(4) below
-         * reaps every remaining fd above the temporary status channel. */
+         * 0..2 is now a std stream we must keep; the close sweep below reaps
+         * every remaining fd above the status/executable channels. */
         if (in_pipe[0] > STDERR_FILENO) close(in_pipe[0]);
         if (in_pipe[1] > STDERR_FILENO) close(in_pipe[1]);
         if (out_pipe[0] > STDERR_FILENO) close(out_pipe[0]);
@@ -1912,7 +2345,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
         /* Reserve fd 3 for the setup-status channel.  Keeping that one fd
          * below the close-from boundary lets the child report failures through
-         * execv(), while FD_CLOEXEC turns successful exec into an EOF proof. */
+         * descriptor exec, while FD_CLOEXEC turns success into an EOF proof. */
         if (child_status_fd != STDERR_FILENO + 1) {
             if (dup2(child_status_fd, STDERR_FILENO + 1) < 0) {
                 child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
@@ -1929,12 +2362,53 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                                  errno, 126);
         }
 
+        /* Preserve exactly the verified executable/script at fd 4. A script
+         * also receives its separately verified binary interpreter at fd 5.
+         * Parent pins are >=6 and are swept after these dup2 operations. */
+        int child_exec_fd = STDERR_FILENO + 2;
+        if (dup2(exec_fd, child_exec_fd) < 0) {
+            child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                 errno, 127);
+        }
+        close(exec_fd);
+        int child_exec_flags = fcntl(child_exec_fd, F_GETFD, 0);
+        if (child_exec_flags < 0 ||
+            fcntl(child_exec_fd, F_SETFD,
+                  script_launch.is_script
+                      ? child_exec_flags & ~FD_CLOEXEC
+                      : child_exec_flags | FD_CLOEXEC) != 0) {
+            child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                 errno, 127);
+        }
+
+        int child_interpreter_fd = -1;
+        if (script_launch.is_script) {
+            child_interpreter_fd = STDERR_FILENO + 3;
+            if (dup2(script_launch.interpreter_fd,
+                     child_interpreter_fd) < 0) {
+                child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                     errno, 127);
+            }
+            close(script_launch.interpreter_fd);
+            int interpreter_flags = fcntl(child_interpreter_fd, F_GETFD, 0);
+            if (interpreter_flags < 0 ||
+                fcntl(child_interpreter_fd, F_SETFD,
+                      interpreter_flags | FD_CLOEXEC) != 0) {
+                child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                     errno, 127);
+            }
+        }
+
         /* fd-CLOEXEC: the explicit closes above only cover our own pipes;
-         * sweep everything else the parent had open so the child starts with
-         * just stdin/stdout/stderr. Nothing in this codebase intentionally
-         * hands an fd to a child (SSH_AUTH_SOCK etc. are paths, not fds). */
+         * binaries sweep from 5 so an unrelated inherited fd 5 never leaks.
+         * Scripts retain fd 4 intentionally for /proc/self/fd or /dev/fd and
+         * reserve fd 5 only until the interpreter exec, so they sweep from 6.
+         * Nothing else is intentionally handed to a child. */
         run_test_fd_close_observation_t fd_close_observation;
-        if (child_close_fds_from(STDERR_FILENO + 2, use_bulk_close,
+        int close_lowfd = script_launch.is_script
+                              ? STDERR_FILENO + 4
+                              : STDERR_FILENO + 3;
+        if (child_close_fds_from(close_lowfd, use_bulk_close,
                                  require_bulk_close, &fd_snapshot,
                                  &fd_close_observation) != 0) {
             int close_errno = errno;
@@ -1973,14 +2447,99 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             }
         }
 
-        /* execv, not execvp: the path was pinned pre-fork; re-searching PATH
-         * here would reopen the PS-1 window between resolve and exec. */
-        execv(exec_path, (char *const *)argv); /* Flawfinder: ignore — argv exec of a pre-pinned path; no shell */
+        /* Same-inode metadata/content churn that changes size, mode, uid/gid,
+         * or nanosecond mtime/ctime fails closed. The fd itself prevents a
+         * pathname/inode replacement from redirecting execution. */
+        struct stat child_exec_stat;
+        if (fstat(child_exec_fd, &child_exec_stat) != 0 ||
+            !exec_stat_identity_matches(&exec_identity, &child_exec_stat)) {
+            child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                 EACCES, 127);
+        }
+        if (script_launch.is_script) {
+            struct stat child_interpreter_stat;
+            if (fstat(child_interpreter_fd, &child_interpreter_stat) != 0 ||
+                !exec_stat_identity_matches(
+                    &script_launch.interpreter_identity,
+                    &child_interpreter_stat)) {
+                child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                     EACCES, 127);
+            }
+
+            /* Prove that the platform descriptor filesystem maps the exact
+             * argv path to fd 4 before starting the interpreter. Absence of
+             * procfs/fdescfs/devfs or an unexpected mapping is a setup error,
+             * never a fallback to the mutable script pathname. */
+            int proof_flags = O_RDONLY | O_NONBLOCK;
+#ifdef O_CLOEXEC
+            proof_flags |= O_CLOEXEC;
+#endif
+            int proof_fd = open(script_launch.script_fd_path, proof_flags);
+            struct stat proof_stat;
+            if (proof_fd < 0) {
+                child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                     errno, 127);
+            }
+            if (fstat(proof_fd, &proof_stat) != 0) {
+                int proof_errno = errno;
+                close(proof_fd);
+                child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                     proof_errno, 127);
+            }
+            if (!exec_stat_identity_matches(&exec_identity, &proof_stat)) {
+                close(proof_fd);
+                child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                     EACCES, 127);
+            }
+            close(proof_fd);
+        }
+
+        char *const *launch_argv = script_launch.is_script
+                                       ? script_launch.script_argv
+                                       : (char *const *)argv;
+
+#if defined(__linux__) || defined(__FreeBSD__)
+        /* Scripts never enter the kernel's shebang path. The already-pinned,
+         * proven-binary direct interpreter executes instead, with the pinned
+         * readable script descriptor as its script operand. */
+        int launch_fd = script_launch.is_script
+                            ? child_interpreter_fd
+                            : child_exec_fd;
+        fexecve(launch_fd, launch_argv, environ); /* Flawfinder: ignore — descriptor-pinned binary/interpreter; no shell */
+#elif defined(__APPLE__)
+        /* macOS 14 has no supported fexecve/execveat equivalent.  Re-walk the
+         * canonical pathname from root with no-follow directory descriptors
+         * immediately before execve and require it still names the exact
+         * parent-pinned inode and metadata.  This catches every deterministic
+         * lookup-to-launch mutation (including the test hook).  One
+         * irreducible kernel pathname lookup remains between this proof and
+         * execve; unlike Linux/FreeBSD, Darwin exposes no descriptor-exec API. */
+        const char *apple_launch_path = script_launch.is_script
+                                            ? script_launch.interpreter_path
+                                            : exec_path;
+        const struct stat *apple_identity = script_launch.is_script
+                                                 ? &script_launch.interpreter_identity
+                                                 : &exec_identity;
+        struct stat apple_reopened;
+        int apple_fd = exec_open_canonical(apple_launch_path, &apple_reopened);
+        if (apple_fd < 0 ||
+            !exec_stat_identity_matches(apple_identity, &apple_reopened)) {
+            if (apple_fd >= 0) close(apple_fd);
+            child_report_failure(child_status_fd, CHILD_STAGE_EXEC,
+                                 EACCES, 127);
+        }
+        close(apple_fd);
+        execve(apple_launch_path, launch_argv, environ); /* Flawfinder: ignore — canonical path was descriptor-reproved immediately above; no shell */
+#else
+        errno = ENOTSUP;
+#endif
         child_report_failure(child_status_fd, CHILD_STAGE_EXEC, errno, 127);
     }
 
     /* ---- parent ---- */
     free(fd_snapshot.fds);
+    close(exec_fd);
+    trusted_script_launch_cleanup(&script_launch);
     result->spawned = true;
     /* AR-03 L8: publish the in-flight child so the signal handler can kill()
      * it if a rollback wedges behind an interactive prompt (see signals.h). */
@@ -2255,7 +2814,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                 break;
             case CHILD_STAGE_EXEC:
                 set_system_error(ERR_SYSTEM_COMMAND_FAILED,
-                                 "run_argv: execv failed for '%s'", exec_path);
+                                 "run_argv: verified descriptor execution failed for '%s'",
+                                 exec_path);
                 break;
             default:
                 set_error(ERR_SYSTEM_CALL,
@@ -2314,187 +2874,583 @@ int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *res
     return g_runner(argv, opts, result);
 }
 
-/* PS-1/PS-2 PATH supply-chain defense: every trusted helper (git, gpg,
- * ssh-add, ssh-agent, gpgconf, ...) is resolved through these checks before it
- * is executed, and `gitswitch resume` runs from every interactive shell
- * startup — so a shadowing binary in a hostile PATH entry would otherwise run
- * automatically with the user's keys in scope.
- *
- * A directory may supply an executable only if it is an absolute path to a
- * real directory that is not group- or world-writable. Relative entries (".", "", "bin")
- * resolve against the CWD — inside a freshly cloned repo that is attacker
- * territory. Writable dirs are rejected even with the sticky bit set: sticky
- * only stops deleting other users' files, while a writable group member can
- * still replace or create a shadowing helper. User-owned prefixes like
- * ~/.local/bin, Homebrew's /opt/homebrew/bin, or Nix profiles are
- * 0755-or-tighter and keep working. */
-static bool exec_dir_is_trusted(const char *dir) {
-    struct stat st;
+/* AR-07 M28/M29 executable trust.  A helper is trusted only when every
+ * root-to-leaf directory is pinned with openat(O_NOFOLLOW), is owned by root
+ * or this uid, and cannot be replaced by a group/other or extended-ACL writer.
+ * The final executable is opened and verified as a descriptor, which run_argv
+ * keeps through fork. Linux/FreeBSD execute that descriptor; macOS performs a
+ * final descriptor-relative identity proof before its pathname-only execve fallback.
+ * find_command_path closes its descriptor and therefore redoes this complete
+ * walk on every call: no positive pathname memo can outlive chmod/chown/inode/
+ * ancestor replacement. */
 
-    if (dir[0] != '/') {
+static bool exec_owner_is_allowed(uid_t owner) {
+    return owner == (uid_t)0 || owner == getuid();
+}
+
+static bool exec_directory_stat_is_trusted(const struct stat *st) {
+    return st && S_ISDIR(st->st_mode) && exec_owner_is_allowed(st->st_uid) &&
+           (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/* Darwin ACLs are independent access-control entries, while FreeBSD may expose
+ * either POSIX.1e or NFSv4 ACLs. A safe-looking 0755 mode is therefore not a
+ * complete writer check on those systems. FreeBSD provides a canonical
+ * triviality check, so reject every nontrivial ACL there. Darwin deny ACEs and
+ * read/execute-only allow ACEs cannot mutate the object and remain usable; all
+ * other allow bits and unknown entries fail closed. Filesystems that do not
+ * implement ACL retrieval still use their authoritative mode bits. Linux POSIX
+ * ACL write grants are reflected in the group-class mode mask, so the existing
+ * mode check remains complete there. */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+static bool exec_acl_query_is_unsupported(int error) {
+    return error == EOPNOTSUPP
+#ifdef ENOTSUP
+           || error == ENOTSUP
+#endif
+        ;
+}
+
+#if defined(__FreeBSD__)
+static bool exec_freebsd_acl_is_trivial(acl_t acl) {
+    int trivial = 0;
+    errno = 0;
+    int check_rc = acl_is_trivial_np(acl, &trivial);
+    int check_errno = errno;
+    int free_rc = acl_free(acl);
+    if (check_rc != 0 || free_rc != 0) {
+        errno = check_errno ? check_errno : EIO;
         return false;
     }
-    if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        return false;
-    }
-    if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+    if (trivial != 1) {
+        errno = EACCES;
         return false;
     }
     return true;
 }
+#endif
 
-/* The resolved binary itself must be a regular file (access(X_OK) alone would
- * happily "find" a directory named git) and not group- or world-writable — a
- * writable binary in an otherwise sane directory is just as replaceable as a
- * writable directory. */
-static bool exec_candidate_is_trusted(const char *path) {
-    struct stat st;
-
-    if (stat(path, &st) != 0) {
-        return false;
-    }
-    if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IWGRP | S_IWOTH))) {
-        return false;
-    }
-    if (access(path, X_OK) != 0) { /* Flawfinder: ignore — advisory post-stat probe; exec re-validates */
+static bool exec_fd_acl_is_trusted(int fd) {
+#if defined(__APPLE__)
+    errno = 0;
+    acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
+    if (!acl) {
+        int query_errno = errno;
+        if (exec_acl_query_is_unsupported(query_errno)) return true;
+        errno = query_errno;
         return false;
     }
 
-    /* AR-06 F74: the stat() above followed any symlink to the target file and
-     * vetted THAT file's mode — but a symlink sitting in a trusted directory
-     * (e.g. /usr/local/bin/git) can point at a 0755 binary that lives inside a
-     * group/world-writable directory (e.g. /tmp/evil/git), where an attacker
-     * atomically swaps the target for their own. Canonicalize the whole chain
-     * and require the directory actually holding the resolved binary to be
-     * trusted too, so a shadow target in a writable dir is rejected. */
-    char *resolved = realpath(path, NULL);
-    if (!resolved) {
+    const acl_permset_mask_t harmless_allow =
+        (acl_permset_mask_t)ACL_READ_DATA |
+        (acl_permset_mask_t)ACL_EXECUTE |
+        (acl_permset_mask_t)ACL_READ_ATTRIBUTES |
+        (acl_permset_mask_t)ACL_READ_EXTATTRIBUTES |
+        (acl_permset_mask_t)ACL_READ_SECURITY |
+        (acl_permset_mask_t)ACL_SYNCHRONIZE;
+    int entry_id = ACL_FIRST_ENTRY;
+    bool trusted = true;
+    for (;;) {
+        acl_entry_t entry;
+        errno = 0;
+        int entry_rc = acl_get_entry(acl, entry_id, &entry);
+        if (entry_rc != 0) {
+            /* A valid ACL reports EINVAL after its last entry (and for an
+             * empty ACL). Other errors are ambiguous and fail closed. */
+            if (errno != EINVAL) trusted = false;
+            break;
+        }
+
+        acl_tag_t tag;
+        if (acl_get_tag_type(entry, &tag) != 0) {
+            trusted = false;
+            break;
+        }
+        if (tag == ACL_EXTENDED_ALLOW) {
+            acl_permset_mask_t permissions = 0;
+            if (acl_get_permset_mask_np(entry, &permissions) != 0 ||
+                (permissions & ~harmless_allow) != 0) {
+                trusted = false;
+                break;
+            }
+        } else if (tag != ACL_EXTENDED_DENY) {
+            trusted = false;
+            break;
+        }
+        entry_id = ACL_NEXT_ENTRY;
+    }
+
+    int free_rc = acl_free(acl);
+    if (!trusted || free_rc != 0) {
+        errno = EACCES;
         return false;
     }
-    bool trusted = false;
-    const char *slash = strrchr(resolved, '/');
-    if (slash) {
-        /* Keep the leading '/' when the binary sits directly under the root. */
-        size_t dlen = (slash == resolved) ? 1 : (size_t)(slash - resolved);
-        char rdir[MAX_PATH_LEN];
-        if (dlen < sizeof(rdir)) {
-            memcpy(rdir, resolved, dlen);
-            rdir[dlen] = '\0';
-            trusted = exec_dir_is_trusted(rdir);
+    return true;
+#elif defined(__FreeBSD__)
+    acl_t acl;
+#ifdef ACL_TYPE_NFS4
+    errno = 0;
+    acl = acl_get_fd_np(fd, ACL_TYPE_NFS4);
+    if (acl) return exec_freebsd_acl_is_trivial(acl);
+    int nfs4_errno = errno;
+    if (nfs4_errno != EINVAL &&
+        !exec_acl_query_is_unsupported(nfs4_errno)) {
+        errno = nfs4_errno;
+        return false;
+    }
+#endif
+
+    errno = 0;
+    acl = acl_get_fd(fd);
+    if (!acl) {
+        int access_errno = errno;
+        if (exec_acl_query_is_unsupported(access_errno)) return true;
+        errno = access_errno;
+        return false;
+    }
+    return exec_freebsd_acl_is_trivial(acl);
+#endif
+}
+#else
+static bool exec_fd_acl_is_trusted(int fd) {
+    (void)fd;
+    return true;
+}
+#endif
+
+static bool exec_current_user_in_group(gid_t group) {
+    if (group == getgid()) return true;
+
+    int count = getgroups(0, NULL);
+    if (count <= 0) return false;
+    gid_t *groups = malloc((size_t)count * sizeof(*groups));
+    if (!groups) return false;
+    int got = getgroups(count, groups);
+    bool found = false;
+    if (got >= 0) {
+        for (int i = 0; i < got; i++) {
+            if (groups[i] == group) {
+                found = true;
+                break;
+            }
         }
     }
-    free(resolved);
-    return trusted;
+    free(groups);
+    return found;
 }
 
-/* Process-lifetime memo for find_command_path (AR-02 #24): one switch
- * resolves the same handful of helpers (git, ssh-add, gpg, ...) ~16 times —
- * init-time probes plus every run_argv spawn — and each resolution walks the
- * trusted-PATH at ~3 syscalls per entry, ~550 redundant stat/access calls per
- * switch. Sub-millisecond warm, but each stat is a network round trip on cold
- * NFS/autofs PATH entries. Keyed on the exact PATH string so an intra-process
- * PATH change (tests do this) drops the cache. Positive results only: a miss
- * usually aborts the command anyway, and caching one could outlive a
- * transient failure. Single-threaded, like the other utils caches. */
-#define CMD_MEMO_SLOTS 16
-#define CMD_MEMO_NAME_LEN 32
-typedef struct {
-    char name[CMD_MEMO_NAME_LEN];
-    char path[MAX_PATH_LEN];
-} cmd_memo_slot_t;
-static cmd_memo_slot_t g_cmd_memo[CMD_MEMO_SLOTS];
-static size_t g_cmd_memo_used = 0;
-static char *g_cmd_memo_pathenv = NULL;
+static bool exec_file_stat_is_trusted(const struct stat *st) {
+    if (!st || !S_ISREG(st->st_mode) ||
+        !exec_owner_is_allowed(st->st_uid) ||
+        (st->st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        return false;
+    }
 
-int find_command_path(const char *name, char *buf, size_t size) {
-    const char *path_env;
-    const char *p;
+    uid_t uid = getuid();
+    if (uid == (uid_t)0) {
+        return (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+    }
+    /* Header/format validation must read the exact pinned inode before any
+     * fork. Execute-only files are therefore deliberately unsupported: raw
+     * descriptor execution could otherwise run an unreadable script whose
+     * interpreter was never validated. */
+    if (st->st_uid == uid) {
+        return (st->st_mode & (S_IRUSR | S_IXUSR)) ==
+               (S_IRUSR | S_IXUSR);
+    }
+    if (exec_current_user_in_group(st->st_gid)) {
+        return (st->st_mode & (S_IRGRP | S_IXGRP)) ==
+               (S_IRGRP | S_IXGRP);
+    }
+    return (st->st_mode & (S_IROTH | S_IXOTH)) ==
+           (S_IROTH | S_IXOTH);
+}
 
-    if (!name || !buf || size == 0 || name[0] == '\0') {
+/* Mode bits alone are not an execution authorization decision: a POSIX ACL
+ * can deny this caller and a noexec mount rejects every leaf regardless of
+ * its mode.  Use the same credentials the eventual exec will use.  This
+ * utility is not a set-id boundary, so reject split real/effective identities
+ * rather than validating under one identity and launching under another. */
+static int exec_leaf_is_effectively_executable_at(int parent_fd,
+                                                  const char *component) {
+    if (getuid() != geteuid() || getgid() != getegid()) {
+        errno = EPERM;
         return -1;
     }
 
-    /* A name containing a slash is used directly, no PATH search — but only
-     * if absolute ("./git" or "bin/git" would resolve against the CWD, which
-     * is exactly the hole this function closes) and only out of a trusted
-     * directory, same rules as a PATH entry. */
-    if (strchr(name, '/')) {
-        char dir[MAX_PATH_LEN];
-        const char *slash = strrchr(name, '/');
-        /* Keep the leading '/' when the binary sits directly under the root. */
-        size_t dirlen = (slash == name) ? 1 : (size_t)(slash - name);
+    /* With the identities equal, the real-ID contract is also the effective
+     * launch contract. Keep flags zero so older glibc uses the kernel access
+     * check; its historical AT_EACCESS emulation derived permission from mode
+     * bits and could miss an ACL denial. */
+    return faccessat(parent_fd, component, X_OK, 0);
+}
 
-        if (name[0] != '/' || dirlen >= sizeof(dir)) {
-            return -1;
-        }
-        memcpy(dir, name, dirlen);
-        dir[dirlen] = '\0';
+static int exec_open_directory_at(int parent_fd, const char *component,
+                                  struct stat *opened) {
+#if defined(O_DIRECTORY) && defined(O_NOFOLLOW)
+    int flags = O_DIRECTORY | O_NOFOLLOW;
+#if defined(__FreeBSD__) && defined(O_SEARCH)
+    flags |= O_SEARCH;
+#elif defined(__linux__) && defined(O_PATH)
+    flags |= O_PATH;
+#elif defined(O_SEARCH)
+    flags |= O_SEARCH;
+#else
+    /* O_NONBLOCK is immaterial for a directory but keeps this fallback from
+     * acquiring a blocking special-file open if a platform ignores
+     * O_DIRECTORY before type validation. */
+    flags |= O_RDONLY | O_NONBLOCK;
+#endif
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = openat(parent_fd, component, flags);
+    if (fd < 0) return -1;
+    if (fstat(fd, opened) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!exec_directory_stat_is_trusted(opened) ||
+        !exec_fd_acl_is_trusted(fd)) {
+        close(fd);
+        errno = EACCES;
+        return -1;
+    }
+    struct stat sealed;
+    if (fstat(fd, &sealed) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!exec_stat_identity_matches(opened, &sealed)) {
+        close(fd);
+        errno = EACCES;
+        return -1;
+    }
+#ifndef O_CLOEXEC
+    int fd_flags = fcntl(fd, F_GETFD, 0);
+    if (fd_flags < 0 || fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+#endif
+    return fd;
+#else
+    (void)parent_fd;
+    (void)component;
+    (void)opened;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
 
-        if (!exec_dir_is_trusted(dir) || !exec_candidate_is_trusted(name)) {
-            return -1;
+/* Validate the spelling supplied by PATH as well as its canonical target.
+ * This prevents `/tmp/safe-looking-link -> /usr/bin` from erasing the hostile
+ * 01777 lexical ancestor during realpath().  A symlink is accepted only when
+ * it is itself held in an already-pinned trusted directory and owned by root
+ * or this uid; the separately pinned canonical walk validates its target. */
+static bool exec_lexical_path_is_trusted(const char *path) {
+    if (!path || path[0] != '/' || strlen(path) >= MAX_PATH_LEN) return false;
+
+    struct stat root_st;
+    int root_fd = exec_open_directory_at(AT_FDCWD, "/", &root_st);
+    if (root_fd < 0) return false;
+
+    const char *cursor = path + 1;
+    bool trusted = false;
+    while (*cursor) {
+        const char *slash = strchr(cursor, '/');
+        size_t length = slash ? (size_t)(slash - cursor) : strlen(cursor);
+        if (length == 0) {
+            cursor++;
+            continue;
         }
-        if (safe_strncpy(buf, name, size) != 0) return -1;
-        return 0;
+        if (length >= MAX_PATH_LEN) break;
+
+        char component[MAX_PATH_LEN];
+        memcpy(component, cursor, length);
+        component[length] = '\0';
+        if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+            break;
+        }
+
+        if (!slash) {
+            struct stat leaf;
+            if (fstatat(root_fd, component, &leaf,
+                        AT_SYMLINK_NOFOLLOW) == 0 &&
+                exec_owner_is_allowed(leaf.st_uid)) {
+                trusted = true;
+            }
+            break;
+        }
+
+        struct stat next_st;
+        int next_fd = exec_open_directory_at(root_fd, component, &next_st);
+        if (next_fd >= 0) {
+            close(root_fd);
+            root_fd = next_fd;
+            cursor = slash + 1;
+            continue;
+        }
+
+        struct stat link_st;
+        if (fstatat(root_fd, component, &link_st,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISLNK(link_st.st_mode) &&
+            exec_owner_is_allowed(link_st.st_uid)) {
+            trusted = true;
+        }
+        break;
+    }
+    close(root_fd);
+    return trusted;
+}
+
+static int exec_open_canonical(const char *canonical,
+                               struct stat *file_stat) {
+    if (!canonical || canonical[0] != '/' ||
+        canonical[1] == '\0' || strlen(canonical) >= MAX_PATH_LEN) {
+        errno = EINVAL;
+        return -1;
     }
 
-    path_env = getenv("PATH");
+    struct stat root_st;
+    int dir_fd = exec_open_directory_at(AT_FDCWD, "/", &root_st);
+    if (dir_fd < 0) return -1;
+
+    const char *cursor = canonical + 1;
+    for (;;) {
+        const char *slash = strchr(cursor, '/');
+        size_t length = slash ? (size_t)(slash - cursor) : strlen(cursor);
+        if (length == 0 || length >= MAX_PATH_LEN) {
+            close(dir_fd);
+            errno = EINVAL;
+            return -1;
+        }
+
+        char component[MAX_PATH_LEN];
+        memcpy(component, cursor, length);
+        component[length] = '\0';
+        if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+            close(dir_fd);
+            errno = EINVAL;
+            return -1;
+        }
+
+        if (slash) {
+            struct stat opened;
+            int next_fd = exec_open_directory_at(dir_fd, component, &opened);
+            close(dir_fd);
+            if (next_fd < 0) return -1;
+            dir_fd = next_fd;
+            cursor = slash + 1;
+            continue;
+        }
+
+#if defined(O_NOFOLLOW)
+        /* Acquire a metadata/execute-only handle first. This cannot block on
+         * a FIFO and does not activate a device before regular-file/type and
+         * trust validation. A second readable handle is identity-matched for
+         * bounded format/shebang parsing. */
+        int metadata_flags = O_NOFOLLOW;
+#if defined(__linux__) && defined(O_PATH)
+        metadata_flags |= O_PATH;
+#elif defined(__FreeBSD__) && defined(O_EXEC)
+        metadata_flags |= O_EXEC | O_NONBLOCK;
+#elif defined(O_EVTONLY)
+        metadata_flags |= O_EVTONLY | O_NONBLOCK;
+#else
+        metadata_flags |= O_RDONLY | O_NONBLOCK;
+#endif
+#ifdef O_CLOEXEC
+        metadata_flags |= O_CLOEXEC;
+#endif
+        int metadata_fd = openat(dir_fd, component, metadata_flags);
+        int open_errno = errno;
+        if (metadata_fd < 0) {
+            close(dir_fd);
+            errno = open_errno;
+            return -1;
+        }
+        if (fstat(metadata_fd, file_stat) != 0) {
+            int saved_errno = errno;
+            close(metadata_fd);
+            close(dir_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (!exec_file_stat_is_trusted(file_stat)) {
+            close(metadata_fd);
+            close(dir_fd);
+            errno = EACCES;
+            return -1;
+        }
+
+        int read_flags = O_RDONLY | O_NONBLOCK | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        read_flags |= O_CLOEXEC;
+#endif
+        int fd = openat(dir_fd, component, read_flags);
+        int read_errno = errno;
+        if (fd < 0) {
+            close(metadata_fd);
+            close(dir_fd);
+            errno = read_errno;
+            return -1;
+        }
+        struct stat readable_stat;
+        if (fstat(fd, &readable_stat) != 0) {
+            int saved_errno = errno;
+            close(fd);
+            close(metadata_fd);
+            close(dir_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (!exec_stat_identity_matches(file_stat, &readable_stat)) {
+            close(fd);
+            close(metadata_fd);
+            close(dir_fd);
+            errno = EACCES;
+            return -1;
+        }
+        if (!exec_fd_acl_is_trusted(fd)) {
+            close(fd);
+            close(metadata_fd);
+            close(dir_fd);
+            errno = EACCES;
+            return -1;
+        }
+
+        if (exec_leaf_is_effectively_executable_at(dir_fd, component) != 0) {
+            int saved_errno = errno;
+            close(fd);
+            close(metadata_fd);
+            close(dir_fd);
+            errno = saved_errno;
+            return -1;
+        }
+
+        /* Seal the pathname-based ACL/noexec probe back to both pinned
+         * handles. ACL edits update ctime; leaf replacement changes inode.
+         * A later metadata mutation is caught again in the child immediately
+         * before descriptor execution. */
+        struct stat named_after_access;
+        struct stat readable_after_access;
+        if (fstatat(dir_fd, component, &named_after_access,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            fstat(fd, &readable_after_access) != 0) {
+            int saved_errno = errno;
+            close(fd);
+            close(metadata_fd);
+            close(dir_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (!exec_stat_identity_matches(file_stat, &named_after_access) ||
+            !exec_stat_identity_matches(file_stat,
+                                        &readable_after_access)) {
+            close(fd);
+            close(metadata_fd);
+            close(dir_fd);
+            errno = EACCES;
+            return -1;
+        }
+        close(metadata_fd);
+        close(dir_fd);
+#ifndef O_CLOEXEC
+        int fd_flags = fcntl(fd, F_GETFD, 0);
+        if (fd_flags < 0 ||
+            fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+#endif
+        return fd;
+#else
+        close(dir_fd);
+        errno = ENOTSUP;
+        return -1;
+#endif
+    }
+}
+
+static int exec_open_candidate(const char *candidate, char *resolved,
+                               size_t resolved_size, struct stat *file_stat) {
+    if (!exec_lexical_path_is_trusted(candidate)) return -1;
+
+    char *canonical = realpath(candidate, NULL);
+    if (!canonical) return -1;
+    if (strlen(canonical) >= MAX_PATH_LEN ||
+        safe_strncpy(resolved, canonical, resolved_size) != 0) {
+        free(canonical);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    int fd = exec_open_canonical(canonical, file_stat);
+    free(canonical);
+    return fd;
+}
+
+static int open_trusted_command(const char *name, char *resolved,
+                                size_t resolved_size,
+                                struct stat *file_stat) {
+    if (!name || !resolved || resolved_size == 0 || !file_stat || !*name) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    if (strchr(name, '/')) {
+        if (name[0] != '/') {
+            errno = EINVAL;
+            return -1;
+        }
+        return exec_open_candidate(name, resolved, resolved_size, file_stat);
+    }
+
+    const char *path_env = getenv("PATH");
     if (!path_env || !*path_env) {
         path_env = "/usr/local/bin:/usr/bin:/bin";
     }
 
-    /* Memo lookup, valid only while PATH is byte-identical to the PATH the
-     * cache was filled under. Staleness within one short-lived process (a
-     * memoized binary deleted mid-run) is the same resolve-to-exec TOCTOU
-     * window that already exists for a single call. */
-    if (!g_cmd_memo_pathenv || strcmp(g_cmd_memo_pathenv, path_env) != 0) {
-        free(g_cmd_memo_pathenv);
-        g_cmd_memo_pathenv = strdup(path_env);
-        g_cmd_memo_used = 0;
-    } else {
-        for (size_t i = 0; i < g_cmd_memo_used; i++) {
-            if (strcmp(g_cmd_memo[i].name, name) == 0) {
-                return safe_strncpy(buf, g_cmd_memo[i].path, size);
-            }
-        }
-    }
-
-    /* Walk colon-separated PATH entries, testing <dir>/<name> in each trusted
-     * directory. Untrusted entries are skipped, not fatal: a stray "." or
-     * group/world-writable dir in PATH must not hide the real /usr/bin/git
-     * behind it. An empty
-     * entry historically means the CWD — refused, not honored. */
-    p = path_env;
-    while (*p) {
-        const char *colon = strchr(p, ':');
-        size_t dirlen = colon ? (size_t)(colon - p) : strlen(p);
-        char dir[MAX_PATH_LEN];
+    const char *cursor = path_env;
+    while (*cursor) {
+        const char *colon = strchr(cursor, ':');
+        size_t dir_length = colon ? (size_t)(colon - cursor) : strlen(cursor);
+        size_t name_length = strlen(name);
         char candidate[MAX_PATH_LEN];
 
-        if (dirlen > 0 && dirlen < sizeof(dir) &&
-            dirlen + 1 + strlen(name) + 1 <= sizeof(candidate)) {
-            memcpy(dir, p, dirlen);
-            dir[dirlen] = '\0';
-            memcpy(candidate, dir, dirlen);
-            candidate[dirlen] = '/';
-            strcpy(candidate + dirlen + 1, name); /* Flawfinder: ignore — bounds proven by dirlen+name checks above */
-            if (exec_dir_is_trusted(dir) && exec_candidate_is_trusted(candidate)) {
-                if (g_cmd_memo_pathenv && g_cmd_memo_used < CMD_MEMO_SLOTS &&
-                    strlen(name) < CMD_MEMO_NAME_LEN) {
-                    cmd_memo_slot_t *slot = &g_cmd_memo[g_cmd_memo_used];
-                    if (safe_strncpy(slot->name, name, sizeof(slot->name)) == 0 &&
-                        safe_strncpy(slot->path, candidate, sizeof(slot->path)) == 0) {
-                        g_cmd_memo_used++;
-                    }
-                }
-                if (safe_strncpy(buf, candidate, size) != 0) return -1;
-                return 0;
-            }
+        if (dir_length > 0 && cursor[0] == '/' &&
+            dir_length + 1 + name_length + 1 <= sizeof(candidate)) {
+            memcpy(candidate, cursor, dir_length);
+            candidate[dir_length] = '/';
+            memcpy(candidate + dir_length + 1, name, name_length + 1);
+            int fd = exec_open_candidate(candidate, resolved, resolved_size,
+                                         file_stat);
+            if (fd >= 0) return fd;
         }
 
         if (!colon) break;
-        p = colon + 1;
+        cursor = colon + 1;
     }
+    errno = ENOENT;
     return -1;
+}
+
+int find_command_path(const char *name, char *buf, size_t size) {
+    struct stat file_stat;
+    int fd = open_trusted_command(name, buf, size, &file_stat);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
 }
 
 bool command_exists(const char *command) {

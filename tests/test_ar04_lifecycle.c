@@ -132,11 +132,11 @@ static const char *active_work_config(void) {
            "preferred_scope = \"global\"\n";
 }
 
-static int prepare_shims(const char *runtime, char *shim_dir, size_t size) {
+static int prepare_shims(char *shim_dir, size_t size) {
     char path[1024];
 
-    snprintf(shim_dir, size, "%s/shims", runtime);
-    if (mkdir_private(shim_dir) != 0) return -1;
+    if (!ts_mkdtemp_trusted(shim_dir, size,
+                            "gitswitch-ar04-life-shims")) return -1;
     snprintf(path, sizeof(path), "%s/gpg", shim_dir);
     if (write_text(path, "#!/bin/sh\nexit 0\n", 0700) != 0) return -1;
     snprintf(path, sizeof(path), "%s/gpgconf", shim_dir);
@@ -167,7 +167,7 @@ TEST(active_live_field_edits_are_rejected_without_mutation) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     snprintf(key, sizeof(key), "%s/new-key", runtime);
     CHECK_EQ_INT(write_text(key,
                             "-----BEGIN OPENSSH PRIVATE KEY-----\n"
@@ -243,7 +243,7 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     snprintf(output, sizeof(output), "%s/edit.out", runtime);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
 
@@ -384,7 +384,7 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
 
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
@@ -476,7 +476,7 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(join_path(key_path, sizeof(key_path), runtime, "/retry-key"), 0);
     snprintf(cmd, sizeof(cmd),
              "PATH='/usr/bin:/bin:/usr/local/bin' ssh-keygen -q -t ed25519 "
@@ -587,7 +587,7 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
     snprintf(target, sizeof(target), "%s/foreign-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(target), 0);
@@ -618,7 +618,7 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
      * the account remains so the next remove/reset can retry. */
     remove_tree(runtime);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
@@ -663,7 +663,7 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, body), 0);
 
     /* Give the active account real stable entry points. Removing the inactive

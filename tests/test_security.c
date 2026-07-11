@@ -98,12 +98,15 @@ static void restore_path(void) {
     setenv("PATH", saved_path_env, 1);
 }
 
-/* mkdtemp + explicit chmod (not umask-clipped); returns 0 on success. */
+/* Executable-trust fixtures must start below a non-replaceable ancestor.
+ * /tmp itself is 01777 and AR-07 M28 correctly rejects every helper beneath
+ * it even when the immediate mkdtemp leaf is 0700, so place these particular
+ * PATH fixtures below the user's private home instead. */
 static int make_test_dir(char *out, size_t out_size, mode_t mode) {
-    char tmpl[] = "/tmp/gs_sec_XXXXXX";
-    if (!ts_mkdtemp(tmpl)) return -1;
+    char tmpl[MAX_PATH_LEN];
+    if (!ts_mkdtemp_trusted(tmpl, sizeof(tmpl), "gs-sec")) return -1;
     if (chmod(tmpl, mode) != 0) return -1;
-    snprintf(out, out_size, "%s", tmpl);
+    if ((size_t)snprintf(out, out_size, "%s", tmpl) >= out_size) return -1;
     return 0;
 }
 
@@ -115,7 +118,9 @@ static int install_fake_tool(const char *dir, const char *name,
     if ((size_t)snprintf(tool_out, tool_out_size, "%s/%s", dir, name) >= tool_out_size) {
         return -1;
     }
-    snprintf(body, sizeof(body), "#!/bin/sh\ntouch '%s'\n", marker_path);
+    /* Shell redirection is a builtin, so the positive control remains valid
+     * even when PATH intentionally contains only the trusted fixture dir. */
+    snprintf(body, sizeof(body), "#!/bin/sh\n: > '%s'\n", marker_path);
     return write_string_to_file(tool_out, body, 0755);
 }
 

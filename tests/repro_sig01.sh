@@ -12,10 +12,10 @@
 #           ~/.ssh/config.gitswitch.* scratch orphans.
 #
 # Everything runs in a throwaway sandbox: private HOME, private
-# XDG_RUNTIME_DIR, and a PATH shim `git` that delegates to the real git but
-# can sleep on / fail the identity writes (that's what makes the race
-# deterministic). Real ssh-agent/ssh-add are used; `ssh` itself is stubbed so
-# no network is touched. Run from anywhere:
+# XDG_RUNTIME_DIR, and PATH shims below the operator's trusted HOME ancestry.
+# The `git` shim delegates to the real git but can sleep on / fail the identity
+# writes (that's what makes the race deterministic). Real ssh-agent/ssh-add are
+# used; `ssh` itself is stubbed so no network is touched. Run from anywhere:
 #
 #   sh tests/repro_sig01.sh
 #
@@ -30,7 +30,17 @@ BIN="$ROOT/build/bin/gitswitch"
 REAL_GIT=$(command -v git) || { echo "git not found"; exit 1; }
 command -v ssh-agent >/dev/null || { echo "ssh-agent not found"; exit 1; }
 
+case ${HOME-} in
+    /*) ;;
+    *) echo "absolute HOME required for trusted PATH shims"; exit 1 ;;
+esac
+TRUSTED_HOME=$(CDPATH= cd "$HOME" 2>/dev/null && pwd -P) \
+    || { echo "cannot resolve HOME: $HOME"; exit 1; }
 SBX=$(mktemp -d /tmp/gsw_repro.XXXXXX) || exit 1
+SHIM_DIR=$(mktemp -d "$TRUSTED_HOME/.gsw-repro-shims.XXXXXX") \
+    || { rm -rf "$SBX"; exit 1; }
+chmod 700 "$SHIM_DIR" \
+    || { rm -rf "$SBX" "$SHIM_DIR"; exit 1; }
 
 FAILURES=0
 pass() { echo "PASS: $1"; }
@@ -41,7 +51,7 @@ cleanup() {
     for f in "$SBX"/run/gitswitch-ssh/*.pid; do
         [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null
     done
-    rm -rf "$SBX"
+    rm -rf "$SBX" "$SHIM_DIR"
 }
 trap cleanup EXIT INT TERM
 
@@ -60,8 +70,7 @@ unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM 2>/dev/null
 #     creating a wide deterministic window to deliver SIGINT mid-switch;
 #   - GS_FAIL_NAME=1: fails the `config <scope> user.name X` write, forcing the
 #     switch to fail exactly at the git-config step.
-mkdir "$SBX/bin"
-cat > "$SBX/bin/git" <<EOF
+cat > "$SHIM_DIR/git" <<EOF
 #!/bin/sh
 if [ "\${1:-}" = "config" ] && [ \$# -eq 4 ]; then
     if [ "\$3" = "user.email" ] && [ -n "\${GS_SLEEP_EMAIL:-}" ] && [ ! -e "$SBX/email.mark" ]; then
@@ -74,11 +83,11 @@ if [ "\${1:-}" = "config" ] && [ \$# -eq 4 ]; then
 fi
 exec "$REAL_GIT" "\$@"
 EOF
-chmod +x "$SBX/bin/git"
+chmod +x "$SHIM_DIR/git"
 # ssh stub: the post-switch connection test must not hit the network.
-printf '#!/bin/sh\nexit 1\n' > "$SBX/bin/ssh"
-chmod +x "$SBX/bin/ssh"
-export PATH="$SBX/bin:$PATH"
+printf '#!/bin/sh\nexit 1\n' > "$SHIM_DIR/ssh"
+chmod +x "$SHIM_DIR/ssh"
+export PATH="$SHIM_DIR:$PATH"
 
 # Two passphrase-less test keys (never leave the sandbox).
 ssh-keygen -q -t ed25519 -N "" -C "keyA" -f "$SBX/keyA" || exit 1

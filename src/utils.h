@@ -55,10 +55,11 @@ int ensure_private_dir(const char *path);
 
 /**
  * Open and pin the runtime parent used by SSH/GPG state.  A configured
- * XDG_RUNTIME_DIR is accepted only when it is a real, self-owned private
- * directory; the returned descriptor names the validated inode even if its
- * pathname is subsequently renamed.  When XDG_RUNTIME_DIR is absent, /tmp is
- * opened as the parent for the uid-specific fallback directories.
+ * XDG_RUNTIME_DIR is accepted only when it is absolute and names a real,
+ * self-owned 0700 directory; the returned descriptor names the validated
+ * inode even if its pathname is subsequently renamed.  When XDG_RUNTIME_DIR
+ * is absent or empty, the system /tmp target is opened and the absolute /tmp
+ * spelling is returned for the uid-specific fallback directories.
  */
 int open_runtime_parent(char *path, size_t path_size);
 
@@ -115,10 +116,20 @@ time_t get_file_mtime(const char *file_path);
 /**
  * Process utilities
  *
- * All external commands are run via run_argv(), which resolves a trusted
- * absolute path and uses execv() with an explicit argv vector — NO shell is involved, so command
- * arguments (account names, key paths, etc.) can never be interpreted as shell
- * syntax. This is the structural defense against command injection.
+ * All external commands are run via run_argv(), which resolves a trusted,
+ * readable executable descriptor and uses descriptor execution where
+ * supported. Recognized native binaries execute directly. A script is
+ * accepted only with a bounded, well-formed shebang naming an absolute direct
+ * interpreter (never env); that interpreter is independently trust-walked,
+ * pinned, and required to be a recognized native binary. The script is passed
+ * through /proc/self/fd or /dev/fd after proving that mapping names the pinned
+ * inode, so platforms without that descriptor filesystem fail closed. On
+ * macOS, which lacks descriptor execution, the binary/interpreter pathname is
+ * descriptor-rewalked and exact-identity-proved immediately before execve.
+ * An explicit argv vector is always used: the runner never inserts a shell or
+ * interpolates caller arguments into a command string. A caller may still
+ * explicitly request a shell executable, in which case its argv is deliberate
+ * caller policy rather than runner-side interpretation.
  */
 
 /* Options for a single child invocation. Any field may be left zero/NULL. */
@@ -153,16 +164,18 @@ typedef int (*command_runner_fn)(const char *const argv[],
 /* Install a runner; returns the previous one (NULL means the default). */
 command_runner_fn run_set_runner(command_runner_fn fn);
 
-/* Run argv[0] (pinned to an absolute path via the sanitized PATH walk in
- * find_command_path, then execv'd), argv NULL-terminated, through the active
- * runner. Returns 0 iff the child spawned and exited 0. opts/result may be
- * NULL. If argv[0] cannot be resolved from a trusted directory, fails closed
- * before forking (result->spawned stays false). Child setup/exec failures,
- * incomplete stdin delivery, subprocess pipe errors, and a capture pipe held
- * open by descendants are runner failures even if the direct child exits 0. */
+/* Run argv[0] (opened through the sanitized PATH walk, format/shebang checked,
+ * then launched from a verified descriptor), argv NULL-terminated, through
+ * the active runner. Returns 0 iff the child spawned and exited 0. opts/result
+ * may be NULL. An untrusted path, unknown format, malformed/indirect shebang,
+ * recursive script interpreter, or unavailable script-descriptor filesystem
+ * fails closed; pre-fork rejection leaves result->spawned false. Child
+ * setup/exec failures, incomplete stdin delivery, subprocess pipe errors, and
+ * a capture pipe held open by descendants are runner failures even if the
+ * direct child exits 0. */
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result);
 
-/* The real fork+execv implementation; normally reached via run_argv(). */
+/* The real fork+verified-exec implementation; normally reached via run_argv(). */
 int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result);
 
 /* Test-only child-FD cleanup selector. Production code must leave this at
@@ -195,18 +208,33 @@ void run_test_set_fd_close_observation(bool enabled);
 bool run_test_get_fd_close_observation(run_test_fd_close_observation_t *out);
 void run_test_set_bulk_close_failure(int system_errno);
 
+/* Test-only deterministic race seam.  The callback runs in the parent after
+ * the helper file is verified and pinned but before fork; production leaves
+ * it NULL.  It lets regression tests replace/chmod the pathname and prove the
+ * child never reopens it. */
+typedef void (*run_test_exec_resolved_hook_fn)(const char *resolved_path);
+void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook);
+
 /* True if an executable named `command` is found in PATH. */
 bool command_exists(const char *command);
 
 /**
- * Resolve the absolute path of an executable by walking $PATH — no shell
- * involved. Supply-chain hardened (PS-1/PS-2): only absolute directories with
- * no group/other write bits may supply a binary (relative/"."/empty and
- * group/world-writable entries are skipped), and the resolved file must be a
- * regular executable with the same write-bit restriction. A `name` containing
- * a slash bypasses the PATH walk but must pass the same checks. Portable across
- * Linux, macOS, and the BSDs.
- * Returns 0 and writes the path into buf on success; -1 otherwise.
+ * Resolve the canonical absolute path of an executable by walking $PATH — no
+ * shell involved. Supply-chain hardened (PS-1/PS-2, AR-07 M28/M29): only
+ * absolute paths whose complete root-to-leaf ancestry is owned by root/the
+ * current user and has no group/other-writable or ACL-mutable directory may
+ * supply a file.
+ * The resolved leaf must be a root/current-user-owned regular file, have no
+ * group/other write bits or ACL mutation grants, and be both readable and
+ * executable through the caller's effective permission class. Execute-only
+ * leaves are deliberately rejected because their format/shebang cannot be
+ * validated safely. A final
+ * descriptor-relative X_OK probe also enforces ACL and noexec-mount policy,
+ * then is identity-sealed to the pinned leaf. Relative/"."/empty and unsafe
+ * entries are skipped. A `name` containing a slash bypasses the PATH search
+ * but not the checks. Every call reopens and revalidates the chain; positive
+ * pathnames are not cached across inode or metadata replacement. Returns 0
+ * and writes the canonical path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
 bool process_is_running(pid_t pid);

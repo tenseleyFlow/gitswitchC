@@ -100,15 +100,10 @@ static bool reap_within(pid_t pid, int timeout_ms, int *status_out) {
     return false;
 }
 
-/* M45: with no descriptor available for the required null device/status
- * channel, run_argv must stop in the parent and never fork a helper. */
-TEST(stdio_isolation_fails_before_spawn_under_fd_exhaustion) {
-    char resolved[MAX_PATH_LEN];
+/* M45/T13: with no descriptor available even for trusted-command pinning,
+ * run_argv must stop in the parent and never fork a helper. */
+TEST(runner_fails_before_spawn_under_fd_exhaustion) {
     int status = 0;
-
-    /* Warm the trusted-command memo before lowering the worker's limit, so
-     * the witness specifically reaches runner descriptor acquisition. */
-    CHECK_EQ_INT(find_command_path("true", resolved, sizeof(resolved)), 0);
 
     pid_t worker = fork();
     CHECK(worker >= 0);
@@ -127,7 +122,7 @@ TEST(stdio_isolation_fails_before_spawn_under_fd_exhaustion) {
         int rc = run_argv(argv, NULL, &result);
         const error_context_t *error = get_last_error();
         _exit(rc != 0 && !result.spawned && error &&
-                      strstr(error->message, "/dev/null") != NULL
+                      strstr(error->message, "trusted PATH") != NULL
                   ? 0 : 1);
     }
     CHECK(reap_within(worker, 1500, &status));
@@ -528,18 +523,24 @@ TEST(forced_bulk_failure_is_reported_without_fallback) {
     CHECK_EQ_INT(observation.close_syscalls, 0);
 }
 
-/* Forced SNAPSHOT must prove enumeration complete before any fork.  Lowering
- * RLIMIT_NOFILE to the three occupied stdio slots makes both enumeration
- * directories unopenable and gives a deterministic pre-spawn witness. */
+static void exhaust_fds_after_exec_pin(const char *resolved_path) {
+    (void)resolved_path;
+    while (open("/dev/null", O_RDONLY) >= 0) {
+        /* The short-lived worker intentionally retains every descriptor. */
+    }
+}
+
+/* Forced SNAPSHOT must prove enumeration complete before any fork.  The T13
+ * post-resolution hook exhausts the worker's remaining slots only AFTER the
+ * trusted executable descriptor has been pinned, so enumeration (not command
+ * lookup) is the deterministic failure boundary. */
 TEST(forced_incomplete_snapshot_fails_before_spawn) {
-    char resolved[MAX_PATH_LEN];
     int status = 0;
 
-    CHECK_EQ_INT(find_command_path("true", resolved, sizeof(resolved)), 0);
     pid_t worker = fork();
     CHECK(worker >= 0);
     if (worker == 0) {
-        struct rlimit limit = {.rlim_cur = 3, .rlim_max = 3};
+        struct rlimit limit = {.rlim_cur = 16, .rlim_max = 16};
         const char *argv[] = {"true", NULL};
         run_result_t result;
 
@@ -551,6 +552,7 @@ TEST(forced_incomplete_snapshot_fails_before_spawn) {
             setrlimit(RLIMIT_NOFILE, &limit) != 0) {
             _exit(2);
         }
+        run_test_set_exec_resolved_hook(exhaust_fds_after_exec_pin);
         clear_error();
         int rc = run_argv(argv, NULL, &result);
         const error_context_t *error = get_last_error();
@@ -608,11 +610,9 @@ TEST(large_fd_limit_proves_auto_avoids_numeric_sweep) {
     const int iterations = 3;
     struct rlimit original;
     struct rlimit raised;
-    char resolved[MAX_PATH_LEN];
     fd_close_measurement_t auto_measurement;
     fd_close_measurement_t numeric_measurement;
 
-    CHECK_EQ_INT(find_command_path("true", resolved, sizeof(resolved)), 0);
     if (getrlimit(RLIMIT_NOFILE, &original) != 0) {
         CHECK(!"getrlimit failed");
         return;
@@ -636,8 +636,8 @@ TEST(large_fd_limit_proves_auto_avoids_numeric_sweep) {
                                                 &numeric_measurement);
     long numeric_maxfd = sysconf(_SC_OPEN_MAX);
     if (numeric_maxfd < 0 || numeric_maxfd > 65536) numeric_maxfd = 65536;
-    uint64_t expected_numeric_calls = numeric_maxfd > 4
-        ? (uint64_t)(numeric_maxfd - 4) * (uint64_t)iterations
+    uint64_t expected_numeric_calls = numeric_maxfd > 5
+        ? (uint64_t)(numeric_maxfd - 5) * (uint64_t)iterations
         : 0;
     run_test_set_fd_close_observation(false);
     int restore_strategy =
@@ -684,7 +684,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "test_ar07_runner: cannot resolve own executable\n");
         return 2;
     }
-    RUN_TEST(stdio_isolation_fails_before_spawn_under_fd_exhaustion);
+    RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
     RUN_TEST(early_stdin_close_is_a_runner_failure);
     RUN_TEST(full_binary_stdin_delivery_remains_successful);
