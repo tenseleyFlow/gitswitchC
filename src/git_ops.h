@@ -97,15 +97,19 @@ int git_clear_config(git_scope_t scope);
 /**
  * Snapshot the gitswitch-managed config keys (user.name/email/signingkey,
  * commit.gpgsign, gpg.program, core.sshcommand) at `scope` before a switch
- * mutates them, plus the LOCAL scope when a global write would clear it. Pair
- * with git_config_restore() to roll back on a failed switch. Single snapshot
- * slot (the CLI is single-threaded); a new snapshot replaces the previous.
+ * mutates them, plus the LOCAL scope when a global write would clear it and
+ * any distinct WORKTREE override scope. Every repeated value is retained in
+ * order. Included managed values are refused when their origin cannot be
+ * restored exactly. Pair with git_config_restore() to roll back on a failed
+ * switch. Single snapshot slot (the CLI is single-threaded); a new snapshot
+ * replaces the previous.
  */
 int git_config_snapshot(git_scope_t scope);
 
 /**
- * Restore the most recent git_config_snapshot(), re-setting keys that were
- * present and unsetting keys that were absent. No-op if nothing was snapshotted.
+ * Restore the most recent git_config_snapshot(), rebuilding every key with its
+ * exact ordered values. A failed restore retains the snapshot and completed
+ * per-key progress for retry. No-op if nothing was snapshotted.
  */
 int git_config_restore(void);
 

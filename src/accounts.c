@@ -463,8 +463,8 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
 
     /* If not in dry-run mode, actually perform the switch.
      *
-     * Ordering matters for safety: validate availability first (read-only),
-     * then activate SSH/GPG and write the snapshotted Git identity as
+     * Ordering matters for safety: validate availability and capture the Git
+     * before-image first (read-only), then activate SSH/GPG and write Git as
      * recoverable mutations. Required teardown follows, and the atomic
      * ~/.ssh/config host-alias rewrite is the final fallible commit. On any
      * earlier failure the Git/runtime state is restored; because the alias
@@ -562,6 +562,22 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
          * each login shell (AR-05 M1). */
         if (!ctx->config.resuming && ssh_user_config_preflight(account) != 0) {
             runtime_state_lock_release(runtime_lock_fd);
+            return -1;
+        }
+
+        /* AR-07 M24: snapshot capture is part of read-only preflight, not the
+         * later Git-write step. A failed/truncated/oversized config read must
+         * stop before an SSH agent is spawned or GNUPGHOME is repointed;
+         * runtime rollback after such a rejection is avoidable mutation, not
+         * an acceptable substitute for fail-before-mutation. */
+        if (write_git && git_config_snapshot(scope) != 0) {
+            char detail[sizeof(g_last_error.message)];
+
+            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            runtime_state_lock_release(runtime_lock_fd);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Cannot snapshot Git configuration before switching: %s",
+                      detail[0] ? detail : "unknown snapshot error");
             return -1;
         }
 
@@ -725,26 +741,8 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
                                        runtime_lock_fd);
         }
 
-        /* --- 4. Git identity (snapshotted and reversible) --- */
+        /* --- 4. Git identity (preflight-snapshotted and reversible) --- */
         if (write_git) {
-            if (git_config_snapshot(scope) != 0) {
-                char detail[sizeof(g_last_error.message)];
-
-                safe_strncpy(detail, get_last_error()->message,
-                             sizeof(detail));
-                /* The snapshot is the Git transaction boundary: when its
-                 * scope/preflight contract rejects the before-image, no Git
-                 * mutation is permitted. The runtime work from steps 2-3 is
-                 * still reversible and Git is deliberately marked clean so
-                 * rollback cannot operate on a rejected/stale snapshot. */
-                abort_failed_switch(prev_account, prev_gpg_home,
-                                    prev_gpg_present, false, ssh_dirty,
-                                    gpg_dirty, runtime_lock_fd);
-                set_error(ERR_GIT_CONFIG_FAILED,
-                          "Cannot snapshot Git configuration before switching: %s",
-                          detail[0] ? detail : "unknown snapshot error");
-                return -1;
-            }
             if (git_set_config(account, scope) != 0) {
                 abort_failed_switch(prev_account, prev_gpg_home,
                                     prev_gpg_present, true, ssh_dirty, gpg_dirty,

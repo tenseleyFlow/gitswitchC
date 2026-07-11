@@ -159,6 +159,8 @@ TEST(worktree_values_are_cleared_and_restored_around_global_switch) {
     real_fixture_t fixture;
     account_t account = basic_account();
     char value[GIT_CONFIG_VALUE_MAX];
+    char global_config[192];
+    char xdg_global_config[192];
     CHECK(fixture_init(&fixture));
     CHECK_EQ_INT(set_git_value("--local", "extensions.worktreeConfig", "true"), 0);
     CHECK_EQ_INT(set_git_value("--worktree", GIT_CONFIG_USER_NAME, "Old Worktree"), 0);
@@ -172,6 +174,21 @@ TEST(worktree_values_are_cleared_and_restored_around_global_switch) {
                                "ssh -i /old/worktree/key"), 0);
     CHECK_EQ_INT(set_git_value("--worktree", GIT_CONFIG_GPG_PROGRAM,
                                "/old/worktree/gpg"), 0);
+
+    /* Keep the primary global scope genuinely absent. Git reports this as
+     * fatal/ENOENT for --global --list, while an exact snapshot must model it
+     * as an empty value vector and still preserve the populated worktree
+     * override scope. */
+    snprintf(global_config, sizeof(global_config), "%s/.gitconfig",
+             fixture.home);
+    snprintf(xdg_global_config, sizeof(xdg_global_config), "%s/git/config",
+             fixture.xdg);
+    errno = 0;
+    CHECK_EQ_INT(access(global_config, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    errno = 0;
+    CHECK_EQ_INT(access(xdg_global_config, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
 
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);

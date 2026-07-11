@@ -24,6 +24,8 @@ static int validate_git_installation(void);
 static bool is_valid_git_config_value(const char *value);
 static int git_set_config_value_impl(const char *key, const char *value,
                                      git_scope_t scope, bool skip_validation);
+static int git_unset_config_value_impl(const char *key, git_scope_t scope,
+                                       bool force);
 static int git_get_config_value_ex(const char *key, char *value,
                                    size_t value_size, git_scope_t scope,
                                    bool *value_too_long);
@@ -32,14 +34,14 @@ static int git_verify_merged_account(const account_t *account);
 
 /* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
 
-/* Value capacity for the snapshot and the exec cache below. Sized for the
+/* Value capacity for the effective-status representation and exec cache
+ * below. The transactional snapshot is dynamically allocated so it can retain
+ * every value of every managed key without truncation. Sized for the
  * largest value gitswitch itself writes: git_configure_ssh's core.sshCommand
  * is ~85 bytes of fixed ssh options plus a single-quoted key path of up to
  * MAX_PATH_LEN. The old 512-byte cap could not hold gitswitch's OWN value for
  * a long key path, and the drop was then recorded as "proven absent" — the
- * AR-03 M1 bug. Stack note: the two aggregates using this are file-scope
- * statics (.bss, ~127 KB total), not stack; the one per-call buffer this size
- * is git_get_config_value_ex's capture (~4 KB frame at shallow depth). */
+ * AR-03 M1 bug. */
 #define GIT_CFG_VALUE_MAX GIT_CONFIG_VALUE_MAX
 
 /* Worktree scope is intentionally internal: accounts may choose local,
@@ -65,15 +67,30 @@ static const char *const g_managed_keys[GIT_MANAGED_KEY_COUNT] = {
 };
 static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]);
 
-static struct {
+typedef struct {
+    char **values;
+    size_t count;
+    size_t capacity;
+    bool restored;
+} git_snapshot_key_t;
+
+typedef struct {
+    git_snapshot_key_t keys[GIT_MANAGED_KEY_COUNT];
+} git_scope_snapshot_t;
+
+typedef struct {
     git_scope_t scope;
     bool local_also;
     bool worktree_also;
-    git_kv_t primary[GIT_MANAGED_KEY_COUNT];
-    git_kv_t local[GIT_MANAGED_KEY_COUNT];
-    git_kv_t worktree[GIT_MANAGED_KEY_COUNT];
+    git_scope_snapshot_t primary;
+    git_scope_snapshot_t local;
+    git_scope_snapshot_t worktree;
     bool valid;
-} g_git_snapshot;
+    bool restore_incomplete;
+} git_config_snapshot_t;
+
+static git_config_snapshot_t g_git_snapshot;
+static void git_snapshot_clear(git_config_snapshot_t *snapshot);
 
 /* ---- Process-scoped exec caches (perf-1..4) ------------------------------
  *
@@ -169,80 +186,10 @@ static void cfg_cache_store(int s, int k, cfg_state_t state, bool present,
  * API surface is unchanged; tests declare this prototype locally. */
 void git_ops_test_reset_caches(void);
 void git_ops_test_reset_caches(void) {
+    git_snapshot_clear(&g_git_snapshot);
     memset(g_cfg_cache, 0, sizeof(g_cfg_cache));
     memset(&g_repo_cache, 0, sizeof(g_repo_cache));
     g_git_validated = false;
-}
-
-/* Parse a value out of `git config --list -z` output. The listing is a series
- * of NUL-terminated records, each "key\nvalue" (the value itself may contain
- * newlines — that's the whole point of -z over plain --list, which would let a
- * value's embedded newline masquerade as a record boundary and truncate the
- * snapshot). `buf`/`len` are binary (the buffer holds embedded NULs), so we
- * work by length rather than strlen. Last match wins, matching git's own
- * resolution.
- *
- * Tri-state result: found-but-too-long is NOT absent. The pre-fix bool
- * conflated the two, so an overlong (foreign) value was snapshotted and
- * cache-seeded as proven-absent — git_clear_config then elided a real --unset
- * and git_config_restore --unset the user's original value (AR-03 M1). */
-typedef enum {
-    CFG_Z_ABSENT = 0, /* no record carries the key */
-    CFG_Z_FOUND,      /* key found; out[] holds its (last-wins) value */
-    CFG_Z_TOO_LONG    /* key PRESENT, but its value cannot fit out[] —
-                       * treat as present with an unknown value, never absent */
-} cfg_z_result_t;
-
-static cfg_z_result_t parse_config_z_value(const char *buf, size_t len,
-                                           const char *key,
-                                           char *out, size_t out_size) {
-    size_t key_len = strlen(key);
-    cfg_z_result_t result = CFG_Z_ABSENT;
-    size_t pos = 0;
-    while (pos < len) {
-        size_t rec_start = pos;
-        while (pos < len && buf[pos] != '\0') pos++;
-        size_t rec_len = pos - rec_start;
-        if (pos < len) pos++; /* step over the record's NUL terminator */
-
-        const char *rec = buf + rec_start;
-        const char *nl = memchr(rec, '\n', rec_len);
-        if (!nl) {
-            /* No key/value separator. `git config --list -z` emits an
-             * implicit-boolean key (e.g. `[commit]\n\tgpgsign`, which git
-             * defines as true) as "commit.gpgsign\0" with NO newline. Such a
-             * key IS present (AR-06 F19); the old blanket skip returned it
-             * ABSENT, so git_clear_config elided the --unset and a `true`
-             * boolean survived a switch to a non-signing account. Its bare
-             * value ("true") cannot be round-tripped by `git config <key>
-             * <value>` (writing "" flips --bool semantics to an error), so
-             * treat it as present-but-uncapturable — the same value_unknown
-             * state CFG_Z_TOO_LONG carries — which makes the caller UNSET it
-             * rather than elide. */
-            if (rec_len == key_len && memcmp(rec, key, key_len) == 0) {
-                out[0] = '\0';
-                result = CFG_Z_TOO_LONG;
-            }
-            continue;
-        }
-        size_t k_len = (size_t)(nl - rec);
-        if (k_len == key_len && memcmp(rec, key, key_len) == 0) {
-            const char *val = nl + 1;
-            size_t val_len = rec_len - k_len - 1;
-            if (val_len < out_size) {
-                memcpy(out, val, val_len);
-                out[val_len] = '\0';
-                result = CFG_Z_FOUND; /* keep scanning: last wins */
-            } else {
-                /* Clear any earlier occurrence's copy: last wins, and the
-                 * winner is uncapturable — a stale earlier value must not
-                 * leak out alongside TOO_LONG. */
-                out[0] = '\0';
-                result = CFG_Z_TOO_LONG;
-            }
-        }
-    }
-    return result;
 }
 
 typedef struct {
@@ -357,26 +304,6 @@ static int parse_effective_listing(const char *buf, size_t len,
     return 0;
 }
 
-/* Run `git config <scope> --list -z`, capturing the NUL-delimited listing into
- * buf and its byte length into *out_len. Returns 0 on success. Kept local (not
- * via git_list_config) so the binary, -z output and its true length stay
- * intact — git_list_config's public contract is a plain C string. */
-static int git_list_config_z(git_scope_t scope, char *buf, size_t size, size_t *out_len) {
-    const char *scope_flag = git_scope_to_flag(scope);
-    if (!scope_flag) return -1;
-    const char *argv[] = { "git", "config", scope_flag, "--list", "-z", NULL };
-    run_opts_t opts;
-    run_result_t res;
-    memset(&opts, 0, sizeof(opts));
-    memset(&res, 0, sizeof(res));
-    opts.out = buf;
-    opts.out_size = size;
-    opts.stderr_to_devnull = true;
-    if (run_argv(argv, &opts, &res) != 0) return -1;
-    *out_len = res.out_len;
-    return 0;
-}
-
 /* Detect whether any managed value is contributed by the distinct worktree
  * scope. We intentionally inspect Git's effective scope attribution instead
  * of blindly issuing --worktree: when extensions.worktreeConfig is disabled,
@@ -449,177 +376,452 @@ static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
     }
 }
 
-/* Apply a complete, untruncated scope-specific `--list -z` capture to the kv
- * array and seed the exec cache used by snapshot/restore. */
-static void git_apply_config_listing(git_scope_t scope, const char *list,
-                                     size_t list_len,
-                                     git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
+/* Transaction snapshots are exact ordered vectors, not last-value-wins
+ * scalars. Git permits repeated values for every config key; collapsing those
+ * values changes both meaning and rollback fidelity (AR-07 M25). */
+#define GIT_SNAPSHOT_INITIAL_BYTES (16U * 1024U)
+#define GIT_SNAPSHOT_MAX_BYTES (8U * 1024U * 1024U)
+
+static void git_scope_snapshot_clear(git_scope_snapshot_t *scope) {
+    if (!scope) return;
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        for (size_t j = 0; j < scope->keys[i].count; j++) {
+            free(scope->keys[i].values[j]);
+        }
+        free(scope->keys[i].values);
+    }
+    memset(scope, 0, sizeof(*scope));
+}
+
+static void git_snapshot_clear(git_config_snapshot_t *snapshot) {
+    if (!snapshot) return;
+    git_scope_snapshot_clear(&snapshot->primary);
+    git_scope_snapshot_clear(&snapshot->local);
+    git_scope_snapshot_clear(&snapshot->worktree);
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+static int git_managed_key_index_n(const char *key, size_t key_len) {
+    for (int i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        size_t managed_len = strlen(g_managed_keys[i]);
+        if (key_len == managed_len &&
+            strncasecmp(key, g_managed_keys[i], key_len) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int git_snapshot_key_append(git_snapshot_key_t *key,
+                                   const char *value, size_t value_len) {
+    char **grown;
+    char *copy;
+
+    if (key->count == key->capacity) {
+        size_t capacity = key->capacity ? key->capacity * 2U : 2U;
+        grown = realloc(key->values, capacity * sizeof(*grown));
+        if (!grown) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Out of memory capturing Git configuration snapshot");
+            return -1;
+        }
+        key->values = grown;
+        key->capacity = capacity;
+    }
+    copy = malloc(value_len + 1U);
+    if (!copy) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory capturing Git configuration value");
+        return -1;
+    }
+    memcpy(copy, value, value_len);
+    copy[value_len] = '\0';
+    key->values[key->count++] = copy;
+    return 0;
+}
+
+/* Parse a complete `git config <scope> --list -z` result. A managed implicit
+ * boolean has no key/value separator, so its file spelling cannot be recreated
+ * through `git config --add`; refuse it before any mutation instead of
+ * guessing. Every record, including the final one, must be NUL terminated. */
+static int git_parse_snapshot_listing(const char *buf, size_t len,
+                                      git_scope_snapshot_t *out) {
+    size_t pos = 0;
+
+    while (pos < len) {
+        const char *record = buf + pos;
+        const char *end = memchr(record, '\0', len - pos);
+        const char *newline;
+        size_t record_len;
+        int key_index;
+
+        if (!end) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Malformed or truncated Git configuration snapshot");
+            return -1;
+        }
+        record_len = (size_t)(end - record);
+        pos += record_len + 1U;
+        newline = memchr(record, '\n', record_len);
+        if (!newline) {
+            key_index = git_managed_key_index_n(record, record_len);
+            if (key_index >= 0) {
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Cannot exactly snapshot implicit Git value %s",
+                          g_managed_keys[key_index]);
+                return -1;
+            }
+            continue;
+        }
+
+        key_index = git_managed_key_index_n(
+            record, (size_t)(newline - record));
+        if (key_index >= 0 &&
+            git_snapshot_key_append(&out->keys[key_index], newline + 1,
+                                    record_len -
+                                        (size_t)(newline - record) - 1U) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Grow until the complete binary listing fits. A hard cap bounds hostile or
+ * corrupt config input; reaching it is a preflight failure, never a partial
+ * snapshot followed by mutation (AR-07 M24). */
+static int git_read_snapshot_listing(git_scope_t scope, bool includes,
+                                     char **out, size_t *out_len) {
+    const char *scope_flag = git_scope_to_flag(scope);
+    size_t capacity = GIT_SNAPSHOT_INITIAL_BYTES;
+    char *buf;
+
+    if (!scope_flag || !out || !out_len) {
+        set_error(ERR_INVALID_ARGS, "Invalid Git snapshot scope");
+        return -1;
+    }
+    buf = malloc(capacity);
+    if (!buf) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory allocating Git snapshot buffer");
+        return -1;
+    }
+
+    for (;;) {
+        const char *argv[] = {
+            "git", "config", scope_flag, "--list", "-z",
+            includes ? "--includes" : "--no-includes", NULL
+        };
+        const char *const diagnostic_env[] = {
+            "LC_ALL=C", "LANG=C", NULL
+        };
+        run_opts_t opts;
+        run_result_t res;
+
+        memset(&opts, 0, sizeof(opts));
+        memset(&res, 0, sizeof(res));
+        opts.out = buf;
+        opts.out_size = capacity;
+        /* Git reports a genuinely absent explicitly selected scope file as
+         * exit 128, not as an empty successful listing. Capture that canonical
+         * diagnostic in a stable locale so ENOENT can be distinguished from
+         * corruption, permissions, and every other read failure. Merging is
+         * safe here: any stderr on a successful binary listing makes parsing
+         * fail closed instead of being silently discarded. */
+        opts.merge_stderr = true;
+        opts.extra_env = diagnostic_env;
+        if (run_argv(argv, &opts, &res) != 0) {
+            static const char missing_prefix[] =
+                "fatal: unable to read config file '";
+            static const char missing_suffix[] =
+                "': No such file or directory\n";
+            size_t prefix_len = sizeof(missing_prefix) - 1U;
+            size_t suffix_len = sizeof(missing_suffix) - 1U;
+            bool clean_missing =
+                res.spawned && res.term_signal == 0 && res.exit_code == 128 &&
+                !res.out_truncated && res.out_len > prefix_len + suffix_len &&
+                memchr(buf, '\0', res.out_len) == NULL &&
+                memcmp(buf, missing_prefix, prefix_len) == 0 &&
+                memcmp(buf + res.out_len - suffix_len, missing_suffix,
+                       suffix_len) == 0;
+
+            if (clean_missing) {
+                /* Missing and empty have the same exact managed-value vector.
+                 * Restore remains checked: it unsets any values introduced by
+                 * the forward transaction. */
+                buf[0] = '\0';
+                *out = buf;
+                *out_len = 0;
+                return 0;
+            }
+            free(buf);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Failed to read %s Git configuration for rollback",
+                      scope_flag);
+            return -1;
+        }
+        if (!res.out_truncated) {
+            if (res.out_len >= capacity) {
+                free(buf);
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Invalid Git snapshot capture length");
+                return -1;
+            }
+            *out = buf;
+            *out_len = res.out_len;
+            return 0;
+        }
+        if (capacity >= GIT_SNAPSHOT_MAX_BYTES) {
+            free(buf);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git configuration snapshot exceeds %u bytes",
+                      (unsigned)GIT_SNAPSHOT_MAX_BYTES);
+            return -1;
+        }
+        {
+            size_t grown_capacity = capacity * 2U;
+            char *grown;
+            if (grown_capacity > GIT_SNAPSHOT_MAX_BYTES) {
+                grown_capacity = GIT_SNAPSHOT_MAX_BYTES;
+            }
+            grown = realloc(buf, grown_capacity);
+            if (!grown) {
+                free(buf);
+                set_error(ERR_MEMORY_ALLOCATION,
+                          "Out of memory growing Git snapshot buffer");
+                return -1;
+            }
+            buf = grown;
+            capacity = grown_capacity;
+        }
+    }
+}
+
+static bool git_scope_snapshot_equal(const git_scope_snapshot_t *a,
+                                     const git_scope_snapshot_t *b) {
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (a->keys[i].count != b->keys[i].count) return false;
+        for (size_t j = 0; j < a->keys[i].count; j++) {
+            if (strcmp(a->keys[i].values[j], b->keys[i].values[j]) != 0)
+                return false;
+        }
+    }
+    return true;
+}
+
+/* Restore can only write the selected scope's own file. Compare an explicit
+ * no-include capture with Git's include-expanded view and refuse before the
+ * transaction if an include contributes/reorders any managed value. This is
+ * the conservative exactness option permitted by AR-07 M25: never flatten an
+ * included value into the including file or pretend its origin was restored. */
+static int git_capture_scope_snapshot(git_scope_t scope,
+                                      git_scope_snapshot_t *out) {
+    char *direct_buf = NULL;
+    char *expanded_buf = NULL;
+    size_t direct_len = 0;
+    size_t expanded_len = 0;
+    git_scope_snapshot_t direct;
+    git_scope_snapshot_t expanded;
+    int rc = -1;
+
+    memset(&direct, 0, sizeof(direct));
+    memset(&expanded, 0, sizeof(expanded));
+    if (git_read_snapshot_listing(scope, false, &direct_buf, &direct_len) != 0 ||
+        git_parse_snapshot_listing(direct_buf, direct_len, &direct) != 0 ||
+        git_read_snapshot_listing(scope, true, &expanded_buf,
+                                  &expanded_len) != 0 ||
+        git_parse_snapshot_listing(expanded_buf, expanded_len, &expanded) != 0) {
+        goto done;
+    }
+    if (!git_scope_snapshot_equal(&direct, &expanded)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Managed Git values from include files cannot be exactly restored in %s scope",
+                  git_scope_to_flag(scope));
+        goto done;
+    }
+
+    *out = direct;
+    memset(&direct, 0, sizeof(direct));
+    rc = 0;
+
+done:
+    free(direct_buf);
+    free(expanded_buf);
+    git_scope_snapshot_clear(&direct);
+    git_scope_snapshot_clear(&expanded);
+    return rc;
+}
+
+static void git_seed_snapshot_cache(git_scope_t scope,
+                                    const git_scope_snapshot_t *snapshot) {
     int s = cfg_scope_index(scope);
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        cfg_z_result_t zr = parse_config_z_value(list, list_len,
-                                                 g_managed_keys[i],
-                                                 out[i].value,
-                                                 sizeof(out[i].value));
-        if (zr == CFG_Z_TOO_LONG) {
-            /* The key IS present; only its value is beyond what we can
-             * hold (necessarily a foreign writer — everything gitswitch
-             * writes fits GIT_CFG_VALUE_MAX). Recording it absent is the
-             * AR-03 M1 bug: git_clear_config would elide a real --unset
-             * (the foreign SSH identity survives the switch) and the
-             * rollback would --unset the user's original value. Degrade
-             * to CFG_UNKNOWN/present so nothing is elided or served. */
-            out[i].present = true;
-            out[i].value_unknown = true;
+        const git_snapshot_key_t *key = &snapshot->keys[i];
+        if (key->count == 0) {
+            cfg_cache_store(s, (int)i, CFG_READBACK, false, "");
+        } else if (key->count == 1) {
+            cfg_cache_store(s, (int)i, CFG_READBACK, true, key->values[0]);
+        } else {
+            /* A scalar cache cannot faithfully represent multiplicity. */
             cfg_cache_store(s, (int)i, CFG_UNKNOWN, true, "");
-            continue;
-        }
-        out[i].present = (zr == CFG_Z_FOUND);
-        /* AR-02 #15: the complete listing is an authoritative read of
-         * every managed key — presence AND proven absence — so seed the
-         * exec cache instead of discarding it. git_clear_config (run by
-         * the very next step of a global switch) then elides the --unset
-         * execs this listing just proved were no-ops, and reads of
-         * present values are served without a spawn. */
-        cfg_cache_store(s, (int)i, CFG_READBACK, out[i].present,
-                        out[i].value);
-    }
-}
-
-/* Per-key snapshot reads, the correctness fallback when a `--list -z` listing
- * failed or was truncated. */
-static void git_capture_keys_per_key(git_scope_t scope,
-                                     git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
-    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        bool too_long = false;
-        if (git_get_config_value_ex(g_managed_keys[i], out[i].value,
-                                    sizeof(out[i].value), scope,
-                                    &too_long) == 0) {
-            out[i].present = true;
-        } else if (too_long) {
-            /* Present-but-indeterminate: value too long to capture, OR git
-             * could not be run cleanly (AR-06 F56). Either way, record it
-             * present/value-unknown so rollback leaves it alone instead of
-             * --unsetting a value that may exist (AR-03 M1). */
-            out[i].present = true;
-            out[i].value_unknown = true;
-            out[i].value[0] = '\0';
-        } else {
-            out[i].present = false;
-            out[i].value[0] = '\0';
         }
     }
 }
 
-static void git_capture_keys(git_scope_t scope, git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
-    git_init_kv(out);
+static int git_add_snapshot_value(git_scope_t scope, const char *key,
+                                  const char *value) {
+    char output[256] = "";
+    const char *scope_flag = git_scope_to_flag(scope);
+    const char *argv[] = {
+        "git", "config", scope_flag, "--add", key, value, NULL
+    };
+    run_opts_t opts;
+    run_result_t res;
 
-    /* Fast path: one `git config --list -z` exec instead of one per key. Fall
-     * back to per-key reads if the listing failed or looks truncated (buffer
-     * full) — a truncated list could miss a pre-existing value and corrupt the
-     * rollback snapshot, so correctness wins over the extra execs. */
-    char list[16384];
-    size_t list_len = 0;
-    if (git_list_config_z(scope, list, sizeof(list), &list_len) == 0 &&
-        list_len < sizeof(list) - 1) {
-        git_apply_config_listing(scope, list, list_len, out);
-        return;
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+    if (run_argv(argv, &opts, &res) != 0) {
+        cfg_cache_store(cfg_scope_index(scope), cfg_key_index(key),
+                        CFG_UNKNOWN, true, "");
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to restore Git config %s (%s): %s", key,
+                  scope_flag, output[0] ? output : "unknown error");
+        return -1;
     }
-
-    git_capture_keys_per_key(scope, out);
+    return 0;
 }
 
-/* Returns the number of managed keys that could NOT be restored (0 = clean
- * rollback). AR-06 F04: the old version discarded every set/unset result, so a
- * rollback that git actually rejected still reported success and left a mixed
- * identity. Values are restored with validation skipped because they came from
- * git's own snapshot. Keys uncapturable at snapshot time count as failures. */
-static int git_restore_keys(git_scope_t scope, const git_kv_t in[GIT_MANAGED_KEY_COUNT]) {
+/* Each not-yet-complete key is rebuilt as checked unset-all plus ordered adds.
+ * A failed key remains armed for retry; completed keys retain an explicit
+ * progress bit and are skipped on later idempotent restore attempts (M27). */
+static int git_restore_scope_snapshot(git_scope_t scope,
+                                      git_scope_snapshot_t *snapshot) {
     int failures = 0;
+
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        if (in[i].value_unknown) {
-            /* Present before the switch but too long to snapshot: writing
-             * value[] back would install a truncated corruption and --unset
-             * would destroy the user's original — leaving whatever is there
-             * now is the only non-destructive option, so say so instead of
-             * silently pretending the rollback was complete (AR-03 M1). */
-            log_warning("Not restoring %s: pre-switch value could not be "
-                        "snapshotted (too long, or git config read failed)",
-                        in[i].key);
-            /* Not counted as a failure: this is the deliberate non-destructive
-             * choice (AR-03 M1) — a truncated write-back or a --unset would be
-             * worse. F04 targets SWALLOWED git rejections of capturable values,
-             * below, not this known-and-warned limitation. */
+        git_snapshot_key_t *key = &snapshot->keys[i];
+        bool failed = false;
+
+        if (key->restored) continue;
+        if (git_unset_config_value_impl(g_managed_keys[i], scope, true) != 0) {
+            log_warning("Rollback failed to clear %s: %s",
+                        g_managed_keys[i], get_last_error()->message);
+            failures++;
             continue;
         }
-        if (in[i].present) {
-            if (git_set_config_value_impl(in[i].key, in[i].value, scope, true) != 0) {
+        for (size_t j = 0; j < key->count; j++) {
+            if (git_add_snapshot_value(scope, g_managed_keys[i],
+                                       key->values[j]) != 0) {
                 log_warning("Rollback failed to restore %s: %s",
-                            in[i].key, get_last_error()->message);
-                failures++;
-            }
-        } else {
-            if (git_unset_config_value(in[i].key, scope) != 0) {
-                log_warning("Rollback failed to clear %s: %s",
-                            in[i].key, get_last_error()->message);
-                failures++;
+                            g_managed_keys[i], get_last_error()->message);
+                failed = true;
+                break;
             }
         }
+        if (failed) {
+            failures++;
+            continue;
+        }
+
+        if (key->count == 0) {
+            cfg_cache_store(cfg_scope_index(scope), (int)i,
+                            CFG_WRITTEN, false, "");
+        } else if (key->count == 1) {
+            cfg_cache_store(cfg_scope_index(scope), (int)i,
+                            CFG_WRITTEN, true, key->values[0]);
+        } else {
+            cfg_cache_store(cfg_scope_index(scope), (int)i,
+                            CFG_UNKNOWN, true, "");
+        }
+        key->restored = true;
     }
     return failures;
 }
 
 int git_config_snapshot(git_scope_t scope) {
+    git_config_snapshot_t next;
     bool manage_worktree = false;
+
+    memset(&next, 0, sizeof(next));
+    /* An ordinary completed transaction may be replaced by the next switch,
+     * but an incomplete rollback owns this slot until exact retry succeeds.
+     * Allowing a fresh snapshot to consume it would make M27 retention a
+     * cosmetic flag rather than a recovery guarantee. */
+    if (g_git_snapshot.valid && g_git_snapshot.restore_incomplete) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot start a new Git snapshot while rollback remains incomplete");
+        return -1;
+    }
+    git_snapshot_clear(&g_git_snapshot);
+    if (!git_scope_to_flag(scope)) {
+        set_error(ERR_INVALID_ARGS, "Invalid Git snapshot scope");
+        return -1;
+    }
 
     /* Worktree attribution must be known before any forward mutation. A
      * failed/unsupported scope probe is a hard stop: otherwise a higher
      * precedence identity could survive an apparently successful switch. */
-    g_git_snapshot.valid = false;
     if ((scope == GIT_SCOPE_GLOBAL || scope == GIT_SCOPE_LOCAL) &&
         git_detect_managed_worktree_scope(&manage_worktree) != 0) {
         return -1;
     }
 
-    g_git_snapshot.scope = scope;
-    g_git_snapshot.local_also = (scope == GIT_SCOPE_GLOBAL && git_is_repository());
-    g_git_snapshot.worktree_also = manage_worktree;
-    git_capture_keys(scope, g_git_snapshot.primary);
+    next.scope = scope;
+    next.local_also = (scope == GIT_SCOPE_GLOBAL && git_is_repository());
+    next.worktree_also = manage_worktree;
+    if (git_capture_scope_snapshot(scope, &next.primary) != 0 ||
+        (next.local_also &&
+         git_capture_scope_snapshot(GIT_SCOPE_LOCAL, &next.local) != 0) ||
+        (next.worktree_also &&
+         git_capture_scope_snapshot(GIT_SCOPE_WORKTREE_INTERNAL,
+                                    &next.worktree) != 0)) {
+        git_snapshot_clear(&next);
+        return -1;
+    }
+
+    next.valid = true;
+    g_git_snapshot = next;
+    git_seed_snapshot_cache(scope, &g_git_snapshot.primary);
     if (g_git_snapshot.local_also) {
-        git_capture_keys(GIT_SCOPE_LOCAL, g_git_snapshot.local);
+        git_seed_snapshot_cache(GIT_SCOPE_LOCAL, &g_git_snapshot.local);
     }
     if (g_git_snapshot.worktree_also) {
-        git_capture_keys(GIT_SCOPE_WORKTREE_INTERNAL, g_git_snapshot.worktree);
+        git_seed_snapshot_cache(GIT_SCOPE_WORKTREE_INTERNAL,
+                                &g_git_snapshot.worktree);
     }
-    g_git_snapshot.valid = true;
     return 0;
 }
 
 int git_config_restore(void) {
     int failures = 0;
-    if (!g_git_snapshot.valid) {
-        return 0;
-    }
+
+    if (!g_git_snapshot.valid) return 0;
     log_info("Rolling back git configuration after a failed switch");
     /* Restore override scopes before the primary scope. */
     if (g_git_snapshot.worktree_also) {
-        failures += git_restore_keys(GIT_SCOPE_WORKTREE_INTERNAL,
-                                     g_git_snapshot.worktree);
+        failures += git_restore_scope_snapshot(GIT_SCOPE_WORKTREE_INTERNAL,
+                                               &g_git_snapshot.worktree);
     }
     if (g_git_snapshot.local_also) {
-        failures += git_restore_keys(GIT_SCOPE_LOCAL, g_git_snapshot.local);
+        failures += git_restore_scope_snapshot(GIT_SCOPE_LOCAL,
+                                               &g_git_snapshot.local);
     }
-    failures += git_restore_keys(g_git_snapshot.scope, g_git_snapshot.primary);
-    g_git_snapshot.valid = false;
-    /* AR-06 F04: an incomplete rollback must not masquerade as clean. Surface
-     * it to the user (the switch already failed; this warns their identity may
-     * be partially reverted) and report it to the caller. */
+    failures += git_restore_scope_snapshot(g_git_snapshot.scope,
+                                           &g_git_snapshot.primary);
     if (failures > 0) {
+        /* Retain the exact snapshot and per-key progress until every key has
+         * succeeded. Consuming it here made transient lock failures
+         * irrecoverable on a second rollback attempt (AR-07 M27). */
+        g_git_snapshot.restore_incomplete = true;
         fprintf(stderr,
                 "gitswitch: [!!] git rollback incomplete — %d config key(s) could "
-                "not be restored; check `git config --list` for a mixed identity\n",
+                "not be restored; retry after repairing the Git config lock\n",
                 failures);
         return -1;
     }
+    git_snapshot_clear(&g_git_snapshot);
     return 0;
 }
 
@@ -1189,7 +1391,7 @@ int git_test_config(const account_t *account, git_scope_t scope) {
  * value being written came verbatim from git's own `--list -z` snapshot, so it
  * is by construction representable (git stored it, e.g. a multi-line user.name
  * or a leading-'-' value — both of which is_valid_git_config_value rejects).
- * The old gate silently refused to restore them, and because git_restore_keys
+ * The old gate silently refused to restore them, and because the restore loop
  * discarded the error, a failed switch left the new account's name over the
  * user's original — a chimera identity the tool exists to prevent. On the argv
  * exec path the value never reaches a shell, so bypassing the gate for a
@@ -1257,9 +1459,9 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
  * the key, but either the capture itself overflowed (run_result_t.out_truncated
  * — the pre-fix code never checked it, so a silently truncated value was
  * stored as the real one, AR-03 M1) or the full value would not fit the
- * caller's buffer. rc is still -1 either way; *value_too_long lets
- * git_capture_keys tell an uncapturable value apart from a genuinely absent
- * key instead of snapshotting it absent. */
+ * caller's buffer. rc is still -1 either way; *value_too_long lets ordinary
+ * scoped verification distinguish an uncapturable value from a genuinely
+ * absent key. Transaction snapshots use the separate dynamic listing path. */
 static int git_get_config_value_ex(const char *key, char *value,
                                    size_t value_size, git_scope_t scope,
                                    bool *value_too_long) {
@@ -1375,9 +1577,13 @@ int git_get_config_value(const char *key, char *value, size_t value_size, git_sc
     return git_get_config_value_ex(key, value, value_size, scope, NULL);
 }
 
-/* Unset git configuration value */
-int git_unset_config_value(const char *key, git_scope_t scope) {
-    char output[256];
+/* Unset git configuration value. Rollback passes force=true because every
+ * restore starts with a checked unset-all even when the forward path's scalar
+ * cache says the key is absent; a partial earlier restore or external lock
+ * recovery can invalidate that optimization (AR-07 M27). */
+static int git_unset_config_value_impl(const char *key, git_scope_t scope,
+                                       bool force) {
+    char output[256] = "";
     const char *scope_flag;
 
     if (!key) {
@@ -1394,12 +1600,12 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
     /* Skip an unset the cache proves is a no-op: this process already unset
      * the key itself (CFG_WRITTEN/absent — the original duplicate-unset
      * skip), or a complete --list -z snapshot observed the key absent
-     * (CFG_READBACK/absent, seeded by git_capture_keys — AR-02 #15: the
+     * (CFG_READBACK/absent, seeded by exact snapshot capture — AR-02 #15: the
      * global-switch clear-local step used to blindly re-exec six unsets the
      * snapshot one exec earlier had just proved unnecessary). */
     int s = cfg_scope_index(scope);
     int k = cfg_key_index(key);
-    if (s >= 0 && k >= 0 && !g_cfg_cache[s][k].present &&
+    if (!force && s >= 0 && k >= 0 && !g_cfg_cache[s][k].present &&
         (g_cfg_cache[s][k].state == CFG_WRITTEN ||
          g_cfg_cache[s][k].state == CFG_READBACK)) {
         log_debug("Skipping git config --unset %s: known absent in this process", key);
@@ -1420,6 +1626,7 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
         run_result_t res;
         const char *argv[] = {"git", "config", scope_flag, "--unset-all", key, NULL};
         memset(&opts, 0, sizeof(opts));
+        memset(&res, 0, sizeof(res));
         opts.out = output;
         opts.out_size = sizeof(output);
         opts.merge_stderr = true;
@@ -1442,6 +1649,10 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
                   output[0] ? output : "unknown error");
         return -1;
     }
+}
+
+int git_unset_config_value(const char *key, git_scope_t scope) {
+    return git_unset_config_value_impl(key, scope, false);
 }
 
 /* List all git configuration values */

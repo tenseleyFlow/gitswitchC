@@ -91,9 +91,10 @@ static bool symlink_present(const char *path) {
 /* Behavior knobs for the fake runner. */
 static bool g_fail_user_name_set;   /* fail `git config <scope> user.name X` */
 static bool g_raise_on_user_name;   /* raise SIGINT during that same command */
-static bool g_fail_list_config;     /* force snapshot's per-key fallback */
+static bool g_fail_list_config;     /* fail exact snapshot acquisition */
 static int g_worktree_probe_failures; /* fail the next N --show-scope probes */
 static int g_user_name_writes;
+static int g_ssh_activation_commands;
 static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
 static FILE *g_log;                 /* when set, every argv is logged here */
 
@@ -123,6 +124,20 @@ static bool is_config_write(const char *const argv[], const char *key) {
     return argv[0] && argv[1] && argv[2] && argv[3] && argv[4] && !argv[5] &&
            strcmp(argv[0], "git") == 0 && strcmp(argv[1], "config") == 0 &&
            strcmp(argv[3], key) == 0;
+}
+
+static bool is_config_add(const char *const argv[], const char *key) {
+    return argv[0] && argv[1] && argv[2] && argv[3] && argv[4] && argv[5] &&
+           !argv[6] && strcmp(argv[0], "git") == 0 &&
+           strcmp(argv[1], "config") == 0 && strcmp(argv[3], "--add") == 0 &&
+           strcmp(argv[4], key) == 0;
+}
+
+static bool is_config_unset(const char *const argv[], const char *key) {
+    return argv[0] && argv[1] && argv[2] && argv[3] && argv[4] && !argv[5] &&
+           strcmp(argv[0], "git") == 0 && strcmp(argv[1], "config") == 0 &&
+           (strcmp(argv[3], "--unset-all") == 0 ||
+            strcmp(argv[3], "--unset") == 0) && strcmp(argv[4], key) == 0;
 }
 
 /* True for the 4-element read form {git, config, <scope>, <key>}. */
@@ -173,6 +188,51 @@ static int append_effective_record(char *out, size_t out_size, size_t *used,
     return 0;
 }
 
+static int append_snapshot_record(char *out, size_t out_size, size_t *used,
+                                  const char *key, const char *value) {
+    size_t key_len = strlen(key);
+    size_t value_len = strlen(value);
+    size_t need = key_len + 1U + value_len + 1U;
+    if (*used + need > out_size) return -1;
+    memcpy(out + *used, key, key_len);
+    *used += key_len;
+    out[(*used)++] = '\n';
+    memcpy(out + *used, value, value_len);
+    *used += value_len;
+    out[(*used)++] = '\0';
+    return 0;
+}
+
+static int emit_scope_config(const char *scope, const run_opts_t *opts,
+                             run_result_t *result) {
+    size_t used = 0;
+
+    if (!opts || !opts->out || opts->out_size == 0) return -1;
+#define APPEND_GLOBAL_IF_SET(key_, value_) do {                               \
+    if (strcmp(scope, "--global") == 0 && (value_)[0] &&                     \
+        append_snapshot_record(opts->out, opts->out_size, &used,              \
+                               (key_), (value_)) != 0) {                       \
+        if (result) result->out_truncated = true;                              \
+        return -1;                                                             \
+    }                                                                          \
+} while (0)
+    APPEND_GLOBAL_IF_SET("user.name", g_store_name);
+    APPEND_GLOBAL_IF_SET("user.email", g_store_email);
+    APPEND_GLOBAL_IF_SET("user.signingkey", g_store_signingkey);
+    APPEND_GLOBAL_IF_SET("commit.gpgsign", g_store_gpgsign);
+    APPEND_GLOBAL_IF_SET("gpg.program", g_store_gpgprogram);
+    APPEND_GLOBAL_IF_SET("core.sshcommand", g_store_sshcmd);
+#undef APPEND_GLOBAL_IF_SET
+    if (used < opts->out_size) opts->out[used] = '\0';
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 0;
+        result->out_len = used;
+    }
+    return 0;
+}
+
 static int emit_effective_config(const run_opts_t *opts, run_result_t *result) {
     size_t used = 0;
     if (!opts || !opts->out || opts->out_size == 0) return -1;
@@ -218,6 +278,17 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         }
         return 0; /* no distinct worktree values in this fixture */
     }
+    if (is_config_list(argv)) {
+        if (g_fail_list_config) {
+            if (result) {
+                memset(result, 0, sizeof(*result));
+                result->spawned = true;
+                result->exit_code = 1;
+            }
+            return -1;
+        }
+        return emit_scope_config(argv[2], opts, result);
+    }
 
     if (g_log) {
         for (int i = 0; argv[i]; i++) fprintf(g_log, "%s ", argv[i]);
@@ -255,9 +326,7 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         }
     }
 
-    if (g_fail_list_config && is_config_list(argv)) {
-        exit_code = 1;
-    } else if (is_config_write(argv, "user.name")) {
+    if (is_config_write(argv, "user.name")) {
         g_user_name_writes++;
         if (g_retarget_gpg_on_user_name) {
             unlink(g_gpg_link);
@@ -286,6 +355,30 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         safe_strncpy(g_store_gpgsign, argv[4], sizeof(g_store_gpgsign));
     } else if (is_config_write(argv, "gpg.program")) {
         safe_strncpy(g_store_gpgprogram, argv[4], sizeof(g_store_gpgprogram));
+    } else if (is_config_add(argv, "user.name")) {
+        safe_strncpy(g_store_name, argv[5], sizeof(g_store_name));
+    } else if (is_config_add(argv, "user.email")) {
+        safe_strncpy(g_store_email, argv[5], sizeof(g_store_email));
+    } else if (is_config_add(argv, "core.sshcommand")) {
+        safe_strncpy(g_store_sshcmd, argv[5], sizeof(g_store_sshcmd));
+    } else if (is_config_add(argv, "user.signingkey")) {
+        safe_strncpy(g_store_signingkey, argv[5], sizeof(g_store_signingkey));
+    } else if (is_config_add(argv, "commit.gpgsign")) {
+        safe_strncpy(g_store_gpgsign, argv[5], sizeof(g_store_gpgsign));
+    } else if (is_config_add(argv, "gpg.program")) {
+        safe_strncpy(g_store_gpgprogram, argv[5], sizeof(g_store_gpgprogram));
+    } else if (is_config_unset(argv, "user.name")) {
+        g_store_name[0] = '\0';
+    } else if (is_config_unset(argv, "user.email")) {
+        g_store_email[0] = '\0';
+    } else if (is_config_unset(argv, "core.sshcommand")) {
+        g_store_sshcmd[0] = '\0';
+    } else if (is_config_unset(argv, "user.signingkey")) {
+        g_store_signingkey[0] = '\0';
+    } else if (is_config_unset(argv, "commit.gpgsign")) {
+        g_store_gpgsign[0] = '\0';
+    } else if (is_config_unset(argv, "gpg.program")) {
+        g_store_gpgprogram[0] = '\0';
     } else if (is_config_read(argv, "user.name") &&
                (!is_global_config_command(argv) || !g_store_name[0])) {
         exit_code = 1; /* not set: git reports failure */
@@ -366,6 +459,7 @@ static int bind_fake_agent_socket_for_runner(const char *path,
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
     if (strcmp(argv[0], "ssh-agent") == 0) {
+        g_ssh_activation_commands++;
         /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
          * explicit -s ahead of it, so the socket is no longer argv[2]. */
         const char *sock = NULL;
@@ -392,6 +486,7 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         return 0;
     }
     if (strcmp(argv[0], "ssh-add") == 0 || strcmp(argv[0], "ssh-keygen") == 0) {
+        if (strcmp(argv[0], "ssh-add") == 0) g_ssh_activation_commands++;
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
@@ -543,9 +638,7 @@ static void seed_previous_git_identity(void) {
     g_store_signingkey[0] = '\0';
     g_store_gpgsign[0] = '\0';
     g_store_gpgprogram[0] = '\0';
-    /* The fake runner does not synthesize the binary `git config --list -z`
-     * stream. Make the snapshot take its supported per-key fallback instead. */
-    g_fail_list_config = true;
+    g_fail_list_config = false;
 }
 
 static int write_fake_key(const char *path);
@@ -576,6 +669,43 @@ TEST(snapshot_failure_aborts_before_any_git_write) {
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK(strstr(get_last_error()->message,
                  "Cannot inspect Git worktree configuration") != NULL);
+    CHECK(symlink_present(g_ssh_sock));
+    CHECK(symlink_present(g_gpg_link));
+}
+
+/* AR-07 M24: the exact config listing is acquired before runtime activation,
+ * not merely before the first Git write. A failed read must not spawn an
+ * agent and then rely on runtime rollback to hide the ordering mistake. */
+TEST(snapshot_listing_failure_aborts_before_ssh_activation) {
+    char key_path[512];
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    gitswitch_ctx_t ctx = make_ctx();
+    account_t *target = &ctx.accounts[0];
+    snprintf(key_path, sizeof(key_path), "%s/key_target", g_xdg);
+    CHECK_EQ_INT(write_fake_key(key_path), 0);
+    target->ssh_enabled = true;
+    safe_strncpy(target->ssh_key_path, key_path,
+                 sizeof(target->ssh_key_path));
+
+    seed_previous_git_identity();
+    g_fail_list_config = true;
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_ssh_activation_commands = 0;
+    g_log = NULL;
+    command_runner_fn previous = run_set_runner(ssh_git_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous);
+    g_fail_list_config = false;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(g_user_name_writes, 0);
+    CHECK_EQ_INT(g_ssh_activation_commands, 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(strstr(get_last_error()->message,
+                 "Cannot snapshot Git configuration") != NULL);
     CHECK(symlink_present(g_ssh_sock));
     CHECK(symlink_present(g_gpg_link));
 }
@@ -749,7 +879,7 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
 
     g_fail_user_name_set = false;
     g_raise_on_user_name = false;
-    g_fail_list_config = true;
+    g_fail_list_config = false;
     g_log = NULL;
     command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
     CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
@@ -823,7 +953,7 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
 
     g_fail_user_name_set = false;
     g_raise_on_user_name = false;
-    g_fail_list_config = true;
+    g_fail_list_config = false;
     g_log = NULL;
     command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
     CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
@@ -1590,6 +1720,7 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(snapshot_failure_aborts_before_any_git_write);
+    RUN_TEST(snapshot_listing_failure_aborts_before_ssh_activation);
     RUN_TEST(failed_git_config_keeps_previous_runtime_isolation);
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
     RUN_TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg);
