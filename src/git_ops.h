@@ -13,6 +13,28 @@
 #define GIT_CONFIG_GPG_PROGRAM "gpg.program"
 #define GIT_CONFIG_CORE_SSHCOMMAND "core.sshcommand"
 
+/* Largest managed value emitted by gitswitch (core.sshCommand contains a
+ * MAX_PATH_LEN key path plus fixed options). Public status records use the
+ * same lossless capacity as the internal snapshot. */
+#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN + 128)
+
+typedef enum {
+    GIT_CONFIG_ORIGIN_UNKNOWN = 0,
+    GIT_CONFIG_ORIGIN_SYSTEM,
+    GIT_CONFIG_ORIGIN_GLOBAL,
+    GIT_CONFIG_ORIGIN_LOCAL,
+    GIT_CONFIG_ORIGIN_WORKTREE,
+    GIT_CONFIG_ORIGIN_COMMAND
+} git_config_origin_scope_t;
+
+typedef struct {
+    char value[GIT_CONFIG_VALUE_MAX];
+    char origin[MAX_PATH_LEN];
+    git_config_origin_scope_t scope;
+    bool present;
+    bool value_unknown;
+} git_config_effective_value_t;
+
 /* Current git configuration */
 typedef struct {
     char name[MAX_NAME_LEN];
@@ -20,6 +42,10 @@ typedef struct {
     char signing_key[MAX_KEY_ID_LEN];
     bool gpg_signing_enabled;
     git_scope_t scope;
+    git_config_origin_scope_t effective_name_scope;
+    char effective_name_origin[MAX_PATH_LEN];
+    git_config_effective_value_t ssh_command;
+    git_config_effective_value_t gpg_program;
     bool valid;
 } git_current_config_t;
 
@@ -50,6 +76,18 @@ int git_set_config(const account_t *account, git_scope_t scope);
  * - Returns structured configuration data
  */
 int git_get_current_config(git_current_config_t *config);
+
+/** Return a stable display name for an effective Git configuration scope. */
+const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope);
+
+/**
+ * Build the exact core.sshCommand expected for an SSH-enabled account.
+ * This performs path expansion and serialization validation but does not
+ * require the key file to exist, so read-only status can compare persisted
+ * Git state without introducing a filesystem mutation.
+ */
+int git_expected_ssh_command(const account_t *account, char *command,
+                             size_t command_size);
 
 /**
  * Clear git configuration (unset values)

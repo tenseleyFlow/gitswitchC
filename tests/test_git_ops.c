@@ -60,6 +60,33 @@ static int fk_ret(run_result_t *result, int code) {
     return code == 0 ? 0 : -1;
 }
 
+static int fk_emit_effective_listing(const run_opts_t *opts,
+                                     run_result_t *result) {
+    size_t used = 0;
+    if (!opts || !opts->out || opts->out_size == 0) return fk_ret(result, 1);
+    for (int i = 0; i < FK_MAX; i++) {
+        if (!fk_store[i].used) continue;
+        const char *scope = fk_store[i].scope;
+        if (scope[0] == '-' && scope[1] == '-') scope += 2;
+        const char *origin = "file:/fake/config";
+        size_t scope_len = strlen(scope) + 1;
+        size_t origin_len = strlen(origin) + 1;
+        size_t record_len = strlen(fk_store[i].key) + 1 +
+                            strlen(fk_store[i].value) + 1;
+        if (used + scope_len + origin_len + record_len > opts->out_size)
+            return fk_ret(result, 1);
+        memcpy(opts->out + used, scope, scope_len);
+        used += scope_len;
+        memcpy(opts->out + used, origin, origin_len);
+        used += origin_len;
+        used += (size_t)snprintf(opts->out + used, opts->out_size - used,
+                                 "%s\n%s", fk_store[i].key,
+                                 fk_store[i].value) + 1;
+    }
+    if (result) result->out_len = used;
+    return fk_ret(result, 0);
+}
+
 static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
                            run_result_t *result) {
     fk_execs++;
@@ -77,6 +104,8 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
     }
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
+        if (strcmp(argv[2], "--show-origin") == 0)
+            return fk_emit_effective_listing(opts, result);
         const char *scope = argv[2];
 
         /* Production emits --unset-all (AR-06 F03); accept the legacy spelling

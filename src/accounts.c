@@ -727,7 +727,24 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
 
         /* --- 4. Git identity (snapshotted and reversible) --- */
         if (write_git) {
-            git_config_snapshot(scope);
+            if (git_config_snapshot(scope) != 0) {
+                char detail[sizeof(g_last_error.message)];
+
+                safe_strncpy(detail, get_last_error()->message,
+                             sizeof(detail));
+                /* The snapshot is the Git transaction boundary: when its
+                 * scope/preflight contract rejects the before-image, no Git
+                 * mutation is permitted. The runtime work from steps 2-3 is
+                 * still reversible and Git is deliberately marked clean so
+                 * rollback cannot operate on a rejected/stale snapshot. */
+                abort_failed_switch(prev_account, prev_gpg_home,
+                                    prev_gpg_present, false, ssh_dirty,
+                                    gpg_dirty, runtime_lock_fd);
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Cannot snapshot Git configuration before switching: %s",
+                          detail[0] ? detail : "unknown snapshot error");
+                return -1;
+            }
             if (git_set_config(account, scope) != 0) {
                 abort_failed_switch(prev_account, prev_gpg_home,
                                     prev_gpg_present, true, ssh_dirty, gpg_dirty,
@@ -1501,6 +1518,35 @@ int accounts_list(const gitswitch_ctx_t *ctx) {
     return 0;
 }
 
+/* Git origin strings contain filesystem paths. Keep diagnostics single-line
+ * and terminal-safe even when a repository/config filename contains control
+ * characters or arbitrary non-UTF-8 bytes. Escaping backslashes as well makes
+ * the byte representation unambiguous. */
+static void print_terminal_safe(const char *text) {
+    const unsigned char *cursor = (const unsigned char *)text;
+
+    if (!cursor) return;
+    for (; *cursor != '\0'; cursor++) {
+        if (*cursor >= 0x20 && *cursor <= 0x7e && *cursor != '\\') {
+            putchar((int)*cursor);
+        } else if (*cursor == '\\') {
+            fputs("\\\\", stdout);
+        } else {
+            printf("\\x%02X", (unsigned int)*cursor);
+        }
+    }
+}
+
+static void print_git_value_origin(const git_config_effective_value_t *value) {
+    if (!value || !value->present) return;
+    printf(" (%s scope", git_config_origin_scope_to_string(value->scope));
+    if (value->origin[0] != '\0') {
+        printf(", ");
+        print_terminal_safe(value->origin);
+    }
+    printf(")");
+}
+
 /* Show current account status */
 int accounts_show_status(const gitswitch_ctx_t *ctx) {
     if (!ctx) {
@@ -1561,21 +1607,59 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         printf("\nGit Configuration:\n");
         git_current_config_t git_config;
         if (git_get_current_config(&git_config) == 0) {
+            char expected_ssh[GIT_CONFIG_VALUE_MAX] = "";
+            bool identity_matches;
+            bool ssh_matches;
+            bool gpg_program_matches;
+
             printf("  Current Name: %s\n", git_config.name);
             printf("  Current Email: %s\n", git_config.email);
-            printf("  Configuration Scope: %s\n", 
-                   git_config.scope == GIT_SCOPE_LOCAL ? "local" : 
-                   git_config.scope == GIT_SCOPE_GLOBAL ? "global" : "system");
+            printf("  Configuration Scope: %s",
+                   git_config_origin_scope_to_string(
+                       git_config.effective_name_scope));
+            if (git_config.effective_name_origin[0] != '\0') {
+                printf(" (");
+                print_terminal_safe(git_config.effective_name_origin);
+                printf(")");
+            }
+            printf("\n");
+
+            identity_matches =
+                strcmp(git_config.name, account->name) == 0 &&
+                strcmp(git_config.email, account->email) == 0;
+            if (account->ssh_enabled && account->ssh_key_path[0] != '\0') {
+                ssh_matches =
+                    git_expected_ssh_command(account, expected_ssh,
+                                             sizeof(expected_ssh)) == 0 &&
+                    git_config.ssh_command.present &&
+                    !git_config.ssh_command.value_unknown &&
+                    strcmp(git_config.ssh_command.value, expected_ssh) == 0;
+            } else {
+                ssh_matches = !git_config.ssh_command.present;
+            }
+            /* gitswitch selects an isolated keyring through GNUPGHOME and
+             * intentionally expects no persisted gpg.program override. */
+            gpg_program_matches = !git_config.gpg_program.present;
             
             /* Check if git config matches account */
-            if (strcmp(git_config.name, account->name) == 0 &&
-                strcmp(git_config.email, account->email) == 0) {
+            if (identity_matches && ssh_matches && gpg_program_matches) {
                 printf("  Match Status: [OK] Git config matches account\n");
             } else {
                 printf("  Match Status: [WARN] Git config does not match account\n");
-                printf("    Expected: %s <%s>\n", account->name, account->email);
-                printf("    Current:  %s <%s>\n", git_config.name, git_config.email);
+                if (!identity_matches) {
+                    printf("    Expected: %s <%s>\n", account->name, account->email);
+                    printf("    Current:  %s <%s>\n", git_config.name, git_config.email);
+                }
             }
+
+            printf("  Effective SSH Command: %s",
+                   ssh_matches ? "[MATCH]" : "[MISMATCH]");
+            print_git_value_origin(&git_config.ssh_command);
+            printf("\n");
+            printf("  Effective GPG Program: %s",
+                   gpg_program_matches ? "[ABSENT]" : "[MISMATCH]");
+            print_git_value_origin(&git_config.gpg_program);
+            printf("\n");
             
             /* GPG signing status */
             if (strlen(git_config.signing_key) > 0) {
@@ -1612,9 +1696,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         if (git_get_current_config(&git_config) == 0) {
             printf("  Name: %s\n", git_config.name);
             printf("  Email: %s\n", git_config.email);
-            printf("  Scope: %s\n", 
-                   git_config.scope == GIT_SCOPE_LOCAL ? "local" : 
-                   git_config.scope == GIT_SCOPE_GLOBAL ? "global" : "system");
+            printf("  Scope: %s\n",
+                   git_config_origin_scope_to_string(
+                       git_config.effective_name_scope));
         } else {
             printf("  Status: [NOT FOUND] No git configuration found\n");
         }
