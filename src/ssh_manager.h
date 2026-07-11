@@ -3,6 +3,7 @@
 #ifndef SSH_MANAGER_H
 #define SSH_MANAGER_H
 
+#include <stdint.h>
 #include <sys/types.h> /* pid_t: don't rely on the includer's chain for it */
 
 #include "gitswitch.h"
@@ -37,6 +38,26 @@ typedef int (*ssh_setenv_fn)(const char *name, const char *value, int overwrite)
 typedef bool (*ssh_reap_fn)(pid_t pid, const char *socket_arg);
 typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);
+typedef int (*ssh_dirsync_fn)(int dir_fd);
+typedef int (*ssh_current_cleanup_hook_fn)(int dir_fd);
+typedef int (*ssh_current_precleanup_hook_fn)(int dir_fd);
+typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
+typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
+typedef int (*ssh_key_open_fn)(const char *path, int flags);
+typedef int64_t (*ssh_probe_clock_fn)(void);
+typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
+
+/* One descriptor-backed view of an SSH key file. Status callers can reuse
+ * these fields instead of independently resolving, statting, and reopening a
+ * pathname that may change between checks. */
+typedef struct {
+    bool exists;
+    bool regular;
+    bool owned_by_user;
+    bool secure_permissions;
+    bool private_key;
+    mode_t mode;
+} ssh_key_inspection_t;
 
 /* Function prototypes */
 
@@ -76,8 +97,25 @@ ssh_setenv_fn ssh_manager_set_setenv_fn(ssh_setenv_fn fn);
 ssh_reap_fn ssh_manager_set_reap_fn(ssh_reap_fn fn);
 ssh_pid_commit_hook_fn ssh_manager_set_pid_commit_hook_fn(
     ssh_pid_commit_hook_fn fn);
+ssh_pid_commit_hook_fn ssh_manager_set_pid_postrename_hook_fn(
+    ssh_pid_commit_hook_fn fn);
 ssh_namespace_commit_hook_fn ssh_manager_set_namespace_commit_hook_fn(
     ssh_namespace_commit_hook_fn fn);
+ssh_dirsync_fn ssh_manager_set_dirsync_fn(ssh_dirsync_fn fn);
+ssh_current_cleanup_hook_fn ssh_manager_set_current_cleanup_hook_fn(
+    ssh_current_cleanup_hook_fn fn);
+ssh_current_precleanup_hook_fn ssh_manager_set_current_precleanup_hook_fn(
+    ssh_current_precleanup_hook_fn fn);
+ssh_current_publish_hook_fn ssh_manager_set_current_publish_hook_fn(
+    ssh_current_publish_hook_fn fn);
+ssh_quarantine_hook_fn ssh_manager_set_quarantine_hook_fn(
+    ssh_quarantine_hook_fn fn);
+ssh_quarantine_hook_fn ssh_manager_set_quarantine_capture_hook_fn(
+    ssh_quarantine_hook_fn fn);
+bool ssh_manager_set_force_portable_quarantine(bool force);
+ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
+ssh_probe_clock_fn ssh_manager_set_probe_clock_fn(ssh_probe_clock_fn fn);
+ssh_probe_poll_fn ssh_manager_set_probe_poll_fn(ssh_probe_poll_fn fn);
 
 /**
  * Stop SSH agent (only if we own it)
@@ -106,6 +144,26 @@ int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size);
  * Validate SSH key file permissions and format
  */
 int ssh_validate_key_file(const char *key_path);
+
+/**
+ * Inspect one key through one O_NOFOLLOW descriptor. A missing path is a
+ * successful inspection with exists=false; unsafe/unreadable namespace state
+ * is an error. The descriptor supplies metadata and content, eliminating
+ * path-revalidation races and repeated opens in status/health callers.
+ */
+int ssh_inspect_key_file(const char *key_path,
+                         ssh_key_inspection_t *inspection);
+
+/* Focused adversarial test surfaces. They route through the same internal
+ * implementations used by production and do not weaken production defaults. */
+bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
+                                     const char *key_path);
+int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
+                                       pid_t pid);
+int ssh_manager_test_publish_current_link(int dir_fd, const char *target);
+int ssh_manager_test_cleanup_current_link(int dir_fd);
+int ssh_manager_test_probe_socket(const char *path, bool *reachable);
+int ssh_manager_test_probe_deadline(int timeout_ms);
 
 /**
  * Set SSH host alias in ~/.ssh/config if specified

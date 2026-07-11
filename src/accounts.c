@@ -1801,22 +1801,27 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         /* SSH Status */
         printf("\nSSH Configuration:\n");
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
+            ssh_key_inspection_t key_inspection;
+            int inspection_rc;
+
             printf("  Status: [ENABLED]\n");
             printf("  Key: %s\n", account->ssh_key_path);
-            
-            if (path_exists(account->ssh_key_path)) {
+
+            inspection_rc = ssh_inspect_key_file(account->ssh_key_path,
+                                                  &key_inspection);
+            if (inspection_rc == 0 && key_inspection.exists) {
                 printf("  Key File: [FOUND]\n");
-                
-                mode_t key_mode;
-                if (get_file_permissions(account->ssh_key_path, &key_mode) == 0) {
-                    if ((key_mode & 077) == 0) {
-                        printf("  Permissions: [SECURE] (600)\n");
-                    } else {
-                        printf("  Permissions: [WARN] Insecure (%o)\n", key_mode & 0777);
-                    }
+
+                if (key_inspection.secure_permissions) {
+                    printf("  Permissions: [SECURE] (600)\n");
+                } else {
+                    printf("  Permissions: [WARN] Insecure (%o)\n",
+                           key_inspection.mode);
                 }
-            } else {
+            } else if (inspection_rc == 0) {
                 printf("  Key File: [NOT FOUND]\n");
+            } else {
+                printf("  Key File: [ERROR] Unable to inspect safely\n");
             }
             
             if (strlen(account->ssh_host_alias) > 0) {
