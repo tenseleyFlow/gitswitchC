@@ -29,6 +29,20 @@ int accounts_init(gitswitch_ctx_t *ctx);
 int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
 
 /**
+ * CLI transaction boundary: prepare applies a switch while retaining its
+ * rollback state and runtime lock. Commit releases that state only after the
+ * caller durably saves active-account metadata; abort restores the prior Git,
+ * runtime, and in-memory active state. Resume and direct library callers keep
+ * using accounts_switch().
+ */
+int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier);
+int accounts_switch_commit(gitswitch_ctx_t *ctx);
+/* continue_persistence_rollback keeps the signal rollback window active so
+ * the caller can restore config/hint state without an interruptible gap. */
+int accounts_switch_abort(gitswitch_ctx_t *ctx,
+                          bool continue_persistence_rollback);
+
+/**
  * Add new account interactively
  * - Prompts for account details
  * - Validates input

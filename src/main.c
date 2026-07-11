@@ -43,6 +43,7 @@ static void print_usage(const char *prog_name) {
     printf("  init <shell>         Emit shell integration (fish|bash|zsh|sh)\n");
     printf("  resume               Re-activate the last-used account (used on login)\n");
     printf("  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n");
+    printf("  switch <account>     Switch to specified account\n");
     printf("  <account>            Switch to specified account\n");
     printf("\nOptions:\n");
     printf("  --global, -g         Use global git scope\n");
@@ -79,19 +80,149 @@ static void print_usage(const char *prog_name) {
 static void print_version(void) {
     printf("%s %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
 }
-static int handle_add_command(gitswitch_ctx_t *ctx);
-static int handle_edit_command(gitswitch_ctx_t *ctx, const char *identifier);
+typedef enum {
+    COMMAND_SAVE_NONE = 0,
+    COMMAND_SAVE_FULL,
+    COMMAND_SAVE_ACTIVE
+} command_save_kind_t;
+
+typedef enum {
+    COMMAND_NOTICE_NONE = 0,
+    COMMAND_NOTICE_ADD,
+    COMMAND_NOTICE_EDIT,
+    COMMAND_NOTICE_REMOVE,
+    COMMAND_NOTICE_SWITCH,
+    COMMAND_NOTICE_RESET_ONE,
+    COMMAND_NOTICE_RESET_ALL
+} command_notice_kind_t;
+
+/* Mutating handlers describe what they changed; main owns persistence and the
+ * final user-visible success. A prepared switch also carries the resume-hint
+ * before-image needed to undo a post-mutation commit failure. */
+typedef struct {
+    int status;
+    command_save_kind_t save_kind;
+    command_notice_kind_t notice_kind;
+    bool switch_prepared;
+    config_resume_hint_snapshot_t hint_snapshot;
+    char previous_active[MAX_NAME_LEN];
+    char subject[MAX_NAME_LEN];
+} command_result_t;
+
+static command_result_t command_result(int status);
+static void emit_command_success(const gitswitch_ctx_t *ctx,
+                                 const command_result_t *result);
+static command_result_t handle_add_command(gitswitch_ctx_t *ctx);
+static command_result_t handle_edit_command(gitswitch_ctx_t *ctx,
+                                            const char *identifier);
 static int handle_list_command(gitswitch_ctx_t *ctx);
 static int handle_list_names(gitswitch_ctx_t *ctx);
-static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier);
+static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
+                                              const char *identifier);
 static int handle_status_command(gitswitch_ctx_t *ctx);
-static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier);
+static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
+                                              const char *identifier);
 static int handle_doctor_command(gitswitch_ctx_t *ctx);
 static int handle_config_command(gitswitch_ctx_t *ctx);
 static int handle_init_command(const char *shell);
 static int handle_resume_command(gitswitch_ctx_t *ctx);
-static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account);
+static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
+                                             const char *account);
 static const char *detect_shell_from_env(void);
+
+/* Validate the complete positional grammar before any command can acquire the
+ * config lock, create ~/.config/gitswitch, or dispatch a handler. Unknown first
+ * positionals are the established bare-account switch form and therefore take
+ * no additional operands. */
+static int validate_command_arity(const char *command, int operand_count) {
+    const char *usage = NULL;
+    int min_operands = 0;
+    int max_operands = 0;
+
+    if (!command) {
+        return operand_count == 0 ? 0 : -1;
+    }
+
+    if (strcmp(command, "edit") == 0) {
+        min_operands = max_operands = 1;
+        usage = "gitswitch edit <account>";
+    } else if (strcmp(command, "remove") == 0 ||
+               strcmp(command, "rm") == 0 ||
+               strcmp(command, "delete") == 0) {
+        min_operands = max_operands = 1;
+        usage = "gitswitch remove <account>";
+    } else if (strcmp(command, "switch") == 0) {
+        min_operands = max_operands = 1;
+        usage = "gitswitch switch <account>";
+    } else if (strcmp(command, "reset") == 0) {
+        max_operands = 1;
+        usage = "gitswitch reset [account]";
+    } else if (strcmp(command, "init") == 0) {
+        max_operands = 1;
+        usage = "gitswitch init [shell]";
+    } else if (strcmp(command, "add") == 0 ||
+               strcmp(command, "list") == 0 ||
+               strcmp(command, "ls") == 0 ||
+               strcmp(command, "status") == 0 ||
+               strcmp(command, "doctor") == 0 ||
+               strcmp(command, "health") == 0 ||
+               strcmp(command, "config") == 0 ||
+               strcmp(command, "resume") == 0) {
+        usage = command;
+    } else {
+        usage = "gitswitch <account>";
+    }
+
+    if (operand_count >= min_operands && operand_count <= max_operands) {
+        return 0;
+    }
+
+    fprintf(stderr, "gitswitch: invalid number of operands for '%s'\n", command);
+    if (usage == command) {
+        fprintf(stderr, "Usage: gitswitch %s\n", usage);
+    } else {
+        fprintf(stderr, "Usage: %s\n", usage);
+    }
+    return -1;
+}
+
+static command_result_t command_result(int status) {
+    command_result_t result;
+
+    memset(&result, 0, sizeof(result));
+    result.status = status;
+    return result;
+}
+
+static void emit_command_success(const gitswitch_ctx_t *ctx,
+                                 const command_result_t *result) {
+    if (!ctx || !result || result->status != EXIT_SUCCESS) {
+        return;
+    }
+    switch (result->notice_kind) {
+        case COMMAND_NOTICE_ADD:
+            display_success("Account added successfully!");
+            break;
+        case COMMAND_NOTICE_EDIT:
+            display_success("Account updated.");
+            break;
+        case COMMAND_NOTICE_REMOVE:
+            display_success("Account removed successfully.");
+            break;
+        case COMMAND_NOTICE_SWITCH:
+            display_success("Switched to: %s", result->subject);
+            break;
+        case COMMAND_NOTICE_RESET_ONE:
+            display_success("Reset gitswitch state for: %s", result->subject);
+            break;
+        case COMMAND_NOTICE_RESET_ALL:
+            display_success("Reset all gitswitch SSH/GPG state");
+            break;
+        case COMMAND_NOTICE_NONE:
+        default:
+            break;
+    }
+}
 
 int main(int argc, char *argv[]) {
     gitswitch_ctx_t ctx;
@@ -109,6 +240,9 @@ int main(int argc, char *argv[]) {
     bool force_local = false;
     bool assume_yes = false;
     bool names_only = false;
+    bool legacy_agent_info = false;
+    const char *command = NULL;
+    const char *arg1 = NULL;
     int exit_code = EXIT_SUCCESS;
     
     static struct option long_options[] = {
@@ -173,11 +307,9 @@ int main(int argc, char *argv[]) {
             case OPT_NAMES:
                 names_only = true;
                 break;
-            case OPT_SSH_AGENT_INFO: {
-                int rc = handle_init_command(detect_shell_from_env());
-                error_cleanup();
-                return rc;
-            }
+            case OPT_SSH_AGENT_INFO:
+                legacy_agent_info = true;
+                break;
             default:
                 print_usage(argv[0]);
                 error_cleanup();
@@ -192,6 +324,33 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
         error_cleanup();
         return EXIT_FAILURE;
+    }
+
+    /* getopt_long has already permuted recognized options out of the
+     * positional tail, including options written after a command operand. */
+    if (optind < argc) {
+        command = argv[optind];
+        if (optind + 1 < argc) {
+            arg1 = argv[optind + 1];
+        }
+    }
+
+    /* Help/version remain unconditional informational exits. Every executable
+     * command form, including the legacy init alias, is otherwise checked here
+     * before display/config initialization can cause observable work. */
+    if (!show_help && !show_version) {
+        if (legacy_agent_info && command) {
+            fprintf(stderr,
+                    "gitswitch: --ssh-agent-info does not accept operands\n");
+            error_cleanup();
+            return EXIT_FAILURE;
+        }
+        if (!legacy_agent_info &&
+            validate_command_arity(command,
+                                   command ? argc - optind - 1 : 0) != 0) {
+            error_cleanup();
+            return EXIT_FAILURE;
+        }
     }
 
     /* Initialize display system */
@@ -212,6 +371,12 @@ int main(int argc, char *argv[]) {
         print_usage(argv[0]);
         error_cleanup();
         return EXIT_SUCCESS;
+    }
+
+    if (legacy_agent_info) {
+        int rc = handle_init_command(detect_shell_from_env());
+        error_cleanup();
+        return rc;
     }
 
     /* `init` needs no config — it only emits shell-integration text derived
@@ -249,7 +414,10 @@ int main(int argc, char *argv[]) {
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
             strcmp(c, "health") == 0;
-        if (!read_only) {
+        /* Preview-only work must not create/chmod the config directory or its
+         * lock. The read-only initializer below can still inspect an existing
+         * config, while a fresh HOME remains byte-for-byte untouched. */
+        if (!read_only && !dry_run) {
             config_lock_fd = config_write_lock();
             if (config_lock_fd < 0) {
                 int lock_errno = errno;
@@ -282,7 +450,7 @@ int main(int argc, char *argv[]) {
 
     /* Initialize configuration system */
     log_info("Initializing gitswitch-c configuration system");
-    if (config_init(&ctx) != 0) {
+    if ((dry_run ? config_init_readonly(&ctx) : config_init(&ctx)) != 0) {
         display_error("Configuration initialization failed", "%s", get_last_error()->message);
         error_cleanup();
         return EXIT_CONFIG_ERROR;
@@ -295,28 +463,9 @@ int main(int argc, char *argv[]) {
     ctx.config.assume_yes = assume_yes;
     ctx.config.verbose = should_log(LOG_LEVEL_DEBUG);
     
-    /* Parse command and arguments */
-    const char *command = NULL;
-    const char *arg1 = NULL;
+    command_result_t mutation = command_result(EXIT_SUCCESS);
+    bool has_mutation_result = false;
 
-    if (optind < argc) {
-        command = argv[optind];
-        if (optind + 1 < argc) {
-            arg1 = argv[optind + 1];
-        }
-    }
-
-    /* Snapshot the active account so a switch that doesn't actually change it
-     * (re-switching to the current account) skips config_save below and its
-     * backup churn. */
-    char prev_active[MAX_NAME_LEN];
-    safe_strncpy(prev_active, ctx.config.active_account, sizeof(prev_active));
-    /* Snapshot the account count so a CANCELLED remove (user declined the
-     * confirmation — accounts_remove returns 0 having changed nothing) skips
-     * config_save and its backup/comment-destroying churn (AR-06 F25). A real
-     * remove decrements the count; a cancel leaves it untouched. */
-    size_t prev_account_count = ctx.account_count;
-    
     /* Execute command */
     if (command == NULL) {
         /* No command specified - interactive mode or help */
@@ -333,25 +482,21 @@ int main(int argc, char *argv[]) {
             exit_code = handle_list_command(&ctx);
         }
     } else if (strcmp(command, "add") == 0) {
-        exit_code = handle_add_command(&ctx);
+        mutation = handle_add_command(&ctx);
+        has_mutation_result = true;
+        exit_code = mutation.status;
     } else if (strcmp(command, "edit") == 0) {
-        if (!arg1) {
-            display_error("Missing account identifier", "Usage: gitswitch edit <account>");
-            exit_code = EXIT_FAILURE;
-        } else {
-            exit_code = handle_edit_command(&ctx, arg1);
-        }
+        mutation = handle_edit_command(&ctx, arg1);
+        has_mutation_result = true;
+        exit_code = mutation.status;
     } else if (strcmp(command, "list") == 0 || strcmp(command, "ls") == 0) {
         /* `list --names` is a plumbing mode: one account name per line, no
          * decoration, for shell-completion scripts to consume. */
         exit_code = names_only ? handle_list_names(&ctx) : handle_list_command(&ctx);
     } else if (strcmp(command, "remove") == 0 || strcmp(command, "rm") == 0 || strcmp(command, "delete") == 0) {
-        if (!arg1) {
-            display_error("Missing account identifier", "Usage: gitswitch remove <account>");
-            exit_code = EXIT_FAILURE;
-        } else {
-            exit_code = handle_remove_command(&ctx, arg1);
-        }
+        mutation = handle_remove_command(&ctx, arg1);
+        has_mutation_result = true;
+        exit_code = mutation.status;
     } else if (strcmp(command, "status") == 0) {
         exit_code = handle_status_command(&ctx);
     } else if (strcmp(command, "doctor") == 0 || strcmp(command, "health") == 0) {
@@ -361,89 +506,142 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(command, "resume") == 0) {
         exit_code = handle_resume_command(&ctx);
     } else if (strcmp(command, "reset") == 0) {
-        exit_code = handle_reset_command(&ctx, arg1);
+        mutation = handle_reset_command(&ctx, arg1);
+        has_mutation_result = true;
+        exit_code = mutation.status;
+    } else if (strcmp(command, "switch") == 0) {
+        mutation = handle_switch_command(&ctx, arg1);
+        has_mutation_result = true;
+        exit_code = mutation.status;
     } else {
         /* Assume it's an account identifier for switching */
-        exit_code = handle_switch_command(&ctx, command);
+        mutation = handle_switch_command(&ctx, command);
+        has_mutation_result = true;
+        exit_code = mutation.status;
     }
-    
-    /* Save configuration only for commands that modify accounts */
-    bool should_save = false;
-    bool settings_only_save = false;
-    if (command && exit_code == EXIT_SUCCESS && !dry_run) {
-        if (strcmp(command, "add") == 0 ||
-            strcmp(command, "edit") == 0) {
-            should_save = true;
-        } else if (strcmp(command, "remove") == 0 ||
-                   strcmp(command, "rm") == 0 ||
-                   strcmp(command, "delete") == 0) {
-            /* AR-06 F25: only persist when an account was actually removed. A
-             * declined confirmation returns success with the count unchanged;
-             * saving then would rewrite accounts.toml and churn a backup for a
-             * no-op, destroying user comments. */
-            should_save = (ctx.account_count != prev_account_count);
-        } else if (strcmp(command, "list") != 0 &&
-                   strcmp(command, "ls") != 0 &&
-                   strcmp(command, "status") != 0 &&
-                   strcmp(command, "doctor") != 0 &&
-                   strcmp(command, "health") != 0 &&
-                   strcmp(command, "config") != 0 &&
-                   strcmp(command, "init") != 0 &&
-                   strcmp(command, "resume") != 0) {
-            /* A switch — or a reset that cleared the saved active account —
-             * changes only settings.active_account, so save only when it
-             * actually changed (a re-switch to the current account rewrites
-             * nothing, skipping the save and its backup churn), and persist
-             * it via the targeted settings-only write-back (AR-03 M9): the
-             * full rebuild is refused whenever the load skipped sections,
-             * but switching between the HEALTHY accounts must still record
-             * active_account or the next boot resumes the wrong identity. */
-            should_save = (strcmp(prev_active, ctx.config.active_account) != 0);
-            settings_only_save = true;
-        }
-        /* `resume` re-activates the already-saved account and changes nothing
-         * durable, so it is intentionally excluded above to avoid backup churn. */
 
-        if (should_save) {
+    /* Mutating handlers never print their final success. This centralized
+     * commit path persists their structured outcome first, then either commits
+     * a prepared switch or rolls it and the active/hint metadata back. */
+    if (has_mutation_result && exit_code == EXIT_SUCCESS && !dry_run) {
+        int save_rc = 0;
+        bool config_installed = false;
+        char save_error[sizeof(g_last_error.message)] = "";
+
+        if (mutation.save_kind != COMMAND_SAVE_NONE) {
             log_debug("Saving configuration after %s command (account_count=%zu)",
-                     command, ctx.account_count);
-            /* SIG-02 (AR-02 #27): hold the deferring guard across the save so
-             * config_save's scratch registration of its temp file has a live
-             * handler behind it — a signal mid-save then defers instead of
-             * orphaning accounts.toml.tmp.<pid>. After a switch the guard is
-             * ALREADY armed: accounts_switch's success path leaves it up so
-             * the stretch between "identity applied" and this save is never
-             * signal-killable (M3) — this begin is then a no-op re-begin that
-             * preserves any deferred signal. For add/edit/remove it arms
-             * fresh. The command's work is already fully applied at this
-             * point, so a deferred signal is not re-raised: the process
-             * finishes persisting and exits normally moments later. */
+                      command, ctx.account_count);
             signals_guard_begin();
-            /* AR-06 F27: also DEFER the second-signal emergency exit across the
-             * save, like the rollback and deferred-teardown windows. Without
-             * this, two rapid signals here took the handler's emergency exit
-             * mid-config_save and persisted a mixed identity that auto-resume
-             * then made durable. The save is bounded, non-interactive work (no
-             * children to wedge at a prompt), so deferring is safe; the deferred
-             * signal is dispatched once the state is fully persisted. */
             signals_rollback_begin();
-            int save_rc = settings_only_save
-                ? config_save_active_account(&ctx, ctx.config.config_path)
-                : config_save(&ctx, ctx.config.config_path);
+            if (mutation.save_kind == COMMAND_SAVE_FULL) {
+                save_rc = config_save(&ctx, ctx.config.config_path);
+            } else if (mutation.switch_prepared) {
+                save_rc = config_save_active_account_transactional(
+                    &ctx, ctx.config.config_path, &config_installed);
+            } else {
+                save_rc = config_save_active_account(
+                    &ctx, ctx.config.config_path);
+            }
             if (save_rc != 0) {
-                /* AR-03 M9: a failed persist after a mutating command must
-                 * surface in the exit code. The old warn-and-exit-0 path let
-                 * scripted callers see success while the change was silently
-                 * discarded (add/edit) or while active_account went stale
-                 * for the next boot's resume (switch). */
-                display_error("Failed to save configuration changes",
-                              "%s", get_last_error()->message);
-                exit_code = EXIT_FAILURE;
+                safe_strncpy(save_error, get_last_error()->message,
+                             sizeof(save_error));
             }
             signals_scratch_cleanup();
+            if (!mutation.switch_prepared) {
+                signals_rollback_end();
+            }
+        }
+
+        if (mutation.switch_prepared && save_rc == 0) {
+            if (accounts_switch_commit(&ctx) != 0) {
+                save_rc = -1;
+                config_installed = true;
+                safe_strncpy(save_error, get_last_error()->message,
+                             sizeof(save_error));
+            } else {
+                signals_rollback_end();
+            }
+        }
+
+        if (mutation.switch_prepared && save_rc != 0) {
+            bool rollback_complete = true;
+            char rollback_detail[sizeof(g_last_error.message)] = "";
+
+            /* Keep the cross-HOME runtime lock owned by the prepared switch
+             * until the persistence before-images are restored. Reversing
+             * accounts first released that lock and let another HOME sharing
+             * XDG_RUNTIME_DIR interleave between runtime and active/hint
+             * rollback. The outer config lock still excludes same-HOME
+             * writers while these persisted before-images are installed. */
+            safe_strncpy(ctx.config.active_account,
+                         mutation.previous_active,
+                         sizeof(ctx.config.active_account));
+            if (config_installed &&
+                config_restore_active_account(&ctx,
+                                              ctx.config.config_path) != 0) {
+                rollback_complete = false;
+                safe_strncpy(rollback_detail, get_last_error()->message,
+                             sizeof(rollback_detail));
+            }
+            /* The writer cannot touch the hint before the config rename. When
+             * no new config inode was installed the before-image is already
+             * intact (and may live in the same unwritable directory that
+             * caused the save failure), so do not manufacture a rollback
+             * failure by rewriting unchanged state. */
+            if (config_installed &&
+                config_resume_hint_snapshot_restore(
+                    &mutation.hint_snapshot) != 0) {
+                rollback_complete = false;
+                safe_strncpy(rollback_detail, get_last_error()->message,
+                             sizeof(rollback_detail));
+            }
+            /* accounts_switch_abort is deliberately last: it restores
+             * Git/runtime and releases the retained shared-runtime lock only
+             * after every config/hint rollback attempt has finished. */
+            if (accounts_switch_abort(&ctx, true) != 0) {
+                rollback_complete = false;
+                safe_strncpy(rollback_detail, get_last_error()->message,
+                             sizeof(rollback_detail));
+            }
             signals_rollback_end();
+
+            if (rollback_complete) {
+                display_error("Failed to save configuration changes; previous switch state restored",
+                              "%s", save_error[0] ? save_error :
+                              "unknown persistence error");
+            } else {
+                display_error("Failed to save configuration changes; switch rollback incomplete",
+                              "%s; rollback error: %s",
+                              save_error[0] ? save_error :
+                              "unknown persistence error",
+                              rollback_detail[0] ? rollback_detail :
+                              "unknown rollback error");
+            }
+            exit_code = EXIT_FAILURE;
+            if (signals_pending()) {
+                fprintf(stderr,
+                        "gitswitch: interrupted — switch rollback attempt completed\n");
+                signals_dispatch_pending();
+            }
+        } else if (save_rc != 0) {
+            /* Account edits are process-local until this point. Remove/reset
+             * may already have completed runtime cleanup; retain the on-disk
+             * account as a retry handle and report the possible partial commit
+             * explicitly instead of printing a completed mutation. */
+            display_error("Failed to save configuration changes",
+                          "%s; no success was recorded. The config rename may "
+                          "have completed before a later durability or resume-hint failure",
+                          save_error[0] ? save_error :
+                          "unknown persistence error");
+            exit_code = EXIT_FAILURE;
+        }
+
+        if (exit_code == EXIT_SUCCESS) {
+            emit_command_success(&ctx, &mutation);
         }
     }
+
+    config_resume_hint_snapshot_clear(&mutation.hint_snapshot);
 
     /* M3: drop the guard a successful switch left armed (see above). Done
      * unconditionally — it also closes the save-path guard, and it is an
@@ -469,8 +667,10 @@ int main(int argc, char *argv[]) {
 
 /* Command handler implementations */
 
-static int handle_add_command(gitswitch_ctx_t *ctx) {
-    if (!ctx) return EXIT_FAILURE;
+static command_result_t handle_add_command(gitswitch_ctx_t *ctx) {
+    command_result_t result = command_result(EXIT_FAILURE);
+
+    if (!ctx) return result;
 
     /* AR-06 F24: add has no meaningful dry-run. The old code ran the full
      * interactive flow, mutated the in-memory context, and printed "Account
@@ -479,7 +679,7 @@ static int handle_add_command(gitswitch_ctx_t *ctx) {
     if (ctx->config.dry_run) {
         display_info("DRY RUN MODE - No actual changes will be made");
         display_error("Nothing to preview", "add has no dry-run mode; re-run without --dry-run to add an account");
-        return EXIT_FAILURE;
+        return result;
     }
 
     /* AR-03 M9: refuse BEFORE the interactive work. The save at the end of
@@ -490,38 +690,47 @@ static int handle_add_command(gitswitch_ctx_t *ctx) {
      * with the reason instead. */
     if (config_check_rewritable(ctx) != 0) {
         display_error("Cannot add an account right now", "%s", get_last_error()->message);
-        return EXIT_FAILURE;
+        return result;
     }
 
     if (accounts_add_interactive(ctx) != 0) {
         display_error("Failed to add account", "%s", get_last_error()->message);
-        return EXIT_FAILURE;
+        return result;
     }
 
-    return EXIT_SUCCESS;
+    result.status = EXIT_SUCCESS;
+    result.save_kind = COMMAND_SAVE_FULL;
+    result.notice_kind = COMMAND_NOTICE_ADD;
+    return result;
 }
 
-static int handle_edit_command(gitswitch_ctx_t *ctx, const char *identifier) {
-    if (!ctx || !identifier) return EXIT_FAILURE;
+static command_result_t handle_edit_command(gitswitch_ctx_t *ctx,
+                                            const char *identifier) {
+    command_result_t result = command_result(EXIT_FAILURE);
+
+    if (!ctx || !identifier) return result;
 
     /* AR-06 F24: edit has no meaningful dry-run either — see handle_add_command. */
     if (ctx->config.dry_run) {
         display_info("DRY RUN MODE - No actual changes will be made");
         display_error("Nothing to preview", "edit has no dry-run mode; re-run without --dry-run to edit an account");
-        return EXIT_FAILURE;
+        return result;
     }
 
     /* AR-03 M9: same up-front refusal as `add` — see handle_add_command. */
     if (config_check_rewritable(ctx) != 0) {
         display_error("Cannot edit an account right now", "%s", get_last_error()->message);
-        return EXIT_FAILURE;
+        return result;
     }
 
     if (accounts_edit_interactive(ctx, identifier) != 0) {
         display_error("Failed to edit account", "%s", get_last_error()->message);
-        return EXIT_FAILURE;
+        return result;
     }
-    return EXIT_SUCCESS;
+    result.status = EXIT_SUCCESS;
+    result.save_kind = COMMAND_SAVE_FULL;
+    result.notice_kind = COMMAND_NOTICE_EDIT;
+    return result;
 }
 
 static int handle_list_command(gitswitch_ctx_t *ctx) {
@@ -539,15 +748,20 @@ static int handle_list_names(gitswitch_ctx_t *ctx) {
     return EXIT_SUCCESS;
 }
 
-static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier) {
-    if (!ctx || !identifier) return EXIT_FAILURE;
+static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
+                                              const char *identifier) {
+    command_result_t result = command_result(EXIT_FAILURE);
+    size_t previous_count;
+
+    if (!ctx || !identifier) return result;
+    previous_count = ctx->account_count;
 
     /* AR-03 M9: refuse before the confirmation prompt — see handle_add_command.
      * (A remove here could only ever target a HEALTHY account anyway: the
      * skipped ones aren't in memory to be found.) */
     if (config_check_rewritable(ctx) != 0) {
         display_error("Cannot remove an account right now", "%s", get_last_error()->message);
-        return EXIT_FAILURE;
+        return result;
     }
 
     /* AR-06 F07: accounts_remove tears down the SSH/GPG runtime (kills agents,
@@ -559,22 +773,28 @@ static int handle_remove_command(gitswitch_ctx_t *ctx, const char *identifier) {
         account_t *acct = config_find_account(ctx, identifier);
         if (!acct) {
             display_error("Account not found", "%s", identifier);
-            return EXIT_FAILURE;
+            return result;
         }
         display_info("DRY RUN MODE - No actual changes will be made");
         printf("Would kill the SSH/GPG agents and delete the isolated GPG home for\n"
                "'%s' (removing its on-disk secret-key copy), then remove the account\n"
                "from %s.\n", acct->name, ctx->config.config_path);
         display_success("DRY RUN complete - no changes were made");
-        return EXIT_SUCCESS;
+        result.status = EXIT_SUCCESS;
+        return result;
     }
 
     if (accounts_remove(ctx, identifier) != 0) {
         display_error("Failed to remove account", "%s", get_last_error()->message);
-        return EXIT_FAILURE;
+        return result;
     }
-    
-    return EXIT_SUCCESS;
+
+    result.status = EXIT_SUCCESS;
+    if (ctx->account_count != previous_count) {
+        result.save_kind = COMMAND_SAVE_FULL;
+        result.notice_kind = COMMAND_NOTICE_REMOVE;
+    }
+    return result;
 }
 
 static int handle_status_command(gitswitch_ctx_t *ctx) {
@@ -583,27 +803,52 @@ static int handle_status_command(gitswitch_ctx_t *ctx) {
     return accounts_show_status(ctx) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-static int handle_switch_command(gitswitch_ctx_t *ctx, const char *identifier) {
-    if (!ctx || !identifier) return EXIT_FAILURE;
+static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
+                                              const char *identifier) {
+    command_result_t result = command_result(EXIT_FAILURE);
+
+    if (!ctx || !identifier) return result;
 
     if (ctx->config.dry_run) {
         display_info("DRY RUN MODE - No actual changes will be made");
-    }
-
-    if (accounts_switch(ctx, identifier) != 0) {
-        display_error("Failed to switch account", "%s", get_last_error()->message);
-        return EXIT_FAILURE;
-    }
-
-    /* accounts_switch already prints detailed status; confirm success. Under
-     * dry-run it mutates nothing (current_account stays unset), so don't deref it. */
-    if (ctx->config.dry_run) {
+        if (accounts_switch(ctx, identifier) != 0) {
+            display_error("Failed to switch account", "%s",
+                          get_last_error()->message);
+            return result;
+        }
         display_success("DRY RUN complete - no changes were made");
-    } else {
-        display_success("Switched to: %s", ctx->current_account->name);
+        result.status = EXIT_SUCCESS;
+        return result;
     }
 
-    return EXIT_SUCCESS;
+    /* The hint before-image must be complete before Git or runtime mutation.
+     * The prepare call retains every other rollback input until main has
+     * committed both active_account and the new hint. */
+    if (config_resume_hint_snapshot_capture(&result.hint_snapshot) != 0) {
+        display_error("Cannot prepare account switch", "%s",
+                      get_last_error()->message);
+        return result;
+    }
+    safe_strncpy(result.previous_active, ctx->config.active_account,
+                 sizeof(result.previous_active));
+    if (accounts_switch_prepare(ctx, identifier) != 0) {
+        display_error("Failed to switch account", "%s",
+                      get_last_error()->message);
+        config_resume_hint_snapshot_clear(&result.hint_snapshot);
+        return result;
+    }
+
+    result.status = EXIT_SUCCESS;
+    result.save_kind = COMMAND_SAVE_ACTIVE;
+    result.notice_kind = COMMAND_NOTICE_SWITCH;
+    result.switch_prepared = true;
+    if (ctx->current_account) {
+        safe_strncpy(result.subject, ctx->current_account->name,
+                     sizeof(result.subject));
+    } else {
+        safe_strncpy(result.subject, identifier, sizeof(result.subject));
+    }
+    return result;
 }
 
 static int handle_doctor_command(gitswitch_ctx_t *ctx) {
@@ -1047,6 +1292,17 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
         return EXIT_SUCCESS;
     }
 
+    /* Preview must stop before the liveness helpers: the GPG check pins and
+     * locks runtime metadata and may create/repair its private lock paths.
+     * Describe the possible restore without probing or touching them. */
+    if (ctx->config.dry_run) {
+        display_info("DRY RUN MODE - No actual changes will be made");
+        printf("Would check boot-volatile SSH/GPG state for '%s' and restore "
+               "it only if needed.\n", acct->name);
+        display_success("DRY RUN complete - no changes were made");
+        return EXIT_SUCCESS;
+    }
+
     /* Already live this boot: exit silently before the notice below. The shell
      * snippet re-invokes resume whenever its ssh-add probe fails, which for a
      * GPG-only account is EVERY interactive shell — re-running the switch and
@@ -1100,7 +1356,9 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
  * GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may remain forensically
  * recoverable after deletion (AR-02 #26). With an account argument, only that
  * account; otherwise all. Destructive — confirmed. */
-static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
+static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
+                                             const char *account) {
+    command_result_t result = command_result(EXIT_FAILURE);
     char resp[16];
     const char *target = NULL;
     char ssh_error[sizeof(g_last_error.message)] = "";
@@ -1109,7 +1367,7 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     int gpg_rc;
     int runtime_lock_fd;
 
-    if (!ctx) return EXIT_FAILURE;
+    if (!ctx) return result;
 
     /* Resolve the argument to a real account first so a typo can't report a
      * false success while the intended account's on-disk secret-key copy is
@@ -1119,7 +1377,7 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
         account_t *acct = config_find_account_destructive(ctx, account);
         if (!acct) {
             display_error("Account not found", "%s", get_last_error()->message);
-            return EXIT_FAILURE;
+            return result;
         }
         target = acct->name;
     }
@@ -1149,7 +1407,8 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
                    ctx->config.active_account);
         }
         display_success("DRY RUN complete - no changes were made");
-        return EXIT_SUCCESS;
+        result.status = EXIT_SUCCESS;
+        return result;
     }
 
     if (target) {
@@ -1169,12 +1428,14 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
         fflush(stdout);
         if (!fgets(resp, sizeof(resp), stdin)) {
             printf("Reset cancelled.\n");
-            return EXIT_SUCCESS;
+            result.status = EXIT_SUCCESS;
+            return result;
         }
         resp[strcspn(resp, "\n")] = '\0';
         if (strcmp(resp, "yes") != 0) {
             printf("Reset cancelled.\n");
-            return EXIT_SUCCESS;
+            result.status = EXIT_SUCCESS;
+            return result;
         }
     }
 
@@ -1182,7 +1443,7 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
     if (runtime_lock_fd < 0) {
         display_error("Cannot lock shared runtime state", "%s",
                       get_last_error()->message);
-        return EXIT_FAILURE;
+        return result;
     }
 
     /* ssh_manager_reset already drops the stable current.sock link (under its
@@ -1222,7 +1483,7 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
         fprintf(stderr,
                 "gitswitch: reset failed; retry metadata was preserved\n");
         set_error(ERR_SYSTEM_CALL, "SSH/GPG reset did not complete");
-        return EXIT_FAILURE;
+        return result;
     }
 
     /* When the reset covered the saved active account (or everything), clear
@@ -1234,12 +1495,15 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
      * targeted reset of a NON-active account changes neither. */
     if (!target || strcmp(ctx->config.active_account, target) == 0) {
         ctx->config.active_account[0] = '\0';
+        result.save_kind = COMMAND_SAVE_ACTIVE;
     }
 
     if (target) {
-        display_success("Reset gitswitch state for: %s", target);
+        result.notice_kind = COMMAND_NOTICE_RESET_ONE;
+        safe_strncpy(result.subject, target, sizeof(result.subject));
     } else {
-        display_success("Reset all gitswitch SSH/GPG state");
+        result.notice_kind = COMMAND_NOTICE_RESET_ALL;
     }
-    return EXIT_SUCCESS;
+    result.status = EXIT_SUCCESS;
+    return result;
 }

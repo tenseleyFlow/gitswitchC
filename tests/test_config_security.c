@@ -1079,7 +1079,10 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
     strncpy(ctx.config.active_account, "alice",
             sizeof(ctx.config.active_account) - 1);
 
-    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    /* The resume hint is required commit state as of AR-07 T5. Refusing an
+     * unsafe node must now make the save truthful/nonzero while preserving the
+     * node and its target exactly. */
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
     CHECK(slurp(victim, buf, sizeof(buf)) > 0);
     CHECK_STR_EQ(buf, "victim-content\n"); /* pre-fix: truncated to none */
     CHECK_EQ_INT(lstat(hint, &after), 0);
@@ -1087,14 +1090,14 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
 
     CHECK_EQ_INT(unlink(hint), 0);
     CHECK_EQ_INT(mkfifo(hint, 0600), 0);
-    CHECK_EQ_INT(config_save(&ctx, path), 0); /* never opens/blocks on FIFO */
+    CHECK_EQ_INT(config_save(&ctx, path), -1); /* never opens/blocks on FIFO */
     CHECK_EQ_INT(lstat(hint, &after), 0);
     CHECK(S_ISFIFO(after.st_mode));
 
     CHECK_EQ_INT(unlink(hint), 0);
     CHECK_EQ_INT(write_config(hint, "unsafe\n", 7), 0);
     CHECK_EQ_INT(chmod(hint, 0660), 0);
-    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
     CHECK(slurp(hint, buf, sizeof(buf)) > 0);
     CHECK_STR_EQ(buf, "unsafe\n");
     CHECK_EQ_INT(lstat(hint, &after), 0);

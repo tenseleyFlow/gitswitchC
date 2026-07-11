@@ -91,14 +91,17 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path);
 static bool sanitize_tty_text(char *text);
 static bool text_is_tty_safe(const char *text);
 static int create_config_directory_secure(const char *config_dir);
+static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
+                            bool detect_runtime);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
 
-/* Initialize configuration system */
-int config_init(gitswitch_ctx_t *ctx) {
+/* Shared initializer. Preview-only commands use the non-creating form so
+ * merely inspecting a fresh HOME cannot mkdir or chmod configuration state. */
+static int config_init_mode(gitswitch_ctx_t *ctx, bool create_directory) {
     char config_path[MAX_PATH_LEN];
     char config_dir[MAX_PATH_LEN];
     
@@ -119,8 +122,10 @@ int config_init(gitswitch_ctx_t *ctx) {
         return -1;
     }
     
-    /* Ensure config directory exists with secure permissions */
-    if (create_config_directory_secure(config_dir) != 0) {
+    /* A normal command secures/creates the directory before use. A dry-run is
+     * observational: it may read an existing config, but must not create the
+     * directory or repair its mode as a side effect of previewing a command. */
+    if (create_directory && create_config_directory_secure(config_dir) != 0) {
         return -1;
     }
     
@@ -135,12 +140,25 @@ int config_init(gitswitch_ctx_t *ctx) {
     /* Load configuration if it exists */
     if (path_exists(config_path)) {
         log_info("Loading configuration from: %s", config_path);
-        return config_load(ctx, config_path);
+        return config_load_mode(ctx, config_path, create_directory);
     } else {
         log_info("Configuration file not found, will create default");
         /* Don't automatically create - let user create when needed */
         return 0;
     }
+}
+
+/* Initialize configuration system for an ordinary command. */
+int config_init(gitswitch_ctx_t *ctx) {
+    return config_init_mode(ctx, true);
+}
+
+/* Initialize enough state to inspect an existing configuration without
+ * creating or chmod'ing any path. This is intentionally a separate API rather
+ * than a flag in gitswitch_ctx_t: the context does not exist until this call,
+ * and setting dry_run afterwards is the ordering bug this entry point fixes. */
+int config_init_readonly(gitswitch_ctx_t *ctx) {
+    return config_init_mode(ctx, false);
 }
 
 /* AR-06 F48/F52/F73: toml_document_t is ~600 KiB (MAX_SECTIONS section structs
@@ -238,8 +256,10 @@ fail_buffer:
     return -1;
 }
 
-/* Load configuration from TOML file */
-int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
+/* Load configuration from TOML file. Preview-only callers skip live-runtime
+ * discovery because its cross-process lock may create/chmod a lock inode. */
+static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
+                            bool detect_runtime) {
     toml_document_t *toml_doc;
     char scope_str[32];
 
@@ -302,11 +322,22 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
 
     config_document_free(toml_doc);
 
-    /* Detect current account from SSH socket symlink */
-    accounts_detect_current(ctx);
+    /* Detect current account from SSH socket symlink for ordinary commands.
+     * A dry-run remains observational and uses the persisted active_account
+     * already loaded above rather than acquiring a runtime lock. */
+    if (detect_runtime) {
+        accounts_detect_current(ctx);
+    } else if (ctx->config.active_account[0] != '\0') {
+        ctx->current_account = config_find_account_exact(
+            ctx, ctx->config.active_account);
+    }
 
     log_info("Configuration loaded successfully: %zu accounts", ctx->account_count);
     return 0;
+}
+
+int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
+    return config_load_mode(ctx, config_path, true);
 }
 
 /* Acquire an exclusive, cross-process lock for a mutating config cycle. Returns
@@ -431,15 +462,307 @@ int config_resume_hint_path(char *buf, size_t size) {
     return 0;
 }
 
+#define CONFIG_RESUME_HINT_SNAPSHOT_MAX 4096U
+
+void config_resume_hint_snapshot_clear(
+    config_resume_hint_snapshot_t *snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    if (snapshot->data) {
+        secure_zero_memory(snapshot->data, snapshot->length);
+        free(snapshot->data);
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
+}
+
+int config_resume_hint_snapshot_capture(
+    config_resume_hint_snapshot_t *snapshot) {
+    char hint[MAX_PATH_LEN];
+    struct stat before;
+    struct stat opened;
+    struct stat after;
+    unsigned char *data = NULL;
+    size_t total = 0;
+    int fd = -1;
+
+    if (!snapshot) {
+        set_error(ERR_INVALID_ARGS, "NULL resume-hint snapshot");
+        return -1;
+    }
+    config_resume_hint_snapshot_clear(snapshot);
+    if (config_resume_hint_path(hint, sizeof(hint)) != 0) {
+        return -1;
+    }
+    if (lstat(hint, &before) != 0) {
+        if (errno == ENOENT) {
+            snapshot->valid = true;
+            return 0;
+        }
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect resume hint before switch: %s", hint);
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&before, false) || before.st_size < 0 ||
+        (uintmax_t)before.st_size > CONFIG_RESUME_HINT_SNAPSHOT_MAX) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Resume hint is not a small, stable, self-owned regular file: %s",
+                  hint);
+        return -1;
+    }
+
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, false) ||
+        !config_metadata_same_file(&before, &opened)) {
+        int saved_errno = errno;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot open a stable resume hint before switch: %s",
+                         hint);
+        return -1;
+    }
+
+    snapshot->length = (size_t)opened.st_size;
+    data = malloc(snapshot->length == 0 ? 1 : snapshot->length);
+    if (!data) {
+        close(fd);
+        snapshot->length = 0;
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate resume-hint before-image");
+        return -1;
+    }
+    while (total < snapshot->length) {
+        ssize_t n = read(fd, data + total, snapshot->length - total);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            close(fd);
+            free(data);
+            snapshot->length = 0;
+            set_error(ERR_FILE_IO,
+                      "Cannot read the complete resume hint before switch: %s",
+                      hint);
+            return -1;
+        }
+    }
+    if (fstat(fd, &after) != 0 || !config_metadata_same_file(&opened, &after) ||
+        after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
+        !config_metadata_same_file(&opened, &after)) {
+        close(fd);
+        free(data);
+        snapshot->length = 0;
+        set_error(ERR_FILE_IO,
+                  "Resume hint changed while its before-image was captured: %s",
+                  hint);
+        return -1;
+    }
+    close(fd);
+
+    snapshot->data = data;
+    snapshot->mode = (unsigned int)(opened.st_mode & 0777);
+    snapshot->existed = true;
+    snapshot->valid = true;
+    return 0;
+}
+
+int config_resume_hint_snapshot_restore(
+    const config_resume_hint_snapshot_t *snapshot) {
+    char dir[MAX_PATH_LEN];
+    char hint[MAX_PATH_LEN];
+    char temp[MAX_PATH_LEN];
+    struct stat dir_identity;
+    struct stat current;
+    struct stat installed;
+    size_t total = 0;
+    int dir_fd = -1;
+    int fd = -1;
+
+    if (!snapshot || !snapshot->valid) {
+        set_error(ERR_INVALID_ARGS, "Invalid resume-hint snapshot");
+        return -1;
+    }
+    if (get_config_directory(dir, sizeof(dir)) != 0 ||
+        config_resume_hint_path(hint, sizeof(hint)) != 0) {
+        return -1;
+    }
+
+    if (lstat(dir, &dir_identity) != 0 ||
+        !config_metadata_dir_is_safe(&dir_identity)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Cannot restore resume hint: config directory is unsafe: %s",
+                  dir);
+        return -1;
+    }
+    dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fstat(dir_fd, &current) != 0 ||
+        !config_metadata_dir_is_safe(&current) ||
+        !config_metadata_same_file(&dir_identity, &current)) {
+        if (dir_fd >= 0) close(dir_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot pin config directory while restoring resume hint");
+        return -1;
+    }
+
+    if (!snapshot->existed) {
+        if (unlink(hint) != 0 && errno != ENOENT) {
+            close(dir_fd);
+            set_system_error(ERR_FILE_IO,
+                             "Cannot restore prior resume-hint absence: %s",
+                             hint);
+            return -1;
+        }
+        if (fsync(dir_fd) != 0) {
+            close(dir_fd);
+            set_system_error(ERR_FILE_IO,
+                             "Cannot durably restore prior resume-hint absence");
+            return -1;
+        }
+        close(dir_fd);
+        return 0;
+    }
+    if (lstat(hint, &current) == 0) {
+        if (!config_metadata_file_is_safe(&current, false)) {
+            close(dir_fd);
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing to replace unsafe resume hint during rollback: %s",
+                      hint);
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        close(dir_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect resume hint during rollback: %s", hint);
+        return -1;
+    }
+
+    if ((size_t)snprintf(temp, sizeof(temp), "%s.restore.XXXXXX", hint) >=
+        sizeof(temp)) {
+        close(dir_fd);
+        set_error(ERR_INVALID_PATH, "Resume-hint rollback path is too long");
+        return -1;
+    }
+    fd = mkstemp(temp);
+    if (fd < 0) {
+        close(dir_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot create resume-hint rollback file: %s", temp);
+        return -1;
+    }
+    (void)signals_scratch_register(temp);
+    if (fchmod(fd, (mode_t)snapshot->mode) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot restore resume-hint permissions: %s", temp);
+        goto restore_fail;
+    }
+    while (total < snapshot->length) {
+        ssize_t n = write(fd, snapshot->data + total,
+                          snapshot->length - total);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot restore resume-hint contents: %s", temp);
+            goto restore_fail;
+        }
+    }
+    if (fsync(fd) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot flush restored resume hint: %s", temp);
+        goto restore_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close restored resume hint: %s", temp);
+        goto restore_fail;
+    }
+    fd = -1;
+    if (rename(temp, hint) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot install restored resume hint: %s", hint);
+        goto restore_fail;
+    }
+    signals_scratch_unregister(temp);
+    if (fsync(dir_fd) != 0 || lstat(hint, &installed) != 0 ||
+        !config_metadata_file_is_safe(&installed, false) ||
+        (installed.st_mode & 0777) != (mode_t)snapshot->mode ||
+        (size_t)installed.st_size != snapshot->length) {
+        close(dir_fd);
+        set_error(ERR_FILE_IO,
+                  "Cannot verify restored resume hint: %s", hint);
+        return -1;
+    }
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) {
+        close(dir_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot reopen restored resume hint: %s", hint);
+        return -1;
+    }
+    total = 0;
+    while (total < snapshot->length) {
+        unsigned char verify[512];
+        size_t wanted = snapshot->length - total;
+        ssize_t n;
+
+        if (wanted > sizeof(verify)) wanted = sizeof(verify);
+        n = read(fd, verify, wanted);
+        if (n > 0 &&
+            memcmp(verify, snapshot->data + total, (size_t)n) == 0) {
+            total += (size_t)n;
+            continue;
+        }
+        if (n < 0 && errno == EINTR) continue;
+        close(fd);
+        close(dir_fd);
+        set_error(ERR_FILE_IO,
+                  "Restored resume hint does not match its before-image: %s",
+                  hint);
+        return -1;
+    }
+    {
+        unsigned char extra;
+        ssize_t n;
+        do {
+            n = read(fd, &extra, 1);
+        } while (n < 0 && errno == EINTR);
+        if (n != 0) {
+            close(fd);
+            close(dir_fd);
+            set_error(ERR_FILE_IO,
+                      "Restored resume hint has unexpected trailing data: %s",
+                      hint);
+            return -1;
+        }
+    }
+    close(fd);
+    close(dir_fd);
+    return 0;
+
+restore_fail:
+    if (fd >= 0) close(fd);
+    unlink(temp);
+    signals_scratch_unregister(temp);
+    close(dir_fd);
+    return -1;
+}
+
 /* Create or remove the resume-hint marker so the shell integration knows
  * whether a boot-time resume is worth attempting. The marker's CONTENT records
  * the active account's boot-volatile runtime needs as a space-separated token
  * set ("ssh", "gpg", or "none"), so the shell snippet can skip the per-shell
  * ssh-add liveness probe entirely for an SSH-less active account — otherwise a
  * GPG-only or identity-only account made every new interactive shell spawn
- * ssh-add (exit 2) plus a `gitswitch resume` in perpetuity (AR-02 #23). Cheap
- * and best-effort. */
-static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
+ * ssh-add (exit 2) plus a `gitswitch resume` in perpetuity (AR-02 #23). This is
+ * required transaction state: failure is reported so a CLI switch can roll
+ * the matching Git/runtime/config state back. */
+static int config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     const char *content;
     char dir[MAX_PATH_LEN];
     char hint[MAX_PATH_LEN];
@@ -451,19 +774,47 @@ static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     bool existed = false;
     int fd = -1;
 
+    /* Deterministic commit-boundary fault injection for the CLI transaction
+     * regression. The active config has already been atomically installed
+     * when this helper runs, so failure here exercises the required reverse
+     * commit of config, Git/runtime state, and the exact hint before-image. */
+    const char *fault = getenv("GITSWITCH_TEST_FAIL_RESUME_HINT_COMMIT");
+    if (fault && strcmp(fault, "1") == 0) {
+        set_error(ERR_FILE_IO, "Injected resume-hint commit failure");
+        return -1;
+    }
+
     if (get_config_directory(dir, sizeof(dir)) != 0 ||
         create_config_directory_secure(dir) != 0 ||
         lstat(dir, &dir_identity) != 0 ||
         !config_metadata_dir_is_safe(&dir_identity)) {
-        log_warning("Cannot safely update the resume hint: config directory is unavailable");
-        return;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Cannot safely update the resume hint: config directory is unavailable");
+        return -1;
     }
-    if (config_resume_hint_path(hint, sizeof(hint)) != 0) return;
+    if (config_resume_hint_path(hint, sizeof(hint)) != 0) return -1;
     if (ctx->config.active_account[0] == '\0') {
         /* unlink() removes only the directory entry and never follows a final
          * symlink, so reset cannot alter a symlink target. */
-        unlink(hint);
-        return;
+        if (unlink(hint) != 0 && errno != ENOENT) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot remove obsolete resume hint: %s", hint);
+            return -1;
+        }
+        {
+            int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
+                                   O_NOFOLLOW);
+            if (dir_fd < 0 || fsync(dir_fd) != 0) {
+                int saved_errno = errno;
+                if (dir_fd >= 0) close(dir_fd);
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot durably remove obsolete resume hint");
+                return -1;
+            }
+            close(dir_fd);
+        }
+        return 0;
     }
 
     /* Resolve the active account to read its ssh/gpg flags. If it can't be
@@ -492,28 +843,32 @@ static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     if (lstat(hint, &before) == 0) {
         existed = true;
         if (!config_metadata_file_is_safe(&before, false)) {
-            log_warning("Refusing to replace unsafe resume hint metadata: %s", hint);
-            return;
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing to replace unsafe resume hint metadata: %s", hint);
+            return -1;
         }
     } else if (errno != ENOENT) {
-        log_warning("Cannot inspect resume hint before update: %s", hint);
-        return;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect resume hint before update: %s", hint);
+        return -1;
     }
     if ((size_t)snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", hint) >= sizeof(temp)) {
-        log_warning("Resume hint temporary path is too long");
-        return;
+        set_error(ERR_INVALID_PATH, "Resume hint temporary path is too long");
+        return -1;
     }
 
     fd = mkstemp(temp);
     if (fd < 0) {
-        log_warning("Cannot create temporary resume hint: %s", hint);
-        return;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot create temporary resume hint: %s", hint);
+        return -1;
     }
     (void)signals_scratch_register(temp);
     if (fchmod(fd, PERM_USER_RW) != 0 ||
         fstat(fd, &temp_identity) != 0 ||
         !config_metadata_file_is_safe(&temp_identity, true)) {
-        log_warning("Cannot secure temporary resume hint: %s", temp);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot secure temporary resume hint: %s", temp);
         goto hint_fail;
     }
 
@@ -526,17 +881,20 @@ static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
         } else if (n < 0 && errno == EINTR) {
             continue;
         } else {
-            log_warning("Cannot write temporary resume hint: %s", temp);
+            set_system_error(ERR_FILE_IO,
+                             "Cannot write temporary resume hint: %s", temp);
             goto hint_fail;
         }
     }
     if (fsync(fd) != 0) {
-        log_warning("Cannot flush temporary resume hint: %s", temp);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot flush temporary resume hint: %s", temp);
         goto hint_fail;
     }
     if (close(fd) != 0) {
         fd = -1;
-        log_warning("Cannot finalize temporary resume hint: %s", temp);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot finalize temporary resume hint: %s", temp);
         goto hint_fail;
     }
     fd = -1;
@@ -547,22 +905,28 @@ static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
         lstat(dir, &after) != 0 ||
         !config_metadata_dir_is_safe(&after) ||
         !config_metadata_same_file(&dir_identity, &after)) {
-        log_warning("Resume hint metadata changed before installation: %s", hint);
+        set_error(ERR_FILE_IO,
+                  "Resume hint metadata changed before installation: %s", hint);
         goto hint_fail;
     }
     if (lstat(hint, &after) == 0) {
         if (!existed || !config_metadata_file_is_safe(&after, false) ||
             !config_metadata_same_file(&before, &after)) {
-            log_warning("Resume hint changed before update; refusing replacement: %s", hint);
+            set_error(ERR_FILE_IO,
+                      "Resume hint changed before update; refusing replacement: %s",
+                      hint);
             goto hint_fail;
         }
     } else if (existed || errno != ENOENT) {
-        log_warning("Resume hint changed before update; refusing replacement: %s", hint);
+        set_error(ERR_FILE_IO,
+                  "Resume hint changed before update; refusing replacement: %s",
+                  hint);
         goto hint_fail;
     }
 
     if (rename(temp, hint) != 0) {
-        log_warning("Cannot install resume hint atomically: %s", hint);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot install resume hint atomically: %s", hint);
         goto hint_fail;
     }
     signals_scratch_unregister(temp);
@@ -570,22 +934,46 @@ static void config_update_resume_hint(const gitswitch_ctx_t *ctx) {
     if (lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, true) ||
         !config_metadata_same_file(&temp_identity, &after)) {
-        log_warning("Cannot verify installed resume hint: %s", hint);
+        set_error(ERR_FILE_IO,
+                  "Cannot verify installed resume hint: %s", hint);
+        return -1;
     }
-    return;
+    {
+        int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
+                               O_NOFOLLOW);
+        if (dir_fd < 0 || fsync(dir_fd) != 0) {
+            int saved_errno = errno;
+            if (dir_fd >= 0) close(dir_fd);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot durably commit resume hint: %s", hint);
+            return -1;
+        }
+        close(dir_fd);
+    }
+    return 0;
 
 hint_fail:
     if (fd >= 0) close(fd);
     unlink(temp);
     signals_scratch_unregister(temp);
+    return -1;
 }
 
 /* Shared atomic-write tail for config_save and config_save_active_account:
  * validate the destination, back up the existing file, write doc to a fresh
  * 0600 temp, rename it into place, refresh the resume hint. */
-static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_document_t *doc,
-                                        const char *config_path, bool make_backup) {
+static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
+                                        const toml_document_t *doc,
+                                        const char *config_path,
+                                        bool make_backup,
+                                        bool update_hint,
+                                        bool *config_installed) {
     char temp_path[MAX_PATH_LEN];
+
+    if (config_installed) {
+        *config_installed = false;
+    }
 
     /* Refuse to write through or next to a symlink (cfg-symlink-01). rename()
      * would replace a symlinked accounts.toml with a real file, but the
@@ -657,14 +1045,18 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_d
         return -1;
     }
     signals_scratch_unregister(temp_path); /* renamed away: nothing to clean */
+    if (config_installed) {
+        *config_installed = true;
+    }
 
     /* AR-05 L11: per POSIX a rename() is only durable once the directory
      * holding the new entry is itself fsynced. toml_write_file already
      * fsyncs the payload, but without this a crash right after a
      * reported-successful save could silently revert the directory entry to
      * the pre-rename config (lost-but-acknowledged update; never a torn
-     * file). Best-effort: the live system sees the new file either way, so
-     * failure only warns. O_NOFOLLOW matches the dir opens above. */
+     * file). It is a required commit now: a caller must not print success for
+     * an update the filesystem has not made durable. O_NOFOLLOW matches the
+     * directory validation above. */
     {
         char dir_path[MAX_PATH_LEN];
         const char *slash = strrchr(config_path, '/');
@@ -677,20 +1069,34 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_d
                            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
             if (dfd >= 0) {
                 if (fsync(dfd) != 0) {
-                    log_warning("Could not fsync config directory %s: saved "
-                                "config may not survive an immediate crash",
-                                dir_path);
+                    int saved_errno = errno;
+                    close(dfd);
+                    errno = saved_errno;
+                    set_system_error(ERR_CONFIG_WRITE_FAILED,
+                                     "Could not durably commit config directory: %s",
+                                     dir_path);
+                    return -1;
+                } else {
+                    close(dfd);
                 }
-                close(dfd);
             } else {
-                log_warning("Could not open config directory %s to fsync it",
-                            dir_path);
+                set_system_error(ERR_CONFIG_WRITE_FAILED,
+                                 "Could not open config directory for durable commit: %s",
+                                 dir_path);
+                return -1;
             }
+        } else {
+            set_error(ERR_INVALID_PATH,
+                      "Cannot determine config directory for durable commit: %s",
+                      config_path);
+            return -1;
         }
     }
 
-    log_info("Configuration saved successfully to: %s", config_path);
-    config_update_resume_hint(ctx);
+    if (update_hint && config_update_resume_hint(ctx) != 0) {
+        return -1;
+    }
+    log_info("Configuration document committed to: %s", config_path);
     return 0;
 }
 
@@ -754,7 +1160,10 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx) {
 }
 
 /* Save configuration to TOML file */
-int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
+static int config_save_mode(const gitswitch_ctx_t *ctx,
+                            const char *config_path,
+                            bool update_hint,
+                            bool *config_installed) {
     toml_document_t *toml_doc;
     int result = -1;
 
@@ -803,11 +1212,17 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     }
     log_debug("After saving accounts, TOML doc has %zu sections", toml_doc->section_count);
 
-    result = config_write_document_atomic(ctx, toml_doc, config_path, true);
+    result = config_write_document_atomic(ctx, toml_doc, config_path, true,
+                                          update_hint,
+                                          config_installed);
 
 cleanup:
     config_document_free(toml_doc);
     return result;
+}
+
+int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
+    return config_save_mode(ctx, config_path, true, NULL);
 }
 
 /* Persist only settings.active_account via parse -> edit -> write-back of the
@@ -820,7 +1235,10 @@ cleanup:
  * only the section's is_set is cleared) and unrecognized sections, so nothing
  * the loader couldn't model is lost. Comments are not preserved — same as
  * every existing save path. */
-int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path) {
+static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
+                                           const char *config_path,
+                                           bool update_hint,
+                                           bool *config_installed) {
     toml_document_t *toml_doc;
     int result;
 
@@ -832,7 +1250,8 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
     /* No file yet: nothing to preserve, and the write-back needs a document
      * to edit — the full rebuild is both safe and required to create one. */
     if (!path_exists(config_path)) {
-        return config_save(ctx, config_path);
+        return config_save_mode(ctx, config_path, update_hint,
+                                config_installed);
     }
 
     toml_doc = config_document_alloc();
@@ -869,9 +1288,34 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
     }
 
     /* Settings-only write-back: no backup (AR-06 F51). */
-    result = config_write_document_atomic(ctx, toml_doc, config_path, false);
+    result = config_write_document_atomic(ctx, toml_doc, config_path, false,
+                                          update_hint,
+                                          config_installed);
     config_document_free(toml_doc);
     return result;
+}
+
+int config_save_active_account(const gitswitch_ctx_t *ctx,
+                               const char *config_path) {
+    return config_save_active_account_mode(ctx, config_path, true, NULL);
+}
+
+int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
+                                             const char *config_path,
+                                             bool *config_installed) {
+    if (!config_installed) {
+        set_error(ERR_INVALID_ARGS,
+                  "NULL install-state output for transactional active save");
+        return -1;
+    }
+    *config_installed = false;
+    return config_save_active_account_mode(ctx, config_path, true,
+                                           config_installed);
+}
+
+int config_restore_active_account(const gitswitch_ctx_t *ctx,
+                                  const char *config_path) {
+    return config_save_active_account_mode(ctx, config_path, false, NULL);
 }
 
 /* Create default configuration file */

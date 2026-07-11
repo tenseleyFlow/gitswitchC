@@ -22,6 +22,13 @@ extern const char *default_config_template;
 int config_init(gitswitch_ctx_t *ctx);
 
 /**
+ * Initialize configuration for preview-only inspection. Computes the normal
+ * config path and loads an existing file, but never creates or chmods the
+ * config directory or lock metadata.
+ */
+int config_init_readonly(gitswitch_ctx_t *ctx);
+
+/**
  * Load configuration from TOML file
  * - Parses TOML configuration
  * - Validates all required fields
@@ -68,6 +75,33 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
  * `gitswitch resume` on every interactive shell. Returns 0 on success.
  */
 int config_resume_hint_path(char *buf, size_t size);
+
+/* Exact before-image for the small resume-hint file. A CLI switch captures it
+ * before runtime/Git mutation so a failed active-state commit can restore the
+ * previous bytes (or previous absence) exactly. Snapshot values must be
+ * zero-initialized before their first capture and cleared after final use. */
+typedef struct {
+    bool valid;
+    bool existed;
+    unsigned char *data;
+    size_t length;
+    unsigned int mode;
+} config_resume_hint_snapshot_t;
+
+int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot);
+int config_resume_hint_snapshot_restore(
+    const config_resume_hint_snapshot_t *snapshot);
+void config_resume_hint_snapshot_clear(config_resume_hint_snapshot_t *snapshot);
+
+/* Transaction-aware active-account save. config_installed is true once the
+ * new accounts.toml inode has been renamed into place, even if the subsequent
+ * required hint commit fails. The rollback variant rewrites only the active
+ * setting; callers restore the exact hint snapshot separately. */
+int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
+                                             const char *config_path,
+                                             bool *config_installed);
+int config_restore_active_account(const gitswitch_ctx_t *ctx,
+                                  const char *config_path);
 
 /**
  * Acquire an exclusive cross-process lock for a mutating config cycle without
