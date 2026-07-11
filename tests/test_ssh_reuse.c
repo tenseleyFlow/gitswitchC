@@ -802,6 +802,83 @@ TEST(host_alias_removal_excises_only_named_block) {
     CHECK_EQ_INT(ssh_remove_host_alias("github.com-personal"), 0);
 }
 
+/* AR-06 F29: a ~/.ssh/config larger than the old fixed 64 KiB cap must no
+ * longer fail the whole switch. Seed ~200 KiB of user content, configure a
+ * host alias (heap-sized read/write), and confirm the block installs while all
+ * the user content survives; then remove it and confirm the large content is
+ * still intact. */
+TEST(host_alias_handles_config_larger_than_64k) {
+    char home[128], cfg_path[256];
+    account_t acct;
+    FILE *f;
+    size_t i;
+    const size_t line_count = 8000; /* 8000 * ~26 bytes ≈ 208 KiB */
+    char *content;
+    long sz;
+
+    snprintf(home, sizeof(home), "/tmp/gswsshbig_XXXXXX");
+    CHECK(mkdtemp(home) != NULL);
+    setenv("HOME", home, 1);
+
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh", home);
+    CHECK_EQ_INT(mkdir(cfg_path, 0700), 0);
+    snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh/config", home);
+    f = fopen(cfg_path, "w");
+    CHECK(f != NULL);
+    if (f) {
+        for (i = 0; i < line_count; i++) {
+            fprintf(f, "# padding line %06zu filler\n", i);
+        }
+        fputs("Host sentinel-marker\n    HostName sentinel.example\n", f);
+        CHECK_EQ_INT(fclose(f), 0);
+    }
+
+    memset(&acct, 0, sizeof(acct));
+    acct.ssh_enabled = true;
+    snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), "github.com-big");
+    snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path), "%s/key_big", home);
+
+    /* Pre-fix this returned -1 ("SSH config too large to update safely"). */
+    CHECK_EQ_INT(ssh_configure_host_alias(&acct), 0);
+
+    /* Read the whole thing back and confirm block + user content coexist. */
+    f = fopen(cfg_path, "r");
+    CHECK(f != NULL);
+    if (f) {
+        CHECK_EQ_INT(fseek(f, 0, SEEK_END), 0);
+        sz = ftell(f);
+        CHECK(sz > 200000);                       /* still large */
+        rewind(f);
+        content = malloc((size_t)sz + 1);
+        CHECK(content != NULL);
+        if (content) {
+            size_t n = fread(content, 1, (size_t)sz, f);
+            content[n] = '\0';
+            CHECK(strstr(content, "Host sentinel-marker") != NULL); /* user kept */
+            CHECK(strstr(content, "github.com-big") != NULL);       /* block added */
+            CHECK(strstr(content, "key_big") != NULL);
+            free(content);
+        }
+        fclose(f);
+    }
+
+    /* Removal on a large config also works and preserves user content. */
+    CHECK_EQ_INT(ssh_remove_host_alias("github.com-big"), 0);
+    f = fopen(cfg_path, "r");
+    CHECK(f != NULL);
+    if (f) {
+        int saw_block = 0, saw_user = 0;
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "github.com-big")) saw_block = 1;
+            if (strstr(line, "Host sentinel-marker")) saw_user = 1;
+        }
+        fclose(f);
+        CHECK(saw_block == 0); /* block gone */
+        CHECK(saw_user == 1);  /* user content preserved */
+    }
+}
+
 #if defined(__linux__)
 /* AR-02 test menu (ranks 19/20): a sidecar PID that now belongs to a NON-agent
  * same-uid process — the classic PID-recycle scenario — must never be
@@ -867,6 +944,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(stop_agent_reap_failure_preserves_retry_handle);
     RUN_TEST(host_alias_write_rejects_newline_key_path);
     RUN_TEST(host_alias_removal_excises_only_named_block);
+    RUN_TEST(host_alias_handles_config_larger_than_64k);
 #if defined(__linux__)
     RUN_TEST(reset_never_signals_bystander_pid_in_sidecar);
 #endif

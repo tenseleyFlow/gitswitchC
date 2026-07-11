@@ -230,7 +230,10 @@ static void restore_previous_gpg_isolation(const char *prev_gpg_home,
  * check-then-rename restoration path entirely. The final writer repeats these
  * no-follow and identity checks immediately before its atomic rename. */
 static int ssh_user_config_preflight(const account_t *account) {
-    enum { SSH_CONFIG_MAX_BYTES = 65535 };
+    /* AR-06 F29: the writer now heap-sizes the config, so the preflight ceiling
+     * is the same generous shared limit rather than the old 64 KiB cap that
+     * failed the whole switch for any larger-but-valid config. */
+    const size_t SSH_CONFIG_MAX_BYTES = GITSWITCH_SSH_CONFIG_MAX_BYTES;
     char path[MAX_PATH_LEN];
     char chunk[4096];
     struct stat before;
