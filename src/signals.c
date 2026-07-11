@@ -12,6 +12,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#include <errno.h>
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
@@ -85,12 +86,19 @@ static void scratch_unlink_all(void) {
 }
 
 static void guard_handler(int sig) {
+    /* AR-06 F67: a signal handler runs asynchronously in the middle of mainline
+     * code; the kill()/unlink() calls below clobber errno, so save and restore
+     * it around the whole handler or the interrupted mainline sees a corrupted
+     * errno (e.g. a checked syscall's ESRCH/EINTR turned into something else). */
+    int saved_errno = errno;
+
     if (g_pending_signal == 0) {
         /* First signal: record it and return. The mainline notices via
          * signals_pending() between durable steps and rolls back in normal
          * context — running git/teardown from here would not be
          * async-signal-safe. */
         g_pending_signal = sig;
+        errno = saved_errno;
         return;
     }
 
@@ -126,6 +134,7 @@ static void guard_handler(int sig) {
                 (void)kill(child, sig);
             }
         }
+        errno = saved_errno;
         return;
     }
 
