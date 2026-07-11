@@ -727,7 +727,13 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     }
     /* One global order for every participant prevents ABBA deadlocks.  Parent
      * is the namespace anchor: a replacement leaf beneath that same parent
-     * cannot enter until the old leaf's holder releases this lock. */
+     * cannot enter until the old leaf's holder releases this lock.  It MUST be
+     * exclusive (AR-06 F31 considered SHARED to decouple the sibling chains
+     * rooted at XDG_RUNTIME_DIR, but that breaks the leaf-replacement
+     * guarantee: after a leaf dir is renamed away and recreated the new leaf is
+     * a distinct inode, so the leaf/file locks below no longer serialize the old
+     * holder against a new locker — only this exclusive parent lock does, as
+     * config_lock_survives_post_acquisition_namespace_replacement proves). */
     if (private_lock_inode_acquire(parent_fd, nonblocking, &parent_slot) != 0) {
         close(leaf_fd);
         return -1;
