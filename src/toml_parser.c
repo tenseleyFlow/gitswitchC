@@ -516,6 +516,58 @@ int toml_get_boolean(const toml_document_t *doc, const char *section,
     return 0;
 }
 
+static bool ascii_alphanumeric(unsigned char c) {
+    return (c >= (unsigned char)'A' && c <= (unsigned char)'Z') ||
+           (c >= (unsigned char)'a' && c <= (unsigned char)'z') ||
+           (c >= (unsigned char)'0' && c <= (unsigned char)'9');
+}
+
+/* `ssh_host` is the owned OpenSSH Host pattern. Keep its historical wildcard
+ * support, but make the grammar locale-independent and single-token. */
+bool toml_validate_ssh_host_alias(const char *alias) {
+    size_t len;
+
+    if (!alias) {
+        return false;
+    }
+    len = strlen(alias);
+    if (len == 0 || len >= MAX_NAME_LEN) {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)alias; *p; p++) {
+        if (!(ascii_alphanumeric(*p) || *p == (unsigned char)'.' ||
+              *p == (unsigned char)'-' || *p == (unsigned char)'_' ||
+              *p == (unsigned char)'*' || *p == (unsigned char)'?')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* `ssh_hostname` is emitted as a literal HostName destination. In particular,
+ * it is not an OpenSSH pattern and cannot carry '%' token expansion. This
+ * conservative ASCII grammar covers DNS names and unbracketed IPv4/IPv6
+ * literals without admitting whitespace, quoting, escapes, or wildcards. */
+bool toml_validate_ssh_hostname(const char *hostname) {
+    size_t len;
+
+    if (!hostname) {
+        return false;
+    }
+    len = strlen(hostname);
+    if (len == 0 || len >= MAX_NAME_LEN) {
+        return false;
+    }
+    for (const unsigned char *p = (const unsigned char *)hostname; *p; p++) {
+        if (!(ascii_alphanumeric(*p) || *p == (unsigned char)'.' ||
+              *p == (unsigned char)'-' || *p == (unsigned char)'_' ||
+              *p == (unsigned char)':')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Validate TOML document structure for gitswitch schema.
  *
  * Failure granularity matters here (AR-03 M5): this runs inside
@@ -653,6 +705,33 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                                       kv->value);
                             return -1;
                         }
+                    }
+                }
+
+                if (strcmp(kv->key, "ssh_host") == 0) {
+                    if (kv->type != TOML_TYPE_STRING) {
+                        set_error(ERR_CONFIG_INVALID, "ssh_host must be a string");
+                        return -1;
+                    }
+                    if (!toml_validate_ssh_host_alias(kv->value)) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "ssh_host must contain only ASCII letters, digits, "
+                                  "'.', '-', '_', '*', or '?'");
+                        return -1;
+                    }
+                }
+
+                if (strcmp(kv->key, "ssh_hostname") == 0) {
+                    if (kv->type != TOML_TYPE_STRING) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "ssh_hostname must be a string");
+                        return -1;
+                    }
+                    if (!toml_validate_ssh_hostname(kv->value)) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "ssh_hostname must contain only ASCII letters, "
+                                  "digits, '.', '-', '_', or ':'");
+                        return -1;
                     }
                 }
                 

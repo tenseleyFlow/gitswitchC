@@ -9,6 +9,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "config.h"
+#include "toml_parser.h"
 #include "signals.h"
 #include "error.h"
 #include <string.h>
@@ -87,6 +88,18 @@ static void fill_account(account_t *a, uint32_t id, const char *name,
     strncpy(a->email, email, sizeof(a->email) - 1);
     strncpy(a->description, desc, sizeof(a->description) - 1);
     a->preferred_scope = GIT_SCOPE_LOCAL;
+}
+
+static size_t count_occurrences(const char *haystack, const char *needle) {
+    size_t count = 0;
+    size_t needle_len = strlen(needle);
+
+    if (needle_len == 0) return 0;
+    while ((haystack = strstr(haystack, needle)) != NULL) {
+        count++;
+        haystack += needle_len;
+    }
+    return count;
 }
 
 /* ---- cfg-symlink-01/02: read path ---- */
@@ -495,6 +508,213 @@ TEST(save_and_reload_regular_path_roundtrip) {
                           sizeof(ctx.accounts[1].gpg_key_id), "%s",
                           overlong), 65);
     CHECK_EQ_INT(config_save(&ctx, path), -1);
+}
+
+/* ---- AR-07 M13 prerequisite: alias and canonical host are distinct ------ */
+
+TEST(ssh_hostname_load_save_and_shared_destination_roundtrip) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char path[640], key[256], cfg[4096], after[4096];
+    gitswitch_ctx_t ctx, reloaded;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
+    snprintf(key, sizeof(key), "%s/id_test", home);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(key, "test-private-key\n", 17), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"work\"\n"
+                   "email = \"work@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-work\"\n"
+                   "ssh_hostname = \"github.com\"\n"
+                   "[accounts.2]\n"
+                   "name = \"personal\"\n"
+                   "email = \"me@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-personal\"\n"
+                   "ssh_hostname = \"github.com\"\n",
+                   key, key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 2);
+    CHECK_EQ_INT(ctx.unknown_keys_on_load, 0);
+    if (ctx.account_count == 2) {
+        CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "github-work");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "github.com");
+        CHECK_STR_EQ(ctx.accounts[1].ssh_host_alias, "github-personal");
+        CHECK_STR_EQ(ctx.accounts[1].ssh_hostname, "github.com");
+    }
+
+    /* Canonical hostnames are destinations, not owned namespaces: sharing
+     * github.com is valid even though the managed aliases remain distinct. */
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    CHECK_EQ_INT(count_occurrences(after,
+                                   "ssh_hostname = \"github.com\""), 2);
+
+    memset(&reloaded, 0, sizeof(reloaded));
+    CHECK_EQ_INT(config_load(&reloaded, path), 0);
+    CHECK_EQ_INT(reloaded.account_count, 2);
+    if (reloaded.account_count == 2) {
+        CHECK_STR_EQ(reloaded.accounts[0].ssh_hostname, "github.com");
+        CHECK_STR_EQ(reloaded.accounts[1].ssh_hostname, "github.com");
+    }
+    restore_home_env(saved_home);
+}
+
+TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char path[640], key[256], cfg[2048], after[4096];
+    gitswitch_ctx_t ctx;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
+    snprintf(key, sizeof(key), "%s/id_test", home);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(key, "test-private-key\n", 17), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"legacy\"\n"
+                   "email = \"legacy@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"git.example.test\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) {
+        CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "git.example.test");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "git.example.test");
+    }
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    CHECK_EQ_INT(count_occurrences(
+                     after, "ssh_hostname = \"git.example.test\""), 1);
+    restore_home_env(saved_home);
+}
+
+TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
+    char dir[128], path[256], key[256], cfg[2048];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_test", dir);
+    CHECK_EQ_INT(write_config(key, "test-private-key\n", 17), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"legacy-pattern\"\n"
+                   "email = \"legacy@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-*\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+
+    /* The pattern itself remains legal when an unambiguous destination is
+     * supplied; only using a wildcard as the HostName fallback is rejected. */
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"explicit-pattern\"\n"
+                   "email = \"explicit@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-*\"\n"
+                   "ssh_hostname = \"github.com\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) {
+        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "github.com");
+    }
+}
+
+TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
+    static const char *const invalid[] = {
+        "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
+        "*.example.com", "host?", "h\xC3\xB6st.example", NULL
+    };
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+    account_t account;
+
+    CHECK(strstr(default_config_template,
+                 "#ssh_host = \"github.com-work\"") != NULL);
+    CHECK(strstr(default_config_template,
+                 "#ssh_hostname = \"github.com\"") != NULL);
+    CHECK(toml_validate_ssh_hostname("git.example.test:2222"));
+    CHECK(toml_validate_ssh_hostname("2001:db8::1"));
+    CHECK(!toml_validate_ssh_hostname(""));
+    CHECK(toml_validate_ssh_host_alias("github-*"));
+    for (size_t i = 0; invalid[i]; i++) {
+        CHECK(!toml_validate_ssh_hostname(invalid[i]));
+        memset(&ctx, 0, sizeof(ctx));
+        fill_account(&account, 1, "bad-host", "bad@example.com", "d");
+        strncpy(account.ssh_hostname, invalid[i],
+                sizeof(account.ssh_hostname) - 1);
+        CHECK_EQ_INT(config_add_account(&ctx, &account), -1);
+        CHECK_EQ_INT(ctx.account_count, 0);
+    }
+
+    /* Canonical destinations are deliberately not unique account resources. */
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&account, 1, "one", "one@example.com", "d");
+    strncpy(account.ssh_hostname, "github.com",
+            sizeof(account.ssh_hostname) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+    fill_account(&account, 2, "two", "two@example.com", "d");
+    strncpy(account.ssh_hostname, "github.com",
+            sizeof(account.ssh_hostname) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+    CHECK_EQ_INT(ctx.account_count, 2);
+
+    /* The parser's modeled schema must reject the wrong TOML type rather
+     * than let retrieval treat a present key as absent. */
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    {
+        const char *wrong_type =
+            "[settings]\n"
+            "default_scope = \"local\"\n"
+            "[accounts.1]\n"
+            "name = \"typed\"\n"
+            "email = \"typed@example.com\"\n"
+            "ssh_hostname = true\n";
+        CHECK_EQ_INT(write_config(path, wrong_type, strlen(wrong_type)), 0);
+        memset(&ctx, 0, sizeof(ctx));
+        CHECK_EQ_INT(config_load(&ctx, path), -1);
+    }
 }
 
 /* ---- int-id-02: identifier lookup must not wrap ---- */
@@ -1289,6 +1509,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(save_refuses_symlinked_config_path);
     RUN_TEST(backup_refuses_symlinked_source);
     RUN_TEST(save_and_reload_regular_path_roundtrip);
+    RUN_TEST(ssh_hostname_load_save_and_shared_destination_roundtrip);
+    RUN_TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized);
+    RUN_TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname);
+    RUN_TEST(ssh_hostname_schema_and_api_reject_unsafe_values);
     RUN_TEST(find_account_rejects_out_of_range_and_noncanonical_ids);
     RUN_TEST(load_skips_leading_zero_id_section);
     RUN_TEST(load_counts_unknown_keys_in_recognized_sections);

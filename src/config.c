@@ -75,7 +75,9 @@ const char *default_config_template =
 "#ssh_key = \"~/.ssh/id_rsa_work\"\n"
 "#gpg_key = \"ABCDEF1234567890\"\n"
 "#gpg_signing_enabled = true\n"
+"# ssh_host is the alias used in Git remotes; ssh_hostname is its real destination\n"
 "#ssh_host = \"github.com-work\"\n"
+"#ssh_hostname = \"github.com\"\n"
 "\n"
 "# Security Notes:\n"
 "# - SSH keys should have 600 permissions\n"
@@ -2274,7 +2276,8 @@ static bool config_key_is_modeled(const char *section, const char *key) {
     /* An [accounts.<id>] section. */
     static const char *const account_keys[] = {
         "name", "email", "description", "preferred_scope",
-        "ssh_key", "ssh_host", "gpg_key", "gpg_signing_enabled", NULL
+        "ssh_key", "ssh_host", "ssh_hostname", "gpg_key",
+        "gpg_signing_enabled", NULL
     };
     for (size_t i = 0; account_keys[i]; i++) {
         if (strcmp(key, account_keys[i]) == 0) {
@@ -2452,14 +2455,66 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                     safe_strncpy(account.ssh_key_path, expanded_path, sizeof(account.ssh_key_path));
                 }
 
-                /* Optional SSH host alias */
-                fs = get_account_field(doc, sections[i], "ssh_host",
-                                       account.ssh_host_alias, sizeof(account.ssh_host_alias));
-                if (fs == FIELD_UNLOADABLE) {
+                /* `ssh_host` remains the managed OpenSSH Host alias. The
+                 * canonical destination is modeled separately so the writer
+                 * can emit HostName instead of trying to resolve the alias
+                 * literally (AR-07 M13). */
+                field_state_t alias_state = get_account_field(
+                    doc, sections[i], "ssh_host", account.ssh_host_alias,
+                    sizeof(account.ssh_host_alias));
+                if (alias_state == FIELD_UNLOADABLE) {
                     ctx->accounts_skipped_on_load++;
                     display_warning("Account '%s' (id %u) was skipped: %s",
                                     account.name, account_id, get_last_error()->message);
                     continue;
+                }
+
+                field_state_t hostname_state = get_account_field(
+                    doc, sections[i], "ssh_hostname", account.ssh_hostname,
+                    sizeof(account.ssh_hostname));
+                if (hostname_state == FIELD_UNLOADABLE) {
+                    ctx->accounts_skipped_on_load++;
+                    display_warning("Account '%s' (id %u) was skipped: %s",
+                                    account.name, account_id,
+                                    get_last_error()->message);
+                    continue;
+                }
+
+                /* Backward compatibility for files written before M13:
+                 * an ordinary literal alias was also the only available
+                 * destination, so preserve it byte-for-byte as HostName and
+                 * surface the migration. A wildcard Host pattern does not
+                 * name one destination and must never be copied into the
+                 * literal HostName slot. Skip it and engage the existing
+                 * no-rewrite guard until the user adds ssh_hostname. */
+                if (hostname_state == FIELD_ABSENT &&
+                    alias_state == FIELD_LOADED &&
+                    account.ssh_host_alias[0] != '\0') {
+                    if (!toml_validate_ssh_hostname(account.ssh_host_alias)) {
+                        ctx->accounts_skipped_on_load++;
+                        display_warning(
+                            "Account '%s' (id %u) was skipped: legacy ssh_host "
+                            "'%s' is a Host pattern, not one canonical destination; "
+                            "add ssh_hostname to this account.",
+                            account.name, account_id,
+                            account.ssh_host_alias);
+                        continue;
+                    }
+                    if (safe_strncpy(account.ssh_hostname,
+                                     account.ssh_host_alias,
+                                     sizeof(account.ssh_hostname)) != 0) {
+                        ctx->accounts_skipped_on_load++;
+                        display_warning(
+                            "Account '%s' (id %u) was skipped: legacy ssh_host "
+                            "is too long to preserve as ssh_hostname.",
+                            account.name, account_id);
+                        continue;
+                    }
+                    display_warning(
+                        "Account '%s' (id %u) uses legacy ssh_host without "
+                        "ssh_hostname; treating '%s' as the canonical "
+                        "destination. Save the account to persist the new key.",
+                        account.name, account_id, account.ssh_hostname);
                 }
             }
 
@@ -2690,7 +2745,35 @@ static int validate_account_security(const account_t *account) {
 
     if (validate_field_roundtrips("name", account->name) != 0 ||
         validate_field_roundtrips("description", account->description) != 0 ||
-        validate_field_roundtrips("SSH host alias", account->ssh_host_alias) != 0) {
+        validate_field_roundtrips("SSH host alias", account->ssh_host_alias) != 0 ||
+        validate_field_roundtrips("SSH canonical hostname",
+                                  account->ssh_hostname) != 0) {
+        return -1;
+    }
+
+    if (account->ssh_host_alias[0] != '\0' &&
+        !toml_validate_ssh_host_alias(account->ssh_host_alias)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Invalid SSH host alias (ASCII letters, digits, '.', '-', "
+                  "'_', '*', and '?' only): %s",
+                  account->ssh_host_alias);
+        return -1;
+    }
+    if (account->ssh_hostname[0] != '\0' &&
+        !toml_validate_ssh_hostname(account->ssh_hostname)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Invalid SSH canonical hostname (ASCII letters, digits, "
+                  "'.', '-', '_', and ':' only): %s",
+                  account->ssh_hostname);
+        return -1;
+    }
+    if (account->ssh_host_alias[0] != '\0' &&
+        account->ssh_hostname[0] == '\0' &&
+        !toml_validate_ssh_hostname(account->ssh_host_alias)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Wildcard SSH host alias '%s' requires an explicit "
+                  "ssh_hostname canonical destination",
+                  account->ssh_host_alias);
         return -1;
     }
 
@@ -2791,6 +2874,7 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
     /* Save each account */
     for (size_t i = 0; i < ctx->account_count; i++) {
         const account_t *account = &ctx->accounts[i];
+        const char *ssh_hostname = account->ssh_hostname;
         
         log_debug("Saving account %zu: ID=%u, name='%s', email='%s'", 
                   i, account->id, account->name, account->email);
@@ -2822,12 +2906,57 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         toml_set_string(doc, section_name, "preferred_scope", 
                        config_scope_to_string(account->preferred_scope));
         
+        /* Save SSH configuration. Alias-only in-memory callers are treated
+         * like legacy files when the alias is one literal destination; the
+         * save canonicalizes them by emitting ssh_hostname. Wildcard aliases
+         * cannot be inferred and fail before writing a misleading HostName. */
+        if (account->ssh_host_alias[0] != '\0' &&
+            !toml_validate_ssh_host_alias(account->ssh_host_alias)) {
+            set_error(ERR_ACCOUNT_INVALID, "Invalid SSH host alias: %s",
+                      account->ssh_host_alias);
+            return -1;
+        }
+        if (ssh_hostname[0] == '\0' &&
+            account->ssh_host_alias[0] != '\0') {
+            if (!toml_validate_ssh_hostname(account->ssh_host_alias)) {
+                set_error(ERR_ACCOUNT_INVALID,
+                          "Wildcard SSH host alias '%s' requires an explicit "
+                          "ssh_hostname canonical destination",
+                          account->ssh_host_alias);
+                return -1;
+            }
+            ssh_hostname = account->ssh_host_alias;
+        }
+        if (ssh_hostname[0] != '\0' &&
+            !toml_validate_ssh_hostname(ssh_hostname)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Invalid SSH canonical hostname: %s", ssh_hostname);
+            return -1;
+        }
+
         /* Save SSH configuration */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
-            toml_set_string(doc, section_name, "ssh_key", account->ssh_key_path);
+            if (toml_set_string(doc, section_name, "ssh_key",
+                                account->ssh_key_path) != 0) {
+                set_error(ERR_CONFIG_INVALID, "Failed to save SSH key path");
+                return -1;
+            }
             
             if (strlen(account->ssh_host_alias) > 0) {
-                toml_set_string(doc, section_name, "ssh_host", account->ssh_host_alias);
+                if (toml_set_string(doc, section_name, "ssh_host",
+                                    account->ssh_host_alias) != 0) {
+                    set_error(ERR_CONFIG_INVALID,
+                              "Failed to save SSH host alias");
+                    return -1;
+                }
+            }
+            if (ssh_hostname[0] != '\0') {
+                if (toml_set_string(doc, section_name, "ssh_hostname",
+                                    ssh_hostname) != 0) {
+                    set_error(ERR_CONFIG_INVALID,
+                              "Failed to save SSH canonical hostname");
+                    return -1;
+                }
             }
         }
         

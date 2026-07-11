@@ -150,6 +150,14 @@ int toml_write_file(const toml_document_t *doc, const char *file_path);
  */
 int toml_validate_gitswitch_schema(toml_document_t *doc);
 
+/**
+ * Validate the two distinct SSH host fields used by the config schema.
+ * `ssh_host` is a managed OpenSSH Host pattern and may contain '*'/'?'.
+ * `ssh_hostname` is a literal canonical destination and never may.
+ */
+bool toml_validate_ssh_host_alias(const char *alias);
+bool toml_validate_ssh_hostname(const char *hostname);
+
 
 /**
  * Get list of all sections in document

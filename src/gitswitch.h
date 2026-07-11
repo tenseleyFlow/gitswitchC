@@ -74,7 +74,8 @@ typedef struct {
     /* SSH configuration */
     bool ssh_enabled;
     char ssh_key_path[MAX_PATH_LEN];
-    char ssh_host_alias[MAX_NAME_LEN];
+    char ssh_host_alias[MAX_NAME_LEN]; /* Managed `Host` alias (`ssh_host`). */
+    char ssh_hostname[MAX_NAME_LEN];   /* Canonical destination (`ssh_hostname`). */
     
     /* GPG configuration */
     bool gpg_enabled;
