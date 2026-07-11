@@ -505,7 +505,7 @@ DIST_ARCHIVE = $(DIST_ROOT).tar.gz
 # state, build products, cores, logs, and previously generated archives.
 DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
-.PHONY: dist distcheck qa-contract-test rpm
+.PHONY: dist distcheck qa-contract-test sig-repro-test rpm
 # Archive COMMITTED VCS content, not the live working tree: the old cp -R of
 # the manifest directories shipped any stray file nested inside src/, tests/,
 # or completions/ (editor backups, experiment files, test-run droppings), so
@@ -527,6 +527,18 @@ distcheck: dist
 
 qa-contract-test:
 	@sh tests/test_qa.sh "$(CURDIR)" "$(MAKE_COMMAND)"
+
+# AR-06 F32: the SIG-01/SIG-02/F4 end-to-end signal-interruption repro was
+# tracked but executed by nothing (not `make test`, not CI). Wire it in against
+# the freshly built binary. It requires a real ssh-agent; skip gracefully where
+# one is unavailable so local dev on a minimal box is not blocked (CI provides
+# ssh-agent and therefore runs it for real).
+sig-repro-test: $(BINDIR)/$(TARGET)
+	@if command -v ssh-agent >/dev/null 2>&1; then \
+		sh tests/repro_sig01.sh; \
+	else \
+		echo "SKIP sig-repro-test: ssh-agent not available on this host"; \
+	fi
 
 rpm: dist
 	@echo "Building RPM package..."
