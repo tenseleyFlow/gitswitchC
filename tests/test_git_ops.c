@@ -141,7 +141,7 @@ TEST(git_configure_ssh_rejects_single_quote_in_keypath) {
     command_runner_fn prev;
 
     snprintf(dir, sizeof(dir), "/tmp/gsw_gitops_XXXXXX");
-    CHECK(mkdtemp(dir) != NULL);
+    CHECK(ts_mkdtemp(dir) != NULL);
     snprintf(quote_path, sizeof(quote_path), "%s/k'ey", dir);
     snprintf(dquote_path, sizeof(dquote_path), "%s/k\"ey", dir);
     /* A single FILE NAME (no '/' after the newline, so it is creatable) that
@@ -633,8 +633,71 @@ TEST(git_test_config_skips_gpg_probe_when_key_seen) {
     run_set_runner(prev);
 }
 
+/* ---- AR-06 F58: per-key snapshot preserves surrounding whitespace -------- */
+static char f58_set_key[16][64], f58_set_val[16][1024];
+static int f58_sets;
+
+static int f58_runner(const char *const argv[], const run_opts_t *opts,
+                      run_result_t *result) {
+    if (result) { memset(result, 0, sizeof(*result)); result->spawned = true; }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (strcmp(argv[0], "git") != 0 || !argv[1]) return fk_ret(result, 1);
+    if (strcmp(argv[1], "rev-parse") == 0) return fk_ret(result, 1); /* not a repo */
+    if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
+        if (strcmp(argv[3], "--list") == 0) return fk_ret(result, 1); /* force per-key */
+        if ((strcmp(argv[3], "--unset-all") == 0 || strcmp(argv[3], "--unset") == 0) && argv[4])
+            return fk_ret(result, 0);
+        if (argv[4]) { /* set (restore write) */
+            if (f58_sets < 16) {
+                snprintf(f58_set_key[f58_sets], sizeof(f58_set_key[0]), "%s", argv[3]);
+                snprintf(f58_set_val[f58_sets], sizeof(f58_set_val[0]), "%s", argv[4]);
+            }
+            f58_sets++;
+            return fk_ret(result, 0);
+        }
+        /* per-key read: user.name carries leading+trailing spaces; git appends
+         * exactly one trailing newline. */
+        if (opts && opts->out && opts->out_size > 0) {
+            const char *v = NULL;
+            if (strcmp(argv[3], "user.name") == 0) v = "  spaced  name  ";
+            else if (strcmp(argv[3], "user.email") == 0) v = "e@x.com";
+            if (v) {
+                snprintf(opts->out, opts->out_size, "%s\n", v);
+                if (result) result->out_len = strlen(opts->out);
+                return fk_ret(result, 0);
+            }
+        }
+        return fk_ret(result, 1); /* other keys absent */
+    }
+    return fk_ret(result, 1);
+}
+
+static int f58_find_set(const char *key) {
+    for (int i = 0; i < f58_sets && i < 16; i++)
+        if (strcmp(f58_set_key[i], key) == 0) return i;
+    return -1;
+}
+
+TEST(per_key_snapshot_preserves_surrounding_whitespace) {
+    git_ops_test_reset_caches();
+    f58_sets = 0;
+    command_runner_fn prev = run_set_runner(f58_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+
+    run_set_runner(prev);
+
+    /* Restored byte-for-byte: pre-fix trim_whitespace() ate the surrounding
+     * spaces and rollback wrote back "spaced  name". */
+    int in = f58_find_set("user.name");
+    CHECK(in >= 0);
+    if (in >= 0) CHECK_STR_EQ(f58_set_val[in], "  spaced  name  ");
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
+    RUN_TEST(per_key_snapshot_preserves_surrounding_whitespace);
     RUN_TEST(git_configure_ssh_rejects_single_quote_in_keypath);
     RUN_TEST(git_ops_init_spawns_no_subprocess);
     RUN_TEST(git_is_repository_caches_result);

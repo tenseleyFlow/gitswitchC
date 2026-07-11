@@ -84,7 +84,7 @@ static int resolve_binary(void) {
 
 static const char *make_temp_dir(char *buf, size_t size) {
     snprintf(buf, size, "/tmp/gswar5-XXXXXX");
-    if (!mkdtemp(buf)) {
+    if (!ts_mkdtemp(buf)) {
         return NULL;
     }
     return buf;

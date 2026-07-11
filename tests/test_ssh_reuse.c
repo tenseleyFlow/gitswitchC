@@ -183,7 +183,7 @@ static int setup_agent_socket(const char *account, char *sock_out, size_t size) 
     int fd;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
-    if (!mkdtemp(g_xdg)) return -1;
+    if (!ts_mkdtemp(g_xdg)) return -1;
     if (chmod(g_xdg, 0700) != 0) return -1;
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
 
@@ -363,7 +363,7 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     /* Runtime dir only — deliberately NO pre-existing per-account socket, so
      * the reuse fast path is skipped and a fresh agent is "started". */
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
-    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
     CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
     snprintf(sock, sizeof(sock), "%s/gitswitch-ssh/ssh-agent.work.sock", g_xdg);
@@ -398,7 +398,7 @@ TEST(fresh_commit_revalidates_public_agent_directory) {
     ssh_namespace_commit_hook_fn prev_hook;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
-    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
     CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
     snprintf(public_dir, sizeof(public_dir), "%s/gitswitch-ssh", g_xdg);
@@ -505,7 +505,7 @@ TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
     command_runner_fn prev;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
-    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
     CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
     snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg);
@@ -585,7 +585,7 @@ TEST(fresh_start_aborts_and_cleans_on_namespace_replacement) {
     command_runner_fn prev;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
-    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
     CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
     snprintf(public_dir, sizeof(public_dir), "%s/gitswitch-ssh", g_xdg);
@@ -631,7 +631,7 @@ TEST(pid_sidecar_rejects_temp_path_inode_swap) {
     ssh_pid_commit_hook_fn prev_hook;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
-    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
     CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
     snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg);
@@ -703,7 +703,7 @@ TEST(host_alias_write_rejects_newline_key_path) {
     size_t n;
 
     snprintf(home, sizeof(home), "/tmp/gswsshalias_XXXXXX");
-    CHECK(mkdtemp(home) != NULL);
+    CHECK(ts_mkdtemp(home) != NULL);
     setenv("HOME", home, 1);
 
     memset(&acct, 0, sizeof(acct));
@@ -751,7 +751,7 @@ TEST(host_alias_removal_excises_only_named_block) {
     size_t n;
 
     snprintf(home, sizeof(home), "/tmp/gswsshrm_XXXXXX");
-    CHECK(mkdtemp(home) != NULL);
+    CHECK(ts_mkdtemp(home) != NULL);
     setenv("HOME", home, 1);
 
     /* Seed a user-authored stanza first so we can prove it survives. */
@@ -817,7 +817,7 @@ TEST(host_alias_handles_config_larger_than_64k) {
     long sz;
 
     snprintf(home, sizeof(home), "/tmp/gswsshbig_XXXXXX");
-    CHECK(mkdtemp(home) != NULL);
+    CHECK(ts_mkdtemp(home) != NULL);
     setenv("HOME", home, 1);
 
     snprintf(cfg_path, sizeof(cfg_path), "%s/.ssh", home);
@@ -893,7 +893,7 @@ TEST(reset_never_signals_bystander_pid_in_sidecar) {
     int status = 0;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswsraXXXXXX");
-    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
     CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
     snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg);

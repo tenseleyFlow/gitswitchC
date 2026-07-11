@@ -34,7 +34,7 @@ static const char *valid_config =
 /* Create a fresh 0700 scratch directory for one test. */
 static int make_scratch_dir(char *dir, size_t size) {
     snprintf(dir, size, "/tmp/gswcfgtest.XXXXXX");
-    return mkdtemp(dir) ? 0 : -1;
+    return ts_mkdtemp(dir) ? 0 : -1;
 }
 
 /* Write content to path with the 0600 mode the loader requires. */
@@ -1211,9 +1211,34 @@ TEST(back_to_back_backups_in_same_second_both_persist) {
     CHECK_EQ_INT(backups, 2); /* both backups survive */
 }
 
+/* AR-06 F50: destructive resolution (remove/reset) accepts only an exact
+ * id/name/email, never a substring or description match. */
+TEST(destructive_resolution_refuses_substring) {
+    gitswitch_ctx_t ctx;
+    account_t a;
+    memset(&ctx, 0, sizeof(ctx));
+
+    fill_account(&a, 1, "work-old", "old@example.com", "primary");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), 0);
+    fill_account(&a, 2, "personal", "me@example.com", "the work laptop");
+    CHECK_EQ_INT(config_add_account(&ctx, &a), 0);
+
+    /* Even an UNAMBIGUOUS substring is refused for destructive ops... */
+    CHECK(config_find_account_destructive(&ctx, "person") == NULL); /* in "personal" */
+    CHECK(config_find_account_destructive(&ctx, "laptop") == NULL); /* in a description */
+    /* ...while the fuzzy resolver still accepts the unambiguous substring. */
+    CHECK(config_find_account(&ctx, "person") != NULL);
+
+    /* Exact id / name / email still resolve for destructive ops. */
+    CHECK(config_find_account_destructive(&ctx, "1") != NULL);
+    CHECK(config_find_account_destructive(&ctx, "work-old") != NULL);
+    CHECK(config_find_account_destructive(&ctx, "me@example.com") != NULL);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(back_to_back_backups_in_same_second_both_persist);
+    RUN_TEST(destructive_resolution_refuses_substring);
     RUN_TEST(load_accepts_regular_file);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);

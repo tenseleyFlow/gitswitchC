@@ -631,6 +631,13 @@ static int lock_gpg_dir(int base_fd) {
     return lock_private_file_at(base_fd, ".lock");
 }
 
+/* Non-blocking variant: -1 with errno==EWOULDBLOCK when another holder (a
+ * concurrent switch) has the base lock. Used by the login-shell resume liveness
+ * check so it never hangs the shell (AR-06 F60). */
+static int try_lock_gpg_dir(int base_fd) {
+    return try_lock_private_file_at(base_fd, ".lock");
+}
+
 static void unlock_gpg_dir(int base_fd, int lock_fd) {
     if (lock_fd >= 0) unlock_private_file(lock_fd);
     if (base_fd >= 0) close(base_fd);
@@ -654,8 +661,11 @@ static int gpg_current_path_from_base(const char *base, char *buf, size_t size) 
 /* Validate an existing base before taking its lock, then verify that the path
  * still names the same private directory after the lock is held. Return 1 for
  * an absent base, 0 with a held lock, and -1 for every unsafe/unknown state. */
+/* Returns 1 for an absent base, 0 with a held lock, -1 for an unsafe/unknown
+ * state, and (when nonblocking) 2 when the base lock is currently held by
+ * another holder — the caller decides what "busy" means (AR-06 F60). */
 static int gpg_lock_private_base(const char *base, int *base_fd_out,
-                                 int *lock_out) {
+                                 int *lock_out, bool nonblocking) {
     char opened_base[MAX_PATH_LEN];
     bool absent = false;
     int base_fd;
@@ -677,8 +687,16 @@ static int gpg_lock_private_base(const char *base, int *base_fd_out,
         set_error(ERR_INVALID_PATH, "GPG base path changed unexpectedly");
         return -1;
     }
-    lock_fd = lock_gpg_dir(base_fd);
+    lock_fd = nonblocking ? try_lock_gpg_dir(base_fd) : lock_gpg_dir(base_fd);
     if (lock_fd < 0) {
+        if (nonblocking && (errno == EWOULDBLOCK
+#if defined(EAGAIN) && EAGAIN != EWOULDBLOCK
+                            || errno == EAGAIN
+#endif
+                            )) {
+            close(base_fd);
+            return 2; /* busy: another holder (a switch) has the lock */
+        }
         close(base_fd);
         set_system_error(ERR_FILE_IO, "Failed to lock GPG base directory: %s", base);
         return -1;
@@ -1013,7 +1031,7 @@ int gpg_manager_retarget_current(const char *real_home) {
         return -1;
     }
 
-    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd);
+    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd, false);
     if (base_rc != 0) {
         if (base_rc > 0) {
             set_error(ERR_INVALID_PATH, "GPG base directory is missing: %s", base);
@@ -1042,7 +1060,7 @@ int gpg_manager_drop_current(void) {
         return -1;
     }
 
-    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd);
+    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd, false);
     if (base_rc != 0) {
         return base_rc > 0 ? 0 : -1;
     }
@@ -1083,7 +1101,7 @@ int gpg_manager_snapshot_current(char *target, size_t size, bool *present) {
     if (gpg_get_base_dir(base, sizeof(base)) != 0) {
         return -1;
     }
-    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd);
+    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd, false);
     if (base_rc != 0) {
         return base_rc > 0 ? 0 : -1;
     }
@@ -1137,8 +1155,17 @@ int gpg_manager_current_is_live_for_account(const char *account, bool *live) {
         safe_snprintf(expected, sizeof(expected), "%s/%s", base, account) != 0) {
         return -1;
     }
-    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd);
+    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd, true);
     if (base_rc != 0) {
+        /* AR-06 F60: a nonblocking lock keeps this login-shell liveness check
+         * from hanging behind a concurrent switch. base_rc==2 (busy) means a
+         * switch is actively establishing GPG state, so report the account live
+         * and let resume defer to that switch rather than blocking here (and
+         * then blocking again inside a redundant re-activation). base_rc==1 (no
+         * base yet) leaves *live=false so resume runs. */
+        if (base_rc == 2) {
+            *live = true;
+        }
         return base_rc > 0 ? 0 : -1;
     }
     current_rc = gpg_read_current_locked(base_fd, base, target, sizeof(target));
@@ -1198,7 +1225,7 @@ int gpg_manager_restore_current_if(const char *expected_target,
         return -1;
     }
 
-    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd);
+    base_rc = gpg_lock_private_base(base, &base_fd, &lock_fd, false);
     if (base_rc > 0) {
         if (!expect_present && !restore_present) {
             *changed = true;
@@ -1849,58 +1876,8 @@ out:
     return rc;
 }
 
-/* Import GPG key from file or keyserver */
-int gpg_import_key(gpg_config_t *gpg_config, const char *key_source) {
-    char output[1024];
-    int result;
-    
-    if (!gpg_config || !key_source) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_import_key");
-        return -1;
-    }
-    
-    log_debug("Importing GPG key from: %s", key_source);
-
-    /* Import from a key file, or fetch by id from the keyserver. */
-    if (path_exists(key_source)) {
-        result = gpg_run(gpg_config, NULL, output, sizeof(output),
-                         "gpg", "--import", key_source, (const char *)NULL);
-    } else {
-        result = gpg_run(gpg_config, NULL, output, sizeof(output),
-                         "gpg", "--keyserver", "hkps://keys.openpgp.org",
-                         "--recv-keys", key_source, (const char *)NULL);
-    }
-    if (result != 0) {
-        set_error(ERR_GPG_KEY_FAILED, "Failed to import GPG key: %s", output);
-        return -1;
-    }
-    
-    log_info("Successfully imported GPG key from: %s", key_source);
-    return 0;
-}
-
-/* Export GPG public key for backup/sharing */
-int gpg_export_public_key(gpg_config_t *gpg_config, const char *key_id,
-                          char *output, size_t output_size) {
-    if (!gpg_config || !key_id || !output || output_size == 0) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_export_public_key");
-        return -1;
-    }
-
-    return gpg_run(gpg_config, NULL, output, output_size,
-                   "gpg", "--armor", "--export", key_id, (const char *)NULL);
-}
-
-/* List available GPG keys */
-int gpg_list_keys(gpg_config_t *gpg_config, char *output, size_t output_size) {
-    if (!gpg_config || !output || output_size == 0) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_list_keys");
-        return -1;
-    }
-    
-    return gpg_run(gpg_config, NULL, output, output_size,
-                   "gpg", "--list-keys", "--with-colons", (const char *)NULL);
-}
+/* AR-06 F61: gpg_import_key(), gpg_export_public_key() and gpg_list_keys() were
+ * removed here — dead public API with zero callers anywhere in the tree. */
 
 /* Validate GPG key exists and is usable */
 int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id) {
@@ -2116,55 +2093,8 @@ static int gpg_test_signing_pinned(gpg_config_t *gpg_config,
     return 0;
 }
 
-/* Generate new GPG key for account */
-int gpg_generate_key(gpg_config_t *gpg_config, const account_t *account) {
-    char key_params[512];
-    char output[2048];
-    char envbuf[MAX_PATH_LEN + 16];
-    const char *env[2];
-    run_opts_t opts;
-    const char *argv[] = {"gpg", "--batch", "--generate-key", NULL};
-
-    if (!gpg_config || !account) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_generate_key");
-        return -1;
-    }
-
-    log_info("Generating new GPG key for account: %s", account->name);
-
-    /* Key-generation parameters are fed to gpg on stdin (no shell). */
-    if (safe_snprintf(key_params, sizeof(key_params),
-                     "Key-Type: RSA\n"
-                     "Key-Length: 4096\n"
-                     "Subkey-Type: RSA\n"
-                     "Subkey-Length: 4096\n"
-                     "Name-Real: %s\n"
-                     "Name-Email: %s\n"
-                     "Expire-Date: 2y\n"
-                     "%%commit\n"
-                     "%%echo done\n",
-                     account->name, account->email) != 0) {
-        set_error(ERR_INVALID_ARGS, "GPG key parameters too long");
-        return -1;
-    }
-
-    gpg_build_env(gpg_config, envbuf, sizeof(envbuf), env);
-    memset(&opts, 0, sizeof(opts));
-    opts.out = output;
-    opts.out_size = sizeof(output);
-    opts.input = key_params;
-    opts.input_len = strlen(key_params);
-    opts.merge_stderr = true;
-    if (env[0]) opts.extra_env = env;
-
-    if (run_argv(argv, &opts, NULL) != 0) {
-        set_error(ERR_GPG_KEY_FAILED, "Failed to generate GPG key: %s", output);
-        return -1;
-    }
-
-    log_info("Successfully generated GPG key for account: %s", account->name);
-    return 0;
-}
+/* AR-06 F61: gpg_generate_key() was removed here — dead public API with zero
+ * callers (gitswitch never generated keys; it isolates existing ones). */
 
 /* Set environment variables for GPG operation */
 int gpg_set_environment(const gpg_config_t *gpg_config) {

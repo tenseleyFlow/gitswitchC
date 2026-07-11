@@ -783,6 +783,22 @@ static int handle_init_command(const char *shell) {
     }
 
     if (strcmp(shell, "fish") == 0) {
+        /* AR-06 F63: unlike POSIX single quotes (fully literal), fish single
+         * quotes still interpret \\ and \' — a backslash in a single-quoted
+         * path could escape the closing quote or alter the path. The up-front
+         * check only refused a literal quote. These are gitswitch-controlled
+         * runtime paths, so a backslash is pathological: refuse it for the
+         * mandatory SSH socket, and drop the optional GPG/hint wiring (mirroring
+         * how a quote is handled) rather than emit a subtly wrong path. */
+        bool fish_gpg = have_gpg_home && strchr(gpg_home, '\\') == NULL;
+        bool fish_hint = have_hint && strchr(hint_path, '\\') == NULL;
+        if (strchr(sock_path, '\\')) {
+            fprintf(stderr, "gitswitch: refusing to emit SSH_AUTH_SOCK path "
+                            "containing a backslash for fish\n");
+            return EXIT_FAILURE;
+        }
+        have_gpg_home = fish_gpg;
+        have_hint = fish_hint;
         printf("# gitswitch shell integration (fish)\n");
         printf("set -l __gitswitch_auth_sock '%s'\n", sock_path);
         /* First interactive shell after a boot: if no SSH agent is reachable at
@@ -895,7 +911,12 @@ static int handle_init_command(const char *shell) {
             /* Exact cases keep combined accounts from being swallowed by the
              * SSH branch. Empty/unknown legacy content probes both runtimes. */
             printf("    if [ -e '%s' ]; then\n", hint_path);
-            printf("        IFS= read -r __gitswitch_needs < '%s' 2>/dev/null || __gitswitch_needs=\n", hint_path);
+            /* AR-06 F64: the stderr redirect must precede the input redirect —
+             * shells apply redirections left to right, so `< file 2>/dev/null`
+             * leaves a failed open of `file` (removed between the -e test and
+             * the read) reported on the ORIGINAL stderr. Put 2>/dev/null first
+             * so it actually suppresses the open error. */
+            printf("        IFS= read -r __gitswitch_needs 2>/dev/null < '%s' || __gitswitch_needs=\n", hint_path);
             printf("        case \"$__gitswitch_needs\" in\n");
             printf("        none) : ;;\n");
             printf("        ssh)\n");
@@ -1090,13 +1111,14 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
 
     if (!ctx) return EXIT_FAILURE;
 
-    /* Resolve the argument to a real account first (fuzzy/ID matching for
-     * free) so a typo can't report a false success while the intended
-     * account's on-disk secret-key copy is left in place. */
+    /* Resolve the argument to a real account first so a typo can't report a
+     * false success while the intended account's on-disk secret-key copy is
+     * left in place. AR-06 F50: exact id/name/email only — reset destroys
+     * secret-key material, so it must never fire on a mere substring match. */
     if (account && *account) {
-        account_t *acct = config_find_account(ctx, account);
+        account_t *acct = config_find_account_destructive(ctx, account);
         if (!acct) {
-            display_error("Account not found", "%s", account);
+            display_error("Account not found", "%s", get_last_error()->message);
             return EXIT_FAILURE;
         }
         target = acct->name;

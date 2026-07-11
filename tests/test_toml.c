@@ -340,6 +340,39 @@ TEST(rejects_duplicate_section_header) {
     toml_cleanup_document(&doc);
 }
 
+/* AR-06 F70: the tokenizer consumed one value then returned to line scanning,
+ * so trailing content on the same line ("a = 1 b = 2", or a key/value after a
+ * section header) was silently swallowed — a second pair on a line was dropped
+ * with no diagnostic. Enforce one key/value or one section header per line. */
+TEST(rejects_multiple_pairs_per_line) {
+    toml_document_t doc;
+
+    /* Two key/value pairs on one line: the second used to be discarded. */
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\" active_account = \"alice\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
+
+    /* A key/value trailing a section header on the same line. */
+    CHECK_EQ_INT(parse(
+        "[accounts.1] name = \"alice\"\n"
+        "email = \"a@b.com\"\n", &doc), -1);
+    toml_cleanup_document(&doc);
+
+    /* Bare token after a quoted value (not a comment). */
+    CHECK_EQ_INT(parse(
+        "[settings]\n"
+        "default_scope = \"local\" garbage\n", &doc), -1);
+    toml_cleanup_document(&doc);
+
+    /* Positive control: a trailing comment and surrounding whitespace parse. */
+    CHECK_EQ_INT(parse(
+        "[settings]  \n"
+        "default_scope = \"local\"   # inline comment\n"
+        "active_account = \"alice\"\t\n", &doc), 0);
+    toml_cleanup_document(&doc);
+}
+
 /* Write→read round-trip with a bracket-heavy description: the injection guard
  * used to count these data brackets and refuse to reload a config the tool
  * had just written (toml F1). */
@@ -525,6 +558,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(empty_config_reports_targeted_error);
     RUN_TEST(rejects_duplicate_key_in_section);
     RUN_TEST(rejects_duplicate_section_header);
+    RUN_TEST(rejects_multiple_pairs_per_line);
     RUN_TEST(bracket_heavy_value_round_trips);
     RUN_TEST(rejects_relative_ssh_key);
     RUN_TEST(accepts_anchored_ssh_key);

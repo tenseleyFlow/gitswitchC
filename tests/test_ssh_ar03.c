@@ -117,7 +117,7 @@ static int bind_sock_for_runner(const char *path, mode_t mode,
 /* Scratch XDG_RUNTIME_DIR + the gitswitch-ssh dir under it. */
 static int make_xdg_agent_dir(char *dir_out, size_t size) {
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswar03XXXXXX");
-    if (!mkdtemp(g_xdg)) return -1;
+    if (!ts_mkdtemp(g_xdg)) return -1;
     if (chmod(g_xdg, 0700) != 0) return -1;
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
     if ((size_t)snprintf(dir_out, size, "%s/gitswitch-ssh", g_xdg) >= size) {
@@ -539,7 +539,7 @@ TEST(reset_refuses_unsafe_socket_dir) {
     FILE *pf;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswar03XXXXXX");
-    CHECK(mkdtemp(g_xdg) != NULL);
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
     CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
 
@@ -589,7 +589,7 @@ static int setup_home_with_ssh_config(char *home, size_t home_size,
     FILE *f;
 
     snprintf(home, home_size, "/tmp/gswar03hXXXXXX");
-    if (!mkdtemp(home)) return -1;
+    if (!ts_mkdtemp(home)) return -1;
     setenv("HOME", home, 1);
     snprintf(sshdir, sizeof(sshdir), "%s/.ssh", home);
     if (mkdir(sshdir, 0700) != 0) return -1;

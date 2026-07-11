@@ -386,7 +386,7 @@ static int fail_agent_pid_setenv(const char *name, const char *value,
 
 static int setup_runtime(char *agent_dir, size_t size) {
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswssh4XXXXXX");
-    if (!mkdtemp(g_xdg) || chmod(g_xdg, 0700) != 0) return -1;
+    if (!ts_mkdtemp(g_xdg) || chmod(g_xdg, 0700) != 0) return -1;
     if (setenv("XDG_RUNTIME_DIR", g_xdg, 1) != 0) return -1;
     if ((size_t)snprintf(agent_dir, size, "%s/gitswitch-ssh", g_xdg) >= size) {
         return -1;
@@ -940,7 +940,7 @@ TEST(reused_agent_aborts_when_other_orphan_cleanup_is_incomplete) {
 static int setup_home(char *home, size_t size, char *config, size_t config_size) {
     char ssh_dir[256];
     snprintf(home, size, "/tmp/gswssh4homeXXXXXX");
-    if (!mkdtemp(home) || setenv("HOME", home, 1) != 0) return -1;
+    if (!ts_mkdtemp(home) || setenv("HOME", home, 1) != 0) return -1;
     if ((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) >= sizeof(ssh_dir) ||
         mkdir(ssh_dir, 0700) != 0) {
         return -1;

@@ -1319,11 +1319,11 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         return -1;
     }
     
-    /* Find the account */
-    account = config_find_account(ctx, identifier);
+    /* Find the account. AR-06 F50: destructive resolution (exact id/name/email
+     * only) — never a substring, so `remove work` can't delete "work-old". */
+    account = config_find_account_destructive(ctx, identifier);
     if (!account) {
-        set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: %s", identifier);
-        return -1;
+        return -1; /* error already set with an explanatory message */
     }
     
     /* Show account details */

@@ -28,6 +28,7 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
 static int parse_integer_value(toml_parser_state_t *state, int *value);
 static int parse_boolean_value(toml_parser_state_t *state, bool *value);
 static void skip_whitespace(toml_parser_state_t *state);
+static int require_line_end(toml_parser_state_t *state);
 static void skip_comment(toml_parser_state_t *state);
 static bool is_at_end(const toml_parser_state_t *state);
 static char current_char(const toml_parser_state_t *state);
@@ -224,6 +225,10 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
                     set_parser_error(&state, "Failed to create section");
                     break;
                 }
+                /* Nothing but whitespace/comment may follow `]` (AR-06 F70). */
+                if (require_line_end(&state) != 0) {
+                    break;
+                }
             }
             continue;
         }
@@ -264,6 +269,13 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
                              "Duplicate key '%s' in section [%s] (TOML forbids "
                              "defining a key twice)", kv->key, current_section->name);
                     set_parser_error(&state, dup_msg);
+                    break;
+                }
+                /* Nothing but whitespace/comment may follow the value — no
+                 * second `key = value` on the same physical line (AR-06 F70).
+                 * Checked before committing the pair so a trailing-junk line is
+                 * rejected wholesale. */
+                if (require_line_end(&state) != 0) {
                     break;
                 }
                 current_section->key_count++;
@@ -1146,6 +1158,27 @@ static void skip_whitespace(toml_parser_state_t *state) {
             break;
         }
     }
+}
+
+/* AR-06 F70: after a value or a section header, the rest of the physical line
+ * must be nothing but optional trailing whitespace and an optional comment.
+ * Without this the tokenizer silently accepted multiple pairs on one line
+ * (`a = 1 b = 2`) and content after `]` (`[accounts.1] name = "x"`), giving a
+ * malformed config a meaning the writer never produces. Returns 0 when the line
+ * ends cleanly, -1 (with a parser error set) when trailing content remains. */
+static int require_line_end(toml_parser_state_t *state) {
+    skip_whitespace(state); /* trailing spaces/tabs only (not newlines) */
+    if (is_at_end(state)) {
+        return 0;
+    }
+    char c = current_char(state);
+    if (c == '\n' || c == '\r' || c == '#') {
+        return 0;
+    }
+    set_parser_error(state,
+                     "Unexpected content after value/section header on the "
+                     "same line (one key/value or section header per line)");
+    return -1;
 }
 
 static void skip_comment(toml_parser_state_t *state) {

@@ -160,13 +160,35 @@ if command -v rpmbuild >/dev/null 2>&1; then
         tail -40 "$tmp/rpmbuild.log" >&2
         fail "source archive cannot satisfy gitswitcher.spec under rpmbuild"
     fi
+    # AR-06 F80: "an .rpm exists" is far too weak — a spec that packaged an
+    # empty %files, or dropped the binary/completions, would still emit an RPM
+    # and pass. Locate the MAIN package RPM (skip -debuginfo/-debugsource/-devel
+    # subpackages) and assert its payload actually carries every path the spec's
+    # %files promises. rpm -qlp lists the archived paths without installing.
     rpm_count=0
+    main_rpm=
     for built_rpm in "$rpmtop"/RPMS/*/*.rpm; do
         [ -f "$built_rpm" ] || continue
         rpm_count=$((rpm_count + 1))
+        case ${built_rpm##*/} in
+            *-debuginfo-*|*-debugsource-*|*-devel-*) ;;
+            *) main_rpm=$built_rpm ;;
+        esac
     done
     [ "$rpm_count" -ge 1 ] || fail "rpmbuild reported success but produced no binary RPM"
-    rpm_status="rpmbuild OK"
+    [ -n "$main_rpm" ] || fail "rpmbuild produced only debug/devel subpackages, no main RPM"
+
+    payload=$(rpm -qlp "$main_rpm" 2>/dev/null) ||
+        fail "cannot list payload of $main_rpm"
+    for want in \
+        /bin/gitswitch \
+        /share/bash-completion/completions/gitswitch \
+        /share/zsh/site-functions/_gitswitch \
+        /share/fish/vendor_completions.d/gitswitch.fish; do
+        printf '%s\n' "$payload" | grep -q -- "$want\$" ||
+            fail "built RPM payload is missing $want"
+    done
+    rpm_status="rpmbuild OK, payload verified"
 else
     printf 'distcheck: rpmbuild not available - RPM build skipped\n'
     rpm_status="rpmbuild skipped"

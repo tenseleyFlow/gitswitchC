@@ -143,6 +143,29 @@ int config_init(gitswitch_ctx_t *ctx) {
     }
 }
 
+/* AR-06 F48/F52/F73: toml_document_t is ~600 KiB (MAX_SECTIONS section structs
+ * each carrying MAX_KEYS_PER_SECTION inline key/value buffers). Placing one on
+ * the stack put a single frame within striking distance of the default 8 MiB
+ * thread stack and blew past smaller ulimits outright. Every config path now
+ * allocates the document on the heap via these helpers. calloc gives the same
+ * zeroed state toml_init_document would; toml_cleanup_document is still called
+ * on the contents before the block is freed. */
+static toml_document_t *config_document_alloc(void) {
+    toml_document_t *doc = calloc(1, sizeof(*doc));
+    if (!doc) {
+        set_error(ERR_MEMORY_ALLOCATION, "Failed to allocate TOML document");
+    }
+    return doc;
+}
+
+static void config_document_free(toml_document_t *doc) {
+    if (!doc) {
+        return;
+    }
+    toml_cleanup_document(doc);
+    free(doc);
+}
+
 /* Read config_path through a validated fd and parse it into doc
  * (cfg-symlink-01/02). The old flow validated the path with stat() and then
  * had the parser fopen() the path a second time, so a symlinked accounts.toml
@@ -217,11 +240,16 @@ fail_buffer:
 
 /* Load configuration from TOML file */
 int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
-    toml_document_t toml_doc;
+    toml_document_t *toml_doc;
     char scope_str[32];
 
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
+        return -1;
+    }
+
+    toml_doc = config_document_alloc();
+    if (!toml_doc) {
         return -1;
     }
 
@@ -234,13 +262,13 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
     ctx->unknown_sections_on_load = 0;
     ctx->unknown_keys_on_load = 0;
 
-    if (config_read_document(config_path, &toml_doc) != 0) {
-        toml_cleanup_document(&toml_doc);
+    if (config_read_document(config_path, toml_doc) != 0) {
+        config_document_free(toml_doc);
         return -1;
     }
 
     /* Load settings section */
-    if (toml_get_string(&toml_doc, "settings", "default_scope",
+    if (toml_get_string(toml_doc, "settings", "default_scope",
                         scope_str, sizeof(scope_str)) == 0) {
         ctx->config.default_scope = config_parse_scope(scope_str);
     } else {
@@ -252,7 +280,7 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
      * Sanitized like the other untrusted display fields; a name that needed
      * sanitizing can no longer match any (validated) account name, which is
      * the correct fail-closed outcome for resume. */
-    if (toml_get_string(&toml_doc, "settings", "active_account",
+    if (toml_get_string(toml_doc, "settings", "active_account",
                         ctx->config.active_account, sizeof(ctx->config.active_account)) != 0) {
         ctx->config.active_account[0] = '\0';
     } else if (sanitize_tty_text(ctx->config.active_account)) {
@@ -260,19 +288,19 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
     }
 
     /* Load accounts */
-    if (load_accounts_from_toml(ctx, &toml_doc) != 0) {
-        toml_cleanup_document(&toml_doc);
+    if (load_accounts_from_toml(ctx, toml_doc) != 0) {
+        config_document_free(toml_doc);
         return -1;
     }
 
     /* AR-06 F02: also detect unmodeled KEYS inside recognized sections, so a
      * full rewrite is refused before it silently erases them. */
-    count_unknown_keys(ctx, &toml_doc);
+    count_unknown_keys(ctx, toml_doc);
 
     /* Store config path */
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
 
-    toml_cleanup_document(&toml_doc);
+    config_document_free(toml_doc);
 
     /* Detect current account from SSH socket symlink */
     accounts_detect_current(ctx);
@@ -556,7 +584,7 @@ hint_fail:
  * validate the destination, back up the existing file, write doc to a fresh
  * 0600 temp, rename it into place, refresh the resume hint. */
 static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_document_t *doc,
-                                        const char *config_path) {
+                                        const char *config_path, bool make_backup) {
     char temp_path[MAX_PATH_LEN];
 
     /* Refuse to write through or next to a symlink (cfg-symlink-01). rename()
@@ -568,8 +596,12 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_d
         return -1;
     }
 
-    /* Create backup if file exists */
-    if (path_exists(config_path)) {
+    /* Create backup if file exists. AR-06 F51: skip it for a settings-only
+     * write-back (just active_account), which happens on EVERY switch — the
+     * account DATA is unchanged, the write is atomic (temp+rename), and backing
+     * up on each switch churned five backups for five switches, rotating real
+     * account-edit backups out of the bounded set. */
+    if (make_backup && path_exists(config_path)) {
         if (config_backup(config_path) != 0) {
             log_warning("Failed to create backup before saving config");
         }
@@ -723,7 +755,7 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx) {
 
 /* Save configuration to TOML file */
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
-    toml_document_t toml_doc;
+    toml_document_t *toml_doc;
     int result = -1;
 
     if (!ctx || !config_path) {
@@ -743,34 +775,38 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
         return -1;
     }
 
-    /* Initialize TOML document */
-    toml_init_document(&toml_doc);
+    /* Initialize TOML document (heap-allocated; calloc already zeroed it). */
+    toml_doc = config_document_alloc();
+    if (!toml_doc) {
+        return -1;
+    }
+    toml_init_document(toml_doc);
 
     /* Add/update settings section */
-    if (toml_set_string(&toml_doc, "settings", "default_scope",
+    if (toml_set_string(toml_doc, "settings", "default_scope",
                         config_scope_to_string(ctx->config.default_scope)) != 0) {
         goto cleanup;
     }
 
     /* Persist the last-active account for boot resume (when one is set) */
     if (ctx->config.active_account[0] != '\0') {
-        if (toml_set_string(&toml_doc, "settings", "active_account",
+        if (toml_set_string(toml_doc, "settings", "active_account",
                             ctx->config.active_account) != 0) {
             goto cleanup;
         }
     }
 
     /* Add current accounts */
-    log_debug("About to save accounts to TOML doc with %zu sections", toml_doc.section_count);
-    if (save_accounts_to_toml(ctx, &toml_doc) != 0) {
+    log_debug("About to save accounts to TOML doc with %zu sections", toml_doc->section_count);
+    if (save_accounts_to_toml(ctx, toml_doc) != 0) {
         goto cleanup;
     }
-    log_debug("After saving accounts, TOML doc has %zu sections", toml_doc.section_count);
+    log_debug("After saving accounts, TOML doc has %zu sections", toml_doc->section_count);
 
-    result = config_write_document_atomic(ctx, &toml_doc, config_path);
+    result = config_write_document_atomic(ctx, toml_doc, config_path, true);
 
 cleanup:
-    toml_cleanup_document(&toml_doc);
+    config_document_free(toml_doc);
     return result;
 }
 
@@ -785,7 +821,7 @@ cleanup:
  * the loader couldn't model is lost. Comments are not preserved — same as
  * every existing save path. */
 int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path) {
-    toml_document_t toml_doc;
+    toml_document_t *toml_doc;
     int result;
 
     if (!ctx || !config_path) {
@@ -799,8 +835,13 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
         return config_save(ctx, config_path);
     }
 
-    if (config_read_document(config_path, &toml_doc) != 0) {
-        toml_cleanup_document(&toml_doc);
+    toml_doc = config_document_alloc();
+    if (!toml_doc) {
+        return -1;
+    }
+
+    if (config_read_document(config_path, toml_doc) != 0) {
+        config_document_free(toml_doc);
         return -1;
     }
 
@@ -808,27 +849,28 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
      * name; toml_write_file would emit that as a bare "[]" header the next
      * load then rejects. Refuse rather than corrupt (the loader already warned
      * about the unrecognized section; the user has to fix the file anyway). */
-    for (size_t i = 0; i < toml_doc.section_count; i++) {
-        if (toml_doc.sections[i].name[0] == '\0' && toml_doc.sections[i].key_count > 0) {
+    for (size_t i = 0; i < toml_doc->section_count; i++) {
+        if (toml_doc->sections[i].name[0] == '\0' && toml_doc->sections[i].key_count > 0) {
             set_error(ERR_CONFIG_INVALID,
                       "Config file %s has keys before its first [section] header; "
                       "they cannot be written back faithfully — fix the file first",
                       config_path);
-            toml_cleanup_document(&toml_doc);
+            config_document_free(toml_doc);
             return -1;
         }
     }
 
     /* An empty active_account (e.g. after `reset`) is stored as "" — there is
      * no key-removal primitive, and the loader treats "" as "none saved". */
-    if (toml_set_string(&toml_doc, "settings", "active_account",
+    if (toml_set_string(toml_doc, "settings", "active_account",
                         ctx->config.active_account) != 0) {
-        toml_cleanup_document(&toml_doc);
+        config_document_free(toml_doc);
         return -1;
     }
 
-    result = config_write_document_atomic(ctx, &toml_doc, config_path);
-    toml_cleanup_document(&toml_doc);
+    /* Settings-only write-back: no backup (AR-06 F51). */
+    result = config_write_document_atomic(ctx, toml_doc, config_path, false);
+    config_document_free(toml_doc);
     return result;
 }
 
@@ -1093,16 +1135,13 @@ account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name) {
     return NULL;
 }
 
-account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
+/* Exact resolution only: canonical numeric ID -> exact name -> exact email.
+ * Returns NULL if none match. Shared by config_find_account (which then falls
+ * back to a substring search) and config_find_account_destructive (which does
+ * NOT — AR-06 F50). */
+static account_t *config_resolve_exact(gitswitch_ctx_t *ctx, const char *identifier) {
     char *endptr;
     unsigned long account_id;
-    account_t *match = NULL;
-    size_t match_count = 0;
-
-    if (!ctx || !identifier || !*identifier) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account");
-        return NULL;
-    }
 
     /* 1. Exact numeric ID (only when the whole identifier is a canonical
      * decimal in range, int-id-02). The old bare strtoul + (uint32_t) cast
@@ -1146,6 +1185,43 @@ account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
             return &ctx->accounts[i];
         }
     }
+    return NULL;
+}
+
+/* AR-06 F50: destructive resolution (remove/reset) — id/exact-name/exact-email
+ * ONLY, never the substring arm. `remove work` must not delete an account whose
+ * name or description merely CONTAINS "work" (e.g. "work-old", or a description
+ * mentioning work) just because it happens to be the sole substring match. */
+account_t *config_find_account_destructive(gitswitch_ctx_t *ctx, const char *identifier) {
+    account_t *acct;
+    if (!ctx || !identifier || !*identifier) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account_destructive");
+        return NULL;
+    }
+    acct = config_resolve_exact(ctx, identifier);
+    if (!acct) {
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "No account matches '%s' by ID, exact name, or exact email "
+                  "(substring matching is disabled for destructive commands)",
+                  identifier);
+    }
+    return acct;
+}
+
+account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
+    account_t *match = NULL;
+    size_t match_count = 0;
+
+    if (!ctx || !identifier || !*identifier) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account");
+        return NULL;
+    }
+
+    match = config_resolve_exact(ctx, identifier);
+    if (match) {
+        return match;
+    }
+    match_count = 0;
 
     /* 4. Unambiguous substring of name or description. */
     for (size_t i = 0; i < ctx->account_count; i++) {

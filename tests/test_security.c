@@ -101,7 +101,7 @@ static void restore_path(void) {
 /* mkdtemp + explicit chmod (not umask-clipped); returns 0 on success. */
 static int make_test_dir(char *out, size_t out_size, mode_t mode) {
     char tmpl[] = "/tmp/gs_sec_XXXXXX";
-    if (!mkdtemp(tmpl)) return -1;
+    if (!ts_mkdtemp(tmpl)) return -1;
     if (chmod(tmpl, mode) != 0) return -1;
     snprintf(out, out_size, "%s", tmpl);
     return 0;
@@ -133,7 +133,7 @@ TEST(file_helpers_apply_descriptor_permissions) {
     char src[512], dst[512], content[64];
     struct stat st;
 
-    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
     snprintf(src, sizeof(src), "%s/source", root);
     snprintf(dst, sizeof(dst), "%s/destination", root);
 
@@ -157,7 +157,7 @@ TEST(ensure_private_dir_pins_leaf_and_rejects_symlink) {
     char private_dir[512], link_path[512];
     struct stat st;
 
-    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
     snprintf(private_dir, sizeof(private_dir), "%s/private", root);
     snprintf(link_path, sizeof(link_path), "%s/link", root);
 
@@ -197,7 +197,7 @@ TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast) {
     int poll_rc;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     parent_lock = runtime_state_lock_acquire();
     CHECK(parent_lock >= 0);
@@ -290,7 +290,7 @@ TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir) {
     bool had_xdg = old_xdg && *old_xdg;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
 
     CHECK_EQ_INT(chmod(runtime, 0755), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
@@ -335,7 +335,7 @@ TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting) {
     char marker;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(chmod(runtime, 0700), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
@@ -420,7 +420,7 @@ TEST(runtime_state_lock_excludes_contender_after_leaf_replacement) {
     char marker = '\0';
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
     snprintf(moved_dir, sizeof(moved_dir), "%s/gitswitch-runtime.old", runtime);
@@ -523,7 +523,7 @@ TEST(private_lock_release_ignores_reused_inherited_token) {
     pid_t child = -1;
     int status = 0;
 
-    if (!mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
     dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     CHECK(dir_fd >= 0);
     if (dir_fd < 0) goto cleanup;
@@ -582,7 +582,7 @@ TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
     int status = 0;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
-    if (!mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
     parent_lock = runtime_state_lock_acquire();
     CHECK(parent_lock >= 3);
@@ -743,6 +743,61 @@ TEST(find_command_path_rejects_group_writable_components) {
     remove_test_dir(f775dir, f775tool, marker[3]);
     remove_test_dir(ok700dir, ok700tool, marker[4]);
     remove_test_dir(ok755dir, ok755tool, marker[5]);
+}
+
+/* AR-06 F74: a symlink living in a trusted PATH directory can point at a 0755
+ * binary that sits inside a group/world-writable directory, where an attacker
+ * atomically swaps the target. The candidate stat() followed the link and only
+ * vetted the target file's own mode, so the shadow resolved. find_command_path
+ * must canonicalize and reject when the directory holding the resolved target
+ * is itself writable — while still honoring a symlink into a trusted dir. */
+TEST(find_command_path_rejects_symlink_into_writable_dir) {
+    char linkdir[256], wwdir[256], okdir[256];
+    char realtool[512], oktool[512];
+    char wwmarker[512], okmarker[512];
+    char evil_link[600], good_link[600];
+    char buf[512], path[512];
+
+    if (make_test_dir(linkdir, sizeof(linkdir), 0755) != 0 ||
+        make_test_dir(wwdir, sizeof(wwdir), 0777) != 0 ||
+        make_test_dir(okdir, sizeof(okdir), 0755) != 0) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+
+    /* Real 0755 targets: one inside the world-writable dir, one inside a
+     * trusted dir. The files themselves are identical and un-writable. */
+    snprintf(wwmarker, sizeof(wwmarker), "%s/marker", wwdir);
+    snprintf(okmarker, sizeof(okmarker), "%s/marker", okdir);
+    CHECK_EQ_INT(install_fake_tool(wwdir, "gs_f74_real", wwmarker,
+                                   realtool, sizeof(realtool)), 0);
+    CHECK_EQ_INT(install_fake_tool(okdir, "gs_f74_real", okmarker,
+                                   oktool, sizeof(oktool)), 0);
+
+    /* Both symlinks live in the trusted linkdir. */
+    snprintf(evil_link, sizeof(evil_link), "%s/gs_f74_evil", linkdir);
+    snprintf(good_link, sizeof(good_link), "%s/gs_f74_good", linkdir);
+    CHECK_EQ_INT(symlink(realtool, evil_link), 0);
+    CHECK_EQ_INT(symlink(oktool, good_link), 0);
+
+    save_path();
+    snprintf(path, sizeof(path), "%s", linkdir);
+    setenv("PATH", path, 1);
+
+    /* Shadow: link's own dir is trusted, but the resolved target's dir is
+     * world-writable — must be refused, both by name and by explicit path. */
+    CHECK_EQ_INT(find_command_path("gs_f74_evil", buf, sizeof(buf)), -1);
+    CHECK_EQ_INT(find_command_path(evil_link, buf, sizeof(buf)), -1);
+
+    /* Control: link into a trusted dir still resolves. */
+    CHECK_EQ_INT(find_command_path("gs_f74_good", buf, sizeof(buf)), 0);
+
+    restore_path();
+    unlink(evil_link);
+    unlink(good_link);
+    remove_test_dir(wwdir, realtool, wwmarker);
+    remove_test_dir(okdir, oktool, okmarker);
+    rmdir(linkdir);
 }
 
 /* Relative ("."), bare-name ("bin"), and empty ("::") PATH entries all resolve
@@ -938,6 +993,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers);
     RUN_TEST(find_command_path_skips_world_writable_dir);
     RUN_TEST(find_command_path_rejects_group_writable_components);
+    RUN_TEST(find_command_path_rejects_symlink_into_writable_dir);
     RUN_TEST(find_command_path_skips_relative_and_empty_entries);
     RUN_TEST(find_command_path_allows_user_owned_absolute_dir);
     RUN_TEST(run_argv_never_executes_from_world_writable_dir);
