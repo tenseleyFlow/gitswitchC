@@ -340,7 +340,7 @@ install:
 		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
 		exit 1; \
 	fi
-	@bt=`cut -d'|' -f1 $(BUILDTYPE_STAMP) 2>/dev/null`; \
+	@bt=`sed -n '1s/|.*//p' $(BUILDTYPE_STAMP) 2>/dev/null`; \
 	if [ "$$bt" != "release" ]; then \
 		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
 	fi
@@ -653,7 +653,17 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 	@set -e; \
 	stage=`mktemp -d "$${TMPDIR:-/tmp}/gitswitch-release-stage.XXXXXX"`; \
 	trap 'status=$$?; trap - 0 1 2 3 15; rm -rf "$$stage"; exit $$status' 0 1 2 3 15; \
-	$(MAKE) BUILD_TYPE=release install DESTDIR="$$stage" PREFIX="$(PREFIX)" >/dev/null; \
+	install_log="$$stage/install.log"; \
+	if ! $(MAKE) BUILD_TYPE=release install DESTDIR="$$stage" PREFIX="$(PREFIX)" \
+		>"$$install_log" 2>&1; then \
+		cat "$$install_log" >&2; \
+		exit 1; \
+	fi; \
+	if grep -F 'Warning: installing a' "$$install_log" >/dev/null; then \
+		cat "$$install_log" >&2; \
+		echo 'ERROR: release build stamp was not recognized by install' >&2; \
+		exit 1; \
+	fi; \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
 		"$$stage$(PREFIX)/bin/$(TARGET)"; \
 	sh tests/test_ar07_release.sh neuter "$(CC)" \
