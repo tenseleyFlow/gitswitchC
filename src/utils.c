@@ -1661,7 +1661,35 @@ static bool exec_candidate_is_trusted(const char *path) {
     if (!S_ISREG(st.st_mode) || (st.st_mode & (S_IWGRP | S_IWOTH))) {
         return false;
     }
-    return access(path, X_OK) == 0; /* Flawfinder: ignore — advisory post-stat probe; exec re-validates */
+    if (access(path, X_OK) != 0) { /* Flawfinder: ignore — advisory post-stat probe; exec re-validates */
+        return false;
+    }
+
+    /* AR-06 F74: the stat() above followed any symlink to the target file and
+     * vetted THAT file's mode — but a symlink sitting in a trusted directory
+     * (e.g. /usr/local/bin/git) can point at a 0755 binary that lives inside a
+     * group/world-writable directory (e.g. /tmp/evil/git), where an attacker
+     * atomically swaps the target for their own. Canonicalize the whole chain
+     * and require the directory actually holding the resolved binary to be
+     * trusted too, so a shadow target in a writable dir is rejected. */
+    char *resolved = realpath(path, NULL);
+    if (!resolved) {
+        return false;
+    }
+    bool trusted = false;
+    const char *slash = strrchr(resolved, '/');
+    if (slash) {
+        /* Keep the leading '/' when the binary sits directly under the root. */
+        size_t dlen = (slash == resolved) ? 1 : (size_t)(slash - resolved);
+        char rdir[MAX_PATH_LEN];
+        if (dlen < sizeof(rdir)) {
+            memcpy(rdir, resolved, dlen);
+            rdir[dlen] = '\0';
+            trusted = exec_dir_is_trusted(rdir);
+        }
+    }
+    free(resolved);
+    return trusted;
 }
 
 /* Process-lifetime memo for find_command_path (AR-02 #24): one switch

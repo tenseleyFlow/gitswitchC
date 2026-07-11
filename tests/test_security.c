@@ -745,6 +745,61 @@ TEST(find_command_path_rejects_group_writable_components) {
     remove_test_dir(ok755dir, ok755tool, marker[5]);
 }
 
+/* AR-06 F74: a symlink living in a trusted PATH directory can point at a 0755
+ * binary that sits inside a group/world-writable directory, where an attacker
+ * atomically swaps the target. The candidate stat() followed the link and only
+ * vetted the target file's own mode, so the shadow resolved. find_command_path
+ * must canonicalize and reject when the directory holding the resolved target
+ * is itself writable — while still honoring a symlink into a trusted dir. */
+TEST(find_command_path_rejects_symlink_into_writable_dir) {
+    char linkdir[256], wwdir[256], okdir[256];
+    char realtool[512], oktool[512];
+    char wwmarker[512], okmarker[512];
+    char evil_link[600], good_link[600];
+    char buf[512], path[512];
+
+    if (make_test_dir(linkdir, sizeof(linkdir), 0755) != 0 ||
+        make_test_dir(wwdir, sizeof(wwdir), 0777) != 0 ||
+        make_test_dir(okdir, sizeof(okdir), 0755) != 0) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+
+    /* Real 0755 targets: one inside the world-writable dir, one inside a
+     * trusted dir. The files themselves are identical and un-writable. */
+    snprintf(wwmarker, sizeof(wwmarker), "%s/marker", wwdir);
+    snprintf(okmarker, sizeof(okmarker), "%s/marker", okdir);
+    CHECK_EQ_INT(install_fake_tool(wwdir, "gs_f74_real", wwmarker,
+                                   realtool, sizeof(realtool)), 0);
+    CHECK_EQ_INT(install_fake_tool(okdir, "gs_f74_real", okmarker,
+                                   oktool, sizeof(oktool)), 0);
+
+    /* Both symlinks live in the trusted linkdir. */
+    snprintf(evil_link, sizeof(evil_link), "%s/gs_f74_evil", linkdir);
+    snprintf(good_link, sizeof(good_link), "%s/gs_f74_good", linkdir);
+    CHECK_EQ_INT(symlink(realtool, evil_link), 0);
+    CHECK_EQ_INT(symlink(oktool, good_link), 0);
+
+    save_path();
+    snprintf(path, sizeof(path), "%s", linkdir);
+    setenv("PATH", path, 1);
+
+    /* Shadow: link's own dir is trusted, but the resolved target's dir is
+     * world-writable — must be refused, both by name and by explicit path. */
+    CHECK_EQ_INT(find_command_path("gs_f74_evil", buf, sizeof(buf)), -1);
+    CHECK_EQ_INT(find_command_path(evil_link, buf, sizeof(buf)), -1);
+
+    /* Control: link into a trusted dir still resolves. */
+    CHECK_EQ_INT(find_command_path("gs_f74_good", buf, sizeof(buf)), 0);
+
+    restore_path();
+    unlink(evil_link);
+    unlink(good_link);
+    remove_test_dir(wwdir, realtool, wwmarker);
+    remove_test_dir(okdir, oktool, okmarker);
+    rmdir(linkdir);
+}
+
 /* Relative ("."), bare-name ("bin"), and empty ("::") PATH entries all resolve
  * against the CWD — inside a cloned repo that is attacker territory, so they
  * are refused. An explicit relative path with a slash is refused too. */
@@ -938,6 +993,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers);
     RUN_TEST(find_command_path_skips_world_writable_dir);
     RUN_TEST(find_command_path_rejects_group_writable_components);
+    RUN_TEST(find_command_path_rejects_symlink_into_writable_dir);
     RUN_TEST(find_command_path_skips_relative_and_empty_entries);
     RUN_TEST(find_command_path_allows_user_owned_absolute_dir);
     RUN_TEST(run_argv_never_executes_from_world_writable_dir);
