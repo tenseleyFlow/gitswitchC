@@ -620,6 +620,7 @@ TEST(host_alias_preserves_user_stanzas_around_managed_block) {
     memset(&acct, 0, sizeof(acct));
     acct.ssh_enabled = true;
     snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), ALIAS);
+    snprintf(acct.ssh_hostname, sizeof(acct.ssh_hostname), "github.com");
     snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path), "%s/key1", home);
 
     CHECK_EQ_INT(ssh_configure_host_alias(&acct), 0);
@@ -636,38 +637,33 @@ TEST(host_alias_preserves_user_stanzas_around_managed_block) {
     CHECK(strstr(buf, "key1") != NULL);
 }
 
-/* Malformed managed block (begin marker, no end marker): only OUR recognizable
- * stanza may be dropped — user stanzas below the damaged block must survive
- * the rewrite instead of being silently truncated away. */
-TEST(host_alias_malformed_block_keeps_trailing_user_content) {
+/* AR-07 M12: an exact but malformed managed block is ambiguous. Preserve the
+ * complete file and fail rather than guessing which user bytes are ours. */
+TEST(host_alias_malformed_block_fails_without_rewrite) {
     char home[128], cfgp[256], buf[8192];
-    account_t acct;
-
-    CHECK_EQ_INT(setup_home_with_ssh_config(home, sizeof(home),
+    const char *original =
         USER_STANZA_ABOVE
         BEGIN_MARK "\n"
         "Host " ALIAS "\n"
         "  IdentityFile /stale/key\n"
         "  IdentitiesOnly yes\n"
-        /* end marker missing: truncated/hand-damaged block */
-        USER_STANZA_BELOW), 0);
+        USER_STANZA_BELOW;
+    account_t acct;
+
+    CHECK_EQ_INT(setup_home_with_ssh_config(home, sizeof(home),
+                                            original), 0);
 
     memset(&acct, 0, sizeof(acct));
     acct.ssh_enabled = true;
     snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), ALIAS);
+    snprintf(acct.ssh_hostname, sizeof(acct.ssh_hostname), "github.com");
     snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path), "%s/key1", home);
 
-    CHECK_EQ_INT(ssh_configure_host_alias(&acct), 0);
+    CHECK_EQ_INT(ssh_configure_host_alias(&acct), -1);
 
     snprintf(cfgp, sizeof(cfgp), "%s/.ssh/config", home);
     CHECK_EQ_INT(read_all(cfgp, buf, sizeof(buf)), 0);
-
-    CHECK(strstr(buf, USER_STANZA_ABOVE) != NULL);
-    CHECK(strstr(buf, USER_STANZA_BELOW) != NULL); /* NOT truncated away */
-    CHECK_EQ_INT(count_substr(buf, BEGIN_MARK), 1);
-    CHECK_EQ_INT(count_substr(buf, END_MARK), 1);  /* fresh block is complete */
-    CHECK(strstr(buf, "/stale/key") == NULL);
-    CHECK(strstr(buf, "key1") != NULL);
+    CHECK_STR_EQ(buf, original);
 }
 
 /* L16: a byte-identical result must not be rewritten — mkstemp+rename churns
@@ -681,6 +677,7 @@ TEST(host_alias_skips_rewrite_when_content_identical) {
     memset(&acct, 0, sizeof(acct));
     acct.ssh_enabled = true;
     snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), ALIAS);
+    snprintf(acct.ssh_hostname, sizeof(acct.ssh_hostname), "github.com");
     snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path), "%s/key1", home);
 
     CHECK_EQ_INT(ssh_configure_host_alias(&acct), 0);
@@ -713,6 +710,6 @@ TEST_MAIN_BEGIN()
 #endif
     RUN_TEST(reset_refuses_unsafe_socket_dir);
     RUN_TEST(host_alias_preserves_user_stanzas_around_managed_block);
-    RUN_TEST(host_alias_malformed_block_keeps_trailing_user_content);
+    RUN_TEST(host_alias_malformed_block_fails_without_rewrite);
     RUN_TEST(host_alias_skips_rewrite_when_content_identical);
 TEST_MAIN_END()

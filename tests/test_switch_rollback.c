@@ -1169,6 +1169,7 @@ static int setup_alias_ctx(gitswitch_ctx_t *ctx, const char *alias) {
     tgt->ssh_enabled = true;
     safe_strncpy(tgt->ssh_key_path, key_target, sizeof(tgt->ssh_key_path));
     safe_strncpy(tgt->ssh_host_alias, alias, sizeof(tgt->ssh_host_alias));
+    safe_strncpy(tgt->ssh_hostname, "github.com", sizeof(tgt->ssh_hostname));
     return 0;
 }
 

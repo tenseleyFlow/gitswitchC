@@ -39,6 +39,7 @@ typedef bool (*ssh_reap_fn)(pid_t pid, const char *socket_arg);
 typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);
 typedef int (*ssh_dirsync_fn)(int dir_fd);
+typedef int (*ssh_config_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_current_cleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_precleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
@@ -102,6 +103,10 @@ ssh_pid_commit_hook_fn ssh_manager_set_pid_postrename_hook_fn(
 ssh_namespace_commit_hook_fn ssh_manager_set_namespace_commit_hook_fn(
     ssh_namespace_commit_hook_fn fn);
 ssh_dirsync_fn ssh_manager_set_dirsync_fn(ssh_dirsync_fn fn);
+/* Test-only pre-rename seam for SSH user-config namespace races. Production
+ * leaves it NULL; the callback receives the pinned ~/.ssh fd and temp name. */
+ssh_config_commit_hook_fn ssh_manager_set_config_commit_hook_fn(
+    ssh_config_commit_hook_fn fn);
 ssh_current_cleanup_hook_fn ssh_manager_set_current_cleanup_hook_fn(
     ssh_current_cleanup_hook_fn fn);
 ssh_current_precleanup_hook_fn ssh_manager_set_current_precleanup_hook_fn(
@@ -166,7 +171,8 @@ int ssh_manager_test_probe_socket(const char *path, bool *reachable);
 int ssh_manager_test_probe_deadline(int timeout_ms);
 
 /**
- * Set SSH host alias in ~/.ssh/config if specified
+ * Set SSH host alias in ~/.ssh/config if specified. An alias requires a valid
+ * account->ssh_hostname canonical destination; it is emitted as HostName.
  */
 int ssh_configure_host_alias(const account_t *account);
 
