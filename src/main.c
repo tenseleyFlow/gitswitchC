@@ -1111,13 +1111,14 @@ static int handle_reset_command(gitswitch_ctx_t *ctx, const char *account) {
 
     if (!ctx) return EXIT_FAILURE;
 
-    /* Resolve the argument to a real account first (fuzzy/ID matching for
-     * free) so a typo can't report a false success while the intended
-     * account's on-disk secret-key copy is left in place. */
+    /* Resolve the argument to a real account first so a typo can't report a
+     * false success while the intended account's on-disk secret-key copy is
+     * left in place. AR-06 F50: exact id/name/email only — reset destroys
+     * secret-key material, so it must never fire on a mere substring match. */
     if (account && *account) {
-        account_t *acct = config_find_account(ctx, account);
+        account_t *acct = config_find_account_destructive(ctx, account);
         if (!acct) {
-            display_error("Account not found", "%s", account);
+            display_error("Account not found", "%s", get_last_error()->message);
             return EXIT_FAILURE;
         }
         target = acct->name;

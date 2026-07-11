@@ -556,7 +556,7 @@ hint_fail:
  * validate the destination, back up the existing file, write doc to a fresh
  * 0600 temp, rename it into place, refresh the resume hint. */
 static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_document_t *doc,
-                                        const char *config_path) {
+                                        const char *config_path, bool make_backup) {
     char temp_path[MAX_PATH_LEN];
 
     /* Refuse to write through or next to a symlink (cfg-symlink-01). rename()
@@ -568,8 +568,12 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx, const toml_d
         return -1;
     }
 
-    /* Create backup if file exists */
-    if (path_exists(config_path)) {
+    /* Create backup if file exists. AR-06 F51: skip it for a settings-only
+     * write-back (just active_account), which happens on EVERY switch — the
+     * account DATA is unchanged, the write is atomic (temp+rename), and backing
+     * up on each switch churned five backups for five switches, rotating real
+     * account-edit backups out of the bounded set. */
+    if (make_backup && path_exists(config_path)) {
         if (config_backup(config_path) != 0) {
             log_warning("Failed to create backup before saving config");
         }
@@ -767,7 +771,7 @@ int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     }
     log_debug("After saving accounts, TOML doc has %zu sections", toml_doc.section_count);
 
-    result = config_write_document_atomic(ctx, &toml_doc, config_path);
+    result = config_write_document_atomic(ctx, &toml_doc, config_path, true);
 
 cleanup:
     toml_cleanup_document(&toml_doc);
@@ -827,7 +831,8 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
         return -1;
     }
 
-    result = config_write_document_atomic(ctx, &toml_doc, config_path);
+    /* Settings-only write-back: no backup (AR-06 F51). */
+    result = config_write_document_atomic(ctx, &toml_doc, config_path, false);
     toml_cleanup_document(&toml_doc);
     return result;
 }
@@ -1093,16 +1098,13 @@ account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name) {
     return NULL;
 }
 
-account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
+/* Exact resolution only: canonical numeric ID -> exact name -> exact email.
+ * Returns NULL if none match. Shared by config_find_account (which then falls
+ * back to a substring search) and config_find_account_destructive (which does
+ * NOT — AR-06 F50). */
+static account_t *config_resolve_exact(gitswitch_ctx_t *ctx, const char *identifier) {
     char *endptr;
     unsigned long account_id;
-    account_t *match = NULL;
-    size_t match_count = 0;
-
-    if (!ctx || !identifier || !*identifier) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account");
-        return NULL;
-    }
 
     /* 1. Exact numeric ID (only when the whole identifier is a canonical
      * decimal in range, int-id-02). The old bare strtoul + (uint32_t) cast
@@ -1146,6 +1148,43 @@ account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
             return &ctx->accounts[i];
         }
     }
+    return NULL;
+}
+
+/* AR-06 F50: destructive resolution (remove/reset) — id/exact-name/exact-email
+ * ONLY, never the substring arm. `remove work` must not delete an account whose
+ * name or description merely CONTAINS "work" (e.g. "work-old", or a description
+ * mentioning work) just because it happens to be the sole substring match. */
+account_t *config_find_account_destructive(gitswitch_ctx_t *ctx, const char *identifier) {
+    account_t *acct;
+    if (!ctx || !identifier || !*identifier) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account_destructive");
+        return NULL;
+    }
+    acct = config_resolve_exact(ctx, identifier);
+    if (!acct) {
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "No account matches '%s' by ID, exact name, or exact email "
+                  "(substring matching is disabled for destructive commands)",
+                  identifier);
+    }
+    return acct;
+}
+
+account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
+    account_t *match = NULL;
+    size_t match_count = 0;
+
+    if (!ctx || !identifier || !*identifier) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account");
+        return NULL;
+    }
+
+    match = config_resolve_exact(ctx, identifier);
+    if (match) {
+        return match;
+    }
+    match_count = 0;
 
     /* 4. Unambiguous substring of name or description. */
     for (size_t i = 0; i < ctx->account_count; i++) {

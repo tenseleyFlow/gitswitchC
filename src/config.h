@@ -129,6 +129,14 @@ account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier);
 account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name);
 
 /**
+ * Resolve a destructive command's target (remove/reset) by canonical ID, exact
+ * name, or exact email ONLY — never by the substring/description match that
+ * config_find_account also accepts (AR-06 F50). Sets a not-found error and
+ * returns NULL when nothing matches exactly.
+ */
+account_t *config_find_account_destructive(gitswitch_ctx_t *ctx, const char *identifier);
+
+/**
  * Parse git scope from string
  */
 git_scope_t config_parse_scope(const char *scope_str);
