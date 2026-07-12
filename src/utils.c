@@ -3057,7 +3057,13 @@ static bool exec_fd_acl_is_trusted(int fd) {
     acl_t acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED);
     if (!acl) {
         int query_errno = errno;
-        if (exec_acl_query_is_unsupported(query_errno)) return true;
+        /* Darwin represents an object with no extended ACL as NULL/ENOENT:
+         * acl_get_fd_np() delegates to filesec_get_property(FILESEC_ACL),
+         * whose missing-property result is ENOENT. That is the safe, trivial
+         * ACL case; every other supported-filesystem query failure remains
+         * ambiguous and fails closed. */
+        if (query_errno == ENOENT ||
+            exec_acl_query_is_unsupported(query_errno)) return true;
         errno = query_errno;
         return false;
     }
