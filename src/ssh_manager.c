@@ -1815,30 +1815,39 @@ static bool same_ssh_config_directory(const struct stat *left,
            S_ISDIR(right->st_mode);
 }
 
+static bool same_ssh_config_mtime(const struct stat *left,
+                                  const struct stat *right) {
+#ifdef __APPLE__
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec;
+#endif
+}
+
+static bool same_ssh_config_ctime(const struct stat *left,
+                                  const struct stat *right) {
+#ifdef __APPLE__
+    return left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
 static bool same_ssh_config_snapshot(const struct stat *left,
                                      const struct stat *right) {
-    bool timestamps_match;
-
-#ifdef __APPLE__
-    timestamps_match =
-        left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
-        left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
-        left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
-        left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
-#else
-    timestamps_match =
-        left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
-        left->st_mtim.tv_nsec == right->st_mtim.tv_nsec &&
-        left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
-        left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
-#endif
     return left->st_dev == right->st_dev &&
            left->st_ino == right->st_ino &&
            left->st_mode == right->st_mode &&
            left->st_uid == right->st_uid &&
            left->st_gid == right->st_gid &&
            left->st_nlink == right->st_nlink &&
-           left->st_size == right->st_size && timestamps_match &&
+           left->st_size == right->st_size &&
+           same_ssh_config_mtime(left, right) &&
+           same_ssh_config_ctime(left, right) &&
            S_ISREG(right->st_mode);
 }
 
@@ -2278,8 +2287,19 @@ static int ssh_config_recheck_before_rename(int dir_fd,
     }
     if (!existed || !same_ssh_config_snapshot(identity, &now)) {
         set_error(ERR_FILE_IO,
-                  "SSH config changed before update; refusing to replace it: %s",
-                  display_path);
+                  "SSH config changed before update; refusing to replace it: %s "
+                  "[existed=%d regular=%d dev=%d ino=%d mode=%d uid=%d gid=%d "
+                  "nlink=%d size=%d mtime=%d ctime=%d]",
+                  display_path, existed, S_ISREG(now.st_mode),
+                  identity->st_dev == now.st_dev,
+                  identity->st_ino == now.st_ino,
+                  identity->st_mode == now.st_mode,
+                  identity->st_uid == now.st_uid,
+                  identity->st_gid == now.st_gid,
+                  identity->st_nlink == now.st_nlink,
+                  identity->st_size == now.st_size,
+                  same_ssh_config_mtime(identity, &now),
+                  same_ssh_config_ctime(identity, &now));
         return -1;
     }
     return 0;
