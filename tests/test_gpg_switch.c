@@ -720,8 +720,9 @@ TEST(inherited_readonly_agent_config_is_installed_atomically_at_0600) {
  * same-uid swap to a FIFO in that gap must be rejected without waiting for a
  * writer; O_NOFOLLOW alone does not make FIFO open nonblocking. */
 TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
-    char xdg[128], source_home[256], installed[MAX_PATH_LEN];
-    char original[128];
+    char xdg[128], source_home[256], canonical_source_home[MAX_PATH_LEN];
+    char installed[MAX_PATH_LEN];
+    char original[128] = "";
     gpg_config_t cfg;
     account_t acct;
     pid_t pid;
@@ -733,11 +734,16 @@ TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
     CHECK(ts_mkdtemp(xdg) != NULL);
     CHECK_EQ_INT(chmod(xdg, 0700), 0);
     snprintf(source_home, sizeof(source_home), "%s/user-gnupg", xdg);
-    snprintf(g_fifo_source, sizeof(g_fifo_source), "%s/gpg-agent.conf",
-             source_home);
-    snprintf(g_fifo_backup, sizeof(g_fifo_backup), "%s/gpg-agent.conf.old",
-             source_home);
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    if (!realpath(source_home, canonical_source_home)) {
+        CHECK(false);
+        return;
+    }
+    CHECK_EQ_INT(safe_snprintf(g_fifo_source, sizeof(g_fifo_source),
+                               "%s/gpg-agent.conf", canonical_source_home), 0);
+    CHECK_EQ_INT(safe_snprintf(g_fifo_backup, sizeof(g_fifo_backup),
+                               "%s/gpg-agent.conf.old",
+                               canonical_source_home), 0);
     CHECK_EQ_INT(write_string_to_file(g_fifo_source, "cache-ttl 77\n", 0600), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
