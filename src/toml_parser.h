@@ -66,6 +66,18 @@ typedef void (*toml_document_init_hook_fn)(toml_document_t *doc);
 toml_document_init_hook_fn toml_set_document_init_hook_fn(
     toml_document_init_hook_fn fn);
 
+/* Focused writer observer for deterministic namespace-race regression tests.
+ * The parser/writer is single-threaded; restore the previous hook immediately
+ * after the bounded test operation. */
+typedef enum {
+    TOML_WRITER_TEST_AFTER_TEMP_CREATE = 1
+} toml_writer_test_stage_t;
+typedef void (*toml_writer_test_hook_fn)(toml_writer_test_stage_t stage,
+                                        const char *directory,
+                                        const char *temp_name);
+toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
+    toml_writer_test_hook_fn fn);
+
 /* Parser state for security tracking */
 typedef struct {
     const char *input;
@@ -135,10 +147,11 @@ int toml_set_boolean(toml_document_t *doc, const char *section,
                      const char *key, bool value);
 
 /**
- * Write TOML document to file with atomic operations
- * - Creates backup of existing file
- * - Uses temporary file for atomic write
- * - Validates written content
+ * Atomically and durably replace a TOML file.
+ * - Serializes into a private 0600 same-directory temporary file
+ * - Checks flush, payload fsync, and close before atomic rename
+ * - Fsyncs the parent directory before reporting success
+ * - Leaves an existing destination unchanged on pre-rename failure
  */
 int toml_write_file(const toml_document_t *doc, const char *file_path);
 

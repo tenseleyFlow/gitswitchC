@@ -7,13 +7,27 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "toml_parser.h"
 #include "error.h"
+#include "signals.h"
 #include "utils.h"
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+#ifndef O_DIRECTORY
+#define O_DIRECTORY 0
+#endif
+
+#ifndef O_NOFOLLOW
+#define O_NOFOLLOW 0
+#endif
 
 /* Every account gets one section and config_save always writes [settings]
  * first; if this ever regresses the writer reports success for accounts that
@@ -38,12 +52,21 @@ static void set_parser_error(toml_parser_state_t *state, const char *message);
 static toml_section_t *find_section(toml_document_t *doc, const char *section_name);
 static toml_section_t *find_or_create_section(toml_document_t *doc, const char *section_name);
 static toml_keyvalue_t *find_key(toml_section_t *section, const char *key_name);
+static bool section_name_is_valid(const char *section_name);
 static toml_document_init_hook_fn g_document_init_hook;
+static toml_writer_test_hook_fn g_writer_test_hook;
 
 toml_document_init_hook_fn toml_set_document_init_hook_fn(
     toml_document_init_hook_fn fn) {
     toml_document_init_hook_fn previous = g_document_init_hook;
     g_document_init_hook = fn;
+    return previous;
+}
+
+toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
+    toml_writer_test_hook_fn fn) {
+    toml_writer_test_hook_fn previous = g_writer_test_hook;
+    g_writer_test_hook = fn;
     return previous;
 }
 
@@ -1059,6 +1082,23 @@ static toml_section_t *find_section(toml_document_t *doc, const char *section_na
     return NULL;
 }
 
+/* Public setters must only construct section names the parser can read back.
+ * Keep the root section (empty name) as an internal parser-only state; every
+ * public section is a non-empty bare TOML key made from the same byte class as
+ * parse_section_header(). */
+static bool section_name_is_valid(const char *section_name) {
+    if (!section_name || section_name[0] == '\0') return false;
+
+    size_t length = strlen(section_name);
+    if (length >= TOML_MAX_SECTION_LEN) return false;
+
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)section_name[i];
+        if (!isalnum(c) && c != '.' && c != '_' && c != '-') return false;
+    }
+    return true;
+}
+
 /* Find or create section */
 static toml_section_t *find_or_create_section(toml_document_t *doc, const char *section_name) {
     toml_section_t *section;
@@ -1076,12 +1116,20 @@ static toml_section_t *find_or_create_section(toml_document_t *doc, const char *
     }
     
     section = &doc->sections[doc->section_count];
-    memset(section, 0, sizeof(toml_section_t));
-    
-    safe_strncpy(section->name, section_name, sizeof(section->name));
-    section->is_set = true;
-    section->key_count = 0;
-    
+
+    /* Copy into a detached zeroed value, then publish the whole section and
+     * advance section_count. A failed copy cannot leave a reachable empty
+     * section that toml_write_file() serializes as `[]` (AR-07 L30). */
+    toml_section_t candidate;
+    memset(&candidate, 0, sizeof(candidate));
+    if (safe_strncpy(candidate.name, section_name, sizeof(candidate.name)) != 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Section name is too long (max %d bytes)",
+                  TOML_MAX_SECTION_LEN - 1);
+        return NULL;
+    }
+    candidate.is_set = true;
+    *section = candidate;
     doc->section_count++;
     
     return section;
@@ -1112,9 +1160,10 @@ static int parse_section_header(toml_parser_state_t *state, char *section_name) 
     
     skip_whitespace(state);
     
-    /* Parse section name */
-    while (!is_at_end(state) && current_char(state) != ']' &&
-           name_pos < TOML_MAX_SECTION_LEN - 1) {
+    /* Parse section name. Examine a delimiter before declaring overflow: at
+     * exactly 63 bytes, a space/tab is legal trailing whitespace, whereas a
+     * 64th name byte is a real overflow (AR-07 L31). */
+    while (!is_at_end(state) && current_char(state) != ']') {
         char c = current_char(state);
 
         /* Stop at trailing whitespace and let the skip_whitespace + ']' below
@@ -1124,6 +1173,10 @@ static int parse_section_header(toml_parser_state_t *state, char *section_name) 
          * whitespace (`[set tings]`) still fails at the ']' match. */
         if (c == ' ' || c == '\t') {
             break;
+        }
+        if (name_pos >= TOML_MAX_SECTION_LEN - 1) {
+            set_parser_error(state, "Section name too long");
+            return -1;
         }
         c = advance_char(state);
 
@@ -1136,14 +1189,6 @@ static int parse_section_header(toml_parser_state_t *state, char *section_name) 
     }
     
     section_name[name_pos] = '\0';
-
-    /* If we stopped because the buffer filled (not because of ']'), the section
-     * name is too long — error rather than silently truncate (which could
-     * collide two distinct [accounts.<id>] sections into one). */
-    if (name_pos >= TOML_MAX_SECTION_LEN - 1 && !is_at_end(state) && current_char(state) != ']') {
-        set_parser_error(state, "Section name too long");
-        return -1;
-    }
 
     skip_whitespace(state);
 
@@ -1323,9 +1368,11 @@ static int parse_integer_value(toml_parser_state_t *state, int *value) {
     if (c == '+' || c == '-') {
         num_str[num_pos++] = advance_char(state);
     }
+    size_t digit_start = num_pos;
     
     /* Parse digits */
-    while (!is_at_end(state) && isdigit(current_char(state)) && 
+    while (!is_at_end(state) &&
+           isdigit((unsigned char)current_char(state)) &&
            num_pos < sizeof(num_str) - 1) {
         num_str[num_pos++] = advance_char(state);
     }
@@ -1334,6 +1381,14 @@ static int parse_integer_value(toml_parser_state_t *state, int *value) {
     
     if (num_pos == 0 || (num_pos == 1 && (num_str[0] == '+' || num_str[0] == '-'))) {
         set_parser_error(state, "Invalid integer format");
+        return -1;
+    }
+
+    /* TOML decimal integers may be zero, but a multi-digit magnitude may not
+     * start with zero. Reject before strtol canonicalizes malformed `01` into
+     * an apparently valid `1` that the writer would then preserve (L32). */
+    if (num_pos - digit_start > 1 && num_str[digit_start] == '0') {
+        set_parser_error(state, "Leading zeros are not allowed in integers");
         return -1;
     }
     
@@ -1463,6 +1518,13 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
         return -1;
     }
 
+    if (!section_name_is_valid(section_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Invalid TOML section name (1-%d bare-key bytes required): %s",
+                  TOML_MAX_SECTION_LEN - 1, section_name);
+        return -1;
+    }
+
     /* Bound-check BEFORE mutating the document (AR-03 M5, writer half).
      * safe_strncpy fails without writing on an oversized source, and this
      * function used to ignore that: a >= TOML_MAX_VALUE_LEN value left the
@@ -1525,6 +1587,13 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
     
     if (!doc || !section_name || !key_name) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_set_boolean");
+        return -1;
+    }
+
+    if (!section_name_is_valid(section_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Invalid TOML section name (1-%d bare-key bytes required): %s",
+                  TOML_MAX_SECTION_LEN - 1, section_name);
         return -1;
     }
 
@@ -1592,82 +1661,447 @@ static int write_escaped_string_value(FILE *file, const char *key, const char *v
     return 0;
 }
 
-/* Write document to file */
-int toml_write_file(const toml_document_t *doc, const char *file_path) {
-    FILE *file;
+static bool toml_same_file(const struct stat *left, const struct stat *right) {
+    return left && right && left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino;
+}
 
-    if (!doc || !file_path) {
+static bool toml_named_directory_matches(const char *dir_path,
+                                         const struct stat *pinned) {
+    struct stat named;
+    if (stat(dir_path, &named) != 0) return false;
+    if (!toml_same_file(&named, pinned)) {
+        errno = ESTALE;
+        return false;
+    }
+    return true;
+}
+
+static bool toml_temp_identity_is_private(const struct stat *identity) {
+    return identity && S_ISREG(identity->st_mode) &&
+           identity->st_uid == getuid() && identity->st_nlink == 1 &&
+           (identity->st_mode & 07777) == (S_IRUSR | S_IWUSR);
+}
+
+static bool toml_temp_matches_created(const struct stat *created,
+                                      const struct stat *current) {
+    return toml_same_file(created, current) &&
+           toml_temp_identity_is_private(current);
+}
+
+/* mkstemp() cannot create relative to a pinned directory descriptor. Generate
+ * collision-resistant names and let O_CREAT|O_EXCL provide the authoritative
+ * uniqueness/symlink guarantee inside the exact opened parent instead. */
+static int toml_create_temp_at(int dir_fd, char *temp_name,
+                               size_t temp_name_size) {
+    static const char random_chars[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    char suffix[17];
+
+    for (unsigned int attempt = 0; attempt < 16; attempt++) {
+        if (generate_random_string(suffix, sizeof(suffix), random_chars) != 0) {
+            if (errno == 0) errno = EIO;
+            return -1;
+        }
+        int written = snprintf(temp_name, temp_name_size,
+                               ".gitswitch-toml.%s.tmp", suffix);
+        if (written < 0 || (size_t)written >= temp_name_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        int fd = openat(dir_fd, temp_name,
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                        S_IRUSR | S_IWUSR);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) return -1;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+/* Write document to a fresh same-directory inode and publish only after every
+ * serialization and payload durability boundary succeeds (AR-07 L33). The
+ * destination is never opened for writing, so a short write cannot truncate a
+ * previously valid configuration. */
+int toml_write_file(const toml_document_t *doc, const char *file_path) {
+    const char *failure_context = NULL;
+    const char *slash;
+    const char *target_name;
+    char *dir_path = NULL;
+    char *temp_path = NULL;
+    char temp_name[128] = "";
+    FILE *file = NULL;
+    size_t file_path_length;
+    size_t dir_length;
+    struct stat pinned_dir;
+    struct stat temp_identity;
+    struct stat current_temp;
+    struct stat installed_temp;
+    int dir_fd = -1;
+    int temp_fd = -1;
+    int identity_fd = -1;
+    int saved_errno = 0;
+    int result = -1;
+    bool temp_registered = false;
+    bool temp_created = false;
+    bool have_temp_identity = false;
+
+    if (!doc || !file_path || file_path[0] == '\0') {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_write_file");
         return -1;
     }
 
-    file = fopen(file_path, "w");
-    if (!file) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to open file for writing: %s", file_path);
+    file_path_length = strlen(file_path);
+    if (file_path[file_path_length - 1] == '/') {
+        set_error(ERR_INVALID_PATH, "Invalid TOML destination path: %s", file_path);
         return -1;
     }
-    
-    /* Write sections */
+
+    slash = strrchr(file_path, '/');
+    target_name = slash ? slash + 1 : file_path;
+    if (!slash) {
+        dir_length = 1; /* "." */
+    } else if (slash == file_path) {
+        dir_length = 1; /* "/" */
+    } else {
+        dir_length = (size_t)(slash - file_path);
+    }
+
+    dir_path = safe_malloc(dir_length + 1);
+    if (!dir_path) goto cleanup;
+
+    if (!slash) {
+        memcpy(dir_path, ".", 2);
+    } else {
+        memcpy(dir_path, file_path, dir_length);
+        dir_path[dir_length] = '\0';
+    }
+    /* Open the parent before publishing anything. The descriptor remains open
+     * through rename so the exact directory can be fsynced before success is
+     * reported. */
+    dir_fd = open(dir_path, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (dir_fd < 0) {
+        failure_context = "Failed to open TOML destination directory";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    if (fstat(dir_fd, &pinned_dir) != 0) {
+        failure_context = "Failed to pin TOML destination directory";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    if (!S_ISDIR(pinned_dir.st_mode)) {
+        failure_context = "TOML destination parent is not a directory";
+        saved_errno = ENOTDIR;
+        goto cleanup;
+    }
+
+    temp_fd = toml_create_temp_at(dir_fd, temp_name, sizeof(temp_name));
+    if (temp_fd < 0) {
+        failure_context = "Failed to create temporary TOML file";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    temp_created = true;
+
+    /* Capture the inode immediately, then force and re-check the complete
+     * private-file contract before exposing a test/signal interleaving point.
+     * The identity is retained for both pre-rename sealing and safe cleanup. */
+    if (fstat(temp_fd, &temp_identity) != 0) {
+        failure_context = "Failed to identify temporary TOML file";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    have_temp_identity = true;
+    if (!S_ISREG(temp_identity.st_mode) ||
+        temp_identity.st_uid != getuid() || temp_identity.st_nlink != 1) {
+        failure_context = "Temporary TOML file has an unsafe identity";
+        saved_errno = EPERM;
+        goto cleanup;
+    }
+    if (fchmod(temp_fd, S_IRUSR | S_IWUSR) != 0) {
+        failure_context = "Failed to secure temporary TOML file";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    errno = 0;
+    if (fstat(temp_fd, &current_temp) != 0 ||
+        !toml_temp_matches_created(&temp_identity, &current_temp)) {
+        failure_context = "Temporary TOML file failed its creation seal";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
+    }
+
+    size_t temp_name_length = strlen(temp_name);
+    size_t separator_length = strcmp(dir_path, "/") == 0 ? 0 : 1;
+    if (dir_length > SIZE_MAX - separator_length - temp_name_length - 1) {
+        set_error(ERR_INVALID_PATH, "TOML temporary path is too long");
+        goto cleanup;
+    }
+    size_t temp_path_size = dir_length + separator_length + temp_name_length + 1;
+    temp_path = safe_malloc(temp_path_size);
+    if (!temp_path) goto cleanup;
+    int temp_path_written = snprintf(temp_path, temp_path_size, "%s%s%s",
+                                     dir_path, separator_length ? "/" : "",
+                                     temp_name);
+    if (temp_path_written < 0 || (size_t)temp_path_written >= temp_path_size) {
+        set_error(ERR_INVALID_PATH, "Could not construct TOML temporary path");
+        goto cleanup;
+    }
+    if (signals_scratch_register(temp_path) != 0) {
+        failure_context = "Failed to register temporary TOML file for signal cleanup";
+        saved_errno = ENOSPC;
+        goto cleanup;
+    }
+    temp_registered = true;
+
+    if (g_writer_test_hook) {
+        g_writer_test_hook(TOML_WRITER_TEST_AFTER_TEMP_CREATE,
+                           dir_path, temp_name);
+    }
+    if (!toml_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_context = "TOML destination directory changed during write";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
+    }
+
+    file = fdopen(temp_fd, "w");
+    if (!file) {
+        failure_context = "Failed to open temporary TOML stream";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    temp_fd = -1; /* owned by file */
+
     for (size_t i = 0; i < doc->section_count; i++) {
         const toml_section_t *section = &doc->sections[i];
-        
-        /* Write section header */
+
         if (fprintf(file, "[%s]\n", section->name) < 0) {
-            fclose(file);
-            set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to write section header");
-            return -1;
+            failure_context = "Failed to write TOML section header";
+            saved_errno = errno;
+            goto cleanup;
         }
-        
-        /* Write key-value pairs */
+
         for (size_t j = 0; j < section->key_count; j++) {
             const toml_keyvalue_t *kv = &section->keys[j];
-            
             if (!kv->is_set) continue;
-            
+
             switch (kv->type) {
                 case TOML_TYPE_STRING:
                     if (write_escaped_string_value(file, kv->key, kv->value) < 0) {
-                        fclose(file);
-                        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to write string value");
-                        return -1;
+                        failure_context = "Failed to write TOML string value";
+                        saved_errno = errno;
+                        goto cleanup;
                     }
                     break;
-                    
                 case TOML_TYPE_INTEGER:
                 case TOML_TYPE_BOOLEAN:
                     if (fprintf(file, "%s = %s\n", kv->key, kv->value) < 0) {
-                        fclose(file);
-                        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to write value");
-                        return -1;
+                        failure_context = "Failed to write TOML value";
+                        saved_errno = errno;
+                        goto cleanup;
                     }
                     break;
-                    
                 case TOML_TYPE_INVALID:
                 default:
                     break;
             }
         }
-        
-        /* Add blank line between sections */
-        if (i < doc->section_count - 1) {
-            fprintf(file, "\n");
+
+        if (i < doc->section_count - 1 && fputc('\n', file) == EOF) {
+            failure_context = "Failed to write TOML section separator";
+            saved_errno = errno;
+            goto cleanup;
         }
     }
 
-    /* Durably close: stdio buffers writes, so ENOSPC/EIO/quota failures often
-     * surface only at the final flush. Flush + fsync + a *checked* fclose so a
-     * truncated temp file is reported as failure and never renamed over the
-     * real config by config_save. */
-    if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to flush config to disk");
-        fclose(file);
-        return -1;
+    /* stdio may defer EFBIG/ENOSPC/EIO until flush or close. Check every
+     * boundary before rename. A duplicate descriptor pins the populated inode
+     * across fclose so it can still be sealed to the pathname at commit. */
+    if (fflush(file) != 0) {
+        failure_context = "Failed to flush temporary TOML file";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    if (fsync(fileno(file)) != 0) {
+        failure_context = "Failed to sync temporary TOML file";
+        saved_errno = errno;
+        goto cleanup;
+    }
+
+    /* Refuse to publish if the pathname stopped selecting the pinned parent,
+     * then perform both source and destination lookup relative to that exact
+     * descriptor. This prevents a directory rename/replacement from making us
+     * publish in one directory and fsync/clean another. */
+    if (!toml_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_context = "TOML destination directory changed before commit";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
+    }
+    identity_fd = dup(fileno(file));
+    if (identity_fd < 0 ||
+        fcntl(identity_fd, F_SETFD, FD_CLOEXEC) != 0) {
+        failure_context = "Failed to pin temporary TOML file for commit";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    errno = 0;
+    if (fstat(identity_fd, &current_temp) != 0 ||
+        fstatat(dir_fd, temp_name, &installed_temp,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !toml_temp_matches_created(&temp_identity, &current_temp) ||
+        !toml_temp_matches_created(&temp_identity, &installed_temp)) {
+        failure_context = "Temporary TOML file changed before atomic commit";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
     }
     if (fclose(file) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED, "Failed to close config file");
-        return -1;
+        file = NULL; /* fclose consumes the stream even when it reports EOF */
+        failure_context = "Failed to close temporary TOML file";
+        saved_errno = errno;
+        goto cleanup;
     }
-    return 0;
+    file = NULL;
+
+    /* Re-check after fclose and immediately before rename: a same-uid peer may
+     * unlink/recreate the random name at any point during serialization. */
+    if (!toml_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_context = "TOML destination directory changed before commit";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
+    }
+    errno = 0;
+    if (fstat(identity_fd, &current_temp) != 0 ||
+        fstatat(dir_fd, temp_name, &installed_temp,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !toml_temp_matches_created(&temp_identity, &current_temp) ||
+        !toml_temp_matches_created(&temp_identity, &installed_temp)) {
+        failure_context = "Temporary TOML file changed before atomic commit";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
+    }
+    if (renameat(dir_fd, temp_name, dir_fd, target_name) != 0) {
+        failure_context = "Failed to atomically replace TOML destination";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    temp_created = false;
+    signals_scratch_unregister(temp_path);
+    temp_registered = false;
+
+    errno = 0;
+    if (fstat(identity_fd, &current_temp) != 0 ||
+        fstatat(dir_fd, target_name, &installed_temp,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !toml_temp_matches_created(&temp_identity, &current_temp) ||
+        !toml_temp_matches_created(&temp_identity, &installed_temp)) {
+        failure_context = "Installed TOML file changed during atomic commit";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
+    }
+
+    if (close(identity_fd) != 0) {
+        identity_fd = -1;
+        failure_context = "Failed to close installed TOML identity handle";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    identity_fd = -1;
+
+    if (!toml_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_context = "TOML destination directory changed during commit";
+        saved_errno = errno ? errno : ESTALE;
+        goto cleanup;
+    }
+
+    if (fsync(dir_fd) != 0) {
+        failure_context = "Failed to sync TOML destination directory";
+        saved_errno = errno;
+        goto cleanup;
+    }
+
+    result = 0;
+
+cleanup:
+    if (file) {
+        if (fclose(file) != 0 && !failure_context) {
+            failure_context = "Failed to close temporary TOML file";
+            saved_errno = errno;
+        }
+    } else if (temp_fd >= 0) {
+        if (close(temp_fd) != 0 && !failure_context) {
+            failure_context = "Failed to close temporary TOML file";
+            saved_errno = errno;
+        }
+    }
+    if (identity_fd >= 0 && close(identity_fd) != 0 && !failure_context) {
+        failure_context = "Failed to close temporary TOML identity handle";
+        saved_errno = errno;
+    }
+    if (temp_created && dir_fd >= 0 && temp_name[0] != '\0') {
+        bool cleanup_resolved = false;
+        bool pathname_substituted = false;
+        int cleanup_errno = 0;
+
+        if (fstatat(dir_fd, temp_name, &current_temp,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            cleanup_errno = errno;
+            cleanup_resolved = cleanup_errno == ENOENT;
+        } else if (!have_temp_identity) {
+            /* Without the created fd snapshot, neither unlink nor unregister
+             * is safe: inspection cannot identify whose pathname this is. */
+            cleanup_errno = EIO;
+        } else if (!toml_same_file(&temp_identity, &current_temp)) {
+            /* The pathname provably names somebody else's inode. Do not unlink
+             * it, and drop our path-only scratch slot so a later signal cleanup
+             * cannot become an attacker-file deletion primitive. */
+            pathname_substituted = true;
+            cleanup_resolved = true;
+        } else if (unlinkat(dir_fd, temp_name, 0) == 0) {
+            cleanup_resolved = true;
+        } else {
+            cleanup_errno = errno;
+            cleanup_resolved = cleanup_errno == ENOENT;
+        }
+
+        if (cleanup_resolved) {
+            temp_created = false;
+            if (temp_registered) {
+                signals_scratch_unregister(temp_path);
+                temp_registered = false;
+            }
+            if (pathname_substituted) {
+                log_warning("Temporary TOML pathname was substituted; refusing "
+                            "to unlink replacement %s",
+                            temp_path ? temp_path : temp_name);
+            }
+        } else {
+            if (!failure_context) {
+                failure_context = "Failed to safely remove temporary TOML file";
+                saved_errno = cleanup_errno ? cleanup_errno : EIO;
+            } else {
+                log_warning("Temporary TOML cleanup refused/failed for %s: "
+                            "%s (errno=%d); retaining signal-cleanup registration",
+                            temp_path ? temp_path : temp_name,
+                            strerror(cleanup_errno ? cleanup_errno : EIO),
+                            cleanup_errno ? cleanup_errno : EIO);
+            }
+            /* Retain the slot only when inspection was indeterminate or
+             * unlinking the exact created inode failed. */
+        }
+    }
+    if (dir_fd >= 0) (void)close(dir_fd);
+
+    if (failure_context) {
+        errno = saved_errno ? saved_errno : EIO;
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "%s: %s",
+                         failure_context, file_path);
+        result = -1;
+    }
+    free(temp_path);
+    free(dir_path);
+    return result;
 }
 
 /* Cleanup TOML document */

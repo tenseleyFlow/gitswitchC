@@ -11,6 +11,20 @@ static int parse(const char *s, toml_document_t *doc) {
     return toml_parse_string(s, strlen(s), doc);
 }
 
+/* Every file-backed parser test gets a private, tracked directory. Fixed
+ * names directly under /tmp let concurrent suites truncate one another and
+ * followed attacker-planted symlinks before AR-07 L20. */
+static int make_temp_toml_path(char *dir, size_t dir_size,
+                               char *path, size_t path_size) {
+    int written = snprintf(dir, dir_size, "/tmp/gitswitch-toml-XXXXXX");
+    if (written < 0 || (size_t)written >= dir_size || !ts_mkdtemp(dir)) {
+        return -1;
+    }
+    written = snprintf(path, path_size, "%s/fixture.toml", dir);
+    if (written < 0 || (size_t)written >= path_size) return -1;
+    return 0;
+}
+
 TEST(parses_valid_config) {
     toml_document_t doc;
     char buf[64];
@@ -122,13 +136,17 @@ TEST(rejects_control_char_in_string) {
  * config.c's loader turns it into a counted skip, never whole-file loss. */
 TEST(quote_in_value_round_trips) {
     toml_document_t doc;
+    char dir[128];
+    char path[192];
+    if (make_temp_toml_path(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        return;
+    }
     toml_init_document(&doc);
     CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"), 0);
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "name", "Work \"GmbH\""), 0);
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "email", "a@b.com"), 0);
-    char path[] = "/tmp/gitswitch_toml_rt_test.toml";
     CHECK_EQ_INT(toml_write_file(&doc, path), 0);
-    chmod(path, 0600); /* toml_parse_file requires 0600, like config_save sets */
     toml_cleanup_document(&doc);
 
     toml_document_t doc2;
@@ -236,6 +254,12 @@ TEST(max_accounts_plus_settings_fit_and_round_trip) {
     /* ~600KB each after the M7 bump: static keeps them off the test stack. */
     static toml_document_t doc, doc2;
     char sec[32], name[32], email[64], buf[64];
+    char dir[128];
+    char path[192];
+    if (make_temp_toml_path(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        return;
+    }
     toml_init_document(&doc);
     CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"), 0);
     int failed_sets = 0;
@@ -247,9 +271,7 @@ TEST(max_accounts_plus_settings_fit_and_round_trip) {
         if (toml_set_string(&doc, sec, "email", email) != 0) failed_sets++;
     }
     CHECK_EQ_INT(failed_sets, 0); /* pre-fix: fails from the 32nd section on */
-    char path[] = "/tmp/gitswitch_toml_maxacct_test.toml";
     CHECK_EQ_INT(toml_write_file(&doc, path), 0);
-    chmod(path, 0600); /* toml_parse_file requires 0600, like config_save sets */
     toml_cleanup_document(&doc);
 
     CHECK_EQ_INT(toml_parse_file(path, &doc2), 0);
@@ -265,7 +287,12 @@ TEST(max_accounts_plus_settings_fit_and_round_trip) {
  * indistinguishable from a gitswitch bug. It must fail with a targeted
  * diagnostic that names the actual problem. */
 TEST(empty_config_reports_targeted_error) {
-    char path[] = "/tmp/gitswitch_toml_empty_test.toml";
+    char dir[128];
+    char path[192];
+    if (make_temp_toml_path(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        return;
+    }
     FILE *f = fopen(path, "w");
     CHECK(f != NULL);
     if (f) fclose(f);
@@ -375,6 +402,12 @@ TEST(rejects_multiple_pairs_per_line) {
 TEST(bracket_heavy_value_round_trips) {
     toml_document_t doc;
     char desc[48];
+    char dir[128];
+    char path[192];
+    if (make_temp_toml_path(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        return;
+    }
     memset(desc, '[', sizeof(desc) - 1);
     desc[sizeof(desc) - 1] = '\0';
     toml_init_document(&doc);
@@ -382,9 +415,7 @@ TEST(bracket_heavy_value_round_trips) {
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "name", "alice"), 0);
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "email", "a@b.com"), 0);
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "description", desc), 0);
-    char path[] = "/tmp/gitswitch_toml_bracket_rt_test.toml";
     CHECK_EQ_INT(toml_write_file(&doc, path), 0);
-    chmod(path, 0600); /* toml_parse_file requires 0600, like config_save sets */
     toml_cleanup_document(&doc);
 
     toml_document_t doc2;
