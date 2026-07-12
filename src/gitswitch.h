@@ -98,6 +98,11 @@ typedef struct {
                           * purely-informational SSH connection test so the
                           * login shell prompt isn't stalled on a network RTT */
     bool assume_yes;     /* --yes: skip interactive confirmation prompts */
+    /* Runtime-only ownership marker. The CLI's common tail must release its
+     * config lock and securely free the heap context before a deferred signal
+     * is re-raised; zero-initialized library/test contexts retain the historic
+     * accounts-layer dispatch behavior. Never persisted. */
+    bool defer_signal_cleanup;
 } config_t;
 
 /* Application context */

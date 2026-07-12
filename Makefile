@@ -84,6 +84,12 @@ CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
          -Wswitch-default -Wunused -Werror-implicit-function-declaration \
          $(VERSION_FLAGS)
 
+# Production frames above 128 KiB are a build-time regression: the supported
+# CLI must run with a 256 KiB stack, leaving room for libc and nested helpers.
+# Keep this on production translation units (tests intentionally construct
+# several large fixtures on their own stacks).
+FRAME_SIZE_WARNING = -Wframe-larger-than=131072
+
 # Platform-specific flags
 ifeq ($(UNAME_S),Linux)
     # Compiler-specific warnings. Clang does not implement -Wlogical-op.
@@ -236,7 +242,9 @@ HEADERS = $(wildcard $(SRCDIR)/*.h)
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
-DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d)
+AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
+DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
+           $(AR07_RESET_MAIN_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -275,6 +283,7 @@ cc=$(CC)
 cc_is_clang=$(CC_IS_CLANG)
 cppflags=$(CPPFLAGS)
 cflags=$(CFLAGS)
+frame_size_warning=$(FRAME_SIZE_WARNING)
 includes=$(INCLUDES)
 depflags=$(DEPFLAGS)
 ldflags=$(LDFLAGS)
@@ -315,7 +324,7 @@ buildtype-force:
 # Compile source files
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling $<..."
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 # Link main executable
 $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
@@ -371,8 +380,22 @@ $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) -c $< -o $@
 
+# The reset suite calls the real CLI entry point in isolated child processes
+# while installing deterministic in-process boundary hooks. Rename only this
+# test object's main; the production binary remains free of those hooks.
+$(AR07_RESET_MAIN_OBJECT): $(SRCDIR)/main.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-07 reset CLI test entry..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING -Dmain=gitswitch_cli_main -c $< -o $@
+
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 
@@ -664,6 +687,21 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 		echo 'ERROR: release build stamp was not recognized by install' >&2; \
 		exit 1; \
 	fi; \
+	stack_home="$$stage/stack-home"; \
+	stack_runtime="$$stage/stack-runtime"; \
+	mkdir -m 700 "$$stack_home" "$$stack_runtime"; \
+	stack_log="$$stage/stack.log"; \
+	if ! (ulimit -s 256; \
+		"$(BINDIR)/$(TARGET)" --help >/dev/null && \
+		"$(BINDIR)/$(TARGET)" --version >/dev/null && \
+		HOME="$$stack_home" XDG_RUNTIME_DIR="$$stack_runtime" \
+			"$(BINDIR)/$(TARGET)" -n -C config </dev/null >/dev/null) \
+			>"$$stack_log" 2>&1; then \
+		cat "$$stack_log" >&2; \
+		echo 'ERROR: release CLI failed under a 256 KiB stack' >&2; \
+		exit 1; \
+	fi; \
+	echo 'Release stack check passed: help/version/config at 256 KiB'; \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
 		"$$stage$(PREFIX)/bin/$(TARGET)"; \
 	sh tests/test_ar07_release.sh neuter "$(CC)" \
@@ -704,4 +742,4 @@ rpm: dist
 	@echo "RPM packages created in ~/rpmbuild/RPMS/"
 
 # Prevent make from removing intermediate files
-.SECONDARY: $(OBJECTS) $(TEST_OBJECTS)
+.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT)

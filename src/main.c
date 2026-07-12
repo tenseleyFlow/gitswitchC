@@ -105,10 +105,54 @@ typedef struct {
     command_notice_kind_t notice_kind;
     bool switch_prepared;
     bool edit_prepared;
+    bool reset_guarded;
     config_resume_hint_snapshot_t hint_snapshot;
     char previous_active[MAX_NAME_LEN];
     char subject[MAX_NAME_LEN];
 } command_result_t;
+
+/* Deterministic reset transaction checkpoints used only by the dedicated
+ * AR-07 regression binary.  The production main object contains no injectable
+ * environment-variable seam and pays only for the no-op calls below. */
+enum {
+    RESET_TEST_AFTER_SSH = 1,
+    RESET_TEST_AFTER_GPG,
+    RESET_TEST_AFTER_ACTIVE_CLEAR,
+    RESET_TEST_AFTER_ACTIVE_COMMIT
+};
+
+#ifdef GITSWITCH_TESTING
+typedef void (*reset_test_hook_fn)(int stage);
+reset_test_hook_fn gitswitch_test_set_reset_hook(reset_test_hook_fn hook);
+int gitswitch_test_context_allocations(void);
+int gitswitch_test_context_allocation_total(void);
+
+static reset_test_hook_fn g_reset_test_hook;
+static int g_context_allocations;
+static int g_context_allocation_total;
+
+reset_test_hook_fn gitswitch_test_set_reset_hook(reset_test_hook_fn hook) {
+    reset_test_hook_fn previous = g_reset_test_hook;
+    g_reset_test_hook = hook;
+    return previous;
+}
+
+int gitswitch_test_context_allocations(void) {
+    return g_context_allocations;
+}
+
+int gitswitch_test_context_allocation_total(void) {
+    return g_context_allocation_total;
+}
+#endif
+
+static void reset_test_checkpoint(int stage) {
+#ifdef GITSWITCH_TESTING
+    if (g_reset_test_hook) g_reset_test_hook(stage);
+#else
+    (void)stage;
+#endif
+}
 
 static command_result_t command_result(int status);
 static void emit_command_success(const gitswitch_ctx_t *ctx,
@@ -130,6 +174,12 @@ static int handle_resume_command(gitswitch_ctx_t *ctx);
 static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                                              const char *account);
 static const char *detect_shell_from_env(void);
+
+#ifdef GITSWITCH_TESTING
+/* `main` is macro-renamed by the focused reset-test object. Keep the renamed
+ * external entry under the same missing-prototype gate as every other API. */
+int main(int argc, char *argv[]);
+#endif
 
 /* Validate the complete positional grammar before any command can acquire the
  * config lock, create ~/.config/gitswitch, or dispatch a handler. Unknown first
@@ -226,7 +276,11 @@ static void emit_command_success(const gitswitch_ctx_t *ctx,
 }
 
 int main(int argc, char *argv[]) {
-    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t *ctx = NULL;
+    command_result_t mutation = command_result(EXIT_SUCCESS);
+    bool has_mutation_result = false;
+    const char *pending_signal_notice = NULL;
+    int config_lock_fd = -1;
     int opt;
 
     /* Restrict permissions on everything we create (config, keys, agent dirs,
@@ -354,18 +408,19 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Handle informational commands before display/config initialization and,
+     * critically, before allocating the large application context. */
+    if (show_version) {
+        print_version();
+        error_cleanup();
+        return EXIT_SUCCESS;
+    }
+
     /* Initialize display system */
     if (display_init(force_color, no_color) != 0) {
         log_error("Failed to initialize display system");
         error_cleanup();
         return EXIT_FAILURE;
-    }
-    
-    /* Handle special commands that don't need config */
-    if (show_version) {
-        print_version();
-        error_cleanup();
-        return EXIT_SUCCESS;
     }
     
     if (show_help) {
@@ -391,6 +446,18 @@ int main(int argc, char *argv[]) {
         return rc;
     }
 
+    ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        display_error("Could not allocate application context", "%s",
+                      strerror(errno));
+        exit_code = EXIT_FAILURE;
+        goto cleanup;
+    }
+#ifdef GITSWITCH_TESTING
+    g_context_allocations++;
+    g_context_allocation_total++;
+#endif
+
     /* For commands that mutate shared state, hold an exclusive cross-process
      * lock across the WHOLE load->mutate->save cycle. That is not just the
      * config read-modify-writers (add/edit/remove, a bare-account switch that
@@ -408,7 +475,6 @@ int main(int argc, char *argv[]) {
      * into login/command latency (AR-03 L10). Fail closed on other lock errors:
      * silently proceeding unlocked would reopen the exact lost-update and
      * split-identity races the lock exists to prevent (AR-02 #17). */
-    int config_lock_fd = -1;
     {
         const char *c = (optind < argc) ? argv[optind] : NULL;
         bool read_only = (c == NULL) ||
@@ -432,8 +498,8 @@ int main(int argc, char *argv[]) {
                  * result, so this redundant restore is a successful no-op and
                  * must not delay or alarm every newly opened shell. */
                 if (contended && c && strcmp(c, "resume") == 0) {
-                    error_cleanup();
-                    return EXIT_SUCCESS;
+                    exit_code = EXIT_SUCCESS;
+                    goto cleanup;
                 }
                 if (contended) {
                     display_error("Another gitswitch holds the config lock",
@@ -443,34 +509,36 @@ int main(int argc, char *argv[]) {
                                   "the config directory or lock is unavailable; "
                                   "check permissions and try again");
                 }
-                error_cleanup();
-                return EXIT_FAILURE;
+                exit_code = EXIT_FAILURE;
+                goto cleanup;
             }
         }
     }
 
     /* Initialize configuration system */
     log_info("Initializing gitswitch-c configuration system");
-    if ((dry_run ? config_init_readonly(&ctx) : config_init(&ctx)) != 0) {
+    if ((dry_run ? config_init_readonly(ctx) : config_init(ctx)) != 0) {
         display_error("Configuration initialization failed", "%s", get_last_error()->message);
-        error_cleanup();
-        return EXIT_CONFIG_ERROR;
+        exit_code = EXIT_CONFIG_ERROR;
+        goto cleanup;
     }
     
     /* Set dry run mode if requested */
-    ctx.config.dry_run = dry_run;
-    ctx.config.force_global = force_global;
-    ctx.config.force_local = force_local;
-    ctx.config.assume_yes = assume_yes;
-    ctx.config.verbose = should_log(LOG_LEVEL_DEBUG);
-    
-    command_result_t mutation = command_result(EXIT_SUCCESS);
-    bool has_mutation_result = false;
+    ctx->config.dry_run = dry_run;
+    ctx->config.force_global = force_global;
+    ctx->config.force_local = force_local;
+    ctx->config.assume_yes = assume_yes;
+    ctx->config.verbose = should_log(LOG_LEVEL_DEBUG);
+    /* accounts.c historically re-raised interrupted direct/library calls at
+     * its own rollback boundary. The CLI owns additional resources beyond
+     * that boundary, so its common tail performs the truthful re-raise only
+     * after releasing the config lock and securely freeing this heap context. */
+    ctx->config.defer_signal_cleanup = true;
 
     /* Execute command */
     if (command == NULL) {
         /* No command specified - interactive mode or help */
-        if (ctx.account_count == 0) {
+        if (ctx->account_count == 0) {
             display_header("Welcome to gitswitch-c");
             display_warning("No accounts configured yet");
             printf("\nTo get started:\n");
@@ -480,43 +548,43 @@ int main(int argc, char *argv[]) {
             printf("  4. Run 'gitswitch --help' for more options\n\n");
         } else {
             /* Show account list */
-            exit_code = handle_list_command(&ctx);
+            exit_code = handle_list_command(ctx);
         }
     } else if (strcmp(command, "add") == 0) {
-        mutation = handle_add_command(&ctx);
+        mutation = handle_add_command(ctx);
         has_mutation_result = true;
         exit_code = mutation.status;
     } else if (strcmp(command, "edit") == 0) {
-        mutation = handle_edit_command(&ctx, arg1);
+        mutation = handle_edit_command(ctx, arg1);
         has_mutation_result = true;
         exit_code = mutation.status;
     } else if (strcmp(command, "list") == 0 || strcmp(command, "ls") == 0) {
         /* `list --names` is a plumbing mode: one account name per line, no
          * decoration, for shell-completion scripts to consume. */
-        exit_code = names_only ? handle_list_names(&ctx) : handle_list_command(&ctx);
+        exit_code = names_only ? handle_list_names(ctx) : handle_list_command(ctx);
     } else if (strcmp(command, "remove") == 0 || strcmp(command, "rm") == 0 || strcmp(command, "delete") == 0) {
-        mutation = handle_remove_command(&ctx, arg1);
+        mutation = handle_remove_command(ctx, arg1);
         has_mutation_result = true;
         exit_code = mutation.status;
     } else if (strcmp(command, "status") == 0) {
-        exit_code = handle_status_command(&ctx);
+        exit_code = handle_status_command(ctx);
     } else if (strcmp(command, "doctor") == 0 || strcmp(command, "health") == 0) {
-        exit_code = handle_doctor_command(&ctx);
+        exit_code = handle_doctor_command(ctx);
     } else if (strcmp(command, "config") == 0) {
-        exit_code = handle_config_command(&ctx);
+        exit_code = handle_config_command(ctx);
     } else if (strcmp(command, "resume") == 0) {
-        exit_code = handle_resume_command(&ctx);
+        exit_code = handle_resume_command(ctx);
     } else if (strcmp(command, "reset") == 0) {
-        mutation = handle_reset_command(&ctx, arg1);
+        mutation = handle_reset_command(ctx, arg1);
         has_mutation_result = true;
         exit_code = mutation.status;
     } else if (strcmp(command, "switch") == 0) {
-        mutation = handle_switch_command(&ctx, arg1);
+        mutation = handle_switch_command(ctx, arg1);
         has_mutation_result = true;
         exit_code = mutation.status;
     } else {
         /* Assume it's an account identifier for switching */
-        mutation = handle_switch_command(&ctx, command);
+        mutation = handle_switch_command(ctx, command);
         has_mutation_result = true;
         exit_code = mutation.status;
     }
@@ -531,41 +599,39 @@ int main(int argc, char *argv[]) {
 
         if (mutation.save_kind != COMMAND_SAVE_NONE) {
             log_debug("Saving configuration after %s command (account_count=%zu)",
-                      command, ctx.account_count);
+                      command, ctx->account_count);
             signals_guard_begin();
             signals_rollback_begin();
             if (mutation.save_kind == COMMAND_SAVE_FULL) {
                 if (mutation.edit_prepared) {
                     save_rc = config_save_transactional(
-                        &ctx, ctx.config.config_path, &config_installed);
+                        ctx, ctx->config.config_path, &config_installed);
                 } else {
-                    save_rc = config_save(&ctx, ctx.config.config_path);
+                    save_rc = config_save(ctx, ctx->config.config_path);
                 }
             } else if (mutation.switch_prepared) {
                 save_rc = config_save_active_account_transactional(
-                    &ctx, ctx.config.config_path, &config_installed);
+                    ctx, ctx->config.config_path, &config_installed);
+            } else if (mutation.reset_guarded) {
+                save_rc = config_save_active_account_transactional(
+                    ctx, ctx->config.config_path, &config_installed);
             } else {
                 save_rc = config_save_active_account(
-                    &ctx, ctx.config.config_path);
+                    ctx, ctx->config.config_path);
             }
             if (save_rc != 0) {
                 safe_strncpy(save_error, get_last_error()->message,
                              sizeof(save_error));
             }
             signals_scratch_cleanup();
-            if (!mutation.switch_prepared && !mutation.edit_prepared) {
-                signals_rollback_end();
-            }
         }
 
         if (mutation.switch_prepared && save_rc == 0) {
-            if (accounts_switch_commit(&ctx) != 0) {
+            if (accounts_switch_commit(ctx) != 0) {
                 save_rc = -1;
                 config_installed = true;
                 safe_strncpy(save_error, get_last_error()->message,
                              sizeof(save_error));
-            } else {
-                signals_rollback_end();
             }
         }
 
@@ -577,7 +643,7 @@ int main(int argc, char *argv[]) {
              * routing too; restoring the old block would create a chimera.
              * Only a proven pre-install failure may restore the before-image. */
             if (save_rc == 0 || config_installed) {
-                if (accounts_edit_commit(&ctx) != 0) {
+                if (accounts_edit_commit(ctx) != 0) {
                     edit_rollback_complete = false;
                     safe_strncpy(edit_rollback_detail,
                                  get_last_error()->message,
@@ -585,13 +651,12 @@ int main(int argc, char *argv[]) {
                     save_rc = -1;
                     config_installed = true;
                 }
-            } else if (accounts_edit_abort(&ctx) != 0) {
+            } else if (accounts_edit_abort(ctx) != 0) {
                 edit_rollback_complete = false;
                 safe_strncpy(edit_rollback_detail,
                              get_last_error()->message,
                              sizeof(edit_rollback_detail));
             }
-            signals_rollback_end();
         }
 
         if (mutation.switch_prepared && save_rc != 0) {
@@ -604,12 +669,12 @@ int main(int argc, char *argv[]) {
              * XDG_RUNTIME_DIR interleave between runtime and active/hint
              * rollback. The outer config lock still excludes same-HOME
              * writers while these persisted before-images are installed. */
-            safe_strncpy(ctx.config.active_account,
+            safe_strncpy(ctx->config.active_account,
                          mutation.previous_active,
-                         sizeof(ctx.config.active_account));
+                         sizeof(ctx->config.active_account));
             if (config_installed &&
-                config_restore_active_account(&ctx,
-                                              ctx.config.config_path) != 0) {
+                config_restore_active_account(ctx,
+                                              ctx->config.config_path) != 0) {
                 rollback_complete = false;
                 safe_strncpy(rollback_detail, get_last_error()->message,
                              sizeof(rollback_detail));
@@ -629,13 +694,11 @@ int main(int argc, char *argv[]) {
             /* accounts_switch_abort is deliberately last: it restores
              * Git/runtime and releases the retained shared-runtime lock only
              * after every config/hint rollback attempt has finished. */
-            if (accounts_switch_abort(&ctx, true) != 0) {
+            if (accounts_switch_abort(ctx, true) != 0) {
                 rollback_complete = false;
                 safe_strncpy(rollback_detail, get_last_error()->message,
                              sizeof(rollback_detail));
             }
-            signals_rollback_end();
-
             if (rollback_complete) {
                 display_error("Failed to save configuration changes; previous switch state restored",
                               "%s", save_error[0] ? save_error :
@@ -650,9 +713,11 @@ int main(int argc, char *argv[]) {
             }
             exit_code = EXIT_FAILURE;
             if (signals_pending()) {
-                fprintf(stderr,
-                        "gitswitch: interrupted — switch rollback attempt completed\n");
-                signals_dispatch_pending();
+                /* Keep repeats deferred through config unlock and heap cleanup;
+                 * the actual re-raise is owned by the common tail. */
+                signals_rollback_begin();
+                pending_signal_notice =
+                    "gitswitch: interrupted — switch rollback attempt completed\n";
             }
         } else if (mutation.edit_prepared && save_rc != 0) {
             if (config_installed) {
@@ -688,23 +753,28 @@ int main(int argc, char *argv[]) {
         }
 
         if (mutation.edit_prepared && signals_pending()) {
-            fprintf(stderr,
-                    "gitswitch: interrupted — edit transaction completed or rolled back\n");
-            signals_dispatch_pending();
+            signals_rollback_begin();
+            pending_signal_notice =
+                "gitswitch: interrupted — edit transaction completed or rolled back\n";
         }
 
-        if (exit_code == EXIT_SUCCESS) {
-            emit_command_success(&ctx, &mutation);
+        if (mutation.reset_guarded &&
+            mutation.save_kind == COMMAND_SAVE_ACTIVE && save_rc == 0) {
+            reset_test_checkpoint(RESET_TEST_AFTER_ACTIVE_COMMIT);
+        }
+
+        if (exit_code == EXIT_SUCCESS && !pending_signal_notice &&
+            !signals_pending()) {
+            emit_command_success(ctx, &mutation);
         }
     }
 
+cleanup:
+    /* Any path can arrive here with a mutation guard still armed. Mark cleanup
+     * rollback-class before touching snapshots, locks, or heap state so a
+     * repeated signal cannot bypass the single secure release path. */
+    signals_rollback_begin();
     config_resume_hint_snapshot_clear(&mutation.hint_snapshot);
-
-    /* M3: drop the guard a successful switch left armed (see above). Done
-     * unconditionally — it also closes the save-path guard, and it is an
-     * idempotent no-op for every command that never armed one. */
-    signals_guard_end();
-
 
     /* Release the config write-lock now that load+mutate+save is done (harmless
      * no-op for read-only commands that never took it; the OS would also drop it
@@ -713,12 +783,43 @@ int main(int argc, char *argv[]) {
         config_write_unlock(config_lock_fd);
     }
 
+    /* The context can contain key paths and identity metadata.  Zero it before
+     * release, including initialization/error exits, and keep a confirmed
+     * reset's deferral window armed until both this cleanup and lock release
+     * have completed. */
+    if (ctx) {
+        secure_zero_memory(ctx, sizeof(*ctx));
+        free(ctx);
+        ctx = NULL;
+#ifdef GITSWITCH_TESTING
+        g_context_allocations--;
+#endif
+    }
+
     /* Note: We intentionally do NOT clean up SSH agents on exit.
      * The agent should persist so subsequent git commands can use it.
      * Cleanup happens at the start of the next account switch. */
 
+    signals_rollback_end();
+
+    /* Restore inherited dispositions only after every owned lock and the heap
+     * context have been released. A signal arriving before this restoration is
+     * recorded; one arriving after follows the caller's original disposition. */
+    signals_guard_end();
+
+    if (signals_pending() && !pending_signal_notice) {
+        pending_signal_notice = mutation.reset_guarded
+            ? "gitswitch: interrupted — reset transaction cleanup completed\n"
+            : "gitswitch: interrupted — command cleanup completed\n";
+    }
+
     /* Cleanup error handling */
     error_cleanup();
+
+    if (pending_signal_notice && signals_pending()) {
+        fputs(pending_signal_notice, stderr);
+        signals_dispatch_pending();
+    }
     return exit_code == EXIT_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -1418,6 +1519,8 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
 static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                                              const char *account) {
     command_result_t result = command_result(EXIT_FAILURE);
+    account_t *target_account = NULL;
+    account_t *active_account = NULL;
     char resp[16];
     const char *target = NULL;
     char ssh_error[sizeof(g_last_error.message)] = "";
@@ -1433,12 +1536,16 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
      * left in place. AR-06 F50: exact id/name/email only — reset destroys
      * secret-key material, so it must never fire on a mere substring match. */
     if (account && *account) {
-        account_t *acct = config_find_account_destructive(ctx, account);
-        if (!acct) {
+        target_account = config_find_account_destructive(ctx, account);
+        if (!target_account) {
             display_error("Account not found", "%s", get_last_error()->message);
             return result;
         }
-        target = acct->name;
+        target = target_account->name;
+    }
+    if (ctx->config.active_account[0] != '\0') {
+        active_account = config_find_account_exact(
+            ctx, ctx->config.active_account);
     }
 
     /* Reset deletes secret-key material, so it is exactly the command a
@@ -1459,7 +1566,8 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
             printf("Would kill ALL gitswitch SSH/GPG agents and delete ALL isolated GPG\n"
                    "homes, removing every on-disk secret-key copy.\n");
         }
-        if ((!target || strcmp(ctx->config.active_account, target) == 0) &&
+        if ((!target || (active_account &&
+                         active_account == target_account)) &&
             ctx->config.active_account[0] != '\0') {
             printf("Would clear the saved active account '%s' and mark resume state\n"
                    "inactive, so login shells stop auto-resuming it.\n",
@@ -1498,6 +1606,21 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         }
     }
 
+    /* From the instant the destructive operation is confirmed until the
+     * active-state artifact is durably committed (or retry metadata is
+     * retained on failure), every guarded signal is deferred.  Repeats stay
+     * deferred as rollback-class work so they cannot strand a half-reset
+     * identity. Main owns the end of this window and truthful re-raise after
+     * config unlock plus secure context cleanup. */
+    signals_rollback_begin();
+    if (signals_guard_begin() != 0) {
+        signals_rollback_end();
+        display_error("Cannot guard reset transaction", "%s",
+                      get_last_error()->message);
+        return result;
+    }
+    result.reset_guarded = true;
+
     runtime_lock_fd = runtime_state_lock_acquire();
     if (runtime_lock_fd < 0) {
         display_error("Cannot lock shared runtime state", "%s",
@@ -1520,6 +1643,7 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                  get_last_error()->message[0] ? get_last_error()->message
                                               : "unknown SSH teardown error");
     }
+    reset_test_checkpoint(RESET_TEST_AFTER_SSH);
 
     /* Always attempt GPG teardown even after an SSH error: independent
      * resources should be cleaned as far as safely possible, while the saved
@@ -1530,6 +1654,7 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                  get_last_error()->message[0] ? get_last_error()->message
                                               : "unknown GPG teardown error");
     }
+    reset_test_checkpoint(RESET_TEST_AFTER_GPG);
     runtime_state_lock_release(runtime_lock_fd);
 
     if (ssh_rc != 0 || gpg_rc != 0) {
@@ -1553,9 +1678,10 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
      * the agents and re-importing the GPG secret key that this command exists
      * to delete. A
      * targeted reset of a NON-active account changes neither. */
-    if (!target || strcmp(ctx->config.active_account, target) == 0) {
+    if (!target || (active_account && active_account == target_account)) {
         ctx->config.active_account[0] = '\0';
         result.save_kind = COMMAND_SAVE_ACTIVE;
+        reset_test_checkpoint(RESET_TEST_AFTER_ACTIVE_CLEAR);
     }
 
     if (target) {
