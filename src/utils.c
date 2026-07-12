@@ -3668,7 +3668,8 @@ bool validate_email(const char *email) {
 bool name_is_reserved_for_commands(const char *name) {
     static const char *const keywords[] = {
         "add", "edit", "list", "ls", "remove", "rm", "delete", "status",
-        "doctor", "health", "config", "init", "resume", "reset", NULL
+        "doctor", "health", "config", "init", "resume", "reset", "switch",
+        NULL
     };
     if (!name || !*name) {
         return false;

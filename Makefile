@@ -399,6 +399,10 @@ $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 
+# This focused suite executes the production CLI to prove that main selects
+# the side-effect-free loader only for the exact `list|ls --names` grammar.
+$(BINDIR)/test_ar07_completion: | $(BINDIR)/$(TARGET)
+
 # Dependency files are optional on the first build and authoritative
 # thereafter. Keep this after `all` so an included -MP compatibility target
 # can never become Make's accidental default goal.

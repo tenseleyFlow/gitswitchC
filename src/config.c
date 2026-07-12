@@ -95,7 +95,7 @@ static bool sanitize_tty_text(char *text);
 static bool text_is_tty_safe(const char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
-                            bool detect_runtime);
+                            bool apply_active_state, bool detect_runtime);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
@@ -124,11 +124,21 @@ typedef struct {
 static int config_read_active_state(const char *config_path,
                                     config_active_state_t *state);
 
-/* Shared initializer. Preview-only commands use the non-creating form so
- * merely inspecting a fresh HOME cannot mkdir or chmod configuration state. */
-static int config_init_mode(gitswitch_ctx_t *ctx, bool create_directory) {
+typedef enum {
+    CONFIG_INIT_NORMAL = 0,
+    CONFIG_INIT_READONLY,
+    CONFIG_INIT_NAMES
+} config_init_kind_t;
+
+/* Shared initializer. Preview-only commands use a non-creating form so merely
+ * inspecting a fresh HOME cannot mkdir or chmod configuration state. The
+ * completion-specific names form goes one step further: it parses the same
+ * account document, but never consults persisted active state or live runtime
+ * state. */
+static int config_init_mode(gitswitch_ctx_t *ctx, config_init_kind_t kind) {
     char config_path[MAX_PATH_LEN];
     char config_dir[MAX_PATH_LEN];
+    bool create_directory = kind == CONFIG_INIT_NORMAL;
     
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_init");
@@ -165,17 +175,19 @@ static int config_init_mode(gitswitch_ctx_t *ctx, bool create_directory) {
     /* Load configuration if it exists */
     if (path_exists(config_path)) {
         log_info("Loading configuration from: %s", config_path);
-        return config_load_mode(ctx, config_path, create_directory);
+        return config_load_mode(ctx, config_path,
+                                kind != CONFIG_INIT_NAMES,
+                                kind == CONFIG_INIT_NORMAL);
     } else {
-        log_info("Configuration file not found, will create default");
-        /* Don't automatically create - let user create when needed */
+        log_info("Configuration file not found: %s", config_path);
+        /* File creation remains deferred to a command that actually needs it. */
         return 0;
     }
 }
 
 /* Initialize configuration system for an ordinary command. */
 int config_init(gitswitch_ctx_t *ctx) {
-    return config_init_mode(ctx, true);
+    return config_init_mode(ctx, CONFIG_INIT_NORMAL);
 }
 
 /* Initialize enough state to inspect an existing configuration without
@@ -183,7 +195,16 @@ int config_init(gitswitch_ctx_t *ctx) {
  * than a flag in gitswitch_ctx_t: the context does not exist until this call,
  * and setting dry_run afterwards is the ordering bug this entry point fixes. */
 int config_init_readonly(gitswitch_ctx_t *ctx) {
-    return config_init_mode(ctx, false);
+    return config_init_mode(ctx, CONFIG_INIT_READONLY);
+}
+
+/* Load only the account document needed by `list --names`. It still validates
+ * the legacy field in that document for schema compatibility, but deliberately
+ * does not apply legacy/versioned active-account state and never reaches
+ * accounts_detect_current(), whose socket inspection takes a runtime lock and
+ * may probe a live agent. */
+int config_init_names(gitswitch_ctx_t *ctx) {
+    return config_init_mode(ctx, CONFIG_INIT_NAMES);
 }
 
 static config_document_malloc_fn g_config_document_malloc = malloc;
@@ -543,7 +564,7 @@ static const char *config_account_runtime_needs(const account_t *account) {
 /* Load configuration from TOML file. Preview-only callers skip live-runtime
  * discovery because its cross-process lock may create/chmod a lock inode. */
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
-                            bool detect_runtime) {
+                            bool apply_active_state, bool detect_runtime) {
     toml_document_t *toml_doc;
     config_active_state_t active_state;
     char legacy_active[MAX_NAME_LEN] = "";
@@ -625,6 +646,12 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
 
     config_document_free(toml_doc);
 
+    if (!apply_active_state) {
+        log_info("Configuration names loaded successfully: %zu accounts",
+                 ctx->account_count);
+        return 0;
+    }
+
     /* A versioned tombstone is authoritative inactive state. Otherwise a
      * two-line artifact supplies the active name directly, while every historic
      * representation (no marker, the original zero-byte marker, or a one-line
@@ -700,7 +727,7 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
 }
 
 int config_load(gitswitch_ctx_t *ctx, const char *config_path) {
-    return config_load_mode(ctx, config_path, true);
+    return config_load_mode(ctx, config_path, true, true);
 }
 
 /* Acquire an exclusive, cross-process lock for a mutating config cycle. Returns

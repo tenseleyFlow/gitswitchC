@@ -562,10 +562,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* Initialize configuration system */
+    /* Completion invokes `list --names` on every TAB. Give exactly that
+     * grammar a names-only loader which parses the full account document but
+     * ignores active/runtime state; other uses of --names retain the ordinary
+     * command initialization contract. */
     log_info("Initializing gitswitch-c configuration system");
-    if (((dry_run || resume_check) ? config_init_readonly(ctx)
-                                   : config_init(ctx)) != 0) {
+    bool names_list = names_only && command &&
+        (strcmp(command, "list") == 0 || strcmp(command, "ls") == 0);
+    int config_rc = names_list ? config_init_names(ctx) :
+        ((dry_run || resume_check) ? config_init_readonly(ctx) :
+                                     config_init(ctx));
+    if (config_rc != 0) {
         display_error("Configuration initialization failed", "%s", get_last_error()->message);
         exit_code = EXIT_CONFIG_ERROR;
         goto cleanup;

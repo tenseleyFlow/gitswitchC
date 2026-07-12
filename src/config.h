@@ -72,6 +72,14 @@ int config_init(gitswitch_ctx_t *ctx);
 int config_init_readonly(gitswitch_ctx_t *ctx);
 
 /**
+ * Load the complete account document for `list --names` without creating or
+ * chmod'ing configuration state, reading active-state artifacts, discovering
+ * SSH/GPG runtime state, taking runtime locks, probing sockets/helpers, or
+ * writing any path.
+ */
+int config_init_names(gitswitch_ctx_t *ctx);
+
+/**
  * Load configuration from TOML file
  * - Parses TOML configuration
  * - Validates all required fields
