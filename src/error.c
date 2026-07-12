@@ -72,6 +72,17 @@ static const struct {
 static const char* log_level_strings[] = {
     "DEBUG", "INFO", "WARN", "ERROR", "CRIT"
 };
+_Static_assert(sizeof(log_level_strings) / sizeof(log_level_strings[0]) ==
+                   LOG_LEVEL_CRITICAL + 1,
+               "log label table must cover every log_level_t value");
+
+static const char *log_level_to_string(log_level_t level) {
+    if ((int)level < (int)LOG_LEVEL_DEBUG ||
+        (int)level > (int)LOG_LEVEL_CRITICAL) {
+        return "UNKNOWN";
+    }
+    return log_level_strings[(size_t)level];
+}
 
 /* Initialize error handling and logging system */
 int error_init(log_level_t level, const char *log_file_path) {
@@ -101,8 +112,8 @@ int error_init(log_level_t level, const char *log_file_path) {
     /* Clear any existing error */
     clear_error();
     
-    log_info("Error handling system initialized (level=%s)", 
-             log_level_strings[level]);
+    log_info("Error handling system initialized (level=%s)",
+             log_level_to_string(level));
     
     return 0;
 }
@@ -234,8 +245,7 @@ void log_message(log_level_t level, const char *file, int line,
     get_timestamp(timestamp, sizeof(timestamp));
     
     /* Format complete log entry */
-    const char *level_str = (level < LOG_LEVEL_CRITICAL) ? 
-        log_level_strings[level] : "UNKNOWN";
+    const char *level_str = log_level_to_string(level);
     
     /* Log to file/stderr */
     if (g_log_file) {
@@ -253,7 +263,7 @@ void log_message(log_level_t level, const char *file, int line,
 /* Set logging level */
 void set_log_level(log_level_t level) {
     g_log_level = level;
-    log_info("Log level changed to %s", log_level_strings[level]);
+    log_info("Log level changed to %s", log_level_to_string(level));
 }
 
 /* Set log output file */
@@ -325,6 +335,15 @@ void print_error(const char *prefix) {
 
 /* Check if error level should be logged */
 bool should_log(log_level_t level) {
+    /* Invalid enum values are diagnostic corruption, not a filtering level.
+     * Let log_message render them as UNKNOWN instead of indexing outside the
+     * label table or silently discarding the only evidence of the bad caller. */
+    if ((int)level < (int)LOG_LEVEL_DEBUG ||
+        (int)level > (int)LOG_LEVEL_CRITICAL ||
+        (int)g_log_level < (int)LOG_LEVEL_DEBUG ||
+        (int)g_log_level > (int)LOG_LEVEL_CRITICAL) {
+        return true;
+    }
     return level >= g_log_level;
 }
 

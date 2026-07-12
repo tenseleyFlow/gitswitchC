@@ -93,6 +93,21 @@ void unlock_private_file(int token_fd);
 int runtime_state_lock_acquire(void);
 void runtime_state_lock_release(int fd);
 
+/* Test-only one-shot fault selector for the four release-time namespace
+ * probes. Production code leaves this at NONE. The hook exists because the
+ * two pinned fstat() calls cannot be made to fail through namespace mutation
+ * without corrupting an unrelated descriptor in the process. */
+typedef enum {
+    RUNTIME_LOCK_RELEASE_STAT_NONE = 0,
+    RUNTIME_LOCK_RELEASE_STAT_PINNED_PARENT,
+    RUNTIME_LOCK_RELEASE_STAT_NAMED_PARENT,
+    RUNTIME_LOCK_RELEASE_STAT_PINNED_DIRECTORY,
+    RUNTIME_LOCK_RELEASE_STAT_NAMED_DIRECTORY
+} runtime_lock_release_stat_probe_t;
+
+void runtime_lock_test_fail_release_stat(
+    runtime_lock_release_stat_probe_t probe, int system_errno);
+
 /**
  * Atomically (re)point a symlink: create a temp link to `target` then rename it
  * over `linkpath`, so a follower never observes a missing/half-updated link.

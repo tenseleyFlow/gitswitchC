@@ -79,11 +79,12 @@ void signals_rollback_begin(void);
 void signals_rollback_end(void);
 
 /**
- * Reset the guarded signals to SIG_DFL (and unblock them) in a freshly-forked
- * child, before it execs (AR-06 F76). Closes the window where the child still
- * runs the parent's guard handler, which would swallow a signal instead of
- * letting the child terminate. Async-signal-safe enough for our single-threaded
- * fork; call it first thing in the child branch.
+ * Reset only signals whose dispositions signals_guard_begin() actually
+ * replaced, and unblock only that same set, in a freshly-forked child before
+ * it execs (AR-06 F76 / AR-07 M32). This closes the window where the child
+ * still runs guard_handler without changing an inherited SIG_IGN or its mask.
+ * Async-signal-safe enough for our single-threaded fork; call it first thing
+ * in the child branch.
  */
 void signals_reset_for_child(void);
 

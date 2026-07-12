@@ -590,6 +590,58 @@ static int runtime_parent_named_stat(const char *path, struct stat *st) {
     return strcmp(path, "/tmp") == 0 ? stat(path, st) : lstat(path, st);
 }
 
+static const char *runtime_lock_stat_failure_kind(int error) {
+    if (error == ENOENT || error == ENOTDIR) return "disappeared";
+    if (error == EACCES || error == EPERM) return "became inaccessible";
+    return "could not be inspected";
+}
+
+static void runtime_lock_warn_stat_failure(const char *subject,
+                                           const char *parent_path,
+                                           const char *child_name,
+                                           int error) {
+    const char *kind = runtime_lock_stat_failure_kind(error);
+    if (child_name) {
+        log_warning("runtime lock %s '%s/%s' %s during release: %s "
+                    "(errno=%d)", subject, parent_path, child_name, kind,
+                    strerror(error), error);
+    } else {
+        log_warning("runtime lock %s '%s' %s during release: %s (errno=%d)",
+                    subject, parent_path, kind, strerror(error), error);
+    }
+}
+
+static runtime_lock_release_stat_probe_t
+    g_runtime_lock_test_release_stat_probe = RUNTIME_LOCK_RELEASE_STAT_NONE;
+static int g_runtime_lock_test_release_stat_errno = EIO;
+
+void runtime_lock_test_fail_release_stat(
+    runtime_lock_release_stat_probe_t probe, int system_errno) {
+    switch (probe) {
+        case RUNTIME_LOCK_RELEASE_STAT_NONE:
+        case RUNTIME_LOCK_RELEASE_STAT_PINNED_PARENT:
+        case RUNTIME_LOCK_RELEASE_STAT_NAMED_PARENT:
+        case RUNTIME_LOCK_RELEASE_STAT_PINNED_DIRECTORY:
+        case RUNTIME_LOCK_RELEASE_STAT_NAMED_DIRECTORY:
+            g_runtime_lock_test_release_stat_probe = probe;
+            break;
+        default:
+            g_runtime_lock_test_release_stat_probe =
+                RUNTIME_LOCK_RELEASE_STAT_NONE;
+            break;
+    }
+    g_runtime_lock_test_release_stat_errno =
+        system_errno > 0 ? system_errno : EIO;
+}
+
+static bool runtime_lock_test_consume_release_stat(
+    runtime_lock_release_stat_probe_t probe) {
+    if (g_runtime_lock_test_release_stat_probe != probe) return false;
+    g_runtime_lock_test_release_stat_probe = RUNTIME_LOCK_RELEASE_STAT_NONE;
+    errno = g_runtime_lock_test_release_stat_errno;
+    return true;
+}
+
 int open_private_subdir_at(int parent_fd, const char *name, bool create,
                            bool *absent) {
     struct stat opened;
@@ -1087,22 +1139,69 @@ void runtime_state_lock_release(int fd) {
                 struct stat named_parent;
                 struct stat pinned_dir;
                 struct stat named_dir;
-                bool have_pp = fstat(g_runtime_locks[i].parent_fd, &pinned_parent) == 0;
-                bool have_np = runtime_parent_named_stat(
-                                   g_runtime_locks[i].parent_path,
-                                   &named_parent) == 0;
-                bool have_pd = fstat(g_runtime_locks[i].dir_fd, &pinned_dir) == 0;
-                bool have_nd = fstatat(g_runtime_locks[i].parent_fd,
-                                       g_runtime_locks[i].child_name, &named_dir,
-                                       AT_SYMLINK_NOFOLLOW) == 0;
-                if ((have_pp && have_np &&
-                     (pinned_parent.st_dev != named_parent.st_dev ||
-                      pinned_parent.st_ino != named_parent.st_ino)) ||
-                    (have_pd && have_nd &&
-                     (pinned_dir.st_dev != named_dir.st_dev ||
-                      pinned_dir.st_ino != named_dir.st_ino))) {
-                    log_warning("runtime lock namespace for '%s' was replaced during "
-                                "the critical section", g_runtime_locks[i].child_name);
+                int pinned_parent_rc =
+                    runtime_lock_test_consume_release_stat(
+                        RUNTIME_LOCK_RELEASE_STAT_PINNED_PARENT)
+                        ? -1
+                        : fstat(g_runtime_locks[i].parent_fd,
+                                &pinned_parent);
+                int pinned_parent_errno =
+                    pinned_parent_rc == 0 ? 0 : errno;
+                int named_parent_rc =
+                    runtime_lock_test_consume_release_stat(
+                        RUNTIME_LOCK_RELEASE_STAT_NAMED_PARENT)
+                        ? -1
+                        : runtime_parent_named_stat(
+                              g_runtime_locks[i].parent_path, &named_parent);
+                int named_parent_errno = named_parent_rc == 0 ? 0 : errno;
+                int pinned_dir_rc =
+                    runtime_lock_test_consume_release_stat(
+                        RUNTIME_LOCK_RELEASE_STAT_PINNED_DIRECTORY)
+                        ? -1
+                        : fstat(g_runtime_locks[i].dir_fd, &pinned_dir);
+                int pinned_dir_errno = pinned_dir_rc == 0 ? 0 : errno;
+                int named_dir_rc =
+                    runtime_lock_test_consume_release_stat(
+                        RUNTIME_LOCK_RELEASE_STAT_NAMED_DIRECTORY)
+                        ? -1
+                        : fstatat(g_runtime_locks[i].parent_fd,
+                                  g_runtime_locks[i].child_name, &named_dir,
+                                  AT_SYMLINK_NOFOLLOW);
+                int named_dir_errno = named_dir_rc == 0 ? 0 : errno;
+
+                if (pinned_parent_errno != 0) {
+                    runtime_lock_warn_stat_failure(
+                        "pinned parent", g_runtime_locks[i].parent_path,
+                        NULL, pinned_parent_errno);
+                }
+                if (named_parent_errno != 0) {
+                    runtime_lock_warn_stat_failure(
+                        "named parent", g_runtime_locks[i].parent_path,
+                        NULL, named_parent_errno);
+                }
+                if (pinned_dir_errno != 0) {
+                    runtime_lock_warn_stat_failure(
+                        "pinned directory", g_runtime_locks[i].parent_path,
+                        g_runtime_locks[i].child_name, pinned_dir_errno);
+                }
+                if (named_dir_errno != 0) {
+                    runtime_lock_warn_stat_failure(
+                        "named directory", g_runtime_locks[i].parent_path,
+                        g_runtime_locks[i].child_name, named_dir_errno);
+                }
+
+                if (pinned_parent_rc == 0 && named_parent_rc == 0 &&
+                    !same_fs_identity(&pinned_parent, &named_parent)) {
+                    log_warning("runtime lock named parent '%s' was replaced "
+                                "during the critical section",
+                                g_runtime_locks[i].parent_path);
+                }
+                if (pinned_dir_rc == 0 && named_dir_rc == 0 &&
+                    !same_fs_identity(&pinned_dir, &named_dir)) {
+                    log_warning("runtime lock named directory '%s/%s' was "
+                                "replaced during the critical section",
+                                g_runtime_locks[i].parent_path,
+                                g_runtime_locks[i].child_name);
                 }
                 unlock_private_file(fd);
                 close(g_runtime_locks[i].dir_fd);
