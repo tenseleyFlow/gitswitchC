@@ -1849,8 +1849,28 @@ static void print_git_value_origin(const git_config_effective_value_t *value) {
     printf(")");
 }
 
+/* Absence is a normal status state; an unreadable, malformed, or invalid Git
+ * configuration is not. Keep the distinction visible so status cannot turn a
+ * failed/truncated inspection into the reassuring appearance of no config. */
+static int print_git_status_read_failure(void) {
+    const error_context_t *error = get_last_error();
+    if (error && error->code == ERR_GIT_CONFIG_NOT_FOUND) {
+        printf("  Status: [NOT FOUND] No git configuration found\n");
+        return 0;
+    }
+    printf("  Status: [ERROR] Unable to determine Git configuration");
+    if (error && error->message[0] != '\0') {
+        printf(": ");
+        print_terminal_safe(error->message);
+    }
+    printf("\n");
+    return -1;
+}
+
 /* Show current account status */
 int accounts_show_status(const gitswitch_ctx_t *ctx) {
+    int status_result = 0;
+
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to accounts_show_status");
         return -1;
@@ -1915,8 +1935,10 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         git_current_config_t git_config;
         if (git_get_current_config(&git_config) == 0) {
             char expected_ssh[GIT_CONFIG_VALUE_MAX] = "";
+            char ssh_status_error[512] = "";
             bool identity_matches;
             bool ssh_matches;
+            bool ssh_status_determined = true;
             bool gpg_program_matches;
 
             printf("  Current Name: %s\n", git_config.name);
@@ -1935,12 +1957,23 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 strcmp(git_config.name, account->name) == 0 &&
                 strcmp(git_config.email, account->email) == 0;
             if (account->ssh_enabled && account->ssh_key_path[0] != '\0') {
-                ssh_matches =
-                    git_expected_ssh_command(account, expected_ssh,
-                                             sizeof(expected_ssh)) == 0 &&
-                    git_config.ssh_command.present &&
-                    !git_config.ssh_command.value_unknown &&
-                    strcmp(git_config.ssh_command.value, expected_ssh) == 0;
+                if (git_expected_ssh_command(account, expected_ssh,
+                                             sizeof(expected_ssh)) != 0) {
+                    const error_context_t *error = get_last_error();
+                    ssh_status_determined = false;
+                    ssh_matches = false;
+                    status_result = -1;
+                    if (error && error->message[0] != '\0') {
+                        (void)snprintf(ssh_status_error,
+                                       sizeof(ssh_status_error), "%s",
+                                       error->message);
+                    }
+                } else {
+                    ssh_matches =
+                        git_config.ssh_command.present &&
+                        !git_config.ssh_command.value_unknown &&
+                        strcmp(git_config.ssh_command.value, expected_ssh) == 0;
+                }
             } else {
                 ssh_matches = !git_config.ssh_command.present;
             }
@@ -1949,7 +1982,14 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             gpg_program_matches = !git_config.gpg_program.present;
             
             /* Check if git config matches account */
-            if (identity_matches && ssh_matches && gpg_program_matches) {
+            if (!ssh_status_determined) {
+                printf("  Match Status: [ERROR] Unable to determine trusted expected SSH command");
+                if (ssh_status_error[0] != '\0') {
+                    printf(": ");
+                    print_terminal_safe(ssh_status_error);
+                }
+                printf("\n");
+            } else if (identity_matches && ssh_matches && gpg_program_matches) {
                 printf("  Match Status: [OK] Git config matches account\n");
             } else {
                 printf("  Match Status: [WARN] Git config does not match account\n");
@@ -1959,8 +1999,12 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 }
             }
 
-            printf("  Effective SSH Command: %s",
-                   ssh_matches ? "[MATCH]" : "[MISMATCH]");
+            if (ssh_status_determined) {
+                printf("  Effective SSH Command: %s",
+                       ssh_matches ? "[MATCH]" : "[MISMATCH]");
+            } else {
+                printf("  Effective SSH Command: [ERROR] Expected command unavailable");
+            }
             print_git_value_origin(&git_config.ssh_command);
             printf("\n");
             printf("  Effective GPG Program: %s",
@@ -1976,7 +2020,7 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 printf("  GPG Signing: [NOT CONFIGURED]\n");
             }
         } else {
-            printf("  Status: [NOT FOUND] No git configuration found\n");
+            if (print_git_status_read_failure() != 0) status_result = -1;
         }
         
         /* Repository context */
@@ -2007,7 +2051,7 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                    git_config_origin_scope_to_string(
                        git_config.effective_name_scope));
         } else {
-            printf("  Status: [NOT FOUND] No git configuration found\n");
+            if (print_git_status_read_failure() != 0) status_result = -1;
         }
         
         /* Repository context */
@@ -2020,7 +2064,7 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
     }
     
     printf("\n");
-    return 0;
+    return status_result;
 }
 
 /* Simple account validation for Phase 2 */

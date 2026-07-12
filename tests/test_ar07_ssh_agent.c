@@ -1174,7 +1174,7 @@ TEST(account_status_reuses_one_descriptor_backed_key_inspection) {
     previous_open = ssh_manager_set_key_open_fn(counting_key_open);
     fflush(stdout);
     CHECK_EQ_INT(dup2(fileno(capture), STDOUT_FILENO), STDOUT_FILENO);
-    CHECK_EQ_INT(accounts_show_status(&ctx), 0);
+    CHECK_EQ_INT(accounts_show_status(&ctx), -1);
     fflush(stdout);
     CHECK_EQ_INT(dup2(saved_stdout, STDOUT_FILENO), STDOUT_FILENO);
     ssh_manager_set_key_open_fn(previous_open);

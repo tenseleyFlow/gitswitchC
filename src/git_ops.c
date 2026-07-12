@@ -8,6 +8,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdarg.h>
+#include <limits.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -36,12 +37,11 @@ static int git_verify_merged_account(const account_t *account);
 
 /* Value capacity for the effective-status representation and exec cache
  * below. The transactional snapshot is dynamically allocated so it can retain
- * every value of every managed key without truncation. Sized for the
- * largest value gitswitch itself writes: git_configure_ssh's core.sshCommand
- * is ~85 bytes of fixed ssh options plus a single-quoted key path of up to
- * MAX_PATH_LEN. The old 512-byte cap could not hold gitswitch's OWN value for
- * a long key path, and the drop was then recorded as "proven absent" — the
- * AR-03 M1 bug. */
+ * every value of every managed key without truncation. This covers the largest
+ * value gitswitch itself writes: git_configure_ssh's core.sshCommand contains
+ * a safely quoted canonical SSH executable plus a separately quoted key path.
+ * The old 512-byte cap could not hold gitswitch's OWN value for a long key
+ * path, and the drop was then recorded as "proven absent" — the AR-03 M1 bug. */
 #define GIT_CFG_VALUE_MAX GIT_CONFIG_VALUE_MAX
 
 /* Worktree scope is intentionally internal: accounts may choose local,
@@ -55,6 +55,7 @@ typedef struct {
     const char *key;
     char value[GIT_CFG_VALUE_MAX];
     bool present;
+    bool implicit;
     bool value_unknown; /* present, but the value exceeded value[] (a foreign
                          * writer): restore must neither write back a
                          * truncated copy nor --unset the user's original. */
@@ -198,8 +199,8 @@ typedef struct {
     git_config_origin_scope_t scopes[GIT_MANAGED_KEY_COUNT];
 } git_effective_listing_t;
 
-/* Single-threaded CLI scratch. Keeping this in .bss avoids adding roughly
- * 50 KiB to the already substantial status stack frame. */
+/* Single-threaded CLI scratch. Keeping the large status representation in
+ * .bss avoids adding it to the already substantial status stack frame. */
 static git_effective_listing_t g_effective_listing;
 
 static git_config_origin_scope_t parse_origin_scope(const char *scope,
@@ -276,6 +277,7 @@ static int parse_effective_listing(const char *buf, size_t len,
 
         git_kv_t *entry = &out->keys[key_index];
         entry->present = true;
+        entry->implicit = false;
         entry->value_unknown = false;
         entry->value[0] = '\0';
         out->origins[key_index][0] = '\0';
@@ -283,9 +285,10 @@ static int parse_effective_listing(const char *buf, size_t len,
                                                     scope_len);
 
         if (!newline) {
-            /* Implicit booleans are present but cannot be losslessly restored
-             * as a string through this status representation. */
-            entry->value_unknown = true;
+            /* `key` without `= value` is an implicit Boolean true. Keep that
+             * semantic distinct from both an explicit empty value (false for
+             * Git Booleans) and an oversized unknown value. */
+            entry->implicit = true;
         } else {
             const char *value = newline + 1;
             size_t value_len = record_len - key_len - 1;
@@ -1097,35 +1100,219 @@ int git_set_config(const account_t *account, git_scope_t scope) {
     return 0;
 }
 
-/* Read effective values and their exact scope/file origins in one process.
- * A failed or truncated read is an error, never an all-absent status. */
-static int git_read_effective_keys(git_effective_listing_t **out) {
-    char list[16384];
+/* Preserve a useful Git diagnostic without ever feeding its arbitrary control
+ * bytes into a terminal/error string. run_argv has one capture channel, so a
+ * successful binary listing keeps stderr separate; only after that read fails
+ * do we repeat the same read-only command with stderr merged for diagnostics.
+ * The original run_result remains authoritative if the diagnostic retry races
+ * with a concurrent repair. */
+static void git_set_capture_error(const char *context,
+                                  const char *const argv[],
+                                  const run_result_t *original) {
+    char diagnostic[2048];
     run_opts_t opts;
-    run_result_t res;
+    run_result_t retry;
+    size_t length;
+
+    memset(diagnostic, 0, sizeof(diagnostic));
+    memset(&opts, 0, sizeof(opts));
+    memset(&retry, 0, sizeof(retry));
+    opts.out = diagnostic;
+    opts.out_size = sizeof(diagnostic);
+    opts.merge_stderr = true;
+    (void)run_argv(argv, &opts, &retry);
+
+    length = retry.out_len;
+    if (length >= sizeof(diagnostic)) length = sizeof(diagnostic) - 1U;
+    {
+        size_t read_offset = 0;
+        size_t write_offset = 0;
+
+        /* Sanitize before set_error(): it logs immediately, so a later
+         * terminal-safe print wrapper cannot protect the log. Strict UTF-8
+         * decoding catches encoded C1 controls such as U+009B (CSI); malformed
+         * bytes and every unsafe codepoint collapse to one ordinary space.
+         * In-place compaction is safe because output never grows. */
+        while (read_offset < length) {
+            uint32_t codepoint = 0;
+            size_t decoded = utf8_decode(
+                (const unsigned char *)diagnostic + read_offset,
+                length - read_offset, &codepoint);
+            if (decoded == 0) {
+                diagnostic[write_offset++] = ' ';
+                read_offset++;
+            } else if (!tty_safe_codepoint(codepoint)) {
+                diagnostic[write_offset++] = ' ';
+                read_offset += decoded;
+            } else {
+                memmove(diagnostic + write_offset,
+                        diagnostic + read_offset, decoded);
+                write_offset += decoded;
+                read_offset += decoded;
+            }
+        }
+        length = write_offset;
+    }
+    while (length > 0 && diagnostic[length - 1U] == ' ') length--;
+    diagnostic[length] = '\0';
+
+    if (diagnostic[0] != '\0' &&
+        (!retry.spawned || retry.term_signal != 0 || retry.exit_code != 0)) {
+        set_error(ERR_GIT_CONFIG_FAILED, "%s: %s%s", context, diagnostic,
+                  retry.out_truncated ? " [diagnostic truncated]" : "");
+    } else if (original && original->term_signal != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "%s: Git was killed by signal %d",
+                  context, original->term_signal);
+    } else if (original && original->spawned) {
+        set_error(ERR_GIT_CONFIG_FAILED, "%s: Git exited with status %d",
+                  context, original->exit_code);
+    } else {
+        set_error(ERR_GIT_CONFIG_FAILED, "%s: Git could not be started",
+                  context);
+    }
+}
+
+/* Read effective values and their exact scope/file origins. The complete Git
+ * configuration can be much larger than the six managed keys because --list
+ * includes unrelated values. Grow and retry until the binary listing is
+ * complete instead of converting a fixed-buffer truncation into six absences.
+ * Allocation/size overflow is an explicit error, never a clean status. */
+static int git_read_effective_keys(git_effective_listing_t **out) {
+    size_t capacity = 16384U;
+    char *list = NULL;
     const char *argv[] = {
         "git", "config", "--show-origin", "--show-scope", "-z", "--list", NULL
     };
 
     if (!out) return -1;
     *out = NULL;
-    memset(&opts, 0, sizeof(opts));
-    memset(&res, 0, sizeof(res));
-    opts.out = list;
-    opts.out_size = sizeof(list);
-    opts.stderr_to_devnull = true;
-    if (run_argv(argv, &opts, &res) != 0 || res.out_truncated) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Could not read effective Git configuration with origins");
+    list = malloc(capacity);
+    if (!list) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory reading effective Git configuration");
         return -1;
     }
-    if (parse_effective_listing(list, res.out_len, &g_effective_listing) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Malformed effective Git configuration listing");
+
+    for (;;) {
+        run_opts_t opts;
+        run_result_t res;
+        memset(&opts, 0, sizeof(opts));
+        memset(&res, 0, sizeof(res));
+        opts.out = list;
+        opts.out_size = capacity;
+        opts.stderr_to_devnull = true;
+
+        if (run_argv(argv, &opts, &res) != 0) {
+            git_set_capture_error(
+                "Could not read effective Git configuration with origins",
+                argv, &res);
+            free(list);
+            return -1;
+        }
+        if (!res.out_truncated) {
+            int parse_rc = parse_effective_listing(
+                list, res.out_len, &g_effective_listing);
+            free(list);
+            if (parse_rc != 0) {
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Malformed effective Git configuration listing");
+                return -1;
+            }
+            *out = &g_effective_listing;
+            return 0;
+        }
+
+        if (capacity > SIZE_MAX / 2U) {
+            free(list);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Effective Git configuration is too large to inspect");
+            return -1;
+        }
+        capacity *= 2U;
+        char *grown = realloc(list, capacity);
+        if (!grown) {
+            free(list);
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Out of memory growing effective Git configuration capture");
+            return -1;
+        }
+        list = grown;
+    }
+}
+
+/* Mirror Git's complete Boolean grammar while retaining the one atomic
+ * effective listing: an implicit key is true; empty, false/no/off, and every
+ * in-range signed integer equal to zero are false; true/yes/on and nonzero
+ * integers are true. Text keywords are case-insensitive. Numeric parsing uses
+ * C base detection plus Git's optional k/m/g binary scale suffix, remains
+ * within a signed-int result, and rejects trailing bytes/overflow. The focused
+ * regression table compares every category to `git config --bool` itself. */
+static int git_parse_effective_bool(const git_kv_t *entry, const char *key,
+                                    bool *value) {
+    char *end = NULL;
+    long long number;
+    long long multiplier = 1;
+
+    if (!entry || !key || !value || !entry->present) {
+        set_error(ERR_INVALID_ARGS, "Invalid Git Boolean query");
         return -1;
     }
-    *out = &g_effective_listing;
-    return 0;
+    if (entry->implicit) {
+        *value = true;
+        return 0;
+    }
+    if (entry->value_unknown) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective Git Boolean value is too large to inspect");
+        return -1;
+    }
+    if (entry->value[0] == '\0' ||
+        strcasecmp(entry->value, "false") == 0 ||
+        strcasecmp(entry->value, "no") == 0 ||
+        strcasecmp(entry->value, "off") == 0) {
+        *value = false;
+        return 0;
+    }
+    if (strcasecmp(entry->value, "true") == 0 ||
+        strcasecmp(entry->value, "yes") == 0 ||
+        strcasecmp(entry->value, "on") == 0) {
+        *value = true;
+        return 0;
+    }
+
+    errno = 0;
+    number = strtoll(entry->value, &end, 0);
+    if (errno == 0 && end != entry->value) {
+        if (*end != '\0') {
+            if (end[1] != '\0') goto invalid;
+            switch (*end) {
+                case 'k':
+                case 'K':
+                    multiplier = 1024LL;
+                    break;
+                case 'm':
+                case 'M':
+                    multiplier = 1024LL * 1024LL;
+                    break;
+                case 'g':
+                case 'G':
+                    multiplier = 1024LL * 1024LL * 1024LL;
+                    break;
+                default:
+                    goto invalid;
+            }
+        }
+        if (number >= (long long)INT_MIN / multiplier &&
+            number <= (long long)INT_MAX / multiplier) {
+            *value = number != 0;
+            return 0;
+        }
+    }
+
+invalid:
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Invalid effective Git Boolean value for %s", key);
+    return -1;
 }
 
 static int effective_key_matches(const git_effective_listing_t *listing,
@@ -1214,25 +1401,55 @@ int git_get_current_config(git_current_config_t *config) {
         return -1;
     }
     if (git_read_effective_keys(&effective) != 0) return -1;
-    if (!effective->keys[k_name].present ||
-        effective->keys[k_name].value_unknown) {
-        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.name configured");
-        return -1;
-    }
-    if (!effective->keys[k_email].present ||
-        effective->keys[k_email].value_unknown) {
-        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
+
+    /* Validate every present managed value before classifying a missing
+     * identity. Otherwise an absent user.name can hide an invalid Boolean or
+     * an unrepresentable SSH/GPG value and status reports a reassuring normal
+     * NOT FOUND state even though the effective configuration is malformed. */
+    if (effective->keys[k_name].value_unknown ||
+        effective->keys[k_email].value_unknown ||
+        effective->keys[k_signkey].value_unknown ||
+        effective->keys[k_gpgsign].value_unknown ||
+        effective->keys[k_sshcommand].value_unknown ||
+        effective->keys[k_gpgprogram].value_unknown) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "An effective managed Git value exceeds the supported status representation");
         return -1;
     }
 
-    if (safe_strncpy(config->name, effective->keys[k_name].value,
-                     sizeof(config->name)) != 0 ||
-        safe_strncpy(config->email, effective->keys[k_email].value,
-                     sizeof(config->email)) != 0) {
+    if ((effective->keys[k_name].present &&
+         safe_strncpy(config->name, effective->keys[k_name].value,
+                      sizeof(config->name)) != 0) ||
+        (effective->keys[k_email].present &&
+         safe_strncpy(config->email, effective->keys[k_email].value,
+                      sizeof(config->email)) != 0)) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Effective Git identity exceeds supported field length");
         return -1;
     }
+    if (effective->keys[k_signkey].present &&
+        safe_strncpy(config->signing_key,
+                     effective->keys[k_signkey].value,
+                     sizeof(config->signing_key)) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective Git signing key exceeds supported field length");
+        return -1;
+    }
+    if (effective->keys[k_gpgsign].present &&
+        git_parse_effective_bool(&effective->keys[k_gpgsign],
+                                 GIT_CONFIG_COMMIT_GPGSIGN,
+                                 &config->gpg_signing_enabled) != 0) {
+        return -1;
+    }
+    if (!effective->keys[k_name].present) {
+        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.name configured");
+        return -1;
+    }
+    if (!effective->keys[k_email].present) {
+        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
+        return -1;
+    }
+
     config->effective_name_scope = effective->scopes[k_name];
     snprintf(config->effective_name_origin,
              sizeof(config->effective_name_origin), "%s",
@@ -1247,16 +1464,6 @@ int git_get_current_config(git_current_config_t *config) {
         default: config->scope = GIT_SCOPE_LOCAL; break;
     }
 
-    if (effective->keys[k_signkey].present &&
-        !effective->keys[k_signkey].value_unknown) {
-        safe_strncpy(config->signing_key, effective->keys[k_signkey].value,
-                     sizeof(config->signing_key));
-    }
-    if (effective->keys[k_gpgsign].present &&
-        !effective->keys[k_gpgsign].value_unknown) {
-        config->gpg_signing_enabled =
-            (strcmp(effective->keys[k_gpgsign].value, "true") == 0);
-    }
     copy_effective_value(&config->ssh_command, effective, k_sshcommand);
     copy_effective_value(&config->gpg_program, effective, k_gpgprogram);
 
@@ -1687,10 +1894,58 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
  * TOML-load sanitizer stripping newlines/quotes, an incidental, load-time-only
  * defense (AR-02 #10). */
 
+static int ssh_command_append(char *command, size_t command_size,
+                              size_t *used, const char *text) {
+    size_t length;
+    if (!command || command_size == 0 || !used || !text) return -1;
+    length = strlen(text);
+    if (*used >= command_size || length > command_size - *used - 1U) {
+        set_error(ERR_INVALID_ARGS, "SSH command too long");
+        return -1;
+    }
+    memcpy(command + *used, text, length);
+    *used += length;
+    command[*used] = '\0';
+    return 0;
+}
+
+/* Quote one argv word for the POSIX shell Git uses to interpret
+ * core.sshCommand. Unlike the old key-only serialization, this must support a
+ * trusted executable whose canonical path itself contains spaces or quotes.
+ * The standard '\'' close/escaped-quote/reopen sequence preserves every byte. */
+static int ssh_command_append_quoted(char *command, size_t command_size,
+                                     size_t *used, const char *value) {
+    if (ssh_command_append(command, command_size, used, "'") != 0) return -1;
+    for (const char *cursor = value; *cursor; cursor++) {
+        const char *piece = *cursor == '\'' ? "'\\''" : NULL;
+        char byte[2] = { *cursor, '\0' };
+        if (ssh_command_append(command, command_size, used,
+                               piece ? piece : byte) != 0) {
+            return -1;
+        }
+    }
+    return ssh_command_append(command, command_size, used, "'");
+}
+
+#define SSH_COMMAND_OPTIONS                                                   \
+    " -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"             \
+    " -o LogLevel=ERROR"
+
+/* GIT_CONFIG_VALUE_MAX reserves 256 bytes beyond the two serialized path
+ * payloads. Prove at compile time that the exact fixed spelling, four quote
+ * delimiters, and terminating NUL fit inside that reserve. */
+_Static_assert((sizeof(" -i ") - 1U) + (sizeof(SSH_COMMAND_OPTIONS) - 1U) +
+                       4U + 1U <=
+                   256U,
+               "GIT_CONFIG_VALUE_MAX fixed SSH command reserve is too small");
+
 static int build_expected_ssh_command(const account_t *account,
                                       char *command, size_t command_size,
                                       char *expanded_path,
                                       size_t expanded_path_size) {
+    char ssh_path[MAX_PATH_LEN];
+    size_t used = 0;
+
     if (!account || !account->ssh_enabled || strlen(account->ssh_key_path) == 0) {
         set_error(ERR_INVALID_ARGS,
                   "SSH command requested for an account without an SSH key");
@@ -1720,10 +1975,32 @@ static int build_expected_ssh_command(const account_t *account,
         return -1;
     }
 
-    if ((size_t)snprintf(command, command_size,
-                        "ssh -i '%s' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR",
-                        expanded_path) >= command_size) {
-        set_error(ERR_INVALID_ARGS, "SSH command too long");
+    /* Resolve the executable through the same complete owner/mode/ACL ancestry
+     * proof used for immediate helper launches. Persisting a bare `ssh` would
+     * make a later Git process repeat PATH lookup under unrelated, possibly
+     * writable search directories. The absolute trusted spelling makes that
+     * later lookup impossible. */
+    if (find_command_path("ssh", ssh_path, sizeof(ssh_path)) != 0) {
+        set_error(ERR_SSH_NOT_FOUND,
+                  "No trusted SSH executable was found in PATH");
+        return -1;
+    }
+    for (const unsigned char *byte = (const unsigned char *)ssh_path;
+         *byte; byte++) {
+        if (*byte < 0x20 || *byte == 0x7f) {
+            set_error(ERR_INVALID_PATH,
+                      "Trusted SSH executable path contains a control character");
+            return -1;
+        }
+    }
+
+    command[0] = '\0';
+    if (ssh_command_append_quoted(command, command_size, &used, ssh_path) != 0 ||
+        ssh_command_append(command, command_size, &used, " -i ") != 0 ||
+        ssh_command_append_quoted(command, command_size, &used,
+                                  expanded_path) != 0 ||
+        ssh_command_append(command, command_size, &used,
+                           SSH_COMMAND_OPTIONS) != 0) {
         return -1;
     }
     return 0;

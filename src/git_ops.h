@@ -13,10 +13,16 @@
 #define GIT_CONFIG_GPG_PROGRAM "gpg.program"
 #define GIT_CONFIG_CORE_SSHCOMMAND "core.sshcommand"
 
-/* Largest managed value emitted by gitswitch (core.sshCommand contains a
- * MAX_PATH_LEN key path plus fixed options). Public status records use the
- * same lossless capacity as the internal snapshot. */
-#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN + 128)
+/* Largest managed value emitted by gitswitch. core.sshCommand contains two
+ * inputs shorter than MAX_PATH_LEN. A canonical executable can consist
+ * entirely of apostrophes, so POSIX single-quote serialization needs at most
+ * 4 * (MAX_PATH_LEN - 1) bytes for it. is_safe_ssh_key_path() rejects quotes,
+ * so its serialized key contributes at most MAX_PATH_LEN - 1 bytes. The 256
+ * bytes cover both pairs of quote delimiters, fixed options, and the NUL.
+ * Public status records and the scalar cache use this lossless capacity;
+ * transactional snapshots remain dynamically allocated for arbitrary foreign
+ * values. */
+#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN * 5 + 256)
 
 typedef enum {
     GIT_CONFIG_ORIGIN_UNKNOWN = 0,
@@ -82,9 +88,10 @@ const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope);
 
 /**
  * Build the exact core.sshCommand expected for an SSH-enabled account.
- * This performs path expansion and serialization validation but does not
- * require the key file to exist, so read-only status can compare persisted
- * Git state without introducing a filesystem mutation.
+ * This resolves `ssh` through the hardened executable trust walk, expands the
+ * key path, and serializes both absolute arguments safely. It does not require
+ * the key file to exist, so read-only status can compare persisted Git state
+ * without introducing a filesystem mutation.
  */
 int git_expected_ssh_command(const account_t *account, char *command,
                              size_t command_size);
