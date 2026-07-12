@@ -96,6 +96,16 @@ jobs:
             # and assert no subprocess spawn — they need a real git binary,
             # which the Linux/macOS runners ship but this VM does not.
             sudo pkg install -y gmake gcc git binutils
+            # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
+            # run_argv passes the verified script as /dev/fd/4 and never falls
+            # back to its mutable pathname. The minimal CI image does not mount
+            # fdescfs, although normal installations commonly do.
+            if ! mount | grep -q ' on /dev/fd '; then
+              sudo mount -t fdescfs none /dev/fd
+            fi
+            exec 9</bin/sh
+            test "$(stat -f '%d:%i' /bin/sh)" = "$(stat -f '%d:%i' /dev/fd/9)"
+            exec 9<&-
             readelf_tool=$(command -v readelf || command -v llvm-readelf || command -v greadelf)
             test -n "$readelf_tool"
             "$readelf_tool" -h /bin/sh >/dev/null
