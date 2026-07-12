@@ -1,6 +1,8 @@
 /* AR-07 T7: account selector, alias ownership, edit transaction, admission,
  * and inactive GPG-key lifecycle regressions. */
+#ifdef __linux__
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "test.h"
 #include "accounts.h"

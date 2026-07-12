@@ -4354,7 +4354,9 @@ static int gpg_resolve_path_aliases(const char *input, char *output,
                 errno = ELOOP;
                 return -1;
             }
-            n = readlink(probe, target, sizeof(target) - 1);
+            /* Classification-only read: lstat identity is rechecked below;
+             * bounds, truncation, and termination are handled explicitly. */
+            n = readlink(probe, target, sizeof(target) - 1); /* Flawfinder: ignore */
             read_error = errno;
             if (lstat(probe, &after) != 0 ||
                 before.st_dev != after.st_dev ||

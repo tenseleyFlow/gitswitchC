@@ -1,5 +1,7 @@
 /* AR-07 T14: trusted persisted SSH command and truthful Git status. */
+#ifdef __linux__
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "test.h"
 #include "accounts.h"
