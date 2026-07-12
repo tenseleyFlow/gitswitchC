@@ -838,9 +838,39 @@ static int gpg_native_rename_noreplace(int old_dir_fd, const char *old_name,
 #endif
     return (int)syscall(SYS_renameat2, old_dir_fd, old_name, new_dir_fd,
                         new_name, RENAME_NOREPLACE);
-#elif (defined(__APPLE__) || defined(__FreeBSD__)) && defined(RENAME_EXCL)
+#elif defined(__APPLE__) && defined(RENAME_EXCL)
     return renameatx_np(old_dir_fd, old_name, new_dir_fd, new_name,
                         RENAME_EXCL);
+#elif defined(__FreeBSD__)
+    int old_fd;
+    int saved_errno;
+
+    /* FreeBSD 14.x does not provide Darwin's renameatx_np(2) or a native
+     * no-replace rename.  Every caller moves a symlink inside the same pinned,
+     * private directory.  linkat(2) without AT_SYMLINK_FOLLOW hard-links the
+     * symlink itself and atomically fails with EEXIST when the destination is
+     * occupied; only after that compare-and-publish succeeds do we retire the
+     * old name.  Pinning that source with O_PATH lets funlinkat(2) retire only
+     * the directory entry still associated with the opened vnode; it returns
+     * EDEADLK instead of deleting a same-uid racer's replacement.  Thus
+     * `current` is never absent and a later writer is never overwritten.
+     *
+     * Once linkat succeeds, publication has happened and must be reported as
+     * success even if retirement fails: all three callers re-prove the
+     * published identity and safely handle the retained alias (the prepared-
+     * publication caller also removes its private alias below). */
+    old_fd = openat(old_dir_fd, old_name,
+                    O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (old_fd < 0) return -1;
+    if (linkat(old_dir_fd, old_name, new_dir_fd, new_name, 0) != 0) {
+        saved_errno = errno;
+        close(old_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    (void)funlinkat(old_dir_fd, old_name, old_fd, 0);
+    close(old_fd);
+    return 0;
 #else
     (void)old_dir_fd;
     (void)old_name;
@@ -1257,6 +1287,50 @@ static int gpg_read_current_locked(int base_fd, const char *base,
 
 static int gpg_discard_prepared_link_locked(
     int base_fd, const char *name, const gpg_link_identity_t *expected) {
+#if defined(__FreeBSD__)
+    struct stat pinned;
+    int pinned_fd;
+    int saved_errno;
+
+    if (!expected || !expected->valid) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid prepared GPG runtime link identity");
+        return -1;
+    }
+    pinned_fd = openat(base_fd, name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (pinned_fd < 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot pin prepared GPG runtime link: %s", name);
+        return -1;
+    }
+    if (fstat(pinned_fd, &pinned) != 0) {
+        saved_errno = errno;
+        close(pinned_fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect prepared GPG runtime link: %s", name);
+        return -1;
+    }
+    if (pinned.st_dev != expected->st.st_dev ||
+        pinned.st_ino != expected->st.st_ino ||
+        pinned.st_mode != expected->st.st_mode ||
+        pinned.st_uid != expected->st.st_uid ||
+        pinned.st_size != expected->st.st_size) {
+        close(pinned_fd);
+        set_error(ERR_FILE_IO,
+                  "Prepared GPG runtime link changed; preserving it: %s", name);
+        return -1;
+    }
+    if (funlinkat(base_fd, name, pinned_fd, 0) != 0) {
+        saved_errno = errno;
+        close(pinned_fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot remove prepared GPG runtime link: %s", name);
+        return -1;
+    }
+    close(pinned_fd);
+#else
     gpg_link_identity_t current;
 
     if (gpg_capture_link_at(base_fd, name, &current) != 0 ||
@@ -1270,6 +1344,7 @@ static int gpg_discard_prepared_link_locked(
                          "Cannot remove prepared GPG runtime link: %s", name);
         return -1;
     }
+#endif
     if (g_sync_base(base_fd) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot synchronize prepared GPG link cleanup");
@@ -1287,6 +1362,7 @@ static int gpg_publish_link_noreplace_locked(
     int base_fd, const char *base, const char *target,
     gpg_link_identity_t *published, bool *conflict) {
     char publish_name[GPG_QUARANTINE_NAME_LEN] = "";
+    gpg_link_identity_t committed;
     gpg_link_identity_t prepared;
     int live_rc;
 
@@ -1342,7 +1418,35 @@ static int gpg_publish_link_noreplace_locked(
         }
         return -1;
     }
-    *published = prepared;
+    /* FreeBSD's linkat-based fallback publishes by pathname, so a same-uid
+     * replacement of the private source must not be accepted as the link we
+     * prepared.  Native rename implementations also benefit from this final
+     * identity proof before the result becomes rollback state. */
+    if (gpg_capture_link_at(base_fd, "current", &committed) != 0 ||
+        !gpg_same_link(&committed, &prepared)) {
+        set_error(ERR_FILE_IO,
+                  "Published GPG runtime link does not match prepared identity");
+        return -1;
+    }
+    /* FreeBSD's linkat-based no-replace fallback can leave the private source
+     * alias behind when its retirement unlink fails after publication.  Reap
+     * it through the exact-identity cleanup above; a replacement is preserved
+     * and turns this into a fail-closed error while the published `current`
+     * remains available for retry-state discovery. */
+    {
+        gpg_link_identity_t leftover;
+        int leftover_rc = gpg_capture_link_at(base_fd, publish_name,
+                                              &leftover);
+
+        if (leftover_rc < 0) return -1;
+        if (leftover_rc == 0) {
+            if (gpg_discard_prepared_link_locked(base_fd, publish_name,
+                                                 &prepared) != 0) {
+                return -1;
+            }
+        }
+    }
+    *published = committed;
     return 0;
 }
 

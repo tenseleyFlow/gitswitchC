@@ -587,6 +587,29 @@ static int unsupported_noreplace(int old_dir_fd, const char *old_name,
     return -1;
 }
 
+/* Model FreeBSD's linkat-based fallback when publication succeeds but the
+ * source-retirement unlink does not.  The rollback state machine must re-prove
+ * both names instead of interpreting success as proof that the source moved. */
+static int link_only_noreplace(int old_dir_fd, const char *old_name,
+                               int new_dir_fd, const char *new_name) {
+    return linkat(old_dir_fd, old_name, new_dir_fd, new_name, 0);
+}
+
+static const char *g_wrong_noreplace_target;
+static int publish_replaced_source_noreplace(int old_dir_fd,
+                                             const char *old_name,
+                                             int new_dir_fd,
+                                             const char *new_name) {
+    if (!g_wrong_noreplace_target ||
+        unlinkat(old_dir_fd, old_name, 0) != 0 ||
+        symlinkat(g_wrong_noreplace_target, old_dir_fd, old_name) != 0 ||
+        linkat(old_dir_fd, old_name, new_dir_fd, new_name, 0) != 0 ||
+        unlinkat(old_dir_fd, old_name, 0) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static int g_sync_calls;
 static int g_sync_fail_call;
 static int fail_selected_base_sync(int base_fd) {
@@ -709,6 +732,50 @@ TEST(rollback_cas_retries_stale_collision_unsupported_and_sync_states) {
     CHECK_EQ_INT(gpg_manager_restore_current_if(&config, one, three,
                                                 &changed), 0);
     CHECK(changed);
+
+    CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
+    memset(&config, 0, sizeof(config));
+    changed = true;
+    gpg_manager_set_rename_noreplace_fn(link_only_noreplace);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&config, one, three,
+                                                &changed), 0);
+    CHECK(!changed);
+    CHECK(!gpg_manager_runtime_restore_pending(&config));
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+    gpg_manager_set_rename_noreplace_fn(NULL);
+
+    CHECK_EQ_INT(unlink(current), 0);
+    memset(&config, 0, sizeof(config));
+    changed = false;
+    gpg_manager_set_rename_noreplace_fn(link_only_noreplace);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&config, NULL, three,
+                                                &changed), 0);
+    CHECK(changed);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, three);
+    gpg_manager_set_rename_noreplace_fn(NULL);
+    memset(&config, 0, sizeof(config));
+    changed = false;
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&config, three, one,
+                                                &changed), 0);
+    CHECK(changed);
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, one);
+
+    CHECK_EQ_INT(unlink(current), 0);
+    memset(&config, 0, sizeof(config));
+    changed = true;
+    g_wrong_noreplace_target = two;
+    gpg_manager_set_rename_noreplace_fn(publish_replaced_source_noreplace);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&config, NULL, three,
+                                                &changed), -1);
+    CHECK(!changed);
+    CHECK(!gpg_manager_runtime_restore_pending(&config));
+    CHECK_EQ_INT(read_current(target, sizeof(target)), 0);
+    CHECK_STR_EQ(target, two);
+    gpg_manager_set_rename_noreplace_fn(NULL);
+    g_wrong_noreplace_target = NULL;
 
     CHECK_EQ_INT(gpg_manager_retarget_current(one), 0);
     memset(&config, 0, sizeof(config));
