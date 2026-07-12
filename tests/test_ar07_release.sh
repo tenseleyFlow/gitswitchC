@@ -228,6 +228,7 @@ check_neuter_contract()
     norelro=$tmp/neuter-no-relro
     nonow=$tmp/neuter-no-now
     execstack=$tmp/neuter-exec-stack
+    have_nonpie_neuter=false
     have_execstack_neuter=false
     case $platform in
         Linux|FreeBSD)
@@ -236,6 +237,7 @@ check_neuter_contract()
                 cat "$tmp/nonpie.log" >&2
                 fail "cannot build ELF non-PIE neuter fixture"
             fi
+            have_nonpie_neuter=true
             if ! "$compiler" -std=c11 -O0 -fno-stack-protector -fPIE \
                 "$source_file" -pie -Wl,-z,relro -Wl,-z,now \
                 -Wl,-z,noexecstack -o "$nocanary" \
@@ -267,12 +269,28 @@ check_neuter_contract()
             have_execstack_neuter=true
             ;;
         Darwin)
-            if ! "$compiler" -std=c11 -O0 -fno-stack-protector \
-                "$source_file" -Wl,-no_pie -o "$nonpie" \
-                >"$tmp/nonpie.log" 2>&1; then
-                cat "$tmp/nonpie.log" >&2
-                fail "cannot build Mach-O non-PIE neuter fixture"
-            fi
+            # Apple ld forces arm64 dynamic executables to be PIE and accepts
+            # -no_pie only with a warning. A real non-PIE negative fixture is
+            # therefore constructible only on Intel Darwin; the positive PIE
+            # assertion above still applies to every supported architecture.
+            case $(uname -m) in
+                x86_64|i386)
+                    if ! "$compiler" -std=c11 -O0 -fno-stack-protector \
+                        "$source_file" -Wl,-no_pie -o "$nonpie" \
+                        >"$tmp/nonpie.log" 2>&1; then
+                        cat "$tmp/nonpie.log" >&2
+                        fail "cannot build Mach-O non-PIE neuter fixture"
+                    fi
+                    have_nonpie_neuter=true
+                    ;;
+                arm64|arm64e)
+                    # There is no native negative artifact to construct: the
+                    # architecture contract itself requires MH_PIE.
+                    ;;
+                *)
+                    fail "unsupported Darwin architecture: $(uname -m)"
+                    ;;
+            esac
             if ! "$compiler" -std=c11 -O0 -fno-stack-protector \
                 "$source_file" -Wl,-pie -o "$nocanary" \
                 >"$tmp/nocanary.log" 2>&1; then
@@ -301,10 +319,12 @@ check_neuter_contract()
             ;;
     esac
 
-    cp "$nonpie" "$tmp/neuter-nonpie-staged"
-    expect_artifact_rejection "non-PIE" "$script" "$nonpie" \
-        "$tmp/neuter-nonpie-staged" \
-        'not PIE|lacks the Mach-O PIE flag' "$tmp/nonpie-check.log"
+    if [ "$have_nonpie_neuter" = true ]; then
+        cp "$nonpie" "$tmp/neuter-nonpie-staged"
+        expect_artifact_rejection "non-PIE" "$script" "$nonpie" \
+            "$tmp/neuter-nonpie-staged" \
+            'not PIE|lacks the Mach-O PIE flag' "$tmp/nonpie-check.log"
+    fi
 
     cp "$nocanary" "$tmp/neuter-no-canary-staged"
     expect_artifact_rejection "no-canary" "$script" "$nocanary" \
