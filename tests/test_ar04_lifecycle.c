@@ -5,6 +5,7 @@
 #include "accounts.h"
 #include "error.h"
 #include "gitswitch.h"
+#include "utils.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -58,8 +59,8 @@ static int mkdir_private(const char *path) {
     return chmod(path, 0700);
 }
 
-static int join_path(char *dest, size_t size, const char *base,
-                     const char *suffix) {
+static int test_join_path(char *dest, size_t size, const char *base,
+                          const char *suffix) {
     size_t base_len = strlen(base);
     size_t suffix_len = strlen(suffix);
 
@@ -133,14 +134,25 @@ static const char *active_work_config(void) {
 }
 
 static int prepare_shims(char *shim_dir, size_t size) {
-    char path[1024];
+    char path[1024], true_path[PATH_MAX], git_path[PATH_MAX];
 
     if (!ts_mkdtemp_trusted(shim_dir, size,
                             "gitswitch-ar04-life-shims")) return -1;
+    /* This suite owns account lifecycle semantics. Interpreted executable
+     * descriptor coverage belongs to test_ar07_exec_trust, so use a native
+     * no-op here and avoid coupling these fixtures to /dev/fd availability.
+     * Pin Git into the same private PATH as well: hosted arm64 macOS installs
+     * it under /opt/homebrew, which the deliberately narrow child PATH omits. */
+    if (find_command_path("true", true_path, sizeof(true_path)) != 0 ||
+        find_command_path("git", git_path, sizeof(git_path)) != 0) {
+        return -1;
+    }
     snprintf(path, sizeof(path), "%s/gpg", shim_dir);
-    if (write_text(path, "#!/bin/sh\nexit 0\n", 0700) != 0) return -1;
+    if (symlink(true_path, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/gpgconf", shim_dir);
-    return write_text(path, "#!/bin/sh\nexit 0\n", 0700);
+    if (symlink(true_path, path) != 0) return -1;
+    snprintf(path, sizeof(path), "%s/git", shim_dir);
+    return symlink(git_path, path);
 }
 
 static int run_edit(const char *home, const char *runtime, const char *shim_dir,
@@ -477,7 +489,8 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
-    CHECK_EQ_INT(join_path(key_path, sizeof(key_path), runtime, "/retry-key"), 0);
+    CHECK_EQ_INT(test_join_path(key_path, sizeof(key_path), runtime,
+                                "/retry-key"), 0);
     snprintf(cmd, sizeof(cmd),
              "PATH='/usr/bin:/bin:/usr/local/bin' ssh-keygen -q -t ed25519 "
              "-N '' -f '%s' >/dev/null 2>&1",
@@ -507,7 +520,8 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK_EQ_INT(symlink(target, path), 0);
 
     snprintf(config_dir, sizeof(config_dir), "%s/.config/gitswitch", home);
-    CHECK_EQ_INT(join_path(path, sizeof(path), config_dir, "/.config.lock"), 0);
+    CHECK_EQ_INT(test_join_path(path, sizeof(path), config_dir,
+                                "/.config.lock"), 0);
     lock_file = fopen(path, "w");
     CHECK(lock_file != NULL);
     if (lock_file) fclose(lock_file);
@@ -542,12 +556,12 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK_EQ_INT(switch_rc, 0);
     CHECK(strstr(contents, "SSH key loaded") != NULL);
 
-    CHECK_EQ_INT(join_path(socket_path, sizeof(socket_path), runtime,
-                           "/gitswitch-ssh/ssh-agent.work.sock"), 0);
-    CHECK_EQ_INT(join_path(current_path, sizeof(current_path), runtime,
-                           "/gitswitch-ssh/current.sock"), 0);
-    CHECK_EQ_INT(join_path(pid_path, sizeof(pid_path), runtime,
-                           "/gitswitch-ssh/ssh-agent.work.pid"), 0);
+    CHECK_EQ_INT(test_join_path(socket_path, sizeof(socket_path), runtime,
+                                "/gitswitch-ssh/ssh-agent.work.sock"), 0);
+    CHECK_EQ_INT(test_join_path(current_path, sizeof(current_path), runtime,
+                                "/gitswitch-ssh/current.sock"), 0);
+    CHECK_EQ_INT(test_join_path(pid_path, sizeof(pid_path), runtime,
+                                "/gitswitch-ssh/ssh-agent.work.pid"), 0);
     CHECK_EQ_INT(lstat(current_path, &st), 0);
     CHECK(S_ISLNK(st.st_mode));
     link_len = readlink(current_path, link_target, sizeof(link_target) - 1);

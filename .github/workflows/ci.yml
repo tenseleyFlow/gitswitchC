@@ -104,7 +104,7 @@ jobs:
               sudo mount -t fdescfs none /dev/fd
             fi
             exec 9</bin/sh
-            test "$(stat -f '%d:%i' /bin/sh)" = "$(stat -f '%d:%i' /dev/fd/9)"
+            cmp -s /bin/sh /dev/fd/9
             exec 9<&-
             readelf_tool=$(command -v readelf || command -v llvm-readelf || command -v greadelf)
             test -n "$readelf_tool"
