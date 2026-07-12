@@ -118,14 +118,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      # Temporary AR-07 hosted diagnostic: the lifecycle suite runs before the
-      # dedicated executable-trust suite, so expose Darwin's positive-control
-      # failure and the ACLs on its trusted HOME ancestry first.
-      - name: Executable trust preflight (diagnostic)
-        run: |
-          ls -ldeO@ / /Users "$HOME"
-          make BUILD_TYPE=debug WERROR=1 build/bin/test_ar07_exec_trust
-          build/bin/test_ar07_exec_trust
       - name: Build + test (ASan/UBSan, warnings-as-errors)
         run: make BUILD_TYPE=debug WERROR=1 test
       - name: Release build (warnings-as-errors)
