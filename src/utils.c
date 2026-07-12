@@ -39,6 +39,14 @@
 #include "error.h"
 #include "signals.h"
 
+/* POSIX exposes the process environment through this external object, but
+ * Darwin and FreeBSD do not declare it from <unistd.h> under every feature
+ * profile used by our warnings-as-errors builds. Keep the declaration beside
+ * the execve/fexecve portability layer instead of relying on libc extensions. */
+#if defined(__APPLE__) || defined(__FreeBSD__)
+extern char **environ;
+#endif
+
 /* Linux, macOS, and FreeBSD can pin a directory descriptor without following
  * a replaced final-component symlink. Other platforms fail closed rather than
  * attempt a pathname chmod that could be redirected after validation. */
@@ -3017,7 +3025,9 @@ static bool exec_directory_stat_is_trusted(const struct stat *st) {
 static bool exec_acl_query_is_unsupported(int error) {
     return error == EOPNOTSUPP
 #ifdef ENOTSUP
+#if ENOTSUP != EOPNOTSUPP
            || error == ENOTSUP
+#endif
 #endif
         ;
 }

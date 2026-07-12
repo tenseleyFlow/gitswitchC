@@ -203,7 +203,11 @@ check_neuter_contract()
     # Prove the witness is genuinely mutation-sensitive before accepting the
     # configured positive compile. A compiler that accepts the source without
     # the release define would make the contract vacuous.
-    if "$compiler" -std=c11 -O2 -c "$fortify_source" \
+    # Some hosted toolchains inject a distro-default FORTIFY level through
+    # compiler specs. Explicitly undefine it so this negative control measures
+    # the Makefile flag we own, not ambient compiler policy. The positive
+    # control applies the audited definition after the undefine.
+    if "$compiler" -std=c11 -O2 -U_FORTIFY_SOURCE -c "$fortify_source" \
         -o "$tmp/fortify-neutered.o" >"$tmp/fortify-neutered.log" 2>&1; then
         fail "FORTIFY-neutered compile fixture was accepted"
     fi
@@ -211,7 +215,8 @@ check_neuter_contract()
         cat "$tmp/fortify-neutered.log" >&2
         fail "FORTIFY-neutered fixture failed for an unrelated reason"
     }
-    if ! "$compiler" -std=c11 -O2 "$fortify_define" -c "$fortify_source" \
+    if ! "$compiler" -std=c11 -O2 -U_FORTIFY_SOURCE "$fortify_define" \
+        -c "$fortify_source" \
         -o "$tmp/fortify-enabled.o" >"$tmp/fortify-enabled.log" 2>&1; then
         cat "$tmp/fortify-enabled.log" >&2
         fail "configured FORTIFY compile intent is not accepted by the compiler"
