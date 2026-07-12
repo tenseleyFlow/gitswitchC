@@ -3963,8 +3963,10 @@ static bool same_runtime_symlink(const struct stat *before,
            before->st_size == after->st_size;
 }
 
-int ssh_manager_get_current_account(char *name, size_t name_size,
-                                    bool *present) {
+static int ssh_manager_inspect_current_account(char *name, size_t name_size,
+                                               bool *present,
+                                               const account_t *expected,
+                                               bool *expected_live) {
     static const char current_suffix[] = "/current.sock";
     static const char socket_prefix[] = "ssh-agent.";
     static const char socket_suffix[] = ".sock";
@@ -3972,7 +3974,7 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
     char socket_dir[MAX_PATH_LEN];
     char target[MAX_PATH_LEN];
     char account_name[MAX_NAME_LEN];
-    char expected[MAX_PATH_LEN];
+    char expected_path[MAX_PATH_LEN];
     struct stat link_before;
     struct stat link_after;
     struct stat socket_before;
@@ -3990,15 +3992,26 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
     int lock_fd = -1;
     int rc = -1;
 
+    if (expected_live) {
+        *expected_live = false;
+    }
     if (present) {
         *present = false;
     }
     if (name && name_size > 0) {
         name[0] = '\0';
     }
-    if (!name || name_size == 0 || !present) {
+    if (!name || name_size == 0 || !present ||
+        ((expected == NULL) != (expected_live == NULL))) {
         set_error(ERR_INVALID_ARGS,
-                  "Invalid output arguments to ssh_manager_get_current_account");
+                  "Invalid SSH current-account inspection arguments");
+        return -1;
+    }
+    if (expected &&
+        (!validate_name(expected->name) || !expected->ssh_enabled ||
+         expected->ssh_key_path[0] == '\0')) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account for SSH runtime liveness check");
         return -1;
     }
 
@@ -4126,9 +4139,10 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
                   "Stable SSH socket contains an invalid account name");
         goto done;
     }
-    if ((size_t)snprintf(expected, sizeof(expected), "%s/ssh-agent.%s.sock",
-                         socket_dir, account_name) >= sizeof(expected) ||
-        strcmp(target, expected) != 0) {
+    if ((size_t)snprintf(expected_path, sizeof(expected_path),
+                         "%s/ssh-agent.%s.sock", socket_dir,
+                         account_name) >= sizeof(expected_path) ||
+        strcmp(target, expected_path) != 0) {
         set_error(ERR_INVALID_PATH,
                   "Stable SSH socket does not name the exact managed socket");
         goto done;
@@ -4141,6 +4155,10 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
 
     if (fstatat(dir_fd, component, &socket_before,
                 AT_SYMLINK_NOFOLLOW) != 0) {
+        if (expected && errno == ENOENT) {
+            rc = 0;
+            goto done;
+        }
         set_system_error(ERR_SSH_AGENT_SOCKET_INVALID,
                          "Current SSH agent socket is missing: %s", target);
         goto done;
@@ -4153,7 +4171,26 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
                   target);
         goto done;
     }
-    if (probe_ssh_agent_socket(target, &reachable) != 0) {
+    if (expected) {
+        char key_path[MAX_PATH_LEN];
+
+        /* The stable link, exact account target, agent identity listing, and
+         * socket inode are all inspected while the manager lock is held. This
+         * is the production counterpart of the reuse fast path: an empty,
+         * wrong-key, or extra-key agent is not live for the saved account. */
+        if (strcmp(account_name, expected->name) == 0) {
+            if (expand_path(expected->ssh_key_path, key_path,
+                            sizeof(key_path)) != 0) {
+                goto done;
+            }
+            reachable = ssh_socket_has_key(dir_fd, component, key_path);
+            if (!reachable) {
+                /* Empty/wrong/extra identities are ordinary stale runtime,
+                 * not an API failure. The caller will perform a real resume. */
+                clear_error();
+            }
+        }
+    } else if (probe_ssh_agent_socket(target, &reachable) != 0) {
         goto done;
     }
     if (fstatat(dir_fd, component, &socket_after,
@@ -4164,10 +4201,14 @@ int ssh_manager_get_current_account(char *name, size_t name_size,
                   target);
         goto done;
     }
-    if (!reachable) {
+    if (!reachable && !expected) {
         set_error(ERR_SSH_AGENT_SOCKET_INVALID,
                   "Current SSH agent socket is not live: %s", target);
         goto done;
+    }
+
+    if (expected) {
+        *expected_live = reachable;
     }
 
     memcpy(name, account_name, account_len + 1);
@@ -4178,6 +4219,28 @@ done:
     unlock_agent_dir(lock_fd);
     close(dir_fd);
     return rc;
+}
+
+int ssh_manager_get_current_account(char *name, size_t name_size,
+                                    bool *present) {
+    return ssh_manager_inspect_current_account(name, name_size, present,
+                                               NULL, NULL);
+}
+
+int ssh_manager_current_is_live_for_account(const account_t *account,
+                                            bool *live) {
+    char current_name[MAX_NAME_LEN];
+    bool present = false;
+
+    if (!live) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid output for SSH runtime liveness check");
+        return -1;
+    }
+    *live = false;
+    return ssh_manager_inspect_current_account(current_name,
+                                               sizeof(current_name),
+                                               &present, account, live);
 }
 
 /* Read a PID sidecar without following or accepting a swapped final

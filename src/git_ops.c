@@ -100,7 +100,7 @@ static void git_snapshot_clear(git_config_snapshot_t *snapshot);
  * that asked "am I in a repo?", the post-switch name/email read-back twice
  * (git_set_config's verify and then git_test_config), and the GPG keys
  * written twice (git_configure_gpg and gpg_manager's
- * gpg_configure_git_signing). On the login-shell resume hot path each exec is
+ * gpg_configure_git_signing). On the interactive switch hot path each exec is
  * a fork+execvp round trip, so these are cached for the process lifetime.
  *
  * Invalidation assumptions (documented deliberately — the caches trade a

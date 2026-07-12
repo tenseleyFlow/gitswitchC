@@ -211,6 +211,18 @@ int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size);
 int ssh_manager_get_current_account(char *name, size_t name_size, bool *present);
 
 /**
+ * Return whether current.sock names this exact account and its agent holds
+ * exactly the configured key (one matching identity, no extras). The complete
+ * inspection is performed under the SSH runtime lock. Missing, empty,
+ * wrong-account, wrong-key, extra-key, and otherwise unproven identity state
+ * returns success with `*live == false` so callers fail closed into a restore.
+ * Invalid arguments and unsafe/indeterminate runtime namespace state return
+ * -1.
+ */
+int ssh_manager_current_is_live_for_account(const account_t *account,
+                                            bool *live);
+
+/**
  * Tear down isolated SSH agents (kill by recorded PID and remove sockets/PID
  * sidecars). Resets a single account when `account` is non-NULL, or all
  * accounts when NULL. Returns 0 on success.

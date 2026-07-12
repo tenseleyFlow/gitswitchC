@@ -27,6 +27,32 @@
  * ASCII short options handled by getopt_long. */
 #define OPT_SSH_AGENT_INFO 0x100
 #define OPT_NAMES 0x101
+#define OPT_RESUME_CHECK 0x102
+
+static const char *const g_supported_shells[] = {
+    "bash", "zsh", "fish", "sh", "dash", "ksh"
+};
+
+static void print_supported_shells(FILE *stream, const char *separator) {
+    size_t count = sizeof(g_supported_shells) / sizeof(g_supported_shells[0]);
+
+    for (size_t i = 0; i < count; i++) {
+        if (i > 0) {
+            fputs(separator, stream);
+        }
+        fputs(g_supported_shells[i], stream);
+    }
+}
+
+static bool shell_is_supported(const char *shell) {
+    size_t count = sizeof(g_supported_shells) / sizeof(g_supported_shells[0]);
+
+    if (!shell) return false;
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(shell, g_supported_shells[i]) == 0) return true;
+    }
+    return false;
+}
 
 static void print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
@@ -40,8 +66,10 @@ static void print_usage(const char *prog_name) {
     printf("  status               Show current account status\n");
     printf("  doctor, health       Run comprehensive health check\n");
     printf("  config               Show configuration file information\n");
-    printf("  init <shell>         Emit shell integration (fish|bash|zsh|sh)\n");
-    printf("  resume               Re-activate the last-used account (used on login)\n");
+    printf("  init <shell>         Emit shell integration (");
+    print_supported_shells(stdout, "|");
+    printf(")\n");
+    printf("  resume               Restore saved boot-volatile SSH/GPG state (never rewrites Git config)\n");
     printf("  reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)\n");
     printf("  switch <account>     Switch to specified account\n");
     printf("  <account>            Switch to specified account\n");
@@ -171,6 +199,7 @@ static int handle_doctor_command(gitswitch_ctx_t *ctx);
 static int handle_config_command(gitswitch_ctx_t *ctx);
 static int handle_init_command(const char *shell);
 static int handle_resume_command(gitswitch_ctx_t *ctx);
+static int handle_resume_check_command(gitswitch_ctx_t *ctx);
 static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                                              const char *account);
 static const char *detect_shell_from_env(void);
@@ -296,6 +325,7 @@ int main(int argc, char *argv[]) {
     bool assume_yes = false;
     bool names_only = false;
     bool legacy_agent_info = false;
+    bool resume_check = false;
     const char *command = NULL;
     const char *arg1 = NULL;
     int exit_code = EXIT_SUCCESS;
@@ -315,6 +345,12 @@ int main(int argc, char *argv[]) {
         /* Compat alias for the Python gitswitch era. Dispatches to `init`
          * with shell auto-detected from $SHELL so stale rc lines keep working. */
         {"ssh-agent-info", no_argument, 0, OPT_SSH_AGENT_INFO},
+        /* Internal, non-switching shell-integration readiness probe. It may
+         * acquire manager runtime locks while inspecting live state, but never
+         * changes config, identity, or agent/key routing. It is deliberately
+         * unadvertised; `init` uses it to distinguish a status-0 wrong/extra
+         * key agent from the exact saved runtime. */
+        {"resume-check", no_argument, 0, OPT_RESUME_CHECK},
         {0, 0, 0, 0}
     };
     
@@ -365,6 +401,9 @@ int main(int argc, char *argv[]) {
             case OPT_SSH_AGENT_INFO:
                 legacy_agent_info = true;
                 break;
+            case OPT_RESUME_CHECK:
+                resume_check = true;
+                break;
             default:
                 print_usage(argv[0]);
                 error_cleanup();
@@ -394,9 +433,16 @@ int main(int argc, char *argv[]) {
      * command form, including the legacy init alias, is otherwise checked here
      * before display/config initialization can cause observable work. */
     if (!show_help && !show_version) {
-        if (legacy_agent_info && command) {
+        if ((legacy_agent_info || resume_check) && command) {
             fprintf(stderr,
-                    "gitswitch: --ssh-agent-info does not accept operands\n");
+                    "gitswitch: %s does not accept operands\n",
+                    legacy_agent_info ? "--ssh-agent-info" : "--resume-check");
+            error_cleanup();
+            return EXIT_FAILURE;
+        }
+        if (legacy_agent_info && resume_check) {
+            fprintf(stderr,
+                    "gitswitch: --ssh-agent-info and --resume-check are mutually exclusive\n");
             error_cleanup();
             return EXIT_FAILURE;
         }
@@ -461,12 +507,13 @@ int main(int argc, char *argv[]) {
     /* For commands that mutate shared state, hold an exclusive cross-process
      * lock across the WHOLE load->mutate->save cycle. That is not just the
      * config read-modify-writers (add/edit/remove, a bare-account switch that
-     * updates active_account): `resume` runs the full mutating accounts_switch
-     * (SSH agent retarget, GPG symlink retarget, git config write) and `reset`
-     * kills agents and retargets/deletes runtime symlinks, so both must be
-     * serialized against a concurrent switch or the final state splits git
-     * identity from the live SSH/GPG runtime (AR-02 #1: tmux-restore shells
-     * running resume while another shell switches). Acquire before config_init
+     * updates active_account): `resume` mutates only boot-volatile SSH/GPG
+     * runtime state (it deliberately leaves Git configuration untouched), and
+     * `reset` kills agents and retargets/deletes runtime symlinks. Both must be
+     * serialized against a concurrent switch or the final runtime can belong
+     * to a different account than the switch's persisted Git identity
+     * (AR-02 #1: tmux-restore shells running resume while another shell
+     * switches). Acquire before config_init
      * so the load itself happens under the lock. Only genuinely read-only
      * commands (list/status/doctor) skip it; `config` can create accounts.toml,
      * so it belongs to the locked class too (AR-03 L11). Acquisition is
@@ -477,7 +524,7 @@ int main(int argc, char *argv[]) {
      * split-identity races the lock exists to prevent (AR-02 #17). */
     {
         const char *c = (optind < argc) ? argv[optind] : NULL;
-        bool read_only = (c == NULL) ||
+        bool read_only = resume_check || (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
             strcmp(c, "health") == 0;
@@ -517,7 +564,8 @@ int main(int argc, char *argv[]) {
 
     /* Initialize configuration system */
     log_info("Initializing gitswitch-c configuration system");
-    if ((dry_run ? config_init_readonly(ctx) : config_init(ctx)) != 0) {
+    if (((dry_run || resume_check) ? config_init_readonly(ctx)
+                                   : config_init(ctx)) != 0) {
         display_error("Configuration initialization failed", "%s", get_last_error()->message);
         exit_code = EXIT_CONFIG_ERROR;
         goto cleanup;
@@ -536,7 +584,9 @@ int main(int argc, char *argv[]) {
     ctx->config.defer_signal_cleanup = true;
 
     /* Execute command */
-    if (command == NULL) {
+    if (resume_check) {
+        exit_code = handle_resume_check_command(ctx);
+    } else if (command == NULL) {
         /* No command specified - interactive mode or help */
         if (ctx->account_count == 0) {
             display_header("Welcome to gitswitch-c");
@@ -1133,6 +1183,214 @@ static int finish_snippet_emit(void) {
     return EXIT_SUCCESS;
 }
 
+/* Emit the parent-shell state synchronizer. It only restores/unsets a value
+ * that still equals the last path gitswitch installed; a user or another tool
+ * that replaces either variable keeps ownership. Values present before the
+ * first managed assignment are saved and restored when that capability is
+ * later switched off or reset. */
+static void emit_posix_refresh(const char *sock_path, const char *gpg_home,
+                               bool have_gpg_home) {
+    printf("__gitswitch_refresh() {\n");
+    printf("    __gitswitch_next_auth_sock='%s'\n", sock_path);
+    printf("    if [ -S \"$__gitswitch_next_auth_sock\" ]; then\n");
+    printf("        if [ \"${__gitswitch_managed_auth_sock+x}\" != x ]; then\n");
+    printf("            unset __gitswitch_saved_auth_sock __gitswitch_saved_auth_sock_set\n");
+    printf("            if [ \"${SSH_AUTH_SOCK+x}\" = x ] && [ \"$SSH_AUTH_SOCK\" != \"$__gitswitch_next_auth_sock\" ]; then\n");
+    printf("                __gitswitch_saved_auth_sock=$SSH_AUTH_SOCK\n");
+    printf("                __gitswitch_saved_auth_sock_set=1\n");
+    printf("            fi\n");
+    printf("        elif [ \"${SSH_AUTH_SOCK+x}\" != x ]; then\n");
+    printf("            unset __gitswitch_saved_auth_sock __gitswitch_saved_auth_sock_set\n");
+    printf("        elif [ \"$SSH_AUTH_SOCK\" != \"$__gitswitch_managed_auth_sock\" ]; then\n");
+    printf("            __gitswitch_saved_auth_sock=$SSH_AUTH_SOCK\n");
+    printf("            __gitswitch_saved_auth_sock_set=1\n");
+    printf("        fi\n");
+    printf("        SSH_AUTH_SOCK=$__gitswitch_next_auth_sock\n");
+    printf("        export SSH_AUTH_SOCK\n");
+    printf("        __gitswitch_managed_auth_sock=$__gitswitch_next_auth_sock\n");
+    printf("    elif [ \"${__gitswitch_managed_auth_sock+x}\" = x ]; then\n");
+    printf("        if [ \"${SSH_AUTH_SOCK+x}\" = x ] && [ \"$SSH_AUTH_SOCK\" = \"$__gitswitch_managed_auth_sock\" ]; then\n");
+    printf("            if [ \"${__gitswitch_saved_auth_sock_set-0}\" = 1 ]; then\n");
+    printf("                SSH_AUTH_SOCK=$__gitswitch_saved_auth_sock\n");
+    printf("                export SSH_AUTH_SOCK\n");
+    printf("            else\n");
+    printf("                unset SSH_AUTH_SOCK\n");
+    printf("            fi\n");
+    printf("        fi\n");
+    printf("        unset __gitswitch_managed_auth_sock __gitswitch_saved_auth_sock __gitswitch_saved_auth_sock_set\n");
+    printf("    elif [ \"${SSH_AUTH_SOCK+x}\" = x ] && [ \"$SSH_AUTH_SOCK\" = \"$__gitswitch_next_auth_sock\" ]; then\n");
+    printf("        unset SSH_AUTH_SOCK\n");
+    printf("    fi\n");
+    printf("    unset __gitswitch_next_auth_sock\n");
+
+    if (have_gpg_home) {
+        printf("    __gitswitch_next_gnupghome='%s'\n", gpg_home);
+        printf("    if [ -d \"$__gitswitch_next_gnupghome\" ]; then\n");
+        printf("        if [ \"${__gitswitch_managed_gnupghome+x}\" != x ]; then\n");
+        printf("            unset __gitswitch_saved_gnupghome __gitswitch_saved_gnupghome_set\n");
+        printf("            if [ \"${GNUPGHOME+x}\" = x ] && [ \"$GNUPGHOME\" != \"$__gitswitch_next_gnupghome\" ]; then\n");
+        printf("                __gitswitch_saved_gnupghome=$GNUPGHOME\n");
+        printf("                __gitswitch_saved_gnupghome_set=1\n");
+        printf("            fi\n");
+        printf("        elif [ \"${GNUPGHOME+x}\" != x ]; then\n");
+        printf("            unset __gitswitch_saved_gnupghome __gitswitch_saved_gnupghome_set\n");
+        printf("        elif [ \"$GNUPGHOME\" != \"$__gitswitch_managed_gnupghome\" ]; then\n");
+        printf("            __gitswitch_saved_gnupghome=$GNUPGHOME\n");
+        printf("            __gitswitch_saved_gnupghome_set=1\n");
+        printf("        fi\n");
+        printf("        GNUPGHOME=$__gitswitch_next_gnupghome\n");
+        printf("        export GNUPGHOME\n");
+        printf("        __gitswitch_managed_gnupghome=$__gitswitch_next_gnupghome\n");
+        printf("    elif [ \"${__gitswitch_managed_gnupghome+x}\" = x ]; then\n");
+        printf("        if [ \"${GNUPGHOME+x}\" = x ] && [ \"$GNUPGHOME\" = \"$__gitswitch_managed_gnupghome\" ]; then\n");
+        printf("            if [ \"${__gitswitch_saved_gnupghome_set-0}\" = 1 ]; then\n");
+        printf("                GNUPGHOME=$__gitswitch_saved_gnupghome\n");
+        printf("                export GNUPGHOME\n");
+        printf("            else\n");
+        printf("                unset GNUPGHOME\n");
+        printf("            fi\n");
+        printf("        fi\n");
+        printf("        unset __gitswitch_managed_gnupghome __gitswitch_saved_gnupghome __gitswitch_saved_gnupghome_set\n");
+        printf("    elif [ \"${GNUPGHOME+x}\" = x ] && [ \"$GNUPGHOME\" = \"$__gitswitch_next_gnupghome\" ]; then\n");
+        printf("        unset GNUPGHOME\n");
+        printf("    fi\n");
+        printf("    unset __gitswitch_next_gnupghome\n");
+    }
+    printf("    return 0\n");
+    printf("}\n");
+    printf("__gitswitch_command_updates_runtime() {\n");
+    printf("    __gitswitch_runtime_command=\n");
+    printf("    __gitswitch_after_dashdash=0\n");
+    printf("    for __gitswitch_arg do\n");
+    printf("        if [ \"$__gitswitch_after_dashdash\" = 1 ]; then\n");
+    printf("            [ -n \"$__gitswitch_runtime_command\" ] || __gitswitch_runtime_command=$__gitswitch_arg\n");
+    printf("        else\n");
+    printf("            case $__gitswitch_arg in\n");
+    printf("            --) __gitswitch_after_dashdash=1 ;;\n");
+    printf("            --h|--he|--hel|--help|--vers*|--dr*) unset __gitswitch_runtime_command __gitswitch_after_dashdash __gitswitch_arg; return 1 ;;\n");
+    printf("            --*) : ;;\n");
+    printf("            -?*)\n");
+    printf("                case $__gitswitch_arg in *n*|*h*|*v*) unset __gitswitch_runtime_command __gitswitch_after_dashdash __gitswitch_arg; return 1 ;; esac ;;\n");
+    printf("            *) [ -n \"$__gitswitch_runtime_command\" ] || __gitswitch_runtime_command=$__gitswitch_arg ;;\n");
+    printf("            esac\n");
+    printf("        fi\n");
+    printf("    done\n");
+    printf("    case $__gitswitch_runtime_command in\n");
+    printf("        switch|resume|reset|remove|rm|delete|edit) __gitswitch_runtime_result=0 ;;\n");
+    printf("        ''|add|list|ls|status|doctor|health|config|init) __gitswitch_runtime_result=1 ;;\n");
+    printf("        *) __gitswitch_runtime_result=0 ;;\n");
+    printf("    esac\n");
+    printf("    unset __gitswitch_runtime_command __gitswitch_after_dashdash __gitswitch_arg\n");
+    printf("    if [ \"$__gitswitch_runtime_result\" = 0 ]; then\n");
+    printf("        unset __gitswitch_runtime_result\n");
+    printf("        return 0\n");
+    printf("    fi\n");
+    printf("    unset __gitswitch_runtime_result\n");
+    printf("    return 1\n");
+    printf("}\n");
+}
+
+static void emit_fish_refresh(const char *sock_path, const char *gpg_home,
+                              bool have_gpg_home) {
+    printf("function __gitswitch_refresh\n");
+    printf("    set -l __gitswitch_next_auth_sock '%s'\n", sock_path);
+    printf("    if test -S \"$__gitswitch_next_auth_sock\"\n");
+    printf("        if not set -q __gitswitch_managed_auth_sock\n");
+    printf("            set -eg __gitswitch_saved_auth_sock __gitswitch_saved_auth_sock_set\n");
+    printf("            if set -q SSH_AUTH_SOCK; and test \"$SSH_AUTH_SOCK\" != \"$__gitswitch_next_auth_sock\"\n");
+    printf("                set -g __gitswitch_saved_auth_sock $SSH_AUTH_SOCK\n");
+    printf("                set -g __gitswitch_saved_auth_sock_set 1\n");
+    printf("            end\n");
+    printf("        else if not set -q SSH_AUTH_SOCK\n");
+    printf("            set -eg __gitswitch_saved_auth_sock __gitswitch_saved_auth_sock_set\n");
+    printf("        else if test \"$SSH_AUTH_SOCK\" != \"$__gitswitch_managed_auth_sock\"\n");
+    printf("            set -g __gitswitch_saved_auth_sock $SSH_AUTH_SOCK\n");
+    printf("            set -g __gitswitch_saved_auth_sock_set 1\n");
+    printf("        end\n");
+    printf("        set -gx SSH_AUTH_SOCK $__gitswitch_next_auth_sock\n");
+    printf("        set -g __gitswitch_managed_auth_sock $__gitswitch_next_auth_sock\n");
+    printf("    else if set -q __gitswitch_managed_auth_sock\n");
+    printf("        if set -q SSH_AUTH_SOCK; and test \"$SSH_AUTH_SOCK\" = \"$__gitswitch_managed_auth_sock\"\n");
+    printf("            if set -q __gitswitch_saved_auth_sock_set; and test \"$__gitswitch_saved_auth_sock_set\" = 1\n");
+    printf("                set -gx SSH_AUTH_SOCK $__gitswitch_saved_auth_sock\n");
+    printf("            else\n");
+    printf("                set -eg SSH_AUTH_SOCK\n");
+    printf("            end\n");
+    printf("        end\n");
+    printf("        set -eg __gitswitch_managed_auth_sock __gitswitch_saved_auth_sock __gitswitch_saved_auth_sock_set\n");
+    printf("    else if set -q SSH_AUTH_SOCK; and test \"$SSH_AUTH_SOCK\" = \"$__gitswitch_next_auth_sock\"\n");
+    printf("        set -eg SSH_AUTH_SOCK\n");
+    printf("    end\n");
+
+    if (have_gpg_home) {
+        printf("    set -l __gitswitch_next_gnupghome '%s'\n", gpg_home);
+        printf("    if test -d \"$__gitswitch_next_gnupghome\"\n");
+        printf("        if not set -q __gitswitch_managed_gnupghome\n");
+        printf("            set -eg __gitswitch_saved_gnupghome __gitswitch_saved_gnupghome_set\n");
+        printf("            if set -q GNUPGHOME; and test \"$GNUPGHOME\" != \"$__gitswitch_next_gnupghome\"\n");
+        printf("                set -g __gitswitch_saved_gnupghome $GNUPGHOME\n");
+        printf("                set -g __gitswitch_saved_gnupghome_set 1\n");
+        printf("            end\n");
+        printf("        else if not set -q GNUPGHOME\n");
+        printf("            set -eg __gitswitch_saved_gnupghome __gitswitch_saved_gnupghome_set\n");
+        printf("        else if test \"$GNUPGHOME\" != \"$__gitswitch_managed_gnupghome\"\n");
+        printf("            set -g __gitswitch_saved_gnupghome $GNUPGHOME\n");
+        printf("            set -g __gitswitch_saved_gnupghome_set 1\n");
+        printf("        end\n");
+        printf("        set -gx GNUPGHOME $__gitswitch_next_gnupghome\n");
+        printf("        set -g __gitswitch_managed_gnupghome $__gitswitch_next_gnupghome\n");
+        printf("    else if set -q __gitswitch_managed_gnupghome\n");
+        printf("        if set -q GNUPGHOME; and test \"$GNUPGHOME\" = \"$__gitswitch_managed_gnupghome\"\n");
+        printf("            if set -q __gitswitch_saved_gnupghome_set; and test \"$__gitswitch_saved_gnupghome_set\" = 1\n");
+        printf("                set -gx GNUPGHOME $__gitswitch_saved_gnupghome\n");
+        printf("            else\n");
+        printf("                set -eg GNUPGHOME\n");
+        printf("            end\n");
+        printf("        end\n");
+        printf("        set -eg __gitswitch_managed_gnupghome __gitswitch_saved_gnupghome __gitswitch_saved_gnupghome_set\n");
+        printf("    else if set -q GNUPGHOME; and test \"$GNUPGHOME\" = \"$__gitswitch_next_gnupghome\"\n");
+        printf("        set -eg GNUPGHOME\n");
+        printf("    end\n");
+    }
+    printf("    return 0\n");
+    printf("end\n");
+    printf("function __gitswitch_command_updates_runtime\n");
+    printf("    set -l __gitswitch_runtime_command ''\n");
+    printf("    set -l __gitswitch_after_dashdash 0\n");
+    printf("    for __gitswitch_arg in $argv\n");
+    printf("        if test $__gitswitch_after_dashdash -eq 1\n");
+    printf("            if test -z \"$__gitswitch_runtime_command\"\n");
+    printf("                set __gitswitch_runtime_command $__gitswitch_arg\n");
+    printf("            end\n");
+    printf("        else\n");
+    printf("            switch $__gitswitch_arg\n");
+    printf("                case --\n");
+    printf("                    set __gitswitch_after_dashdash 1\n");
+    printf("                case --h --he --hel --help '--vers*' '--dr*'\n");
+    printf("                    return 1\n");
+    printf("                case '--*'\n");
+    printf("                case '-*'\n");
+    printf("                    if string match -q -- '*n*' $__gitswitch_arg; or string match -q -- '*h*' $__gitswitch_arg; or string match -q -- '*v*' $__gitswitch_arg\n");
+    printf("                        return 1\n");
+    printf("                    end\n");
+    printf("                case '*'\n");
+    printf("                    if test -z \"$__gitswitch_runtime_command\"\n");
+    printf("                        set __gitswitch_runtime_command $__gitswitch_arg\n");
+    printf("                    end\n");
+    printf("            end\n");
+    printf("        end\n");
+    printf("    end\n");
+    printf("    switch \"$__gitswitch_runtime_command\"\n");
+    printf("        case switch resume reset remove rm delete edit\n");
+    printf("            return 0\n");
+    printf("        case '' add list ls status doctor health config init\n");
+    printf("            return 1\n");
+    printf("        case '*'\n");
+    printf("            return 0\n");
+    printf("    end\n");
+    printf("end\n");
+}
+
 /* Emit shell-integration snippet for `shell` on stdout. The snippet sets
  * SSH_AUTH_SOCK to the stable gitswitch symlink, guarded by a socket test so
  * sourcing before the first switch (or after /tmp is wiped) is silent. */
@@ -1142,6 +1400,22 @@ static int handle_init_command(const char *shell) {
      * not kill us with SIGPIPE before we can report the failure. Not restored:
      * both callers return from main() immediately after this function (SIPW-1). */
     signal(SIGPIPE, SIG_IGN);
+
+    if (!shell || !*shell) {
+        fprintf(stderr,
+                "gitswitch: could not detect shell; pass one explicitly:\n"
+                "  gitswitch init fish | source\n"
+                "  eval \"$(gitswitch init bash)\"\n"
+                "  eval \"$(gitswitch init zsh)\"\n");
+        return EXIT_FAILURE;
+    }
+    if (!shell_is_supported(shell)) {
+        fprintf(stderr, "gitswitch: unsupported shell '%s' (supported: ",
+                shell);
+        print_supported_shells(stderr, ", ");
+        fputs(")\n", stderr);
+        return EXIT_FAILURE;
+    }
 
     char sock_path[MAX_PATH_LEN];
     if (ssh_manager_get_auth_sock_path(sock_path, sizeof(sock_path)) != 0) {
@@ -1178,15 +1452,6 @@ static int handle_init_command(const char *shell) {
     bool have_hint = (config_resume_hint_path(hint_path, sizeof(hint_path)) == 0) &&
                      (strchr(hint_path, '\'') == NULL);
 
-    if (!shell || !*shell) {
-        fprintf(stderr,
-                "gitswitch: could not detect shell; pass one explicitly:\n"
-                "  gitswitch init fish | source\n"
-                "  eval \"$(gitswitch init bash)\"\n"
-                "  eval \"$(gitswitch init zsh)\"\n");
-        return EXIT_FAILURE;
-    }
-
     if (strcmp(shell, "fish") == 0) {
         /* AR-06 F63: unlike POSIX single quotes (fully literal), fish single
          * quotes still interpret \\ and \' — a backslash in a single-quoted
@@ -1206,12 +1471,20 @@ static int handle_init_command(const char *shell) {
         have_hint = fish_hint;
         printf("# gitswitch shell integration (fish)\n");
         printf("set -l __gitswitch_auth_sock '%s'\n", sock_path);
-        /* First interactive shell after a boot: if no SSH agent is reachable at
-         * the stable socket, resume the last account. We probe with `ssh-add -l`
-         * (exit > 1 means no agent reachable) rather than `test -S`, because a
-         * stale socket file left behind after a reboot — common on macOS, which
-         * doesn't wipe /tmp — passes a plain -S test and would silently skip
-         * resume. Interactive-gated so pinentry has a user. The "restoring your
+        printf("function __gitswitch_ssh_needs_resume\n");
+        printf("    env SSH_AUTH_SOCK='%s' ssh-add -l >/dev/null 2>&1\n",
+               sock_path);
+        printf("    if test $status -ne 0\n");
+        printf("        return 0\n");
+        printf("    end\n");
+        printf("    command gitswitch --resume-check >/dev/null 2>&1\n");
+        printf("    test $status -ne 0\n");
+        printf("end\n");
+        /* First interactive shell after a boot: a nonzero `ssh-add -l` result
+         * (including status 1 for an empty agent) resumes directly. Status 0 is
+         * followed by the read-only exact-runtime check, which rejects the
+         * wrong key or any extra identity. Interactive-gated so pinentry has a
+         * user. The "restoring your
          * account" notice is printed by `resume` itself (on stderr, past the
          * stdout suppression) only when it actually has an account to restore —
          * echoing it here would nag on every shell when there is nothing saved,
@@ -1227,23 +1500,22 @@ static int handle_init_command(const char *shell) {
             printf("        switch \"$__gitswitch_needs\"\n");
             printf("            case none\n");
             printf("            case ssh\n");
-            printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
-            printf("                if test $status -gt 1\n");
-            printf("                    gitswitch resume >/dev/null\n");
+            printf("                if __gitswitch_ssh_needs_resume\n");
+            printf("                    command gitswitch resume >/dev/null\n");
             printf("                end\n");
             if (have_gpg_home) {
                 printf("            case gpg\n");
-                printf("                if not test -d '%s'\n", gpg_home);
-                printf("                    gitswitch resume >/dev/null\n");
+                printf("                if not test -d '%s'; or not command gitswitch --resume-check >/dev/null 2>&1\n",
+                       gpg_home);
+                printf("                    command gitswitch resume >/dev/null\n");
                 printf("                end\n");
             } else {
                 printf("            case gpg\n");
-                printf("                gitswitch resume >/dev/null\n");
+                printf("                command gitswitch resume >/dev/null\n");
             }
             printf("            case 'ssh gpg'\n");
             printf("                set -l __gitswitch_resume 0\n");
-            printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
-            printf("                if test $status -gt 1\n");
+            printf("                if __gitswitch_ssh_needs_resume\n");
             printf("                    set __gitswitch_resume 1\n");
             printf("                end\n");
             if (have_gpg_home) {
@@ -1254,13 +1526,12 @@ static int handle_init_command(const char *shell) {
                 printf("                set __gitswitch_resume 1\n");
             }
             printf("                if test $__gitswitch_resume -eq 1\n");
-            printf("                    gitswitch resume >/dev/null\n");
+            printf("                    command gitswitch resume >/dev/null\n");
             printf("                end\n");
             printf("                set -e __gitswitch_resume\n");
             printf("            case '*'\n");
             printf("                set -l __gitswitch_resume 0\n");
-            printf("                env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
-            printf("                if test $status -gt 1\n");
+            printf("                if __gitswitch_ssh_needs_resume\n");
             printf("                    set __gitswitch_resume 1\n");
             printf("                end\n");
             if (have_gpg_home) {
@@ -1271,44 +1542,47 @@ static int handle_init_command(const char *shell) {
                 printf("                set __gitswitch_resume 1\n");
             }
             printf("                if test $__gitswitch_resume -eq 1\n");
-            printf("                    gitswitch resume >/dev/null\n");
+            printf("                    command gitswitch resume >/dev/null\n");
             printf("                end\n");
             printf("                set -e __gitswitch_resume\n");
             printf("        end\n");            /* close switch */
             printf("        set -e __gitswitch_needs\n");
             printf("    end\n");                /* close `if test -e <hint>` */
         } else {
-            printf("    env SSH_AUTH_SOCK=$__gitswitch_auth_sock ssh-add -l >/dev/null 2>&1\n");
-            printf("    if test $status -gt 1\n");
-            printf("        gitswitch resume >/dev/null\n");
+            printf("    if __gitswitch_ssh_needs_resume\n");
+            printf("        command gitswitch resume >/dev/null\n");
             printf("    end\n");
         }
         printf("end\n");
-        printf("if test -S $__gitswitch_auth_sock\n");
-        printf("    set -gx SSH_AUTH_SOCK $__gitswitch_auth_sock\n");
+        emit_fish_refresh(sock_path, gpg_home, have_gpg_home);
+        printf("__gitswitch_refresh\n");
+        printf("function gitswitch\n");
+        printf("    command gitswitch $argv\n");
+        printf("    set -l __gitswitch_status $status\n");
+        printf("    if test $__gitswitch_status -eq 0; and __gitswitch_command_updates_runtime $argv\n");
+        printf("        __gitswitch_refresh\n");
+        printf("    end\n");
+        printf("    return $__gitswitch_status\n");
         printf("end\n");
         printf("set -e __gitswitch_auth_sock\n");
-        if (have_gpg_home) {
-            printf("set -l __gitswitch_gnupghome '%s'\n", gpg_home);
-            printf("if test -d $__gitswitch_gnupghome\n");
-            printf("    set -gx GNUPGHOME $__gitswitch_gnupghome\n");
-            printf("end\n");
-            printf("set -e __gitswitch_gnupghome\n");
-        }
         return finish_snippet_emit();
     }
 
-    if (strcmp(shell, "bash") == 0 || strcmp(shell, "zsh") == 0 ||
-        strcmp(shell, "sh") == 0 || strcmp(shell, "dash") == 0 ||
-        strcmp(shell, "ksh") == 0) {
+    {
         printf("# gitswitch shell integration (%s)\n", shell);
         printf("__gitswitch_auth_sock='%s'\n", sock_path);
-        /* First interactive shell after a boot: if no SSH agent is reachable at
-         * the stable socket, resume the last account. We probe with `ssh-add -l`
-         * (exit > 1 means no agent reachable) rather than `test -S`, because a
-         * stale socket file left behind after a reboot — common on macOS, which
-         * doesn't wipe /tmp — passes a plain -S test and would silently skip
-         * resume. Interactive-gated so pinentry has a user. The notice comes
+        printf("__gitswitch_ssh_needs_resume() {\n");
+        printf("    SSH_AUTH_SOCK='%s' ssh-add -l >/dev/null 2>&1\n",
+               sock_path);
+        printf("    [ $? -ne 0 ] && return 0\n");
+        printf("    command gitswitch --resume-check >/dev/null 2>&1\n");
+        printf("    [ $? -ne 0 ]\n");
+        printf("}\n");
+        /* First interactive shell after a boot: nonzero/empty agent results
+         * resume directly, while status 0 is verified against the saved
+         * account's exact single fingerprint by --resume-check. A stale socket
+         * or a reachable wrong/extra-key agent therefore cannot suppress the
+         * restore. Interactive-gated so pinentry has a user. The notice comes
          * from `resume` itself (stderr) only when there is an account to
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
@@ -1325,69 +1599,62 @@ static int handle_init_command(const char *shell) {
             printf("        case \"$__gitswitch_needs\" in\n");
             printf("        none) : ;;\n");
             printf("        ssh)\n");
-            printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
-            printf("            [ $? -gt 1 ] && gitswitch resume >/dev/null ;;\n");
+            printf("            __gitswitch_ssh_needs_resume && command gitswitch resume >/dev/null ;;\n");
             if (have_gpg_home) {
                 printf("        gpg)\n");
-                printf("            [ -d '%s' ] || gitswitch resume >/dev/null ;;\n", gpg_home);
+                printf("            [ -d '%s' ] && command gitswitch --resume-check >/dev/null 2>&1 || command gitswitch resume >/dev/null ;;\n",
+                       gpg_home);
             } else {
-                printf("        gpg) gitswitch resume >/dev/null ;;\n");
+                printf("        gpg) command gitswitch resume >/dev/null ;;\n");
             }
             printf("        'ssh gpg')\n");
             printf("            __gitswitch_resume=0\n");
-            printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
-            printf("            [ $? -gt 1 ] && __gitswitch_resume=1\n");
+            printf("            __gitswitch_ssh_needs_resume && __gitswitch_resume=1\n");
             if (have_gpg_home) {
                 printf("            [ -d '%s' ] || __gitswitch_resume=1\n", gpg_home);
             } else {
                 printf("            __gitswitch_resume=1\n");
             }
-            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || gitswitch resume >/dev/null\n");
+            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || command gitswitch resume >/dev/null\n");
             printf("            unset __gitswitch_resume ;;\n");
             printf("        *)\n");
             printf("            __gitswitch_resume=0\n");
-            printf("            SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
-            printf("            [ $? -gt 1 ] && __gitswitch_resume=1\n");
+            printf("            __gitswitch_ssh_needs_resume && __gitswitch_resume=1\n");
             if (have_gpg_home) {
                 printf("            [ -d '%s' ] || __gitswitch_resume=1\n", gpg_home);
             } else {
                 printf("            __gitswitch_resume=1\n");
             }
-            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || gitswitch resume >/dev/null\n");
+            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || command gitswitch resume >/dev/null\n");
             printf("            unset __gitswitch_resume ;;\n");
             printf("        esac\n");
             printf("        unset __gitswitch_needs\n");
             printf("    fi ;;\n");
         } else {
-            printf("    SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\" ssh-add -l >/dev/null 2>&1\n");
-            printf("    if [ $? -gt 1 ]; then\n");
-            printf("        gitswitch resume >/dev/null\n");
+            printf("    if __gitswitch_ssh_needs_resume; then\n");
+            printf("        command gitswitch resume >/dev/null\n");
             printf("    fi ;;\n");
         }
         printf("esac\n");
-        printf("[ -S \"$__gitswitch_auth_sock\" ] && export SSH_AUTH_SOCK=\"$__gitswitch_auth_sock\"\n");
+        emit_posix_refresh(sock_path, gpg_home, have_gpg_home);
+        printf("__gitswitch_refresh\n");
+        printf("gitswitch() {\n");
+        printf("    command gitswitch \"$@\" || return $?\n");
+        printf("    __gitswitch_command_updates_runtime \"$@\" || return 0\n");
+        printf("    __gitswitch_refresh\n");
+        printf("}\n");
         printf("unset __gitswitch_auth_sock\n");
-        if (have_gpg_home) {
-            printf("__gitswitch_gnupghome='%s'\n", gpg_home);
-            printf("[ -d \"$__gitswitch_gnupghome\" ] && export GNUPGHOME=\"$__gitswitch_gnupghome\"\n");
-            printf("unset __gitswitch_gnupghome\n");
-        }
         return finish_snippet_emit();
     }
 
-    fprintf(stderr,
-            "gitswitch: unsupported shell '%s' (supported: fish, bash, zsh, sh, dash, ksh)\n",
-            shell);
-    return EXIT_FAILURE;
 }
 
 /* True when the saved account's per-boot runtime state is already live, so
- * `resume` can no-op silently. The shell snippet can only probe the SSH agent
- * socket, but a GPG-only account never creates one (its switch tears the SSH
- * side down), so without this check every interactive shell would re-run the
- * whole switch and re-print the restore notice for such accounts (F2).
- * - SSH accounts: never "already applied" here — the snippet's ssh-add probe
- *   IS the liveness test, and when it fails a real re-switch is needed.
+ * `resume` and the shell integration's hidden readiness probe can no-op
+ * silently. Both SSH and GPG checks validate the exact saved account; a cheap
+ * shell path/socket test is only a negative fast path, never positive proof.
+ * - SSH accounts: live only when current.sock names this account and its agent
+ *   contains exactly the configured key, with no additional identities.
  * - GPG-only accounts: live iff the stable GNUPGHOME `current` symlink points
  *   at THIS account's isolated home and that home still exists. The symlink
  *   lives under XDG_RUNTIME_DIR (wiped per boot on Linux) or /tmp; where /tmp
@@ -1402,7 +1669,17 @@ static bool resume_already_applied(const account_t *acct) {
     bool wants_gpg = acct->gpg_enabled && acct->gpg_key_id[0] != '\0';
 
     if (wants_ssh) {
-        return false;
+        bool live = false;
+
+        /* Reachability and `ssh-add -l` status 0 are insufficient: the
+         * stable agent must belong to this account and contain exactly its
+         * configured key. Empty, wrong-key, and extra-key agents all force a
+         * bounded resume. The manager keeps the runtime lock across the link,
+         * socket, and fingerprint inspection. */
+        if (ssh_manager_current_is_live_for_account(acct, &live) != 0 ||
+            !live) {
+            return false;
+        }
     }
 
     if (wants_gpg) {
@@ -1416,6 +1693,26 @@ static bool resume_already_applied(const account_t *acct) {
     }
 
     return true;
+}
+
+/* Non-switching readiness predicate consumed by generated shell integration.
+ * Manager inspection may acquire internal runtime locks, but this path never
+ * changes config, identity, or agent/key routing. A successful result means
+ * every boot-volatile capability requested by the saved account is exact and
+ * live; nonzero tells the shell to invoke ordinary `resume` once. Missing
+ * accounts and identity-only accounts need no restore. */
+static int handle_resume_check_command(gitswitch_ctx_t *ctx) {
+    account_t *acct;
+
+    if (!ctx) return EXIT_FAILURE;
+    if (ctx->config.active_account[0] == '\0') return EXIT_SUCCESS;
+
+    acct = config_find_account_exact(ctx, ctx->config.active_account);
+    if (!acct) {
+        clear_error();
+        return EXIT_SUCCESS;
+    }
+    return resume_already_applied(acct) ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 /* Re-activate the last-active account, recorded in config across reboots. This
@@ -1464,9 +1761,9 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
     }
 
     /* Already live this boot: exit silently before the notice below. The shell
-     * snippet re-invokes resume whenever its ssh-add probe fails, which for a
-     * GPG-only account is EVERY interactive shell — re-running the switch and
-     * nagging on each one is exactly the F2 bug. */
+     * integration invokes resume only after its exact readiness probe fails;
+     * keep this same check here to close the probe/action race and make manual
+     * redundant resume calls quiet. */
     if (resume_already_applied(acct)) {
         log_debug("Runtime state for '%s' already live; resume is a no-op",
                   ctx->config.active_account);
