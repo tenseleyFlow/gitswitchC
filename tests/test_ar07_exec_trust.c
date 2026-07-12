@@ -383,7 +383,7 @@ TEST(symlink_targets_and_lookup_to_exec_swap_are_descriptor_pinned) {
     CHECK_EQ_INT(find_command_path(hostile_link, resolved,
                                    sizeof(resolved)), -1);
 
-    CHECK_EQ_INT(find_command_path("/bin/false", g_swap_target,
+    CHECK_EQ_INT(find_command_path("false", g_swap_target,
                                    sizeof(g_swap_target)), 0);
     CHECK_EQ_INT(safe_strncpy(g_swap_expected, helper,
                               sizeof(g_swap_expected)), 0);
@@ -398,7 +398,7 @@ TEST(symlink_targets_and_lookup_to_exec_swap_are_descriptor_pinned) {
     CHECK(result.spawned);
     /* A rename can update ctime and trigger the exact metadata seal (127), or
      * descriptor platforms may execute the already-pinned original (0). The
-     * replacement /bin/false (1) is never an outcome. */
+     * replacement `false` (1) is never an outcome. */
     CHECK(rc == 0 || rc == -1);
     CHECK(result.exit_code == 0 || result.exit_code == 127);
     CHECK(result.exit_code != 1);
@@ -550,7 +550,7 @@ TEST(pinned_direct_interpreter_cannot_be_replaced_at_launch) {
     CHECK((size_t)snprintf(body, sizeof(body), "#!%s\nexit 99\n",
                            interpreter) < sizeof(body));
     CHECK_EQ_INT(write_string_to_file(script, body, 0755), 0);
-    CHECK_EQ_INT(find_command_path("/bin/false", g_swap_target,
+    CHECK_EQ_INT(find_command_path("false", g_swap_target,
                                    sizeof(g_swap_target)), 0);
     CHECK_EQ_INT(safe_strncpy(g_swap_expected, interpreter,
                               sizeof(g_swap_expected)), 0);
