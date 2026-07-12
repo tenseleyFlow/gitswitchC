@@ -5,9 +5,9 @@
 #include "accounts.h"
 #include "error.h"
 #include "gitswitch.h"
-#include "utils.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -59,8 +59,8 @@ static int mkdir_private(const char *path) {
     return chmod(path, 0700);
 }
 
-static int test_join_path(char *dest, size_t size, const char *base,
-                          const char *suffix) {
+static int join_path(char *dest, size_t size, const char *base,
+                     const char *suffix) {
     size_t base_len = strlen(base);
     size_t suffix_len = strlen(suffix);
 
@@ -133,26 +133,102 @@ static const char *active_work_config(void) {
            "preferred_scope = \"global\"\n";
 }
 
+/* Resolve and copy host tools only to construct deterministic native test
+ * fixtures. Production still performs its complete trust walk on the private
+ * copies before execution. This deliberately does not use find_command_path:
+ * a package-manager prefix can be safe for the CI operator yet intentionally
+ * fail the product's stricter ancestry policy. */
+static int find_fixture_executable(const char *name, char *resolved,
+                                   size_t resolved_size) {
+    const char *path_env = getenv("PATH");
+    const char *cursor;
+
+    if (!name || !*name || !resolved || resolved_size == 0 ||
+        !path_env || !*path_env || strchr(name, '/')) return -1;
+
+    cursor = path_env;
+    while (*cursor) {
+        const char *colon = strchr(cursor, ':');
+        size_t dir_len = colon ? (size_t)(colon - cursor) : strlen(cursor);
+        size_t name_len = strlen(name);
+        char candidate[PATH_MAX], canonical[PATH_MAX];
+        struct stat st;
+
+        if (dir_len > 0 && cursor[0] == '/' &&
+            dir_len + 1 + name_len + 1 <= sizeof(candidate)) {
+            memcpy(candidate, cursor, dir_len);
+            candidate[dir_len] = '/';
+            memcpy(candidate + dir_len + 1, name, name_len + 1);
+            if (realpath(candidate, canonical) &&
+                stat(canonical, &st) == 0 && S_ISREG(st.st_mode) &&
+                access(canonical, R_OK | X_OK) == 0 &&
+                strlen(canonical) < resolved_size) {
+                memcpy(resolved, canonical, strlen(canonical) + 1);
+                return 0;
+            }
+        }
+        if (!colon) break;
+        cursor = colon + 1;
+    }
+    return -1;
+}
+
+static int copy_executable(const char *source, const char *destination) {
+    unsigned char buffer[16384];
+    int source_fd = -1, destination_fd = -1;
+    int result = -1;
+
+    source_fd = open(source, O_RDONLY);
+    if (source_fd < 0) goto done;
+    destination_fd = open(destination, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    if (destination_fd < 0) goto done;
+
+    for (;;) {
+        ssize_t count = read(source_fd, buffer, sizeof(buffer));
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            goto done;
+        }
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(destination_fd, buffer + offset,
+                                    (size_t)(count - offset));
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) goto done;
+            offset += written;
+        }
+    }
+    if (fchmod(destination_fd, 0700) != 0) goto done;
+    result = 0;
+
+done:
+    if (source_fd >= 0 && close(source_fd) != 0) result = -1;
+    if (destination_fd >= 0 && close(destination_fd) != 0) result = -1;
+    if (result != 0) (void)unlink(destination);
+    return result;
+}
+
 static int prepare_shims(char *shim_dir, size_t size) {
     char path[1024], true_path[PATH_MAX], git_path[PATH_MAX];
 
     if (!ts_mkdtemp_trusted(shim_dir, size,
                             "gitswitch-ar04-life-shims")) return -1;
     /* This suite owns account lifecycle semantics. Interpreted executable
-     * descriptor coverage belongs to test_ar07_exec_trust, so use a native
-     * no-op here and avoid coupling these fixtures to /dev/fd availability.
+     * descriptor coverage belongs to test_ar07_exec_trust, so use native
+     * copies here and avoid coupling these fixtures to /dev/fd availability.
      * Pin Git into the same private PATH as well: hosted arm64 macOS installs
      * it under /opt/homebrew, which the deliberately narrow child PATH omits. */
-    if (find_command_path("true", true_path, sizeof(true_path)) != 0 ||
-        find_command_path("git", git_path, sizeof(git_path)) != 0) {
+    if (find_fixture_executable("true", true_path, sizeof(true_path)) != 0 ||
+        find_fixture_executable("git", git_path, sizeof(git_path)) != 0) {
         return -1;
     }
     snprintf(path, sizeof(path), "%s/gpg", shim_dir);
-    if (symlink(true_path, path) != 0) return -1;
+    if (copy_executable(true_path, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/gpgconf", shim_dir);
-    if (symlink(true_path, path) != 0) return -1;
+    if (copy_executable(true_path, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/git", shim_dir);
-    return symlink(git_path, path);
+    return copy_executable(git_path, path);
 }
 
 static int run_edit(const char *home, const char *runtime, const char *shim_dir,
@@ -489,8 +565,7 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
-    CHECK_EQ_INT(test_join_path(key_path, sizeof(key_path), runtime,
-                                "/retry-key"), 0);
+    CHECK_EQ_INT(join_path(key_path, sizeof(key_path), runtime, "/retry-key"), 0);
     snprintf(cmd, sizeof(cmd),
              "PATH='/usr/bin:/bin:/usr/local/bin' ssh-keygen -q -t ed25519 "
              "-N '' -f '%s' >/dev/null 2>&1",
@@ -520,8 +595,7 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK_EQ_INT(symlink(target, path), 0);
 
     snprintf(config_dir, sizeof(config_dir), "%s/.config/gitswitch", home);
-    CHECK_EQ_INT(test_join_path(path, sizeof(path), config_dir,
-                                "/.config.lock"), 0);
+    CHECK_EQ_INT(join_path(path, sizeof(path), config_dir, "/.config.lock"), 0);
     lock_file = fopen(path, "w");
     CHECK(lock_file != NULL);
     if (lock_file) fclose(lock_file);
@@ -556,12 +630,12 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK_EQ_INT(switch_rc, 0);
     CHECK(strstr(contents, "SSH key loaded") != NULL);
 
-    CHECK_EQ_INT(test_join_path(socket_path, sizeof(socket_path), runtime,
-                                "/gitswitch-ssh/ssh-agent.work.sock"), 0);
-    CHECK_EQ_INT(test_join_path(current_path, sizeof(current_path), runtime,
-                                "/gitswitch-ssh/current.sock"), 0);
-    CHECK_EQ_INT(test_join_path(pid_path, sizeof(pid_path), runtime,
-                                "/gitswitch-ssh/ssh-agent.work.pid"), 0);
+    CHECK_EQ_INT(join_path(socket_path, sizeof(socket_path), runtime,
+                           "/gitswitch-ssh/ssh-agent.work.sock"), 0);
+    CHECK_EQ_INT(join_path(current_path, sizeof(current_path), runtime,
+                           "/gitswitch-ssh/current.sock"), 0);
+    CHECK_EQ_INT(join_path(pid_path, sizeof(pid_path), runtime,
+                           "/gitswitch-ssh/ssh-agent.work.pid"), 0);
     CHECK_EQ_INT(lstat(current_path, &st), 0);
     CHECK(S_ISLNK(st.st_mode));
     link_len = readlink(current_path, link_target, sizeof(link_target) - 1);
