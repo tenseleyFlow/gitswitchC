@@ -2107,10 +2107,13 @@ static int ssh_quote_identity_file(const char *path, char **quoted_out) {
 /* Read config through the pinned directory and carry its exact length. NUL is
  * rejected while the original descriptor and metadata snapshot are still the
  * only state involved: no temp file, chmod, rename, or directory sync has
- * happened, so a hostile binary config remains byte/inode/mtime identical. */
+ * happened, so a hostile binary config remains byte/inode/mtime identical.
+ * Keep the descriptor open through the caller's transaction.  Some systems
+ * finalize read-side inode timestamps on close; closing here would make our
+ * own access look like hostile ctime drift at the pre-rename recheck. */
 static int read_ssh_config_at(int dir_fd, const char *display_path,
                               char **out, size_t *out_len, bool *existed,
-                              struct stat *identity) {
+                              struct stat *identity, int *pinned_fd) {
     const size_t max_bytes = (size_t)GITSWITCH_SSH_CONFIG_MAX_BYTES;
     struct stat before;
     struct stat opened;
@@ -2123,6 +2126,7 @@ static int read_ssh_config_at(int dir_fd, const char *display_path,
     *out = NULL;
     *out_len = 0;
     *existed = false;
+    *pinned_fd = -1;
     memset(identity, 0, sizeof(*identity));
 
     if (fstatat(dir_fd, "config", &before, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -2246,17 +2250,12 @@ static int read_ssh_config_at(int dir_fd, const char *display_path,
                   display_path);
         return -1;
     }
-    if (close(fd) != 0) {
-        set_system_error(ERR_FILE_IO, "Failed to close SSH config: %s",
-                         display_path);
-        free(buf);
-        return -1;
-    }
     if (memchr(buf, '\0', used) != NULL) {
         set_error(ERR_FILE_IO,
                   "SSH config contains an embedded NUL; refusing any update: %s",
                   display_path);
         free(buf);
+        close(fd);
         return -1;
     }
 
@@ -2265,17 +2264,30 @@ static int read_ssh_config_at(int dir_fd, const char *display_path,
     *out_len = used;
     *existed = true;
     *identity = after;
+    *pinned_fd = fd;
     return 0;
 }
 
 /* Refuse to rename over a path whose final component changed after the safe
  * read. For a previously absent config, any newly-created entry is a conflict;
- * for an existing config, only the exact regular-file inode may be replaced. */
+ * for an existing config, both the retained descriptor and public name must
+ * still identify the exact regular-file snapshot. */
 static int ssh_config_recheck_before_rename(int dir_fd,
                                             const char *display_path,
                                             bool existed,
-                                            const struct stat *identity) {
+                                            const struct stat *identity,
+                                            int pinned_fd) {
+    struct stat pinned;
     struct stat now;
+
+    if (existed &&
+        (pinned_fd < 0 || fstat(pinned_fd, &pinned) != 0 ||
+         !same_ssh_config_snapshot(identity, &pinned))) {
+        set_error(ERR_FILE_IO,
+                  "Pinned SSH config changed before update: %s",
+                  display_path);
+        return -1;
+    }
 
     if (fstatat(dir_fd, "config", &now, AT_SYMLINK_NOFOLLOW) != 0) {
         if (!existed && errno == ENOENT) {
@@ -2472,7 +2484,8 @@ static int ssh_filter_managed_blocks(const char *buf, size_t len,
 static int ssh_write_config_atomic_at(
     int dir_fd, const char *dir_path, const struct stat *dir_identity,
     const char *display_path, const char *content, size_t content_len,
-    bool config_existed, const struct stat *config_identity) {
+    bool config_existed, const struct stat *config_identity,
+    int pinned_config_fd) {
     static const char random_chars[] =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     char suffix[17];
@@ -2563,7 +2576,8 @@ static int ssh_write_config_atomic_at(
     }
     if (recheck_ssh_config_directory(dir_path, dir_identity) != 0 ||
         ssh_config_recheck_before_rename(dir_fd, display_path, config_existed,
-                                         config_identity) != 0) {
+                                         config_identity,
+                                         pinned_config_fd) != 0) {
         goto fail;
     }
     if (fstatat(dir_fd, temp_name, &current_temp,
@@ -2625,6 +2639,7 @@ int ssh_remove_host_alias(const char *alias) {
     bool config_existed;
     int dir_fd = -1;
     int config_lock_fd = -1;
+    int pinned_config_fd = -1;
     int rc = -1;
 
     if (!alias || !*alias) {
@@ -2663,7 +2678,8 @@ int ssh_remove_host_alias(const char *alias) {
         goto done;
     }
     if (read_ssh_config_at(dir_fd, ssh_config_path, &buf, &buf_len,
-                           &config_existed, &config_identity) != 0) {
+                           &config_existed, &config_identity,
+                           &pinned_config_fd) != 0) {
         goto done;
     }
     if (!config_existed) {
@@ -2681,7 +2697,8 @@ int ssh_remove_host_alias(const char *alias) {
 
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, filtered, filtered_len,
-                                   config_existed, &config_identity) != 0) {
+                                   config_existed, &config_identity,
+                                   pinned_config_fd) != 0) {
         goto done;
     }
     log_info("Removed %zu SSH host alias block%s: %s", removed,
@@ -2690,6 +2707,11 @@ int ssh_remove_host_alias(const char *alias) {
 done:
     free(buf);
     free(filtered);
+    if (pinned_config_fd >= 0 && close(pinned_config_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close pinned SSH config");
+        rc = -1;
+    }
     if (config_lock_fd >= 0) unlock_private_file(config_lock_fd);
     if (dir_fd >= 0 && close(dir_fd) != 0 && rc == 0) {
         set_system_error(ERR_FILE_IO,
@@ -2722,6 +2744,7 @@ int ssh_configure_host_alias(const account_t *account) {
     bool config_existed;
     int dir_fd = -1;
     int config_lock_fd = -1;
+    int pinned_config_fd = -1;
     int rc = -1;
     int need;
 
@@ -2792,7 +2815,8 @@ int ssh_configure_host_alias(const account_t *account) {
     }
 
     if (read_ssh_config_at(dir_fd, ssh_config_path, &buf, &buf_len,
-                           &config_existed, &config_identity) != 0) {
+                           &config_existed, &config_identity,
+                           &pinned_config_fd) != 0) {
         goto done;
     }
     if (ssh_filter_managed_blocks(buf, buf_len, account->ssh_host_alias,
@@ -2848,7 +2872,8 @@ int ssh_configure_host_alias(const account_t *account) {
      * reuse it). */
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, newbuf, newbuf_len,
-                                   config_existed, &config_identity) != 0) {
+                                   config_existed, &config_identity,
+                                   pinned_config_fd) != 0) {
         goto done;
     }
 
@@ -2861,6 +2886,11 @@ done:
     free(filtered);
     free(newbuf);
     free(quoted_key_path);
+    if (pinned_config_fd >= 0 && close(pinned_config_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close pinned SSH config");
+        rc = -1;
+    }
     if (config_lock_fd >= 0) unlock_private_file(config_lock_fd);
     if (dir_fd >= 0 && close(dir_fd) != 0 && rc == 0) {
         set_system_error(ERR_FILE_IO,
