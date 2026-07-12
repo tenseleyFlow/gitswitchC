@@ -558,7 +558,10 @@ TEST(equal_length_substitution_survives_restoration_sync_failure_and_resets) {
     ssh_manager_set_quarantine_hook_fn(previous_quarantine);
     ssh_manager_set_current_cleanup_hook_fn(previous_cleanup);
 
-    CHECK_EQ_INT(g_dirsync_calls, 2);
+    /* Native no-replace rename reaches the retained duplicate in two
+     * barriers.  The portable link/re-prove/unlink protocol performs one
+     * additional preservation sync after detecting the substitution. */
+    CHECK(g_dirsync_calls == 2 || g_dirsync_calls == 3);
     n = readlinkat(dir_fd, "current.sock", target, sizeof(target) - 1U);
     CHECK(n > 0 && (size_t)n < sizeof(target));
     if (n > 0 && (size_t)n < sizeof(target)) {
@@ -729,7 +732,10 @@ TEST(current_link_substitution_is_preserved_not_unlinked) {
         CHECK_EQ_INT(ssh_manager_test_cleanup_current_link(dir_fd), 0);
         ssh_manager_set_dirsync_fn(previous_sync);
     }
-    CHECK_EQ_INT(g_dirsync_calls, 2);
+    /* Native rename needs publication+cleanup barriers; the portable
+     * quarantine additionally syncs its hard-link publication and public-name
+     * removal.  Both must durably remove the exact captured link. */
+    CHECK(g_dirsync_calls == 2 || g_dirsync_calls == 4);
     {
         struct stat absent;
         errno = 0;
@@ -929,6 +935,7 @@ TEST(reset_retry_confirms_empty_and_newly_absent_namespaces) {
     int dir_fd = make_runtime_dir(xdg, sizeof(xdg), runtime,
                                    sizeof(runtime), &parent_fd);
     ssh_dirsync_fn previous;
+    bool previous_force;
 
     CHECK(dir_fd >= 0);
     if (dir_fd < 0) return;
@@ -953,10 +960,17 @@ TEST(reset_retry_confirms_empty_and_newly_absent_namespaces) {
                  0);
     g_dirsync_calls = 0;
     g_dirsync_fail_call = 1;
+    previous_force = ssh_manager_set_force_portable_quarantine(true);
     previous = ssh_manager_set_dirsync_fn(counting_dirsync);
+    CHECK_EQ_INT(ssh_manager_reset(NULL), -1);
+    /* A failed portable quarantine publication leaves its exact hard-linked
+     * retry name discoverable.  The next reset reconciles that evidence but
+     * deliberately remains nonzero; only a fresh pass may confirm the clean
+     * namespace. */
     CHECK_EQ_INT(ssh_manager_reset(NULL), -1);
     CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
     ssh_manager_set_dirsync_fn(previous);
+    ssh_manager_set_force_portable_quarantine(previous_force);
     CHECK(g_dirsync_calls >= 2);
     errno = 0;
     CHECK_EQ_INT(faccessat(dir_fd, "current.sock", F_OK,
