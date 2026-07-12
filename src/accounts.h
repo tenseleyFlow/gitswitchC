@@ -56,6 +56,18 @@ int accounts_add_interactive(gitswitch_ctx_t *ctx);
  */
 int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier);
 
+/* CLI edit transaction. Prepare validates and installs the candidate in the
+ * in-memory context while retaining enough state to restore managed SSH alias
+ * routing if the full config save fails before installation. An installed-
+ * but durability-uncertain save must commit, not abort, so config and routing
+ * continue to describe the same account. */
+int accounts_edit_interactive_prepare(gitswitch_ctx_t *ctx,
+                                      const char *identifier);
+int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
+                                    const account_t *candidate);
+int accounts_edit_commit(gitswitch_ctx_t *ctx);
+int accounts_edit_abort(gitswitch_ctx_t *ctx);
+
 /**
  * Remove account with confirmation
  * - Shows account details

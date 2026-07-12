@@ -128,7 +128,9 @@ static int sandbox_setup(sandbox_t *sb) {
     }
 
     snprintf(sb->key, sizeof(sb->key), "%s/key_ed25519", sb->home);
-    if (write_file_mode(sb->key, "dummy-ssh-key\n", 0600) != 0) return -1;
+    if (write_file_mode(sb->key,
+                        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                        0600) != 0) return -1;
 
     snprintf(path, sizeof(path), "%s/.config", sb->home);
     if (mkdir(path, 0700) != 0) return -1;

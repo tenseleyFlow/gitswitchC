@@ -32,6 +32,7 @@
 #include "gpg_manager.h"
 #include "prompt.h"
 #include "signals.h"
+#include "toml_parser.h"
 
 /* Active session state - tracks SSH/GPG resources for proper cleanup */
 typedef struct {
@@ -70,11 +71,24 @@ typedef struct {
 
 static pending_switch_t g_pending_switch = {0};
 
+typedef struct {
+    bool active;
+    gitswitch_ctx_t *ctx;
+    account_t original;
+    account_t candidate;
+    bool routing_changed;
+    bool original_alias_exclusive;
+    bool candidate_alias_attempted;
+    bool original_alias_remove_attempted;
+} pending_edit_t;
+
+static pending_edit_t g_pending_edit = {0};
+
 /* Internal helper functions */
 static uint32_t get_next_available_id(const gitswitch_ctx_t *ctx);
 static bool prompt_host_alias_valid(const char *alias);
-static int validate_ssh_key_security(const char *ssh_key_path);
 static int validate_gpg_key_availability(const char *gpg_key_id);
+static int validate_gpg_key_availability_fresh(const char *gpg_key_id);
 static int test_ssh_key_functionality(const account_t *account);
 static int test_gpg_key_functionality(const account_t *account);
 
@@ -572,7 +586,11 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         ? config_find_account_exact(ctx, identifier)
         : config_find_account(ctx, identifier);
     if (!account) {
-        set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: %s", identifier);
+        /* The fuzzy resolver already owns useful ambiguity/candidate detail.
+         * Only the exact-name resume path returns NULL without setting it. */
+        if (ctx->config.resuming) {
+            set_error(ERR_ACCOUNT_NOT_FOUND, "Account not found: %s", identifier);
+        }
         return -1;
     }
 
@@ -1276,9 +1294,340 @@ static bool account_live_fields_equal(const account_t *a, const account_t *b) {
            a->ssh_enabled == b->ssh_enabled &&
            strcmp(a->ssh_key_path, b->ssh_key_path) == 0 &&
            strcmp(a->ssh_host_alias, b->ssh_host_alias) == 0 &&
+           strcmp(a->ssh_hostname, b->ssh_hostname) == 0 &&
            a->gpg_enabled == b->gpg_enabled &&
            a->gpg_signing_enabled == b->gpg_signing_enabled &&
            strcmp(a->gpg_key_id, b->gpg_key_id) == 0;
+}
+
+static account_t *account_by_id(gitswitch_ctx_t *ctx, uint32_t id) {
+    for (size_t i = 0; ctx && i < ctx->account_count; i++) {
+        if (ctx->accounts[i].id == id) return &ctx->accounts[i];
+    }
+    return NULL;
+}
+
+static bool account_has_managed_alias(const account_t *account) {
+    return account && account->ssh_enabled &&
+           account->ssh_key_path[0] != '\0' &&
+           account->ssh_host_alias[0] != '\0' &&
+           account->ssh_hostname[0] != '\0';
+}
+
+/* Admission prevents shared aliases, but a hand-constructed/corrupted context
+ * must not let removing one account delete another account's only block. */
+static bool account_alias_exclusively_owned(const gitswitch_ctx_t *ctx,
+                                            uint32_t owner_id,
+                                            const char *alias) {
+    if (!ctx || !alias || alias[0] == '\0') return false;
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (ctx->accounts[i].id != owner_id &&
+            ctx->accounts[i].ssh_host_alias[0] != '\0' &&
+            string_ascii_case_equal(ctx->accounts[i].ssh_host_alias, alias)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool account_ssh_routing_equal(const account_t *a,
+                                      const account_t *b) {
+    return a && b && a->ssh_enabled == b->ssh_enabled &&
+           strcmp(a->ssh_key_path, b->ssh_key_path) == 0 &&
+           strcmp(a->ssh_host_alias, b->ssh_host_alias) == 0 &&
+           strcmp(a->ssh_hostname, b->ssh_hostname) == 0;
+}
+
+static bool account_ssh_runtime_identity_equal(const account_t *a,
+                                               const account_t *b) {
+    return a && b && strcmp(a->name, b->name) == 0 &&
+           a->ssh_enabled == b->ssh_enabled &&
+           strcmp(a->ssh_key_path, b->ssh_key_path) == 0;
+}
+
+static bool account_gpg_runtime_identity_equal(const account_t *a,
+                                               const account_t *b) {
+    return a && b && strcmp(a->name, b->name) == 0 &&
+           a->gpg_enabled == b->gpg_enabled &&
+           strcmp(a->gpg_key_id, b->gpg_key_id) == 0;
+}
+
+static int restore_pending_edit_alias(void) {
+    bool complete = true;
+    char detail[sizeof(g_last_error.message)] = "";
+    const account_t *original = &g_pending_edit.original;
+    const account_t *candidate = &g_pending_edit.candidate;
+
+    if (!g_pending_edit.routing_changed) return 0;
+
+    if (g_pending_edit.candidate_alias_attempted) {
+        if (account_has_managed_alias(candidate) &&
+            account_has_managed_alias(original) &&
+            string_ascii_case_equal(candidate->ssh_host_alias,
+                                    original->ssh_host_alias) &&
+            g_pending_edit.original_alias_exclusive) {
+            if (ssh_configure_host_alias(original) != 0) {
+                complete = false;
+                safe_strncpy(detail, get_last_error()->message,
+                             sizeof(detail));
+            }
+        } else if (candidate->ssh_host_alias[0] != '\0' &&
+                   ssh_remove_host_alias(candidate->ssh_host_alias) != 0) {
+            complete = false;
+            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+        }
+    }
+
+    if (g_pending_edit.original_alias_remove_attempted &&
+        g_pending_edit.original_alias_exclusive &&
+        account_has_managed_alias(original) &&
+        !(account_has_managed_alias(candidate) &&
+          string_ascii_case_equal(candidate->ssh_host_alias,
+                                  original->ssh_host_alias))) {
+        if (ssh_configure_host_alias(original) != 0) {
+            complete = false;
+            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+        }
+    }
+
+    if (!complete) {
+        set_error(ERR_FILE_IO,
+                  "Could not restore the original SSH alias routing: %s",
+                  detail[0] ? detail : "unknown SSH config error");
+        return -1;
+    }
+    return 0;
+}
+
+int accounts_edit_abort(gitswitch_ctx_t *ctx) {
+    account_t *slot;
+    int alias_rc;
+
+    if (!ctx || !g_pending_edit.active || g_pending_edit.ctx != ctx) {
+        set_error(ERR_INVALID_ARGS, "No prepared account edit to roll back");
+        return -1;
+    }
+
+    alias_rc = restore_pending_edit_alias();
+    slot = account_by_id(ctx, g_pending_edit.original.id);
+    if (!slot) {
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "Edited account disappeared before rollback");
+        return -1;
+    }
+    secure_zero_memory(slot, sizeof(*slot));
+    *slot = g_pending_edit.original;
+
+    if (alias_rc != 0) return -1;
+    memset(&g_pending_edit, 0, sizeof(g_pending_edit));
+    return 0;
+}
+
+int accounts_edit_commit(gitswitch_ctx_t *ctx) {
+    if (!ctx || !g_pending_edit.active || g_pending_edit.ctx != ctx) {
+        set_error(ERR_INVALID_ARGS, "No prepared account edit to commit");
+        return -1;
+    }
+    memset(&g_pending_edit, 0, sizeof(g_pending_edit));
+    return 0;
+}
+
+int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
+                                    const account_t *candidate) {
+    account_t edited;
+    account_t *existing;
+    bool editing_active;
+    bool isolated_gpg_home_present = false;
+    bool retire_ssh;
+    bool retire_gpg;
+    int runtime_lock_fd = -1;
+
+    if (!ctx || !candidate) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to account edit prepare");
+        return -1;
+    }
+    if (g_pending_edit.active) {
+        set_error(ERR_SYSTEM_CALL,
+                  "A prepared account edit is already awaiting completion");
+        return -1;
+    }
+    existing = account_by_id(ctx, candidate->id);
+    if (!existing) {
+        set_error(ERR_ACCOUNT_NOT_FOUND, "Account with ID %u not found",
+                  candidate->id);
+        return -1;
+    }
+
+    edited = *candidate;
+    if (!edited.ssh_enabled) {
+        edited.ssh_key_path[0] = '\0';
+        edited.ssh_host_alias[0] = '\0';
+        edited.ssh_hostname[0] = '\0';
+    } else if (edited.ssh_host_alias[0] != '\0' &&
+               edited.ssh_hostname[0] == '\0' &&
+               toml_validate_ssh_hostname(edited.ssh_host_alias)) {
+        if (safe_strncpy(edited.ssh_hostname, edited.ssh_host_alias,
+                         sizeof(edited.ssh_hostname)) != 0) return -1;
+    }
+    if (!edited.gpg_enabled) {
+        edited.gpg_key_id[0] = '\0';
+        edited.gpg_signing_enabled = false;
+    }
+
+    editing_active = (existing == ctx->current_account) ||
+                     (ctx->config.active_account[0] != '\0' &&
+                      strcasecmp(ctx->config.active_account,
+                                 existing->name) == 0);
+    if (editing_active && !account_live_fields_equal(existing, &edited)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Cannot change live fields for active account '%s'; "
+                  "switch away or reset it, then rerun edit",
+                  existing->name);
+        return -1;
+    }
+
+    memset(&g_pending_edit, 0, sizeof(g_pending_edit));
+    g_pending_edit.ctx = ctx;
+    g_pending_edit.original = *existing;
+    g_pending_edit.candidate = edited;
+    g_pending_edit.routing_changed =
+        !account_ssh_routing_equal(existing, &edited);
+    g_pending_edit.original_alias_exclusive =
+        account_alias_exclusively_owned(ctx, existing->id,
+                                        existing->ssh_host_alias);
+    retire_ssh = !account_ssh_runtime_identity_equal(existing, &edited);
+    retire_gpg = !account_gpg_runtime_identity_equal(existing, &edited);
+
+    /* config_update_account is the single add/edit admission gate. Nothing
+     * externally visible has changed yet, so a validation failure needs no
+     * rollback window. */
+    if (config_update_account(ctx, &edited) != 0) {
+        memset(&g_pending_edit, 0, sizeof(g_pending_edit));
+        return -1;
+    }
+    g_pending_edit.active = true;
+    signals_guard_begin();
+    signals_rollback_begin();
+
+    if (retire_ssh || retire_gpg) {
+        runtime_lock_fd = runtime_state_lock_acquire();
+        if (runtime_lock_fd < 0) goto prepare_fail;
+    }
+
+    /* An isolated home can contain the only remaining copy of this account's
+     * secret key (AR-06 F17). Deleting it during prepare would make a later
+     * pre-install config failure impossible to roll back truthfully. Check
+     * while holding the cross-manager runtime lock and keep that lock through
+     * retirement, so a concurrent switch cannot create the home after the
+     * check. The explicit reset command is the user's destructive commit
+     * point; after it succeeds, retrying the edit is safe. */
+    if (retire_gpg) {
+        if (gpg_manager_isolated_home_present(
+                g_pending_edit.original.name,
+                &isolated_gpg_home_present) != 0) {
+            goto prepare_fail;
+        }
+        if (isolated_gpg_home_present) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Cannot change GPG identity for account '%s' while its "
+                      "isolated GPG home exists; it may contain the only secret "
+                      "key copy. Run 'gitswitch reset %u' and confirm that "
+                      "destructive cleanup, then retry the edit.",
+                      g_pending_edit.original.name,
+                      g_pending_edit.original.id);
+            goto prepare_fail;
+        }
+        if (strcmp(g_pending_edit.original.name, edited.name) != 0) {
+            if (gpg_manager_isolated_home_present(
+                    edited.name, &isolated_gpg_home_present) != 0) {
+                goto prepare_fail;
+            }
+            if (isolated_gpg_home_present) {
+                set_error(ERR_ACCOUNT_INVALID,
+                          "Cannot rename account '%s' to '%s': an isolated GPG "
+                          "home already exists for that target name and may "
+                          "contain unrelated secret material. Choose another "
+                          "name or run 'gitswitch reset' to explicitly clear "
+                          "all isolated runtime state, then retry.",
+                          g_pending_edit.original.name, edited.name);
+                goto prepare_fail;
+            }
+        }
+        if (edited.gpg_enabled &&
+            validate_gpg_key_availability_fresh(edited.gpg_key_id) != 0) {
+            error_context_t cause = *get_last_error();
+            set_error(ERR_GPG_KEY_NOT_FOUND,
+                      "Cannot change GPG identity for account '%s': edited "
+                      "key '%s' is not available in the real/system keyring. "
+                      "Import its secret key into the system keyring, then "
+                      "retry the edit (%s).",
+                      g_pending_edit.original.name, edited.gpg_key_id,
+                      cause.message[0] ? cause.message : "key probe failed");
+            goto prepare_fail;
+        }
+    }
+
+    if (g_pending_edit.routing_changed) {
+        if (account_has_managed_alias(&edited)) {
+            g_pending_edit.candidate_alias_attempted = true;
+            if (ssh_configure_host_alias(&edited) != 0) goto prepare_fail;
+        }
+        if (g_pending_edit.original_alias_exclusive &&
+            g_pending_edit.original.ssh_host_alias[0] != '\0' &&
+            !(account_has_managed_alias(&edited) &&
+              string_ascii_case_equal(
+                  g_pending_edit.original.ssh_host_alias,
+                  edited.ssh_host_alias))) {
+            g_pending_edit.original_alias_remove_attempted = true;
+            if (ssh_remove_host_alias(
+                    g_pending_edit.original.ssh_host_alias) != 0) {
+                goto prepare_fail;
+            }
+        }
+    }
+
+    if (retire_ssh || retire_gpg) {
+        if (retire_ssh &&
+            ssh_manager_reset(g_pending_edit.original.name) != 0) {
+            runtime_state_lock_release(runtime_lock_fd);
+            runtime_lock_fd = -1;
+            goto prepare_fail;
+        }
+        if (retire_gpg &&
+            gpg_manager_reset(g_pending_edit.original.name) != 0) {
+            runtime_state_lock_release(runtime_lock_fd);
+            runtime_lock_fd = -1;
+            goto prepare_fail;
+        }
+        runtime_state_lock_release(runtime_lock_fd);
+        runtime_lock_fd = -1;
+    }
+
+    if (signals_pending()) {
+        set_error(ERR_SYSTEM_CALL, "Account edit interrupted before persistence");
+        goto prepare_fail;
+    }
+    return 0;
+
+prepare_fail:
+    {
+        error_context_t cause = *get_last_error();
+        char rollback_error[sizeof(g_last_error.message)] = "";
+        if (runtime_lock_fd >= 0) runtime_state_lock_release(runtime_lock_fd);
+        if (accounts_edit_abort(ctx) != 0) {
+            safe_strncpy(rollback_error, get_last_error()->message,
+                         sizeof(rollback_error));
+            set_error(ERR_SYSTEM_CALL,
+                      "Account edit failed (%s), and rollback was incomplete (%s)",
+                      cause.message, rollback_error);
+        } else {
+            g_last_error = cause;
+        }
+        signals_rollback_end();
+        signals_guard_end();
+        if (signals_pending()) signals_dispatch_pending();
+        return -1;
+    }
 }
 
 /* Shared interactive add/edit flow. `existing` is NULL for add, or points at
@@ -1287,22 +1636,13 @@ static bool account_live_fields_equal(const account_t *a, const account_t *b) {
  * prompt_line so readline builds get line editing and TAB path completion. */
 static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     account_t acct;
-    account_t original;
     char input[512];
     char expanded_path[MAX_PATH_LEN];
     bool edit = (existing != NULL);
-    bool editing_active = false;
 
     if (edit) {
-        original = *existing;
-        acct = original;
-        editing_active = (existing == ctx->current_account) ||
-                         (ctx->config.active_account[0] != '\0' &&
-                          /* AR-06 F45: case-insensitive to match the
-                           * case-insensitive name uniqueness invariant. */
-                          strcasecmp(ctx->config.active_account, original.name) == 0);
+        acct = *existing;
     } else {
-        memset(&original, 0, sizeof(original));
         memset(&acct, 0, sizeof(acct));
         acct.id = get_next_available_id(ctx);
         acct.preferred_scope = ctx->config.default_scope;
@@ -1384,6 +1724,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
             acct.ssh_enabled = false;
             acct.ssh_key_path[0] = '\0';
             acct.ssh_host_alias[0] = '\0';
+            acct.ssh_hostname[0] = '\0';
             break;
         }
         if (expand_path(input, expanded_path, sizeof(expanded_path)) != 0) {
@@ -1405,7 +1746,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
             printf("[ERROR]: SSH key file not found: %s (try again, or Enter to skip)\n", expanded_path);
             continue;
         }
-        if (validate_ssh_key_security(expanded_path) != 0) {
+        if (ssh_validate_key_file(expanded_path) != 0) {
             printf("[ERROR]: SSH key failed validation: %s (try again, or Enter to skip)\n", expanded_path);
             continue;
         }
@@ -1522,68 +1863,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     }
 
     if (edit) {
-        /* If the name changed, make sure it doesn't collide with another
-         * account (config_add_account's dup check would reject the account's
-         * own unchanged name, so we check by-hand here and write in place). */
-        for (size_t i = 0; i < ctx->account_count; i++) {
-            if (&ctx->accounts[i] != existing &&
-                strcasecmp(ctx->accounts[i].name, acct.name) == 0) {
-                set_error(ERR_ACCOUNT_EXISTS, "Account named '%s' already exists", acct.name);
-                return -1;
-            }
-        }
-
-        /* Updating live-affecting fields in place would persist a different
-         * identity while Git and name-keyed runtime resources remain on the
-         * old one. Until there is a true cross-subsystem edit transaction,
-         * fail closed and keep the original struct byte-for-byte. */
-        if (editing_active && !account_live_fields_equal(&original, &acct)) {
-            set_error(ERR_ACCOUNT_INVALID,
-                      "Cannot change live fields for active account '%s'; "
-                      "switch away or reset it, then rerun edit",
-                      original.name);
-            return -1;
-        }
-
-        /* AR-06 F16: a non-active account's runtime resources are keyed by
-         * name (the isolated GNUPGHOME <base>/<name> holding an exported
-         * secret-key copy, and the per-account ssh-agent) and by alias (the
-         * managed ~/.ssh/config host stanza). Renaming/aliasing in place would
-         * orphan them under the old key, so a later targeted reset/remove under
-         * the new name would silently miss them. Retire the old identity before
-         * committing the rename. The active account can't reach here — its live
-         * fields (name included) are frozen by the guard above. */
-        bool name_changed = (strcmp(original.name, acct.name) != 0);
-        bool alias_changed =
-            (strcmp(original.ssh_host_alias, acct.ssh_host_alias) != 0);
-        if (name_changed) {
-            int rt_fd = runtime_state_lock_acquire();
-            if (rt_fd < 0) {
-                return -1;
-            }
-            int s_rc = ssh_manager_reset(original.name);
-            int g_rc = gpg_manager_reset(original.name);
-            runtime_state_lock_release(rt_fd);
-            if (s_rc != 0 || g_rc != 0) {
-                set_error(ERR_SYSTEM_CALL,
-                          "Cannot rename '%s' to '%s': runtime teardown of the "
-                          "old identity failed; the account is unchanged",
-                          original.name, acct.name);
-                return -1;
-            }
-        }
-        /* A changed alias orphans the old managed host-alias block (edit never
-         * rewrites it; only switch does, and switch now uses the new alias).
-         * Best-effort: a stale stanza is visible, not silent. */
-        if (alias_changed && original.ssh_host_alias[0] != '\0' &&
-            ssh_remove_host_alias(original.ssh_host_alias) != 0) {
-            log_warning("Could not remove stale ~/.ssh/config host-alias block "
-                        "for '%s': %s", original.ssh_host_alias,
-                        get_last_error()->message);
-        }
-
-        *existing = acct;
-        return 0;
+        return accounts_edit_candidate_prepare(ctx, &acct);
     }
 
     if (config_add_account(ctx, &acct) != 0) {
@@ -1605,10 +1885,11 @@ int accounts_add_interactive(gitswitch_ctx_t *ctx) {
     return add_or_edit_account(ctx, NULL);
 }
 
-/* Edit an existing account interactively. */
-int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
+int accounts_edit_interactive_prepare(gitswitch_ctx_t *ctx,
+                                      const char *identifier) {
     if (!ctx || !identifier) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_edit_interactive");
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid arguments to accounts_edit_interactive_prepare");
         return -1;
     }
     account_t *account = config_find_account(ctx, identifier);
@@ -1616,6 +1897,21 @@ int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
         return -1; /* error already set with candidate list */
     }
     return add_or_edit_account(ctx, account);
+}
+
+/* Direct/library compatibility: callers that do not own the CLI persistence
+ * transaction retain the historical one-call in-memory edit behavior. */
+int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
+    if (accounts_edit_interactive_prepare(ctx, identifier) != 0) return -1;
+    if (accounts_edit_commit(ctx) != 0) {
+        signals_rollback_end();
+        signals_guard_end();
+        return -1;
+    }
+    signals_rollback_end();
+    signals_guard_end();
+    if (signals_pending()) signals_dispatch_pending();
+    return 0;
 }
 
 /* Remove account with confirmation and cleanup */
@@ -1630,6 +1926,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     bool had_current;
     bool was_current;
     bool was_active;
+    bool removed_alias_exclusive;
     int ssh_rc;
     int gpg_rc;
     int runtime_lock_fd;
@@ -1682,6 +1979,8 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     char removed_alias[MAX_NAME_LEN];
     removed_alias[0] = '\0';
     safe_strncpy(removed_alias, account->ssh_host_alias, sizeof(removed_alias));
+    removed_alias_exclusive = account_alias_exclusively_owned(
+        ctx, account->id, removed_alias);
     account_id = account->id;
     had_current = (ctx->current_account != NULL);
     if (had_current) {
@@ -1755,7 +2054,12 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
      * longer routes to the deleted account's key (AR-06 F15). Best-effort: the
      * account is already gone from config, so a failure here only leaves a
      * stale (visible) stanza — warn rather than fail the whole removal. */
-    if (removed_alias[0] != '\0' && ssh_remove_host_alias(removed_alias) != 0) {
+    if (removed_alias[0] != '\0' && !removed_alias_exclusive) {
+        log_warning("Retaining shared ~/.ssh/config host-alias block for '%s'; "
+                    "another account still claims the same alias",
+                    removed_alias);
+    } else if (removed_alias[0] != '\0' &&
+               ssh_remove_host_alias(removed_alias) != 0) {
         log_warning("Could not remove ~/.ssh/config host-alias block for '%s': %s",
                     removed_alias, get_last_error()->message);
     }
@@ -2094,10 +2398,7 @@ int accounts_validate(const account_t *account) {
             return -1;
         }
         
-        if (!path_exists(expanded_path)) {
-            set_error(ERR_ACCOUNT_INVALID, "SSH key file not found: %s", expanded_path);
-            return -1;
-        }
+        if (ssh_validate_key_file(expanded_path) != 0) return -1;
     }
     
     /* Basic GPG validation if enabled */
@@ -2168,75 +2469,6 @@ static bool prompt_host_alias_valid(const char *alias) {
     return true;
 }
 
-/* Validate SSH key security */
-static int validate_ssh_key_security(const char *ssh_key_path) {
-    FILE *key_file;
-    char first_line[256];
-    mode_t file_mode;
-    
-    if (!ssh_key_path || !path_exists(ssh_key_path)) {
-        return -1;
-    }
-    
-    /* Check file permissions */
-    if (get_file_permissions(ssh_key_path, &file_mode) != 0) {
-        return -1;
-    }
-    
-    /* Check if it's a private key (should be 600) or public key (can be 644) */
-    if (strstr(ssh_key_path, ".pub") == NULL) {
-        /* Private key - should be 600 */
-        if ((file_mode & 077) != 0) {
-            log_warning("SSH private key file has insecure permissions: %o", file_mode & 0777);
-            return -1;
-        }
-    } else {
-        /* Public key - 644 is acceptable */
-        if ((file_mode & 022) != 0 && (file_mode & 044) == 0) {
-            log_warning("SSH public key file has unusual permissions: %o", file_mode & 0777);
-            /* Continue anyway for public keys */
-        }
-    }
-    
-    /* Check if it looks like a valid SSH key */
-    key_file = fopen(ssh_key_path, "r");
-    if (!key_file) {
-        return -1;
-    }
-    
-    if (fgets(first_line, sizeof(first_line), key_file)) {
-        /* Check for SSH key formats - both public and private */
-        bool is_valid_key = false;
-        
-        /* Private key formats */
-        if (string_starts_with(first_line, "-----BEGIN OPENSSH PRIVATE KEY-----") ||
-            string_starts_with(first_line, "-----BEGIN RSA PRIVATE KEY-----") ||
-            string_starts_with(first_line, "-----BEGIN DSA PRIVATE KEY-----") ||
-            string_starts_with(first_line, "-----BEGIN EC PRIVATE KEY-----") ||
-            string_starts_with(first_line, "-----BEGIN SSH2 PRIVATE KEY-----")) {
-            is_valid_key = true;
-        }
-        
-        /* Public key formats */
-        if (string_starts_with(first_line, "ssh-rsa ") ||
-            string_starts_with(first_line, "ssh-dss ") ||
-            string_starts_with(first_line, "ssh-ed25519 ") ||
-            string_starts_with(first_line, "ecdsa-sha2-") ||
-            string_starts_with(first_line, "ssh-ecdsa ")) {
-            is_valid_key = true;
-        }
-        
-        if (!is_valid_key) {
-            fclose(key_file);
-            log_warning("SSH key file format not recognized");
-            return -1;
-        }
-    }
-    
-    fclose(key_file);
-    return 0;
-}
-
 /* Validate GPG key availability.
  * Checks the *system* keyring — but with an explicit GNUPGHOME override to the
  * user's REAL keyring home (AR-06 F05/F06). `gitswitch init` exports
@@ -2247,14 +2479,15 @@ static int validate_ssh_key_security(const char *ssh_key_path) {
  * accounts_switch() when the isolated GPG path did not already confirm the key
  * (gpg_ok), and during health checks. The isolated-home validation lives in
  * gpg_validate_key()/gpg_test_signing(). */
-static int validate_gpg_key_availability(const char *gpg_key_id) {
+static int validate_gpg_key_availability_mode(const char *gpg_key_id,
+                                              bool allow_cached) {
     if (!gpg_key_id) {
         return -1;
     }
 
     /* A gpg spawn earlier in this process already proved this key's presence
      * — don't fork gpg again just to re-ask (AR-02 #14). */
-    if (gpg_manager_key_available_cached(gpg_key_id)) {
+    if (allow_cached && gpg_manager_key_available_cached(gpg_key_id)) {
         return 0;
     }
 
@@ -2266,14 +2499,21 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
     const char *source_env[2] = {NULL, NULL};
     memset(&opts, 0, sizeof(opts));
     opts.stderr_to_devnull = true;
-    if (gpg_manager_system_keyring_home(source_home, sizeof(source_home)) == 0) {
-        snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
-        source_env[0] = source_env_str;
-        opts.extra_env = source_env;
+    if (gpg_manager_system_keyring_home(source_home, sizeof(source_home)) != 0) {
+        log_debug("Could not resolve the real/system GPG keyring home");
+        set_error(ERR_GPG_KEY_NOT_FOUND,
+                  "Cannot resolve the real/system GPG keyring home");
+        return -1;
     }
+    snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
+    source_env[0] = source_env_str;
+    opts.extra_env = source_env;
 
     if (run_argv(argv, &opts, NULL) != 0) {
         log_debug("GPG key %s not found in keyring", gpg_key_id);
+        set_error(ERR_GPG_KEY_NOT_FOUND,
+                  "GPG secret key not found in the real/system keyring: %s",
+                  gpg_key_id);
         return -1;
     }
 
@@ -2281,8 +2521,20 @@ static int validate_gpg_key_availability(const char *gpg_key_id) {
     return 0;
 }
 
+static int validate_gpg_key_availability(const char *gpg_key_id) {
+    return validate_gpg_key_availability_mode(gpg_key_id, true);
+}
+
+/* Destructive edit preflight must re-read the real keyring. A process-local
+ * cache only proves that the key existed at some earlier instant and may even
+ * have been populated while an isolated home was authoritative. */
+static int validate_gpg_key_availability_fresh(const char *gpg_key_id) {
+    return validate_gpg_key_availability_mode(gpg_key_id, false);
+}
+
 /* Test SSH key functionality */
 static int test_ssh_key_functionality(const account_t *account) {
+    char expanded_path[MAX_PATH_LEN];
     /* This is a placeholder for SSH functionality testing
      * In a full implementation, this would:
      * 1. Start SSH agent if needed
@@ -2293,8 +2545,9 @@ static int test_ssh_key_functionality(const account_t *account) {
     log_debug("SSH key functionality test for %s: %s", 
               account->name, account->ssh_key_path);
     
-    /* For now, just validate the key file exists and has correct permissions */
-    return validate_ssh_key_security(account->ssh_key_path);
+    if (expand_path(account->ssh_key_path, expanded_path,
+                    sizeof(expanded_path)) != 0) return -1;
+    return ssh_validate_key_file(expanded_path);
 }
 
 /* Test GPG key functionality */

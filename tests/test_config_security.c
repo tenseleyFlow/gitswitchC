@@ -525,7 +525,9 @@ TEST(ssh_hostname_load_save_and_shared_destination_roundtrip) {
     snprintf(key, sizeof(key), "%s/id_test", home);
     CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
     CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
-    CHECK_EQ_INT(write_config(key, "test-private-key\n", 17), 0);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
     CHECK_EQ_INT(setenv("HOME", home, 1), 0);
 
     CHECK(snprintf(cfg, sizeof(cfg),
@@ -587,7 +589,9 @@ TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized) {
     snprintf(key, sizeof(key), "%s/id_test", home);
     CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
     CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
-    CHECK_EQ_INT(write_config(key, "test-private-key\n", 17), 0);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
     CHECK_EQ_INT(setenv("HOME", home, 1), 0);
     CHECK(snprintf(cfg, sizeof(cfg),
                    "[settings]\n"
@@ -621,7 +625,9 @@ TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(path, sizeof(path), "%s/accounts.toml", dir);
     snprintf(key, sizeof(key), "%s/id_test", dir);
-    CHECK_EQ_INT(write_config(key, "test-private-key\n", 17), 0);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
     CHECK(snprintf(cfg, sizeof(cfg),
                    "[settings]\n"
                    "default_scope = \"local\"\n"
@@ -1036,7 +1042,9 @@ TEST(config_validate_rejects_hostile_account) {
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(key, sizeof(key), "%s/id_ed25519", dir);
     snprintf(missing, sizeof(missing), "%s/no_such_key", dir);
-    CHECK_EQ_INT(write_config(key, "KEY", 3), 0); /* creates it 0600 */
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
 
     /* Baseline: a well-formed account with a 0600 key validates. */
     memset(&ctx, 0, sizeof(ctx));

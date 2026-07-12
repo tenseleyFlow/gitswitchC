@@ -28,6 +28,9 @@
 char *trim_whitespace(char *str);
 bool string_empty(const char *str);
 bool string_equals(const char *a, const char *b);
+/* Locale-independent ASCII case folding for protocol/config identifiers whose
+ * admitted grammar is ASCII. */
+bool string_ascii_case_equal(const char *a, const char *b);
 bool string_starts_with(const char *str, const char *prefix);
 bool string_ends_with(const char *str, const char *suffix);
 int string_replace(char *str, size_t str_size, const char *old, const char *new);

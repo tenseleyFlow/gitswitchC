@@ -33,6 +33,8 @@ typedef enum {
     CONFIG_IO_BACKUP_BEFORE_FILE_SYNC,
     CONFIG_IO_BACKUP_BEFORE_DIR_SYNC,
     CONFIG_IO_BACKUP_BEFORE_REOPEN,
+    CONFIG_IO_DOCUMENT_BEFORE_RENAME,
+    CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC,
     CONFIG_IO_STATE_AFTER_TEMP,
     CONFIG_IO_STATE_AFTER_WRITE,
     CONFIG_IO_STATE_BEFORE_FILE_SYNC,
@@ -88,6 +90,12 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
  * that was silently discarded.
  */
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
+/* Full-document transactional save. `config_installed` becomes true once the
+ * new accounts.toml inode is renamed into place, including a later directory-
+ * sync failure whose visible result must be treated as installed/uncertain. */
+int config_save_transactional(const gitswitch_ctx_t *ctx,
+                              const char *config_path,
+                              bool *config_installed);
 
 /**
  * Fail-closed gate shared by config_save and the mutating-command handlers

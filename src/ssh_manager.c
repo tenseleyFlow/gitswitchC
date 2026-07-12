@@ -2424,7 +2424,7 @@ static int ssh_filter_managed_blocks(const char *buf, size_t len,
             return -1;
         }
 
-        if (strcmp(block_alias, target_alias) == 0) {
+        if (string_ascii_case_equal(block_alias, target_alias)) {
             size_t prefix_len = begin_line.start - copied_from;
             memcpy(filtered + written, buf + copied_from, prefix_len);
             written += prefix_len;

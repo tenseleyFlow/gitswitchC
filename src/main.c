@@ -104,6 +104,7 @@ typedef struct {
     command_save_kind_t save_kind;
     command_notice_kind_t notice_kind;
     bool switch_prepared;
+    bool edit_prepared;
     config_resume_hint_snapshot_t hint_snapshot;
     char previous_active[MAX_NAME_LEN];
     char subject[MAX_NAME_LEN];
@@ -534,7 +535,12 @@ int main(int argc, char *argv[]) {
             signals_guard_begin();
             signals_rollback_begin();
             if (mutation.save_kind == COMMAND_SAVE_FULL) {
-                save_rc = config_save(&ctx, ctx.config.config_path);
+                if (mutation.edit_prepared) {
+                    save_rc = config_save_transactional(
+                        &ctx, ctx.config.config_path, &config_installed);
+                } else {
+                    save_rc = config_save(&ctx, ctx.config.config_path);
+                }
             } else if (mutation.switch_prepared) {
                 save_rc = config_save_active_account_transactional(
                     &ctx, ctx.config.config_path, &config_installed);
@@ -547,7 +553,7 @@ int main(int argc, char *argv[]) {
                              sizeof(save_error));
             }
             signals_scratch_cleanup();
-            if (!mutation.switch_prepared) {
+            if (!mutation.switch_prepared && !mutation.edit_prepared) {
                 signals_rollback_end();
             }
         }
@@ -561,6 +567,31 @@ int main(int argc, char *argv[]) {
             } else {
                 signals_rollback_end();
             }
+        }
+
+        bool edit_rollback_complete = true;
+        char edit_rollback_detail[sizeof(g_last_error.message)] = "";
+        if (mutation.edit_prepared) {
+            /* A post-rename failure means accounts.toml visibly contains the
+             * candidate even though durability is uncertain. Keep its SSH
+             * routing too; restoring the old block would create a chimera.
+             * Only a proven pre-install failure may restore the before-image. */
+            if (save_rc == 0 || config_installed) {
+                if (accounts_edit_commit(&ctx) != 0) {
+                    edit_rollback_complete = false;
+                    safe_strncpy(edit_rollback_detail,
+                                 get_last_error()->message,
+                                 sizeof(edit_rollback_detail));
+                    save_rc = -1;
+                    config_installed = true;
+                }
+            } else if (accounts_edit_abort(&ctx) != 0) {
+                edit_rollback_complete = false;
+                safe_strncpy(edit_rollback_detail,
+                             get_last_error()->message,
+                             sizeof(edit_rollback_detail));
+            }
+            signals_rollback_end();
         }
 
         if (mutation.switch_prepared && save_rc != 0) {
@@ -623,6 +654,26 @@ int main(int argc, char *argv[]) {
                         "gitswitch: interrupted — switch rollback attempt completed\n");
                 signals_dispatch_pending();
             }
+        } else if (mutation.edit_prepared && save_rc != 0) {
+            if (config_installed) {
+                display_error("Configuration installed but durability is uncertain",
+                              "%s; the edited account and SSH routing were retained "
+                              "together. Verify the file before retrying",
+                              save_error[0] ? save_error :
+                              "unknown persistence error");
+            } else if (edit_rollback_complete) {
+                display_error("Failed to save configuration changes; previous edit state restored",
+                              "%s", save_error[0] ? save_error :
+                              "unknown persistence error");
+            } else {
+                display_error("Failed to save configuration changes; edit rollback incomplete",
+                              "%s; rollback error: %s",
+                              save_error[0] ? save_error :
+                              "unknown persistence error",
+                              edit_rollback_detail[0] ? edit_rollback_detail :
+                              "unknown rollback error");
+            }
+            exit_code = EXIT_FAILURE;
         } else if (save_rc != 0) {
             /* Account edits are process-local until this point. Remove/reset
              * may already have completed runtime cleanup; retain the on-disk
@@ -634,6 +685,12 @@ int main(int argc, char *argv[]) {
                           save_error[0] ? save_error :
                           "unknown persistence error");
             exit_code = EXIT_FAILURE;
+        }
+
+        if (mutation.edit_prepared && signals_pending()) {
+            fprintf(stderr,
+                    "gitswitch: interrupted — edit transaction completed or rolled back\n");
+            signals_dispatch_pending();
         }
 
         if (exit_code == EXIT_SUCCESS) {
@@ -723,13 +780,14 @@ static command_result_t handle_edit_command(gitswitch_ctx_t *ctx,
         return result;
     }
 
-    if (accounts_edit_interactive(ctx, identifier) != 0) {
+    if (accounts_edit_interactive_prepare(ctx, identifier) != 0) {
         display_error("Failed to edit account", "%s", get_last_error()->message);
         return result;
     }
     result.status = EXIT_SUCCESS;
     result.save_kind = COMMAND_SAVE_FULL;
     result.notice_kind = COMMAND_NOTICE_EDIT;
+    result.edit_prepared = true;
     return result;
 }
 
@@ -770,9 +828,10 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
      * closed for `reset` only. Gate here, before the confirmation prompt, the
      * runtime lock, and the manager teardown, mirroring handle_reset_command. */
     if (ctx->config.dry_run) {
-        account_t *acct = config_find_account(ctx, identifier);
+        account_t *acct = config_find_account_destructive(ctx, identifier);
         if (!acct) {
-            display_error("Account not found", "%s", identifier);
+            display_error("Account not found", "%s",
+                          get_last_error()->message);
             return result;
         }
         display_info("DRY RUN MODE - No actual changes will be made");

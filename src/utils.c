@@ -125,6 +125,18 @@ bool string_equals(const char *a, const char *b) {
     return strcmp(a, b) == 0;
 }
 
+bool string_ascii_case_equal(const char *a, const char *b) {
+    if (!a || !b) return a == b;
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 bool string_starts_with(const char *str, const char *prefix) {
     if (!str || !prefix) return false;
     return strncmp(str, prefix, strlen(prefix)) == 0;

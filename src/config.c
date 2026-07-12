@@ -44,6 +44,7 @@
 #include "utils.h"
 #include "display.h"
 #include "signals.h"
+#include "ssh_manager.h"
 
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
@@ -100,6 +101,9 @@ static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc)
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
+static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
+                                       const account_t *account,
+                                       size_t ignore_index);
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed);
@@ -1481,7 +1485,9 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     }
 
     /* Atomic move from temp to final location */
-    if (rename(temp_path, config_path) != 0) {
+    if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_RENAME,
+                        "config document rename") ||
+        rename(temp_path, config_path) != 0) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                         "Failed to move temporary config file to final location");
         unlink(temp_path);
@@ -1512,7 +1518,9 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
             int dfd = open(dir_path,
                            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
             if (dfd >= 0) {
-                if (fsync(dfd) != 0) {
+                if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC,
+                                    "config document directory sync") ||
+                    fsync(dfd) != 0) {
                     int saved_errno = errno;
                     close(dfd);
                     errno = saved_errno;
@@ -1713,6 +1721,18 @@ cleanup:
 
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
     return config_save_mode(ctx, config_path, true, NULL);
+}
+
+int config_save_transactional(const gitswitch_ctx_t *ctx,
+                              const char *config_path,
+                              bool *config_installed) {
+    if (!config_installed) {
+        set_error(ERR_INVALID_ARGS,
+                  "NULL install-state output for transactional config save");
+        return -1;
+    }
+    *config_installed = false;
+    return config_save_mode(ctx, config_path, true, config_installed);
 }
 
 /* Persist only the consolidated state artifact. This intentionally does not
@@ -1930,6 +1950,43 @@ default_fail:
 }
 
 /* Validate configuration structure */
+static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
+                                       const account_t *account,
+                                       size_t ignore_index) {
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        const account_t *other;
+
+        if (i == ignore_index) continue;
+        other = &ctx->accounts[i];
+        if (other->id == account->id) {
+            set_error(ERR_ACCOUNT_EXISTS,
+                      "Account with ID %u already exists", account->id);
+            return -1;
+        }
+        /* Isolation homes/sockets are name-keyed, including on filesystems
+         * that fold ASCII case. */
+        if (strcasecmp(other->name, account->name) == 0) {
+            set_error(ERR_ACCOUNT_EXISTS,
+                      "Account named '%s' already exists", account->name);
+            return -1;
+        }
+        /* OpenSSH Host aliases are one shared user namespace. Their admitted
+         * grammar is ASCII, so use a locale-independent case fold everywhere
+         * admission or managed-block ownership is decided. */
+        if (account->ssh_host_alias[0] != '\0' &&
+            other->ssh_host_alias[0] != '\0' &&
+            string_ascii_case_equal(other->ssh_host_alias,
+                                    account->ssh_host_alias)) {
+            set_error(ERR_ACCOUNT_EXISTS,
+                      "SSH host alias '%s' is already owned by account '%s' "
+                      "(aliases are case-insensitive)",
+                      account->ssh_host_alias, other->name);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 int config_validate(const gitswitch_ctx_t *ctx) {
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_validate");
@@ -1948,6 +2005,9 @@ int config_validate(const gitswitch_ctx_t *ctx) {
         if (validate_account_security(&ctx->accounts[i]) != 0) {
             set_error(ERR_ACCOUNT_INVALID, "Account %u failed security validation", 
                       ctx->accounts[i].id);
+            return -1;
+        }
+        if (validate_account_uniqueness(ctx, &ctx->accounts[i], i) != 0) {
             return -1;
         }
     }
@@ -1991,22 +2051,7 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
         return -1;
     }
     
-    /* Check for duplicate IDs and names. All per-account isolation state is
-     * keyed by name — GNUPGHOME <base>/<name>, ssh-agent.<name>.sock,
-     * active_account, current-account detection — so two accounts sharing a
-     * name would share one GPG home and socket, defeating the isolation the
-     * tool exists to provide. Names are matched case-insensitively because the
-     * paths they build live on case-insensitive filesystems too. */
-    for (size_t i = 0; i < ctx->account_count; i++) {
-        if (ctx->accounts[i].id == account->id) {
-            set_error(ERR_ACCOUNT_EXISTS, "Account with ID %u already exists", account->id);
-            return -1;
-        }
-        if (strcasecmp(ctx->accounts[i].name, account->name) == 0) {
-            set_error(ERR_ACCOUNT_EXISTS, "Account named '%s' already exists", account->name);
-            return -1;
-        }
-    }
+    if (validate_account_uniqueness(ctx, account, SIZE_MAX) != 0) return -1;
     
     /* Add account */
     ctx->accounts[ctx->account_count] = *account;
@@ -2058,16 +2103,20 @@ int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
 /* Update existing account */
 int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     account_t *existing_account = NULL;
+    account_t replacement;
+    size_t existing_index = SIZE_MAX;
     
     if (!ctx || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_update_account");
         return -1;
     }
+    replacement = *account;
     
     /* Find existing account */
     for (size_t i = 0; i < ctx->account_count; i++) {
         if (ctx->accounts[i].id == account->id) {
             existing_account = &ctx->accounts[i];
+            existing_index = i;
             break;
         }
     }
@@ -2078,7 +2127,10 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     }
     
     /* Validate new account data */
-    if (validate_account_security(account) != 0) {
+    if (validate_account_security(&replacement) != 0) {
+        return -1;
+    }
+    if (validate_account_uniqueness(ctx, &replacement, existing_index) != 0) {
         return -1;
     }
     
@@ -2086,9 +2138,10 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     secure_zero_memory(existing_account, sizeof(account_t));
     
     /* Update with new data */
-    *existing_account = *account;
+    *existing_account = replacement;
     
-    log_info("Updated account: %s (%s)", account->name, account->description);
+    log_info("Updated account: %s (%s)", replacement.name,
+             replacement.description);
     return 0;
 }
 
@@ -2123,9 +2176,19 @@ account_t *config_find_account_exact(gitswitch_ctx_t *ctx, const char *name) {
  * Returns NULL if none match. Shared by config_find_account (which then falls
  * back to a substring search) and config_find_account_destructive (which does
  * NOT — AR-06 F50). */
-static account_t *config_resolve_exact(gitswitch_ctx_t *ctx, const char *identifier) {
+typedef enum {
+    EXACT_NONE = 0,
+    EXACT_FOUND,
+    EXACT_AMBIGUOUS
+} exact_resolution_t;
+
+static exact_resolution_t config_resolve_exact(gitswitch_ctx_t *ctx,
+                                               const char *identifier,
+                                               account_t **resolved) {
     char *endptr;
     unsigned long account_id;
+
+    *resolved = NULL;
 
     /* 1. Exact numeric ID (only when the whole identifier is a canonical
      * decimal in range, int-id-02). The old bare strtoul + (uint32_t) cast
@@ -2148,7 +2211,8 @@ static account_t *config_resolve_exact(gitswitch_ctx_t *ctx, const char *identif
             if (errno == 0 && *endptr == '\0' && account_id <= UINT32_MAX) {
                 for (size_t i = 0; i < ctx->account_count; i++) {
                     if (ctx->accounts[i].id == (uint32_t)account_id) {
-                        return &ctx->accounts[i];
+                        *resolved = &ctx->accounts[i];
+                        return EXACT_FOUND;
                     }
                 }
             }
@@ -2159,17 +2223,43 @@ static account_t *config_resolve_exact(gitswitch_ctx_t *ctx, const char *identif
     /* 2. Exact name. */
     for (size_t i = 0; i < ctx->account_count; i++) {
         if (strcmp(ctx->accounts[i].name, identifier) == 0) {
-            return &ctx->accounts[i];
+            *resolved = &ctx->accounts[i];
+            return EXACT_FOUND;
         }
     }
 
-    /* 3. Exact email. */
+    /* 3. Exact email. Emails are deliberately not unique account identity,
+     * so collect every match and reject a selector that names more than one
+     * account instead of silently choosing array order. */
+    size_t email_matches = 0;
+    char candidates[256] = "";
+    size_t off = 0;
     for (size_t i = 0; i < ctx->account_count; i++) {
         if (strcmp(ctx->accounts[i].email, identifier) == 0) {
-            return &ctx->accounts[i];
+            if (email_matches == 0) *resolved = &ctx->accounts[i];
+            email_matches++;
+            if (off < sizeof(candidates) - 1) {
+                int wrote = snprintf(candidates + off, sizeof(candidates) - off,
+                                     "%s%s (id %u)", off ? ", " : "",
+                                     ctx->accounts[i].name, ctx->accounts[i].id);
+                if (wrote > 0) {
+                    size_t available = sizeof(candidates) - off;
+                    off += (size_t)wrote < available ? (size_t)wrote
+                                                     : available - 1;
+                }
+            }
         }
     }
-    return NULL;
+    if (email_matches == 1) return EXACT_FOUND;
+    if (email_matches > 1) {
+        *resolved = NULL;
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "Email '%s' is ambiguous between %s; use an exact account "
+                  "name or numeric id",
+                  identifier, candidates);
+        return EXACT_AMBIGUOUS;
+    }
+    return EXACT_NONE;
 }
 
 /* AR-06 F50: destructive resolution (remove/reset) — id/exact-name/exact-email
@@ -2178,12 +2268,14 @@ static account_t *config_resolve_exact(gitswitch_ctx_t *ctx, const char *identif
  * mentioning work) just because it happens to be the sole substring match. */
 account_t *config_find_account_destructive(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *acct;
+    exact_resolution_t resolution;
     if (!ctx || !identifier || !*identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account_destructive");
         return NULL;
     }
-    acct = config_resolve_exact(ctx, identifier);
-    if (!acct) {
+    resolution = config_resolve_exact(ctx, identifier, &acct);
+    if (resolution == EXACT_AMBIGUOUS) return NULL;
+    if (resolution == EXACT_NONE) {
         set_error(ERR_ACCOUNT_NOT_FOUND,
                   "No account matches '%s' by ID, exact name, or exact email "
                   "(substring matching is disabled for destructive commands)",
@@ -2195,16 +2287,16 @@ account_t *config_find_account_destructive(gitswitch_ctx_t *ctx, const char *ide
 account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *match = NULL;
     size_t match_count = 0;
+    exact_resolution_t resolution;
 
     if (!ctx || !identifier || !*identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account");
         return NULL;
     }
 
-    match = config_resolve_exact(ctx, identifier);
-    if (match) {
-        return match;
-    }
+    resolution = config_resolve_exact(ctx, identifier, &match);
+    if (resolution == EXACT_FOUND) return match;
+    if (resolution == EXACT_AMBIGUOUS) return NULL;
     match_count = 0;
 
     /* 4. Unambiguous substring of name or description. */
@@ -3300,7 +3392,8 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                 }
             }
 
-            /* Reject duplicate name (case-insensitive) or id against already-
+            /* Reject duplicate name (case-insensitive), id, or managed SSH
+             * alias against already-
              * loaded accounts. config_add_account enforces this for the
              * interactive path, but the load path bypassed it entirely — and a
              * hand-edited accounts.toml is fully user-controlled. Two accounts
@@ -3311,16 +3404,22 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             bool dup = false;
             for (size_t j = 0; j < ctx->account_count; j++) {
                 if (ctx->accounts[j].id == account.id ||
-                    strcasecmp(ctx->accounts[j].name, account.name) == 0) {
+                    strcasecmp(ctx->accounts[j].name, account.name) == 0 ||
+                    (ctx->accounts[j].ssh_host_alias[0] != '\0' &&
+                     account.ssh_host_alias[0] != '\0' &&
+                     string_ascii_case_equal(
+                         ctx->accounts[j].ssh_host_alias,
+                         account.ssh_host_alias))) {
                     dup = true;
                     break;
                 }
             }
             if (dup) {
                 ctx->accounts_skipped_on_load++;
-                display_warning("Account '%s' (id %u) duplicates the name or id of an "
-                                "earlier account and was skipped; names and ids must be "
-                                "unique because SSH/GPG isolation is keyed by them.",
+                display_warning("Account '%s' (id %u) duplicates the name, id, or SSH "
+                                "host alias of an earlier account and was skipped; those "
+                                "identifiers must be unique because SSH/GPG isolation and "
+                                "the managed SSH config namespace are keyed by them.",
                                 account.name[0] ? account.name : "?", account_id);
             }
             /* Validate and add account */
@@ -3492,7 +3591,6 @@ static int validate_field_roundtrips(const char *field_name, const char *value) 
 /* Validate account security */
 static int validate_account_security(const account_t *account) {
     char expanded_path[MAX_PATH_LEN];
-    struct stat key_stat;
 
     if (!account) {
         set_error(ERR_INVALID_ARGS, "NULL account to validate");
@@ -3595,19 +3693,10 @@ static int validate_account_security(const account_t *account) {
             return -1;
         }
 
-        /* One stat answers both the existence and the permission question
-         * (AR-03 L17: this was a back-to-back path_exists +
-         * get_file_permissions, two stats of the same path). Must be 600. */
-        if (stat(expanded_path, &key_stat) != 0) {
-            set_error(ERR_ACCOUNT_INVALID, "SSH key file not found: %s", expanded_path);
-            return -1;
-        }
-        if ((key_stat.st_mode & 077) != 0) {
-            set_error(ERR_ACCOUNT_INVALID,
-                      "SSH key file has unsafe permissions: %o (should be 600)",
-                      key_stat.st_mode & 0777);
-            return -1;
-        }
+        /* One authoritative descriptor-backed validator owns the admission
+         * contract for load/add/edit/switch: regular file, current uid,
+         * owner-only mode, and private-key content from the same open object. */
+        if (ssh_validate_key_file(expanded_path) != 0) return -1;
     }
     
     /* Validate GPG key if configured */
