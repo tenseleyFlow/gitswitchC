@@ -397,21 +397,32 @@ TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
 }
 
 TEST(managed_home_classification_uses_exact_components) {
-    char xdg[128], home[256], base[512];
+    char xdg[128], canonical_xdg[MAX_PATH_LEN], home[256], base[512];
     char external[MAX_PATH_LEN], expected[MAX_PATH_LEN];
+    char expected_external[MAX_PATH_LEN];
     char alias[MAX_PATH_LEN], dangling_managed[MAX_PATH_LEN];
     char fallback[MAX_PATH_LEN], missing_child[MAX_PATH_LEN];
     char managed_child[MAX_PATH_LEN];
 
     CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    if (!realpath(xdg, canonical_xdg)) {
+        CHECK(!"runtime canonicalization failed");
+        return;
+    }
     snprintf(home, sizeof(home), "%s/home", xdg);
     CHECK_EQ_INT(mkdir(home, 0700), 0);
     CHECK_EQ_INT(setenv("HOME", home, 1), 0);
-    snprintf(expected, sizeof(expected), "%s/.gnupg", home);
     snprintf(external, sizeof(external), "%s/gitswitch-gpg-backup", xdg);
+    if (safe_snprintf(expected, sizeof(expected), "%s/home/.gnupg",
+                      canonical_xdg) != 0 ||
+        safe_snprintf(expected_external, sizeof(expected_external),
+                      "%s/gitswitch-gpg-backup", canonical_xdg) != 0) {
+        CHECK(!"canonical expected path is too long");
+        return;
+    }
     CHECK_EQ_INT(setenv("GNUPGHOME", external, 1), 0);
     CHECK_EQ_INT(gpg_manager_system_keyring_home(base, sizeof(base)), 0);
-    CHECK_STR_EQ(base, external);
+    CHECK_STR_EQ(base, expected_external);
 
     snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
     CHECK_EQ_INT(mkdir(base, 0700), 0);

@@ -606,6 +606,8 @@ TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow) {
     char trusted_dir[MAX_PATH_LEN] = "";
     char trusted_ssh[MAX_PATH_LEN] = "";
     char trusted_marker[MAX_PATH_LEN] = "";
+    char trusted_git[MAX_PATH_LEN] = "";
+    char trusted_git_dir[MAX_PATH_LEN] = "";
     char key_path[MAX_PATH_LEN] = "";
     char hostile_root[MAX_PATH_LEN] = "/tmp/gsw_ar07_shadow_XXXXXX";
     char hostile_ssh[MAX_PATH_LEN] = "";
@@ -624,9 +626,26 @@ TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow) {
     saved_env_t config_count = save_env("GIT_CONFIG_COUNT");
     saved_env_t ssh_command = save_env("GIT_SSH_COMMAND");
     FILE *marker = NULL;
+    char *git_leaf;
 
     (void)unsetenv("GIT_CONFIG_COUNT");
     (void)unsetenv("GIT_SSH_COMMAND");
+
+    /* The test deliberately replaces PATH below, but Git is installed in
+     * /usr/local/bin on FreeBSD rather than the Linux/macOS /usr/bin default.
+     * Preserve the directory of the already trust-checked ambient Git instead
+     * of baking a platform-specific installation prefix into the fixture. */
+    if (find_command_path("git", trusted_git, sizeof(trusted_git)) != 0 ||
+        !(git_leaf = strrchr(trusted_git, '/')) || git_leaf == trusted_git) {
+        CHECK(false);
+        goto cleanup;
+    }
+    if ((size_t)(git_leaf - trusted_git) >= sizeof(trusted_git_dir)) {
+        CHECK(false);
+        goto cleanup;
+    }
+    memcpy(trusted_git_dir, trusted_git, (size_t)(git_leaf - trusted_git));
+    trusted_git_dir[git_leaf - trusted_git] = '\0';
 
     if (!getcwd(original_cwd, sizeof(original_cwd)) ||
         !ts_mkdtemp_trusted(trusted_root, sizeof(trusted_root),
@@ -673,10 +692,10 @@ TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow) {
                      "exit 1\n",
                      0700),
                  0);
-    if ((size_t)snprintf(initial_path, sizeof(initial_path), "%s:/usr/bin:/bin",
-                         trusted_dir) >= sizeof(initial_path) ||
-        (size_t)snprintf(hostile_path, sizeof(hostile_path), "%s:/usr/bin:/bin",
-                         hostile_root) >= sizeof(hostile_path)) {
+    if ((size_t)snprintf(initial_path, sizeof(initial_path), "%s:%s:/usr/bin:/bin",
+                         trusted_dir, trusted_git_dir) >= sizeof(initial_path) ||
+        (size_t)snprintf(hostile_path, sizeof(hostile_path), "%s:%s:/usr/bin:/bin",
+                         hostile_root, trusted_git_dir) >= sizeof(hostile_path)) {
         CHECK(false);
         goto cleanup;
     }
