@@ -1061,7 +1061,11 @@ check_manifest_contract()
 
     # The physical absolute spelling of the dedicated output is also valid;
     # publication still lands at the one canonical path from a fresh temp.
-    "$make_cmd" -C "$clean_repo" DIST_ARCHIVE="$archive" dist >"$out" 2>&1 ||
+    archive_physical_dir=$(CDPATH='' cd "${archive%/*}" && pwd -P) ||
+        fail "cannot resolve physical distribution directory"
+    archive_physical=$archive_physical_dir/${archive##*/}
+    "$make_cmd" -C "$clean_repo" DIST_ARCHIVE="$archive_physical" dist \
+        >"$out" 2>&1 ||
         fail "valid absolute artifact path was rejected"
     assert_archive_metadata "$archive" "$dist_root" "$version"
     inspect_dist_residue "$archive" "$copy_platform"
