@@ -152,6 +152,51 @@ static struct dirent *failing_readdir(DIR *dir) {
     return NULL;
 }
 
+TEST(gpg_manager_reset_rejects_empty_selector_without_mutation) {
+    char xdg[128], base[256], work[512], other[512];
+    char work_marker[1024], other_marker[1024], current[512], lock_path[512];
+    char linked[64];
+    ssize_t linked_len;
+    command_runner_fn prev;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    CHECK(access(base, F_OK) != 0 && errno == ENOENT);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_reset(""), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(access(base, F_OK) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    snprintf(work, sizeof(work), "%s/work", base);
+    snprintf(other, sizeof(other), "%s/other", base);
+    CHECK_EQ_INT(mkdir(work, 0700), 0);
+    CHECK_EQ_INT(mkdir(other, 0700), 0);
+    snprintf(work_marker, sizeof(work_marker), "%s/keep", work);
+    snprintf(other_marker, sizeof(other_marker), "%s/keep", other);
+    CHECK_EQ_INT(touch(work_marker), 0);
+    CHECK_EQ_INT(touch(other_marker), 0);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(symlink("work", current), 0);
+    snprintf(lock_path, sizeof(lock_path), "%s/.lock", base);
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+
+    prev = run_set_runner(null_runner);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_reset(""), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK(path_exists(work_marker));
+    CHECK(path_exists(other_marker));
+    linked_len = readlink(current, linked, sizeof(linked) - 1);
+    CHECK(linked_len >= 0);
+    if (linked_len >= 0) {
+        linked[linked_len] = '\0';
+        CHECK_STR_EQ(linked, "work");
+    }
+    run_set_runner(prev);
+}
+
 /* A crafted account name must never become a deletable path component that
  * escapes <base>. The victim dir sits exactly where "../victim" would land. */
 TEST(gpg_manager_reset_rejects_traversal) {
@@ -646,6 +691,7 @@ TEST(create_isolated_home_refuses_persistent_xdg_base) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(gpg_manager_reset_rejects_empty_selector_without_mutation);
     RUN_TEST(gpg_manager_reset_rejects_traversal);
     RUN_TEST(gpg_manager_reset_refuses_symlinked_base);
     RUN_TEST(gpg_manager_reset_single_account_refuses_symlinked_home);

@@ -262,6 +262,58 @@ TEST(informational_and_config_paths_obey_context_lifetime) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) != 0);
 }
 
+TEST(empty_reset_selector_is_rejected_before_any_reset_work) {
+    const char *modes[] = { "-n", "-y" };
+
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        reset_fixture_t fixture;
+        char gpg_base[PATH_MAX];
+        char gpg_home[PATH_MAX];
+        char marker[PATH_MAX];
+        char config_lock[PATH_MAX];
+        char hint[128];
+        char output[4096];
+        char prog[] = "gitswitch";
+        char no_color[] = "-C";
+        char reset[] = "reset";
+        char empty[] = "";
+        char *argv[] = {
+            prog, no_color, (char *)modes[i], reset, empty, NULL
+        };
+        int status;
+
+        CHECK_EQ_INT(fixture_setup(&fixture), 0);
+        CHECK_EQ_INT(join_path(gpg_base, sizeof(gpg_base), fixture.runtime,
+                               "/gitswitch-gpg"), 0);
+        CHECK_EQ_INT(mkdir(gpg_base, 0700), 0);
+        CHECK_EQ_INT(join_path(gpg_home, sizeof(gpg_home), gpg_base,
+                               "/work"), 0);
+        CHECK_EQ_INT(mkdir(gpg_home, 0700), 0);
+        CHECK_EQ_INT(join_path(marker, sizeof(marker), gpg_home,
+                               "/keep"), 0);
+        CHECK_EQ_INT(write_private(marker, "preserve\n"), 0);
+        CHECK_EQ_INT(join_path(config_lock, sizeof(config_lock),
+                               fixture.config_dir, "/.config.lock"), 0);
+        CHECK(access(config_lock, F_OK) != 0 && errno == ENOENT);
+
+        status = run_simple_child(&fixture, 5, argv, 0);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+        }
+        CHECK(access(marker, F_OK) == 0);
+        CHECK(access(config_lock, F_OK) != 0 && errno == ENOENT);
+        CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+        CHECK_STR_EQ(hint, "none\nactive=work\n");
+        CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+        CHECK(strstr(output, "reset account selector must not be empty") != NULL);
+        CHECK(strstr(output, "kill ALL") == NULL);
+        CHECK(strstr(output, "delete ALL") == NULL);
+        CHECK(strstr(output, "DRY RUN complete") == NULL);
+        CHECK(strstr(output, "Reset all gitswitch") == NULL);
+    }
+}
+
 TEST(repeated_signals_defer_across_every_reset_boundary) {
     const int stages[] = {
         RESET_TEST_AFTER_SSH,
@@ -342,6 +394,7 @@ TEST(case_different_active_account_clears_by_name_id_and_email) {
 
 int main(void) {
     RUN_TEST(informational_and_config_paths_obey_context_lifetime);
+    RUN_TEST(empty_reset_selector_is_rejected_before_any_reset_work);
     RUN_TEST(repeated_signals_defer_across_every_reset_boundary);
     RUN_TEST(manager_failure_keeps_retry_state_while_signal_is_deferred);
     RUN_TEST(case_different_active_account_clears_by_name_id_and_email);

@@ -2989,7 +2989,7 @@ int gpg_manager_reset(const char *account) {
     int lock_fd = -1;
     bool failed = false;
 
-    if (account && *account && !validate_name(account)) {
+    if (account && !validate_name(account)) {
         set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
         return -1;
     }
@@ -3010,13 +3010,13 @@ int gpg_manager_reset(const char *account) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
-    if ((!account || !*account) &&
+    if (!account &&
         gpg_preflight_reset_all_locked(base_fd, base) != 0) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
 
-    if (account && *account) {
+    if (account) {
         struct stat hst;
         if (fstatat(base_fd, account, &hst, AT_SYMLINK_NOFOLLOW) == 0) {
             if (!S_ISDIR(hst.st_mode) || hst.st_uid != getuid() ||
@@ -3120,7 +3120,7 @@ int gpg_manager_reset(const char *account) {
         int current_rc = gpg_read_current_locked(base_fd, base, target,
                                                   sizeof(target));
         if (current_rc == 0) {
-            if ((!account || !*account) && !failed) {
+            if (!account && !failed) {
                 if (unlinkat(base_fd, "current", 0) != 0 && errno != ENOENT) {
                     set_system_error(ERR_FILE_IO,
                                      "Failed to remove stable GNUPGHOME link: %s",
@@ -3161,7 +3161,7 @@ int gpg_manager_reset(const char *account) {
         }
     }
 reset_finalize:
-    if ((!account || !*account) && !failed) {
+    if (!account && !failed) {
         if (g_reset_final_hook && g_reset_final_hook(base_fd) != 0) {
             set_error(ERR_FILE_IO, "GPG reset final-verification hook failed");
             failed = true;

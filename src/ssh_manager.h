@@ -224,8 +224,10 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
 
 /**
  * Tear down isolated SSH agents (kill by recorded PID and remove sockets/PID
- * sidecars). Resets a single account when `account` is non-NULL, or all
- * accounts when NULL. Returns 0 on success.
+ * sidecars). Resets a single account when `account` is a nonempty name
+ * accepted by validate_name(); callers must pass the canonical stored account
+ * name. Resets all accounts only when `account` is NULL. Invalid non-NULL
+ * input fails with ERR_INVALID_ARGS before runtime I/O. Returns 0 on success.
  */
 int ssh_manager_reset(const char *account);
 

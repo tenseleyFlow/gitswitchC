@@ -151,6 +151,33 @@ static int read_all(const char *path, char *buf, size_t size) {
     return 0;
 }
 
+TEST(ssh_manager_reset_rejects_empty_selector) {
+    char dir[128];
+    char lock_path[160];
+
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswar03XXXXXX");
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
+    CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
+    CHECK((size_t)snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg) <
+          sizeof(dir));
+    CHECK(access(dir, F_OK) != 0 && errno == ENOENT);
+    clear_error();
+    CHECK_EQ_INT(ssh_manager_reset(""), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(access(dir, F_OK) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(mkdir(dir, 0700), 0);
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock", dir) <
+          sizeof(lock_path));
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+    clear_error();
+    CHECK_EQ_INT(ssh_manager_reset(""), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(path_exists(dir));
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+}
+
 /* ---- H1: csh/tcsh output format + leak-on-failure ------------------------ */
 
 /* Fake ssh-agent that genuinely binds the -a socket, then reports in CSH
@@ -700,6 +727,7 @@ TEST(host_alias_skips_rewrite_when_content_identical) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(ssh_manager_reset_rejects_empty_selector);
     RUN_TEST(agent_spawn_pins_bourne_format_and_reaps_on_parse_failure);
     RUN_TEST(socket_validation_failure_reaps_spawned_agent);
     RUN_TEST(reuse_refuses_contaminated_agent);

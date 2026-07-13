@@ -242,7 +242,10 @@ int gpg_manager_system_keyring_home(char *buf, size_t size);
  * the affected home when it cannot prove one mount boundary and one link per
  * non-directory entry. A full reset also rejects unknown base entries and
  * verifies that only its exact lock survives. Resets a single account when
- * `account` is non-NULL, or all accounts when NULL. Returns 0 on success.
+ * `account` is a nonempty name accepted by validate_name(); callers must pass
+ * the canonical stored account name. Resets all accounts only when `account`
+ * is NULL. Invalid non-NULL input fails with ERR_INVALID_ARGS before any
+ * runtime I/O. Returns 0 on success.
  */
 int gpg_manager_reset(const char *account);
 

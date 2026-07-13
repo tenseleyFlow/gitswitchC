@@ -4727,12 +4727,10 @@ int ssh_manager_reset(const char *account) {
     bool absent = false;
     int dir_fd = -1;
 
-    /* Validate the name up front (the single-account branch uses it as a path
-     * component). Every loaded account already passed validate_name, so this is
-     * unreachable in practice — but guard it symmetrically with gpg_manager_reset(). */
-    if (account && *account &&
-        (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
-         account[0] == '.')) {
+    /* NULL alone selects reset-all. Any non-NULL selector reaches filesystem
+     * path construction, so reject empty and otherwise invalid account names
+     * before opening or locking the runtime namespace. */
+    if (account && !validate_name(account)) {
         set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
         return -1;
     }
@@ -4755,7 +4753,7 @@ int ssh_manager_reset(const char *account) {
         return -1;
     }
 
-    if (!account || !*account) {
+    if (!account) {
         int all_rc = kill_orphaned_gitswitch_agents(dir_fd, socket_dir, NULL);
         unlock_agent_dir(lock_fd);
         close(dir_fd);

@@ -214,7 +214,8 @@ int main(int argc, char *argv[]);
  * config lock, create ~/.config/gitswitch, or dispatch a handler. Unknown first
  * positionals are the established bare-account switch form and therefore take
  * no additional operands. */
-static int validate_command_arity(const char *command, int operand_count) {
+static int validate_command_arity(const char *command, int operand_count,
+                                  const char *first_operand) {
     const char *usage = NULL;
     int min_operands = 0;
     int max_operands = 0;
@@ -254,6 +255,13 @@ static int validate_command_arity(const char *command, int operand_count) {
     }
 
     if (operand_count >= min_operands && operand_count <= max_operands) {
+        if (strcmp(command, "reset") == 0 && operand_count == 1 &&
+            (!first_operand || first_operand[0] == '\0')) {
+            fprintf(stderr,
+                    "gitswitch: reset account selector must not be empty\n");
+            fprintf(stderr, "Usage: gitswitch reset [account]\n");
+            return -1;
+        }
         return 0;
     }
 
@@ -448,7 +456,8 @@ int main(int argc, char *argv[]) {
         }
         if (!legacy_agent_info &&
             validate_command_arity(command,
-                                   command ? argc - optind - 1 : 0) != 0) {
+                                   command ? argc - optind - 1 : 0,
+                                   arg1) != 0) {
             error_cleanup();
             return EXIT_FAILURE;
         }
@@ -1839,7 +1848,7 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
      * false success while the intended account's on-disk secret-key copy is
      * left in place. AR-06 F50: exact id/name/email only — reset destroys
      * secret-key material, so it must never fire on a mere substring match. */
-    if (account && *account) {
+    if (account) {
         target_account = config_find_account_destructive(ctx, account);
         if (!target_account) {
             display_error("Account not found", "%s", get_last_error()->message);
