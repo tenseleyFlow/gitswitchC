@@ -242,6 +242,15 @@ HEADERS = $(wildcard $(SRCDIR)/*.h)
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
+CLI_E2E_TEST_TARGETS = \
+	$(BINDIR)/test_ar04_cli \
+	$(BINDIR)/test_ar04_lifecycle \
+	$(BINDIR)/test_ar05_pty \
+	$(BINDIR)/test_ar07_cli_commit \
+	$(BINDIR)/test_ar07_completion \
+	$(BINDIR)/test_ar07_shell_init \
+	$(BINDIR)/test_cli \
+	$(BINDIR)/test_pty
 AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
 AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
 AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
@@ -447,9 +456,11 @@ $(BINDIR)/test_ar08_copy_permissions: \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 
-# This focused suite executes the production CLI to prove that main selects
-# the side-effect-free loader only for the exact `list|ls --names` grammar.
-$(BINDIR)/test_ar07_completion: | $(BINDIR)/$(TARGET)
+# These suites execute the worktree production CLI instead of a linked test
+# entry point. Keep the dependency explicit for focused invocations: the
+# aggregate `make test` prerequisite must not be the only thing preventing a
+# stale or missing build/bin/gitswitch from being exercised (AR-08 M47).
+$(CLI_E2E_TEST_TARGETS): | $(BINDIR)/$(TARGET)
 
 # Dependency files are optional on the first build and authoritative
 # thereafter. Keep this after `all` so an included -MP compatibility target
