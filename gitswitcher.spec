@@ -17,6 +17,11 @@ BuildRequires:  make
 %global debug_package %{nil}
 Requires:       git
 Requires:       openssh-clients
+# GPG account activation imports/queries keys with gpg, while isolated-home
+# reset invokes gpgconf. File requirements guarantee the exact executables the
+# runtime resolves instead of assuming a distribution package name.
+Requires:       /usr/bin/gpg
+Requires:       /usr/bin/gpgconf
 
 %description
 gitswitcher is a secure Git identity and SSH/GPG key management tool that enables

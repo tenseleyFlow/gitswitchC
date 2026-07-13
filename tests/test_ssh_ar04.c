@@ -955,6 +955,7 @@ static void make_alias_account(account_t *account, const char *home) {
     memset(account, 0, sizeof(*account));
     account->ssh_enabled = true;
     snprintf(account->ssh_host_alias, sizeof(account->ssh_host_alias), "github-work");
+    snprintf(account->ssh_hostname, sizeof(account->ssh_hostname), "github.com");
     snprintf(account->ssh_key_path, sizeof(account->ssh_key_path), "%s/id_ed25519", home);
 }
 

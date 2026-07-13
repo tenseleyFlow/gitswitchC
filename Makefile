@@ -11,14 +11,24 @@ PREFIX ?= /usr/local
 
 # Version: the VERSION file is the single source of truth for the release
 # number, so the binary stamp is deterministic and identical in git checkouts
-# and source tarballs. A VERSION= env override is honored for one-off builds.
-# COMMIT is the short git hash (or "unknown" outside a checkout) for traceability.
-VERSION ?= $(shell cat VERSION 2>/dev/null)
-ifeq ($(strip $(VERSION)),)
-    VERSION := unknown
+# and source tarballs. Freeze defaults at parse time: recursive ?= shell
+# expressions used to re-run cat/git every time VERSION_FLAGS or the build
+# fingerprint expanded. Explicit environment/command-line values are frozen
+# too, but never probe the checkout (AR-07 L25).
+ifeq ($(origin VERSION),undefined)
+    VERSION := $(shell cat VERSION 2>/dev/null)
+else
+    override VERSION := $(VERSION)
 endif
-COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
-VERSION_FLAGS = -DGITSWITCH_VERSION=\"$(VERSION)\" -DGITSWITCH_COMMIT=\"$(COMMIT)\"
+ifeq ($(strip $(VERSION)),)
+    override VERSION := unknown
+endif
+ifeq ($(origin COMMIT),undefined)
+    COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+else
+    override COMMIT := $(COMMIT)
+endif
+VERSION_FLAGS := -DGITSWITCH_VERSION=\"$(VERSION)\" -DGITSWITCH_COMMIT=\"$(COMMIT)\"
 
 # Directories
 SRCDIR = src
@@ -74,56 +84,71 @@ CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
          -Wswitch-default -Wunused -Werror-implicit-function-declaration \
          $(VERSION_FLAGS)
 
+# Production frames above 128 KiB are a build-time regression: the supported
+# CLI must run with a 256 KiB stack, leaving room for libc and nested helpers.
+# Keep this on production translation units (tests intentionally construct
+# several large fixtures on their own stacks).
+FRAME_SIZE_WARNING = -Wframe-larger-than=131072
+
 # Platform-specific flags
 ifeq ($(UNAME_S),Linux)
-    # GCC-specific warnings
-    CFLAGS += -Wlogical-op -Wdate-time
+    # Compiler-specific warnings. Clang does not implement -Wlogical-op.
+    ifeq ($(CC_IS_CLANG),0)
+        CFLAGS += -Wlogical-op
+    endif
+    CFLAGS += -Wdate-time
     # Linux-specific security flags. -fPIE/-pie are REQUESTED, not inherited:
     # relying on the host compiler's default-PIE meant non-mainstream
     # toolchains (vanilla upstream gcc, older cross compilers) shipped
     # ASLR-defeating non-PIE release binaries with all QA green (AR-05 L9).
     # distcheck now asserts the staged binary is ET_DYN with RELRO+NOW.
-    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION) \
-                          -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection $(CF_PROTECTION) -fPIE -pie \
-                            -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    SECURITY_CFLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION)
+    SECURITY_LDFLAGS_DEBUG = -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+                             -fstack-clash-protection $(CF_PROTECTION) -fPIE
+    SECURITY_LDFLAGS_RELEASE = -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 
 ifeq ($(UNAME_S),Darwin)
     # macOS-specific security flags (no cf-protection, stack-clash-protection, or Linux linker flags)
-    SECURITY_FLAGS_DEBUG = -fstack-protector-strong
-    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+    SECURITY_CFLAGS_DEBUG = -fstack-protector-strong
+    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
 endif
 
 ifeq ($(UNAME_S),FreeBSD)
-    # GCC-specific warnings (GCC from ports)
-    CFLAGS += -Wlogical-op -Wdate-time
+    # Compiler-specific warnings (CI normally uses GCC from ports).
+    ifeq ($(CC_IS_CLANG),0)
+        CFLAGS += -Wlogical-op
+    endif
+    CFLAGS += -Wdate-time
     # FreeBSD security flags (ELF linker supports relro/now/noexecstack).
     # -fPIE/-pie requested explicitly — the ports gcc used in CI does not
     # default to PIE (AR-05 L9).
-    SECURITY_FLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION) \
-                          -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-    SECURITY_FLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
-                            -fstack-clash-protection $(CF_PROTECTION) -fPIE -pie \
-                            -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    SECURITY_CFLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION)
+    SECURITY_LDFLAGS_DEBUG = -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+                             -fstack-clash-protection $(CF_PROTECTION) -fPIE
+    SECURITY_LDFLAGS_RELEASE = -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
 endif
 
 # Debug/Release configurations
 DEBUG_FLAGS = -g -O0 -DDEBUG -Wp,-U_FORTIFY_SOURCE -fsanitize=address -fsanitize=undefined \
-              -fno-omit-frame-pointer -Wpedantic $(SECURITY_FLAGS_DEBUG)
+              -fno-omit-frame-pointer -Wpedantic $(SECURITY_CFLAGS_DEBUG)
+DEBUG_LDFLAGS = -fsanitize=address -fsanitize=undefined $(SECURITY_LDFLAGS_DEBUG)
 # -s (strip) lives in RELEASE_LDFLAGS, not here: it is a link-only flag, and
 # CFLAGS feeds the compile step too, where clang errors on it as an unused
 # command-line argument under WERROR (gcc silently ignores it).
-RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_FLAGS_RELEASE)
+RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_CFLAGS_RELEASE)
+RELEASE_LDFLAGS = -s $(SECURITY_LDFLAGS_RELEASE)
 
 # Default to debug build
 BUILD_TYPE ?= debug
 ifeq ($(BUILD_TYPE),release)
     CFLAGS += $(RELEASE_FLAGS)
-    LDFLAGS += -s
+    LDFLAGS += $(RELEASE_LDFLAGS)
 else
     CFLAGS += $(DEBUG_FLAGS)
+    LDFLAGS += $(DEBUG_LDFLAGS)
 endif
 
 # Warnings-as-errors knob. CI passes WERROR=1 so the ~20 -W flags above gate
@@ -217,6 +242,16 @@ HEADERS = $(wildcard $(SRCDIR)/*.h)
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
+AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
+DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
+           $(AR07_RESET_MAIN_OBJECT:.o=.d)
+
+# Let each translation unit describe its real header graph. -MP keeps a stale
+# dependency file usable long enough to re-run the compiler after a header is
+# removed/renamed, where the missing include is then reported authoritatively.
+# CPPFLAGS is included explicitly so standard caller-provided preprocessor
+# inputs participate in both compilation and the build fingerprint.
+DEPFLAGS ?= -MMD -MP
 
 # Default target
 .PHONY: all
@@ -229,40 +264,72 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
-# Build-config stamp: debug and release share build/obj and build/bin, but
-# their flag sets differ radically (ASan/UBSan -O0 vs stripped NDEBUG -O2)
-# and BUILD_TYPE is invisible to the dependency graph. Without the stamp,
-# `make BUILD_TYPE=release` followed by `make BUILD_TYPE=debug test` printed
-# "Nothing to be done" and ran the "sanitizer" suite against uninstrumented
-# release objects — silently fake QA results (AR-05 M3). The recipe rewrites
-# the stamp only when the recorded config differs, forcing a full rebuild.
+# Build-config stamp: objects/tests share build/obj and build/bin across every
+# configuration. Record every effective compile/link input, not just the build
+# type and metadata: otherwise READLINE, compiler, flag, library, or platform
+# changes can reuse incompatible objects and make tests falsely green (AR-07
+# M34). The first line retains BUILD_TYPE before `|` for the install guard.
 #
-# The stamp also carries VERSION and COMMIT (AR-06 F11): those feed -D macros
-# baked into every object via CFLAGS, but objects depend only on sources,
-# headers, and this stamp — so a VERSION bump or new commits changed the -D
-# values while `make` reported nothing to do and the binary kept reporting the
-# stale version. Folding them into the stamp makes any change force the rebuild
-# exactly like a BUILD_TYPE cross. Field 1 stays BUILD_TYPE so the install
-# guard can read it with a simple prefix check.
+# A make-exported value reaches the shell as data rather than recipe syntax,
+# so command-line flags containing quotes/metacharacters cannot alter this
+# recipe. The temporary file is compared byte-for-byte and the real stamp is
+# replaced only on change, preserving true no-op incremental builds.
 BUILDTYPE_STAMP = $(OBJDIR)/.buildconfig
-BUILD_STAMP_CONTENT = $(BUILD_TYPE)|$(VERSION)|$(COMMIT)
+define BUILD_STAMP_CONTENT
+$(BUILD_TYPE)|buildconfig-v2
+version=$(VERSION)
+commit=$(COMMIT)
+cc=$(CC)
+cc_is_clang=$(CC_IS_CLANG)
+cppflags=$(CPPFLAGS)
+cflags=$(CFLAGS)
+frame_size_warning=$(FRAME_SIZE_WARNING)
+includes=$(INCLUDES)
+depflags=$(DEPFLAGS)
+ldflags=$(LDFLAGS)
+libs=$(LIBS)
+readline_request=$(READLINE)
+readline_effective=$(READLINE_OK)
+readline_hint_cflags=$(READLINE_HINT_CFLAGS)
+readline_hint_libs=$(READLINE_HINT_LIBS)
+platform_os=$(UNAME_S)
+platform_arch=$(UNAME_M)
+cf_protection=$(CF_PROTECTION)
+security_cflags_debug=$(SECURITY_CFLAGS_DEBUG)
+security_ldflags_debug=$(SECURITY_LDFLAGS_DEBUG)
+security_cflags_release=$(SECURITY_CFLAGS_RELEASE)
+security_ldflags_release=$(SECURITY_LDFLAGS_RELEASE)
+target=$(TARGET)
+sources=$(SOURCES)
+objects=$(OBJECTS)
+source_dir=$(SRCDIR)
+test_dir=$(TESTDIR)
+endef
+export GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
 $(BUILDTYPE_STAMP): buildtype-force | $(OBJDIR)
-	@if [ "`cat $(BUILDTYPE_STAMP) 2>/dev/null`" != "$(BUILD_STAMP_CONTENT)" ]; then \
-		echo "$(BUILD_STAMP_CONTENT)" > $(BUILDTYPE_STAMP); \
-	fi
+	@set -e; \
+	tmp="$@.tmp.$$$$"; \
+	trap 'rm -f "$$tmp"' 0 1 2 3 15; \
+	printf '%s\n' "$$GITSWITCH_BUILD_CONFIG" >"$$tmp"; \
+	if test -r "$@" && cmp -s "$$tmp" "$@"; then \
+		rm -f "$$tmp"; \
+	else \
+		mv -f "$$tmp" "$@"; \
+	fi; \
+	trap - 0 1 2 3 15
 
 .PHONY: buildtype-force
 buildtype-force:
 
 # Compile source files
-$(OBJDIR)/%.o: $(SRCDIR)/%.c $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
+$(OBJDIR)/%.o: $(SRCDIR)/%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling $<..."
-	$(CC) $(CFLAGS) $(INCLUDES) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
 
 # Link main executable
 $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 	@echo "Linking $@..."
-	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
 	@echo "Build complete: $@"
 
 # Install target.
@@ -282,7 +349,7 @@ install:
 		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
 		exit 1; \
 	fi
-	@bt=`cut -d'|' -f1 $(BUILDTYPE_STAMP) 2>/dev/null`; \
+	@bt=`sed -n '1s/|.*//p' $(BUILDTYPE_STAMP) 2>/dev/null`; \
 	if [ "$$bt" != "release" ]; then \
 		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
 	fi
@@ -309,14 +376,37 @@ uninstall:
 	@echo "Uninstall complete"
 
 # Test compilation
-$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(TESTDIR)/test.h $(HEADERS) $(BUILDTYPE_STAMP) | $(OBJDIR)
+$(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
-	$(CC) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) -c $< -o $@
+
+# The reset suite calls the real CLI entry point in isolated child processes
+# while installing deterministic in-process boundary hooks. Rename only this
+# test object's main; the production binary remains free of those hooks.
+$(AR07_RESET_MAIN_OBJECT): $(SRCDIR)/main.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-07 reset CLI test entry..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING -Dmain=gitswitch_cli_main -c $< -o $@
 
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+# This focused suite executes the production CLI to prove that main selects
+# the side-effect-free loader only for the exact `list|ls --names` grammar.
+$(BINDIR)/test_ar07_completion: | $(BINDIR)/$(TARGET)
+
+# Dependency files are optional on the first build and authoritative
+# thereafter. Keep this after `all` so an included -MP compatibility target
+# can never become Make's accidental default goal.
+-include $(DEPFILES)
 
 # Build and run tests. The main binary is a dependency because the CLI-level
 # tests (tests/test_cli.c) exec build/bin/gitswitch: main.c is excluded from
@@ -499,6 +589,8 @@ help:
 	@echo "  dev          Quick development cycle (clean + debug + test)"
 	@echo "  dist         Create distribution tarball"
 	@echo "  distcheck    Build, test, and stage-install the source tarball"
+	@echo "  release-contract-test Verify commit-pinned release inputs"
+	@echo "  release-artifact-test Inspect built and staged release hardening"
 	@echo "  qa-contract-test Verify QA failure and cleanup contracts"
 	@echo "  rpm          Build RPM package"
 	@echo "  help         Show this help"
@@ -510,35 +602,123 @@ help:
 
 # RPM package building
 PACKAGE = gitswitcher
-RPM_VERSION = $(VERSION)
-DIST_ROOT = $(PACKAGE)-$(RPM_VERSION)
-DIST_ARCHIVE = $(DIST_ROOT).tar.gz
+# Release artifacts are named and populated from one immutable commit. Regular
+# developer builds may still override VERSION, but dist/RPM metadata may not be
+# mixed with that live value. Command-line overrides are deliberately ignored
+# for RELEASE_COMMIT/RELEASE_VERSION/DIST_ROOT so the archive contract cannot
+# be renamed away from the VERSION committed at HEAD. Resolve these only for a
+# goal that consumes release metadata; ordinary builds otherwise paid for two
+# unrelated Git processes on every Make invocation (AR-07 L25).
+RELEASE_METADATA_GOALS = release-manifest-check dist distcheck \
+	release-contract-test rpm
+ifneq ($(strip $(filter $(RELEASE_METADATA_GOALS),$(MAKECMDGOALS))),)
+    override RELEASE_COMMIT := $(shell git rev-parse --verify HEAD^{commit} 2>/dev/null)
+    override RELEASE_VERSION := $(shell git show $(RELEASE_COMMIT):VERSION 2>/dev/null)
+else
+    override RELEASE_COMMIT :=
+    override RELEASE_VERSION :=
+endif
+RPM_VERSION = $(RELEASE_VERSION)
+override DIST_ROOT := $(PACKAGE)-$(RELEASE_VERSION)
+DIST_ARCHIVE ?= $(DIST_ROOT).tar.gz
 # Reviewed allowlist. Copying only these entries inherently excludes VCS/OMX
 # state, build products, cores, logs, and previously generated archives.
 DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
-.PHONY: dist distcheck qa-contract-test sig-repro-test rpm
+.PHONY: release-manifest-check dist distcheck release-contract-test \
+	release-artifact-test qa-contract-test sig-repro-test rpm
+# Fail closed before producing an artifact when any tracked or untracked
+# release-manifest path differs from the exact commit selected above. Besides
+# preventing a live VERSION from naming committed payload, this makes the spec
+# consumed by `rpm` review-identical to the spec shipped in the archive.
+release-manifest-check:
+	@git rev-parse --git-dir >/dev/null 2>&1 || \
+		{ echo "ERROR: release artifacts require a git checkout" >&2; exit 1; }
+	@test -n "$(RELEASE_COMMIT)" && test -n "$(RELEASE_VERSION)" || \
+		{ echo "ERROR: cannot resolve committed release VERSION at HEAD" >&2; exit 1; }
+	@if ! git diff --quiet --no-ext-diff "$(RELEASE_COMMIT)" -- $(DIST_MANIFEST); then \
+		echo "ERROR: release manifest differs from committed HEAD" >&2; \
+		git status --short --untracked-files=all -- $(DIST_MANIFEST) >&2; \
+		exit 1; \
+	fi
+	@if test -n "`git ls-files --others --exclude-standard -- $(DIST_MANIFEST)`"; then \
+		echo "ERROR: release manifest contains untracked paths" >&2; \
+		git status --short --untracked-files=all -- $(DIST_MANIFEST) >&2; \
+		exit 1; \
+	fi
+	@spec_version=`git show "$(RELEASE_COMMIT):$(PACKAGE).spec" | \
+		sed -n 's/^Version:[[:space:]]*//p' | sed -n '1p'`; \
+	if test "$$spec_version" != "$(RELEASE_VERSION)"; then \
+		echo "ERROR: committed spec Version '$$spec_version' differs from VERSION '$(RELEASE_VERSION)'" >&2; \
+		exit 1; \
+	fi
+
 # Archive COMMITTED VCS content, not the live working tree: the old cp -R of
 # the manifest directories shipped any stray file nested inside src/, tests/,
 # or completions/ (editor backups, experiment files, test-run droppings), so
 # release tarballs were not reproducible from a tag and could leak unreviewed
 # content (AR-05 L5). git archive draws from HEAD, which also inherently
 # excludes VCS state, build products, cores, logs, and prior archives.
-dist:
+dist: release-manifest-check
 	@echo "Creating distribution tarball..."
-	@git rev-parse --git-dir >/dev/null 2>&1 || \
-		{ echo "ERROR: dist builds from committed VCS content and requires a git checkout" >&2; exit 1; }
-	@if ! git diff-index --quiet HEAD -- $(DIST_MANIFEST) 2>/dev/null; then \
-		echo "WARNING: working tree differs from HEAD for manifest paths; the archive contains committed content only" >&2; \
-	fi
-	git archive --prefix=$(DIST_ROOT)/ -o $(DIST_ARCHIVE) HEAD -- $(DIST_MANIFEST)
+	git archive --prefix=$(DIST_ROOT)/ -o $(DIST_ARCHIVE) \
+		$(RELEASE_COMMIT) -- $(DIST_MANIFEST)
 
 distcheck: dist
 	@sh tests/test_dist.sh "$(CURDIR)/$(DIST_ARCHIVE)" "$(DIST_ROOT)" \
 		"$(PREFIX)" "$(MAKE_COMMAND)"
 
+# Negative release-input checks run in isolated local clones, so they can dirty
+# VERSION/spec/manifest fixtures without touching the operator's checkout.
+release-contract-test:
+	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)"
+
+# Inspect the exact release binary and byte-identical staged-install copy with
+# native ELF or Mach-O tooling. The shell test owns its temporary stage.
+ifeq ($(BUILD_TYPE),release)
+release-artifact-test: $(BINDIR)/$(TARGET)
+	@set -e; \
+	stage=`mktemp -d "$${TMPDIR:-/tmp}/gitswitch-release-stage.XXXXXX"`; \
+	trap 'status=$$?; trap - 0 1 2 3 15; rm -rf "$$stage"; exit $$status' 0 1 2 3 15; \
+	install_log="$$stage/install.log"; \
+	if ! $(MAKE) BUILD_TYPE=release install DESTDIR="$$stage" PREFIX="$(PREFIX)" \
+		>"$$install_log" 2>&1; then \
+		cat "$$install_log" >&2; \
+		exit 1; \
+	fi; \
+	if grep -F 'Warning: installing a' "$$install_log" >/dev/null; then \
+		cat "$$install_log" >&2; \
+		echo 'ERROR: release build stamp was not recognized by install' >&2; \
+		exit 1; \
+	fi; \
+	stack_home="$$stage/stack-home"; \
+	stack_runtime="$$stage/stack-runtime"; \
+	mkdir -m 700 "$$stack_home" "$$stack_runtime"; \
+	stack_log="$$stage/stack.log"; \
+	if ! (ulimit -s 256; \
+		"$(BINDIR)/$(TARGET)" --help >/dev/null && \
+		"$(BINDIR)/$(TARGET)" --version >/dev/null && \
+		HOME="$$stack_home" XDG_RUNTIME_DIR="$$stack_runtime" \
+			"$(BINDIR)/$(TARGET)" -n -C config </dev/null >/dev/null) \
+			>"$$stack_log" 2>&1; then \
+		cat "$$stack_log" >&2; \
+		echo 'ERROR: release CLI failed under a 256 KiB stack' >&2; \
+		exit 1; \
+	fi; \
+	echo 'Release stack check passed: help/version/config at 256 KiB'; \
+	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
+		"$$stage$(PREFIX)/bin/$(TARGET)"; \
+	sh tests/test_ar07_release.sh neuter "$(CC)" \
+		"$(SECURITY_CFLAGS_RELEASE)"
+else
+release-artifact-test:
+	@echo "ERROR: release-artifact-test requires BUILD_TYPE=release" >&2
+	@exit 2
+endif
+
 qa-contract-test:
 	@sh tests/test_qa.sh "$(CURDIR)" "$(MAKE_COMMAND)"
+	@sh tests/test_ar07_build.sh "$(CURDIR)" "$(MAKE_COMMAND)"
 
 # AR-06 F32: the SIG-01/SIG-02/F4 end-to-end signal-interruption repro was
 # tracked but executed by nothing (not `make test`, not CI). Wire it in against
@@ -558,9 +738,12 @@ rpm: dist
 	mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES \
 		~/rpmbuild/SPECS ~/rpmbuild/SRPMS
 	cp $(DIST_ARCHIVE) ~/rpmbuild/SOURCES/
-	cp $(PACKAGE).spec ~/rpmbuild/SPECS/
+	# Consume the review-identical spec embedded in the commit-pinned archive,
+	# never a second live-checkout input.
+	tar -xOf $(DIST_ARCHIVE) $(DIST_ROOT)/$(PACKAGE).spec > \
+		~/rpmbuild/SPECS/$(PACKAGE).spec
 	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
 	@echo "RPM packages created in ~/rpmbuild/RPMS/"
 
 # Prevent make from removing intermediate files
-.SECONDARY: $(OBJECTS) $(TEST_OBJECTS)
+.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT)

@@ -1,0 +1,388 @@
+#!/bin/sh
+# AR-07 T19: build-fingerprint, precise-dependency, and metadata-probe gates.
+
+set -eu
+
+fail()
+{
+    printf 'ar07-build: ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+[ "$#" -eq 2 ] || fail "usage: $0 PROJECT_ROOT MAKE"
+root=$1
+make_cmd=$2
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-ar07-build.XXXXXX") ||
+    fail "cannot create temporary directory"
+cleanup()
+{
+    status=$?
+    trap - 0 1 2 3 15
+    rm -rf "$tmp"
+    exit "$status"
+}
+trap cleanup 0
+trap 'exit 1' 1 2 3 15
+
+real_cc=$(command -v "${CC:-cc}") || fail "C compiler not found"
+real_ar=$(command -v ar) || fail "ar not found"
+real_git=$(command -v git) || fail "git not found"
+real_cat=$(command -v cat) || fail "cat not found"
+
+fixture=$tmp/project
+mkdir -p "$fixture/src" "$fixture/tests" "$tmp/shims" \
+    "$tmp/fake-readline/include/readline" "$tmp/fake-readline/lib"
+cp "$root/Makefile" "$fixture/Makefile"
+cp "$root/VERSION" "$fixture/VERSION"
+
+cat >"$fixture/src/narrow.h" <<'EOF'
+#ifndef AR07_NARROW_H
+#define AR07_NARROW_H
+int helper_value(void);
+#endif
+EOF
+cat >"$fixture/src/helper.h" <<'EOF'
+#ifndef AR07_HELPER_H
+#define AR07_HELPER_H
+int helper_value(void);
+#endif
+EOF
+cat >"$fixture/src/helper.c" <<'EOF'
+#include "helper.h"
+int helper_value(void)
+{
+    return 7;
+}
+EOF
+cat >"$fixture/src/main.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include "narrow.h"
+
+#ifndef AR07_CFLAG
+#define AR07_CFLAG 0
+#endif
+#ifndef AR07_CPPFLAG
+#define AR07_CPPFLAG 0
+#endif
+#ifndef AR07_PLATFORM
+#define AR07_PLATFORM 0
+#endif
+
+#ifdef AR07_USE_LIB
+int ar07_lib_marker(void);
+#endif
+
+#ifdef HAVE_READLINE
+#include <readline/readline.h>
+#endif
+
+int main(void)
+{
+    int library_marker = 0;
+    int readline_marker = 0;
+
+#ifdef AR07_USE_LIB
+    library_marker = ar07_lib_marker();
+#endif
+#ifdef HAVE_READLINE
+    char *line = readline("");
+    if (line == NULL) {
+        return 2;
+    }
+    free(line);
+    readline_marker = 1;
+#endif
+    printf("cflag=%d cppflag=%d platform=%d lib=%d readline=%d helper=%d\n",
+           AR07_CFLAG, AR07_CPPFLAG, AR07_PLATFORM, library_marker,
+           readline_marker, helper_value());
+    return helper_value() == 7 ? 0 : 1;
+}
+EOF
+
+cat >"$tmp/fake-readline/include/readline/readline.h" <<'EOF'
+#ifndef AR07_FAKE_READLINE_H
+#define AR07_FAKE_READLINE_H
+extern int rl_inhibit_completion;
+char *readline(const char *prompt);
+#endif
+EOF
+cat >"$tmp/fake-readline/include/readline/history.h" <<'EOF'
+#ifndef AR07_FAKE_HISTORY_H
+#define AR07_FAKE_HISTORY_H
+#endif
+EOF
+cat >"$tmp/readline.c" <<'EOF'
+#include <stdlib.h>
+#include <readline/readline.h>
+int rl_inhibit_completion;
+char *readline(const char *prompt)
+{
+    char *line = malloc(1);
+    (void)prompt;
+    if (line != NULL) {
+        line[0] = '\0';
+    }
+    return line;
+}
+EOF
+"$real_cc" -fPIE -I"$tmp/fake-readline/include" -c "$tmp/readline.c" \
+    -o "$tmp/readline.o"
+"$real_ar" rcs "$tmp/fake-readline/lib/libreadline.a" "$tmp/readline.o"
+
+cat >"$tmp/lib-one.c" <<'EOF'
+int ar07_lib_marker(void) { return 1; }
+EOF
+cat >"$tmp/lib-two.c" <<'EOF'
+int ar07_lib_marker(void) { return 2; }
+EOF
+"$real_cc" -c "$tmp/lib-one.c" -o "$tmp/lib-one.o"
+"$real_cc" -c "$tmp/lib-two.c" -o "$tmp/lib-two.o"
+"$real_ar" rcs "$tmp/lib-one.a" "$tmp/lib-one.o"
+"$real_ar" rcs "$tmp/lib-two.a" "$tmp/lib-two.o"
+
+cc_log=$tmp/compiler.log
+for wrapper in cc-a cc-b; do
+    cat >"$tmp/shims/$wrapper" <<'EOF'
+#!/bin/sh
+: "${AR07_REAL_CC:?}"
+: "${AR07_CC_LOG:?}"
+kind=other
+has_object=0
+for arg do
+    if [ "$arg" = "-c" ]; then
+        kind=compile
+    fi
+    case $arg in *.o) has_object=1 ;; esac
+done
+if [ "$kind" = other ] && [ "$has_object" -eq 1 ]; then
+    kind=link
+fi
+printf '%s wrapper=%s' "$kind" "${0##*/}" >>"$AR07_CC_LOG"
+for arg do
+    printf ' <%s>' "$arg" >>"$AR07_CC_LOG"
+done
+printf '\n' >>"$AR07_CC_LOG"
+exec "$AR07_REAL_CC" "$@"
+EOF
+    chmod 0700 "$tmp/shims/$wrapper"
+done
+
+target=build/bin/ar07-probe
+sources='src/main.c src/helper.c'
+out=$tmp/make.out
+
+invoke_build()
+{
+    : >"$cc_log"
+    AR07_REAL_CC="$real_cc" AR07_CC_LOG="$cc_log" \
+        "$make_cmd" -C "$fixture" TARGET=ar07-probe SOURCES="$sources" \
+        VERSION=fixture-version COMMIT=fixture-commit "$@" "$target" \
+        >"$out" 2>&1
+}
+
+require_build()
+{
+    label=$1
+    shift
+    if ! invoke_build "$@"; then
+        sed -n '1,200p' "$out" >&2
+        fail "$label build failed"
+    fi
+}
+
+assert_rebuilt()
+{
+    label=$1
+    grep '^compile ' "$cc_log" >/dev/null ||
+        fail "$label did not recompile after its fingerprint changed"
+    grep '^link ' "$cc_log" >/dev/null ||
+        fail "$label did not relink after its fingerprint changed"
+}
+
+assert_output()
+{
+    expected=$1
+    actual=$("$fixture/$target") || fail "probe binary failed"
+    case $actual in
+        *"$expected"*) ;;
+        *) fail "probe output '$actual' lacks '$expected'" ;;
+    esac
+}
+
+cc_a=$tmp/shims/cc-a
+cc_b=$tmp/shims/cc-b
+
+# CFLAGS and CPPFLAGS changes must rebuild, while an identical invocation is a
+# true no-op. Explicit minimal flags keep this fixture independent of the
+# production sanitizer/linker configuration.
+require_build "initial CFLAGS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_CFLAG=1' CPPFLAGS=-DAR07_CPPFLAG=1 \
+    LDFLAGS= LIBS=
+assert_rebuilt "initial CFLAGS"
+assert_output 'cflag=1 cppflag=1'
+
+require_build "no-op" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_CFLAG=1' CPPFLAGS=-DAR07_CPPFLAG=1 \
+    LDFLAGS= LIBS=
+if grep -E '^(compile|link) ' "$cc_log" >/dev/null; then
+    fail "identical configuration rebuilt instead of remaining a no-op"
+fi
+
+require_build "CFLAGS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_CFLAG=2' CPPFLAGS=-DAR07_CPPFLAG=1 \
+    LDFLAGS= LIBS=
+assert_rebuilt "CFLAGS"
+assert_output 'cflag=2 cppflag=1'
+
+require_build "CPPFLAGS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_CFLAG=2' CPPFLAGS=-DAR07_CPPFLAG=2 \
+    LDFLAGS= LIBS=
+assert_rebuilt "CPPFLAGS"
+assert_output 'cflag=2 cppflag=2'
+
+# LDFLAGS must force a fresh link before the requested new map is observable.
+require_build "first LDFLAGS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_CFLAG=2' CPPFLAGS=-DAR07_CPPFLAG=2 \
+    LDFLAGS="-Wl,-Map,$tmp/link-one.map" LIBS=
+assert_rebuilt "first LDFLAGS"
+[ -s "$tmp/link-one.map" ] || fail "first LDFLAGS were not applied"
+require_build "second LDFLAGS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_CFLAG=2' CPPFLAGS=-DAR07_CPPFLAG=2 \
+    LDFLAGS="-Wl,-Map,$tmp/link-two.map" LIBS=
+assert_rebuilt "second LDFLAGS"
+[ -s "$tmp/link-two.map" ] || fail "changed LDFLAGS were not applied"
+
+# Changing only LIBS must replace the linked implementation.
+require_build "first LIBS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_USE_LIB' CPPFLAGS= LDFLAGS= \
+    LIBS="$tmp/lib-one.a"
+assert_rebuilt "first LIBS"
+assert_output 'lib=1'
+require_build "second LIBS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
+    CFLAGS='-std=gnu11 -DAR07_USE_LIB' CPPFLAGS= LDFLAGS= \
+    LIBS="$tmp/lib-two.a"
+assert_rebuilt "second LIBS"
+assert_output 'lib=2'
+
+# A compiler command change is itself part of the toolchain fingerprint.
+require_build "compiler" BUILD_TYPE=debug READLINE=0 CC="$cc_b" \
+    CFLAGS='-std=gnu11 -DAR07_USE_LIB' CPPFLAGS= LDFLAGS= \
+    LIBS="$tmp/lib-two.a"
+assert_rebuilt "compiler"
+grep '^compile wrapper=cc-b ' "$cc_log" >/dev/null ||
+    fail "changed compiler wrapper did not compile the objects"
+
+# Exercise a platform hardening input through the real release flag expansion.
+require_build "first platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
+    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=1 -fPIE'
+assert_rebuilt "first platform flags"
+assert_output 'platform=1'
+require_build "second platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
+    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE'
+assert_rebuilt "second platform flags"
+assert_output 'platform=2'
+
+# Stabilize the fake readline search hints while disabled, then change only the
+# READLINE request. Both 0->1 and 1->0 must replace the conditional code path.
+readline_cflags=-I$tmp/fake-readline/include
+readline_libs=-L$tmp/fake-readline/lib
+require_build "readline baseline" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
+    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
+    READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
+assert_rebuilt "readline baseline"
+assert_output 'readline=0'
+require_build "READLINE 0 to 1" BUILD_TYPE=release READLINE=1 CC="$cc_b" \
+    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
+    READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
+assert_rebuilt "READLINE 0 to 1"
+assert_output 'readline=1'
+require_build "READLINE 1 to 0" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
+    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
+    READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
+assert_rebuilt "READLINE 1 to 0"
+assert_output 'readline=0'
+
+# Compiler-generated dependency files should name only actual includes. A
+# narrow header edit recompiles main.c but not the unrelated helper.c.
+[ -s "$fixture/build/obj/main.d" ] || fail "main dependency file missing"
+[ -s "$fixture/build/obj/helper.d" ] || fail "helper dependency file missing"
+grep -F 'src/narrow.h' "$fixture/build/obj/main.d" >/dev/null ||
+    fail "main dependency file omits narrow.h"
+grep -F 'src/helper.h' "$fixture/build/obj/helper.d" >/dev/null ||
+    fail "helper dependency file omits helper.h"
+sleep 1
+touch "$fixture/src/narrow.h"
+require_build "narrow header" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
+    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
+    READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
+grep '^compile .*<src/main.c>' "$cc_log" >/dev/null ||
+    fail "narrow header edit did not rebuild its dependent"
+if grep '^compile .*<src/helper.c>' "$cc_log" >/dev/null; then
+    fail "narrow header edit rebuilt an unrelated translation unit"
+fi
+
+# -MP should turn a removed header into a compiler diagnostic, not a stale
+# success or Make's premature "no rule" error before the dependent compiles.
+mv "$fixture/src/narrow.h" "$fixture/src/narrow.h.saved"
+if invoke_build BUILD_TYPE=release READLINE=0 CC="$cc_b" \
+    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
+    READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"; then
+    fail "build succeeded after a required header was removed"
+fi
+grep '^compile .*<src/main.c>' "$cc_log" >/dev/null ||
+    fail "removed header did not drive the dependent back through the compiler"
+mv "$fixture/src/narrow.h.saved" "$fixture/src/narrow.h"
+
+# Default metadata lookups execute exactly once. Explicit overrides execute no
+# Git/VERSION probes and are preserved verbatim in the generated stamp.
+probe_dir=$tmp/probes
+mkdir "$probe_dir"
+git_log=$tmp/git.log
+cat_log=$tmp/cat.log
+cat >"$probe_dir/git" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$AR07_GIT_LOG"
+exec "$AR07_REAL_GIT" "$@"
+EOF
+cat >"$probe_dir/cat" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$AR07_CAT_LOG"
+exec "$AR07_REAL_CAT" "$@"
+EOF
+chmod 0700 "$probe_dir/git" "$probe_dir/cat"
+: >"$git_log"
+: >"$cat_log"
+if ! PATH="$probe_dir:$PATH" AR07_REAL_GIT="$real_git" \
+    AR07_REAL_CAT="$real_cat" AR07_GIT_LOG="$git_log" AR07_CAT_LOG="$cat_log" \
+    "$make_cmd" -C "$fixture" info >"$out" 2>&1; then
+    sed -n '1,200p' "$out" >&2
+    fail "default metadata probe invocation failed"
+fi
+[ "$(wc -l <"$git_log" | tr -d ' ')" -eq 1 ] ||
+    fail "default COMMIT lookup executed more than once"
+[ "$(wc -l <"$cat_log" | tr -d ' ')" -eq 1 ] ||
+    fail "default VERSION lookup executed more than once"
+
+: >"$git_log"
+: >"$cat_log"
+if ! PATH="$probe_dir:$PATH" AR07_REAL_GIT="$real_git" \
+    AR07_REAL_CAT="$real_cat" AR07_GIT_LOG="$git_log" AR07_CAT_LOG="$cat_log" \
+    AR07_REAL_CC="$real_cc" AR07_CC_LOG="$cc_log" \
+    "$make_cmd" -C "$fixture" TARGET=ar07-probe SOURCES="$sources" \
+    VERSION=override-version COMMIT=override-commit BUILD_TYPE=debug READLINE=0 \
+    CC="$cc_a" CFLAGS='-std=gnu11' CPPFLAGS= LDFLAGS= LIBS= "$target" \
+    >"$out" 2>&1; then
+    sed -n '1,200p' "$out" >&2
+    fail "metadata override build failed"
+fi
+[ ! -s "$git_log" ] || fail "COMMIT override still executed Git"
+[ ! -s "$cat_log" ] || fail "VERSION override still read VERSION"
+grep -F 'version=override-version' "$fixture/build/obj/.buildconfig" >/dev/null ||
+    fail "VERSION override was not preserved in the build fingerprint"
+grep -F 'commit=override-commit' "$fixture/build/obj/.buildconfig" >/dev/null ||
+    fail "COMMIT override was not preserved in the build fingerprint"
+
+printf '%s\n' \
+    'ar07-build: PASS (complete fingerprints, precise depfiles, frozen probes)'

@@ -69,12 +69,12 @@ fi
 # mode first so the injected Valgrind failure tests the recipe contract rather
 # than a missing/stale prerequisite.
 "$make_cmd" -C "$root" clean >/dev/null
-"$make_cmd" -C "$root" BUILD_TYPE=release \
+"$make_cmd" -C "$root" BUILD_TYPE=release READLINE=0 \
     build/bin/gitswitch build/bin/test_runner build/bin/test_security >/dev/null
 arg_log=$tmp/valgrind.args
 if PATH="$shim_dir:$PATH" QA_TOOL_EXIT=73 \
     QA_REQUIRE_ARG=--error-exitcode=99 QA_ARG_LOG="$arg_log" \
-    "$make_cmd" -C "$root" BUILD_TYPE=release memcheck >"$out" 2>&1; then
+    "$make_cmd" -C "$root" BUILD_TYPE=release READLINE=0 memcheck >"$out" 2>&1; then
     fail "memcheck succeeded after an installed valgrind failed"
 fi
 grep -F -- "--error-exitcode=99" "$arg_log" >/dev/null ||
@@ -94,16 +94,17 @@ fi
 make_abs=$(command -v "$make_cmd" 2>/dev/null || printf '%s' "$make_cmd")
 notools_dir=$tmp/notools
 mkdir "$notools_dir"
-for basic in sh uname git wc tr grep sed printf echo cat mkdir rm touch \
-             head tail sort expr test; do
+for basic in sh uname git gcc cc clang brew wc tr grep sed printf echo cat cmp \
+             mkdir mv rm touch head tail sort expr test; do
     basic_path=$(command -v "$basic" 2>/dev/null) || continue
     case $basic_path in /*) ln -s "$basic_path" "$notools_dir/$basic" ;; esac
 done
 for pair in "analyze:cppcheck" "security-scan:flawfinder" "memcheck:valgrind"; do
     absent_target=${pair%%:*}
     absent_tool=${pair##*:}
-    if ! PATH="$notools_dir" "$make_abs" -C "$root" BUILD_TYPE=release \
+    if ! PATH="$notools_dir" "$make_abs" -C "$root" BUILD_TYPE=release READLINE=0 \
         "$absent_target" >"$out" 2>&1; then
+        sed -n '1,200p' "$out" >&2
         fail "$absent_target failed with $absent_tool genuinely absent from PATH"
     fi
     grep -F "not installed" "$out" >/dev/null ||

@@ -7,6 +7,7 @@
 #include "gitswitch.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -111,7 +112,13 @@ static int prepare_home(const char *home, const char *config_body) {
     snprintf(path, sizeof(path), "%s/.config/gitswitch", home);
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
-    return write_text(path, config_body, 0600);
+    if (write_text(path, config_body, 0600) != 0) return -1;
+
+    /* Historical active-only files predate the consolidated artifact. Remove
+     * state left by an earlier command in this reused HOME so this fixture
+     * exercises migration from settings.active_account itself. */
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
+    return unlink(path) == 0 || errno == ENOENT ? 0 : -1;
 }
 
 static const char *active_work_config(void) {
@@ -126,15 +133,102 @@ static const char *active_work_config(void) {
            "preferred_scope = \"global\"\n";
 }
 
-static int prepare_shims(const char *runtime, char *shim_dir, size_t size) {
-    char path[1024];
+/* Resolve and copy host tools only to construct deterministic native test
+ * fixtures. Production still performs its complete trust walk on the private
+ * copies before execution. This deliberately does not use find_command_path:
+ * a package-manager prefix can be safe for the CI operator yet intentionally
+ * fail the product's stricter ancestry policy. */
+static int find_fixture_executable(const char *name, char *resolved,
+                                   size_t resolved_size) {
+    const char *path_env = getenv("PATH");
+    const char *cursor;
 
-    snprintf(shim_dir, size, "%s/shims", runtime);
-    if (mkdir_private(shim_dir) != 0) return -1;
+    if (!name || !*name || !resolved || resolved_size == 0 ||
+        !path_env || !*path_env || strchr(name, '/')) return -1;
+
+    cursor = path_env;
+    while (*cursor) {
+        const char *colon = strchr(cursor, ':');
+        size_t dir_len = colon ? (size_t)(colon - cursor) : strlen(cursor);
+        size_t name_len = strlen(name);
+        char candidate[PATH_MAX], canonical[PATH_MAX];
+        struct stat st;
+
+        if (dir_len > 0 && cursor[0] == '/' &&
+            dir_len + 1 + name_len + 1 <= sizeof(candidate)) {
+            memcpy(candidate, cursor, dir_len);
+            candidate[dir_len] = '/';
+            memcpy(candidate + dir_len + 1, name, name_len + 1);
+            if (realpath(candidate, canonical) &&
+                stat(canonical, &st) == 0 && S_ISREG(st.st_mode) &&
+                access(canonical, R_OK | X_OK) == 0 &&
+                strlen(canonical) < resolved_size) {
+                memcpy(resolved, canonical, strlen(canonical) + 1);
+                return 0;
+            }
+        }
+        if (!colon) break;
+        cursor = colon + 1;
+    }
+    return -1;
+}
+
+static int copy_executable(const char *source, const char *destination) {
+    unsigned char buffer[16384];
+    int source_fd = -1, destination_fd = -1;
+    int result = -1;
+
+    source_fd = open(source, O_RDONLY);
+    if (source_fd < 0) goto done;
+    destination_fd = open(destination, O_WRONLY | O_CREAT | O_EXCL, 0700);
+    if (destination_fd < 0) goto done;
+
+    for (;;) {
+        ssize_t count = read(source_fd, buffer, sizeof(buffer));
+        if (count == 0) break;
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            goto done;
+        }
+        ssize_t offset = 0;
+        while (offset < count) {
+            ssize_t written = write(destination_fd, buffer + offset,
+                                    (size_t)(count - offset));
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) goto done;
+            offset += written;
+        }
+    }
+    if (fchmod(destination_fd, 0700) != 0) goto done;
+    result = 0;
+
+done:
+    if (source_fd >= 0 && close(source_fd) != 0) result = -1;
+    if (destination_fd >= 0 && close(destination_fd) != 0) result = -1;
+    if (result != 0) (void)unlink(destination);
+    return result;
+}
+
+static int prepare_shims(char *shim_dir, size_t size) {
+    char path[1024], true_path[PATH_MAX], git_path[PATH_MAX];
+
+    if (!ts_mkdtemp_trusted(shim_dir, size,
+                            "gitswitch-ar04-life-shims")) return -1;
+    /* This suite owns account lifecycle semantics. Interpreted executable
+     * descriptor coverage belongs to test_ar07_exec_trust, so use native
+     * copies here and avoid coupling these fixtures to /dev/fd availability.
+     * Pin Git into the same private PATH as well: hosted arm64 macOS installs
+     * it under /opt/homebrew, which the deliberately narrow child PATH omits. */
+    if (find_fixture_executable("true", true_path, sizeof(true_path)) != 0 ||
+        find_fixture_executable("git", git_path, sizeof(git_path)) != 0) {
+        return -1;
+    }
     snprintf(path, sizeof(path), "%s/gpg", shim_dir);
-    if (write_text(path, "#!/bin/sh\nexit 0\n", 0700) != 0) return -1;
+    if (copy_executable(true_path, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/gpgconf", shim_dir);
-    return write_text(path, "#!/bin/sh\nexit 0\n", 0700);
+    if (copy_executable(true_path, path) != 0) return -1;
+    snprintf(path, sizeof(path), "%s/git", shim_dir);
+    return copy_executable(git_path, path);
 }
 
 static int run_edit(const char *home, const char *runtime, const char *shim_dir,
@@ -161,7 +255,7 @@ TEST(active_live_field_edits_are_rejected_without_mutation) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     snprintf(key, sizeof(key), "%s/new-key", runtime);
     CHECK_EQ_INT(write_text(key,
                             "-----BEGIN OPENSSH PRIVATE KEY-----\n"
@@ -237,7 +331,7 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     snprintf(output, sizeof(output), "%s/edit.out", runtime);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
 
@@ -334,7 +428,10 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"renamed\"") != NULL);
     CHECK(strstr(contents, "email = \"new@example.com\"") != NULL);
-    CHECK(strstr(contents, "active_account = \"other\"") != NULL);
+    CHECK(strstr(contents, "active_account") == NULL);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
+    slurp(path, contents, sizeof(contents));
+    CHECK_STR_EQ(contents, "none\nactive=other\n");
 
     CHECK_EQ_INT(prepare_home(home, inactive_config), 0);
     snprintf(key, sizeof(key), "%s/inactive-key", runtime);
@@ -375,7 +472,7 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
 
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
@@ -467,7 +564,7 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(join_path(key_path, sizeof(key_path), runtime, "/retry-key"), 0);
     snprintf(cmd, sizeof(cmd),
              "PATH='/usr/bin:/bin:/usr/local/bin' ssh-keygen -q -t ed25519 "
@@ -578,7 +675,7 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
     snprintf(target, sizeof(target), "%s/foreign-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(target), 0);
@@ -609,7 +706,7 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
      * the account remains so the next remove/reset can retry. */
     remove_tree(runtime);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
@@ -654,7 +751,7 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(prepare_shims(runtime, shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, body), 0);
 
     /* Give the active account real stable entry points. Removing the inactive
@@ -679,7 +776,10 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"work\"") == NULL);
-    CHECK(strstr(contents, "active_account = \"other\"") != NULL);
+    CHECK(strstr(contents, "active_account") == NULL);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
+    slurp(path, contents, sizeof(contents));
+    CHECK_STR_EQ(contents, "none\nactive=other\n");
     link_len = readlink(ssh_current, link_target, sizeof(link_target) - 1);
     CHECK(link_len > 0);
     if (link_len > 0) {

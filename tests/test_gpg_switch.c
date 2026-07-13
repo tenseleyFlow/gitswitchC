@@ -38,8 +38,10 @@
 #include <time.h>
 #include <unistd.h>
 
-/* A real `sec` line whose capability field (12) contains 's'. */
-#define SEC_SIGN "sec:-:4096:1:FEEDFACE01234567:1700000000:::-:::scESC:::+:::23::0:\n"
+/* A real `sec` record plus its canonical primary fingerprint. */
+#define SEC_SIGN \
+    "sec:-:4096:1:FEEDFACE01234567:1700000000:::-:::scESC:::+:::23::0:\n" \
+    "fpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:\n"
 
 static int g_gpg_execs;
 static const char *env_lookup(const char *const *envp, const char *prefix);
@@ -278,9 +280,10 @@ TEST(isolated_switch_fails_when_current_cannot_be_retargeted) {
 
 static bool g_import_ran;
 
-/* Key absent from every keyring; the export "succeeds" but overflows the
- * capture (out_truncated) — exactly what a multi-subkey RSA-4096 armor did to
- * the old fixed 8 KB buffer. The import must never see those bytes. */
+/* Key absent from the isolated home but canonically resolved in the source;
+ * the export then "succeeds" while overflowing the capture (out_truncated) —
+ * exactly what a multi-subkey RSA-4096 armor did to the old fixed 8 KB buffer.
+ * The import must never see those bytes. */
 static int truncating_export_runner(const char *const argv[],
                                     const run_opts_t *opts,
                                     run_result_t *result) {
@@ -315,8 +318,13 @@ static int truncating_export_runner(const char *const argv[],
         return 0;
     }
     if (is_listing) {
+        if (!(opts && opts->use_cwd_fd) && opts && opts->out) {
+            snprintf(opts->out, opts->out_size, "%s", SEC_SIGN);
+            if (result) result->out_len = strlen(opts->out);
+            return 0; /* canonical source inventory */
+        }
         if (result) result->exit_code = 2;
-        return -1; /* key present nowhere */
+        return -1; /* absent from the isolated home */
     }
     return 0; /* gpgconf etc. */
 }
@@ -357,8 +365,8 @@ TEST(truncated_secret_key_export_is_never_imported) {
 /* ---- AR-03 T2: the first-time import's DIRECTION is pinned --------------- */
 
 /* The whole point of the export/import pair is directional: export reads the
- * SYSTEM keyring (no GNUPGHOME override — stock env), import writes the
- * ISOLATED home (GNUPGHOME=<base>/<account>). Before this test, neutering the
+ * SYSTEM keyring (an explicit real-home GNUPGHOME), import writes the ISOLATED
+ * home (GNUPGHOME=<base>/<account>). Before this test, neutering the
  * import's gpg_build_env/extra_env plumbing — so the decrypted secret key
  * lands in the user's persistent ~/.gnupg instead of the memory-backed
  * isolated home — passed the entire suite. */
@@ -412,8 +420,15 @@ static int import_flow_runner(const char *const argv[], const run_opts_t *opts,
         }
     }
     if (is_listing) {
+        if (!(opts && opts->use_cwd_fd) || g_imp_import_count > 0) {
+            if (opts && opts->out) {
+                snprintf(opts->out, opts->out_size, "%s", SEC_SIGN);
+                if (result) result->out_len = strlen(opts->out);
+            }
+            return 0; /* source resolution or post-import validation */
+        }
         if (result) result->exit_code = 2;
-        return -1; /* not in the isolated home: forces the export/import path */
+        return -1; /* first pinned probe forces the export/import path */
     }
     if (is_export) {
         const char *egh = env_lookup(opts ? opts->extra_env : NULL, "GNUPGHOME=");
@@ -705,8 +720,9 @@ TEST(inherited_readonly_agent_config_is_installed_atomically_at_0600) {
  * same-uid swap to a FIFO in that gap must be rejected without waiting for a
  * writer; O_NOFOLLOW alone does not make FIFO open nonblocking. */
 TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
-    char xdg[128], source_home[256], installed[MAX_PATH_LEN];
-    char original[128];
+    char xdg[128], source_home[256], canonical_source_home[MAX_PATH_LEN];
+    char installed[MAX_PATH_LEN];
+    char original[128] = "";
     gpg_config_t cfg;
     account_t acct;
     pid_t pid;
@@ -718,11 +734,16 @@ TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
     CHECK(ts_mkdtemp(xdg) != NULL);
     CHECK_EQ_INT(chmod(xdg, 0700), 0);
     snprintf(source_home, sizeof(source_home), "%s/user-gnupg", xdg);
-    snprintf(g_fifo_source, sizeof(g_fifo_source), "%s/gpg-agent.conf",
-             source_home);
-    snprintf(g_fifo_backup, sizeof(g_fifo_backup), "%s/gpg-agent.conf.old",
-             source_home);
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    if (!realpath(source_home, canonical_source_home)) {
+        CHECK(false);
+        return;
+    }
+    CHECK_EQ_INT(safe_snprintf(g_fifo_source, sizeof(g_fifo_source),
+                               "%s/gpg-agent.conf", canonical_source_home), 0);
+    CHECK_EQ_INT(safe_snprintf(g_fifo_backup, sizeof(g_fifo_backup),
+                               "%s/gpg-agent.conf.old",
+                               canonical_source_home), 0);
     CHECK_EQ_INT(write_string_to_file(g_fifo_source, "cache-ttl 77\n", 0600), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
@@ -989,6 +1010,7 @@ TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap) {
     char one[320], two[320], three[320], external[320];
     char snapshot[MAX_PATH_LEN], target[MAX_PATH_LEN];
     struct stat st;
+    gpg_config_t rollback = {0};
     bool present = false;
     bool changed = false;
     bool live = false;
@@ -1022,13 +1044,15 @@ TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap) {
      * `one` must report a conflict and preserve that later state. */
     CHECK_EQ_INT(gpg_manager_retarget_current(two), 0);
     changed = true;
-    CHECK_EQ_INT(gpg_manager_restore_current_if(one, three, &changed), 0);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&rollback, one, three,
+                                                &changed), 0);
     CHECK(!changed);
     CHECK_EQ_INT(read_link_target(current, target, sizeof(target)), 0);
     CHECK_STR_EQ(target, two);
 
     /* Positive restore: the exact expected state is atomically replaced. */
-    CHECK_EQ_INT(gpg_manager_restore_current_if(two, one, &changed), 0);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&rollback, two, one,
+                                                &changed), 0);
     CHECK(changed);
     CHECK_EQ_INT(read_link_target(current, target, sizeof(target)), 0);
     CHECK_STR_EQ(target, one);
@@ -1036,18 +1060,21 @@ TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap) {
     /* Both the destination and the observed current state must remain exact
      * managed children; an external directory is never accepted by basename. */
     changed = true;
-    CHECK_EQ_INT(gpg_manager_restore_current_if(one, external, &changed), -1);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&rollback, one, external,
+                                                &changed), -1);
     CHECK(!changed);
     CHECK_EQ_INT(read_link_target(current, target, sizeof(target)), 0);
     CHECK_STR_EQ(target, one);
 
-    CHECK_EQ_INT(gpg_manager_restore_current_if(one, NULL, &changed), 0);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&rollback, one, NULL,
+                                                &changed), 0);
     CHECK(changed);
     CHECK(lstat(current, &st) != 0 && errno == ENOENT);
     present = true;
     CHECK_EQ_INT(gpg_manager_snapshot_current(snapshot, sizeof(snapshot), &present), 0);
     CHECK(!present);
-    CHECK_EQ_INT(gpg_manager_restore_current_if(NULL, two, &changed), 0);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&rollback, NULL, two,
+                                                &changed), 0);
     CHECK(changed);
     CHECK_EQ_INT(read_link_target(current, target, sizeof(target)), 0);
     CHECK_STR_EQ(target, two);
@@ -1061,7 +1088,8 @@ TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap) {
     CHECK(!present);
     CHECK_EQ_INT(gpg_manager_current_is_live_for_account("one", &live), -1);
     changed = true;
-    CHECK_EQ_INT(gpg_manager_restore_current_if(two, one, &changed), -1);
+    CHECK_EQ_INT(gpg_manager_restore_current_if(&rollback, two, one,
+                                                &changed), -1);
     CHECK(!changed);
 }
 
@@ -1121,7 +1149,9 @@ TEST(gpg_current_snapshot_blocks_on_base_lock) {
 /* ---- AR-03 L4: a truncated colons capture is inconclusive ---------------- */
 
 /* Primary that only certifies — no 's' anywhere in the visible capture. */
-#define SEC_CERT_ONLY "sec:-:255:22:1111111111111111:1700000000:::-:::cC:::+:::ed25519::\n"
+#define SEC_CERT_ONLY \
+    "sec:-:255:22:1111111111111111:1700000000:::-:::cC:::+:::ed25519::\n" \
+    "fpr:::::::::1111111111111111111111111111111111111111:\n"
 
 static int  g_l4_listings;
 static bool g_l4_first_truncated;

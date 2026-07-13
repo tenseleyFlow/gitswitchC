@@ -212,6 +212,11 @@ static const char *gpg_only_config(const char *scope, char *buf, size_t size) {
     return buf;
 }
 
+static int write_legacy_gpg_config(const char *home, const char *scope,
+                                   char *buf, size_t size) {
+    return write_config(home, gpg_only_config(scope, buf, size));
+}
+
 /* A GPG-only account whose isolated home is live this boot (GNUPGHOME `current`
  * symlink resolves to <base>/<name>): `resume` must be a silent success no-op —
  * no restore notice, no switch attempt. This is the F2 acceptance case: the
@@ -226,7 +231,7 @@ TEST(resume_gpg_only_noops_silently_when_state_live) {
         CHECK(!"mkdtemp failed");
         return;
     }
-    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+    CHECK_EQ_INT(write_legacy_gpg_config(home, "global", cfg, sizeof(cfg)), 0);
 
     /* Simulate a completed switch this boot: isolated home + current symlink. */
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", rt);
@@ -265,7 +270,7 @@ TEST(resume_gpg_only_attempts_restore_after_boot_wipe) {
         CHECK(!"mkdtemp failed");
         return;
     }
-    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+    CHECK_EQ_INT(write_legacy_gpg_config(home, "global", cfg, sizeof(cfg)), 0);
 
     snprintf(err_path, sizeof(err_path), "%s/resume.err", rt);
     snprintf(cmd, sizeof(cmd),
@@ -294,7 +299,7 @@ TEST(resume_gpg_only_restores_when_current_points_at_other_account) {
         CHECK(!"mkdtemp failed");
         return;
     }
-    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+    CHECK_EQ_INT(write_legacy_gpg_config(home, "global", cfg, sizeof(cfg)), 0);
 
     /* `current` resolves to a REAL isolated home — but a different account's. */
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", rt);
@@ -332,7 +337,7 @@ TEST(resume_gpg_only_restores_when_same_basename_is_external) {
         CHECK(!"mkdtemp failed");
         return;
     }
-    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+    CHECK_EQ_INT(write_legacy_gpg_config(home, "global", cfg, sizeof(cfg)), 0);
 
     snprintf(target, sizeof(target), "%s/gpgonly", external);
     CHECK_EQ_INT(mkdir(target, 0700), 0);
@@ -363,7 +368,7 @@ TEST(resume_gpg_only_restores_when_current_dangles) {
         CHECK(!"mkdtemp failed");
         return;
     }
-    CHECK_EQ_INT(write_config(home, gpg_only_config("global", cfg, sizeof(cfg))), 0);
+    CHECK_EQ_INT(write_legacy_gpg_config(home, "global", cfg, sizeof(cfg)), 0);
 
     /* `current` names this account's home, but the home is GONE — the state
      * `gitswitch reset gpgonly` leaves behind. */
@@ -404,7 +409,7 @@ TEST(resume_never_blocks_reading_stdin) {
         CHECK(!"mkdtemp failed");
         return;
     }
-    CHECK_EQ_INT(write_config(home, gpg_only_config("local", cfg, sizeof(cfg))), 0);
+    CHECK_EQ_INT(write_legacy_gpg_config(home, "local", cfg, sizeof(cfg)), 0);
 
     master = posix_openpt(O_RDWR | O_NOCTTY);
     if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0 ||
@@ -996,9 +1001,9 @@ TEST(add_reprompts_email_at_exact_length_bound) {
 /* ---------- AR-03 T4: resume-hint writer end-to-end ---------- */
 
 /* A -y switch to an identity-only account must leave .resume-hint with the
- * exact content "none\n" (the snippet's no-probe arm), and a -y reset must
- * remove the marker AND the persisted active_account — pre-fix reset touched
- * neither, so every later login shell auto-resumed (re-created agents,
+ * exact needs token plus active identity, and a -y reset must remove that
+ * consolidated state artifact — pre-fix reset touched neither, so every
+ * later login shell auto-resumed (re-created agents,
  * re-imported GPG keys for) the state the user had just torn down. */
 TEST(switch_writes_resume_hint_and_reset_clears_it) {
     char home[256], rt[256], cmd[16384], hint[4352], toml_path[4352];
@@ -1029,19 +1034,21 @@ TEST(switch_writes_resume_hint_and_reset_clears_it) {
 
     /* Exact content: the shell snippet string-matches on it. */
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "none\n");
+    CHECK_STR_EQ(buf, "none\nactive=solo\n");
     slurp(toml_path, buf, sizeof(buf));
-    CHECK(strstr(buf, "active_account = \"solo\"") != NULL);
+    CHECK(strstr(buf, "active_account") == NULL);
 
-    /* Reset (full): marker gone, active_account cleared. */
+    /* Reset: consolidated state is explicitly inactive; accounts.toml remains
+     * state-free. */
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y reset >/dev/null 2>&1",
              home, rt, g_bin);
     rc = run_shell(cmd);
     CHECK_EQ_INT(rc, 0);
-    CHECK(access(hint, F_OK) != 0);                       /* pre-fix: stale marker */
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "none\ninactive=v1\n");
     slurp(toml_path, buf, sizeof(buf));
-    CHECK(strstr(buf, "active_account = \"solo\"") == NULL); /* pre-fix: still "solo" */
+    CHECK(strstr(buf, "active_account") == NULL);
 
     remove_tree(home);
     remove_tree(rt);
@@ -1058,7 +1065,7 @@ TEST(switch_writes_resume_hint_and_reset_clears_it) {
  * the unrecognized one was erased by any completed save). */
 TEST(partial_load_blocks_add_but_switch_persists_active) {
     char home[256], rt[256], cmd[16384], stdin_path[4352], out_path[4352];
-    char toml_path[4352], buf[8192], cfg[2048], longname[300];
+    char toml_path[4352], hint[4352], buf[8192], cfg[2048], longname[300];
     int rc;
 
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
@@ -1086,6 +1093,7 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
              longname);
     CHECK_EQ_INT(write_config(home, cfg), 0);
     snprintf(toml_path, sizeof(toml_path), "%s/.config/gitswitch/accounts.toml", home);
+    snprintf(hint, sizeof(hint), "%s/.config/gitswitch/.resume-hint", home);
 
     /* add: refused before any prompt is consumed, nonzero exit. */
     CHECK_EQ_INT(write_stdin_script(rt,
@@ -1107,17 +1115,19 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
     slurp(toml_path, buf, sizeof(buf));
     CHECK(strstr(buf, "\"good\"") != NULL);        /* nothing was rewritten */
 
-    /* switch: succeeds AND persists active_account without touching the
-     * skipped/unknown sections. */
+    /* switch: succeeds AND persists consolidated state without touching the
+     * skipped/unknown sections or accounts.toml bytes. */
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -y good </dev/null >/dev/null 2>&1",
              home, rt, g_bin);
     rc = run_shell(cmd);
     CHECK_EQ_INT(rc, 0);
     slurp(toml_path, buf, sizeof(buf));
-    CHECK(strstr(buf, "active_account = \"good\"") != NULL); /* pre-fix: absent */
+    CHECK(strstr(buf, "active_account") == NULL);
     CHECK(strstr(buf, longname) != NULL);                    /* skipped intact */
     CHECK(strstr(buf, "[account.3]") != NULL);               /* unknown intact (M8) */
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "none\nactive=good\n");
 
     remove_tree(home);
     remove_tree(rt);

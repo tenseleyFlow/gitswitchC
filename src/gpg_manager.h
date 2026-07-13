@@ -5,6 +5,7 @@
 
 #include "gitswitch.h"
 #include <dirent.h>
+#include <sys/stat.h>
 
 /* GPG management modes */
 typedef enum {
@@ -13,13 +14,55 @@ typedef enum {
     GPG_MODE_SHARED        /* Shared GNUPGHOME with key switching */
 } gpg_mode_t;
 
+/* Keep manager identities on the shared account/Git key-ID contract. */
+#define GPG_FINGERPRINT_BUFSIZE MAX_GPG_FINGERPRINT_LEN
+#define GPG_QUARANTINE_NAME_LEN 96
+
+typedef struct {
+    struct stat st;
+    char target[MAX_PATH_LEN];
+    bool valid;
+} gpg_link_identity_t;
+
+typedef enum {
+    GPG_ROLLBACK_NONE,
+    GPG_ROLLBACK_EXPECTED_CURRENT,
+    GPG_ROLLBACK_OWNED_QUARANTINED,
+    GPG_ROLLBACK_FOREIGN_QUARANTINED,
+    GPG_ROLLBACK_PUBLIC_DONE
+} gpg_rollback_phase_t;
+
+typedef struct {
+    gpg_rollback_phase_t phase;
+    gpg_link_identity_t published;
+    gpg_link_identity_t quarantined;
+    gpg_link_identity_t final_link;
+    bool final_state_valid;
+    bool final_present;
+    bool restore_present;
+    char restore_target[MAX_PATH_LEN];
+    char quarantine[GPG_QUARANTINE_NAME_LEN];
+    bool conflict;
+} gpg_rollback_token_t;
+
 /* GPG configuration structure */
 typedef struct {
     gpg_mode_t mode;
     char gnupg_home[MAX_PATH_LEN];    /* GNUPGHOME path */
-    char current_key_id[MAX_KEY_ID_LEN];
+    char current_key_id[GPG_FINGERPRINT_BUFSIZE];
     bool signing_enabled;
     bool home_owned;       /* Whether we created this GNUPGHOME */
+
+    /* Transaction metadata is deliberately retained until cleanup succeeds.
+     * This makes an environment or runtime rollback failure observable and
+     * retryable rather than erasing evidence of a partially committed switch. */
+    char previous_gnupg_home[MAX_PATH_LEN];
+    bool previous_gnupg_home_present;
+    bool environment_installed;
+    gpg_link_identity_t published_link;
+    bool published_link_valid;
+    gpg_rollback_token_t rollback;
+    bool runtime_restore_pending;
 } gpg_config_t;
 
 /* Narrow dependency seams for deterministic filesystem-race/error tests. The
@@ -29,6 +72,31 @@ typedef void (*gpg_agent_conf_preopen_fn)(const char *path);
 typedef int (*gpg_agent_conf_precommit_fn)(int home_fd,
                                             const char *temp_name);
 typedef int (*gpg_retarget_commit_hook_fn)(int base_fd);
+typedef int (*gpg_retarget_restore_hook_fn)(int base_fd);
+typedef enum {
+    GPG_ROLLBACK_HOOK_BEFORE_QUARANTINE,
+    GPG_ROLLBACK_HOOK_AFTER_QUARANTINE,
+    GPG_ROLLBACK_HOOK_BEFORE_QUARANTINE_UNLINK
+} gpg_rollback_hook_stage_t;
+typedef int (*gpg_rollback_hook_fn)(int base_fd,
+                                    gpg_rollback_hook_stage_t stage,
+                                    const char *quarantine);
+typedef int (*gpg_sync_base_fn)(int base_fd);
+typedef int (*gpg_rename_noreplace_fn)(int old_dir_fd, const char *old_name,
+                                       int new_dir_fd, const char *new_name);
+typedef int (*gpg_setenv_fn)(const char *name, const char *value,
+                             int overwrite);
+typedef int (*gpg_unsetenv_fn)(const char *name);
+/* Test seams around reset's two-pass cleanup. The predelete hook runs only
+ * after the complete home has passed its second validation and immediately
+ * before destructive traversal. The final hook runs after an all-home reset
+ * has removed `current` and immediately before the required final base scan. */
+typedef int (*gpg_cleanup_predelete_fn)(int home_fd);
+typedef int (*gpg_reset_final_hook_fn)(int base_fd);
+/* Deterministic mount-identity and managed-writer durability seams. NULL
+ * restores the native statx/fsid and fsync implementations. */
+typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
+typedef int (*gpg_agent_conf_sync_fn)(int fd, bool directory);
 gpg_readdir_fn gpg_manager_set_readdir_fn(gpg_readdir_fn fn);
 gpg_agent_conf_preopen_fn
 gpg_manager_set_agent_conf_preopen_fn(gpg_agent_conf_preopen_fn fn);
@@ -36,6 +104,29 @@ gpg_agent_conf_precommit_fn
 gpg_manager_set_agent_conf_precommit_fn(gpg_agent_conf_precommit_fn fn);
 gpg_retarget_commit_hook_fn
 gpg_manager_set_retarget_commit_hook_fn(gpg_retarget_commit_hook_fn fn);
+gpg_retarget_restore_hook_fn
+gpg_manager_set_retarget_restore_hook_fn(gpg_retarget_restore_hook_fn fn);
+gpg_rollback_hook_fn
+gpg_manager_set_rollback_hook_fn(gpg_rollback_hook_fn fn);
+gpg_sync_base_fn gpg_manager_set_sync_base_fn(gpg_sync_base_fn fn);
+gpg_rename_noreplace_fn
+gpg_manager_set_rename_noreplace_fn(gpg_rename_noreplace_fn fn);
+gpg_setenv_fn gpg_manager_set_setenv_fn(gpg_setenv_fn fn);
+gpg_unsetenv_fn gpg_manager_set_unsetenv_fn(gpg_unsetenv_fn fn);
+gpg_cleanup_predelete_fn
+gpg_manager_set_cleanup_predelete_fn(gpg_cleanup_predelete_fn fn);
+gpg_reset_final_hook_fn
+gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn);
+gpg_mount_identity_probe_fn
+gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
+gpg_agent_conf_sync_fn
+gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
+
+/* Focused verification entry point for the otherwise-internal managed writer.
+ * It preserves the switch's existing best-effort policy while allowing tests
+ * to assert the writer's own sync-error return contract directly. */
+int gpg_manager_setup_agent_config_for_test(int home_fd,
+                                            const char *gnupg_home);
 
 /* Function prototypes */
 
@@ -44,10 +135,10 @@ gpg_manager_set_retarget_commit_hook_fn(gpg_retarget_commit_hook_fn fn);
  */
 int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode);
 
-/**
- * Cleanup GPG manager
- */
-void gpg_manager_cleanup(gpg_config_t *gpg_config);
+/** Restore manager-owned environment/runtime retry state, then clear the
+ * configuration. Returns -1 without clearing retry metadata if restoration
+ * fails. */
+int gpg_manager_cleanup(gpg_config_t *gpg_config);
 
 /**
  * Switch to account's GPG configuration with proper isolation
@@ -96,10 +187,21 @@ int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id);
 /* AR-06 F61: gpg_generate_key() was removed — dead public API with zero
  * callers. */
 
-/**
- * Set environment variables for GPG operation
- */
-int gpg_set_environment(const gpg_config_t *gpg_config);
+/** Install GNUPGHOME transactionally and retain its previous value for
+ * gpg_manager_cleanup(). */
+int gpg_set_environment(gpg_config_t *gpg_config);
+
+/** Return whether a failed switch still owns a published runtime entry point
+ * that must be restored before the transaction can be forgotten. */
+bool gpg_manager_runtime_restore_pending(const gpg_config_t *gpg_config);
+
+/** Strict parser used by the switch and exposed for mutation-sensitive colon
+ * record tests. Resolves exactly one usable primary secret key, writes its
+ * canonical fingerprint, and optionally requires a usable signing record. */
+int gpg_manager_resolve_secret_key_listing(const char *listing,
+                                           bool require_signing,
+                                           char *fingerprint,
+                                           size_t fingerprint_size);
 
 /**
  * Compute the stable GNUPGHOME path (a `current` symlink under the isolated
@@ -136,7 +238,10 @@ int gpg_manager_system_keyring_home(char *buf, size_t size);
  * homes, removing the on-disk secret-key copies). Deletion is unlink, not a
  * secure overwrite: on the default memory-backed storage that destroys the
  * bytes, but on the GITSWITCH_ALLOW_TMP_GPG non-tmpfs opt-in path they may
- * remain forensically recoverable (AR-02 #26). Resets a single account when
+ * remain forensically recoverable (AR-02 #26). Cleanup fails closed and keeps
+ * the affected home when it cannot prove one mount boundary and one link per
+ * non-directory entry. A full reset also rejects unknown base entries and
+ * verifies that only its exact lock survives. Resets a single account when
  * `account` is non-NULL, or all accounts when NULL. Returns 0 on success.
  */
 int gpg_manager_reset(const char *account);
@@ -180,13 +285,16 @@ int gpg_manager_current_is_live_for_account(const char *account, bool *live);
 
 /**
  * Compare and conditionally restore the stable target while holding the same
- * manager lock. NULL/empty `expected_target` means the link is expected to be
- * absent; NULL/empty `restore_target` means remove it. A compare conflict is
- * ordinary success with `*changed == false` and leaves the later writer's
- * state untouched. A match completes the requested restore and sets
- * `*changed == true`; unsafe/unmanaged state fails closed.
+ * manager lock. `gpg_config` carries the exact symlink inode+target installed
+ * by the forward transaction; `expected_target` is an additional spelling
+ * assertion for legacy/direct callers and may be NULL only when the retained
+ * identity is valid. NULL/empty `restore_target` means remove it. A compare
+ * conflict is ordinary success with `*changed == false` and preserves the later
+ * writer. Native no-replace quarantine or durability uncertainty returns -1
+ * with retry state retained in `gpg_config`.
  */
-int gpg_manager_restore_current_if(const char *expected_target,
+int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
+                                   const char *expected_target,
                                    const char *restore_target,
                                    bool *changed);
 

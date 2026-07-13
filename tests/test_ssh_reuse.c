@@ -709,6 +709,7 @@ TEST(host_alias_write_rejects_newline_key_path) {
     memset(&acct, 0, sizeof(acct));
     acct.ssh_enabled = true;
     snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), "github.com-work");
+    snprintf(acct.ssh_hostname, sizeof(acct.ssh_hostname), "github.com");
     snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path),
              "%s/key\nProxyCommand touch PWNED", home);
 
@@ -768,6 +769,7 @@ TEST(host_alias_removal_excises_only_named_block) {
     memset(&work, 0, sizeof(work));
     work.ssh_enabled = true;
     snprintf(work.ssh_host_alias, sizeof(work.ssh_host_alias), "github.com-work");
+    snprintf(work.ssh_hostname, sizeof(work.ssh_hostname), "github.com");
     snprintf(work.ssh_key_path, sizeof(work.ssh_key_path), "%s/key_work", home);
     CHECK_EQ_INT(ssh_configure_host_alias(&work), 0);
 
@@ -775,6 +777,7 @@ TEST(host_alias_removal_excises_only_named_block) {
     personal.ssh_enabled = true;
     snprintf(personal.ssh_host_alias, sizeof(personal.ssh_host_alias),
              "github.com-personal");
+    snprintf(personal.ssh_hostname, sizeof(personal.ssh_hostname), "github.com");
     snprintf(personal.ssh_key_path, sizeof(personal.ssh_key_path),
              "%s/key_personal", home);
     CHECK_EQ_INT(ssh_configure_host_alias(&personal), 0);
@@ -836,6 +839,7 @@ TEST(host_alias_handles_config_larger_than_64k) {
     memset(&acct, 0, sizeof(acct));
     acct.ssh_enabled = true;
     snprintf(acct.ssh_host_alias, sizeof(acct.ssh_host_alias), "github.com-big");
+    snprintf(acct.ssh_hostname, sizeof(acct.ssh_hostname), "github.com");
     snprintf(acct.ssh_key_path, sizeof(acct.ssh_key_path), "%s/key_big", home);
 
     /* Pre-fix this returned -1 ("SSH config too large to update safely"). */

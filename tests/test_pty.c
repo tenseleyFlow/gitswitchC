@@ -118,7 +118,9 @@ static int sandbox_setup(sandbox_t *sb) {
     }
 
     snprintf(path, sizeof(path), "%s/key_ed25519", sb->home);
-    if (write_file_mode(path, "dummy-ssh-key\n", 0600) != 0) return -1;
+    if (write_file_mode(path,
+                        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                        0600) != 0) return -1;
 
     snprintf(path, sizeof(path), "%s/.config", sb->home);
     if (mkdir(path, 0700) != 0) return -1;
@@ -562,7 +564,9 @@ TEST(ssh_key_path_tab_completion_and_inhibition) {
 
     /* Unique completion target in the child's CWD ($HOME). */
     snprintf(path, sizeof(path), "%s/zzuniq_target_rsa", sb.home);
-    CHECK_EQ_INT(write_file_mode(path, "dummy\n", 0600), 0);
+    CHECK_EQ_INT(write_file_mode(path,
+                                 "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                                 0600), 0);
 
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
 

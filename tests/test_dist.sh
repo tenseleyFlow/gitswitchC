@@ -52,7 +52,19 @@ git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checko
 checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
 [ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-distcheck.XXXXXX")
+# The executable-trust boundary rejects every helper below sticky /tmp even
+# when a deeper mktemp leaf is 0700.  Distcheck builds and runs every test
+# binary from its extraction tree, and several suites deliberately re-exec
+# their own binary; putting that tree under /tmp would make a valid production
+# rejection look like a test failure.  Use the operator's private HOME
+# ancestry intentionally (not TMPDIR, whose conventional default is /tmp).
+case ${HOME-} in
+    /*) ;;
+    *) fail "distcheck requires an absolute HOME for its trusted build root" ;;
+esac
+[ -d "$HOME" ] || fail "HOME is not a directory: $HOME"
+tmp=$(mktemp -d "$HOME/.gitswitch-distcheck.XXXXXX")
+chmod 0700 "$tmp" || fail "cannot make distcheck build root private"
 
 members=$tmp/archive-members.txt
 tar -tzf "$archive" >"$members"
@@ -90,6 +102,12 @@ done
 
 expected_version=$(sed -n '1p' "$source_root/VERSION")
 [ -n "$expected_version" ] || fail "VERSION is empty"
+[ "$dist_root" = "gitswitcher-$expected_version" ] ||
+    fail "archive root $dist_root disagrees with VERSION $expected_version"
+spec_version=$(sed -n 's/^Version:[[:space:]]*//p' \
+    "$source_root/gitswitcher.spec" | sed -n '1p')
+[ "$spec_version" = "$expected_version" ] ||
+    fail "RPM spec Version $spec_version disagrees with VERSION $expected_version"
 
 "$make_cmd" -C "$source_root" BUILD_TYPE=debug test
 
@@ -104,26 +122,7 @@ done
 "$make_cmd" -C "$source_root" clean
 "$make_cmd" -C "$source_root" BUILD_TYPE=release all
 
-# AR-05 L9: assert the hardening properties the Makefile claims. PIE and
-# RELRO/NOW were previously inherited from the host toolchain's defaults with
-# no post-build check, so a non-default-PIE compiler could ship an
-# ASLR-defeating binary with QA green.
 release_bin=$source_root/build/bin/gitswitch
-if command -v readelf >/dev/null 2>&1; then
-    readelf -h "$release_bin" | grep -Eq 'Type:[[:space:]]+DYN' ||
-        fail "release binary is not PIE (ET_DYN)"
-    readelf -d "$release_bin" | grep -Eq 'BIND_NOW|FLAGS(_1)?.*\bNOW\b' ||
-        fail "release binary lacks BIND_NOW"
-    readelf -l "$release_bin" | grep -q 'GNU_RELRO' ||
-        fail "release binary lacks GNU_RELRO"
-    # -W: without wide mode readelf truncates long names to "[...]", hiding
-    # __stack_chk_fail entirely.
-    readelf -W --dyn-syms "$release_bin" | grep -q '__stack_chk_fail' ||
-        fail "release binary lacks stack-protector instrumentation"
-else
-    printf 'distcheck: readelf not available - hardening assertions skipped\n'
-fi
-
 version_output=$("$release_bin" --version)
 case $version_output in
     *" $expected_version ("*) ;;
@@ -140,6 +139,12 @@ stage=$tmp/stage
     fail "installed zsh completion missing"
 [ -f "$stage$prefix/share/fish/vendor_completions.d/gitswitch.fish" ] ||
     fail "installed fish completion missing"
+
+# Inspect both the exact release artifact and its byte-identical staged copy.
+# The helper selects native ELF checks on Linux/FreeBSD and Mach-O checks on
+# Darwin, so platform CI exercises the flags selected by that platform branch.
+sh "$source_root/tests/test_ar07_release.sh" artifact "$release_bin" \
+    "$stage$prefix/bin/gitswitch"
 
 # AR-05 L17: the H4 manifest fix exists because the source archive once could
 # not satisfy its own RPM spec (%install ran make install against missing
@@ -188,7 +193,41 @@ if command -v rpmbuild >/dev/null 2>&1; then
         printf '%s\n' "$payload" | grep -q -- "$want\$" ||
             fail "built RPM payload is missing $want"
     done
-    rpm_status="rpmbuild OK, payload verified"
+    requirements=$(rpm -qp --requires "$main_rpm" 2>/dev/null) ||
+        fail "cannot query runtime requirements of $main_rpm"
+    for required_command in /usr/bin/gpg /usr/bin/gpgconf; do
+        printf '%s\n' "$requirements" | grep -Fx "$required_command" >/dev/null ||
+            fail "built RPM does not require $required_command"
+    done
+
+    # Metadata presence alone does not prove RPM's transaction solver enforces
+    # these file requirements. Test-install into a deliberately empty root and
+    # require dependency resolution to reject the package while naming both
+    # missing commands. --test performs no installation.
+    rpm_root=$tmp/rpm-empty-root
+    rpm_db=/var/lib/rpm
+    mkdir -p "$rpm_root$rpm_db"
+    if ! rpm --root "$rpm_root" --dbpath "$rpm_db" --initdb \
+        >"$tmp/rpm-initdb.log" 2>&1; then
+        cat "$tmp/rpm-initdb.log" >&2
+        fail "cannot initialize isolated empty RPM database"
+    fi
+    if LC_ALL=C rpm --root "$rpm_root" --dbpath "$rpm_db" --test \
+        -i "$main_rpm" >"$tmp/rpm-transaction.log" 2>&1; then
+        fail "built RPM installed into an empty root despite runtime dependencies"
+    fi
+    grep -F 'Failed dependencies:' "$tmp/rpm-transaction.log" >/dev/null || {
+        cat "$tmp/rpm-transaction.log" >&2
+        fail "empty-root RPM transaction failed before dependency resolution"
+    }
+    for required_command in /usr/bin/gpg /usr/bin/gpgconf; do
+        grep -F "$required_command is needed by" \
+            "$tmp/rpm-transaction.log" >/dev/null || {
+            cat "$tmp/rpm-transaction.log" >&2
+            fail "empty-root transaction did not enforce $required_command"
+        }
+    done
+    rpm_status="rpmbuild OK, payload and enforced GPG dependencies verified"
 else
     printf 'distcheck: rpmbuild not available - RPM build skipped\n'
     rpm_status="rpmbuild skipped"

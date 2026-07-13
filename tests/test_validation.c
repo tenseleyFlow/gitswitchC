@@ -117,10 +117,26 @@ TEST(validate_key_id_is_hex_only) {
     CHECK(!validate_key_id(""));
     CHECK(!validate_key_id(NULL));
 
-    char toolong[MAX_KEY_ID_LEN + 2];
-    memset(toolong, 'A', sizeof(toolong) - 1);
-    toolong[sizeof(toolong) - 1] = '\0';
-    CHECK(!validate_key_id(toolong));
+    /* Pin the raw/prefixed v5 boundary: the optional prefix is selector syntax,
+     * not part of the canonical 64-digit fingerprint budget. */
+    char v5_fingerprint[MAX_GPG_FINGERPRINT_LEN];
+    char prefixed[MAX_GPG_SELECTOR_LEN];
+    char overlong[MAX_GPG_SELECTOR_LEN];
+    char overprefixed[MAX_GPG_SELECTOR_LEN + 1];
+    memset(v5_fingerprint, 'A', MAX_GPG_FINGERPRINT_LEN - 1);
+    v5_fingerprint[MAX_GPG_FINGERPRINT_LEN - 1] = '\0';
+    memset(overlong, 'A', 65);
+    overlong[65] = '\0';
+    CHECK_EQ_INT((int)strlen(v5_fingerprint), 64);
+    CHECK(validate_key_id(v5_fingerprint));
+    CHECK_EQ_INT(snprintf(prefixed, sizeof(prefixed), "0X%s",
+                          v5_fingerprint), 66);
+    CHECK(validate_key_id(prefixed));
+    CHECK_EQ_INT((int)strlen(overlong), 65);
+    CHECK(!validate_key_id(overlong));
+    CHECK_EQ_INT(snprintf(overprefixed, sizeof(overprefixed), "0x%s",
+                          overlong), 67);
+    CHECK(!validate_key_id(overprefixed));
 }
 
 TEST_MAIN_BEGIN()

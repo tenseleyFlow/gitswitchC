@@ -28,6 +28,9 @@
 char *trim_whitespace(char *str);
 bool string_empty(const char *str);
 bool string_equals(const char *a, const char *b);
+/* Locale-independent ASCII case folding for protocol/config identifiers whose
+ * admitted grammar is ASCII. */
+bool string_ascii_case_equal(const char *a, const char *b);
 bool string_starts_with(const char *str, const char *prefix);
 bool string_ends_with(const char *str, const char *suffix);
 int string_replace(char *str, size_t str_size, const char *old, const char *new);
@@ -55,10 +58,11 @@ int ensure_private_dir(const char *path);
 
 /**
  * Open and pin the runtime parent used by SSH/GPG state.  A configured
- * XDG_RUNTIME_DIR is accepted only when it is a real, self-owned private
- * directory; the returned descriptor names the validated inode even if its
- * pathname is subsequently renamed.  When XDG_RUNTIME_DIR is absent, /tmp is
- * opened as the parent for the uid-specific fallback directories.
+ * XDG_RUNTIME_DIR is accepted only when it is absolute and names a real,
+ * self-owned 0700 directory; the returned descriptor names the validated
+ * inode even if its pathname is subsequently renamed.  When XDG_RUNTIME_DIR
+ * is absent or empty, the system /tmp target is opened and the absolute /tmp
+ * spelling is returned for the uid-specific fallback directories.
  */
 int open_runtime_parent(char *path, size_t path_size);
 
@@ -92,6 +96,21 @@ void unlock_private_file(int token_fd);
 int runtime_state_lock_acquire(void);
 void runtime_state_lock_release(int fd);
 
+/* Test-only one-shot fault selector for the four release-time namespace
+ * probes. Production code leaves this at NONE. The hook exists because the
+ * two pinned fstat() calls cannot be made to fail through namespace mutation
+ * without corrupting an unrelated descriptor in the process. */
+typedef enum {
+    RUNTIME_LOCK_RELEASE_STAT_NONE = 0,
+    RUNTIME_LOCK_RELEASE_STAT_PINNED_PARENT,
+    RUNTIME_LOCK_RELEASE_STAT_NAMED_PARENT,
+    RUNTIME_LOCK_RELEASE_STAT_PINNED_DIRECTORY,
+    RUNTIME_LOCK_RELEASE_STAT_NAMED_DIRECTORY
+} runtime_lock_release_stat_probe_t;
+
+void runtime_lock_test_fail_release_stat(
+    runtime_lock_release_stat_probe_t probe, int system_errno);
+
 /**
  * Atomically (re)point a symlink: create a temp link to `target` then rename it
  * over `linkpath`, so a follower never observes a missing/half-updated link.
@@ -115,10 +134,20 @@ time_t get_file_mtime(const char *file_path);
 /**
  * Process utilities
  *
- * All external commands are run via run_argv(), which spawns a child with
- * execvp() and an explicit argv vector — NO shell is involved, so command
- * arguments (account names, key paths, etc.) can never be interpreted as shell
- * syntax. This is the structural defense against command injection.
+ * All external commands are run via run_argv(), which resolves a trusted,
+ * readable executable descriptor and uses descriptor execution where
+ * supported. Recognized native binaries execute directly. A script is
+ * accepted only with a bounded, well-formed shebang naming an absolute direct
+ * interpreter (never env); that interpreter is independently trust-walked,
+ * pinned, and required to be a recognized native binary. The script is passed
+ * through /proc/self/fd or /dev/fd after proving that mapping names the pinned
+ * inode, so platforms without that descriptor filesystem fail closed. On
+ * macOS, which lacks descriptor execution, the binary/interpreter pathname is
+ * descriptor-rewalked and exact-identity-proved immediately before execve.
+ * An explicit argv vector is always used: the runner never inserts a shell or
+ * interpolates caller arguments into a command string. A caller may still
+ * explicitly request a shell executable, in which case its argv is deliberate
+ * caller policy rather than runner-side interpretation.
  */
 
 /* Options for a single child invocation. Any field may be left zero/NULL. */
@@ -153,28 +182,77 @@ typedef int (*command_runner_fn)(const char *const argv[],
 /* Install a runner; returns the previous one (NULL means the default). */
 command_runner_fn run_set_runner(command_runner_fn fn);
 
-/* Run argv[0] (pinned to an absolute path via the sanitized PATH walk in
- * find_command_path, then execv'd), argv NULL-terminated, through the active
- * runner. Returns 0 iff the child spawned and exited 0. opts/result may be
- * NULL. If argv[0] cannot be resolved from a trusted directory, fails closed
- * before forking (result->spawned stays false). */
+/* Run argv[0] (opened through the sanitized PATH walk, format/shebang checked,
+ * then launched from a verified descriptor), argv NULL-terminated, through
+ * the active runner. Returns 0 iff the child spawned and exited 0. opts/result
+ * may be NULL. An untrusted path, unknown format, malformed/indirect shebang,
+ * recursive script interpreter, or unavailable script-descriptor filesystem
+ * fails closed; pre-fork rejection leaves result->spawned false. Child
+ * setup/exec failures, incomplete stdin delivery, subprocess pipe errors, and
+ * a capture pipe held open by descendants are runner failures even if the
+ * direct child exits 0. */
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result);
 
-/* The real fork+execv implementation; normally reached via run_argv(). */
+/* The real fork+verified-exec implementation; normally reached via run_argv(). */
 int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t *result);
+
+/* Test-only child-FD cleanup selector. Production code must leave this at
+ * RUN_TEST_FD_CLOSE_AUTO; the default is zero so normal behavior is unchanged.
+ * Forced strategies are strict: BULK reports a child setup failure if its
+ * primitive cannot run, and SNAPSHOT fails in the parent if enumeration was
+ * incomplete. AUTO alone may fall back to another safe cleanup method. */
+typedef enum {
+    RUN_TEST_FD_CLOSE_AUTO = 0,
+    RUN_TEST_FD_CLOSE_SNAPSHOT,
+    RUN_TEST_FD_CLOSE_NUMERIC,
+    RUN_TEST_FD_CLOSE_BULK
+} run_test_fd_close_strategy_t;
+
+typedef enum {
+    RUN_TEST_FD_METHOD_NONE = 0,
+    RUN_TEST_FD_METHOD_BULK,
+    RUN_TEST_FD_METHOD_SNAPSHOT,
+    RUN_TEST_FD_METHOD_NUMERIC
+} run_test_fd_close_method_t;
+
+typedef struct {
+    run_test_fd_close_method_t method;
+    uint64_t close_syscalls;
+} run_test_fd_close_observation_t;
+
+int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy);
+bool run_test_fd_close_bulk_supported(void);
+void run_test_set_fd_close_observation(bool enabled);
+bool run_test_get_fd_close_observation(run_test_fd_close_observation_t *out);
+void run_test_set_bulk_close_failure(int system_errno);
+
+/* Test-only deterministic race seam.  The callback runs in the parent after
+ * the helper file is verified and pinned but before fork; production leaves
+ * it NULL.  It lets regression tests replace/chmod the pathname and prove the
+ * child never reopens it. */
+typedef void (*run_test_exec_resolved_hook_fn)(const char *resolved_path);
+void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook);
 
 /* True if an executable named `command` is found in PATH. */
 bool command_exists(const char *command);
 
 /**
- * Resolve the absolute path of an executable by walking $PATH — no shell
- * involved. Supply-chain hardened (PS-1/PS-2): only absolute directories with
- * no group/other write bits may supply a binary (relative/"."/empty and
- * group/world-writable entries are skipped), and the resolved file must be a
- * regular executable with the same write-bit restriction. A `name` containing
- * a slash bypasses the PATH walk but must pass the same checks. Portable across
- * Linux, macOS, and the BSDs.
- * Returns 0 and writes the path into buf on success; -1 otherwise.
+ * Resolve the canonical absolute path of an executable by walking $PATH — no
+ * shell involved. Supply-chain hardened (PS-1/PS-2, AR-07 M28/M29): only
+ * absolute paths whose complete root-to-leaf ancestry is owned by root/the
+ * current user and has no group/other-writable or ACL-mutable directory may
+ * supply a file.
+ * The resolved leaf must be a root/current-user-owned regular file, have no
+ * group/other write bits or ACL mutation grants, and be both readable and
+ * executable through the caller's effective permission class. Execute-only
+ * leaves are deliberately rejected because their format/shebang cannot be
+ * validated safely. A final
+ * descriptor-relative X_OK probe also enforces ACL and noexec-mount policy,
+ * then is identity-sealed to the pinned leaf. Relative/"."/empty and unsafe
+ * entries are skipped. A `name` containing a slash bypasses the PATH search
+ * but not the checks. Every call reopens and revalidates the chain; positive
+ * pathnames are not cached across inode or metadata replacement. Returns 0
+ * and writes the canonical path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
 bool process_is_running(pid_t pid);
@@ -211,13 +289,14 @@ bool is_safe_ssh_key_path(const char *path);
  * the TOML parser's charset gate, so both layers apply the SAME strict
  * decoding policy — AR-02 #6).
  *
- * utf8_decode: decode one UTF-8 sequence starting at s, writing the codepoint
- * to *cp_out and returning the number of bytes consumed, or 0 if the sequence
- * is malformed. Deliberately strict: overlong encodings and surrogates are
+ * utf8_decode: decode one UTF-8 sequence starting at s, where available is the
+ * exact number of readable bytes, writing the codepoint to *cp_out and
+ * returning the number of bytes consumed, or 0 if the sequence is truncated
+ * or malformed. Deliberately strict: overlong encodings and surrogates are
  * rejected, because an overlong form (e.g. 0xE0 0x80 0x9B) is exactly how a
  * C1 terminal control sneaks past a naive byte filter into a lenient terminal
- * decoder. NUL and stray continuation bytes fail the (b & 0xC0) == 0x80 test,
- * so NUL-terminated strings need no length bound.
+ * decoder. Callers handling NUL-terminated text still pass their known
+ * remaining strlen so a truncated final sequence can never be over-read.
  *
  * tty_safe_codepoint: true if the codepoint is safe to echo to a terminal.
  * C0 controls (including ESC 0x1B and CR), DEL 0x7F, and C1 controls
@@ -225,7 +304,8 @@ bool is_safe_ssh_key_path(const char *path);
  * or \r-overwrite the line — enough for a hostile config field to render
  * itself as "[CURRENT] trusted-account" in list/status/whoami output.
  */
-size_t utf8_decode(const unsigned char *s, uint32_t *cp_out);
+size_t utf8_decode(const unsigned char *s, size_t available,
+                   uint32_t *cp_out);
 bool tty_safe_codepoint(uint32_t cp);
 
 /**

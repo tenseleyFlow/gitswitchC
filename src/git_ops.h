@@ -13,13 +13,45 @@
 #define GIT_CONFIG_GPG_PROGRAM "gpg.program"
 #define GIT_CONFIG_CORE_SSHCOMMAND "core.sshcommand"
 
+/* Largest managed value emitted by gitswitch. core.sshCommand contains two
+ * inputs shorter than MAX_PATH_LEN. A canonical executable can consist
+ * entirely of apostrophes, so POSIX single-quote serialization needs at most
+ * 4 * (MAX_PATH_LEN - 1) bytes for it. is_safe_ssh_key_path() rejects quotes,
+ * so its serialized key contributes at most MAX_PATH_LEN - 1 bytes. The 256
+ * bytes cover both pairs of quote delimiters, fixed options, and the NUL.
+ * Public status records and the scalar cache use this lossless capacity;
+ * transactional snapshots remain dynamically allocated for arbitrary foreign
+ * values. */
+#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN * 5 + 256)
+
+typedef enum {
+    GIT_CONFIG_ORIGIN_UNKNOWN = 0,
+    GIT_CONFIG_ORIGIN_SYSTEM,
+    GIT_CONFIG_ORIGIN_GLOBAL,
+    GIT_CONFIG_ORIGIN_LOCAL,
+    GIT_CONFIG_ORIGIN_WORKTREE,
+    GIT_CONFIG_ORIGIN_COMMAND
+} git_config_origin_scope_t;
+
+typedef struct {
+    char value[GIT_CONFIG_VALUE_MAX];
+    char origin[MAX_PATH_LEN];
+    git_config_origin_scope_t scope;
+    bool present;
+    bool value_unknown;
+} git_config_effective_value_t;
+
 /* Current git configuration */
 typedef struct {
     char name[MAX_NAME_LEN];
     char email[MAX_EMAIL_LEN];
-    char signing_key[MAX_KEY_ID_LEN];
+    char signing_key[MAX_GPG_FINGERPRINT_LEN];
     bool gpg_signing_enabled;
     git_scope_t scope;
+    git_config_origin_scope_t effective_name_scope;
+    char effective_name_origin[MAX_PATH_LEN];
+    git_config_effective_value_t ssh_command;
+    git_config_effective_value_t gpg_program;
     bool valid;
 } git_current_config_t;
 
@@ -51,6 +83,19 @@ int git_set_config(const account_t *account, git_scope_t scope);
  */
 int git_get_current_config(git_current_config_t *config);
 
+/** Return a stable display name for an effective Git configuration scope. */
+const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope);
+
+/**
+ * Build the exact core.sshCommand expected for an SSH-enabled account.
+ * This resolves `ssh` through the hardened executable trust walk, expands the
+ * key path, and serializes both absolute arguments safely. It does not require
+ * the key file to exist, so read-only status can compare persisted Git state
+ * without introducing a filesystem mutation.
+ */
+int git_expected_ssh_command(const account_t *account, char *command,
+                             size_t command_size);
+
 /**
  * Clear git configuration (unset values)
  */
@@ -59,15 +104,19 @@ int git_clear_config(git_scope_t scope);
 /**
  * Snapshot the gitswitch-managed config keys (user.name/email/signingkey,
  * commit.gpgsign, gpg.program, core.sshcommand) at `scope` before a switch
- * mutates them, plus the LOCAL scope when a global write would clear it. Pair
- * with git_config_restore() to roll back on a failed switch. Single snapshot
- * slot (the CLI is single-threaded); a new snapshot replaces the previous.
+ * mutates them, plus the LOCAL scope when a global write would clear it and
+ * any distinct WORKTREE override scope. Every repeated value is retained in
+ * order. Included managed values are refused when their origin cannot be
+ * restored exactly. Pair with git_config_restore() to roll back on a failed
+ * switch. Single snapshot slot (the CLI is single-threaded); a new snapshot
+ * replaces the previous.
  */
 int git_config_snapshot(git_scope_t scope);
 
 /**
- * Restore the most recent git_config_snapshot(), re-setting keys that were
- * present and unsetting keys that were absent. No-op if nothing was snapshotted.
+ * Restore the most recent git_config_snapshot(), rebuilding every key with its
+ * exact ordered values. A failed restore retains the snapshot and completed
+ * per-key progress for retry. No-op if nothing was snapshotted.
  */
 int git_config_restore(void);
 

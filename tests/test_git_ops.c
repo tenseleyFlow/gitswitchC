@@ -60,6 +60,33 @@ static int fk_ret(run_result_t *result, int code) {
     return code == 0 ? 0 : -1;
 }
 
+static int fk_emit_effective_listing(const run_opts_t *opts,
+                                     run_result_t *result) {
+    size_t used = 0;
+    if (!opts || !opts->out || opts->out_size == 0) return fk_ret(result, 1);
+    for (int i = 0; i < FK_MAX; i++) {
+        if (!fk_store[i].used) continue;
+        const char *scope = fk_store[i].scope;
+        if (scope[0] == '-' && scope[1] == '-') scope += 2;
+        const char *origin = "file:/fake/config";
+        size_t scope_len = strlen(scope) + 1;
+        size_t origin_len = strlen(origin) + 1;
+        size_t record_len = strlen(fk_store[i].key) + 1 +
+                            strlen(fk_store[i].value) + 1;
+        if (used + scope_len + origin_len + record_len > opts->out_size)
+            return fk_ret(result, 1);
+        memcpy(opts->out + used, scope, scope_len);
+        used += scope_len;
+        memcpy(opts->out + used, origin, origin_len);
+        used += origin_len;
+        used += (size_t)snprintf(opts->out + used, opts->out_size - used,
+                                 "%s\n%s", fk_store[i].key,
+                                 fk_store[i].value) + 1;
+    }
+    if (result) result->out_len = used;
+    return fk_ret(result, 0);
+}
+
 static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
                            run_result_t *result) {
     fk_execs++;
@@ -77,6 +104,8 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
     }
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
+        if (strcmp(argv[2], "--show-origin") == 0)
+            return fk_emit_effective_listing(opts, result);
         const char *scope = argv[2];
 
         /* Production emits --unset-all (AR-06 F03); accept the legacy spelling
@@ -289,10 +318,10 @@ TEST(git_set_config_value_skips_duplicate_managed_write) {
 /* Regression lock for the `git config --list -z` snapshot fix: with plain
  * --list, a managed value containing a newline masqueraded as a record
  * boundary, truncating that value in the rollback snapshot AND corrupting the
- * records after it. The -z parser (parse_config_z_value) must keep the full
+ * records after it. The binary snapshot parser must keep the full
  * value and still attribute the NEXT record to the right key. */
 
-static char zfk_set_key[16][64], zfk_set_val[16][1024];
+static char zfk_set_key[16][64], zfk_set_val[16][8192];
 static int zfk_sets;
 static char zfk_unset_key[16][64];
 static int zfk_unsets;
@@ -344,15 +373,18 @@ static int zfk_runner(const char *const argv[], const run_opts_t *opts,
             zfk_unsets++;
             return fk_ret(result, 0);
         }
-        if (argv[4]) { /* set */
+        if (strcmp(argv[3], "--add") == 0 && argv[4] && argv[5]) {
             if (zfk_sets < 16) {
-                snprintf(zfk_set_key[zfk_sets], sizeof(zfk_set_key[0]), "%s", argv[3]);
-                snprintf(zfk_set_val[zfk_sets], sizeof(zfk_set_val[0]), "%s", argv[4]);
+                snprintf(zfk_set_key[zfk_sets], sizeof(zfk_set_key[0]), "%s", argv[4]);
+                snprintf(zfk_set_val[zfk_sets], sizeof(zfk_set_val[0]), "%s", argv[5]);
             }
             zfk_sets++;
             return fk_ret(result, 0);
         }
-        zfk_fallback_reads++; /* per-key read: only the pre-fix fallback path */
+        if (argv[4]) { /* ordinary forward set */
+            return fk_ret(result, 0);
+        }
+        zfk_fallback_reads++; /* per-key read: snapshot must never fall back */
         return fk_ret(result, 1);
     }
 
@@ -391,7 +423,7 @@ TEST(rollback_z_parser_survives_embedded_newline) {
 
     run_set_runner(prev);
 
-    /* The snapshot came from the one-exec -z listing, not per-key reads. */
+    /* The snapshot came from exact direct/include -z listings, not per-key reads. */
     CHECK_EQ_INT(zfk_fallback_reads, 0);
 
     /* The record AFTER the multiline value is attributed correctly and
@@ -413,16 +445,13 @@ TEST(rollback_z_parser_survives_embedded_newline) {
     int in = zfk_find_set("user.name");
     CHECK(in >= 0);
     if (in >= 0) CHECK_STR_EQ(zfk_set_val[in], "Alpha\nBeta");
-    CHECK(!zfk_was_unset("user.name"));
+    CHECK(zfk_was_unset("user.name"));
 
-    /* Keys absent from the listing were snapshotted absent AND seeded into
-     * the exec cache as proven-absent (AR-02 #15); nothing wrote them after
-     * the snapshot, so the restore's unsets are provable no-ops and are
-     * elided rather than exec'd. (restore_unsets_keys_written_after_snapshot
-     * covers the case where a forward write makes the unset real.) */
-    CHECK(!zfk_was_unset("user.signingkey"));
-    CHECK(!zfk_was_unset("commit.gpgsign"));
-    CHECK(!zfk_was_unset("gpg.program"));
+    /* Exact rollback force-clears every key before ordered re-adds. It cannot
+     * trust the forward-path scalar cache after a partial restore attempt. */
+    CHECK(zfk_was_unset("user.signingkey"));
+    CHECK(zfk_was_unset("commit.gpgsign"));
+    CHECK(zfk_was_unset("gpg.program"));
 }
 
 /* AR-02 #15: the snapshot's complete -z listing seeds the exec cache, so
@@ -529,12 +558,10 @@ TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim) {
     CHECK_EQ_INT(zfk_fallback_reads, 0); /* served by the -z fast path */
 }
 
-TEST(oversize_foreign_sshcommand_degrades_to_present_unknown) {
+TEST(oversize_foreign_sshcommand_restores_exactly) {
     /* Longer than ANY value gitswitch writes (past MAX_PATH_LEN plus the ssh
-     * option overhead): uncapturable, but the key is still PRESENT. The clear
-     * must exec its --unset (no proven-absent elision), and the rollback must
-     * leave the key alone — a truncated write-back and a destructive --unset
-     * are both corruption. */
+     * option overhead): the dynamic snapshot still captures and restores it
+     * exactly rather than degrading the rollback to an unknown value. */
     static char val[MAX_PATH_LEN + 600];
     memset(val, 'k', sizeof(val) - 1);
     val[sizeof(val) - 1] = '\0';
@@ -554,10 +581,11 @@ TEST(oversize_foreign_sshcommand_degrades_to_present_unknown) {
     CHECK_EQ_INT(zfk_count_unsets("core.sshcommand"), 1);
 
     CHECK_EQ_INT(git_config_restore(), 0);
-    /* Value unknown: no corrupt write-back... */
-    CHECK(zfk_find_set("core.sshcommand") < 0);
-    /* ...and no second, destructive --unset of the user's original. */
-    CHECK_EQ_INT(zfk_count_unsets("core.sshcommand"), 1);
+    int is = zfk_find_set("core.sshcommand");
+    CHECK(is >= 0);
+    if (is >= 0) CHECK_STR_EQ(zfk_set_val[is], val);
+    /* Clear plus rollback's checked unset-all. */
+    CHECK_EQ_INT(zfk_count_unsets("core.sshcommand"), 2);
     /* Keys that DID fit still round-trip normally. */
     int in = zfk_find_set("user.name");
     int ie = zfk_find_set("user.email");
@@ -601,6 +629,34 @@ TEST(git_test_config_reuses_switch_readback) {
     run_set_runner(prev);
 }
 
+TEST(v5_fingerprint_survives_git_current_config_snapshot) {
+    static const char v5_fingerprint[] =
+        "0123456789ABCDEF0123456789ABCDEF"
+        "0123456789ABCDEF0123456789ABCDEF";
+    git_current_config_t current;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+
+    CHECK_EQ_INT((int)strlen(v5_fingerprint), 64);
+    CHECK_EQ_INT(git_set_config_value("user.name", "V5 User",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value("user.email", "v5@example.test",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value("user.signingkey", v5_fingerprint,
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value("commit.gpgsign", "true",
+                                      GIT_SCOPE_GLOBAL), 0);
+    memset(&current, 0, sizeof(current));
+    CHECK_EQ_INT(git_get_current_config(&current), 0);
+    CHECK(current.valid);
+    CHECK_STR_EQ(current.signing_key, v5_fingerprint);
+    CHECK_EQ_INT((int)strlen(current.signing_key), 64);
+
+    run_set_runner(prev);
+}
+
 /* AR-02 #14: git_test_config's GPG availability probe must be skipped when a
  * gpg spawn earlier in this process already proved the key present. The fake
  * runner refuses every non-git argv, so a gpg spawn here FAILS the check —
@@ -633,7 +689,7 @@ TEST(git_test_config_skips_gpg_probe_when_key_seen) {
     run_set_runner(prev);
 }
 
-/* ---- AR-06 F58: per-key snapshot preserves surrounding whitespace -------- */
+/* ---- AR-06 F58: snapshot preserves surrounding whitespace ---------------- */
 static char f58_set_key[16][64], f58_set_val[16][1024];
 static int f58_sets;
 
@@ -644,30 +700,30 @@ static int f58_runner(const char *const argv[], const run_opts_t *opts,
     if (strcmp(argv[0], "git") != 0 || !argv[1]) return fk_ret(result, 1);
     if (strcmp(argv[1], "rev-parse") == 0) return fk_ret(result, 1); /* not a repo */
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
-        if (strcmp(argv[3], "--list") == 0) return fk_ret(result, 1); /* force per-key */
+        if (strcmp(argv[3], "--list") == 0 && argv[4] &&
+            strcmp(argv[4], "-z") == 0) {
+            static const char listing[] =
+                "user.name\n  spaced  name  \0"
+                "user.email\ne@x.com\0";
+            size_t n = sizeof(listing) - 1U;
+            if (!opts || !opts->out || opts->out_size <= n)
+                return fk_ret(result, 1);
+            memcpy(opts->out, listing, n);
+            opts->out[n] = '\0';
+            if (result) result->out_len = n;
+            return fk_ret(result, 0);
+        }
         if ((strcmp(argv[3], "--unset-all") == 0 || strcmp(argv[3], "--unset") == 0) && argv[4])
             return fk_ret(result, 0);
-        if (argv[4]) { /* set (restore write) */
+        if (strcmp(argv[3], "--add") == 0 && argv[4] && argv[5]) {
             if (f58_sets < 16) {
-                snprintf(f58_set_key[f58_sets], sizeof(f58_set_key[0]), "%s", argv[3]);
-                snprintf(f58_set_val[f58_sets], sizeof(f58_set_val[0]), "%s", argv[4]);
+                snprintf(f58_set_key[f58_sets], sizeof(f58_set_key[0]), "%s", argv[4]);
+                snprintf(f58_set_val[f58_sets], sizeof(f58_set_val[0]), "%s", argv[5]);
             }
             f58_sets++;
             return fk_ret(result, 0);
         }
-        /* per-key read: user.name carries leading+trailing spaces; git appends
-         * exactly one trailing newline. */
-        if (opts && opts->out && opts->out_size > 0) {
-            const char *v = NULL;
-            if (strcmp(argv[3], "user.name") == 0) v = "  spaced  name  ";
-            else if (strcmp(argv[3], "user.email") == 0) v = "e@x.com";
-            if (v) {
-                snprintf(opts->out, opts->out_size, "%s\n", v);
-                if (result) result->out_len = strlen(opts->out);
-                return fk_ret(result, 0);
-            }
-        }
-        return fk_ret(result, 1); /* other keys absent */
+        return fk_ret(result, 1);
     }
     return fk_ret(result, 1);
 }
@@ -678,7 +734,7 @@ static int f58_find_set(const char *key) {
     return -1;
 }
 
-TEST(per_key_snapshot_preserves_surrounding_whitespace) {
+TEST(snapshot_preserves_surrounding_whitespace) {
     git_ops_test_reset_caches();
     f58_sets = 0;
     command_runner_fn prev = run_set_runner(f58_runner);
@@ -697,7 +753,7 @@ TEST(per_key_snapshot_preserves_surrounding_whitespace) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
-    RUN_TEST(per_key_snapshot_preserves_surrounding_whitespace);
+    RUN_TEST(snapshot_preserves_surrounding_whitespace);
     RUN_TEST(git_configure_ssh_rejects_single_quote_in_keypath);
     RUN_TEST(git_ops_init_spawns_no_subprocess);
     RUN_TEST(git_is_repository_caches_result);
@@ -706,7 +762,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);
     RUN_TEST(restore_unsets_keys_written_after_snapshot);
     RUN_TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim);
-    RUN_TEST(oversize_foreign_sshcommand_degrades_to_present_unknown);
+    RUN_TEST(oversize_foreign_sshcommand_restores_exactly);
     RUN_TEST(git_test_config_reuses_switch_readback);
+    RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()

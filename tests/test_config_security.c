@@ -9,6 +9,7 @@
 #include "test.h"
 #include "gitswitch.h"
 #include "config.h"
+#include "toml_parser.h"
 #include "signals.h"
 #include "error.h"
 #include <string.h>
@@ -87,6 +88,18 @@ static void fill_account(account_t *a, uint32_t id, const char *name,
     strncpy(a->email, email, sizeof(a->email) - 1);
     strncpy(a->description, desc, sizeof(a->description) - 1);
     a->preferred_scope = GIT_SCOPE_LOCAL;
+}
+
+static size_t count_occurrences(const char *haystack, const char *needle) {
+    size_t count = 0;
+    size_t needle_len = strlen(needle);
+
+    if (needle_len == 0) return 0;
+    while ((haystack = strstr(haystack, needle)) != NULL) {
+        count++;
+        haystack += needle_len;
+    }
+    return count;
 }
 
 /* ---- cfg-symlink-01/02: read path ---- */
@@ -437,6 +450,11 @@ TEST(save_and_reload_regular_path_roundtrip) {
      * installed file is 0600, reload it and find the account again. Save a
      * second time to exercise the (no-follow) backup branch too. */
     char dir[128], path[256];
+    static const char v5_fingerprint[] =
+        "0123456789ABCDEF0123456789ABCDEF"
+        "0123456789ABCDEF0123456789ABCDEF";
+    char prefixed_v5[MAX_GPG_SELECTOR_LEN];
+    char overlong[MAX_GPG_SELECTOR_LEN];
     gitswitch_ctx_t ctx, reloaded;
     struct stat st;
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
@@ -444,7 +462,22 @@ TEST(save_and_reload_regular_path_roundtrip) {
 
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
-    ctx.account_count = 1;
+    CHECK_EQ_INT((int)strlen(v5_fingerprint), 64);
+    CHECK(snprintf(ctx.accounts[0].gpg_key_id,
+                   sizeof(ctx.accounts[0].gpg_key_id), "%s",
+                   v5_fingerprint) <
+          (int)sizeof(ctx.accounts[0].gpg_key_id));
+    ctx.accounts[0].gpg_enabled = true;
+    ctx.accounts[0].gpg_signing_enabled = true;
+    fill_account(&ctx.accounts[1], 2, "bob", "b@b.com", "prefixed");
+    CHECK_EQ_INT(snprintf(prefixed_v5, sizeof(prefixed_v5), "0x%s",
+                          v5_fingerprint), 66);
+    CHECK_EQ_INT(snprintf(ctx.accounts[1].gpg_key_id,
+                          sizeof(ctx.accounts[1].gpg_key_id), "%s",
+                          prefixed_v5), 66);
+    ctx.accounts[1].gpg_enabled = true;
+    ctx.accounts[1].gpg_signing_enabled = false;
+    ctx.account_count = 2;
 
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     CHECK_EQ_INT(lstat(path, &st), 0);
@@ -455,9 +488,238 @@ TEST(save_and_reload_regular_path_roundtrip) {
 
     memset(&reloaded, 0, sizeof(reloaded));
     CHECK_EQ_INT(config_load(&reloaded, path), 0);
-    CHECK_EQ_INT(reloaded.account_count, 1);
-    if (reloaded.account_count == 1) {
+    CHECK_EQ_INT(reloaded.account_count, 2);
+    if (reloaded.account_count == 2) {
         CHECK_STR_EQ(reloaded.accounts[0].name, "alice");
+        CHECK_STR_EQ(reloaded.accounts[0].gpg_key_id, v5_fingerprint);
+        CHECK(reloaded.accounts[0].gpg_enabled);
+        CHECK(reloaded.accounts[0].gpg_signing_enabled);
+        CHECK_STR_EQ(reloaded.accounts[1].name, "bob");
+        CHECK_STR_EQ(reloaded.accounts[1].gpg_key_id, prefixed_v5);
+        CHECK(reloaded.accounts[1].gpg_enabled);
+        CHECK(!reloaded.accounts[1].gpg_signing_enabled);
+    }
+
+    /* Persistence must refuse 65 fingerprint digits even though the selector
+     * field has room for a valid 0x-prefixed 64-digit value. */
+    memset(overlong, 'A', 65);
+    overlong[65] = '\0';
+    CHECK_EQ_INT(snprintf(ctx.accounts[1].gpg_key_id,
+                          sizeof(ctx.accounts[1].gpg_key_id), "%s",
+                          overlong), 65);
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
+}
+
+/* ---- AR-07 M13 prerequisite: alias and canonical host are distinct ------ */
+
+TEST(ssh_hostname_load_save_and_shared_destination_roundtrip) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char path[640], key[256], cfg[4096], after[4096];
+    gitswitch_ctx_t ctx, reloaded;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
+    snprintf(key, sizeof(key), "%s/id_test", home);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"work\"\n"
+                   "email = \"work@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-work\"\n"
+                   "ssh_hostname = \"github.com\"\n"
+                   "[accounts.2]\n"
+                   "name = \"personal\"\n"
+                   "email = \"me@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-personal\"\n"
+                   "ssh_hostname = \"github.com\"\n",
+                   key, key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 2);
+    CHECK_EQ_INT(ctx.unknown_keys_on_load, 0);
+    if (ctx.account_count == 2) {
+        CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "github-work");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "github.com");
+        CHECK_STR_EQ(ctx.accounts[1].ssh_host_alias, "github-personal");
+        CHECK_STR_EQ(ctx.accounts[1].ssh_hostname, "github.com");
+    }
+
+    /* Canonical hostnames are destinations, not owned namespaces: sharing
+     * github.com is valid even though the managed aliases remain distinct. */
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    CHECK_EQ_INT(count_occurrences(after,
+                                   "ssh_hostname = \"github.com\""), 2);
+
+    memset(&reloaded, 0, sizeof(reloaded));
+    CHECK_EQ_INT(config_load(&reloaded, path), 0);
+    CHECK_EQ_INT(reloaded.account_count, 2);
+    if (reloaded.account_count == 2) {
+        CHECK_STR_EQ(reloaded.accounts[0].ssh_hostname, "github.com");
+        CHECK_STR_EQ(reloaded.accounts[1].ssh_hostname, "github.com");
+    }
+    restore_home_env(saved_home);
+}
+
+TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char path[640], key[256], cfg[2048], after[4096];
+    gitswitch_ctx_t ctx;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
+    snprintf(key, sizeof(key), "%s/id_test", home);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"legacy\"\n"
+                   "email = \"legacy@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"git.example.test\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) {
+        CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "git.example.test");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "git.example.test");
+    }
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    CHECK_EQ_INT(count_occurrences(
+                     after, "ssh_hostname = \"git.example.test\""), 1);
+    restore_home_env(saved_home);
+}
+
+TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
+    char dir[128], path[256], key[256], cfg[2048];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_test", dir);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"legacy-pattern\"\n"
+                   "email = \"legacy@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-*\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+
+    /* The pattern itself remains legal when an unambiguous destination is
+     * supplied; only using a wildcard as the HostName fallback is rejected. */
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"explicit-pattern\"\n"
+                   "email = \"explicit@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_host = \"github-*\"\n"
+                   "ssh_hostname = \"github.com\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) {
+        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "github.com");
+    }
+}
+
+TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
+    static const char *const invalid[] = {
+        "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
+        "*.example.com", "host?", "h\xC3\xB6st.example", NULL
+    };
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+    account_t account;
+
+    CHECK(strstr(default_config_template,
+                 "#ssh_host = \"github.com-work\"") != NULL);
+    CHECK(strstr(default_config_template,
+                 "#ssh_hostname = \"github.com\"") != NULL);
+    CHECK(toml_validate_ssh_hostname("git.example.test:2222"));
+    CHECK(toml_validate_ssh_hostname("2001:db8::1"));
+    CHECK(!toml_validate_ssh_hostname(""));
+    CHECK(toml_validate_ssh_host_alias("github-*"));
+    for (size_t i = 0; invalid[i]; i++) {
+        CHECK(!toml_validate_ssh_hostname(invalid[i]));
+        memset(&ctx, 0, sizeof(ctx));
+        fill_account(&account, 1, "bad-host", "bad@example.com", "d");
+        strncpy(account.ssh_hostname, invalid[i],
+                sizeof(account.ssh_hostname) - 1);
+        CHECK_EQ_INT(config_add_account(&ctx, &account), -1);
+        CHECK_EQ_INT(ctx.account_count, 0);
+    }
+
+    /* Canonical destinations are deliberately not unique account resources. */
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&account, 1, "one", "one@example.com", "d");
+    strncpy(account.ssh_hostname, "github.com",
+            sizeof(account.ssh_hostname) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+    fill_account(&account, 2, "two", "two@example.com", "d");
+    strncpy(account.ssh_hostname, "github.com",
+            sizeof(account.ssh_hostname) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+    CHECK_EQ_INT(ctx.account_count, 2);
+
+    /* The parser's modeled schema must reject the wrong TOML type rather
+     * than let retrieval treat a present key as absent. */
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    {
+        const char *wrong_type =
+            "[settings]\n"
+            "default_scope = \"local\"\n"
+            "[accounts.1]\n"
+            "name = \"typed\"\n"
+            "email = \"typed@example.com\"\n"
+            "ssh_hostname = true\n";
+        CHECK_EQ_INT(write_config(path, wrong_type, strlen(wrong_type)), 0);
+        memset(&ctx, 0, sizeof(ctx));
+        CHECK_EQ_INT(config_load(&ctx, path), -1);
     }
 }
 
@@ -780,7 +1042,9 @@ TEST(config_validate_rejects_hostile_account) {
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(key, sizeof(key), "%s/id_ed25519", dir);
     snprintf(missing, sizeof(missing), "%s/no_such_key", dir);
-    CHECK_EQ_INT(write_config(key, "KEY", 3), 0); /* creates it 0600 */
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
 
     /* Baseline: a well-formed account with a 0600 key validates. */
     memset(&ctx, 0, sizeof(ctx));
@@ -926,7 +1190,7 @@ TEST(settings_only_save_records_active_and_preserves_sections) {
      * success while active_account stayed stale, so the next boot's resume
      * restored the wrong identity. The write-back must keep BOTH problem
      * sections byte-for-byte-meaningful on disk. */
-    char longname[300], cfg[1024], after[2048];
+    char longname[300], cfg[1024], after[2048], hint[256], state[512];
     char dir[128], path[256];
     gitswitch_ctx_t ctx;
 
@@ -946,6 +1210,7 @@ TEST(settings_only_save_records_active_and_preserves_sections) {
              longname);
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
     CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
 
     memset(&ctx, 0, sizeof(ctx));
@@ -959,11 +1224,9 @@ TEST(settings_only_save_records_active_and_preserves_sections) {
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0); /* succeeds where config_save refuses */
 
     slurp(path, after, sizeof(after));
-    CHECK(strstr(after, "active_account = \"alice\"") != NULL); /* pre-fix: never persisted */
-    CHECK(strstr(after, longname) != NULL);                     /* skipped account intact */
-    CHECK(strstr(after, "[account.3]") != NULL);                /* unknown section intact */
-    CHECK(strstr(after, "typod") != NULL);
-    CHECK(strstr(after, "default_scope = \"local\"") != NULL);  /* other settings intact */
+    CHECK_STR_EQ(after, cfg); /* state-only persistence never replaces accounts */
+    CHECK(slurp(hint, state, sizeof(state)) > 0);
+    CHECK_STR_EQ(state, "none\nactive=alice\n");
 
     /* And the write-back result must load again with the same view. */
     gitswitch_ctx_t ctx2;
@@ -998,7 +1261,7 @@ TEST(resume_hint_reflects_account_runtime_needs) {
     snprintf(path, sizeof(path), "%s/.config/gitswitch", dir);
     CHECK_EQ_INT(mkdir(path, 0700), 0);
     snprintf(hint, sizeof(hint), "%s/.config/gitswitch/.resume-hint", dir);
-    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", dir);
 
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&ctx.accounts[0], 1, "alice", "a@b.com", "day job");
@@ -1008,7 +1271,7 @@ TEST(resume_hint_reflects_account_runtime_needs) {
     /* Identity-only: no boot-volatile state, the snippet must not probe. */
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     CHECK(slurp(hint, buf, sizeof(buf)) > 0);
-    CHECK_STR_EQ(buf, "none\n");
+    CHECK_STR_EQ(buf, "none\nactive=alice\n");
 
     /* SSH-only. */
     ctx.accounts[0].ssh_enabled = true;
@@ -1016,7 +1279,7 @@ TEST(resume_hint_reflects_account_runtime_needs) {
             sizeof(ctx.accounts[0].ssh_key_path) - 1);
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "ssh\n");
+    CHECK_STR_EQ(buf, "ssh\nactive=alice\n");
 
     /* SSH + GPG. */
     ctx.accounts[0].gpg_enabled = true;
@@ -1024,29 +1287,29 @@ TEST(resume_hint_reflects_account_runtime_needs) {
             sizeof(ctx.accounts[0].gpg_key_id) - 1);
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "ssh gpg\n");
+    CHECK_STR_EQ(buf, "ssh gpg\nactive=alice\n");
 
     /* GPG-only. */
     ctx.accounts[0].ssh_enabled = false;
     ctx.accounts[0].ssh_key_path[0] = '\0';
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "gpg\n");
+    CHECK_STR_EQ(buf, "gpg\nactive=alice\n");
 
-    /* An UNKNOWN active account (just-removed race) must fall back to the
-     * conservative "ssh gpg" so the snippet still probes rather than
-     * wrongly skipping a needed resume. */
+    /* An unknown active account is never advertised as a successful durable
+     * identity; retain the last coherent state instead. */
     strncpy(ctx.config.active_account, "ghost", sizeof(ctx.config.active_account) - 1);
-    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
     slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "ssh gpg\n");
+    CHECK_STR_EQ(buf, "gpg\nactive=alice\n");
 
-    /* Cleared active account (reset path): the marker must be REMOVED, or
-     * login shells keep probing/resuming state the user tore down. Exercised
-     * through the settings-only save, the path `reset` actually takes. */
+    /* Cleared active account (reset path): install the explicit inactive
+     * tombstone. Its first-line `none` keeps login-shell probes no-op while the
+     * second line prevents a stale legacy settings key from resurrecting. */
     ctx.config.active_account[0] = '\0';
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
-    CHECK(access(hint, F_OK) != 0);
+    slurp(hint, buf, sizeof(buf));
+    CHECK_STR_EQ(buf, "none\ninactive=v1\n");
 
     if (old_home[0]) setenv("HOME", old_home, 1); else unsetenv("HOME");
 }
@@ -1079,7 +1342,10 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
     strncpy(ctx.config.active_account, "alice",
             sizeof(ctx.config.active_account) - 1);
 
-    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    /* The resume hint is required commit state as of AR-07 T5. Refusing an
+     * unsafe node must now make the save truthful/nonzero while preserving the
+     * node and its target exactly. */
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
     CHECK(slurp(victim, buf, sizeof(buf)) > 0);
     CHECK_STR_EQ(buf, "victim-content\n"); /* pre-fix: truncated to none */
     CHECK_EQ_INT(lstat(hint, &after), 0);
@@ -1087,14 +1353,14 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
 
     CHECK_EQ_INT(unlink(hint), 0);
     CHECK_EQ_INT(mkfifo(hint, 0600), 0);
-    CHECK_EQ_INT(config_save(&ctx, path), 0); /* never opens/blocks on FIFO */
+    CHECK_EQ_INT(config_save(&ctx, path), -1); /* never opens/blocks on FIFO */
     CHECK_EQ_INT(lstat(hint, &after), 0);
     CHECK(S_ISFIFO(after.st_mode));
 
     CHECK_EQ_INT(unlink(hint), 0);
     CHECK_EQ_INT(write_config(hint, "unsafe\n", 7), 0);
     CHECK_EQ_INT(chmod(hint, 0660), 0);
-    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), -1);
     CHECK(slurp(hint, buf, sizeof(buf)) > 0);
     CHECK_STR_EQ(buf, "unsafe\n");
     CHECK_EQ_INT(lstat(hint, &after), 0);
@@ -1102,7 +1368,7 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
 
     /* A safe existing marker is replaced, not truncated in place: readers
      * see either complete old or complete new content, never a partial file. */
-    CHECK_EQ_INT(chmod(hint, 0600), 0);
+    CHECK_EQ_INT(write_config(hint, "none\n", 5), 0);
     CHECK_EQ_INT(lstat(hint, &before), 0);
     CHECK_EQ_INT(config_save(&ctx, path), 0);
     CHECK_EQ_INT(lstat(hint, &after), 0);
@@ -1110,7 +1376,7 @@ TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically) {
     CHECK_EQ_INT((long)(after.st_mode & 0777), 0600);
     CHECK(before.st_dev != after.st_dev || before.st_ino != after.st_ino);
     CHECK(slurp(hint, buf, sizeof(buf)) > 0);
-    CHECK_STR_EQ(buf, "none\n");
+    CHECK_STR_EQ(buf, "none\nactive=alice\n");
 
     stream = opendir(config_dir);
     CHECK(stream != NULL);
@@ -1194,7 +1460,7 @@ TEST(back_to_back_backups_in_same_second_both_persist) {
 
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(cfg, sizeof(cfg), "%s/accounts.toml", dir);
-    CHECK_EQ_INT(write_config(cfg, "x\n", 2), 0);
+    CHECK_EQ_INT(write_config(cfg, valid_config, strlen(valid_config)), 0);
 
     /* Same second (no sleep between): pre-fix the 2nd hit EEXIST and vanished. */
     CHECK_EQ_INT(config_backup(cfg), 0);
@@ -1250,6 +1516,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(save_refuses_symlinked_config_path);
     RUN_TEST(backup_refuses_symlinked_source);
     RUN_TEST(save_and_reload_regular_path_roundtrip);
+    RUN_TEST(ssh_hostname_load_save_and_shared_destination_roundtrip);
+    RUN_TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized);
+    RUN_TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname);
+    RUN_TEST(ssh_hostname_schema_and_api_reject_unsafe_values);
     RUN_TEST(find_account_rejects_out_of_range_and_noncanonical_ids);
     RUN_TEST(load_skips_leading_zero_id_section);
     RUN_TEST(load_counts_unknown_keys_in_recognized_sections);

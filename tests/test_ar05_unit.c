@@ -111,17 +111,26 @@ TEST(is_safe_ssh_key_path_blocks_quote_and_control_injection) {
  * space or NL that survived would split into extra arguments if a caller ever
  * mishandled it; the validator must forbid them regardless. */
 TEST(validate_key_id_boundary_and_control) {
-    /* Longest storable id (MAX_KEY_ID_LEN-1 hex chars) is accepted. */
-    char maxhex[MAX_KEY_ID_LEN];
-    memset(maxhex, 'A', MAX_KEY_ID_LEN - 1);
-    maxhex[MAX_KEY_ID_LEN - 1] = '\0';
+    /* Both raw and conventional 0x-prefixed OpenPGP v5 fingerprints fit. */
+    char maxhex[MAX_GPG_FINGERPRINT_LEN];
+    char prefixed[MAX_GPG_SELECTOR_LEN];
+    char overprefixed[MAX_GPG_SELECTOR_LEN + 1];
+    memset(maxhex, 'A', MAX_GPG_FINGERPRINT_LEN - 1);
+    maxhex[MAX_GPG_FINGERPRINT_LEN - 1] = '\0';
+    CHECK_EQ_INT((int)strlen(maxhex), 64);
     CHECK(validate_key_id(maxhex));
+    CHECK_EQ_INT(snprintf(prefixed, sizeof(prefixed), "0x%s", maxhex), 66);
+    CHECK(validate_key_id(prefixed));
 
-    /* One over the storable bound is refused. */
-    char over[MAX_KEY_ID_LEN + 1];
-    memset(over, 'A', MAX_KEY_ID_LEN);
-    over[MAX_KEY_ID_LEN] = '\0';
+    /* Prefixes do not buy extra fingerprint digits. */
+    char over[MAX_GPG_SELECTOR_LEN];
+    memset(over, 'A', 65);
+    over[65] = '\0';
+    CHECK_EQ_INT((int)strlen(over), 65);
     CHECK(!validate_key_id(over));
+    CHECK_EQ_INT(snprintf(overprefixed, sizeof(overprefixed), "0x%s", over),
+                 67);
+    CHECK(!validate_key_id(overprefixed));
 
     /* 0x + single hex digit is the minimal accepted prefixed id. */
     CHECK(validate_key_id("0xA"));

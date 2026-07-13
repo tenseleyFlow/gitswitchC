@@ -58,6 +58,26 @@ typedef struct {
     bool is_valid;
 } toml_document_t;
 
+/* Focused initialization observer used by regression tests. The parser is
+ * single-threaded; install an observer only around a bounded test operation
+ * and restore the previous value afterwards. Returning the previous observer
+ * makes nesting safe. */
+typedef void (*toml_document_init_hook_fn)(toml_document_t *doc);
+toml_document_init_hook_fn toml_set_document_init_hook_fn(
+    toml_document_init_hook_fn fn);
+
+/* Focused writer observer for deterministic namespace-race regression tests.
+ * The parser/writer is single-threaded; restore the previous hook immediately
+ * after the bounded test operation. */
+typedef enum {
+    TOML_WRITER_TEST_AFTER_TEMP_CREATE = 1
+} toml_writer_test_stage_t;
+typedef void (*toml_writer_test_hook_fn)(toml_writer_test_stage_t stage,
+                                        const char *directory,
+                                        const char *temp_name);
+toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
+    toml_writer_test_hook_fn fn);
+
 /* Parser state for security tracking */
 typedef struct {
     const char *input;
@@ -78,6 +98,8 @@ void toml_init_document(toml_document_t *doc);
 
 /**
  * Parse TOML from file with comprehensive security validation
+ * - Initializes and replaces *doc exactly once; callers must not pre-initialize
+ * - A non-NULL doc is left invalid but safe to clean up on every failure
  * - Validates file size limits
  * - Sanitizes all input
  * - Checks for malicious patterns
@@ -87,6 +109,8 @@ int toml_parse_file(const char *file_path, toml_document_t *doc);
 
 /**
  * Parse TOML from string buffer with security validation
+ * - Initializes and replaces *doc exactly once; callers must not pre-initialize
+ * - A non-NULL doc is left invalid but safe to clean up on every failure
  */
 int toml_parse_string(const char *toml_string, size_t length, toml_document_t *doc);
 
@@ -123,10 +147,11 @@ int toml_set_boolean(toml_document_t *doc, const char *section,
                      const char *key, bool value);
 
 /**
- * Write TOML document to file with atomic operations
- * - Creates backup of existing file
- * - Uses temporary file for atomic write
- * - Validates written content
+ * Atomically and durably replace a TOML file.
+ * - Serializes into a private 0600 same-directory temporary file
+ * - Checks flush, payload fsync, and close before atomic rename
+ * - Fsyncs the parent directory before reporting success
+ * - Leaves an existing destination unchanged on pre-rename failure
  */
 int toml_write_file(const toml_document_t *doc, const char *file_path);
 
@@ -137,6 +162,14 @@ int toml_write_file(const toml_document_t *doc, const char *file_path);
  * skipped (is_set cleared) instead of failing the whole document (AR-03 M5).
  */
 int toml_validate_gitswitch_schema(toml_document_t *doc);
+
+/**
+ * Validate the two distinct SSH host fields used by the config schema.
+ * `ssh_host` is a managed OpenSSH Host pattern and may contain '*'/'?'.
+ * `ssh_hostname` is a literal canonical destination and never may.
+ */
+bool toml_validate_ssh_host_alias(const char *alias);
+bool toml_validate_ssh_hostname(const char *hostname);
 
 
 /**

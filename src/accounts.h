@@ -29,6 +29,20 @@ int accounts_init(gitswitch_ctx_t *ctx);
 int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
 
 /**
+ * CLI transaction boundary: prepare applies a switch while retaining its
+ * rollback state and runtime lock. Commit releases that state only after the
+ * caller durably saves active-account metadata; abort restores the prior Git,
+ * runtime, and in-memory active state. Resume and direct library callers keep
+ * using accounts_switch().
+ */
+int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier);
+int accounts_switch_commit(gitswitch_ctx_t *ctx);
+/* continue_persistence_rollback keeps the signal rollback window active so
+ * the caller can restore config/hint state without an interruptible gap. */
+int accounts_switch_abort(gitswitch_ctx_t *ctx,
+                          bool continue_persistence_rollback);
+
+/**
  * Add new account interactively
  * - Prompts for account details
  * - Validates input
@@ -41,6 +55,18 @@ int accounts_add_interactive(gitswitch_ctx_t *ctx);
  * Edit an existing account interactively (prompts default to current values)
  */
 int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier);
+
+/* CLI edit transaction. Prepare validates and installs the candidate in the
+ * in-memory context while retaining enough state to restore managed SSH alias
+ * routing if the full config save fails before installation. An installed-
+ * but durability-uncertain save must commit, not abort, so config and routing
+ * continue to describe the same account. */
+int accounts_edit_interactive_prepare(gitswitch_ctx_t *ctx,
+                                      const char *identifier);
+int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
+                                    const account_t *candidate);
+int accounts_edit_commit(gitswitch_ctx_t *ctx);
+int accounts_edit_abort(gitswitch_ctx_t *ctx);
 
 /**
  * Remove account with confirmation
