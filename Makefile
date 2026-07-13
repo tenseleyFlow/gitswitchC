@@ -140,12 +140,33 @@ DEBUG_LDFLAGS = -fsanitize=address -fsanitize=undefined $(SECURITY_LDFLAGS_DEBUG
 # command-line argument under WERROR (gcc silently ignores it).
 RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_CFLAGS_RELEASE)
 RELEASE_LDFLAGS = -s $(SECURITY_LDFLAGS_RELEASE)
+COVERAGE_FLAGS = -g -O0 --coverage -fprofile-abs-path
+COVERAGE_LDFLAGS = --coverage
+
+# The coverage lane is intentionally canonical and reproducible: GCC's gcov
+# data is collected from a clean tree. gcovr publishes every human/machine
+# report in one pass, then enforces the measured ratchet from that pass's JSON.
+COVERAGE_CC ?= gcc
+COVERAGE_GCOV ?= gcov
+GCOVR ?= gcovr
+COVERAGE_READLINE ?= 1
+COVERAGE_REPORT_DIR ?= $(BUILDDIR)/coverage
+# Baseline at 81afb4c with GCC/gcov 16.1.1 and gcovr 8.6: three clean
+# full-capability runs were identical at 10,277/14,805 lines (69.4%) and
+# 7,034/12,068 branches (58.3%). Whole-point floors leave a narrow allowance
+# for supported-runner gcov reporting differences; ratchets only move upward
+# after a new measured baseline, never downward to accommodate a regression.
+COVERAGE_MIN_LINES ?= 69
+COVERAGE_MIN_BRANCHES ?= 58
 
 # Default to debug build
 BUILD_TYPE ?= debug
 ifeq ($(BUILD_TYPE),release)
     CFLAGS += $(RELEASE_FLAGS)
     LDFLAGS += $(RELEASE_LDFLAGS)
+else ifeq ($(BUILD_TYPE),coverage)
+    CFLAGS += $(COVERAGE_FLAGS)
+    LDFLAGS += $(COVERAGE_LDFLAGS)
 else
     CFLAGS += $(DEBUG_FLAGS)
     LDFLAGS += $(DEBUG_LDFLAGS)
@@ -493,6 +514,36 @@ endif
 shell-static-test:
 	@sh tests/test_shell_assets.sh "$(CURDIR)"
 
+# The small contract fixture proves both threshold metrics are wired to gcovr's
+# documented nonzero exit bits; a no-op or report-only replacement cannot make
+# the real coverage lane falsely green.
+.PHONY: coverage-contract-test
+coverage-contract-test:
+	@COVERAGE_CC="$(COVERAGE_CC)" COVERAGE_GCOV="$(COVERAGE_GCOV)" \
+		GCOVR="$(GCOVR)" sh tests/test_coverage.sh
+
+.PHONY: coverage
+coverage: coverage-contract-test
+	@$(MAKE) clean
+	@$(MAKE) CC="$(COVERAGE_CC)" BUILD_TYPE=coverage \
+		READLINE="$(COVERAGE_READLINE)" WERROR=1 test
+	@mkdir -p "$(COVERAGE_REPORT_DIR)"
+	@$(GCOVR) --root "$(CURDIR)" \
+		--gcov-executable "$(COVERAGE_GCOV)" \
+		--filter "$(SRCDIR)/" \
+		--txt="$(COVERAGE_REPORT_DIR)/coverage.txt" --print-summary \
+		--html-details="$(COVERAGE_REPORT_DIR)/index.html" \
+		--xml="$(COVERAGE_REPORT_DIR)/coverage.xml" --xml-pretty \
+		--json="$(COVERAGE_REPORT_DIR)/coverage.json" --json-pretty \
+		--json-summary="$(COVERAGE_REPORT_DIR)/coverage-summary.json" \
+		--json-summary-pretty \
+		"$(OBJDIR)"
+	@$(GCOVR) --root "$(CURDIR)" \
+		--json-add-tracefile "$(COVERAGE_REPORT_DIR)/coverage.json" \
+		--txt="$(COVERAGE_REPORT_DIR)/threshold.txt" \
+		--fail-under-line "$(COVERAGE_MIN_LINES)" \
+		--fail-under-branch "$(COVERAGE_MIN_BRANCHES)"
+
 # Static analysis
 .PHONY: analyze
 analyze:
@@ -643,6 +694,8 @@ help:
 	@echo "  release      Build release version"
 	@echo "  test         Build and run tests"
 	@echo "  shell-static-test Lint and native-parse shipped shell assets"
+	@echo "  coverage     Run tests and enforce the GCC/gcovr coverage ratchet"
+	@echo "  coverage-contract-test Verify gcovr threshold failure plumbing"
 	@echo "  install      Install to system"
 	@echo "  uninstall    Remove from system"
 	@echo "  clean        Remove build files"
@@ -663,8 +716,9 @@ help:
 	@echo "  help         Show this help"
 	@echo ""
 	@echo "Variables:"
-	@echo "  BUILD_TYPE   debug (default) or release"
+	@echo "  BUILD_TYPE   debug (default), release, or coverage"
 	@echo "  CC           Compiler (default: gcc)"
+	@echo "  COVERAGE_MIN_LINES/COVERAGE_MIN_BRANCHES Coverage floors (69/58)"
 	@echo "  DESTDIR      Installation prefix"
 
 # RPM package building
