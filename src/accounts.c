@@ -2,7 +2,12 @@
  * Implements secure account switching and management for gitswitch-c
  */
 
-/* Enable POSIX extensions for setenv/unsetenv */
+/* Enable POSIX extensions for setenv/unsetenv. Darwin's strict POSIX
+ * namespace hides O_NOFOLLOW, so restore the extension namespace before any
+ * system header is included. */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -18,7 +23,18 @@
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
 #endif
-#ifndef O_NOFOLLOW
+
+/* O_NOFOLLOW is load-bearing for the SSH-config preflight below. Every
+ * supported kernel provides it, so a feature-profile regression must fail at
+ * compile time instead of silently turning the flag into zero. Explicitly
+ * acknowledged exotic platforms retain the prior compile-only fallback; the
+ * lstat/fstat identity checks still reject a different opened inode before
+ * any bytes are read. */
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+# if !defined(O_NOFOLLOW) || O_NOFOLLOW == 0
+#  error "O_NOFOLLOW is required on supported platforms"
+# endif
+#elif !defined(O_NOFOLLOW)
 #define O_NOFOLLOW 0
 #endif
 
