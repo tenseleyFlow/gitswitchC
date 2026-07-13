@@ -90,6 +90,24 @@ static void fill_account(account_t *a, uint32_t id, const char *name,
     a->preferred_scope = GIT_SCOPE_LOCAL;
 }
 
+static void seed_three_accounts(gitswitch_ctx_t *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->config.default_scope = GIT_SCOPE_LOCAL;
+    fill_account(&ctx->accounts[0], 1, "before", "before@x.com", "before");
+    fill_account(&ctx->accounts[1], 2, "current-old", "current@x.com", "current");
+    fill_account(&ctx->accounts[2], 3, "after", "after@x.com", "after");
+    ctx->account_count = 3;
+    ctx->current_account = &ctx->accounts[1];
+}
+
+static bool current_pointer_is_valid(const gitswitch_ctx_t *ctx) {
+    if (!ctx->current_account) return true;
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (ctx->current_account == &ctx->accounts[i]) return true;
+    }
+    return false;
+}
+
 static size_t count_occurrences(const char *haystack, const char *needle) {
     size_t count = 0;
     size_t needle_len = strlen(needle);
@@ -227,6 +245,89 @@ TEST(system_scope_is_rejected_before_admission_or_persistence) {
     CHECK_EQ_INT(config_save(&ctx, account_path), -1); /* pre-fix: 0 */
     CHECK(access(account_path, F_OK) != 0);
     CHECK(access(account_hint, F_OK) != 0);
+}
+
+TEST(current_pointer_rebinds_after_direct_array_compaction) {
+    gitswitch_ctx_t ctx;
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(config_remove_account(&ctx, 1), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(config_remove_account(&ctx, 2), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == NULL);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(config_remove_account(&ctx, 3), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+}
+
+TEST(current_pointer_rebinds_by_id_across_reloads) {
+    static const char reordered_and_replaced[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n"
+        "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n"
+        "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n";
+    static const char removed_before[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n"
+        "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n";
+    static const char removed_current[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n"
+        "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n";
+    static const char removed_after[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n"
+        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n";
+    const char *old_runtime = getenv("XDG_RUNTIME_DIR");
+    bool had_runtime = old_runtime != NULL;
+    char saved_runtime[MAX_PATH_LEN] = "";
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+
+    if (had_runtime) snprintf(saved_runtime, sizeof(saved_runtime), "%s", old_runtime);
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, reordered_and_replaced,
+                              sizeof(reordered_and_replaced) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+    if (ctx.current_account) CHECK_STR_EQ(ctx.current_account->name, "current-new");
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, removed_before, sizeof(removed_before) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, removed_current, sizeof(removed_current) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == NULL);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, removed_after, sizeof(removed_after) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+
+    if (had_runtime) setenv("XDG_RUNTIME_DIR", saved_runtime, 1);
+    else unsetenv("XDG_RUNTIME_DIR");
 }
 
 TEST(load_rejects_symlinked_config) {
@@ -1617,6 +1718,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(load_accepts_regular_file);
     RUN_TEST(load_rejects_file_growth_after_prefix_read);
     RUN_TEST(system_scope_is_rejected_before_admission_or_persistence);
+    RUN_TEST(current_pointer_rebinds_after_direct_array_compaction);
+    RUN_TEST(current_pointer_rebinds_by_id_across_reloads);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
     RUN_TEST(config_init_rejects_nondirectory_final_components);

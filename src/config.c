@@ -124,6 +124,11 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
 static bool config_scope_is_persistable(git_scope_t scope);
+static bool config_capture_current_id(const gitswitch_ctx_t *ctx,
+                                      uint32_t *account_id);
+static void config_rebind_current_id(gitswitch_ctx_t *ctx,
+                                     bool had_current,
+                                     uint32_t account_id);
 static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
                                        const account_t *account,
                                        size_t ignore_index);
@@ -699,6 +704,8 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
     config_active_state_t active_state;
     char legacy_active[MAX_NAME_LEN] = "";
     char scope_str[32];
+    uint32_t current_id = 0;
+    bool had_current;
 
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
@@ -761,11 +768,21 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
         return -1;
     }
 
+    /* load_accounts_from_toml rebuilds the fixed array from index zero. Never
+     * let an interior pointer survive that rebuild by address: section order
+     * can move the same account to a different slot, or put a different
+     * account at the old address. Capture only a pointer proven to name a
+     * current array element, clear it before mutation, then rebind by the
+     * unique stable ID. */
+    had_current = config_capture_current_id(ctx, &current_id);
+    ctx->current_account = NULL;
+
     /* Load accounts */
     if (load_accounts_from_toml(ctx, toml_doc) != 0) {
         config_document_free(toml_doc);
         return -1;
     }
+    config_rebind_current_id(ctx, had_current, current_id);
 
     /* AR-06 F02: also detect unmodeled KEYS inside recognized sections, so a
      * full rewrite is refused before it silently erases them. */
@@ -2196,6 +2213,44 @@ static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
     return 0;
 }
 
+/* current_account is an optional interior pointer into the fixed account
+ * array. Capture it only after proving address equality with a live slot; this
+ * avoids dereferencing an already-stale external pointer. Rebinding by the
+ * unique account ID keeps compaction/reload from silently retargeting it. */
+static bool config_capture_current_id(const gitswitch_ctx_t *ctx,
+                                      uint32_t *account_id) {
+    size_t count;
+
+    if (!ctx || !account_id || !ctx->current_account) return false;
+    count = ctx->account_count < MAX_ACCOUNTS
+        ? ctx->account_count : MAX_ACCOUNTS;
+    for (size_t i = 0; i < count; i++) {
+        if (ctx->current_account == &ctx->accounts[i]) {
+            *account_id = ctx->accounts[i].id;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void config_rebind_current_id(gitswitch_ctx_t *ctx,
+                                     bool had_current,
+                                     uint32_t account_id) {
+    size_t count;
+
+    if (!ctx) return;
+    ctx->current_account = NULL;
+    if (!had_current) return;
+    count = ctx->account_count < MAX_ACCOUNTS
+        ? ctx->account_count : MAX_ACCOUNTS;
+    for (size_t i = 0; i < count; i++) {
+        if (ctx->accounts[i].id == account_id) {
+            ctx->current_account = &ctx->accounts[i];
+            return;
+        }
+    }
+}
+
 int config_validate(const gitswitch_ctx_t *ctx) {
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_validate");
@@ -2250,6 +2305,9 @@ int config_get_path(char *path_buffer, size_t buffer_size) {
 
 /* Add new account to configuration */
 int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
+    uint32_t current_id = 0;
+    bool had_current;
+
     if (!ctx || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_add_account");
         return -1;
@@ -2266,10 +2324,13 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
     }
     
     if (validate_account_uniqueness(ctx, account, SIZE_MAX) != 0) return -1;
-    
+
+    had_current = config_capture_current_id(ctx, &current_id);
+
     /* Add account */
     ctx->accounts[ctx->account_count] = *account;
     ctx->account_count++;
+    config_rebind_current_id(ctx, had_current, current_id);
     
     log_info("Added account: %s (%s)", account->name, account->description);
     return 0;
@@ -2278,6 +2339,8 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
 /* Remove account from configuration */
 int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
     size_t found_index = SIZE_MAX;
+    uint32_t current_id = 0;
+    bool had_current;
     
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_remove_account");
@@ -2296,7 +2359,9 @@ int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
         set_error(ERR_ACCOUNT_NOT_FOUND, "Account with ID %u not found", account_id);
         return -1;
     }
-    
+
+    had_current = config_capture_current_id(ctx, &current_id);
+
     /* Clear sensitive data before removing */
     secure_zero_memory(&ctx->accounts[found_index], sizeof(account_t));
     
@@ -2309,6 +2374,7 @@ int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
     
     /* Clear the last slot */
     memset(&ctx->accounts[ctx->account_count], 0, sizeof(account_t));
+    config_rebind_current_id(ctx, had_current, current_id);
     
     log_info("Removed account with ID: %u", account_id);
     return 0;
@@ -2319,6 +2385,8 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     account_t *existing_account = NULL;
     account_t replacement;
     size_t existing_index = SIZE_MAX;
+    uint32_t current_id = 0;
+    bool had_current;
     
     if (!ctx || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_update_account");
@@ -2347,12 +2415,15 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     if (validate_account_uniqueness(ctx, &replacement, existing_index) != 0) {
         return -1;
     }
-    
+
+    had_current = config_capture_current_id(ctx, &current_id);
+
     /* Clear old sensitive data */
     secure_zero_memory(existing_account, sizeof(account_t));
     
     /* Update with new data */
     *existing_account = replacement;
+    config_rebind_current_id(ctx, had_current, current_id);
     
     log_info("Updated account: %s (%s)", replacement.name,
              replacement.description);
