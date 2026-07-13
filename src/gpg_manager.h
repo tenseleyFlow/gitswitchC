@@ -93,6 +93,10 @@ typedef int (*gpg_unsetenv_fn)(const char *name);
  * has removed `current` and immediately before the required final base scan. */
 typedef int (*gpg_cleanup_predelete_fn)(int home_fd);
 typedef int (*gpg_reset_final_hook_fn)(int base_fd);
+/* Runs after reset captures the exact `current` symlink and before it moves
+ * that pathname into a private quarantine. Tests use this boundary to prove
+ * that a same-uid writer replacing `current` is restored, never unlinked. */
+typedef int (*gpg_reset_current_hook_fn)(int base_fd);
 /* Deterministic mount-identity and managed-writer durability seams. NULL
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
@@ -117,6 +121,8 @@ gpg_cleanup_predelete_fn
 gpg_manager_set_cleanup_predelete_fn(gpg_cleanup_predelete_fn fn);
 gpg_reset_final_hook_fn
 gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn);
+gpg_reset_current_hook_fn
+gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn);
 gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn
@@ -157,18 +163,9 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account);
  */
 int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account);
 
-/**
- * AR-06 F61: gpg_import_key(), gpg_export_public_key() and gpg_list_keys()
- * were removed — dead public API with zero callers.
- */
-
-/**
- * Validate GPG key exists and is usable
- * - Checks key exists in keyring
- * - Verifies key is not expired
- * - Tests signing capability if required
- */
-int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id);
+/** AR-06 F61 / AR-08 L17: gpg_import_key(), gpg_export_public_key(),
+ * gpg_list_keys(), and gpg_validate_key() were removed — dead public API;
+ * gpg_validate_key() also overstated its exit-status-only implementation. */
 
 /**
  * Configure git GPG signing
@@ -203,6 +200,17 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
                                            char *fingerprint,
                                            size_t fingerprint_size);
 
+/** Resolve a selector against the real/system keyring through a retained,
+ * provenance-checked directory descriptor. The helper runs with cwd_fd and
+ * GNUPGHOME=. so namespace replacement cannot redirect it. Exactly one
+ * currently usable primary secret key is required; when require_signing is
+ * true it must also have usable signing capability. On success writes the
+ * canonical primary fingerprint. */
+int gpg_manager_resolve_system_key(const char *selector,
+                                   bool require_signing,
+                                   char *fingerprint,
+                                   size_t fingerprint_size);
+
 /**
  * Compute the stable GNUPGHOME path (a `current` symlink under the isolated
  * GPG base directory) that `gitswitch init` exports into the shell and that
@@ -221,19 +229,6 @@ int gpg_manager_get_home_path(char *buf, size_t size);
 int gpg_manager_get_home_path_quiet(char *buf, size_t size);
 
 /**
- * Resolve the user's REAL/system gpg home for operations documented to consult
- * the system keyring (secret-key export, availability probe). Returns the
- * configured $GNUPGHOME when it is NOT one of our managed isolated homes,
- * otherwise $HOME/.gnupg. This exists because `gitswitch init` exports
- * GNUPGHOME=<base>/current into interactive shells; a child that merely
- * inherits it would read the previously-active account's isolated home instead
- * of the real keyring and fail closed (AR-06 F05/F06). Callers pass the result
- * as an explicit GNUPGHOME override so the inherited managed value can't
- * misdirect them. Returns 0 on success, -1 on overflow or missing $HOME.
- */
-int gpg_manager_system_keyring_home(char *buf, size_t size);
-
-/**
  * Tear down isolated GPG homes (kill per-home gpg-agents and delete the
  * homes, removing the on-disk secret-key copies). Deletion is unlink, not a
  * secure overwrite: on the default memory-backed storage that destroys the
@@ -241,8 +236,15 @@ int gpg_manager_system_keyring_home(char *buf, size_t size);
  * remain forensically recoverable (AR-02 #26). Cleanup fails closed and keeps
  * the affected home when it cannot prove one mount boundary and one link per
  * non-directory entry. A full reset also rejects unknown base entries and
- * verifies that only its exact lock survives. Resets a single account when
- * `account` is non-NULL, or all accounts when NULL. Returns 0 on success.
+ * verifies that only its exact lock survives. Namespace changes are synced
+ * through the pinned base before success; a failed sync returns nonzero so an
+ * otherwise empty retry can repair durability. `current` is removed through
+ * an identity-aware quarantine, preserving a same-uid writer that replaced it
+ * after capture. Resets a single account when
+ * `account` is a nonempty name accepted by validate_name(); callers must pass
+ * the canonical stored account name. Resets all accounts only when `account`
+ * is NULL. Invalid non-NULL input fails with ERR_INVALID_ARGS before any
+ * runtime I/O. Returns 0 on success.
  */
 int gpg_manager_reset(const char *account);
 

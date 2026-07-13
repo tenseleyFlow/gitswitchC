@@ -1,5 +1,6 @@
 /* AR-07 T6: constrained-stack entry, reset atomicity, and canonical identity. */
 #include "test.h"
+#include "signals.h"
 
 #include <fcntl.h>
 #include <getopt.h>
@@ -139,7 +140,15 @@ static void install_fixture_environment(const reset_fixture_t *fixture) {
 
 static void inject_repeated_signal(int stage) {
     char marker = (char)('0' + stage);
-    if (g_trace_fd >= 0) (void)write(g_trace_fd, &marker, 1);
+    if (g_trace_fd >= 0) {
+        int saved_errno = errno;
+        ssize_t written;
+        do {
+            written = write(g_trace_fd, &marker, 1);
+        } while (written < 0 && errno == EINTR);
+        (void)written;
+        errno = saved_errno;
+    }
     if (stage == g_inject_stage) {
         (void)raise(SIGTERM);
         (void)raise(SIGTERM);
@@ -238,6 +247,71 @@ static int run_simple_child(const reset_fixture_t *fixture,
     return wait_status(child);
 }
 
+static int run_add_guard_failure_child(const reset_fixture_t *fixture) {
+    static const char answers[] =
+        "new\nnew@example.com\n\n\n\nglobal\n";
+    int input_pipe[2];
+    pid_t child;
+
+    if (pipe(input_pipe) != 0) return -1;
+    if (write(input_pipe[1], answers, sizeof(answers) - 1) !=
+        (ssize_t)(sizeof(answers) - 1)) {
+        close(input_pipe[0]);
+        close(input_pipe[1]);
+        return -1;
+    }
+    close(input_pipe[1]);
+
+    child = fork();
+    if (child < 0) {
+        close(input_pipe[0]);
+        return -1;
+    }
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char assume_yes[] = "-y";
+        char add[] = "add";
+        char *argv[] = { program, no_color, assume_yes, add, NULL };
+        int rc;
+
+        if (dup2(input_pipe[0], STDIN_FILENO) < 0) _exit(119);
+        close(input_pipe[0]);
+        install_fixture_environment(fixture);
+        if (redirect_output(fixture->output) != 0) _exit(120);
+        signals_test_fail_sigaction(SIGTERM,
+                                    SIGNALS_TEST_SIGACTION_INSTALL, EPERM);
+        optind = 1;
+        rc = gitswitch_cli_main(4, argv);
+        if (gitswitch_test_context_allocations() != 0) _exit(121);
+        _exit(rc);
+    }
+    close(input_pipe[0]);
+    return wait_status(child);
+}
+
+/* AR-08 M22: add's first guard is the centralized persistence boundary. A
+ * failed guard must reject the command without installing the process-local
+ * candidate in accounts.toml or printing a false success. */
+TEST(add_persistence_guard_failure_leaves_config_unchanged) {
+    reset_fixture_t fixture;
+    char before[4096];
+    char after[4096];
+    char output[4096];
+    int status;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    CHECK(read_text(fixture.config, before, sizeof(before)) > 0);
+    status = run_add_guard_failure_child(&fixture);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK(WEXITSTATUS(status) != 0);
+    CHECK(read_text(fixture.config, after, sizeof(after)) > 0);
+    CHECK_STR_EQ(after, before);
+    CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+    CHECK(strstr(output, "Failed to install guarded disposition") != NULL);
+    CHECK(strstr(output, "Account added successfully") == NULL);
+}
+
 TEST(informational_and_config_paths_obey_context_lifetime) {
     reset_fixture_t fixture;
     char prog[] = "gitswitch";
@@ -260,6 +334,58 @@ TEST(informational_and_config_paths_obey_context_lifetime) {
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     status = run_simple_child(&fixture, 2, invalid_argv, 0);
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) != 0);
+}
+
+TEST(empty_reset_selector_is_rejected_before_any_reset_work) {
+    const char *modes[] = { "-n", "-y" };
+
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        reset_fixture_t fixture;
+        char gpg_base[PATH_MAX];
+        char gpg_home[PATH_MAX];
+        char marker[PATH_MAX];
+        char config_lock[PATH_MAX];
+        char hint[128];
+        char output[4096];
+        char prog[] = "gitswitch";
+        char no_color[] = "-C";
+        char reset[] = "reset";
+        char empty[] = "";
+        char *argv[] = {
+            prog, no_color, (char *)modes[i], reset, empty, NULL
+        };
+        int status;
+
+        CHECK_EQ_INT(fixture_setup(&fixture), 0);
+        CHECK_EQ_INT(join_path(gpg_base, sizeof(gpg_base), fixture.runtime,
+                               "/gitswitch-gpg"), 0);
+        CHECK_EQ_INT(mkdir(gpg_base, 0700), 0);
+        CHECK_EQ_INT(join_path(gpg_home, sizeof(gpg_home), gpg_base,
+                               "/work"), 0);
+        CHECK_EQ_INT(mkdir(gpg_home, 0700), 0);
+        CHECK_EQ_INT(join_path(marker, sizeof(marker), gpg_home,
+                               "/keep"), 0);
+        CHECK_EQ_INT(write_private(marker, "preserve\n"), 0);
+        CHECK_EQ_INT(join_path(config_lock, sizeof(config_lock),
+                               fixture.config_dir, "/.config.lock"), 0);
+        CHECK(access(config_lock, F_OK) != 0 && errno == ENOENT);
+
+        status = run_simple_child(&fixture, 5, argv, 0);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+        }
+        CHECK(access(marker, F_OK) == 0);
+        CHECK(access(config_lock, F_OK) != 0 && errno == ENOENT);
+        CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+        CHECK_STR_EQ(hint, "none\nactive=work\n");
+        CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+        CHECK(strstr(output, "reset account selector must not be empty") != NULL);
+        CHECK(strstr(output, "kill ALL") == NULL);
+        CHECK(strstr(output, "delete ALL") == NULL);
+        CHECK(strstr(output, "DRY RUN complete") == NULL);
+        CHECK(strstr(output, "Reset all gitswitch") == NULL);
+    }
 }
 
 TEST(repeated_signals_defer_across_every_reset_boundary) {
@@ -341,9 +467,11 @@ TEST(case_different_active_account_clears_by_name_id_and_email) {
 }
 
 int main(void) {
+    RUN_TEST(add_persistence_guard_failure_leaves_config_unchanged);
     RUN_TEST(informational_and_config_paths_obey_context_lifetime);
+    RUN_TEST(empty_reset_selector_is_rejected_before_any_reset_work);
     RUN_TEST(repeated_signals_defer_across_every_reset_boundary);
     RUN_TEST(manager_failure_keeps_retry_state_while_signal_is_deferred);
     RUN_TEST(case_different_active_account_clears_by_name_id_and_email);
-    return ts_tests_failed ? 1 : 0;
+    return ts_test_finish();
 }

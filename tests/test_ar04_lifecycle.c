@@ -21,16 +21,21 @@
 #include <unistd.h>
 
 static char g_bin[PATH_MAX];
+static char g_self[PATH_MAX];
 
 static int install_live_current_socket(const char *runtime,
                                        const char *account_name);
 
-static int resolve_binary(void) {
+static int resolve_binary_and_self(const char *argv0) {
     const char *bin = getenv("GITSWITCH_BIN");
 
     if (!bin || !*bin) bin = "build/bin/gitswitch";
     if (!realpath(bin, g_bin) || access(g_bin, X_OK) != 0) {
         fprintf(stderr, "test_ar04_lifecycle: executable not found at %s\n", bin);
+        return -1;
+    }
+    if (!argv0 || !realpath(argv0, g_self) || access(g_self, X_OK) != 0) {
+        fprintf(stderr, "test_ar04_lifecycle: cannot resolve self helper\n");
         return -1;
     }
     return 0;
@@ -110,6 +115,10 @@ static int prepare_home(const char *home, const char *config_body) {
     snprintf(path, sizeof(path), "%s/.config", home);
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch", home);
+    if (mkdir_private(path) != 0) return -1;
+    /* Child CLI invocations pin GNUPGHOME here so prompt validation never
+     * depends on the operator's keyring or on whether GNUPGHOME is inherited. */
+    snprintf(path, sizeof(path), "%s/.gnupg", home);
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     if (write_text(path, config_body, 0600) != 0) return -1;
@@ -223,8 +232,13 @@ static int prepare_shims(char *shim_dir, size_t size) {
         find_fixture_executable("git", git_path, sizeof(git_path)) != 0) {
         return -1;
     }
+    /* Account edit now resolves a selector to one canonical primary
+     * fingerprint. Exit-zero-with-no-output is deliberately a miss, so the
+     * old copied `true` fixture no longer supplies valid key evidence. Copy
+     * this test binary as a native helper; its helper mode below emits a
+     * minimal, structurally valid secret-key inventory. */
     snprintf(path, sizeof(path), "%s/gpg", shim_dir);
-    if (copy_executable(true_path, path) != 0) return -1;
+    if (copy_executable(g_self, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/gpgconf", shim_dir);
     if (copy_executable(true_path, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/git", shim_dir);
@@ -239,9 +253,10 @@ static int run_edit(const char *home, const char *runtime, const char *shim_dir,
     snprintf(stdin_path, sizeof(stdin_path), "%s/edit.in", runtime);
     if (write_text(stdin_path, input, 0600) != 0) return -1;
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
+             "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
+             "PATH='%s:/usr/bin:/bin' "
              "'%s' -C -y edit work <'%s' >'%s' 2>&1",
-             home, runtime, shim_dir, g_bin, stdin_path, output);
+             home, home, runtime, shim_dir, g_bin, stdin_path, output);
     return run_shell(cmd);
 }
 
@@ -458,17 +473,18 @@ static int run_remove(const char *home, const char *runtime,
     char cmd[8192];
 
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
+             "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
+             "PATH='%s:/usr/bin:/bin' "
              "'%s' -C -y remove '%s' </dev/null >'%s' 2>&1",
-             home, runtime, shim_dir, g_bin, account, output);
+             home, home, runtime, shim_dir, g_bin, account, output);
     return run_shell(cmd);
 }
 
-TEST(remove_tears_down_runtime_before_deleting_account) {
+static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
     char home[256], runtime[256], shims[512], path[1024], target[1024];
-    char output[1024], contents[8192], cmd[4096], pid_text[64];
+    char output[1024], contents[8192], cmd[PATH_MAX + 4096], pid_text[64];
     pid_t agent_pid = -1;
-    bool real_agent = false;
+    bool agent_started = false;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
@@ -478,14 +494,14 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
     snprintf(target, sizeof(target), "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
-    if (run_shell("command -v ssh-agent >/dev/null 2>&1") == 0) {
+    if (ssh_agent_path) {
         char *pid_marker;
 
         snprintf(output, sizeof(output), "%s/ssh-agent.out", runtime);
         snprintf(cmd, sizeof(cmd),
-                 "PATH='/usr/bin:/bin:/usr/local/bin' ssh-agent -s -a '%s' "
+                 "PATH='/usr/bin:/bin:/usr/local/bin' '%s' -s -a '%s' "
                  ">'%s' 2>/dev/null",
-                 target, output);
+                 ssh_agent_path, target, output);
         CHECK_EQ_INT(run_shell(cmd), 0);
         slurp(output, contents, sizeof(contents));
         pid_marker = strstr(contents, "SSH_AGENT_PID=");
@@ -500,10 +516,9 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
                      "%s/gitswitch-ssh/ssh-agent.work.pid", runtime);
             snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)agent_pid);
             CHECK_EQ_INT(write_text(path, pid_text, 0600), 0);
-            real_agent = true;
+            agent_started = true;
         }
     } else {
-        fprintf(stderr, "  (skipped real-agent assertion: ssh-agent not installed)\n");
         CHECK_EQ_INT(write_text(target, "socket fixture\n", 0600), 0);
     }
     snprintf(path, sizeof(path), "%s/gitswitch-ssh/current.sock", runtime);
@@ -518,7 +533,7 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
 
     snprintf(output, sizeof(output), "%s/remove.out", runtime);
     CHECK_EQ_INT(run_remove(home, runtime, shims, "work", output), 0);
-    if (real_agent) {
+    if (agent_started) {
         errno = 0;
         CHECK(kill(agent_pid, 0) != 0);
         CHECK_EQ_INT(errno, ESRCH);
@@ -547,6 +562,20 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
     remove_tree(runtime);
 }
 
+TEST(remove_tears_down_runtime_before_deleting_account) {
+    exercise_remove_runtime_teardown(NULL);
+}
+
+TEST(remove_reaps_real_agent_before_deleting_account) {
+    char ssh_agent_path[PATH_MAX];
+
+    if (find_fixture_executable("ssh-agent", ssh_agent_path,
+                                sizeof(ssh_agent_path)) != 0) {
+        TS_SKIP("openssh", "ssh-agent unavailable in PATH");
+    }
+    exercise_remove_runtime_teardown(ssh_agent_path);
+}
+
 TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     char home[256], runtime[256], shims[512], config_dir[1024];
     char path[1024], target[1024], output[1024], cmd[8192], contents[8192];
@@ -558,8 +587,8 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     FILE *lock_file;
 
     if (getuid() == 0) {
-        fprintf(stderr, "  (skipped: root bypasses the save permission fixture)\n");
-        return;
+        TS_SKIP("unprivileged",
+                "save permission denial requires an unprivileged uid");
     }
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
@@ -618,10 +647,10 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
      * be recreated cleanly after the earlier teardown. */
     CHECK_EQ_INT(chmod(config_dir, 0700), 0);
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' "
+             "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
              "PATH='%s:/usr/local/bin:/usr/bin:/bin' "
              "'%s' -C -y work >'%s' 2>&1",
-             home, runtime, shims, g_bin, output);
+             home, home, runtime, shims, g_bin, output);
     int switch_rc = run_shell(cmd);
     slurp(output, contents, sizeof(contents));
     if (switch_rc != 0) {
@@ -946,15 +975,23 @@ TEST(sock_substrings_round_trip_and_malformed_links_fall_back) {
     remove_tree(runtime);
 }
 
-TEST_MAIN_BEGIN()
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--batch") == 0) {
+        puts("sec:u:4096:1:ABCDEF0123456789:1700000000:::-:::scESC:::+:::23::0:");
+        puts("fpr:::::::::0123456789ABCDEF01234567ABCDEF0123456789:");
+        return 0;
+    }
     error_init(LOG_LEVEL_WARNING, NULL);
-    if (resolve_binary() != 0) return 1;
+    if (resolve_binary_and_self(argc > 0 ? argv[0] : NULL) != 0) return 1;
     RUN_TEST(active_live_field_edits_are_rejected_without_mutation);
     RUN_TEST(active_description_edit_and_inactive_live_edits_still_work);
     RUN_TEST(remove_tears_down_runtime_before_deleting_account);
+    RUN_TEST(remove_reaps_real_agent_before_deleting_account);
     RUN_TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown);
     RUN_TEST(remove_failure_retains_account_and_attempts_other_manager);
     RUN_TEST(remove_inactive_account_with_no_runtime_preserves_active_account);
     RUN_TEST(remove_rebinds_current_pointer_after_array_compaction);
     RUN_TEST(sock_substrings_round_trip_and_malformed_links_fall_back);
-TEST_MAIN_END()
+    error_cleanup();
+    return ts_test_finish();
+}

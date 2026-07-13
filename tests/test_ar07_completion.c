@@ -561,6 +561,9 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
     CHECK(strstr(bash, "--resume-check") == NULL);
     CHECK(strstr(zsh, "--resume-check") == NULL);
     CHECK(strstr(fish, "--resume-check") == NULL);
+    CHECK(strstr(bash, "--resume-hint-probe") == NULL);
+    CHECK(strstr(zsh, "--resume-hint-probe") == NULL);
+    CHECK(strstr(fish, "--resume-hint-probe") == NULL);
 }
 
 TEST(bash_completion_executes_getopt_style_operand_state) {
@@ -612,8 +615,7 @@ TEST(zsh_completion_executes_runtime_expansion_and_state_scanner) {
         "scan gitswitch edit -- Alpha ''; scan gitswitch switch ''";
 
     if (!zsh) {
-        printf("  (skipped zsh runtime completion: shell unavailable)\n");
-        return;
+        TS_SKIP("zsh", "zsh shell is unavailable");
     }
     CHECK_EQ_INT(run_script(zsh, false, script, output, sizeof(output)), 0);
     CHECK(strstr(output, "D:accounts\nREADY\n") != NULL);
@@ -643,8 +645,7 @@ TEST(fish_completion_executes_getopt_style_operand_state) {
         "echo P; complete -C \"$line\"; echo E; end";
 
     if (!fish) {
-        printf("  (skipped fish runtime completion: shell unavailable)\n");
-        return;
+        TS_SKIP("fish", "fish shell is unavailable");
     }
     CHECK_EQ_INT(run_script(fish, true, script, output, sizeof(output)), 0);
     CHECK_STR_EQ(output,

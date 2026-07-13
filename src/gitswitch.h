@@ -133,8 +133,4 @@ typedef struct {
     size_t unknown_keys_on_load;
 } gitswitch_ctx_t;
 
-/* Function prototypes */
-int gitswitch_init(gitswitch_ctx_t *ctx);
-void gitswitch_cleanup(gitswitch_ctx_t *ctx);
-
 #endif /* GITSWITCH_H */

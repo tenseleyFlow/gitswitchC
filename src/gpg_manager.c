@@ -75,6 +75,23 @@ typedef struct {
     const char *name;
     const char *path;
 } gpg_pinned_home_t;
+typedef struct {
+    bool injected;
+    uint64_t injected_id;
+#ifdef __linux__
+    unsigned long long mount_id;
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    fsid_t fsid;
+#else
+    int unsupported;
+#endif
+} gpg_mount_identity_t;
+typedef struct {
+    int fd;
+    char path[MAX_PATH_LEN];
+    struct stat identity;
+    gpg_mount_identity_t mount;
+} gpg_source_home_t;
 static int gpg_run_pinned(const gpg_pinned_home_t *home,
                           const gpg_config_t *cfg, run_result_t *res_out,
                           char *output, size_t output_size, ...);
@@ -90,7 +107,13 @@ static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
                                         int base_fd, const char *base,
                                         int *home_fd_out);
 static int gpg_validate_pinned_home(const gpg_pinned_home_t *home);
+static int gpg_mount_identity_fd(int fd, gpg_mount_identity_t *identity);
+static bool gpg_same_mount(const gpg_mount_identity_t *left,
+                           const gpg_mount_identity_t *right);
 static int gpg_user_source_home(char *buf, size_t size);
+static int gpg_open_user_source_home(gpg_source_home_t *source);
+static int gpg_validate_source_home(const gpg_source_home_t *source);
+static void gpg_close_source_home(gpg_source_home_t *source);
 static int gpg_resolve_source_key(const char *selector, bool require_signing,
                                   char *fingerprint,
                                   size_t fingerprint_size);
@@ -121,6 +144,7 @@ static gpg_setenv_fn g_gpg_setenv = setenv;
 static gpg_unsetenv_fn g_gpg_unsetenv = unsetenv;
 static gpg_cleanup_predelete_fn g_cleanup_predelete;
 static gpg_reset_final_hook_fn g_reset_final_hook;
+static gpg_reset_current_hook_fn g_reset_current_hook;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
@@ -202,6 +226,13 @@ gpg_reset_final_hook_fn
 gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn) {
     gpg_reset_final_hook_fn previous = g_reset_final_hook;
     g_reset_final_hook = fn;
+    return previous;
+}
+
+gpg_reset_current_hook_fn
+gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn) {
+    gpg_reset_current_hook_fn previous = g_reset_current_hook;
+    g_reset_current_hook = fn;
     return previous;
 }
 
@@ -1176,6 +1207,8 @@ static int gpg_validate_pinned_home(const gpg_pinned_home_t *home) {
     struct stat child_named;
     struct stat home_opened;
     struct stat home_named;
+    gpg_mount_identity_t base_mount;
+    gpg_mount_identity_t home_mount;
 
     if (!home || home->base_fd < 0 || home->home_fd < 0 ||
         !home->base || !*home->base || !home->name || !*home->name ||
@@ -1209,6 +1242,19 @@ static int gpg_validate_pinned_home(const gpg_pinned_home_t *home) {
         home_named.st_ino != home_opened.st_ino) {
         set_error(ERR_PERMISSION_DENIED,
                   "GPG home pathname no longer names the pinned directory: %s",
+                  home->path);
+        return -1;
+    }
+    if (gpg_mount_identity_fd(home->base_fd, &base_mount) != 0 ||
+        gpg_mount_identity_fd(home->home_fd, &home_mount) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot prove isolated GPG home mount boundary: %s",
+                         home->path);
+        return -1;
+    }
+    if (!gpg_same_mount(&base_mount, &home_mount)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing isolated GPG home mounted outside its memory-backed base: %s",
                   home->path);
         return -1;
     }
@@ -2343,18 +2389,6 @@ out:
     return rc;
 }
 
-typedef struct {
-    bool injected;
-    uint64_t injected_id;
-#ifdef __linux__
-    unsigned long long mount_id;
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-    fsid_t fsid;
-#else
-    int unsupported;
-#endif
-} gpg_mount_identity_t;
-
 /* Capture the kernel mount identity for a pinned directory. Linux st_dev is
  * deliberately not used: a bind mount of the same filesystem (or even the
  * same inode) keeps st_dev while crossing into a distinct mount. statx's mount
@@ -2974,6 +3008,119 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     return 0;
 }
 
+/* Remove only the exact `current` inode reset inspected. Moving the public
+ * name to an unpredictable quarantine is the atomic ownership boundary: if a
+ * same-uid writer replaced it after capture, the moved inode will not compare
+ * equal and is restored with no-replace semantics. A writer that appears after
+ * the move remains at `current` while reset retires only its private inode. */
+static int gpg_remove_captured_current_locked(
+    int base_fd, const char *base, const gpg_link_identity_t *captured,
+    bool *changed) {
+    char quarantine[GPG_QUARANTINE_NAME_LEN] = "";
+    gpg_link_identity_t moved;
+    gpg_link_identity_t current;
+    int current_rc;
+    int quarantine_rc;
+
+    if (base_fd < 0 || !base || !*base || !captured || !captured->valid ||
+        !changed) {
+        set_error(ERR_INVALID_ARGS, "Invalid captured GNUPGHOME reset state");
+        return -1;
+    }
+    *changed = false;
+    if (gpg_make_private_name(quarantine, sizeof(quarantine),
+                              GPG_ROLLBACK_PREFIX) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, quarantine) != 0) {
+        return -1;
+    }
+    if (g_reset_current_hook && g_reset_current_hook(base_fd) != 0) {
+        set_error(ERR_FILE_IO, "GPG reset current-link hook failed");
+        return -1;
+    }
+    if (g_rename_noreplace(base_fd, "current", base_fd, quarantine) != 0) {
+        int saved_errno = errno;
+        if (saved_errno == ENOENT) {
+            *changed = true;
+            set_error(ERR_FILE_IO,
+                      "Stable GNUPGHOME changed during reset; later absence preserved");
+        } else if (saved_errno == ENOTSUP ||
+#if EOPNOTSUPP != ENOTSUP
+                   saved_errno == EOPNOTSUPP ||
+#endif
+                   saved_errno == ENOSYS || saved_errno == EINVAL) {
+            set_error(ERR_FILE_IO,
+                      "Platform lacks atomic no-replace GPG reset quarantine");
+        } else {
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot quarantine stable GNUPGHOME during reset");
+        }
+        return -1;
+    }
+    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &moved);
+    if (quarantine_rc != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot identify quarantined GNUPGHOME; reset state retained for retry");
+        return -1;
+    }
+
+    if (!gpg_same_link(&moved, captured)) {
+        current_rc = gpg_capture_link_at(base_fd, "current", &current);
+        if (current_rc < 0) return -1;
+        if (current_rc == 0) {
+            set_error(ERR_FILE_IO,
+                      "A newer GNUPGHOME writer blocks restoration; foreign quarantine retained: %s",
+                      quarantine);
+            return -1;
+        }
+        if (g_rename_noreplace(base_fd, quarantine, base_fd, "current") != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot restore GNUPGHOME link replaced during reset");
+            return -1;
+        }
+        current_rc = gpg_capture_link_at(base_fd, "current", &current);
+        if (current_rc != 0 || !gpg_same_link(&current, &moved)) {
+            set_error(ERR_FILE_IO,
+                      "Restored GNUPGHOME link changed during reset recovery");
+            return -1;
+        }
+        /* FreeBSD's no-replace fallback may retain the private hard-link alias.
+         * Remove it only while it is still the exact foreign inode restored. */
+        quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &current);
+        if (quarantine_rc < 0) return -1;
+        if (quarantine_rc == 0) {
+            if (!gpg_same_link(&current, &moved) ||
+                unlinkat(base_fd, quarantine, 0) != 0) {
+                set_error(ERR_FILE_IO,
+                          "Restored GNUPGHOME quarantine changed; preserving it");
+                return -1;
+            }
+        }
+        *changed = true;
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed during reset; later writer preserved: %s",
+                  moved.target);
+        return 0;
+    }
+
+    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &current);
+    if (quarantine_rc != 0 || !gpg_same_link(&current, &moved) ||
+        unlinkat(base_fd, quarantine, 0) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Captured GNUPGHOME quarantine changed; preserving replacement");
+        return -1;
+    }
+    current_rc = gpg_capture_link_at(base_fd, "current", &current);
+    if (current_rc < 0) return -1;
+    if (current_rc == 0) {
+        *changed = true;
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed during reset; later writer preserved: %s",
+                  current.target);
+    }
+    return 0;
+}
+
 /* Tear down isolated GPG homes: one account, or all when account is NULL.
  * Kills the per-home gpg-agents and deletes (unlinks) the homes, then drops
  * the stable `current` symlink if it dangles. NB: deletion is remove(), not a
@@ -2989,8 +3136,8 @@ int gpg_manager_reset(const char *account) {
     int lock_fd = -1;
     bool failed = false;
 
-    if (account && *account && !validate_name(account)) {
-        set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
+    if (account && !validate_name(account)) {
+        set_error(ERR_INVALID_ARGS, "Invalid account name for reset");
         return -1;
     }
     if (gpg_get_base_dir(base, sizeof(base)) != 0) {
@@ -3010,13 +3157,13 @@ int gpg_manager_reset(const char *account) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
-    if ((!account || !*account) &&
+    if (!account &&
         gpg_preflight_reset_all_locked(base_fd, base) != 0) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
 
-    if (account && *account) {
+    if (account) {
         struct stat hst;
         if (fstatat(base_fd, account, &hst, AT_SYMLINK_NOFOLLOW) == 0) {
             if (!S_ISDIR(hst.st_mode) || hst.st_uid != getuid() ||
@@ -3116,20 +3263,21 @@ int gpg_manager_reset(const char *account) {
     if (gpg_current_path_from_base(base, current, sizeof(current)) != 0) {
         failed = true;
     } else {
-        char target[MAX_PATH_LEN];
-        int current_rc = gpg_read_current_locked(base_fd, base, target,
-                                                  sizeof(target));
+        gpg_link_identity_t captured_current;
+        int current_rc = gpg_capture_link_at(base_fd, "current",
+                                             &captured_current);
         if (current_rc == 0) {
-            if ((!account || !*account) && !failed) {
-                if (unlinkat(base_fd, "current", 0) != 0 && errno != ENOENT) {
-                    set_system_error(ERR_FILE_IO,
-                                     "Failed to remove stable GNUPGHOME link: %s",
-                                     current);
+            if (!account && !failed) {
+                bool current_changed = false;
+                if (gpg_remove_captured_current_locked(
+                        base_fd, base, &captured_current,
+                        &current_changed) != 0 || current_changed) {
                     failed = true;
                 }
                 goto reset_finalize;
             }
-            const char *component = gpg_managed_component(base, target);
+            const char *component = gpg_managed_component(
+                base, captured_current.target);
             struct stat target_st;
             bool remove_current = component == NULL;
             if (component &&
@@ -3140,7 +3288,7 @@ int gpg_manager_reset(const char *account) {
                 } else {
                     set_system_error(ERR_FILE_IO,
                                      "Cannot inspect managed GNUPGHOME target: %s",
-                                     target);
+                                     captured_current.target);
                     failed = true;
                 }
             } else if (component &&
@@ -3149,24 +3297,46 @@ int gpg_manager_reset(const char *account) {
                         (target_st.st_mode & 077) != 0)) {
                 remove_current = true;
             }
-            if (remove_current &&
-                unlinkat(base_fd, "current", 0) != 0 && errno != ENOENT) {
-                set_system_error(ERR_FILE_IO,
-                                 "Failed to remove invalid GNUPGHOME link: %s",
-                                 current);
-                failed = true;
+            if (remove_current) {
+                bool current_changed = false;
+                if (gpg_remove_captured_current_locked(
+                        base_fd, base, &captured_current,
+                        &current_changed) != 0 || current_changed) {
+                    failed = true;
+                }
             }
         } else if (current_rc < 0) {
             failed = true;
         }
     }
 reset_finalize:
-    if ((!account || !*account) && !failed) {
+    if (!account && !failed) {
         if (g_reset_final_hook && g_reset_final_hook(base_fd) != 0) {
             set_error(ERR_FILE_IO, "GPG reset final-verification hook failed");
             failed = true;
         } else if (gpg_verify_reset_all_final_locked(base_fd, lock_fd,
                                                      base) != 0) {
+            failed = true;
+        }
+    }
+    {
+        char prior[sizeof(g_last_error.message)] = "";
+        if (failed) {
+            safe_strncpy(prior, get_last_error()->message, sizeof(prior));
+        }
+        /* Every successful reset — including an otherwise byte-for-byte retry
+         * after an earlier fsync failure — repairs the durability boundary of
+         * home/current namespace changes before releasing the manager lock. */
+        if (g_sync_base(base_fd) != 0) {
+            char sync_error[sizeof(g_last_error.message)];
+            set_system_error(
+                ERR_FILE_IO,
+                "GPG reset changed the namespace but the base directory is not durable; retry reset");
+            safe_strncpy(sync_error, get_last_error()->message,
+                         sizeof(sync_error));
+            if (prior[0] != '\0') {
+                set_error(ERR_FILE_IO, "%s; %s", prior, sync_error);
+            }
             failed = true;
         }
     }
@@ -3369,32 +3539,10 @@ out:
     return rc;
 }
 
-/* AR-06 F61: gpg_import_key(), gpg_export_public_key() and gpg_list_keys() were
- * removed here — dead public API with zero callers anywhere in the tree. */
-
-/* Validate GPG key exists and is usable */
-int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id) {
-    char output[512];
-    int result;
-
-    if (!gpg_config || !key_id) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_validate_key");
-        return -1;
-    }
-
-    log_debug("Validating GPG key: %s", key_id);
-
-    result = gpg_run(gpg_config, NULL, output, sizeof(output),
-                     "gpg", "--list-secret-keys", key_id, (const char *)NULL);
-    if (result != 0) {
-        set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found: %s", key_id);
-        return -1;
-    }
-
-    log_debug("GPG key validation passed: %s", key_id);
-    gpg_manager_note_key_available(key_id);
-    return 0;
-}
+/* AR-06 F61 / AR-08 L17: gpg_import_key(), gpg_export_public_key(),
+ * gpg_list_keys(), and gpg_validate_key() were removed here. They had no
+ * callers, and the latter's name promised strict usability/capability checks
+ * while its implementation only observed a helper exit status. */
 
 /* Configure git GPG signing */
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, git_scope_t scope) {
@@ -3650,6 +3798,20 @@ static int gpg_runv(const gpg_pinned_home_t *home,
     return rc;
 }
 
+int gpg_manager_resolve_system_key(const char *selector,
+                                   bool require_signing,
+                                   char *fingerprint,
+                                   size_t fingerprint_size) {
+    if (!fingerprint || fingerprint_size == 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid canonical GPG fingerprint destination");
+        return -1;
+    }
+    fingerprint[0] = '\0';
+    return gpg_resolve_source_key(selector, require_signing, fingerprint,
+                                  fingerprint_size);
+}
+
 static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
                    char *output, size_t output_size, ...) {
     va_list ap;
@@ -3901,94 +4063,163 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
     return 0;
 }
 
-/* Return 0 for one validated key, 1 for an ordinary listing miss, and -1 for
- * incomplete or ambiguous evidence. */
+/* Classify the runner result without collapsing transport/setup failures into
+ * an ordinary key miss. GnuPG documents exit status 2 for the no-secret-key
+ * result of --list-secret-keys; every other nonzero state is operational
+ * failure, including pre-spawn rejection, child setup/exec failure, signal
+ * termination, and a runner I/O failure after an exit-0 child. */
+static int gpg_classify_secret_listing_run(int run_rc,
+                                           const run_result_t *res,
+                                           const char *selector) {
+    if (!res || !selector) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG key-listing result classification");
+        return -1;
+    }
+    if (run_rc == 0) {
+        if (res->spawned && res->exit_code == 0 && res->term_signal == 0) {
+            return 0;
+        }
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper returned inconsistent success for %s",
+                  selector);
+        return -1;
+    }
+    if (res->spawned && res->term_signal == 0 && res->exit_code == 2) {
+        return 1;
+    }
+    if (!res->spawned) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper failed before spawn for %s",
+                  selector);
+    } else if (res->term_signal != 0) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper was terminated by signal %d for %s",
+                  res->term_signal, selector);
+    } else if (res->exit_code == 126 || res->exit_code == 127) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper failed during child setup or exec "
+                  "(exit %d) for %s",
+                  res->exit_code, selector);
+    } else if (res->exit_code == 0) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper transport failed after exit 0 for %s",
+                  selector);
+    } else {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper failed with exit status %d for %s",
+                  res->exit_code, selector);
+    }
+    return -1;
+}
+
+/* Return 0 for one validated key, 1 only for GnuPG's ordinary listing miss,
+ * and -1 for incomplete, ambiguous, or operationally failed evidence. */
 static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                                       const gpg_pinned_home_t *home,
-                                      const char *source_home,
+                                      const gpg_source_home_t *source,
                                       const char *selector,
                                       bool require_signing,
                                       char *fingerprint,
                                       size_t fingerprint_size) {
     enum { KEY_LISTING_CAP = 512 * 1024 };
-    char source_env[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
-    const char *env[2] = {NULL, NULL};
+    const char *env[2] = {"GNUPGHOME=.", NULL};
     const char *argv[] = {
         "gpg", "--batch", "--with-colons", "--fixed-list-mode",
         "--list-secret-keys", "--fingerprint", "--fingerprint", selector,
         NULL
     };
-    char *listing = malloc(KEY_LISTING_CAP);
-    int attempt;
+    char *listing;
+    run_result_t res;
+    int run_rc;
+    int status;
 
+    if ((!home && !source) || (home && source) || !selector || !*selector) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG secret-key listing source");
+        return -1;
+    }
+    listing = malloc(KEY_LISTING_CAP);
     if (!listing) {
         set_error(ERR_MEMORY_ALLOCATION,
                   "Failed to allocate GPG key-listing buffer");
         return -1;
     }
-    for (attempt = 0; attempt < 2; attempt++) {
-        run_result_t res;
-        int run_rc;
-
-        memset(&res, 0, sizeof(res));
-        if (home) {
-            run_rc = gpg_run_pinned(home, gpg_config, &res, listing,
-                                    KEY_LISTING_CAP,
-                                    "gpg", "--batch", "--with-colons",
-                                    "--fixed-list-mode", "--list-secret-keys",
-                                    "--fingerprint", "--fingerprint", selector,
-                                    (const char *)NULL);
-        } else {
-            run_opts_t opts;
-            memset(&opts, 0, sizeof(opts));
-            opts.out = listing;
-            opts.out_size = KEY_LISTING_CAP;
-            opts.stderr_to_devnull = true;
-            if (safe_snprintf(source_env, sizeof(source_env),
-                              "GNUPGHOME=%s", source_home) != 0) {
-                free(listing);
-                set_error(ERR_INVALID_PATH, "GPG source home is too long");
-                return -1;
-            }
-            env[0] = source_env;
-            opts.extra_env = env;
-            run_rc = run_argv(argv, &opts, &res);
-        }
-        if (run_rc != 0) {
+    memset(&res, 0, sizeof(res));
+    res.exit_code = -1;
+    if (home) {
+        run_rc = gpg_run_pinned(home, gpg_config, &res, listing,
+                                KEY_LISTING_CAP,
+                                "gpg", "--batch", "--with-colons",
+                                "--fixed-list-mode", "--list-secret-keys",
+                                "--fingerprint", "--fingerprint", selector,
+                                (const char *)NULL);
+    } else {
+        run_opts_t opts;
+        if (gpg_validate_source_home(source) != 0) {
             secure_zero_memory(listing, KEY_LISTING_CAP);
             free(listing);
-            return 1;
+            return -1;
         }
-        if (!res.out_truncated) {
-            int parse_rc = gpg_manager_resolve_secret_key_listing(
-                listing, require_signing, fingerprint, fingerprint_size);
+        memset(&opts, 0, sizeof(opts));
+        opts.out = listing;
+        opts.out_size = KEY_LISTING_CAP;
+        opts.stderr_to_devnull = true;
+        opts.extra_env = env;
+        opts.cwd_fd = source->fd;
+        opts.use_cwd_fd = true;
+        run_rc = run_argv(argv, &opts, &res);
+        if (gpg_validate_source_home(source) != 0) {
             secure_zero_memory(listing, KEY_LISTING_CAP);
             free(listing);
-            return parse_rc;
+            return -1;
         }
+    }
+    status = gpg_classify_secret_listing_run(run_rc, &res, selector);
+    if (status != 0) {
+        secure_zero_memory(listing, KEY_LISTING_CAP);
+        free(listing);
+        return status;
+    }
+    if (!res.out_truncated) {
+        int parse_rc = gpg_manager_resolve_secret_key_listing(
+            listing, require_signing, fingerprint, fingerprint_size);
+        secure_zero_memory(listing, KEY_LISTING_CAP);
+        free(listing);
+        return parse_rc;
     }
     secure_zero_memory(listing, KEY_LISTING_CAP);
     free(listing);
     set_error(ERR_GPG_KEY_FAILED,
-              "GPG secret-key inventory is too large to resolve safely");
+              "GPG secret-key inventory exceeds the one-shot %d-byte "
+              "capture limit",
+              KEY_LISTING_CAP);
     return -1;
 }
 
 static int gpg_resolve_source_key(const char *selector, bool require_signing,
                                   char *fingerprint,
                                   size_t fingerprint_size) {
-    char source_home[MAX_PATH_LEN];
+    gpg_source_home_t source;
+    int open_rc;
     int rc;
 
-    if (!selector || !*selector ||
-        gpg_user_source_home(source_home, sizeof(source_home)) != 0) {
-        set_error(ERR_GPG_KEY_NOT_FOUND,
-                  "Cannot resolve GPG selector in the system keyring");
+    if (!selector || !*selector) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG key selector");
         return -1;
     }
-    rc = gpg_capture_secret_listing(NULL, NULL, source_home, selector,
+    open_rc = gpg_open_user_source_home(&source);
+    if (open_rc != 0) {
+        if (open_rc > 0) {
+            set_error(ERR_GPG_KEY_NOT_FOUND,
+                      "System GPG keyring home is absent");
+        }
+        return -1;
+    }
+    rc = gpg_capture_secret_listing(NULL, NULL, &source, selector,
                                     require_signing, fingerprint,
                                     fingerprint_size);
+    gpg_close_source_home(&source);
     if (rc == 1) {
         set_error(ERR_GPG_KEY_NOT_FOUND,
                   "GPG selector resolved no secret key: %s", selector);
@@ -4028,6 +4259,8 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     char imported_fingerprint[GPG_FINGERPRINT_BUFSIZE];
     run_opts_t opts;
     run_result_t res;
+    gpg_source_home_t source = { .fd = -1 };
+    int source_rc;
     int present_rc;
 
     if (!gpg_config || !home || !selector || !*selector || !fingerprint ||
@@ -4063,13 +4296,29 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         return -1;
     }
 
-    if (gpg_resolve_source_key(selector, require_signing, fingerprint,
-                               fingerprint_size) != 0) {
+    source_rc = gpg_open_user_source_home(&source);
+    if (source_rc != 0) {
+        if (source_rc > 0) {
+            set_error(ERR_GPG_KEY_NOT_FOUND,
+                      "System GPG keyring home is absent");
+        }
+        return -1;
+    }
+    source_rc = gpg_capture_secret_listing(
+        NULL, NULL, &source, selector, require_signing, fingerprint,
+        fingerprint_size);
+    if (source_rc != 0) {
+        gpg_close_source_home(&source);
+        if (source_rc > 0) {
+            set_error(ERR_GPG_KEY_NOT_FOUND,
+                      "GPG selector resolved no secret key: %s", selector);
+        }
         return -1;
     }
 
     key_data = malloc(KEY_DATA_CAP);
     if (!key_data) {
+        gpg_close_source_home(&source);
         set_error(ERR_MEMORY_ALLOCATION, "Failed to allocate GPG export buffer");
         return -1;
     }
@@ -4092,22 +4341,52 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
     {
         const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys",
                                      fingerprint, NULL};
-        char source_home[MAX_PATH_LEN];
-        char source_env_str[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
-        const char *export_env[2] = {NULL, NULL};
+        const char *export_env[2] = {"GNUPGHOME=.", NULL};
+        int export_rc;
         memset(&opts, 0, sizeof(opts));
+        memset(&res, 0, sizeof(res));
+        res.exit_code = -1;
         opts.out = key_data;
         opts.out_size = KEY_DATA_CAP;
         opts.stderr_to_devnull = true;
-        if (gpg_user_source_home(source_home, sizeof(source_home)) == 0) {
-            snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
-            export_env[0] = source_env_str;
-            opts.extra_env = export_env;
-        }
-        if (run_argv(export_argv, &opts, &res) != 0 || res.out_len == 0) {
+        opts.extra_env = export_env;
+        opts.cwd_fd = source.fd;
+        opts.use_cwd_fd = true;
+        if (gpg_validate_source_home(&source) != 0) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
-            set_error(ERR_GPG_KEY_NOT_FOUND, "Failed to export GPG key from system keyring");
+            gpg_close_source_home(&source);
+            return -1;
+        }
+        export_rc = run_argv(export_argv, &opts, &res);
+        if (gpg_validate_source_home(&source) != 0) {
+            secure_zero_memory(key_data, KEY_DATA_CAP);
+            free(key_data);
+            gpg_close_source_home(&source);
+            return -1;
+        }
+        if (export_rc != 0 || res.out_len == 0) {
+            secure_zero_memory(key_data, KEY_DATA_CAP);
+            free(key_data);
+            gpg_close_source_home(&source);
+            if (!res.spawned) {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key export failed before spawn");
+            } else if (res.term_signal != 0) {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key export was terminated by signal %d",
+                          res.term_signal);
+            } else if (res.exit_code == 2) {
+                set_error(ERR_GPG_KEY_NOT_FOUND,
+                          "GPG key disappeared from the system keyring before export");
+            } else if (res.exit_code == 0) {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key export produced no complete output");
+            } else {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key export failed with exit status %d",
+                          res.exit_code);
+            }
             return -1;
         }
         /* An incomplete armor must never reach the import: gpg would reject
@@ -4116,6 +4395,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         if (res.out_truncated) {
             secure_zero_memory(key_data, KEY_DATA_CAP);
             free(key_data);
+            gpg_close_source_home(&source);
             set_error(ERR_GPG_KEY_FAILED,
                       "GPG secret-key export for %s exceeds %d bytes; refusing to "
                       "import a truncated key", fingerprint,
@@ -4123,6 +4403,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
             return -1;
         }
     }
+    gpg_close_source_home(&source);
 
     /* The system export can block on pinentry. Re-check the public namespace
      * before handing those now-decrypted bytes to an import process. */
@@ -4249,7 +4530,8 @@ static int append_conf_bytes(unsigned char *dest, size_t capacity,
 
 /* Return 1 only for a byte-identical, private regular destination; 0 means a
  * safe atomic replacement is needed, and -1 means comparison raced or failed.
- * The match path opens no write descriptor and performs no fsync or rename. */
+ * The comparator opens no write descriptor and performs no fsync or rename;
+ * its caller still syncs the directory before accepting an identical retry. */
 static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
                                   size_t desired_len) {
     struct stat before;
@@ -4507,24 +4789,37 @@ static bool gpg_path_is_managed(const char *base, const char *candidate) {
            gpg_target_is_managed_child(base, candidate);
 }
 
-static bool gpg_source_path_is_managed(const char *candidate,
-                                       char *resolved_out,
-                                       size_t resolved_out_size) {
+/* Classify one source spelling: 0 is an external resolved path, 1 is a
+ * managed GPG path (the caller may deliberately fall back to HOME/.gnupg),
+ * and -1 is resolution uncertainty. Keeping those states distinct prevents an
+ * overlong/inaccessible input from masquerading as a managed path and then
+ * silently selecting defaults. */
+static int gpg_classify_source_path(const char *candidate,
+                                    char *resolved_out,
+                                    size_t resolved_out_size) {
     char base[MAX_PATH_LEN];
     char normalized_base[MAX_PATH_LEN];
     char normalized_candidate[MAX_PATH_LEN];
     char resolved_base[MAX_PATH_LEN];
     char resolved_candidate[MAX_PATH_LEN];
 
-    if (!resolved_out || resolved_out_size == 0 ||
-        gpg_get_base_dir(base, sizeof(base)) != 0 ||
-        gpg_normalize_path(base, normalized_base, sizeof(normalized_base)) != 0 ||
+    if (!candidate || !*candidate || !resolved_out || resolved_out_size == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG source-home path");
+        return -1;
+    }
+    if (gpg_get_base_dir(base, sizeof(base)) != 0) {
+        return -1;
+    }
+    if (gpg_normalize_path(base, normalized_base, sizeof(normalized_base)) != 0 ||
         gpg_normalize_path(candidate, normalized_candidate,
                            sizeof(normalized_candidate)) != 0) {
-        return true; /* classification uncertainty fails closed */
+        set_error(ERR_INVALID_PATH,
+                  "GPG source-home path is invalid or too long: %s",
+                  candidate);
+        return -1;
     }
     if (gpg_path_is_managed(normalized_base, normalized_candidate)) {
-        return true;
+        return 1;
     }
 
     /* Resolve aliases even when their final targets do not exist yet.  Any
@@ -4534,12 +4829,18 @@ static bool gpg_source_path_is_managed(const char *candidate,
                                  sizeof(resolved_base)) != 0 ||
         gpg_resolve_path_aliases(normalized_candidate, resolved_candidate,
                                  sizeof(resolved_candidate)) != 0) {
-        return true;
+        set_system_error(ERR_INVALID_PATH,
+                         "Cannot safely resolve GPG source-home path: %s",
+                         candidate);
+        return -1;
     }
-    if (gpg_path_is_managed(resolved_base, resolved_candidate)) return true;
+    if (gpg_path_is_managed(resolved_base, resolved_candidate)) return 1;
     if (safe_strncpy(resolved_out, resolved_candidate,
-                     resolved_out_size) != 0) return true;
-    return false;
+                     resolved_out_size) != 0) {
+        set_error(ERR_INVALID_PATH, "GPG source-home path is too long");
+        return -1;
+    }
+    return 0;
 }
 
 /* Resolve the user's real gpg home to inherit agent settings from: their
@@ -4550,32 +4851,254 @@ static int gpg_user_source_home(char *buf, size_t size) {
     const char *home;
     char fallback[MAX_PATH_LEN];
     char resolved[MAX_PATH_LEN];
+    int classification;
 
-    if (env_gh && *env_gh &&
-        !gpg_source_path_is_managed(env_gh, resolved, sizeof(resolved))) {
-        return safe_strncpy(buf, resolved, size);
+    if (!buf || size == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG source-home destination");
+        return -1;
+    }
+    if (env_gh && *env_gh) {
+        classification = gpg_classify_source_path(
+            env_gh, resolved, sizeof(resolved));
+        if (classification < 0) {
+            return -1;
+        }
+        if (classification == 0) {
+            if (safe_strncpy(buf, resolved, size) != 0) {
+                set_error(ERR_INVALID_PATH, "GPG source-home path is too long");
+                return -1;
+            }
+            return 0;
+        }
     }
     home = getenv("HOME");
     if (!home || !*home) {
-        return -1;
-    }
-    if (safe_snprintf(fallback, sizeof(fallback), "%s/.gnupg", home) != 0 ||
-        gpg_source_path_is_managed(fallback, resolved, sizeof(resolved))) {
         set_error(ERR_INVALID_PATH,
-                  "Refusing managed or unresolvable HOME/.gnupg as a system keyring");
+                  "HOME is unset; cannot resolve the system GPG keyring");
         return -1;
     }
-    return safe_strncpy(buf, resolved, size);
+    if (safe_snprintf(fallback, sizeof(fallback), "%s/.gnupg", home) != 0) {
+        set_error(ERR_INVALID_PATH,
+                  "HOME is too long to resolve the system GPG keyring");
+        return -1;
+    }
+    classification = gpg_classify_source_path(
+        fallback, resolved, sizeof(resolved));
+    if (classification < 0) {
+        return -1;
+    }
+    if (classification > 0) {
+        set_error(ERR_INVALID_PATH,
+                  "Refusing managed HOME/.gnupg as a system keyring");
+        return -1;
+    }
+    if (safe_strncpy(buf, resolved, size) != 0) {
+        set_error(ERR_INVALID_PATH, "GPG source-home path is too long");
+        return -1;
+    }
+    return 0;
 }
 
-/* Public wrapper (AR-06 F05/F06): callers outside this TU (accounts.c's
- * system-keyring availability probe) need the same real-home resolution the
- * export path uses, so they can override an inherited managed GNUPGHOME. */
-int gpg_manager_system_keyring_home(char *buf, size_t size) {
-    if (!buf || size == 0) {
+static int gpg_source_matches_managed_object(
+    const gpg_source_home_t *source, int candidate_fd,
+    const char *description) {
+    struct stat candidate;
+    gpg_mount_identity_t candidate_mount;
+
+    if (!source || source->fd < 0 || candidate_fd < 0 ||
+        fstat(candidate_fd, &candidate) != 0 ||
+        gpg_mount_identity_fd(candidate_fd, &candidate_mount) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot prove GPG source provenance against %s",
+                         description ? description : "managed state");
         return -1;
     }
-    return gpg_user_source_home(buf, size);
+    if (candidate.st_dev == source->identity.st_dev &&
+        candidate.st_ino == source->identity.st_ino) {
+        set_error(ERR_PERMISSION_DENIED,
+                  gpg_same_mount(&source->mount, &candidate_mount)
+                      ? "Refusing managed GPG home as the system keyring: %s"
+                      : "Refusing bind-mounted alias of a managed GPG home: %s",
+                  source->path);
+        return 1;
+    }
+    return 0;
+}
+
+/* Compare the opened source object—not its spelling—to the managed base and
+ * every live account-home directory. A bind alias preserves st_dev/st_ino
+ * while acquiring a distinct mount id, so equality rejects both ordinary
+ * aliases and bind-mounted aliases; the mount comparison makes the latter
+ * diagnosis explicit. */
+static int gpg_source_matches_managed_home(
+    const gpg_source_home_t *source) {
+    char base[MAX_PATH_LEN];
+    bool absent = false;
+    int base_fd;
+    int scan_fd = -1;
+    DIR *dir = NULL;
+    struct dirent *entry;
+    int match;
+
+    base_fd = gpg_open_base_dir(base, sizeof(base), false, &absent);
+    if (base_fd < 0) {
+        return absent ? 0 : -1;
+    }
+    match = gpg_source_matches_managed_object(source, base_fd,
+                                               "the managed GPG base");
+    if (match != 0) {
+        close(base_fd);
+        return match;
+    }
+    scan_fd = dup(base_fd);
+    if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL) {
+        int saved_errno = errno;
+        if (scan_fd >= 0) close(scan_fd);
+        close(base_fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot enumerate managed GPG homes for source proof");
+        return -1;
+    }
+    scan_fd = -1; /* owned by dir */
+    for (;;) {
+        struct stat named;
+        int child_fd;
+
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                close(base_fd);
+                errno = saved_errno;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot enumerate managed GPG homes for source proof");
+                return -1;
+            }
+            break;
+        }
+        if (!validate_name(entry->d_name)) {
+            continue;
+        }
+        if (fstatat(base_fd, entry->d_name, &named,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            {
+                int saved_errno = errno;
+                closedir(dir);
+                close(base_fd);
+                errno = saved_errno;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot inspect managed GPG home for source proof");
+                return -1;
+            }
+        }
+        if (!S_ISDIR(named.st_mode)) continue;
+        child_fd = openat(base_fd, entry->d_name,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (child_fd < 0) {
+            if (errno == ENOENT) continue;
+            {
+                char child_name[MAX_NAME_LEN];
+                int saved_errno = errno;
+                safe_strncpy(child_name, entry->d_name,
+                             sizeof(child_name));
+                closedir(dir);
+                close(base_fd);
+                errno = saved_errno;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot pin managed GPG home for source proof: %s",
+                    child_name);
+                return -1;
+            }
+        }
+        match = gpg_source_matches_managed_object(
+            source, child_fd, "a managed GPG account home");
+        close(child_fd);
+        if (match != 0) {
+            closedir(dir);
+            close(base_fd);
+            return match;
+        }
+    }
+    closedir(dir);
+    close(base_fd);
+    return 0;
+}
+
+static int gpg_validate_source_home(const gpg_source_home_t *source) {
+    struct stat current;
+    gpg_mount_identity_t current_mount;
+
+    if (!source || source->fd < 0 || !source->path[0] ||
+        fstat(source->fd, &current) != 0 ||
+        gpg_mount_identity_fd(source->fd, &current_mount) != 0 ||
+        !S_ISDIR(current.st_mode) || current.st_uid != getuid() ||
+        (current.st_mode & 022) != 0 ||
+        current.st_dev != source->identity.st_dev ||
+        current.st_ino != source->identity.st_ino ||
+        !gpg_same_mount(&current_mount, &source->mount)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Pinned GPG source home is no longer safe: %s",
+                  source && source->path[0] ? source->path : "(unknown)");
+        return -1;
+    }
+    return 0;
+}
+
+/* Return 0 with a retained descriptor, 1 only for confirmed ENOENT, and -1
+ * for every resolution/access/provenance error. */
+static int gpg_open_user_source_home(gpg_source_home_t *source) {
+    int provenance;
+
+    if (!source) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG source-home handle");
+        return -1;
+    }
+    memset(source, 0, sizeof(*source));
+    source->fd = -1;
+    if (gpg_user_source_home(source->path, sizeof(source->path)) != 0) {
+        return -1;
+    }
+    source->fd = open(source->path,
+                      O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (source->fd < 0) {
+        if (errno == ENOENT) {
+            return 1;
+        }
+        set_system_error(ERR_FILE_IO,
+                         "Cannot open the system GPG keyring home: %s",
+                         source->path);
+        return -1;
+    }
+    if (fstat(source->fd, &source->identity) != 0 ||
+        !S_ISDIR(source->identity.st_mode) ||
+        source->identity.st_uid != getuid() ||
+        (source->identity.st_mode & 022) != 0 ||
+        gpg_mount_identity_fd(source->fd, &source->mount) != 0) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing unsafe system GPG keyring home: %s",
+                  source->path);
+        gpg_close_source_home(source);
+        return -1;
+    }
+    provenance = gpg_source_matches_managed_home(source);
+    if (provenance != 0) {
+        gpg_close_source_home(source);
+        return -1;
+    }
+    return 0;
+}
+
+static void gpg_close_source_home(gpg_source_home_t *source) {
+    if (!source) return;
+    if (source->fd >= 0) close(source->fd);
+    source->fd = -1;
 }
 
 /* Set up gpg-agent.conf for the isolated environment.
@@ -4599,7 +5122,6 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     char temp_path[MAX_PATH_LEN] = "";
     char temp_name[64] = "";
     char suffix[13];
-    char source_home[MAX_PATH_LEN];
     char source_conf[MAX_PATH_LEN];
     unsigned char *desired = NULL;
     size_t desired_len = 0;
@@ -4612,6 +5134,8 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     int source_fd = -1;
     int fd = -1;
     int match;
+    int source_rc;
+    gpg_source_home_t source = { .fd = -1 };
     
     if (home_fd < 0 || !gnupg_home) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG agent config destination");
@@ -4631,14 +5155,28 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     }
 
     /* Compose the exact desired bytes in memory before creating any scratch
-     * file. This is what makes the byte-identical path genuinely zero-write. */
-    if (gpg_user_source_home(source_home, sizeof(source_home)) == 0 &&
-        safe_snprintf(source_conf, sizeof(source_conf),
-                      "%s/gpg-agent.conf", source_home) == 0) {
+     * file. This is what makes the byte-identical path genuinely zero-write.
+     * Only confirmed source-home/config absence selects defaults; path,
+     * access, and provenance failures leave the installed config untouched. */
+    source_rc = gpg_open_user_source_home(&source);
+    if (source_rc < 0) {
+        goto fail;
+    }
+    if (source_rc == 0) {
         struct stat before;
         struct stat opened;
         struct stat after;
-        if (lstat(source_conf, &before) == 0) {
+        if (safe_snprintf(source_conf, sizeof(source_conf),
+                          "%s/gpg-agent.conf", source.path) != 0) {
+            set_error(ERR_INVALID_PATH,
+                      "Inherited gpg-agent.conf path is too long");
+            goto fail;
+        }
+        if (gpg_validate_source_home(&source) != 0) {
+            goto fail;
+        }
+        if (fstatat(source.fd, "gpg-agent.conf", &before,
+                    AT_SYMLINK_NOFOLLOW) == 0) {
             if (!S_ISREG(before.st_mode) || before.st_uid != getuid() ||
                 before.st_nlink != 1 || (before.st_mode & 022) != 0) {
                 set_error(ERR_PERMISSION_DENIED,
@@ -4647,8 +5185,8 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
                 goto fail;
             }
             if (g_agent_conf_preopen) g_agent_conf_preopen(source_conf);
-            source_fd = open(source_conf,
-                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+            source_fd = openat(source.fd, "gpg-agent.conf",
+                               O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
             if (source_fd < 0) {
                 set_system_error(ERR_FILE_IO,
                                  "Failed to open inherited gpg-agent.conf safely: %s",
@@ -4678,7 +5216,8 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
                 }
                 goto fail;
             }
-            if (lstat(source_conf, &after) != 0 ||
+            if (fstatat(source.fd, "gpg-agent.conf", &after,
+                        AT_SYMLINK_NOFOLLOW) != 0 ||
                 !gpg_same_file_version(&opened, &after) ||
                 !S_ISREG(after.st_mode) || after.st_uid != getuid() ||
                 after.st_nlink != 1 || (after.st_mode & 022) != 0) {
@@ -4695,6 +5234,9 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
                 goto fail;
             }
             source_fd = -1;
+            if (gpg_validate_source_home(&source) != 0) {
+                goto fail;
+            }
             inherited = true;
             log_debug("Inherited gpg-agent.conf from %s", source_conf);
         } else if (errno != ENOENT) {
@@ -4704,6 +5246,7 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
             goto fail;
         }
     }
+    gpg_close_source_home(&source);
 
     if (!inherited &&
         append_conf_bytes(desired, GPG_AGENT_CONF_DESIRED_MAX,
@@ -4751,6 +5294,15 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     match = gpg_agent_conf_matches(home_fd, desired, desired_len);
     if (match < 0) goto fail;
     if (match > 0) {
+        /* Matching bytes do not prove that a prior rename is directory-durable.
+         * Re-sync the pinned home so a retry after post-rename fsync failure
+         * repairs that uncertain namespace commit before reporting success. */
+        if (g_agent_conf_sync(home_fd, true) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to synchronize unchanged installed gpg-agent.conf");
+            goto fail;
+        }
         free(desired);
         log_debug("Reused unchanged GPG agent configuration: %s",
                   gpg_agent_conf_path);
@@ -4858,6 +5410,7 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
 
 fail:
     if (source_fd >= 0) close(source_fd);
+    gpg_close_source_home(&source);
     if (fd >= 0) close(fd);
     /* A failed commit must never delete a pathname another process substituted.
      * Remove only names which still resolve to the inode created above. */

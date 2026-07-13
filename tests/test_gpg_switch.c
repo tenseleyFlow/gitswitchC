@@ -279,6 +279,7 @@ TEST(isolated_switch_fails_when_current_cannot_be_retargeted) {
 /* ---- AR-02 #4 at the switch level: truncated exports never import -------- */
 
 static bool g_import_ran;
+static int g_trunc_export_listings;
 
 /* Key absent from the isolated home but canonically resolved in the source;
  * the export then "succeeds" while overflowing the capture (out_truncated) —
@@ -318,7 +319,8 @@ static int truncating_export_runner(const char *const argv[],
         return 0;
     }
     if (is_listing) {
-        if (!(opts && opts->use_cwd_fd) && opts && opts->out) {
+        g_trunc_export_listings++;
+        if (g_trunc_export_listings > 1 && opts && opts->out) {
             snprintf(opts->out, opts->out_size, "%s", SEC_SIGN);
             if (result) result->out_len = strlen(opts->out);
             return 0; /* canonical source inventory */
@@ -351,6 +353,7 @@ TEST(truncated_secret_key_export_is_never_imported) {
     snprintf(acct.gpg_key_id, sizeof(acct.gpg_key_id), "DDDDEEEEFFFF0000");
 
     g_import_ran = false;
+    g_trunc_export_listings = 0;
     prev = run_set_runner(truncating_export_runner);
     rc = gpg_switch_account(&cfg, &acct);
     run_set_runner(prev);
@@ -420,7 +423,15 @@ static int import_flow_runner(const char *const argv[], const run_opts_t *opts,
         }
     }
     if (is_listing) {
-        if (!(opts && opts->use_cwd_fd) || g_imp_import_count > 0) {
+        struct stat cwd_st;
+        struct stat isolated_st;
+        bool isolated = opts && opts->use_cwd_fd && opts->cwd_fd >= 0 &&
+            fstat(opts->cwd_fd, &cwd_st) == 0 &&
+            stat(g_imp_home, &isolated_st) == 0 &&
+            cwd_st.st_dev == isolated_st.st_dev &&
+            cwd_st.st_ino == isolated_st.st_ino;
+
+        if (!isolated || g_imp_import_count > 0) {
             if (opts && opts->out) {
                 snprintf(opts->out, opts->out_size, "%s", SEC_SIGN);
                 if (result) result->out_len = strlen(opts->out);
@@ -488,6 +499,7 @@ static int run_first_time_import(char *home_expect, size_t home_expect_size) {
     int rc;
 
     char managed_gnupghome[700];
+    char source_home[700];
     char *prev_home = getenv("HOME");
     char *prev_gnupghome = getenv("GNUPGHOME");
     char saved_home[600] = "";
@@ -511,6 +523,8 @@ static int run_first_time_import(char *home_expect, size_t home_expect_size) {
      * inherit it — it must resolve to the real keyring instead. HOME is set so
      * the fallback ($HOME/.gnupg) is deterministic. */
     setenv("HOME", xdg, 1);
+    snprintf(source_home, sizeof(source_home), "%s/.gnupg", xdg);
+    if (mkdir(source_home, 0700) != 0) return -99;
     snprintf(managed_gnupghome, sizeof(managed_gnupghome), "%s/current", g_imp_base);
     setenv("GNUPGHOME", managed_gnupghome, 1);
 
@@ -641,7 +655,7 @@ static char g_conf_commit_replacement[64];
 static bool g_conf_commit_swap_ok;
 
 static int swap_agent_conf_temp_before_commit(int home_fd,
-                                              const char *temp_name) {
+                                               const char *temp_name) {
     static const char replacement[] = "replacement-not-written-by-gitswitch\n";
     int fd = -1;
 
@@ -670,6 +684,81 @@ static int swap_agent_conf_temp_before_commit(int home_fd,
     if (close(fd) != 0) return -1;
     g_conf_commit_swap_ok = true;
     return 0;
+}
+
+static char g_source_dir_swap_original[MAX_PATH_LEN];
+static char g_source_dir_swap_moved[MAX_PATH_LEN];
+static char g_source_dir_swap_replacement_conf[MAX_PATH_LEN];
+static bool g_source_dir_swap_ok;
+
+static void swap_inherited_source_directory(const char *source_conf) {
+    static const char replacement[] = "default-cache-ttl 999\n";
+
+    if (!source_conf ||
+        rename(g_source_dir_swap_original, g_source_dir_swap_moved) != 0 ||
+        mkdir(g_source_dir_swap_original, 0700) != 0 ||
+        write_string_to_file(g_source_dir_swap_replacement_conf,
+                             replacement, 0600) != 0) {
+        return;
+    }
+    g_source_dir_swap_ok = true;
+}
+
+TEST(inherited_agent_config_read_stays_on_pinned_source_directory) {
+    static const char inherited[] =
+        "# proved source config\n"
+        "default-cache-ttl 44\n"
+        "pinentry-program /opt/proved/pinentry\n";
+    char xdg[128], original_conf[MAX_PATH_LEN];
+    char installed[MAX_PATH_LEN], content[512];
+    gpg_agent_conf_preopen_fn previous;
+    gpg_config_t cfg;
+    account_t acct;
+
+    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsrcpin_XXXXXX");
+    CHECK(ts_mkdtemp(xdg) != NULL);
+    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(g_source_dir_swap_original,
+                               sizeof(g_source_dir_swap_original),
+                               "%s/source", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(g_source_dir_swap_moved,
+                               sizeof(g_source_dir_swap_moved),
+                               "%s/source.proved", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(original_conf, sizeof(original_conf),
+                               "%s/gpg-agent.conf",
+                               g_source_dir_swap_original), 0);
+    CHECK_EQ_INT(safe_snprintf(g_source_dir_swap_replacement_conf,
+                               sizeof(g_source_dir_swap_replacement_conf),
+                               "%s/gpg-agent.conf",
+                               g_source_dir_swap_original), 0);
+    CHECK_EQ_INT(mkdir(g_source_dir_swap_original, 0700), 0);
+    CHECK_EQ_INT(write_string_to_file(original_conf, inherited, 0600), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
+    CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", g_source_dir_swap_original, 1), 0);
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = GPG_MODE_ISOLATED;
+    memset(&acct, 0, sizeof(acct));
+    snprintf(acct.name, sizeof(acct.name), "sourcepin");
+    g_source_dir_swap_ok = false;
+    previous = gpg_manager_set_agent_conf_preopen_fn(
+        swap_inherited_source_directory);
+    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), 0);
+    gpg_manager_set_agent_conf_preopen_fn(previous);
+
+    CHECK(g_source_dir_swap_ok);
+    CHECK_EQ_INT(safe_snprintf(installed, sizeof(installed),
+                               "%s/gpg-agent.conf", cfg.gnupg_home), 0);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(inherited) - 1));
+    CHECK_STR_EQ(content, inherited);
+    CHECK(read_file_to_string(g_source_dir_swap_replacement_conf,
+                              content, sizeof(content)) > 0);
+    CHECK_STR_EQ(content, "default-cache-ttl 999\n");
+
+    unsetenv("GNUPGHOME");
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
 }
 
 TEST(inherited_readonly_agent_config_is_installed_atomically_at_0600) {
@@ -1157,9 +1246,8 @@ static int  g_l4_listings;
 static bool g_l4_first_truncated;
 
 /* Key present in the isolated home, but the idempotency probe's capture
- * overflows: the visible prefix shows no signing capability because the
- * signing `ssb` fell in the dropped tail. A follow-up listing (smaller key
- * of the same id re-asked by gpg_test_signing) completes and shows 's'. */
+ * overflows: the visible prefix is incomplete and cannot authorize either a
+ * present-key fast path or an import fallback. */
 static int truncated_probe_runner(const char *const argv[],
                                   const run_opts_t *opts,
                                   run_result_t *result) {
@@ -1222,12 +1310,11 @@ TEST(truncated_idempotency_probe_is_not_signing_evidence) {
     rc = gpg_switch_account(&cfg, &acct);
     run_set_runner(prev);
 
-    CHECK_EQ_INT(rc, 0);
-    /* The truncated probe must NOT be treated as the signing evidence: the
-     * switch re-asks with a fresh listing (2 spawns). Pre-fix it answered the
-     * capability question from the truncated capture (1 spawn) and warned
-     * "GPG signing test failed" for a perfectly good key. */
-    CHECK_EQ_INT(g_l4_listings, 2);
+    CHECK_EQ_INT(rc, -1);
+    /* AR-08 L18: repeating the same fixed-capacity capture cannot produce new
+     * evidence. Fail once at the documented hard cap. */
+    CHECK_EQ_INT(g_l4_listings, 1);
+    CHECK(strstr(get_last_error()->message, "one-shot 524288-byte") != NULL);
 
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
 }
@@ -1289,6 +1376,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(first_time_import_is_directional_and_isolated);
     RUN_TEST(first_time_import_runs_under_base_lock);
     RUN_TEST(retarget_current_refuses_missing_home);
+    RUN_TEST(inherited_agent_config_read_stays_on_pinned_source_directory);
     RUN_TEST(inherited_readonly_agent_config_is_installed_atomically_at_0600);
     RUN_TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected);
     RUN_TEST(inherited_agent_config_refuses_symlink_and_oversize_source);

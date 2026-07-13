@@ -53,8 +53,34 @@ static toml_section_t *find_section(toml_document_t *doc, const char *section_na
 static toml_section_t *find_or_create_section(toml_document_t *doc, const char *section_name);
 static toml_keyvalue_t *find_key(toml_section_t *section, const char *key_name);
 static bool section_name_is_valid(const char *section_name);
+static bool toml_same_file(const struct stat *left, const struct stat *right);
+static bool toml_temp_identity_is_private(const struct stat *identity);
 static toml_document_init_hook_fn g_document_init_hook;
 static toml_writer_test_hook_fn g_writer_test_hook;
+
+static bool ascii_key_initial_is_valid(unsigned char c) {
+    return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static bool ascii_key_continuation_is_valid(unsigned char c) {
+    return ascii_key_initial_is_valid(c) || (c >= '0' && c <= '9');
+}
+
+/* This intentionally implements the application's narrower key contract, not
+ * TOML's full bare-key grammar. Keep parser and setter-created documents on
+ * the same ASCII-only, round-trippable surface. */
+static bool key_name_is_valid(const char *key_name) {
+    if (!key_name || !ascii_key_initial_is_valid((unsigned char)key_name[0])) {
+        return false;
+    }
+
+    for (size_t i = 1; i < TOML_MAX_KEY_LEN; i++) {
+        unsigned char c = (unsigned char)key_name[i];
+        if (c == '\0') return true;
+        if (!ascii_key_continuation_is_valid(c)) return false;
+    }
+    return false;
+}
 
 toml_document_init_hook_fn toml_set_document_init_hook_fn(
     toml_document_init_hook_fn fn) {
@@ -303,7 +329,7 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         }
         
         /* Parse key-value pair */
-        if (isalpha(c) || c == '_') {
+        if (ascii_key_initial_is_valid((unsigned char)c)) {
             if (!current_section) {
                 /* Create default section if none exists */
                 current_section = find_or_create_section(doc, "");
@@ -607,6 +633,18 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
         return -1;
     }
 
+    /* Account visibility is derived from this complete validation attempt.
+     * Revoke every candidate before validating settings or any account: an
+     * earlier fatal error may return before the main pass reaches a later
+     * account, and that later section must not retain stale visibility from a
+     * previous successful pass. Each account is published again only after
+     * all of its fields and dependencies below succeed. */
+    for (size_t i = 0; i < doc->section_count; i++) {
+        if (string_starts_with(doc->sections[i].name, "accounts.")) {
+            doc->sections[i].is_set = false;
+        }
+    }
+
     /* Check for required sections */
     bool has_settings = false;
     bool has_accounts = false;
@@ -867,6 +905,8 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                           section->name);
                 return -1;
             }
+
+            section->is_set = true;
         }
     }
     
@@ -1211,9 +1251,9 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
            key_pos < TOML_MAX_KEY_LEN - 1) {
         char c = current_char(state);
         
-        if (isalnum(c) || c == '_') {
+        if (ascii_key_continuation_is_valid((unsigned char)c)) {
             kv->key[key_pos++] = advance_char(state);
-        } else if (isspace(c)) {
+        } else if (c == ' ' || c == '\t') {
             advance_char(state);
             break;
         } else {
@@ -1226,8 +1266,13 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
 
     /* Stopped because the key buffer filled, with more key text remaining? Too long. */
     if (key_pos >= TOML_MAX_KEY_LEN - 1 && !is_at_end(state) &&
-        (isalnum((unsigned char)current_char(state)) || current_char(state) == '_')) {
+        ascii_key_continuation_is_valid((unsigned char)current_char(state))) {
         set_parser_error(state, "Key name too long");
+        return -1;
+    }
+
+    if (!key_name_is_valid(kv->key)) {
+        set_parser_error(state, "Invalid key name");
         return -1;
     }
 
@@ -1532,9 +1577,11 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
      * wrote `ssh_key = ""` to disk and exited 0 — the account's key silently
      * erased by the very save that claimed success. Checking up front also
      * means a failed set leaves no half-built key behind. */
-    if (strlen(key_name) >= TOML_MAX_KEY_LEN) {
-        set_error(ERR_CONFIG_INVALID, "Key name too long for %s (max %d bytes): %s",
-                  section_name, TOML_MAX_KEY_LEN - 1, key_name);
+    if (!key_name_is_valid(key_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Invalid TOML key name for %s (1-%d ASCII bytes; first "
+                  "[A-Za-z_], remaining [A-Za-z0-9_])",
+                  section_name, TOML_MAX_KEY_LEN - 1);
         return -1;
     }
     if (strlen(value) >= TOML_MAX_VALUE_LEN) {
@@ -1597,12 +1644,14 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
         return -1;
     }
 
-    /* Same up-front bound as toml_set_string: an oversized key name used to
-     * leave a ghost key with key="" behind (safe_strncpy fails without
-     * writing) while still reporting success. */
-    if (strlen(key_name) >= TOML_MAX_KEY_LEN) {
-        set_error(ERR_CONFIG_INVALID, "Key name too long for %s (max %d bytes): %s",
-                  section_name, TOML_MAX_KEY_LEN - 1, key_name);
+    /* Validate the full parser grammar before section lookup/creation. This
+     * also retains the old oversized-name guard: safe_strncpy fails without
+     * writing, which otherwise left a newly published ghost section behind. */
+    if (!key_name_is_valid(key_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Invalid TOML key name for %s (1-%d ASCII bytes; first "
+                  "[A-Za-z_], remaining [A-Za-z0-9_])",
+                  section_name, TOML_MAX_KEY_LEN - 1);
         return -1;
     }
 
@@ -1659,6 +1708,174 @@ static int write_escaped_string_value(FILE *file, const char *key, const char *v
     }
     if (fputs("\"\n", file) < 0) return -1;
     return 0;
+}
+
+/* Serialize, size-check, and durably flush one already-open stream. Keeping
+ * this stream-only work separate from publication lets config.c own exactly one
+ * final rename and directory fsync while toml_write_file retains its standalone
+ * atomic API. */
+static int toml_serialize_stream(const toml_document_t *doc, FILE *file,
+                                 const char **failure_context,
+                                 int *saved_errno) {
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const toml_section_t *section = &doc->sections[i];
+
+        if (fprintf(file, "[%s]\n", section->name) < 0) {
+            *failure_context = "Failed to write TOML section header";
+            *saved_errno = errno ? errno : EIO;
+            return -1;
+        }
+
+        for (size_t j = 0; j < section->key_count; j++) {
+            const toml_keyvalue_t *kv = &section->keys[j];
+            if (!kv->is_set) continue;
+
+            switch (kv->type) {
+                case TOML_TYPE_STRING:
+                    if (write_escaped_string_value(file, kv->key,
+                                                   kv->value) < 0) {
+                        *failure_context = "Failed to write TOML string value";
+                        *saved_errno = errno ? errno : EIO;
+                        return -1;
+                    }
+                    break;
+                case TOML_TYPE_INTEGER:
+                case TOML_TYPE_BOOLEAN:
+                    if (fprintf(file, "%s = %s\n", kv->key, kv->value) < 0) {
+                        *failure_context = "Failed to write TOML value";
+                        *saved_errno = errno ? errno : EIO;
+                        return -1;
+                    }
+                    break;
+                case TOML_TYPE_INVALID:
+                default:
+                    break;
+            }
+        }
+
+        if (i < doc->section_count - 1 && fputc('\n', file) == EOF) {
+            *failure_context = "Failed to write TOML section separator";
+            *saved_errno = errno ? errno : EIO;
+            return -1;
+        }
+    }
+
+    /* stdio may defer EFBIG/ENOSPC/EIO until flush or close. The parser accepts
+     * exactly TOML_MAX_FILE_SIZE bytes, so measure the escaped output itself. */
+    if (fflush(file) != 0) {
+        *failure_context = "Failed to flush temporary TOML file";
+        *saved_errno = errno ? errno : EIO;
+        return -1;
+    }
+    struct stat serialized;
+    if (fstat(fileno(file), &serialized) != 0) {
+        *failure_context = "Failed to measure serialized TOML file";
+        *saved_errno = errno ? errno : EIO;
+        return -1;
+    }
+    if (serialized.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+        *failure_context = "Serialized TOML file exceeds parser size limit";
+        *saved_errno = EFBIG;
+        return -1;
+    }
+    if (fsync(fileno(file)) != 0) {
+        *failure_context = "Failed to sync temporary TOML file";
+        *saved_errno = errno ? errno : EIO;
+        return -1;
+    }
+    return 0;
+}
+
+int toml_write_fd(const toml_document_t *doc, int fd) {
+    const char *failure_context = NULL;
+    struct stat before;
+    struct stat after;
+    FILE *file = NULL;
+    int stream_fd = -1;
+    int saved_errno = 0;
+    int result = -1;
+
+    if (!doc || fd < 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_write_fd");
+        return -1;
+    }
+    if (fstat(fd, &before) != 0) {
+        saved_errno = errno ? errno : EIO;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot identify TOML output descriptor");
+        errno = saved_errno;
+        return -1;
+    }
+    errno = 0;
+    off_t offset = lseek(fd, 0, SEEK_CUR);
+    if (offset < 0) {
+        saved_errno = errno ? errno : EIO;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot inspect TOML output descriptor offset");
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISREG(before.st_mode) || before.st_uid != getuid() ||
+        before.st_nlink != 1 ||
+        (before.st_mode & 07777) != (S_IRUSR | S_IWUSR) ||
+        before.st_size != 0 || offset != 0) {
+        saved_errno = EINVAL;
+        errno = saved_errno;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "TOML descriptor is not a fresh private file");
+        errno = saved_errno;
+        return -1;
+    }
+
+    stream_fd = dup(fd);
+    if (stream_fd < 0 || fcntl(stream_fd, F_SETFD, FD_CLOEXEC) != 0) {
+        saved_errno = errno ? errno : EIO;
+        failure_context = "Failed to duplicate TOML output descriptor";
+        goto cleanup;
+    }
+    file = fdopen(stream_fd, "w");
+    if (!file) {
+        saved_errno = errno ? errno : EIO;
+        failure_context = "Failed to open TOML output stream";
+        goto cleanup;
+    }
+    stream_fd = -1;
+
+    if (toml_serialize_stream(doc, file, &failure_context, &saved_errno) != 0) {
+        goto cleanup;
+    }
+    if (fclose(file) != 0) {
+        file = NULL;
+        saved_errno = errno ? errno : EIO;
+        failure_context = "Failed to close TOML output stream";
+        goto cleanup;
+    }
+    file = NULL;
+
+    if (fstat(fd, &after) != 0 || !toml_same_file(&before, &after) ||
+        !toml_temp_identity_is_private(&after) || after.st_size < 0 ||
+        after.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+        saved_errno = errno ? errno : ESTALE;
+        failure_context = "TOML output descriptor changed during serialization";
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (file) {
+        if (fclose(file) != 0 && !failure_context) {
+            saved_errno = errno ? errno : EIO;
+            failure_context = "Failed to close TOML output stream";
+        }
+    } else if (stream_fd >= 0) {
+        (void)close(stream_fd);
+    }
+    if (failure_context) {
+        errno = saved_errno ? saved_errno : EIO;
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "%s", failure_context);
+        result = -1;
+    }
+    return result;
 }
 
 static bool toml_same_file(const struct stat *left, const struct stat *right) {
@@ -1874,59 +2091,7 @@ int toml_write_file(const toml_document_t *doc, const char *file_path) {
     }
     temp_fd = -1; /* owned by file */
 
-    for (size_t i = 0; i < doc->section_count; i++) {
-        const toml_section_t *section = &doc->sections[i];
-
-        if (fprintf(file, "[%s]\n", section->name) < 0) {
-            failure_context = "Failed to write TOML section header";
-            saved_errno = errno;
-            goto cleanup;
-        }
-
-        for (size_t j = 0; j < section->key_count; j++) {
-            const toml_keyvalue_t *kv = &section->keys[j];
-            if (!kv->is_set) continue;
-
-            switch (kv->type) {
-                case TOML_TYPE_STRING:
-                    if (write_escaped_string_value(file, kv->key, kv->value) < 0) {
-                        failure_context = "Failed to write TOML string value";
-                        saved_errno = errno;
-                        goto cleanup;
-                    }
-                    break;
-                case TOML_TYPE_INTEGER:
-                case TOML_TYPE_BOOLEAN:
-                    if (fprintf(file, "%s = %s\n", kv->key, kv->value) < 0) {
-                        failure_context = "Failed to write TOML value";
-                        saved_errno = errno;
-                        goto cleanup;
-                    }
-                    break;
-                case TOML_TYPE_INVALID:
-                default:
-                    break;
-            }
-        }
-
-        if (i < doc->section_count - 1 && fputc('\n', file) == EOF) {
-            failure_context = "Failed to write TOML section separator";
-            saved_errno = errno;
-            goto cleanup;
-        }
-    }
-
-    /* stdio may defer EFBIG/ENOSPC/EIO until flush or close. Check every
-     * boundary before rename. A duplicate descriptor pins the populated inode
-     * across fclose so it can still be sealed to the pathname at commit. */
-    if (fflush(file) != 0) {
-        failure_context = "Failed to flush temporary TOML file";
-        saved_errno = errno;
-        goto cleanup;
-    }
-    if (fsync(fileno(file)) != 0) {
-        failure_context = "Failed to sync temporary TOML file";
-        saved_errno = errno;
+    if (toml_serialize_stream(doc, file, &failure_context, &saved_errno) != 0) {
         goto cleanup;
     }
 

@@ -22,12 +22,12 @@
  *     the git rollback by design — running git from a handler is not
  *     async-signal-safe — so the escape hatch trades atomicity for liveness
  *     only when the user insists twice.
- *   - EXCEPT while the rollback itself is running (signals_rollback_begin/
- *     end): the emergency exit there would abandon git_config_restore mid-way
- *     and permanently persist the aborted account's identity (AR-02 #2), so
- *     further signals stay recorded until the restore completes and the
- *     mainline dispatches. Interactive children spawned by the rollback keep
- *     default dispositions, so Ctrl-C still interrupts them.
+ *   - EXCEPT while a transaction-critical mutation or rollback is running
+ *     (signals_rollback_begin/end): the emergency exit there would abandon
+ *     forward publication, prepared persistence, or git_config_restore
+ *     mid-way and persist a mixed identity (AR-08 M4 / AR-02 #2), so further
+ *     signals stay recorded until commit or completed abort. Interactive
+ *     children keep default dispositions, so Ctrl-C still interrupts them.
  *   - That rollback deferral is BOUNDED, not absolute (AR-03 L8): a
  *     PROCESS-TARGETED kill never reaches the child's terminal group, so a
  *     rollback blocked at a re-prompting ssh-add passphrase read used to
@@ -49,6 +49,7 @@
 #define SIGNALS_H
 
 #include <stdbool.h>
+#include <signal.h>
 #include <sys/types.h>
 
 /**
@@ -56,24 +57,51 @@
  * previously pending signal. Idempotent while a guard is active. SA_RESTART
  * is used so a signal doesn't interrupt the parent blocked in poll/waitpid on
  * an in-flight child (run_argv already retries EINTR; restarting avoids
- * surprising every other syscall in the window). Returns 0.
+ * surprising every other syscall in the window). Returns 0 on success and -1
+ * if any disposition query or installation fails. A failed begin restores
+ * every disposition it already changed and preserves the originating errno;
+ * only an inherited SIG_IGN is intentionally skipped.
  */
 int signals_guard_begin(void);
+
+/* Deterministic, one-shot fault injection for each sigaction(2) stage used by
+ * the guard. Failures are stored independently by stage, so a test can arm an
+ * installation failure and the rollback restoration failure it triggers at
+ * the same time. Passing SIGNALS_TEST_SIGACTION_NONE clears every stage. */
+typedef enum {
+    SIGNALS_TEST_SIGACTION_NONE = 0,
+    SIGNALS_TEST_SIGACTION_QUERY,
+    SIGNALS_TEST_SIGACTION_INSTALL,
+    SIGNALS_TEST_SIGACTION_RESTORE
+} signals_test_sigaction_stage_t;
+
+void signals_test_fail_sigaction(int signal_number,
+                                 signals_test_sigaction_stage_t stage,
+                                 int system_errno);
+
+/* One-shot checkpoint immediately before guard_end starts restoration. It is
+ * used to reproduce the pending-check/restoration race deterministically. */
+typedef void (*signals_test_guard_end_hook_fn)(void);
+signals_test_guard_end_hook_fn signals_test_set_guard_end_hook(
+    signals_test_guard_end_hook_fn hook);
 
 /**
  * Restore the dispositions saved by signals_guard_begin(). Idempotent. Does
  * NOT clear a pending signal — callers finish their teardown first and then
  * either signals_dispatch_pending() (failure path) or deliberately complete
- * the already-applied switch (success path).
+ * the already-applied switch (success path). Returns 0 once every installed
+ * disposition is restored, or -1 while one or more restorations remain
+ * pending; failed entries stay recorded so a later call can retry them.
  */
-void signals_guard_end(void);
+int signals_guard_end(void);
 
 /**
- * Mark the failed-switch rollback window. Between begin and end, the handler
- * defers even a second guarded signal (no emergency exit) so the multi-exec
- * git_config_restore can never be abandoned half-done (AR-02 #2). Callers
- * must pair these around the whole rollback sequence, before dispatching any
- * pending signal.
+ * Mark a transaction-critical mutation/rollback window. Between begin and
+ * end, the handler defers even a second guarded signal (no emergency exit) so
+ * forward publication, prepared persistence, and multi-exec restoration can
+ * never be abandoned half-done (AR-08 M4 / AR-02 #2). Calls are idempotent,
+ * not nesting; the transaction owner ends the state once at commit or after
+ * completed abort, before dispatching any pending signal.
  */
 void signals_rollback_begin(void);
 void signals_rollback_end(void);
@@ -87,6 +115,17 @@ void signals_rollback_end(void);
  * in the child branch.
  */
 void signals_reset_for_child(void);
+
+/**
+ * Close the post-fork/pre-publication race for a guarded child launch.
+ * signals_block_for_child_spawn() adds exactly the dispositions installed by
+ * the active guard to the caller's mask and captures the complete prior mask.
+ * In the parent, publish the PID and then restore that exact mask with
+ * signals_restore_after_child_spawn(). In the child, signals_reset_for_child()
+ * resets the inherited guard dispositions and unblocks that installed set.
+ */
+int signals_block_for_child_spawn(sigset_t *previous_mask);
+int signals_restore_after_child_spawn(const sigset_t *previous_mask);
 
 /**
  * Publish / retract the in-flight subprocess (AR-03 L8). run_argv's spawn
@@ -108,11 +147,15 @@ bool signals_pending(void);
 int signals_pending_signal(void);
 
 /**
- * If a signal is pending: end the guard (restoring default dispositions) and
- * re-raise it, terminating the process with the correct signal exit status.
- * No-op when nothing is pending. Call only after rollback/teardown is done.
+ * If a signal is pending: end the guard (restoring the caller's exact saved
+ * dispositions) and re-raise it, terminating the process with the correct
+ * signal exit status. If exact restoration fails, return -1 without clearing
+ * or raising the pending signal; the failed guard entries and signal remain
+ * owned for an explicit checked retry. Returns 0 when nothing is pending or
+ * when a non-terminating inherited handler accepted the re-raised signal.
+ * Call only after rollback/teardown is done.
  */
-void signals_dispatch_pending(void);
+int signals_dispatch_pending(void);
 
 /* --- SIG-02: scratch-file registry -----------------------------------------
  *

@@ -38,8 +38,10 @@ static bool g_large_restored;
 
 static const char *const managed_keys[] = {
     "user.name", "user.email", "user.signingkey", "commit.gpgsign",
-    "gpg.program", "core.sshcommand"
+    "gpg.program", "core.sshcommand", "gpg.format",
+    "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program"
 };
+#define MANAGED_KEY_COUNT (sizeof(managed_keys) / sizeof(managed_keys[0]))
 
 static int fake_ret(run_result_t *result, int code) {
     if (result) {
@@ -223,7 +225,7 @@ TEST(missing_scope_file_is_an_exact_empty_snapshot) {
     CHECK_EQ_INT(g_list_calls, 2); /* direct and include-expanded emptiness */
     CHECK_EQ_INT(g_mutations, 0);
     CHECK_EQ_INT(git_config_restore(), 0);
-    CHECK_EQ_INT(g_unsets, 6);
+    CHECK_EQ_INT(g_unsets, MANAGED_KEY_COUNT);
     CHECK_EQ_INT(g_adds, 0);
 
     run_set_runner(previous);
@@ -284,13 +286,13 @@ TEST(multivalue_restore_preserves_every_key_count_and_order) {
 
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_config_restore(), 0);
-    CHECK_EQ_INT(g_unsets, 6);
-    CHECK_EQ_INT(g_adds, 12);
-    for (int i = 0; i < 6; i++) {
+    CHECK_EQ_INT(g_unsets, MANAGED_KEY_COUNT);
+    CHECK_EQ_INT(g_adds, MANAGED_KEY_COUNT * 2U);
+    for (size_t i = 0; i < MANAGED_KEY_COUNT; i++) {
         char first[64];
         char second[64];
-        snprintf(first, sizeof(first), "first-%d\nline", i);
-        snprintf(second, sizeof(second), " second-%d ", i);
+        snprintf(first, sizeof(first), "first-%zu\nline", i);
+        snprintf(second, sizeof(second), " second-%zu ", i);
         CHECK_STR_EQ(g_add_key[i * 2], managed_keys[i]);
         CHECK_STR_EQ(g_add_value[i * 2], first);
         CHECK_STR_EQ(g_add_key[i * 2 + 1], managed_keys[i]);
@@ -318,14 +320,23 @@ TEST(failed_restore_retains_snapshot_and_retries_only_incomplete_key) {
         CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), -1);
         CHECK_EQ_INT(g_list_calls, list_calls);
     }
+    /* The failed second --add left the exact transaction-owned prefix in the
+     * real config. Reflect that state in the fake listing: retry is permitted
+     * only while the vector still equals this recorded progress. */
+    memset(g_direct, 0, sizeof(g_direct));
+    g_direct_len = 0;
+    CHECK(append_record(g_direct, &g_direct_len,
+                        "user.email", "first@old"));
+    memcpy(g_expanded, g_direct, g_direct_len);
+    g_expanded_len = g_direct_len;
     CHECK_EQ_INT(git_config_restore(), 0);
     /* user.name completed once; failed user.email was force-cleared/replayed. */
     CHECK_STR_EQ(g_unset_key[0], "user.name");
     CHECK_STR_EQ(g_unset_key[1], "user.email");
-    CHECK_STR_EQ(g_unset_key[6], "user.email");
-    CHECK_EQ_INT(g_unsets, 7);
+    CHECK_STR_EQ(g_unset_key[MANAGED_KEY_COUNT], "user.email");
+    CHECK_EQ_INT(g_unsets, MANAGED_KEY_COUNT + 1U);
     CHECK_EQ_INT(git_config_restore(), 0); /* consumed only after exact success */
-    CHECK_EQ_INT(g_unsets, 7);
+    CHECK_EQ_INT(g_unsets, MANAGED_KEY_COUNT + 1U);
     run_set_runner(previous);
 }
 

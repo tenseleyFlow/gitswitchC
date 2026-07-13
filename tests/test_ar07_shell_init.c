@@ -13,6 +13,7 @@
 #include "utils.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -25,6 +26,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef enum {
@@ -89,6 +91,23 @@ static int write_text(const char *path, const char *text, mode_t mode) {
     return chmod(path, mode);
 }
 
+static int write_bytes(const char *path, const void *bytes, size_t length,
+                       mode_t mode) {
+    const unsigned char *cursor = bytes;
+    size_t total = 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+
+    if (fd < 0) return -1;
+    while (total < length) {
+        ssize_t written = write(fd, cursor + total, length - total);
+        if (written > 0) total += (size_t)written;
+        else if (written < 0 && errno == EINTR) continue;
+        else { close(fd); return -1; }
+    }
+    if (fchmod(fd, mode) != 0) { close(fd); return -1; }
+    return close(fd);
+}
+
 static const char *read_text(const char *path, char *text, size_t size) {
     FILE *file;
     size_t used;
@@ -111,6 +130,43 @@ static int run_shell(const char *command) {
         return WIFSIGNALED(status) ? -(1000 + WTERMSIG(status)) : -1;
     }
     return WEXITSTATUS(status);
+}
+
+static int run_shell_bounded(const char *command, long timeout_ms) {
+    struct timespec start;
+    struct timespec now;
+    struct timespec pause = {0, 10000000L};
+    pid_t child = fork();
+    int status = 0;
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        (void)setpgid(0, 0);
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        _exit(127);
+    }
+    (void)setpgid(child, child);
+    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) goto timeout;
+    for (;;) {
+        pid_t waited = waitpid(child, &status, WNOHANG);
+        if (waited == child) break;
+        if (waited < 0 && errno != EINTR) return -1;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) goto timeout;
+        long elapsed = (now.tv_sec - start.tv_sec) * 1000L +
+                       (now.tv_nsec - start.tv_nsec) / 1000000L;
+        if (elapsed >= timeout_ms) goto timeout;
+        (void)nanosleep(&pause, NULL);
+    }
+    if (!WIFEXITED(status)) {
+        return WIFSIGNALED(status) ? -(1000 + WTERMSIG(status)) : -1;
+    }
+    return WEXITSTATUS(status);
+
+timeout:
+    (void)kill(-child, SIGKILL);
+    (void)kill(child, SIGKILL);
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    return -2;
 }
 
 static int make_socket_node(const char *path) {
@@ -199,6 +255,7 @@ static int fixture_setup(shell_fixture_t *fixture) {
         "    for GS_ARG do printf 'arg=<%s>\\n' \"$GS_ARG\" >>\"$GS_ARGV_LOG\"; done\n"
         "fi\n"
         "case ${1-} in\n"
+        "    --resume-hint-probe) exec \"$GS_REAL_BIN\" \"$@\" ;;\n"
         "    --resume-check) exit \"${GS_CHECK_RC:-1}\" ;;\n"
         "    resume) printf 'resume\\n' >>\"$GS_RESUME_LOG\"; exit 0 ;;\n"
         "    fail) exit 23 ;;\n"
@@ -312,10 +369,9 @@ static int set_gpg_live(shell_fixture_t *fixture, bool live) {
                : -1;
 }
 
-static int evaluate_resume_case(size_t shell, const char *hint, int ssh_rc,
-                                int check_rc, bool gpg_live) {
+static int evaluate_current_hint(size_t shell, int ssh_rc, int check_rc,
+                                 bool gpg_live, bool bounded) {
     char shell_path[PATH_MAX];
-    char hint_body[64];
     char command[PATH_MAX * 10];
     const char *flags;
     const char *source_word;
@@ -326,9 +382,7 @@ static int evaluate_resume_case(size_t shell, const char *hint, int ssh_rc,
         return -2;
     }
     clear_managed_runtime(&g_fixture);
-    if (snprintf(hint_body, sizeof(hint_body), "%s\n", hint) < 0 ||
-        write_text(g_fixture.hint, hint_body, 0600) != 0 ||
-        set_gpg_live(&g_fixture, gpg_live) != 0) {
+    if (set_gpg_live(&g_fixture, gpg_live) != 0) {
         return -1;
     }
 
@@ -350,17 +404,30 @@ static int evaluate_resume_case(size_t shell, const char *hint, int ssh_rc,
         "env HOME='%s' XDG_RUNTIME_DIR='%s' ENV=/dev/null "
         "PATH='%s:/usr/bin:/bin' GS_SSH_RC=%d GS_CHECK_RC=%d "
         "GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' GS_HELPER='%s' "
-        "GS_SOCK='%s' GS_GPG='%s' '%s' %s \"%s '%s'\" "
+        "GS_SOCK='%s' GS_GPG='%s' GS_REAL_BIN='%s' "
+        "'%s' %s \"%s '%s'\" "
         ">/dev/null 2>&1",
         g_fixture.home, g_fixture.runtime, g_fixture.shims, ssh_rc, check_rc,
         g_fixture.resume_log, g_fixture.argv_log, g_self,
-        g_fixture.auth_sock, g_fixture.gpg_current, shell_path, flags,
-        source_word, g_fixture.snippets[shell]);
-    if (written < 0 || (size_t)written >= sizeof(command) ||
-        run_shell(command) != 0) {
+        g_fixture.auth_sock, g_fixture.gpg_current, g_bin, shell_path,
+        flags, source_word, g_fixture.snippets[shell]);
+    if (written < 0 || (size_t)written >= sizeof(command)) {
         return -1;
     }
+    if ((bounded ? run_shell_bounded(command, 1500L) : run_shell(command)) != 0)
+        return -1;
     return count_resume_calls(g_fixture.resume_log);
+}
+
+static int evaluate_resume_case(size_t shell, const char *hint, int ssh_rc,
+                                int check_rc, bool gpg_live) {
+    char hint_body[64];
+
+    if (snprintf(hint_body, sizeof(hint_body), "%s\n", hint) < 0 ||
+        write_text(g_fixture.hint, hint_body, 0600) != 0) {
+        return -1;
+    }
+    return evaluate_current_hint(shell, ssh_rc, check_rc, gpg_live, false);
 }
 
 static int run_wrapper_script(bool fish, const char *script,
@@ -382,11 +449,12 @@ static int run_wrapper_script(bool fish, const char *script,
             "env -u SSH_AUTH_SOCK -u GNUPGHOME HOME='%s' "
             "XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' ENV=/dev/null "
             "GS_KIND=unset GS_SNIPPET='%s' GS_HELPER='%s' GS_SOCK='%s' "
-            "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' '%s' %s '%s'",
+            "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' "
+            "GS_REAL_BIN='%s' '%s' %s '%s'",
             g_fixture.home, g_fixture.runtime, g_fixture.shims,
             g_fixture.snippets[snippet_index], g_self, g_fixture.auth_sock,
             g_fixture.gpg_current, g_fixture.resume_log, g_fixture.argv_log,
-            shell_path, fish ? "--no-config" : "", script);
+            g_bin, shell_path, fish ? "--no-config" : "", script);
     } else {
         const char *value = strcmp(kind, "empty") == 0 ? "" : "/foreign/value";
         written = snprintf(
@@ -394,11 +462,13 @@ static int run_wrapper_script(bool fish, const char *script,
             "env SSH_AUTH_SOCK='%s' GNUPGHOME='%s' HOME='%s' "
             "XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' ENV=/dev/null "
             "GS_KIND='%s' GS_SNIPPET='%s' GS_HELPER='%s' GS_SOCK='%s' "
-            "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' '%s' %s '%s'",
+            "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' "
+            "GS_REAL_BIN='%s' '%s' %s '%s'",
             value, value, g_fixture.home, g_fixture.runtime, g_fixture.shims,
             kind, g_fixture.snippets[snippet_index], g_self,
             g_fixture.auth_sock, g_fixture.gpg_current, g_fixture.resume_log,
-            g_fixture.argv_log, shell_path, fish ? "--no-config" : "", script);
+            g_fixture.argv_log, g_bin, shell_path,
+            fish ? "--no-config" : "", script);
     }
     if (written < 0 || (size_t)written >= sizeof(command)) return -1;
     return run_shell(command);
@@ -475,66 +545,299 @@ TEST(help_and_init_share_the_exact_six_shell_matrix) {
     }
 }
 
-TEST(every_available_supported_shell_accepts_its_generated_syntax) {
+TEST(generated_snippets_use_only_the_bounded_resume_hint_probe) {
+    char contents[32768];
+
+    for (size_t i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
+        read_text(g_fixture.snippets[i], contents, sizeof(contents));
+        CHECK(strstr(contents, "command gitswitch --resume-hint-probe") != NULL);
+        CHECK(strstr(contents, ".resume-hint") == NULL);
+        CHECK(strstr(contents, "read -r __gitswitch_needs") == NULL);
+        CHECK(strstr(contents, "read -l __gitswitch_needs") == NULL);
+    }
+}
+
+static int run_resume_hint_probe(char *output, size_t output_size) {
+    char output_path[PATH_MAX];
+    char command[PATH_MAX * 5];
+    int written;
+    int status;
+
+    if (join_path(output_path, sizeof(output_path), g_fixture.root,
+                  "/probe.out") != 0) return -1;
+    written = snprintf(command, sizeof(command),
+                       "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' "
+                       "--resume-hint-probe >'%s' 2>/dev/null",
+                       g_fixture.home, g_fixture.runtime, g_bin, output_path);
+    if (written < 0 || (size_t)written >= sizeof(command)) return -1;
+    status = run_shell_bounded(command, 1500L);
+    read_text(output_path, output, output_size);
+    unlink(output_path);
+    return status;
+}
+
+TEST(resume_hint_probe_accepts_only_safe_exact_artifacts) {
+    static const struct {
+        const char *body;
+        const char *expected;
+    } valid[] = {
+        {"none\ninactive=v1\n", "none\n"},
+        {"ssh\nactive=work\n", "ssh\n"},
+        {"gpg\nactive=work\n", "gpg\n"},
+        {"ssh gpg\nactive=work\n", "ssh gpg\n"},
+        {"ssh\n", "ssh\n"},
+        {"gpg\n", "gpg\n"}
+    };
+    static const unsigned char with_nul[] = {
+        's', 's', 'h', '\n', 'a', 'c', 't', 'i', 'v', 'e', '=',
+        'w', 'o', 'r', 'k', '\0', '\n'
+    };
+    char target[PATH_MAX];
+    char output[256];
+    char oversized[1026];
+
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(run_resume_hint_probe(output, sizeof(output)), 0);
+    CHECK_STR_EQ(output, "none\n");
+    for (size_t i = 0; i < sizeof(valid) / sizeof(valid[0]); i++) {
+        CHECK_EQ_INT(write_text(g_fixture.hint, valid[i].body, 0600), 0);
+        CHECK_EQ_INT(run_resume_hint_probe(output, sizeof(output)), 0);
+        CHECK_STR_EQ(output, valid[i].expected);
+    }
+    CHECK_EQ_INT(write_text(g_fixture.hint, "", 0600), 0);
+    CHECK_EQ_INT(run_resume_hint_probe(output, sizeof(output)), 0);
+    CHECK_STR_EQ(output, "ssh gpg\n");
+
+    CHECK_EQ_INT(write_text(g_fixture.hint, "ssh", 0600), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    CHECK_EQ_INT(write_text(g_fixture.hint,
+                            "ssh\nactive=work\ntrailing\n", 0600), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    CHECK_EQ_INT(write_bytes(g_fixture.hint, with_nul, sizeof(with_nul),
+                             0600), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    memset(oversized, 'x', sizeof(oversized));
+    CHECK_EQ_INT(write_bytes(g_fixture.hint, oversized, sizeof(oversized),
+                             0600), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    CHECK_EQ_INT(write_text(g_fixture.hint, "ssh\n", 0644), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+
+    CHECK_EQ_INT(join_path(target, sizeof(target), g_fixture.root,
+                           "/hint-target"), 0);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(write_text(target, "ssh\n", 0600), 0);
+    CHECK_EQ_INT(link(target, g_fixture.hint), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(symlink(target, g_fixture.hint), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(mkfifo(g_fixture.hint, 0600), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(make_socket_node(g_fixture.hint), 0);
+    CHECK(run_resume_hint_probe(output, sizeof(output)) != 0);
+    CHECK_STR_EQ(output, "");
+    unlink(g_fixture.hint);
+    unlink(target);
+}
+
+TEST(resume_hint_probe_is_noncreating_and_rejects_other_grammar) {
+    char home[PATH_MAX];
+    char config_dir[PATH_MAX];
+    char output_path[PATH_MAX];
+    char command[PATH_MAX * 5];
+    char output[256];
+    int written;
+
+    CHECK_EQ_INT(join_path(home, sizeof(home), g_fixture.root,
+                           "/fresh-probe-home"), 0);
+    CHECK_EQ_INT(join_path(config_dir, sizeof(config_dir), home,
+                           "/.config"), 0);
+    CHECK_EQ_INT(join_path(output_path, sizeof(output_path), g_fixture.root,
+                           "/fresh-probe.out"), 0);
+    CHECK_EQ_INT(mkdir_private(home), 0);
+
+    written = snprintf(command, sizeof(command),
+                       "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' "
+                       "--resume-hint-probe >'%s' 2>/dev/null",
+                       home, g_fixture.runtime, g_bin, output_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(command));
+    CHECK_EQ_INT(run_shell_bounded(command, 1500L), 0);
+    CHECK_STR_EQ(read_text(output_path, output, sizeof(output)), "none\n");
+    CHECK(access(config_dir, F_OK) != 0 && errno == ENOENT);
+
+    written = snprintf(command, sizeof(command),
+                       "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' "
+                       "--resume-hint-probe unexpected >'%s' 2>/dev/null",
+                       home, g_fixture.runtime, g_bin, output_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(command));
+    CHECK(run_shell_bounded(command, 1500L) != 0);
+    CHECK_STR_EQ(read_text(output_path, output, sizeof(output)), "");
+    CHECK(access(config_dir, F_OK) != 0 && errno == ENOENT);
+
+    written = snprintf(command, sizeof(command),
+                       "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' "
+                       "--resume-hint-probe --resume-check >'%s' 2>/dev/null",
+                       home, g_fixture.runtime, g_bin, output_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(command));
+    CHECK(run_shell_bounded(command, 1500L) != 0);
+    CHECK_STR_EQ(read_text(output_path, output, sizeof(output)), "");
+    CHECK(access(config_dir, F_OK) != 0 && errno == ENOENT);
+}
+
+static void check_generated_syntax_for_shell(size_t index) {
     char shell_path[PATH_MAX];
     char command[PATH_MAX * 3];
-    size_t i;
+    int resolved;
 
-    for (i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
-        if (resolve_executable(g_shells[i].name, shell_path,
-                               sizeof(shell_path)) != 0) {
-            fprintf(stderr, "  (skipped %s syntax: shell unavailable)\n",
-                    g_shells[i].name);
-            continue;
-        }
-        snprintf(command, sizeof(command), "'%s' %s -n '%s' >/dev/null 2>&1",
-                 shell_path,
-                 strcmp(g_shells[i].name, "bash") == 0 ? "--noprofile --norc" :
-                 strcmp(g_shells[i].name, "zsh") == 0 ? "-f" :
-                 strcmp(g_shells[i].name, "fish") == 0 ? "--no-config" : "",
-                 g_fixture.snippets[i]);
+    resolved = resolve_executable(g_shells[index].name, shell_path,
+                                  sizeof(shell_path));
+    CHECK_EQ_INT(resolved, 0);
+    if (resolved != 0) return;
+    int written = snprintf(
+        command, sizeof(command), "'%s' %s -n '%s' >/dev/null 2>&1",
+        shell_path,
+        strcmp(g_shells[index].name, "bash") == 0 ? "--noprofile --norc" :
+        strcmp(g_shells[index].name, "zsh") == 0 ? "-f" :
+        strcmp(g_shells[index].name, "fish") == 0 ? "--no-config" : "",
+        g_fixture.snippets[index]);
+    CHECK(written >= 0 && (size_t)written < sizeof(command));
+    if (written >= 0 && (size_t)written < sizeof(command)) {
         CHECK_EQ_INT(run_shell(command), 0);
     }
 }
 
-TEST(available_shells_resume_once_for_empty_wrong_or_extra_but_not_exact) {
-    char shell_path[PATH_MAX];
-    size_t i;
-
-    for (i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
-        if (resolve_executable(g_shells[i].name, shell_path,
-                               sizeof(shell_path)) != 0) {
-            continue;
-        }
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 1, 0, false), 1);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 0, 1, false), 1);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 0, 1, false), 1);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 0, 0, false), 0);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 2, 0, false), 1);
-    }
+static void check_resume_matrix_for_shell(size_t index) {
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 1, 0, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 0, false), 0);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 2, 0, false), 1);
 }
 
-TEST(combined_runtime_misses_trigger_one_bounded_resume) {
-    static const char *const shells[] = {"sh", "fish"};
-    size_t i;
+static void check_combined_runtime_misses_for_shell(const char *shell) {
+    int index = shell_index(shell);
 
-    for (i = 0; i < sizeof(shells) / sizeof(shells[0]); i++) {
-        int index = shell_index(shells[i]);
-        char shell_path[PATH_MAX];
-        if (index < 0 || resolve_executable(shells[i], shell_path,
-                                            sizeof(shell_path)) != 0) {
-            continue;
-        }
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
-                                          true), 0);
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
-                                          false), 1);
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
-                                          true), 1);
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
-                                          false), 1);
-    }
+    CHECK(index >= 0);
+    if (index < 0) return;
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
+                                      true), 0);
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
+                                      false), 1);
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
+                                      true), 1);
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
+                                      false), 1);
 }
+
+static void check_invalid_hints_for_shell(const char *shell) {
+    char target[PATH_MAX];
+    char oversized[1026];
+    int index = shell_index(shell);
+
+    CHECK(index >= 0);
+    if (index < 0) return;
+    CHECK_EQ_INT(join_path(target, sizeof(target), g_fixture.root,
+                           "/shell-hint-target"), 0);
+    memset(oversized, 'x', sizeof(oversized));
+    CHECK_EQ_INT(write_text(g_fixture.hint,
+                            "ssh\nactive=work\n", 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 1);
+
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    CHECK_EQ_INT(write_text(g_fixture.hint, "ssh", 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    CHECK_EQ_INT(write_bytes(g_fixture.hint, oversized,
+                             sizeof(oversized), 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    CHECK_EQ_INT(write_text(g_fixture.hint, "ssh\n", 0644), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+
+    unlink(g_fixture.hint);
+    unlink(target);
+    CHECK_EQ_INT(write_text(target, "ssh\n", 0600), 0);
+    CHECK_EQ_INT(link(target, g_fixture.hint), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(symlink(target, g_fixture.hint), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(mkfifo(g_fixture.hint, 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(make_socket_node(g_fixture.hint), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    unlink(target);
+}
+
+#define REQUIRE_NATIVE_SHELL(shell) do {                                    \
+    char ts_shell_path[PATH_MAX];                                           \
+    if (resolve_executable((shell), ts_shell_path,                          \
+                           sizeof(ts_shell_path)) != 0) {                   \
+        TS_SKIP((shell), "native shell executable is unavailable");       \
+    }                                                                       \
+} while (0)
+
+#define DEFINE_SHELL_MATRIX_TESTS(label, index)                              \
+    TEST(label##_generated_syntax) {                                        \
+        REQUIRE_NATIVE_SHELL(g_shells[index].name);                         \
+        check_generated_syntax_for_shell(index);                            \
+    }                                                                       \
+    TEST(label##_resume_matrix) {                                           \
+        REQUIRE_NATIVE_SHELL(g_shells[index].name);                         \
+        check_resume_matrix_for_shell(index);                               \
+    }
+
+DEFINE_SHELL_MATRIX_TESTS(bash, 0)
+DEFINE_SHELL_MATRIX_TESTS(zsh, 1)
+DEFINE_SHELL_MATRIX_TESTS(fish, 2)
+DEFINE_SHELL_MATRIX_TESTS(sh, 3)
+DEFINE_SHELL_MATRIX_TESTS(dash, 4)
+DEFINE_SHELL_MATRIX_TESTS(ksh, 5)
+#undef DEFINE_SHELL_MATRIX_TESTS
+
+TEST(sh_combined_runtime_misses) {
+    REQUIRE_NATIVE_SHELL("sh");
+    check_combined_runtime_misses_for_shell("sh");
+}
+
+TEST(fish_combined_runtime_misses) {
+    REQUIRE_NATIVE_SHELL("fish");
+    check_combined_runtime_misses_for_shell("fish");
+}
+
+TEST(sh_invalid_hints_are_bounded) {
+    REQUIRE_NATIVE_SHELL("sh");
+    check_invalid_hints_for_shell("sh");
+}
+
+TEST(fish_invalid_hints_are_bounded) {
+    REQUIRE_NATIVE_SHELL("fish");
+    check_invalid_hints_for_shell("fish");
+}
+
+#undef REQUIRE_NATIVE_SHELL
 
 TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership) {
     char script[PATH_MAX];
@@ -590,8 +893,7 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "end\n";
 
     if (resolve_executable("fish", fish_path, sizeof(fish_path)) != 0) {
-        fprintf(stderr, "  (skipped fish parent-state matrix: fish unavailable)\n");
-        return;
+        TS_SKIP("fish", "native fish executable is unavailable");
     }
     CHECK_EQ_INT(join_path(script, sizeof(script), g_fixture.root,
                            "/fish-transition.fish"), 0);
@@ -668,8 +970,7 @@ TEST(fish_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths) {
         "test \"$SSH_AUTH_SOCK:$GNUPGHOME\" = /manual/socket:/manual/gpg; or exit 25\n";
 
     if (resolve_executable("fish", fish_path, sizeof(fish_path)) != 0) {
-        fprintf(stderr, "  (skipped fish wrapper matrix: fish unavailable)\n");
-        return;
+        TS_SKIP("fish", "native fish executable is unavailable");
     }
     CHECK_EQ_INT(join_path(script, sizeof(script), g_fixture.root,
                            "/fish-wrapper.fish"), 0);
@@ -697,6 +998,11 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     bool live = true;
     pid_t agent_pid = -1;
 
+    if (resolve_executable("ssh-agent", output, sizeof(output)) != 0 ||
+        resolve_executable("ssh-add", output, sizeof(output)) != 0 ||
+        resolve_executable("ssh-keygen", output, sizeof(output)) != 0) {
+        TS_SKIP("openssh", "OpenSSH test tools are unavailable");
+    }
     if (old_runtime) saved_runtime = strdup(old_runtime);
     if (!ts_mkdtemp(root) ||
         join_path(runtime, sizeof(runtime), root, "/runtime") != 0 ||
@@ -715,12 +1021,6 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         free(saved_runtime);
         ts_rm_rf(root);
         return;
-    }
-    if (resolve_executable("ssh-agent", output, sizeof(output)) != 0 ||
-        resolve_executable("ssh-add", output, sizeof(output)) != 0 ||
-        resolve_executable("ssh-keygen", output, sizeof(output)) != 0) {
-        fprintf(stderr, "  (skipped real SSH liveness: OpenSSH tools unavailable)\n");
-        goto done;
     }
     CHECK_EQ_INT(generate_key(expected_key), 0);
     CHECK_EQ_INT(generate_key(other_key), 0);
@@ -805,8 +1105,7 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
     if (resolve_executable("ssh-agent", after, sizeof(after)) != 0 ||
         resolve_executable("ssh-add", after, sizeof(after)) != 0 ||
         resolve_executable("ssh-keygen", after, sizeof(after)) != 0) {
-        fprintf(stderr, "  (skipped real resume: OpenSSH tools unavailable)\n");
-        return;
+        TS_SKIP("openssh", "OpenSSH test tools are unavailable");
     }
     if (!ts_mkdtemp(root)) {
         CHECK(!"real resume root setup failed");
@@ -881,9 +1180,25 @@ int main(int argc, char **argv) {
     }
 
     RUN_TEST(help_and_init_share_the_exact_six_shell_matrix);
-    RUN_TEST(every_available_supported_shell_accepts_its_generated_syntax);
-    RUN_TEST(available_shells_resume_once_for_empty_wrong_or_extra_but_not_exact);
-    RUN_TEST(combined_runtime_misses_trigger_one_bounded_resume);
+    RUN_TEST(generated_snippets_use_only_the_bounded_resume_hint_probe);
+    RUN_TEST(resume_hint_probe_accepts_only_safe_exact_artifacts);
+    RUN_TEST(resume_hint_probe_is_noncreating_and_rejects_other_grammar);
+    RUN_TEST(bash_generated_syntax);
+    RUN_TEST(bash_resume_matrix);
+    RUN_TEST(zsh_generated_syntax);
+    RUN_TEST(zsh_resume_matrix);
+    RUN_TEST(fish_generated_syntax);
+    RUN_TEST(fish_resume_matrix);
+    RUN_TEST(sh_generated_syntax);
+    RUN_TEST(sh_resume_matrix);
+    RUN_TEST(dash_generated_syntax);
+    RUN_TEST(dash_resume_matrix);
+    RUN_TEST(ksh_generated_syntax);
+    RUN_TEST(ksh_resume_matrix);
+    RUN_TEST(sh_combined_runtime_misses);
+    RUN_TEST(fish_combined_runtime_misses);
+    RUN_TEST(sh_invalid_hints_are_bounded);
+    RUN_TEST(fish_invalid_hints_are_bounded);
     RUN_TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership);
     RUN_TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership);
     RUN_TEST(posix_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths);
@@ -893,8 +1208,5 @@ int main(int argc, char **argv) {
 
     ts_rm_rf(g_fixture.root);
     error_cleanup();
-    printf("\n%s: %d run, %d failed\n",
-           ts_tests_failed ? "RESULT FAIL" : "RESULT OK",
-           ts_tests_run, ts_tests_failed);
-    return ts_tests_failed == 0 ? 0 : 1;
+    return ts_test_finish();
 }

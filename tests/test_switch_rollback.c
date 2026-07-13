@@ -49,6 +49,12 @@
 static char g_xdg[256];
 static char g_ssh_sock[512];   /* <xdg>/gitswitch-ssh/current.sock */
 static char g_gpg_link[512];   /* <xdg>/gitswitch-gpg/current */
+static char g_gpg_source_home[512]; /* external source keyring fixture */
+static char g_gpg_command_dir[MAX_PATH_LEN];
+static char *g_gpg_saved_path;
+static bool g_gpg_saved_path_present;
+static bool g_gpg_command_fixture_active;
+static bool g_host_gpg_available;
 
 /* Create a fresh fake XDG_RUNTIME_DIR holding the pre-switch runtime state of
  * a "previous" account: a current.sock symlink and a GNUPGHOME `current`
@@ -82,6 +88,141 @@ static int setup_runtime_dir(void) {
     return 0;
 }
 
+/* A transaction with no pre-existing runtime identity is the smallest exact
+ * fixture for signal-lifecycle tests: prepare/abort can prove a complete Git
+ * rollback without manufacturing an SSH agent solely for restoration. */
+static int setup_empty_runtime_dir(void) {
+    if (accounts_session_cleanup() != 0) return -1;
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_empty_XXXXXX");
+    if (!ts_mkdtemp(g_xdg)) return -1;
+    return setenv("XDG_RUNTIME_DIR", g_xdg, 1);
+}
+
+/* The GPG runner below fakes key inventory and transfer, but production still
+ * pins and validates the source keyring directory around every child spawn.
+ * Give those tests a private external source so they never depend on the
+ * operator's GNUPGHOME or on whether HOME/.gnupg exists. */
+static int setup_gpg_source_home(void) {
+    if (safe_snprintf(g_gpg_source_home, sizeof(g_gpg_source_home),
+                      "%s/system-gnupg", g_xdg) != 0) {
+        return -1;
+    }
+    if (mkdir(g_gpg_source_home, 0700) != 0) return -1;
+    return setenv("GNUPGHOME", g_gpg_source_home, 1);
+}
+
+/* These cases fake every GPG child invocation, but gpg_manager_init still
+ * performs production's descriptor-pinned availability check. Homebrew's
+ * shared, group-writable prefix is intentionally rejected by that resolver,
+ * even though the installed gpg is a valid CI dependency. First execute the
+ * host command solely as a test-capability preflight; when it is runnable,
+ * prepend a private trusted script that command_exists can validate. The
+ * script is a tripwire: the fake runner must intercept it before execution. */
+static int host_gpg_preflight(void) {
+    int status;
+    pid_t waited;
+    pid_t pid = fork();
+
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
+            dup2(null_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        if (null_fd > STDERR_FILENO) close(null_fd);
+        execlp("gpg", "gpg", "--version", (char *)NULL);
+        _exit(127);
+    }
+
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid) return -1;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 1 : 0;
+}
+
+static int restore_gpg_command_fixture(void) {
+    int rc;
+
+    if (!g_gpg_command_fixture_active) return 0;
+    rc = g_gpg_saved_path_present
+             ? setenv("PATH", g_gpg_saved_path, 1)
+             : unsetenv("PATH");
+    free(g_gpg_saved_path);
+    g_gpg_saved_path = NULL;
+    g_gpg_saved_path_present = false;
+    g_gpg_command_fixture_active = false;
+    return rc;
+}
+
+static int setup_gpg_command_fixture(void) {
+    static const char script[] = "#!/bin/sh\nexit 125\n";
+    const char *path = getenv("PATH");
+    char command_path[MAX_PATH_LEN];
+    char *saved_path = NULL;
+    char *fixture_path = NULL;
+    size_t dir_len;
+    size_t path_len = path ? strlen(path) : 0;
+    size_t fixture_len;
+    bool append_path = path_len > 0;
+
+    if (path) {
+        saved_path = strdup(path);
+        if (!saved_path) return -1;
+    }
+    if (!ts_mkdtemp_trusted(g_gpg_command_dir,
+                            sizeof(g_gpg_command_dir), "gsw-gpg-bin") ||
+        safe_snprintf(command_path, sizeof(command_path), "%s/gpg",
+                      g_gpg_command_dir) != 0 ||
+        write_string_to_file(command_path, script, 0700) != 0) {
+        free(saved_path);
+        return -1;
+    }
+
+    dir_len = strlen(g_gpg_command_dir);
+    if (path_len > SIZE_MAX - dir_len - 2) {
+        free(saved_path);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    fixture_len = dir_len + (append_path ? path_len + 1 : 0) + 1;
+    fixture_path = malloc(fixture_len);
+    if (!fixture_path) {
+        free(saved_path);
+        return -1;
+    }
+    memcpy(fixture_path, g_gpg_command_dir, dir_len);
+    if (append_path) {
+        fixture_path[dir_len] = ':';
+        memcpy(fixture_path + dir_len + 1, path, path_len);
+        fixture_path[dir_len + path_len + 1] = '\0';
+    } else {
+        fixture_path[dir_len] = '\0';
+    }
+
+    if (setenv("PATH", fixture_path, 1) != 0) {
+        free(fixture_path);
+        free(saved_path);
+        return -1;
+    }
+    free(fixture_path);
+    g_gpg_saved_path = saved_path;
+    g_gpg_saved_path_present = path != NULL;
+    g_gpg_command_fixture_active = true;
+    if (!command_exists("gpg")) {
+        int saved_errno = errno;
+        (void)restore_gpg_command_fixture();
+        errno = saved_errno ? saved_errno : ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
+static bool gpg_test_command_available(void) {
+    return g_host_gpg_available && command_exists("gpg");
+}
+
 static bool symlink_present(const char *path) {
     struct stat st;
     return lstat(path, &st) == 0;
@@ -100,10 +241,47 @@ static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer *
 static FILE *g_log;                 /* when set, every argv is logged here */
 static char g_effective_signingkey_observed[MAX_GPG_FINGERPRINT_LEN];
 
-static bool refuse_session_agent_reap(pid_t pid, const char *socket_arg) {
+static const int switch_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
+#define SWITCH_GUARDED_SIGNAL_COUNT \
+    (sizeof(switch_guarded_signals) / sizeof(switch_guarded_signals[0]))
+
+static ssh_process_outcome_t refuse_session_agent_reap(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
     (void)pid;
     (void)socket_arg;
-    return false;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_OWNED;
+}
+
+static int g_session_reap_signal;
+static int g_session_reap_calls;
+static ssh_reap_fn g_session_reap_delegate;
+
+/* Causal AR-08 M4 probe: inject the repeated signal from inside the exact
+ * previous-session reap boundary. The first call belongs to
+ * accounts_session_cleanup(); a later call proves the checked abort reached
+ * runtime rollback before the pending signal was re-raised. */
+static ssh_process_outcome_t signal_during_session_agent_reap(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
+    int call = ++g_session_reap_calls;
+    ssh_process_outcome_t outcome;
+
+    if (g_log) {
+        fprintf(g_log, "MARK-SESSION-REAP-%d-BEFORE\n", call);
+        fflush(g_log);
+    }
+    if (call == 1) {
+        raise(g_session_reap_signal);
+        raise(g_session_reap_signal);
+    }
+    if (g_log) {
+        fprintf(g_log, "MARK-SESSION-REAP-%d-AFTER\n", call);
+        fflush(g_log);
+    }
+    outcome = g_session_reap_delegate
+                  ? g_session_reap_delegate(pid, socket_arg, runtime_dir_fd)
+                  : SSH_PROCESS_INDETERMINATE;
+    return outcome;
 }
 
 /* Minimal fake config store so git_set_config's read-back verification sees
@@ -114,7 +292,11 @@ static char g_store_email[MAX_EMAIL_LEN];
 static char g_store_sshcmd[MAX_PATH_LEN * 2];
 static char g_store_signingkey[MAX_GPG_SELECTOR_LEN];
 static char g_store_gpgsign[16];
+static char g_store_gpgformat[16];
 static char g_store_gpgprogram[MAX_PATH_LEN];
+static char g_store_gpgopenpgp[MAX_PATH_LEN];
+static char g_store_gpgx509[MAX_PATH_LEN];
+static char g_store_gpgssh[MAX_PATH_LEN];
 
 /* git_ops.c deliberately keeps this test-only cache reset out of its public
  * header. Identity-sensitive cases below need a fresh snapshot/read-back view. */
@@ -224,6 +406,10 @@ static int emit_scope_config(const char *scope, const run_opts_t *opts,
     APPEND_GLOBAL_IF_SET("commit.gpgsign", g_store_gpgsign);
     APPEND_GLOBAL_IF_SET("gpg.program", g_store_gpgprogram);
     APPEND_GLOBAL_IF_SET("core.sshcommand", g_store_sshcmd);
+    APPEND_GLOBAL_IF_SET("gpg.format", g_store_gpgformat);
+    APPEND_GLOBAL_IF_SET("gpg.openpgp.program", g_store_gpgopenpgp);
+    APPEND_GLOBAL_IF_SET("gpg.x509.program", g_store_gpgx509);
+    APPEND_GLOBAL_IF_SET("gpg.ssh.program", g_store_gpgssh);
 #undef APPEND_GLOBAL_IF_SET
     if (used < opts->out_size) opts->out[used] = '\0';
     if (result) {
@@ -253,6 +439,10 @@ static int emit_effective_config(const run_opts_t *opts, run_result_t *result) {
     APPEND_IF_SET("commit.gpgsign", g_store_gpgsign);
     APPEND_IF_SET("gpg.program", g_store_gpgprogram);
     APPEND_IF_SET("core.sshcommand", g_store_sshcmd);
+    APPEND_IF_SET("gpg.format", g_store_gpgformat);
+    APPEND_IF_SET("gpg.openpgp.program", g_store_gpgopenpgp);
+    APPEND_IF_SET("gpg.x509.program", g_store_gpgx509);
+    APPEND_IF_SET("gpg.ssh.program", g_store_gpgssh);
 #undef APPEND_IF_SET
     if (result) {
         memset(result, 0, sizeof(*result));
@@ -329,6 +519,22 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
                    is_config_read(argv, "gpg.program") &&
                    g_store_gpgprogram[0]) {
             snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgprogram);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.format") &&
+                   g_store_gpgformat[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgformat);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.openpgp.program") &&
+                   g_store_gpgopenpgp[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgopenpgp);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.x509.program") &&
+                   g_store_gpgx509[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgx509);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.ssh.program") &&
+                   g_store_gpgssh[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgssh);
         }
     }
 
@@ -361,6 +567,14 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         safe_strncpy(g_store_gpgsign, argv[4], sizeof(g_store_gpgsign));
     } else if (is_config_write(argv, "gpg.program")) {
         safe_strncpy(g_store_gpgprogram, argv[4], sizeof(g_store_gpgprogram));
+    } else if (is_config_write(argv, "gpg.format")) {
+        safe_strncpy(g_store_gpgformat, argv[4], sizeof(g_store_gpgformat));
+    } else if (is_config_write(argv, "gpg.openpgp.program")) {
+        safe_strncpy(g_store_gpgopenpgp, argv[4], sizeof(g_store_gpgopenpgp));
+    } else if (is_config_write(argv, "gpg.x509.program")) {
+        safe_strncpy(g_store_gpgx509, argv[4], sizeof(g_store_gpgx509));
+    } else if (is_config_write(argv, "gpg.ssh.program")) {
+        safe_strncpy(g_store_gpgssh, argv[4], sizeof(g_store_gpgssh));
     } else if (is_config_add(argv, "user.name")) {
         safe_strncpy(g_store_name, argv[5], sizeof(g_store_name));
     } else if (is_config_add(argv, "user.email")) {
@@ -373,18 +587,44 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         safe_strncpy(g_store_gpgsign, argv[5], sizeof(g_store_gpgsign));
     } else if (is_config_add(argv, "gpg.program")) {
         safe_strncpy(g_store_gpgprogram, argv[5], sizeof(g_store_gpgprogram));
-    } else if (is_config_unset(argv, "user.name")) {
+    } else if (is_config_add(argv, "gpg.format")) {
+        safe_strncpy(g_store_gpgformat, argv[5], sizeof(g_store_gpgformat));
+    } else if (is_config_add(argv, "gpg.openpgp.program")) {
+        safe_strncpy(g_store_gpgopenpgp, argv[5], sizeof(g_store_gpgopenpgp));
+    } else if (is_config_add(argv, "gpg.x509.program")) {
+        safe_strncpy(g_store_gpgx509, argv[5], sizeof(g_store_gpgx509));
+    } else if (is_config_add(argv, "gpg.ssh.program")) {
+        safe_strncpy(g_store_gpgssh, argv[5], sizeof(g_store_gpgssh));
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "user.name")) {
         g_store_name[0] = '\0';
-    } else if (is_config_unset(argv, "user.email")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "user.email")) {
         g_store_email[0] = '\0';
-    } else if (is_config_unset(argv, "core.sshcommand")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "core.sshcommand")) {
         g_store_sshcmd[0] = '\0';
-    } else if (is_config_unset(argv, "user.signingkey")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "user.signingkey")) {
         g_store_signingkey[0] = '\0';
-    } else if (is_config_unset(argv, "commit.gpgsign")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "commit.gpgsign")) {
         g_store_gpgsign[0] = '\0';
-    } else if (is_config_unset(argv, "gpg.program")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.program")) {
         g_store_gpgprogram[0] = '\0';
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.format")) {
+        g_store_gpgformat[0] = '\0';
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.openpgp.program")) {
+        g_store_gpgopenpgp[0] = '\0';
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.x509.program")) {
+        g_store_gpgx509[0] = '\0';
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.ssh.program")) {
+        g_store_gpgssh[0] = '\0';
     } else if (is_config_read(argv, "user.name") &&
                (!is_global_config_command(argv) || !g_store_name[0])) {
         exit_code = 1; /* not set: git reports failure */
@@ -402,6 +642,18 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         exit_code = 1;
     } else if (is_config_read(argv, "gpg.program") &&
                (!is_global_config_command(argv) || !g_store_gpgprogram[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.format") &&
+               (!is_global_config_command(argv) || !g_store_gpgformat[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.openpgp.program") &&
+               (!is_global_config_command(argv) || !g_store_gpgopenpgp[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.x509.program") &&
+               (!is_global_config_command(argv) || !g_store_gpgx509[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.ssh.program") &&
+               (!is_global_config_command(argv) || !g_store_gpgssh[0])) {
         exit_code = 1;
     }
 
@@ -455,13 +707,15 @@ static int bind_fake_agent_socket_for_runner(const char *path,
     return rc;
 }
 
-/* Extends fake_runner with a working fake ssh-agent (binds the -a socket) and
- * a happy ssh-add, so accounts_switch can walk the full SSH activation and
- * the rollback can genuinely re-start the previous account's agent. git
- * handling is delegated to fake_runner. The reported agent PID is far above
- * any platform's pid_max so the later teardown's reaper can never find — let
- * alone signal — a real process behind it. */
+/* Extends fake_runner with a working fake ssh-agent (binds the -a socket), a
+ * happy ssh-add, and matching identity/fingerprint probes, so accounts_switch
+ * can walk the full SSH activation and the rollback can genuinely re-start
+ * the previous account's agent. git handling is delegated to fake_runner.
+ * The reported agent PID is far above any platform's pid_max so the later
+ * teardown's reaper can never find — let alone signal — a real process behind
+ * it. */
 #define FAKE_AGENT_PID 1073741824
+#define FAKE_AGENT_FP "SHA256:rollback-fixture-fingerprint"
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
     if (strcmp(argv[0], "ssh-agent") == 0) {
@@ -491,8 +745,34 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-add") == 0 || strcmp(argv[0], "ssh-keygen") == 0) {
-        if (strcmp(argv[0], "ssh-add") == 0) g_ssh_activation_commands++;
+    if (strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
+        strcmp(argv[1], "-l") == 0) {
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+        }
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s loaded-key (ED25519)\n", FAKE_AGENT_FP);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
+        strcmp(argv[1], "-lf") == 0) {
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+        }
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s key-file (ED25519)\n", FAKE_AGENT_FP);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-add") == 0) {
+        g_ssh_activation_commands++;
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
@@ -508,6 +788,26 @@ static const char g_concurrent_config_content[] =
 static char g_concurrent_config_path[1024];
 static bool g_replace_config_on_user_name;
 static bool g_replace_config_with_symlink_on_user_name;
+
+static int fail_alias_postrename_verification(int dir_fd) {
+    (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static int fail_alias_dirsync(int dir_fd) {
+    (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static int replace_git_name_and_fail_alias_commit(int dir_fd,
+                                                  const char *temp_name) {
+    (void)dir_fd;
+    (void)temp_name;
+    safe_strncpy(g_store_name, "Concurrent Name", sizeof(g_store_name));
+    return -1;
+}
 
 static int replace_ssh_config_concurrently(void) {
     char replacement_path[1100];
@@ -643,7 +943,11 @@ static void seed_previous_git_identity(void) {
     g_store_sshcmd[0] = '\0';
     g_store_signingkey[0] = '\0';
     g_store_gpgsign[0] = '\0';
+    g_store_gpgformat[0] = '\0';
     g_store_gpgprogram[0] = '\0';
+    g_store_gpgopenpgp[0] = '\0';
+    g_store_gpgx509[0] = '\0';
+    g_store_gpgssh[0] = '\0';
     g_effective_signingkey_observed[0] = '\0';
     g_fail_list_config = false;
 }
@@ -678,6 +982,48 @@ TEST(snapshot_failure_aborts_before_any_git_write) {
                  "Cannot inspect Git worktree configuration") != NULL);
     CHECK(symlink_present(g_ssh_sock));
     CHECK(symlink_present(g_gpg_link));
+}
+
+/* AR-08 M22: signals_guard_begin() is the final fail-before-mutation boundary
+ * in accounts_switch.  Failure after one earlier handler was installed must
+ * return the original error without tearing down runtime, writing Git, or
+ * publishing a new active account. */
+TEST(signal_guard_failure_aborts_before_switch_mutation) {
+    error_context_t failure;
+    int returned_errno;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    gitswitch_ctx_t ctx = make_ctx();
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+
+    signals_guard_end();
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_INSTALL,
+                                EPERM);
+    clear_error();
+    errno = 0;
+    command_runner_fn previous = run_set_runner(fake_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    returned_errno = errno;
+    failure = *get_last_error();
+    run_set_runner(previous);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(returned_errno, EPERM);
+    CHECK_EQ_INT(failure.code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(failure.system_errno, EPERM);
+    CHECK_EQ_INT(g_user_name_writes, 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(ctx.current_account == NULL);
+    CHECK(ctx.config.active_account[0] == '\0');
+    CHECK(symlink_present(g_ssh_sock));
+    CHECK(symlink_present(g_gpg_link));
+
+    signals_guard_end();
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
 }
 
 /* AR-07 M24: the exact config listing is acquired before runtime activation,
@@ -808,8 +1154,10 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
  * lookup failure reaped the previous account's healthy agent and unlinked
  * current.sock for a switch that never started. */
 TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
-    char key_path[512], emptybin[512], saved_path[4096];
+    char key_path[512], emptybin[512];
     const char *env_path;
+    char *saved_path;
+    bool saved_path_present;
     FILE *kf;
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -839,10 +1187,13 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     /* Cripple PATH: an empty (but trusted) dir makes command_exists fail for
      * ssh-agent/ssh-add without any agent operation being attempted. */
     env_path = getenv("PATH");
-    snprintf(saved_path, sizeof(saved_path), "%s", env_path ? env_path : "");
+    saved_path_present = env_path != NULL;
+    saved_path = env_path ? strdup(env_path) : NULL;
+    CHECK(!saved_path_present || saved_path != NULL);
+    if (saved_path_present && !saved_path) return;
     snprintf(emptybin, sizeof(emptybin), "%s/emptybin", g_xdg);
     CHECK_EQ_INT(mkdir(emptybin, 0755), 0);
-    setenv("PATH", emptybin, 1);
+    CHECK_EQ_INT(setenv("PATH", emptybin, 1), 0);
 
     g_fail_user_name_set = false;
     g_raise_on_user_name = false;
@@ -850,7 +1201,15 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     command_runner_fn prev = run_set_runner(fake_runner);
     int rc = accounts_switch(&ctx, "testacct");
     run_set_runner(prev);
-    setenv("PATH", saved_path, 1);
+    CHECK_EQ_INT(saved_path_present ? setenv("PATH", saved_path, 1)
+                                    : unsetenv("PATH"),
+                 0);
+    if (saved_path_present) {
+        CHECK_STR_EQ(getenv("PATH"), saved_path);
+    } else {
+        CHECK(getenv("PATH") == NULL);
+    }
+    free(saved_path);
 
     CHECK_EQ_INT(rc, -1);
     /* The previous account's entry points were never disturbed and must
@@ -870,8 +1229,7 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
     ssize_t target_len;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -944,8 +1302,7 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     ssh_reap_fn previous_reap;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1011,6 +1368,114 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     g_fail_list_config = false;
 }
 
+/* AR-08 M4: previous-session teardown is already a mutating switch phase.
+ * Repeated signals raised from inside its reap callback must stay deferred
+ * through the checked rollback. Before the fix, rollback deferral began only
+ * after accounts_session_cleanup(), so the second raise terminated the child
+ * before the callback's AFTER marker (and before any rollback reap). */
+TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
+    char first_key[512];
+    char second_key[512];
+    command_runner_fn previous_runner;
+    gitswitch_ctx_t ctx;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    ctx = make_ctx();
+    snprintf(first_key, sizeof(first_key), "%s/key_signal_first", g_xdg);
+    CHECK_EQ_INT(write_fake_key(first_key), 0);
+    ctx.accounts[0].ssh_enabled = true;
+    safe_strncpy(ctx.accounts[0].ssh_key_path, first_key,
+                 sizeof(ctx.accounts[0].ssh_key_path));
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_fail_list_config = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+
+    memset(&ctx.accounts[1], 0, sizeof(ctx.accounts[1]));
+    ctx.accounts[1].id = 2;
+    safe_strncpy(ctx.accounts[1].name, "second",
+                 sizeof(ctx.accounts[1].name));
+    safe_strncpy(ctx.accounts[1].email, "second@example.com",
+                 sizeof(ctx.accounts[1].email));
+    safe_strncpy(ctx.accounts[1].description, "signal cleanup target",
+                 sizeof(ctx.accounts[1].description));
+    ctx.accounts[1].preferred_scope = GIT_SCOPE_GLOBAL;
+    ctx.accounts[1].ssh_enabled = true;
+    snprintf(second_key, sizeof(second_key), "%s/key_signal_second", g_xdg);
+    CHECK_EQ_INT(write_fake_key(second_key), 0);
+    safe_strncpy(ctx.accounts[1].ssh_key_path, second_key,
+                 sizeof(ctx.accounts[1].ssh_key_path));
+    ctx.account_count = 2;
+
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        char log_path[512];
+        char line[256];
+        bool cleanup_returned = false;
+        bool previous_agent_restored_after_cleanup = false;
+        int signal_number = switch_guarded_signals[signal_index];
+        int status = 0;
+        pid_t pid;
+
+        CHECK((size_t)snprintf(log_path, sizeof(log_path),
+                               "%s/session-cleanup-%d.log", g_xdg,
+                               signal_number) < sizeof(log_path));
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct sigaction default_action;
+
+            memset(&default_action, 0, sizeof(default_action));
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            if (sigaction(signal_number, &default_action, NULL) != 0) _exit(30);
+            g_log = fopen(log_path, "w");
+            if (!g_log) _exit(31);
+            g_session_reap_signal = signal_number;
+            g_session_reap_calls = 0;
+            g_session_reap_delegate =
+                ssh_manager_set_reap_fn(signal_during_session_agent_reap);
+            (void)accounts_switch(&ctx, "second");
+            _exit(32); /* completed checked abort dispatches the signal */
+        }
+
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        {
+            FILE *log = fopen(log_path, "r");
+
+            CHECK(log != NULL);
+            if (log) {
+                while (fgets(line, sizeof(line), log)) {
+                    if (strstr(line, "MARK-SESSION-REAP-1-AFTER")) {
+                        cleanup_returned = true;
+                    }
+                    if (cleanup_returned && strstr(line, "ssh-agent -a") &&
+                        strstr(line, "ssh-agent.testacct.sock")) {
+                        previous_agent_restored_after_cleanup = true;
+                    }
+                }
+                fclose(log);
+            }
+        }
+        CHECK(cleanup_returned);
+        CHECK(previous_agent_restored_after_cleanup);
+    }
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+}
+
 /* Write a private-key-shaped 0600 file so ssh_validate_key_file accepts it. */
 static int write_fake_key(const char *path) {
     FILE *f = fopen(path, "w");
@@ -1028,8 +1493,7 @@ TEST(ssh_stable_link_obstruction_aborts_integrated_switch) {
     char key_path[512];
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1077,8 +1541,7 @@ TEST(failed_switch_restarts_previous_accounts_agent) {
     /* The real ssh-agent/ssh-add must be findable for ssh_manager_init's
      * probes (the runner fakes the spawns themselves). */
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1173,6 +1636,188 @@ static int setup_alias_ctx(gitswitch_ctx_t *ctx, const char *alias) {
     return 0;
 }
 
+static int setup_alias_config_file(char *home, size_t home_size,
+                                   char *saved_home, size_t saved_home_size,
+                                   char *config_path, size_t config_path_size,
+                                   const char *content) {
+    char ssh_dir[700];
+    FILE *file;
+
+    if (setup_fake_home(home, home_size, saved_home, saved_home_size) != 0 ||
+        (size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) >=
+            sizeof(ssh_dir) ||
+        mkdir(ssh_dir, 0700) != 0 ||
+        (size_t)snprintf(config_path, config_path_size, "%s/config",
+                         ssh_dir) >= config_path_size) {
+        return -1;
+    }
+    if (!content) return 0;
+    file = fopen(config_path, "w");
+    if (!file) return -1;
+    if (fputs(content, file) == EOF || fclose(file) != 0) return -1;
+    return chmod(config_path, 0600);
+}
+
+/* M5 direct-library policy: once renameat has installed the alias, a failed
+ * public-inode verification is a committed-but-uncertain switch, not a reason
+ * to restore Git/runtime around the retained new alias. */
+TEST(postrename_alias_verification_failure_retains_complete_direct_switch) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    char after[4096], detail[sizeof(g_last_error.message)];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_config_postrename_hook_fn previous_hook;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    previous_hook = ssh_manager_set_config_postrename_hook_fn(
+        fail_alias_postrename_verification);
+    rc = accounts_switch(&ctx, "testacct");
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    ssh_manager_set_config_postrename_hook_fn(previous_hook);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    after[0] = '\0';
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK(strstr(after, "Host personal\n") != NULL);
+    CHECK(strstr(after, "Host github.com-tgt\n") != NULL);
+    CHECK(strstr(detail, "committed") != NULL);
+    CHECK(strstr(detail, "public inode could not be verified") != NULL);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
+}
+
+/* The prepared/CLI boundary exposes the retained commit structurally. Main
+ * consumes this exact state to keep its already-installed active file and
+ * resume hint while exiting nonzero with truthful durability diagnostics. */
+TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    char after[4096], detail[sizeof(g_last_error.message)];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_dirsync_fn previous_sync;
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
+    rc = accounts_switch_commit_result(&ctx, &state);
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    ssh_manager_set_dirsync_fn(previous_sync);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(state,
+                 ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    after[0] = '\0';
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK(strstr(after, "Host personal\n") != NULL);
+    CHECK(strstr(after, "Host github.com-tgt\n") != NULL);
+    CHECK(strstr(detail, "committed") != NULL);
+    CHECK(strstr(detail, "directory-durable") != NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    signals_rollback_end();
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
+}
+
+/* A pre-rename alias failure remains rollback-authorized. If M7 detects an
+ * external Git vector at that late point, direct API callers receive both the
+ * cause and the retained retry handle instead of losing signal ownership. */
+TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    char after[4096], detail[sizeof(g_last_error.message)];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_config_commit_hook_fn previous_hook;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    previous_hook = ssh_manager_set_config_commit_hook_fn(
+        replace_git_name_and_fail_alias_commit);
+    rc = accounts_switch(&ctx, "testacct");
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    ssh_manager_set_config_commit_hook_fn(previous_hook);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Concurrent Name");
+    CHECK(strstr(detail, "rollback remains incomplete") != NULL);
+    CHECK(strstr(detail, "changed outside this transaction") != NULL);
+    CHECK(strstr(detail, "retry ownership retained") != NULL);
+    after[0] = '\0';
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK_STR_EQ(after, original);
+
+    /* Repair only the conflicting vector to the transaction's exact intended
+     * post-image. The retained M7 retry restores its old value and completes
+     * signal/rollback ownership without replaying already-restored keys. */
+    safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
+}
+
 /* The alias writer is the final commit, so a Git failure must leave the
  * existing SSH config byte-for-byte untouched without invoking a rollback
  * writer at all. */
@@ -1183,8 +1828,7 @@ TEST(failed_switch_never_rewrites_existing_ssh_config) {
     FILE *f;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1230,8 +1874,7 @@ TEST(failed_switch_never_creates_ssh_config) {
     struct stat st;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1264,8 +1907,7 @@ TEST(failed_switch_preserves_concurrent_ssh_config_replacement) {
     FILE *f;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1326,8 +1968,7 @@ TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back) {
     ssize_t n;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1518,12 +2159,12 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     char target[512];
     ssize_t n;
 
-    if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
@@ -1557,18 +2198,19 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
         CHECK(strstr(target, "/prevhome") != NULL);
     }
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    unsetenv("GNUPGHOME");
 }
 
 TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     char target[MAX_PATH_LEN];
     ssize_t n;
 
-    if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
@@ -1594,19 +2236,19 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
         target[n] = '\0';
         CHECK(strstr(target, "/prevhome") != NULL);
     }
+    unsetenv("GNUPGHOME");
 }
 
 TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     char active_home[MAX_PATH_LEN];
 
-    if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
-    CHECK_EQ_INT(setenv("GNUPGHOME", "/external/original-gpg", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
     account->gpg_enabled = true;
@@ -1636,7 +2278,7 @@ TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     gpg_fail_session_env_restore = false;
     gpg_manager_set_setenv_fn(NULL);
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
-    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/original-gpg");
+    CHECK_STR_EQ(getenv("GNUPGHOME"), g_gpg_source_home);
 
     run_set_runner(previous_runner);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
@@ -1649,15 +2291,16 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
     char active_gpg_home[MAX_PATH_LEN];
     ssize_t target_len;
 
-    if (!command_exists("gpg") || !command_exists("ssh-agent") ||
-        !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: missing gpg/ssh-agent/ssh-add in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
+    }
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
-    CHECK_EQ_INT(setenv("GNUPGHOME", "/external/repeated-before", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *first = &ctx.accounts[0];
     snprintf(first_key, sizeof(first_key), "%s/repeated-first-key", g_xdg);
@@ -1706,19 +2349,19 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
     gpg_fail_session_env_restore = false;
     gpg_manager_set_setenv_fn(NULL);
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
-    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/repeated-before");
+    CHECK_STR_EQ(getenv("GNUPGHOME"), g_gpg_source_home);
     run_set_runner(previous_runner);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
     unsetenv("GNUPGHOME");
 }
 
 TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
-    if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
@@ -1746,18 +2389,19 @@ TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
     CHECK(g_store_gpgprogram[0] == '\0');
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    unsetenv("GNUPGHOME");
 }
 
 /* M2 at the accounts_switch boundary for GPG: an obstructing non-symlink at
  * `current` makes the stable-home commit fail. That failure must abort before
  * Git/active state changes and must not disturb the independent SSH link. */
 TEST(gpg_stable_link_obstruction_aborts_integrated_switch) {
-    if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(unlink(g_gpg_link), 0);
     CHECK_EQ_INT(mkdir(g_gpg_link, 0700), 0);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
@@ -1786,6 +2430,7 @@ TEST(gpg_stable_link_obstruction_aborts_integrated_switch) {
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(is_directory(g_gpg_link));
     CHECK(symlink_present(g_ssh_sock));
+    unsetenv("GNUPGHOME");
 }
 
 /* Mirror of failed_switch_restarts_previous_accounts_agent for the GPG side
@@ -1800,12 +2445,12 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
 
     /* gpg_manager_init PATH-probes the real gpg binary (the runner fakes the
      * spawns themselves). */
-    if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     /* The fake runtime dir lives under /tmp: opt out of the tmpfs fail-closed
      * guard so the test is independent of where /tmp is mounted. */
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
@@ -1848,6 +2493,7 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
         base = base ? base + 1 : target;
         CHECK_STR_EQ(base, "prevhome");
     }
+    unsetenv("GNUPGHOME");
 }
 
 /* A failed transaction may share XDG_RUNTIME_DIR with a later writer whose
@@ -1859,12 +2505,12 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
     char target[512];
     ssize_t n;
 
-    if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
     snprintf(later_home, sizeof(later_home), "%s/gitswitch-gpg/later", g_xdg);
     CHECK_EQ_INT(mkdir(later_home, 0700), 0);
@@ -1899,21 +2545,425 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
         target[n] = '\0';
         CHECK_STR_EQ(target, later_home);
     }
+    unsetenv("GNUPGHOME");
+}
+
+/* ---- AR-08 M4/M6: transaction-wide signal ownership ----------------------- */
+
+static volatile sig_atomic_t g_guard_end_checkpoint_signal;
+static int g_guard_end_hook_signal;
+
+static void switch_inherited_handler(int signal_number) {
+    g_guard_end_checkpoint_signal = signal_number;
+}
+
+static void raise_during_guard_end(void) {
+    raise(g_guard_end_hook_signal);
+}
+
+/* sigaction has implementation padding, so compare the semantic fields and
+ * every mask member this fixture deliberately varies. */
+static bool switch_actions_equal(const struct sigaction *left,
+                                 const struct sigaction *right) {
+    static const int mask_signals[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM
+    };
+
+    if (left->sa_handler != right->sa_handler ||
+        left->sa_flags != right->sa_flags) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(mask_signals) / sizeof(mask_signals[0]); i++) {
+        if (sigismember(&left->sa_mask, mask_signals[i]) !=
+            sigismember(&right->sa_mask, mask_signals[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* AR-08 M6: the one-call API owns its complete signal lifecycle. This test
+ * intentionally performs no signals_guard_end() cleanup after the switch;
+ * every caller disposition and pending-state bit must already be restored. */
+TEST(direct_switch_restores_callers_signal_dispositions) {
+    struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+    struct sigaction expected[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction action;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &original[i]), 0);
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = switch_inherited_handler;
+        sigemptyset(&action.sa_mask);
+        sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+        sigaddset(&action.sa_mask,
+                  switch_guarded_signals[(i + 1) %
+                                         SWITCH_GUARDED_SIGNAL_COUNT]);
+        action.sa_flags = i == 1 ? SA_RESTART : 0;
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &action, NULL), 0);
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &expected[i]), 0);
+    }
+
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(fake_runner);
+    rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK(!signals_pending());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL, &observed), 0);
+        CHECK(switch_actions_equal(&observed, &expected[i]));
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &original[i], NULL),
+                     0);
+    }
+}
+
+/* Restoration itself can fail after the durable switch has committed. The
+ * API must report that exact partial-success truth and retain the unrestored
+ * disposition for a checked retry instead of returning a false success. */
+TEST(direct_switch_reports_signal_restoration_failure_after_commit) {
+    struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+    int returned_errno;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &original[i]), 0);
+    }
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+    previous_runner = run_set_runner(fake_runner);
+    errno = 0;
+    rc = accounts_switch(&ctx, "testacct");
+    returned_errno = errno;
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(returned_errno, EIO);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(strstr(get_last_error()->message, "switch committed") != NULL);
+    CHECK(strstr(get_last_error()->message, "signal dispositions failed") !=
+          NULL);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK(!signals_pending());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL, &observed), 0);
+        CHECK(switch_actions_equal(&observed, &original[i]));
+    }
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
+/* A signal can arrive after a direct API caller's first pending-state read but
+ * while guard_end is still restoring handlers. The successful return path
+ * must recheck and dispatch it instead of leaking stale pending ownership. */
+TEST(direct_switch_dispatches_signal_arriving_during_guard_end) {
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+        struct sigaction expected[SWITCH_GUARDED_SIGNAL_COUNT];
+        int signal_number = switch_guarded_signals[signal_index];
+        gitswitch_ctx_t ctx;
+        command_runner_fn previous_runner;
+        int rc;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+            struct sigaction action;
+
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                                   &original[i]), 0);
+            memset(&action, 0, sizeof(action));
+            action.sa_handler = switch_inherited_handler;
+            sigemptyset(&action.sa_mask);
+            sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+            action.sa_flags = i == 2 ? SA_RESTART : 0;
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &action, NULL),
+                         0);
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                                   &expected[i]), 0);
+        }
+        ctx = make_ctx();
+        seed_previous_git_identity();
+        g_fail_user_name_set = false;
+        g_raise_on_user_name = false;
+        g_log = NULL;
+        g_guard_end_checkpoint_signal = 0;
+        g_guard_end_hook_signal = signal_number;
+        previous_runner = run_set_runner(fake_runner);
+        (void)signals_test_set_guard_end_hook(raise_during_guard_end);
+        rc = accounts_switch(&ctx, "testacct");
+        run_set_runner(previous_runner);
+
+        CHECK_EQ_INT(rc, 0);
+        CHECK_EQ_INT(g_guard_end_checkpoint_signal, signal_number);
+        CHECK(!signals_pending());
+        for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+            struct sigaction observed;
+
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                                   &observed), 0);
+            CHECK(switch_actions_equal(&observed, &expected[i]));
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &original[i],
+                                   NULL), 0);
+        }
+    }
+}
+
+/* Causal restoration-failure witness for the checked abort path. Before the
+ * fix, abort ignored guard_end's failure and dispatch immediately retried it,
+ * killing the child and erasing the only observable retry boundary. */
+TEST(interrupted_switch_retains_pending_signal_on_restore_failure) {
+    char retained_marker[512];
+    int status = 0;
+    pid_t pid;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK((size_t)snprintf(retained_marker, sizeof(retained_marker),
+                           "%s/guard-restore-retained", g_xdg) <
+          sizeof(retained_marker));
+    seed_previous_git_identity();
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct sigaction default_action;
+        gitswitch_ctx_t ctx = make_ctx();
+        int marker_fd;
+        int rc;
+
+        memset(&default_action, 0, sizeof(default_action));
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        if (sigaction(SIGINT, &default_action, NULL) != 0) _exit(60);
+        g_fail_user_name_set = false;
+        g_raise_on_user_name = true;
+        g_log = NULL;
+        signals_test_fail_sigaction(SIGINT,
+                                    SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        run_set_runner(fake_runner);
+        errno = 0;
+        rc = accounts_switch(&ctx, "testacct");
+        if (rc != -1 || errno != EIO) _exit(61);
+        if (!signals_pending() || signals_pending_signal() != SIGINT) {
+            _exit(62);
+        }
+        if (!strstr(get_last_error()->message, "retained for retry")) {
+            _exit(63);
+        }
+        marker_fd = open(retained_marker,
+                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (marker_fd < 0 || close(marker_fd) != 0) _exit(64);
+        (void)signals_dispatch_pending(); /* explicit retry must terminate */
+        _exit(65);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
+    CHECK(access(retained_marker, F_OK) == 0);
+    (void)unlink(retained_marker);
+}
+
+/* AR-08 M4: prepare has already published Git/runtime state but persistence
+ * has not committed. Two signals at this exact handoff must remain deferred;
+ * abort restores the prior Git vector and only then re-raises normally. The
+ * pre-fix implementation cleared repeat deferral before returning prepare,
+ * so the second raise killed the child before any restore command appeared. */
+TEST(repeated_signals_wait_for_prepared_switch_rollback) {
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        char log_path[512];
+        int signal_number = switch_guarded_signals[signal_index];
+        int status = 0;
+        pid_t pid;
+        bool seen_handoff = false;
+        bool restored_after_handoff = false;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        CHECK((size_t)snprintf(log_path, sizeof(log_path),
+                               "%s/handoff-%d.log", g_xdg,
+                               signal_number) < sizeof(log_path));
+        seed_previous_git_identity();
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct sigaction default_action;
+            gitswitch_ctx_t ctx = make_ctx();
+
+            memset(&default_action, 0, sizeof(default_action));
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            if (sigaction(signal_number, &default_action, NULL) != 0) _exit(20);
+            g_fail_user_name_set = false;
+            g_raise_on_user_name = false;
+            g_log = fopen(log_path, "w");
+            if (!g_log) _exit(21);
+            run_set_runner(fake_runner);
+            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(22);
+            if (fputs("MARK-HANDOFF\n", g_log) == EOF || fflush(g_log) != 0)
+                _exit(23);
+            raise(signal_number);
+            raise(signal_number);
+            if (!signals_pending() ||
+                signals_pending_signal() != signal_number) _exit(24);
+            (void)accounts_switch_abort(&ctx, false);
+            _exit(25); /* completed abort dispatches the pending signal */
+        }
+
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        {
+            char line[1024];
+            FILE *log = fopen(log_path, "r");
+
+            CHECK(log != NULL);
+            if (log) {
+                while (fgets(line, sizeof(line), log)) {
+                    if (strstr(line, "MARK-HANDOFF")) {
+                        seen_handoff = true;
+                    } else if (seen_handoff && strstr(line, "user.name") &&
+                               strstr(line, "Previous Name")) {
+                        restored_after_handoff = true;
+                    }
+                }
+                fclose(log);
+            }
+        }
+        CHECK(seen_handoff);
+        CHECK(restored_after_handoff);
+    }
+}
+
+/* AR-08 M4/M7: a prepared abort that preserves a concurrent Git vector is
+ * intentionally incomplete and retryable. Its retained retry handle includes
+ * both signal layers: two signals delivered before the writer repairs the
+ * exact post-image cannot kill the process until the second abort restores
+ * the before-image. This is also the accounts-level witness that M7's precise
+ * conflict diagnostic survives the broader runtime cleanup path. */
+TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry) {
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        char log_path[512];
+        char line[1024];
+        int signal_number = switch_guarded_signals[signal_index];
+        int status = 0;
+        pid_t pid;
+        bool seen_incomplete = false;
+        bool restored_after_retry = false;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        CHECK((size_t)snprintf(log_path, sizeof(log_path),
+                               "%s/incomplete-abort-%d.log", g_xdg,
+                               signal_number) < sizeof(log_path));
+        seed_previous_git_identity();
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct sigaction default_action;
+            gitswitch_ctx_t ctx = make_ctx();
+
+            memset(&default_action, 0, sizeof(default_action));
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            if (sigaction(signal_number, &default_action, NULL) != 0) _exit(40);
+            g_fail_user_name_set = false;
+            g_raise_on_user_name = false;
+            g_log = fopen(log_path, "w");
+            if (!g_log) _exit(41);
+            run_set_runner(fake_runner);
+            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(42);
+
+            /* External writer after the sealed post-image. */
+            safe_strncpy(g_store_name, "later-writer",
+                         sizeof(g_store_name));
+            if (accounts_switch_abort(&ctx, false) != -1) _exit(43);
+            if (!strstr(get_last_error()->message, "1 managed vector(s)") ||
+                !strstr(get_last_error()->message, "changed outside") ||
+                !strstr(get_last_error()->message, "retry material")) {
+                _exit(44);
+            }
+            if (fputs("MARK-INCOMPLETE-ABORT\n", g_log) == EOF ||
+                fflush(g_log) != 0) {
+                _exit(45);
+            }
+
+            raise(signal_number);
+            raise(signal_number);
+            if (!signals_pending() ||
+                signals_pending_signal() != signal_number) {
+                _exit(46);
+            }
+
+            /* Repair only the conflicted key to the sealed image. The
+             * retained Git snapshot now owns it again and retry can finish. */
+            safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+            (void)accounts_switch_abort(&ctx, false);
+            _exit(47); /* completed retry dispatches the pending signal */
+        }
+
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        {
+            FILE *log = fopen(log_path, "r");
+
+            CHECK(log != NULL);
+            if (log) {
+                while (fgets(line, sizeof(line), log)) {
+                    if (strstr(line, "MARK-INCOMPLETE-ABORT")) {
+                        seen_incomplete = true;
+                    } else if (seen_incomplete && strstr(line, "user.name") &&
+                               strstr(line, "Previous Name")) {
+                        restored_after_retry = true;
+                    }
+                }
+                fclose(log);
+            }
+        }
+        CHECK(seen_incomplete);
+        CHECK(restored_after_retry);
+    }
 }
 
 /* ---- AR-03 M3: guard continuity through the post-switch window ------------ */
 
 /* A signal landing AFTER the switch completed but BEFORE main() persists the
  * new active_account must be deferred, and main()'s re-arm around config_save
- * must not discard it. Pre-fix, accounts_switch dropped the guard on its
- * success path, so the raise() below killed the child with the new identity
- * applied and the old active_account persisted — the split state boot resume
- * then reactivates. The child mimics main()'s exact post-switch sequence. */
+ * must not discard it. The child uses the prepared API that the CLI now owns,
+ * then aborts so the deferred signal is re-raised after rollback. */
 TEST(deferred_signal_survives_post_switch_window) {
     int status = 0;
     pid_t pid;
 
-    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
 
     fflush(NULL);
     pid = fork();
@@ -1924,21 +2974,20 @@ TEST(deferred_signal_survives_post_switch_window) {
         g_raise_on_user_name = false;
         g_log = NULL;
         run_set_runner(fake_runner);
-        if (accounts_switch(&ctx, "testacct") != 0) _exit(8);
-        /* Ctrl-C in the tip-block/config-save gap. Pre-fix: default action,
-         * child dies here by SIGINT. */
+        if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(8);
+        /* Ctrl-C in the prepared persistence gap. */
         raise(SIGINT);
         if (!signals_pending()) _exit(7);
         /* main()'s re-arm around config_save: a no-op re-begin while active —
          * it must NOT reset the deferred signal. */
         signals_guard_begin();
         if (!signals_pending() || signals_pending_signal() != SIGINT) _exit(6);
-        signals_guard_end();
-        _exit(0);
+        (void)accounts_switch_abort(&ctx, false);
+        _exit(5); /* abort dispatches */
     }
     CHECK(waitpid(pid, &status, 0) == pid);
-    CHECK(WIFEXITED(status));
-    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
 }
 
 /* SIG-01: a SIGINT during the git-config write must be deferred, the rollback
@@ -1999,6 +3048,7 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(snapshot_failure_aborts_before_any_git_write);
+    RUN_TEST(signal_guard_failure_aborts_before_switch_mutation);
     RUN_TEST(snapshot_listing_failure_aborts_before_ssh_activation);
     RUN_TEST(failed_git_config_keeps_previous_runtime_isolation);
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
@@ -2006,13 +3056,27 @@ TEST_MAIN_BEGIN()
     RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
     RUN_TEST(repeated_switch_validation_failure_keeps_live_session);
     RUN_TEST(repeated_switch_reap_failure_preserves_live_session);
+    RUN_TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort);
     RUN_TEST(ssh_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_restarts_previous_accounts_agent);
+    RUN_TEST(postrename_alias_verification_failure_retains_complete_direct_switch);
+    RUN_TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch);
+    RUN_TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry);
     RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);
     RUN_TEST(failed_switch_never_creates_ssh_config);
     RUN_TEST(failed_switch_preserves_concurrent_ssh_config_replacement);
     RUN_TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back);
     RUN_TEST(symlinked_ssh_config_fails_before_switch_mutation);
+    int gpg_preflight_rc = host_gpg_preflight();
+    if (gpg_preflight_rc < 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot run host GPG preflight\n");
+        return 1;
+    }
+    g_host_gpg_available = gpg_preflight_rc > 0;
+    if (g_host_gpg_available && setup_gpg_command_fixture() != 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot prepare trusted GPG probe\n");
+        return 1;
+    }
     RUN_TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback);
     RUN_TEST(signing_capability_failure_precedes_runtime_and_git_publication);
     RUN_TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry);
@@ -2021,6 +3085,16 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_retargets_gpg_current_to_previous_home);
     RUN_TEST(failed_switch_does_not_overwrite_later_gpg_writer);
+    if (restore_gpg_command_fixture() != 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot restore PATH after GPG tests\n");
+        return 1;
+    }
+    RUN_TEST(direct_switch_restores_callers_signal_dispositions);
+    RUN_TEST(direct_switch_reports_signal_restoration_failure_after_commit);
+    RUN_TEST(direct_switch_dispatches_signal_arriving_during_guard_end);
+    RUN_TEST(interrupted_switch_retains_pending_signal_on_restore_failure);
+    RUN_TEST(repeated_signals_wait_for_prepared_switch_rollback);
+    RUN_TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()

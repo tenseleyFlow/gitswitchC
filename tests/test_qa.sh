@@ -14,7 +14,10 @@ root=$1
 make_cmd=$2
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-qa-contract.XXXXXX")
-qa_archive=$root/qa-contract-$$.tar.gz
+qa_version=$(sed -n '1p' "$root/VERSION")
+[ -n "$qa_version" ] || fail "VERSION is empty"
+qa_root=gitswitcher-$qa_version
+qa_archive=$root/build/dist/$qa_root.tar.gz
 cleanup()
 {
     status=$?
@@ -29,6 +32,9 @@ trap 'exit 1' 1 2 3 15
 shim_dir=$tmp/shims
 mkdir "$shim_dir"
 for tool in cppcheck flawfinder valgrind; do
+    # These expansions belong to the generated shim and must remain literal
+    # until that shim is executed by the contract test.
+    # shellcheck disable=SC2016
     printf '%s\n' \
         '#!/bin/sh' \
         'if [ -n "${QA_ARG_LOG:-}" ]; then printf "%s\n" "$*" >"$QA_ARG_LOG"; fi' \
@@ -94,15 +100,22 @@ fi
 make_abs=$(command -v "$make_cmd" 2>/dev/null || printf '%s' "$make_cmd")
 notools_dir=$tmp/notools
 mkdir "$notools_dir"
-for basic in sh uname git gcc cc clang brew wc tr grep sed printf echo cat cmp \
-             mkdir mv rm touch head tail sort expr test; do
+for basic in sh uname git gcc cc clang as brew awk cksum sha256sum shasum sha256 \
+             wc tr grep sed printf echo cat cmp mkdir mv rm touch head tail \
+             sort expr test; do
     basic_path=$(command -v "$basic" 2>/dev/null) || continue
     case $basic_path in /*) ln -s "$basic_path" "$notools_dir/$basic" ;; esac
 done
+build_stamp=$root/build/obj/.buildconfig
+qa_cc_identity=$(sed -n 's/^cc_resolved=//p' "$build_stamp")
+[ -f "$qa_cc_identity" ] ||
+    fail "release build stamp lacks stable toolchain identity"
 for pair in "analyze:cppcheck" "security-scan:flawfinder" "memcheck:valgrind"; do
     absent_target=${pair%%:*}
     absent_tool=${pair##*:}
     if ! PATH="$notools_dir" "$make_abs" -C "$root" BUILD_TYPE=release READLINE=0 \
+        CC_IDENTITY_FILE="$qa_cc_identity" \
+        TOOLCHAIN_IDENTITY_FILES="$qa_cc_identity" \
         "$absent_target" >"$out" 2>&1; then
         sed -n '1,200p' "$out" >&2
         fail "$absent_target failed with $absent_tool genuinely absent from PATH"
@@ -123,16 +136,19 @@ fi
 
 # `dist` runs before the validator. A deliberately invalid prefix must fail
 # and the validator's earliest exit path must still delete the new archive.
-if "$make_cmd" -C "$root" DIST_ARCHIVE="$(basename "$qa_archive")" \
-    DIST_ROOT="gitswitcher-qa-$$" PREFIX=relative distcheck >"$out" 2>&1; then
+rm -f "$qa_archive"
+if "$make_cmd" -C "$root" PREFIX=relative distcheck >"$out" 2>&1; then
     fail "distcheck accepted a relative installation prefix"
 fi
+grep -F 'PREFIX must be absolute' "$out" >/dev/null ||
+    fail "distcheck failed before exercising the invalid-prefix cleanup path"
 [ ! -e "$qa_archive" ] || fail "failed distcheck left its source archive behind"
 
 # Even malformed direct invocations must install cleanup before validating
 # argc, because the archive path may already name a generated artifact.
+mkdir -p "$(dirname "$qa_archive")"
 printf 'usage-path fixture\n' >"$qa_archive"
-if sh "$root/tests/test_dist.sh" "$qa_archive" "gitswitcher-qa-$$" /usr/local \
+if sh "$root/tests/test_dist.sh" "$qa_archive" "$qa_root" /usr/local \
     >"$out" 2>&1; then
     fail "dist validator accepted a malformed three-argument invocation"
 fi

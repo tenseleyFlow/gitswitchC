@@ -30,6 +30,7 @@
 #include <dirent.h>
 #include <ctype.h>
 #include <limits.h>
+#include <inttypes.h>
 #ifdef __linux__
 #include <sys/syscall.h>
 #endif
@@ -67,6 +68,12 @@ typedef struct {
     char target[MAX_PATH_LEN];
 } ssh_current_link_identity_t;
 
+typedef struct {
+    struct stat identity;
+    int fd;
+    char anchor[96];
+} ssh_runtime_pin_t;
+
 static int capture_current_socket_link(int dir_fd, const char *socket_path,
                                        const char *display_path,
                                        ssh_current_link_identity_t *identity);
@@ -80,17 +87,46 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                                           const char *keep_account);
 static bool same_runtime_identity(const struct stat *before,
                                   const struct stat *after);
+static bool same_runtime_revision(const struct stat *before,
+                                  const struct stat *after);
 static bool same_runtime_symlink(const struct stat *before,
                                  const struct stat *after);
+static void ssh_runtime_pin_init(ssh_runtime_pin_t *pin);
+static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
+                                    const char *display_path,
+                                    ssh_runtime_pin_t *pin);
+static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
+                                     const char *display_path,
+                                     const ssh_runtime_pin_t *pin);
+static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin);
+static int reconcile_ssh_runtime_pins(int dir_fd, const char *socket_dir);
 static int read_ssh_agent_pid_at(int dir_fd, const char *name,
-                                 const char *display_path, pid_t *pid_out);
+                                 const char *display_path, pid_t *pid_out,
+                                 ssh_runtime_pin_t *pin);
 static int write_ssh_agent_pid_at(int dir_fd, const char *name, pid_t pid);
-static bool reap_ssh_agent(pid_t pid, const char *sock);
+static ssh_process_outcome_t reap_ssh_agent(pid_t pid, const char *sock,
+                                            int runtime_dir_fd);
+static ssh_process_outcome_t pid_is_our_ssh_agent(pid_t pid,
+                                                   const char *expected_sock,
+                                                   int runtime_dir_fd);
+static int ssh_process_signal_real(pid_t pid, int signal_number);
+static int ssh_pidfd_open_real(pid_t pid);
+static int ssh_pidfd_signal_real(int pidfd, int signal_number);
 static int sync_ssh_runtime_dir(int dir_fd, const char *operation);
 static int unlink_ssh_runtime_entry(int dir_fd, const char *name,
                                     bool missing_ok,
                                     const char *description);
+static int unlink_ssh_runtime_identity_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    bool missing_ok, const char *description,
+    ssh_quarantine_hook_fn predelete_hook, struct stat *observed_out);
+static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
+                                    const char *display_path,
+                                    const char *description,
+                                    const ssh_runtime_pin_t *pin,
+                                    bool expected_present);
 static int wait_for_ssh_probe(int fd, int timeout_ms);
+static int probe_ssh_agent_socket(const char *path, bool *reachable);
 static int reconcile_current_socket_quarantines(int dir_fd,
                                                 const char *socket_dir);
 
@@ -105,16 +141,25 @@ typedef struct {
  * libc directly so an injected failure cannot disable recovery itself. */
 static ssh_setenv_fn g_ssh_setenv = setenv;
 static ssh_reap_fn g_ssh_reap = reap_ssh_agent;
+static ssh_reap_test_ops_t g_reap_ops = {
+    .identity = pid_is_our_ssh_agent,
+    .signal = ssh_process_signal_real,
+    .pidfd_open = ssh_pidfd_open_real,
+    .pidfd_signal = ssh_pidfd_signal_real
+};
 static ssh_pid_commit_hook_fn g_pid_commit_hook;
 static ssh_pid_commit_hook_fn g_pid_postrename_hook;
 static ssh_namespace_commit_hook_fn g_namespace_commit_hook;
 static ssh_dirsync_fn g_ssh_dirsync = fsync;
 static ssh_config_commit_hook_fn g_ssh_config_commit_hook;
+static ssh_config_postrename_hook_fn g_ssh_config_postrename_hook;
 static ssh_current_cleanup_hook_fn g_current_cleanup_hook;
 static ssh_current_precleanup_hook_fn g_current_precleanup_hook;
 static ssh_current_publish_hook_fn g_current_publish_hook;
 static ssh_quarantine_hook_fn g_quarantine_hook;
 static ssh_quarantine_hook_fn g_quarantine_capture_hook;
+static ssh_quarantine_hook_fn g_reset_retire_hook;
+static ssh_quarantine_hook_fn g_unrecorded_cleanup_hook;
 static bool g_force_portable_quarantine;
 static unsigned int g_agent_lock_depth;
 static int ssh_key_open_real(const char *path, int flags) {
@@ -153,6 +198,25 @@ ssh_reap_fn ssh_manager_set_reap_fn(ssh_reap_fn fn) {
     return previous;
 }
 
+ssh_reap_test_ops_t ssh_manager_set_reap_test_ops(
+    const ssh_reap_test_ops_t *ops) {
+    ssh_reap_test_ops_t previous = g_reap_ops;
+
+    g_reap_ops.identity = ops && ops->identity
+                              ? ops->identity
+                              : pid_is_our_ssh_agent;
+    g_reap_ops.signal = ops && ops->signal
+                            ? ops->signal
+                            : ssh_process_signal_real;
+    g_reap_ops.pidfd_open = ops && ops->pidfd_open
+                                ? ops->pidfd_open
+                                : ssh_pidfd_open_real;
+    g_reap_ops.pidfd_signal = ops && ops->pidfd_signal
+                                  ? ops->pidfd_signal
+                                  : ssh_pidfd_signal_real;
+    return previous;
+}
+
 ssh_pid_commit_hook_fn ssh_manager_set_pid_commit_hook_fn(
     ssh_pid_commit_hook_fn fn) {
     ssh_pid_commit_hook_fn previous = g_pid_commit_hook;
@@ -184,6 +248,13 @@ ssh_config_commit_hook_fn ssh_manager_set_config_commit_hook_fn(
     ssh_config_commit_hook_fn fn) {
     ssh_config_commit_hook_fn previous = g_ssh_config_commit_hook;
     g_ssh_config_commit_hook = fn;
+    return previous;
+}
+
+ssh_config_postrename_hook_fn ssh_manager_set_config_postrename_hook_fn(
+    ssh_config_postrename_hook_fn fn) {
+    ssh_config_postrename_hook_fn previous = g_ssh_config_postrename_hook;
+    g_ssh_config_postrename_hook = fn;
     return previous;
 }
 
@@ -219,6 +290,20 @@ ssh_quarantine_hook_fn ssh_manager_set_quarantine_capture_hook_fn(
     ssh_quarantine_hook_fn fn) {
     ssh_quarantine_hook_fn previous = g_quarantine_capture_hook;
     g_quarantine_capture_hook = fn;
+    return previous;
+}
+
+ssh_quarantine_hook_fn ssh_manager_set_reset_retire_hook_fn(
+    ssh_quarantine_hook_fn fn) {
+    ssh_quarantine_hook_fn previous = g_reset_retire_hook;
+    g_reset_retire_hook = fn;
+    return previous;
+}
+
+ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
+    ssh_quarantine_hook_fn fn) {
+    ssh_quarantine_hook_fn previous = g_unrecorded_cleanup_hook;
+    g_unrecorded_cleanup_hook = fn;
     return previous;
 }
 
@@ -325,33 +410,121 @@ static void ssh_env_snapshot_discard(ssh_env_snapshot_t *snapshot) {
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
-/* Return true only for a NUL-separated argv whose executable is ssh-agent and
- * whose `-a` value is the recorded managed socket argument. Accept the legacy
- * absolute path or the descriptor-pinned launch form's final component so
- * sidecars created by either version remain reapable. Requiring the complete
- * option value, rather than a substring anywhere in the command line, avoids
- * signaling an agent whose unrelated argument merely mentions the socket.
+/* Encode the pinned runtime-directory identity into the relative -a argument.
+ * The marker directory is present only while ssh-agent binds; the lexical
+ * dev/inode token remains in argv for later provenance checks. This preserves
+ * descriptor-relative binding while making identical socket basenames in two
+ * runtime roots distinguishable on Linux, macOS, and FreeBSD. */
+#define SSH_AGENT_PROVENANCE_PREFIX ".gsp-"
+
+static int build_provenance_socket_arg(int dir_fd, const char *socket_name,
+                                       char *buf, size_t buf_size,
+                                       char *marker, size_t marker_size) {
+    struct stat runtime;
+    const char *leaf;
+    char local_marker[80];
+    int marker_len;
+    int arg_len;
+
+    if (dir_fd < 0 || !socket_name || !*socket_name || !buf || buf_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    leaf = strrchr(socket_name, '/');
+    leaf = leaf ? leaf + 1 : socket_name;
+    if (!*leaf || strchr(leaf, '/')) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (fstat(dir_fd, &runtime) != 0) return -1;
+    /* The format is a compile-time literal and every bounded-write failure is
+     * rejected before local_marker is consumed. */
+    // flawfinder: ignore
+    marker_len = snprintf(local_marker, sizeof(local_marker),
+                          SSH_AGENT_PROVENANCE_PREFIX "%jx-%jx",
+                          (uintmax_t)runtime.st_dev,
+                          (uintmax_t)runtime.st_ino);
+    if (marker_len <= 0 || (size_t)marker_len >= sizeof(local_marker)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    arg_len = snprintf(buf, buf_size, "%s/../%s", local_marker, leaf);
+    if (arg_len <= 0 || (size_t)arg_len >= buf_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (marker) {
+        if (marker_size == 0 ||
+            (size_t)marker_len >= marker_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(marker, local_marker, (size_t)marker_len + 1U);
+    }
+    return 0;
+}
+
+static ssh_process_outcome_t socket_argument_outcome(
+    const char *actual, const char *expected, int runtime_dir_fd) {
+    const char *leaf;
+    char qualified[MAX_PATH_LEN];
+
+    if (!actual || !*actual || !expected || !*expected) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    leaf = strrchr(expected, '/');
+    leaf = leaf ? leaf + 1 : expected;
+
+    /* A legacy absolute launch has an unambiguous complete argument. An
+     * in-memory configuration may also retain the exact provenance argument. */
+    if (strcmp(actual, expected) == 0) {
+        if (actual[0] == '/' ||
+            strncmp(actual, SSH_AGENT_PROVENANCE_PREFIX,
+                    sizeof(SSH_AGENT_PROVENANCE_PREFIX) - 1U) == 0) {
+            return SSH_PROCESS_OWNED;
+        }
+        /* A bare legacy basename cannot identify which runtime root resolved
+         * it. Retain its record rather than guessing. */
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    if (runtime_dir_fd >= 0 &&
+        build_provenance_socket_arg(runtime_dir_fd, leaf, qualified,
+                                    sizeof(qualified), NULL, 0) == 0 &&
+        strcmp(actual, qualified) == 0) {
+        return SSH_PROCESS_OWNED;
+    }
+    if (strcmp(actual, leaf) == 0) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    return SSH_PROCESS_UNRELATED;
+}
+
+/* Classify a NUL-separated argv whose executable must be ssh-agent and whose
+ * `-a` value must carry the exact managed socket provenance. Requiring the
+ * complete option value, rather than a substring anywhere in the command
+ * line, avoids signaling an agent whose unrelated argument mentions it.
  *
  * Guarded to the platforms whose reaper calls it (Linux procfs, FreeBSD
  * sysctl argv). macOS uses counted_argv_is_our_ssh_agent instead, so an
  * unguarded definition is an unused-function error there under clang+WERROR. */
 #if defined(__linux__) || defined(__FreeBSD__)
-static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
-                                  const char *expected_sock) {
+static ssh_process_outcome_t argv_is_our_ssh_agent(
+    const char *argv, size_t argv_len, const char *expected_sock,
+    int runtime_dir_fd) {
     bool expect_socket = false;
     bool matched_socket = false;
     size_t offset = 0;
     size_t index = 0;
 
     if (!argv || argv_len == 0 || !expected_sock || !*expected_sock) {
-        return false;
+        return SSH_PROCESS_INDETERMINATE;
     }
 
     while (offset < argv_len) {
         const char *token = argv + offset;
         size_t token_len = strnlen(token, argv_len - offset);
         if (token_len == argv_len - offset) {
-            return false; /* truncated/non-terminated process arguments */
+            return SSH_PROCESS_INDETERMINATE;
         }
         if (token_len == 0) {
             offset++;
@@ -362,20 +535,17 @@ static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
             const char *basename = strrchr(token, '/');
             basename = basename ? basename + 1 : token;
             if (strcmp(basename, "ssh-agent") != 0) {
-                return false;
+                return SSH_PROCESS_UNRELATED;
             }
         } else if (expect_socket) {
-            const char *relative = strrchr(expected_sock, '/');
-            relative = relative ? relative + 1 : expected_sock;
-            if (strcmp(token, expected_sock) != 0 &&
-                strcmp(token, relative) != 0) {
-                return false;
-            }
+            ssh_process_outcome_t socket_outcome = socket_argument_outcome(
+                token, expected_sock, runtime_dir_fd);
+            if (socket_outcome != SSH_PROCESS_OWNED) return socket_outcome;
             matched_socket = true;
             expect_socket = false;
         } else if (strcmp(token, "-a") == 0) {
             if (matched_socket) {
-                return false; /* ambiguous duplicate socket option */
+                return SSH_PROCESS_UNRELATED;
             }
             expect_socket = true;
         }
@@ -383,7 +553,8 @@ static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
         index++;
         offset += token_len + 1;
     }
-    return matched_socket && !expect_socket;
+    if (expect_socket) return SSH_PROCESS_INDETERMINATE;
+    return matched_socket ? SSH_PROCESS_OWNED : SSH_PROCESS_UNRELATED;
 }
 #endif /* __linux__ || __FreeBSD__ */
 
@@ -393,16 +564,16 @@ static bool argv_is_our_ssh_agent(const char *argv, size_t argv_len,
  * contain "-a" and a managed socket can never authorize signaling a process.
  * Empty argv entries still count toward argc, as they do in the kernel's
  * flattened representation. */
-static bool counted_argv_is_our_ssh_agent(const char *argv, size_t argv_len,
-                                          int argc,
-                                          const char *expected_sock) {
+static ssh_process_outcome_t counted_argv_is_our_ssh_agent(
+    const char *argv, size_t argv_len, int argc, const char *expected_sock,
+    int runtime_dir_fd) {
     bool expect_socket = false;
     bool matched_socket = false;
     size_t offset = 0;
 
     if (!argv || argv_len == 0 || argc <= 0 ||
         !expected_sock || !*expected_sock) {
-        return false;
+        return SSH_PROCESS_INDETERMINATE;
     }
 
     for (int index = 0; index < argc; index++) {
@@ -410,39 +581,37 @@ static bool counted_argv_is_our_ssh_agent(const char *argv, size_t argv_len,
         size_t token_len;
 
         if (offset >= argv_len) {
-            return false;
+            return SSH_PROCESS_INDETERMINATE;
         }
         token = argv + offset;
         token_len = strnlen(token, argv_len - offset);
         if (token_len == argv_len - offset) {
-            return false; /* truncated/non-terminated argv entry */
+            return SSH_PROCESS_INDETERMINATE;
         }
 
         if (index == 0) {
             const char *basename = strrchr(token, '/');
             basename = basename ? basename + 1 : token;
             if (strcmp(basename, "ssh-agent") != 0) {
-                return false;
+                return SSH_PROCESS_UNRELATED;
             }
         } else if (expect_socket) {
-            const char *relative = strrchr(expected_sock, '/');
-            relative = relative ? relative + 1 : expected_sock;
-            if (strcmp(token, expected_sock) != 0 &&
-                strcmp(token, relative) != 0) {
-                return false;
-            }
+            ssh_process_outcome_t socket_outcome = socket_argument_outcome(
+                token, expected_sock, runtime_dir_fd);
+            if (socket_outcome != SSH_PROCESS_OWNED) return socket_outcome;
             matched_socket = true;
             expect_socket = false;
         } else if (strcmp(token, "-a") == 0) {
             if (matched_socket) {
-                return false; /* ambiguous duplicate socket option */
+                return SSH_PROCESS_UNRELATED;
             }
             expect_socket = true;
         }
 
         offset += token_len + 1;
     }
-    return matched_socket && !expect_socket;
+    if (expect_socket) return SSH_PROCESS_INDETERMINATE;
+    return matched_socket ? SSH_PROCESS_OWNED : SSH_PROCESS_UNRELATED;
 }
 #endif
 
@@ -456,44 +625,137 @@ static bool counted_argv_is_our_ssh_agent(const char *argv, size_t argv_len,
  * our exact `-a <expected_sock>` argv pair. Linux exposes argv through procfs;
  * Darwin and FreeBSD expose it through their native process sysctl APIs. Any
  * unavailable, truncated, or unparseable identity fails closed. */
-static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
-    if (pid <= 1) {
-        return false;
+static ssh_process_outcome_t probe_process_presence(pid_t pid) {
+    int attempts = 0;
+
+    if (pid <= 1) return SSH_PROCESS_GONE;
+    while (g_reap_ops.signal(pid, 0) != 0) {
+        int saved_errno = errno;
+        if (saved_errno == EINTR && attempts++ < 16) continue;
+        if (saved_errno == ESRCH) return SSH_PROCESS_GONE;
+        return SSH_PROCESS_INDETERMINATE;
     }
+    return SSH_PROCESS_OWNED;
+}
+
+static ssh_process_outcome_t inspection_failure_outcome(pid_t pid) {
+    ssh_process_outcome_t presence = probe_process_presence(pid);
+    return presence == SSH_PROCESS_GONE ? SSH_PROCESS_GONE
+                                        : SSH_PROCESS_INDETERMINATE;
+}
+
+#ifdef __linux__
+static int read_proc_file(const char *path, char **data_out,
+                          size_t *size_out) {
+    const size_t limit = 1024U * 1024U;
+    size_t capacity = 256U;
+    size_t used = 0;
+    char *data = NULL;
+    int fd = -1;
+
+    if (!path || !data_out || !size_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    data = malloc(capacity);
+    if (!data) {
+        close(fd);
+        errno = ENOMEM;
+        return -1;
+    }
+    for (;;) {
+        ssize_t n;
+        if (used == capacity) {
+            size_t next = capacity < limit / 2U ? capacity * 2U : limit;
+            char *grown;
+            if (capacity == limit) {
+                free(data);
+                close(fd);
+                errno = EOVERFLOW;
+                return -1;
+            }
+            grown = realloc(data, next);
+            if (!grown) {
+                free(data);
+                close(fd);
+                errno = ENOMEM;
+                return -1;
+            }
+            data = grown;
+            capacity = next;
+        }
+        n = read(fd, data + used, capacity - used);
+        if (n > 0) {
+            used += (size_t)n;
+            continue;
+        }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+        {
+            int saved_errno = errno;
+            free(data);
+            close(fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    if (close(fd) != 0) {
+        int saved_errno = errno;
+        free(data);
+        errno = saved_errno;
+        return -1;
+    }
+    *data_out = data;
+    *size_out = used;
+    return 0;
+}
+#endif
+
+static ssh_process_outcome_t pid_is_our_ssh_agent(
+    pid_t pid, const char *expected_sock, int runtime_dir_fd) {
+    ssh_process_outcome_t presence;
+
+    if (pid <= 1) return SSH_PROCESS_GONE;
+    if (!expected_sock || !*expected_sock) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    presence = probe_process_presence(pid);
+    if (presence != SSH_PROCESS_OWNED) return presence;
 #ifdef __linux__
     char path[64];
-    char comm[64];
-    snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
-    FILE *f = fopen(path, "r");
-    if (!f) {
-        return false; /* no such process (or no /proc entry) — don't kill */
-    }
-    bool is_agent = false;
-    if (fgets(comm, sizeof(comm), f)) {
-        comm[strcspn(comm, "\n")] = '\0';
-        is_agent = (strcmp(comm, "ssh-agent") == 0);
-    }
-    fclose(f);
-    if (!is_agent) {
-        return false;
-    }
+    char *comm = NULL;
+    char *cmd = NULL;
+    size_t comm_size = 0;
+    size_t cmd_size = 0;
+    ssh_process_outcome_t outcome;
 
-    /* Require our exact socket option in the process's argv to defeat PID reuse. */
-    if (!expected_sock || !*expected_sock) {
-        return false;
+    snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
+    if (read_proc_file(path, &comm, &comm_size) != 0 || comm_size == 0) {
+        free(comm);
+        return inspection_failure_outcome(pid);
     }
+    while (comm_size > 0 &&
+           (comm[comm_size - 1U] == '\n' || comm[comm_size - 1U] == '\r')) {
+        comm_size--;
+    }
+    if (comm_size != strlen("ssh-agent") ||
+        memcmp(comm, "ssh-agent", comm_size) != 0) {
+        free(comm);
+        return SSH_PROCESS_UNRELATED;
+    }
+    free(comm);
+
     snprintf(path, sizeof(path), "/proc/%ld/cmdline", (long)pid);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        return false;
+    if (read_proc_file(path, &cmd, &cmd_size) != 0 || cmd_size == 0) {
+        free(cmd);
+        return inspection_failure_outcome(pid);
     }
-    char cmd[4096];
-    ssize_t n = read(fd, cmd, sizeof(cmd));
-    close(fd);
-    if (n <= 0) {
-        return false;
-    }
-    return argv_is_our_ssh_agent(cmd, (size_t)n, expected_sock);
+    outcome = argv_is_our_ssh_agent(cmd, cmd_size, expected_sock,
+                                    runtime_dir_fd);
+    free(cmd);
+    return outcome;
 #elif defined(__APPLE__)
     /* KERN_PROCARGS2 begins with argc, then the executable path, alignment
      * NULs, the NUL-separated argv vector, then the environment. A fixed
@@ -506,33 +768,33 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
     int argc = 0;
     size_t argmax_len = sizeof(argmax);
     char *process_args;
-    bool matched;
+    ssh_process_outcome_t matched;
 
     if (sysctl(argmax_mib, 2, &argmax, &argmax_len, NULL, 0) != 0 ||
         argmax_len != sizeof(argmax) || argmax <= (int)sizeof(int)) {
-        return false;
+        return inspection_failure_outcome(pid);
     }
     size_t process_args_len = (size_t)argmax;
     process_args = malloc(process_args_len);
     if (!process_args) {
-        return false;
+        return SSH_PROCESS_INDETERMINATE;
     }
     if (sysctl(process_mib, 3, process_args, &process_args_len, NULL, 0) != 0 ||
         process_args_len <= sizeof(argc)) {
         free(process_args);
-        return false;
+        return inspection_failure_outcome(pid);
     }
     memcpy(&argc, process_args, sizeof(argc));
     if (argc <= 0) {
         free(process_args);
-        return false;
+        return SSH_PROCESS_INDETERMINATE;
     }
     size_t offset = sizeof(int);
     size_t executable_len = strnlen(process_args + offset,
                                     process_args_len - offset);
     if (executable_len == 0 || executable_len == process_args_len - offset) {
         free(process_args);
-        return false;
+        return SSH_PROCESS_INDETERMINATE;
     }
     const char *executable = process_args + offset;
     const char *executable_basename = strrchr(executable, '/');
@@ -540,7 +802,7 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
                                               : executable;
     if (strcmp(executable_basename, "ssh-agent") != 0) {
         free(process_args);
-        return false;
+        return SSH_PROCESS_UNRELATED;
     }
     offset += executable_len + 1;
     while (offset < process_args_len && process_args[offset] == '\0') {
@@ -549,24 +811,38 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
     matched = offset < process_args_len &&
               counted_argv_is_our_ssh_agent(process_args + offset,
                                              process_args_len - offset,
-                                             argc, expected_sock);
+                                             argc, expected_sock,
+                                             runtime_dir_fd);
     free(process_args);
     return matched;
 #elif defined(__FreeBSD__)
     /* FreeBSD's KERN_PROC_ARGS result is already a flattened NUL-separated
      * argv vector for the requested PID. */
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ARGS, (int)pid};
-    char process_args[4096];
-    size_t process_args_len = sizeof(process_args);
-    if (sysctl(mib, 4, process_args, &process_args_len, NULL, 0) != 0) {
-        return false;
+    char *process_args = NULL;
+    size_t process_args_len = 0;
+    ssh_process_outcome_t outcome;
+    if (sysctl(mib, 4, NULL, &process_args_len, NULL, 0) != 0 ||
+        process_args_len == 0) {
+        return inspection_failure_outcome(pid);
     }
-    return argv_is_our_ssh_agent(process_args, process_args_len, expected_sock);
+    process_args = malloc(process_args_len);
+    if (!process_args) return SSH_PROCESS_INDETERMINATE;
+    if (sysctl(mib, 4, process_args, &process_args_len, NULL, 0) != 0 ||
+        process_args_len == 0) {
+        free(process_args);
+        return inspection_failure_outcome(pid);
+    }
+    outcome = argv_is_our_ssh_agent(process_args, process_args_len,
+                                    expected_sock, runtime_dir_fd);
+    free(process_args);
+    return outcome;
 #else
     /* Unknown platforms have no proven PID ownership mechanism here. Never
      * turn mere liveness into authority to signal the process. */
     (void)expected_sock;
-    return false;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_INDETERMINATE;
 #endif
 }
 
@@ -578,34 +854,97 @@ static bool pid_is_our_ssh_agent(pid_t pid, const char *expected_sock) {
  * so a fixed 50ms interval used to stack ~50ms of dead time per reaped agent
  * — all of it under the held agent-dir lock (AR-03 L19). A healthy agent
  * exits within the first millisecond or two. */
-static bool wait_pid_gone(pid_t pid, int total_ms) {
-    int waited = 0;
+static int64_t monotonic_milliseconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int sleep_until_milliseconds(int64_t target_ms) {
+    for (;;) {
+        int64_t now = monotonic_milliseconds();
+        int64_t remaining;
+        struct timespec delay;
+        if (now < 0) return -1;
+        remaining = target_ms - now;
+        if (remaining <= 0) return 0;
+        delay.tv_sec = (time_t)(remaining / 1000);
+        delay.tv_nsec = (long)(remaining % 1000) * 1000000L;
+        if (nanosleep(&delay, NULL) == 0) return 0;
+        if (errno != EINTR) return -1;
+        /* Recompute from CLOCK_MONOTONIC. An interrupted sleep consumes only
+         * the time that actually elapsed, never its requested slice. */
+    }
+}
+
+static ssh_process_outcome_t wait_pid_gone(pid_t pid, int total_ms) {
+    int64_t started;
+    int64_t deadline;
     int delay = 1;
-    while (waited < total_ms) {
-        if (kill(pid, 0) != 0) {
-            return true;
+
+    if (total_ms < 0) return SSH_PROCESS_INDETERMINATE;
+    started = monotonic_milliseconds();
+    if (started < 0 || started > INT64_MAX - total_ms) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    deadline = started + total_ms;
+    for (;;) {
+        ssh_process_outcome_t presence = probe_process_presence(pid);
+        int64_t now;
+        int64_t next;
+        if (presence != SSH_PROCESS_OWNED) return presence;
+        now = monotonic_milliseconds();
+        if (now < 0) return SSH_PROCESS_INDETERMINATE;
+        if (now >= deadline) return SSH_PROCESS_OWNED;
+        next = now + delay;
+        if (next > deadline) next = deadline;
+        if (sleep_until_milliseconds(next) != 0) {
+            return SSH_PROCESS_INDETERMINATE;
         }
-        int slice = delay < total_ms - waited ? delay : total_ms - waited;
-        struct timespec ts = { .tv_sec = 0, .tv_nsec = slice * 1000000L };
-        nanosleep(&ts, NULL);
-        waited += slice;
         if (delay < 50) {
             delay = delay * 2 < 50 ? delay * 2 : 50;
         }
     }
-    return kill(pid, 0) != 0;
 }
 
-/* Verify a recorded PID is our agent (holding `sock`), SIGTERM it, confirm
- * death, and escalate to SIGKILL if it lingers (AR-02 #20 — a single fired-
- * and-forgotten SIGTERM let a stopped/stuck agent survive teardown holding
- * the decrypted key, while both callers unlinked its sidecar immediately,
- * leaving it permanently unreapable). Returns true when the recorded agent is
- * GONE — killed and confirmed dead, already dead, or the PID isn't our agent
- * at all (stale record, safe to drop) — so callers may remove the sidecar.
- * Returns false when our agent is still alive despite SIGKILL (e.g. wedged in
- * uninterruptible I/O): the caller must then KEEP the sidecar so a future run
- * can retry the reap.
+static ssh_process_outcome_t wait_pidfd_gone(int pidfd, int total_ms) {
+    int64_t started = monotonic_milliseconds();
+    int64_t deadline;
+    struct pollfd pfd;
+
+    if (total_ms < 0 || started < 0 || started > INT64_MAX - total_ms) {
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    deadline = started + total_ms;
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = pidfd;
+    pfd.events = POLLIN;
+    for (;;) {
+        int64_t now = monotonic_milliseconds();
+        int timeout;
+        int rc;
+        if (now < 0) return SSH_PROCESS_INDETERMINATE;
+        if (now >= deadline) return SSH_PROCESS_OWNED;
+        timeout = (int)(deadline - now);
+        rc = poll(&pfd, 1, timeout);
+        if (rc > 0) {
+            if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+                return SSH_PROCESS_GONE;
+            }
+            return SSH_PROCESS_INDETERMINATE;
+        }
+        if (rc == 0) return SSH_PROCESS_OWNED;
+        if (errno != EINTR) return SSH_PROCESS_INDETERMINATE;
+    }
+}
+
+/* Classify a recorded PID against `sock`; when it is conclusively OWNED,
+ * SIGTERM it, confirm death, and escalate to SIGKILL if it lingers (AR-02
+ * #20). GONE means the PID is absent, UNRELATED means a live PID was proved
+ * not to be this managed agent, and either permits sidecar cleanup.
+ * INDETERMINATE covers every failed inspection/signal and OWNED after both
+ * observation windows means the agent conclusively survived; both require
+ * the caller to retain the recovery tuple.
  *
  * On Linux, pin the process with a pidfd BEFORE verifying+signaling so a PID
  * recycled in the check-then-signal window (CONC-4 TOCTOU) cannot receive
@@ -613,62 +952,154 @@ static bool wait_pid_gone(pid_t pid, int total_ms) {
  * reusable number. Where pidfd is unavailable (older kernels, non-Linux) fall
  * back to plain kill guarded by the identity check, re-verified before the
  * SIGKILL escalation. */
-static bool reap_ssh_agent(pid_t pid, const char *sock) {
-    if (pid <= 1) {
-        return true;
-    }
-#if defined(__linux__) && defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
-    int pidfd = (int)syscall(SYS_pidfd_open, (long)pid, 0L);
+static int ssh_process_signal_real(pid_t pid, int signal_number) {
+    return kill(pid, signal_number);
+}
+
+static int ssh_pidfd_open_real(pid_t pid) {
+#if defined(__linux__) && defined(SYS_pidfd_open)
+    return (int)syscall(SYS_pidfd_open, (long)pid, 0L);
+#else
+    (void)pid;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int ssh_pidfd_signal_real(int pidfd, int signal_number) {
+#if defined(__linux__) && defined(SYS_pidfd_send_signal)
+    return (int)syscall(SYS_pidfd_send_signal, (long)pidfd,
+                        (long)signal_number, (void *)0, 0L);
+#else
+    (void)pidfd;
+    (void)signal_number;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static ssh_process_outcome_t reap_ssh_agent(pid_t pid, const char *sock,
+                                            int runtime_dir_fd) {
+    ssh_process_outcome_t identity;
+    ssh_process_outcome_t outcome;
+    int pidfd;
+    int open_errno;
+
+    if (pid <= 1) return SSH_PROCESS_GONE;
+    pidfd = g_reap_ops.pidfd_open(pid);
+    open_errno = errno;
     if (pidfd >= 0) {
-        bool gone = true;
-        if (pid_is_our_ssh_agent(pid, sock)) {
-            syscall(SYS_pidfd_send_signal, (long)pidfd, (long)SIGTERM, (void *)0, 0L);
-            gone = wait_pid_gone(pid, 500);
-            if (!gone) {
-                log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",
-                            (long)pid);
-                syscall(SYS_pidfd_send_signal, (long)pidfd, (long)SIGKILL, (void *)0, 0L);
-                gone = wait_pid_gone(pid, 500);
+        identity = g_reap_ops.identity(pid, sock, runtime_dir_fd);
+        if (identity != SSH_PROCESS_OWNED) {
+            close(pidfd);
+            return identity;
+        }
+        for (int attempts = 0;; attempts++) {
+            if (g_reap_ops.pidfd_signal(pidfd, SIGTERM) == 0) {
+                outcome = SSH_PROCESS_OWNED;
+                break;
+            }
+            if (errno == EINTR && attempts < 16) continue;
+            outcome = errno == ESRCH ? SSH_PROCESS_GONE
+                                     : SSH_PROCESS_INDETERMINATE;
+            break;
+        }
+        if (outcome == SSH_PROCESS_OWNED) {
+            outcome = wait_pidfd_gone(pidfd, 500);
+        }
+        if (outcome == SSH_PROCESS_OWNED) {
+            log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",
+                        (long)pid);
+            for (int attempts = 0;; attempts++) {
+                if (g_reap_ops.pidfd_signal(pidfd, SIGKILL) == 0) break;
+                if (errno == EINTR && attempts < 16) continue;
+                outcome = errno == ESRCH ? SSH_PROCESS_GONE
+                                         : SSH_PROCESS_INDETERMINATE;
+                break;
+            }
+            if (outcome == SSH_PROCESS_OWNED) {
+                outcome = wait_pidfd_gone(pidfd, 500);
             }
         }
         close(pidfd);
-        return gone;
+        return outcome;
     }
-    /* pidfd_open unsupported/failed (ENOSYS on <5.3): fall through. */
-#endif
-    if (pid_is_our_ssh_agent(pid, sock)) {
-        if (kill(pid, SIGTERM) != 0) {
-            return kill(pid, 0) != 0; /* raced its exit, or EPERM (not ours) */
-        }
-        bool gone = wait_pid_gone(pid, 500);
-        /* Re-verify identity before the harder signal: without a pidfd the
-         * PID could have been recycled during the wait. */
-        if (!gone && pid_is_our_ssh_agent(pid, sock)) {
-            log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",
-                        (long)pid);
-            kill(pid, SIGKILL);
-            gone = wait_pid_gone(pid, 500);
-        }
-        return gone;
+    if (open_errno == ESRCH) return SSH_PROCESS_GONE;
+    if (open_errno != ENOSYS && open_errno != EINVAL &&
+        open_errno != EOPNOTSUPP) {
+        return SSH_PROCESS_INDETERMINATE;
     }
-    return true; /* recorded PID is not our agent: the record itself is garbage */
+
+    identity = g_reap_ops.identity(pid, sock, runtime_dir_fd);
+    if (identity != SSH_PROCESS_OWNED) return identity;
+    for (int attempts = 0;; attempts++) {
+        if (g_reap_ops.signal(pid, SIGTERM) == 0) {
+            outcome = SSH_PROCESS_OWNED;
+            break;
+        }
+        if (errno == EINTR && attempts < 16) continue;
+        return errno == ESRCH ? SSH_PROCESS_GONE
+                              : SSH_PROCESS_INDETERMINATE;
+    }
+    outcome = wait_pid_gone(pid, 500);
+    if (outcome != SSH_PROCESS_OWNED) return outcome;
+
+    /* Without a pidfd, re-prove the PID identity before the harder signal. */
+    identity = g_reap_ops.identity(pid, sock, runtime_dir_fd);
+    if (identity != SSH_PROCESS_OWNED) return identity;
+    log_warning("ssh-agent PID %ld ignored SIGTERM; escalating to SIGKILL",
+                (long)pid);
+    for (int attempts = 0;; attempts++) {
+        if (g_reap_ops.signal(pid, SIGKILL) == 0) break;
+        if (errno == EINTR && attempts < 16) continue;
+        return errno == ESRCH ? SSH_PROCESS_GONE
+                              : SSH_PROCESS_INDETERMINATE;
+    }
+    return wait_pid_gone(pid, 500);
 }
 
-/* Best-effort teardown of a just-spawned agent that failed the post-spawn
+static bool ssh_reap_allows_cleanup(ssh_process_outcome_t outcome) {
+    return outcome == SSH_PROCESS_GONE || outcome == SSH_PROCESS_UNRELATED;
+}
+
+static const char *ssh_process_outcome_name(ssh_process_outcome_t outcome) {
+    switch (outcome) {
+        case SSH_PROCESS_OWNED: return "OWNED";
+        case SSH_PROCESS_UNRELATED: return "UNRELATED";
+        case SSH_PROCESS_GONE: return "GONE";
+        case SSH_PROCESS_INDETERMINATE: return "INDETERMINATE";
+        default: return "INVALID";
+    }
+}
+
+/* Recovery teardown of a just-spawned agent that failed the post-spawn
  * checks (output parse, socket validation) BEFORE its PID sidecar was
- * written. Such an agent is invisible to the sidecar-driven reaper forever,
- * so it either dies here or holds the account's decrypted key until reboot
- * (AR-03 H1). When the parsed PID is unknown (unparseable output), fall back
- * to scanning /proc for an ssh-agent whose argv carries our exact socket
- * path — the same identity proof pid_is_our_ssh_agent demands of sidecar
- * PIDs. Where /proc is unavailable (BSD/macOS) no safe scan exists; unlinking
- * the socket at least guarantees no future run can validate/adopt the
- * orphan, and -s (see the spawn site) makes the PID-less case unreachable
- * there in practice. */
-static void reap_unrecorded_agent(pid_t pid, const char *socket_arg,
-                                  int dir_fd, const char *socket_name) {
+ * written. If reap is not conclusive, publish the recovered PID as a durable
+ * sidecar and retain the socket. When the parsed PID is unknown, Linux scans
+ * /proc for the exact provenance-qualified argv; other platforms retain a
+ * live or uninspectable socket as the last discovery handle. The return value
+ * is true exactly when recovery state remains for a later retry. */
+static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
+                                  int dir_fd, const char *socket_name,
+                                  const char *pid_name,
+                                  const char *socket_path,
+                                  const char *socket_dir) {
+    ssh_process_outcome_t outcome = SSH_PROCESS_INDETERMINATE;
+    ssh_runtime_pin_t socket_pin;
+    bool socket_present = false;
+    pid_t retry_pid = pid;
+
+    ssh_runtime_pin_init(&socket_pin);
+    int socket_rc = pin_ssh_runtime_entry_at(
+        dir_fd, socket_name, socket_path, &socket_pin);
+    if (socket_rc == 0) {
+        socket_present = true;
+    } else if (socket_rc < 0) {
+        return true;
+    }
+
     if (pid > 1) {
-        g_ssh_reap(pid, socket_arg);
+        outcome = g_ssh_reap(pid, socket_arg, dir_fd);
     }
 #ifdef __linux__
     else {
@@ -679,16 +1110,77 @@ static void reap_unrecorded_agent(pid_t pid, const char *socket_arg,
                 char *end = NULL;
                 long scan = strtol(ent->d_name, &end, 10);
                 if (end && *end == '\0' && scan > 1 &&
-                    pid_is_our_ssh_agent((pid_t)scan, socket_arg)) {
-                    g_ssh_reap((pid_t)scan, socket_arg);
+                    pid_is_our_ssh_agent((pid_t)scan, socket_arg, dir_fd) ==
+                        SSH_PROCESS_OWNED) {
+                    retry_pid = (pid_t)scan;
+                    outcome = g_ssh_reap(retry_pid, socket_arg, dir_fd);
+                    break;
                 }
             }
             closedir(d);
         }
     }
 #endif
-    (void)unlink_ssh_runtime_entry(dir_fd, socket_name, true,
-                                   "unrecorded agent socket cleanup");
+
+    if (ssh_reap_allows_cleanup(outcome)) {
+        if (g_unrecorded_cleanup_hook &&
+            g_unrecorded_cleanup_hook(dir_fd, socket_name) != 0) {
+            set_error(ERR_FILE_IO,
+                      "SSH unrecorded-agent cleanup hook failed");
+            (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
+            return true;
+        }
+        bool retained = unlink_ssh_reset_path_at(
+                            dir_fd, socket_name, socket_path,
+                            "unrecorded agent socket cleanup",
+                            &socket_pin,
+                            socket_present) != 0;
+        if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) retained = true;
+        return retained;
+    }
+    if (retry_pid > 1) {
+        if (write_ssh_agent_pid_at(dir_fd, pid_name, retry_pid) == 0) {
+            log_warning("SSH agent reap outcome %s; retained PID %ld and socket for retry",
+                        ssh_process_outcome_name(outcome), (long)retry_pid);
+        } else {
+            log_warning("SSH agent reap outcome %s and PID recovery publication failed; retaining socket",
+                        ssh_process_outcome_name(outcome));
+        }
+        (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
+        return true;
+    }
+
+    /* If the PID could not be recovered, the socket itself remains the only
+     * discovery handle. A conclusively stale inode can be removed; a live or
+     * uninspectable listener is retained so reset reports the unresolved
+     * runtime instead of erasing its last trace. */
+    if (socket_path) {
+        bool reachable = false;
+        if (verify_socket_dir_namespace(dir_fd, socket_dir) == 0 &&
+            probe_ssh_agent_socket(socket_path, &reachable) == 0 &&
+            verify_socket_dir_namespace(dir_fd, socket_dir) == 0 &&
+            !reachable) {
+            if (g_unrecorded_cleanup_hook &&
+                g_unrecorded_cleanup_hook(dir_fd, socket_name) != 0) {
+                set_error(ERR_FILE_IO,
+                          "SSH unrecorded-agent cleanup hook failed");
+                (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
+                return true;
+            }
+            bool retained = unlink_ssh_reset_path_at(
+                                dir_fd, socket_name, socket_path,
+                                "stale unrecorded agent socket cleanup",
+                                &socket_pin,
+                                socket_present) != 0;
+            if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) {
+                retained = true;
+            }
+            return retained;
+        }
+    }
+    log_warning("Unrecorded SSH agent state is indeterminate; retaining socket for recovery");
+    (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
+    return true;
 }
 
 /* Guard the agent socket base before scanning/locking/unlinking under it.
@@ -790,8 +1282,9 @@ static int ssh_key_fingerprint(const char *key_path, char *buf, size_t size) {
  * knowing the agent is alive wasted a fork+exec on every such miss. Anything
  * indeterminate falls back to false (restart + load) rather than risk
  * adopting the wrong agent. */
-static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
-                               const char *key_path) {
+static bool ssh_agent_has_exact_key(int dir_fd, bool use_cwd_fd,
+                                    const char *socket_arg,
+                                    const char *key_path) {
     char want_fp[256];
     char envbuf[MAX_PATH_LEN + 20];
     char out[2048];
@@ -800,7 +1293,8 @@ static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
     run_opts_t opts;
     run_result_t res;
 
-    if ((size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s",
+    if (!socket_arg || !*socket_arg || !key_path || !*key_path ||
+        (size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s",
                          socket_arg) >= sizeof(envbuf)) {
         return false;
     }
@@ -811,7 +1305,7 @@ static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
     opts.stderr_to_devnull = true;
     opts.extra_env = env;
     opts.cwd_fd = dir_fd;
-    opts.use_cwd_fd = true;
+    opts.use_cwd_fd = use_cwd_fd;
     if (run_argv(argv, &opts, &res) != 0) {
         return false; /* exit 1 (no identities) / 2 (no agent) */
     }
@@ -849,6 +1343,11 @@ static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
     return identities == 1 && ours;
 }
 
+static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
+                               const char *key_path) {
+    return ssh_agent_has_exact_key(dir_fd, true, socket_arg, key_path);
+}
+
 bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
                                      const char *key_path) {
     return ssh_socket_has_key(dir_fd, socket_arg, key_path);
@@ -875,9 +1374,10 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
      * (AR-02 #24): only the best-effort connection test uses it — which
      * degrades gracefully through run_argv's own resolution failure — and
      * the boot-time resume path never execs it at all, so a missing `ssh`
-     * was hard-failing resumes it could never affect. The probes themselves
-     * are near-free now that find_command_path memoizes: the same resolution
-     * is reused by every subsequent run_argv spawn. */
+     * was hard-failing resumes it could never affect. The probes are bounded,
+     * parent-only checks; they do not spawn helpers. Every call reopens and
+     * revalidates the candidate, and run_argv independently does so again
+     * immediately before launch. */
     if (!command_exists("ssh-agent")) {
         set_error(ERR_SSH_AGENT_NOT_FOUND, "ssh-agent command not found in PATH");
         return -1;
@@ -989,11 +1489,21 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
             /* Clear existing keys and add new one to system agent */
             if (strlen(ssh_config->agent_socket_path) > 0) {
                 log_debug("Clearing system SSH agent keys");
-                ssh_clear_agent_keys(ssh_config);
+                if (ssh_clear_agent_keys(ssh_config) != 0) {
+                    return -1;
+                }
                 
                 log_debug("Adding key to system SSH agent: %s", expanded_key_path);
                 if (ssh_add_key(ssh_config, expanded_key_path) != 0) {
                     set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to load key into system SSH agent");
+                    return -1;
+                }
+                if (!ssh_agent_has_exact_key(
+                        -1, false, ssh_config->agent_socket_path,
+                        expanded_key_path)) {
+                    set_error(ERR_SSH_KEY_LOAD_FAILED,
+                              "System SSH agent does not contain exactly the "
+                              "requested key after replacement");
                     return -1;
                 }
             } else {
@@ -1043,13 +1553,19 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     char pid_path[MAX_PATH_LEN] = "";
     char socket_name[MAX_NAME_LEN + 32];
     char pid_name[MAX_NAME_LEN + 32];
+    char launch_socket_arg[MAX_PATH_LEN];
+    char provenance_marker[80];
     ssh_env_snapshot_t env_snapshot;
     bool env_snapshot_taken = false;
     bool pid_recorded = false;
     bool agent_retained = false;
     bool current_committed = false;
     ssh_current_link_identity_t committed_current;
+    ssh_runtime_pin_t reuse_pin;
+    bool reuse_pin_active = false;
     int dir_fd = -1;
+
+    ssh_runtime_pin_init(&reuse_pin);
 
     if (!ssh_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
@@ -1072,6 +1588,11 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     if (lock_fd < 0) {
         close(dir_fd);
         set_system_error(ERR_FILE_IO, "Failed to lock SSH agent directory");
+        return -1;
+    }
+    if (reconcile_ssh_runtime_pins(dir_fd, socket_dir) != 0) {
+        unlock_agent_dir(lock_fd);
+        close(dir_fd);
         return -1;
     }
 
@@ -1103,6 +1624,16 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
                   spn, sizeof(((struct sockaddr_un *)0)->sun_path));
         goto done;
     }
+    if (build_provenance_socket_arg(
+            dir_fd, socket_name, launch_socket_arg,
+            sizeof(launch_socket_arg), provenance_marker,
+            sizeof(provenance_marker)) != 0 ||
+        strlen(launch_socket_arg) >=
+            sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Account name too long for a provenance-qualified SSH socket");
+        goto done;
+    }
 
     /* Reuse fast path: if this account's agent is already alive and holds
      * EXACTLY this key (single identity, fingerprint token match — see
@@ -1117,23 +1648,35 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     bool have_reuse_key =
         account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
         expand_path(account->ssh_key_path, reuse_key_path, sizeof(reuse_key_path)) == 0;
-    struct stat reuse_before;
-    struct stat reuse_after;
-    bool can_reuse =
-        validate_ssh_agent_socket_at(dir_fd, socket_name, socket_path,
-                                     &reuse_before) == 0 &&
-        have_reuse_key &&
-        ssh_socket_has_key(dir_fd, socket_name, reuse_key_path) &&
-        fstatat(dir_fd, socket_name, &reuse_after, AT_SYMLINK_NOFOLLOW) == 0 &&
-        same_runtime_identity(&reuse_before, &reuse_after) &&
-        S_ISSOCK(reuse_after.st_mode) && reuse_after.st_uid == getuid() &&
-        (reuse_after.st_mode & 0777) == 0600;
+    bool can_reuse = false;
 
     if (!have_reuse_key) {
         set_error(ERR_INVALID_PATH,
                   "Cannot resolve isolated SSH key path for account: %s",
                   account->name);
         goto done;
+    }
+    {
+        int pin_rc = pin_ssh_runtime_entry_at(
+            dir_fd, socket_name, socket_path, &reuse_pin);
+        if (pin_rc < 0) goto done;
+        if (pin_rc == 0) {
+            reuse_pin_active = true;
+            if (S_ISSOCK(reuse_pin.identity.st_mode) &&
+                reuse_pin.identity.st_uid == getuid() &&
+                (reuse_pin.identity.st_mode & 0777) == 0600) {
+                can_reuse = ssh_socket_has_key(
+                    dir_fd, socket_name, reuse_key_path);
+                if (verify_ssh_runtime_pin_at(
+                        dir_fd, socket_name, socket_path, &reuse_pin) != 0) {
+                    goto done;
+                }
+            }
+        }
+    }
+    if (!can_reuse && reuse_pin_active) {
+        if (release_ssh_runtime_pin(dir_fd, &reuse_pin) != 0) goto done;
+        reuse_pin_active = false;
     }
 
     /* ssh-add/ssh-keygen are external scheduling points. Before any orphan
@@ -1165,10 +1708,25 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
                              socket_dir, account->name) < sizeof(pid_path)) {
             pid_t pid = -1;
             int pid_rc = read_ssh_agent_pid_at(dir_fd, pid_name, pid_path,
-                                               &pid);
-            if (pid_rc == 0 && pid_is_our_ssh_agent(pid, socket_name)) {
-                adopted.agent_pid = pid;
-                adopted.agent_owned = true;
+                                               &pid, NULL);
+            if (pid_rc == 0) {
+                ssh_process_outcome_t qualified_identity =
+                    pid_is_our_ssh_agent(pid, launch_socket_arg, -1);
+                ssh_process_outcome_t absolute_identity =
+                    qualified_identity == SSH_PROCESS_OWNED
+                        ? SSH_PROCESS_UNRELATED
+                        : pid_is_our_ssh_agent(pid, socket_path, -1);
+                if (qualified_identity == SSH_PROCESS_OWNED ||
+                    absolute_identity == SSH_PROCESS_OWNED) {
+                    adopted.agent_pid = pid;
+                    adopted.agent_owned = true;
+                    safe_strncpy(
+                        adopted.agent_socket_arg,
+                        qualified_identity == SSH_PROCESS_OWNED
+                            ? launch_socket_arg
+                            : socket_path,
+                        sizeof(adopted.agent_socket_arg));
+                }
             } else if (pid_rc < 0) {
                 goto done;
             }
@@ -1230,6 +1788,15 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
                 ssh_env_snapshot_restore(&env_snapshot);
                 goto done;
             }
+            if (verify_ssh_runtime_pin_at(
+                    dir_fd, socket_name, socket_path, &reuse_pin) != 0 ||
+                release_ssh_runtime_pin(dir_fd, &reuse_pin) != 0) {
+                (void)remove_current_socket_link_if_unchanged(dir_fd,
+                                                               &committed);
+                ssh_env_snapshot_restore(&env_snapshot);
+                goto done;
+            }
+            reuse_pin_active = false;
         }
 
         ssh_env_snapshot_discard(&env_snapshot);
@@ -1274,12 +1841,38 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
      * alive but BEFORE its PID sidecar existed, leaking one unreapable
      * key-holding agent per attempt (AR-03 H1). Capture its stdout (the eval
      * script) only; stderr stays on the terminal. */
-    log_debug("Starting SSH agent on pinned socket entry: %s", socket_name);
-    if (ssh_run_in_dir(dir_fd, output, sizeof(output), false,
-                       "ssh-agent", "-s", "-a", socket_name,
-                       (const char *)NULL) != 0) {
-        set_error(ERR_SSH_AGENT_START_FAILED, "Failed to start SSH agent");
-        goto done;
+    log_debug("Starting SSH agent on provenance-qualified pinned entry: %s",
+              launch_socket_arg);
+    {
+        struct stat marker_stat;
+        int run_rc;
+        if (mkdirat(dir_fd, provenance_marker, 0700) != 0 && errno != EEXIST) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to create SSH provenance marker");
+            goto done;
+        }
+        if (fstatat(dir_fd, provenance_marker, &marker_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISDIR(marker_stat.st_mode) ||
+            marker_stat.st_uid != getuid() ||
+            (marker_stat.st_mode & 0777) != 0700) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing unsafe SSH provenance marker");
+            goto done;
+        }
+        run_rc = ssh_run_in_dir(dir_fd, output, sizeof(output), false,
+                                "ssh-agent", "-s", "-a",
+                                launch_socket_arg,
+                                (const char *)NULL);
+        if (unlinkat(dir_fd, provenance_marker, AT_REMOVEDIR) != 0 &&
+            errno != ENOENT) {
+            log_warning("Could not remove temporary SSH provenance marker: %s",
+                        provenance_marker);
+        }
+        if (run_rc != 0) {
+            set_error(ERR_SSH_AGENT_START_FAILED, "Failed to start SSH agent");
+            goto done;
+        }
     }
 
     /* Parse ssh-agent output for the PID. Do NOT trust the echoed SSH_AUTH_SOCK
@@ -1287,52 +1880,79 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
      * shell-special characters — which validate_name permits in account names
      * (spaces/parens, e.g. "Jane Doe (Work)") — so the quotes would be taken
      * literally and the socket "not found", silently breaking SSH for that
-     * account. We passed the pinned directory's relative socket component to
-     * `-a`; the public `socket_path` assembled above is therefore the
-     * authoritative exported path. Use it directly and keep only the parsed
-     * PID. */
+     * account. We passed a provenance-qualified path resolved from the pinned
+     * directory to `-a`; the public `socket_path` assembled above is therefore
+     * the authoritative exported path. Use it directly and keep only the
+     * parsed PID. */
     if (parse_ssh_agent_output(output, ssh_config) != 0) {
+        bool retained;
         set_error(ERR_SSH_AGENT_START_FAILED, "Failed to parse ssh-agent output");
         /* The agent is typically already alive and bound to socket_path here,
          * but its PID sidecar does not exist yet, so the sidecar-driven
          * reaper could never find it: reap it now while we still know the
          * socket it was started on, or it holds the key until reboot
          * (AR-03 H1). The parsed PID may be unknown on this path. */
-        reap_unrecorded_agent(ssh_config->agent_pid, socket_name,
-                              dir_fd, socket_name);
-        ssh_config->agent_pid = -1;
-        ssh_config->agent_socket_path[0] = '\0';
-        ssh_config->agent_socket_arg[0] = '\0';
+        safe_strncpy(ssh_config->agent_socket_path, socket_path,
+                     sizeof(ssh_config->agent_socket_path));
+        safe_strncpy(ssh_config->agent_socket_arg, launch_socket_arg,
+                     sizeof(ssh_config->agent_socket_arg));
+        retained = reap_unrecorded_agent(
+            ssh_config->agent_pid, launch_socket_arg, dir_fd, socket_name,
+            pid_name, socket_path, socket_dir);
+        ssh_config->agent_owned = retained && ssh_config->agent_pid > 1;
+        if (!retained) {
+            ssh_config->agent_pid = -1;
+            ssh_config->agent_socket_path[0] = '\0';
+            ssh_config->agent_socket_arg[0] = '\0';
+        }
+        set_error(ERR_SSH_AGENT_START_FAILED,
+                  retained
+                      ? "Failed to parse ssh-agent output; runtime retained for retry"
+                      : "Failed to parse ssh-agent output; spawned runtime removed");
         goto done;
     }
     safe_strncpy(ssh_config->agent_socket_path, socket_path,
                  sizeof(ssh_config->agent_socket_path));
-    safe_strncpy(ssh_config->agent_socket_arg, socket_name,
+    safe_strncpy(ssh_config->agent_socket_arg, launch_socket_arg,
                  sizeof(ssh_config->agent_socket_arg));
 
     /* Validate the agent is working */
     if (validate_ssh_agent_socket_at(dir_fd, socket_name, socket_path,
                                      NULL) != 0) {
+        bool retained;
         set_error(ERR_SSH_AGENT_START_FAILED, "SSH agent socket validation failed");
         /* Same pre-sidecar leak shape as the parse failure above, but the
          * parsed PID is known here, so the reap targets it directly. */
-        reap_unrecorded_agent(ssh_config->agent_pid, socket_name,
-                              dir_fd, socket_name);
-        ssh_config->agent_pid = -1;
-        ssh_config->agent_socket_path[0] = '\0';
-        ssh_config->agent_socket_arg[0] = '\0';
+        retained = reap_unrecorded_agent(
+            ssh_config->agent_pid, launch_socket_arg, dir_fd, socket_name,
+            pid_name, socket_path, socket_dir);
+        ssh_config->agent_owned = retained && ssh_config->agent_pid > 1;
+        if (!retained) {
+            ssh_config->agent_pid = -1;
+            ssh_config->agent_socket_path[0] = '\0';
+            ssh_config->agent_socket_arg[0] = '\0';
+        }
+        set_error(ERR_SSH_AGENT_START_FAILED,
+                  retained
+                      ? "SSH agent socket validation failed; runtime retained for retry"
+                      : "SSH agent socket validation failed; spawned runtime removed");
         goto done;
     }
 
-    /* The runner used only the pinned cwd + relative socket entry. If the
-     * public directory was replaced while it ran, reap that pinned agent and
-     * refuse to split its sidecar/link/environment into another namespace. */
+    /* The runner used only the pinned cwd + provenance-qualified relative
+     * socket entry. If the public directory was replaced while it ran, reap
+     * that pinned agent and refuse to split its sidecar/link/environment into
+     * another namespace. */
     if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
-        reap_unrecorded_agent(ssh_config->agent_pid, socket_name,
-                              dir_fd, socket_name);
-        ssh_config->agent_pid = -1;
-        ssh_config->agent_socket_path[0] = '\0';
-        ssh_config->agent_socket_arg[0] = '\0';
+        bool retained = reap_unrecorded_agent(
+            ssh_config->agent_pid, launch_socket_arg, dir_fd, socket_name,
+            pid_name, socket_path, socket_dir);
+        ssh_config->agent_owned = retained && ssh_config->agent_pid > 1;
+        if (!retained) {
+            ssh_config->agent_pid = -1;
+            ssh_config->agent_socket_path[0] = '\0';
+            ssh_config->agent_socket_arg[0] = '\0';
+        }
         goto done;
     }
 
@@ -1354,8 +1974,11 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
         pid_recorded = recorded;
         if (!recorded) {
             char detail[sizeof(g_last_error.message)];
+            ssh_process_outcome_t reap_outcome;
             safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-            if (g_ssh_reap(ssh_config->agent_pid, socket_name)) {
+            reap_outcome = g_ssh_reap(ssh_config->agent_pid,
+                                      launch_socket_arg, dir_fd);
+            if (ssh_reap_allows_cleanup(reap_outcome)) {
                 (void)unlink_ssh_runtime_entry(
                     dir_fd, socket_name, true,
                     "agent socket cleanup after sidecar failure");
@@ -1364,7 +1987,8 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
                 ssh_config->agent_socket_path[0] = '\0';
                 ssh_config->agent_socket_arg[0] = '\0';
             } else {
-                log_warning("SSH agent survived PID-sidecar failure; retaining ownership for retry");
+                log_warning("SSH agent reap outcome %s after PID-sidecar failure; retaining ownership for retry",
+                            ssh_process_outcome_name(reap_outcome));
             }
             set_error(ERR_FILE_IO,
                       "Failed to record SSH agent PID; %s: %s",
@@ -1380,6 +2004,12 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
      * the child fchdir()s to dir_fd, so replacing the public runtime directory
      * cannot redirect ssh-add to an attacker-controlled agent. */
     if (ssh_add_key_pinned(dir_fd, socket_name, reuse_key_path) != 0) {
+        goto fresh_commit_failed;
+    }
+    if (!ssh_socket_has_key(dir_fd, socket_name, reuse_key_path)) {
+        set_error(ERR_SSH_KEY_LOAD_FAILED,
+                  "Fresh isolated SSH agent does not contain exactly the "
+                  "requested key");
         goto fresh_commit_failed;
     }
     ssh_config->key_already_loaded = true;
@@ -1443,11 +2073,13 @@ fresh_commit_failed:
         env_snapshot_taken = false;
     }
     if (ssh_config->agent_owned) {
-        bool agent_gone = g_ssh_reap(ssh_config->agent_pid,
-                                     ssh_config->agent_socket_arg[0]
-                                         ? ssh_config->agent_socket_arg
-                                         : socket_path);
-        if (agent_gone) {
+        ssh_process_outcome_t reap_outcome = g_ssh_reap(
+            ssh_config->agent_pid,
+            ssh_config->agent_socket_arg[0]
+                ? ssh_config->agent_socket_arg
+                : socket_path,
+            dir_fd);
+        if (ssh_reap_allows_cleanup(reap_outcome)) {
             if (pid_recorded) {
                 (void)unlink_ssh_runtime_entry(
                     dir_fd, pid_name, true,
@@ -1457,10 +2089,11 @@ fresh_commit_failed:
                 dir_fd, socket_name, true,
                 "agent socket cleanup after failed publication");
         } else {
-            /* Preserve the sidecar/socket when a process survives: deleting
-             * its only targeting information would make a future retry
-             * impossible and leak a key-holding agent until reboot. */
-            log_warning("SSH agent survived failed stable-link commit; keeping sidecar for retry");
+            /* Preserve the sidecar/socket whenever reap is inconclusive:
+             * deleting its targeting information would make a future retry
+             * impossible and could leak a key-holding agent until reboot. */
+            log_warning("SSH agent reap outcome %s after failed stable-link commit; keeping sidecar for retry",
+                        ssh_process_outcome_name(reap_outcome));
             agent_retained = true;
         }
     }
@@ -1474,6 +2107,9 @@ fresh_commit_failed:
 done:
     if (env_snapshot_taken) {
         ssh_env_snapshot_discard(&env_snapshot);
+    }
+    if (reuse_pin_active) {
+        (void)release_ssh_runtime_pin(dir_fd, &reuse_pin);
     }
     unlock_agent_dir(lock_fd);
     close(dir_fd);
@@ -1503,14 +2139,18 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
      * pidfd-pin it before signaling, so a recorded PID that was recycled to
      * an unrelated same-uid process — or to the user's own login ssh-agent —
      * is never signaled. The old path gated only on kill(pid, 0) liveness. */
-    if (!g_ssh_reap(ssh_config->agent_pid,
-                    ssh_config->agent_socket_arg[0]
-                        ? ssh_config->agent_socket_arg
-                        : ssh_config->agent_socket_path)) {
+    ssh_process_outcome_t reap_outcome = g_ssh_reap(
+        ssh_config->agent_pid,
+        ssh_config->agent_socket_arg[0]
+            ? ssh_config->agent_socket_arg
+            : ssh_config->agent_socket_path,
+        -1);
+    if (!ssh_reap_allows_cleanup(reap_outcome)) {
         set_error(ERR_SSH_AGENT_FAILED,
-                  "SSH agent PID %ld survived teardown; retained for retry",
-                  (long)ssh_config->agent_pid);
-        log_warning("SSH agent did not exit after SIGTERM/SIGKILL; retaining ownership state");
+                  "SSH agent PID %ld reap outcome %s; retained for retry",
+                  (long)ssh_config->agent_pid,
+                  ssh_process_outcome_name(reap_outcome));
+        log_warning("SSH agent teardown was not conclusive; retaining ownership state");
         return -1;
     }
     log_debug("SSH agent stopped");
@@ -1600,15 +2240,18 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
         return -1;
     }
     
-    /* Execute ssh-add -D to delete all keys */
+    /* Execute ssh-add -D to delete all keys. A nonzero result is not evidence
+     * that the agent was already empty: it can also mean the agent was
+     * unreachable or rejected the operation. Loading into that unproved state
+     * would violate system mode's exact replacement contract. */
     if (ssh_run(output, sizeof(output), false, "ssh-add", "-D",
                 (const char *)NULL) != 0) {
-        log_warning("Failed to clear SSH agent keys (agent may be empty)");
-        /* This is not necessarily an error - agent might be empty */
-    } else {
-        log_debug("SSH agent keys cleared successfully");
+        set_error(ERR_SSH_KEY_LOAD_FAILED,
+                  "Failed to clear SSH agent before key replacement: %s",
+                  output);
+        return -1;
     }
-    
+    log_debug("SSH agent keys cleared successfully");
     return 0;
 }
 
@@ -1633,9 +2276,10 @@ int ssh_add_key(ssh_config_t *ssh_config, const char *key_path) {
         return -1;
     }
 
-    /* Execute ssh-add with the key path as a distinct argv element (no shell):
-     * a path containing shell metacharacters can no longer be interpreted. */
-    if (ssh_run(output, sizeof(output), false, "ssh-add", key_path,
+    /* `-k` disables ssh-add's implicit sibling-certificate autoload. The
+     * switch contract is one exact private-key identity, not an unmodeled
+     * key-plus-certificate pair. Keep the path as one argv element. */
+    if (ssh_run(output, sizeof(output), false, "ssh-add", "-k", key_path,
                 (const char *)NULL) != 0) {
         set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to add SSH key: %s", output);
         return -1;
@@ -1968,6 +2612,13 @@ static bool ssh_config_next_line(const char *buf, size_t len, size_t offset,
     line->start = offset;
     if (newline) {
         line->text_len = (size_t)(newline - (buf + offset));
+        /* Treat the CR in a conventional CRLF terminator as syntax, not as
+         * part of the marker/directive text. line->end still spans both
+         * bytes, so untouched ranges retain their original byte encoding. */
+        if (line->text_len > 0U &&
+            buf[line->start + line->text_len - 1U] == '\r') {
+            line->text_len--;
+        }
         line->end = (size_t)(newline - buf) + 1U;
     } else {
         line->text_len = len - offset;
@@ -2599,7 +3250,7 @@ static int ssh_write_config_atomic_at(
     const char *display_path, const char *content, size_t content_len,
     bool config_existed, const struct stat *config_identity,
     int pinned_config_fd, const char *original_content,
-    size_t original_len) {
+    size_t original_len, ssh_config_publication_state_t *publication) {
     static const char random_chars[] =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     char suffix[17];
@@ -2708,9 +3359,20 @@ static int ssh_write_config_atomic_at(
         goto fail;
     }
     renamed = true;
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED;
+    }
     if (temp_registered) signals_scratch_unregister(temp_path);
     temp_registered = false;
 
+    if (g_ssh_config_postrename_hook &&
+        g_ssh_config_postrename_hook(dir_fd) != 0) {
+        set_error(ERR_FILE_IO,
+                  "SSH config was installed but injected post-rename "
+                  "verification failed; the new bytes were retained and "
+                  "their public identity is uncertain");
+        return -1;
+    }
     if (recheck_ssh_config_directory(dir_path, dir_identity) != 0 ||
         fstatat(dir_fd, "config", &installed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !same_installed_ssh_config(&temp_identity, &installed)) {
@@ -2719,12 +3381,18 @@ static int ssh_write_config_atomic_at(
                   "the commit changed bytes and its public state is uncertain");
         return -1;
     }
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+    }
     if (g_ssh_dirsync(dir_fd) != 0) {
         set_system_error(
             ERR_FILE_IO,
             "SSH config was replaced but its directory sync failed; "
             "the commit changed bytes and durability is uncertain");
         return -1;
+    }
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_COMMITTED;
     }
     return 0;
 
@@ -2814,7 +3482,7 @@ int ssh_remove_host_alias(const char *alias) {
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, filtered, filtered_len,
                                    config_existed, &config_identity,
-                                   pinned_config_fd, buf, buf_len) != 0) {
+                                   pinned_config_fd, buf, buf_len, NULL) != 0) {
         goto done;
     }
     log_info("Removed %zu SSH host alias block%s: %s", removed,
@@ -2837,7 +3505,9 @@ done:
     return rc;
 }
 
-int ssh_configure_host_alias(const account_t *account) {
+int ssh_configure_host_alias_result(
+    const account_t *account,
+    ssh_config_publication_state_t *publication) {
     char ssh_config_dir[MAX_PATH_LEN];
     char ssh_config_path[MAX_PATH_LEN];
     char expanded_key_path[MAX_PATH_LEN];
@@ -2864,7 +3534,13 @@ int ssh_configure_host_alias(const account_t *account) {
     int rc = -1;
     int need;
 
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    }
     if (!account || strlen(account->ssh_host_alias) == 0) {
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+        }
         return 0; /* Nothing to configure */
     }
     if (!home || !*home) {
@@ -2979,6 +3655,9 @@ int ssh_configure_host_alias(const account_t *account) {
     if (config_existed && newbuf_len == buf_len &&
         memcmp(newbuf, buf, buf_len) == 0) {
         log_debug("SSH host alias block already current; skipping rewrite");
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+        }
         rc = 0;
         goto done;
     }
@@ -2989,7 +3668,8 @@ int ssh_configure_host_alias(const account_t *account) {
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, newbuf, newbuf_len,
                                    config_existed, &config_identity,
-                                   pinned_config_fd, buf, buf_len) != 0) {
+                                   pinned_config_fd, buf, buf_len,
+                                   publication) != 0) {
         goto done;
     }
 
@@ -3016,9 +3696,126 @@ done:
     return rc;
 }
 
+int ssh_configure_host_alias(const account_t *account) {
+    return ssh_configure_host_alias_result(account, NULL);
+}
+
+static bool ssh_auth_identity_is_anonymous(const char *identity,
+                                           size_t identity_len) {
+    static const char anonymous[] = "anonymous";
+    size_t i;
+
+    if (identity_len != sizeof(anonymous) - 1U) return false;
+    for (i = 0; i < identity_len; i++) {
+        unsigned char c = (unsigned char)identity[i];
+        if (c >= (unsigned char)'A' && c <= (unsigned char)'Z') {
+            c = (unsigned char)(c - (unsigned char)'A' +
+                                (unsigned char)'a');
+        }
+        if (c != (unsigned char)anonymous[i]) return false;
+    }
+    return true;
+}
+
+/* Match a complete output line with a nonempty provider identity between a
+ * fixed prefix/suffix. Embedded controls and GitLab's unauthenticated
+ * "Anonymous" discovery result are not authentication proof. */
+static bool ssh_auth_line_with_identity(const char *line, size_t line_len,
+                                        const char *prefix,
+                                        const char *suffix,
+                                        bool reject_anonymous) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    const char *identity;
+    size_t identity_len;
+    size_t i;
+
+    if (line_len <= prefix_len + suffix_len ||
+        memcmp(line, prefix, prefix_len) != 0 ||
+        memcmp(line + line_len - suffix_len, suffix, suffix_len) != 0) {
+        return false;
+    }
+    identity = line + prefix_len;
+    identity_len = line_len - prefix_len - suffix_len;
+    for (i = 0; i < identity_len; i++) {
+        unsigned char c = (unsigned char)identity[i];
+        if (c < 0x20U || c == 0x7fU) return false;
+    }
+    return !reject_anonymous ||
+           !ssh_auth_identity_is_anonymous(identity, identity_len);
+}
+
+/* Git hosting probes deliberately request no shell. GitHub documents a
+ * successful authentication as exit 1; GitLab and Bitbucket discovery shells
+ * return exit 0. A provider-specific complete line (or complete Bitbucket
+ * line pair) is required in addition to that normal, unsignaled exit class. */
+static bool ssh_authentication_was_proven(const char *output,
+                                          size_t output_len,
+                                          const run_result_t *result) {
+    static const char github_suffix[] =
+        "! You've successfully authenticated, but GitHub does not provide "
+        "shell access.";
+    static const char bitbucket_legacy_access[] =
+        "You can use git or hg to connect to Bitbucket. Shell access is "
+        "disabled.";
+    static const char bitbucket_current_access[] =
+        "You can use git to connect to Bitbucket. Shell access is disabled";
+    bool github = false;
+    bool gitlab = false;
+    bool bitbucket_identity = false;
+    bool bitbucket_access = false;
+    size_t offset = 0U;
+
+    if (!output || !result || !result->spawned || result->term_signal != 0 ||
+        result->out_truncated) {
+        return false;
+    }
+    while (offset < output_len) {
+        const char *line = output + offset;
+        const char *newline = memchr(line, '\n', output_len - offset);
+        size_t line_len = newline ? (size_t)(newline - line)
+                                  : output_len - offset;
+
+        if (line_len > 0U && line[line_len - 1U] == '\r') line_len--;
+        if (ssh_auth_line_with_identity(line, line_len, "Hi ",
+                                        github_suffix, false)) {
+            github = true;
+        }
+        if (ssh_auth_line_with_identity(line, line_len,
+                                        "Welcome to GitLab, ", "!", true)) {
+            gitlab = true;
+        }
+        if (ssh_auth_line_with_identity(line, line_len, "logged in as ",
+                                        ".", true) ||
+            (line_len == strlen("authenticated via ssh key.") &&
+             memcmp(line, "authenticated via ssh key.", line_len) == 0)) {
+            bitbucket_identity = true;
+        }
+        if ((line_len == sizeof(bitbucket_legacy_access) - 1U &&
+             memcmp(line, bitbucket_legacy_access, line_len) == 0) ||
+            (line_len == sizeof(bitbucket_current_access) - 1U &&
+             memcmp(line, bitbucket_current_access, line_len) == 0)) {
+            bitbucket_access = true;
+        }
+        if (!newline) break;
+        offset = (size_t)(newline - output) + 1U;
+    }
+
+    if (result->exit_code == 1) return github;
+    if (result->exit_code == 0) {
+        return gitlab || (bitbucket_identity && bitbucket_access);
+    }
+    return false;
+}
+
 /* Test SSH connection */
 int ssh_test_connection(const account_t *account, const char *host) {
-    char output[1024];
+    char output[1024] = {0};
+    run_opts_t opts;
+    run_result_t result;
+    const char *const alias_argv[] = {
+        "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+        account ? account->ssh_host_alias : NULL, NULL};
 
     if (!account || !host) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_test_connection");
@@ -3027,32 +3824,35 @@ int ssh_test_connection(const account_t *account, const char *host) {
     
     log_debug("Testing SSH connection to: %s", host);
     
-    /* Build SSH test command using -T (no TTY) for git hosting services
-     * GitHub/GitLab/Bitbucket don't allow shell commands, they return a
-     * greeting message on successful auth (exit code 1 but with success message) */
-    /* Execute SSH test (merged stderr: git hosts print their greeting there)
-     * with each option as a distinct argv element — no shell.
-     * Note: GitHub returns exit code 1 even on success (no shell access). */
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+
+    /* Git hosts print their discovery greeting on stderr. The alias path uses
+     * the managed config block's IdentitiesOnly policy. A direct literal-host
+     * probe must ignore every user/system config file as well: IdentitiesOnly
+     * still permits IdentityFile entries inherited from those files. */
     if (strlen(account->ssh_host_alias) > 0) {
-        (void)ssh_run(output, sizeof(output), true,
-                      "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                      account->ssh_host_alias, (const char *)NULL);
+        (void)run_argv(alias_argv, &opts, &result);
     } else {
         char expanded_key_path[MAX_PATH_LEN];
-        if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
+        const char *direct_argv[] = {
+            "ssh", "-T", "-F", "none", "-o", "ConnectTimeout=5", "-o",
+            "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i",
+            expanded_key_path, host, NULL};
+
+        if (expand_path(account->ssh_key_path, expanded_key_path,
+                        sizeof(expanded_key_path)) != 0) {
             return -1;
         }
-        (void)ssh_run(output, sizeof(output), true,
-                      "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                      "-i", expanded_key_path, host, (const char *)NULL);
+        (void)run_argv(direct_argv, &opts, &result);
     }
 
-    /* Check for authentication success messages from common git hosting services */
-    if (strstr(output, "successfully authenticated") ||  /* GitHub */
-        strstr(output, "Welcome to GitLab") ||           /* GitLab */
-        strstr(output, "logged in as") ||                /* Bitbucket */
-        strstr(output, "Hi ") ||                         /* GitHub greeting */
-        strstr(output, "authentication successful")) {   /* Generic */
+    if (result.out_len < sizeof(output) &&
+        ssh_authentication_was_proven(output, result.out_len, &result)) {
         log_debug("SSH authentication successful to %s", host);
         return 0;
     }
@@ -3150,7 +3950,7 @@ static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
 /* Load a key through a descriptor-pinned relative agent socket. */
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path) {
-    const char *argv[] = {"ssh-add", key_path, NULL};
+    const char *argv[] = {"ssh-add", "-k", key_path, NULL};
     const char *env[2] = {NULL, NULL};
     char envbuf[MAX_PATH_LEN + 20];
     char output[512];
@@ -3945,6 +4745,26 @@ static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) 
             }
             ssh_config->agent_pid = (pid_t)strtol(pid_start, NULL, 10);
         }
+
+        /* Preserve a recovery PID even when the surrounding output syntax is
+         * not one the activation parser accepts. OpenSSH's diagnostic line is
+         * emitted after both Bourne and csh forms; retaining it lets the
+         * pre-sidecar failure path publish a durable retry tuple. This does
+         * not make the overall parse succeed without SSH_AUTH_SOCK. */
+        if (ssh_config->agent_pid <= 1) {
+            char *agent_pid = strstr(line, "Agent pid ");
+            if (agent_pid) {
+                char *end = NULL;
+                long parsed;
+                errno = 0;
+                agent_pid += strlen("Agent pid ");
+                parsed = strtol(agent_pid, &end, 10);
+                if (errno == 0 && end != agent_pid && parsed > 1 &&
+                    (long)(pid_t)parsed == parsed) {
+                    ssh_config->agent_pid = (pid_t)parsed;
+                }
+            }
+        }
         
         line = strtok_r(NULL, "\n", &saveptr);
     }
@@ -4123,6 +4943,325 @@ static bool same_runtime_identity(const struct stat *before,
            before->st_uid == after->st_uid;
 }
 
+/* Revision equality is intentionally narrower than the repository-wide
+ * identity predicate. Rename/link operations legitimately change ctime and
+ * nlink, so strict revision checks are used only after a reset artifact has
+ * reached its final, quiescent quarantine name. */
+static bool same_runtime_revision(const struct stat *before,
+                                  const struct stat *after) {
+    if (!same_runtime_identity(before, after) ||
+        before->st_gid != after->st_gid ||
+        before->st_nlink != after->st_nlink ||
+        before->st_size != after->st_size) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return before->st_gen == after->st_gen &&
+           before->st_birthtimespec.tv_sec == after->st_birthtimespec.tv_sec &&
+           before->st_birthtimespec.tv_nsec == after->st_birthtimespec.tv_nsec &&
+           before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+           before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec &&
+           before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+           before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#elif defined(__FreeBSD__)
+    return before->st_gen == after->st_gen &&
+           before->st_birthtim.tv_sec == after->st_birthtim.tv_sec &&
+           before->st_birthtim.tv_nsec == after->st_birthtim.tv_nsec &&
+           before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#else
+    return before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+}
+
+static void ssh_runtime_pin_init(ssh_runtime_pin_t *pin) {
+    if (!pin) return;
+    memset(pin, 0, sizeof(*pin));
+    pin->fd = -1;
+}
+
+static int stat_ssh_runtime_pin(const ssh_runtime_pin_t *pin,
+                                int dir_fd, struct stat *identity) {
+    if (!pin || !identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (pin->fd >= 0) {
+        return fstat(pin->fd, identity);
+    }
+    if (pin->anchor[0] != '\0') {
+        return fstatat(dir_fd, pin->anchor, identity, AT_SYMLINK_NOFOLLOW);
+    }
+    errno = EBADF;
+    return -1;
+}
+
+/* Hold an object reference across every external scheduling point and
+ * deletion hook. A stat tuple alone is not a pin: ext4 may immediately reuse
+ * an unlinked inode and give a replacement the old dev/ino/mode/uid tuple.
+ * Linux and FreeBSD can hold arbitrary runtime entries with O_PATH. Darwin
+ * cannot open a filesystem socket (open(2) reports EOPNOTSUPP), so its
+ * descriptor-equivalent reference is a private hard-link anchor in the
+ * already locked 0700 runtime directory. Interrupted anchors are reconciled
+ * before the next mutating start/reset transaction. The reserved anchor
+ * namespace and manager lock are the Darwin concurrency boundary; removal by
+ * a same-UID process that ignores the lock is detected and fails closed. */
+static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
+                                    const char *display_path,
+                                    ssh_runtime_pin_t *pin) {
+#if !defined(O_PATH)
+    static unsigned long anchor_sequence;
+    struct stat before;
+#endif
+    struct stat opened;
+    struct stat named;
+    int fd = -1;
+
+    if (dir_fd < 0 || !name || !*name || !pin) {
+        set_error(ERR_INVALID_ARGS, "Invalid SSH runtime pin arguments");
+        errno = EINVAL;
+        return -1;
+    }
+    ssh_runtime_pin_init(pin);
+#if defined(O_PATH)
+    {
+        int flags = O_PATH | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        fd = openat(dir_fd, name, flags);
+    }
+#else
+    if (fstatat(dir_fd, name, &before, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return 1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect SSH runtime artifact before pinning: %s",
+                         display_path ? display_path : name);
+        return -1;
+    }
+    for (unsigned int attempts = 0; attempts < 128; attempts++) {
+        int written = snprintf(pin->anchor, sizeof(pin->anchor),
+                               ".runtime.pin.%ld.%lu", (long)getpid(),
+                               anchor_sequence++);
+        if (written < 0 || (size_t)written >= sizeof(pin->anchor)) {
+            pin->anchor[0] = '\0';
+            set_error(ERR_INVALID_PATH,
+                      "SSH runtime pin anchor name is too long");
+            return -1;
+        }
+        if (linkat(dir_fd, name, dir_fd, pin->anchor, 0) == 0) break;
+        if (errno != EEXIST) {
+            pin->anchor[0] = '\0';
+            if (errno == ENOENT) return 1;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot anchor SSH runtime artifact safely: %s",
+                             display_path ? display_path : name);
+            return -1;
+        }
+        pin->anchor[0] = '\0';
+    }
+    if (pin->anchor[0] == '\0') {
+        errno = EEXIST;
+        set_error(ERR_FILE_IO,
+                  "Cannot allocate a private SSH runtime pin anchor");
+        return -1;
+    }
+    if (fstatat(dir_fd, pin->anchor, &opened, AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify SSH runtime pin anchor: %s",
+                         pin->anchor);
+        return -1; /* uncertain reserved state is reconciled on next mutation */
+    }
+    if (fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(&before, &opened) ||
+        !same_runtime_identity(&opened, &named)) {
+        int saved_errno = errno ? errno : ESTALE;
+        int retire_rc = unlink_ssh_runtime_identity_at(
+            dir_fd, pin->anchor, &opened, false,
+            "failed SSH runtime pin anchor rollback", NULL, NULL);
+        if (retire_rc == 0) pin->anchor[0] = '\0';
+        errno = saved_errno;
+        set_error(ERR_FILE_IO,
+                  "SSH runtime artifact changed while being anchored; pin %s: %s",
+                  retire_rc == 0 ? "retired" : "retained for retry",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    pin->identity = opened;
+    return 0;
+#endif
+
+    if (fd < 0) {
+        if (errno == ENOENT) return 1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot pin SSH runtime artifact safely: %s",
+                         display_path ? display_path : name);
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0 ||
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(&opened, &named)) {
+        int saved_errno = errno ? errno : ESTALE;
+        close(fd);
+        errno = saved_errno;
+        set_error(ERR_FILE_IO,
+                  "SSH runtime artifact changed while being pinned: %s",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    pin->identity = opened;
+    pin->fd = fd;
+    return 0;
+}
+
+static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
+                                     const char *display_path,
+                                     const ssh_runtime_pin_t *pin) {
+    struct stat held;
+    struct stat named;
+
+    if (stat_ssh_runtime_pin(pin, dir_fd, &held) != 0 ||
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_revision(&pin->identity, &held) ||
+        !same_runtime_revision(&pin->identity, &named)) {
+        set_error(ERR_FILE_IO,
+                  "SSH runtime artifact changed while pinned: %s",
+                  display_path ? display_path : name);
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin) {
+    if (!pin) return 0;
+    if (pin->fd >= 0) {
+        int fd = pin->fd;
+        pin->fd = -1;
+        if (close(fd) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot close SSH runtime descriptor pin");
+            return -1;
+        }
+    }
+    if (pin->anchor[0] != '\0') {
+        if (unlink_ssh_runtime_identity_at(
+                dir_fd, pin->anchor, &pin->identity, false,
+                "SSH runtime pin anchor retirement", NULL, NULL) != 0) {
+            return -1;
+        }
+        pin->anchor[0] = '\0';
+    }
+    return 0;
+}
+
+static bool ssh_runtime_pin_name_is_managed(const char *name) {
+    static const char prefix[] = ".runtime.pin.";
+    const char *cursor;
+
+    if (!name || strncmp(name, prefix, sizeof(prefix) - 1U) != 0) {
+        return false;
+    }
+    cursor = name + sizeof(prefix) - 1U;
+    if (!isdigit((unsigned char)*cursor)) return false;
+    while (isdigit((unsigned char)*cursor)) cursor++;
+    if (*cursor++ != '.' || !isdigit((unsigned char)*cursor)) return false;
+    while (isdigit((unsigned char)*cursor)) cursor++;
+    return *cursor == '\0';
+}
+
+/* A Darwin/fallback hard-link pin is intentionally ephemeral. If a process
+ * dies while holding one, the next top-level mutator retires it under the
+ * manager lock, synchronizes that cleanup, and fails once so the following
+ * retry starts from a freshly proved namespace. Malformed reserved names are
+ * never guessed at or deleted. */
+static int reconcile_ssh_runtime_pins(int dir_fd, const char *socket_dir) {
+    static const char prefix[] = ".runtime.pin.";
+    DIR *directory;
+    struct dirent *entry;
+    int scan_fd;
+    bool saw_pin = false;
+    bool failed = false;
+    int scan_flags = O_RDONLY | O_CLOEXEC;
+
+#ifdef O_DIRECTORY
+    scan_flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    scan_flags |= O_NOFOLLOW;
+#endif
+    scan_fd = openat(dir_fd, ".", scan_flags);
+    directory = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!directory) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect SSH runtime pin recovery state: %s",
+                         socket_dir);
+        return -1;
+    }
+    for (;;) {
+        struct stat identity;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno != 0) {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot enumerate SSH runtime pin recovery state: %s",
+                    socket_dir);
+                failed = true;
+            }
+            break;
+        }
+        if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1U) != 0) {
+            continue;
+        }
+        saw_pin = true;
+        if (!ssh_runtime_pin_name_is_managed(entry->d_name)) {
+            set_error(ERR_FILE_IO,
+                      "Malformed reserved SSH runtime pin state was preserved: %s",
+                      entry->d_name);
+            failed = true;
+            continue;
+        }
+        if (fstatat(dir_fd, entry->d_name, &identity,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            identity.st_uid != getuid() || S_ISDIR(identity.st_mode)) {
+            set_error(ERR_FILE_IO,
+                      "Unsafe SSH runtime pin recovery state was preserved: %s",
+                      entry->d_name);
+            failed = true;
+            continue;
+        }
+        if (unlink_ssh_runtime_identity_at(
+                dir_fd, entry->d_name, &identity, false,
+                "interrupted SSH runtime pin reconciliation", NULL,
+                NULL) != 0) {
+            failed = true;
+        }
+    }
+    if (closedir(directory) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close SSH runtime pin recovery scan: %s",
+                         socket_dir);
+        failed = true;
+    }
+    if (saw_pin) {
+        set_error(
+            ERR_FILE_IO,
+            "SSH runtime pin recovery state was %s; rerun the operation to confirm the reconciled namespace",
+            failed ? "preserved for retry" : "reconciled");
+        return -1;
+    }
+    return failed ? -1 : 0;
+}
+
 static bool same_runtime_symlink(const struct stat *before,
                                  const struct stat *after) {
     return same_runtime_identity(before, after) &&
@@ -4141,10 +5280,8 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     char target[MAX_PATH_LEN];
     char account_name[MAX_NAME_LEN];
     char expected_path[MAX_PATH_LEN];
-    struct stat link_before;
-    struct stat link_after;
-    struct stat socket_before;
-    struct stat socket_after;
+    ssh_runtime_pin_t current_pin;
+    ssh_runtime_pin_t socket_pin;
     const char *component;
     size_t current_len;
     size_t dir_len;
@@ -4157,6 +5294,9 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     int dir_fd = -1;
     int lock_fd = -1;
     int rc = -1;
+
+    ssh_runtime_pin_init(&current_pin);
+    ssh_runtime_pin_init(&socket_pin);
 
     if (expected_live) {
         *expected_live = false;
@@ -4204,10 +5344,13 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
         return -1;
     }
 
-    /* Discovery is a pure read: never wait on a writer that may be parked at
-     * an interactive prompt for minutes. On contention return an error so
+    /* Discovery never waits on a writer that may be parked at an interactive
+     * prompt for minutes. On contention return an error so
      * accounts_detect_current serves the persisted saved-account fallback
-     * instead of hanging every read-only command (AR-05 H2). */
+     * instead of hanging every read-only command (AR-05 H2). Linux/FreeBSD
+     * pins are descriptor-only; Darwin briefly creates a reserved hard-link
+     * anchor inside this locked private directory and retires it before
+     * returning, without changing either public runtime name. */
     lock_fd = try_lock_agent_dir(dir_fd);
     if (lock_fd < 0) {
         bool contended = errno == EWOULDBLOCK;
@@ -4227,23 +5370,23 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
         return -1;
     }
 
-    if (fstatat(dir_fd, "current.sock", &link_before,
-                AT_SYMLINK_NOFOLLOW) != 0) {
-        if (errno == ENOENT) {
+    {
+        int pin_rc = pin_ssh_runtime_entry_at(
+            dir_fd, "current.sock", current, &current_pin);
+        if (pin_rc > 0) {
             rc = 0;
             goto done;
         }
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect stable SSH socket: %s", current);
-        goto done;
+        if (pin_rc < 0) goto done;
     }
-    if (!S_ISLNK(link_before.st_mode) || link_before.st_uid != getuid()) {
+    if (!S_ISLNK(current_pin.identity.st_mode) ||
+        current_pin.identity.st_uid != getuid()) {
         set_error(ERR_PERMISSION_DENIED,
                   "Stable SSH socket is not a self-owned symlink: %s", current);
         goto done;
     }
-    if (link_before.st_size > 0 &&
-        (uintmax_t)link_before.st_size >= (uintmax_t)sizeof(target)) {
+    if (current_pin.identity.st_size > 0 &&
+        (uintmax_t)current_pin.identity.st_size >= (uintmax_t)sizeof(target)) {
         set_error(ERR_INVALID_PATH,
                   "Stable SSH socket target is too long: %s", current);
         goto done;
@@ -4253,12 +5396,8 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
                                                          target,
                                                          sizeof(target) - 1);
     int readlink_errno = errno;
-    if (fstatat(dir_fd, "current.sock", &link_after,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_symlink(&link_before, &link_after)) {
-        set_error(ERR_FILE_IO,
-                  "Stable SSH socket changed while being inspected: %s",
-                  current);
+    if (verify_ssh_runtime_pin_at(dir_fd, "current.sock", current,
+                                  &current_pin) != 0) {
         goto done;
     }
     if (target_len < 0) {
@@ -4319,19 +5458,23 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
         goto done;
     }
 
-    if (fstatat(dir_fd, component, &socket_before,
-                AT_SYMLINK_NOFOLLOW) != 0) {
-        if (expected && errno == ENOENT) {
+    {
+        int pin_rc = pin_ssh_runtime_entry_at(
+            dir_fd, component, target, &socket_pin);
+        if (pin_rc > 0 && expected) {
             rc = 0;
             goto done;
         }
-        set_system_error(ERR_SSH_AGENT_SOCKET_INVALID,
-                         "Current SSH agent socket is missing: %s", target);
-        goto done;
+        if (pin_rc > 0) {
+            set_error(ERR_SSH_AGENT_SOCKET_INVALID,
+                      "Current SSH agent socket is missing: %s", target);
+            goto done;
+        }
+        if (pin_rc < 0) goto done;
     }
-    if (!S_ISSOCK(socket_before.st_mode) ||
-        socket_before.st_uid != getuid() ||
-        (socket_before.st_mode & 0777) != 0600) {
+    if (!S_ISSOCK(socket_pin.identity.st_mode) ||
+        socket_pin.identity.st_uid != getuid() ||
+        (socket_pin.identity.st_mode & 0777) != 0600) {
         set_error(ERR_SSH_AGENT_SOCKET_INVALID,
                   "Current SSH agent socket is not a self-owned 0600 socket: %s",
                   target);
@@ -4356,15 +5499,17 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
                 clear_error();
             }
         }
-    } else if (probe_ssh_agent_socket(target, &reachable) != 0) {
-        goto done;
+    } else {
+        if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
+            probe_ssh_agent_socket(target, &reachable) != 0 ||
+            verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
+            goto done;
+        }
     }
-    if (fstatat(dir_fd, component, &socket_after,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_identity(&socket_before, &socket_after)) {
-        set_error(ERR_SSH_AGENT_SOCKET_INVALID,
-                  "Current SSH agent socket changed while being probed: %s",
-                  target);
+    if (verify_ssh_runtime_pin_at(dir_fd, component, target,
+                                  &socket_pin) != 0 ||
+        verify_ssh_runtime_pin_at(dir_fd, "current.sock", current,
+                                  &current_pin) != 0) {
         goto done;
     }
     if (!reachable && !expected) {
@@ -4382,6 +5527,8 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     rc = 0;
 
 done:
+    if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) rc = -1;
+    if (release_ssh_runtime_pin(dir_fd, &current_pin) != 0) rc = -1;
     unlock_agent_dir(lock_fd);
     close(dir_fd);
     return rc;
@@ -4414,12 +5561,15 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
  * which reset cannot prove what it is targeting is an error and leaves the
  * sidecar in place for inspection/retry. */
 static int read_ssh_agent_pid_at(int dir_fd, const char *name,
-                                 const char *display_path, pid_t *pid_out) {
+                                 const char *display_path, pid_t *pid_out,
+                                 ssh_runtime_pin_t *pin) {
     struct stat opened;
     struct stat entry;
     char buf[64];
     size_t used = 0;
     int fd;
+
+    if (pin) ssh_runtime_pin_init(pin);
 
     if (fstatat(dir_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno == ENOENT) {
@@ -4491,7 +5641,6 @@ static int read_ssh_agent_pid_at(int dir_fd, const char *name,
                   display_path);
         return -1;
     }
-    close(fd);
     buf[used] = '\0';
 
     errno = 0;
@@ -4502,12 +5651,19 @@ static int read_ssh_agent_pid_at(int dir_fd, const char *name,
     }
     if (errno != 0 || end == buf || !end || *end != '\0' || parsed <= 1 ||
         (long)(pid_t)parsed != parsed) {
+        close(fd);
         set_error(ERR_FILE_IO,
                   "Invalid SSH agent PID sidecar; retained for retry: %s",
                   display_path);
         return -1;
     }
     *pid_out = (pid_t)parsed;
+    if (pin) {
+        pin->identity = opened;
+        pin->fd = fd;
+    } else {
+        close(fd);
+    }
     return 0;
 }
 
@@ -4666,16 +5822,334 @@ int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
     return write_ssh_agent_pid_at(dir_fd, name, pid);
 }
 
+/* Re-prove an entry immediately before removing its name. POSIX has no
+ * unlink-by-inode operation, so this is the narrowest fail-closed boundary:
+ * the caller's captured identity must still own the name after every
+ * durability wait and deterministic race hook. A changed name is preserved
+ * and reported separately so callers can restore it to a public location. */
+static int unlink_ssh_runtime_identity_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    bool missing_ok, const char *description,
+    ssh_quarantine_hook_fn predelete_hook, struct stat *observed_out) {
+    struct stat observed;
+
+    if (predelete_hook != NULL) {
+        int hook_rc = (*predelete_hook)(dir_fd, name);
+        if (hook_rc != 0) {
+            set_error(
+                ERR_FILE_IO,
+                "SSH cleanup hook failed before identity-bound removal: %s",
+                name);
+            return -1;
+        }
+    }
+    if (fstatat(dir_fd, name, &observed, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (missing_ok && errno == ENOENT) {
+            return sync_ssh_runtime_dir(
+                dir_fd, description ? description
+                                    : "identity-bound artifact absence");
+        }
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify SSH cleanup target: %s", name);
+        return -1;
+    }
+    if (!expected || !same_runtime_identity(expected, &observed)) {
+        if (observed_out) *observed_out = observed;
+        errno = ESTALE;
+        set_error(ERR_FILE_IO,
+                  "SSH cleanup target identity changed; replacement preserved: %s",
+                  name);
+        return 1;
+    }
+    return unlink_ssh_runtime_entry(
+        dir_fd, name, missing_ok,
+        description ? description : "identity-bound artifact removal");
+}
+
+/* Final retirement happens only after the quarantine name is stable. Compare
+ * the full quiescent revision after the deterministic hook, and also prove
+ * that the transaction still holds the originally pinned object. */
+static int unlink_ssh_runtime_revision_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    const ssh_runtime_pin_t *pin, const char *witness_name,
+    const char *description,
+    ssh_quarantine_hook_fn predelete_hook, struct stat *observed_out) {
+    struct stat held;
+    struct stat observed;
+    struct stat witness;
+    bool held_matches = true;
+    bool witness_matches = true;
+
+    if (predelete_hook && predelete_hook(dir_fd, name) != 0) {
+        set_error(ERR_FILE_IO,
+                  "SSH cleanup hook failed before revision-bound removal: %s",
+                  name);
+        return -1;
+    }
+    if (fstatat(dir_fd, name, &observed, AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify SSH cleanup target: %s", name);
+        return -1;
+    }
+    if (pin &&
+        (stat_ssh_runtime_pin(pin, dir_fd, &held) != 0 ||
+         !same_runtime_identity(&pin->identity, &held) ||
+         !same_runtime_identity(&pin->identity, &observed) ||
+         !same_runtime_revision(expected, &held))) {
+        held_matches = false;
+    }
+    if (witness_name &&
+        (fstatat(dir_fd, witness_name, &witness, AT_SYMLINK_NOFOLLOW) != 0 ||
+         !same_runtime_identity(expected, &witness) ||
+         !same_runtime_identity(&witness, &observed) ||
+         !same_runtime_revision(expected, &witness))) {
+        witness_matches = false;
+    }
+    if (!expected || (!pin && !witness_name) || !held_matches ||
+        !witness_matches ||
+        !same_runtime_revision(expected, &observed)) {
+        if (observed_out) *observed_out = observed;
+        errno = ESTALE;
+        set_error(ERR_FILE_IO,
+                  "SSH cleanup target revision changed; replacement preserved: %s",
+                  name);
+        return 1;
+    }
+#if defined(__FreeBSD__)
+    if (pin && pin->fd >= 0) {
+        if (funlinkat(dir_fd, name, pin->fd, 0) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot remove descriptor-pinned SSH cleanup target: %s",
+                             name);
+            return -1;
+        }
+        return sync_ssh_runtime_dir(
+            dir_fd,
+            description ? description : "revision-bound artifact removal");
+    }
+#endif
+    return unlink_ssh_runtime_entry(
+        dir_fd, name, false,
+        description ? description : "revision-bound artifact removal");
+}
+
+/* Atomically move a reset target out of its public name without overwriting a
+ * pre-existing quarantine. Native no-replace rename is the race-free path;
+ * the locked hard-link fallback mirrors current.sock's portable protocol and
+ * re-proves both names before removing the public one. */
+static int quarantine_ssh_reset_entry(
+    int dir_fd, const char *name, const char *quarantine,
+    const struct stat *expected) {
+    struct stat source;
+    struct stat captured;
+
+    if (!g_force_portable_quarantine) {
+#if defined(__linux__) && defined(SYS_renameat2)
+    if (syscall(SYS_renameat2, dir_fd, name, dir_fd, quarantine,
+                RENAME_NOREPLACE) == 0) {
+        return 0;
+    }
+    if (errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP) {
+        return -1;
+    }
+#elif (defined(__APPLE__) || defined(__FreeBSD__)) && defined(RENAME_EXCL)
+    if (renameatx_np(dir_fd, name, dir_fd, quarantine, RENAME_EXCL) == 0) {
+        return 0;
+    }
+    if (errno != ENOTSUP && errno != EOPNOTSUPP && errno != EINVAL) {
+        return -1;
+    }
+#endif
+    }
+
+    if (linkat(dir_fd, name, dir_fd, quarantine, 0) != 0) return -1;
+    if (fstatat(dir_fd, name, &source, AT_SYMLINK_NOFOLLOW) != 0 ||
+        fstatat(dir_fd, quarantine, &captured, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(expected, &source) ||
+        !same_runtime_identity(expected, &captured) ||
+        !same_runtime_identity(&source, &captured)) {
+        int saved_errno = errno == 0 ? ESTALE : errno;
+        (void)unlink_ssh_runtime_identity_at(
+            dir_fd, quarantine, expected, true,
+            "failed portable reset quarantine rollback", NULL, NULL);
+        errno = saved_errno;
+        return -1;
+    }
+    if (sync_ssh_runtime_dir(
+            dir_fd, "portable reset quarantine publication") != 0) {
+        return -1; /* both names retain the exact same inode */
+    }
+    {
+        int remove_rc = unlink_ssh_runtime_identity_at(
+            dir_fd, name, expected, false,
+            "portable reset public-name removal", NULL, NULL);
+        if (remove_rc > 0) errno = ESTALE;
+        return remove_rc == 0 ? 0 : -1;
+    }
+}
+
+static int restore_ssh_reset_quarantine(
+    int dir_fd, const char *name, const char *quarantine,
+    const struct stat *identity) {
+    struct stat restored;
+    struct stat retirement_identity;
+    int retirement_rc;
+
+    if (!g_force_portable_quarantine) {
+#if defined(__linux__) && defined(SYS_renameat2)
+    if (syscall(SYS_renameat2, dir_fd, quarantine, dir_fd, name,
+                RENAME_NOREPLACE) == 0) {
+        return sync_ssh_runtime_dir(dir_fd,
+                                    "reset quarantine restoration");
+    }
+    if (errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP) {
+        return -1;
+    }
+#elif (defined(__APPLE__) || defined(__FreeBSD__)) && defined(RENAME_EXCL)
+    if (renameatx_np(dir_fd, quarantine, dir_fd, name, RENAME_EXCL) == 0) {
+        return sync_ssh_runtime_dir(dir_fd,
+                                    "reset quarantine restoration");
+    }
+    if (errno != ENOTSUP && errno != EOPNOTSUPP && errno != EINVAL) {
+        return -1;
+    }
+#endif
+    }
+
+    if (linkat(dir_fd, quarantine, dir_fd, name, 0) != 0 ||
+        fstatat(dir_fd, name, &restored, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(identity, &restored) ||
+        sync_ssh_runtime_dir(dir_fd,
+                            "portable reset quarantine restoration") != 0) {
+        return -1;
+    }
+    if (fstatat(dir_fd, quarantine, &retirement_identity,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        return -1;
+    }
+    retirement_rc = unlink_ssh_runtime_revision_at(
+        dir_fd, quarantine, &retirement_identity, NULL, name,
+        "portable reset quarantine retirement", g_reset_retire_hook, NULL);
+    return retirement_rc == 0 ? 0 : -1;
+}
+
+/* Remove exactly the inode classified by the reset transaction. A raced
+ * replacement is moved only long enough to identify it, then restored to its
+ * public name; it is never mistaken for the artifact that earned deletion
+ * authority. */
 static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                                     const char *display_path,
-                                    const char *description) {
-    int rc = unlink_ssh_runtime_entry(dir_fd, name, true, description);
-    if (rc != 0 && display_path) {
-        char detail[sizeof(g_last_error.message)];
-        safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-        set_error(ERR_FILE_IO, "%s: %s", detail, display_path);
+                                    const char *description,
+                                    const ssh_runtime_pin_t *pin,
+                                    bool expected_present) {
+    static unsigned long sequence;
+    char quarantine[96];
+    struct stat current;
+    struct stat captured;
+    struct stat published;
+    struct stat replacement;
+    int written;
+    int remove_rc;
+
+    if (!expected_present) {
+        if (fstatat(dir_fd, name, &current, AT_SYMLINK_NOFOLLOW) == 0) {
+            set_error(ERR_FILE_IO,
+                      "SSH reset artifact appeared during cleanup; replacement preserved: %s",
+                      display_path ? display_path : name);
+            return -1;
+        }
+        if (errno != ENOENT) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot confirm absent SSH reset artifact: %s",
+                             display_path ? display_path : name);
+            return -1;
+        }
+        return sync_ssh_runtime_dir(
+            dir_fd, description ? description : "reset artifact absence");
     }
-    return rc;
+    if (!pin) {
+        set_error(ERR_INVALID_ARGS,
+                  "Missing SSH reset artifact identity for cleanup");
+        return -1;
+    }
+    if (verify_ssh_runtime_pin_at(dir_fd, name, display_path, pin) != 0) {
+        return -1;
+    }
+    written = snprintf(quarantine, sizeof(quarantine),
+                       ".reset.cleanup.%ld.%lu", (long)getpid(), sequence++);
+    if (written < 0 || (size_t)written >= sizeof(quarantine)) {
+        set_error(ERR_INVALID_PATH, "SSH reset quarantine name is too long");
+        return -1;
+    }
+    if (quarantine_ssh_reset_entry(dir_fd, name, quarantine,
+                                   &pin->identity) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot quarantine SSH reset artifact: %s",
+                         display_path ? display_path : name);
+        return -1;
+    }
+    if (fstatat(dir_fd, quarantine, &captured, AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify quarantined SSH reset artifact: %s",
+                         display_path ? display_path : name);
+        return -1;
+    }
+    if (!same_runtime_identity(&pin->identity, &captured)) {
+        int restore_rc = restore_ssh_reset_quarantine(
+            dir_fd, name, quarantine, &captured);
+        set_error(ERR_FILE_IO,
+                  "SSH reset artifact changed before cleanup; replacement %s: %s",
+                  restore_rc == 0 ? "preserved" : "retained in quarantine",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    if (sync_ssh_runtime_dir(dir_fd,
+                            "reset artifact quarantine publication") != 0) {
+        char detail[sizeof(g_last_error.message)];
+        int restore_rc;
+
+        safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+        restore_rc = restore_ssh_reset_quarantine(
+            dir_fd, name, quarantine, &captured);
+        set_error(ERR_FILE_IO, "%s; artifact %s: %s", detail,
+                  restore_rc == 0 ? "restored" : "retained in quarantine",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    /* Directory synchronization can finalize BSD metadata. Capture the
+     * quiescent revision only after publication is durable, immediately
+     * before the retirement hook whose mutation it must detect. */
+    if (fstatat(dir_fd, quarantine, &published,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(&captured, &published) ||
+        !same_runtime_identity(&pin->identity, &published)) {
+        int restore_rc = restore_ssh_reset_quarantine(
+            dir_fd, name, quarantine, &captured);
+        set_error(ERR_FILE_IO,
+                  "SSH reset quarantine changed after publication; artifact %s: %s",
+                  restore_rc == 0 ? "restored" : "retained in quarantine",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    captured = published;
+    remove_rc = unlink_ssh_runtime_revision_at(
+        dir_fd, quarantine, &captured, pin, NULL,
+        description ? description : "owned reset artifact cleanup",
+        g_reset_retire_hook, &replacement);
+    if (remove_rc != 0) {
+        char detail[sizeof(g_last_error.message)];
+        int restore_rc;
+        const struct stat *restore_identity =
+            remove_rc > 0 ? &replacement : &captured;
+
+        safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+        restore_rc = restore_ssh_reset_quarantine(
+            dir_fd, name, quarantine, restore_identity);
+        set_error(ERR_FILE_IO, "%s; artifact %s: %s", detail,
+                  restore_rc == 0 ? "restored" : "retained in quarantine",
+                  display_path ? display_path : name);
+    }
+    return remove_rc == 0 ? 0 : -1;
 }
 
 /* Inspect current.sock without following it. Missing is success with
@@ -4727,13 +6201,11 @@ int ssh_manager_reset(const char *account) {
     bool absent = false;
     int dir_fd = -1;
 
-    /* Validate the name up front (the single-account branch uses it as a path
-     * component). Every loaded account already passed validate_name, so this is
-     * unreachable in practice — but guard it symmetrically with gpg_manager_reset(). */
-    if (account && *account &&
-        (strpbrk(account, "/\\") != NULL || strstr(account, "..") != NULL ||
-         account[0] == '.')) {
-        set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
+    /* NULL alone selects reset-all. Any non-NULL selector reaches filesystem
+     * path construction, so reject empty and otherwise invalid account names
+     * before opening or locking the runtime namespace. */
+    if (account && !validate_name(account)) {
+        set_error(ERR_INVALID_ARGS, "Invalid account name for reset");
         return -1;
     }
 
@@ -4754,8 +6226,13 @@ int ssh_manager_reset(const char *account) {
         set_system_error(ERR_FILE_IO, "Failed to lock SSH agent directory: %s", socket_dir);
         return -1;
     }
+    if (reconcile_ssh_runtime_pins(dir_fd, socket_dir) != 0) {
+        unlock_agent_dir(lock_fd);
+        close(dir_fd);
+        return ssh_reset_incomplete();
+    }
 
-    if (!account || !*account) {
+    if (!account) {
         int all_rc = kill_orphaned_gitswitch_agents(dir_fd, socket_dir, NULL);
         unlock_agent_dir(lock_fd);
         close(dir_fd);
@@ -4771,7 +6248,13 @@ int ssh_manager_reset(const char *account) {
     ssh_current_link_identity_t current_identity;
     bool failed = false;
     bool can_remove_runtime = true;
+    bool socket_present = false;
+    ssh_runtime_pin_t pid_pin;
+    ssh_runtime_pin_t socket_pin;
     pid_t pid = -1;
+
+    ssh_runtime_pin_init(&pid_pin);
+    ssh_runtime_pin_init(&socket_pin);
 
     if (reconcile_current_socket_quarantines(dir_fd, socket_dir) != 0) {
         failed = true;
@@ -4793,37 +6276,102 @@ int ssh_manager_reset(const char *account) {
         return -1;
     }
 
-    int pid_rc = read_ssh_agent_pid_at(dir_fd, pid_name, pid_path, &pid);
+    int socket_rc = pin_ssh_runtime_entry_at(
+        dir_fd, sock_name, sock_path, &socket_pin);
+    if (socket_rc == 0) {
+        socket_present = true;
+    } else if (socket_rc < 0) {
+        failed = true;
+        can_remove_runtime = false;
+    }
+
+    int pid_rc = read_ssh_agent_pid_at(dir_fd, pid_name, pid_path, &pid,
+                                       &pid_pin);
     if (pid_rc < 0) {
         failed = true;
         can_remove_runtime = false;
     } else if (pid_rc == 0) {
-        if (!g_ssh_reap(pid, sock_path)) {
-            set_error(ERR_SSH_AGENT_FAILED,
-                      "SSH agent PID %ld survived teardown; retained for retry",
-                      (long)pid);
+        ssh_process_outcome_t reap_outcome;
+        if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
             failed = true;
             can_remove_runtime = false;
-        } else if (unlink_ssh_reset_path_at(dir_fd, pid_name, pid_path,
-                                            "SSH agent PID sidecar") != 0) {
+        }
+        reap_outcome = can_remove_runtime
+                           ? g_ssh_reap(pid, sock_path, dir_fd)
+                           : SSH_PROCESS_INDETERMINATE;
+        if (can_remove_runtime &&
+            verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
             failed = true;
+            can_remove_runtime = false;
+        }
+        if (!ssh_reap_allows_cleanup(reap_outcome)) {
+            if (can_remove_runtime) {
+                set_error(ERR_SSH_AGENT_FAILED,
+                          "SSH agent PID %ld reap outcome %s; retained for retry",
+                          (long)pid, ssh_process_outcome_name(reap_outcome));
+            }
+            failed = true;
+            can_remove_runtime = false;
+        } else if (can_remove_runtime &&
+                   unlink_ssh_reset_path_at(dir_fd, pid_name, pid_path,
+                                            "SSH agent PID sidecar",
+                                            &pid_pin,
+                                            true) != 0) {
+            failed = true;
+            can_remove_runtime = false;
+        }
+        if (can_remove_runtime && socket_present) {
+            struct stat after_reap;
+
+            /* A real ssh-agent removes its listening socket while exiting.
+             * Refresh only the presence bit after the cleanup-authorizing
+             * reap: if any entry remains, keep the original identity so the
+             * quarantine path detects and preserves a raced replacement. If
+             * it is absent, unlink_ssh_reset_path_at performs a second
+             * descriptor-relative absence proof before reporting success. */
+            if (fstatat(dir_fd, sock_name, &after_reap,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno == ENOENT) {
+                    socket_present = false;
+                } else {
+                    set_system_error(
+                        ERR_FILE_IO,
+                        "Cannot refresh SSH agent socket after reap: %s",
+                        sock_path);
+                    failed = true;
+                    can_remove_runtime = false;
+                }
+            }
         }
     }
 
     /* A missing sidecar is idempotent only when the socket is absent or
      * provably stale. Apply the same proof after a recorded PID was classified
-     * dead/not-ours: a stale sidecar can coexist with a different live agent
-     * on the managed socket, so reap_ssh_agent()==true alone is insufficient
-     * authority to unlink the runtime entry point. */
+     * GONE/UNRELATED: a stale sidecar can coexist with a different live agent
+     * on the managed socket, so a cleanup-authorizing process outcome alone
+     * is insufficient authority to unlink the runtime entry point. */
     if (can_remove_runtime) {
         bool reachable = false;
-        if (probe_ssh_agent_socket(sock_path, &reachable) != 0) {
+        if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
+            probe_ssh_agent_socket(sock_path, &reachable) != 0 ||
+            verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
             failed = true;
             can_remove_runtime = false;
         } else if (reachable) {
             set_error(ERR_SSH_AGENT_FAILED,
                       "Reachable SSH agent socket has no safely matched PID; "
                       "retained for retry: %s", sock_path);
+            failed = true;
+            can_remove_runtime = false;
+        }
+    }
+    if (can_remove_runtime && pid_rc > 0) {
+        struct stat appeared;
+        if (fstatat(dir_fd, pid_name, &appeared,
+                    AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+            set_error(ERR_FILE_IO,
+                      "SSH PID sidecar appeared during reset; replacement retained: %s",
+                      pid_path);
             failed = true;
             can_remove_runtime = false;
         }
@@ -4839,7 +6387,8 @@ int ssh_manager_reset(const char *account) {
             failed = true;
         }
         if (unlink_ssh_reset_path_at(dir_fd, sock_name, sock_path,
-                                     "SSH agent socket") != 0) {
+                                     "SSH agent socket", &socket_pin,
+                                     socket_present) != 0) {
             failed = true;
         } else if (current_matches &&
                    remove_current_socket_link_if_unchanged(
@@ -4856,6 +6405,8 @@ int ssh_manager_reset(const char *account) {
         failed = true;
     }
 
+    if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
+    if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) failed = true;
     unlock_agent_dir(lock_fd);
     close(dir_fd);
     return failed ? ssh_reset_incomplete() : 0;
@@ -4940,8 +6491,10 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         /* The socket this agent was started on (ssh-agent.<name>.sock), used
          * to confirm the recorded PID is genuinely our agent. */
         char sock_full[MAX_PATH_LEN];
+        ssh_runtime_pin_t pid_pin;
         int sw = snprintf(sock_full, sizeof(sock_full), "%s/%.*ssock",
                           socket_dir, (int)(nlen - 3), name);
+        ssh_runtime_pin_init(&pid_pin);
         if (sw <= 0 || (size_t)sw >= sizeof(sock_full)) {
             set_error(ERR_INVALID_PATH, "SSH cleanup socket path too long: %s", name);
             failed = true;
@@ -4949,7 +6502,8 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         }
 
         pid_t pid = -1;
-        int pid_rc = read_ssh_agent_pid_at(dir_fd, name, full, &pid);
+        int pid_rc = read_ssh_agent_pid_at(dir_fd, name, full, &pid,
+                                           &pid_pin);
         if (pid_rc != 0) {
             if (pid_rc > 0) {
                 set_error(ERR_FILE_IO,
@@ -4958,18 +6512,33 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             failed = true;
             continue;
         }
-        if (!g_ssh_reap(pid, sock_full)) {
-            set_error(ERR_SSH_AGENT_FAILED,
-                      "SSH agent PID %ld survived teardown; retained for retry",
-                      (long)pid);
+        if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
             failed = true;
+            if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
+            continue;
+        }
+        ssh_process_outcome_t reap_outcome = g_ssh_reap(
+            pid, sock_full, dir_fd);
+        if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
+            failed = true;
+            if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
+            continue;
+        }
+        if (!ssh_reap_allows_cleanup(reap_outcome)) {
+            set_error(ERR_SSH_AGENT_FAILED,
+                      "SSH agent PID %ld reap outcome %s; retained for retry",
+                      (long)pid, ssh_process_outcome_name(reap_outcome));
+            failed = true;
+            if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
             continue;
         }
         log_debug("Reaped orphaned ssh-agent PID %ld", (long)pid);
         if (unlink_ssh_reset_path_at(dir_fd, name, full,
-                                     "SSH agent PID sidecar") != 0) {
+                                     "SSH agent PID sidecar", &pid_pin,
+                                     true) != 0) {
             failed = true;
         }
+        if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
     }
     if (closedir(d) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to close SSH agent directory: %s", socket_dir);
@@ -5001,6 +6570,9 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         const char *name = ent->d_name;
         size_t nlen = strlen(name);
         char full[MAX_PATH_LEN];
+        ssh_runtime_pin_t artifact_pin;
+
+        ssh_runtime_pin_init(&artifact_pin);
 
         if (strncmp(name, "ssh-agent.", 10) != 0 ||
             (nlen > 4 && strcmp(name + nlen - 4, ".pid") == 0)) {
@@ -5014,6 +6586,11 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             failed = true;
             continue;
         }
+        if (pin_ssh_runtime_entry_at(dir_fd, name, full,
+                                     &artifact_pin) != 0) {
+            failed = true;
+            continue;
+        }
 
         if (nlen > 5 && strcmp(name + nlen - 5, ".sock") == 0) {
             char pid_full[MAX_PATH_LEN];
@@ -5023,6 +6600,9 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             if (pw <= 0 || (size_t)pw >= sizeof(pid_full)) {
                 set_error(ERR_INVALID_PATH, "SSH cleanup PID path too long: %s", name);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
             char pid_name[MAX_NAME_LEN + 16];
@@ -5032,15 +6612,24 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                 set_error(ERR_INVALID_PATH,
                           "SSH cleanup PID name too long: %s", name);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
             if (fstatat(dir_fd, pid_name, &pst, AT_SYMLINK_NOFOLLOW) == 0) {
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue; /* survivor/invalid sidecar: retain its socket */
             }
             if (errno != ENOENT) {
                 set_system_error(ERR_FILE_IO,
                                  "Cannot inspect SSH cleanup sidecar: %s", pid_full);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
 
@@ -5048,8 +6637,13 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
              * reachable listener cannot be reaped safely without its PID, and
              * an indeterminate probe is equally non-destructive. */
             bool reachable = false;
-            if (probe_ssh_agent_socket(full, &reachable) != 0) {
+            if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0 ||
+                probe_ssh_agent_socket(full, &reachable) != 0 ||
+                verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
             if (reachable) {
@@ -5057,13 +6651,19 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                           "Live SSH agent socket has no PID sidecar; retained for retry: %s",
                           full);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
         }
         if (unlink_ssh_reset_path_at(dir_fd, name, full,
-                                     "SSH agent artifact") != 0) {
+                                     "SSH agent artifact",
+                                     &artifact_pin,
+                                     true) != 0) {
             failed = true;
         }
+        if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) failed = true;
     }
     if (closedir(d) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to close SSH agent directory: %s", socket_dir);
@@ -5100,7 +6700,8 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             retain_current = true;
         } else if (failed) {
             struct stat target_entry;
-            if (lstat(current_identity.target, &target_entry) == 0) {
+            if (fstatat(dir_fd, component, &target_entry,
+                        AT_SYMLINK_NOFOLLOW) == 0) {
                 retain_current = true;
             }
         }

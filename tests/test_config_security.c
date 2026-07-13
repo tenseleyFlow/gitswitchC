@@ -8,6 +8,7 @@
  *   rejected at config load / account validation, never handed to display. */
 #include "test.h"
 #include "gitswitch.h"
+#include "accounts.h"
 #include "config.h"
 #include "toml_parser.h"
 #include "signals.h"
@@ -90,6 +91,69 @@ static void fill_account(account_t *a, uint32_t id, const char *name,
     a->preferred_scope = GIT_SCOPE_LOCAL;
 }
 
+typedef enum {
+    INVALID_SSH_ENABLED_WITHOUT_KEY = 0,
+    INVALID_SSH_DISABLED_WITH_KEY,
+    INVALID_SSH_DISABLED_WITH_ALIAS,
+    INVALID_SSH_DISABLED_WITH_HOSTNAME,
+    INVALID_GPG_ENABLED_WITHOUT_KEY,
+    INVALID_GPG_DISABLED_WITH_KEY,
+    INVALID_GPG_DISABLED_WITH_SIGNING
+} invalid_account_model_t;
+
+static void fill_invalid_account_model(account_t *account,
+                                       invalid_account_model_t invalid,
+                                       const char *ssh_key) {
+    fill_account(account, 1, "invalid", "invalid@example.com", "invalid");
+    switch (invalid) {
+        case INVALID_SSH_ENABLED_WITHOUT_KEY:
+            account->ssh_enabled = true;
+            break;
+        case INVALID_SSH_DISABLED_WITH_KEY:
+            strncpy(account->ssh_key_path, ssh_key,
+                    sizeof(account->ssh_key_path) - 1U);
+            break;
+        case INVALID_SSH_DISABLED_WITH_ALIAS:
+            strncpy(account->ssh_host_alias, "github-work",
+                    sizeof(account->ssh_host_alias) - 1U);
+            break;
+        case INVALID_SSH_DISABLED_WITH_HOSTNAME:
+            strncpy(account->ssh_hostname, "github.com",
+                    sizeof(account->ssh_hostname) - 1U);
+            break;
+        case INVALID_GPG_ENABLED_WITHOUT_KEY:
+            account->gpg_enabled = true;
+            break;
+        case INVALID_GPG_DISABLED_WITH_KEY:
+            strncpy(account->gpg_key_id, "ABCDEF0123456789",
+                    sizeof(account->gpg_key_id) - 1U);
+            break;
+        case INVALID_GPG_DISABLED_WITH_SIGNING:
+            account->gpg_signing_enabled = true;
+            break;
+        default:
+            break;
+    }
+}
+
+static void seed_three_accounts(gitswitch_ctx_t *ctx) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->config.default_scope = GIT_SCOPE_LOCAL;
+    fill_account(&ctx->accounts[0], 1, "before", "before@x.com", "before");
+    fill_account(&ctx->accounts[1], 2, "current-old", "current@x.com", "current");
+    fill_account(&ctx->accounts[2], 3, "after", "after@x.com", "after");
+    ctx->account_count = 3;
+    ctx->current_account = &ctx->accounts[1];
+}
+
+static bool current_pointer_is_valid(const gitswitch_ctx_t *ctx) {
+    if (!ctx->current_account) return true;
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (ctx->current_account == &ctx->accounts[i]) return true;
+    }
+    return false;
+}
+
 static size_t count_occurrences(const char *haystack, const char *needle) {
     size_t count = 0;
     size_t needle_len = strlen(needle);
@@ -100,6 +164,39 @@ static size_t count_occurrences(const char *haystack, const char *needle) {
         haystack += needle_len;
     }
     return count;
+}
+
+static const char *growth_hook_path;
+static bool growth_hook_ran;
+
+static bool append_after_prefix_read(config_io_boundary_t boundary) {
+    static const char appended_account[] =
+        "\n[accounts.2]\n"
+        "name = \"bob\"\n"
+        "email = \"b@b.com\"\n";
+    int fd;
+    size_t total = 0;
+
+    if (boundary != CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ || growth_hook_ran) {
+        return false;
+    }
+    growth_hook_ran = true;
+    fd = open(growth_hook_path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0) return false;
+    while (total < sizeof(appended_account) - 1U) {
+        ssize_t written = write(fd, appended_account + total,
+                                sizeof(appended_account) - 1U - total);
+        if (written > 0) {
+            total += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    (void)fsync(fd);
+    close(fd);
+    return false;
 }
 
 /* ---- cfg-symlink-01/02: read path ---- */
@@ -118,6 +215,195 @@ TEST(load_accepts_regular_file) {
         CHECK_STR_EQ(ctx.accounts[0].name, "alice");
         CHECK_EQ_INT(ctx.accounts[0].id, 1);
     }
+}
+
+TEST(load_rejects_file_growth_after_prefix_read) {
+    char dir[128], path[256], contents[1024];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, valid_config, strlen(valid_config)), 0);
+
+    growth_hook_path = path;
+    growth_hook_ran = false;
+    config_set_io_fault_fn(append_after_prefix_read);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), -1); /* pre-fix: accepted alice only */
+    config_set_io_fault_fn(NULL);
+
+    CHECK(growth_hook_ran);
+    CHECK(slurp(path, contents, sizeof(contents)) > 0);
+    CHECK(strstr(contents, "[accounts.2]") != NULL);
+}
+
+TEST(system_scope_is_rejected_before_admission_or_persistence) {
+    char dir[128], account_dir[256];
+    char default_path[512], account_path[512];
+    char default_hint[512], account_hint[512];
+    gitswitch_ctx_t ctx;
+    account_t local, system, before;
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&system, 1, "alice", "a@b.com", "day job");
+    system.preferred_scope = GIT_SCOPE_SYSTEM;
+    CHECK_EQ_INT(config_add_account(&ctx, &system), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&local, 1, "alice", "a@b.com", "day job");
+    CHECK_EQ_INT(config_add_account(&ctx, &local), 0);
+    before = ctx.accounts[0];
+    CHECK_EQ_INT(config_update_account(&ctx, &system), -1); /* pre-fix: 0 */
+    CHECK(memcmp(&ctx.accounts[0], &before, sizeof(before)) == 0);
+
+    ctx.config.default_scope = GIT_SCOPE_SYSTEM;
+    CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx.accounts[0] = system;
+    CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(join_path(default_path, sizeof(default_path), dir,
+                           "/default.toml"), 0);
+    CHECK_EQ_INT(join_path(default_hint, sizeof(default_hint), dir,
+                           "/.resume-hint"), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_SYSTEM;
+    CHECK_EQ_INT(config_save(&ctx, default_path), -1); /* pre-fix: 0 */
+    CHECK(access(default_path, F_OK) != 0);
+    CHECK(access(default_hint, F_OK) != 0);
+
+    /* Use a separate private directory so an accidental resume-hint write by
+     * the first save cannot mask whether the account-scope save was pure. */
+    CHECK_EQ_INT(join_path(account_dir, sizeof(account_dir), dir,
+                           "/account-dir"), 0);
+    CHECK_EQ_INT(mkdir(account_dir, 0700), 0);
+    CHECK_EQ_INT(join_path(account_path, sizeof(account_path), account_dir,
+                           "/account.toml"), 0);
+    CHECK_EQ_INT(join_path(account_hint, sizeof(account_hint), account_dir,
+                           "/.resume-hint"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx.accounts[0] = system;
+    ctx.account_count = 1;
+    CHECK_EQ_INT(config_save(&ctx, account_path), -1); /* pre-fix: 0 */
+    CHECK(access(account_path, F_OK) != 0);
+    CHECK(access(account_hint, F_OK) != 0);
+}
+
+TEST(zero_account_id_is_rejected_before_mutation_or_persistence) {
+    char dir[128], path[512], hint[512];
+    gitswitch_ctx_t ctx;
+    account_t zero, changed, before;
+
+    fill_account(&zero, 0, "zero", "zero@x.com", "zero");
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(config_add_account(&ctx, &zero), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx.accounts[0] = zero;
+    ctx.account_count = 1;
+    before = ctx.accounts[0];
+    changed = zero;
+    snprintf(changed.name, sizeof(changed.name), "zero-changed");
+    CHECK_EQ_INT(config_update_account(&ctx, &changed), -1); /* pre-fix: 0 */
+    CHECK(memcmp(&ctx.accounts[0], &before, sizeof(before)) == 0);
+    CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(join_path(path, sizeof(path), dir, "/accounts.toml"), 0);
+    CHECK_EQ_INT(join_path(hint, sizeof(hint), dir, "/.resume-hint"), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), -1); /* pre-fix: emits accounts.0 */
+    CHECK(access(path, F_OK) != 0);
+    CHECK(access(hint, F_OK) != 0);
+}
+
+TEST(current_pointer_rebinds_after_direct_array_compaction) {
+    gitswitch_ctx_t ctx;
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(config_remove_account(&ctx, 1), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(config_remove_account(&ctx, 2), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == NULL);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(config_remove_account(&ctx, 3), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+}
+
+TEST(current_pointer_rebinds_by_id_across_reloads) {
+    static const char reordered_and_replaced[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n"
+        "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n"
+        "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n";
+    static const char removed_before[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n"
+        "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n";
+    static const char removed_current[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n"
+        "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n";
+    static const char removed_after[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n"
+        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n";
+    const char *old_runtime = getenv("XDG_RUNTIME_DIR");
+    bool had_runtime = old_runtime != NULL;
+    char saved_runtime[MAX_PATH_LEN] = "";
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+
+    if (had_runtime) snprintf(saved_runtime, sizeof(saved_runtime), "%s", old_runtime);
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, reordered_and_replaced,
+                              sizeof(reordered_and_replaced) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+    if (ctx.current_account) CHECK_STR_EQ(ctx.current_account->name, "current-new");
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, removed_before, sizeof(removed_before) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, removed_current, sizeof(removed_current) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == NULL);
+
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, removed_after, sizeof(removed_after) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+
+    if (had_runtime) setenv("XDG_RUNTIME_DIR", saved_runtime, 1);
+    else unsetenv("XDG_RUNTIME_DIR");
 }
 
 TEST(load_rejects_symlinked_config) {
@@ -338,6 +624,58 @@ static int config_lock_child_contended(void) {
     return WEXITSTATUS(status);
 }
 
+/* AR-08 L7: config_write_lock exposes the shared private-lock token. If a
+ * caller closes that opaque handle and the fd number is reused, unlock must
+ * preserve the replacement while still retiring every lock reference. */
+TEST(config_lock_release_preserves_reused_fd_and_retires_context) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char lock_path[640];
+    int token = -1;
+    int replacement = -1;
+    bool released = false;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(lock_path, sizeof(lock_path), "%s/.config.lock", config_dir);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    token = config_write_lock();
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+    close(token);
+    replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    CHECK(replacement >= 0);
+    if (replacement < 0) goto cleanup;
+    if (replacement != token) {
+        CHECK_EQ_INT(dup2(replacement, token), token);
+        close(replacement);
+        replacement = token;
+        CHECK_EQ_INT(fcntl(replacement, F_SETFD, FD_CLOEXEC), 0);
+    }
+
+    errno = ENOTTY;
+    config_write_unlock(token);
+    released = true;
+    CHECK_EQ_INT(errno, ENOTTY);
+    CHECK(fcntl(replacement, F_GETFD) >= 0);
+    /* The existing helper exits 1 when it acquired. An identity-mismatch
+     * early return would leave the parent's registry lock held and yield 0. */
+    CHECK_EQ_INT(config_lock_child_contended(), 1);
+
+cleanup:
+    if (!released && token >= 0) config_write_unlock(token);
+    if (replacement >= 0) close(replacement);
+    (void)unlink(lock_path);
+    (void)rmdir(config_dir);
+    (void)rmdir(dotconfig);
+    (void)rmdir(home);
+    restore_home_env(saved_home);
+}
+
 TEST(config_lock_survives_post_acquisition_namespace_replacement) {
     char home[128], saved_home[512], dotconfig[256], config_dir[512];
     char moved_dir[512], lock[640], moved_lock[640];
@@ -510,6 +848,181 @@ TEST(save_and_reload_regular_path_roundtrip) {
     CHECK_EQ_INT(config_save(&ctx, path), -1);
 }
 
+TEST(account_model_invariant_blocks_lossy_states_before_mutation) {
+    char dir[128], path[256], key[256];
+    char before[4096], after[4096];
+    gitswitch_ctx_t baseline;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_model", dir);
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") -
+                         1U),
+                 0);
+
+    memset(&baseline, 0, sizeof(baseline));
+    baseline.config.default_scope = GIT_SCOPE_LOCAL;
+    fill_account(&baseline.accounts[0], 1, "baseline",
+                 "baseline@example.com", "baseline");
+    baseline.account_count = 1;
+    CHECK_EQ_INT(config_save(&baseline, path), 0);
+    CHECK(slurp(path, before, sizeof(before)) > 0);
+
+    for (int invalid = INVALID_SSH_ENABLED_WITHOUT_KEY;
+         invalid <= INVALID_GPG_DISABLED_WITH_SIGNING; invalid++) {
+        gitswitch_ctx_t api;
+        gitswitch_ctx_t direct;
+        account_t account;
+
+        fill_invalid_account_model(&account,
+                                   (invalid_account_model_t)invalid, key);
+        memset(&api, 0, sizeof(api));
+        CHECK_EQ_INT(config_add_account(&api, &account), -1);
+        CHECK_EQ_INT(api.account_count, 0);
+        CHECK_EQ_INT(accounts_validate(&account), -1);
+
+        memset(&direct, 0, sizeof(direct));
+        direct.config.default_scope = GIT_SCOPE_LOCAL;
+        direct.accounts[0] = account;
+        direct.account_count = 1;
+        CHECK_EQ_INT(config_validate(&direct), -1);
+        CHECK_EQ_INT(config_save(&direct, path), -1);
+        CHECK(slurp(path, after, sizeof(after)) > 0);
+        CHECK_STR_EQ(after, before);
+    }
+
+    {
+        gitswitch_ctx_t api;
+        account_t account;
+
+        memset(&api, 0, sizeof(api));
+        fill_account(&account, 1, "legacy-api", "legacy@example.com",
+                     "legacy api");
+        account.ssh_enabled = true;
+        strncpy(account.ssh_key_path, key,
+                sizeof(account.ssh_key_path) - 1U);
+        strncpy(account.ssh_host_alias, "git.example.test",
+                sizeof(account.ssh_host_alias) - 1U);
+        CHECK_EQ_INT(config_add_account(&api, &account), 0);
+        CHECK_EQ_INT(api.account_count, 1);
+        if (api.account_count == 1) {
+            CHECK_STR_EQ(api.accounts[0].ssh_hostname, "git.example.test");
+
+            /* Admission normalizes the legacy literal form. A hand-built
+             * context that bypasses admission must not be changed while it is
+             * being saved. */
+            api.accounts[0].ssh_hostname[0] = '\0';
+            CHECK_EQ_INT(config_validate(&api), -1);
+            CHECK_EQ_INT(config_save(&api, path), -1);
+            CHECK(slurp(path, after, sizeof(after)) > 0);
+            CHECK_STR_EQ(after, before);
+        }
+    }
+
+    {
+        gitswitch_ctx_t api;
+        account_t account;
+
+        memset(&api, 0, sizeof(api));
+        fill_account(&account, 1, "wildcard", "wildcard@example.com",
+                     "wildcard");
+        account.ssh_enabled = true;
+        strncpy(account.ssh_key_path, key,
+                sizeof(account.ssh_key_path) - 1U);
+        strncpy(account.ssh_host_alias, "github-*",
+                sizeof(account.ssh_host_alias) - 1U);
+        CHECK_EQ_INT(config_add_account(&api, &account), -1);
+        CHECK_EQ_INT(api.account_count, 0);
+    }
+}
+
+TEST(account_model_admitted_states_roundtrip_exactly) {
+    typedef struct {
+        bool ssh_enabled;
+        const char *ssh_alias;
+        const char *ssh_hostname;
+        bool gpg_enabled;
+        bool gpg_signing_enabled;
+    } model_case_t;
+    static const model_case_t cases[] = {
+        {false, NULL, NULL, false, false},
+        {true, NULL, NULL, false, false},
+        {true, NULL, "github.com", false, false},
+        {true, "github-work", "github.com", false, false},
+        {false, NULL, NULL, true, false},
+        {false, NULL, NULL, true, true},
+        {true, "github-work", "github.com", true, true},
+    };
+    char dir[128], path[256], key[256];
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_roundtrip", dir);
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") -
+                         1U),
+                 0);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        gitswitch_ctx_t ctx;
+        gitswitch_ctx_t reloaded;
+        account_t account;
+
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.config.default_scope = GIT_SCOPE_LOCAL;
+        fill_account(&account, 1, "roundtrip", "roundtrip@example.com",
+                     "roundtrip");
+        if (cases[i].ssh_enabled) {
+            account.ssh_enabled = true;
+            strncpy(account.ssh_key_path, key,
+                    sizeof(account.ssh_key_path) - 1U);
+        }
+        if (cases[i].ssh_alias) {
+            strncpy(account.ssh_host_alias, cases[i].ssh_alias,
+                    sizeof(account.ssh_host_alias) - 1U);
+        }
+        if (cases[i].ssh_hostname) {
+            strncpy(account.ssh_hostname, cases[i].ssh_hostname,
+                    sizeof(account.ssh_hostname) - 1U);
+        }
+        if (cases[i].gpg_enabled) {
+            account.gpg_enabled = true;
+            strncpy(account.gpg_key_id, "ABCDEF0123456789",
+                    sizeof(account.gpg_key_id) - 1U);
+        }
+        account.gpg_signing_enabled = cases[i].gpg_signing_enabled;
+
+        CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+        CHECK_EQ_INT(ctx.account_count, 1);
+        CHECK_EQ_INT(config_save(&ctx, path), 0);
+
+        memset(&reloaded, 0, sizeof(reloaded));
+        CHECK_EQ_INT(config_load(&reloaded, path), 0);
+        CHECK_EQ_INT(reloaded.account_count, 1);
+        if (ctx.account_count == 1 && reloaded.account_count == 1) {
+            CHECK_EQ_INT(reloaded.accounts[0].ssh_enabled,
+                         ctx.accounts[0].ssh_enabled);
+            CHECK_STR_EQ(reloaded.accounts[0].ssh_key_path,
+                         ctx.accounts[0].ssh_key_path);
+            CHECK_STR_EQ(reloaded.accounts[0].ssh_host_alias,
+                         ctx.accounts[0].ssh_host_alias);
+            CHECK_STR_EQ(reloaded.accounts[0].ssh_hostname,
+                         ctx.accounts[0].ssh_hostname);
+            CHECK_EQ_INT(reloaded.accounts[0].gpg_enabled,
+                         ctx.accounts[0].gpg_enabled);
+            CHECK_EQ_INT(reloaded.accounts[0].gpg_signing_enabled,
+                         ctx.accounts[0].gpg_signing_enabled);
+            CHECK_STR_EQ(reloaded.accounts[0].gpg_key_id,
+                         ctx.accounts[0].gpg_key_id);
+        }
+    }
+}
+
 /* ---- AR-07 M13 prerequisite: alias and canonical host are distinct ------ */
 
 TEST(ssh_hostname_load_save_and_shared_destination_roundtrip) {
@@ -671,10 +1184,19 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
         "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
         "*.example.com", "host?", "h\xC3\xB6st.example", NULL
     };
-    char dir[128], path[256];
+    char dir[128], path[256], key[256];
     gitswitch_ctx_t ctx;
     account_t account;
 
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_hostname", dir);
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") -
+                         1U),
+                 0);
     CHECK(strstr(default_config_template,
                  "#ssh_host = \"github.com-work\"") != NULL);
     CHECK(strstr(default_config_template,
@@ -687,6 +1209,9 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
         CHECK(!toml_validate_ssh_hostname(invalid[i]));
         memset(&ctx, 0, sizeof(ctx));
         fill_account(&account, 1, "bad-host", "bad@example.com", "d");
+        account.ssh_enabled = true;
+        strncpy(account.ssh_key_path, key,
+                sizeof(account.ssh_key_path) - 1U);
         strncpy(account.ssh_hostname, invalid[i],
                 sizeof(account.ssh_hostname) - 1);
         CHECK_EQ_INT(config_add_account(&ctx, &account), -1);
@@ -696,10 +1221,16 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     /* Canonical destinations are deliberately not unique account resources. */
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&account, 1, "one", "one@example.com", "d");
+    account.ssh_enabled = true;
+    strncpy(account.ssh_key_path, key,
+            sizeof(account.ssh_key_path) - 1U);
     strncpy(account.ssh_hostname, "github.com",
             sizeof(account.ssh_hostname) - 1);
     CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
     fill_account(&account, 2, "two", "two@example.com", "d");
+    account.ssh_enabled = true;
+    strncpy(account.ssh_key_path, key,
+            sizeof(account.ssh_key_path) - 1U);
     strncpy(account.ssh_hostname, "github.com",
             sizeof(account.ssh_hostname) - 1);
     CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
@@ -707,8 +1238,6 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
 
     /* The parser's modeled schema must reject the wrong TOML type rather
      * than let retrieval treat a present key as absent. */
-    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
-    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
     {
         const char *wrong_type =
             "[settings]\n"
@@ -1424,6 +1953,64 @@ TEST(add_rejects_ssh_key_path_over_256_chars_api) {
     CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_INVALID);
 }
 
+/* AR-08 L5 integration: a caller may repair a schema-skipped document in
+ * memory and persist it. Revalidation must clear the stale visibility state
+ * before the repaired document is written and loaded through config.c. */
+TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[256];
+    char key[256];
+    char longpath[302];
+    char src[1024];
+    char visible_name[64] = "";
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK(snprintf(path, sizeof(path), "%s/accounts.toml", dir) <
+          (int)sizeof(path));
+    CHECK(snprintf(key, sizeof(key), "%s/id_repaired", dir) <
+          (int)sizeof(key));
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1),
+                 0);
+
+    longpath[0] = '/';
+    memset(longpath + 1, 'b', sizeof(longpath) - 2);
+    longpath[sizeof(longpath) - 1] = '\0';
+    CHECK(snprintf(src, sizeof(src),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"repaired\"\n"
+                   "email = \"repaired@example.com\"\n"
+                   "ssh_key = \"%s\"\n",
+                   longpath) < (int)sizeof(src));
+
+    CHECK_EQ_INT(toml_parse_string(src, strlen(src), &doc), 0);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", visible_name,
+                                 sizeof(visible_name)), -1);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "ssh_key", key), 0);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", visible_name,
+                                 sizeof(visible_name)), 0);
+    CHECK_STR_EQ(visible_name, "repaired");
+    CHECK_EQ_INT(toml_write_file(&doc, path), 0);
+    toml_cleanup_document(&doc);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 0);
+    if (ctx.account_count == 1) {
+        CHECK_STR_EQ(ctx.accounts[0].name, "repaired");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, key);
+        CHECK(ctx.accounts[0].ssh_enabled);
+    }
+}
+
 /* ---- AR-03 M6 follow-through: the write gate matches the read gate ------- */
 
 TEST(add_rejects_values_that_cannot_roundtrip) {
@@ -1506,16 +2093,24 @@ TEST_MAIN_BEGIN()
     RUN_TEST(back_to_back_backups_in_same_second_both_persist);
     RUN_TEST(destructive_resolution_refuses_substring);
     RUN_TEST(load_accepts_regular_file);
+    RUN_TEST(load_rejects_file_growth_after_prefix_read);
+    RUN_TEST(system_scope_is_rejected_before_admission_or_persistence);
+    RUN_TEST(zero_account_id_is_rejected_before_mutation_or_persistence);
+    RUN_TEST(current_pointer_rebinds_after_direct_array_compaction);
+    RUN_TEST(current_pointer_rebinds_by_id_across_reloads);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
     RUN_TEST(config_init_rejects_nondirectory_final_components);
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
     RUN_TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode);
+    RUN_TEST(config_lock_release_preserves_reused_fd_and_retires_context);
     RUN_TEST(config_lock_survives_post_acquisition_namespace_replacement);
     RUN_TEST(config_init_preserves_symlinked_parent_policy);
     RUN_TEST(save_refuses_symlinked_config_path);
     RUN_TEST(backup_refuses_symlinked_source);
     RUN_TEST(save_and_reload_regular_path_roundtrip);
+    RUN_TEST(account_model_invariant_blocks_lossy_states_before_mutation);
+    RUN_TEST(account_model_admitted_states_roundtrip_exactly);
     RUN_TEST(ssh_hostname_load_save_and_shared_destination_roundtrip);
     RUN_TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized);
     RUN_TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname);
@@ -1538,5 +2133,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(resume_hint_reflects_account_runtime_needs);
     RUN_TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically);
     RUN_TEST(add_rejects_ssh_key_path_over_256_chars_api);
+    RUN_TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip);
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
 TEST_MAIN_END()

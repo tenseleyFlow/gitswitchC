@@ -35,30 +35,78 @@ SRCDIR = src
 BUILDDIR = build
 OBJDIR = $(BUILDDIR)/obj
 BINDIR = $(BUILDDIR)/bin
+# Release publication is a security boundary, not a caller-selected build
+# output. Keep its host helper in one untracked namespace even when ordinary
+# build directories are redirected by a packager.
+override TOOLBUILDDIR := build/tools
 TESTDIR = tests
 DOCDIR = docs
+HOSTCC ?= cc
 
-# Platform detection
-UNAME_S := $(shell uname -s)
-UNAME_M := $(shell uname -m)
+# Compiler identity and target policy. Hardening follows the compiler's target,
+# never the machine running Make. The launcher itself is content-fingerprinted
+# so an in-place wrapper/toolchain policy change invalidates every shared
+# object. Multi-launcher commands (for example, ccache plus a compiler) may set
+# TOOLCHAIN_IDENTITY_FILES to the complete whitespace-free path list.
+CC = gcc
+CC_LAUNCHER := $(firstword $(CC))
+# macOS still ships GNU make 3.81, whose parser treats an unescaped `#` inside
+# $(shell ...) as a comment. Use the already-required POSIX sed instead of
+# ${p##*/} here, without adding another parse-time tool dependency.
+CC_RESOLVED_DEFAULT := $(shell p=`command -v "$(CC_LAUNCHER)" 2>/dev/null` || exit 0; \
+	d=$${p%/*}; b=`printf '%s\n' "$$p" | sed 's,.*/,,'`; \
+	if test "$$d" = "$$p"; then d=.; b=$$p; fi; \
+	cd "$$d" 2>/dev/null && printf '%s/%s' "$$PWD" "$$b")
+CC_IDENTITY_FILE ?= $(CC_RESOLVED_DEFAULT)
+TOOLCHAIN_IDENTITY_FILES ?= $(CC_IDENTITY_FILE)
+TOOLCHAIN_FILE_FINGERPRINT := $(shell set -e; \
+	for f in $(TOOLCHAIN_IDENTITY_FILES); do \
+		test -f "$$f" || exit 1; \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			digest=`sha256sum "$$f" | awk '{print $$1}'`; \
+		elif command -v shasum >/dev/null 2>&1; then \
+			digest=`shasum -a 256 "$$f" | awk '{print $$1}'`; \
+		elif command -v sha256 >/dev/null 2>&1; then \
+			digest=`sha256 -q "$$f"`; \
+		else \
+			digest=`cksum "$$f" | awk '{print $$1 ":" $$2}'`; \
+		fi; \
+		printf '%s=%s;' "$$f" "$$digest"; \
+	done)
+CC_VERSION_ID := $(shell $(CC) --version 2>/dev/null | sed -n '1p')
+override TARGET_TRIPLE_DETECTED := $(shell $(CC) -dumpmachine 2>/dev/null | sed -n '1p')
+# A claimed target is security policy, not caller metadata: accepting a
+# command-line TARGET_TRIPLE let a native x86 compiler claim AArch64 and omit
+# CET while still producing an x86 release. Always bind the policy to the
+# selected compiler's own target report.
+override TARGET_TRIPLE := $(strip $(TARGET_TRIPLE_DETECTED))
+override TARGET_ARCH := $(firstword $(subst -, ,$(TARGET_TRIPLE)))
 
-# Control-flow integrity flag, gated by architecture (AR-06 F12). -fcf-protection
-# is Intel CET and x86-only: gcc AND clang HARD-ERROR with
-# "'-fcf-protection=full' is not supported for this target" on aarch64, so the
-# unconditional flag broke every non-x86 build — while the spec advertises
-# aarch64 support. Use the ARM equivalent (-mbranch-protection=standard, PAC/BTI)
-# on aarch64, and nothing on other arches, so the hardening is applied where the
-# toolchain supports it instead of failing the build.
-ifneq ($(filter x86_64 i386 i486 i586 i686,$(UNAME_M)),)
-    CF_PROTECTION := -fcf-protection
-else ifneq ($(filter aarch64 arm64,$(UNAME_M)),)
-    CF_PROTECTION := -mbranch-protection=standard
+# Platform detection (OS selects linker/ABI policy; architecture comes from
+# TARGET_TRIPLE above). UNAME_M remains diagnostic fingerprint material only.
+override UNAME_S := $(shell uname -s)
+override UNAME_M := $(shell uname -m)
+
+# Destination control-flow protection is selected by target architecture and
+# compile-probed against the actual compiler. Unsupported optional protection
+# is omitted; host uname can neither add the wrong ISA flag nor remove the
+# destination-appropriate one.
+ifneq ($(filter x86_64 i386 i486 i586 i686,$(TARGET_ARCH)),)
+    override CF_PROTECTION_CANDIDATE := -fcf-protection
+else ifneq ($(filter aarch64 arm64,$(TARGET_ARCH)),)
+    override CF_PROTECTION_CANDIDATE := -mbranch-protection=standard
 else
-    CF_PROTECTION :=
+    override CF_PROTECTION_CANDIDATE :=
+endif
+ifneq ($(CF_PROTECTION_CANDIDATE),)
+    override CF_PROTECTION := $(shell printf 'int gitswitch_cf_probe(void){return 0;}\n' | \
+	$(CC) $(CF_PROTECTION_CANDIDATE) -x c -c -o /dev/null - \
+	>/dev/null 2>&1 && printf '%s' '$(CF_PROTECTION_CANDIDATE)')
+else
+    override CF_PROTECTION :=
 endif
 
 # Compiler and flags
-CC = gcc
 # Compiler family, needed before the flag set: macOS 'gcc' is clang, and a
 # few spellings/diagnostics differ (see the clang block further down).
 CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -c clang)
@@ -74,6 +122,20 @@ ifneq ($(CC_IS_CLANG),0)
     STRICT_ALIASING_FLAG = -Wstrict-aliasing
 else
     STRICT_ALIASING_FLAG = -Wstrict-aliasing=3
+endif
+
+# Supported platforms have a fixed native artifact inspector. An unsupported
+# release must supply both an audited format and an explicit acknowledgement;
+# release-policy-check below also validates its complete minimum flag set.
+UNSUPPORTED_RELEASE_ACK ?=
+ifeq ($(UNAME_S),Linux)
+    override RELEASE_ARTIFACT_FORMAT := elf
+else ifeq ($(UNAME_S),FreeBSD)
+    override RELEASE_ARTIFACT_FORMAT := elf
+else ifeq ($(UNAME_S),Darwin)
+    override RELEASE_ARTIFACT_FORMAT := macho
+else
+    RELEASE_ARTIFACT_FORMAT ?=
 endif
 
 CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
@@ -104,15 +166,19 @@ ifeq ($(UNAME_S),Linux)
     # distcheck now asserts the staged binary is ET_DYN with RELRO+NOW.
     SECURITY_CFLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION)
     SECURITY_LDFLAGS_DEBUG = -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+    override SECURITY_CFLAGS_RELEASE := -D_FORTIFY_SOURCE=2 \
+                             -fstack-protector-strong \
                              -fstack-clash-protection $(CF_PROTECTION) -fPIE
-    SECURITY_LDFLAGS_RELEASE = -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    override SECURITY_LDFLAGS_RELEASE := -pie -Wl,-z,relro -Wl,-z,now \
+                             -Wl,-z,noexecstack
 endif
 
 ifeq ($(UNAME_S),Darwin)
     # macOS-specific security flags (no cf-protection, stack-clash-protection, or Linux linker flags)
     SECURITY_CFLAGS_DEBUG = -fstack-protector-strong
-    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+    override SECURITY_CFLAGS_RELEASE := -D_FORTIFY_SOURCE=2 \
+                             -fstack-protector-strong -fPIE
+    override SECURITY_LDFLAGS_RELEASE := -Wl,-pie
 endif
 
 ifeq ($(UNAME_S),FreeBSD)
@@ -126,9 +192,11 @@ ifeq ($(UNAME_S),FreeBSD)
     # default to PIE (AR-05 L9).
     SECURITY_CFLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION)
     SECURITY_LDFLAGS_DEBUG = -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+    override SECURITY_CFLAGS_RELEASE := -D_FORTIFY_SOURCE=2 \
+                             -fstack-protector-strong \
                              -fstack-clash-protection $(CF_PROTECTION) -fPIE
-    SECURITY_LDFLAGS_RELEASE = -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    override SECURITY_LDFLAGS_RELEASE := -pie -Wl,-z,relro -Wl,-z,now \
+                             -Wl,-z,noexecstack
 endif
 
 # Debug/Release configurations
@@ -138,15 +206,68 @@ DEBUG_LDFLAGS = -fsanitize=address -fsanitize=undefined $(SECURITY_LDFLAGS_DEBUG
 # -s (strip) lives in RELEASE_LDFLAGS, not here: it is a link-only flag, and
 # CFLAGS feeds the compile step too, where clang errors on it as an unused
 # command-line argument under WERROR (gcc silently ignores it).
-RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_CFLAGS_RELEASE)
-RELEASE_LDFLAGS = -s $(SECURITY_LDFLAGS_RELEASE)
+# This final, non-overridable release suffix applies to every production and
+# test translation unit. The forced header makes a missing effective stack
+# policy a compile error in that exact TU; the flag is deliberately last so a
+# caller cannot neutralize it through CFLAGS or platform flag ordering.
+# Unknown operating systems retain an explicit operator-supplied security
+# policy, but the minimum is reasserted after that input so a later negation
+# cannot satisfy a presence-only check while winning compiler/linker ordering.
+override UNSUPPORTED_RELEASE_REQUIRED_CFLAGS :=
+override UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS :=
+ifeq ($(filter $(UNAME_S),Linux Darwin FreeBSD),)
+    override UNSUPPORTED_RELEASE_REQUIRED_CFLAGS := \
+        -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE
+    ifeq ($(RELEASE_ARTIFACT_FORMAT),elf)
+        override UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS := \
+            -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    else ifeq ($(RELEASE_ARTIFACT_FORMAT),macho)
+        override UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS := -Wl,-pie
+    endif
+endif
+override RELEASE_REQUIRED_CFLAGS := \
+                          $(UNSUPPORTED_RELEASE_REQUIRED_CFLAGS) \
+                          -fstack-protector-strong \
+                          -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+                          -include $(SRCDIR)/release_hardening.h
+override RELEASE_FLAGS := -O2 -DNDEBUG $(SECURITY_CFLAGS_RELEASE)
+override RELEASE_LDFLAGS := -s $(SECURITY_LDFLAGS_RELEASE)
+COVERAGE_FLAGS = -g -O0 --coverage -fprofile-abs-path
+COVERAGE_LDFLAGS = --coverage
+
+# The coverage lane is intentionally canonical and reproducible: GCC's gcov
+# data is collected from a clean tree. gcovr publishes every human/machine
+# report in one pass, then enforces the measured ratchet from that pass's JSON.
+COVERAGE_CC ?= gcc
+COVERAGE_GCOV ?= gcov
+GCOVR ?= gcovr
+COVERAGE_READLINE ?= 1
+COVERAGE_REPORT_DIR ?= $(BUILDDIR)/coverage
+# Baseline at 81afb4c with GCC/gcov 16.1.1 and gcovr 8.6: three clean
+# full-capability runs were identical at 10,277/14,805 lines (69.4%) and
+# 7,034/12,068 branches (58.3%). Whole-point floors leave a narrow allowance
+# for supported-runner gcov reporting differences; ratchets only move upward
+# after a new measured baseline, never downward to accommodate a regression.
+COVERAGE_MIN_LINES ?= 69
+COVERAGE_MIN_BRANCHES ?= 58
 
 # Default to debug build
 BUILD_TYPE ?= debug
 ifeq ($(BUILD_TYPE),release)
-    CFLAGS += $(RELEASE_FLAGS)
-    LDFLAGS += $(RELEASE_LDFLAGS)
+    override RELEASE_ENFORCED_CFLAGS := $(RELEASE_FLAGS)
+    override RELEASE_ENFORCED_LDFLAGS := $(RELEASE_LDFLAGS) \
+                                         $(UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS)
+    override TU_HARDENING_FLAGS := $(RELEASE_REQUIRED_CFLAGS)
+else ifeq ($(BUILD_TYPE),coverage)
+    override RELEASE_ENFORCED_CFLAGS :=
+    override RELEASE_ENFORCED_LDFLAGS :=
+    override TU_HARDENING_FLAGS :=
+    CFLAGS += $(COVERAGE_FLAGS)
+    LDFLAGS += $(COVERAGE_LDFLAGS)
 else
+    override RELEASE_ENFORCED_CFLAGS :=
+    override RELEASE_ENFORCED_LDFLAGS :=
+    override TU_HARDENING_FLAGS :=
     CFLAGS += $(DEBUG_FLAGS)
     LDFLAGS += $(DEBUG_LDFLAGS)
 endif
@@ -242,9 +363,24 @@ HEADERS = $(wildcard $(SRCDIR)/*.h)
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
+CLI_E2E_TEST_TARGETS = \
+	$(BINDIR)/test_ar04_cli \
+	$(BINDIR)/test_ar04_lifecycle \
+	$(BINDIR)/test_ar05_pty \
+	$(BINDIR)/test_ar07_cli_commit \
+	$(BINDIR)/test_ar07_completion \
+	$(BINDIR)/test_ar07_shell_init \
+	$(BINDIR)/test_cli \
+	$(BINDIR)/test_pty
 AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
+AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
+AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
+AR08_COPY_UTILS_OBJECT = $(OBJDIR)/utils_ar08_copy.o
 DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
-           $(AR07_RESET_MAIN_OBJECT:.o=.d)
+           $(AR07_RESET_MAIN_OBJECT:.o=.d) \
+           $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d) \
+           $(AR08_HINT_CONFIG_OBJECT:.o=.d) \
+           $(AR08_COPY_UTILS_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -264,6 +400,26 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
+$(TOOLBUILDDIR):
+	@mkdir -p $(TOOLBUILDDIR)
+
+override DIST_PUBLISH_HELPER := build/tools/release-publish
+$(DIST_PUBLISH_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
+	@echo "Building descriptor-pinned release publisher..."
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror $< -o $@
+
+# Exercise descriptor-bound publication from a named temp on every QA host;
+# macOS CI exercises its exact fclonefileat implementation below this contract.
+override DIST_PUBLISH_NAMED_TEST_HELPER := build/tools/release-publish-named-test
+$(DIST_PUBLISH_NAMED_TEST_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
+	@echo "Building named-temp release publisher fixture..."
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror \
+		-DGITSWITCH_RELEASE_FORCE_NAMED_TEMP=1 \
+		-DGITSWITCH_RELEASE_TEST_FD_PRESSURE=1 \
+		-DGITSWITCH_RELEASE_TEST_ADOPTION_RACE=1 \
+		-DGITSWITCH_RELEASE_TEST_PUBLICATION_RACE=1 \
+		-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 $< -o $@
+
 # Build-config stamp: objects/tests share build/obj and build/bin across every
 # configuration. Record every effective compile/link input, not just the build
 # type and metadata: otherwise READLINE, compiler, flag, library, or platform
@@ -276,17 +432,30 @@ $(BINDIR):
 # replaced only on change, preserving true no-op incremental builds.
 BUILDTYPE_STAMP = $(OBJDIR)/.buildconfig
 define BUILD_STAMP_CONTENT
-$(BUILD_TYPE)|buildconfig-v2
+$(BUILD_TYPE)|buildconfig-v3
 version=$(VERSION)
 commit=$(COMMIT)
 cc=$(CC)
+cc_launcher=$(CC_LAUNCHER)
+cc_resolved=$(CC_IDENTITY_FILE)
+cc_identity_files=$(TOOLCHAIN_IDENTITY_FILES)
+cc_file_fingerprint=$(TOOLCHAIN_FILE_FINGERPRINT)
+cc_version=$(CC_VERSION_ID)
 cc_is_clang=$(CC_IS_CLANG)
+target_triple=$(TARGET_TRIPLE)
+target_triple_detected=$(TARGET_TRIPLE_DETECTED)
+target_arch=$(TARGET_ARCH)
 cppflags=$(CPPFLAGS)
 cflags=$(CFLAGS)
+release_enforced_cflags=$(RELEASE_ENFORCED_CFLAGS)
+release_required_cflags=$(RELEASE_REQUIRED_CFLAGS)
 frame_size_warning=$(FRAME_SIZE_WARNING)
 includes=$(INCLUDES)
 depflags=$(DEPFLAGS)
 ldflags=$(LDFLAGS)
+release_enforced_ldflags=$(RELEASE_ENFORCED_LDFLAGS)
+unsupported_required_cflags=$(UNSUPPORTED_RELEASE_REQUIRED_CFLAGS)
+unsupported_required_ldflags=$(UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS)
 libs=$(LIBS)
 readline_request=$(READLINE)
 readline_effective=$(READLINE_OK)
@@ -294,6 +463,8 @@ readline_hint_cflags=$(READLINE_HINT_CFLAGS)
 readline_hint_libs=$(READLINE_HINT_LIBS)
 platform_os=$(UNAME_S)
 platform_arch=$(UNAME_M)
+release_artifact_format=$(RELEASE_ARTIFACT_FORMAT)
+unsupported_release_ack=$(UNSUPPORTED_RELEASE_ACK)
 cf_protection=$(CF_PROTECTION)
 security_cflags_debug=$(SECURITY_CFLAGS_DEBUG)
 security_ldflags_debug=$(SECURITY_LDFLAGS_DEBUG)
@@ -305,7 +476,113 @@ objects=$(OBJECTS)
 source_dir=$(SRCDIR)
 test_dir=$(TESTDIR)
 endef
-export GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
+override GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
+override GITSWITCH_RELEASE_POLICY_OS := $(UNAME_S)
+override GITSWITCH_RELEASE_POLICY_TRIPLE := $(TARGET_TRIPLE)
+override GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE := $(TARGET_TRIPLE_DETECTED)
+override GITSWITCH_RELEASE_POLICY_CC := $(CC_IDENTITY_FILE)
+override GITSWITCH_RELEASE_POLICY_CC_VERSION := $(CC_VERSION_ID)
+override GITSWITCH_RELEASE_POLICY_FINGERPRINT := $(TOOLCHAIN_FILE_FINGERPRINT)
+override GITSWITCH_RELEASE_POLICY_ACK := $(UNSUPPORTED_RELEASE_ACK)
+override GITSWITCH_RELEASE_POLICY_FORMAT := $(RELEASE_ARTIFACT_FORMAT)
+override GITSWITCH_RELEASE_POLICY_CFLAGS := $(SECURITY_CFLAGS_RELEASE)
+override GITSWITCH_RELEASE_POLICY_LDFLAGS := $(SECURITY_LDFLAGS_RELEASE)
+override GITSWITCH_RELEASE_EFFECTIVE_CFLAGS := $(CFLAGS) \
+	$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS)
+override GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS := $(LDFLAGS) $(LIBS) \
+	$(RELEASE_ENFORCED_LDFLAGS)
+export GITSWITCH_BUILD_CONFIG
+export GITSWITCH_RELEASE_POLICY_OS
+export GITSWITCH_RELEASE_POLICY_TRIPLE
+export GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE
+export GITSWITCH_RELEASE_POLICY_CC
+export GITSWITCH_RELEASE_POLICY_CC_VERSION
+export GITSWITCH_RELEASE_POLICY_FINGERPRINT
+export GITSWITCH_RELEASE_POLICY_ACK
+export GITSWITCH_RELEASE_POLICY_FORMAT
+export GITSWITCH_RELEASE_POLICY_CFLAGS
+export GITSWITCH_RELEASE_POLICY_LDFLAGS
+export GITSWITCH_RELEASE_EFFECTIVE_CFLAGS
+export GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS
+
+.PHONY: release-policy-check
+release-policy-check:
+	@set -e; \
+	printf '%s\n' "$$GITSWITCH_RELEASE_POLICY_TRIPLE" | \
+		grep -Eq '^[A-Za-z0-9_.+]+(-[A-Za-z0-9_.+]+)+$$' || { \
+		echo 'ERROR: compiler target triple is empty or invalid' >&2; exit 1; \
+	}; \
+	test "$$GITSWITCH_RELEASE_POLICY_TRIPLE" = \
+	     "$$GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE" || { \
+		echo 'ERROR: claimed release target differs from compiler target' >&2; exit 1; \
+	}; \
+	test -f "$$GITSWITCH_RELEASE_POLICY_CC" && \
+	test -n "$$GITSWITCH_RELEASE_POLICY_CC_VERSION" && \
+	test -n "$$GITSWITCH_RELEASE_POLICY_FINGERPRINT" || { \
+		echo 'ERROR: compiler path, version, and content fingerprint are required' >&2; exit 1; \
+	}; \
+	case "$$GITSWITCH_RELEASE_POLICY_OS" in \
+		Linux|FreeBSD) \
+			test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = elf || { \
+				echo 'ERROR: ELF platform lost its release inspection policy' >&2; exit 1; \
+			} ;; \
+		Darwin) \
+			test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = macho || { \
+				echo 'ERROR: Darwin lost its release inspection policy' >&2; exit 1; \
+			} ;; \
+		*) \
+			test "$$GITSWITCH_RELEASE_POLICY_ACK" = I_ACKNOWLEDGE_UNSUPPORTED_RELEASE || { \
+				echo "ERROR: unsupported release OS '$$GITSWITCH_RELEASE_POLICY_OS' requires explicit acknowledgement" >&2; exit 1; \
+			}; \
+			case "$$GITSWITCH_RELEASE_POLICY_FORMAT" in elf|macho) ;; \
+				*) echo 'ERROR: unsupported release requires elf or macho inspection policy' >&2; exit 1 ;; \
+			esac; \
+			for required in -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE; do \
+				case " $$GITSWITCH_RELEASE_POLICY_CFLAGS " in *" $$required "*) ;; \
+					*) echo "ERROR: unsupported release C flags omit $$required" >&2; exit 1 ;; \
+				esac; \
+			done; \
+			for forbidden in -U_FORTIFY_SOURCE -fno-stack-protector \
+				-fno-stack-protector-all -fno-stack-protector-strong \
+				-fno-pie -fno-PIE; do \
+				case " $$GITSWITCH_RELEASE_POLICY_CFLAGS " in *" $$forbidden "*) \
+					echo "ERROR: unsupported release C flags conflict with $$forbidden" >&2; exit 1 ;; \
+				esac; \
+			done; \
+			if test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = elf; then \
+				for required in -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack; do \
+					case " $$GITSWITCH_RELEASE_POLICY_LDFLAGS " in *" $$required "*) ;; \
+						*) echo "ERROR: unsupported ELF release linker flags omit $$required" >&2; exit 1 ;; \
+					esac; \
+				done; \
+				for forbidden in -no-pie -nopie -Wl,-no-pie -Wl,-z,norelro \
+					-Wl,-z,lazy -Wl,-z,execstack; do \
+					case " $$GITSWITCH_RELEASE_POLICY_LDFLAGS " in *" $$forbidden "*) \
+						echo "ERROR: unsupported ELF linker flags conflict with $$forbidden" >&2; exit 1 ;; \
+					esac; \
+				done; \
+			fi ;; \
+	esac; \
+	for required in -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE; do \
+		case " $$GITSWITCH_RELEASE_EFFECTIVE_CFLAGS " in *" $$required "*) ;; \
+			*) echo "ERROR: effective release C flags omit $$required" >&2; exit 1 ;; \
+		esac; \
+	done; \
+	case "$$GITSWITCH_RELEASE_POLICY_FORMAT" in \
+		elf) for required in -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack; do \
+			case " $$GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS " in *" $$required "*) ;; \
+				*) echo "ERROR: effective ELF release linker flags omit $$required" >&2; exit 1 ;; \
+			esac; \
+		done ;; \
+		macho) case " $$GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS " in \
+			*' -Wl,-pie '*) ;; \
+			*) echo 'ERROR: effective Mach-O release linker flags omit PIE' >&2; exit 1 ;; \
+		esac ;; \
+	esac
+
+ifeq ($(BUILD_TYPE),release)
+$(BUILDTYPE_STAMP): release-policy-check
+endif
 $(BUILDTYPE_STAMP): buildtype-force | $(OBJDIR)
 	@set -e; \
 	tmp="$@.tmp.$$$$"; \
@@ -324,12 +601,14 @@ buildtype-force:
 # Compile source files
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling $<..."
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # Link main executable
 $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 	@echo "Linking $@..."
-	$(CC) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS) \
+		$(RELEASE_ENFORCED_LDFLAGS)
 	@echo "Build complete: $@"
 
 # Install target.
@@ -344,6 +623,9 @@ $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 # caller must build explicitly first (`make release` / `make`). BUILD_TYPE is
 # irrelevant here — no rebuild happens.
 .PHONY: install
+ifeq ($(BUILD_TYPE),release)
+install: release-policy-check
+endif
 install:
 	@if [ ! -x "$(BINDIR)/$(TARGET)" ]; then \
 		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
@@ -352,6 +634,23 @@ install:
 	@bt=`sed -n '1s/|.*//p' $(BUILDTYPE_STAMP) 2>/dev/null`; \
 	if [ "$$bt" != "release" ]; then \
 		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
+	else \
+		built_os=`sed -n 's/^platform_os=//p' $(BUILDTYPE_STAMP)`; \
+		case "$$built_os" in Linux|Darwin|FreeBSD) ;; \
+			*) built_ack=`sed -n 's/^unsupported_release_ack=//p' $(BUILDTYPE_STAMP)`; \
+			   built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
+			   test "$$built_ack" = I_ACKNOWLEDGE_UNSUPPORTED_RELEASE && \
+			   { test "$$built_format" = elf || test "$$built_format" = macho; } || { \
+				echo 'ERROR: refusing release install without a recorded supported/acknowledged inspection policy' >&2; exit 1; \
+			   } ;; \
+			esac; \
+		built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
+		built_triple=`sed -n 's/^target_triple=//p' $(BUILDTYPE_STAMP)`; \
+		GITSWITCH_RELEASE_FORMAT="$$built_format" \
+			sh tests/test_ar07_release.sh artifact \
+			"$(BINDIR)/$(TARGET)" "$(BINDIR)/$(TARGET)" "$$built_triple" || { \
+			echo 'ERROR: refusing to install an unverified release artifact' >&2; exit 1; \
+		}; \
 	fi
 	@echo "Installing $(TARGET)..."
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -378,7 +677,8 @@ uninstall:
 # Test compilation
 $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The reset suite calls the real CLI entry point in isolated child processes
 # while installing deterministic in-process boundary hooks. Rename only this
@@ -386,22 +686,70 @@ $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 $(AR07_RESET_MAIN_OBJECT): $(SRCDIR)/main.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling AR-07 reset CLI test entry..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
-		-DGITSWITCH_TESTING -Dmain=gitswitch_cli_main -c $< -o $@
+		-DGITSWITCH_TESTING -Dmain=gitswitch_cli_main \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
+
+# The removal signal suite needs checkpoints inside accounts_remove(), while
+# production accounts.o remains free of test hooks.
+$(AR08_REMOVE_ACCOUNTS_OBJECT): $(SRCDIR)/accounts.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-08 removal signal test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
+# The resume-hint race suite replaces the artifact at exact parser boundaries.
+# Keep its hook out of the production config object and binary.
+$(AR08_HINT_CONFIG_OBJECT): $(SRCDIR)/config.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-08 resume-hint race test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
+# The copy-permission suite observes exact descriptor checkpoints before any
+# bytes and after its first flushed test chunk; production utils.o has no hook.
+$(AR08_COPY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-08 copy permission test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
 
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
-# This focused suite executes the production CLI to prove that main selects
-# the side-effect-free loader only for the exact `list|ls --names` grammar.
-$(BINDIR)/test_ar07_completion: | $(BINDIR)/$(TARGET)
+$(BINDIR)/test_ar08_remove_signal: $(OBJDIR)/test_ar08_remove_signal.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR08_REMOVE_ACCOUNTS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/accounts.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_ar08_resume_hint_race: \
+		$(OBJDIR)/test_ar08_resume_hint_race.o \
+		$(AR08_HINT_CONFIG_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_ar08_copy_permissions: \
+		$(OBJDIR)/test_ar08_copy_permissions.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# These suites execute the worktree production CLI instead of a linked test
+# entry point. Keep the dependency explicit for focused invocations: the
+# aggregate `make test` prerequisite must not be the only thing preventing a
+# stale or missing build/bin/gitswitch from being exercised (AR-08 M47).
+$(CLI_E2E_TEST_TARGETS): | $(BINDIR)/$(TARGET)
 
 # Dependency files are optional on the first build and authoritative
 # thereafter. Keep this after `all` so an included -MP compatibility target
@@ -426,6 +774,46 @@ test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	done
 	@echo "All tests passed!"
 endif
+
+# ShellCheck is intentionally a separate, fail-closed QA gate instead of an
+# ordinary `make test` prerequisite: builds remain package-independent while
+# CI and release reviewers can require every dialect parser explicitly.
+.PHONY: shell-static-test ci-policy-test
+shell-static-test:
+	@sh tests/test_shell_assets.sh "$(CURDIR)"
+
+ci-policy-test:
+	@sh tests/test_ci_policy.sh "$(CURDIR)"
+
+# The small contract fixture proves both threshold metrics are wired to gcovr's
+# documented nonzero exit bits; a no-op or report-only replacement cannot make
+# the real coverage lane falsely green.
+.PHONY: coverage-contract-test
+coverage-contract-test:
+	@COVERAGE_CC="$(COVERAGE_CC)" COVERAGE_GCOV="$(COVERAGE_GCOV)" \
+		GCOVR="$(GCOVR)" sh tests/test_coverage.sh
+
+.PHONY: coverage
+coverage: coverage-contract-test
+	@$(MAKE) clean
+	@$(MAKE) CC="$(COVERAGE_CC)" BUILD_TYPE=coverage \
+		READLINE="$(COVERAGE_READLINE)" WERROR=1 test
+	@mkdir -p "$(COVERAGE_REPORT_DIR)"
+	@$(GCOVR) --root "$(CURDIR)" \
+		--gcov-executable "$(COVERAGE_GCOV)" \
+		--filter "$(SRCDIR)/" \
+		--txt="$(COVERAGE_REPORT_DIR)/coverage.txt" --print-summary \
+		--html-details="$(COVERAGE_REPORT_DIR)/index.html" \
+		--xml="$(COVERAGE_REPORT_DIR)/coverage.xml" --xml-pretty \
+		--json="$(COVERAGE_REPORT_DIR)/coverage.json" --json-pretty \
+		--json-summary="$(COVERAGE_REPORT_DIR)/coverage-summary.json" \
+		--json-summary-pretty \
+		"$(OBJDIR)"
+	@$(GCOVR) --root "$(CURDIR)" \
+		--json-add-tracefile "$(COVERAGE_REPORT_DIR)/coverage.json" \
+		--txt="$(COVERAGE_REPORT_DIR)/threshold.txt" \
+		--fail-under-line "$(COVERAGE_MIN_LINES)" \
+		--fail-under-branch "$(COVERAGE_MIN_BRANCHES)"
 
 # Static analysis
 .PHONY: analyze
@@ -468,16 +856,18 @@ security-scan:
 # instrumentation and Valgrind must not be combined in the same binary.
 # AR-06 F36: the memcheck lane used to cover only test_runner + test_security
 # (2 of 21 suites). Broaden it to the deterministic, non-forking logic suites
-# (parser, config, validation, git_ops fake-runner, gpg colon parsing) so
-# release-path allocation/free bugs across the core are actually exercised under
-# Valgrind. The fork/timing-heavy end-to-end suites (cli, pty, ssh_reuse,
+# (parser, config, validation, git_ops fake-runner, gpg colon parsing, and
+# display formatting/capture) so release-path allocation/free bugs across the
+# core are actually exercised under Valgrind. The fork/timing-heavy end-to-end
+# suites (cli, pty, ssh_reuse,
 # gpg_switch/reset, ar04/ar05 e2e) are deliberately excluded: Valgrind traces
 # into forked children and real ssh-agent/gpg subprocesses, making them slow and
 # flaky in CI. ASan/UBSan (the debug `test` lane) covers those paths.
 MEMCHECK_TARGETS = $(BINDIR)/test_runner $(BINDIR)/test_security \
 	$(BINDIR)/test_toml $(BINDIR)/test_validation \
 	$(BINDIR)/test_config_security $(BINDIR)/test_git_ops \
-	$(BINDIR)/test_gpg_parse $(BINDIR)/test_ar05_unit
+	$(BINDIR)/test_gpg_parse $(BINDIR)/test_ar05_unit \
+	$(BINDIR)/test_display
 
 .PHONY: memcheck
 ifeq ($(BUILD_TYPE),release)
@@ -549,7 +939,12 @@ info:
 	@echo "Target: $(TARGET)"
 	@echo "Build type: $(BUILD_TYPE)"
 	@echo "Compiler: $(CC)"
-	@echo "CFLAGS: $(CFLAGS)"
+	@echo "Compiler identity: $(CC_IDENTITY_FILE)"
+	@echo "Compiler version: $(CC_VERSION_ID)"
+	@echo "Target triple: $(TARGET_TRIPLE)"
+	@echo "Toolchain fingerprint: $(TOOLCHAIN_FILE_FINGERPRINT)"
+	@echo "CFLAGS: $(CFLAGS) $(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS)"
+	@echo "LDFLAGS: $(LDFLAGS) $(RELEASE_ENFORCED_LDFLAGS)"
 	@echo "Sources: $(SOURCES)"
 	@echo "Objects: $(OBJECTS)"
 
@@ -576,6 +971,10 @@ help:
 	@echo "  debug        Build debug version"
 	@echo "  release      Build release version"
 	@echo "  test         Build and run tests"
+	@echo "  shell-static-test Lint and native-parse shipped shell assets"
+	@echo "  ci-policy-test Verify immutable, least-privilege CI policy"
+	@echo "  coverage     Run tests and enforce the GCC/gcovr coverage ratchet"
+	@echo "  coverage-contract-test Verify gcovr threshold failure plumbing"
 	@echo "  install      Install to system"
 	@echo "  uninstall    Remove from system"
 	@echo "  clean        Remove build files"
@@ -596,12 +995,16 @@ help:
 	@echo "  help         Show this help"
 	@echo ""
 	@echo "Variables:"
-	@echo "  BUILD_TYPE   debug (default) or release"
+	@echo "  BUILD_TYPE   debug (default), release, or coverage"
 	@echo "  CC           Compiler (default: gcc)"
+	@echo "  TARGET_TRIPLE Validated compiler target (default: CC -dumpmachine)"
+	@echo "  TOOLCHAIN_IDENTITY_FILES Compiler/wrapper files to fingerprint"
+	@echo "  UNSUPPORTED_RELEASE_ACK/RELEASE_ARTIFACT_FORMAT Audited release override"
+	@echo "  COVERAGE_MIN_LINES/COVERAGE_MIN_BRANCHES Coverage floors (69/58)"
 	@echo "  DESTDIR      Installation prefix"
 
 # RPM package building
-PACKAGE = gitswitcher
+override PACKAGE := gitswitcher
 # Release artifacts are named and populated from one immutable commit. Regular
 # developer builds may still override VERSION, but dist/RPM metadata may not be
 # mixed with that live value. Command-line overrides are deliberately ignored
@@ -620,10 +1023,25 @@ else
 endif
 RPM_VERSION = $(RELEASE_VERSION)
 override DIST_ROOT := $(PACKAGE)-$(RELEASE_VERSION)
-DIST_ARCHIVE ?= $(DIST_ROOT).tar.gz
+# Release output has one dedicated, ignored namespace. DIST_ARCHIVE remains a
+# compatibility/request variable, but the dist recipe accepts only this exact
+# path (relative or physical absolute spelling); it is never interpolated as
+# shell syntax. Consumers use the fixed canonical path below.
+override DIST_ARTIFACT_DIR := build/dist
+override DIST_ARCHIVE_NAME := $(DIST_ROOT).tar.gz
+override DIST_ARCHIVE_PATH := $(CURDIR)/$(DIST_ARTIFACT_DIR)/$(DIST_ARCHIVE_NAME)
+DIST_ARCHIVE ?= $(DIST_ARTIFACT_DIR)/$(DIST_ARCHIVE_NAME)
+override GITSWITCH_DIST_ARCHIVE_REQUEST := $(DIST_ARCHIVE)
+override GITSWITCH_DIST_ARCHIVE_PATH := $(DIST_ARCHIVE_PATH)
+override GITSWITCH_DIST_ARCHIVE_NAME := $(DIST_ARCHIVE_NAME)
+override GITSWITCH_DIST_ROOT := $(DIST_ROOT)
+export GITSWITCH_DIST_ARCHIVE_REQUEST
+export GITSWITCH_DIST_ARCHIVE_PATH
+export GITSWITCH_DIST_ARCHIVE_NAME
+export GITSWITCH_DIST_ROOT
 # Reviewed allowlist. Copying only these entries inherently excludes VCS/OMX
 # state, build products, cores, logs, and previously generated archives.
-DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
+override DIST_MANIFEST := src tests tools completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
 .PHONY: release-manifest-check dist distcheck release-contract-test \
 	release-artifact-test qa-contract-test sig-repro-test rpm
@@ -659,19 +1077,61 @@ release-manifest-check:
 # release tarballs were not reproducible from a tag and could leak unreviewed
 # content (AR-05 L5). git archive draws from HEAD, which also inherently
 # excludes VCS state, build products, cores, logs, and prior archives.
-dist: release-manifest-check
-	@echo "Creating distribution tarball..."
-	git archive --prefix=$(DIST_ROOT)/ -o $(DIST_ARCHIVE) \
-		$(RELEASE_COMMIT) -- $(DIST_MANIFEST)
+dist: release-manifest-check $(DIST_PUBLISH_HELPER)
+	@set -e; \
+	root_physical=`CDPATH='' cd "$(CURDIR)" && pwd -P`; \
+	request="$$GITSWITCH_DIST_ARCHIVE_REQUEST"; \
+	expected_rel="$(DIST_ARTIFACT_DIR)/$$GITSWITCH_DIST_ARCHIVE_NAME"; \
+	expected_abs="$$root_physical/$$expected_rel"; \
+	case "$(RELEASE_VERSION)" in \
+		''|*[!A-Za-z0-9._+-]*) \
+			echo 'ERROR: committed release VERSION is not path-safe' >&2; exit 1 ;; \
+	esac; \
+	case "$$request" in \
+		"$$expected_rel"|"$$expected_abs") ;; \
+		*) echo "ERROR: DIST_ARCHIVE must be exactly $$expected_rel" >&2; exit 1 ;; \
+	esac; \
+	if git ls-files --error-unmatch -- "$$expected_rel" >/dev/null 2>&1; then \
+		echo 'ERROR: distribution output aliases a tracked path' >&2; exit 1; \
+	fi; \
+	if ! git check-ignore -q -- "$$expected_rel"; then \
+		echo 'ERROR: distribution output directory is not ignored' >&2; exit 1; \
+	fi; \
+	for component in build "$(DIST_ARTIFACT_DIR)"; do \
+		if test -L "$$component"; then \
+			echo "ERROR: distribution directory is a symlink: $$component" >&2; exit 1; \
+		fi; \
+		if test -e "$$component" && ! test -d "$$component"; then \
+			echo "ERROR: distribution directory is not a directory: $$component" >&2; exit 1; \
+		fi; \
+		test -d "$$component" || mkdir "$$component"; \
+	done; \
+	cd "$(DIST_ARTIFACT_DIR)"; \
+	actual_dir=`pwd -P`; \
+	if test "$$actual_dir" != "$$root_physical/$(DIST_ARTIFACT_DIR)"; then \
+		echo 'ERROR: distribution directory resolved outside its dedicated namespace' >&2; exit 1; \
+	fi; \
+	if test -e "$$GITSWITCH_DIST_ARCHIVE_NAME" || \
+	   test -L "$$GITSWITCH_DIST_ARCHIVE_NAME"; then \
+		echo 'ERROR: distribution archive already exists; refusing to replace it' >&2; exit 1; \
+	fi; \
+	echo "Creating distribution tarball: $$expected_rel"; \
+	"$$root_physical/$(DIST_PUBLISH_HELPER)" . "$$actual_dir" \
+		"$$GITSWITCH_DIST_ARCHIVE_NAME" -- \
+		git -C "$$root_physical" archive --format=tar.gz \
+		--prefix="$$GITSWITCH_DIST_ROOT/" \
+		"$(RELEASE_COMMIT)" -- $(DIST_MANIFEST)
 
 distcheck: dist
-	@sh tests/test_dist.sh "$(CURDIR)/$(DIST_ARCHIVE)" "$(DIST_ROOT)" \
+	@sh tests/test_dist.sh "$$GITSWITCH_DIST_ARCHIVE_PATH" \
+		"$$GITSWITCH_DIST_ROOT" \
 		"$(PREFIX)" "$(MAKE_COMMAND)"
 
 # Negative release-input checks run in isolated local clones, so they can dirty
 # VERSION/spec/manifest fixtures without touching the operator's checkout.
-release-contract-test:
-	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)"
+release-contract-test: $(DIST_PUBLISH_NAMED_TEST_HELPER)
+	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)" \
+		"$(CURDIR)/$(DIST_PUBLISH_NAMED_TEST_HELPER)"
 
 # Inspect the exact release binary and byte-identical staged-install copy with
 # native ELF or Mach-O tooling. The shell test owns its temporary stage.
@@ -706,10 +1166,14 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 		exit 1; \
 	fi; \
 	echo 'Release stack check passed: help/version/config at 256 KiB'; \
+	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
-		"$$stage$(PREFIX)/bin/$(TARGET)"; \
+		"$$stage$(PREFIX)/bin/$(TARGET)" "$(TARGET_TRIPLE)"; \
+	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh neuter "$(CC)" \
-		"$(SECURITY_CFLAGS_RELEASE)"
+		"$(SECURITY_CFLAGS_RELEASE)" \
+		"$(CURDIR)/$(SRCDIR)/release_hardening.h" \
+		"$(MAKE_COMMAND)"
 else
 release-artifact-test:
 	@echo "ERROR: release-artifact-test requires BUILD_TYPE=release" >&2
@@ -719,17 +1183,26 @@ endif
 qa-contract-test:
 	@sh tests/test_qa.sh "$(CURDIR)" "$(MAKE_COMMAND)"
 	@sh tests/test_ar07_build.sh "$(CURDIR)" "$(MAKE_COMMAND)"
+	@sh tests/test_ci_policy.sh "$(CURDIR)"
 
 # AR-06 F32: the SIG-01/SIG-02/F4 end-to-end signal-interruption repro was
 # tracked but executed by nothing (not `make test`, not CI). Wire it in against
-# the freshly built binary. It requires a real ssh-agent; skip gracefully where
-# one is unavailable so local dev on a minimal box is not blocked (CI provides
-# ssh-agent and therefore runs it for real).
+# the freshly built binary. Local development may still skip on a minimal host,
+# but a lane that lists the exact `openssh` capability as required must fail
+# closed if the real agent/key tools are unavailable (AR-08 M46).
 sig-repro-test: $(BINDIR)/$(TARGET)
-	@if command -v ssh-agent >/dev/null 2>&1; then \
+	@if command -v ssh-agent >/dev/null 2>&1 && \
+	   command -v ssh-add >/dev/null 2>&1 && \
+	   command -v ssh-keygen >/dev/null 2>&1; then \
 		sh tests/repro_sig01.sh; \
 	else \
-		echo "SKIP sig-repro-test: ssh-agent not available on this host"; \
+		case ",$${GITSWITCH_TEST_REQUIRED_CAPS-}," in \
+			*,openssh,*) \
+				echo "ERROR: sig-repro-test requires OpenSSH test tools in this lane" >&2; \
+				exit 1 ;; \
+			*) \
+				echo "SKIP sig-repro-test: OpenSSH test tools are unavailable" ;; \
+		esac; \
 	fi
 
 rpm: dist
@@ -737,13 +1210,15 @@ rpm: dist
 	@command -v rpmbuild >/dev/null 2>&1 || (echo "rpmbuild not available - install rpm-build package" && exit 1)
 	mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES \
 		~/rpmbuild/SPECS ~/rpmbuild/SRPMS
-	cp $(DIST_ARCHIVE) ~/rpmbuild/SOURCES/
+	cp "$$GITSWITCH_DIST_ARCHIVE_PATH" ~/rpmbuild/SOURCES/
 	# Consume the review-identical spec embedded in the commit-pinned archive,
 	# never a second live-checkout input.
-	tar -xOf $(DIST_ARCHIVE) $(DIST_ROOT)/$(PACKAGE).spec > \
+	tar -xOf "$$GITSWITCH_DIST_ARCHIVE_PATH" \
+		"$$GITSWITCH_DIST_ROOT/$(PACKAGE).spec" > \
 		~/rpmbuild/SPECS/$(PACKAGE).spec
 	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
 	@echo "RPM packages created in ~/rpmbuild/RPMS/"
 
 # Prevent make from removing intermediate files
-.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT)
+.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT) \
+	$(AR08_REMOVE_ACCOUNTS_OBJECT) $(AR08_HINT_CONFIG_OBJECT)

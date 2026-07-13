@@ -77,6 +77,7 @@ typedef struct {
     int token_fd;
     dev_t token_dev;
     ino_t token_ino;
+    uint64_t token_generation;
     size_t parent_slot;
     size_t leaf_slot;
     size_t file_slot;
@@ -85,6 +86,7 @@ typedef struct {
 typedef struct {
     bool active;
     int lock_fd;
+    uint64_t lock_generation;
     int parent_fd;
     int dir_fd;
     dev_t parent_dev;
@@ -99,6 +101,7 @@ static private_lock_inode_t g_private_lock_inodes[PRIVATE_LOCK_INODES];
 static private_lock_context_t g_private_lock_contexts[PRIVATE_LOCK_CONTEXTS];
 static pid_t g_private_lock_pid;
 static pid_t g_runtime_lock_pid;
+static uint64_t g_private_lock_next_generation;
 
 /* String utilities */
 
@@ -782,7 +785,26 @@ static void private_lock_prepare_process(void) {
     }
     memset(g_private_lock_contexts, 0, sizeof(g_private_lock_contexts));
     memset(g_private_lock_inodes, 0, sizeof(g_private_lock_inodes));
+    g_private_lock_next_generation = 0;
     g_private_lock_pid = pid;
+}
+
+static int private_lock_allocate_generation(uint64_t *generation_out) {
+    if (!generation_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (g_private_lock_next_generation == UINT64_MAX) {
+        for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+            if (g_private_lock_contexts[i].active) {
+                errno = EOVERFLOW;
+                return -1;
+            }
+        }
+        g_private_lock_next_generation = 0;
+    }
+    *generation_out = ++g_private_lock_next_generation;
+    return 0;
 }
 
 static int private_lock_inode_acquire(int owned_fd, bool nonblocking,
@@ -853,6 +875,7 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     int leaf_fd = -1;
     int file_fd = -1;
     int token_fd = -1;
+    uint64_t token_generation = 0;
     size_t parent_slot = PRIVATE_LOCK_INODES;
     size_t leaf_slot = PRIVATE_LOCK_INODES;
     size_t file_slot = PRIVATE_LOCK_INODES;
@@ -944,11 +967,13 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     }
     token_fd = private_lock_dup_cloexec(g_private_lock_inodes[file_slot].fd);
     if (token_fd < 0) goto fail;
+    if (private_lock_allocate_generation(&token_generation) != 0) goto fail;
 
     g_private_lock_contexts[context_slot].active = true;
     g_private_lock_contexts[context_slot].token_fd = token_fd;
     g_private_lock_contexts[context_slot].token_dev = opened.st_dev;
     g_private_lock_contexts[context_slot].token_ino = opened.st_ino;
+    g_private_lock_contexts[context_slot].token_generation = token_generation;
     g_private_lock_contexts[context_slot].parent_slot = parent_slot;
     g_private_lock_contexts[context_slot].leaf_slot = leaf_slot;
     g_private_lock_contexts[context_slot].file_slot = file_slot;
@@ -974,29 +999,84 @@ int try_lock_private_file_at(int dir_fd, const char *name) {
     return lock_private_file_at_mode(dir_fd, name, true);
 }
 
-void unlock_private_file(int token_fd) {
-    private_lock_prepare_process();
-    if (token_fd < 0) return;
+static uint64_t private_lock_latest_generation_for_fd(int token_fd) {
+    uint64_t latest = 0;
+
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        const private_lock_context_t *ctx = &g_private_lock_contexts[i];
+        if (ctx->active && ctx->token_fd == token_fd &&
+            ctx->token_generation > latest) {
+            latest = ctx->token_generation;
+        }
+    }
+    return latest;
+}
+
+static void private_lock_context_retire(private_lock_context_t *ctx,
+                                        bool close_live_token) {
+    size_t parent_slot = ctx->parent_slot;
+    size_t leaf_slot = ctx->leaf_slot;
+    size_t file_slot = ctx->file_slot;
+
+    if (close_live_token &&
+        private_lock_fd_has_identity(ctx->token_fd, ctx->token_dev,
+                                     ctx->token_ino)) {
+        close(ctx->token_fd);
+    }
+    memset(ctx, 0, sizeof(*ctx));
+    private_lock_inode_release(file_slot);
+    private_lock_inode_release(leaf_slot);
+    private_lock_inode_release(parent_slot);
+}
+
+static bool private_lock_release_generation(int token_fd,
+                                            uint64_t token_generation) {
+    uint64_t latest = private_lock_latest_generation_for_fd(token_fd);
 
     for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
         private_lock_context_t *ctx = &g_private_lock_contexts[i];
-        if (ctx->active && ctx->token_fd == token_fd) {
-            size_t parent_slot = ctx->parent_slot;
-            size_t leaf_slot = ctx->leaf_slot;
-            size_t file_slot = ctx->file_slot;
-            close(ctx->token_fd);
-            memset(ctx, 0, sizeof(*ctx));
-            private_lock_inode_release(file_slot);
-            private_lock_inode_release(leaf_slot);
-            private_lock_inode_release(parent_slot);
-            return;
+        if (ctx->active && ctx->token_fd == token_fd &&
+            ctx->token_generation == token_generation) {
+            private_lock_context_retire(
+                ctx, token_generation == latest && latest != 0);
+            return true;
         }
     }
+    return false;
+}
 
-    /* Opaque tokens are valid only while registered in this process.  An
-     * inherited token can be closed and its descriptor number reused before
-     * the first post-fork release.  Acting on an unknown number here would
-     * unlock/close that unrelated resource, so stale tokens are a no-op. */
+void unlock_private_file(int token_fd) {
+    private_lock_context_t *oldest = NULL;
+    int saved_errno = errno;
+
+    private_lock_prepare_process();
+    if (token_fd < 0) {
+        errno = saved_errno;
+        return;
+    }
+
+    /* A closed token number can be reused by a later registered token. The
+     * only descriptor that can still be live is the newest registration for
+     * that number; consume older generations one release at a time without
+     * closing the descriptor. This also resolves same-inode ABA, for which a
+     * device/inode comparison alone cannot distinguish nested registrations. */
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        private_lock_context_t *ctx = &g_private_lock_contexts[i];
+        if (ctx->active && ctx->token_fd == token_fd &&
+            (!oldest ||
+             ctx->token_generation < oldest->token_generation)) {
+            oldest = ctx;
+        }
+    }
+    if (oldest) {
+        (void)private_lock_release_generation(token_fd,
+                                              oldest->token_generation);
+    }
+
+    /* Opaque tokens are valid only while registered in this process. Unknown
+     * or double-released numbers are no-ops; acting on them could close an
+     * unrelated descriptor that later reused the integer. */
+    errno = saved_errno;
 }
 
 static void runtime_lock_prepare_process(void) {
@@ -1034,6 +1114,7 @@ int runtime_state_lock_acquire(void) {
     int parent_fd = -1;
     int dir_fd = -1;
     int lock_fd = -1;
+    uint64_t lock_generation = 0;
     int written;
 
     runtime_lock_prepare_process();
@@ -1093,6 +1174,16 @@ int runtime_state_lock_acquire(void) {
         }
         return -1;
     }
+    lock_generation = private_lock_latest_generation_for_fd(lock_fd);
+    if (lock_generation == 0) {
+        unlock_private_file(lock_fd);
+        close(dir_fd);
+        close(parent_fd);
+        errno = EINVAL;
+        set_error(ERR_SYSTEM_CALL,
+                  "Shared runtime lock token was not registered");
+        return -1;
+    }
 
     /* A same-uid process may have renamed/replaced either path between the
      * opens and the (non-blocking) flock succeeding.  Keep both descriptors
@@ -1110,7 +1201,7 @@ int runtime_state_lock_acquire(void) {
         fstatat(parent_fd, child_name, &dir_entry_st,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         !same_fs_identity(&dir_st, &dir_entry_st)) {
-        unlock_private_file(lock_fd);
+        (void)private_lock_release_generation(lock_fd, lock_generation);
         close(dir_fd);
         close(parent_fd);
         set_error(ERR_PERMISSION_DENIED,
@@ -1122,6 +1213,7 @@ int runtime_state_lock_acquire(void) {
         if (!g_runtime_locks[i].active) {
             g_runtime_locks[i].active = true;
             g_runtime_locks[i].lock_fd = lock_fd;
+            g_runtime_locks[i].lock_generation = lock_generation;
             g_runtime_locks[i].parent_fd = parent_fd;
             g_runtime_locks[i].dir_fd = dir_fd;
             g_runtime_locks[i].parent_dev = parent_st.st_dev;
@@ -1135,7 +1227,7 @@ int runtime_state_lock_acquire(void) {
             return lock_fd;
         }
     }
-    unlock_private_file(lock_fd);
+    (void)private_lock_release_generation(lock_fd, lock_generation);
     close(dir_fd);
     close(parent_fd);
     set_error(ERR_SYSTEM_CALL, "Too many nested shared runtime locks");
@@ -1145,8 +1237,19 @@ int runtime_state_lock_acquire(void) {
 void runtime_state_lock_release(int fd) {
     runtime_lock_prepare_process();
     if (fd >= 0) {
+        size_t selected = RUNTIME_LOCK_CONTEXTS;
+
         for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
-            if (g_runtime_locks[i].active && g_runtime_locks[i].lock_fd == fd) {
+            if (g_runtime_locks[i].active && g_runtime_locks[i].lock_fd == fd &&
+                (selected == RUNTIME_LOCK_CONTEXTS ||
+                 g_runtime_locks[i].lock_generation <
+                     g_runtime_locks[selected].lock_generation)) {
+                selected = i;
+            }
+        }
+        if (selected != RUNTIME_LOCK_CONTEXTS) {
+            size_t i = selected;
+
                 /* Retained descriptors are deliberately closed only after the
                  * critical section; release also performs a final namespace
                  * check as diagnostic hardening. The void API cannot surface a
@@ -1223,14 +1326,13 @@ void runtime_state_lock_release(int fd) {
                                 g_runtime_locks[i].parent_path,
                                 g_runtime_locks[i].child_name);
                 }
-                unlock_private_file(fd);
+                (void)private_lock_release_generation(
+                    fd, g_runtime_locks[i].lock_generation);
                 close(g_runtime_locks[i].dir_fd);
                 close(g_runtime_locks[i].parent_fd);
                 memset(&g_runtime_locks[i], 0, sizeof(g_runtime_locks[i]));
                 return;
-            }
         }
-        unlock_private_file(fd);
     }
 }
 
@@ -1388,12 +1490,46 @@ int write_string_to_file(const char *file_path, const char *content, mode_t mode
     return 0;
 }
 
+#ifdef GITSWITCH_TESTING
+typedef void (*copy_file_test_hook_fn)(int stage, const char *dst_path);
+copy_file_test_hook_fn gitswitch_test_set_copy_file_hook(
+    copy_file_test_hook_fn hook);
+
+static copy_file_test_hook_fn g_copy_file_test_hook;
+
+copy_file_test_hook_fn gitswitch_test_set_copy_file_hook(
+    copy_file_test_hook_fn hook) {
+    copy_file_test_hook_fn previous = g_copy_file_test_hook;
+    g_copy_file_test_hook = hook;
+    return previous;
+}
+
+#define COPY_FILE_TEST_CHECKPOINT(stage, path) \
+    do { \
+        if (g_copy_file_test_hook) g_copy_file_test_hook((stage), (path)); \
+    } while (0)
+#else
+#define COPY_FILE_TEST_CHECKPOINT(stage, path) \
+    do { (void)(stage); (void)(path); } while (0)
+#endif
+
+enum {
+    COPY_FILE_TEST_AFTER_DESTINATION_OPEN = 1,
+    COPY_FILE_TEST_AFTER_FIRST_WRITE
+};
+
 int copy_file(const char *src_path, const char *dst_path) {
-    FILE *src, *dst;
+    FILE *src = NULL;
+    FILE *dst = NULL;
     char buffer[4096];
     size_t bytes;
     int result = 0;
+    int dst_fd = -1;
+    int dst_flags = O_WRONLY | O_CREAT | O_TRUNC;
     struct stat src_stat;
+#ifdef GITSWITCH_TESTING
+    bool first_write_checkpointed = false;
+#endif
     
     if (!src_path || !dst_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to copy_file");
@@ -1406,27 +1542,88 @@ int copy_file(const char *src_path, const char *dst_path) {
         return -1;
     }
     
-    dst = fopen(dst_path, "wbe");
-    if (!dst) {
-        set_system_error(ERR_FILE_IO, "Failed to open destination file: %s", dst_path);
+    /* Capture metadata from the same source object whose bytes are copied. */
+    if (fstat(fileno(src), &src_stat) != 0) {
+        int saved_errno = errno;
         fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
         return -1;
     }
 
-    /* Capture metadata from the same source object whose bytes are copied. */
-    if (fstat(fileno(src), &src_stat) != 0) {
-        set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
+#ifdef O_CLOEXEC
+    dst_flags |= O_CLOEXEC;
+#endif
+    /* A new destination is born private even under umask(000). For an
+     * existing destination, the creation mode is ignored, so fchmod the
+     * already-open descriptor before fdopen or the first byte write. */
+    dst_fd = open(dst_path, dst_flags, 0600);
+    if (dst_fd < 0) {
+        int saved_errno = errno;
         fclose(src);
-        fclose(dst);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO, "Failed to open destination file: %s",
+                         dst_path);
         return -1;
     }
-    
+#ifndef O_CLOEXEC
+    {
+        int fd_flags = fcntl(dst_fd, F_GETFD);
+        if (fd_flags < 0 ||
+            fcntl(dst_fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            close(dst_fd);
+            fclose(src);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Failed to secure destination descriptor: %s",
+                             dst_path);
+            return -1;
+        }
+    }
+#endif
+    COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_DESTINATION_OPEN, dst_path);
+    if (fchmod(dst_fd, src_stat.st_mode & 0777) != 0) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Failed to set destination permissions: %s", dst_path);
+        return -1;
+    }
+    dst = fdopen(dst_fd, "wb");
+    if (!dst) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to open destination stream: %s", dst_path);
+        return -1;
+    }
+    dst_fd = -1; /* fdopen owns it from here. */
+
     while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
         if (fwrite(buffer, 1, bytes, dst) != bytes) {
             set_system_error(ERR_FILE_IO, "Failed to write to destination file: %s", dst_path);
             result = -1;
             break;
         }
+#ifdef GITSWITCH_TESTING
+        if (!first_write_checkpointed) {
+            if (fflush(dst) != 0) {
+                set_system_error(ERR_FILE_IO,
+                                 "Failed to flush destination file: %s",
+                                 dst_path);
+                result = -1;
+                break;
+            }
+            COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_FIRST_WRITE,
+                                      dst_path);
+            first_write_checkpointed = true;
+        }
+#endif
     }
     
     if (ferror(src)) {
@@ -1437,16 +1634,6 @@ int copy_file(const char *src_path, const char *dst_path) {
     if (result == 0 && fflush(dst) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to flush destination file: %s", dst_path);
         result = -1;
-    }
-
-    /* Pin the destination descriptor while applying ordinary permission bits;
-     * never propagate set-id or sticky bits from a copied input. */
-    if (result == 0) {
-        if (fchmod(fileno(dst), src_stat.st_mode & 0777) != 0) {
-            set_system_error(ERR_PERMISSION_DENIED,
-                             "Failed to set destination permissions: %s", dst_path);
-            result = -1;
-        }
     }
 
     if (fclose(src) != 0 && result == 0) {
@@ -1973,7 +2160,11 @@ static bool g_test_fd_close_observation_enabled;
 static bool g_test_fd_close_observation_valid;
 static run_test_fd_close_observation_t g_test_fd_close_observation;
 static int g_test_bulk_close_failure_errno;
+static bool g_test_auto_bulk_close_unavailable;
 static run_test_exec_resolved_hook_fn g_test_exec_resolved_hook;
+static run_test_post_fork_pre_publish_hook_fn
+    g_test_post_fork_pre_publish_hook;
+static int g_test_fork_failure_errno;
 
 int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
     switch (strategy) {
@@ -2015,8 +2206,21 @@ void run_test_set_bulk_close_failure(int system_errno) {
     g_test_bulk_close_failure_errno = system_errno > 0 ? system_errno : 0;
 }
 
+void run_test_set_auto_bulk_close_unavailable(bool unavailable) {
+    g_test_auto_bulk_close_unavailable = unavailable;
+}
+
 void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook) {
     g_test_exec_resolved_hook = hook;
+}
+
+void run_test_set_post_fork_pre_publish_hook(
+    run_test_post_fork_pre_publish_hook_fn hook) {
+    g_test_post_fork_pre_publish_hook = hook;
+}
+
+void run_test_set_fork_failure(int system_errno) {
+    g_test_fork_failure_errno = system_errno > 0 ? system_errno : 0;
 }
 
 /* Close every descriptor >= lowfd in the forked child before exec (fd-CLOEXEC).
@@ -2296,8 +2500,14 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     bool require_bulk_close = false;
     switch (g_test_fd_close_strategy) {
         case RUN_TEST_FD_CLOSE_AUTO:
-            use_bulk_close = child_bulk_close_available();
+            use_bulk_close = !g_test_auto_bulk_close_unavailable &&
+                             child_bulk_close_available();
             capture_fd_snapshot = !use_bulk_close;
+            /* A bulk-capable AUTO launch deliberately avoids the O(open-fds)
+             * parent snapshot.  If the selected primitive then fails, there
+             * is no complete fallback: report child setup failure instead of
+             * leaking descriptors beyond the bounded numeric sweep. */
+            require_bulk_close = use_bulk_close;
             break;
         case RUN_TEST_FD_CLOSE_SNAPSHOT:
             capture_fd_snapshot = true;
@@ -2311,17 +2521,22 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         default:
             /* Defensive equivalent of AUTO if memory corruption reaches this
              * test-only selector. */
-            use_bulk_close = child_bulk_close_available();
+            use_bulk_close = !g_test_auto_bulk_close_unavailable &&
+                             child_bulk_close_available();
             capture_fd_snapshot = !use_bulk_close;
+            require_bulk_close = use_bulk_close;
             break;
     }
     child_fd_snapshot_t fd_snapshot = {0};
     if (capture_fd_snapshot) {
         fd_snapshot = child_fd_snapshot_capture();
-        if (g_test_fd_close_strategy == RUN_TEST_FD_CLOSE_SNAPSHOT &&
-            !fd_snapshot.complete) {
+        if (!fd_snapshot.complete) {
+            const char *snapshot_kind =
+                g_test_fd_close_strategy == RUN_TEST_FD_CLOSE_SNAPSHOT
+                    ? "forced" : "automatic";
             set_error(ERR_SYSTEM_CALL,
-                      "run_argv: forced child-FD snapshot is incomplete");
+                      "run_argv: %s child-FD snapshot is incomplete",
+                      snapshot_kind);
             free(fd_snapshot.fds);
             close(exec_fd);
             trusted_script_launch_cleanup(&script_launch);
@@ -2372,9 +2587,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         return -1;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        set_system_error(ERR_SYSTEM_CALL, "fork() failed");
+    sigset_t pre_spawn_mask;
+    if (signals_block_for_child_spawn(&pre_spawn_mask) != 0) {
+        int block_errno = errno;
         if (devnull >= 0) close(devnull);
         if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
@@ -2383,6 +2598,46 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
+        errno = block_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot block guarded signals before fork");
+        errno = block_errno;
+        return -1;
+    }
+
+    pid_t pid;
+    if (g_test_fork_failure_errno != 0) {
+        int injected_errno = g_test_fork_failure_errno;
+        g_test_fork_failure_errno = 0;
+        errno = injected_errno;
+        pid = -1;
+    } else {
+        pid = fork();
+    }
+    if (pid < 0) {
+        int fork_errno = errno;
+        int mask_restore_errno = 0;
+        if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+            mask_restore_errno = errno;
+        }
+        if (devnull >= 0) close(devnull);
+        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = fork_errno;
+        if (mask_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "fork() failed; also failed to restore parent signal mask (restore errno=%d)",
+                mask_restore_errno);
+        } else {
+            set_system_error(ERR_SYSTEM_CALL, "fork() failed");
+        }
+        errno = fork_errno;
         return -1;
     }
 
@@ -2656,13 +2911,40 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
 
     /* ---- parent ---- */
+    result->spawned = true;
+    if (g_test_post_fork_pre_publish_hook) {
+        g_test_post_fork_pre_publish_hook();
+    }
+    /* AR-03 L8: publish the in-flight child while guarded signals are still
+     * blocked, so a pending rollback signal can observe it when the exact
+     * parent mask is restored below. */
+    signals_child_spawned(pid);
+    if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+        int restore_errno = errno;
+        pid_t waited;
+
+        (void)kill(pid, SIGKILL);
+        do {
+            waited = waitpid(pid, NULL, 0);
+        } while (waited < 0 && errno == EINTR);
+        signals_child_reaped();
+        if (devnull >= 0) close(devnull);
+        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = restore_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot restore parent signal mask after fork");
+        errno = restore_errno;
+        return -1;
+    }
     free(fd_snapshot.fds);
     close(exec_fd);
     trusted_script_launch_cleanup(&script_launch);
-    result->spawned = true;
-    /* AR-03 L8: publish the in-flight child so the signal handler can kill()
-     * it if a rollback wedges behind an interactive prompt (see signals.h). */
-    signals_child_spawned(pid);
     if (devnull >= 0) close(devnull);
     if (want_in) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
@@ -2987,6 +3269,10 @@ command_runner_fn run_set_runner(command_runner_fn fn) {
     command_runner_fn prev = g_runner;
     g_runner = fn ? fn : run_argv_real;
     return prev;
+}
+
+bool run_uses_default_runner(void) {
+    return g_runner == run_argv_real;
 }
 
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
@@ -3574,8 +3860,24 @@ static int open_trusted_command(const char *name, char *resolved,
 
 int find_command_path(const char *name, char *buf, size_t size) {
     struct stat file_stat;
+    trusted_script_launch_t launch;
+    const char *probe_argv[] = {name, NULL};
     int fd = open_trusted_command(name, buf, size, &file_stat);
     if (fd < 0) return -1;
+
+    /* A dependency probe must answer the same parent-side eligibility
+     * question as the default runner. Reuse its pinned-descriptor format and
+     * shebang validation instead of accepting a file run_argv would reject
+     * before fork (AR-08 L10). The synthetic argv is sufficient because this
+     * path validates launch shape but does not execute the constructed argv. */
+    if (prepare_trusted_script_launch(fd, probe_argv, &launch) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        trusted_script_launch_cleanup(&launch);
+        errno = saved_errno;
+        return -1;
+    }
+    trusted_script_launch_cleanup(&launch);
     close(fd);
     return 0;
 }
@@ -3728,6 +4030,13 @@ bool validate_name(const char *name) {
             return false;
         }
     }
+    /* Names are printed interactively before config admission and also key
+     * filesystem/runtime state. Reject malformed UTF-8 and every invisible or
+     * terminal-affecting codepoint at this first shared boundary so no prompt,
+     * summary, log, or later validation error can echo hostile identity text. */
+    if (!text_is_tty_safe(name)) {
+        return false;
+    }
 
     /* Reserve "current": the per-account GNUPGHOME is <base>/<name>, and the
      * stable GPG symlink the shell integration exports is <base>/current. An
@@ -3821,7 +4130,64 @@ size_t utf8_decode(const unsigned char *s, size_t available,
 }
 
 bool tty_safe_codepoint(uint32_t cp) {
-    return cp >= 0x20 && cp != 0x7F && !(cp >= 0x80 && cp <= 0x9F);
+    /* Unicode 16.0 Default_Ignorable_Code_Point ranges. These characters are
+     * intentionally invisible or alter the display/order of neighboring
+     * glyphs. That is useful in rich text, but unsafe in identity text printed
+     * by list/status: an account can look empty, hide a suffix, or visually
+     * reorder trusted text. Reject the complete property instead of chasing
+     * only the currently abused bidi controls. This deliberately also rejects
+     * variation selectors and joiners; account identity remains the visible
+     * base text rather than an invisible presentation sequence. Ordinary
+     * combining marks (for example U+0301) remain allowed. */
+    static const struct {
+        uint32_t first;
+        uint32_t last;
+    } default_ignorable_ranges[] = {
+        {0x00AD, 0x00AD}, {0x034F, 0x034F}, {0x061C, 0x061C},
+        {0x115F, 0x1160}, {0x17B4, 0x17B5}, {0x180B, 0x180F},
+        {0x200B, 0x200F}, {0x202A, 0x202E}, {0x2060, 0x206F},
+        {0x3164, 0x3164}, {0xFE00, 0xFE0F}, {0xFEFF, 0xFEFF},
+        {0xFFA0, 0xFFA0}, {0xFFF0, 0xFFF8},
+        {0x1BCA0, 0x1BCA3}, {0x1D173, 0x1D17A},
+        {0xE0000, 0xE0FFF}
+    };
+
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) ||
+        cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F) ||
+        cp == 0x2028 || cp == 0x2029) {
+        return false;
+    }
+
+    for (size_t i = 0;
+         i < sizeof(default_ignorable_ranges) /
+                 sizeof(default_ignorable_ranges[0]);
+         i++) {
+        if (cp >= default_ignorable_ranges[i].first &&
+            cp <= default_ignorable_ranges[i].last) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool text_is_tty_safe(const char *text) {
+    const unsigned char *cursor;
+    size_t remaining;
+
+    if (!text) return false;
+    cursor = (const unsigned char *)text;
+    remaining = strlen(text);
+    while (remaining > 0) {
+        uint32_t codepoint;
+        size_t consumed = utf8_decode(cursor, remaining, &codepoint);
+
+        if (consumed == 0 || !tty_safe_codepoint(codepoint)) {
+            return false;
+        }
+        cursor += consumed;
+        remaining -= consumed;
+    }
+    return true;
 }
 
 bool validate_key_id(const char *key_id) {
@@ -4006,28 +4372,47 @@ int get_terminal_size(int *width, int *height) {
     return 0;
 }
 
-void disable_echo(void) {
+int disable_echo(void) {
     struct termios new_termios;
-    
-    if (g_echo_disabled) return;
-    
+
+    if (g_echo_disabled) return 0;
+
     if (tcgetattr(STDIN_FILENO, &g_original_termios) != 0) {
-        return; /* Can't save original, don't disable echo */
+        int saved_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Failed to read terminal state before disabling echo");
+        errno = saved_errno;
+        return -1; /* Can't save original, don't disable echo. */
     }
-    
+
     new_termios = g_original_termios;
     new_termios.c_lflag &= ~ECHO;
-    
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) == 0) {
-        g_echo_disabled = true;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) != 0) {
+        int saved_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL, "Failed to disable terminal echo");
+        errno = saved_errno;
+        return -1;
     }
+    g_echo_disabled = true;
+    return 0;
 }
 
-void enable_echo(void) {
-    if (!g_echo_disabled) return;
-    
-    tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios);
+int enable_echo(void) {
+    if (!g_echo_disabled) return 0;
+
+    /* Keep the recovery flag set until the kernel accepts the restore. A
+     * transient descriptor/PTY failure must remain retryable rather than
+     * turning every later enable_echo() call into a false-success no-op. */
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios) != 0) {
+        int saved_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL, "Failed to restore terminal echo");
+        errno = saved_errno;
+        return -1;
+    }
     g_echo_disabled = false;
+    clear_error();
+    return 0;
 }
 
 /* Time utilities */

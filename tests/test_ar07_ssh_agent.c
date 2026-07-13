@@ -101,10 +101,12 @@ static int counting_key_open(const char *path, int flags) {
     return open(path, flags);
 }
 
-static bool classify_recorded_agent_gone(pid_t pid, const char *socket_arg) {
+static ssh_process_outcome_t classify_recorded_agent_gone(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
     (void)pid;
     (void)socket_arg;
-    return true;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_GONE;
 }
 
 static int replace_current_during_cleanup(int dir_fd) {
@@ -1142,6 +1144,7 @@ TEST(account_status_reuses_one_descriptor_backed_key_inspection) {
     command_runner_fn previous_runner;
     ssh_key_open_fn previous_open;
     FILE *capture;
+    size_t captured;
     int saved_stdout;
     int dir_fd = make_private_dir(dir, sizeof(dir));
     int fd;
@@ -1196,7 +1199,9 @@ TEST(account_status_reuses_one_descriptor_backed_key_inspection) {
     close(saved_stdout);
     rewind(capture);
     memset(output, 0, sizeof(output));
-    (void)fread(output, 1, sizeof(output) - 1U, capture);
+    captured = fread(output, 1, sizeof(output) - 1U, capture);
+    CHECK(!ferror(capture));
+    output[captured] = '\0';
     fclose(capture);
 
     CHECK_EQ_INT(g_key_open_calls, 1);

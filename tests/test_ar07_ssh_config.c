@@ -199,6 +199,12 @@ static int fail_dirsync(int dir_fd) {
     return -1;
 }
 
+static int fail_postrename_verification(int dir_fd) {
+    (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
 static int swap_public_ssh_directory(int dir_fd, const char *temp_name) {
     static const char replacement[] = "Host replacement\n  User untouched\n";
     char config[MAX_PATH_LEN];
@@ -341,12 +347,9 @@ static int replace_config_byte_preserving_mtime(int dir_fd,
     return close(fd);
 }
 
-TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
+TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
-    char output[32768];
     account_t account;
-    run_opts_t opts;
-    run_result_t result;
     size_t config_len = 0;
     char *content;
 
@@ -362,11 +365,22 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
         CHECK(strstr(content, "key dir/id\\backslash\"") != NULL);
         free(content);
     }
+}
+
+TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char output[32768];
+    account_t account;
+    run_opts_t opts;
+    run_result_t result;
 
     if (!command_exists("ssh")) {
-        fprintf(stderr, "  (skipped OpenSSH oracle: ssh not in trusted PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
     }
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    snprintf(key, sizeof(key), "%s/key dir/id\\backslash", home);
+    make_account(&account, key);
+    CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
     memset(&opts, 0, sizeof(opts));
     memset(&result, 0, sizeof(result));
     opts.out = output;
@@ -536,6 +550,110 @@ TEST(valid_duplicates_collapse_to_one_then_remove_to_zero) {
     }
 }
 
+TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes) {
+    static const char preserved[] =
+        "Host user-top\r\n  User alice\r\n"
+        "# >>> gitswitch other >>>\r\nHost other\r\n"
+        "  HostName other.example\r\n"
+        "  IdentityFile \"/other\"\r\n  IdentitiesOnly yes\r\n"
+        "# <<< gitswitch other <<<\r\n"
+        "Host user-tail\r\n  User bob\r\n";
+    static const char original[] =
+        "Host user-top\r\n  User alice\r\n"
+        BEGIN_MARK "\r\nHost " TEST_ALIAS "\r\n"
+        "  HostName stale-one.example\r\n"
+        "  IdentityFile \"/stale/one\"\r\n  IdentitiesOnly yes\r\n"
+        END_MARK "\r\n"
+        "# >>> gitswitch other >>>\r\nHost other\r\n"
+        "  HostName other.example\r\n"
+        "  IdentityFile \"/other\"\r\n  IdentitiesOnly yes\r\n"
+        "# <<< gitswitch other <<<\r\n"
+        BEGIN_MARK "\r\nHost " TEST_ALIAS "\r\n"
+        "  HostName stale-two.example\r\n"
+        "  IdentityFile \"/stale/two\"\r\n  IdentitiesOnly yes\r\n"
+        END_MARK "\r\n"
+        "Host user-tail\r\n  User bob\r\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char output[32768];
+    account_t account;
+    run_opts_t opts;
+    run_result_t result;
+    size_t length = 0;
+    char *content;
+
+    if (!command_exists("ssh")) {
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/new key", home);
+    make_account(&account, key);
+    CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
+
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(length > sizeof(preserved) - 1U);
+        CHECK(length <= sizeof(preserved) - 1U ||
+              memcmp(content, preserved, sizeof(preserved) - 1U) == 0);
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 1);
+        CHECK_EQ_INT(count_text(content, END_MARK), 1);
+        CHECK(strstr(content, "stale-one.example") == NULL);
+        CHECK(strstr(content, "stale-two.example") == NULL);
+        free(content);
+    }
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+    {
+        const char *const argv[] = {
+            "ssh", "-G", "-F", config, TEST_ALIAS, NULL
+        };
+        CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+    }
+    CHECK(!result.out_truncated);
+    CHECK(output_has_value(output, "hostname", TEST_HOSTNAME));
+    CHECK(output_has_value(output, "identityfile", key));
+}
+
+TEST(crlf_remove_preserves_all_unmanaged_bytes) {
+    static const char before[] = "Host before\r\n  User alice\r\n";
+    static const char after[] = "Host after\r\n  User bob\r\n";
+    static const char original[] =
+        "Host before\r\n  User alice\r\n"
+        BEGIN_MARK "\r\nHost " TEST_ALIAS "\r\n"
+        "  HostName github.com\r\n"
+        "  IdentityFile \"/stale/key\"\r\n  IdentitiesOnly yes\r\n"
+        END_MARK "\r\n"
+        "Host after\r\n  User bob\r\n";
+    char home[96], config[MAX_PATH_LEN];
+    char expected[sizeof(before) + sizeof(after)];
+    size_t expected_len;
+    size_t length = 0;
+    char *content;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_remove_host_alias(TEST_ALIAS), 0);
+    expected_len = (sizeof(before) - 1U) + (sizeof(after) - 1U);
+    memcpy(expected, before, sizeof(before) - 1U);
+    memcpy(expected + sizeof(before) - 1U, after, sizeof(after) - 1U);
+
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK_EQ_INT(length, expected_len);
+        CHECK(length != expected_len ||
+              memcmp(content, expected, expected_len) == 0);
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 0);
+        CHECK_EQ_INT(count_text(content, END_MARK), 0);
+        free(content);
+    }
+}
+
 TEST(byte_identical_config_skips_all_write_and_sync_work) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
     account_t account;
@@ -562,6 +680,7 @@ TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     account_t account;
     ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication;
     size_t length = 0;
     char *content;
 
@@ -571,10 +690,42 @@ TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
     make_account(&account, key);
     g_dirsync_calls = 0;
     previous = ssh_manager_set_dirsync_fn(fail_dirsync);
-    CHECK_EQ_INT(ssh_configure_host_alias(&account), -1);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
     ssh_manager_set_dirsync_fn(previous);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN);
     CHECK_EQ_INT(g_dirsync_calls, 1);
     CHECK(strstr(get_last_error()->message, "changed bytes") != NULL);
+    CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(strstr(content, BEGIN_MARK) != NULL);
+        free(content);
+    }
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(postrename_verification_failure_reports_installed_unverified) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    ssh_config_postrename_hook_fn previous;
+    ssh_config_publication_state_t publication;
+    size_t length = 0;
+    char *content;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
+    make_account(&account, key);
+    previous = ssh_manager_set_config_postrename_hook_fn(
+        fail_postrename_verification);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    ssh_manager_set_config_postrename_hook_fn(previous);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED);
+    CHECK(strstr(get_last_error()->message, "installed") != NULL);
+    CHECK(strstr(get_last_error()->message, "retained") != NULL);
     CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
     content = read_bytes(config, &length);
     CHECK(content != NULL);
@@ -616,6 +767,7 @@ TEST(ctime_only_metadata_shape_does_not_hide_content_change) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     account_t account;
     ssh_config_commit_hook_fn previous;
+    ssh_config_publication_state_t publication;
     size_t length = 0;
     char *content;
 
@@ -626,8 +778,10 @@ TEST(ctime_only_metadata_shape_does_not_hide_content_change) {
     make_account(&account, key);
     previous = ssh_manager_set_config_commit_hook_fn(
         replace_config_byte_preserving_mtime);
-    CHECK_EQ_INT(ssh_configure_host_alias(&account), -1);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
     ssh_manager_set_config_commit_hook_fn(previous);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
     CHECK(strstr(get_last_error()->message, "bytes changed") != NULL);
 
     content = read_bytes(config, &length);
@@ -866,14 +1020,18 @@ cleanup:
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(identityfile_quoting_and_hostname_are_serialized_safely);
     RUN_TEST(identityfile_quoting_and_hostname_match_openssh_oracle);
     RUN_TEST(openssh_percent_and_environment_expansions_are_safe);
     RUN_TEST(embedded_nul_at_every_region_fails_without_mutation);
     RUN_TEST(exact_marker_parser_preserves_incidental_substrings);
     RUN_TEST(malformed_nested_and_mismatched_blocks_fail_closed);
     RUN_TEST(valid_duplicates_collapse_to_one_then_remove_to_zero);
+    RUN_TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes);
+    RUN_TEST(crlf_remove_preserves_all_unmanaged_bytes);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
     RUN_TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp);
+    RUN_TEST(postrename_verification_failure_reports_installed_unverified);
     RUN_TEST(ctime_only_drift_revalidates_exact_pinned_bytes);
     RUN_TEST(ctime_only_metadata_shape_does_not_hide_content_change);
     RUN_TEST(pinned_directory_swap_fails_without_touching_replacement_or_leaking_temp);

@@ -34,12 +34,39 @@ typedef struct {
                               * reuse avoids a passphrase re-prompt. */
 } ssh_config_t;
 
+/* One truthful process-state vocabulary for identity, liveness, and reap.
+ * OWNED means the recorded PID is conclusively the managed ssh-agent and is
+ * still alive. UNRELATED means a live PID was conclusively proved to be a
+ * different process. GONE means no process remains at that PID. Every failed,
+ * inaccessible, truncated, or permission-denied inspection is INDETERMINATE.
+ * Only UNRELATED and GONE authorize consuming a recovery sidecar. */
+typedef enum {
+    SSH_PROCESS_OWNED,
+    SSH_PROCESS_UNRELATED,
+    SSH_PROCESS_GONE,
+    SSH_PROCESS_INDETERMINATE
+} ssh_process_outcome_t;
+
 typedef int (*ssh_setenv_fn)(const char *name, const char *value, int overwrite);
-typedef bool (*ssh_reap_fn)(pid_t pid, const char *socket_arg);
+typedef ssh_process_outcome_t (*ssh_reap_fn)(pid_t pid,
+                                             const char *socket_arg,
+                                             int runtime_dir_fd);
+typedef ssh_process_outcome_t (*ssh_process_identity_fn)(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd);
+typedef int (*ssh_process_signal_fn)(pid_t pid, int signal_number);
+typedef int (*ssh_pidfd_open_fn)(pid_t pid);
+typedef int (*ssh_pidfd_signal_fn)(int pidfd, int signal_number);
+typedef struct {
+    ssh_process_identity_fn identity;
+    ssh_process_signal_fn signal;
+    ssh_pidfd_open_fn pidfd_open;
+    ssh_pidfd_signal_fn pidfd_signal;
+} ssh_reap_test_ops_t;
 typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);
 typedef int (*ssh_dirsync_fn)(int dir_fd);
 typedef int (*ssh_config_commit_hook_fn)(int dir_fd, const char *temp_name);
+typedef int (*ssh_config_postrename_hook_fn)(int dir_fd);
 typedef int (*ssh_current_cleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_precleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
@@ -47,6 +74,19 @@ typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
 typedef int64_t (*ssh_probe_clock_fn)(void);
 typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
+
+/* Public-state result for one ~/.ssh/config alias publication.  Failure is
+ * transactionally reversible only while PREINSTALL_FAILED remains current.
+ * The two uncertain states mean renameat() already made the new bytes public;
+ * callers must retain the matching account transaction instead of rolling its
+ * Git/runtime/config state back around an installed alias. */
+typedef enum {
+    SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED,
+    SSH_CONFIG_PUBLICATION_UNCHANGED,
+    SSH_CONFIG_PUBLICATION_COMMITTED,
+    SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED,
+    SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN
+} ssh_config_publication_state_t;
 
 /* One descriptor-backed view of an SSH key file. Status callers can reuse
  * these fields instead of independently resolving, statting, and reopening a
@@ -96,6 +136,11 @@ ssh_setenv_fn ssh_manager_set_setenv_fn(ssh_setenv_fn fn);
 
 /* Deterministic failure/race seams used by the adversarial runtime tests. */
 ssh_reap_fn ssh_manager_set_reap_fn(ssh_reap_fn fn);
+/* Replace the process-inspection/signal boundary used by the real reaper.
+ * NULL fields select production defaults. Passing NULL restores every
+ * production default. The previous complete set is returned for restoration. */
+ssh_reap_test_ops_t ssh_manager_set_reap_test_ops(
+    const ssh_reap_test_ops_t *ops);
 ssh_pid_commit_hook_fn ssh_manager_set_pid_commit_hook_fn(
     ssh_pid_commit_hook_fn fn);
 ssh_pid_commit_hook_fn ssh_manager_set_pid_postrename_hook_fn(
@@ -107,6 +152,10 @@ ssh_dirsync_fn ssh_manager_set_dirsync_fn(ssh_dirsync_fn fn);
  * leaves it NULL; the callback receives the pinned ~/.ssh fd and temp name. */
 ssh_config_commit_hook_fn ssh_manager_set_config_commit_hook_fn(
     ssh_config_commit_hook_fn fn);
+/* Test-only post-rename seam. Production leaves it NULL. A failure here models
+ * an installed config whose public inode could not be verified. */
+ssh_config_postrename_hook_fn ssh_manager_set_config_postrename_hook_fn(
+    ssh_config_postrename_hook_fn fn);
 ssh_current_cleanup_hook_fn ssh_manager_set_current_cleanup_hook_fn(
     ssh_current_cleanup_hook_fn fn);
 ssh_current_precleanup_hook_fn ssh_manager_set_current_precleanup_hook_fn(
@@ -116,6 +165,10 @@ ssh_current_publish_hook_fn ssh_manager_set_current_publish_hook_fn(
 ssh_quarantine_hook_fn ssh_manager_set_quarantine_hook_fn(
     ssh_quarantine_hook_fn fn);
 ssh_quarantine_hook_fn ssh_manager_set_quarantine_capture_hook_fn(
+    ssh_quarantine_hook_fn fn);
+ssh_quarantine_hook_fn ssh_manager_set_reset_retire_hook_fn(
+    ssh_quarantine_hook_fn fn);
+ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
     ssh_quarantine_hook_fn fn);
 bool ssh_manager_set_force_portable_quarantine(bool force);
 ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
@@ -176,6 +229,14 @@ int ssh_manager_test_probe_deadline(int timeout_ms);
  */
 int ssh_configure_host_alias(const account_t *account);
 
+/* Structured form used by account transactions. Returns the same status as
+ * ssh_configure_host_alias() and always initializes `publication` when it is
+ * non-NULL. A nonzero return with an installed/uncertain publication is a
+ * committed-state warning, not authorization to roll back adjacent state. */
+int ssh_configure_host_alias_result(
+    const account_t *account,
+    ssh_config_publication_state_t *publication);
+
 /**
  * Remove the managed host-alias block for `alias` from ~/.ssh/config (AR-06
  * F15). No-op if the config or the block is absent. Returns 0 on success
@@ -224,8 +285,10 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
 
 /**
  * Tear down isolated SSH agents (kill by recorded PID and remove sockets/PID
- * sidecars). Resets a single account when `account` is non-NULL, or all
- * accounts when NULL. Returns 0 on success.
+ * sidecars). Resets a single account when `account` is a nonempty name
+ * accepted by validate_name(); callers must pass the canonical stored account
+ * name. Resets all accounts only when `account` is NULL. Invalid non-NULL
+ * input fails with ERR_INVALID_ARGS before runtime I/O. Returns 0 on success.
  */
 int ssh_manager_reset(const char *account);
 

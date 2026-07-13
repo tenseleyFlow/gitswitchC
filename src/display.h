@@ -53,21 +53,6 @@ void display_validation_results(const account_validation_t *validation);
 */
 
 /**
- * Print health check results
- */
-void display_health_check(const gitswitch_ctx_t *ctx);
-
-/**
- * Display progress indicator for long operations
- */
-void display_progress(const char *operation, int percent);
-
-/**
- * Clear current line (for progress updates)
- */
-void display_clear_line(void);
-
-/**
  * Print error message with context
  */
 void display_error(const char *context, const char *message, ...) GS_PRINTF_FMT(2, 3);
@@ -96,17 +81,6 @@ const char *display_colorize(const char *text, const char *type);
  * Check if terminal supports color output
  */
 bool display_supports_color(void);
-
-/**
- * Get user input with prompt and validation
- */
-int display_get_input(const char *prompt, char *buffer, size_t buffer_size,
-                      bool (*validator)(const char *));
-
-/**
- * Get password/sensitive input (hidden)
- */
-int display_get_password(const char *prompt, char *buffer, size_t buffer_size);
 
 /**
  * Print configuration file location and status

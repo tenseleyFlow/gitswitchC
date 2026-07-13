@@ -151,6 +151,33 @@ static int read_all(const char *path, char *buf, size_t size) {
     return 0;
 }
 
+TEST(ssh_manager_reset_rejects_empty_selector) {
+    char dir[128];
+    char lock_path[160];
+
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswar03XXXXXX");
+    CHECK(ts_mkdtemp(g_xdg) != NULL);
+    CHECK_EQ_INT(chmod(g_xdg, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
+    CHECK((size_t)snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", g_xdg) <
+          sizeof(dir));
+    CHECK(access(dir, F_OK) != 0 && errno == ENOENT);
+    clear_error();
+    CHECK_EQ_INT(ssh_manager_reset(""), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(access(dir, F_OK) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(mkdir(dir, 0700), 0);
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock", dir) <
+          sizeof(lock_path));
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+    clear_error();
+    CHECK_EQ_INT(ssh_manager_reset(""), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(path_exists(dir));
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+}
+
 /* ---- H1: csh/tcsh output format + leak-on-failure ------------------------ */
 
 /* Fake ssh-agent that genuinely binds the -a socket, then reports in CSH
@@ -483,8 +510,7 @@ TEST(reset_reaps_real_recorded_agent) {
     pid_t pid;
 
     if (!command_exists("ssh-agent")) {
-        fprintf(stderr, "  (skipped: no ssh-agent in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
@@ -520,6 +546,13 @@ TEST(reset_reaps_real_recorded_agent) {
      * under CI load): the fixed 50ms post-SIGTERM poll used to floor this. */
     fprintf(stderr, "  (info: real-agent reap took %ld ms)\n", ms);
 
+    /* A readable pidfd proves process exit before the parent namespace has
+     * necessarily reaped the zombie, so kill(pid, 0) can briefly succeed even
+     * though reset already has conclusive instance-level death evidence. */
+    for (int attempts = 0; attempts < 100 && kill(pid, 0) == 0; attempts++) {
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+    }
     errno = 0;
     CHECK(kill(pid, 0) != 0);       /* reaped: ESRCH, not just signaled */
     CHECK_EQ_INT(errno, ESRCH);
@@ -700,6 +733,7 @@ TEST(host_alias_skips_rewrite_when_content_identical) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(ssh_manager_reset_rejects_empty_selector);
     RUN_TEST(agent_spawn_pins_bourne_format_and_reaps_on_parse_failure);
     RUN_TEST(socket_validation_failure_reaps_spawned_agent);
     RUN_TEST(reuse_refuses_contaminated_agent);

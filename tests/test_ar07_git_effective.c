@@ -67,7 +67,7 @@ TEST(global_switch_stops_before_writes_when_any_local_clear_fails) {
     command_runner_fn previous = run_set_runner(clearing_runner);
 
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), -1);
-    CHECK_EQ_INT(fake_unsets, 6); /* aggregate every managed unset */
+    CHECK_EQ_INT(fake_unsets, 10); /* aggregate every managed unset */
     CHECK_EQ_INT(fake_writes, 0); /* no forward global identity write */
 
     run_set_runner(previous);
@@ -233,8 +233,8 @@ TEST(unwritable_repo_config_stops_global_identity_write) {
     int restore_mode_rc;
 
     if (geteuid() == 0) {
-        printf("  SKIP permission witness requires an unprivileged uid\n");
-        return;
+        TS_SKIP("unprivileged",
+                "repository permission witness requires an unprivileged uid");
     }
 
     CHECK(fixture_init(&fixture));
@@ -283,6 +283,7 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
     git_current_config_t current;
     char output[16384];
     FILE *capture;
+    size_t captured;
     int saved_stdout;
     char global_config[192];
 
@@ -326,7 +327,9 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
     close(saved_stdout);
     rewind(capture);
     memset(output, 0, sizeof(output));
-    fread(output, 1, sizeof(output) - 1, capture);
+    captured = fread(output, 1, sizeof(output) - 1U, capture);
+    CHECK(!ferror(capture));
+    output[captured] = '\0';
     fclose(capture);
     unsetenv("GIT_CONFIG_GLOBAL");
 

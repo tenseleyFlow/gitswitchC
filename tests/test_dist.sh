@@ -195,6 +195,8 @@ if command -v rpmbuild >/dev/null 2>&1; then
     done
     requirements=$(rpm -qp --requires "$main_rpm" 2>/dev/null) ||
         fail "cannot query runtime requirements of $main_rpm"
+    printf '%s\n' "$requirements" | grep -E '^libreadline\.so' >/dev/null ||
+        fail "built RPM does not link the explicitly required Readline feature"
     for required_command in /usr/bin/gpg /usr/bin/gpgconf; do
         printf '%s\n' "$requirements" | grep -Fx "$required_command" >/dev/null ||
             fail "built RPM does not require $required_command"

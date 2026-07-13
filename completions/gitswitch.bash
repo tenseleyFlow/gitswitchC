@@ -32,11 +32,22 @@ _gitswitch_complete_accounts() {
     done
 }
 
+_gitswitch_complete_words() {
+    local wordlist=$1 cur=$2 candidate
+    # `mapfile` is unavailable in Bash 3.2. Read compgen's one-candidate-per-
+    # line output without command-substitution word splitting instead.
+    while IFS= read -r candidate; do
+        COMPREPLY+=("$candidate")
+    done < <(compgen -W "$wordlist" -- "$cur")
+}
+
 _gitswitch() {
+    # `_init_completion` populates `prev` as part of its standard caller
+    # contract even though this completion does not need to inspect it.
+    # shellcheck disable=SC2034
     local cur prev words cword
     _init_completion 2>/dev/null || {
         cur="${COMP_WORDS[COMP_CWORD]}"
-        prev="${COMP_WORDS[COMP_CWORD-1]}"
         words=("${COMP_WORDS[@]}")
         cword=$COMP_CWORD
     }
@@ -72,14 +83,14 @@ _gitswitch() {
     # Options complete anywhere before `--`. These are fixed literals, so
     # compgen -W is safe (unlike the account-name path above).
     if ((options_enabled)) && [[ $cur == -* ]]; then
-        COMPREPLY=($(compgen -W "$options" -- "$cur"))
+        _gitswitch_complete_words "$options" "$cur"
         return
     fi
 
     # No positional command yet: accept a subcommand or the established bare
     # account switch form. Options may have appeared before this position.
     if [[ -z $seen_cmd ]]; then
-        COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
+        _gitswitch_complete_words "$subcommands" "$cur"
         _gitswitch_complete_accounts "$cur"
         return
     fi
@@ -93,7 +104,7 @@ _gitswitch() {
             return
             ;;
         init)
-            COMPREPLY=($(compgen -W "fish bash zsh sh dash ksh" -- "$cur"))
+            _gitswitch_complete_words "fish bash zsh sh dash ksh" "$cur"
             return
             ;;
         esac

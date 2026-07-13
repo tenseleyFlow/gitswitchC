@@ -334,6 +334,7 @@ TEST(nested_bind_mount_is_never_traversed) {
     char external[256], marker[320];
     pid_t child;
     int status = 0;
+    bool mount_namespace_unavailable = false;
 
     CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
                            home, sizeof(home), "work"), 0);
@@ -369,13 +370,68 @@ TEST(nested_bind_mount_is_never_traversed) {
     if (child > 0) {
         CHECK_EQ_INT(waitpid(child, &status, 0), child);
         if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
-            fprintf(stderr,
-                    "  (skip: private mount namespace/bind mount unavailable)\n");
+            mount_namespace_unavailable = true;
         } else {
             CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
         }
     }
     CHECK(path_exists(marker));
+    if (mount_namespace_unavailable) {
+        TS_SKIP("mount-namespace",
+                "private mount namespace/bind mount unavailable");
+    }
+}
+
+TEST(bind_mounted_account_home_is_rejected_before_config_write) {
+    char xdg[128], base[256], home[320], external[256], installed[320];
+    pid_t child;
+    int status = 0;
+    bool mount_namespace_unavailable = false;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "mounted"), 0);
+    snprintf(external, sizeof(external), "%s/external-home", xdg);
+    snprintf(installed, sizeof(installed), "%s/gpg-agent.conf", external);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        gpg_config_t config;
+        account_t account;
+        int rc;
+
+        if (unshare(CLONE_NEWNS) != 0 ||
+            mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
+            mount(external, home, NULL, MS_BIND, NULL) != 0) {
+            _exit(77);
+        }
+        memset(&config, 0, sizeof(config));
+        config.mode = GPG_MODE_ISOLATED;
+        memset(&account, 0, sizeof(account));
+        snprintf(account.name, sizeof(account.name), "mounted");
+        rc = gpg_create_isolated_home(&config, &account);
+        if (rc != -1 || access(installed, F_OK) == 0 || errno != ENOENT) {
+            (void)umount2(home, MNT_DETACH);
+            _exit(9);
+        }
+        if (umount2(home, MNT_DETACH) != 0) _exit(9);
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
+            mount_namespace_unavailable = true;
+        } else {
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+    CHECK(!path_exists(installed));
+    if (mount_namespace_unavailable) {
+        TS_SKIP("mount-namespace",
+                "private mount namespace/bind mount unavailable");
+    }
 }
 #endif
 
@@ -407,6 +463,45 @@ static int record_agent_conf_sync(int fd, bool directory) {
         }
     }
     return fsync(fd);
+}
+
+TEST(mounted_account_home_is_rejected_before_config_write) {
+    char xdg[128], base[256], home[320], installed[384];
+    struct stat home_st;
+    gpg_mount_identity_probe_fn old_probe;
+    gpg_agent_conf_precommit_fn old_hook;
+    command_runner_fn previous;
+    gpg_config_t config;
+    account_t account;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "mounted"), 0);
+    CHECK_EQ_INT(stat(home, &home_st), 0);
+    snprintf(installed, sizeof(installed), "%s/gpg-agent.conf", home);
+    memset(&config, 0, sizeof(config));
+    config.mode = GPG_MODE_ISOLATED;
+    memset(&account, 0, sizeof(account));
+    snprintf(account.name, sizeof(account.name), "mounted");
+
+    g_injected_mount_dev = home_st.st_dev;
+    g_injected_mount_ino = home_st.st_ino;
+    g_precommit_calls = 0;
+    old_probe = gpg_manager_set_mount_identity_probe_fn(
+        injected_mount_identity);
+    old_hook = gpg_manager_set_agent_conf_precommit_fn(
+        count_agent_conf_commit);
+    CHECK_EQ_INT(gpg_create_isolated_home(&config, &account), -1);
+    gpg_manager_set_agent_conf_precommit_fn(old_hook);
+    gpg_manager_set_mount_identity_probe_fn(old_probe);
+
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    CHECK(strstr(get_last_error()->message, "mounted outside") != NULL);
+    CHECK_EQ_INT(g_precommit_calls, 0);
+    CHECK(!path_exists(installed));
+
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("mounted"), 0);
+    run_set_runner(previous);
 }
 
 static bool same_mtime(const struct stat *left, const struct stat *right) {
@@ -480,7 +575,7 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK(same_mtime(&first, &second));
     CHECK(!has_agent_conf_scratch(config.gnupg_home));
     CHECK_EQ_INT(g_file_syncs, 0);
-    CHECK_EQ_INT(g_directory_syncs, 0);
+    CHECK_EQ_INT(g_directory_syncs, 1);
 
     CHECK_EQ_INT(make_file(source_conf, changed), 0);
     g_file_syncs = 0;
@@ -563,12 +658,104 @@ TEST(agent_config_sync_failures_return_nonzero) {
     CHECK(!has_agent_conf_scratch(home));
 
     g_fail_directory_sync = false;
+    g_file_syncs = 0;
+    g_directory_syncs = 0;
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
+    CHECK_EQ_INT(g_file_syncs, 0);
+    CHECK_EQ_INT(g_directory_syncs, 1);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(changed) - 1));
+    CHECK_STR_EQ(content, changed);
     gpg_manager_set_agent_conf_sync_fn(old_sync);
     if (home_fd >= 0) CHECK_EQ_INT(close(home_fd), 0);
     previous = run_set_runner(recording_null_runner);
     CHECK_EQ_INT(gpg_manager_reset("syncfault"), 0);
     run_set_runner(previous);
     unsetenv("GNUPGHOME");
+}
+
+TEST(agent_config_defaults_require_confirmed_source_absence) {
+    static const char retained[] =
+        "# retain this config on source resolution failure\n"
+        "default-cache-ttl 17\n";
+    char xdg[128], base[256], home[320], installed[384];
+    char inaccessible[256], absent[256], content[512];
+    char old_home[MAX_PATH_LEN] = "";
+    char old_gnupghome[MAX_PATH_LEN] = "";
+    char overlong[MAX_PATH_LEN + 64];
+    bool had_home = getenv("HOME") != NULL;
+    bool had_gnupghome = getenv("GNUPGHOME") != NULL;
+    command_runner_fn previous;
+    int home_fd;
+
+    if (had_home) safe_strncpy(old_home, getenv("HOME"), sizeof(old_home));
+    if (had_gnupghome) {
+        safe_strncpy(old_gnupghome, getenv("GNUPGHOME"),
+                     sizeof(old_gnupghome));
+    }
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "source-errors"), 0);
+    snprintf(installed, sizeof(installed), "%s/gpg-agent.conf", home);
+    snprintf(inaccessible, sizeof(inaccessible), "%s/inaccessible", xdg);
+    snprintf(absent, sizeof(absent), "%s/confirmed-absent", xdg);
+    CHECK_EQ_INT(make_file(installed, retained), 0);
+    home_fd = open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(home_fd >= 0);
+
+    unsetenv("GNUPGHOME");
+    unsetenv("HOME");
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message, "HOME is unset") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+
+    memset(overlong, 'a', sizeof(overlong));
+    overlong[0] = '/';
+    overlong[sizeof(overlong) - 1] = '\0';
+    CHECK_EQ_INT(setenv("GNUPGHOME", overlong, 1), 0);
+    CHECK_EQ_INT(setenv("HOME", xdg, 1), 0);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message, "too long") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+
+    CHECK_EQ_INT(mkdir(inaccessible, 0700), 0);
+    CHECK_EQ_INT(chmod(inaccessible, 0000), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", inaccessible, 1), 0);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message, "Cannot open") != NULL ||
+          strstr(get_last_error()->message, "unsafe") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+    CHECK_EQ_INT(chmod(inaccessible, 0700), 0);
+
+    /* ENOENT is the sole source-resolution outcome that may compose and
+     * install defaults in place of the retained configuration. */
+    CHECK_EQ_INT(setenv("GNUPGHOME", absent, 1), 0);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
+    CHECK(read_file_to_string(installed, content, sizeof(content)) > 0);
+    CHECK(strstr(content, "GPG Agent configuration for gitswitch") != NULL);
+    CHECK(strstr(content, "default-cache-ttl 3600") != NULL);
+    CHECK(strstr(content, "retain this config") == NULL);
+    CHECK(!has_agent_conf_scratch(home));
+
+    if (home_fd >= 0) CHECK_EQ_INT(close(home_fd), 0);
+    if (had_home) setenv("HOME", old_home, 1); else unsetenv("HOME");
+    if (had_gnupghome) {
+        setenv("GNUPGHOME", old_gnupghome, 1);
+    } else {
+        unsetenv("GNUPGHOME");
+    }
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("source-errors"), 0);
+    run_set_runner(previous);
 }
 
 TEST_MAIN_BEGIN()
@@ -581,7 +768,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(final_enumeration_catches_late_unknown_survivor);
 #ifdef __linux__
     RUN_TEST(nested_bind_mount_is_never_traversed);
+    RUN_TEST(bind_mounted_account_home_is_rejected_before_config_write);
 #endif
+    RUN_TEST(mounted_account_home_is_rejected_before_config_write);
     RUN_TEST(byte_identical_agent_config_performs_no_commit);
     RUN_TEST(agent_config_sync_failures_return_nonzero);
+    RUN_TEST(agent_config_defaults_require_confirmed_source_absence);
 TEST_MAIN_END()

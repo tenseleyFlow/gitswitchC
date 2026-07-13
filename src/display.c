@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <ctype.h>
 #include <termios.h>
@@ -20,6 +21,41 @@ static bool g_color_enabled = false;
 static bool g_color_forced = false;
 static int g_terminal_width = 80;
 static int g_terminal_height = 24;
+
+/* Format a complete diagnostic before any bytes are emitted.  The first pass
+ * determines the exact allocation, and the second pass is checked again: an
+ * encoding error (for example, an unrepresentable %lc) or an inconsistent
+ * result must never expose a partially initialized buffer to a display path. */
+static char *display_vformat(const char *format, va_list arguments) {
+    va_list measured_arguments;
+    va_list written_arguments;
+    int required;
+    int written;
+    size_t buffer_size;
+    char *buffer;
+
+    if (!format) return NULL;
+
+    va_copy(measured_arguments, arguments);
+    required = vsnprintf(NULL, 0, format, measured_arguments); /* Flawfinder: ignore -- sizing pass; fmt from internal callers */
+    va_end(measured_arguments);
+    if (required < 0 || (size_t)required == SIZE_MAX) return NULL;
+
+    buffer_size = (size_t)required + 1U;
+    buffer = malloc(buffer_size);
+    if (!buffer) return NULL;
+
+    va_copy(written_arguments, arguments);
+    written = vsnprintf(buffer, buffer_size, format, written_arguments); /* Flawfinder: ignore -- exact checked allocation; fmt from internal callers */
+    va_end(written_arguments);
+    if (written < 0 || written != required ||
+        (size_t)written >= buffer_size) {
+        free(buffer);
+        return NULL;
+    }
+
+    return buffer;
+}
 
 /* Color support detection */
 static bool detect_color_support(void) {
@@ -84,11 +120,18 @@ const char *display_colorize(const char *text, const char *type) {
      * (all args are evaluated before printf runs). Keep this >= the most
      * colorize() results ever live in a single expression, or an earlier call's
      * buffer gets clobbered by a later one before printf reads it. */
-    enum { COLORED_BUFFER_SIZE = 512 };
-    static char colored_buffers[8][COLORED_BUFFER_SIZE];
-    static int buffer_index = 0;
+    enum { COLORED_BUFFER_COUNT = 8 };
+    static char *colored_buffers[COLORED_BUFFER_COUNT];
+    static size_t colored_capacities[COLORED_BUFFER_COUNT];
+    static unsigned int buffer_index = 0;
     char *colored_buffer;
+    char *resized_buffer;
     const char *color_code = "";
+    size_t code_len;
+    size_t text_len;
+    size_t reset_len;
+    size_t required;
+    unsigned int selected_buffer;
 
     if (!g_color_enabled || !text || !type) {
         return text;
@@ -113,25 +156,34 @@ const char *display_colorize(const char *text, const char *type) {
         return text; /* No coloring */
     }
 
-    /* Use next buffer in rotation */
-    colored_buffer = colored_buffers[buffer_index];
-    buffer_index = (buffer_index + 1) % (int)(sizeof(colored_buffers) / sizeof(colored_buffers[0]));
-
-    /* AR-06 F54/F55: reserve room for the trailing COLOR_RESET so it is NEVER
-     * the part that gets truncated. A long message that overran the 512-byte
-     * buffer used to lose its reset, leaving the terminal stuck in the color
-     * (and every following line miscolored). Bound the TEXT with a precision so
-     * the prefix color code and the reset always fit. */
-    {
-        size_t code_len = strlen(color_code);
-        size_t reset_len = strlen(COLOR_RESET);
-        int text_budget = (int)COLORED_BUFFER_SIZE - 1 - (int)code_len - (int)reset_len;
-        if (text_budget < 0) {
-            text_budget = 0;
-        }
-        snprintf(colored_buffer, COLORED_BUFFER_SIZE,
-                 "%s%.*s%s", color_code, text_budget, text, COLOR_RESET);
+    code_len = strlen(color_code);
+    text_len = strlen(text);
+    reset_len = strlen(COLOR_RESET);
+    if (code_len > SIZE_MAX - reset_len - 1U ||
+        text_len > SIZE_MAX - code_len - reset_len - 1U) {
+        return text;
     }
+    required = code_len + text_len + reset_len + 1U;
+
+    /* AR-06 F54/F55 kept the reset inside a fixed buffer, but that necessarily
+     * discarded long diagnostic payloads. Grow the selected rotating slot to
+     * the exact checked size so both the complete text and reset survive.
+     * Allocation failure falls back to the complete uncolored text. */
+    selected_buffer = buffer_index;
+    buffer_index = (buffer_index + 1U) % COLORED_BUFFER_COUNT;
+    colored_buffer = colored_buffers[selected_buffer];
+    if (colored_capacities[selected_buffer] < required) {
+        resized_buffer = realloc(colored_buffer, required);
+        if (!resized_buffer) return text;
+        colored_buffer = resized_buffer;
+        colored_buffers[selected_buffer] = colored_buffer;
+        colored_capacities[selected_buffer] = required;
+    }
+
+    memcpy(colored_buffer, color_code, code_len);
+    memcpy(colored_buffer + code_len, text, text_len);
+    memcpy(colored_buffer + code_len + text_len, COLOR_RESET,
+           reset_len + 1U);
 
     return colored_buffer;
 }
@@ -178,7 +230,7 @@ void display_header(const char *title) {
 /* Print status message with appropriate color and icon */
 void display_status(const char *level, const char *message, ...) {
     va_list args;
-    char formatted_message[1024];
+    char *formatted_message;
     const char *icon = "";
     const char *color_type = "";
     
@@ -186,8 +238,9 @@ void display_status(const char *level, const char *message, ...) {
     
     /* Format the message */
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+    formatted_message = display_vformat(message, args);
     va_end(args);
+    if (!formatted_message) return;
     
     /* Select icon and color based on level */
     if (strcmp(level, "success") == 0) {
@@ -207,7 +260,7 @@ void display_status(const char *level, const char *message, ...) {
         color_type = "info";
     }
     
-    if (strlen(formatted_message) > 0) {
+    if (formatted_message[0] != '\0') {
         printf("%s %s\n",
                display_colorize(icon, color_type),
                display_colorize(formatted_message, color_type));
@@ -215,69 +268,81 @@ void display_status(const char *level, const char *message, ...) {
         printf("%s\n", display_colorize(icon, color_type));
     }
     fflush(stdout);
+    free(formatted_message);
 }
 
 /* Print error message with context */
 void display_error(const char *context, const char *message, ...) {
     va_list args;
-    char formatted_message[1024];
+    char *formatted_message;
     
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+    formatted_message = display_vformat(message, args);
     va_end(args);
-    
+    if (!formatted_message) return;
+
     /* Don't display if message is empty */
-    if (strlen(formatted_message) == 0) return;
+    if (formatted_message[0] == '\0') {
+        free(formatted_message);
+        return;
+    }
     
     if (context && strlen(context) > 0) {
         display_status("error", "%s: %s", context, formatted_message);
     } else {
         display_status("error", "%s", formatted_message);
     }
+    free(formatted_message);
 }
 
 /* Print warning message */
 void display_warning(const char *message, ...) {
     va_list args;
-    char formatted_message[1024];
+    char *formatted_message;
     
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+    formatted_message = display_vformat(message, args);
     va_end(args);
-    
+    if (!formatted_message) return;
+
     display_status("warning", "%s", formatted_message);
+    free(formatted_message);
 }
 
 /* Print success message */
 void display_success(const char *message, ...) {
     va_list args;
-    char formatted_message[1024];
+    char *formatted_message;
     
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+    formatted_message = display_vformat(message, args);
     va_end(args);
-    
+    if (!formatted_message) return;
+
     display_status("success", "%s", formatted_message);
+    free(formatted_message);
 }
 
 /* Print info message */
 void display_info(const char *message, ...) {
     va_list args;
-    char formatted_message[1024];
+    char *formatted_message;
     
     if (!message) return;
     
     va_start(args, message);
-    vsnprintf(formatted_message, sizeof(formatted_message), message, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+    formatted_message = display_vformat(message, args);
     va_end(args);
-    
+    if (!formatted_message) return;
+
     display_status("info", "%s", formatted_message);
+    free(formatted_message);
 }
 
 /* Print configuration file location and status */

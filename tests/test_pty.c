@@ -50,8 +50,7 @@ static int g_no_pty = 0;
 
 #define SKIP_IF_NO_PTY() do {                                                \
     if (g_no_pty) {                                                          \
-        fprintf(stderr, "  (skipped: no PTY available on this system)\n");   \
-        return;                                                              \
+        TS_SKIP("pty", "PTY allocation is unavailable");                    \
     }                                                                        \
 } while (0)
 
@@ -553,7 +552,7 @@ TEST(eof_ctrl_d_cancels_cleanly) {
  *    CFLAGS the binary was built with. */
 TEST(ssh_key_path_tab_completion_and_inhibition) {
 #ifndef HAVE_READLINE
-    fprintf(stderr, "  (skipped: built without readline)\n");
+    TS_SKIP("readline", "binary was built without readline support");
 #else
     sandbox_t sb;
     char path[512];
@@ -718,11 +717,11 @@ TEST_MAIN_BEGIN()
      * SKIPs (matching the test_cli skip idiom) instead of failing. */
     {
         int probe = posix_openpt(O_RDWR | O_NOCTTY);
-        if (probe < 0) {
+        if (probe < 0 || grantpt(probe) != 0 || unlockpt(probe) != 0 ||
+            ptsname(probe) == NULL) {
             g_no_pty = 1;
-        } else {
-            close(probe);
         }
+        if (probe >= 0) close(probe);
     }
     RUN_TEST(edit_empty_input_keeps_all_fields);
     RUN_TEST(none_disables_ssh_and_gpg);

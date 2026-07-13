@@ -17,6 +17,7 @@
 #endif
 
 #include "test.h"
+#include "gitswitch.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
@@ -183,8 +184,7 @@ TEST(init_fails_on_enospc) {
     int rc;
 
     if (access("/dev/full", W_OK) != 0) {
-        fprintf(stderr, "  (skipped: no /dev/full on this platform)\n");
-        return;
+        TS_SKIP("dev-full", "/dev/full is unavailable or not writable");
     }
     if (!make_temp_dir(rt, sizeof(rt))) { CHECK(!"mkdtemp failed"); return; }
     snprintf(cmd, sizeof(cmd),
@@ -414,11 +414,10 @@ TEST(resume_never_blocks_reading_stdin) {
     master = posix_openpt(O_RDWR | O_NOCTTY);
     if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0 ||
         (pts = ptsname(master)) == NULL) {
-        fprintf(stderr, "  (skipped: no PTY available: %s)\n", strerror(errno));
         if (master >= 0) close(master);
         remove_tree(home);
         remove_tree(rt);
-        return;
+        TS_SKIP("pty", "PTY allocation is unavailable");
     }
     snprintf(slave_name, sizeof(slave_name), "%s", pts);
 
@@ -1145,8 +1144,7 @@ TEST(switch_save_failure_exits_nonzero) {
     int rc;
 
     if (getuid() == 0) {
-        fprintf(stderr, "  (skipped: running as root, permission denial won't bite)\n");
-        return;
+        TS_SKIP("unprivileged", "permission-denial test requires a non-root user");
     }
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
         CHECK(!"mkdtemp failed");
@@ -1185,6 +1183,45 @@ TEST(switch_save_failure_exits_nonzero) {
     remove_tree(rt);
 }
 
+TEST(configuration_and_command_failures_keep_distinct_exit_codes) {
+    char home[256], rt[256], output[512], cmd[9000], contents[4096];
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    snprintf(output, sizeof(output), "%s/failure.out", rt);
+
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\n"
+        "default_scope = [malformed\n"), 0);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -C list "
+             "</dev/null >'%s' 2>&1",
+             home, rt, g_bin, output);
+    CHECK_EQ_INT(run_shell(cmd), EXIT_CONFIG_ERROR);
+    slurp(output, contents, sizeof(contents));
+    CHECK(strstr(contents, "Configuration initialization failed") != NULL);
+
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"present\"\n"
+        "email = \"present@example.test\"\n"), 0);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' -C definitely-missing "
+             "</dev/null >'%s' 2>&1",
+             home, rt, g_bin, output);
+    CHECK_EQ_INT(run_shell(cmd), EXIT_FAILURE);
+    slurp(output, contents, sizeof(contents));
+    CHECK(strstr(contents, "Account not found") != NULL);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 TEST_MAIN_BEGIN()
     if (resolve_binary() != 0) {
         fprintf(stderr, "RESULT FAIL: cannot locate gitswitch binary\n");
@@ -1212,4 +1249,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(switch_writes_resume_hint_and_reset_clears_it);
     RUN_TEST(partial_load_blocks_add_but_switch_persists_active);
     RUN_TEST(switch_save_failure_exits_nonzero);
+    RUN_TEST(configuration_and_command_failures_keep_distinct_exit_codes);
 TEST_MAIN_END()

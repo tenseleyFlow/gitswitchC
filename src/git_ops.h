@@ -10,7 +10,11 @@
 #define GIT_CONFIG_USER_EMAIL "user.email"
 #define GIT_CONFIG_USER_SIGNINGKEY "user.signingkey"
 #define GIT_CONFIG_COMMIT_GPGSIGN "commit.gpgsign"
+#define GIT_CONFIG_GPG_FORMAT "gpg.format"
 #define GIT_CONFIG_GPG_PROGRAM "gpg.program"
+#define GIT_CONFIG_GPG_OPENPGP_PROGRAM "gpg.openpgp.program"
+#define GIT_CONFIG_GPG_X509_PROGRAM "gpg.x509.program"
+#define GIT_CONFIG_GPG_SSH_PROGRAM "gpg.ssh.program"
 #define GIT_CONFIG_CORE_SSHCOMMAND "core.sshcommand"
 
 /* Largest managed value emitted by gitswitch. core.sshCommand contains two
@@ -102,23 +106,42 @@ int git_expected_ssh_command(const account_t *account, char *command,
 int git_clear_config(git_scope_t scope);
 
 /**
- * Snapshot the gitswitch-managed config keys (user.name/email/signingkey,
- * commit.gpgsign, gpg.program, core.sshcommand) at `scope` before a switch
- * mutates them, plus the LOCAL scope when a global write would clear it and
- * any distinct WORKTREE override scope. Every repeated value is retained in
- * order. Included managed values are refused when their origin cannot be
- * restored exactly. Pair with git_config_restore() to roll back on a failed
- * switch. Single snapshot slot (the CLI is single-threaded); a new snapshot
- * replaces the previous.
+ * Snapshot the gitswitch-managed config keys (identity/signing keys,
+ * gpg.format, every Git-supported GPG program selector, and core.sshCommand)
+ * at `scope` before a switch mutates them, plus the LOCAL scope when a global
+ * write would clear it and any distinct WORKTREE override scope. Every
+ * repeated value is retained in order. Included managed values are refused
+ * when their origin cannot be restored exactly. Pair with
+ * git_config_restore() to roll back on a failed switch. Single snapshot slot
+ * (the CLI is single-threaded); a new snapshot replaces the previous.
  */
 int git_config_snapshot(git_scope_t scope);
 
 /**
+ * Verify the active transaction's exact intended post-write vectors against a
+ * fresh Git read. The intended image is updated only by this process's
+ * successful managed writes, so a concurrent value arriving before this call
+ * is rejected rather than adopted. Call after all forward Git writes and
+ * before later transaction steps can fail. Idempotent after successful seal.
+ */
+int git_config_seal(void);
+
+/**
  * Restore the most recent git_config_snapshot(), rebuilding every key with its
- * exact ordered values. A failed restore retains the snapshot and completed
- * per-key progress for retry. No-op if nothing was snapshotted.
+ * exact ordered values only while the current vector still matches the sealed
+ * transaction-owned state. A failed restore preserves concurrent changes and
+ * retains the snapshot plus exact per-key progress for retry. Partially failed
+ * forward writes are compared against the intended image recorded through the
+ * last successful managed operation. No-op if nothing was snapshotted.
  */
 int git_config_restore(void);
+
+/**
+ * Infallibly commit the active Git transaction by discarding its in-memory
+ * rollback images. Call only after every external commit point has succeeded;
+ * no-op when no snapshot is active.
+ */
+void git_config_commit(void);
 
 /* AR-06 F59: git_validate_repository() and git_get_config_scope() were removed
  * — dead public API with zero callers. */

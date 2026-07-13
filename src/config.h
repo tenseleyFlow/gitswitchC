@@ -31,6 +31,10 @@ typedef enum {
     CONFIG_IO_DEFAULT_BEFORE_RENAME,
     CONFIG_IO_DEFAULT_BEFORE_DIR_SYNC,
     CONFIG_IO_BACKUP_BEFORE_FILE_SYNC,
+    /* Copy checkpoint after the first complete source chunk has been written.
+     * A test callback may mutate the source and return false; the copy must
+     * reject the now-unstable generation during its final descriptor proof. */
+    CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK,
     CONFIG_IO_BACKUP_BEFORE_DIR_SYNC,
     CONFIG_IO_BACKUP_BEFORE_REOPEN,
     CONFIG_IO_DOCUMENT_BEFORE_RENAME,
@@ -40,7 +44,11 @@ typedef enum {
     CONFIG_IO_STATE_BEFORE_FILE_SYNC,
     CONFIG_IO_STATE_BEFORE_CLOSE,
     CONFIG_IO_STATE_BEFORE_RENAME,
-    CONFIG_IO_STATE_BEFORE_DIR_SYNC
+    CONFIG_IO_STATE_BEFORE_DIR_SYNC,
+    /* Read-side consistency checkpoint. A test callback may mutate the
+     * descriptor's backing file and return false; production leaves the
+     * callback NULL. */
+    CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ
 } config_io_boundary_t;
 
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);
@@ -133,6 +141,12 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
  */
 int config_resume_hint_path(char *buf, size_t size);
 
+/* Read-only login-shell probe for the consolidated active-state artifact.
+ * Missing state normalizes to "none". A safe, self-owned 0600 regular file is
+ * parsed with the same exact grammar as config load; unsafe or malformed state
+ * fails with no output value. */
+int config_resume_hint_probe(char *needs, size_t size);
+
 /* Exact before-image for the consolidated active-state/resume-hint file. A CLI switch captures it
  * before runtime/Git mutation so a failed active-state commit can restore the
  * previous bytes (or previous absence) exactly. Snapshot values must be
@@ -184,6 +198,12 @@ int config_create_default(const char *config_path);
  * - Verifies file paths exist and are accessible
  */
 int config_validate(const gitswitch_ctx_t *ctx);
+
+/**
+ * Validate only the account model's flag/value relationships. This shared
+ * lossless-state gate does not inspect key files or prove key availability.
+ */
+int config_validate_account_model(const account_t *account);
 
 /**
  * Get the configuration file path (<config dir>/accounts.toml).
@@ -242,10 +262,5 @@ const char *config_scope_to_string(git_scope_t scope);
  * Backup configuration file with timestamp
  */
 int config_backup(const char *config_path);
-
-/**
- * Migrate configuration from older format versions
- */
-int config_migrate(const char *config_path);
 
 #endif /* CONFIG_H */

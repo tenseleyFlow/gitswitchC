@@ -48,11 +48,17 @@ int create_directory_recursive(const char *path, mode_t mode);
 int get_file_permissions(const char *path, mode_t *mode);
 
 /**
- * Ensure `path` is a directory that is safe to hold private material: created
- * with mode 0700 if absent, and verified (via lstat) to be a real directory
- * (not a symlink), owned by the current uid, with no group/other permission
- * bits. Refuses (returns -1) if an existing path fails these checks — defends
- * against a hostile pre-created/redirected dir in a shared /tmp. Returns 0 ok.
+ * Ensure the final component of `path` names a real directory owned by the
+ * real uid with no group/other permission bits. An absent path is requested at
+ * mode 0700. Where no-follow directory descriptors are available, a
+ * self-owned existing directory with unsafe permission bits is pinned,
+ * identity-checked, tightened to 0700 through that descriptor, and revalidated
+ * against the pathname. Platforms without those primitives refuse a
+ * permissive existing directory instead of chmodding by pathname. Final
+ * symlinks, non-directories, foreign-owned entries, detected replacement, and
+ * open/chmod/verification failures return -1. Returns 0 only after successful
+ * creation or validation; parent-component symlinks are outside this helper's
+ * contract.
  */
 int ensure_private_dir(const char *path);
 
@@ -182,6 +188,11 @@ typedef int (*command_runner_fn)(const char *const argv[],
 /* Install a runner; returns the previous one (NULL means the default). */
 command_runner_fn run_set_runner(command_runner_fn fn);
 
+/* True only when commands execute through the production descriptor-pinned
+ * runner. Filesystem transactions must not mix real path mutation with a
+ * test runner that models command side effects only in memory. */
+bool run_uses_default_runner(void);
+
 /* Run argv[0] (opened through the sanitized PATH walk, format/shebang checked,
  * then launched from a verified descriptor), argv NULL-terminated, through
  * the active runner. Returns 0 iff the child spawned and exited 0. opts/result
@@ -200,7 +211,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
  * RUN_TEST_FD_CLOSE_AUTO; the default is zero so normal behavior is unchanged.
  * Forced strategies are strict: BULK reports a child setup failure if its
  * primitive cannot run, and SNAPSHOT fails in the parent if enumeration was
- * incomplete. AUTO alone may fall back to another safe cleanup method. */
+ * incomplete. AUTO requires either a supported bulk primitive or a complete
+ * parent snapshot: an incomplete snapshot fails before fork, and an unexpected
+ * bulk failure fails child setup because that branch has no snapshot. */
 typedef enum {
     RUN_TEST_FD_CLOSE_AUTO = 0,
     RUN_TEST_FD_CLOSE_SNAPSHOT,
@@ -225,6 +238,9 @@ bool run_test_fd_close_bulk_supported(void);
 void run_test_set_fd_close_observation(bool enabled);
 bool run_test_get_fd_close_observation(run_test_fd_close_observation_t *out);
 void run_test_set_bulk_close_failure(int system_errno);
+/* Force AUTO to exercise its portable parent-snapshot selection even when the
+ * host normally provides a bulk-close primitive. */
+void run_test_set_auto_bulk_close_unavailable(bool unavailable);
 
 /* Test-only deterministic race seam.  The callback runs in the parent after
  * the helper file is verified and pinned but before fork; production leaves
@@ -233,7 +249,19 @@ void run_test_set_bulk_close_failure(int system_errno);
 typedef void (*run_test_exec_resolved_hook_fn)(const char *resolved_path);
 void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook);
 
-/* True if an executable named `command` is found in PATH. */
+/* Test-only deterministic signal-publication seam. The callback runs in the
+ * parent after fork returns but before the new child PID is published to the
+ * rollback signal handler. Production leaves it NULL. */
+typedef void (*run_test_post_fork_pre_publish_hook_fn)(void);
+void run_test_set_post_fork_pre_publish_hook(
+    run_test_post_fork_pre_publish_hook_fn hook);
+
+/* One-shot parent-side fork failure used to prove the pre-fork signal mask is
+ * restored without replacing the primary system errno. Zero disables it. */
+void run_test_set_fork_failure(int system_errno);
+
+/* True if `command` is currently eligible for the default runner; does not
+ * execute it. */
 bool command_exists(const char *command);
 
 /**
@@ -248,11 +276,17 @@ bool command_exists(const char *command);
  * leaves are deliberately rejected because their format/shebang cannot be
  * validated safely. A final
  * descriptor-relative X_OK probe also enforces ACL and noexec-mount policy,
- * then is identity-sealed to the pinned leaf. Relative/"."/empty and unsafe
- * entries are skipped. A `name` containing a slash bypasses the PATH search
- * but not the checks. Every call reopens and revalidates the chain; positive
- * pathnames are not cached across inode or metadata replacement. Returns 0
- * and writes the canonical path into buf on success; -1 otherwise.
+ * then is identity-sealed to the pinned leaf. Before success, the same
+ * parent-side format/shebang validator as the default runner requires either
+ * recognized binary magic or a bounded direct shebang to a separately trusted
+ * binary interpreter; env, recursive, unsupported, and untrusted interpreter
+ * forms are rejected. Relative/"."/empty and unsafe entries are skipped. A
+ * `name` containing a slash bypasses the PATH search but not the checks. Every
+ * call reopens and revalidates the chain; positive pathnames are not cached
+ * across inode or metadata replacement. This is point-in-time launch
+ * eligibility, not proof of compatible architecture, loader availability, or
+ * successful execution; run_argv reopens and revalidates before launch.
+ * Returns 0 and writes the canonical path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
 bool process_is_running(pid_t pid);
@@ -299,14 +333,20 @@ bool is_safe_ssh_key_path(const char *path);
  * remaining strlen so a truncated final sequence can never be over-read.
  *
  * tty_safe_codepoint: true if the codepoint is safe to echo to a terminal.
- * C0 controls (including ESC 0x1B and CR), DEL 0x7F, and C1 controls
- * U+0080-U+009F (0x9B is a one-byte CSI) can move the cursor, recolor output,
- * or \r-overwrite the line — enough for a hostile config field to render
- * itself as "[CURRENT] trusted-account" in list/status/whoami output.
+ * C0 controls (including ESC 0x1B and CR), DEL 0x7F, C1 controls
+ * U+0080-U+009F (0x9B is a one-byte CSI), Unicode line separators, and the
+ * Unicode 16.0 Default_Ignorable_Code_Point set are rejected. The latter
+ * includes bidi marks/embeddings/overrides/isolates, zero-width controls,
+ * joiners, fillers, tags, and variation selectors: any can hide, reorder, or
+ * ambiguously render identity text in list/status/whoami output. Visible
+ * Unicode and ordinary combining marks remain valid.
  */
 size_t utf8_decode(const unsigned char *s, size_t available,
                    uint32_t *cp_out);
 bool tty_safe_codepoint(uint32_t cp);
+/* Validate an entire NUL-terminated string under tty_safe_codepoint(),
+ * rejecting malformed or truncated UTF-8 without rewriting identity text. */
+bool text_is_tty_safe(const char *text);
 
 /**
  * Security utilities
@@ -326,8 +366,11 @@ int ensure_config_directory_exists(void);
  */
 bool is_terminal(int fd);
 int get_terminal_size(int *width, int *height);
-void disable_echo(void);
-void enable_echo(void);
+/* Echo transitions are idempotent. Failures return -1 with errno mirrored in
+ * the global error context; a failed restore remains pending so callers can
+ * retry enable_echo() after repairing the terminal descriptor. */
+int disable_echo(void);
+int enable_echo(void);
 
 /**
  * Time utilities

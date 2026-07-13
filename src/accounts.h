@@ -12,6 +12,19 @@ typedef struct {
     char warnings[1024];
 } account_validation_t;
 
+/* Prepared-switch commit result. NOT_COMMITTED authorizes the caller to use
+ * accounts_switch_abort(). Every other non-success state means Git/runtime,
+ * active metadata, and the installed SSH alias were intentionally retained as
+ * one committed transaction; the caller reports failure but must not restore
+ * persistence before-images around it. */
+typedef enum {
+    ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED,
+    ACCOUNTS_SWITCH_COMMIT_COMPLETE,
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_UNVERIFIED,
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN,
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED
+} accounts_switch_commit_state_t;
+
 /* Function prototypes */
 
 /**
@@ -37,6 +50,8 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
  */
 int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_switch_commit(gitswitch_ctx_t *ctx);
+int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
+                                  accounts_switch_commit_state_t *state);
 /* continue_persistence_rollback keeps the signal rollback window active so
  * the caller can restore config/hint state without an interruptible gap. */
 int accounts_switch_abort(gitswitch_ctx_t *ctx,
@@ -68,14 +83,15 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
 int accounts_edit_commit(gitswitch_ctx_t *ctx);
 int accounts_edit_abort(gitswitch_ctx_t *ctx);
 
-/**
- * Remove account with confirmation
- * - Shows account details
- * - Prompts for confirmation
- * - Cleans up associated SSH/GPG resources
- * - Updates configuration
- */
+/* Remove transaction. accounts_remove() confirms, tears down runtime state,
+ * and removes the account from the in-memory model. CLI callers defer signal
+ * cleanup and must then call commit after accounts.toml was installed, or
+ * abort after a proven pre-install save failure. Commit retires only an
+ * exclusively owned SSH alias; abort deliberately leaves it paired with the
+ * retained durable account. Direct callers retain one-call behavior. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier);
+int accounts_remove_commit(gitswitch_ctx_t *ctx);
+int accounts_remove_abort(gitswitch_ctx_t *ctx);
 
 /**
  * List all configured accounts
@@ -96,54 +112,19 @@ int accounts_show_status(const gitswitch_ctx_t *ctx);
 
 /**
  * Validate account configuration
- * - Checks required fields are present
- * - Validates email format
- * - Verifies SSH key file exists and has correct permissions
- * - Validates GPG key exists and is usable
- * - Tests connectivity if possible
+ * - Checks the shared account model and required fields
+ * - Validates name, email, and configured key-selector syntax
+ * - Verifies the local SSH private-key node and permissions when enabled
+ * - Does not contact an SSH server or inspect/use a GPG keyring
  */
 int accounts_validate(const account_t *account);
 
 /**
- * Find account by various identifiers
- * - Numeric ID (exact match)
- * - Name (exact or partial match)
- * - Email (exact match)
- * - Description (partial match)
- */
-account_t *accounts_find(const gitswitch_ctx_t *ctx, const char *identifier);
-
-/**
- * Get next available account ID
- */
-uint32_t accounts_get_next_id(const gitswitch_ctx_t *ctx);
-
-/**
- * Clone account configuration (for editing)
- */
-int accounts_clone(const account_t *src, account_t *dst);
-
-/**
- * Compare two accounts for equality
- */
-bool accounts_equal(const account_t *a, const account_t *b);
-
-/**
- * Initialize account structure with defaults
- */
-void accounts_init_struct(account_t *account);
-
-/**
- * Clean up account resources
- */
-void accounts_cleanup_struct(account_t *account);
-
-/**
- * Run comprehensive health check on all accounts
- * - Validates configuration
- * - Tests SSH connectivity
- * - Verifies GPG functionality
- * - Reports issues and recommendations
+ * Run bounded local readiness checks on all accounts
+ * - Validates the account model and fields
+ * - Rechecks the local SSH private-key node and permissions
+ * - Confirms current local GPG secret material and configured capability
+ * - Does not attempt remote SSH authentication or create a test signature
  */
 int accounts_health_check(const gitswitch_ctx_t *ctx);
 
