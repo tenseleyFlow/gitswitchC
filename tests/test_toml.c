@@ -359,6 +359,141 @@ TEST(set_string_rejects_overlong_value_instead_of_erasing) {
     toml_cleanup_document(&doc);
 }
 
+/* AR-09 M12: the public setter must reject every decoded byte sequence that
+ * the writer would emit but the parser's raw-buffer gate refuses on reload.
+ * Rejection precedes both overwrite and new-section mutation. */
+TEST(set_string_rejects_unroundtrippable_values_without_mutation) {
+    static const char c0[] = { 'a', 0x01, 'b', '\0' };
+    static const char escape[] = { 'a', 0x1B, 'b', '\0' };
+    static const char del[] = { 'a', 0x7F, 'b', '\0' };
+    static const char raw_c1[] = { 'a', (char)0x9B, 'b', '\0' };
+    static const char encoded_c1[] = {
+        'a', (char)0xC2, (char)0x9B, 'b', '\0'
+    };
+    static const char truncated_2[] = { 'a', (char)0xC2, '\0' };
+    static const char truncated_3[] = {
+        'a', (char)0xE2, (char)0x82, '\0'
+    };
+    static const char truncated_4[] = {
+        'a', (char)0xF0, (char)0x9F, (char)0x92, '\0'
+    };
+    static const char bare_continuation[] = {
+        'a', (char)0x80, 'b', '\0'
+    };
+    static const char bad_continuation[] = {
+        'a', (char)0xE2, '(', (char)0xA1, '\0'
+    };
+    static const char overlong[] = {
+        'a', (char)0xE0, (char)0x80, (char)0xAF, '\0'
+    };
+    static const char surrogate[] = {
+        'a', (char)0xED, (char)0xA0, (char)0x80, '\0'
+    };
+    static const char out_of_range[] = {
+        'a', (char)0xF4, (char)0x90, (char)0x80, (char)0x80, '\0'
+    };
+    static const char zero_width_space[] = {
+        'a', (char)0xE2, (char)0x80, (char)0x8B, 'b', '\0'
+    };
+    static const char bidi_override[] = {
+        'a', (char)0xE2, (char)0x80, (char)0xAE, 'b', '\0'
+    };
+    static const char line_separator[] = {
+        'a', (char)0xE2, (char)0x80, (char)0xA8, 'b', '\0'
+    };
+    static toml_document_t doc;
+    static toml_document_t before;
+    char too_long[TOML_MAX_VALUE_LEN + 1];
+    const char *invalid[] = {
+        c0, escape, del, raw_c1, encoded_c1, truncated_2, truncated_3,
+        truncated_4, bare_continuation, bad_continuation, overlong, surrogate,
+        out_of_range, zero_width_space, bidi_override, line_separator, too_long
+    };
+
+    memset(too_long, 'x', sizeof(too_long) - 1);
+    too_long[sizeof(too_long) - 1] = '\0';
+
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"),
+                 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "custom", "value", "stable"), 0);
+    memcpy(&before, &doc, sizeof(before));
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        memcpy(&doc, &before, sizeof(doc));
+        CHECK_EQ_INT(toml_set_string(&doc, "custom", "value", invalid[i]),
+                     -1);
+        CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+
+        memcpy(&doc, &before, sizeof(doc));
+        CHECK_EQ_INT(toml_set_string(&doc, "new_section", "value",
+                                     invalid[i]), -1);
+        CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+    }
+
+    toml_cleanup_document(&doc);
+    toml_cleanup_document(&before);
+}
+
+TEST(set_string_admitted_values_round_trip_byte_exact) {
+    static toml_document_t doc;
+    static toml_document_t loaded;
+    char max_backslashes[TOML_MAX_VALUE_LEN];
+    char max_utf8_4[TOML_MAX_VALUE_LEN];
+    char dir[128];
+    char path[192];
+
+    memset(max_backslashes, '\\', sizeof(max_backslashes) - 1);
+    max_backslashes[sizeof(max_backslashes) - 1] = '\0';
+    memset(max_utf8_4, 'x', sizeof(max_utf8_4) - 5);
+    max_utf8_4[sizeof(max_utf8_4) - 5] = (char)0xF0;
+    max_utf8_4[sizeof(max_utf8_4) - 4] = (char)0x9F;
+    max_utf8_4[sizeof(max_utf8_4) - 3] = (char)0x92;
+    max_utf8_4[sizeof(max_utf8_4) - 2] = (char)0xA9;
+    max_utf8_4[sizeof(max_utf8_4) - 1] = '\0';
+    const char *accepted[] = {
+        "",
+        "plain ASCII",
+        "quote \" and backslash \\",
+        "line\ncarriage\rtab\t",
+        "Jos\xC3\xA9",
+        "\xE4\xBB\x95\xE4\xBA\x8B",
+        "\xF0\x9F\x92\xA9",
+        max_backslashes,
+        max_utf8_4
+    };
+
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"),
+                 0);
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        char key[16];
+        CHECK((size_t)snprintf(key, sizeof(key), "value%zu", i) < sizeof(key));
+        CHECK_EQ_INT(toml_set_string(&doc, "custom", key, accepted[i]), 0);
+    }
+
+    if (make_temp_toml_path(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        toml_cleanup_document(&doc);
+        return;
+    }
+    CHECK_EQ_INT(toml_write_file(&doc, path), 0);
+    CHECK_EQ_INT(toml_parse_file(path, &loaded), 0);
+    CHECK_EQ_INT((int)loaded.section_count, 2);
+    CHECK_EQ_INT((int)loaded.sections[1].key_count,
+                 (int)(sizeof(accepted) / sizeof(accepted[0])));
+
+    for (size_t i = 0; i < sizeof(accepted) / sizeof(accepted[0]); i++) {
+        const char *actual = loaded.sections[1].keys[i].value;
+        CHECK_EQ_INT((int)strlen(actual), (int)strlen(accepted[i]));
+        CHECK(memcmp(actual, accepted[i], strlen(accepted[i])) == 0);
+    }
+
+    toml_cleanup_document(&loaded);
+    toml_cleanup_document(&doc);
+    CHECK_EQ_INT(unlink(path), 0);
+}
+
 /* M5 (loader half): a 257-511 char ssh_key passed the writer's cap, so it can
  * be the tool's OWN prior output — the schema's path-length failure must skip
  * that one account, not brick the entire config (pre-fix, every command died
@@ -845,6 +980,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(quote_in_value_round_trips);
     RUN_TEST(get_string_fails_when_sanitization_would_alter_value);
     RUN_TEST(set_string_rejects_overlong_value_instead_of_erasing);
+    RUN_TEST(set_string_rejects_unroundtrippable_values_without_mutation);
+    RUN_TEST(set_string_admitted_values_round_trip_byte_exact);
     RUN_TEST(overlong_ssh_key_skips_account_not_whole_file);
     RUN_TEST(repaired_skipped_account_revalidates_visibility_atomically);
     RUN_TEST(validation_preclear_hides_later_account_on_early_failure);

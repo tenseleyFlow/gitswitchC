@@ -1028,6 +1028,15 @@ bool toml_validate_safe_characters(const char *input, size_t length) {
     return true;
 }
 
+/* A stored string is already decoded: quotes, backslashes, and the three
+ * supported escaped controls are data, while every other byte must satisfy
+ * the same strict UTF-8 and terminal-safety contract as the raw document.
+ * Keep this length-aware so parser output and public setters share one rule. */
+static bool decoded_string_value_is_valid(const char *value, size_t length) {
+    return value && length < TOML_MAX_VALUE_LEN &&
+           toml_validate_safe_characters(value, length);
+}
+
 /* Sanitize string value. Strips what a value must never carry into callers:
  * C0 controls (incl. newline/CR — the ~/.ssh/config IdentityFile sink and
  * core.sshCommand depend on values staying single-line), DEL, quotes and
@@ -1450,6 +1459,12 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
         return -1;
     }
 
+    if (!decoded_string_value_is_valid(value, value_pos)) {
+        set_parser_error(state,
+                         "String value contains invalid control or UTF-8 data");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1673,6 +1688,7 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
                     const char *key_name, const char *value) {
     toml_section_t *section;
     toml_keyvalue_t *kv;
+    size_t value_length;
     
     if (!doc || !section_name || !key_name || !value) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_set_string");
@@ -1701,11 +1717,20 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
                   section_name, TOML_MAX_KEY_LEN - 1);
         return -1;
     }
-    if (strlen(value) >= TOML_MAX_VALUE_LEN) {
+    value_length = strnlen(value, TOML_MAX_VALUE_LEN);
+    if (value_length == TOML_MAX_VALUE_LEN) {
         set_error(ERR_CONFIG_INVALID,
-                  "Value for %s.%s is too long (%zu bytes, max %d); refusing to "
-                  "store it truncated or empty",
-                  section_name, key_name, strlen(value), TOML_MAX_VALUE_LEN - 1);
+                  "Value for %s.%s is too long (at least %d bytes, max %d); "
+                  "refusing to store it truncated or empty",
+                  section_name, key_name, TOML_MAX_VALUE_LEN,
+                  TOML_MAX_VALUE_LEN - 1);
+        return -1;
+    }
+    if (!decoded_string_value_is_valid(value, value_length)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Value for %s.%s contains an unsupported control byte or "
+                  "malformed/unsafe UTF-8",
+                  section_name, key_name);
         return -1;
     }
 
