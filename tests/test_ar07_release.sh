@@ -599,6 +599,41 @@ assert_archive_metadata()
         fail "archived RPM spec does not force Readline in its release build"
 }
 
+inspect_dist_residue()
+{
+    residue_archive=$1
+    residue_platform=$2
+    residue_archive_dir=${residue_archive%/*}
+    residue_archive_name=${residue_archive##*/}
+
+    set -- "$residue_archive_dir/.$residue_archive_name.tmp."*
+    if [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then
+        [ "$residue_platform" != Darwin ] ||
+            fail "Darwin publication did not retain its private clone source"
+        return
+    fi
+    [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ] ||
+        fail "distribution publication left an unexpected staging namespace"
+    case $residue_platform in
+        FreeBSD)
+            fail "FreeBSD publication retained a temporary despite funlinkat"
+            ;;
+        Darwin)
+            cmp -s "$residue_archive" "$1" ||
+                fail "Darwin retained clone source differs from its artifact"
+            ;;
+        *)
+            cmp -s "$residue_archive" "$1" ||
+                fail "retained distribution source differs from its artifact"
+            ;;
+    esac
+
+    # The publisher deliberately avoids a racy pathname deletion on platforms
+    # without funlinkat. This isolated contract owns the directory after the
+    # helper exits, so it can remove the inspected residue between cases.
+    rm -f "$1"
+}
+
 expect_dirty_rejected()
 {
     label=$1
@@ -633,20 +668,26 @@ expect_output_rejected()
 
 check_manifest_contract()
 {
-    [ "$#" -eq 2 ] ||
-        fail "usage: $0 manifest PROJECT_ROOT MAKE"
+    [ "$#" -eq 3 ] ||
+        fail "usage: $0 manifest PROJECT_ROOT MAKE NAMED_PUBLISH_HELPER"
     root=$1
     make_cmd=$2
+    named_publish_helper=$3
     root=$(cd "$root" && pwd) || fail "project root is unavailable: $root"
     git -C "$root" rev-parse --git-dir >/dev/null 2>&1 ||
         fail "manifest contract requires a git checkout"
 
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-release-contract.XXXXXX") ||
         fail "cannot create temporary release-contract directory"
+    copy_pid=
     cleanup()
     {
         status=$?
         trap - 0 1 2 3 15
+        if [ -n "$copy_pid" ]; then
+            kill "$copy_pid" 2>/dev/null || true
+            wait "$copy_pid" 2>/dev/null || true
+        fi
         rm -rf "$tmp"
         exit "$status"
     }
@@ -667,9 +708,236 @@ check_manifest_contract()
     cp "$clean_repo/README.md" "$tmp/README.before"
     cp "$clean_repo/src/main.c" "$tmp/main.before"
 
+    # Exercise descriptor-bound publication from a named temporary on every
+    # host: success, occupied-output refusal, producer failure, and cleanup
+    # must preserve established or foreign state. FreeBSD can remove the exact
+    # open vnode with funlinkat. Linux and Darwin intentionally retain the
+    # private name because neither has a descriptor-conditioned unlink. The
+    # complete source is retained: a same-UID writer can hard-link it after any
+    # user-space proof, making even descriptor truncation unsafe.
+    # Hosted macOS runs this same contract through fclonefileat.
+    [ -x "$named_publish_helper" ] ||
+        fail "named-publish helper is unavailable: $named_publish_helper"
+    copy_dir=$tmp/copy-publish
+    mkdir "$copy_dir"
+    copy_canonical=$(cd "$copy_dir" && pwd -P) ||
+        fail "cannot resolve copy-publish fixture directory"
+    copy_archive=$copy_dir/archive.tar.gz
+    "$named_publish_helper" "$copy_dir" "$copy_canonical" archive.tar.gz \
+        -- /bin/sh -c 'printf original-payload' ||
+        fail "descriptor-bound publication failed"
+    [ "$(cat "$copy_archive")" = original-payload ] ||
+        fail "descriptor-bound publication changed payload"
+    copy_platform=$(uname -s)
+    copy_retained_temp=
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD publication did not retire its exact named temporary"
+            ;;
+        Darwin)
+            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+                fail "Darwin publication did not retain exactly one private source"
+            copy_retained_temp=$1
+            [ "$(cat "$copy_retained_temp")" = original-payload ] ||
+                fail "Darwin retained clone source changed payload"
+            ;;
+        *)
+            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+                fail "named publication did not retain exactly one private source"
+            copy_retained_temp=$1
+            [ "$(cat "$copy_retained_temp")" = original-payload ] ||
+                fail "retained named source changed payload"
+            ;;
+    esac
+    if "$named_publish_helper" "$copy_dir" "$copy_canonical" archive.tar.gz \
+        -- /bin/sh -c 'printf replacement' >"$out" 2>&1; then
+        fail "descriptor-bound publication replaced an existing artifact"
+    fi
+    [ "$(cat "$copy_archive")" = original-payload ] ||
+        fail "occupied descriptor-bound output changed bytes"
+    rm -f "$copy_archive"
+    if [ -n "$copy_retained_temp" ]; then
+        rm -f "$copy_retained_temp"
+    fi
+
+    # On Darwin, race fclonefileat's committed clone before the helper adopts
+    # it: replace the final with a hard link to the named source. Clone ID,
+    # bytes, mode, and pathname identity all match, so the explicit distinct-
+    # inode proof is essential. The helper must fail without truncating either
+    # complete path.
+    if [ "$copy_platform" = Darwin ]; then
+        copy_adoption_marker=$tmp/copy-adoption.marker
+        copy_adoption_release=$tmp/copy-adoption.release
+        GITSWITCH_RELEASE_TEST_ADOPTION_MARKER=$copy_adoption_marker \
+            GITSWITCH_RELEASE_TEST_ADOPTION_RELEASE=$copy_adoption_release \
+            "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            archive.tar.gz -- /bin/sh -c 'printf original-payload' \
+            >"$out" 2>&1 &
+        copy_pid=$!
+        attempt=0
+        while [ ! -e "$copy_adoption_marker" ] && \
+            kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        [ -e "$copy_adoption_marker" ] ||
+            fail "Darwin publication did not reach its adoption race boundary"
+        [ "$(cat "$copy_archive")" = original-payload ] ||
+            fail "Darwin adoption boundary did not publish the complete clone"
+        set -- "$copy_dir"/.archive.tar.gz.tmp.*
+        [ "$#" -eq 1 ] && [ -f "$1" ] ||
+            fail "Darwin adoption race did not expose one private source"
+        copy_temp=$1
+        rm -f "$copy_archive"
+        ln "$copy_temp" "$copy_archive" ||
+            fail "cannot install Darwin hard-link adoption fixture"
+        : >"$copy_adoption_release"
+        if wait "$copy_pid"; then
+            copy_pid=
+            fail "Darwin publisher adopted its source inode as the final clone"
+        fi
+        copy_pid=
+        grep -F 'complete artifact and private source retained' "$out" \
+            >/dev/null ||
+            fail "Darwin adoption race did not report retained uncertainty"
+        [ "$copy_archive" -ef "$copy_temp" ] ||
+            fail "Darwin adoption fixture did not preserve the hard-link alias"
+        [ "$(cat "$copy_archive")" = original-payload ] &&
+            [ "$(cat "$copy_temp")" = original-payload ] ||
+            fail "Darwin adoption rejection changed a complete source"
+        rm -f "$copy_archive" "$copy_temp"
+    fi
+
+    # Replace the named temporary while its producer still owns the open
+    # stdout descriptor.  Publication must read that descriptor, never the
+    # replacement path; cleanup must preserve the foreign replacement and
+    # fail closed rather than leave a canonical artifact.
+    copy_marker=$tmp/copy-producer.marker
+    copy_release=$tmp/copy-producer.release
+    # The spawned child, not this parent shell, expands these variables.
+    # shellcheck disable=SC2016
+    AR08_COPY_MARKER=$copy_marker AR08_COPY_RELEASE=$copy_release \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c '
+            printf original-payload
+            : >"$AR08_COPY_MARKER"
+            attempt=0
+            while [ ! -e "$AR08_COPY_RELEASE" ] && [ "$attempt" -lt 100 ]; do
+                sleep 0.1
+                attempt=$((attempt + 1))
+            done
+            [ -e "$AR08_COPY_RELEASE" ]
+        ' >"$out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while [ ! -e "$copy_marker" ] && kill -0 "$copy_pid" 2>/dev/null &&
+        [ "$attempt" -lt 100 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    [ -e "$copy_marker" ] || fail "copy producer did not reach substitution boundary"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+        fail "copy publication did not expose exactly one named temporary"
+    copy_temp=$1
+    mv "$copy_temp" "$tmp/original-copy-temp"
+    printf '%s' foreign-payload >"$copy_temp"
+    : >"$copy_release"
+    if wait "$copy_pid"; then
+        copy_pid=
+        fail "copy publication accepted a replaced temporary name"
+    fi
+    copy_pid=
+    { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+        fail "replaced temporary left a canonical artifact"
+    [ "$(cat "$copy_temp")" = foreign-payload ] ||
+        fail "copy cleanup removed or changed the foreign temporary"
+    [ "$(cat "$tmp/original-copy-temp")" = original-payload ] ||
+        fail "descriptor publication reopened the substituted temporary path"
+    rm -f "$copy_temp" "$tmp/original-copy-temp"
+
+    # Race the private-name cleanup after its first identity proof.  The
+    # publisher must re-prove the name, preserve the replacement, and retain
+    # the already committed complete artifact rather than compensating with a
+    # check-then-unlink of the public output.
+    copy_cleanup_marker=$tmp/copy-cleanup.marker
+    copy_cleanup_release=$tmp/copy-cleanup.release
+    GITSWITCH_RELEASE_TEST_CLEANUP_MARKER=$copy_cleanup_marker \
+        GITSWITCH_RELEASE_TEST_CLEANUP_RELEASE=$copy_cleanup_release \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c 'printf original-payload' \
+        >"$out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while [ ! -e "$copy_cleanup_marker" ] && \
+        kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    [ -e "$copy_cleanup_marker" ] ||
+        fail "copy cleanup did not reach its post-check race boundary"
+    [ "$(cat "$copy_archive")" = original-payload ] ||
+        fail "copy cleanup boundary did not retain the committed artifact"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+        fail "copy cleanup did not expose exactly one named temporary"
+    copy_temp=$1
+    mv "$copy_temp" "$tmp/original-cleanup-temp"
+    printf '%s' foreign-payload >"$copy_temp"
+    : >"$copy_cleanup_release"
+    if wait "$copy_pid"; then
+        copy_pid=
+        fail "copy cleanup accepted a post-check temporary replacement"
+    fi
+    copy_pid=
+    grep -F 'published artifact and temporary name retained' "$out" \
+        >/dev/null ||
+        fail "copy cleanup did not report its retained commit truthfully"
+    [ "$(cat "$copy_archive")" = original-payload ] ||
+        fail "failed copy cleanup removed the committed artifact"
+    [ "$(cat "$copy_temp")" = foreign-payload ] ||
+        fail "failed copy cleanup removed the foreign replacement"
+    [ "$(cat "$tmp/original-cleanup-temp")" = original-payload ] ||
+        fail "failed copy cleanup changed the pinned source"
+    rm -f "$copy_archive" "$copy_temp" "$tmp/original-cleanup-temp"
+
+    if "$named_publish_helper" "$copy_dir" "$copy_canonical" archive.tar.gz \
+        -- /bin/sh -c 'printf partial; exit 9' >"$out" 2>&1; then
+        fail "descriptor-bound publication accepted producer failure"
+    fi
+    { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+        fail "failed descriptor-bound publication left an artifact"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD producer failure did not retire its exact temporary"
+            ;;
+        Darwin)
+            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+                fail "Darwin producer failure did not retain exactly one private source"
+            [ "$(cat "$1")" = partial ] ||
+                fail "Darwin failed-producer source changed bytes"
+            rm -f "$1"
+            ;;
+        *)
+            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+                fail "producer failure did not retain exactly one private source"
+            [ "$(cat "$1")" = partial ] ||
+                fail "failed-producer retained source changed bytes"
+            rm -f "$1"
+            ;;
+    esac
+    if find "$copy_dir" -name '.*.tmp.*' -print | grep . >/dev/null; then
+        fail "release contract did not remove its inspected test residue"
+    fi
+
     "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 ||
         fail "clean committed release failed"
     assert_archive_metadata "$archive" "$dist_root" "$version"
+    inspect_dist_residue "$archive" "$copy_platform"
 
     # The helper target itself is fixed inside the ignored build namespace.
     # Before that boundary was override-protected, `-B
@@ -683,6 +951,7 @@ check_manifest_contract()
     cmp -s "$clean_repo/VERSION" "$tmp/VERSION.before" ||
         fail "publisher target override changed tracked VERSION"
     assert_archive_metadata "$archive" "$dist_root" "$version"
+    inspect_dist_residue "$archive" "$copy_platform"
     rm -f "$archive"
     "$make_cmd" -B -C "$clean_repo" DIST_PUBLISH_HELPER=README.md \
         TOOLBUILDDIR=src dist >"$out" 2>&1 ||
@@ -690,6 +959,7 @@ check_manifest_contract()
     cmp -s "$clean_repo/README.md" "$tmp/README.before" ||
         fail "publisher target override changed tracked README"
     assert_archive_metadata "$archive" "$dist_root" "$version"
+    inspect_dist_residue "$archive" "$copy_platform"
 
     # An existing artifact is never replaced, even by a byte-identical rerun.
     cp "$archive" "$tmp/archive.before"
@@ -737,10 +1007,7 @@ check_manifest_contract()
     "$make_cmd" -C "$clean_repo" DIST_ARCHIVE="$archive" dist >"$out" 2>&1 ||
         fail "valid absolute artifact path was rejected"
     assert_archive_metadata "$archive" "$dist_root" "$version"
-    if find "$clean_repo/build/dist" -name '.*.tmp.*' -print |
-        grep . >/dev/null; then
-        fail "distribution publication left a temporary archive"
-    fi
+    inspect_dist_residue "$archive" "$copy_platform"
     status_after=$(git -C "$clean_repo" status --porcelain=v1 --untracked-files=all)
     [ "$status_after" = "$status_before" ] ||
         fail "distribution output matrix changed Git status"
@@ -751,6 +1018,7 @@ check_manifest_contract()
         DIST_ROOT=gitswitcher-9.9.9-uncommitted dist >"$out" 2>&1 ||
         fail "commit-pinned release failed under irrelevant live overrides"
     assert_archive_metadata "$archive" "$dist_root" "$version"
+    inspect_dist_residue "$archive" "$copy_platform"
     [ ! -e "$clean_repo/build/dist/gitswitcher-9.9.9-uncommitted.tar.gz" ] ||
         fail "VERSION/DIST_ROOT override renamed committed release payload"
 
@@ -769,6 +1037,7 @@ check_manifest_contract()
     cmp -s "$tmp/archived.spec" \
         "$rpm_home/rpmbuild/SPECS/gitswitcher.spec" ||
         fail "RPM target did not consume the archive-embedded spec"
+    inspect_dist_residue "$archive" "$copy_platform"
 
     # The archive producer must never receive a reopenable temporary path.
     # This wrapper reproduces the original same-uid substitution: when it sees
@@ -830,10 +1099,7 @@ EOF
         fail "distribution temp substitution changed tracked README"
     [ -f "$race_archive" ] && [ ! -L "$race_archive" ] ||
         fail "distribution race published a non-regular archive"
-    if find "$race_repo/build/dist" -name '.*.tmp.*' -print |
-        grep . >/dev/null; then
-        fail "distribution race left a named temporary archive"
-    fi
+    inspect_dist_residue "$race_archive" "$copy_platform"
     rm -f "$race_archive"
     : >"$race_marker"
     if PATH="$race_shims:$PATH" AR08_REAL_GIT="$real_git" \
@@ -848,10 +1114,13 @@ EOF
     cmp -s "$race_repo/VERSION" "$tmp/race.VERSION.before" ||
         fail "distribution directory substitution changed tracked VERSION"
     { [ ! -e "$race_archive" ] && [ ! -L "$race_archive" ]; } ||
-        fail "distribution directory substitution left a canonical artifact"
-    { [ ! -e "$race_repo/build/dist.pinned/gitswitcher-$race_version.tar.gz" ] &&
-      [ ! -L "$race_repo/build/dist.pinned/gitswitcher-$race_version.tar.gz" ]; } ||
-        fail "distribution directory substitution left an artifact in the old directory"
+        fail "distribution directory substitution published into the replacement directory"
+    race_pinned_archive=$race_repo/build/dist.pinned/gitswitcher-$race_version.tar.gz
+    [ -f "$race_pinned_archive" ] && [ ! -L "$race_pinned_archive" ] ||
+        fail "post-commit directory uncertainty did not retain the complete artifact"
+    assert_archive_metadata "$race_pinned_archive" "$dist_root" "$version"
+    inspect_dist_residue "$race_pinned_archive" "$copy_platform"
+    rm -f "$race_pinned_archive"
 
     dirty_version=$tmp/dirty-version
     git clone --quiet "$root" "$dirty_version" || fail "cannot clone VERSION fixture"

@@ -145,6 +145,77 @@ check_policy()
     ' "$workflow" ||
         fail "every release-artifact-test invocation must preserve WERROR=1"
 
+    # Linux descriptor publication normally uses AT_EMPTY_PATH/O_TMPFILE.
+    # Darwin and FreeBSD have distinct fclonefileat/funlinkat paths, so both
+    # hosted jobs must execute the release contract. Parse only effective run
+    # scalars: comments, env values, names, and other job text are not commands.
+    awk '
+        function strip_comment(line) {
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            return line
+        }
+        function indentation(line, prefix) {
+            prefix = line
+            sub(/[^ ].*$/, "", prefix)
+            return length(prefix)
+        }
+        function inspect_command(code, command_count, commands, i,
+                                 command, target_at, normalized) {
+            command_count = split(code, commands, /[;&|]/)
+            for (i = 1; i <= command_count; i++) {
+                command = commands[i]
+                target_at = match(command,
+                    /(^|[[:space:]])release-contract-test([[:space:]]|$)/)
+                if (!target_at) continue
+                normalized = command
+                sub(/^[[:space:]]+/, "", normalized)
+                sub(/[[:space:]]+$/, "", normalized)
+                if (normalized !~ /^g?make[[:space:]]+release-contract-test$/)
+                    bad = 1
+                if (job == "macos") macos_count++
+                if (job == "freebsd") freebsd_count++
+            }
+        }
+        {
+            code = strip_comment($0)
+            if (code ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/) {
+                job = code
+                sub(/^  /, "", job)
+                sub(/:[[:space:]]*$/, "", job)
+                in_run = 0
+                if (job == "macos") macos_jobs++
+                if (job == "freebsd") freebsd_jobs++
+                next
+            }
+            if (job != "macos" && job != "freebsd") next
+            if (in_run) {
+                if (code == "" || indentation(code) > run_indent) {
+                    if (code != "") {
+                        sub(/^[[:space:]]+/, "", code)
+                        inspect_command(code)
+                    }
+                    next
+                }
+                in_run = 0
+            }
+            if (code ~ /^[[:space:]]+run:[[:space:]]*/) {
+                run_indent = indentation(code)
+                sub(/^[[:space:]]+run:[[:space:]]*/, "", code)
+                if (code ~ /^[|>][-+0-9]*[[:space:]]*$/) {
+                    in_run = 1
+                } else if (code != "") {
+                    inspect_command(code)
+                }
+            }
+        }
+        END {
+            exit !(macos_jobs == 1 && freebsd_jobs == 1 &&
+                   macos_count == 1 && freebsd_count == 1 && !bad)
+        }
+    ' "$workflow" ||
+        fail "macOS and FreeBSD CI must each execute one release-contract-test"
+
     # Parse the FreeBSD version only from the uncommented `with` mapping of the
     # cross-platform action step. The old forward search accepted a stale real
     # value when a preceding comment happened to mention the supported one.
@@ -339,5 +410,78 @@ awk '
 ' "$workflow" >"$tmp/artifact-no-werror.yml"
 expect_rejected "artifact rebuild without WERROR" \
     "$tmp/artifact-no-werror.yml" "$today"
+
+# Removing the effective Darwin publication exercise must be detected even
+# while the Linux release-contract lane remains present.
+awk '
+    /^  macos:[[:space:]]*$/ { in_macos = 1 }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
+        in_macos = 0
+    }
+    in_macos && !changed && /release-contract-test/ {
+        sub(/make[[:space:]]+release-contract-test/, "true")
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/macos-no-release-contract.yml"
+expect_rejected "macOS without release contract" \
+    "$tmp/macos-no-release-contract.yml" "$today"
+
+# Non-command text in the same job must not mask removal of the executable
+# macOS contract command.
+awk '
+    /^  macos:[[:space:]]*$/ { in_macos = 1 }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
+        in_macos = 0
+    }
+    in_macos && !changed && /make[[:space:]]+release-contract-test/ {
+        sub(/make[[:space:]]+release-contract-test/, "true")
+        changed = 1
+    }
+    in_macos && changed && !injected && /^[[:space:]]+env:[[:space:]]*$/ {
+        print
+        print "          FAKE_POLICY_TEXT: make release-contract-test"
+        injected = 1
+        next
+    }
+    { print }
+    END { if (!changed || !injected) exit 1 }
+' "$workflow" >"$tmp/macos-env-text-only.yml"
+expect_rejected "macOS env text without release contract" \
+    "$tmp/macos-env-text-only.yml" "$today"
+
+# Mentioning the make command as echo data is not execution either.
+awk '
+    /^  macos:[[:space:]]*$/ { in_macos = 1 }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
+        in_macos = 0
+    }
+    in_macos && !changed && /make[[:space:]]+release-contract-test/ {
+        sub(/make[[:space:]]+release-contract-test/,
+            "echo make release-contract-test")
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/macos-echo-release-contract.yml"
+expect_rejected "macOS echo without release contract" \
+    "$tmp/macos-echo-release-contract.yml" "$today"
+
+# The FreeBSD funlinkat path must remain both Werror-compiled and executed.
+awk '
+    /^  freebsd:[[:space:]]*$/ { in_freebsd = 1 }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  freebsd:/ {
+        in_freebsd = 0
+    }
+    in_freebsd && !changed && /gmake[[:space:]]+release-contract-test/ {
+        sub(/gmake[[:space:]]+release-contract-test/, "true")
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-no-release-contract.yml"
+expect_rejected "FreeBSD without release contract" \
+    "$tmp/freebsd-no-release-contract.yml" "$today"
 
 printf 'ci-policy: PASS (immutable, least-privilege, supported-platform workflow)\n'

@@ -405,6 +405,17 @@ $(DIST_PUBLISH_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
 	@echo "Building descriptor-pinned release publisher..."
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror $< -o $@
 
+# Exercise descriptor-bound publication from a named temp on every QA host;
+# macOS CI exercises its exact fclonefileat implementation below this contract.
+override DIST_PUBLISH_NAMED_TEST_HELPER := build/tools/release-publish-named-test
+$(DIST_PUBLISH_NAMED_TEST_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
+	@echo "Building named-temp release publisher fixture..."
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror \
+		-DGITSWITCH_RELEASE_FORCE_NAMED_TEMP=1 \
+		-DGITSWITCH_RELEASE_TEST_FD_PRESSURE=1 \
+		-DGITSWITCH_RELEASE_TEST_ADOPTION_RACE=1 \
+		-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 $< -o $@
+
 # Build-config stamp: objects/tests share build/obj and build/bin across every
 # configuration. Record every effective compile/link input, not just the build
 # type and metadata: otherwise READLINE, compiler, flag, library, or platform
@@ -1114,8 +1125,9 @@ distcheck: dist
 
 # Negative release-input checks run in isolated local clones, so they can dirty
 # VERSION/spec/manifest fixtures without touching the operator's checkout.
-release-contract-test:
-	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)"
+release-contract-test: $(DIST_PUBLISH_NAMED_TEST_HELPER)
+	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)" \
+		"$(CURDIR)/$(DIST_PUBLISH_NAMED_TEST_HELPER)"
 
 # Inspect the exact release binary and byte-identical staged-install copy with
 # native ELF or Mach-O tooling. The shell test owns its temporary stage.

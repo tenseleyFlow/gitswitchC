@@ -1,4 +1,8 @@
-#define _GNU_SOURCE
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#elif defined(__linux__)
+#define _GNU_SOURCE 1
+#endif
 
 #include <errno.h>
 #include <fcntl.h>
@@ -8,10 +12,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/attr.h>
+#include <sys/clonefile.h>
+#if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
+#include <sys/resource.h>
+#endif
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -101,7 +113,7 @@ static int create_named_temp(int directory_fd, const char *final_name,
             return -1;
         }
         fd = openat(directory_fd, temp_name,
-                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                     S_IRUSR | S_IWUSR);
         if (fd >= 0) {
             return fd;
@@ -118,9 +130,10 @@ static int create_temp(int directory_fd, const char *final_name,
                        char *temp_name, size_t temp_name_size,
                        bool *has_name)
 {
-#if defined(O_TMPFILE) && O_TMPFILE != 0
+#if !defined(GITSWITCH_RELEASE_FORCE_NAMED_TEMP) && \
+    defined(O_TMPFILE) && O_TMPFILE != 0
     int fd = openat(directory_fd, ".",
-                    O_WRONLY | O_TMPFILE | O_CLOEXEC,
+                    O_RDWR | O_TMPFILE | O_CLOEXEC,
                     S_IRUSR | S_IWUSR);
     if (fd >= 0) {
         temp_name[0] = '\0';
@@ -137,24 +150,110 @@ static int create_temp(int directory_fd, const char *final_name,
                              temp_name_size);
 }
 
-static int unlink_named_temp_if_owned(int directory_fd, const char *temp_name,
+static int verify_named_temp_identity(int directory_fd, const char *temp_name,
                                       int temp_fd)
 {
     struct stat descriptor_stat;
     struct stat path_stat;
 
-    if (fstat(temp_fd, &descriptor_stat) != 0) {
-        return -1;
-    }
-    if (fstatat(directory_fd, temp_name, &path_stat,
+    if (fstat(temp_fd, &descriptor_stat) != 0 ||
+        fstatat(directory_fd, temp_name, &path_stat,
                 AT_SYMLINK_NOFOLLOW) != 0) {
-        return errno == ENOENT ? 0 : -1;
+        return -1;
     }
     if (!same_identity(&descriptor_stat, &path_stat)) {
         errno = ESTALE;
         return -1;
     }
-    return unlinkat(directory_fd, temp_name, 0);
+    return 0;
+}
+
+#if defined(GITSWITCH_RELEASE_TEST_CLEANUP_RACE) || \
+    defined(GITSWITCH_RELEASE_TEST_ADOPTION_RACE)
+static int run_test_race_hook(const char *marker_variable,
+                              const char *release_variable, bool *hook_used)
+{
+    const char *marker = getenv(marker_variable);
+    const char *release = getenv(release_variable);
+    struct timespec delay = {0, 50L * 1000L * 1000L};
+    struct stat released;
+    int marker_fd;
+    int attempt;
+
+    if (*hook_used || (marker == NULL && release == NULL)) {
+        return 0;
+    }
+    if (marker == NULL || marker[0] == '\0' || release == NULL ||
+        release[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    *hook_used = true;
+    marker_fd = open(marker,
+                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                     S_IRUSR | S_IWUSR);
+    if (marker_fd < 0 || close(marker_fd) != 0) {
+        return -1;
+    }
+    for (attempt = 0; attempt < 200; attempt++) {
+        if (lstat(release, &released) == 0) {
+            return 0;
+        }
+        if (errno != ENOENT) {
+            return -1;
+        }
+        while (nanosleep(&delay, &delay) != 0) {
+            if (errno != EINTR) {
+                return -1;
+            }
+        }
+        delay.tv_sec = 0;
+        delay.tv_nsec = 50L * 1000L * 1000L;
+    }
+    errno = ETIMEDOUT;
+    return -1;
+}
+#endif
+
+static int run_cleanup_race_hook(void)
+{
+#if defined(GITSWITCH_RELEASE_TEST_CLEANUP_RACE)
+    static bool hook_used;
+
+    return run_test_race_hook("GITSWITCH_RELEASE_TEST_CLEANUP_MARKER",
+                              "GITSWITCH_RELEASE_TEST_CLEANUP_RELEASE",
+                              &hook_used);
+#else
+    return 0;
+#endif
+}
+
+/* FreeBSD can condition unlink on the still-open vnode with funlinkat(2).
+ * Linux and Darwin cannot: after any pathname proof, a same-UID writer can
+ * substitute the name before unlinkat(2).  Their named fallback is therefore
+ * retained, never renamed, unlinked, or truncated: a same-UID process can
+ * hard-link the staging inode after any user-space proof, so descriptor
+ * truncation could still mutate a substituted public name. Return 0 for
+ * removed, 1 for safely retained, and -1 for an identity race or cleanup
+ * failure. */
+static int retire_named_temp(int directory_fd, const char *temp_name,
+                             int temp_fd)
+{
+    if (verify_named_temp_identity(directory_fd, temp_name, temp_fd) != 0 ||
+        run_cleanup_race_hook() != 0) {
+        return -1;
+    }
+#if defined(__FreeBSD__)
+    if (funlinkat(directory_fd, temp_name, temp_fd, 0) != 0) {
+        return -1;
+    }
+    return 0;
+#else
+    if (verify_named_temp_identity(directory_fd, temp_name, temp_fd) != 0) {
+        return -1;
+    }
+    return 1;
+#endif
 }
 
 static int run_to_descriptor(int output_fd, char *const command[])
@@ -198,6 +297,7 @@ static int run_to_descriptor(int output_fd, char *const command[])
     return 0;
 }
 
+#if !defined(__APPLE__)
 static int link_descriptor(int source_fd, int directory_fd,
                            const char *final_name)
 {
@@ -230,6 +330,7 @@ static int link_descriptor(int source_fd, int directory_fd,
     return -1;
 #endif
 }
+#endif
 
 static int verify_published_identity(int source_fd, int directory_fd,
                                      const char *final_name)
@@ -283,13 +384,223 @@ static int verify_canonical_directory(int directory_fd,
     return 0;
 }
 
-static int unlink_published_if_owned(int source_fd, int directory_fd,
-                                     const char *final_name)
+#if defined(__APPLE__)
+static int clone_id_for_descriptor(int fd, uint64_t *clone_id)
 {
-    if (verify_published_identity(source_fd, directory_fd, final_name) != 0) {
+    unsigned char buffer[sizeof(uint32_t) + sizeof(uint64_t)];
+    struct attrlist attributes;
+    uint32_t returned_size;
+
+    memset(&attributes, 0, sizeof(attributes));
+    memset(buffer, 0, sizeof(buffer));
+    attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+    attributes.forkattr = ATTR_CMNEXT_CLONEID;
+    if (fgetattrlist(fd, &attributes, buffer, sizeof(buffer),
+                     FSOPT_ATTR_CMN_EXTENDED) != 0) {
         return -1;
     }
-    return unlinkat(directory_fd, final_name, 0);
+    memcpy(&returned_size, buffer, sizeof(returned_size));
+    if (returned_size != sizeof(buffer)) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    memcpy(clone_id, buffer + sizeof(returned_size), sizeof(*clone_id));
+    if (*clone_id == 0U) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    return 0;
+}
+
+static int descriptors_have_same_contents(int source_fd, int destination_fd)
+{
+    unsigned char source_buffer[64U * 1024U];
+    unsigned char destination_buffer[sizeof(source_buffer)];
+    struct stat source_stat;
+    struct stat destination_stat;
+    off_t offset = 0;
+
+    if (fstat(source_fd, &source_stat) != 0 ||
+        fstat(destination_fd, &destination_stat) != 0) {
+        return -1;
+    }
+    if (same_identity(&source_stat, &destination_stat)) {
+        errno = ESTALE;
+        return -1;
+    }
+    if (!S_ISREG(source_stat.st_mode) ||
+        !S_ISREG(destination_stat.st_mode) ||
+        source_stat.st_size != destination_stat.st_size ||
+        (source_stat.st_mode & 07777) !=
+            (destination_stat.st_mode & 07777)) {
+        errno = ESTALE;
+        return -1;
+    }
+    while (offset < source_stat.st_size) {
+        size_t wanted = sizeof(source_buffer);
+        ssize_t source_count;
+        ssize_t destination_count;
+
+        if (source_stat.st_size - offset < (off_t)wanted) {
+            wanted = (size_t)(source_stat.st_size - offset);
+        }
+        do {
+            source_count = pread(source_fd, source_buffer, wanted, offset);
+        } while (source_count < 0 && errno == EINTR);
+        if (source_count <= 0) {
+            if (source_count == 0) {
+                errno = EIO;
+            }
+            return -1;
+        }
+        do {
+            destination_count = pread(destination_fd, destination_buffer,
+                                      (size_t)source_count, offset);
+        } while (destination_count < 0 && errno == EINTR);
+        if (destination_count != source_count ||
+            memcmp(source_buffer, destination_buffer,
+                   (size_t)source_count) != 0) {
+            if (destination_count >= 0) {
+                errno = ESTALE;
+            }
+            return -1;
+        }
+        offset += source_count;
+    }
+    return 0;
+}
+
+static int run_adoption_race_hook(void)
+{
+#if defined(GITSWITCH_RELEASE_TEST_ADOPTION_RACE)
+    static bool hook_used;
+
+    return run_test_race_hook("GITSWITCH_RELEASE_TEST_ADOPTION_MARKER",
+                              "GITSWITCH_RELEASE_TEST_ADOPTION_RELEASE",
+                              &hook_used);
+#else
+    return 0;
+#endif
+}
+
+static int publish_descriptor_clone(int source_fd, int directory_fd,
+                                    const char *final_name,
+                                    int *published_fd)
+{
+    int destination_fd;
+    int reserve_fd;
+    int saved_errno;
+    uint64_t source_clone_id;
+    uint64_t destination_clone_id;
+#if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
+    struct rlimit saved_limit;
+    struct rlimit pressure_limit;
+#endif
+
+    /* fclonefileat binds its source to source_fd, creates the destination only
+     * if absent, and publishes the complete clone atomically.  Do not fall
+     * back to a pathname rename or visible incremental copy on filesystems
+     * without clone support: both would reopen a race/crash window. */
+    /* Reserve one descriptor before committing the clone. Releasing it gives
+     * this single-threaded helper capacity under its process descriptor limit
+     * before adoption. Global file-table capacity can still be consumed by
+     * another process; that post-commit failure is reported as uncertainty and
+     * both complete paths are retained. */
+    reserve_fd = open("/dev/null", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (reserve_fd < 0) {
+        return -1;
+    }
+#if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
+    if (getrlimit(RLIMIT_NOFILE, &saved_limit) != 0) {
+        saved_errno = errno;
+        (void)close(reserve_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    pressure_limit = saved_limit;
+    pressure_limit.rlim_cur = (rlim_t)reserve_fd + 1U;
+    if (setrlimit(RLIMIT_NOFILE, &pressure_limit) != 0) {
+        saved_errno = errno;
+        (void)close(reserve_fd);
+        errno = saved_errno;
+        return -1;
+    }
+#endif
+    if (fclonefileat(source_fd, directory_fd, final_name, 0) != 0) {
+        saved_errno = errno;
+#if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
+        (void)setrlimit(RLIMIT_NOFILE, &saved_limit);
+#endif
+        (void)close(reserve_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    (void)close(reserve_fd);
+    if (run_adoption_race_hook() != 0) {
+        saved_errno = errno;
+#if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
+        (void)setrlimit(RLIMIT_NOFILE, &saved_limit);
+#endif
+        errno = saved_errno;
+        return 1;
+    }
+    do {
+        destination_fd = openat(directory_fd, final_name,
+                                O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    } while (destination_fd < 0 && errno == EINTR);
+#if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
+    saved_errno = errno;
+    if (setrlimit(RLIMIT_NOFILE, &saved_limit) != 0) {
+        if (destination_fd >= 0) {
+            (void)close(destination_fd);
+        }
+        return 1;
+    }
+    errno = saved_errno;
+#endif
+    if (destination_fd < 0) {
+        return 1;
+    }
+
+    /* The open occurs after the atomic clone syscall, so prove it adopted a
+     * pure clone of our source before reporting the committed name as fully
+     * verified.  A pathname replacement with unrelated contents is closed and
+     * preserved; publication is never compensated with pathname deletion. */
+    if (clone_id_for_descriptor(source_fd, &source_clone_id) != 0 ||
+        clone_id_for_descriptor(destination_fd, &destination_clone_id) != 0 ||
+        source_clone_id != destination_clone_id ||
+        descriptors_have_same_contents(source_fd, destination_fd) != 0) {
+        saved_errno = errno;
+        (void)close(destination_fd);
+        errno = saved_errno == 0 ? ESTALE : saved_errno;
+        return 1;
+    }
+    if (verify_published_identity(destination_fd, directory_fd,
+                                  final_name) == 0) {
+        *published_fd = destination_fd;
+        return 0;
+    }
+
+    saved_errno = errno;
+    (void)close(destination_fd);
+    errno = saved_errno;
+    return 1;
+}
+#endif
+
+static int publish_output(int source_fd, int directory_fd,
+                          const char *final_name, int *published_fd)
+{
+#if defined(__APPLE__)
+    return publish_descriptor_clone(source_fd, directory_fd, final_name,
+                                    published_fd);
+#else
+    if (link_descriptor(source_fd, directory_fd, final_name) != 0) {
+        return -1;
+    }
+    *published_fd = source_fd;
+    return 0;
+#endif
 }
 
 int main(int argc, char **argv)
@@ -300,8 +611,10 @@ int main(int argc, char **argv)
     const char *final_name;
     int directory_fd = -1;
     int output_fd = -1;
+    int published_fd = -1;
+    int publish_rc;
+    int retire_rc;
     bool has_name = false;
-    bool published = false;
     struct stat existing;
     struct stat output_stat;
     int result = EXIT_FAILURE;
@@ -357,55 +670,94 @@ int main(int argc, char **argv)
         fprintf(stderr, "ERROR: archive command produced no regular output\n");
         goto cleanup;
     }
-    if (fchmod(output_fd, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0 ||
+    if (fchmod(output_fd,
+               S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0 ||
         fsync(output_fd) != 0) {
         fprintf(stderr, "ERROR: cannot sync completed distribution output: %s\n",
                 strerror(errno));
         goto cleanup;
     }
-    if (link_descriptor(output_fd, directory_fd, final_name) != 0) {
+    if (has_name &&
+        verify_named_temp_identity(directory_fd, temp_name, output_fd) != 0) {
+        has_name = false;
+        fprintf(stderr,
+                "ERROR: distribution temporary output changed before publication; replacement retained\n");
+        goto cleanup;
+    }
+    publish_rc = publish_output(output_fd, directory_fd, final_name,
+                                &published_fd);
+    if (publish_rc < 0) {
         fprintf(stderr,
                 "ERROR: cannot publish pinned distribution output without replacement: %s\n",
                 strerror(errno));
         goto cleanup;
     }
-    published = true;
-    if (verify_published_identity(output_fd, directory_fd, final_name) != 0) {
-        fprintf(stderr, "ERROR: published distribution output changed identity\n");
+    if (publish_rc > 0) {
+        has_name = false;
+        fprintf(stderr,
+                "ERROR: distribution output was atomically published, but its final identity could not be adopted; complete artifact and private source retained for inspection\n");
+        goto cleanup;
+    }
+    if (verify_published_identity(published_fd, directory_fd,
+                                  final_name) != 0) {
+        has_name = false;
+        fprintf(stderr,
+                "ERROR: published distribution output changed identity; artifact and private source retained\n");
+        goto cleanup;
+    }
+    if (published_fd != output_fd && fsync(published_fd) != 0) {
+        has_name = false;
+        fprintf(stderr,
+                "ERROR: cannot sync adopted distribution output; artifact and private source retained: %s\n",
+                strerror(errno));
         goto cleanup;
     }
     if (has_name &&
-        unlink_named_temp_if_owned(directory_fd, temp_name, output_fd) != 0) {
-        fprintf(stderr, "ERROR: distribution temporary output changed identity\n");
+        (retire_rc = retire_named_temp(directory_fd, temp_name,
+                                      output_fd)) < 0) {
+        has_name = false;
+        fprintf(stderr,
+                "ERROR: distribution temporary output changed identity; published artifact and temporary name retained\n");
         goto cleanup;
+    }
+    if (has_name && retire_rc > 0) {
+        fprintf(stderr,
+                "WARNING: platform lacks descriptor-conditioned unlink; private distribution staging name retained\n");
     }
     has_name = false;
     if (fsync(directory_fd) != 0) {
-        fprintf(stderr, "ERROR: cannot sync distribution directory: %s\n",
+        fprintf(stderr,
+                "ERROR: cannot sync distribution directory; published artifact retained: %s\n",
                 strerror(errno));
         goto cleanup;
     }
     if (verify_canonical_directory(directory_fd, canonical_directory) != 0) {
         fprintf(stderr,
-                "ERROR: canonical distribution directory changed during publication\n");
+                "ERROR: canonical distribution directory changed during publication; artifact retained\n");
         goto cleanup;
     }
-    published = false;
+    if (verify_published_identity(published_fd, directory_fd,
+                                  final_name) != 0) {
+        fprintf(stderr,
+                "ERROR: published distribution output changed before completion; artifact retained\n");
+        goto cleanup;
+    }
     result = EXIT_SUCCESS;
 
 cleanup:
-    if (published &&
-        unlink_published_if_owned(output_fd, directory_fd, final_name) != 0 &&
-        errno != ENOENT) {
-        fprintf(stderr,
-                "ERROR: refusing to remove a replaced distribution output\n");
+    if (has_name && output_fd >= 0) {
+        retire_rc = retire_named_temp(directory_fd, temp_name, output_fd);
+        if (retire_rc < 0) {
+            fprintf(stderr,
+                    "ERROR: distribution staging name changed; replacement retained\n");
+        } else if (retire_rc > 0) {
+            fprintf(stderr,
+                    "WARNING: failed publication retained its private staging name\n");
+        }
         result = EXIT_FAILURE;
     }
-    if (has_name && output_fd >= 0 &&
-        unlink_named_temp_if_owned(directory_fd, temp_name, output_fd) != 0 &&
-        errno != ENOENT) {
-        fprintf(stderr,
-                "ERROR: refusing to remove a replaced distribution temporary\n");
+    if (published_fd >= 0 && published_fd != output_fd &&
+        close(published_fd) != 0) {
         result = EXIT_FAILURE;
     }
     if (output_fd >= 0 && close(output_fd) != 0) {

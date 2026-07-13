@@ -151,6 +151,9 @@ jobs:
             gmake BUILD_TYPE=release WERROR=1
             gmake BUILD_TYPE=release WERROR=1 test
             gmake BUILD_TYPE=release WERROR=1 release-artifact-test
+            # Compiles and exercises FreeBSD's descriptor-conditioned
+            # funlinkat staging retirement instead of merely parsing it.
+            gmake release-contract-test
 
   macos:
     runs-on: macos-latest
@@ -174,6 +177,9 @@ jobs:
           make clean
           make BUILD_TYPE=release READLINE=1 WERROR=1 test
           make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+          # Exercises Darwin's descriptor-bound atomic clone publisher,
+          # including adoption, retained-source, and cleanup-race behavior.
+          make release-contract-test
         env:
           # Same sole OS-specific exclusion as the debug lane above.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
