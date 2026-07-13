@@ -11,9 +11,13 @@
 #   SIG-02: the interrupted switch must leave no accounts.toml.tmp.* /
 #           ~/.ssh/config.gitswitch.* scratch orphans.
 #
-# Everything runs in a throwaway sandbox: private HOME, private
-# XDG_RUNTIME_DIR, and PATH shims below the operator's trusted HOME ancestry.
-# The `git` shim delegates to the real git but can sleep on / fail the identity
+# Everything runs in one throwaway sandbox below a trusted, pre-existing
+# per-user runtime directory: private HOME, XDG_RUNTIME_DIR, keys, and PATH
+# shims.  The invoking user's real HOME is never used as a fixture root or
+# write target.
+# Catchable exits remove the sandbox; even SIGKILL can only strand that private
+# runtime directory, never a shim or config file in the invoking HOME.  The
+# `git` shim delegates to the real git but can sleep on / fail the identity
 # writes (that's what makes the race deterministic). Real ssh-agent/ssh-add are
 # used; `ssh` itself is stubbed so no network is touched. Run from anywhere:
 #
@@ -22,47 +26,206 @@
 # Exits 0 and prints PASS for each check; any failure exits 1.
 
 set -u
+# The caller's umask must not weaken generated keys, configuration, or trusted
+# executable shims.  Exact chmods below retain the public contract where a
+# specific mode is required.
+umask 077
 
-ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ROOT=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
 BIN="$ROOT/build/bin/gitswitch"
 [ -x "$BIN" ] || { echo "build first: make (missing $BIN)"; exit 1; }
 
 REAL_GIT=$(command -v git) || { echo "git not found"; exit 1; }
 command -v ssh-agent >/dev/null || { echo "ssh-agent not found"; exit 1; }
 
-case ${HOME-} in
-    /*) ;;
-    *) echo "absolute HOME required for trusted PATH shims"; exit 1 ;;
-esac
-TRUSTED_HOME=$(CDPATH= cd "$HOME" 2>/dev/null && pwd -P) \
-    || { echo "cannot resolve HOME: $HOME"; exit 1; }
-SBX=$(mktemp -d /tmp/gsw_repro.XXXXXX) || exit 1
-SHIM_DIR=$(mktemp -d "$TRUSTED_HOME/.gsw-repro-shims.XXXXXX") \
-    || { rm -rf "$SBX"; exit 1; }
-chmod 700 "$SHIM_DIR" \
-    || { rm -rf "$SBX" "$SHIM_DIR"; exit 1; }
-
 FAILURES=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
+SBX=
+ACTIVE_PID=
 cleanup() {
+    [ -n "$SBX" ] || return 0
+    case $ACTIVE_PID in
+        ''|*[!0-9]*) ;;
+        *)
+            if [ "$ACTIVE_PID" -gt 1 ]; then
+                kill "$ACTIVE_PID" 2>/dev/null
+                wait "$ACTIVE_PID" 2>/dev/null
+            fi
+            ;;
+    esac
     # Reap any agents the sandbox started (pid sidecars are authoritative).
     for f in "$SBX"/run/gitswitch-ssh/*.pid; do
-        [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null
+        [ -f "$f" ] || continue
+        pid=$(cat "$f" 2>/dev/null) || continue
+        case $pid in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$pid" -gt 1 ] && kill "$pid" 2>/dev/null
     done
-    rm -rf "$SBX" "$SHIM_DIR"
+    rm -rf "$SBX"
 }
-trap cleanup EXIT INT TERM
 
-# --- sandbox ----------------------------------------------------------------
+on_signal() {
+    status=$1
+    trap - 0 HUP INT TERM
+    cleanup
+    exit "$status"
+}
+
+# Preserve the triggering status on every ordinary/error exit.  Catchable
+# termination uses conventional 128+signal statuses after the same cleanup.
+trap 'status=$?; trap - 0 HUP INT TERM; cleanup; exit "$status"' 0
+trap 'on_signal 129' HUP
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+
+# Resolve candidates without changing the caller's working directory.  The
+# canonical spelling is used for both ancestry validation and the new root, so
+# a lexical symlink cannot smuggle the fixture below HOME or the worktree.
+canonical_dir() {
+    (CDPATH= cd "$1" 2>/dev/null && pwd -P)
+}
+
+# Match the production executable resolver's ownership and basic mode policy:
+# every canonical ancestor must be a directory owned by root or this uid and
+# must reject group/other writes.  The real switch below remains the final ACL
+# and executable-admission check.
+trusted_dir_chain() {
+    candidate=$1
+    uid=$2
+    current=
+    rest=${candidate#/}
+
+    while [ -n "$rest" ]; do
+        component=${rest%%/*}
+        if [ "$rest" = "$component" ]; then
+            rest=
+        else
+            rest=${rest#*/}
+        fi
+        [ -n "$component" ] || continue
+        current=$current/$component
+        checked=$(find "$current" -prune -type d \
+            \( -user 0 -o -user "$uid" \) \
+            ! -perm -020 ! -perm -002 -print 2>/dev/null)
+        [ "$checked" = "$current" ] || return 1
+    done
+}
+
+REAL_HOME=
+case ${HOME-} in
+    /*) REAL_HOME=$(canonical_dir "$HOME") || REAL_HOME= ;;
+esac
+
+# Clear inherited repository, trace-output, and agent channels before the first
+# real Git invocation (the worktree-admission probe below).  Several Git trace
+# variables are writable path destinations, so delaying this until after root
+# selection could already mutate an operator-owned file.
+unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE \
+    GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
+    GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM \
+    GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS \
+    GIT_DISCOVERY_ACROSS_FILESYSTEM \
+    GIT_SSH GIT_SSH_COMMAND GIT_SSH_VARIANT GIT_ASKPASS \
+    GIT_TRACE GIT_TRACE_SETUP GIT_TRACE_SHALLOW GIT_TRACE_PACKET \
+    GIT_TRACE_PACK_ACCESS GIT_TRACE_CURL GIT_TRACE_CURL_NO_DATA \
+    GIT_TRACE_PERFORMANCE GIT_TRACE_REFS GIT_TRACE_FSMONITOR \
+    GIT_TRACE2 GIT_TRACE2_EVENT GIT_TRACE2_PERF \
+    SSH_AUTH_SOCK SSH_AGENT_PID SSH_ASKPASS SSH_ASKPASS_REQUIRE \
+    GPG_AGENT_INFO 2>/dev/null
+
+select_private_root() {
+    candidate=$1
+    [ -n "$candidate" ] && [ -d "$candidate" ] || return 1
+    base=$(canonical_dir "$candidate") || return 1
+
+    if [ -n "$REAL_HOME" ]; then
+        case $base in
+            "$REAL_HOME"|"$REAL_HOME"/*) return 1 ;;
+        esac
+    fi
+    case $base in
+        "$ROOT"|"$ROOT"/*) return 1 ;;
+    esac
+
+    uid=$(id -u) || return 1
+    trusted_dir_chain "$base" "$uid" || return 1
+    SBX=$(mktemp -d "$base/gitswitch-repro.XXXXXX") || {
+        SBX=
+        return 1
+    }
+    chmod 700 "$SBX" || {
+        rm -rf "$SBX"
+        SBX=
+        return 1
+    }
+
+    # XDG_RUNTIME_DIR is caller-controlled and may itself sit below an
+    # unrelated worktree.  Detect that with the pinned real Git while hiding
+    # caller repository overrides and global configuration.  Rejecting the
+    # candidate lets the selection chain try the conventional runtime roots.
+    if (
+        unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES
+        HOME=$SBX
+        GIT_CONFIG_GLOBAL=/dev/null
+        GIT_CONFIG_NOSYSTEM=1
+        GIT_DISCOVERY_ACROSS_FILESYSTEM=1
+        export HOME GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
+            GIT_DISCOVERY_ACROSS_FILESYSTEM
+        inside=$(
+            "$REAL_GIT" -c 'safe.directory=*' -C "$SBX" \
+                rev-parse --is-inside-work-tree 2>/dev/null
+        ) || exit 1
+        [ "$inside" = true ]
+    ); then
+        rm -rf "$SBX"
+        SBX=
+        return 1
+    fi
+}
+
+# /tmp itself cannot host positive-control shims: its writable ancestor is
+# intentionally rejected by the production resolver.  Prefer the caller's
+# runtime directory, then conventional per-user runtime locations; TMPDIR is a
+# portable final candidate only when it independently passes the same checks.
+uid=$(id -u) || exit 1
+select_private_root "${XDG_RUNTIME_DIR-}" ||
+    select_private_root "/run/user/$uid" ||
+    select_private_root "/var/run/user/$uid" ||
+    select_private_root "${TMPDIR-}" || {
+        echo "no trusted writable runtime directory outside HOME/worktree" >&2
+        echo "set XDG_RUNTIME_DIR to a private directory with trusted ancestry" >&2
+        exit 1
+    }
+
+# Replace every caller-controlled user-data destination immediately after
+# constructing the root and before making any user-relative file.  This keeps
+# XDG, Git, GPG, SSH-agent, and generic temporary artifacts inside SBX even
+# when the invoking environment points them back into the operator's HOME.
 export HOME="$SBX/home"
 export XDG_RUNTIME_DIR="$SBX/run"
-mkdir -p "$HOME/.ssh" "$HOME/.config/gitswitch"
-mkdir -m 700 "$XDG_RUNTIME_DIR"
-chmod 700 "$HOME/.ssh"
-cd "$SBX" # must not run inside a git repo: switches use --global scope
-unset GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM 2>/dev/null
+export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_CACHE_HOME="$HOME/.cache"
+export XDG_DATA_HOME="$HOME/.local/share"
+export XDG_STATE_HOME="$HOME/.local/state"
+export GNUPGHOME="$HOME/.gnupg"
+export TMPDIR="$SBX/tmp"
+SHIM_DIR="$SBX/shims"
+
+# --- sandbox ----------------------------------------------------------------
+mkdir -m 700 "$HOME" "$XDG_RUNTIME_DIR" "$SHIM_DIR" "$TMPDIR" || exit 1
+mkdir -m 700 "$HOME/.ssh" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" \
+    "$HOME/.local" "$GNUPGHOME" || exit 1
+mkdir -m 700 "$XDG_CONFIG_HOME/gitswitch" "$XDG_DATA_HOME" \
+    "$XDG_STATE_HOME" || exit 1
+# Switches use global scope, but the reproducer must still start outside Git.
+cd "$SBX" || exit 1
+# The inherited repository context was cleared before admission.  This ceiling
+# additionally prevents later parent changes from becoming discoverable.
+export GIT_CEILING_DIRECTORIES="$SBX"
+export GIT_CONFIG_NOSYSTEM=1
 
 # git shim: delegates to the real git, but
 #   - GS_SLEEP_EMAIL=1: sleeps 4s before the first `config <scope> user.email X`
@@ -83,10 +246,10 @@ if [ "\${1:-}" = "config" ] && [ \$# -eq 4 ]; then
 fi
 exec "$REAL_GIT" "\$@"
 EOF
-chmod +x "$SHIM_DIR/git"
+chmod 700 "$SHIM_DIR/git"
 # ssh stub: the post-switch connection test must not hit the network.
 printf '#!/bin/sh\nexit 1\n' > "$SHIM_DIR/ssh"
-chmod +x "$SHIM_DIR/ssh"
+chmod 700 "$SHIM_DIR/ssh"
 export PATH="$SHIM_DIR:$PATH"
 
 # Two passphrase-less test keys (never leave the sandbox).
@@ -95,7 +258,7 @@ ssh-keygen -q -t ed25519 -N "" -C "keyB" -f "$SBX/keyB" || exit 1
 FP_A=$(ssh-keygen -lf "$SBX/keyA" | awk '{print $2}')
 FP_B=$(ssh-keygen -lf "$SBX/keyB" | awk '{print $2}')
 
-cat > "$HOME/.config/gitswitch/accounts.toml" <<EOF
+cat > "$XDG_CONFIG_HOME/gitswitch/accounts.toml" <<EOF
 [settings]
 default_scope = "global"
 
@@ -121,7 +284,7 @@ email = "sshb@example.com"
 description = "ssh account B"
 ssh_key = "$SBX/keyB"
 EOF
-chmod 600 "$HOME/.config/gitswitch/accounts.toml"
+chmod 600 "$XDG_CONFIG_HOME/gitswitch/accounts.toml"
 
 CUR_SOCK="$XDG_RUNTIME_DIR/gitswitch-ssh/current.sock"
 agent_ls() { SSH_AUTH_SOCK="$CUR_SOCK" ssh-add -l 2>/dev/null; }
@@ -140,6 +303,7 @@ echo "== SIG-01: signal during the git-config write =="
 
 GS_SLEEP_EMAIL=1 "$BIN" --global --yes new >/dev/null 2>&1 &
 GS_PID=$!
+ACTIVE_PID=$GS_PID
 # Wait for the shim to enter the user.email write (user.name=new is already
 # on disk at this instant — the half-applied window is OPEN), then interrupt.
 i=0
@@ -148,6 +312,7 @@ while [ ! -e "$SBX/email.mark" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); do
 kill -TERM "$GS_PID"
 wait "$GS_PID"
 RC=$?
+ACTIVE_PID=
 
 NAME=$(git config --global user.name)
 EMAIL=$(git config --global user.email)
@@ -164,7 +329,7 @@ else
 fi
 
 # SIG-02: no scratch orphans from the interrupted run.
-ORPHANS=$(find "$HOME/.config/gitswitch" -name "*.tmp.*" 2>/dev/null;
+ORPHANS=$(find "$XDG_CONFIG_HOME/gitswitch" -name "*.tmp.*" 2>/dev/null;
           find "$HOME/.ssh" -name "config.gitswitch.*" 2>/dev/null)
 if [ -z "$ORPHANS" ]; then
     pass "no scratch temp-file orphans (SIG-02)"
