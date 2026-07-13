@@ -180,7 +180,13 @@ static int null_runner(const char *const argv[], const run_opts_t *opts,
 
 static void inject_repeated_signal(int stage) {
     char marker = (char)('0' + stage);
-    if (g_trace_fd >= 0) (void)write(g_trace_fd, &marker, 1);
+    if (g_trace_fd >= 0) {
+        ssize_t written;
+        do {
+            written = write(g_trace_fd, &marker, 1);
+        } while (written < 0 && errno == EINTR);
+        if (written != 1) _exit(121);
+    }
     if (stage == REMOVE_TEST_AFTER_CONTEXT_FREE &&
         gitswitch_test_context_allocations() != 0) {
         _exit(122);
