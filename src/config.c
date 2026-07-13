@@ -116,7 +116,10 @@ static int open_config_validated(const char *config_path);
 static int validate_config_file_security(const char *config_path);
 static int validate_config_write_destination(const char *config_path);
 static int copy_file_nofollow(const char *src_path, const char *dst_path,
-                              struct stat *created_identity);
+                              struct stat *created_identity,
+                              struct stat *source_identity);
+static int config_backup_internal(const char *config_path,
+                                  struct stat *publication_identity);
 static bool sanitize_tty_text(char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
@@ -144,6 +147,12 @@ static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
 static bool config_metadata_snapshot_same(const struct stat *a,
                                           const struct stat *b);
+static bool config_metadata_ctime_only_change(const struct stat *before,
+                                              const struct stat *after);
+static bool config_refresh_publication_identity(
+    const char *config_path, const char *backup_path,
+    const struct stat *copied_source, const struct stat *backup_identity,
+    struct stat *publication_identity);
 static bool config_metadata_dir_is_safe(const struct stat *st);
 static bool config_metadata_file_is_safe(const struct stat *st,
                                          bool require_private_mode);
@@ -961,6 +970,33 @@ static bool config_metadata_snapshot_same(const struct stat *a,
 #endif
 }
 
+/* FreeBSD UFS may materialize a ctime update for a read source only when the
+ * backup directory is synced. Do not weaken the normal generation comparator:
+ * this predicate is used only with the exact backup created from the strict
+ * pre-copy generation below. */
+static bool config_metadata_ctime_only_change(const struct stat *before,
+                                              const struct stat *after) {
+    bool same_without_ctime = config_metadata_same_file(before, after) &&
+        before->st_uid == after->st_uid && before->st_gid == after->st_gid &&
+        before->st_mode == after->st_mode &&
+        before->st_nlink == after->st_nlink &&
+        before->st_size == after->st_size;
+#if defined(__APPLE__)
+    bool same_mtime =
+        before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+        before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec;
+    bool same_ctime =
+        before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+        before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+    bool same_mtime = before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+                      before->st_mtim.tv_nsec == after->st_mtim.tv_nsec;
+    bool same_ctime = before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+                      before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+    return same_without_ctime && same_mtime && !same_ctime;
+}
+
 static bool config_metadata_dir_is_safe(const struct stat *st) {
     return S_ISDIR(st->st_mode) && st->st_uid == getuid() &&
            (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
@@ -981,6 +1017,115 @@ static bool config_metadata_file_is_safe(const struct stat *st,
      * modes that let another principal alter it. A successful refresh
      * replaces the legacy inode with a fresh 0600 file below. */
     return (mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static bool config_pread_full(int fd, unsigned char *buffer, size_t length,
+                              off_t offset) {
+    size_t total = 0;
+
+    while (total < length) {
+        ssize_t count = pread(fd, buffer + total, length - total,
+                              offset + (off_t)total);
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            if (count == 0) errno = ESTALE;
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Refresh a publication baseline only when the new durable backup proves the
+ * original strict generation was copied and the currently named source still
+ * contains those exact bytes. This admits FreeBSD's delayed ctime-only update
+ * without admitting a same-size in-place rewrite whose mtime was restored. */
+static bool config_refresh_publication_identity(
+    const char *config_path, const char *backup_path,
+    const struct stat *copied_source, const struct stat *backup_identity,
+    struct stat *publication_identity) {
+    unsigned char source_buffer[4096];
+    unsigned char backup_buffer[4096];
+    struct stat source_before;
+    struct stat source_after;
+    struct stat source_named;
+    struct stat backup_before;
+    struct stat backup_after;
+    struct stat backup_named;
+    off_t offset = 0;
+    int source_fd = -1;
+    int backup_fd = -1;
+    bool matches = false;
+
+    /* This ordering is load-bearing: a source edit before the backup starts
+     * changes ctime and must be rejected before backup bytes can be a witness. */
+    if (copied_source &&
+        !config_metadata_snapshot_same(publication_identity, copied_source)) {
+        errno = ESTALE;
+        return false;
+    }
+    if (lstat(config_path, &source_before) != 0) return false;
+    if (config_metadata_snapshot_same(publication_identity, &source_before)) {
+        return true;
+    }
+    if (!config_metadata_ctime_only_change(publication_identity,
+                                           &source_before)) {
+        errno = ESTALE;
+        return false;
+    }
+
+    source_fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    backup_fd = open(backup_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0 || backup_fd < 0 ||
+        fstat(source_fd, &source_after) != 0 ||
+        fstat(backup_fd, &backup_before) != 0 ||
+        !config_metadata_file_is_safe(&source_after, true) ||
+        !config_metadata_file_is_safe(&backup_before, true) ||
+        !config_metadata_snapshot_same(&source_before, &source_after) ||
+        !config_metadata_snapshot_same(backup_identity, &backup_before) ||
+        source_after.st_size < 0 ||
+        source_after.st_size > (off_t)TOML_MAX_FILE_SIZE ||
+        source_after.st_size != backup_before.st_size) {
+        errno = errno ? errno : ESTALE;
+        goto refresh_done;
+    }
+
+    while (offset < source_after.st_size) {
+        off_t remaining = source_after.st_size - offset;
+        size_t chunk = remaining < (off_t)sizeof(source_buffer)
+            ? (size_t)remaining : sizeof(source_buffer);
+        if (!config_pread_full(source_fd, source_buffer, chunk, offset) ||
+            !config_pread_full(backup_fd, backup_buffer, chunk, offset) ||
+            memcmp(source_buffer, backup_buffer, chunk) != 0) {
+            errno = ESTALE;
+            goto refresh_done;
+        }
+        offset += (off_t)chunk;
+    }
+
+    if (fstat(source_fd, &source_after) != 0 ||
+        lstat(config_path, &source_named) != 0 ||
+        fstat(backup_fd, &backup_after) != 0 ||
+        lstat(backup_path, &backup_named) != 0 ||
+        !config_metadata_snapshot_same(&source_before, &source_after) ||
+        !config_metadata_snapshot_same(&source_before, &source_named) ||
+        !config_metadata_snapshot_same(backup_identity, &backup_after) ||
+        !config_metadata_snapshot_same(backup_identity, &backup_named)) {
+        errno = errno ? errno : ESTALE;
+        goto refresh_done;
+    }
+
+    *publication_identity = source_after;
+    matches = true;
+
+refresh_done:
+    if (source_fd >= 0) close(source_fd);
+    if (backup_fd >= 0) close(backup_fd);
+    secure_zero_memory(source_buffer, sizeof(source_buffer));
+    secure_zero_memory(backup_buffer, sizeof(backup_buffer));
+    return matches;
 }
 
 static bool config_named_directory_matches(const char *path,
@@ -1864,7 +2009,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
      * up on each switch churned five backups for five switches, rotating real
      * account-edit backups out of the bounded set. */
     if (make_backup && destination_existed) {
-        if (config_backup(config_path) != 0) {
+        if (config_backup_internal(config_path, &destination_before) != 0) {
             /* A successful save promises a durable, parseable recovery copy.
              * If that promise cannot be established, the config replacement
              * must not begin. */
@@ -3226,12 +3371,14 @@ static int config_backup_collect(const char *config_path,
     return 0;
 }
 
-static int config_backup_prune(const char *config_path, size_t keep) {
+static int config_backup_prune(const char *config_path, size_t keep,
+                               bool *pruned) {
     config_backup_entry_t entries[CONFIG_BACKUP_SCAN_MAX];
     char dir[MAX_PATH_LEN];
     size_t count;
     int dir_fd;
 
+    if (pruned) *pruned = false;
     if (config_backup_collect(config_path, entries,
                               CONFIG_BACKUP_SCAN_MAX, &count,
                               dir, sizeof(dir)) != 0) {
@@ -3255,6 +3402,7 @@ static int config_backup_prune(const char *config_path, size_t keep) {
                       entries[i].name);
             return -1;
         }
+        if (pruned) *pruned = true;
     }
     if (fsync(dir_fd) != 0) {
         close(dir_fd);
@@ -3278,8 +3426,16 @@ static int config_backup_default_clock(uint64_t *seconds,
     return 0;
 }
 
-/* Backup configuration file with a persisted monotonic generation. */
+/* Backup configuration file with a persisted monotonic generation. A full
+ * document publisher may additionally supply the strict identity it captured
+ * before backup so FreeBSD's delayed ctime materialization can be proven
+ * against this exact recovery copy. */
 int config_backup(const char *config_path) {
+    return config_backup_internal(config_path, NULL);
+}
+
+static int config_backup_internal(const char *config_path,
+                                  struct stat *publication_identity) {
     config_backup_entry_t entries[CONFIG_BACKUP_SCAN_MAX];
     toml_document_t *verify_doc = NULL;
     char backup_path[MAX_PATH_LEN];
@@ -3289,8 +3445,10 @@ int config_backup(const char *config_path) {
     uint64_t generation = 0;
     size_t count;
     struct stat backup_identity;
+    struct stat copied_source;
     struct stat named_backup;
     bool backup_created = false;
+    bool backup_pruned = false;
     int dir_fd = -1;
     int rc = -1;
 
@@ -3348,8 +3506,8 @@ int config_backup(const char *config_path) {
             return -1;
         }
         errno = 0;
-        if (copy_file_nofollow(config_path, backup_path,
-                               &backup_identity) == 0) {
+        if (copy_file_nofollow(config_path, backup_path, &backup_identity,
+                               &copied_source) == 0) {
             backup_created = true;
             break;
         }
@@ -3386,8 +3544,32 @@ int config_backup(const char *config_path) {
     config_document_free(verify_doc);
     verify_doc = NULL;
 
-    if (config_backup_prune(config_path, 5) != 0) {
-        return -1;
+    errno = 0;
+    if (lstat(backup_path, &named_backup) != 0 ||
+        !config_metadata_snapshot_same(&backup_identity, &named_backup)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Backup destination changed before completion: %s",
+                         backup_path);
+        goto backup_fail;
+    }
+    /* Reject a stale full-document publication before rotation can destroy an
+     * older recovery point. With five retained backups, removing the oldest
+     * and then unlinking this new backup on rejection would leave only four. */
+    errno = 0;
+    if (publication_identity &&
+        !config_refresh_publication_identity(
+            config_path, backup_path, &copied_source, &backup_identity,
+            publication_identity)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Config destination changed while backup was committed: %s",
+            config_path);
+        goto backup_fail;
+    }
+    if (config_backup_prune(config_path, 5, &backup_pruned) != 0) {
+        goto backup_fail;
     }
     errno = 0;
     if (lstat(backup_path, &named_backup) != 0 ||
@@ -3396,6 +3578,22 @@ int config_backup(const char *config_path) {
         set_system_error(ERR_FILE_IO,
                          "Backup destination changed before completion: %s",
                          backup_path);
+        goto backup_fail;
+    }
+    /* Rotation's directory sync can materialize another delayed UFS ctime
+     * update. Re-prove only that narrow drift against the still-identity-
+     * pinned backup; the first witness above already tied it to the original
+     * publication snapshot. */
+    errno = 0;
+    if (publication_identity &&
+        !config_refresh_publication_identity(
+            config_path, backup_path, NULL, &backup_identity,
+            publication_identity)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_CONFIG_WRITE_FAILED,
+            "Config destination changed while backup was committed: %s",
+            config_path);
         goto backup_fail;
     }
     log_info("Created durable configuration backup: %s", backup_path);
@@ -3407,7 +3605,11 @@ backup_fail:
 
         if (verify_doc) config_document_free(verify_doc);
         if (dir_fd >= 0) close(dir_fd);
-        if (backup_created && lstat(backup_path, &named_backup) == 0 &&
+        /* Once rotation deleted an older entry, this durable, parseable,
+         * identity-verified backup is part of the retained history. Removing
+         * it on a later error would shrink a five-entry history to four. */
+        if (backup_created && !backup_pruned &&
+            lstat(backup_path, &named_backup) == 0 &&
             config_metadata_snapshot_same(&backup_identity, &named_backup) &&
             unlink(backup_path) == 0) {
             int cleanup_fd = open(
@@ -3588,14 +3790,21 @@ static int validate_config_write_destination(const char *config_path) {
  * paths plainly, which follows symlinks; for config backups both ends are
  * attacker-influenceable names, so this local variant is used instead. */
 static int copy_file_nofollow(const char *src_path, const char *dst_path,
-                              struct stat *created_identity) {
+                              struct stat *created_identity,
+                              struct stat *source_identity) {
     struct stat before;
     struct stat after;
     struct stat named;
     struct stat destination_identity;
     struct stat destination_after;
+    struct stat destination_verified;
     struct stat destination_named;
     char buf[4096];
+    unsigned char source_verify[4096];
+    unsigned char destination_verify[4096];
+    unsigned char *source_snapshot = NULL;
+    size_t snapshot_length = 0;
+    off_t verify_offset = 0;
     int sfd = -1;
     int dfd = -1;
     ssize_t n;
@@ -3624,19 +3833,35 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
         failure_reported = true;
         goto fail;
     }
+    if (before.st_size < 0 || before.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+        errno = EFBIG;
+        set_error(ERR_FILE_IO,
+                  "Backup source is outside the supported config size: %s",
+                  src_path);
+        failure_reported = true;
+        goto fail;
+    }
+    source_snapshot = malloc(before.st_size > 0 ? (size_t)before.st_size : 1U);
+    if (!source_snapshot) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate exact config backup snapshot");
+        failure_reported = true;
+        goto fail;
+    }
 
     /* O_EXCL never follows a symlink and fails if the name exists at all, so
      * a pre-planted backup destination cannot redirect the write. */
-    dfd = open(dst_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+    dfd = open(dst_path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+               0600);
     if (dfd < 0) {
         /* Preserve the create errno (esp. EEXIST) across set_system_error/close
          * so callers can distinguish a name collision from a real failure and
          * retry with a fresh name (AR-06 F46/F47). */
         int saved = errno;
         set_system_error(ERR_FILE_IO, "Cannot create backup file: %s", dst_path);
-        close(sfd);
+        failure_reported = true;
         errno = saved;
-        return -1;
+        goto fail;
     }
     destination_created = true;
     if (fchmod(dfd, PERM_USER_RW) != 0 ||
@@ -3664,6 +3889,12 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
             }
             off += w;
         }
+        if ((size_t)n > (size_t)before.st_size - snapshot_length) {
+            errno = ESTALE;
+            goto fail;
+        }
+        memcpy(source_snapshot + snapshot_length, buf, (size_t)n);
+        snapshot_length += (size_t)n;
         if (!copied_first_chunk) {
             copied_first_chunk = true;
             if (config_io_fault(CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK,
@@ -3672,6 +3903,14 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
                 goto fail;
             }
         }
+    }
+    if (snapshot_length != (size_t)before.st_size) {
+        errno = ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Configuration size changed while backup was copied: %s",
+                         src_path);
+        failure_reported = true;
+        goto fail;
     }
 
     errno = 0;
@@ -3687,11 +3926,6 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
         failure_reported = true;
         goto fail;
     }
-    if (close(sfd) != 0) {
-        sfd = -1;
-        goto fail;
-    }
-    sfd = -1;
     if (config_io_fault(CONFIG_IO_BACKUP_BEFORE_FILE_SYNC,
                         "config backup payload sync")) {
         failure_reported = true;
@@ -3721,6 +3955,63 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
         failure_reported = true;
         goto fail;
     }
+
+    /* The backup becomes a publication witness, so write counts and size are
+     * not enough: while both objects are descriptor-pinned, prove that the
+     * durable destination contains the exact strict source generation. */
+    while (verify_offset < before.st_size) {
+        off_t remaining = before.st_size - verify_offset;
+        size_t chunk = remaining < (off_t)sizeof(source_verify)
+            ? (size_t)remaining : sizeof(source_verify);
+        const unsigned char *expected =
+            source_snapshot + (size_t)verify_offset;
+        if (!config_pread_full(sfd, source_verify, chunk, verify_offset) ||
+            !config_pread_full(dfd, destination_verify, chunk,
+                               verify_offset) ||
+            memcmp(source_verify, expected, chunk) != 0 ||
+            memcmp(destination_verify, expected, chunk) != 0) {
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Backup destination does not match its source generation: %s",
+                dst_path);
+            failure_reported = true;
+            goto fail;
+        }
+        verify_offset += (off_t)chunk;
+    }
+    errno = 0;
+    if (fstat(sfd, &after) != 0 || lstat(src_path, &named) != 0 ||
+        fstat(dfd, &destination_verified) != 0 ||
+        lstat(dst_path, &destination_named) != 0 ||
+        !config_metadata_file_is_safe(&after, true) ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_file_is_safe(&destination_verified, true) ||
+        !config_metadata_file_is_safe(&destination_named, true) ||
+        (!config_metadata_snapshot_same(&before, &after) &&
+         !config_metadata_ctime_only_change(&before, &after)) ||
+        (!config_metadata_snapshot_same(&before, &named) &&
+         !config_metadata_ctime_only_change(&before, &named)) ||
+        !config_metadata_snapshot_same(&after, &named) ||
+        !config_metadata_snapshot_same(&destination_after,
+                                       &destination_verified) ||
+        !config_metadata_snapshot_same(&destination_after,
+                                       &destination_named)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Backup source or destination changed during exact verification: %s",
+                         dst_path);
+        failure_reported = true;
+        goto fail;
+    }
+    if (close(sfd) != 0) {
+        sfd = -1;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to finalize backup source: %s", src_path);
+        failure_reported = true;
+        goto fail;
+    }
+    sfd = -1;
     if (close(dfd) != 0) {
         dfd = -1;
         set_system_error(ERR_FILE_IO, "Failed to finalize backup file: %s", dst_path);
@@ -3731,6 +4022,15 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
     if (created_identity) {
         *created_identity = destination_after;
     }
+    if (source_identity) {
+        *source_identity = before;
+    }
+    secure_zero_memory(buf, sizeof(buf));
+    secure_zero_memory(source_verify, sizeof(source_verify));
+    secure_zero_memory(destination_verify, sizeof(destination_verify));
+    secure_zero_memory(source_snapshot,
+                       before.st_size > 0 ? (size_t)before.st_size : 1U);
+    free(source_snapshot);
     return 0;
 
 fail:
@@ -3754,6 +4054,15 @@ fail:
                                           &current_destination)) {
                 (void)unlink(dst_path);
             }
+        }
+        secure_zero_memory(buf, sizeof(buf));
+        secure_zero_memory(source_verify, sizeof(source_verify));
+        secure_zero_memory(destination_verify, sizeof(destination_verify));
+        if (source_snapshot) {
+            secure_zero_memory(
+                source_snapshot,
+                before.st_size > 0 ? (size_t)before.st_size : 1U);
+            free(source_snapshot);
         }
         errno = saved_errno;
     }
