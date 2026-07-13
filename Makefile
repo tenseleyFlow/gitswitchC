@@ -585,16 +585,18 @@ security-scan:
 # instrumentation and Valgrind must not be combined in the same binary.
 # AR-06 F36: the memcheck lane used to cover only test_runner + test_security
 # (2 of 21 suites). Broaden it to the deterministic, non-forking logic suites
-# (parser, config, validation, git_ops fake-runner, gpg colon parsing) so
-# release-path allocation/free bugs across the core are actually exercised under
-# Valgrind. The fork/timing-heavy end-to-end suites (cli, pty, ssh_reuse,
+# (parser, config, validation, git_ops fake-runner, gpg colon parsing, and
+# display formatting/capture) so release-path allocation/free bugs across the
+# core are actually exercised under Valgrind. The fork/timing-heavy end-to-end
+# suites (cli, pty, ssh_reuse,
 # gpg_switch/reset, ar04/ar05 e2e) are deliberately excluded: Valgrind traces
 # into forked children and real ssh-agent/gpg subprocesses, making them slow and
 # flaky in CI. ASan/UBSan (the debug `test` lane) covers those paths.
 MEMCHECK_TARGETS = $(BINDIR)/test_runner $(BINDIR)/test_security \
 	$(BINDIR)/test_toml $(BINDIR)/test_validation \
 	$(BINDIR)/test_config_security $(BINDIR)/test_git_ops \
-	$(BINDIR)/test_gpg_parse $(BINDIR)/test_ar05_unit
+	$(BINDIR)/test_gpg_parse $(BINDIR)/test_ar05_unit \
+	$(BINDIR)/test_display
 
 .PHONY: memcheck
 ifeq ($(BUILD_TYPE),release)
