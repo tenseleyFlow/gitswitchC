@@ -100,8 +100,9 @@ fi
 make_abs=$(command -v "$make_cmd" 2>/dev/null || printf '%s' "$make_cmd")
 notools_dir=$tmp/notools
 mkdir "$notools_dir"
-for basic in sh uname git gcc cc clang brew wc tr grep sed printf echo cat cmp \
-             mkdir mv rm touch head tail sort expr test; do
+for basic in sh uname git gcc cc clang brew awk cksum sha256sum shasum sha256 \
+             wc tr grep sed printf echo cat cmp mkdir mv rm touch head tail \
+             sort expr test; do
     basic_path=$(command -v "$basic" 2>/dev/null) || continue
     case $basic_path in /*) ln -s "$basic_path" "$notools_dir/$basic" ;; esac
 done
