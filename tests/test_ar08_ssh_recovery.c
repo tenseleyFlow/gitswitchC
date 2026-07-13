@@ -109,6 +109,8 @@ static bool g_race_hook_succeeded;
 static char g_retire_quarantine[128];
 static const char *g_retire_replacement;
 static int g_retire_hook_calls;
+static int g_retire_mutations;
+static int g_retire_replace_on_call;
 static int g_reset_dirsync_calls;
 
 static int bind_stale_socket(const char *path) {
@@ -143,6 +145,8 @@ static int replace_reset_retirement_entry(int dir_fd, const char *name) {
     ssize_t written;
 
     g_retire_hook_calls++;
+    if (g_retire_hook_calls != g_retire_replace_on_call) return 0;
+    g_retire_mutations++;
     if (safe_strncpy(g_retire_quarantine, name,
                      sizeof(g_retire_quarantine)) != 0 ||
         unlinkat(dir_fd, name, 0) != 0 || !g_retire_replacement) {
@@ -507,10 +511,12 @@ TEST(socket_replacement_before_cleanup_survives_with_stable_link) {
     ts_rm_rf(fixture.xdg);
 }
 
-TEST(final_quarantine_substitution_is_not_deleted) {
+static void check_final_quarantine_substitution_is_not_deleted(
+    bool force_portable) {
     ssh_fixture_t fixture;
     ssh_reap_fn previous_reap;
     ssh_quarantine_hook_fn previous_retire;
+    bool previous_portable;
     char content[64];
 
     CHECK_EQ_INT(make_fixture(&fixture, "gsar08retire"), 0);
@@ -519,18 +525,32 @@ TEST(final_quarantine_substitution_is_not_deleted) {
     g_retire_quarantine[0] = '\0';
     g_retire_replacement = "foreign final-delete replacement\n";
     g_retire_hook_calls = 0;
+    g_retire_mutations = 0;
+    g_retire_replace_on_call = 1;
+    previous_portable =
+        ssh_manager_set_force_portable_quarantine(force_portable);
     previous_reap = ssh_manager_set_reap_fn(reap_gone);
     previous_retire = ssh_manager_set_reset_retire_hook_fn(
         replace_reset_retirement_entry);
     CHECK_EQ_INT(ssh_manager_reset("work"), -1);
     ssh_manager_set_reset_retire_hook_fn(previous_retire);
     ssh_manager_set_reap_fn(previous_reap);
+    ssh_manager_set_force_portable_quarantine(previous_portable);
 
-    CHECK_EQ_INT(g_retire_hook_calls, 1);
+    CHECK(g_retire_hook_calls >= (force_portable ? 2 : 1));
+    CHECK_EQ_INT(g_retire_mutations, 1);
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, content, sizeof(content)) > 0);
     CHECK_STR_EQ(content, "foreign final-delete replacement\n");
     close(fixture.dir_fd);
+}
+
+TEST(final_quarantine_substitution_is_not_deleted) {
+    check_final_quarantine_substitution_is_not_deleted(false);
+}
+
+TEST(portable_final_quarantine_substitution_is_not_deleted) {
+    check_final_quarantine_substitution_is_not_deleted(true);
 }
 
 TEST(portable_restore_retirement_substitution_is_preserved) {
@@ -548,6 +568,8 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
     g_retire_quarantine[0] = '\0';
     g_retire_replacement = "foreign restoration-retirement replacement\n";
     g_retire_hook_calls = 0;
+    g_retire_mutations = 0;
+    g_retire_replace_on_call = 1;
     g_reset_dirsync_calls = 0;
     previous_portable = ssh_manager_set_force_portable_quarantine(true);
     previous_reap = ssh_manager_set_reap_fn(reap_gone);
@@ -562,6 +584,7 @@ TEST(portable_restore_retirement_substitution_is_preserved) {
 
     CHECK(g_reset_dirsync_calls >= 4);
     CHECK_EQ_INT(g_retire_hook_calls, 1);
+    CHECK_EQ_INT(g_retire_mutations, 1);
     CHECK(path_exists(fixture.sidecar));
     CHECK(read_file_to_string(fixture.sidecar, content, sizeof(content)) > 0);
     CHECK_STR_EQ(content, "1073741824\n");
@@ -1022,6 +1045,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(sidecar_replacement_before_cleanup_is_restored_and_retained);
     RUN_TEST(socket_replacement_before_cleanup_survives_with_stable_link);
     RUN_TEST(final_quarantine_substitution_is_not_deleted);
+    RUN_TEST(portable_final_quarantine_substitution_is_not_deleted);
     RUN_TEST(portable_restore_retirement_substitution_is_preserved);
     RUN_TEST(unrelated_live_pid_is_not_signaled);
     RUN_TEST(signal_storm_preserves_term_and_kill_deadlines);
