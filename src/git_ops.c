@@ -886,8 +886,11 @@ static git_restore_result_t git_restore_scope_snapshot(
         }
         if (!git_restore_key_still_owned(&current->keys[i], key,
                                          &post->keys[i])) {
+            const char *scope_name = git_scope_to_flag(scope);
+
             log_warning("Rollback preserved externally changed Git config %s (%s)",
-                        g_managed_keys[i], git_scope_to_flag(scope));
+                        g_managed_keys[i],
+                        scope_name ? scope_name : "invalid scope");
             cfg_cache_store(cfg_scope_index(scope), (int)i, CFG_UNKNOWN,
                             current->keys[i].count != 0, "");
             result.conflicts++;
