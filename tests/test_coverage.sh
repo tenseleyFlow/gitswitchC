@@ -90,7 +90,7 @@ trap 'exit 131' 3
 trap 'exit 143' 15
 
 chmod 0700 "$tmp" || fail "cannot secure coverage fixture directory"
-[ -d "$tmp" ] && [ ! -L "$tmp" ] ||
+{ [ -d "$tmp" ] && [ ! -L "$tmp" ]; } ||
     fail "coverage fixture root is not a private directory"
 
 cat >"$tmp/fixture.c" <<'EOF'

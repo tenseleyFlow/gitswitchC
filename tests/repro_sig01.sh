@@ -45,7 +45,7 @@ fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 SBX=
 ACTIVE_PID=
 # Invoked indirectly by the EXIT and signal traps installed below.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup() {
     [ -n "$SBX" ] || return 0
     case $ACTIVE_PID in
@@ -70,7 +70,7 @@ cleanup() {
 }
 
 # Invoked indirectly by the signal traps installed below.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 on_signal() {
     status=$1
     trap - 0 HUP INT TERM

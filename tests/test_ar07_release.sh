@@ -612,7 +612,7 @@ inspect_dist_residue()
             fail "Darwin publication did not retain its private clone source"
         return
     fi
-    [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ] ||
+    { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
         fail "distribution publication left an unexpected staging namespace"
     case $residue_platform in
         FreeBSD)
@@ -737,14 +737,14 @@ check_manifest_contract()
                 fail "FreeBSD publication did not retire its exact named temporary"
             ;;
         Darwin)
-            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
                 fail "Darwin publication did not retain exactly one private source"
             copy_retained_temp=$1
             [ "$(cat "$copy_retained_temp")" = original-payload ] ||
                 fail "Darwin retained clone source changed payload"
             ;;
         *)
-            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
                 fail "named publication did not retain exactly one private source"
             copy_retained_temp=$1
             [ "$(cat "$copy_retained_temp")" = original-payload ] ||
@@ -787,7 +787,7 @@ check_manifest_contract()
         [ "$(cat "$copy_archive")" = original-payload ] ||
             fail "Darwin adoption boundary did not publish the complete clone"
         set -- "$copy_dir"/.archive.tar.gz.tmp.*
-        [ "$#" -eq 1 ] && [ -f "$1" ] ||
+        { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
             fail "Darwin adoption race did not expose one private source"
         copy_temp=$1
         rm -f "$copy_archive"
@@ -802,10 +802,14 @@ check_manifest_contract()
         grep -F 'complete artifact and private source retained' "$out" \
             >/dev/null ||
             fail "Darwin adoption race did not report retained uncertainty"
-        [ "$copy_archive" -ef "$copy_temp" ] ||
+        copy_archive_identity=$(stat -f '%d:%i' "$copy_archive") ||
+            fail "cannot identify the Darwin adoption artifact"
+        copy_temp_identity=$(stat -f '%d:%i' "$copy_temp") ||
+            fail "cannot identify the Darwin adoption source"
+        [ "$copy_archive_identity" = "$copy_temp_identity" ] ||
             fail "Darwin adoption fixture did not preserve the hard-link alias"
-        [ "$(cat "$copy_archive")" = original-payload ] &&
-            [ "$(cat "$copy_temp")" = original-payload ] ||
+        { [ "$(cat "$copy_archive")" = original-payload ] &&
+            [ "$(cat "$copy_temp")" = original-payload ]; } ||
             fail "Darwin adoption rejection changed a complete source"
         rm -f "$copy_archive" "$copy_temp"
     fi
@@ -839,7 +843,7 @@ check_manifest_contract()
     done
     [ -e "$copy_marker" ] || fail "copy producer did not reach substitution boundary"
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
         fail "copy publication did not expose exactly one named temporary"
     copy_temp=$1
     mv "$copy_temp" "$tmp/original-copy-temp"
@@ -881,7 +885,7 @@ check_manifest_contract()
     [ "$(cat "$copy_archive")" = original-payload ] ||
         fail "copy cleanup boundary did not retain the committed artifact"
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
-    [ "$#" -eq 1 ] && [ -f "$1" ] ||
+    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
         fail "copy cleanup did not expose exactly one named temporary"
     copy_temp=$1
     mv "$copy_temp" "$tmp/original-cleanup-temp"
@@ -916,14 +920,14 @@ check_manifest_contract()
                 fail "FreeBSD producer failure did not retire its exact temporary"
             ;;
         Darwin)
-            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
                 fail "Darwin producer failure did not retain exactly one private source"
             [ "$(cat "$1")" = partial ] ||
                 fail "Darwin failed-producer source changed bytes"
             rm -f "$1"
             ;;
         *)
-            [ "$#" -eq 1 ] && [ -f "$1" ] ||
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
                 fail "producer failure did not retain exactly one private source"
             [ "$(cat "$1")" = partial ] ||
                 fail "failed-producer retained source changed bytes"
@@ -995,8 +999,8 @@ check_manifest_contract()
     if "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1; then
         fail "symlink release output was replaced"
     fi
-    [ -L "$archive" ] &&
-        [ "$(readlink "$archive")" = ../../README.md ] ||
+    { [ -L "$archive" ] &&
+        [ "$(readlink "$archive")" = ../../README.md ]; } ||
         fail "release output symlink changed after rejection"
     cmp -s "$clean_repo/README.md" "$tmp/README.before" ||
         fail "release output symlink target was modified"
@@ -1097,7 +1101,7 @@ EOF
         fail "distribution temp substitution changed tracked VERSION"
     cmp -s "$race_repo/README.md" "$tmp/race.README.before" ||
         fail "distribution temp substitution changed tracked README"
-    [ -f "$race_archive" ] && [ ! -L "$race_archive" ] ||
+    { [ -f "$race_archive" ] && [ ! -L "$race_archive" ]; } ||
         fail "distribution race published a non-regular archive"
     inspect_dist_residue "$race_archive" "$copy_platform"
     rm -f "$race_archive"
@@ -1116,7 +1120,7 @@ EOF
     { [ ! -e "$race_archive" ] && [ ! -L "$race_archive" ]; } ||
         fail "distribution directory substitution published into the replacement directory"
     race_pinned_archive=$race_repo/build/dist.pinned/gitswitcher-$race_version.tar.gz
-    [ -f "$race_pinned_archive" ] && [ ! -L "$race_pinned_archive" ] ||
+    { [ -f "$race_pinned_archive" ] && [ ! -L "$race_pinned_archive" ]; } ||
         fail "post-commit directory uncertainty did not retain the complete artifact"
     assert_archive_metadata "$race_pinned_archive" "$dist_root" "$version"
     inspect_dist_residue "$race_pinned_archive" "$copy_platform"
