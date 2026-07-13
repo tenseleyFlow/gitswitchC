@@ -100,6 +100,8 @@ void toml_init_document(toml_document_t *doc);
  * Parse TOML from file with comprehensive security validation
  * - Initializes and replaces *doc exactly once; callers must not pre-initialize
  * - A non-NULL doc is left invalid but safe to clean up on every failure
+ * - Rejects symlinks and nonregular inputs without blocking, then reads only
+ *   from the identity-validated descriptor
  * - Validates file size limits
  * - Sanitizes all input
  * - Checks for malicious patterns

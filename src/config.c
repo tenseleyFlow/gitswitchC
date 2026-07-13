@@ -769,19 +769,18 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
         return -1;
     }
 
-    /* AR-06 F49: these are cumulative counters that load_accounts_from_toml and
-     * count_unknown_keys only ever increment. A reload on an already-populated
-     * ctx (e.g. after a save, or a second config_load) would otherwise carry the
-     * previous load's counts forward and wrongly refuse a rewrite. Reset them
-     * for this fresh load. */
-    ctx->accounts_skipped_on_load = 0;
-    ctx->unknown_sections_on_load = 0;
-    ctx->unknown_keys_on_load = 0;
-
     if (config_read_document(config_path, toml_doc) != 0) {
         config_document_free(toml_doc);
         return -1;
     }
+
+    /* AR-06 F49: these are cumulative counters that load_accounts_from_toml and
+     * count_unknown_keys only ever increment. Reset them only after the new
+     * document is completely read: an entry-boundary rejection must leave the
+     * caller's existing context byte-for-byte untouched. */
+    ctx->accounts_skipped_on_load = 0;
+    ctx->unknown_sections_on_load = 0;
+    ctx->unknown_keys_on_load = 0;
 
     /* Load settings section */
     clear_error();
@@ -3647,8 +3646,18 @@ static int open_config_validated(const char *config_path) {
                   "Configuration file is a symlink; refusing to follow it: %s", config_path);
         return -1;
     }
+    if (!S_ISREG(link_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is not a regular file: %s",
+                  config_path);
+        return -1;
+    }
 
-    fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* Stable nonregular nodes were rejected before open. O_NONBLOCK is inert
+     * for regular files and prevents a raced FIFO/device from wedging before
+     * the replacement descriptor type can be rejected by fstat(). */
+    fd = open(config_path,
+              O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot open config file: %s", config_path);
         return -1;

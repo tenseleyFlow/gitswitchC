@@ -109,10 +109,11 @@ void toml_init_document(toml_document_t *doc) {
 /* Parse TOML from file with comprehensive security validation */
 int toml_parse_file(const char *file_path, toml_document_t *doc) {
     FILE *file = NULL;
-    struct stat file_stat;
+    struct stat path_stat, file_stat;
     char *buffer = NULL;
     size_t file_size = 0;
     size_t bytes_read;
+    int fd = -1;
     int result = -1;
     bool delegated_to_string_parser = false;
     
@@ -132,14 +133,57 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
         goto cleanup;
     }
     
-    /* Get file statistics for security checks */
-    if (stat(file_path, &file_stat) != 0) {
+    /* Refuse a named symlink before open for a precise diagnostic. O_NOFOLLOW
+     * below is still authoritative against replacement in this gap. */
+    if (lstat(file_path, &path_stat) != 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot access config file: %s", file_path);
         goto cleanup;
     }
-    
+    if (S_ISLNK(path_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is a symlink; refusing to follow it: %s",
+                  file_path);
+        goto cleanup;
+    }
+    if (!S_ISREG(path_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is not a regular file: %s", file_path);
+        goto cleanup;
+    }
+
+    /* Open once and validate the exact descriptor that will be read.
+     * O_NONBLOCK protects the replacement race after the path-level type gate;
+     * the identity comparison also preserves no-follow behavior on platforms
+     * where O_NOFOLLOW is unavailable. */
+    fd = open(file_path,
+              O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        set_system_error(ERR_CONFIG_NOT_FOUND,
+                         "Failed to open config file: %s", file_path);
+        goto cleanup;
+    }
+    if (fstat(fd, &file_stat) != 0) {
+        set_system_error(ERR_CONFIG_NOT_FOUND,
+                         "Failed to stat opened config file: %s", file_path);
+        goto cleanup;
+    }
+    if (!S_ISREG(file_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is not a regular file: %s", file_path);
+        goto cleanup;
+    }
+    if (path_stat.st_dev != file_stat.st_dev ||
+        path_stat.st_ino != file_stat.st_ino) {
+        errno = ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Configuration file changed before open: %s",
+                         file_path);
+        goto cleanup;
+    }
+
     /* Security: Check file size limit */
-    if (file_stat.st_size > TOML_MAX_FILE_SIZE) {
+    if (file_stat.st_size < 0 ||
+        file_stat.st_size > (off_t)TOML_MAX_FILE_SIZE) {
         /* Cast to long: off_t is long long on macOS/clang (Wformat error under
          * -Werror) but long on Linux; the value is bounded small here (just
          * over the max), so no truncation. Mirrors config.c's size check. */
@@ -157,12 +201,14 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     
     file_size = (size_t)file_stat.st_size;
     
-    /* Open file for reading */
-    file = fopen(file_path, "r");
+    /* fdopen takes ownership of the already-validated descriptor. */
+    file = fdopen(fd, "r");
     if (!file) {
-        set_system_error(ERR_CONFIG_NOT_FOUND, "Failed to open config file: %s", file_path);
+        set_system_error(ERR_CONFIG_NOT_FOUND,
+                         "Failed to stream config file: %s", file_path);
         goto cleanup;
     }
+    fd = -1;
     
     /* Allocate buffer for file content */
     buffer = safe_malloc(file_size + 1);
@@ -196,6 +242,7 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     
 cleanup:
     if (file) fclose(file);
+    if (fd >= 0) close(fd);
     if (buffer) {
         secure_zero_memory(buffer, file_size + 1);
         free(buffer);
