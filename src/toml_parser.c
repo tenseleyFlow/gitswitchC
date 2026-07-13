@@ -631,6 +631,18 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
         return -1;
     }
 
+    /* Account visibility is derived from this complete validation attempt.
+     * Revoke every candidate before validating settings or any account: an
+     * earlier fatal error may return before the main pass reaches a later
+     * account, and that later section must not retain stale visibility from a
+     * previous successful pass. Each account is published again only after
+     * all of its fields and dependencies below succeed. */
+    for (size_t i = 0; i < doc->section_count; i++) {
+        if (string_starts_with(doc->sections[i].name, "accounts.")) {
+            doc->sections[i].is_set = false;
+        }
+    }
+
     /* Check for required sections */
     bool has_settings = false;
     bool has_accounts = false;
@@ -891,6 +903,8 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                           section->name);
                 return -1;
             }
+
+            section->is_set = true;
         }
     }
     

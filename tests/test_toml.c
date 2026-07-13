@@ -245,6 +245,115 @@ TEST(overlong_ssh_key_skips_account_not_whole_file) {
     toml_cleanup_document(&doc);
 }
 
+/* AR-08 L5: section visibility is derived state, not a permanent tombstone.
+ * The overlong key initially hides this account before the deliberately bad
+ * preferred_scope later in the section is examined. Repairing only the key
+ * must not expose the still-invalid account; after the remaining field is
+ * repaired, a complete validation pass must make the same section visible. */
+TEST(repaired_skipped_account_revalidates_visibility_atomically) {
+    static toml_document_t doc;
+    char longpath[302];
+    char src[1024];
+    char value[64] = "";
+
+    longpath[0] = '/';
+    memset(longpath + 1, 'a', sizeof(longpath) - 2);
+    longpath[sizeof(longpath) - 1] = '\0';
+    CHECK(snprintf(src, sizeof(src),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"alice\"\n"
+                   "email = \"alice@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "preferred_scope = \"system\"\n",
+                   longpath) < (int)sizeof(src));
+
+    CHECK_EQ_INT(parse(src, &doc), 0);
+    CHECK(!doc.sections[1].is_set);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
+                                 sizeof(value)), -1);
+
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "ssh_key",
+                                 "/tmp/repaired-key"), 0);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+    CHECK(!doc.sections[1].is_set);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
+                                 sizeof(value)), -1);
+
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
+                                 "local"), 0);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK(doc.sections[1].is_set);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "alice");
+    memset(value, 0, sizeof(value));
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "ssh_key", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "/tmp/repaired-key");
+
+    /* Visibility must also be revoked when a later pass finds a previously
+     * visible account invalid; publishing at validation entry would expose
+     * this bad value after the error return. */
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
+                                 "system"), 0);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+    CHECK(!doc.sections[1].is_set);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
+                                 sizeof(value)), -1);
+
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
+                                 "global"), 0);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK(doc.sections[1].is_set);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "alice");
+
+    toml_cleanup_document(&doc);
+}
+
+/* AR-08 L5: validation can fail before reaching every account. Visibility
+ * therefore has to be revoked for the entire candidate set before validating
+ * the first section, or an invalid later account remains readable after an
+ * earlier account aborts the pass. */
+TEST(validation_preclear_hides_later_account_on_early_failure) {
+    static toml_document_t doc;
+    char value[64] = "";
+
+    CHECK_EQ_INT(parse("[settings]\n"
+                       "default_scope = \"local\"\n"
+                       "[accounts.1]\n"
+                       "name = \"alice\"\n"
+                       "email = \"alice@example.com\"\n"
+                       "preferred_scope = \"local\"\n"
+                       "[accounts.2]\n"
+                       "name = \"bob\"\n"
+                       "email = \"bob@example.com\"\n"
+                       "preferred_scope = \"global\"\n",
+                       &doc), 0);
+    CHECK(doc.sections[1].is_set);
+    CHECK(doc.sections[2].is_set);
+
+    /* Account 2 is invalid too, but validation returns while processing the
+     * earlier account 1. Both were visible before this failed pass. */
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.2", "preferred_scope",
+                                 "system"), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
+                                 "system"), 0);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+
+    CHECK(!doc.sections[1].is_set);
+    CHECK(!doc.sections[2].is_set);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
+                                 sizeof(value)), -1);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.2", "name", value,
+                                 sizeof(value)), -1);
+
+    toml_cleanup_document(&doc);
+}
+
 /* M7: TOML_MAX_SECTIONS(32) contradicted MAX_ACCOUNTS(64) — config_save
  * writes [settings] first, so only 31 accounts fit; the 32nd reported
  * success in memory and silently never reached disk, and a hand-config with
@@ -580,6 +689,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(get_string_fails_when_sanitization_would_alter_value);
     RUN_TEST(set_string_rejects_overlong_value_instead_of_erasing);
     RUN_TEST(overlong_ssh_key_skips_account_not_whole_file);
+    RUN_TEST(repaired_skipped_account_revalidates_visibility_atomically);
+    RUN_TEST(validation_preclear_hides_later_account_on_early_failure);
     RUN_TEST(max_accounts_plus_settings_fit_and_round_trip);
     RUN_TEST(empty_config_reports_targeted_error);
     RUN_TEST(rejects_duplicate_key_in_section);

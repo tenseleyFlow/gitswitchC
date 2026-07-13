@@ -1664,6 +1664,64 @@ TEST(add_rejects_ssh_key_path_over_256_chars_api) {
     CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_INVALID);
 }
 
+/* AR-08 L5 integration: a caller may repair a schema-skipped document in
+ * memory and persist it. Revalidation must clear the stale visibility state
+ * before the repaired document is written and loaded through config.c. */
+TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[256];
+    char key[256];
+    char longpath[302];
+    char src[1024];
+    char visible_name[64] = "";
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK(snprintf(path, sizeof(path), "%s/accounts.toml", dir) <
+          (int)sizeof(path));
+    CHECK(snprintf(key, sizeof(key), "%s/id_repaired", dir) <
+          (int)sizeof(key));
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1),
+                 0);
+
+    longpath[0] = '/';
+    memset(longpath + 1, 'b', sizeof(longpath) - 2);
+    longpath[sizeof(longpath) - 1] = '\0';
+    CHECK(snprintf(src, sizeof(src),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"repaired\"\n"
+                   "email = \"repaired@example.com\"\n"
+                   "ssh_key = \"%s\"\n",
+                   longpath) < (int)sizeof(src));
+
+    CHECK_EQ_INT(toml_parse_string(src, strlen(src), &doc), 0);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", visible_name,
+                                 sizeof(visible_name)), -1);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "ssh_key", key), 0);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", visible_name,
+                                 sizeof(visible_name)), 0);
+    CHECK_STR_EQ(visible_name, "repaired");
+    CHECK_EQ_INT(toml_write_file(&doc, path), 0);
+    toml_cleanup_document(&doc);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 0);
+    if (ctx.account_count == 1) {
+        CHECK_STR_EQ(ctx.accounts[0].name, "repaired");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, key);
+        CHECK(ctx.accounts[0].ssh_enabled);
+    }
+}
+
 /* ---- AR-03 M6 follow-through: the write gate matches the read gate ------- */
 
 TEST(add_rejects_values_that_cannot_roundtrip) {
@@ -1783,5 +1841,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(resume_hint_reflects_account_runtime_needs);
     RUN_TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically);
     RUN_TEST(add_rejects_ssh_key_path_over_256_chars_api);
+    RUN_TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip);
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
 TEST_MAIN_END()
