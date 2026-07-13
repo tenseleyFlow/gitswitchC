@@ -68,6 +68,12 @@ typedef struct {
     char target[MAX_PATH_LEN];
 } ssh_current_link_identity_t;
 
+typedef struct {
+    struct stat identity;
+    int fd;
+    char anchor[96];
+} ssh_runtime_pin_t;
+
 static int capture_current_socket_link(int dir_fd, const char *socket_path,
                                        const char *display_path,
                                        ssh_current_link_identity_t *identity);
@@ -81,11 +87,22 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                                           const char *keep_account);
 static bool same_runtime_identity(const struct stat *before,
                                   const struct stat *after);
+static bool same_runtime_revision(const struct stat *before,
+                                  const struct stat *after);
 static bool same_runtime_symlink(const struct stat *before,
                                  const struct stat *after);
+static void ssh_runtime_pin_init(ssh_runtime_pin_t *pin);
+static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
+                                    const char *display_path,
+                                    ssh_runtime_pin_t *pin);
+static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
+                                     const char *display_path,
+                                     const ssh_runtime_pin_t *pin);
+static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin);
+static int reconcile_ssh_runtime_pins(int dir_fd, const char *socket_dir);
 static int read_ssh_agent_pid_at(int dir_fd, const char *name,
                                  const char *display_path, pid_t *pid_out,
-                                 struct stat *identity_out);
+                                 ssh_runtime_pin_t *pin);
 static int write_ssh_agent_pid_at(int dir_fd, const char *name, pid_t pid);
 static ssh_process_outcome_t reap_ssh_agent(pid_t pid, const char *sock,
                                             int runtime_dir_fd);
@@ -99,10 +116,14 @@ static int sync_ssh_runtime_dir(int dir_fd, const char *operation);
 static int unlink_ssh_runtime_entry(int dir_fd, const char *name,
                                     bool missing_ok,
                                     const char *description);
+static int unlink_ssh_runtime_identity_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    bool missing_ok, const char *description,
+    ssh_quarantine_hook_fn predelete_hook, struct stat *observed_out);
 static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                                     const char *display_path,
                                     const char *description,
-                                    const struct stat *expected,
+                                    const ssh_runtime_pin_t *pin,
                                     bool expected_present);
 static int wait_for_ssh_probe(int fd, int timeout_ms);
 static int probe_ssh_agent_socket(const char *path, bool *reachable);
@@ -1064,17 +1085,16 @@ static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
                                   const char *socket_path,
                                   const char *socket_dir) {
     ssh_process_outcome_t outcome = SSH_PROCESS_INDETERMINATE;
-    struct stat socket_identity;
+    ssh_runtime_pin_t socket_pin;
     bool socket_present = false;
     pid_t retry_pid = pid;
 
-    if (fstatat(dir_fd, socket_name, &socket_identity,
-                AT_SYMLINK_NOFOLLOW) == 0) {
+    ssh_runtime_pin_init(&socket_pin);
+    int socket_rc = pin_ssh_runtime_entry_at(
+        dir_fd, socket_name, socket_path, &socket_pin);
+    if (socket_rc == 0) {
         socket_present = true;
-    } else if (errno != ENOENT) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot capture unrecorded SSH agent socket identity: %s",
-                         socket_path ? socket_path : socket_name);
+    } else if (socket_rc < 0) {
         return true;
     }
 
@@ -1107,12 +1127,16 @@ static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
             g_unrecorded_cleanup_hook(dir_fd, socket_name) != 0) {
             set_error(ERR_FILE_IO,
                       "SSH unrecorded-agent cleanup hook failed");
+            (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
             return true;
         }
-        return unlink_ssh_reset_path_at(
-                   dir_fd, socket_name, socket_path,
-                   "unrecorded agent socket cleanup", &socket_identity,
-                   socket_present) != 0;
+        bool retained = unlink_ssh_reset_path_at(
+                            dir_fd, socket_name, socket_path,
+                            "unrecorded agent socket cleanup",
+                            &socket_pin,
+                            socket_present) != 0;
+        if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) retained = true;
+        return retained;
     }
     if (retry_pid > 1) {
         if (write_ssh_agent_pid_at(dir_fd, pid_name, retry_pid) == 0) {
@@ -1122,6 +1146,7 @@ static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
             log_warning("SSH agent reap outcome %s and PID recovery publication failed; retaining socket",
                         ssh_process_outcome_name(outcome));
         }
+        (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
         return true;
     }
 
@@ -1139,15 +1164,22 @@ static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
                 g_unrecorded_cleanup_hook(dir_fd, socket_name) != 0) {
                 set_error(ERR_FILE_IO,
                           "SSH unrecorded-agent cleanup hook failed");
+                (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
                 return true;
             }
-            return unlink_ssh_reset_path_at(
-                       dir_fd, socket_name, socket_path,
-                       "stale unrecorded agent socket cleanup",
-                       &socket_identity, socket_present) != 0;
+            bool retained = unlink_ssh_reset_path_at(
+                                dir_fd, socket_name, socket_path,
+                                "stale unrecorded agent socket cleanup",
+                                &socket_pin,
+                                socket_present) != 0;
+            if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) {
+                retained = true;
+            }
+            return retained;
         }
     }
     log_warning("Unrecorded SSH agent state is indeterminate; retaining socket for recovery");
+    (void)release_ssh_runtime_pin(dir_fd, &socket_pin);
     return true;
 }
 
@@ -1529,7 +1561,11 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     bool agent_retained = false;
     bool current_committed = false;
     ssh_current_link_identity_t committed_current;
+    ssh_runtime_pin_t reuse_pin;
+    bool reuse_pin_active = false;
     int dir_fd = -1;
+
+    ssh_runtime_pin_init(&reuse_pin);
 
     if (!ssh_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
@@ -1552,6 +1588,11 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     if (lock_fd < 0) {
         close(dir_fd);
         set_system_error(ERR_FILE_IO, "Failed to lock SSH agent directory");
+        return -1;
+    }
+    if (reconcile_ssh_runtime_pins(dir_fd, socket_dir) != 0) {
+        unlock_agent_dir(lock_fd);
+        close(dir_fd);
         return -1;
     }
 
@@ -1607,23 +1648,35 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     bool have_reuse_key =
         account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
         expand_path(account->ssh_key_path, reuse_key_path, sizeof(reuse_key_path)) == 0;
-    struct stat reuse_before;
-    struct stat reuse_after;
-    bool can_reuse =
-        validate_ssh_agent_socket_at(dir_fd, socket_name, socket_path,
-                                     &reuse_before) == 0 &&
-        have_reuse_key &&
-        ssh_socket_has_key(dir_fd, socket_name, reuse_key_path) &&
-        fstatat(dir_fd, socket_name, &reuse_after, AT_SYMLINK_NOFOLLOW) == 0 &&
-        same_runtime_identity(&reuse_before, &reuse_after) &&
-        S_ISSOCK(reuse_after.st_mode) && reuse_after.st_uid == getuid() &&
-        (reuse_after.st_mode & 0777) == 0600;
+    bool can_reuse = false;
 
     if (!have_reuse_key) {
         set_error(ERR_INVALID_PATH,
                   "Cannot resolve isolated SSH key path for account: %s",
                   account->name);
         goto done;
+    }
+    {
+        int pin_rc = pin_ssh_runtime_entry_at(
+            dir_fd, socket_name, socket_path, &reuse_pin);
+        if (pin_rc < 0) goto done;
+        if (pin_rc == 0) {
+            reuse_pin_active = true;
+            if (S_ISSOCK(reuse_pin.identity.st_mode) &&
+                reuse_pin.identity.st_uid == getuid() &&
+                (reuse_pin.identity.st_mode & 0777) == 0600) {
+                can_reuse = ssh_socket_has_key(
+                    dir_fd, socket_name, reuse_key_path);
+                if (verify_ssh_runtime_pin_at(
+                        dir_fd, socket_name, socket_path, &reuse_pin) != 0) {
+                    goto done;
+                }
+            }
+        }
+    }
+    if (!can_reuse && reuse_pin_active) {
+        if (release_ssh_runtime_pin(dir_fd, &reuse_pin) != 0) goto done;
+        reuse_pin_active = false;
     }
 
     /* ssh-add/ssh-keygen are external scheduling points. Before any orphan
@@ -1735,6 +1788,15 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
                 ssh_env_snapshot_restore(&env_snapshot);
                 goto done;
             }
+            if (verify_ssh_runtime_pin_at(
+                    dir_fd, socket_name, socket_path, &reuse_pin) != 0 ||
+                release_ssh_runtime_pin(dir_fd, &reuse_pin) != 0) {
+                (void)remove_current_socket_link_if_unchanged(dir_fd,
+                                                               &committed);
+                ssh_env_snapshot_restore(&env_snapshot);
+                goto done;
+            }
+            reuse_pin_active = false;
         }
 
         ssh_env_snapshot_discard(&env_snapshot);
@@ -2045,6 +2107,9 @@ fresh_commit_failed:
 done:
     if (env_snapshot_taken) {
         ssh_env_snapshot_discard(&env_snapshot);
+    }
+    if (reuse_pin_active) {
+        (void)release_ssh_runtime_pin(dir_fd, &reuse_pin);
     }
     unlock_agent_dir(lock_fd);
     close(dir_fd);
@@ -4878,6 +4943,325 @@ static bool same_runtime_identity(const struct stat *before,
            before->st_uid == after->st_uid;
 }
 
+/* Revision equality is intentionally narrower than the repository-wide
+ * identity predicate. Rename/link operations legitimately change ctime and
+ * nlink, so strict revision checks are used only after a reset artifact has
+ * reached its final, quiescent quarantine name. */
+static bool same_runtime_revision(const struct stat *before,
+                                  const struct stat *after) {
+    if (!same_runtime_identity(before, after) ||
+        before->st_gid != after->st_gid ||
+        before->st_nlink != after->st_nlink ||
+        before->st_size != after->st_size) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return before->st_gen == after->st_gen &&
+           before->st_birthtimespec.tv_sec == after->st_birthtimespec.tv_sec &&
+           before->st_birthtimespec.tv_nsec == after->st_birthtimespec.tv_nsec &&
+           before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+           before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec &&
+           before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+           before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#elif defined(__FreeBSD__)
+    return before->st_gen == after->st_gen &&
+           before->st_birthtim.tv_sec == after->st_birthtim.tv_sec &&
+           before->st_birthtim.tv_nsec == after->st_birthtim.tv_nsec &&
+           before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#else
+    return before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+}
+
+static void ssh_runtime_pin_init(ssh_runtime_pin_t *pin) {
+    if (!pin) return;
+    memset(pin, 0, sizeof(*pin));
+    pin->fd = -1;
+}
+
+static int stat_ssh_runtime_pin(const ssh_runtime_pin_t *pin,
+                                int dir_fd, struct stat *identity) {
+    if (!pin || !identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (pin->fd >= 0) {
+        return fstat(pin->fd, identity);
+    }
+    if (pin->anchor[0] != '\0') {
+        return fstatat(dir_fd, pin->anchor, identity, AT_SYMLINK_NOFOLLOW);
+    }
+    errno = EBADF;
+    return -1;
+}
+
+/* Hold an object reference across every external scheduling point and
+ * deletion hook. A stat tuple alone is not a pin: ext4 may immediately reuse
+ * an unlinked inode and give a replacement the old dev/ino/mode/uid tuple.
+ * Linux and FreeBSD can hold arbitrary runtime entries with O_PATH. Darwin
+ * cannot open a filesystem socket (open(2) reports EOPNOTSUPP), so its
+ * descriptor-equivalent reference is a private hard-link anchor in the
+ * already locked 0700 runtime directory. Interrupted anchors are reconciled
+ * before the next mutating start/reset transaction. The reserved anchor
+ * namespace and manager lock are the Darwin concurrency boundary; removal by
+ * a same-UID process that ignores the lock is detected and fails closed. */
+static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
+                                    const char *display_path,
+                                    ssh_runtime_pin_t *pin) {
+#if !defined(O_PATH)
+    static unsigned long anchor_sequence;
+    struct stat before;
+#endif
+    struct stat opened;
+    struct stat named;
+    int fd = -1;
+
+    if (dir_fd < 0 || !name || !*name || !pin) {
+        set_error(ERR_INVALID_ARGS, "Invalid SSH runtime pin arguments");
+        errno = EINVAL;
+        return -1;
+    }
+    ssh_runtime_pin_init(pin);
+#if defined(O_PATH)
+    {
+        int flags = O_PATH | O_NOFOLLOW;
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        fd = openat(dir_fd, name, flags);
+    }
+#else
+    if (fstatat(dir_fd, name, &before, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return 1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect SSH runtime artifact before pinning: %s",
+                         display_path ? display_path : name);
+        return -1;
+    }
+    for (unsigned int attempts = 0; attempts < 128; attempts++) {
+        int written = snprintf(pin->anchor, sizeof(pin->anchor),
+                               ".runtime.pin.%ld.%lu", (long)getpid(),
+                               anchor_sequence++);
+        if (written < 0 || (size_t)written >= sizeof(pin->anchor)) {
+            pin->anchor[0] = '\0';
+            set_error(ERR_INVALID_PATH,
+                      "SSH runtime pin anchor name is too long");
+            return -1;
+        }
+        if (linkat(dir_fd, name, dir_fd, pin->anchor, 0) == 0) break;
+        if (errno != EEXIST) {
+            pin->anchor[0] = '\0';
+            if (errno == ENOENT) return 1;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot anchor SSH runtime artifact safely: %s",
+                             display_path ? display_path : name);
+            return -1;
+        }
+        pin->anchor[0] = '\0';
+    }
+    if (pin->anchor[0] == '\0') {
+        errno = EEXIST;
+        set_error(ERR_FILE_IO,
+                  "Cannot allocate a private SSH runtime pin anchor");
+        return -1;
+    }
+    if (fstatat(dir_fd, pin->anchor, &opened, AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify SSH runtime pin anchor: %s",
+                         pin->anchor);
+        return -1; /* uncertain reserved state is reconciled on next mutation */
+    }
+    if (fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(&before, &opened) ||
+        !same_runtime_identity(&opened, &named)) {
+        int saved_errno = errno ? errno : ESTALE;
+        int retire_rc = unlink_ssh_runtime_identity_at(
+            dir_fd, pin->anchor, &opened, false,
+            "failed SSH runtime pin anchor rollback", NULL, NULL);
+        if (retire_rc == 0) pin->anchor[0] = '\0';
+        errno = saved_errno;
+        set_error(ERR_FILE_IO,
+                  "SSH runtime artifact changed while being anchored; pin %s: %s",
+                  retire_rc == 0 ? "retired" : "retained for retry",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    pin->identity = opened;
+    return 0;
+#endif
+
+    if (fd < 0) {
+        if (errno == ENOENT) return 1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot pin SSH runtime artifact safely: %s",
+                         display_path ? display_path : name);
+        return -1;
+    }
+    if (fstat(fd, &opened) != 0 ||
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(&opened, &named)) {
+        int saved_errno = errno ? errno : ESTALE;
+        close(fd);
+        errno = saved_errno;
+        set_error(ERR_FILE_IO,
+                  "SSH runtime artifact changed while being pinned: %s",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    pin->identity = opened;
+    pin->fd = fd;
+    return 0;
+}
+
+static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
+                                     const char *display_path,
+                                     const ssh_runtime_pin_t *pin) {
+    struct stat held;
+    struct stat named;
+
+    if (stat_ssh_runtime_pin(pin, dir_fd, &held) != 0 ||
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_revision(&pin->identity, &held) ||
+        !same_runtime_revision(&pin->identity, &named)) {
+        set_error(ERR_FILE_IO,
+                  "SSH runtime artifact changed while pinned: %s",
+                  display_path ? display_path : name);
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin) {
+    if (!pin) return 0;
+    if (pin->fd >= 0) {
+        int fd = pin->fd;
+        pin->fd = -1;
+        if (close(fd) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot close SSH runtime descriptor pin");
+            return -1;
+        }
+    }
+    if (pin->anchor[0] != '\0') {
+        if (unlink_ssh_runtime_identity_at(
+                dir_fd, pin->anchor, &pin->identity, false,
+                "SSH runtime pin anchor retirement", NULL, NULL) != 0) {
+            return -1;
+        }
+        pin->anchor[0] = '\0';
+    }
+    return 0;
+}
+
+static bool ssh_runtime_pin_name_is_managed(const char *name) {
+    static const char prefix[] = ".runtime.pin.";
+    const char *cursor;
+
+    if (!name || strncmp(name, prefix, sizeof(prefix) - 1U) != 0) {
+        return false;
+    }
+    cursor = name + sizeof(prefix) - 1U;
+    if (!isdigit((unsigned char)*cursor)) return false;
+    while (isdigit((unsigned char)*cursor)) cursor++;
+    if (*cursor++ != '.' || !isdigit((unsigned char)*cursor)) return false;
+    while (isdigit((unsigned char)*cursor)) cursor++;
+    return *cursor == '\0';
+}
+
+/* A Darwin/fallback hard-link pin is intentionally ephemeral. If a process
+ * dies while holding one, the next top-level mutator retires it under the
+ * manager lock, synchronizes that cleanup, and fails once so the following
+ * retry starts from a freshly proved namespace. Malformed reserved names are
+ * never guessed at or deleted. */
+static int reconcile_ssh_runtime_pins(int dir_fd, const char *socket_dir) {
+    static const char prefix[] = ".runtime.pin.";
+    DIR *directory;
+    struct dirent *entry;
+    int scan_fd;
+    bool saw_pin = false;
+    bool failed = false;
+    int scan_flags = O_RDONLY | O_CLOEXEC;
+
+#ifdef O_DIRECTORY
+    scan_flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    scan_flags |= O_NOFOLLOW;
+#endif
+    scan_fd = openat(dir_fd, ".", scan_flags);
+    directory = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!directory) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect SSH runtime pin recovery state: %s",
+                         socket_dir);
+        return -1;
+    }
+    for (;;) {
+        struct stat identity;
+
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno != 0) {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot enumerate SSH runtime pin recovery state: %s",
+                    socket_dir);
+                failed = true;
+            }
+            break;
+        }
+        if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1U) != 0) {
+            continue;
+        }
+        saw_pin = true;
+        if (!ssh_runtime_pin_name_is_managed(entry->d_name)) {
+            set_error(ERR_FILE_IO,
+                      "Malformed reserved SSH runtime pin state was preserved: %s",
+                      entry->d_name);
+            failed = true;
+            continue;
+        }
+        if (fstatat(dir_fd, entry->d_name, &identity,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            identity.st_uid != getuid() || S_ISDIR(identity.st_mode)) {
+            set_error(ERR_FILE_IO,
+                      "Unsafe SSH runtime pin recovery state was preserved: %s",
+                      entry->d_name);
+            failed = true;
+            continue;
+        }
+        if (unlink_ssh_runtime_identity_at(
+                dir_fd, entry->d_name, &identity, false,
+                "interrupted SSH runtime pin reconciliation", NULL,
+                NULL) != 0) {
+            failed = true;
+        }
+    }
+    if (closedir(directory) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close SSH runtime pin recovery scan: %s",
+                         socket_dir);
+        failed = true;
+    }
+    if (saw_pin) {
+        set_error(
+            ERR_FILE_IO,
+            "SSH runtime pin recovery state was %s; rerun the operation to confirm the reconciled namespace",
+            failed ? "preserved for retry" : "reconciled");
+        return -1;
+    }
+    return failed ? -1 : 0;
+}
+
 static bool same_runtime_symlink(const struct stat *before,
                                  const struct stat *after) {
     return same_runtime_identity(before, after) &&
@@ -4896,10 +5280,8 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     char target[MAX_PATH_LEN];
     char account_name[MAX_NAME_LEN];
     char expected_path[MAX_PATH_LEN];
-    struct stat link_before;
-    struct stat link_after;
-    struct stat socket_before;
-    struct stat socket_after;
+    ssh_runtime_pin_t current_pin;
+    ssh_runtime_pin_t socket_pin;
     const char *component;
     size_t current_len;
     size_t dir_len;
@@ -4912,6 +5294,9 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     int dir_fd = -1;
     int lock_fd = -1;
     int rc = -1;
+
+    ssh_runtime_pin_init(&current_pin);
+    ssh_runtime_pin_init(&socket_pin);
 
     if (expected_live) {
         *expected_live = false;
@@ -4959,10 +5344,13 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
         return -1;
     }
 
-    /* Discovery is a pure read: never wait on a writer that may be parked at
-     * an interactive prompt for minutes. On contention return an error so
+    /* Discovery never waits on a writer that may be parked at an interactive
+     * prompt for minutes. On contention return an error so
      * accounts_detect_current serves the persisted saved-account fallback
-     * instead of hanging every read-only command (AR-05 H2). */
+     * instead of hanging every read-only command (AR-05 H2). Linux/FreeBSD
+     * pins are descriptor-only; Darwin briefly creates a reserved hard-link
+     * anchor inside this locked private directory and retires it before
+     * returning, without changing either public runtime name. */
     lock_fd = try_lock_agent_dir(dir_fd);
     if (lock_fd < 0) {
         bool contended = errno == EWOULDBLOCK;
@@ -4982,23 +5370,23 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
         return -1;
     }
 
-    if (fstatat(dir_fd, "current.sock", &link_before,
-                AT_SYMLINK_NOFOLLOW) != 0) {
-        if (errno == ENOENT) {
+    {
+        int pin_rc = pin_ssh_runtime_entry_at(
+            dir_fd, "current.sock", current, &current_pin);
+        if (pin_rc > 0) {
             rc = 0;
             goto done;
         }
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect stable SSH socket: %s", current);
-        goto done;
+        if (pin_rc < 0) goto done;
     }
-    if (!S_ISLNK(link_before.st_mode) || link_before.st_uid != getuid()) {
+    if (!S_ISLNK(current_pin.identity.st_mode) ||
+        current_pin.identity.st_uid != getuid()) {
         set_error(ERR_PERMISSION_DENIED,
                   "Stable SSH socket is not a self-owned symlink: %s", current);
         goto done;
     }
-    if (link_before.st_size > 0 &&
-        (uintmax_t)link_before.st_size >= (uintmax_t)sizeof(target)) {
+    if (current_pin.identity.st_size > 0 &&
+        (uintmax_t)current_pin.identity.st_size >= (uintmax_t)sizeof(target)) {
         set_error(ERR_INVALID_PATH,
                   "Stable SSH socket target is too long: %s", current);
         goto done;
@@ -5008,12 +5396,8 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
                                                          target,
                                                          sizeof(target) - 1);
     int readlink_errno = errno;
-    if (fstatat(dir_fd, "current.sock", &link_after,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_symlink(&link_before, &link_after)) {
-        set_error(ERR_FILE_IO,
-                  "Stable SSH socket changed while being inspected: %s",
-                  current);
+    if (verify_ssh_runtime_pin_at(dir_fd, "current.sock", current,
+                                  &current_pin) != 0) {
         goto done;
     }
     if (target_len < 0) {
@@ -5074,19 +5458,23 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
         goto done;
     }
 
-    if (fstatat(dir_fd, component, &socket_before,
-                AT_SYMLINK_NOFOLLOW) != 0) {
-        if (expected && errno == ENOENT) {
+    {
+        int pin_rc = pin_ssh_runtime_entry_at(
+            dir_fd, component, target, &socket_pin);
+        if (pin_rc > 0 && expected) {
             rc = 0;
             goto done;
         }
-        set_system_error(ERR_SSH_AGENT_SOCKET_INVALID,
-                         "Current SSH agent socket is missing: %s", target);
-        goto done;
+        if (pin_rc > 0) {
+            set_error(ERR_SSH_AGENT_SOCKET_INVALID,
+                      "Current SSH agent socket is missing: %s", target);
+            goto done;
+        }
+        if (pin_rc < 0) goto done;
     }
-    if (!S_ISSOCK(socket_before.st_mode) ||
-        socket_before.st_uid != getuid() ||
-        (socket_before.st_mode & 0777) != 0600) {
+    if (!S_ISSOCK(socket_pin.identity.st_mode) ||
+        socket_pin.identity.st_uid != getuid() ||
+        (socket_pin.identity.st_mode & 0777) != 0600) {
         set_error(ERR_SSH_AGENT_SOCKET_INVALID,
                   "Current SSH agent socket is not a self-owned 0600 socket: %s",
                   target);
@@ -5118,12 +5506,10 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
             goto done;
         }
     }
-    if (fstatat(dir_fd, component, &socket_after,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_identity(&socket_before, &socket_after)) {
-        set_error(ERR_SSH_AGENT_SOCKET_INVALID,
-                  "Current SSH agent socket changed while being probed: %s",
-                  target);
+    if (verify_ssh_runtime_pin_at(dir_fd, component, target,
+                                  &socket_pin) != 0 ||
+        verify_ssh_runtime_pin_at(dir_fd, "current.sock", current,
+                                  &current_pin) != 0) {
         goto done;
     }
     if (!reachable && !expected) {
@@ -5141,6 +5527,8 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     rc = 0;
 
 done:
+    if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) rc = -1;
+    if (release_ssh_runtime_pin(dir_fd, &current_pin) != 0) rc = -1;
     unlock_agent_dir(lock_fd);
     close(dir_fd);
     return rc;
@@ -5174,12 +5562,14 @@ int ssh_manager_current_is_live_for_account(const account_t *account,
  * sidecar in place for inspection/retry. */
 static int read_ssh_agent_pid_at(int dir_fd, const char *name,
                                  const char *display_path, pid_t *pid_out,
-                                 struct stat *identity_out) {
+                                 ssh_runtime_pin_t *pin) {
     struct stat opened;
     struct stat entry;
     char buf[64];
     size_t used = 0;
     int fd;
+
+    if (pin) ssh_runtime_pin_init(pin);
 
     if (fstatat(dir_fd, name, &entry, AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno == ENOENT) {
@@ -5251,7 +5641,6 @@ static int read_ssh_agent_pid_at(int dir_fd, const char *name,
                   display_path);
         return -1;
     }
-    close(fd);
     buf[used] = '\0';
 
     errno = 0;
@@ -5262,13 +5651,19 @@ static int read_ssh_agent_pid_at(int dir_fd, const char *name,
     }
     if (errno != 0 || end == buf || !end || *end != '\0' || parsed <= 1 ||
         (long)(pid_t)parsed != parsed) {
+        close(fd);
         set_error(ERR_FILE_IO,
                   "Invalid SSH agent PID sidecar; retained for retry: %s",
                   display_path);
         return -1;
     }
     *pid_out = (pid_t)parsed;
-    if (identity_out) *identity_out = entry;
+    if (pin) {
+        pin->identity = opened;
+        pin->fd = fd;
+    } else {
+        close(fd);
+    }
     return 0;
 }
 
@@ -5471,6 +5866,73 @@ static int unlink_ssh_runtime_identity_at(
         description ? description : "identity-bound artifact removal");
 }
 
+/* Final retirement happens only after the quarantine name is stable. Compare
+ * the full quiescent revision after the deterministic hook, and also prove
+ * that the transaction still holds the originally pinned object. */
+static int unlink_ssh_runtime_revision_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    const ssh_runtime_pin_t *pin, const char *witness_name,
+    const char *description,
+    ssh_quarantine_hook_fn predelete_hook, struct stat *observed_out) {
+    struct stat held;
+    struct stat observed;
+    struct stat witness;
+    bool held_matches = true;
+    bool witness_matches = true;
+
+    if (predelete_hook && predelete_hook(dir_fd, name) != 0) {
+        set_error(ERR_FILE_IO,
+                  "SSH cleanup hook failed before revision-bound removal: %s",
+                  name);
+        return -1;
+    }
+    if (fstatat(dir_fd, name, &observed, AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify SSH cleanup target: %s", name);
+        return -1;
+    }
+    if (pin &&
+        (stat_ssh_runtime_pin(pin, dir_fd, &held) != 0 ||
+         !same_runtime_identity(&pin->identity, &held) ||
+         !same_runtime_identity(&pin->identity, &observed) ||
+         !same_runtime_revision(expected, &held))) {
+        held_matches = false;
+    }
+    if (witness_name &&
+        (fstatat(dir_fd, witness_name, &witness, AT_SYMLINK_NOFOLLOW) != 0 ||
+         !same_runtime_identity(expected, &witness) ||
+         !same_runtime_identity(&witness, &observed) ||
+         !same_runtime_revision(expected, &witness))) {
+        witness_matches = false;
+    }
+    if (!expected || (!pin && !witness_name) || !held_matches ||
+        !witness_matches ||
+        !same_runtime_revision(expected, &observed)) {
+        if (observed_out) *observed_out = observed;
+        errno = ESTALE;
+        set_error(ERR_FILE_IO,
+                  "SSH cleanup target revision changed; replacement preserved: %s",
+                  name);
+        return 1;
+    }
+#if defined(__FreeBSD__)
+    if (pin && pin->fd >= 0) {
+        if (funlinkat(dir_fd, name, pin->fd, 0) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot remove descriptor-pinned SSH cleanup target: %s",
+                             name);
+            return -1;
+        }
+        return sync_ssh_runtime_dir(
+            dir_fd,
+            description ? description : "revision-bound artifact removal");
+    }
+#endif
+    return unlink_ssh_runtime_entry(
+        dir_fd, name, false,
+        description ? description : "revision-bound artifact removal");
+}
+
 /* Atomically move a reset target out of its public name without overwriting a
  * pre-existing quarantine. Native no-replace rename is the race-free path;
  * the locked hard-link fallback mirrors current.sock's portable protocol and
@@ -5530,6 +5992,7 @@ static int restore_ssh_reset_quarantine(
     int dir_fd, const char *name, const char *quarantine,
     const struct stat *identity) {
     struct stat restored;
+    struct stat retirement_identity;
     int retirement_rc;
 
     if (!g_force_portable_quarantine) {
@@ -5560,8 +6023,12 @@ static int restore_ssh_reset_quarantine(
                             "portable reset quarantine restoration") != 0) {
         return -1;
     }
-    retirement_rc = unlink_ssh_runtime_identity_at(
-        dir_fd, quarantine, identity, true,
+    if (fstatat(dir_fd, quarantine, &retirement_identity,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        return -1;
+    }
+    retirement_rc = unlink_ssh_runtime_revision_at(
+        dir_fd, quarantine, &retirement_identity, NULL, name,
         "portable reset quarantine retirement", g_reset_retire_hook, NULL);
     return retirement_rc == 0 ? 0 : -1;
 }
@@ -5573,12 +6040,13 @@ static int restore_ssh_reset_quarantine(
 static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                                     const char *display_path,
                                     const char *description,
-                                    const struct stat *expected,
+                                    const ssh_runtime_pin_t *pin,
                                     bool expected_present) {
     static unsigned long sequence;
     char quarantine[96];
     struct stat current;
     struct stat captured;
+    struct stat published;
     struct stat replacement;
     int written;
     int remove_rc;
@@ -5599,9 +6067,12 @@ static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
         return sync_ssh_runtime_dir(
             dir_fd, description ? description : "reset artifact absence");
     }
-    if (!expected) {
+    if (!pin) {
         set_error(ERR_INVALID_ARGS,
                   "Missing SSH reset artifact identity for cleanup");
+        return -1;
+    }
+    if (verify_ssh_runtime_pin_at(dir_fd, name, display_path, pin) != 0) {
         return -1;
     }
     written = snprintf(quarantine, sizeof(quarantine),
@@ -5610,7 +6081,8 @@ static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
         set_error(ERR_INVALID_PATH, "SSH reset quarantine name is too long");
         return -1;
     }
-    if (quarantine_ssh_reset_entry(dir_fd, name, quarantine, expected) != 0) {
+    if (quarantine_ssh_reset_entry(dir_fd, name, quarantine,
+                                   &pin->identity) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot quarantine SSH reset artifact: %s",
                          display_path ? display_path : name);
@@ -5622,7 +6094,7 @@ static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                          display_path ? display_path : name);
         return -1;
     }
-    if (!same_runtime_identity(expected, &captured)) {
+    if (!same_runtime_identity(&pin->identity, &captured)) {
         int restore_rc = restore_ssh_reset_quarantine(
             dir_fd, name, quarantine, &captured);
         set_error(ERR_FILE_IO,
@@ -5644,8 +6116,24 @@ static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                   display_path ? display_path : name);
         return -1;
     }
-    remove_rc = unlink_ssh_runtime_identity_at(
-        dir_fd, quarantine, &captured, true,
+    /* Directory synchronization can finalize BSD metadata. Capture the
+     * quiescent revision only after publication is durable, immediately
+     * before the retirement hook whose mutation it must detect. */
+    if (fstatat(dir_fd, quarantine, &published,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(&captured, &published) ||
+        !same_runtime_identity(&pin->identity, &published)) {
+        int restore_rc = restore_ssh_reset_quarantine(
+            dir_fd, name, quarantine, &captured);
+        set_error(ERR_FILE_IO,
+                  "SSH reset quarantine changed after publication; artifact %s: %s",
+                  restore_rc == 0 ? "restored" : "retained in quarantine",
+                  display_path ? display_path : name);
+        return -1;
+    }
+    captured = published;
+    remove_rc = unlink_ssh_runtime_revision_at(
+        dir_fd, quarantine, &captured, pin, NULL,
         description ? description : "owned reset artifact cleanup",
         g_reset_retire_hook, &replacement);
     if (remove_rc != 0) {
@@ -5738,6 +6226,11 @@ int ssh_manager_reset(const char *account) {
         set_system_error(ERR_FILE_IO, "Failed to lock SSH agent directory: %s", socket_dir);
         return -1;
     }
+    if (reconcile_ssh_runtime_pins(dir_fd, socket_dir) != 0) {
+        unlock_agent_dir(lock_fd);
+        close(dir_fd);
+        return ssh_reset_incomplete();
+    }
 
     if (!account) {
         int all_rc = kill_orphaned_gitswitch_agents(dir_fd, socket_dir, NULL);
@@ -5756,9 +6249,12 @@ int ssh_manager_reset(const char *account) {
     bool failed = false;
     bool can_remove_runtime = true;
     bool socket_present = false;
-    struct stat pid_identity;
-    struct stat socket_identity;
+    ssh_runtime_pin_t pid_pin;
+    ssh_runtime_pin_t socket_pin;
     pid_t pid = -1;
+
+    ssh_runtime_pin_init(&pid_pin);
+    ssh_runtime_pin_init(&socket_pin);
 
     if (reconcile_current_socket_quarantines(dir_fd, socket_dir) != 0) {
         failed = true;
@@ -5780,19 +6276,17 @@ int ssh_manager_reset(const char *account) {
         return -1;
     }
 
-    if (fstatat(dir_fd, sock_name, &socket_identity,
-                AT_SYMLINK_NOFOLLOW) == 0) {
+    int socket_rc = pin_ssh_runtime_entry_at(
+        dir_fd, sock_name, sock_path, &socket_pin);
+    if (socket_rc == 0) {
         socket_present = true;
-    } else if (errno != ENOENT) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot capture SSH agent socket before reset: %s",
-                         sock_path);
+    } else if (socket_rc < 0) {
         failed = true;
         can_remove_runtime = false;
     }
 
     int pid_rc = read_ssh_agent_pid_at(dir_fd, pid_name, pid_path, &pid,
-                                       &pid_identity);
+                                       &pid_pin);
     if (pid_rc < 0) {
         failed = true;
         can_remove_runtime = false;
@@ -5821,7 +6315,8 @@ int ssh_manager_reset(const char *account) {
         } else if (can_remove_runtime &&
                    unlink_ssh_reset_path_at(dir_fd, pid_name, pid_path,
                                             "SSH agent PID sidecar",
-                                            &pid_identity, true) != 0) {
+                                            &pid_pin,
+                                            true) != 0) {
             failed = true;
             can_remove_runtime = false;
         }
@@ -5892,7 +6387,7 @@ int ssh_manager_reset(const char *account) {
             failed = true;
         }
         if (unlink_ssh_reset_path_at(dir_fd, sock_name, sock_path,
-                                     "SSH agent socket", &socket_identity,
+                                     "SSH agent socket", &socket_pin,
                                      socket_present) != 0) {
             failed = true;
         } else if (current_matches &&
@@ -5910,6 +6405,8 @@ int ssh_manager_reset(const char *account) {
         failed = true;
     }
 
+    if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
+    if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) failed = true;
     unlock_agent_dir(lock_fd);
     close(dir_fd);
     return failed ? ssh_reset_incomplete() : 0;
@@ -5994,9 +6491,10 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         /* The socket this agent was started on (ssh-agent.<name>.sock), used
          * to confirm the recorded PID is genuinely our agent. */
         char sock_full[MAX_PATH_LEN];
-        struct stat pid_identity;
+        ssh_runtime_pin_t pid_pin;
         int sw = snprintf(sock_full, sizeof(sock_full), "%s/%.*ssock",
                           socket_dir, (int)(nlen - 3), name);
+        ssh_runtime_pin_init(&pid_pin);
         if (sw <= 0 || (size_t)sw >= sizeof(sock_full)) {
             set_error(ERR_INVALID_PATH, "SSH cleanup socket path too long: %s", name);
             failed = true;
@@ -6005,7 +6503,7 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
 
         pid_t pid = -1;
         int pid_rc = read_ssh_agent_pid_at(dir_fd, name, full, &pid,
-                                           &pid_identity);
+                                           &pid_pin);
         if (pid_rc != 0) {
             if (pid_rc > 0) {
                 set_error(ERR_FILE_IO,
@@ -6016,12 +6514,14 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         }
         if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
             failed = true;
+            if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
             continue;
         }
         ssh_process_outcome_t reap_outcome = g_ssh_reap(
             pid, sock_full, dir_fd);
         if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
             failed = true;
+            if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
             continue;
         }
         if (!ssh_reap_allows_cleanup(reap_outcome)) {
@@ -6029,14 +6529,16 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                       "SSH agent PID %ld reap outcome %s; retained for retry",
                       (long)pid, ssh_process_outcome_name(reap_outcome));
             failed = true;
+            if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
             continue;
         }
         log_debug("Reaped orphaned ssh-agent PID %ld", (long)pid);
         if (unlink_ssh_reset_path_at(dir_fd, name, full,
-                                     "SSH agent PID sidecar", &pid_identity,
+                                     "SSH agent PID sidecar", &pid_pin,
                                      true) != 0) {
             failed = true;
         }
+        if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) failed = true;
     }
     if (closedir(d) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to close SSH agent directory: %s", socket_dir);
@@ -6068,7 +6570,9 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
         const char *name = ent->d_name;
         size_t nlen = strlen(name);
         char full[MAX_PATH_LEN];
-        struct stat artifact_identity;
+        ssh_runtime_pin_t artifact_pin;
+
+        ssh_runtime_pin_init(&artifact_pin);
 
         if (strncmp(name, "ssh-agent.", 10) != 0 ||
             (nlen > 4 && strcmp(name + nlen - 4, ".pid") == 0)) {
@@ -6082,10 +6586,8 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             failed = true;
             continue;
         }
-        if (fstatat(dir_fd, name, &artifact_identity,
-                    AT_SYMLINK_NOFOLLOW) != 0) {
-            set_system_error(ERR_FILE_IO,
-                             "Cannot capture SSH cleanup artifact: %s", full);
+        if (pin_ssh_runtime_entry_at(dir_fd, name, full,
+                                     &artifact_pin) != 0) {
             failed = true;
             continue;
         }
@@ -6098,6 +6600,9 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
             if (pw <= 0 || (size_t)pw >= sizeof(pid_full)) {
                 set_error(ERR_INVALID_PATH, "SSH cleanup PID path too long: %s", name);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
             char pid_name[MAX_NAME_LEN + 16];
@@ -6107,15 +6612,24 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                 set_error(ERR_INVALID_PATH,
                           "SSH cleanup PID name too long: %s", name);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
             if (fstatat(dir_fd, pid_name, &pst, AT_SYMLINK_NOFOLLOW) == 0) {
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue; /* survivor/invalid sidecar: retain its socket */
             }
             if (errno != ENOENT) {
                 set_system_error(ERR_FILE_IO,
                                  "Cannot inspect SSH cleanup sidecar: %s", pid_full);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
 
@@ -6127,6 +6641,9 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                 probe_ssh_agent_socket(full, &reachable) != 0 ||
                 verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
             if (reachable) {
@@ -6134,14 +6651,19 @@ static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                           "Live SSH agent socket has no PID sidecar; retained for retry: %s",
                           full);
                 failed = true;
+                if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) {
+                    failed = true;
+                }
                 continue;
             }
         }
         if (unlink_ssh_reset_path_at(dir_fd, name, full,
                                      "SSH agent artifact",
-                                     &artifact_identity, true) != 0) {
+                                     &artifact_pin,
+                                     true) != 0) {
             failed = true;
         }
+        if (release_ssh_runtime_pin(dir_fd, &artifact_pin) != 0) failed = true;
     }
     if (closedir(d) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to close SSH agent directory: %s", socket_dir);
