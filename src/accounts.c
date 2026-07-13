@@ -594,6 +594,57 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
              account->description);
 }
 
+static bool ssh_alias_publication_is_installed(
+    ssh_config_publication_state_t publication) {
+    return publication == SSH_CONFIG_PUBLICATION_COMMITTED ||
+           publication == SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED ||
+           publication == SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+}
+
+static accounts_switch_commit_state_t accounts_commit_state_for_alias(
+    ssh_config_publication_state_t publication) {
+    switch (publication) {
+        case SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED:
+            return ACCOUNTS_SWITCH_COMMIT_ALIAS_UNVERIFIED;
+        case SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN:
+            return ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN;
+        case SSH_CONFIG_PUBLICATION_COMMITTED:
+            return ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED;
+        case SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED:
+        case SSH_CONFIG_PUBLICATION_UNCHANGED:
+        default:
+            return ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    }
+}
+
+static void set_retained_alias_publication_error(
+    const char *account_name, ssh_config_publication_state_t publication,
+    const char *detail) {
+    const char *truth;
+
+    switch (publication) {
+        case SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED:
+            truth = "its installed public inode could not be verified";
+            break;
+        case SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN:
+            truth = "its installed bytes could not be made directory-durable";
+            break;
+        case SSH_CONFIG_PUBLICATION_COMMITTED:
+            truth = "post-commit resource cleanup failed";
+            break;
+        case SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED:
+        case SSH_CONFIG_PUBLICATION_UNCHANGED:
+        default:
+            truth = "publication returned an unexpected installed-state result";
+            break;
+    }
+    set_error(ERR_FILE_IO,
+              "Account switch to '%s' committed and its new SSH alias was "
+              "retained, but %s: %s",
+              account_name, truth,
+              detail && detail[0] ? detail : "unknown SSH config error");
+}
+
 /* Switch to specified account with SSH isolation and validation. */
 static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                                 bool defer_commit) {
@@ -603,6 +654,10 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
     bool ssh_ok = false;
     bool gpg_ok = false;
     bool defer_signal_dispatch;
+    bool alias_publication_retained = false;
+    ssh_config_publication_state_t alias_publication =
+        SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    char alias_publication_detail[sizeof(g_last_error.message)] = "";
 
     if (!ctx || !identifier || !*identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_switch");
@@ -1167,19 +1222,89 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * durable change when it refuses. Resume skips the persistent file. */
         if (!defer_commit && !ctx->config.resuming &&
             account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
-            strlen(account->ssh_host_alias) > 0 &&
-            ssh_configure_host_alias(&switch_target) != 0) {
-            char detail[sizeof(g_last_error.message)];
-            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-            abort_failed_switch(prev_account, prev_gpg_home,
-                                prev_gpg_present, write_git,
-                                ssh_dirty, gpg_dirty, runtime_lock_fd,
-                                defer_signal_dispatch);
-            set_error(ERR_FILE_IO,
-                      "Failed to commit SSH host alias for account '%s': %s",
-                      account->name,
-                      detail[0] ? detail : "unknown SSH config error");
-            return -1;
+            strlen(account->ssh_host_alias) > 0) {
+            if (ssh_configure_host_alias_result(&switch_target,
+                                                &alias_publication) != 0) {
+                safe_strncpy(alias_publication_detail,
+                             get_last_error()->message,
+                             sizeof(alias_publication_detail));
+                if (!ssh_alias_publication_is_installed(alias_publication)) {
+                    bool rollback_complete = true;
+                    bool git_remaining = write_git;
+                    bool ssh_remaining = ssh_dirty;
+                    bool gpg_remaining = gpg_dirty;
+                    char rollback_detail[sizeof(g_last_error.message)] = "";
+
+                    /* Learn completeness before releasing signal ownership.
+                     * M7 conflicts deliberately retain their exact Git retry
+                     * image; ending the guard here would strand that handle
+                     * with no safe way to finish a direct-library abort. */
+                    abort_failed_switch_checked(
+                        prev_account, prev_gpg_home, prev_gpg_present,
+                        write_git, ssh_dirty, gpg_dirty, runtime_lock_fd,
+                        false, true, &git_remaining, &ssh_remaining,
+                        &gpg_remaining, &rollback_complete, rollback_detail,
+                        sizeof(rollback_detail));
+                    if (!rollback_complete) {
+                        memset(&g_pending_switch, 0, sizeof(g_pending_switch));
+                        g_pending_switch.active = true;
+                        g_pending_switch.ctx = ctx;
+                        if (prev_account) {
+                            g_pending_switch.previous_account = *prev_account;
+                            g_pending_switch.had_previous_account = true;
+                        }
+                        safe_strncpy(g_pending_switch.previous_active,
+                                     prev_active,
+                                     sizeof(g_pending_switch.previous_active));
+                        safe_strncpy(g_pending_switch.previous_gpg_home,
+                                     prev_gpg_home,
+                                     sizeof(g_pending_switch.previous_gpg_home));
+                        g_pending_switch.previous_gpg_present = prev_gpg_present;
+                        g_pending_switch.git_written = git_remaining;
+                        g_pending_switch.ssh_dirty = ssh_remaining;
+                        g_pending_switch.gpg_dirty = gpg_remaining;
+                        g_pending_switch.runtime_lock_fd = -1;
+                        g_pending_switch.target_id = account->id;
+                        g_pending_switch.switch_target = switch_target;
+                        g_pending_switch.scope = scope;
+                        g_pending_switch.ssh_ok = ssh_ok;
+                        g_pending_switch.gpg_ok = gpg_ok;
+                        set_error(
+                            ERR_FILE_IO,
+                            "Failed to commit SSH host alias for account '%s' "
+                            "(%s), and rollback remains incomplete with retry "
+                            "ownership retained; call accounts_switch_abort() "
+                            "after resolving the conflict: %s",
+                            account->name,
+                            alias_publication_detail[0]
+                                ? alias_publication_detail
+                                : "unknown SSH config error",
+                            rollback_detail[0]
+                                ? rollback_detail
+                                : "unknown rollback error");
+                        return -1;
+                    }
+                    if (!defer_signal_dispatch) {
+                        signals_rollback_end();
+                        (void)signals_guard_end();
+                        if (signals_pending()) {
+                            signals_dispatch_pending();
+                        }
+                    }
+                    set_error(ERR_FILE_IO,
+                              "Failed to commit SSH host alias for account '%s': %s",
+                              account->name,
+                              alias_publication_detail[0]
+                                  ? alias_publication_detail
+                                  : "unknown SSH config error");
+                    return -1;
+                }
+                /* renameat() has already made the target alias public. Rolling
+                 * Git/runtime back would manufacture the mixed state M5
+                 * forbids. Finish the new transaction, then report the exact
+                 * verification/durability uncertainty as a committed error. */
+                alias_publication_retained = true;
+            }
         }
 
         /* No fallible external commit remains for a direct switch. Once the
@@ -1285,6 +1410,12 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             signals_dispatch_pending();
         }
     }
+    if (alias_publication_retained) {
+        set_retained_alias_publication_error(account->name,
+                                             alias_publication,
+                                             alias_publication_detail);
+        return -1;
+    }
     return 0;
 }
 
@@ -1301,8 +1432,18 @@ int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
     return accounts_switch_impl(ctx, identifier, true);
 }
 
-int accounts_switch_commit(gitswitch_ctx_t *ctx) {
+int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
+                                  accounts_switch_commit_state_t *state) {
     account_t *target = NULL;
+    ssh_config_publication_state_t alias_publication =
+        SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    accounts_switch_commit_state_t final_state =
+        ACCOUNTS_SWITCH_COMMIT_COMPLETE;
+    char alias_publication_detail[sizeof(g_last_error.message)] = "";
+
+    if (state) {
+        *state = ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    }
 
     if (!g_pending_switch.active || !ctx || g_pending_switch.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account switch to commit");
@@ -1326,8 +1467,14 @@ int accounts_switch_commit(gitswitch_ctx_t *ctx) {
      * therefore lets main reverse every earlier commit as one transaction. */
     if (target->ssh_enabled && target->ssh_key_path[0] != '\0' &&
         target->ssh_host_alias[0] != '\0' &&
-        ssh_configure_host_alias(&g_pending_switch.switch_target) != 0) {
-        return -1;
+        ssh_configure_host_alias_result(&g_pending_switch.switch_target,
+                                        &alias_publication) != 0) {
+        safe_strncpy(alias_publication_detail, get_last_error()->message,
+                     sizeof(alias_publication_detail));
+        if (!ssh_alias_publication_is_installed(alias_publication)) {
+            return -1;
+        }
+        final_state = accounts_commit_state_for_alias(alias_publication);
     }
 
     if (g_pending_switch.git_written) {
@@ -1342,7 +1489,20 @@ int accounts_switch_commit(gitswitch_ctx_t *ctx) {
                           g_pending_switch.ssh_ok,
                           g_pending_switch.gpg_ok);
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));
+    if (state) {
+        *state = final_state;
+    }
+    if (final_state != ACCOUNTS_SWITCH_COMMIT_COMPLETE) {
+        set_retained_alias_publication_error(target->name,
+                                             alias_publication,
+                                             alias_publication_detail);
+        return -1;
+    }
     return 0;
+}
+
+int accounts_switch_commit(gitswitch_ctx_t *ctx) {
+    return accounts_switch_commit_result(ctx, NULL);
 }
 
 int accounts_switch_abort(gitswitch_ctx_t *ctx,

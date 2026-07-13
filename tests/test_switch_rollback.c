@@ -460,25 +460,35 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         safe_strncpy(g_store_gpgx509, argv[5], sizeof(g_store_gpgx509));
     } else if (is_config_add(argv, "gpg.ssh.program")) {
         safe_strncpy(g_store_gpgssh, argv[5], sizeof(g_store_gpgssh));
-    } else if (is_config_unset(argv, "user.name")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "user.name")) {
         g_store_name[0] = '\0';
-    } else if (is_config_unset(argv, "user.email")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "user.email")) {
         g_store_email[0] = '\0';
-    } else if (is_config_unset(argv, "core.sshcommand")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "core.sshcommand")) {
         g_store_sshcmd[0] = '\0';
-    } else if (is_config_unset(argv, "user.signingkey")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "user.signingkey")) {
         g_store_signingkey[0] = '\0';
-    } else if (is_config_unset(argv, "commit.gpgsign")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "commit.gpgsign")) {
         g_store_gpgsign[0] = '\0';
-    } else if (is_config_unset(argv, "gpg.program")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.program")) {
         g_store_gpgprogram[0] = '\0';
-    } else if (is_config_unset(argv, "gpg.format")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.format")) {
         g_store_gpgformat[0] = '\0';
-    } else if (is_config_unset(argv, "gpg.openpgp.program")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.openpgp.program")) {
         g_store_gpgopenpgp[0] = '\0';
-    } else if (is_config_unset(argv, "gpg.x509.program")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.x509.program")) {
         g_store_gpgx509[0] = '\0';
-    } else if (is_config_unset(argv, "gpg.ssh.program")) {
+    } else if (is_global_config_command(argv) &&
+               is_config_unset(argv, "gpg.ssh.program")) {
         g_store_gpgssh[0] = '\0';
     } else if (is_config_read(argv, "user.name") &&
                (!is_global_config_command(argv) || !g_store_name[0])) {
@@ -615,6 +625,26 @@ static const char g_concurrent_config_content[] =
 static char g_concurrent_config_path[1024];
 static bool g_replace_config_on_user_name;
 static bool g_replace_config_with_symlink_on_user_name;
+
+static int fail_alias_postrename_verification(int dir_fd) {
+    (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static int fail_alias_dirsync(int dir_fd) {
+    (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static int replace_git_name_and_fail_alias_commit(int dir_fd,
+                                                  const char *temp_name) {
+    (void)dir_fd;
+    (void)temp_name;
+    safe_strncpy(g_store_name, "Concurrent Name", sizeof(g_store_name));
+    return -1;
+}
 
 static int replace_ssh_config_concurrently(void) {
     char replacement_path[1100];
@@ -1426,6 +1456,188 @@ static int setup_alias_ctx(gitswitch_ctx_t *ctx, const char *alias) {
     safe_strncpy(tgt->ssh_host_alias, alias, sizeof(tgt->ssh_host_alias));
     safe_strncpy(tgt->ssh_hostname, "github.com", sizeof(tgt->ssh_hostname));
     return 0;
+}
+
+static int setup_alias_config_file(char *home, size_t home_size,
+                                   char *saved_home, size_t saved_home_size,
+                                   char *config_path, size_t config_path_size,
+                                   const char *content) {
+    char ssh_dir[700];
+    FILE *file;
+
+    if (setup_fake_home(home, home_size, saved_home, saved_home_size) != 0 ||
+        (size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) >=
+            sizeof(ssh_dir) ||
+        mkdir(ssh_dir, 0700) != 0 ||
+        (size_t)snprintf(config_path, config_path_size, "%s/config",
+                         ssh_dir) >= config_path_size) {
+        return -1;
+    }
+    if (!content) return 0;
+    file = fopen(config_path, "w");
+    if (!file) return -1;
+    if (fputs(content, file) == EOF || fclose(file) != 0) return -1;
+    return chmod(config_path, 0600);
+}
+
+/* M5 direct-library policy: once renameat has installed the alias, a failed
+ * public-inode verification is a committed-but-uncertain switch, not a reason
+ * to restore Git/runtime around the retained new alias. */
+TEST(postrename_alias_verification_failure_retains_complete_direct_switch) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    char after[4096], detail[sizeof(g_last_error.message)];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_config_postrename_hook_fn previous_hook;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    previous_hook = ssh_manager_set_config_postrename_hook_fn(
+        fail_alias_postrename_verification);
+    rc = accounts_switch(&ctx, "testacct");
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    ssh_manager_set_config_postrename_hook_fn(previous_hook);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    after[0] = '\0';
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK(strstr(after, "Host personal\n") != NULL);
+    CHECK(strstr(after, "Host github.com-tgt\n") != NULL);
+    CHECK(strstr(detail, "committed") != NULL);
+    CHECK(strstr(detail, "public inode could not be verified") != NULL);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
+}
+
+/* The prepared/CLI boundary exposes the retained commit structurally. Main
+ * consumes this exact state to keep its already-installed active file and
+ * resume hint while exiting nonzero with truthful durability diagnostics. */
+TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    char after[4096], detail[sizeof(g_last_error.message)];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_dirsync_fn previous_sync;
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
+    rc = accounts_switch_commit_result(&ctx, &state);
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    ssh_manager_set_dirsync_fn(previous_sync);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(state,
+                 ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    after[0] = '\0';
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK(strstr(after, "Host personal\n") != NULL);
+    CHECK(strstr(after, "Host github.com-tgt\n") != NULL);
+    CHECK(strstr(detail, "committed") != NULL);
+    CHECK(strstr(detail, "directory-durable") != NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    signals_rollback_end();
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
+}
+
+/* A pre-rename alias failure remains rollback-authorized. If M7 detects an
+ * external Git vector at that late point, direct API callers receive both the
+ * cause and the retained retry handle instead of losing signal ownership. */
+TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    char after[4096], detail[sizeof(g_last_error.message)];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_config_commit_hook_fn previous_hook;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    previous_hook = ssh_manager_set_config_commit_hook_fn(
+        replace_git_name_and_fail_alias_commit);
+    rc = accounts_switch(&ctx, "testacct");
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    ssh_manager_set_config_commit_hook_fn(previous_hook);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Concurrent Name");
+    CHECK(strstr(detail, "rollback remains incomplete") != NULL);
+    CHECK(strstr(detail, "changed outside this transaction") != NULL);
+    CHECK(strstr(detail, "retry ownership retained") != NULL);
+    after[0] = '\0';
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK_STR_EQ(after, original);
+
+    /* Repair only the conflicting vector to the transaction's exact intended
+     * post-image. The retained M7 retry restores its old value and completes
+     * signal/rollback ownership without replaying already-restored keys. */
+    safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
 }
 
 /* The alias writer is the final commit, so a Git failure must leave the
@@ -2540,6 +2752,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort);
     RUN_TEST(ssh_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_restarts_previous_accounts_agent);
+    RUN_TEST(postrename_alias_verification_failure_retains_complete_direct_switch);
+    RUN_TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch);
+    RUN_TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry);
     RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);
     RUN_TEST(failed_switch_never_creates_ssh_config);
     RUN_TEST(failed_switch_preserves_concurrent_ssh_config_replacement);

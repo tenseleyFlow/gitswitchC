@@ -714,6 +714,9 @@ int main(int argc, char *argv[]) {
     if (has_mutation_result && exit_code == EXIT_SUCCESS && !dry_run) {
         int save_rc = 0;
         bool config_installed = false;
+        bool switch_commit_retained = false;
+        accounts_switch_commit_state_t switch_commit_state =
+            ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
         char save_error[sizeof(g_last_error.message)] = "";
 
         if (mutation.save_kind != COMMAND_SAVE_NONE) {
@@ -751,11 +754,14 @@ int main(int argc, char *argv[]) {
         }
 
         if (mutation.switch_prepared && save_rc == 0) {
-            if (accounts_switch_commit(ctx) != 0) {
+            if (accounts_switch_commit_result(ctx, &switch_commit_state) != 0) {
                 save_rc = -1;
                 config_installed = true;
                 safe_strncpy(save_error, get_last_error()->message,
                              sizeof(save_error));
+                switch_commit_retained =
+                    switch_commit_state !=
+                    ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
             }
         }
 
@@ -783,7 +789,8 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (mutation.switch_prepared && save_rc != 0) {
+        if (mutation.switch_prepared && save_rc != 0 &&
+            !switch_commit_retained) {
             bool rollback_complete = true;
             char rollback_detail[sizeof(g_last_error.message)] = "";
 
@@ -842,6 +849,25 @@ int main(int argc, char *argv[]) {
                 signals_rollback_begin();
                 pending_signal_notice =
                     "gitswitch: interrupted — switch rollback attempt completed\n";
+            }
+        } else if (mutation.switch_prepared && switch_commit_retained) {
+            /* The SSH config rename crossed its publication point. The
+             * structured account result has already committed Git/runtime and
+             * released rollback ownership, so retain the matching active file
+             * and resume hint too. Exit nonzero because verification or
+             * durability was not proven; never misreport this as success. */
+            display_error(
+                "Account switch committed, but SSH alias publication is uncertain",
+                "%s; active metadata, Git identity, runtime state, and the "
+                "installed alias were retained together. Verify ~/.ssh/config "
+                "and its filesystem durability before retrying",
+                save_error[0] ? save_error :
+                                "unknown SSH alias publication error");
+            exit_code = EXIT_FAILURE;
+            if (signals_pending()) {
+                signals_rollback_begin();
+                pending_signal_notice =
+                    "gitswitch: interrupted — committed switch cleanup completed\n";
             }
         } else if (mutation.edit_prepared && save_rc != 0) {
             if (config_installed) {

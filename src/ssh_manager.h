@@ -66,6 +66,7 @@ typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);
 typedef int (*ssh_dirsync_fn)(int dir_fd);
 typedef int (*ssh_config_commit_hook_fn)(int dir_fd, const char *temp_name);
+typedef int (*ssh_config_postrename_hook_fn)(int dir_fd);
 typedef int (*ssh_current_cleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_precleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
@@ -73,6 +74,19 @@ typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
 typedef int64_t (*ssh_probe_clock_fn)(void);
 typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
+
+/* Public-state result for one ~/.ssh/config alias publication.  Failure is
+ * transactionally reversible only while PREINSTALL_FAILED remains current.
+ * The two uncertain states mean renameat() already made the new bytes public;
+ * callers must retain the matching account transaction instead of rolling its
+ * Git/runtime/config state back around an installed alias. */
+typedef enum {
+    SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED,
+    SSH_CONFIG_PUBLICATION_UNCHANGED,
+    SSH_CONFIG_PUBLICATION_COMMITTED,
+    SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED,
+    SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN
+} ssh_config_publication_state_t;
 
 /* One descriptor-backed view of an SSH key file. Status callers can reuse
  * these fields instead of independently resolving, statting, and reopening a
@@ -138,6 +152,10 @@ ssh_dirsync_fn ssh_manager_set_dirsync_fn(ssh_dirsync_fn fn);
  * leaves it NULL; the callback receives the pinned ~/.ssh fd and temp name. */
 ssh_config_commit_hook_fn ssh_manager_set_config_commit_hook_fn(
     ssh_config_commit_hook_fn fn);
+/* Test-only post-rename seam. Production leaves it NULL. A failure here models
+ * an installed config whose public inode could not be verified. */
+ssh_config_postrename_hook_fn ssh_manager_set_config_postrename_hook_fn(
+    ssh_config_postrename_hook_fn fn);
 ssh_current_cleanup_hook_fn ssh_manager_set_current_cleanup_hook_fn(
     ssh_current_cleanup_hook_fn fn);
 ssh_current_precleanup_hook_fn ssh_manager_set_current_precleanup_hook_fn(
@@ -206,6 +224,14 @@ int ssh_manager_test_probe_deadline(int timeout_ms);
  * account->ssh_hostname canonical destination; it is emitted as HostName.
  */
 int ssh_configure_host_alias(const account_t *account);
+
+/* Structured form used by account transactions. Returns the same status as
+ * ssh_configure_host_alias() and always initializes `publication` when it is
+ * non-NULL. A nonzero return with an installed/uncertain publication is a
+ * committed-state warning, not authorization to roll back adjacent state. */
+int ssh_configure_host_alias_result(
+    const account_t *account,
+    ssh_config_publication_state_t *publication);
 
 /**
  * Remove the managed host-alias block for `alias` from ~/.ssh/config (AR-06

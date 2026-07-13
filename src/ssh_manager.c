@@ -125,6 +125,7 @@ static ssh_pid_commit_hook_fn g_pid_postrename_hook;
 static ssh_namespace_commit_hook_fn g_namespace_commit_hook;
 static ssh_dirsync_fn g_ssh_dirsync = fsync;
 static ssh_config_commit_hook_fn g_ssh_config_commit_hook;
+static ssh_config_postrename_hook_fn g_ssh_config_postrename_hook;
 static ssh_current_cleanup_hook_fn g_current_cleanup_hook;
 static ssh_current_precleanup_hook_fn g_current_precleanup_hook;
 static ssh_current_publish_hook_fn g_current_publish_hook;
@@ -218,6 +219,13 @@ ssh_config_commit_hook_fn ssh_manager_set_config_commit_hook_fn(
     ssh_config_commit_hook_fn fn) {
     ssh_config_commit_hook_fn previous = g_ssh_config_commit_hook;
     g_ssh_config_commit_hook = fn;
+    return previous;
+}
+
+ssh_config_postrename_hook_fn ssh_manager_set_config_postrename_hook_fn(
+    ssh_config_postrename_hook_fn fn) {
+    ssh_config_postrename_hook_fn previous = g_ssh_config_postrename_hook;
+    g_ssh_config_postrename_hook = fn;
     return previous;
 }
 
@@ -3089,7 +3097,7 @@ static int ssh_write_config_atomic_at(
     const char *display_path, const char *content, size_t content_len,
     bool config_existed, const struct stat *config_identity,
     int pinned_config_fd, const char *original_content,
-    size_t original_len) {
+    size_t original_len, ssh_config_publication_state_t *publication) {
     static const char random_chars[] =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     char suffix[17];
@@ -3198,9 +3206,20 @@ static int ssh_write_config_atomic_at(
         goto fail;
     }
     renamed = true;
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED;
+    }
     if (temp_registered) signals_scratch_unregister(temp_path);
     temp_registered = false;
 
+    if (g_ssh_config_postrename_hook &&
+        g_ssh_config_postrename_hook(dir_fd) != 0) {
+        set_error(ERR_FILE_IO,
+                  "SSH config was installed but injected post-rename "
+                  "verification failed; the new bytes were retained and "
+                  "their public identity is uncertain");
+        return -1;
+    }
     if (recheck_ssh_config_directory(dir_path, dir_identity) != 0 ||
         fstatat(dir_fd, "config", &installed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !same_installed_ssh_config(&temp_identity, &installed)) {
@@ -3209,12 +3228,18 @@ static int ssh_write_config_atomic_at(
                   "the commit changed bytes and its public state is uncertain");
         return -1;
     }
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+    }
     if (g_ssh_dirsync(dir_fd) != 0) {
         set_system_error(
             ERR_FILE_IO,
             "SSH config was replaced but its directory sync failed; "
             "the commit changed bytes and durability is uncertain");
         return -1;
+    }
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_COMMITTED;
     }
     return 0;
 
@@ -3304,7 +3329,7 @@ int ssh_remove_host_alias(const char *alias) {
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, filtered, filtered_len,
                                    config_existed, &config_identity,
-                                   pinned_config_fd, buf, buf_len) != 0) {
+                                   pinned_config_fd, buf, buf_len, NULL) != 0) {
         goto done;
     }
     log_info("Removed %zu SSH host alias block%s: %s", removed,
@@ -3327,7 +3352,9 @@ done:
     return rc;
 }
 
-int ssh_configure_host_alias(const account_t *account) {
+int ssh_configure_host_alias_result(
+    const account_t *account,
+    ssh_config_publication_state_t *publication) {
     char ssh_config_dir[MAX_PATH_LEN];
     char ssh_config_path[MAX_PATH_LEN];
     char expanded_key_path[MAX_PATH_LEN];
@@ -3354,7 +3381,13 @@ int ssh_configure_host_alias(const account_t *account) {
     int rc = -1;
     int need;
 
+    if (publication) {
+        *publication = SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
+    }
     if (!account || strlen(account->ssh_host_alias) == 0) {
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+        }
         return 0; /* Nothing to configure */
     }
     if (!home || !*home) {
@@ -3469,6 +3502,9 @@ int ssh_configure_host_alias(const account_t *account) {
     if (config_existed && newbuf_len == buf_len &&
         memcmp(newbuf, buf, buf_len) == 0) {
         log_debug("SSH host alias block already current; skipping rewrite");
+        if (publication) {
+            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+        }
         rc = 0;
         goto done;
     }
@@ -3479,7 +3515,8 @@ int ssh_configure_host_alias(const account_t *account) {
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, newbuf, newbuf_len,
                                    config_existed, &config_identity,
-                                   pinned_config_fd, buf, buf_len) != 0) {
+                                   pinned_config_fd, buf, buf_len,
+                                   publication) != 0) {
         goto done;
     }
 
@@ -3504,6 +3541,10 @@ done:
         rc = -1;
     }
     return rc;
+}
+
+int ssh_configure_host_alias(const account_t *account) {
+    return ssh_configure_host_alias_result(account, NULL);
 }
 
 /* Test SSH connection */

@@ -12,6 +12,19 @@ typedef struct {
     char warnings[1024];
 } account_validation_t;
 
+/* Prepared-switch commit result. NOT_COMMITTED authorizes the caller to use
+ * accounts_switch_abort(). Every other non-success state means Git/runtime,
+ * active metadata, and the installed SSH alias were intentionally retained as
+ * one committed transaction; the caller reports failure but must not restore
+ * persistence before-images around it. */
+typedef enum {
+    ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED,
+    ACCOUNTS_SWITCH_COMMIT_COMPLETE,
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_UNVERIFIED,
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN,
+    ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED
+} accounts_switch_commit_state_t;
+
 /* Function prototypes */
 
 /**
@@ -37,6 +50,8 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
  */
 int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_switch_commit(gitswitch_ctx_t *ctx);
+int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
+                                  accounts_switch_commit_state_t *state);
 /* continue_persistence_rollback keeps the signal rollback window active so
  * the caller can restore config/hint state without an interruptible gap. */
 int accounts_switch_abort(gitswitch_ctx_t *ctx,

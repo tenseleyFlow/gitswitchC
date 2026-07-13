@@ -199,6 +199,12 @@ static int fail_dirsync(int dir_fd) {
     return -1;
 }
 
+static int fail_postrename_verification(int dir_fd) {
+    (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
 static int swap_public_ssh_directory(int dir_fd, const char *temp_name) {
     static const char replacement[] = "Host replacement\n  User untouched\n";
     char config[MAX_PATH_LEN];
@@ -570,6 +576,7 @@ TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     account_t account;
     ssh_dirsync_fn previous;
+    ssh_config_publication_state_t publication;
     size_t length = 0;
     char *content;
 
@@ -579,10 +586,42 @@ TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
     make_account(&account, key);
     g_dirsync_calls = 0;
     previous = ssh_manager_set_dirsync_fn(fail_dirsync);
-    CHECK_EQ_INT(ssh_configure_host_alias(&account), -1);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
     ssh_manager_set_dirsync_fn(previous);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN);
     CHECK_EQ_INT(g_dirsync_calls, 1);
     CHECK(strstr(get_last_error()->message, "changed bytes") != NULL);
+    CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(strstr(content, BEGIN_MARK) != NULL);
+        free(content);
+    }
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(postrename_verification_failure_reports_installed_unverified) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    ssh_config_postrename_hook_fn previous;
+    ssh_config_publication_state_t publication;
+    size_t length = 0;
+    char *content;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
+    make_account(&account, key);
+    previous = ssh_manager_set_config_postrename_hook_fn(
+        fail_postrename_verification);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    ssh_manager_set_config_postrename_hook_fn(previous);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED);
+    CHECK(strstr(get_last_error()->message, "installed") != NULL);
+    CHECK(strstr(get_last_error()->message, "retained") != NULL);
     CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
     content = read_bytes(config, &length);
     CHECK(content != NULL);
@@ -624,6 +663,7 @@ TEST(ctime_only_metadata_shape_does_not_hide_content_change) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     account_t account;
     ssh_config_commit_hook_fn previous;
+    ssh_config_publication_state_t publication;
     size_t length = 0;
     char *content;
 
@@ -634,8 +674,10 @@ TEST(ctime_only_metadata_shape_does_not_hide_content_change) {
     make_account(&account, key);
     previous = ssh_manager_set_config_commit_hook_fn(
         replace_config_byte_preserving_mtime);
-    CHECK_EQ_INT(ssh_configure_host_alias(&account), -1);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
     ssh_manager_set_config_commit_hook_fn(previous);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
     CHECK(strstr(get_last_error()->message, "bytes changed") != NULL);
 
     content = read_bytes(config, &length);
@@ -883,6 +925,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(valid_duplicates_collapse_to_one_then_remove_to_zero);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
     RUN_TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp);
+    RUN_TEST(postrename_verification_failure_reports_installed_unverified);
     RUN_TEST(ctime_only_drift_revalidates_exact_pinned_bytes);
     RUN_TEST(ctime_only_metadata_shape_does_not_hide_content_change);
     RUN_TEST(pinned_directory_swap_fails_without_touching_replacement_or_leaking_temp);
