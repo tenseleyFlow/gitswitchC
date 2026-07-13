@@ -166,6 +166,8 @@ jobs:
       - name: Build + test (ASan/UBSan, warnings-as-errors)
         run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
+          # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin
+          # and remain covered by Linux; every portable runtime is mandatory.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Release build + full NDEBUG suite (warnings-as-errors)
         run: |
@@ -173,4 +175,5 @@ jobs:
           make BUILD_TYPE=release READLINE=1 WERROR=1 test
           make BUILD_TYPE=release READLINE=1 release-artifact-test
         env:
+          # Same sole OS-specific exclusion as the debug lane above.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets

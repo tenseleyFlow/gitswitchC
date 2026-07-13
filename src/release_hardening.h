@@ -1,6 +1,3 @@
-#ifndef GITSWITCH_RELEASE_HARDENING_H
-#define GITSWITCH_RELEASE_HARDENING_H
-
 /*
  * Forced into every release translation unit by the Makefile. This turns a
  * missing/neutralized stack-protector policy into a per-object compile error,
@@ -11,5 +8,3 @@
     !defined(__SSP_STRONG__) && !defined(__SSP_ALL__)
 #error "release translation unit lacks required stack-protector policy"
 #endif
-
-#endif /* GITSWITCH_RELEASE_HARDENING_H */

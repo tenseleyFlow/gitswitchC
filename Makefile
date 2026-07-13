@@ -819,7 +819,12 @@ info:
 	@echo "Target: $(TARGET)"
 	@echo "Build type: $(BUILD_TYPE)"
 	@echo "Compiler: $(CC)"
-	@echo "CFLAGS: $(CFLAGS)"
+	@echo "Compiler identity: $(CC_IDENTITY_FILE)"
+	@echo "Compiler version: $(CC_VERSION_ID)"
+	@echo "Target triple: $(TARGET_TRIPLE)"
+	@echo "Toolchain fingerprint: $(TOOLCHAIN_FILE_FINGERPRINT)"
+	@echo "CFLAGS: $(CFLAGS) $(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS)"
+	@echo "LDFLAGS: $(LDFLAGS) $(RELEASE_ENFORCED_LDFLAGS)"
 	@echo "Sources: $(SOURCES)"
 	@echo "Objects: $(OBJECTS)"
 
@@ -872,6 +877,9 @@ help:
 	@echo "Variables:"
 	@echo "  BUILD_TYPE   debug (default), release, or coverage"
 	@echo "  CC           Compiler (default: gcc)"
+	@echo "  TARGET_TRIPLE Validated compiler target (default: CC -dumpmachine)"
+	@echo "  TOOLCHAIN_IDENTITY_FILES Compiler/wrapper files to fingerprint"
+	@echo "  UNSUPPORTED_RELEASE_ACK/RELEASE_ARTIFACT_FORMAT Audited release override"
 	@echo "  COVERAGE_MIN_LINES/COVERAGE_MIN_BRANCHES Coverage floors (69/58)"
 	@echo "  DESTDIR      Installation prefix"
 

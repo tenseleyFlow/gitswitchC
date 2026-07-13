@@ -133,6 +133,8 @@ rm -f "$qa_archive"
 if "$make_cmd" -C "$root" PREFIX=relative distcheck >"$out" 2>&1; then
     fail "distcheck accepted a relative installation prefix"
 fi
+grep -F 'PREFIX must be absolute' "$out" >/dev/null ||
+    fail "distcheck failed before exercising the invalid-prefix cleanup path"
 [ ! -e "$qa_archive" ] || fail "failed distcheck left its source archive behind"
 
 # Even malformed direct invocations must install cleanup before validating
