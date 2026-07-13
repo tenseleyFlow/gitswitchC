@@ -886,13 +886,18 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
              * home is present — preserving the pre-mutation fast-fail for a
              * genuine first-time switch to a key that exists nowhere. */
             if (validate_gpg_key_availability(account->gpg_key_id) != 0) {
+                error_context_t source_error = *get_last_error();
+                int source_errno = errno;
                 bool isolated_present = false;
+
                 if (gpg_manager_isolated_home_present(account->name,
-                                                      &isolated_present) != 0 ||
-                    !isolated_present) {
-                    set_error(ERR_GPG_KEY_NOT_FOUND,
-                              "GPG key not found in keyring: %s",
-                              account->gpg_key_id);
+                                                      &isolated_present) != 0) {
+                    runtime_state_lock_release(runtime_lock_fd);
+                    return -1;
+                }
+                if (!isolated_present) {
+                    g_last_error = source_error;
+                    errno = source_errno;
                     runtime_state_lock_release(runtime_lock_fd);
                     return -1;
                 }
@@ -1922,14 +1927,12 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
         }
         if (edited.gpg_enabled &&
             validate_gpg_key_availability_fresh(edited.gpg_key_id) != 0) {
-            error_context_t cause = *get_last_error();
-            set_error(ERR_GPG_KEY_NOT_FOUND,
-                      "Cannot change GPG identity for account '%s': edited "
-                      "key '%s' is not available in the real/system keyring. "
-                      "Import its secret key into the system keyring, then "
-                      "retry the edit (%s).",
+            log_debug("Cannot change GPG identity for account '%s': pinned "
+                      "system-source validation of selector '%s' failed: %s",
                       g_pending_edit.original.name, edited.gpg_key_id,
-                      cause.message[0] ? cause.message : "key probe failed");
+                      get_last_error()->message[0]
+                          ? get_last_error()->message
+                          : "unknown key resolution error");
             goto prepare_fail;
         }
     }
@@ -2945,18 +2948,16 @@ static bool prompt_host_alias_valid(const char *alias) {
     return true;
 }
 
-/* Validate GPG key availability.
- * Checks the *system* keyring — but with an explicit GNUPGHOME override to the
- * user's REAL keyring home (AR-06 F05/F06). `gitswitch init` exports
- * GNUPGHOME=<base>/current into interactive shells; without the override this
- * probe would inherit that managed value and list the previously-active
- * account's isolated home, hard-failing every cross-account switch with a
- * misleading "key not found". This is the fallback sanity check run from
- * accounts_switch() when the isolated GPG path did not already confirm the key
- * (gpg_ok), and during health checks. Isolated-home validation belongs to the
- * GPG manager's account-switch and signing-test paths. */
+/* Validate GPG key availability through the GPG manager's descriptor-pinned
+ * system-source resolver. `gitswitch init` may point inherited GNUPGHOME at a
+ * managed isolated home; the resolver chooses and pins the real source,
+ * rejects namespace replacement, parses the secret-key inventory, and returns
+ * the canonical primary fingerprint rather than treating child exit 0 as
+ * sufficient identity proof. */
 static int validate_gpg_key_availability_mode(const char *gpg_key_id,
                                               bool allow_cached) {
+    char canonical[GPG_FINGERPRINT_BUFSIZE];
+
     if (!gpg_key_id) {
         return -1;
     }
@@ -2967,32 +2968,21 @@ static int validate_gpg_key_availability_mode(const char *gpg_key_id,
         return 0;
     }
 
-    /* Look up the key in the system keyring, no shell. */
-    const char *argv[] = {"gpg", "--list-secret-keys", gpg_key_id, NULL};
-    run_opts_t opts;
-    char source_home[MAX_PATH_LEN];
-    char source_env_str[MAX_PATH_LEN + sizeof("GNUPGHOME=")];
-    const char *source_env[2] = {NULL, NULL};
-    memset(&opts, 0, sizeof(opts));
-    opts.stderr_to_devnull = true;
-    if (gpg_manager_system_keyring_home(source_home, sizeof(source_home)) != 0) {
-        log_debug("Could not resolve the real/system GPG keyring home");
-        set_error(ERR_GPG_KEY_NOT_FOUND,
-                  "Cannot resolve the real/system GPG keyring home");
-        return -1;
-    }
-    snprintf(source_env_str, sizeof(source_env_str), "GNUPGHOME=%s", source_home);
-    source_env[0] = source_env_str;
-    opts.extra_env = source_env;
-
-    if (run_argv(argv, &opts, NULL) != 0) {
-        log_debug("GPG key %s not found in keyring", gpg_key_id);
-        set_error(ERR_GPG_KEY_NOT_FOUND,
-                  "GPG secret key not found in the real/system keyring: %s",
-                  gpg_key_id);
+    if (gpg_manager_resolve_system_key(gpg_key_id, false, canonical,
+                                       sizeof(canonical)) != 0) {
+        log_debug("GPG selector %s is unavailable in the pinned system "
+                  "keyring: %s",
+                  gpg_key_id,
+                  get_last_error()->message[0]
+                      ? get_last_error()->message
+                      : "unknown resolver error");
+        /* Preserve the resolver's exact miss/setup/signal/pipe/GPG failure
+         * classification. Recasting every failure as key-not-found would
+         * undo T14's result-truth contract at this accounts boundary. */
         return -1;
     }
 
+    gpg_manager_note_key_available(canonical);
     gpg_manager_note_key_available(gpg_key_id);
     return 0;
 }

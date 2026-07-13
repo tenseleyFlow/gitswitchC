@@ -41,6 +41,24 @@ static int null_runner(const char *const argv[], const run_opts_t *opts,
 }
 
 static int g_source_probe_count;
+static bool g_source_probe_pinned;
+
+#define ACCOUNT_SYSTEM_FPR "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+static const char account_system_listing[] =
+    "sec:u:4096:1:BBBBBBBBBBBBBBBB:1700000000:::-:::scESC:::+:::23::0:\n"
+    "fpr:::::::::" ACCOUNT_SYSTEM_FPR ":\n";
+
+static bool source_probe_uses_pinned_home(const run_opts_t *opts) {
+    const char *const *env;
+    bool dot_home = false;
+
+    for (env = opts ? opts->extra_env : NULL; env && *env; env++) {
+        if (strcmp(*env, "GNUPGHOME=.") == 0) {
+            dot_home = true;
+        }
+    }
+    return opts && opts->use_cwd_fd && opts->cwd_fd >= 0 && dot_home;
+}
 
 static int missing_system_gpg_key_runner(const char *const argv[],
                                          const run_opts_t *opts,
@@ -63,9 +81,64 @@ static int missing_system_gpg_key_runner(const char *const argv[],
     }
     if (list_secret) {
         g_source_probe_count++;
+        g_source_probe_pinned = source_probe_uses_pinned_home(opts);
         return -1;
     }
     return 0;
+}
+
+static int present_system_gpg_key_runner(const char *const argv[],
+                                         const run_opts_t *opts,
+                                         run_result_t *result) {
+    bool list_secret = false;
+
+    if (argv && argv[0] && strcmp(argv[0], "gpg") == 0) {
+        for (size_t i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "--list-secret-keys") == 0) {
+                list_secret = true;
+                break;
+            }
+        }
+    }
+    if (!list_secret) return null_runner(argv, opts, result);
+
+    g_source_probe_count++;
+    g_source_probe_pinned = source_probe_uses_pinned_home(opts);
+    if (opts && opts->out && opts->out_size > 0) {
+        snprintf(opts->out, opts->out_size, "%s", account_system_listing);
+    }
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->out_len = strlen(account_system_listing);
+    }
+    return 0;
+}
+
+static int failed_system_gpg_setup_runner(const char *const argv[],
+                                          const run_opts_t *opts,
+                                          run_result_t *result) {
+    bool list_secret = false;
+
+    if (argv && argv[0] && strcmp(argv[0], "gpg") == 0) {
+        for (size_t i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "--list-secret-keys") == 0) {
+                list_secret = true;
+                break;
+            }
+        }
+    }
+    if (!list_secret) return null_runner(argv, opts, result);
+
+    g_source_probe_count++;
+    g_source_probe_pinned = source_probe_uses_pinned_home(opts);
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 126;
+    }
+    return -1;
 }
 
 static int fail_predelete(int home_fd) {
@@ -528,6 +601,7 @@ TEST(targeted_gpg_reset_failure_preserves_the_edit_retry_handle) {
 
 TEST(targeted_gpg_reset_still_requires_a_fresh_system_key_source) {
     char root[256], key_one[512], key_two[512], home[512], marker[768];
+    char source_home[512];
     gitswitch_ctx_t ctx;
     account_t original, changed;
     command_runner_fn old_runner;
@@ -535,6 +609,9 @@ TEST(targeted_gpg_reset_still_requires_a_fresh_system_key_source) {
 
     CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
                               key_two, sizeof(key_two)), 0);
+    CHECK((size_t)snprintf(source_home, sizeof(source_home), "%s/.gnupg",
+                           root) < sizeof(source_home));
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
     CHECK_EQ_INT(make_gpg_home(root, "one", home, sizeof(home), marker,
                                sizeof(marker)), 0);
     memset(&ctx, 0, sizeof(ctx));
@@ -562,17 +639,38 @@ TEST(targeted_gpg_reset_still_requires_a_fresh_system_key_source) {
      * account when that fresh source probe fails. */
     gpg_manager_note_key_available(changed.gpg_key_id);
     g_source_probe_count = 0;
+    g_source_probe_pinned = false;
     run_set_runner(missing_system_gpg_key_runner);
     CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), -1);
     CHECK_EQ_INT(g_source_probe_count, 1);
+    CHECK(g_source_probe_pinned);
     CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "AAAAAAAAAAAAAAAA");
     CHECK(!path_exists(home));
-    CHECK(strstr(get_last_error()->message, "real/system keyring") != NULL);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GPG_KEY_NOT_FOUND);
+    CHECK(strstr(get_last_error()->message, "resolved no secret key") != NULL);
+
+    /* An operational helper failure must survive the accounts boundary as an
+     * operational GPG error, never be flattened into the ordinary miss above. */
+    g_source_probe_count = 0;
+    g_source_probe_pinned = false;
+    run_set_runner(failed_system_gpg_setup_runner);
+    CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), -1);
+    CHECK_EQ_INT(g_source_probe_count, 1);
+    CHECK(g_source_probe_pinned);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GPG_KEY_FAILED);
+    CHECK(strstr(get_last_error()->message, "child setup or exec") != NULL);
+    CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "AAAAAAAAAAAAAAAA");
 
     /* Positive control: once a fresh system-keyring probe succeeds, the same
      * post-reset identity edit may proceed. */
-    run_set_runner(null_runner);
+    g_source_probe_count = 0;
+    g_source_probe_pinned = false;
+    run_set_runner(present_system_gpg_key_runner);
     CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), 0);
+    CHECK_EQ_INT(g_source_probe_count, 1);
+    CHECK(g_source_probe_pinned);
+    CHECK(gpg_manager_key_available_cached(ACCOUNT_SYSTEM_FPR));
+    CHECK(gpg_manager_key_available_cached(changed.gpg_key_id));
     CHECK_EQ_INT(accounts_edit_commit(&ctx), 0);
     end_edit_guard();
     CHECK_STR_EQ(ctx.accounts[0].name, "one");
