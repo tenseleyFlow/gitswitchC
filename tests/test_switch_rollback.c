@@ -50,6 +50,11 @@ static char g_xdg[256];
 static char g_ssh_sock[512];   /* <xdg>/gitswitch-ssh/current.sock */
 static char g_gpg_link[512];   /* <xdg>/gitswitch-gpg/current */
 static char g_gpg_source_home[512]; /* external source keyring fixture */
+static char g_gpg_command_dir[MAX_PATH_LEN];
+static char *g_gpg_saved_path;
+static bool g_gpg_saved_path_present;
+static bool g_gpg_command_fixture_active;
+static bool g_host_gpg_available;
 
 /* Create a fresh fake XDG_RUNTIME_DIR holding the pre-switch runtime state of
  * a "previous" account: a current.sock symlink and a GNUPGHOME `current`
@@ -104,6 +109,118 @@ static int setup_gpg_source_home(void) {
     }
     if (mkdir(g_gpg_source_home, 0700) != 0) return -1;
     return setenv("GNUPGHOME", g_gpg_source_home, 1);
+}
+
+/* These cases fake every GPG child invocation, but gpg_manager_init still
+ * performs production's descriptor-pinned availability check. Homebrew's
+ * shared, group-writable prefix is intentionally rejected by that resolver,
+ * even though the installed gpg is a valid CI dependency. First execute the
+ * host command solely as a test-capability preflight; when it is runnable,
+ * prepend a private trusted script that command_exists can validate. The
+ * script is a tripwire: the fake runner must intercept it before execution. */
+static int host_gpg_preflight(void) {
+    int status;
+    pid_t waited;
+    pid_t pid = fork();
+
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        int null_fd = open("/dev/null", O_WRONLY);
+        if (null_fd < 0 || dup2(null_fd, STDOUT_FILENO) < 0 ||
+            dup2(null_fd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
+        if (null_fd > STDERR_FILENO) close(null_fd);
+        execlp("gpg", "gpg", "--version", (char *)NULL);
+        _exit(127);
+    }
+
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid) return -1;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 1 : 0;
+}
+
+static int restore_gpg_command_fixture(void) {
+    int rc;
+
+    if (!g_gpg_command_fixture_active) return 0;
+    rc = g_gpg_saved_path_present
+             ? setenv("PATH", g_gpg_saved_path, 1)
+             : unsetenv("PATH");
+    free(g_gpg_saved_path);
+    g_gpg_saved_path = NULL;
+    g_gpg_saved_path_present = false;
+    g_gpg_command_fixture_active = false;
+    return rc;
+}
+
+static int setup_gpg_command_fixture(void) {
+    static const char script[] = "#!/bin/sh\nexit 125\n";
+    const char *path = getenv("PATH");
+    char command_path[MAX_PATH_LEN];
+    char *saved_path = NULL;
+    char *fixture_path = NULL;
+    size_t dir_len;
+    size_t path_len = path ? strlen(path) : 0;
+    size_t fixture_len;
+    bool append_path = path_len > 0;
+
+    if (path) {
+        saved_path = strdup(path);
+        if (!saved_path) return -1;
+    }
+    if (!ts_mkdtemp_trusted(g_gpg_command_dir,
+                            sizeof(g_gpg_command_dir), "gsw-gpg-bin") ||
+        safe_snprintf(command_path, sizeof(command_path), "%s/gpg",
+                      g_gpg_command_dir) != 0 ||
+        write_string_to_file(command_path, script, 0700) != 0) {
+        free(saved_path);
+        return -1;
+    }
+
+    dir_len = strlen(g_gpg_command_dir);
+    if (path_len > SIZE_MAX - dir_len - 2) {
+        free(saved_path);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    fixture_len = dir_len + (append_path ? path_len + 1 : 0) + 1;
+    fixture_path = malloc(fixture_len);
+    if (!fixture_path) {
+        free(saved_path);
+        return -1;
+    }
+    memcpy(fixture_path, g_gpg_command_dir, dir_len);
+    if (append_path) {
+        fixture_path[dir_len] = ':';
+        memcpy(fixture_path + dir_len + 1, path, path_len);
+        fixture_path[dir_len + path_len + 1] = '\0';
+    } else {
+        fixture_path[dir_len] = '\0';
+    }
+
+    if (setenv("PATH", fixture_path, 1) != 0) {
+        free(fixture_path);
+        free(saved_path);
+        return -1;
+    }
+    free(fixture_path);
+    g_gpg_saved_path = saved_path;
+    g_gpg_saved_path_present = path != NULL;
+    g_gpg_command_fixture_active = true;
+    if (!command_exists("gpg")) {
+        int saved_errno = errno;
+        (void)restore_gpg_command_fixture();
+        errno = saved_errno ? saved_errno : ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
+static bool gpg_test_command_available(void) {
+    return g_host_gpg_available && command_exists("gpg");
 }
 
 static bool symlink_present(const char *path) {
@@ -1037,8 +1154,10 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
  * lookup failure reaped the previous account's healthy agent and unlinked
  * current.sock for a switch that never started. */
 TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
-    char key_path[512], emptybin[512], saved_path[4096];
+    char key_path[512], emptybin[512];
     const char *env_path;
+    char *saved_path;
+    bool saved_path_present;
     FILE *kf;
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1068,10 +1187,13 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     /* Cripple PATH: an empty (but trusted) dir makes command_exists fail for
      * ssh-agent/ssh-add without any agent operation being attempted. */
     env_path = getenv("PATH");
-    snprintf(saved_path, sizeof(saved_path), "%s", env_path ? env_path : "");
+    saved_path_present = env_path != NULL;
+    saved_path = env_path ? strdup(env_path) : NULL;
+    CHECK(!saved_path_present || saved_path != NULL);
+    if (saved_path_present && !saved_path) return;
     snprintf(emptybin, sizeof(emptybin), "%s/emptybin", g_xdg);
     CHECK_EQ_INT(mkdir(emptybin, 0755), 0);
-    setenv("PATH", emptybin, 1);
+    CHECK_EQ_INT(setenv("PATH", emptybin, 1), 0);
 
     g_fail_user_name_set = false;
     g_raise_on_user_name = false;
@@ -1079,7 +1201,15 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     command_runner_fn prev = run_set_runner(fake_runner);
     int rc = accounts_switch(&ctx, "testacct");
     run_set_runner(prev);
-    setenv("PATH", saved_path, 1);
+    CHECK_EQ_INT(saved_path_present ? setenv("PATH", saved_path, 1)
+                                    : unsetenv("PATH"),
+                 0);
+    if (saved_path_present) {
+        CHECK_STR_EQ(getenv("PATH"), saved_path);
+    } else {
+        CHECK(getenv("PATH") == NULL);
+    }
+    free(saved_path);
 
     CHECK_EQ_INT(rc, -1);
     /* The previous account's entry points were never disturbed and must
@@ -2029,8 +2159,8 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     char target[512];
     ssize_t n;
 
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -2075,8 +2205,8 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     char target[MAX_PATH_LEN];
     ssize_t n;
 
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -2112,8 +2242,8 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
 TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     char active_home[MAX_PATH_LEN];
 
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -2161,8 +2291,8 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
     char active_gpg_home[MAX_PATH_LEN];
     ssize_t target_len;
 
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
         TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
@@ -2226,8 +2356,8 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
 }
 
 TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -2266,8 +2396,8 @@ TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
  * `current` makes the stable-home commit fail. That failure must abort before
  * Git/active state changes and must not disturb the independent SSH link. */
 TEST(gpg_stable_link_obstruction_aborts_integrated_switch) {
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -2315,8 +2445,8 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
 
     /* gpg_manager_init PATH-probes the real gpg binary (the runner fakes the
      * spawns themselves). */
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -2375,8 +2505,8 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
     char target[512];
     ssize_t n;
 
-    if (!command_exists("gpg")) {
-        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -2937,6 +3067,16 @@ TEST_MAIN_BEGIN()
     RUN_TEST(failed_switch_preserves_concurrent_ssh_config_replacement);
     RUN_TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back);
     RUN_TEST(symlinked_ssh_config_fails_before_switch_mutation);
+    int gpg_preflight_rc = host_gpg_preflight();
+    if (gpg_preflight_rc < 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot run host GPG preflight\n");
+        return 1;
+    }
+    g_host_gpg_available = gpg_preflight_rc > 0;
+    if (g_host_gpg_available && setup_gpg_command_fixture() != 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot prepare trusted GPG probe\n");
+        return 1;
+    }
     RUN_TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback);
     RUN_TEST(signing_capability_failure_precedes_runtime_and_git_publication);
     RUN_TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry);
@@ -2945,6 +3085,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_retargets_gpg_current_to_previous_home);
     RUN_TEST(failed_switch_does_not_overwrite_later_gpg_writer);
+    if (restore_gpg_command_fixture() != 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot restore PATH after GPG tests\n");
+        return 1;
+    }
     RUN_TEST(direct_switch_restores_callers_signal_dispositions);
     RUN_TEST(direct_switch_reports_signal_restoration_failure_after_commit);
     RUN_TEST(direct_switch_dispatches_signal_arriving_during_guard_end);
