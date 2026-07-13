@@ -578,6 +578,58 @@ static int config_lock_child_contended(void) {
     return WEXITSTATUS(status);
 }
 
+/* AR-08 L7: config_write_lock exposes the shared private-lock token. If a
+ * caller closes that opaque handle and the fd number is reused, unlock must
+ * preserve the replacement while still retiring every lock reference. */
+TEST(config_lock_release_preserves_reused_fd_and_retires_context) {
+    char home[128], saved_home[512], dotconfig[256], config_dir[512];
+    char lock_path[640];
+    int token = -1;
+    int replacement = -1;
+    bool released = false;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(home, sizeof(home)), 0);
+    snprintf(dotconfig, sizeof(dotconfig), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", dotconfig);
+    snprintf(lock_path, sizeof(lock_path), "%s/.config.lock", config_dir);
+    CHECK_EQ_INT(mkdir(dotconfig, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+
+    token = config_write_lock();
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+    close(token);
+    replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    CHECK(replacement >= 0);
+    if (replacement < 0) goto cleanup;
+    if (replacement != token) {
+        CHECK_EQ_INT(dup2(replacement, token), token);
+        close(replacement);
+        replacement = token;
+        CHECK_EQ_INT(fcntl(replacement, F_SETFD, FD_CLOEXEC), 0);
+    }
+
+    errno = ENOTTY;
+    config_write_unlock(token);
+    released = true;
+    CHECK_EQ_INT(errno, ENOTTY);
+    CHECK(fcntl(replacement, F_GETFD) >= 0);
+    /* The existing helper exits 1 when it acquired. An identity-mismatch
+     * early return would leave the parent's registry lock held and yield 0. */
+    CHECK_EQ_INT(config_lock_child_contended(), 1);
+
+cleanup:
+    if (!released && token >= 0) config_write_unlock(token);
+    if (replacement >= 0) close(replacement);
+    (void)unlink(lock_path);
+    (void)rmdir(config_dir);
+    (void)rmdir(dotconfig);
+    (void)rmdir(home);
+    restore_home_env(saved_home);
+}
+
 TEST(config_lock_survives_post_acquisition_namespace_replacement) {
     char home[128], saved_home[512], dotconfig[256], config_dir[512];
     char moved_dir[512], lock[640], moved_lock[640];
@@ -1814,6 +1866,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(config_init_rejects_nondirectory_final_components);
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
     RUN_TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode);
+    RUN_TEST(config_lock_release_preserves_reused_fd_and_retires_context);
     RUN_TEST(config_lock_survives_post_acquisition_namespace_replacement);
     RUN_TEST(config_init_preserves_symlinked_parent_policy);
     RUN_TEST(save_refuses_symlinked_config_path);

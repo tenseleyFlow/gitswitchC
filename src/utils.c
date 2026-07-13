@@ -77,6 +77,7 @@ typedef struct {
     int token_fd;
     dev_t token_dev;
     ino_t token_ino;
+    uint64_t token_generation;
     size_t parent_slot;
     size_t leaf_slot;
     size_t file_slot;
@@ -85,6 +86,7 @@ typedef struct {
 typedef struct {
     bool active;
     int lock_fd;
+    uint64_t lock_generation;
     int parent_fd;
     int dir_fd;
     dev_t parent_dev;
@@ -99,6 +101,7 @@ static private_lock_inode_t g_private_lock_inodes[PRIVATE_LOCK_INODES];
 static private_lock_context_t g_private_lock_contexts[PRIVATE_LOCK_CONTEXTS];
 static pid_t g_private_lock_pid;
 static pid_t g_runtime_lock_pid;
+static uint64_t g_private_lock_next_generation;
 
 /* String utilities */
 
@@ -782,7 +785,26 @@ static void private_lock_prepare_process(void) {
     }
     memset(g_private_lock_contexts, 0, sizeof(g_private_lock_contexts));
     memset(g_private_lock_inodes, 0, sizeof(g_private_lock_inodes));
+    g_private_lock_next_generation = 0;
     g_private_lock_pid = pid;
+}
+
+static int private_lock_allocate_generation(uint64_t *generation_out) {
+    if (!generation_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (g_private_lock_next_generation == UINT64_MAX) {
+        for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+            if (g_private_lock_contexts[i].active) {
+                errno = EOVERFLOW;
+                return -1;
+            }
+        }
+        g_private_lock_next_generation = 0;
+    }
+    *generation_out = ++g_private_lock_next_generation;
+    return 0;
 }
 
 static int private_lock_inode_acquire(int owned_fd, bool nonblocking,
@@ -853,6 +875,7 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     int leaf_fd = -1;
     int file_fd = -1;
     int token_fd = -1;
+    uint64_t token_generation = 0;
     size_t parent_slot = PRIVATE_LOCK_INODES;
     size_t leaf_slot = PRIVATE_LOCK_INODES;
     size_t file_slot = PRIVATE_LOCK_INODES;
@@ -944,11 +967,13 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     }
     token_fd = private_lock_dup_cloexec(g_private_lock_inodes[file_slot].fd);
     if (token_fd < 0) goto fail;
+    if (private_lock_allocate_generation(&token_generation) != 0) goto fail;
 
     g_private_lock_contexts[context_slot].active = true;
     g_private_lock_contexts[context_slot].token_fd = token_fd;
     g_private_lock_contexts[context_slot].token_dev = opened.st_dev;
     g_private_lock_contexts[context_slot].token_ino = opened.st_ino;
+    g_private_lock_contexts[context_slot].token_generation = token_generation;
     g_private_lock_contexts[context_slot].parent_slot = parent_slot;
     g_private_lock_contexts[context_slot].leaf_slot = leaf_slot;
     g_private_lock_contexts[context_slot].file_slot = file_slot;
@@ -974,29 +999,84 @@ int try_lock_private_file_at(int dir_fd, const char *name) {
     return lock_private_file_at_mode(dir_fd, name, true);
 }
 
-void unlock_private_file(int token_fd) {
-    private_lock_prepare_process();
-    if (token_fd < 0) return;
+static uint64_t private_lock_latest_generation_for_fd(int token_fd) {
+    uint64_t latest = 0;
+
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        const private_lock_context_t *ctx = &g_private_lock_contexts[i];
+        if (ctx->active && ctx->token_fd == token_fd &&
+            ctx->token_generation > latest) {
+            latest = ctx->token_generation;
+        }
+    }
+    return latest;
+}
+
+static void private_lock_context_retire(private_lock_context_t *ctx,
+                                        bool close_live_token) {
+    size_t parent_slot = ctx->parent_slot;
+    size_t leaf_slot = ctx->leaf_slot;
+    size_t file_slot = ctx->file_slot;
+
+    if (close_live_token &&
+        private_lock_fd_has_identity(ctx->token_fd, ctx->token_dev,
+                                     ctx->token_ino)) {
+        close(ctx->token_fd);
+    }
+    memset(ctx, 0, sizeof(*ctx));
+    private_lock_inode_release(file_slot);
+    private_lock_inode_release(leaf_slot);
+    private_lock_inode_release(parent_slot);
+}
+
+static bool private_lock_release_generation(int token_fd,
+                                            uint64_t token_generation) {
+    uint64_t latest = private_lock_latest_generation_for_fd(token_fd);
 
     for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
         private_lock_context_t *ctx = &g_private_lock_contexts[i];
-        if (ctx->active && ctx->token_fd == token_fd) {
-            size_t parent_slot = ctx->parent_slot;
-            size_t leaf_slot = ctx->leaf_slot;
-            size_t file_slot = ctx->file_slot;
-            close(ctx->token_fd);
-            memset(ctx, 0, sizeof(*ctx));
-            private_lock_inode_release(file_slot);
-            private_lock_inode_release(leaf_slot);
-            private_lock_inode_release(parent_slot);
-            return;
+        if (ctx->active && ctx->token_fd == token_fd &&
+            ctx->token_generation == token_generation) {
+            private_lock_context_retire(
+                ctx, token_generation == latest && latest != 0);
+            return true;
         }
     }
+    return false;
+}
 
-    /* Opaque tokens are valid only while registered in this process.  An
-     * inherited token can be closed and its descriptor number reused before
-     * the first post-fork release.  Acting on an unknown number here would
-     * unlock/close that unrelated resource, so stale tokens are a no-op. */
+void unlock_private_file(int token_fd) {
+    private_lock_context_t *oldest = NULL;
+    int saved_errno = errno;
+
+    private_lock_prepare_process();
+    if (token_fd < 0) {
+        errno = saved_errno;
+        return;
+    }
+
+    /* A closed token number can be reused by a later registered token. The
+     * only descriptor that can still be live is the newest registration for
+     * that number; consume older generations one release at a time without
+     * closing the descriptor. This also resolves same-inode ABA, for which a
+     * device/inode comparison alone cannot distinguish nested registrations. */
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        private_lock_context_t *ctx = &g_private_lock_contexts[i];
+        if (ctx->active && ctx->token_fd == token_fd &&
+            (!oldest ||
+             ctx->token_generation < oldest->token_generation)) {
+            oldest = ctx;
+        }
+    }
+    if (oldest) {
+        (void)private_lock_release_generation(token_fd,
+                                              oldest->token_generation);
+    }
+
+    /* Opaque tokens are valid only while registered in this process. Unknown
+     * or double-released numbers are no-ops; acting on them could close an
+     * unrelated descriptor that later reused the integer. */
+    errno = saved_errno;
 }
 
 static void runtime_lock_prepare_process(void) {
@@ -1034,6 +1114,7 @@ int runtime_state_lock_acquire(void) {
     int parent_fd = -1;
     int dir_fd = -1;
     int lock_fd = -1;
+    uint64_t lock_generation = 0;
     int written;
 
     runtime_lock_prepare_process();
@@ -1093,6 +1174,16 @@ int runtime_state_lock_acquire(void) {
         }
         return -1;
     }
+    lock_generation = private_lock_latest_generation_for_fd(lock_fd);
+    if (lock_generation == 0) {
+        unlock_private_file(lock_fd);
+        close(dir_fd);
+        close(parent_fd);
+        errno = EINVAL;
+        set_error(ERR_SYSTEM_CALL,
+                  "Shared runtime lock token was not registered");
+        return -1;
+    }
 
     /* A same-uid process may have renamed/replaced either path between the
      * opens and the (non-blocking) flock succeeding.  Keep both descriptors
@@ -1110,7 +1201,7 @@ int runtime_state_lock_acquire(void) {
         fstatat(parent_fd, child_name, &dir_entry_st,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         !same_fs_identity(&dir_st, &dir_entry_st)) {
-        unlock_private_file(lock_fd);
+        (void)private_lock_release_generation(lock_fd, lock_generation);
         close(dir_fd);
         close(parent_fd);
         set_error(ERR_PERMISSION_DENIED,
@@ -1122,6 +1213,7 @@ int runtime_state_lock_acquire(void) {
         if (!g_runtime_locks[i].active) {
             g_runtime_locks[i].active = true;
             g_runtime_locks[i].lock_fd = lock_fd;
+            g_runtime_locks[i].lock_generation = lock_generation;
             g_runtime_locks[i].parent_fd = parent_fd;
             g_runtime_locks[i].dir_fd = dir_fd;
             g_runtime_locks[i].parent_dev = parent_st.st_dev;
@@ -1135,7 +1227,7 @@ int runtime_state_lock_acquire(void) {
             return lock_fd;
         }
     }
-    unlock_private_file(lock_fd);
+    (void)private_lock_release_generation(lock_fd, lock_generation);
     close(dir_fd);
     close(parent_fd);
     set_error(ERR_SYSTEM_CALL, "Too many nested shared runtime locks");
@@ -1145,8 +1237,19 @@ int runtime_state_lock_acquire(void) {
 void runtime_state_lock_release(int fd) {
     runtime_lock_prepare_process();
     if (fd >= 0) {
+        size_t selected = RUNTIME_LOCK_CONTEXTS;
+
         for (size_t i = 0; i < RUNTIME_LOCK_CONTEXTS; i++) {
-            if (g_runtime_locks[i].active && g_runtime_locks[i].lock_fd == fd) {
+            if (g_runtime_locks[i].active && g_runtime_locks[i].lock_fd == fd &&
+                (selected == RUNTIME_LOCK_CONTEXTS ||
+                 g_runtime_locks[i].lock_generation <
+                     g_runtime_locks[selected].lock_generation)) {
+                selected = i;
+            }
+        }
+        if (selected != RUNTIME_LOCK_CONTEXTS) {
+            size_t i = selected;
+
                 /* Retained descriptors are deliberately closed only after the
                  * critical section; release also performs a final namespace
                  * check as diagnostic hardening. The void API cannot surface a
@@ -1223,14 +1326,13 @@ void runtime_state_lock_release(int fd) {
                                 g_runtime_locks[i].parent_path,
                                 g_runtime_locks[i].child_name);
                 }
-                unlock_private_file(fd);
+                (void)private_lock_release_generation(
+                    fd, g_runtime_locks[i].lock_generation);
                 close(g_runtime_locks[i].dir_fd);
                 close(g_runtime_locks[i].parent_fd);
                 memset(&g_runtime_locks[i], 0, sizeof(g_runtime_locks[i]));
                 return;
-            }
         }
-        unlock_private_file(fd);
     }
 }
 

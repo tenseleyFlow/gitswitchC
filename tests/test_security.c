@@ -518,6 +518,406 @@ cleanup:
     }
 }
 
+static int replace_fd_with_devnull(int target_fd) {
+    int replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
+    if (replacement < 0) return -1;
+    if (replacement != target_fd) {
+        if (dup2(replacement, target_fd) != target_fd) {
+            int saved_errno = errno;
+            close(replacement);
+            errno = saved_errno;
+            return -1;
+        }
+        close(replacement);
+        if (fcntl(target_fd, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            close(target_fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    return target_fd;
+}
+
+static int occupy_fds_through(int target_fd, int *fds, size_t capacity,
+                              size_t *count_out) {
+    size_t count = 0;
+
+    if (!fds || !count_out || target_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    while (count < capacity) {
+        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+
+        if (fd < 0) goto fail;
+        if (fd > target_fd) {
+            close(fd);
+            errno = ERANGE;
+            goto fail;
+        }
+        fds[count++] = fd;
+        if (fd == target_fd) {
+            *count_out = count;
+            return 0;
+        }
+    }
+    errno = EMFILE;
+
+fail: {
+        int saved_errno = errno;
+        while (count > 0) close(fds[--count]);
+        errno = saved_errno;
+        return -1;
+    }
+}
+
+/* Return 0 when a disposable contender acquires, 1 for expected contention,
+ * and 2+ for harness/setup failures. */
+static int private_lock_child_outcome(const char *directory,
+                                      const char *lock_name) {
+    pid_t child = fork();
+    int status = 0;
+
+    if (child < 0) return 2;
+    if (child == 0) {
+        int dir_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        int token;
+
+        if (dir_fd < 0) _exit(3);
+        token = try_lock_private_file_at(dir_fd, lock_name);
+        close(dir_fd);
+        if (token >= 0) {
+            unlock_private_file(token);
+            _exit(0);
+        }
+        if (errno == EWOULDBLOCK
+#if EAGAIN != EWOULDBLOCK
+            || errno == EAGAIN
+#endif
+        ) {
+            _exit(1);
+        }
+        _exit(4);
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 5;
+    return WEXITSTATUS(status);
+}
+
+/* AR-08 L7: an exposed token is only an opaque handle. Closing it and reusing
+ * the integer must not let release close the replacement, but the stale
+ * context still has to retire its registry references so nested locks remain
+ * live only for their real owners. Double-release is an unknown-token no-op. */
+TEST(private_lock_release_identity_checks_reused_and_nested_tokens) {
+    char root[] = "/tmp/gs_private_lock_reuse_XXXXXX";
+    char lock_path[512];
+    int dir_fd = -1;
+    int first = -1;
+    int second = -1;
+    int replacement = -1;
+    int double_replacement = -1;
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+    first = lock_private_file_at(dir_fd, ".test-lock");
+    second = lock_private_file_at(dir_fd, ".test-lock");
+    CHECK(first >= 0);
+    CHECK(second >= 0);
+    if (first < 0 || second < 0) goto cleanup;
+
+    close(first);
+    replacement = replace_fd_with_devnull(first);
+    CHECK_EQ_INT(replacement, first);
+    if (replacement < 0) goto cleanup;
+    errno = ERANGE;
+    unlock_private_file(first);
+    CHECK_EQ_INT(errno, ERANGE);
+    CHECK(fcntl(replacement, F_GETFD) >= 0);
+    CHECK_EQ_INT(private_lock_child_outcome(root, ".test-lock"), 1);
+
+    unlock_private_file(second);
+    second = -1;
+    CHECK_EQ_INT(private_lock_child_outcome(root, ".test-lock"), 0);
+
+    close(replacement);
+    replacement = -1;
+    double_replacement = replace_fd_with_devnull(first);
+    CHECK_EQ_INT(double_replacement, first);
+    errno = ENOTTY;
+    unlock_private_file(first);
+    CHECK_EQ_INT(errno, ENOTTY);
+    CHECK(fcntl(double_replacement, F_GETFD) >= 0);
+
+cleanup:
+    if (first >= 0 && replacement < 0 && double_replacement < 0) {
+        unlock_private_file(first);
+    }
+    if (second >= 0) unlock_private_file(second);
+    if (replacement >= 0) close(replacement);
+    if (double_replacement >= 0) close(double_replacement);
+    if (dir_fd >= 0) close(dir_fd);
+    (void)unlink(lock_path);
+    (void)rmdir(root);
+}
+
+/* A stale context can share both the numeric descriptor and inode identity of
+ * a newer nested token. The older generation must be consumed first without
+ * closing or releasing the newer registered lock (the ABA rejected by the
+ * independent AR-08 L7 review). */
+TEST(private_lock_release_preserves_newer_registered_token_on_aba) {
+    char root[] = "/tmp/gs_private_lock_aba_XXXXXX";
+    char filler_path[512], target_path[512];
+    int occupied[128];
+    size_t occupied_count = 0;
+    int dir_fd = -1;
+    int filler = -1;
+    int stale = -1;
+    int live = -1;
+    bool stale_retired = false;
+
+    for (size_t i = 0; i < sizeof(occupied) / sizeof(occupied[0]); i++) {
+        occupied[i] = -1;
+    }
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(filler_path, sizeof(filler_path), "%s/.filler", root);
+    snprintf(target_path, sizeof(target_path), "%s/.target", root);
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+
+    filler = lock_private_file_at(dir_fd, ".filler");
+    stale = lock_private_file_at(dir_fd, ".target");
+    CHECK(filler >= 0);
+    CHECK(stale >= 0);
+    if (filler < 0 || stale < 0) goto cleanup;
+    unlock_private_file(filler);
+    filler = -1;
+    close(stale);
+
+    CHECK_EQ_INT(occupy_fds_through(
+                     stale, occupied,
+                     sizeof(occupied) / sizeof(occupied[0]), &occupied_count),
+                 0);
+    if (occupied_count == 0) goto cleanup;
+    CHECK_EQ_INT(occupied[occupied_count - 1], stale);
+    close(occupied[occupied_count - 1]);
+    occupied[occupied_count - 1] = -1;
+
+    live = lock_private_file_at(dir_fd, ".target");
+    CHECK_EQ_INT(live, stale);
+    if (live < 0 || live != stale) goto cleanup;
+
+    errno = ENOTTY;
+    unlock_private_file(stale);
+    stale_retired = true;
+    CHECK_EQ_INT(errno, ENOTTY);
+    CHECK(fcntl(live, F_GETFD) >= 0);
+    CHECK_EQ_INT(private_lock_child_outcome(root, ".target"), 1);
+
+    unlock_private_file(live);
+    live = -1;
+    CHECK_EQ_INT(private_lock_child_outcome(root, ".target"), 0);
+
+cleanup:
+    if (!stale_retired && stale >= 0) unlock_private_file(stale);
+    if (live >= 0) unlock_private_file(live);
+    if (filler >= 0) unlock_private_file(filler);
+    for (size_t i = 0; i < occupied_count; i++) {
+        if (occupied[i] >= 0) close(occupied[i]);
+    }
+    if (dir_fd >= 0) close(dir_fd);
+    (void)unlink(filler_path);
+    (void)unlink(target_path);
+    (void)rmdir(root);
+}
+
+/* A runtime-token release must never fall through into the generic registry:
+ * a foreign integer could be a live private-lock token in the same process. */
+TEST(runtime_lock_release_ignores_foreign_private_token) {
+    char root[] = "/tmp/gs_runtime_foreign_token_XXXXXX";
+    char lock_path[512];
+    int dir_fd = -1;
+    int token = -1;
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+    token = lock_private_file_at(dir_fd, ".test-lock");
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+
+    runtime_state_lock_release(token);
+    CHECK(fcntl(token, F_GETFD) >= 0);
+    CHECK_EQ_INT(private_lock_child_outcome(root, ".test-lock"), 1);
+    unlock_private_file(token);
+    token = -1;
+    CHECK_EQ_INT(private_lock_child_outcome(root, ".test-lock"), 0);
+
+cleanup:
+    if (token >= 0) unlock_private_file(token);
+    if (dir_fd >= 0) close(dir_fd);
+    (void)unlink(lock_path);
+    (void)rmdir(root);
+}
+
+static int runtime_lock_child_outcome(void) {
+    pid_t child = fork();
+    int status = 0;
+
+    if (child < 0) return 2;
+    if (child == 0) {
+        int token = runtime_state_lock_acquire();
+        if (token >= 0) {
+            runtime_state_lock_release(token);
+            _exit(0);
+        }
+        if (errno == EWOULDBLOCK
+#if EAGAIN != EWOULDBLOCK
+            || errno == EAGAIN
+#endif
+        ) {
+            _exit(1);
+        }
+        _exit(3);
+    }
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 4;
+    return WEXITSTATUS(status);
+}
+
+/* Runtime contexts have their own registry layered over private-lock tokens.
+ * Reusing a stale runtime token number for a newer nested runtime token must
+ * consume the old wrapper/generation first, not hijack the newer lock. */
+TEST(runtime_lock_release_preserves_newer_registered_token_on_aba) {
+    char runtime[] = "/tmp/gs_runtime_token_aba_XXXXXX";
+    char lock_dir[512], lock_path[512];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+    int occupied[128];
+    size_t occupied_count = 0;
+    int filler = -1;
+    int stale = -1;
+    int live = -1;
+    bool stale_retired = false;
+
+    for (size_t i = 0; i < sizeof(occupied) / sizeof(occupied[0]); i++) {
+        occupied[i] = -1;
+    }
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+
+    filler = runtime_state_lock_acquire();
+    stale = runtime_state_lock_acquire();
+    CHECK(filler >= 0);
+    CHECK(stale >= 0);
+    if (filler < 0 || stale < 0) goto cleanup;
+    runtime_state_lock_release(filler);
+    filler = -1;
+    close(stale);
+
+    CHECK_EQ_INT(occupy_fds_through(
+                     stale, occupied,
+                     sizeof(occupied) / sizeof(occupied[0]), &occupied_count),
+                 0);
+    CHECK(occupied_count >= 3);
+    if (occupied_count < 3) goto cleanup;
+    CHECK_EQ_INT(occupied[occupied_count - 1], stale);
+    close(occupied[0]);
+    occupied[0] = -1;
+    close(occupied[1]);
+    occupied[1] = -1;
+    close(occupied[occupied_count - 1]);
+    occupied[occupied_count - 1] = -1;
+
+    live = runtime_state_lock_acquire();
+    CHECK_EQ_INT(live, stale);
+    if (live < 0 || live != stale) goto cleanup;
+
+    runtime_state_lock_release(stale);
+    stale_retired = true;
+    CHECK(fcntl(live, F_GETFD) >= 0);
+    CHECK_EQ_INT(runtime_lock_child_outcome(), 1);
+
+    runtime_state_lock_release(live);
+    live = -1;
+    CHECK_EQ_INT(runtime_lock_child_outcome(), 0);
+
+cleanup:
+    if (!stale_retired && stale >= 0) runtime_state_lock_release(stale);
+    if (live >= 0) runtime_state_lock_release(live);
+    if (filler >= 0) runtime_state_lock_release(filler);
+    for (size_t i = 0; i < occupied_count; i++) {
+        if (occupied[i] >= 0) close(occupied[i]);
+    }
+    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-runtime/.lock", runtime);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    (void)unlink(lock_path);
+    (void)rmdir(lock_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
+/* The runtime wrapper adds retained namespace descriptors, but its public
+ * lock token has the same identity contract as a generic private token. */
+TEST(runtime_lock_release_preserves_reused_nested_token) {
+    char runtime[] = "/tmp/gs_runtime_token_reuse_XXXXXX";
+    char lock_dir[512], lock_path[512];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+    int first = -1;
+    int second = -1;
+    int replacement = -1;
+
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    first = runtime_state_lock_acquire();
+    second = runtime_state_lock_acquire();
+    CHECK(first >= 0);
+    CHECK(second >= 0);
+    if (first < 0 || second < 0) goto cleanup;
+
+    close(first);
+    replacement = replace_fd_with_devnull(first);
+    CHECK_EQ_INT(replacement, first);
+    if (replacement < 0) goto cleanup;
+    runtime_state_lock_release(first);
+    first = -1;
+    CHECK(fcntl(replacement, F_GETFD) >= 0);
+    CHECK_EQ_INT(runtime_lock_child_outcome(), 1);
+
+    runtime_state_lock_release(second);
+    second = -1;
+    CHECK_EQ_INT(runtime_lock_child_outcome(), 0);
+
+cleanup:
+    if (first >= 0) runtime_state_lock_release(first);
+    if (second >= 0) runtime_state_lock_release(second);
+    if (replacement >= 0) close(replacement);
+    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-runtime/.lock", runtime);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    (void)unlink(lock_path);
+    (void)rmdir(lock_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
 /* Opaque lock tokens inherited across fork may be closed and their numeric fd
  * reused before the child releases them.  Releasing stale bookkeeping must
  * never close the unrelated replacement descriptor. */
@@ -994,6 +1394,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir);
     RUN_TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting);
     RUN_TEST(runtime_state_lock_excludes_contender_after_leaf_replacement);
+    RUN_TEST(private_lock_release_identity_checks_reused_and_nested_tokens);
+    RUN_TEST(private_lock_release_preserves_newer_registered_token_on_aba);
+    RUN_TEST(runtime_lock_release_ignores_foreign_private_token);
+    RUN_TEST(runtime_lock_release_preserves_newer_registered_token_on_aba);
+    RUN_TEST(runtime_lock_release_preserves_reused_nested_token);
     RUN_TEST(private_lock_release_ignores_reused_inherited_token);
     RUN_TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers);
     RUN_TEST(find_command_path_skips_world_writable_dir);
