@@ -698,12 +698,12 @@ TEST(resume_hint_probe_is_noncreating_and_rejects_other_grammar) {
 static void check_generated_syntax_for_shell(size_t index) {
     char shell_path[PATH_MAX];
     char command[PATH_MAX * 3];
+    int resolved;
 
-    if (resolve_executable(g_shells[index].name, shell_path,
-                           sizeof(shell_path)) != 0) {
-        TS_SKIP(g_shells[index].name,
-                "native shell executable is unavailable");
-    }
+    resolved = resolve_executable(g_shells[index].name, shell_path,
+                                  sizeof(shell_path));
+    CHECK_EQ_INT(resolved, 0);
+    if (resolved != 0) return;
     int written = snprintf(
         command, sizeof(command), "'%s' %s -n '%s' >/dev/null 2>&1",
         shell_path,
@@ -718,13 +718,6 @@ static void check_generated_syntax_for_shell(size_t index) {
 }
 
 static void check_resume_matrix_for_shell(size_t index) {
-    char shell_path[PATH_MAX];
-
-    if (resolve_executable(g_shells[index].name, shell_path,
-                           sizeof(shell_path)) != 0) {
-        TS_SKIP(g_shells[index].name,
-                "native shell executable is unavailable");
-    }
     CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 1, 0, false), 1);
     CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
     CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
@@ -734,13 +727,9 @@ static void check_resume_matrix_for_shell(size_t index) {
 
 static void check_combined_runtime_misses_for_shell(const char *shell) {
     int index = shell_index(shell);
-    char shell_path[PATH_MAX];
 
     CHECK(index >= 0);
     if (index < 0) return;
-    if (resolve_executable(shell, shell_path, sizeof(shell_path)) != 0) {
-        TS_SKIP(shell, "native shell executable is unavailable");
-    }
     CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
                                       true), 0);
     CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
@@ -754,14 +743,10 @@ static void check_combined_runtime_misses_for_shell(const char *shell) {
 static void check_invalid_hints_for_shell(const char *shell) {
     char target[PATH_MAX];
     char oversized[1026];
-    char shell_path[PATH_MAX];
     int index = shell_index(shell);
 
     CHECK(index >= 0);
     if (index < 0) return;
-    if (resolve_executable(shell, shell_path, sizeof(shell_path)) != 0) {
-        TS_SKIP(shell, "native shell executable is unavailable");
-    }
     CHECK_EQ_INT(join_path(target, sizeof(target), g_fixture.root,
                            "/shell-hint-target"), 0);
     memset(oversized, 'x', sizeof(oversized));
@@ -806,9 +791,23 @@ static void check_invalid_hints_for_shell(const char *shell) {
     unlink(target);
 }
 
+#define REQUIRE_NATIVE_SHELL(shell) do {                                    \
+    char ts_shell_path[PATH_MAX];                                           \
+    if (resolve_executable((shell), ts_shell_path,                          \
+                           sizeof(ts_shell_path)) != 0) {                   \
+        TS_SKIP((shell), "native shell executable is unavailable");       \
+    }                                                                       \
+} while (0)
+
 #define DEFINE_SHELL_MATRIX_TESTS(label, index)                              \
-    TEST(label##_generated_syntax) { check_generated_syntax_for_shell(index); } \
-    TEST(label##_resume_matrix) { check_resume_matrix_for_shell(index); }
+    TEST(label##_generated_syntax) {                                        \
+        REQUIRE_NATIVE_SHELL(g_shells[index].name);                         \
+        check_generated_syntax_for_shell(index);                            \
+    }                                                                       \
+    TEST(label##_resume_matrix) {                                           \
+        REQUIRE_NATIVE_SHELL(g_shells[index].name);                         \
+        check_resume_matrix_for_shell(index);                               \
+    }
 
 DEFINE_SHELL_MATRIX_TESTS(bash, 0)
 DEFINE_SHELL_MATRIX_TESTS(zsh, 1)
@@ -819,20 +818,26 @@ DEFINE_SHELL_MATRIX_TESTS(ksh, 5)
 #undef DEFINE_SHELL_MATRIX_TESTS
 
 TEST(sh_combined_runtime_misses) {
+    REQUIRE_NATIVE_SHELL("sh");
     check_combined_runtime_misses_for_shell("sh");
 }
 
 TEST(fish_combined_runtime_misses) {
+    REQUIRE_NATIVE_SHELL("fish");
     check_combined_runtime_misses_for_shell("fish");
 }
 
 TEST(sh_invalid_hints_are_bounded) {
+    REQUIRE_NATIVE_SHELL("sh");
     check_invalid_hints_for_shell("sh");
 }
 
 TEST(fish_invalid_hints_are_bounded) {
+    REQUIRE_NATIVE_SHELL("fish");
     check_invalid_hints_for_shell("fish");
 }
+
+#undef REQUIRE_NATIVE_SHELL
 
 TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership) {
     char script[PATH_MAX];

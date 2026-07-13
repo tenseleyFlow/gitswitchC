@@ -10,10 +10,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Install native test runtimes and QA dependencies
         # rpm: gives distcheck a real rpmbuild so the archive-satisfies-its-
         # own-spec lane (AR-05 L17) actually runs instead of skipping.
-        run: sudo apt-get update && sudo apt-get install -y cppcheck flawfinder rpm
+        # dash also provides the Ubuntu /bin/sh implementation;
+        # openssh-client provides ssh, ssh-agent, ssh-add, and ssh-keygen.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bash dash fish gnupg ksh libreadline-dev openssh-client zsh \
+            cppcheck flawfinder rpm
       # Fast textual tripwire only — headers included, but whitespace variants,
       # function-pointer indirection, and macro wrapping evade a grep. The
       # authoritative gate is the symbol check on the built binary below
@@ -24,9 +30,13 @@ jobs:
             echo "ERROR: shell-based process execution reintroduced in src/" >&2
             exit 1
           fi
-      - name: Build + test (ASan/UBSan, warnings-as-errors)
-        run: make BUILD_TYPE=debug WERROR=1 test
+      - name: Build + test (ASan/UBSan, warnings-as-errors, runtimes required)
+        # AR-08 M45/M46: this is the designated native-runtime lane. Every
+        # provisioned capability is mandatory here, so a vanished runtime or
+        # disabled readline build fails instead of becoming a green skip.
+        run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       - name: Release build (FORTIFY/RELRO, warnings-as-errors)
@@ -72,6 +82,8 @@ jobs:
       # window is caught in CI.
       - name: Signal-interruption repro (SIG-01/SIG-02/F4)
         run: make BUILD_TYPE=release sig-repro-test
+        env:
+          GITSWITCH_TEST_REQUIRED_CAPS: openssh
       - name: Linux clang release build + hardening
         run: |
           make clean

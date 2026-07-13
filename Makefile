@@ -770,14 +770,22 @@ qa-contract-test:
 
 # AR-06 F32: the SIG-01/SIG-02/F4 end-to-end signal-interruption repro was
 # tracked but executed by nothing (not `make test`, not CI). Wire it in against
-# the freshly built binary. It requires a real ssh-agent; skip gracefully where
-# one is unavailable so local dev on a minimal box is not blocked (CI provides
-# ssh-agent and therefore runs it for real).
+# the freshly built binary. Local development may still skip on a minimal host,
+# but a lane that lists the exact `openssh` capability as required must fail
+# closed if the real agent/key tools are unavailable (AR-08 M46).
 sig-repro-test: $(BINDIR)/$(TARGET)
-	@if command -v ssh-agent >/dev/null 2>&1; then \
+	@if command -v ssh-agent >/dev/null 2>&1 && \
+	   command -v ssh-add >/dev/null 2>&1 && \
+	   command -v ssh-keygen >/dev/null 2>&1; then \
 		sh tests/repro_sig01.sh; \
 	else \
-		echo "SKIP sig-repro-test: ssh-agent not available on this host"; \
+		case ",$${GITSWITCH_TEST_REQUIRED_CAPS-}," in \
+			*,openssh,*) \
+				echo "ERROR: sig-repro-test requires OpenSSH test tools in this lane" >&2; \
+				exit 1 ;; \
+			*) \
+				echo "SKIP sig-repro-test: OpenSSH test tools are unavailable" ;; \
+		esac; \
 	fi
 
 rpm: dist
