@@ -12,6 +12,7 @@ fail()
 check_elf()
 {
     binary=$1
+    expected_triple=${2-}
     readelf_cmd=${READELF-}
     if [ -n "$readelf_cmd" ]; then
         if [ ! -x "$readelf_cmd" ] &&
@@ -33,6 +34,49 @@ check_elf()
         fail "readelf could not read ELF header: $binary"
     printf '%s\n' "$elf_header" | grep -Eq 'Type:[[:space:]]+DYN' ||
         fail "release binary is not PIE (ET_DYN): $binary"
+    if [ -n "$expected_triple" ]; then
+        expected_arch=${expected_triple%%-*}
+        elf_machine=$(printf '%s\n' "$elf_header" |
+            sed -n 's/^[[:space:]]*Machine:[[:space:]]*//p')
+        case $expected_arch in
+            x86_64|amd64)
+                case $elf_machine in
+                    *'X86-64'*|*'x86-64'*) ;;
+                    *) fail "ELF machine '$elf_machine' disagrees with $expected_triple" ;;
+                esac ;;
+            i386|i486|i586|i686)
+                case $elf_machine in
+                    *'80386'*) ;;
+                    *) fail "ELF machine '$elf_machine' disagrees with $expected_triple" ;;
+                esac ;;
+            aarch64|arm64)
+                case $elf_machine in
+                    *'AArch64'*) ;;
+                    *) fail "ELF machine '$elf_machine' disagrees with $expected_triple" ;;
+                esac ;;
+            arm*)
+                case $elf_machine in
+                    *'ARM'*) ;;
+                    *) fail "ELF machine '$elf_machine' disagrees with $expected_triple" ;;
+                esac ;;
+            riscv*)
+                case $elf_machine in
+                    *'RISC-V'*) ;;
+                    *) fail "ELF machine '$elf_machine' disagrees with $expected_triple" ;;
+                esac ;;
+            powerpc64*|ppc64*)
+                case $elf_machine in
+                    *'PowerPC64'*) ;;
+                    *) fail "ELF machine '$elf_machine' disagrees with $expected_triple" ;;
+                esac ;;
+            s390x)
+                case $elf_machine in
+                    *'S/390'*) ;;
+                    *) fail "ELF machine '$elf_machine' disagrees with $expected_triple" ;;
+                esac ;;
+            *) fail "unsupported ELF target architecture in $expected_triple" ;;
+        esac
+    fi
 
     elf_dynamic=$("$readelf_cmd" -d "$binary") ||
         fail "readelf could not read dynamic section: $binary"
@@ -63,6 +107,7 @@ check_elf()
 check_macho()
 {
     binary=$1
+    expected_triple=${2-}
     command -v otool >/dev/null 2>&1 ||
         fail "otool is required to inspect $binary"
     command -v nm >/dev/null 2>&1 ||
@@ -76,6 +121,23 @@ check_macho()
     if printf '%s\n' "$macho_header" | grep -q 'ALLOW_STACK_EXECUTION'; then
         fail "release binary permits an executable stack: $binary"
     fi
+    if [ -n "$expected_triple" ]; then
+        command -v lipo >/dev/null 2>&1 ||
+            fail "lipo is required to bind Mach-O architecture to the compiler target"
+        expected_arch=${expected_triple%%-*}
+        case $expected_arch in
+            aarch64|arm64|arm64e) expected_arch=arm64 ;;
+            x86_64|amd64) expected_arch=x86_64 ;;
+            i386|i486|i586|i686) expected_arch=i386 ;;
+            *) fail "unsupported Mach-O target architecture in $expected_triple" ;;
+        esac
+        macho_arches=$(lipo -archs "$binary") ||
+            fail "lipo could not inspect Mach-O architecture: $binary"
+        case " $macho_arches " in
+            *" $expected_arch "*) ;;
+            *) fail "Mach-O architectures '$macho_arches' disagree with $expected_triple" ;;
+        esac
+    fi
 
     macho_symbols=$(nm -u "$binary") ||
         fail "nm could not read undefined symbols: $binary"
@@ -85,10 +147,11 @@ check_macho()
 
 check_artifact_pair()
 {
-    [ "$#" -eq 2 ] ||
-        fail "usage: $0 artifact BUILT_BINARY STAGED_BINARY"
+    { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } ||
+        fail "usage: $0 artifact BUILT_BINARY STAGED_BINARY [TARGET_TRIPLE]"
     built=$1
     staged=$2
+    expected_triple=${3-}
 
     [ -x "$built" ] || fail "built release binary is missing: $built"
     [ -x "$staged" ] || fail "staged release binary is missing: $staged"
@@ -110,12 +173,12 @@ check_artifact_pair()
     fi
     case $format in
         elf)
-            check_elf "$built"
-            check_elf "$staged"
+            check_elf "$built" "$expected_triple"
+            check_elf "$staged" "$expected_triple"
             ;;
         macho)
-            check_macho "$built"
-            check_macho "$staged"
+            check_macho "$built" "$expected_triple"
+            check_macho "$staged" "$expected_triple"
             ;;
         *)
             fail "unsupported artifact-inspection format: $format"
@@ -146,11 +209,12 @@ expect_artifact_rejection()
 
 check_neuter_contract()
 {
-    [ "$#" -eq 3 ] ||
-        fail "usage: $0 neuter COMPILER RELEASE_SECURITY_CFLAGS HARDENING_HEADER"
+    [ "$#" -eq 4 ] ||
+        fail "usage: $0 neuter COMPILER RELEASE_SECURITY_CFLAGS HARDENING_HEADER MAKE"
     compiler=$1
     release_security_cflags=$2
     hardening_header=$3
+    make_cmd=$4
     command -v "$compiler" >/dev/null 2>&1 ||
         fail "neuter compiler is unavailable: $compiler"
     [ -f "$hardening_header" ] ||
@@ -400,6 +464,62 @@ check_neuter_contract()
         fail "fully protected multi-translation-unit fixture was rejected"
     }
 
+    # Exercise the real Make boundary, not only hand-constructed compiler
+    # fixtures. Every named suffix below used to be command-line overrideable;
+    # emptying them together produced a nominal release that was ET_EXEC and
+    # had no canary. CI invokes this contract once with GCC and once with
+    # Clang, and the native artifact inspector proves the hostile caller flags
+    # lose to the final policy.
+    make_fixture=$tmp/make-neuter
+    mkdir -p "$make_fixture/src"
+    cp "$(dirname "$hardening_header")/../Makefile" "$make_fixture/Makefile" ||
+        fail "cannot copy Makefile into hardening-neuter fixture"
+    cp "$(dirname "$hardening_header")/../VERSION" "$make_fixture/VERSION" ||
+        fail "cannot copy VERSION into hardening-neuter fixture"
+    cp "$hardening_header" "$make_fixture/src/release_hardening.h" ||
+        fail "cannot copy hardening header into Make fixture"
+    cat >"$make_fixture/src/neuter.c" <<'EOF'
+#include <stdio.h>
+static volatile char *ar08_make_escape;
+int main(int argc, char **argv)
+{
+    volatile char witness[64];
+    (void)argv;
+    witness[0] = (char)argc;
+    ar08_make_escape = witness;
+    puts("gitswitch-neuter 0.0.0");
+    return witness[0] == 127;
+}
+EOF
+    case $format in
+        elf) hostile_ldflags=-no-pie ;;
+        macho) hostile_ldflags=-Wl,-no_pie ;;
+    esac
+    make_log=$tmp/make-neuter.log
+    if ! "$make_cmd" -C "$make_fixture" CC="$compiler" \
+        TARGET=neuter-probe SOURCES=src/neuter.c \
+        VERSION=0.0.0 COMMIT=neuter BUILD_TYPE=release READLINE=0 \
+        CFLAGS='-std=gnu11 -O2 -fno-stack-protector -fno-pie' \
+        LDFLAGS="$hostile_ldflags" \
+        SECURITY_CFLAGS_RELEASE= SECURITY_LDFLAGS_RELEASE= \
+        RELEASE_FLAGS= RELEASE_LDFLAGS= \
+        RELEASE_ENFORCED_CFLAGS= RELEASE_ENFORCED_LDFLAGS= \
+        RELEASE_REQUIRED_CFLAGS= TU_HARDENING_FLAGS= \
+        CF_PROTECTION= TARGET_ARCH=unknown all >"$make_log" 2>&1; then
+        cat "$make_log" >&2
+        fail "real Make hardening policy did not survive command-line neutering"
+    fi
+    make_binary=$make_fixture/build/bin/neuter-probe
+    cp "$make_binary" "$tmp/make-neuter-staged"
+    make_target_triple=$("$compiler" -dumpmachine) ||
+        fail "cannot read compiler target for Make hardening fixture"
+    GITSWITCH_RELEASE_FORMAT=$format sh "$script" artifact "$make_binary" \
+        "$tmp/make-neuter-staged" "$make_target_triple" \
+        >"$tmp/make-neuter-check.log" 2>&1 || {
+        cat "$tmp/make-neuter-check.log" >&2
+        fail "command-line-neutered Make build escaped final hardening"
+    }
+
     if [ "$have_nonpie_neuter" = true ]; then
         cp "$nonpie" "$tmp/neuter-nonpie-staged"
         expect_artifact_rejection "non-PIE" "$script" "$nonpie" \
@@ -629,6 +749,89 @@ check_manifest_contract()
     cmp -s "$tmp/archived.spec" \
         "$rpm_home/rpmbuild/SPECS/gitswitcher.spec" ||
         fail "RPM target did not consume the archive-embedded spec"
+
+    # The archive producer must never receive a reopenable temporary path.
+    # This wrapper reproduces the original same-uid substitution: when it sees
+    # git archive -o PATH, it replaces PATH with a symlink to tracked VERSION
+    # immediately before the real Git opens it. Descriptor-streamed output has
+    # no such argument, so the attempted swap cannot identify any temp name.
+    race_repo=$tmp/dist-race
+    git clone --quiet "$root" "$race_repo" ||
+        fail "cannot clone distribution temp-race fixture"
+    race_shims=$tmp/dist-race-shims
+    race_marker=$tmp/dist-race.marker
+    mkdir "$race_shims"
+    real_git=$(command -v git) || fail "git is unavailable for dist race"
+    cat >"$race_shims/git" <<'EOF'
+#!/bin/sh
+: "${AR08_REAL_GIT:?}"
+output=
+previous=
+is_archive=false
+for arg do
+    if [ "$previous" = -o ]; then
+        output=$arg
+    fi
+    case $arg in
+        archive) is_archive=true ;;
+        --output=*) output=${arg#--output=} ;;
+    esac
+    previous=$arg
+done
+if [ "$is_archive" = true ]; then
+    printf '%s\n' invoked >>"$AR08_DIST_RACE_MARKER"
+    if [ -n "${AR08_DIST_SWAP_DIR-}" ]; then
+        mv "$AR08_DIST_SWAP_DIR" "$AR08_DIST_SWAP_DIR.pinned"
+        mkdir "$AR08_DIST_SWAP_DIR"
+    fi
+    if [ -n "$output" ]; then
+        rm -f "$output"
+        ln -s "$AR08_DIST_RACE_TARGET" "$output"
+    fi
+fi
+exec "$AR08_REAL_GIT" "$@"
+EOF
+    chmod 0700 "$race_shims/git"
+    cp "$race_repo/VERSION" "$tmp/race.VERSION.before"
+    cp "$race_repo/README.md" "$tmp/race.README.before"
+    race_version=$(cat "$race_repo/VERSION")
+    race_archive=$race_repo/build/dist/gitswitcher-$race_version.tar.gz
+    PATH="$race_shims:$PATH" AR08_REAL_GIT="$real_git" \
+        AR08_DIST_RACE_MARKER="$race_marker" \
+        AR08_DIST_RACE_TARGET="$race_repo/VERSION" \
+        "$make_cmd" -C "$race_repo" dist >"$out" 2>&1 || {
+        sed -n '1,200p' "$out" >&2
+        fail "descriptor-pinned distribution race fixture failed"
+    }
+    [ -s "$race_marker" ] || fail "distribution race wrapper was not exercised"
+    cmp -s "$race_repo/VERSION" "$tmp/race.VERSION.before" ||
+        fail "distribution temp substitution changed tracked VERSION"
+    cmp -s "$race_repo/README.md" "$tmp/race.README.before" ||
+        fail "distribution temp substitution changed tracked README"
+    [ -f "$race_archive" ] && [ ! -L "$race_archive" ] ||
+        fail "distribution race published a non-regular archive"
+    if find "$race_repo/build/dist" -name '.*.tmp.*' -print |
+        grep . >/dev/null; then
+        fail "distribution race left a named temporary archive"
+    fi
+    rm -f "$race_archive"
+    : >"$race_marker"
+    if PATH="$race_shims:$PATH" AR08_REAL_GIT="$real_git" \
+        AR08_DIST_RACE_MARKER="$race_marker" \
+        AR08_DIST_RACE_TARGET="$race_repo/VERSION" \
+        AR08_DIST_SWAP_DIR="$race_repo/build/dist" \
+        "$make_cmd" -C "$race_repo" dist >"$out" 2>&1; then
+        fail "distribution succeeded after its canonical directory was replaced"
+    fi
+    grep -F 'canonical distribution directory changed' "$out" >/dev/null ||
+        fail "distribution directory-race rejection was not precise"
+    cmp -s "$race_repo/VERSION" "$tmp/race.VERSION.before" ||
+        fail "distribution directory substitution changed tracked VERSION"
+    { [ ! -e "$race_archive" ] && [ ! -L "$race_archive" ]; } ||
+        fail "distribution directory substitution left a canonical artifact"
+    { [ ! -e "$race_repo/build/dist.pinned/gitswitcher-$race_version.tar.gz" ] &&
+      [ ! -L "$race_repo/build/dist.pinned/gitswitcher-$race_version.tar.gz" ]; } ||
+        fail "distribution directory substitution left an artifact in the old directory"
 
     dirty_version=$tmp/dirty-version
     git clone --quiet "$root" "$dirty_version" || fail "cannot clone VERSION fixture"

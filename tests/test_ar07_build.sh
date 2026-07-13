@@ -324,13 +324,24 @@ grep -F "cc_file_fingerprint=$cc_b=" \
     "$fixture/build/obj/.buildconfig" >/dev/null ||
     fail "build fingerprint omits the resolved wrapper content digest"
 
-# Exercise a platform hardening input through the real release flag expansion.
+# Exercise the audited unsupported-platform input through the real release
+# expansion. Supported-platform security flags are intentionally immutable;
+# unknown platforms retain an acknowledged extension surface whose complete
+# minimum is validated and reasserted after caller input.
 require_build "first platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=1 -fPIE'
+    UNAME_S=AlienOS \
+    UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
+    RELEASE_ARTIFACT_FORMAT=elf \
+    SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -DAR07_PLATFORM=1' \
+    SECURITY_LDFLAGS_RELEASE='-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack'
 assert_rebuilt "first platform flags"
 assert_output 'platform=1'
 require_build "second platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE'
+    UNAME_S=AlienOS \
+    UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
+    RELEASE_ARTIFACT_FORMAT=elf \
+    SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -DAR07_PLATFORM=2' \
+    SECURITY_LDFLAGS_RELEASE='-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack'
 assert_rebuilt "second platform flags"
 assert_output 'platform=2'
 
@@ -361,6 +372,90 @@ if grep '<-mbranch-protection=standard>' "$cc_log" >/dev/null; then
     fail "x86 target inherited AArch64 host branch-protection flags"
 fi
 
+# TARGET_TRIPLE/TARGET_ARCH/CF_PROTECTION are derived policy, not caller
+# metadata. A syntactically valid lie used to suppress native CET while the
+# compiler still emitted x86 code. Force a rebuild and prove all three hostile
+# command-line values lose to the compiler's own report.
+AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu \
+    require_build "claimed target mismatch" BUILD_TYPE=release READLINE=0 \
+    CC="$cc_b" TARGET_TRIPLE=aarch64-unknown-linux-gnu \
+    TARGET_TRIPLE_DETECTED=s390x-unknown-linux-gnu \
+    TARGET_ARCH=aarch64 CF_PROTECTION= \
+    CFLAGS='-std=gnu11 -DAR07_TARGET_OVERRIDE=1'
+assert_rebuilt "claimed target mismatch"
+grep -F 'target_triple=x86_64-unknown-linux-gnu' \
+    "$fixture/build/obj/.buildconfig" >/dev/null ||
+    fail "command-line target replaced the compiler-reported target"
+grep '<-fcf-protection>' "$cc_log" >/dev/null ||
+    fail "command-line target controls suppressed compiler-target CET"
+
+# The selection fixtures above intentionally log and strip a foreign flag so
+# they can link natively. Complement them with a real Clang cross-object: the
+# compiler itself must report the destination, accept its branch-protection
+# flag, and emit an object whose ELF machine agrees with that report.
+if [ "$(uname -s)" = Linux ]; then
+    cross_clang=$(command -v clang 2>/dev/null) ||
+        fail "clang is required for the real cross-target contract"
+    cross_readelf=$(command -v readelf 2>/dev/null ||
+        command -v llvm-readelf 2>/dev/null) ||
+        fail "readelf is required for the real cross-target contract"
+    case $(uname -m) in
+        x86_64|amd64)
+            cross_triple=aarch64-unknown-linux-gnu
+            cross_machine=AArch64
+            cross_flag=-mbranch-protection=standard
+            ;;
+        *)
+            cross_triple=x86_64-unknown-linux-gnu
+            cross_machine=X86-64
+            cross_flag=-fcf-protection
+            ;;
+    esac
+    cross_wrapper=$tmp/shims/cc-real-cross
+    cross_log=$tmp/real-cross.log
+    cat >"$cross_wrapper" <<'EOF'
+#!/bin/sh
+: "${AR07_REAL_CROSS_CC:?}"
+: "${AR07_REAL_CROSS_TRIPLE:?}"
+: "${AR07_REAL_CROSS_LOG:?}"
+printf '%s' cross >>"$AR07_REAL_CROSS_LOG"
+for arg do
+    printf ' <%s>' "$arg" >>"$AR07_REAL_CROSS_LOG"
+done
+printf '\n' >>"$AR07_REAL_CROSS_LOG"
+exec "$AR07_REAL_CROSS_CC" --target="$AR07_REAL_CROSS_TRIPLE" "$@"
+EOF
+    chmod 0700 "$cross_wrapper"
+    cat >"$fixture/src/cross.c" <<'EOF'
+int ar08_real_cross_object(int value);
+int ar08_real_cross_object(int value)
+{
+    volatile char witness[64];
+    witness[0] = (char)value;
+    return witness[0];
+}
+EOF
+    : >"$cross_log"
+    if ! AR07_REAL_CROSS_CC="$cross_clang" \
+        AR07_REAL_CROSS_TRIPLE="$cross_triple" \
+        AR07_REAL_CROSS_LOG="$cross_log" \
+        "$make_cmd" -C "$fixture" TARGET=ar07-cross \
+        SOURCES=src/cross.c VERSION=fixture-version COMMIT=fixture-commit \
+        BUILD_TYPE=release READLINE=0 CC="$cross_wrapper" WERROR=1 \
+        build/obj/cross.o >"$out" 2>&1; then
+        sed -n '1,200p' "$out" >&2
+        fail "real cross-target object build failed"
+    fi
+    grep -F "<$cross_flag>" "$cross_log" >/dev/null ||
+        fail "real cross compiler did not receive destination protection"
+    "$cross_readelf" -h "$fixture/build/obj/cross.o" |
+        grep -F "Machine:" | grep -F "$cross_machine" >/dev/null ||
+        fail "real cross object machine disagrees with compiler target"
+    grep -F "target_triple=$cross_triple" \
+        "$fixture/build/obj/.buildconfig" >/dev/null ||
+        fail "real cross compiler target missing from build fingerprint"
+fi
+
 # Unknown operating systems fail closed. Even acknowledgement is insufficient
 # without an explicit inspector and the complete minimum compile/link policy;
 # the audited override then proves the escape hatch is deliberate and usable.
@@ -380,6 +475,20 @@ if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu invoke_build \
 fi
 grep -F 'unsupported release C flags omit' "$out" >/dev/null ||
     fail "unsupported OS empty-flag rejection was not precise"
+
+# Required tokens followed by their negations are not an effective policy.
+# This exact presence-only bypass previously produced ET_EXEC, lazy binding,
+# no RELRO, and an executable stack while release-policy-check returned zero.
+if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu invoke_build \
+    BUILD_TYPE=release READLINE=0 CC="$cc_b" UNAME_S=AlienOS \
+    UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
+    RELEASE_ARTIFACT_FORMAT=elf \
+    SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -U_FORTIFY_SOURCE -fno-stack-protector -fno-pie' \
+    SECURITY_LDFLAGS_RELEASE='-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack -no-pie -Wl,-z,norelro -Wl,-z,lazy -Wl,-z,execstack'; then
+    fail "unsupported OS accepted required tokens followed by neuters"
+fi
+grep -F 'conflict with' "$out" >/dev/null ||
+    fail "unsupported OS contradictory-policy rejection was not precise"
 
 AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu \
     require_build "acknowledged unsupported OS" BUILD_TYPE=release READLINE=0 \
@@ -406,17 +515,14 @@ grep -F 'requires explicit acknowledgement' "$out" >/dev/null ||
 readline_cflags=-I$tmp/fake-readline/include
 readline_libs=-L$tmp/fake-readline/lib
 require_build "readline baseline" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
     READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
 assert_rebuilt "readline baseline"
 assert_output 'readline=0'
 require_build "READLINE 0 to 1" BUILD_TYPE=release READLINE=1 CC="$cc_b" \
-    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
     READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
 assert_rebuilt "READLINE 0 to 1"
 assert_output 'readline=1'
 require_build "READLINE 1 to 0" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
     READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
 assert_rebuilt "READLINE 1 to 0"
 assert_output 'readline=0'
@@ -432,7 +538,6 @@ grep -F 'src/helper.h' "$fixture/build/obj/helper.d" >/dev/null ||
 sleep 1
 touch "$fixture/src/narrow.h"
 require_build "narrow header" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
     READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"
 grep '^compile .*<src/main.c>' "$cc_log" >/dev/null ||
     fail "narrow header edit did not rebuild its dependent"
@@ -444,7 +549,6 @@ fi
 # success or Make's premature "no rule" error before the dependent compiles.
 mv "$fixture/src/narrow.h" "$fixture/src/narrow.h.saved"
 if invoke_build BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE' \
     READLINE_HINT_CFLAGS="$readline_cflags" READLINE_HINT_LIBS="$readline_libs"; then
     fail "build succeeded after a required header was removed"
 fi

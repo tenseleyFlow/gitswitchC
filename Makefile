@@ -35,8 +35,10 @@ SRCDIR = src
 BUILDDIR = build
 OBJDIR = $(BUILDDIR)/obj
 BINDIR = $(BUILDDIR)/bin
+TOOLBUILDDIR = $(BUILDDIR)/tools
 TESTDIR = tests
 DOCDIR = docs
+HOSTCC ?= cc
 
 # Compiler identity and target policy. Hardening follows the compiler's target,
 # never the machine running Make. The launcher itself is content-fingerprinted
@@ -66,12 +68,13 @@ TOOLCHAIN_FILE_FINGERPRINT := $(shell set -e; \
 		printf '%s=%s;' "$$f" "$$digest"; \
 	done)
 CC_VERSION_ID := $(shell $(CC) --version 2>/dev/null | sed -n '1p')
-ifeq ($(origin TARGET_TRIPLE),undefined)
-    TARGET_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null | sed -n '1p')
-else
-    override TARGET_TRIPLE := $(strip $(TARGET_TRIPLE))
-endif
-TARGET_ARCH := $(firstword $(subst -, ,$(TARGET_TRIPLE)))
+override TARGET_TRIPLE_DETECTED := $(shell $(CC) -dumpmachine 2>/dev/null | sed -n '1p')
+# A claimed target is security policy, not caller metadata: accepting a
+# command-line TARGET_TRIPLE let a native x86 compiler claim AArch64 and omit
+# CET while still producing an x86 release. Always bind the policy to the
+# selected compiler's own target report.
+override TARGET_TRIPLE := $(strip $(TARGET_TRIPLE_DETECTED))
+override TARGET_ARCH := $(firstword $(subst -, ,$(TARGET_TRIPLE)))
 
 # Platform detection (OS selects linker/ABI policy; architecture comes from
 # TARGET_TRIPLE above). UNAME_M remains diagnostic fingerprint material only.
@@ -83,18 +86,18 @@ UNAME_M := $(shell uname -m)
 # is omitted; host uname can neither add the wrong ISA flag nor remove the
 # destination-appropriate one.
 ifneq ($(filter x86_64 i386 i486 i586 i686,$(TARGET_ARCH)),)
-    CF_PROTECTION_CANDIDATE := -fcf-protection
+    override CF_PROTECTION_CANDIDATE := -fcf-protection
 else ifneq ($(filter aarch64 arm64,$(TARGET_ARCH)),)
-    CF_PROTECTION_CANDIDATE := -mbranch-protection=standard
+    override CF_PROTECTION_CANDIDATE := -mbranch-protection=standard
 else
-    CF_PROTECTION_CANDIDATE :=
+    override CF_PROTECTION_CANDIDATE :=
 endif
 ifneq ($(CF_PROTECTION_CANDIDATE),)
-    CF_PROTECTION := $(shell printf 'int gitswitch_cf_probe(void){return 0;}\n' | \
+    override CF_PROTECTION := $(shell printf 'int gitswitch_cf_probe(void){return 0;}\n' | \
 	$(CC) $(CF_PROTECTION_CANDIDATE) -x c -c -o /dev/null - \
 	>/dev/null 2>&1 && printf '%s' '$(CF_PROTECTION_CANDIDATE)')
 else
-    CF_PROTECTION :=
+    override CF_PROTECTION :=
 endif
 
 # Compiler and flags
@@ -157,15 +160,19 @@ ifeq ($(UNAME_S),Linux)
     # distcheck now asserts the staged binary is ET_DYN with RELRO+NOW.
     SECURITY_CFLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION)
     SECURITY_LDFLAGS_DEBUG = -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+    override SECURITY_CFLAGS_RELEASE := -D_FORTIFY_SOURCE=2 \
+                             -fstack-protector-strong \
                              -fstack-clash-protection $(CF_PROTECTION) -fPIE
-    SECURITY_LDFLAGS_RELEASE = -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    override SECURITY_LDFLAGS_RELEASE := -pie -Wl,-z,relro -Wl,-z,now \
+                             -Wl,-z,noexecstack
 endif
 
 ifeq ($(UNAME_S),Darwin)
     # macOS-specific security flags (no cf-protection, stack-clash-protection, or Linux linker flags)
     SECURITY_CFLAGS_DEBUG = -fstack-protector-strong
-    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong
+    override SECURITY_CFLAGS_RELEASE := -D_FORTIFY_SOURCE=2 \
+                             -fstack-protector-strong -fPIE
+    override SECURITY_LDFLAGS_RELEASE := -Wl,-pie
 endif
 
 ifeq ($(UNAME_S),FreeBSD)
@@ -179,9 +186,11 @@ ifeq ($(UNAME_S),FreeBSD)
     # default to PIE (AR-05 L9).
     SECURITY_CFLAGS_DEBUG = -fstack-protector-strong -fstack-clash-protection $(CF_PROTECTION)
     SECURITY_LDFLAGS_DEBUG = -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
-    SECURITY_CFLAGS_RELEASE = -D_FORTIFY_SOURCE=2 -fstack-protector-strong \
+    override SECURITY_CFLAGS_RELEASE := -D_FORTIFY_SOURCE=2 \
+                             -fstack-protector-strong \
                              -fstack-clash-protection $(CF_PROTECTION) -fPIE
-    SECURITY_LDFLAGS_RELEASE = -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    override SECURITY_LDFLAGS_RELEASE := -pie -Wl,-z,relro -Wl,-z,now \
+                             -Wl,-z,noexecstack
 endif
 
 # Debug/Release configurations
@@ -195,11 +204,28 @@ DEBUG_LDFLAGS = -fsanitize=address -fsanitize=undefined $(SECURITY_LDFLAGS_DEBUG
 # test translation unit. The forced header makes a missing effective stack
 # policy a compile error in that exact TU; the flag is deliberately last so a
 # caller cannot neutralize it through CFLAGS or platform flag ordering.
-RELEASE_REQUIRED_CFLAGS = -fstack-protector-strong \
+# Unknown operating systems retain an explicit operator-supplied security
+# policy, but the minimum is reasserted after that input so a later negation
+# cannot satisfy a presence-only check while winning compiler/linker ordering.
+override UNSUPPORTED_RELEASE_REQUIRED_CFLAGS :=
+override UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS :=
+ifeq ($(filter $(UNAME_S),Linux Darwin FreeBSD),)
+    override UNSUPPORTED_RELEASE_REQUIRED_CFLAGS := \
+        -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE
+    ifeq ($(RELEASE_ARTIFACT_FORMAT),elf)
+        override UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS := \
+            -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack
+    else ifeq ($(RELEASE_ARTIFACT_FORMAT),macho)
+        override UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS := -Wl,-pie
+    endif
+endif
+override RELEASE_REQUIRED_CFLAGS := \
+                          $(UNSUPPORTED_RELEASE_REQUIRED_CFLAGS) \
+                          -fstack-protector-strong \
                           -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
                           -include $(SRCDIR)/release_hardening.h
-RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_CFLAGS_RELEASE)
-RELEASE_LDFLAGS = -s $(SECURITY_LDFLAGS_RELEASE)
+override RELEASE_FLAGS := -O2 -DNDEBUG $(SECURITY_CFLAGS_RELEASE)
+override RELEASE_LDFLAGS := -s $(SECURITY_LDFLAGS_RELEASE)
 COVERAGE_FLAGS = -g -O0 --coverage -fprofile-abs-path
 COVERAGE_LDFLAGS = --coverage
 
@@ -222,13 +248,20 @@ COVERAGE_MIN_BRANCHES ?= 58
 # Default to debug build
 BUILD_TYPE ?= debug
 ifeq ($(BUILD_TYPE),release)
-    RELEASE_ENFORCED_CFLAGS = $(RELEASE_FLAGS)
-    RELEASE_ENFORCED_LDFLAGS = $(RELEASE_LDFLAGS)
-    TU_HARDENING_FLAGS = $(RELEASE_REQUIRED_CFLAGS)
+    override RELEASE_ENFORCED_CFLAGS := $(RELEASE_FLAGS)
+    override RELEASE_ENFORCED_LDFLAGS := $(RELEASE_LDFLAGS) \
+                                         $(UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS)
+    override TU_HARDENING_FLAGS := $(RELEASE_REQUIRED_CFLAGS)
 else ifeq ($(BUILD_TYPE),coverage)
+    override RELEASE_ENFORCED_CFLAGS :=
+    override RELEASE_ENFORCED_LDFLAGS :=
+    override TU_HARDENING_FLAGS :=
     CFLAGS += $(COVERAGE_FLAGS)
     LDFLAGS += $(COVERAGE_LDFLAGS)
 else
+    override RELEASE_ENFORCED_CFLAGS :=
+    override RELEASE_ENFORCED_LDFLAGS :=
+    override TU_HARDENING_FLAGS :=
     CFLAGS += $(DEBUG_FLAGS)
     LDFLAGS += $(DEBUG_LDFLAGS)
 endif
@@ -361,6 +394,14 @@ $(OBJDIR):
 $(BINDIR):
 	@mkdir -p $(BINDIR)
 
+$(TOOLBUILDDIR):
+	@mkdir -p $(TOOLBUILDDIR)
+
+DIST_PUBLISH_HELPER = $(TOOLBUILDDIR)/release-publish
+$(DIST_PUBLISH_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
+	@echo "Building descriptor-pinned release publisher..."
+	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror $< -o $@
+
 # Build-config stamp: objects/tests share build/obj and build/bin across every
 # configuration. Record every effective compile/link input, not just the build
 # type and metadata: otherwise READLINE, compiler, flag, library, or platform
@@ -384,6 +425,7 @@ cc_file_fingerprint=$(TOOLCHAIN_FILE_FINGERPRINT)
 cc_version=$(CC_VERSION_ID)
 cc_is_clang=$(CC_IS_CLANG)
 target_triple=$(TARGET_TRIPLE)
+target_triple_detected=$(TARGET_TRIPLE_DETECTED)
 target_arch=$(TARGET_ARCH)
 cppflags=$(CPPFLAGS)
 cflags=$(CFLAGS)
@@ -394,6 +436,8 @@ includes=$(INCLUDES)
 depflags=$(DEPFLAGS)
 ldflags=$(LDFLAGS)
 release_enforced_ldflags=$(RELEASE_ENFORCED_LDFLAGS)
+unsupported_required_cflags=$(UNSUPPORTED_RELEASE_REQUIRED_CFLAGS)
+unsupported_required_ldflags=$(UNSUPPORTED_RELEASE_REQUIRED_LDFLAGS)
 libs=$(LIBS)
 readline_request=$(READLINE)
 readline_effective=$(READLINE_OK)
@@ -417,6 +461,7 @@ endef
 export GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
 export GITSWITCH_RELEASE_POLICY_OS = $(UNAME_S)
 export GITSWITCH_RELEASE_POLICY_TRIPLE = $(TARGET_TRIPLE)
+export GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE = $(TARGET_TRIPLE_DETECTED)
 export GITSWITCH_RELEASE_POLICY_CC = $(CC_IDENTITY_FILE)
 export GITSWITCH_RELEASE_POLICY_CC_VERSION = $(CC_VERSION_ID)
 export GITSWITCH_RELEASE_POLICY_FINGERPRINT = $(TOOLCHAIN_FILE_FINGERPRINT)
@@ -424,6 +469,10 @@ export GITSWITCH_RELEASE_POLICY_ACK = $(UNSUPPORTED_RELEASE_ACK)
 export GITSWITCH_RELEASE_POLICY_FORMAT = $(RELEASE_ARTIFACT_FORMAT)
 export GITSWITCH_RELEASE_POLICY_CFLAGS = $(SECURITY_CFLAGS_RELEASE)
 export GITSWITCH_RELEASE_POLICY_LDFLAGS = $(SECURITY_LDFLAGS_RELEASE)
+export GITSWITCH_RELEASE_EFFECTIVE_CFLAGS = $(CFLAGS) \
+	$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS)
+export GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS = $(LDFLAGS) $(LIBS) \
+	$(RELEASE_ENFORCED_LDFLAGS)
 
 .PHONY: release-policy-check
 release-policy-check:
@@ -431,6 +480,10 @@ release-policy-check:
 	printf '%s\n' "$$GITSWITCH_RELEASE_POLICY_TRIPLE" | \
 		grep -Eq '^[A-Za-z0-9_.+]+(-[A-Za-z0-9_.+]+)+$$' || { \
 		echo 'ERROR: compiler target triple is empty or invalid' >&2; exit 1; \
+	}; \
+	test "$$GITSWITCH_RELEASE_POLICY_TRIPLE" = \
+	     "$$GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE" || { \
+		echo 'ERROR: claimed release target differs from compiler target' >&2; exit 1; \
 	}; \
 	test -f "$$GITSWITCH_RELEASE_POLICY_CC" && \
 	test -n "$$GITSWITCH_RELEASE_POLICY_CC_VERSION" && \
@@ -458,13 +511,42 @@ release-policy-check:
 					*) echo "ERROR: unsupported release C flags omit $$required" >&2; exit 1 ;; \
 				esac; \
 			done; \
+			for forbidden in -U_FORTIFY_SOURCE -fno-stack-protector \
+				-fno-stack-protector-all -fno-stack-protector-strong \
+				-fno-pie -fno-PIE; do \
+				case " $$GITSWITCH_RELEASE_POLICY_CFLAGS " in *" $$forbidden "*) \
+					echo "ERROR: unsupported release C flags conflict with $$forbidden" >&2; exit 1 ;; \
+				esac; \
+			done; \
 			if test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = elf; then \
 				for required in -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack; do \
 					case " $$GITSWITCH_RELEASE_POLICY_LDFLAGS " in *" $$required "*) ;; \
 						*) echo "ERROR: unsupported ELF release linker flags omit $$required" >&2; exit 1 ;; \
 					esac; \
 				done; \
+				for forbidden in -no-pie -nopie -Wl,-no-pie -Wl,-z,norelro \
+					-Wl,-z,lazy -Wl,-z,execstack; do \
+					case " $$GITSWITCH_RELEASE_POLICY_LDFLAGS " in *" $$forbidden "*) \
+						echo "ERROR: unsupported ELF linker flags conflict with $$forbidden" >&2; exit 1 ;; \
+					esac; \
+				done; \
 			fi ;; \
+	esac; \
+	for required in -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE; do \
+		case " $$GITSWITCH_RELEASE_EFFECTIVE_CFLAGS " in *" $$required "*) ;; \
+			*) echo "ERROR: effective release C flags omit $$required" >&2; exit 1 ;; \
+		esac; \
+	done; \
+	case "$$GITSWITCH_RELEASE_POLICY_FORMAT" in \
+		elf) for required in -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack; do \
+			case " $$GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS " in *" $$required "*) ;; \
+				*) echo "ERROR: effective ELF release linker flags omit $$required" >&2; exit 1 ;; \
+			esac; \
+		done ;; \
+		macho) case " $$GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS " in \
+			*' -Wl,-pie '*) ;; \
+			*) echo 'ERROR: effective Mach-O release linker flags omit PIE' >&2; exit 1 ;; \
+		esac ;; \
 	esac
 
 ifeq ($(BUILD_TYPE),release)
@@ -530,7 +612,14 @@ install:
 			   { test "$$built_format" = elf || test "$$built_format" = macho; } || { \
 				echo 'ERROR: refusing release install without a recorded supported/acknowledged inspection policy' >&2; exit 1; \
 			   } ;; \
-		esac; \
+			esac; \
+		built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
+		built_triple=`sed -n 's/^target_triple=//p' $(BUILDTYPE_STAMP)`; \
+		GITSWITCH_RELEASE_FORMAT="$$built_format" \
+			sh tests/test_ar07_release.sh artifact \
+			"$(BINDIR)/$(TARGET)" "$(BINDIR)/$(TARGET)" "$$built_triple" || { \
+			echo 'ERROR: refusing to install an unverified release artifact' >&2; exit 1; \
+		}; \
 	fi
 	@echo "Installing $(TARGET)..."
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -917,7 +1006,7 @@ export GITSWITCH_DIST_ARCHIVE_NAME = $(DIST_ARCHIVE_NAME)
 export GITSWITCH_DIST_ROOT = $(DIST_ROOT)
 # Reviewed allowlist. Copying only these entries inherently excludes VCS/OMX
 # state, build products, cores, logs, and previously generated archives.
-DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
+DIST_MANIFEST = src tests tools completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
 .PHONY: release-manifest-check dist distcheck release-contract-test \
 	release-artifact-test qa-contract-test sig-repro-test rpm
@@ -953,7 +1042,7 @@ release-manifest-check:
 # release tarballs were not reproducible from a tag and could leak unreviewed
 # content (AR-05 L5). git archive draws from HEAD, which also inherently
 # excludes VCS state, build products, cores, logs, and prior archives.
-dist: release-manifest-check
+dist: release-manifest-check $(DIST_PUBLISH_HELPER)
 	@set -e; \
 	root_physical=`CDPATH='' cd "$(CURDIR)" && pwd -P`; \
 	request="$$GITSWITCH_DIST_ARCHIVE_REQUEST"; \
@@ -991,18 +1080,12 @@ dist: release-manifest-check
 	   test -L "$$GITSWITCH_DIST_ARCHIVE_NAME"; then \
 		echo 'ERROR: distribution archive already exists; refusing to replace it' >&2; exit 1; \
 	fi; \
-	tmp=`mktemp "./.$$GITSWITCH_DIST_ARCHIVE_NAME.tmp.XXXXXX"`; \
-	trap 'status=$$?; trap - 0 1 2 3 15; rm -f "$$tmp"; exit $$status' 0 1 2 3 15; \
-	tmp_abs="$$actual_dir/$${tmp#./}"; \
 	echo "Creating distribution tarball: $$expected_rel"; \
-	git -C "$$root_physical" archive --format=tar.gz \
-		--prefix="$$GITSWITCH_DIST_ROOT/" -o "$$tmp_abs" \
-		"$(RELEASE_COMMIT)" -- $(DIST_MANIFEST); \
-	ln "$$tmp" "$$GITSWITCH_DIST_ARCHIVE_NAME" || { \
-		echo 'ERROR: distribution archive appeared during publication' >&2; exit 1; \
-	}; \
-	rm -f "$$tmp"; \
-	trap - 0 1 2 3 15
+	"$$root_physical/$(DIST_PUBLISH_HELPER)" . "$$actual_dir" \
+		"$$GITSWITCH_DIST_ARCHIVE_NAME" -- \
+		git -C "$$root_physical" archive --format=tar.gz \
+		--prefix="$$GITSWITCH_DIST_ROOT/" \
+		"$(RELEASE_COMMIT)" -- $(DIST_MANIFEST)
 
 distcheck: dist
 	@sh tests/test_dist.sh "$$GITSWITCH_DIST_ARCHIVE_PATH" \
@@ -1049,11 +1132,12 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 	echo 'Release stack check passed: help/version/config at 256 KiB'; \
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
-		"$$stage$(PREFIX)/bin/$(TARGET)"; \
+		"$$stage$(PREFIX)/bin/$(TARGET)" "$(TARGET_TRIPLE)"; \
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh neuter "$(CC)" \
 		"$(SECURITY_CFLAGS_RELEASE)" \
-		"$(CURDIR)/$(SRCDIR)/release_hardening.h"
+		"$(CURDIR)/$(SRCDIR)/release_hardening.h" \
+		"$(MAKE_COMMAND)"
 else
 release-artifact-test:
 	@echo "ERROR: release-artifact-test requires BUILD_TYPE=release" >&2
