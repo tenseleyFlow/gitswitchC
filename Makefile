@@ -837,9 +837,10 @@ dist: release-manifest-check
 	fi; \
 	tmp=`mktemp "./.$$GITSWITCH_DIST_ARCHIVE_NAME.tmp.XXXXXX"`; \
 	trap 'status=$$?; trap - 0 1 2 3 15; rm -f "$$tmp"; exit $$status' 0 1 2 3 15; \
+	tmp_abs="$$actual_dir/$${tmp#./}"; \
 	echo "Creating distribution tarball: $$expected_rel"; \
 	git -C "$$root_physical" archive --format=tar.gz \
-		--prefix="$$GITSWITCH_DIST_ROOT/" -o "$$tmp" \
+		--prefix="$$GITSWITCH_DIST_ROOT/" -o "$$tmp_abs" \
 		"$(RELEASE_COMMIT)" -- $(DIST_MANIFEST); \
 	ln "$$tmp" "$$GITSWITCH_DIST_ARCHIVE_NAME" || { \
 		echo 'ERROR: distribution archive appeared during publication' >&2; exit 1; \
