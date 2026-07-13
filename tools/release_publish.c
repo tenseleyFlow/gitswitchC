@@ -20,6 +20,7 @@
 #if defined(__APPLE__)
 #include <sys/attr.h>
 #include <sys/clonefile.h>
+#include <sys/random.h>
 #if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
 #include <sys/resource.h>
 #endif
