@@ -1924,6 +1924,20 @@ int toml_write_file(const toml_document_t *doc, const char *file_path) {
         saved_errno = errno;
         goto cleanup;
     }
+    /* The parser accepts exactly TOML_MAX_FILE_SIZE bytes. Measure the flushed
+     * temporary inode rather than summing source strings: quotes, backslashes,
+     * and control characters expand during serialization. Never publish a
+     * document that this binary cannot read back. */
+    if (fstat(fileno(file), &current_temp) != 0) {
+        failure_context = "Failed to measure serialized TOML file";
+        saved_errno = errno;
+        goto cleanup;
+    }
+    if (current_temp.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+        failure_context = "Serialized TOML file exceeds parser size limit";
+        saved_errno = EFBIG;
+        goto cleanup;
+    }
     if (fsync(fileno(file)) != 0) {
         failure_context = "Failed to sync temporary TOML file";
         saved_errno = errno;
