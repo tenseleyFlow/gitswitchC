@@ -12,6 +12,30 @@
 
 typedef void (*stdout_emitter_fn)(void *context);
 
+TEST(retained_public_display_api_links) {
+    int (*init_fn)(bool, bool) = display_init;
+    void (*header_fn)(const char *) = display_header;
+    void (*status_fn)(const char *, const char *, ...) = display_status;
+    void (*error_fn)(const char *, const char *, ...) = display_error;
+    void (*warning_fn)(const char *, ...) = display_warning;
+    void (*success_fn)(const char *, ...) = display_success;
+    void (*info_fn)(const char *, ...) = display_info;
+    const char *(*colorize_fn)(const char *, const char *) = display_colorize;
+    bool (*supports_color_fn)(void) = display_supports_color;
+    void (*config_info_fn)(const gitswitch_ctx_t *) = display_config_info;
+
+    CHECK(init_fn != NULL);
+    CHECK(header_fn != NULL);
+    CHECK(status_fn != NULL);
+    CHECK(error_fn != NULL);
+    CHECK(warning_fn != NULL);
+    CHECK(success_fn != NULL);
+    CHECK(info_fn != NULL);
+    CHECK(colorize_fn != NULL);
+    CHECK(supports_color_fn != NULL);
+    CHECK(config_info_fn != NULL);
+}
+
 static char *capture_stdout(stdout_emitter_fn emit, void *context,
                             size_t *length_out) {
     FILE *capture;
@@ -217,6 +241,7 @@ TEST(formatting_failure_emits_no_partial_or_uninitialized_output) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
+    RUN_TEST(retained_public_display_api_links);
     RUN_TEST(long_colored_status_preserves_every_payload_byte);
     RUN_TEST(formatting_failure_emits_no_partial_or_uninitialized_output);
 TEST_MAIN_END()
