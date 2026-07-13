@@ -218,6 +218,30 @@ static void guard_handler(int sig) {
     (void)raise(sig);
 }
 
+int signals_block_for_child_spawn(sigset_t *previous_mask) {
+    sigset_t installed;
+
+    if (!previous_mask) {
+        errno = EINVAL;
+        return -1;
+    }
+    sigemptyset(&installed);
+    for (size_t i = 0; i < GUARDED_SIGNAL_COUNT; i++) {
+        if (g_action_installed[i]) {
+            sigaddset(&installed, g_guarded_signals[i]);
+        }
+    }
+    return sigprocmask(SIG_BLOCK, &installed, previous_mask);
+}
+
+int signals_restore_after_child_spawn(const sigset_t *previous_mask) {
+    if (!previous_mask) {
+        errno = EINVAL;
+        return -1;
+    }
+    return sigprocmask(SIG_SETMASK, previous_mask, NULL);
+}
+
 void signals_reset_for_child(void) {
     /* AR-06 F76 / AR-07 M32: reset only dispositions this guard actually
      * replaced.  An inherited SIG_IGN is deliberately left untouched by

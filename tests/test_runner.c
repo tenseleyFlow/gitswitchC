@@ -3,6 +3,7 @@
 #include "gitswitch.h"
 #include "utils.h"
 #include "error.h"
+#include "signals.h"
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -13,6 +14,152 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <limits.h>
+
+static volatile sig_atomic_t g_post_fork_hook_called;
+static volatile sig_atomic_t g_post_fork_hook_mask_exact;
+static sigset_t g_expected_parent_mask;
+
+static bool signal_masks_equal(const sigset_t *left, const sigset_t *right) {
+    for (int signal_number = 1; signal_number < NSIG; signal_number++) {
+        int left_member = sigismember(left, signal_number);
+        int right_member = sigismember(right, signal_number);
+        /* Some platforms reserve holes below NSIG. They are absent from both
+         * masks by definition, so matching EINVAL results do not make two
+         * otherwise identical masks unequal. */
+        if (left_member < 0 && right_member < 0) continue;
+        if (left_member != right_member) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void raise_second_rollback_signal_before_pid_publication(void) {
+    sigset_t current;
+    sigset_t expected = g_expected_parent_mask;
+
+    sigaddset(&expected, SIGINT);
+    sigaddset(&expected, SIGTERM);
+    g_post_fork_hook_called = 1;
+    g_post_fork_hook_mask_exact =
+        sigprocmask(SIG_SETMASK, NULL, &current) == 0 &&
+        signal_masks_equal(&current, &expected);
+    (void)raise(SIGTERM);
+}
+
+static int exercise_post_fork_signal_publication(void) {
+    const char *argv[] = {"sleep", "2", NULL};
+    run_result_t result;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    int run_rc;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 10;
+    configured_mask = original_mask;
+    sigdelset(&configured_mask, SIGINT);
+    sigdelset(&configured_mask, SIGTERM);
+    sigdelset(&configured_mask, SIGHUP);
+    sigaddset(&configured_mask, SIGUSR1);
+    if (sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) return 11;
+    if (signal(SIGHUP, SIG_IGN) == SIG_ERR) return 12;
+    if (signals_guard_begin() != 0) return 13;
+    if (raise(SIGTERM) != 0 || !signals_pending()) return 14;
+    signals_rollback_begin();
+
+    g_expected_parent_mask = configured_mask;
+    g_post_fork_hook_called = 0;
+    g_post_fork_hook_mask_exact = 0;
+    run_test_set_post_fork_pre_publish_hook(
+        raise_second_rollback_signal_before_pid_publication);
+    run_rc = run_argv(argv, NULL, &result);
+    run_test_set_post_fork_pre_publish_hook(NULL);
+    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) return 15;
+
+    signals_rollback_end();
+    if (signals_guard_end() != 0) return 16;
+    if (!g_post_fork_hook_called) return 17;
+    if (!g_post_fork_hook_mask_exact) return 18;
+    if (!signal_masks_equal(&after_mask, &configured_mask)) return 19;
+    if (run_rc != -1 || !result.spawned || result.exit_code != -1 ||
+        result.term_signal != SIGTERM) {
+        return 20;
+    }
+    return 0;
+}
+
+/* AR-08 M23: a second rollback signal in the few instructions after fork but
+ * before child-PID publication must remain pending until publication, then be
+ * forwarded to the child. The helper's two-second lifetime bounds the old
+ * lost-signal behavior without relying on scheduler timing. */
+TEST(run_publishes_child_before_releasing_blocked_rollback_signal) {
+    int status = 0;
+    pid_t worker;
+
+    fflush(NULL);
+    worker = fork();
+    CHECK(worker >= 0);
+    if (worker == 0) {
+        _exit(exercise_post_fork_signal_publication());
+    }
+    if (worker > 0) {
+        CHECK_EQ_INT(waitpid(worker, &status, 0), worker);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
+static int exercise_fork_failure_mask_restoration(void) {
+    const char *argv[] = {"true", NULL};
+    const error_context_t *failure;
+    run_result_t result;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    int run_rc;
+    int returned_errno;
+
+    if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 30;
+    configured_mask = original_mask;
+    sigdelset(&configured_mask, SIGINT);
+    sigdelset(&configured_mask, SIGTERM);
+    sigdelset(&configured_mask, SIGHUP);
+    sigaddset(&configured_mask, SIGUSR1);
+    if (sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) return 31;
+    if (signals_guard_begin() != 0) return 32;
+
+    run_test_set_fork_failure(EAGAIN);
+    errno = 0;
+    run_rc = run_argv(argv, NULL, &result);
+    returned_errno = errno;
+    failure = get_last_error();
+    if (sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) return 33;
+    if (signals_guard_end() != 0) return 34;
+
+    if (run_rc != -1 || result.spawned) return 35;
+    if (returned_errno != EAGAIN || failure->system_errno != EAGAIN) return 36;
+    if (!signal_masks_equal(&after_mask, &configured_mask)) return 37;
+    return 0;
+}
+
+/* Every failed-fork path releases the barrier and preserves fork's errno,
+ * rather than leaking the temporary guarded-signal mask into the parent. */
+TEST(run_restores_exact_mask_and_errno_when_fork_fails) {
+    int status = 0;
+    pid_t worker;
+
+    fflush(NULL);
+    worker = fork();
+    CHECK(worker >= 0);
+    if (worker == 0) {
+        _exit(exercise_fork_failure_mask_restoration());
+    }
+    if (worker > 0) {
+        CHECK_EQ_INT(waitpid(worker, &status, 0), worker);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
 
 /* Run the zero-input edge in a disposable process. Before AR-04 L1 the
  * nested run_argv() polls forever, so the parent must bound the wait and reap
@@ -317,4 +464,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_empty_argv_fails);
     RUN_TEST(run_reports_output_truncation);
     RUN_TEST(run_reports_death_by_signal);
+    RUN_TEST(run_publishes_child_before_releasing_blocked_rollback_signal);
+    RUN_TEST(run_restores_exact_mask_and_errno_when_fork_fails);
 TEST_MAIN_END()

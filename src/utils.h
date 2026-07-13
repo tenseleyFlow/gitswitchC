@@ -238,6 +238,17 @@ void run_test_set_auto_bulk_close_unavailable(bool unavailable);
 typedef void (*run_test_exec_resolved_hook_fn)(const char *resolved_path);
 void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook);
 
+/* Test-only deterministic signal-publication seam. The callback runs in the
+ * parent after fork returns but before the new child PID is published to the
+ * rollback signal handler. Production leaves it NULL. */
+typedef void (*run_test_post_fork_pre_publish_hook_fn)(void);
+void run_test_set_post_fork_pre_publish_hook(
+    run_test_post_fork_pre_publish_hook_fn hook);
+
+/* One-shot parent-side fork failure used to prove the pre-fork signal mask is
+ * restored without replacing the primary system errno. Zero disables it. */
+void run_test_set_fork_failure(int system_errno);
+
 /* True if an executable named `command` is found in PATH. */
 bool command_exists(const char *command);
 

@@ -316,6 +316,55 @@ TEST(guard_respects_inherited_sig_ign) {
     signal(SIGHUP, SIG_DFL);
 }
 
+/* AR-08 M23: the fork barrier blocks only dispositions actually installed by
+ * the guard. An inherited ignored signal remains untouched, unrelated mask
+ * entries survive, and the complete parent mask is restored exactly. */
+TEST(child_spawn_barrier_blocks_only_installed_guard_signals) {
+    struct sigaction original_hup;
+    struct sigaction ignored;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t saved_mask;
+    sigset_t during_mask;
+    sigset_t restored_mask;
+
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK_EQ_INT(sigaction(SIGHUP, NULL, &original_hup), 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &original_mask), 0);
+    configured_mask = original_mask;
+    sigdelset(&configured_mask, SIGINT);
+    sigdelset(&configured_mask, SIGTERM);
+    sigdelset(&configured_mask, SIGHUP);
+    sigdelset(&configured_mask, SIGUSR2);
+    sigaddset(&configured_mask, SIGUSR1);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &configured_mask, NULL), 0);
+
+    memset(&ignored, 0, sizeof(ignored));
+    ignored.sa_handler = SIG_IGN;
+    sigemptyset(&ignored.sa_mask);
+    CHECK_EQ_INT(sigaction(SIGHUP, &ignored, NULL), 0);
+    CHECK_EQ_INT(signals_guard_begin(), 0);
+    CHECK_EQ_INT(signals_block_for_child_spawn(&saved_mask), 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &during_mask), 0);
+    CHECK_EQ_INT(sigismember(&during_mask, SIGINT), 1);
+    CHECK_EQ_INT(sigismember(&during_mask, SIGTERM), 1);
+    CHECK_EQ_INT(sigismember(&during_mask, SIGHUP), 0);
+    CHECK_EQ_INT(sigismember(&during_mask, SIGUSR1), 1);
+    CHECK_EQ_INT(sigismember(&during_mask, SIGUSR2), 0);
+
+    CHECK_EQ_INT(signals_restore_after_child_spawn(&saved_mask), 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &restored_mask), 0);
+    CHECK_EQ_INT(sigismember(&restored_mask, SIGINT), 0);
+    CHECK_EQ_INT(sigismember(&restored_mask, SIGTERM), 0);
+    CHECK_EQ_INT(sigismember(&restored_mask, SIGHUP), 0);
+    CHECK_EQ_INT(sigismember(&restored_mask, SIGUSR1), 1);
+    CHECK_EQ_INT(sigismember(&restored_mask, SIGUSR2), 0);
+
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK_EQ_INT(sigaction(SIGHUP, &original_hup, NULL), 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &original_mask, NULL), 0);
+}
+
 /* SIG-02: registered scratch paths are unlinked by cleanup; unregistered ones
  * are left alone. */
 TEST(scratch_registry_unlinks_registered_paths) {
@@ -623,6 +672,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(guard_defers_first_signal);
     RUN_TEST(guard_end_restores_default_disposition);
     RUN_TEST(guard_respects_inherited_sig_ign);
+    RUN_TEST(child_spawn_barrier_blocks_only_installed_guard_signals);
     RUN_TEST(scratch_registry_unlinks_registered_paths);
     RUN_TEST(scratch_registry_rejects_invalid);
     RUN_TEST(dispatch_terminates_with_deferred_signal);

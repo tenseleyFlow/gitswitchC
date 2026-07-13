@@ -49,6 +49,7 @@
 #define SIGNALS_H
 
 #include <stdbool.h>
+#include <signal.h>
 #include <sys/types.h>
 
 /**
@@ -107,6 +108,17 @@ void signals_rollback_end(void);
  * in the child branch.
  */
 void signals_reset_for_child(void);
+
+/**
+ * Close the post-fork/pre-publication race for a guarded child launch.
+ * signals_block_for_child_spawn() adds exactly the dispositions installed by
+ * the active guard to the caller's mask and captures the complete prior mask.
+ * In the parent, publish the PID and then restore that exact mask with
+ * signals_restore_after_child_spawn(). In the child, signals_reset_for_child()
+ * resets the inherited guard dispositions and unblocks that installed set.
+ */
+int signals_block_for_child_spawn(sigset_t *previous_mask);
+int signals_restore_after_child_spawn(const sigset_t *previous_mask);
 
 /**
  * Publish / retract the in-flight subprocess (AR-03 L8). run_argv's spawn

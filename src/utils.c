@@ -1975,6 +1975,9 @@ static run_test_fd_close_observation_t g_test_fd_close_observation;
 static int g_test_bulk_close_failure_errno;
 static bool g_test_auto_bulk_close_unavailable;
 static run_test_exec_resolved_hook_fn g_test_exec_resolved_hook;
+static run_test_post_fork_pre_publish_hook_fn
+    g_test_post_fork_pre_publish_hook;
+static int g_test_fork_failure_errno;
 
 int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
     switch (strategy) {
@@ -2022,6 +2025,15 @@ void run_test_set_auto_bulk_close_unavailable(bool unavailable) {
 
 void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook) {
     g_test_exec_resolved_hook = hook;
+}
+
+void run_test_set_post_fork_pre_publish_hook(
+    run_test_post_fork_pre_publish_hook_fn hook) {
+    g_test_post_fork_pre_publish_hook = hook;
+}
+
+void run_test_set_fork_failure(int system_errno) {
+    g_test_fork_failure_errno = system_errno > 0 ? system_errno : 0;
 }
 
 /* Close every descriptor >= lowfd in the forked child before exec (fd-CLOEXEC).
@@ -2388,9 +2400,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         return -1;
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        set_system_error(ERR_SYSTEM_CALL, "fork() failed");
+    sigset_t pre_spawn_mask;
+    if (signals_block_for_child_spawn(&pre_spawn_mask) != 0) {
+        int block_errno = errno;
         if (devnull >= 0) close(devnull);
         if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
@@ -2399,6 +2411,46 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
+        errno = block_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot block guarded signals before fork");
+        errno = block_errno;
+        return -1;
+    }
+
+    pid_t pid;
+    if (g_test_fork_failure_errno != 0) {
+        int injected_errno = g_test_fork_failure_errno;
+        g_test_fork_failure_errno = 0;
+        errno = injected_errno;
+        pid = -1;
+    } else {
+        pid = fork();
+    }
+    if (pid < 0) {
+        int fork_errno = errno;
+        int mask_restore_errno = 0;
+        if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+            mask_restore_errno = errno;
+        }
+        if (devnull >= 0) close(devnull);
+        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = fork_errno;
+        if (mask_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "fork() failed; also failed to restore parent signal mask (restore errno=%d)",
+                mask_restore_errno);
+        } else {
+            set_system_error(ERR_SYSTEM_CALL, "fork() failed");
+        }
+        errno = fork_errno;
         return -1;
     }
 
@@ -2672,13 +2724,40 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
 
     /* ---- parent ---- */
+    result->spawned = true;
+    if (g_test_post_fork_pre_publish_hook) {
+        g_test_post_fork_pre_publish_hook();
+    }
+    /* AR-03 L8: publish the in-flight child while guarded signals are still
+     * blocked, so a pending rollback signal can observe it when the exact
+     * parent mask is restored below. */
+    signals_child_spawned(pid);
+    if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
+        int restore_errno = errno;
+        pid_t waited;
+
+        (void)kill(pid, SIGKILL);
+        do {
+            waited = waitpid(pid, NULL, 0);
+        } while (waited < 0 && errno == EINTR);
+        signals_child_reaped();
+        if (devnull >= 0) close(devnull);
+        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = restore_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot restore parent signal mask after fork");
+        errno = restore_errno;
+        return -1;
+    }
     free(fd_snapshot.fds);
     close(exec_fd);
     trusted_script_launch_cleanup(&script_launch);
-    result->spawned = true;
-    /* AR-03 L8: publish the in-flight child so the signal handler can kill()
-     * it if a rollback wedges behind an interactive prompt (see signals.h). */
-    signals_child_spawned(pid);
     if (devnull >= 0) close(devnull);
     if (want_in) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
