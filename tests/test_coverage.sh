@@ -134,19 +134,22 @@ grep -F 'fixture.c' "$tmp/baseline.txt" >/dev/null || {
 
 # Each component status proves that the corresponding metric is genuinely
 # below 100%; the combined assertion then verifies gcovr's ORed exit contract.
+# gcovr 7.x/8.0 logs "failed minimum ..." while newer releases capitalize
+# "Failed". Match that presentation-only difference without relaxing the exact
+# metric-specific diagnostic or the authoritative status-bit checks above.
 run_threshold_check line-only "$line_failure_status" 100 0
-grep -F 'Failed minimum line coverage' "$tmp/line-only.stderr" >/dev/null ||
+grep -F -i 'failed minimum line coverage' "$tmp/line-only.stderr" >/dev/null ||
     fail "line-only control lacked gcovr's threshold diagnostic"
 
 run_threshold_check branch-only "$branch_failure_status" 0 100
-grep -F 'Failed minimum branch coverage' \
+grep -F -i 'failed minimum branch coverage' \
     "$tmp/branch-only.stderr" >/dev/null ||
     fail "branch-only control lacked gcovr's threshold diagnostic"
 
 run_threshold_check combined "$combined_failure_status" 100 100
-grep -F 'Failed minimum line coverage' "$tmp/combined.stderr" >/dev/null ||
+grep -F -i 'failed minimum line coverage' "$tmp/combined.stderr" >/dev/null ||
     fail "combined control lacked gcovr's line-threshold diagnostic"
-grep -F 'Failed minimum branch coverage' "$tmp/combined.stderr" >/dev/null ||
+grep -F -i 'failed minimum branch coverage' "$tmp/combined.stderr" >/dev/null ||
     fail "combined control lacked gcovr's branch-threshold diagnostic"
 
 printf 'Coverage threshold contract passed (line=%d, branch=%d, combined=%d).\n' \
