@@ -813,6 +813,7 @@ TEST(init_fish_snippet_round_trip) {
 
     if (access("/usr/bin/fish", X_OK) == 0) fish = "/usr/bin/fish";
     else if (access("/usr/local/bin/fish", X_OK) == 0) fish = "/usr/local/bin/fish";
+    else if (access("/opt/homebrew/bin/fish", X_OK) == 0) fish = "/opt/homebrew/bin/fish";
     else if (access("/bin/fish", X_OK) == 0) fish = "/bin/fish";
     if (!fish) {
         TS_SKIP("fish", "fish shell is unavailable");
