@@ -56,6 +56,30 @@ static bool section_name_is_valid(const char *section_name);
 static toml_document_init_hook_fn g_document_init_hook;
 static toml_writer_test_hook_fn g_writer_test_hook;
 
+static bool ascii_key_initial_is_valid(unsigned char c) {
+    return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+static bool ascii_key_continuation_is_valid(unsigned char c) {
+    return ascii_key_initial_is_valid(c) || (c >= '0' && c <= '9');
+}
+
+/* This intentionally implements the application's narrower key contract, not
+ * TOML's full bare-key grammar. Keep parser and setter-created documents on
+ * the same ASCII-only, round-trippable surface. */
+static bool key_name_is_valid(const char *key_name) {
+    if (!key_name || !ascii_key_initial_is_valid((unsigned char)key_name[0])) {
+        return false;
+    }
+
+    for (size_t i = 1; i < TOML_MAX_KEY_LEN; i++) {
+        unsigned char c = (unsigned char)key_name[i];
+        if (c == '\0') return true;
+        if (!ascii_key_continuation_is_valid(c)) return false;
+    }
+    return false;
+}
+
 toml_document_init_hook_fn toml_set_document_init_hook_fn(
     toml_document_init_hook_fn fn) {
     toml_document_init_hook_fn previous = g_document_init_hook;
@@ -303,7 +327,7 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         }
         
         /* Parse key-value pair */
-        if (isalpha(c) || c == '_') {
+        if (ascii_key_initial_is_valid((unsigned char)c)) {
             if (!current_section) {
                 /* Create default section if none exists */
                 current_section = find_or_create_section(doc, "");
@@ -1211,9 +1235,9 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
            key_pos < TOML_MAX_KEY_LEN - 1) {
         char c = current_char(state);
         
-        if (isalnum(c) || c == '_') {
+        if (ascii_key_continuation_is_valid((unsigned char)c)) {
             kv->key[key_pos++] = advance_char(state);
-        } else if (isspace(c)) {
+        } else if (c == ' ' || c == '\t') {
             advance_char(state);
             break;
         } else {
@@ -1226,8 +1250,13 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
 
     /* Stopped because the key buffer filled, with more key text remaining? Too long. */
     if (key_pos >= TOML_MAX_KEY_LEN - 1 && !is_at_end(state) &&
-        (isalnum((unsigned char)current_char(state)) || current_char(state) == '_')) {
+        ascii_key_continuation_is_valid((unsigned char)current_char(state))) {
         set_parser_error(state, "Key name too long");
+        return -1;
+    }
+
+    if (!key_name_is_valid(kv->key)) {
+        set_parser_error(state, "Invalid key name");
         return -1;
     }
 
@@ -1532,9 +1561,11 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
      * wrote `ssh_key = ""` to disk and exited 0 — the account's key silently
      * erased by the very save that claimed success. Checking up front also
      * means a failed set leaves no half-built key behind. */
-    if (strlen(key_name) >= TOML_MAX_KEY_LEN) {
-        set_error(ERR_CONFIG_INVALID, "Key name too long for %s (max %d bytes): %s",
-                  section_name, TOML_MAX_KEY_LEN - 1, key_name);
+    if (!key_name_is_valid(key_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Invalid TOML key name for %s (1-%d ASCII bytes; first "
+                  "[A-Za-z_], remaining [A-Za-z0-9_])",
+                  section_name, TOML_MAX_KEY_LEN - 1);
         return -1;
     }
     if (strlen(value) >= TOML_MAX_VALUE_LEN) {
@@ -1597,12 +1628,14 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
         return -1;
     }
 
-    /* Same up-front bound as toml_set_string: an oversized key name used to
-     * leave a ghost key with key="" behind (safe_strncpy fails without
-     * writing) while still reporting success. */
-    if (strlen(key_name) >= TOML_MAX_KEY_LEN) {
-        set_error(ERR_CONFIG_INVALID, "Key name too long for %s (max %d bytes): %s",
-                  section_name, TOML_MAX_KEY_LEN - 1, key_name);
+    /* Validate the full parser grammar before section lookup/creation. This
+     * also retains the old oversized-name guard: safe_strncpy fails without
+     * writing, which otherwise left a newly published ghost section behind. */
+    if (!key_name_is_valid(key_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Invalid TOML key name for %s (1-%d ASCII bytes; first "
+                  "[A-Za-z_], remaining [A-Za-z0-9_])",
+                  section_name, TOML_MAX_KEY_LEN - 1);
         return -1;
     }
 

@@ -137,6 +137,17 @@ static int parse_integer_literal(const char *literal, toml_document_t *doc) {
     return toml_parse_string(source, (size_t)written, doc);
 }
 
+static int parse_named_key(const char *key, toml_document_t *doc) {
+    char source[512];
+    int written = snprintf(source, sizeof(source),
+                           "[settings]\n"
+                           "default_scope = \"local\"\n"
+                           "%s = \"value\"\n",
+                           key);
+    if (written < 0 || (size_t)written >= sizeof(source)) return -1;
+    return toml_parse_string(source, (size_t)written, doc);
+}
+
 static char g_hook_original[192];
 static char g_hook_moved[192];
 static char g_hook_replacement_file[256];
@@ -262,6 +273,114 @@ TEST(setters_reject_invalid_sections_without_mutating_document) {
         CHECK(strstr(serialized, "[]") == NULL);
         CHECK_EQ_INT(count_writer_temps(dir), 0);
     }
+    toml_cleanup_document(&doc);
+    toml_cleanup_document(&before);
+}
+
+TEST(key_name_grammar_rejects_invalid_setters_without_mutation) {
+    static const char *const invalid_keys[] = {
+        "",
+        "1lead",
+        "has space",
+        "has-hyphen",
+        "has.dot",
+        "\xC3\xA9" "key"
+    };
+    static toml_document_t doc;
+    static toml_document_t before;
+    toml_document_t parsed;
+
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"), 0);
+    memcpy(&before, &doc, sizeof(before));
+
+    for (size_t i = 0; i < sizeof(invalid_keys) / sizeof(invalid_keys[0]); i++) {
+        memcpy(&doc, &before, sizeof(doc));
+        CHECK_EQ_INT(toml_set_string(&doc, "new_section", invalid_keys[i],
+                                     "value"), -1);
+        CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+
+        memcpy(&doc, &before, sizeof(doc));
+        CHECK_EQ_INT(toml_set_boolean(&doc, "new_section", invalid_keys[i],
+                                      true), -1);
+        CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+
+        CHECK_EQ_INT(parse_named_key(invalid_keys[i], &parsed), -1);
+        toml_cleanup_document(&parsed);
+    }
+
+    toml_cleanup_document(&doc);
+    toml_cleanup_document(&before);
+}
+
+TEST(key_name_grammar_accepts_ascii_boundaries_and_round_trips) {
+    static const char spaced_source[] =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "  _under \t= \"spaced\"\n"
+        "alpha123 = true\n";
+    static toml_document_t doc;
+    static toml_document_t before;
+    static toml_document_t loaded;
+    char max_key[TOML_MAX_KEY_LEN];
+    char oversized[TOML_MAX_KEY_LEN + 1];
+    char dir[128];
+    char path[192];
+    char value[32] = "";
+    bool enabled = false;
+
+    max_key[0] = 'k';
+    memset(max_key + 1, 'a', sizeof(max_key) - 2);
+    max_key[sizeof(max_key) - 1] = '\0';
+    oversized[0] = 'k';
+    memset(oversized + 1, 'b', sizeof(oversized) - 2);
+    oversized[sizeof(oversized) - 1] = '\0';
+
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "_under", "value"), 0);
+    CHECK_EQ_INT(toml_set_boolean(&doc, "settings", "alpha123", true), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", max_key, "boundary"), 0);
+    memcpy(&before, &doc, sizeof(before));
+
+    CHECK_EQ_INT(toml_set_string(&doc, "new_section", oversized, "value"), -1);
+    CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+    CHECK_EQ_INT(toml_set_boolean(&doc, "new_section", oversized, true), -1);
+    CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+    CHECK_EQ_INT(parse_named_key(oversized, &loaded), -1);
+    toml_cleanup_document(&loaded);
+
+    if (make_fixture(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+    } else {
+        CHECK_EQ_INT(toml_write_file(&doc, path), 0);
+        CHECK_EQ_INT(toml_parse_file(path, &loaded), 0);
+        CHECK_EQ_INT(toml_get_string(&loaded, "settings", "_under", value,
+                                     sizeof(value)), 0);
+        CHECK_STR_EQ(value, "value");
+        CHECK_EQ_INT(toml_get_boolean(&loaded, "settings", "alpha123",
+                                      &enabled), 0);
+        CHECK(enabled);
+        memset(value, 0, sizeof(value));
+        CHECK_EQ_INT(toml_get_string(&loaded, "settings", max_key, value,
+                                     sizeof(value)), 0);
+        CHECK_STR_EQ(value, "boundary");
+        CHECK_EQ_INT(count_writer_temps(dir), 0);
+        toml_cleanup_document(&loaded);
+        CHECK_EQ_INT(unlink(path), 0);
+    }
+
+    CHECK_EQ_INT(toml_parse_string(spaced_source, sizeof(spaced_source) - 1,
+                                   &loaded), 0);
+    memset(value, 0, sizeof(value));
+    CHECK_EQ_INT(toml_get_string(&loaded, "settings", "_under", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "spaced");
+    enabled = false;
+    CHECK_EQ_INT(toml_get_boolean(&loaded, "settings", "alpha123", &enabled), 0);
+    CHECK(enabled);
+
+    toml_cleanup_document(&loaded);
     toml_cleanup_document(&doc);
     toml_cleanup_document(&before);
 }
@@ -577,6 +696,8 @@ TEST(temp_namespace_replacement_is_never_published_or_unlinked) {
 
 TEST_MAIN_BEGIN()
     RUN_TEST(setters_reject_invalid_sections_without_mutating_document);
+    RUN_TEST(key_name_grammar_rejects_invalid_setters_without_mutation);
+    RUN_TEST(key_name_grammar_accepts_ascii_boundaries_and_round_trips);
     RUN_TEST(section_boundary_classifies_trailing_whitespace_before_overflow);
     RUN_TEST(integer_grammar_rejects_leading_zero_magnitudes);
     RUN_TEST(writer_enforces_the_inclusive_parser_file_size_boundary);
