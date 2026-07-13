@@ -172,6 +172,32 @@ TEST(account_admission_rejects_invisible_name_and_description) {
     CHECK_EQ_INT(context.account_count, 0);
 }
 
+TEST(account_selectors_and_validation_never_reflect_invisible_bytes) {
+    static const char bidi_selector[] = "safe\xE2\x80\xAE" "txt";
+    static const char bidi_email[] = "safe\xE2\x80\xAE" "@example.test";
+    gitswitch_ctx_t context;
+    account_t account;
+
+    memset(&context, 0, sizeof(context));
+    fill_account(&context.accounts[0], "visible", "visible description");
+    context.account_count = 1;
+
+    CHECK(config_find_account(&context, bidi_selector) == NULL);
+    CHECK(strstr(get_last_error()->message, bidi_selector) == NULL);
+    CHECK(config_find_account_destructive(&context, bidi_selector) == NULL);
+    CHECK(strstr(get_last_error()->message, bidi_selector) == NULL);
+
+    context.config.resuming = true;
+    CHECK_EQ_INT(accounts_switch(&context, bidi_selector), -1);
+    CHECK(strstr(get_last_error()->message, bidi_selector) == NULL);
+
+    memset(&context, 0, sizeof(context));
+    fill_account(&account, "visible", "visible description");
+    (void)snprintf(account.email, sizeof(account.email), "%s", bidi_email);
+    CHECK_EQ_INT(config_add_account(&context, &account), -1);
+    CHECK(strstr(get_last_error()->message, bidi_email) == NULL);
+}
+
 static int run_interactive_add(const char *input_text, char *output,
                                size_t output_size, gitswitch_ctx_t *context) {
     FILE *input = tmpfile();
@@ -362,6 +388,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(bidi_marks_zero_width_and_variation_selectors_fail_text_gates);
     RUN_TEST(visible_unicode_combining_marks_and_strict_utf8_remain_exact);
     RUN_TEST(account_admission_rejects_invisible_name_and_description);
+    RUN_TEST(account_selectors_and_validation_never_reflect_invisible_bytes);
     RUN_TEST(interactive_add_rejects_controls_before_summary_or_error_output);
     RUN_TEST(load_rejects_bidi_and_valid_unicode_lists_and_reports_exactly);
 TEST_MAIN_END()

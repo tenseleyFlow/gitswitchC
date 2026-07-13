@@ -2901,6 +2901,11 @@ account_t *config_find_account_destructive(gitswitch_ctx_t *ctx, const char *ide
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account_destructive");
         return NULL;
     }
+    if (!text_is_tty_safe(identifier)) {
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "Account selector contains terminal control bytes or malformed UTF-8");
+        return NULL;
+    }
     resolution = config_resolve_exact(ctx, identifier, &acct);
     if (resolution == EXACT_AMBIGUOUS) return NULL;
     if (resolution == EXACT_NONE) {
@@ -2919,6 +2924,11 @@ account_t *config_find_account(gitswitch_ctx_t *ctx, const char *identifier) {
 
     if (!ctx || !identifier || !*identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_find_account");
+        return NULL;
+    }
+    if (!text_is_tty_safe(identifier)) {
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "Account selector contains terminal control bytes or malformed UTF-8");
         return NULL;
     }
 
@@ -4378,13 +4388,18 @@ static int validate_account_security(const account_t *account) {
         return -1;
     }
 
-    if (!validate_email(account->email)) {
-        set_error(ERR_ACCOUNT_INVALID, "Invalid email address: %s", account->email);
+    if (!text_is_tty_safe(account->email) || !validate_email(account->email)) {
+        set_error(ERR_ACCOUNT_INVALID, "Invalid email address");
         return -1;
     }
     
     /* Validate SSH key if configured */
     if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
+        if (!text_is_tty_safe(account->ssh_key_path)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "SSH key path contains terminal control bytes or malformed UTF-8");
+            return -1;
+        }
         if (expand_path(account->ssh_key_path, expanded_path, sizeof(expanded_path)) != 0) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid SSH key path: %s", account->ssh_key_path);
             return -1;
@@ -4412,6 +4427,11 @@ static int validate_account_security(const account_t *account) {
     
     /* Validate GPG key if configured */
     if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+        if (!text_is_tty_safe(account->gpg_key_id)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "GPG key ID contains terminal control bytes or malformed UTF-8");
+            return -1;
+        }
         if (!validate_key_id(account->gpg_key_id)) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid GPG key ID: %s", account->gpg_key_id);
             return -1;

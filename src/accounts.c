@@ -580,8 +580,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
     bool gpg_ok = false;
     bool defer_signal_dispatch;
 
-    if (!ctx || !identifier) {
+    if (!ctx || !identifier || !*identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_switch");
+        return -1;
+    }
+    if (!text_is_tty_safe(identifier)) {
+        set_error(ERR_ACCOUNT_NOT_FOUND,
+                  "Account selector contains terminal control bytes or malformed UTF-8");
         return -1;
     }
     defer_signal_dispatch = defer_commit || ctx->config.defer_signal_cleanup;
@@ -2532,7 +2537,7 @@ int accounts_validate(const account_t *account) {
         return -1;
     }
     
-    if (!validate_email(account->email)) {
+    if (!text_is_tty_safe(account->email) || !validate_email(account->email)) {
         set_error(ERR_ACCOUNT_INVALID, "Invalid email address format");
         return -1;
     }
@@ -2540,6 +2545,12 @@ int accounts_validate(const account_t *account) {
     /* Basic SSH validation if enabled */
     if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
         char expanded_path[MAX_PATH_LEN];
+
+        if (!text_is_tty_safe(account->ssh_key_path)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "SSH key path contains terminal control bytes or malformed UTF-8");
+            return -1;
+        }
         
         if (expand_path(account->ssh_key_path, expanded_path, sizeof(expanded_path)) != 0) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid SSH key path: %s", account->ssh_key_path);
@@ -2551,6 +2562,11 @@ int accounts_validate(const account_t *account) {
     
     /* Basic GPG validation if enabled */
     if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
+        if (!text_is_tty_safe(account->gpg_key_id)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "GPG key ID contains terminal control bytes or malformed UTF-8");
+            return -1;
+        }
         if (!validate_key_id(account->gpg_key_id)) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid GPG key ID format: %s", account->gpg_key_id);
             return -1;
