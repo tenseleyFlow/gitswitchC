@@ -160,14 +160,85 @@ TEST(account_admission_rejects_invisible_name_and_description) {
     fill_account(&account, bidi_name, "description");
     CHECK_EQ_INT(config_add_account(&context, &account), -1);
     CHECK_EQ_INT(context.account_count, 0);
+    CHECK(strstr(get_last_error()->message, bidi_name) == NULL);
 
     fill_account(&account, "work", isolate_description);
     CHECK_EQ_INT(config_add_account(&context, &account), -1);
     CHECK_EQ_INT(context.account_count, 0);
+    CHECK(strstr(get_last_error()->message, isolate_description) == NULL);
 
     fill_account(&account, variation_name, "description");
     CHECK_EQ_INT(config_add_account(&context, &account), -1);
     CHECK_EQ_INT(context.account_count, 0);
+}
+
+static int run_interactive_add(const char *input_text, char *output,
+                               size_t output_size, gitswitch_ctx_t *context) {
+    FILE *input = tmpfile();
+    FILE *capture = tmpfile();
+    int saved_stdin = -1;
+    int saved_stdout = -1;
+    int result = -2;
+    size_t length;
+
+    if (!input || !capture || !output || output_size == 0 || !context) {
+        if (input) fclose(input);
+        if (capture) fclose(capture);
+        return -2;
+    }
+    if (fwrite(input_text, 1, strlen(input_text), input) != strlen(input_text) ||
+        fflush(input) != 0 || fseek(input, 0, SEEK_SET) != 0) {
+        goto cleanup;
+    }
+    saved_stdin = dup(STDIN_FILENO);
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdin < 0 || saved_stdout < 0 || fflush(stdout) != 0 ||
+        dup2(fileno(input), STDIN_FILENO) != STDIN_FILENO ||
+        dup2(fileno(capture), STDOUT_FILENO) != STDOUT_FILENO) {
+        goto cleanup;
+    }
+    result = accounts_add_interactive(context);
+    if (fflush(stdout) != 0) result = -2;
+
+cleanup:
+    if (saved_stdin >= 0) {
+        (void)dup2(saved_stdin, STDIN_FILENO);
+        close(saved_stdin);
+    }
+    if (saved_stdout >= 0) {
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
+    rewind(capture);
+    length = fread(output, 1, output_size - 1U, capture);
+    output[length] = '\0';
+    fclose(input);
+    fclose(capture);
+    return result;
+}
+
+TEST(interactive_add_rejects_controls_before_summary_or_error_output) {
+    static const char bidi[] = "safe\xE2\x80\xAE" "txt";
+    static const char isolate_description[] =
+        "visible\xE2\x81\xA6" "hidden\xE2\x81\xA9";
+    char input[1024];
+    char output[16384];
+    gitswitch_ctx_t context;
+
+    memset(&context, 0, sizeof(context));
+    context.config.default_scope = GIT_SCOPE_LOCAL;
+    context.config.assume_yes = true;
+    CHECK((size_t)snprintf(input, sizeof(input),
+                           "%s\nvisible-name\nvisible@example.test\n%s\n"
+                           "visible description\n\n\n\n",
+                           bidi, isolate_description) < sizeof(input));
+    CHECK_EQ_INT(run_interactive_add(input, output, sizeof(output),
+                                     &context), 0);
+    CHECK_EQ_INT(context.account_count, 1);
+    CHECK(strstr(output, bidi) == NULL);
+    CHECK(strstr(output, isolate_description) == NULL);
+    CHECK(strstr(output, "Name: visible-name") != NULL);
+    CHECK(strstr(output, "Description: visible description") != NULL);
 }
 
 static int write_fixture(const char *path, const char *contents) {
@@ -291,5 +362,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(bidi_marks_zero_width_and_variation_selectors_fail_text_gates);
     RUN_TEST(visible_unicode_combining_marks_and_strict_utf8_remain_exact);
     RUN_TEST(account_admission_rejects_invisible_name_and_description);
+    RUN_TEST(interactive_add_rejects_controls_before_summary_or_error_output);
     RUN_TEST(load_rejects_bidi_and_valid_unicode_lists_and_reports_exactly);
 TEST_MAIN_END()

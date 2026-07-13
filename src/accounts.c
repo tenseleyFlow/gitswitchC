@@ -1778,14 +1778,35 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
         break;
     }
 
-    /* Description */
-    if (edit) printf("Description [%s]: ", acct.description);
-    else      printf("Description (optional): ");
-    if (account_prompt_line(input, sizeof(input), false) == 0 &&
-        strlen(input) > 0) {
-        safe_strncpy(acct.description, input, sizeof(acct.description));
-    } else if (!edit) {
-        safe_strncpy(acct.description, acct.name, sizeof(acct.description));
+    /* Description. It is printed in the summary before config admission, so
+     * enforce the same strict UTF-8/terminal policy here and never echo a
+     * rejected value in diagnostics. */
+    while (1) {
+        int description_result;
+
+        if (edit) printf("Description [%s]: ", acct.description);
+        else      printf("Description (optional): ");
+        description_result = account_prompt_line(input, sizeof(input), false);
+        if (description_result != PROMPT_LINE_OK || input[0] == '\0') {
+            if (!edit && safe_strncpy(acct.description, acct.name,
+                                      sizeof(acct.description)) != 0) {
+                set_error(ERR_ACCOUNT_INVALID,
+                          "Default account description is too long");
+                return -1;
+            }
+            break;
+        }
+        if (!text_is_tty_safe(input)) {
+            printf("[ERROR]: Description contains unsafe or malformed Unicode. "
+                   "Please try again: ");
+            continue;
+        }
+        if (safe_strncpy(acct.description, input,
+                         sizeof(acct.description)) != 0) {
+            printf("[ERROR]: Description is too long. Please try again: ");
+            continue;
+        }
+        break;
     }
 
     /* SSH key. Empty keeps current (edit) or skips (add); 'none' disables.

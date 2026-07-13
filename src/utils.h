@@ -339,6 +339,9 @@ bool is_safe_ssh_key_path(const char *path);
 size_t utf8_decode(const unsigned char *s, size_t available,
                    uint32_t *cp_out);
 bool tty_safe_codepoint(uint32_t cp);
+/* Validate an entire NUL-terminated string under tty_safe_codepoint(),
+ * rejecting malformed or truncated UTF-8 without rewriting identity text. */
+bool text_is_tty_safe(const char *text);
 
 /**
  * Security utilities

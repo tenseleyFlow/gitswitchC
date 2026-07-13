@@ -117,7 +117,6 @@ static int validate_config_file_security(const char *config_path);
 static int validate_config_write_destination(const char *config_path);
 static int copy_file_nofollow(const char *src_path, const char *dst_path);
 static bool sanitize_tty_text(char *text);
-static bool text_is_tty_safe(const char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
                             bool apply_active_state, bool detect_runtime);
@@ -4236,9 +4235,9 @@ static int parse_account_id_from_section(const char *section_name, uint32_t *acc
  * UTF-8 (accented letters, CJK, emoji) passes through byte-identical.
  *
  * sanitize_tty_text strips in place (display-only fields); returns true if
- * anything was removed. text_is_tty_safe merely reports (identity-bearing
- * fields, where silent rewriting would change which key/socket paths the
- * name maps to). */
+ * anything was removed. The shared text_is_tty_safe utility merely reports
+ * for identity-bearing fields, where silent rewriting would change which
+ * key/socket paths the name maps to. */
 static bool sanitize_tty_text(char *text) {
     unsigned char *src = (unsigned char *)text;
     unsigned char *dst = (unsigned char *)text;
@@ -4267,22 +4266,6 @@ static bool sanitize_tty_text(char *text) {
     return modified;
 }
 
-static bool text_is_tty_safe(const char *text) {
-    const unsigned char *p = (const unsigned char *)text;
-    size_t remaining = strlen(text);
-
-    while (remaining > 0) {
-        uint32_t cp;
-        size_t len = utf8_decode(p, remaining, &cp);
-        if (len == 0 || !tty_safe_codepoint(cp)) {
-            return false;
-        }
-        p += len;
-        remaining -= len;
-    }
-    return true;
-}
-
 /* Reject a value that cannot survive the config round trip: since AR-03 M6,
  * toml_get_string FAILS (rather than repairs) any value its sanitizer would
  * alter — a quote, backslash, control byte, or malformed UTF-8. The writer
@@ -4297,8 +4280,8 @@ static int validate_field_roundtrips(const char *field_name, const char *value) 
         strcmp(sanitized, value) != 0) {
         set_error(ERR_ACCOUNT_INVALID,
                   "Account %s contains characters that cannot round-trip through "
-                  "the config file (quote, backslash, or control byte): %s",
-                  field_name, value);
+                  "the config file (quote, backslash, control, or invisible byte)",
+                  field_name);
         return -1;
     }
     return 0;
@@ -4327,7 +4310,7 @@ static int validate_account_security(const account_t *account) {
 
     /* Validate required fields */
     if (!validate_name(account->name)) {
-        set_error(ERR_ACCOUNT_INVALID, "Invalid account name: %s", account->name);
+        set_error(ERR_ACCOUNT_INVALID, "Invalid account name");
         return -1;
     }
 

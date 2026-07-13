@@ -4026,6 +4026,13 @@ bool validate_name(const char *name) {
             return false;
         }
     }
+    /* Names are printed interactively before config admission and also key
+     * filesystem/runtime state. Reject malformed UTF-8 and every invisible or
+     * terminal-affecting codepoint at this first shared boundary so no prompt,
+     * summary, log, or later validation error can echo hostile identity text. */
+    if (!text_is_tty_safe(name)) {
+        return false;
+    }
 
     /* Reserve "current": the per-account GNUPGHOME is <base>/<name>, and the
      * stable GPG symlink the shell integration exports is <base>/current. An
@@ -4155,6 +4162,26 @@ bool tty_safe_codepoint(uint32_t cp) {
             cp <= default_ignorable_ranges[i].last) {
             return false;
         }
+    }
+    return true;
+}
+
+bool text_is_tty_safe(const char *text) {
+    const unsigned char *cursor;
+    size_t remaining;
+
+    if (!text) return false;
+    cursor = (const unsigned char *)text;
+    remaining = strlen(text);
+    while (remaining > 0) {
+        uint32_t codepoint;
+        size_t consumed = utf8_decode(cursor, remaining, &codepoint);
+
+        if (consumed == 0 || !tty_safe_codepoint(codepoint)) {
+            return false;
+        }
+        cursor += consumed;
+        remaining -= consumed;
     }
     return true;
 }
