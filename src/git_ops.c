@@ -2,6 +2,13 @@
  * Implements safe git configuration management for gitswitch-c
  */
 
+/* Darwin hides O_NOFOLLOW and its timespec-valued struct stat members when a
+ * strict POSIX namespace is selected. Keep POSIX.1-2008 visibility while
+ * explicitly restoring those Darwin extensions used by the descriptor-pinned
+ * rollback path. */
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
 #include <stdio.h>
@@ -1146,7 +1153,7 @@ static bool git_same_file_version(const struct stat *left,
         left->st_gid != right->st_gid || left->st_size != right->st_size) {
         return false;
     }
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#if defined(__APPLE__)
     return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
            left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec &&
            left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
