@@ -87,6 +87,7 @@ typedef struct {
     bool active;
     int lock_fd;
     uint64_t lock_generation;
+    size_t anchor_slot;
     int parent_fd;
     int dir_fd;
     dev_t parent_dev;
@@ -102,6 +103,18 @@ static private_lock_context_t g_private_lock_contexts[PRIVATE_LOCK_CONTEXTS];
 static pid_t g_private_lock_pid;
 static pid_t g_runtime_lock_pid;
 static uint64_t g_private_lock_next_generation;
+
+static int private_lock_dup_cloexec(int fd);
+static int private_lock_inode_acquire(int owned_fd, bool nonblocking,
+                                      size_t *slot_out);
+static void private_lock_inode_release(size_t slot);
+static bool exec_fd_acl_is_trusted(int fd);
+#ifdef GITSWITCH_TESTING
+bool runtime_entry_test_may_be_replaced(
+    uid_t uid, mode_t parent_mode, uid_t parent_uid,
+    bool parent_acl_trusted, uid_t child_uid, bool child_acl_trusted,
+    bool child_owner_can_add_delete_acl);
+#endif
 
 /* String utilities */
 
@@ -459,11 +472,227 @@ static int open_directory_nofollow(const char *path, struct stat *opened) {
     return fd;
 }
 
+/* Conservatively decide whether this uid could replace the child entry. Mode
+ * checks deliberately over-approximate group access: an unnecessary ancestor
+ * lock only narrows concurrency, while missing one can split the namespace.
+ * Sticky directories still protect entries not owned by this uid. Nontrivial
+ * or unreadable ACLs are treated as permitting replacement. */
+static bool runtime_entry_permissions_may_be_replaced(
+    uid_t uid, const struct stat *parent, bool parent_acl_trusted,
+    const struct stat *child, bool child_acl_trusted,
+    bool child_owner_can_add_delete_acl) {
+    bool writable;
+
+    if (uid == (uid_t)0) return true;
+    /* An owner can add write permission later, so current mode bits cannot
+     * make an owned ancestor stable for the lifetime of the transaction. */
+    if (parent->st_uid == uid) return true;
+    /* Darwin and NFSv4 child owners can later add a DELETE ACL even when the
+     * current ACL is trivial. Keep this capability platform-scoped so Linux
+     * paths do not acquire an unnecessarily broad system-directory lock. */
+    if (child_owner_can_add_delete_acl && child->st_uid == uid) return true;
+    /* Darwin and NFSv4 ACLs may grant deletion on the child itself even when
+     * the parent mode/ACL appears immutable. Ambiguous ACLs serialize. */
+    if (!parent_acl_trusted || !child_acl_trusted) return true;
+    writable =
+        (parent->st_mode & (S_IWGRP | S_IXGRP)) ==
+            (S_IWGRP | S_IXGRP) ||
+        (parent->st_mode & (S_IWOTH | S_IXOTH)) ==
+            (S_IWOTH | S_IXOTH);
+    if (!writable) return false;
+    if ((parent->st_mode & S_ISVTX) != 0 && parent->st_uid != uid &&
+        child->st_uid != uid) {
+        return false;
+    }
+    return true;
+}
+
+static bool runtime_entry_may_be_replaced(int parent_fd, int child_fd,
+                                          const struct stat *parent,
+                                          const struct stat *child) {
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    const bool child_owner_can_add_delete_acl = true;
+#else
+    const bool child_owner_can_add_delete_acl = false;
+#endif
+
+    return runtime_entry_permissions_may_be_replaced(
+        getuid(), parent, exec_fd_acl_is_trusted(parent_fd), child,
+        exec_fd_acl_is_trusted(child_fd), child_owner_can_add_delete_acl);
+}
+
+#ifdef GITSWITCH_TESTING
+bool runtime_entry_test_may_be_replaced(
+    uid_t uid, mode_t parent_mode, uid_t parent_uid,
+    bool parent_acl_trusted, uid_t child_uid, bool child_acl_trusted,
+    bool child_owner_can_add_delete_acl) {
+    struct stat parent;
+    struct stat child;
+
+    memset(&parent, 0, sizeof(parent));
+    memset(&child, 0, sizeof(child));
+    parent.st_mode = S_IFDIR | parent_mode;
+    parent.st_uid = parent_uid;
+    child.st_mode = S_IFDIR | 0700;
+    child.st_uid = child_uid;
+    return runtime_entry_permissions_may_be_replaced(
+        uid, &parent, parent_acl_trusted, &child, child_acl_trusted,
+        child_owner_can_add_delete_acl);
+}
+#endif
+
+static void runtime_path_release_anchor(size_t *anchor_slot) {
+    if (anchor_slot && *anchor_slot != PRIVATE_LOCK_INODES) {
+        private_lock_inode_release(*anchor_slot);
+        *anchor_slot = PRIVATE_LOCK_INODES;
+    }
+}
+
+/* Open an absolute, lexically normalized runtime path one component at a
+ * time.  Whole-path O_NOFOLLOW protects only the leaf; using openat() from a
+ * pinned parent makes the same no-link rule apply to every directory entry.
+ * Each opened descriptor is also matched to the entry observed without
+ * following links before the walk advances. When anchor_slot is non-NULL,
+ * acquire and retain a non-blocking lock on the parent of the first entry this
+ * uid could replace. Every cooperating traversal then shares that stable
+ * prefix even if a lower ordinary directory is renamed and recreated. */
+static int open_runtime_path_nofollow(const char *path, struct stat *opened,
+                                      size_t *anchor_slot,
+                                      bool *anchor_lock_failed) {
+    char component[MAX_PATH_LEN];
+    struct stat current_stat;
+    int current_fd;
+
+    if (anchor_slot) *anchor_slot = PRIVATE_LOCK_INODES;
+    if (anchor_lock_failed) *anchor_lock_failed = false;
+    if (!path || path[0] != '/' || !opened ||
+        (anchor_slot && !anchor_lock_failed)) {
+        errno = EINVAL;
+        return -1;
+    }
+    current_fd = open_directory_nofollow("/", &current_stat);
+    if (current_fd < 0) return -1;
+
+    const char *cursor = path + 1;
+    while (*cursor) {
+        const char *separator = strchr(cursor, '/');
+        size_t length = separator ? (size_t)(separator - cursor)
+                                  : strlen(cursor);
+        struct stat entry_stat;
+        struct stat next_stat;
+        int flags = O_RDONLY;
+        int next_fd;
+
+        if (length == 0 || length >= sizeof(component)) {
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = length == 0 ? EINVAL : ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(component, cursor, length);
+        component[length] = '\0';
+#ifdef O_DIRECTORY
+        flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        next_fd = openat(current_fd, component, flags);
+        if (next_fd < 0) {
+            int saved_errno = errno;
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = saved_errno;
+            return -1;
+        }
+        if (fstat(next_fd, &next_stat) != 0 ||
+            fstatat(current_fd, component, &entry_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            int saved_errno = errno;
+            close(next_fd);
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = saved_errno;
+            return -1;
+        }
+        if (!S_ISDIR(next_stat.st_mode) || !S_ISDIR(entry_stat.st_mode) ||
+            !same_fs_identity(&next_stat, &entry_stat)) {
+            close(next_fd);
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = EACCES;
+            return -1;
+        }
+        if (anchor_slot && *anchor_slot == PRIVATE_LOCK_INODES &&
+            runtime_entry_may_be_replaced(current_fd, next_fd, &current_stat,
+                                          &next_stat)) {
+            int anchor_fd = private_lock_dup_cloexec(current_fd);
+            if (anchor_fd < 0 ||
+                private_lock_inode_acquire(anchor_fd, true,
+                                           anchor_slot) != 0) {
+                int saved_errno = errno;
+                *anchor_lock_failed = true;
+                close(next_fd);
+                close(current_fd);
+                runtime_path_release_anchor(anchor_slot);
+                errno = saved_errno;
+                return -1;
+            }
+            if (fstatat(current_fd, component, &entry_stat,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                int saved_errno = errno;
+                close(next_fd);
+                close(current_fd);
+                runtime_path_release_anchor(anchor_slot);
+                errno = saved_errno;
+                return -1;
+            }
+            if (!S_ISDIR(entry_stat.st_mode) ||
+                !same_fs_identity(&next_stat, &entry_stat)) {
+                close(next_fd);
+                close(current_fd);
+                runtime_path_release_anchor(anchor_slot);
+                errno = EACCES;
+                return -1;
+            }
+        }
+        close(current_fd);
+        current_fd = next_fd;
+        current_stat = next_stat;
+        cursor = separator ? separator + 1 : cursor + length;
+    }
+    *opened = current_stat;
+    return current_fd;
+}
+
+static bool runtime_path_component_error(int error) {
+    if (error == EACCES || error == EPERM || error == ENOTDIR ||
+        error == ELOOP) {
+        return true;
+    }
+#ifdef EMLINK
+    if (error == EMLINK) return true;
+#endif
+    return false;
+}
+
+static bool runtime_lock_is_contended_error(int error) {
+    bool contended = error == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+    contended = contended || error == EAGAIN;
+#endif
+    return contended;
+}
+
 /* Normalize only lexical no-op components in XDG_RUNTIME_DIR.  In particular,
- * do not call realpath(): the final component must remain visible to lstat so
- * `link`, `link/`, and `link/.` all receive the same no-symlink decision.
- * Parent traversal is rejected rather than normalized because `..` across an
- * intermediate symlink has filesystem-dependent meaning. */
+ * do not call realpath(): every component must remain visible to the later
+ * descriptor-relative no-follow walk, so `link`, `link/`, and `link/.` all
+ * receive the same decision. Parent traversal is rejected rather than
+ * normalized because `..` across an intermediate link has filesystem-
+ * dependent meaning. */
 static int normalize_runtime_path(const char *input, char *output,
                                   size_t output_size) {
     if (!input || input[0] != '/' || !output || output_size < 2) {
@@ -504,16 +733,41 @@ static int normalize_runtime_path(const char *input, char *output,
     return 0;
 }
 
-int open_runtime_parent(char *path, size_t path_size) {
+/* Darwin exposes /tmp as the system-owned /private/tmp alias. Test fixtures
+ * and callers commonly spell private runtime directories below /tmp, so
+ * translate that one documented platform alias before the strict no-follow
+ * walk. No caller-controlled component below it is resolved. */
+static int canonicalize_runtime_tmp_prefix(const char *normalized,
+                                           char *canonical,
+                                           size_t canonical_size) {
+    if (strncmp(normalized, "/tmp", 4) != 0 ||
+        (normalized[4] != '\0' && normalized[4] != '/')) {
+        return safe_strncpy(canonical, normalized, canonical_size);
+    }
+
+    char *tmp_target = realpath("/tmp", NULL);
+    if (!tmp_target) return -1;
+    int written = snprintf(canonical, canonical_size, "%s%s", tmp_target,
+                           normalized + 4);
+    free(tmp_target);
+    if (written < 0 || (size_t)written >= canonical_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int open_runtime_parent_impl(char *path, size_t path_size,
+                                    size_t *anchor_slot) {
     const char *xdg = getenv("XDG_RUNTIME_DIR");
     char normalized_xdg[MAX_PATH_LEN];
+    char canonical_xdg[MAX_PATH_LEN];
     const char *configured_xdg = xdg;
-    struct stat before;
     struct stat opened;
-    struct stat after;
-    bool use_xdg = false;
+    bool anchor_lock_failed = false;
     int fd;
 
+    if (anchor_slot) *anchor_slot = PRIVATE_LOCK_INODES;
     if (!path || path_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid runtime-parent output buffer");
         return -1;
@@ -537,50 +791,72 @@ int open_runtime_parent(char *path, size_t path_size) {
                       xdg);
             return -1;
         }
-        configured_xdg = normalized_xdg;
+        if (canonicalize_runtime_tmp_prefix(normalized_xdg, canonical_xdg,
+                                            sizeof(canonical_xdg)) != 0) {
+            if (errno == ENAMETOOLONG) {
+                set_error(
+                    ERR_INVALID_PATH,
+                    "XDG_RUNTIME_DIR has an oversized system-temporary path: %s",
+                    xdg);
+            } else {
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot resolve system temporary alias");
+            }
+            return -1;
+        }
+        configured_xdg = canonical_xdg;
     }
 
     if (xdg && *xdg) {
-        if (lstat(configured_xdg, &before) == 0) {
-            use_xdg = true;
-        } else if (errno != ENOENT) {
-            set_system_error(ERR_FILE_IO,
-                             "Cannot inspect XDG_RUNTIME_DIR: %s",
-                             configured_xdg);
+        fd = open_runtime_path_nofollow(configured_xdg, &opened,
+                                        anchor_slot, &anchor_lock_failed);
+        if (fd >= 0) {
+            if (opened.st_uid != getuid() ||
+                (opened.st_mode & 0777) != PERM_USER_RWX) {
+                close(fd);
+                runtime_path_release_anchor(anchor_slot);
+                set_error(ERR_PERMISSION_DENIED,
+                          "XDG_RUNTIME_DIR must be an accessible 0700 self-owned directory: %s",
+                          configured_xdg);
+                return -1;
+            }
+            if (safe_strncpy(path, configured_xdg, path_size) != 0) {
+                close(fd);
+                runtime_path_release_anchor(anchor_slot);
+                set_error(ERR_INVALID_PATH, "XDG_RUNTIME_DIR path is too long");
+                return -1;
+            }
+            return fd;
+        }
+        int open_error = errno;
+        if (anchor_lock_failed) {
+            errno = open_error;
+            if (runtime_lock_is_contended_error(open_error)) {
+                set_error(ERR_FILE_IO,
+                          "Another gitswitch holds the shared runtime lock "
+                          "(possibly waiting at a passphrase/PIN prompt); try "
+                          "again after that command finishes");
+            } else {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot lock stable XDG_RUNTIME_DIR ancestor: %s",
+                    configured_xdg);
+            }
             return -1;
         }
-    }
-
-    if (use_xdg) {
-        if (!S_ISDIR(before.st_mode) || S_ISLNK(before.st_mode) ||
-            before.st_uid != getuid() ||
-            (before.st_mode & 0777) != PERM_USER_RWX) {
-            set_error(ERR_PERMISSION_DENIED,
-                      "XDG_RUNTIME_DIR must be an accessible 0700 self-owned directory: %s",
-                      configured_xdg);
+        if (open_error != ENOENT) {
+            if (runtime_path_component_error(open_error)) {
+                set_error(ERR_PERMISSION_DENIED,
+                          "XDG_RUNTIME_DIR contains an unsafe path component: %s",
+                          configured_xdg);
+            } else {
+                errno = open_error;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot inspect XDG_RUNTIME_DIR: %s",
+                                 configured_xdg);
+            }
             return -1;
         }
-        if (safe_strncpy(path, configured_xdg, path_size) != 0) {
-            set_error(ERR_INVALID_PATH, "XDG_RUNTIME_DIR path is too long");
-            return -1;
-        }
-        fd = open_directory_nofollow(path, &opened);
-        if (fd < 0 || opened.st_uid != getuid() ||
-            (opened.st_mode & 0777) != PERM_USER_RWX ||
-            !same_fs_identity(&before, &opened)) {
-            if (fd >= 0) close(fd);
-            set_error(ERR_PERMISSION_DENIED,
-                      "XDG_RUNTIME_DIR changed or is unsafe: %s", path);
-            return -1;
-        }
-        if (lstat(path, &after) != 0 || !S_ISDIR(after.st_mode) ||
-            !same_fs_identity(&opened, &after)) {
-            close(fd);
-            set_error(ERR_PERMISSION_DENIED,
-                      "XDG_RUNTIME_DIR changed while being opened: %s", path);
-            return -1;
-        }
-        return fd;
     }
 
     /* /tmp is a symlink to /private/tmp on macOS.  Open its canonical target
@@ -606,11 +882,20 @@ int open_runtime_parent(char *path, size_t path_size) {
     return fd;
 }
 
-/* Configured XDG roots are required to be non-symlinks and are checked with
- * lstat. The fixed /tmp fallback may itself be a platform symlink (Darwin), so
- * namespace identity checks compare its followed target to the pinned fd. */
+int open_runtime_parent(char *path, size_t path_size) {
+    return open_runtime_parent_impl(path, path_size, NULL);
+}
+
+/* Configured XDG roots are re-opened through the same component-wise no-follow
+ * walk used for acquisition. The fixed /tmp fallback may itself be a platform
+ * symlink (Darwin), so its identity check follows that one supported alias. */
 static int runtime_parent_named_stat(const char *path, struct stat *st) {
-    return strcmp(path, "/tmp") == 0 ? stat(path, st) : lstat(path, st);
+    if (strcmp(path, "/tmp") == 0) return stat(path, st);
+
+    int fd = open_runtime_path_nofollow(path, st, NULL, NULL);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
 }
 
 static const char *runtime_lock_stat_failure_kind(int error) {
@@ -1114,11 +1399,14 @@ int runtime_state_lock_acquire(void) {
     int parent_fd = -1;
     int dir_fd = -1;
     int lock_fd = -1;
+    size_t anchor_slot = PRIVATE_LOCK_INODES;
     uint64_t lock_generation = 0;
     int written;
 
     runtime_lock_prepare_process();
-    parent_fd = open_runtime_parent(runtime_parent, sizeof(runtime_parent));
+    parent_fd = open_runtime_parent_impl(runtime_parent,
+                                         sizeof(runtime_parent),
+                                         &anchor_slot);
     if (parent_fd < 0) {
         return -1;
     }
@@ -1130,6 +1418,7 @@ int runtime_state_lock_acquire(void) {
                              "gitswitch-runtime-%d", getuid()) >=
             sizeof(fallback_name)) {
             close(parent_fd);
+            private_lock_inode_release(anchor_slot);
             set_error(ERR_INVALID_PATH, "Shared runtime lock name is too long");
             return -1;
         }
@@ -1139,12 +1428,14 @@ int runtime_state_lock_acquire(void) {
                        runtime_parent, child_name);
     if (written < 0 || (size_t)written >= sizeof(lock_dir)) {
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         set_error(ERR_INVALID_PATH, "Shared runtime lock path is too long");
         return -1;
     }
     dir_fd = open_private_subdir_at(parent_fd, child_name, true, NULL);
     if (dir_fd < 0) {
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         return -1;
     }
     /* Non-blocking (AR-05 L13): the holder keeps this lock across ssh-add
@@ -1157,12 +1448,10 @@ int runtime_state_lock_acquire(void) {
      * the same actionable message instead. */
     lock_fd = try_lock_private_file_at(dir_fd, ".lock");
     if (lock_fd < 0) {
-        bool contended = errno == EWOULDBLOCK;
-#if EAGAIN != EWOULDBLOCK
-        contended = contended || errno == EAGAIN;
-#endif
+        bool contended = runtime_lock_is_contended_error(errno);
         close(dir_fd);
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         if (contended) {
             set_error(ERR_FILE_IO,
                       "Another gitswitch holds the shared runtime lock "
@@ -1179,6 +1468,7 @@ int runtime_state_lock_acquire(void) {
         unlock_private_file(lock_fd);
         close(dir_fd);
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         errno = EINVAL;
         set_error(ERR_SYSTEM_CALL,
                   "Shared runtime lock token was not registered");
@@ -1204,6 +1494,7 @@ int runtime_state_lock_acquire(void) {
         (void)private_lock_release_generation(lock_fd, lock_generation);
         close(dir_fd);
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         set_error(ERR_PERMISSION_DENIED,
                   "Shared runtime lock namespace changed during acquisition");
         return -1;
@@ -1214,6 +1505,7 @@ int runtime_state_lock_acquire(void) {
             g_runtime_locks[i].active = true;
             g_runtime_locks[i].lock_fd = lock_fd;
             g_runtime_locks[i].lock_generation = lock_generation;
+            g_runtime_locks[i].anchor_slot = anchor_slot;
             g_runtime_locks[i].parent_fd = parent_fd;
             g_runtime_locks[i].dir_fd = dir_fd;
             g_runtime_locks[i].parent_dev = parent_st.st_dev;
@@ -1230,6 +1522,7 @@ int runtime_state_lock_acquire(void) {
     (void)private_lock_release_generation(lock_fd, lock_generation);
     close(dir_fd);
     close(parent_fd);
+    private_lock_inode_release(anchor_slot);
     set_error(ERR_SYSTEM_CALL, "Too many nested shared runtime locks");
     return -1;
 }
@@ -1330,6 +1623,7 @@ void runtime_state_lock_release(int fd) {
                     fd, g_runtime_locks[i].lock_generation);
                 close(g_runtime_locks[i].dir_fd);
                 close(g_runtime_locks[i].parent_fd);
+                private_lock_inode_release(g_runtime_locks[i].anchor_slot);
                 memset(&g_runtime_locks[i], 0, sizeof(g_runtime_locks[i]));
                 return;
         }

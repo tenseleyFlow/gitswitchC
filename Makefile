@@ -376,11 +376,13 @@ AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
 AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
 AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
 AR08_COPY_UTILS_OBJECT = $(OBJDIR)/utils_ar08_copy.o
+AR09_SECURITY_UTILS_OBJECT = $(OBJDIR)/utils_ar09_security.o
 DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR07_RESET_MAIN_OBJECT:.o=.d) \
            $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d) \
            $(AR08_HINT_CONFIG_OBJECT:.o=.d) \
-           $(AR08_COPY_UTILS_OBJECT:.o=.d)
+           $(AR08_COPY_UTILS_OBJECT:.o=.d) \
+           $(AR09_SECURITY_UTILS_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -713,6 +715,14 @@ $(AR08_COPY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
+# The runtime-lock classification suite injects synthetic ownership and ACL
+# facts so lifetime mutability is deterministic on every supported host.
+$(AR09_SECURITY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-09 runtime classification test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
@@ -741,6 +751,13 @@ $(BINDIR)/test_ar08_resume_hint_race: \
 $(BINDIR)/test_ar08_copy_permissions: \
 		$(OBJDIR)/test_ar08_copy_permissions.o \
 		$(AR08_COPY_UTILS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_security: \
+		$(OBJDIR)/test_security.o \
+		$(AR09_SECURITY_UTILS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)

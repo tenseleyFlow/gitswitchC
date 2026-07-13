@@ -64,11 +64,14 @@ int ensure_private_dir(const char *path);
 
 /**
  * Open and pin the runtime parent used by SSH/GPG state.  A configured
- * XDG_RUNTIME_DIR is accepted only when it is absolute and names a real,
- * self-owned 0700 directory; the returned descriptor names the validated
- * inode even if its pathname is subsequently renamed.  When XDG_RUNTIME_DIR
- * is absent or empty, the system /tmp target is opened and the absolute /tmp
- * spelling is returned for the uid-specific fallback directories.
+ * XDG_RUNTIME_DIR is accepted only when it is absolute, every component can
+ * be opened descriptor-relative without following links, and the leaf is a
+ * self-owned 0700 directory.  The system-owned /tmp alias is canonicalized on
+ * platforms that provide one; no component below it is resolved. The returned
+ * descriptor names the validated inode even if its pathname is subsequently
+ * renamed.  When XDG_RUNTIME_DIR is absent or empty, the system /tmp target is
+ * opened and the absolute /tmp spelling is returned for the uid-specific
+ * fallback directories.
  */
 int open_runtime_parent(char *path, size_t path_size);
 
@@ -96,8 +99,10 @@ void unlock_private_file(int token_fd);
 /**
  * Serialize cross-manager SSH/GPG runtime transactions for processes sharing
  * XDG_RUNTIME_DIR (or the same uid-specific /tmp fallback), even when their
- * different HOME values give them different configuration locks. The caller
- * owns the returned descriptor until runtime_state_lock_release().
+ * different HOME values give them different configuration locks. Configured
+ * paths retain a lock on their first user-replaceable ancestor so renaming and
+ * recreating a lower directory cannot create a second lock namespace. The
+ * caller owns the returned descriptor until runtime_state_lock_release().
  */
 int runtime_state_lock_acquire(void);
 void runtime_state_lock_release(int fd);

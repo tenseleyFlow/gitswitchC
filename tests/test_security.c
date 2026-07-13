@@ -19,6 +19,11 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+bool runtime_entry_test_may_be_replaced(
+    uid_t uid, mode_t parent_mode, uid_t parent_uid,
+    bool parent_acl_trusted, uid_t child_uid, bool child_acl_trusted,
+    bool child_owner_can_add_delete_acl);
+
 /* Recording runner: captures the argv vector instead of executing anything. */
 static char rec_argv[16][512];
 static int rec_argc;
@@ -318,10 +323,14 @@ cleanup:
 
 TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir) {
     char runtime[] = "/tmp/gs_runtime_unsafe_XXXXXX";
-    char real_dir[512], link_path[512];
+    char real_dir[512], other_dir[512], xdg_dir[512], other_xdg_dir[512];
+    char link_path[512], intermediate_path[512];
+    char real_lock_dir[640], real_lock_path[768];
+    char other_lock_dir[640], other_lock_path[768];
     char saved_xdg[MAX_PATH_LEN] = "";
     const char *old_xdg = getenv("XDG_RUNTIME_DIR");
     bool had_xdg = old_xdg && *old_xdg;
+    int lock_fd = -1;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
     if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
@@ -343,8 +352,207 @@ TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir) {
     clear_error();
 
     (void)unlink(link_path);
+    CHECK((size_t)snprintf(other_dir, sizeof(other_dir), "%s/other",
+                           runtime) < sizeof(other_dir));
+    CHECK((size_t)snprintf(xdg_dir, sizeof(xdg_dir), "%s/xdg",
+                           real_dir) < sizeof(xdg_dir));
+    CHECK((size_t)snprintf(other_xdg_dir, sizeof(other_xdg_dir), "%s/xdg",
+                           other_dir) < sizeof(other_xdg_dir));
+    CHECK((size_t)snprintf(intermediate_path, sizeof(intermediate_path),
+                           "%s/xdg", link_path) < sizeof(intermediate_path));
+    CHECK((size_t)snprintf(real_lock_dir, sizeof(real_lock_dir),
+                           "%s/gitswitch-runtime", xdg_dir) <
+          sizeof(real_lock_dir));
+    CHECK((size_t)snprintf(real_lock_path, sizeof(real_lock_path), "%s/.lock",
+                           real_lock_dir) < sizeof(real_lock_path));
+    CHECK((size_t)snprintf(other_lock_dir, sizeof(other_lock_dir),
+                           "%s/gitswitch-runtime", other_xdg_dir) <
+          sizeof(other_lock_dir));
+    CHECK((size_t)snprintf(other_lock_path, sizeof(other_lock_path), "%s/.lock",
+                           other_lock_dir) < sizeof(other_lock_path));
+    CHECK_EQ_INT(mkdir(other_dir, 0700), 0);
+    CHECK_EQ_INT(mkdir(xdg_dir, 0700), 0);
+    CHECK_EQ_INT(mkdir(other_xdg_dir, 0700), 0);
+    CHECK_EQ_INT(symlink(real_dir, link_path), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", intermediate_path, 1), 0);
+    lock_fd = runtime_state_lock_acquire();
+    CHECK_EQ_INT(lock_fd, -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    if (lock_fd >= 0) {
+        runtime_state_lock_release(lock_fd);
+        lock_fd = -1;
+    }
+    clear_error();
+
+    CHECK_EQ_INT(unlink(link_path), 0);
+    CHECK_EQ_INT(symlink(other_dir, link_path), 0);
+    lock_fd = runtime_state_lock_acquire();
+    CHECK_EQ_INT(lock_fd, -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+    if (lock_fd >= 0) runtime_state_lock_release(lock_fd);
+
+    (void)unlink(link_path);
+    (void)unlink(other_lock_path);
+    (void)rmdir(other_lock_dir);
+    (void)unlink(real_lock_path);
+    (void)rmdir(real_lock_dir);
+    (void)rmdir(other_xdg_dir);
+    (void)rmdir(xdg_dir);
+    (void)rmdir(other_dir);
     (void)rmdir(real_dir);
     (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
+TEST(runtime_entry_replacement_classification_is_lifetime_safe) {
+    const uid_t acting_uid = (uid_t)4242;
+    const uid_t other_uid = (uid_t)4343;
+
+    /* Directory owners can chmod a presently read-only ancestor and then
+     * replace its child while a transaction is live. */
+    CHECK(runtime_entry_test_may_be_replaced(
+        acting_uid, 0500, acting_uid, true, other_uid, true, false));
+
+    /* BSD-family/NFSv4 ACLs can grant deletion on the child independently of
+     * an otherwise immutable parent. Unknown/nontrivial child ACLs anchor. */
+    CHECK(runtime_entry_test_may_be_replaced(
+        acting_uid, 0555, other_uid, true, other_uid, false, false));
+
+    /* On ACL_DELETE-capable systems a child owner can make a currently
+     * trivial ACL mutable later, so ownership itself requires an anchor. */
+    CHECK(runtime_entry_test_may_be_replaced(
+        acting_uid, 0555, other_uid, true, acting_uid, true, true));
+
+    /* A non-owned, read-only parent and trivial ACLs need no extra anchor. */
+    CHECK(!runtime_entry_test_may_be_replaced(
+        acting_uid, 0555, other_uid, true, other_uid, true, false));
+}
+
+TEST(runtime_state_lock_excludes_contender_after_ancestor_replacement) {
+    char root[] = "/tmp/gs_runtime_ancestor_XXXXXX";
+    char moved[512], branch[512], xdg[512], lock_dir[640], lock_path[768];
+    char old_branch[512], old_xdg[512], old_lock_dir[640], old_lock_path[768];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *previous_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = previous_xdg && *previous_xdg;
+    struct pollfd pfd;
+    int entered[2] = {-1, -1};
+    int holder = -1;
+    pid_t child = -1;
+    int status = 0;
+    int poll_rc;
+    char marker = '\0';
+
+    if (had_xdg) safe_strncpy(saved_xdg, previous_xdg, sizeof(saved_xdg));
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK((size_t)snprintf(moved, sizeof(moved), "%s.old", root) <
+          sizeof(moved));
+    CHECK((size_t)snprintf(branch, sizeof(branch), "%s/branch", root) <
+          sizeof(branch));
+    CHECK((size_t)snprintf(xdg, sizeof(xdg), "%s/xdg", branch) <
+          sizeof(xdg));
+    CHECK((size_t)snprintf(lock_dir, sizeof(lock_dir),
+                           "%s/gitswitch-runtime", xdg) < sizeof(lock_dir));
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock",
+                           lock_dir) < sizeof(lock_path));
+    CHECK((size_t)snprintf(old_branch, sizeof(old_branch), "%s/branch",
+                           moved) < sizeof(old_branch));
+    CHECK((size_t)snprintf(old_xdg, sizeof(old_xdg), "%s/xdg", old_branch) <
+          sizeof(old_xdg));
+    CHECK((size_t)snprintf(old_lock_dir, sizeof(old_lock_dir),
+                           "%s/gitswitch-runtime", old_xdg) <
+          sizeof(old_lock_dir));
+    CHECK((size_t)snprintf(old_lock_path, sizeof(old_lock_path), "%s/.lock",
+                           old_lock_dir) < sizeof(old_lock_path));
+    CHECK_EQ_INT(mkdir(branch, 0700), 0);
+    CHECK_EQ_INT(mkdir(xdg, 0700), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
+
+    holder = runtime_state_lock_acquire();
+    CHECK(holder >= 0);
+    CHECK_EQ_INT(rename(root, moved), 0);
+    CHECK_EQ_INT(mkdir(root, 0700), 0);
+    CHECK_EQ_INT(mkdir(branch, 0700), 0);
+    CHECK_EQ_INT(mkdir(xdg, 0700), 0);
+    CHECK_EQ_INT(pipe(entered), 0);
+    if (holder < 0 || entered[0] < 0) goto cleanup;
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int child_lock;
+
+        close(entered[0]);
+        close(holder);
+        child_lock = runtime_state_lock_acquire();
+        if (child_lock >= 0) {
+            runtime_state_lock_release(child_lock);
+            if (write(entered[1], "X", 1) != 1) _exit(4);
+            _exit(2);
+        }
+        if (write(entered[1], "B", 1) != 1) _exit(3);
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
+    close(entered[1]);
+    entered[1] = -1;
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = entered[0];
+    pfd.events = POLLIN;
+    do {
+        poll_rc = poll(&pfd, 1, 2000);
+    } while (poll_rc < 0 && errno == EINTR);
+    CHECK(poll_rc > 0 && (pfd.revents & POLLIN) != 0);
+    if (poll_rc > 0 && (pfd.revents & POLLIN) != 0) {
+        CHECK_EQ_INT(read(entered[0], &marker, 1), 1);
+        CHECK_EQ_INT(marker, 'B');
+    } else {
+        (void)kill(child, SIGKILL);
+    }
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    runtime_state_lock_release(holder);
+    holder = -1;
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        int child_lock = runtime_state_lock_acquire();
+        if (child_lock < 0) _exit(2);
+        runtime_state_lock_release(child_lock);
+        _exit(0);
+    }
+    if (child < 0) goto cleanup;
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+cleanup:
+    if (holder >= 0) runtime_state_lock_release(holder);
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (entered[0] >= 0) close(entered[0]);
+    if (entered[1] >= 0) close(entered[1]);
+    (void)unlink(lock_path);
+    (void)rmdir(lock_dir);
+    (void)rmdir(xdg);
+    (void)rmdir(branch);
+    (void)rmdir(root);
+    (void)unlink(old_lock_path);
+    (void)rmdir(old_lock_dir);
+    (void)rmdir(old_xdg);
+    (void)rmdir(old_branch);
+    (void)rmdir(moved);
     if (had_xdg) {
         CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
     } else {
@@ -1421,6 +1629,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(ensure_private_dir_contract_matches_adoption_policy);
     RUN_TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast);
     RUN_TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir);
+    RUN_TEST(runtime_entry_replacement_classification_is_lifetime_safe);
+    RUN_TEST(runtime_state_lock_excludes_contender_after_ancestor_replacement);
     RUN_TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting);
     RUN_TEST(runtime_state_lock_excludes_contender_after_leaf_replacement);
     RUN_TEST(private_lock_release_identity_checks_reused_and_nested_tokens);
