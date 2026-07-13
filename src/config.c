@@ -300,20 +300,35 @@ static void config_document_free(toml_document_t *doc) {
  * cleanup on both success and failure. */
 static int config_read_document(const char *config_path, toml_document_t *doc) {
     char *buffer = NULL;
-    struct stat fst;
+    struct stat before, after, path_after;
     size_t file_size, total = 0;
+    int parse_result;
     int fd;
 
     fd = open_config_validated(config_path);
     if (fd < 0) {
         return -1;
     }
-    if (fstat(fd, &fst) != 0) {
+    if (fstat(fd, &before) != 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot stat config file: %s", config_path);
         close(fd);
         return -1;
     }
-    file_size = (size_t)fst.st_size;
+    if (before.st_size < 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Configuration file has an invalid negative size: %s",
+                  config_path);
+        close(fd);
+        return -1;
+    }
+    if (before.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Configuration file too large: %ld bytes",
+                  (long)before.st_size);
+        close(fd);
+        return -1;
+    }
+    file_size = (size_t)before.st_size;
     buffer = malloc(file_size + 1);
     if (!buffer) {
         set_error(ERR_MEMORY_ALLOCATION, "Failed to allocate config read buffer");
@@ -326,16 +341,92 @@ static int config_read_document(const char *config_path, toml_document_t *doc) {
         if (n <= 0) break;
         total += (size_t)n;
     }
-    close(fd);
+    if (config_io_fault(CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ,
+                        "config document consistency checkpoint")) {
+        close(fd);
+        goto fail_buffer;
+    }
     if (total != file_size) {
         set_system_error(ERR_FILE_IO, "Failed to read complete config file: %s", config_path);
+        close(fd);
         goto fail_buffer;
     }
     buffer[file_size] = '\0';
 
     /* The parser entry point owns character/injection validation and the one
      * document initialization, matching toml_parse_file exactly. */
-    if (toml_parse_string(buffer, file_size, doc) != 0) {
+    parse_result = toml_parse_string(buffer, file_size, doc);
+
+    /* Keep the exact opened object pinned until parsing finishes. A writer may
+     * append or replace accounts.toml after the initial size snapshot; without
+     * this post-parse check we would accept a valid stale prefix and a later
+     * reconstructive save could erase the unseen suffix. Require EOF, stable
+     * descriptor metadata, and the same inode still installed at config_path. */
+    {
+        unsigned char trailing;
+        ssize_t extra;
+
+        do {
+            extra = read(fd, &trailing, 1);
+        } while (extra < 0 && errno == EINTR);
+
+        if (extra < 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot verify complete config read: %s",
+                             config_path);
+            close(fd);
+            goto fail_buffer;
+        }
+        if (fstat(fd, &after) != 0 || lstat(config_path, &path_after) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot verify config identity after read: %s",
+                             config_path);
+            close(fd);
+            goto fail_buffer;
+        }
+
+        bool metadata_stable =
+            config_metadata_same_file(&before, &after) &&
+            config_metadata_same_file(&before, &path_after) &&
+            before.st_uid == after.st_uid &&
+            after.st_uid == path_after.st_uid &&
+            before.st_gid == after.st_gid &&
+            after.st_gid == path_after.st_gid &&
+            before.st_mode == after.st_mode &&
+            after.st_mode == path_after.st_mode &&
+            before.st_size == after.st_size &&
+            after.st_size == path_after.st_size;
+#if defined(__APPLE__)
+        metadata_stable = metadata_stable &&
+            before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
+            before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec &&
+            after.st_mtimespec.tv_sec == path_after.st_mtimespec.tv_sec &&
+            after.st_mtimespec.tv_nsec == path_after.st_mtimespec.tv_nsec &&
+            before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec &&
+            before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec &&
+            after.st_ctimespec.tv_sec == path_after.st_ctimespec.tv_sec &&
+            after.st_ctimespec.tv_nsec == path_after.st_ctimespec.tv_nsec;
+#else
+        metadata_stable = metadata_stable &&
+            before.st_mtim.tv_sec == after.st_mtim.tv_sec &&
+            before.st_mtim.tv_nsec == after.st_mtim.tv_nsec &&
+            after.st_mtim.tv_sec == path_after.st_mtim.tv_sec &&
+            after.st_mtim.tv_nsec == path_after.st_mtim.tv_nsec &&
+            before.st_ctim.tv_sec == after.st_ctim.tv_sec &&
+            before.st_ctim.tv_nsec == after.st_ctim.tv_nsec &&
+            after.st_ctim.tv_sec == path_after.st_ctim.tv_sec &&
+            after.st_ctim.tv_nsec == path_after.st_ctim.tv_nsec;
+#endif
+        if (extra != 0 || !metadata_stable) {
+            set_error(ERR_FILE_IO,
+                      "Configuration changed while it was being read; retry: %s",
+                      config_path);
+            close(fd);
+            goto fail_buffer;
+        }
+    }
+    close(fd);
+    if (parse_result != 0) {
         goto fail_buffer;
     }
 

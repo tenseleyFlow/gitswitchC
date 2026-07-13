@@ -102,6 +102,39 @@ static size_t count_occurrences(const char *haystack, const char *needle) {
     return count;
 }
 
+static const char *growth_hook_path;
+static bool growth_hook_ran;
+
+static bool append_after_prefix_read(config_io_boundary_t boundary) {
+    static const char appended_account[] =
+        "\n[accounts.2]\n"
+        "name = \"bob\"\n"
+        "email = \"b@b.com\"\n";
+    int fd;
+    size_t total = 0;
+
+    if (boundary != CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ || growth_hook_ran) {
+        return false;
+    }
+    growth_hook_ran = true;
+    fd = open(growth_hook_path, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fd < 0) return false;
+    while (total < sizeof(appended_account) - 1U) {
+        ssize_t written = write(fd, appended_account + total,
+                                sizeof(appended_account) - 1U - total);
+        if (written > 0) {
+            total += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            break;
+        }
+    }
+    (void)fsync(fd);
+    close(fd);
+    return false;
+}
+
 /* ---- cfg-symlink-01/02: read path ---- */
 
 TEST(load_accepts_regular_file) {
@@ -118,6 +151,26 @@ TEST(load_accepts_regular_file) {
         CHECK_STR_EQ(ctx.accounts[0].name, "alice");
         CHECK_EQ_INT(ctx.accounts[0].id, 1);
     }
+}
+
+TEST(load_rejects_file_growth_after_prefix_read) {
+    char dir[128], path[256], contents[1024];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_config(path, valid_config, strlen(valid_config)), 0);
+
+    growth_hook_path = path;
+    growth_hook_ran = false;
+    config_set_io_fault_fn(append_after_prefix_read);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), -1); /* pre-fix: accepted alice only */
+    config_set_io_fault_fn(NULL);
+
+    CHECK(growth_hook_ran);
+    CHECK(slurp(path, contents, sizeof(contents)) > 0);
+    CHECK(strstr(contents, "[accounts.2]") != NULL);
 }
 
 TEST(load_rejects_symlinked_config) {
@@ -1506,6 +1559,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(back_to_back_backups_in_same_second_both_persist);
     RUN_TEST(destructive_resolution_refuses_substring);
     RUN_TEST(load_accepts_regular_file);
+    RUN_TEST(load_rejects_file_growth_after_prefix_read);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
     RUN_TEST(config_init_rejects_nondirectory_final_components);

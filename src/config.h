@@ -40,7 +40,11 @@ typedef enum {
     CONFIG_IO_STATE_BEFORE_FILE_SYNC,
     CONFIG_IO_STATE_BEFORE_CLOSE,
     CONFIG_IO_STATE_BEFORE_RENAME,
-    CONFIG_IO_STATE_BEFORE_DIR_SYNC
+    CONFIG_IO_STATE_BEFORE_DIR_SYNC,
+    /* Read-side consistency checkpoint. A test callback may mutate the
+     * descriptor's backing file and return false; production leaves the
+     * callback NULL. */
+    CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ
 } config_io_boundary_t;
 
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);
