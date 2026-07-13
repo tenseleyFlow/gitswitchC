@@ -3530,32 +3530,10 @@ out:
     return rc;
 }
 
-/* AR-06 F61: gpg_import_key(), gpg_export_public_key() and gpg_list_keys() were
- * removed here — dead public API with zero callers anywhere in the tree. */
-
-/* Validate GPG key exists and is usable */
-int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id) {
-    char output[512];
-    int result;
-
-    if (!gpg_config || !key_id) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_validate_key");
-        return -1;
-    }
-
-    log_debug("Validating GPG key: %s", key_id);
-
-    result = gpg_run(gpg_config, NULL, output, sizeof(output),
-                     "gpg", "--list-secret-keys", key_id, (const char *)NULL);
-    if (result != 0) {
-        set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not found: %s", key_id);
-        return -1;
-    }
-
-    log_debug("GPG key validation passed: %s", key_id);
-    gpg_manager_note_key_available(key_id);
-    return 0;
-}
+/* AR-06 F61 / AR-08 L17: gpg_import_key(), gpg_export_public_key(),
+ * gpg_list_keys(), and gpg_validate_key() were removed here. They had no
+ * callers, and the latter's name promised strict usability/capability checks
+ * while its implementation only observed a helper exit status. */
 
 /* Configure git GPG signing */
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, git_scope_t scope) {
@@ -4062,8 +4040,58 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
     return 0;
 }
 
-/* Return 0 for one validated key, 1 for an ordinary listing miss, and -1 for
- * incomplete or ambiguous evidence. */
+/* Classify the runner result without collapsing transport/setup failures into
+ * an ordinary key miss. GnuPG documents exit status 2 for the no-secret-key
+ * result of --list-secret-keys; every other nonzero state is operational
+ * failure, including pre-spawn rejection, child setup/exec failure, signal
+ * termination, and a runner I/O failure after an exit-0 child. */
+static int gpg_classify_secret_listing_run(int run_rc,
+                                           const run_result_t *res,
+                                           const char *selector) {
+    if (!res || !selector) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG key-listing result classification");
+        return -1;
+    }
+    if (run_rc == 0) {
+        if (res->spawned && res->exit_code == 0 && res->term_signal == 0) {
+            return 0;
+        }
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper returned inconsistent success for %s",
+                  selector);
+        return -1;
+    }
+    if (res->spawned && res->term_signal == 0 && res->exit_code == 2) {
+        return 1;
+    }
+    if (!res->spawned) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper failed before spawn for %s",
+                  selector);
+    } else if (res->term_signal != 0) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper was terminated by signal %d for %s",
+                  res->term_signal, selector);
+    } else if (res->exit_code == 126 || res->exit_code == 127) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper failed during child setup or exec "
+                  "(exit %d) for %s",
+                  res->exit_code, selector);
+    } else if (res->exit_code == 0) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper transport failed after exit 0 for %s",
+                  selector);
+    } else {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG secret-key helper failed with exit status %d for %s",
+                  res->exit_code, selector);
+    }
+    return -1;
+}
+
+/* Return 0 for one validated key, 1 only for GnuPG's ordinary listing miss,
+ * and -1 for incomplete, ambiguous, or operationally failed evidence. */
 static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                                       const gpg_pinned_home_t *home,
                                       const char *source_home,
@@ -4080,58 +4108,60 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
         NULL
     };
     char *listing = malloc(KEY_LISTING_CAP);
-    int attempt;
+    run_result_t res;
+    int run_rc;
+    int status;
 
     if (!listing) {
         set_error(ERR_MEMORY_ALLOCATION,
                   "Failed to allocate GPG key-listing buffer");
         return -1;
     }
-    for (attempt = 0; attempt < 2; attempt++) {
-        run_result_t res;
-        int run_rc;
-
-        memset(&res, 0, sizeof(res));
-        if (home) {
-            run_rc = gpg_run_pinned(home, gpg_config, &res, listing,
-                                    KEY_LISTING_CAP,
-                                    "gpg", "--batch", "--with-colons",
-                                    "--fixed-list-mode", "--list-secret-keys",
-                                    "--fingerprint", "--fingerprint", selector,
-                                    (const char *)NULL);
-        } else {
-            run_opts_t opts;
-            memset(&opts, 0, sizeof(opts));
-            opts.out = listing;
-            opts.out_size = KEY_LISTING_CAP;
-            opts.stderr_to_devnull = true;
-            if (safe_snprintf(source_env, sizeof(source_env),
-                              "GNUPGHOME=%s", source_home) != 0) {
-                free(listing);
-                set_error(ERR_INVALID_PATH, "GPG source home is too long");
-                return -1;
-            }
-            env[0] = source_env;
-            opts.extra_env = env;
-            run_rc = run_argv(argv, &opts, &res);
-        }
-        if (run_rc != 0) {
+    memset(&res, 0, sizeof(res));
+    res.exit_code = -1;
+    if (home) {
+        run_rc = gpg_run_pinned(home, gpg_config, &res, listing,
+                                KEY_LISTING_CAP,
+                                "gpg", "--batch", "--with-colons",
+                                "--fixed-list-mode", "--list-secret-keys",
+                                "--fingerprint", "--fingerprint", selector,
+                                (const char *)NULL);
+    } else {
+        run_opts_t opts;
+        memset(&opts, 0, sizeof(opts));
+        opts.out = listing;
+        opts.out_size = KEY_LISTING_CAP;
+        opts.stderr_to_devnull = true;
+        if (safe_snprintf(source_env, sizeof(source_env),
+                          "GNUPGHOME=%s", source_home) != 0) {
             secure_zero_memory(listing, KEY_LISTING_CAP);
             free(listing);
-            return 1;
+            set_error(ERR_INVALID_PATH, "GPG source home is too long");
+            return -1;
         }
-        if (!res.out_truncated) {
-            int parse_rc = gpg_manager_resolve_secret_key_listing(
-                listing, require_signing, fingerprint, fingerprint_size);
-            secure_zero_memory(listing, KEY_LISTING_CAP);
-            free(listing);
-            return parse_rc;
-        }
+        env[0] = source_env;
+        opts.extra_env = env;
+        run_rc = run_argv(argv, &opts, &res);
+    }
+    status = gpg_classify_secret_listing_run(run_rc, &res, selector);
+    if (status != 0) {
+        secure_zero_memory(listing, KEY_LISTING_CAP);
+        free(listing);
+        return status;
+    }
+    if (!res.out_truncated) {
+        int parse_rc = gpg_manager_resolve_secret_key_listing(
+            listing, require_signing, fingerprint, fingerprint_size);
+        secure_zero_memory(listing, KEY_LISTING_CAP);
+        free(listing);
+        return parse_rc;
     }
     secure_zero_memory(listing, KEY_LISTING_CAP);
     free(listing);
     set_error(ERR_GPG_KEY_FAILED,
-              "GPG secret-key inventory is too large to resolve safely");
+              "GPG secret-key inventory exceeds the one-shot %d-byte "
+              "capture limit",
+              KEY_LISTING_CAP);
     return -1;
 }
 

@@ -163,18 +163,9 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account);
  */
 int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account);
 
-/**
- * AR-06 F61: gpg_import_key(), gpg_export_public_key() and gpg_list_keys()
- * were removed — dead public API with zero callers.
- */
-
-/**
- * Validate GPG key exists and is usable
- * - Checks key exists in keyring
- * - Verifies key is not expired
- * - Tests signing capability if required
- */
-int gpg_validate_key(gpg_config_t *gpg_config, const char *key_id);
+/** AR-06 F61 / AR-08 L17: gpg_import_key(), gpg_export_public_key(),
+ * gpg_list_keys(), and gpg_validate_key() were removed — dead public API;
+ * gpg_validate_key() also overstated its exit-status-only implementation. */
 
 /**
  * Configure git GPG signing

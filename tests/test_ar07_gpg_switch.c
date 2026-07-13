@@ -168,6 +168,215 @@ static bool argv_has(const char *const argv[], const char *needle) {
     return false;
 }
 
+static void fill_account(account_t *account, const char *name,
+                         const char *selector, bool signing);
+
+enum listing_result_mode {
+    LISTING_RESULT_MATCH,
+    LISTING_RESULT_MISS,
+    LISTING_RESULT_SPAWN_FAILURE,
+    LISTING_RESULT_SETUP_FAILURE,
+    LISTING_RESULT_SIGNAL_FAILURE,
+    LISTING_RESULT_PIPE_FAILURE,
+    LISTING_RESULT_GPG_FAILURE,
+    LISTING_RESULT_TRUNCATED
+};
+
+static enum listing_result_mode g_listing_result_mode;
+static int g_listing_result_calls;
+static int g_listing_result_exports;
+static int g_listing_result_imports;
+static size_t g_listing_result_capacity;
+
+static int listing_result_runner(const char *const argv[],
+                                 const run_opts_t *opts,
+                                 run_result_t *result) {
+    bool listing = argv_has(argv, "--list-secret-keys");
+    bool export_key = argv_has(argv, "--export-secret-keys");
+    bool import_key = argv_has(argv, "--import");
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 0;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+
+    if (listing) {
+        g_listing_result_calls++;
+        if (g_listing_result_calls == 1) {
+            g_listing_result_capacity = opts ? opts->out_size : 0;
+            switch (g_listing_result_mode) {
+                case LISTING_RESULT_MISS:
+                    if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_SPAWN_FAILURE:
+                    if (result) {
+                        result->spawned = false;
+                        result->exit_code = -1;
+                    }
+                    return -1;
+                case LISTING_RESULT_SETUP_FAILURE:
+                    if (result) result->exit_code = 126;
+                    return -1;
+                case LISTING_RESULT_SIGNAL_FAILURE:
+                    if (result) {
+                        result->exit_code = -1;
+                        result->term_signal = SIGTERM;
+                    }
+                    return -1;
+                case LISTING_RESULT_PIPE_FAILURE:
+                    return -1;
+                case LISTING_RESULT_GPG_FAILURE:
+                    if (result) result->exit_code = 1;
+                    return -1;
+                case LISTING_RESULT_TRUNCATED:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size, "%s", PRIMARY_SIGN);
+                        if (result) {
+                            result->out_len = strlen(opts->out);
+                            result->out_truncated = true;
+                        }
+                    }
+                    return 0;
+                case LISTING_RESULT_MATCH:
+                    break;
+                default:
+                    return -1;
+            }
+        }
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size, "%s", PRIMARY_SIGN);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (export_key) {
+        static const char armor[] =
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----\n"
+            "FAKE\n"
+            "-----END PGP PRIVATE KEY BLOCK-----\n";
+        g_listing_result_exports++;
+        if (opts && opts->out && opts->out_size > sizeof(armor)) {
+            memcpy(opts->out, armor, sizeof(armor));
+            if (result) result->out_len = sizeof(armor) - 1;
+        }
+        return 0;
+    }
+    if (import_key) {
+        g_listing_result_imports++;
+        return 0;
+    }
+    return 0;
+}
+
+static int run_listing_result_case(enum listing_result_mode mode,
+                                   int *listing_calls,
+                                   int *export_calls,
+                                   int *import_calls,
+                                   size_t *capacity,
+                                   char *diagnostic,
+                                   size_t diagnostic_size) {
+    char xdg[128];
+    char source_home[MAX_PATH_LEN];
+    gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
+    account_t account;
+    command_runner_fn previous;
+    int rc;
+
+    if (make_runtime(xdg, sizeof(xdg)) != 0 ||
+        safe_snprintf(source_home, sizeof(source_home), "%s/source", xdg) != 0 ||
+        mkdir(source_home, 0700) != 0 ||
+        setenv("GNUPGHOME", source_home, 1) != 0) {
+        return -2;
+    }
+    fill_account(&account, "matrix", "01234567", true);
+    g_listing_result_mode = mode;
+    g_listing_result_calls = 0;
+    g_listing_result_exports = 0;
+    g_listing_result_imports = 0;
+    g_listing_result_capacity = 0;
+    clear_error();
+    previous = run_set_runner(listing_result_runner);
+    rc = gpg_switch_account(&config, &account);
+    if (diagnostic && diagnostic_size > 0) {
+        safe_strncpy(diagnostic, get_last_error()->message, diagnostic_size);
+    }
+    if (listing_calls) *listing_calls = g_listing_result_calls;
+    if (export_calls) *export_calls = g_listing_result_exports;
+    if (import_calls) *import_calls = g_listing_result_imports;
+    if (capacity) *capacity = g_listing_result_capacity;
+    if (rc == 0) {
+        (void)gpg_manager_cleanup(&config);
+    }
+    run_set_runner(previous);
+    unsetenv("GNUPGHOME");
+    return rc;
+}
+
+TEST(secret_listing_result_matrix_is_causal_and_exact) {
+    static const struct {
+        enum listing_result_mode mode;
+        const char *diagnostic;
+    } failures[] = {
+        { LISTING_RESULT_SPAWN_FAILURE, "before spawn" },
+        { LISTING_RESULT_SETUP_FAILURE, "child setup or exec" },
+        { LISTING_RESULT_SIGNAL_FAILURE, "terminated by signal" },
+        { LISTING_RESULT_PIPE_FAILURE, "transport failed" },
+        { LISTING_RESULT_GPG_FAILURE, "exit status 1" }
+    };
+    char diagnostic[512];
+    int listings;
+    int exports;
+    int imports;
+    size_t capacity;
+    size_t i;
+
+    CHECK_EQ_INT(run_listing_result_case(
+                     LISTING_RESULT_MATCH, &listings, &exports, &imports,
+                     &capacity, diagnostic, sizeof(diagnostic)), 0);
+    CHECK_EQ_INT(listings, 1);
+    CHECK_EQ_INT(exports, 0);
+    CHECK_EQ_INT(imports, 0);
+
+    /* Only the documented spawned/normal exit-2 outcome is a miss. It alone
+     * advances into the source listing, export, import, and verification
+     * sequence; every operational failure stops at the first helper call. */
+    CHECK_EQ_INT(run_listing_result_case(
+                     LISTING_RESULT_MISS, &listings, &exports, &imports,
+                     &capacity, diagnostic, sizeof(diagnostic)), 0);
+    CHECK_EQ_INT(listings, 3);
+    CHECK_EQ_INT(exports, 1);
+    CHECK_EQ_INT(imports, 1);
+
+    for (i = 0; i < sizeof(failures) / sizeof(failures[0]); i++) {
+        CHECK_EQ_INT(run_listing_result_case(
+                         failures[i].mode, &listings, &exports, &imports,
+                         &capacity, diagnostic, sizeof(diagnostic)), -1);
+        CHECK_EQ_INT(listings, 1);
+        CHECK_EQ_INT(exports, 0);
+        CHECK_EQ_INT(imports, 0);
+        CHECK(strstr(diagnostic, failures[i].diagnostic) != NULL);
+    }
+}
+
+TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap) {
+    char diagnostic[512];
+    int listings;
+    int exports;
+    int imports;
+    size_t capacity;
+
+    CHECK_EQ_INT(run_listing_result_case(
+                     LISTING_RESULT_TRUNCATED, &listings, &exports, &imports,
+                     &capacity, diagnostic, sizeof(diagnostic)), -1);
+    CHECK_EQ_INT(listings, 1);
+    CHECK_EQ_INT(exports, 0);
+    CHECK_EQ_INT(imports, 0);
+    CHECK_EQ_INT((long long)capacity, (long long)(512U * 1024U));
+    CHECK(strstr(diagnostic, "one-shot 524288-byte capture limit") != NULL);
+}
+
 static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
                              run_result_t *result) {
     bool listing = argv_has(argv, "--list-secret-keys");
@@ -1085,6 +1294,8 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(strict_capability_parser_rejects_unusable_keys);
     RUN_TEST(selector_inventory_is_exact_and_canonical);
+    RUN_TEST(secret_listing_result_matrix_is_causal_and_exact);
+    RUN_TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap);
     RUN_TEST(ambiguous_selector_exports_and_imports_nothing);
     RUN_TEST(unique_selector_threads_fingerprint_through_import_and_publication);
     RUN_TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication);
