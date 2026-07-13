@@ -4341,28 +4341,47 @@ int get_terminal_size(int *width, int *height) {
     return 0;
 }
 
-void disable_echo(void) {
+int disable_echo(void) {
     struct termios new_termios;
-    
-    if (g_echo_disabled) return;
-    
+
+    if (g_echo_disabled) return 0;
+
     if (tcgetattr(STDIN_FILENO, &g_original_termios) != 0) {
-        return; /* Can't save original, don't disable echo */
+        int saved_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Failed to read terminal state before disabling echo");
+        errno = saved_errno;
+        return -1; /* Can't save original, don't disable echo. */
     }
-    
+
     new_termios = g_original_termios;
     new_termios.c_lflag &= ~ECHO;
-    
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) == 0) {
-        g_echo_disabled = true;
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) != 0) {
+        int saved_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL, "Failed to disable terminal echo");
+        errno = saved_errno;
+        return -1;
     }
+    g_echo_disabled = true;
+    return 0;
 }
 
-void enable_echo(void) {
-    if (!g_echo_disabled) return;
-    
-    tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios);
+int enable_echo(void) {
+    if (!g_echo_disabled) return 0;
+
+    /* Keep the recovery flag set until the kernel accepts the restore. A
+     * transient descriptor/PTY failure must remain retryable rather than
+     * turning every later enable_echo() call into a false-success no-op. */
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios) != 0) {
+        int saved_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL, "Failed to restore terminal echo");
+        errno = saved_errno;
+        return -1;
+    }
     g_echo_disabled = false;
+    clear_error();
+    return 0;
 }
 
 /* Time utilities */

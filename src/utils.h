@@ -358,8 +358,11 @@ int ensure_config_directory_exists(void);
  */
 bool is_terminal(int fd);
 int get_terminal_size(int *width, int *height);
-void disable_echo(void);
-void enable_echo(void);
+/* Echo transitions are idempotent. Failures return -1 with errno mirrored in
+ * the global error context; a failed restore remains pending so callers can
+ * retry enable_echo() after repairing the terminal descriptor. */
+int disable_echo(void);
+int enable_echo(void);
 
 /**
  * Time utilities
