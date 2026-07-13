@@ -84,6 +84,33 @@ static void restore_environment(const char *name, char *saved, bool had) {
     free(saved);
 }
 
+static void check_probe_and_runner_reject(const char *command) {
+    char resolved[MAX_PATH_LEN];
+    const char *argv[] = {command, NULL};
+    run_result_t result;
+
+    CHECK_EQ_INT(find_command_path(command, resolved, sizeof(resolved)), -1);
+    CHECK(!command_exists(command));
+    clear_error();
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), -1);
+    CHECK(!result.spawned);
+}
+
+static void check_probe_and_runner_accept(const char *command,
+                                          const char *argument) {
+    char resolved[MAX_PATH_LEN];
+    const char *argv[] = {command, argument, NULL};
+    run_result_t result;
+
+    CHECK_EQ_INT(find_command_path(command, resolved, sizeof(resolved)), 0);
+    CHECK(resolved[0] == '/');
+    CHECK(command_exists(command));
+    clear_error();
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), 0);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+}
+
 static void replace_after_pin(const char *resolved_path) {
     g_hook_result = -1;
     if (strcmp(resolved_path, g_swap_expected) != 0) return;
@@ -533,6 +560,89 @@ TEST(shebang_env_untrusted_and_recursive_interpreters_are_rejected) {
     restore_environment("PATH", saved_path, had_path);
 }
 
+TEST(probe_and_runner_share_format_and_shebang_eligibility) {
+    char root[MAX_PATH_LEN], bin[MAX_PATH_LEN];
+    char plain[MAX_PATH_LEN], env_script[MAX_PATH_LEN];
+    char untrusted_script[MAX_PATH_LEN], recursive_script[MAX_PATH_LEN];
+    char recursive_interpreter[MAX_PATH_LEN], env_alias[MAX_PATH_LEN];
+    char alias_script[MAX_PATH_LEN], valid_binary[MAX_PATH_LEN];
+    char valid_script[MAX_PATH_LEN], canonical_env[MAX_PATH_LEN];
+    char hostile_root[] = "/tmp/gitswitch-ar08-probe-XXXXXX";
+    char hostile_interpreter[MAX_PATH_LEN];
+    char body[MAX_PATH_LEN * 2], path_value[MAX_PATH_LEN * 2];
+    char *saved_path = NULL;
+    bool had_path = false;
+
+    if (!make_safe_fixture(root, sizeof(root), bin, sizeof(bin)) ||
+        !ts_mkdtemp(hostile_root)) {
+        CHECK(!"probe parity fixture creation failed");
+        return;
+    }
+    CHECK((size_t)snprintf(plain, sizeof(plain), "%s/plain", bin) <
+          sizeof(plain));
+    CHECK((size_t)snprintf(env_script, sizeof(env_script), "%s/env-script",
+                           bin) < sizeof(env_script));
+    CHECK((size_t)snprintf(untrusted_script, sizeof(untrusted_script),
+                           "%s/untrusted-script", bin) <
+          sizeof(untrusted_script));
+    CHECK((size_t)snprintf(recursive_script, sizeof(recursive_script),
+                           "%s/recursive-script", bin) <
+          sizeof(recursive_script));
+    CHECK((size_t)snprintf(recursive_interpreter,
+                           sizeof(recursive_interpreter), "%s/interpreter",
+                           bin) < sizeof(recursive_interpreter));
+    CHECK((size_t)snprintf(env_alias, sizeof(env_alias), "%s/env-alias", bin) <
+          sizeof(env_alias));
+    CHECK((size_t)snprintf(alias_script, sizeof(alias_script),
+                           "%s/alias-script", bin) < sizeof(alias_script));
+    CHECK((size_t)snprintf(valid_binary, sizeof(valid_binary), "%s/valid-bin",
+                           bin) < sizeof(valid_binary));
+    CHECK((size_t)snprintf(valid_script, sizeof(valid_script),
+                           "%s/valid-script", bin) < sizeof(valid_script));
+    CHECK((size_t)snprintf(hostile_interpreter,
+                           sizeof(hostile_interpreter), "%s/interpreter",
+                           hostile_root) < sizeof(hostile_interpreter));
+
+    CHECK_EQ_INT(write_string_to_file(plain, "exit 0\n", 0755), 0);
+    CHECK_EQ_INT(write_string_to_file(
+                     env_script, "#!/usr/bin/env sh\nexit 0\n", 0755), 0);
+    CHECK(install_self_copy(hostile_interpreter, 0755));
+    CHECK((size_t)snprintf(body, sizeof(body), "#!%s\nexit 0\n",
+                           hostile_interpreter) < sizeof(body));
+    CHECK_EQ_INT(write_string_to_file(untrusted_script, body, 0755), 0);
+    CHECK_EQ_INT(write_string_to_file(
+                     recursive_interpreter, "#!/bin/sh\nexit 0\n", 0755), 0);
+    CHECK((size_t)snprintf(body, sizeof(body), "#!%s\nexit 0\n",
+                           recursive_interpreter) < sizeof(body));
+    CHECK_EQ_INT(write_string_to_file(recursive_script, body, 0755), 0);
+    CHECK_EQ_INT(find_command_path("env", canonical_env,
+                                   sizeof(canonical_env)), 0);
+    CHECK_EQ_INT(symlink(canonical_env, env_alias), 0);
+    CHECK((size_t)snprintf(body, sizeof(body), "#!%s sh\nexit 0\n",
+                           env_alias) < sizeof(body));
+    CHECK_EQ_INT(write_string_to_file(alias_script, body, 0755), 0);
+    CHECK(install_self_copy(valid_binary, 0755));
+    CHECK_EQ_INT(write_string_to_file(
+                     valid_script, "#!/bin/sh\nexit 0\n", 0755), 0);
+
+    save_environment("PATH", &saved_path, &had_path);
+    CHECK((size_t)snprintf(path_value, sizeof(path_value), "%s:/usr/bin:/bin",
+                           bin) < sizeof(path_value));
+    CHECK_EQ_INT(setenv("PATH", path_value, 1), 0);
+
+    check_probe_and_runner_reject("plain");
+    check_probe_and_runner_reject("env-script");
+    check_probe_and_runner_reject("untrusted-script");
+    check_probe_and_runner_reject("recursive-script");
+    check_probe_and_runner_reject("alias-script");
+    check_probe_and_runner_accept("valid-bin", "--ar07-exec-probe");
+    check_probe_and_runner_accept("valid-script", NULL);
+
+    restore_environment("PATH", saved_path, had_path);
+    CHECK_EQ_INT(unlink(hostile_interpreter), 0);
+    CHECK_EQ_INT(rmdir(hostile_root), 0);
+}
+
 TEST(pinned_direct_interpreter_cannot_be_replaced_at_launch) {
     char root[MAX_PATH_LEN], bin[MAX_PATH_LEN];
     char interpreter[MAX_PATH_LEN], script[MAX_PATH_LEN], body[MAX_PATH_LEN * 2];
@@ -766,6 +876,7 @@ int main(int argc, char **argv) {
     RUN_TEST(symlink_targets_and_lookup_to_exec_swap_are_descriptor_pinned);
     RUN_TEST(metadata_change_after_pin_fails_before_descriptor_exec);
     RUN_TEST(shebang_env_untrusted_and_recursive_interpreters_are_rejected);
+    RUN_TEST(probe_and_runner_share_format_and_shebang_eligibility);
     RUN_TEST(pinned_direct_interpreter_cannot_be_replaced_at_launch);
     RUN_TEST(nonregular_leaf_is_bounded_and_execute_only_policy_is_explicit);
     RUN_TEST(trusted_shebang_executes_from_the_verified_descriptor);

@@ -875,9 +875,10 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
      * (AR-02 #24): only the best-effort connection test uses it — which
      * degrades gracefully through run_argv's own resolution failure — and
      * the boot-time resume path never execs it at all, so a missing `ssh`
-     * was hard-failing resumes it could never affect. The probes themselves
-     * are near-free now that find_command_path memoizes: the same resolution
-     * is reused by every subsequent run_argv spawn. */
+     * was hard-failing resumes it could never affect. The probes are bounded,
+     * parent-only checks; they do not spawn helpers. Every call reopens and
+     * revalidates the candidate, and run_argv independently does so again
+     * immediately before launch. */
     if (!command_exists("ssh-agent")) {
         set_error(ERR_SSH_AGENT_NOT_FOUND, "ssh-agent command not found in PATH");
         return -1;

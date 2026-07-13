@@ -2183,10 +2183,11 @@ static int git_run(char *output, size_t output_size, ...) {
  *
  * perf-1: this runs on every switch AND on the boot-time `resume` that gates
  * the login shell prompt, and it used to fork+exec `git --version` each time
- * just to strstr the banner. command_exists() is a pure $PATH walk with
- * access(X_OK) — no subprocess — and proves the same thing we act on: an
- * executable git. A pathological non-git `git` binary still fails closed at
- * the first real `git config` invocation (every git_run result is checked).
+ * just to strstr the banner. command_exists() performs the same parent-side
+ * ancestry, permission, format, and shebang eligibility checks as the default
+ * runner without spawning a subprocess. A pathological non-git binary with a
+ * recognized executable format still fails closed at the first real
+ * `git config` invocation (every git_run result is checked).
  * Cached per process: only a positive answer is cached, so a transient PATH
  * problem is re-probed, and git appearing/vanishing mid-process is not a
  * supported flow. */

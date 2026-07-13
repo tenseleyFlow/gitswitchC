@@ -255,7 +255,8 @@ void run_test_set_post_fork_pre_publish_hook(
  * restored without replacing the primary system errno. Zero disables it. */
 void run_test_set_fork_failure(int system_errno);
 
-/* True if an executable named `command` is found in PATH. */
+/* True if `command` is currently eligible for the default runner; does not
+ * execute it. */
 bool command_exists(const char *command);
 
 /**
@@ -270,11 +271,17 @@ bool command_exists(const char *command);
  * leaves are deliberately rejected because their format/shebang cannot be
  * validated safely. A final
  * descriptor-relative X_OK probe also enforces ACL and noexec-mount policy,
- * then is identity-sealed to the pinned leaf. Relative/"."/empty and unsafe
- * entries are skipped. A `name` containing a slash bypasses the PATH search
- * but not the checks. Every call reopens and revalidates the chain; positive
- * pathnames are not cached across inode or metadata replacement. Returns 0
- * and writes the canonical path into buf on success; -1 otherwise.
+ * then is identity-sealed to the pinned leaf. Before success, the same
+ * parent-side format/shebang validator as the default runner requires either
+ * recognized binary magic or a bounded direct shebang to a separately trusted
+ * binary interpreter; env, recursive, unsupported, and untrusted interpreter
+ * forms are rejected. Relative/"."/empty and unsafe entries are skipped. A
+ * `name` containing a slash bypasses the PATH search but not the checks. Every
+ * call reopens and revalidates the chain; positive pathnames are not cached
+ * across inode or metadata replacement. This is point-in-time launch
+ * eligibility, not proof of compatible architecture, loader availability, or
+ * successful execution; run_argv reopens and revalidates before launch.
+ * Returns 0 and writes the canonical path into buf on success; -1 otherwise.
  */
 int find_command_path(const char *name, char *buf, size_t size);
 bool process_is_running(pid_t pid);

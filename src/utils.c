@@ -3856,8 +3856,24 @@ static int open_trusted_command(const char *name, char *resolved,
 
 int find_command_path(const char *name, char *buf, size_t size) {
     struct stat file_stat;
+    trusted_script_launch_t launch;
+    const char *probe_argv[] = {name, NULL};
     int fd = open_trusted_command(name, buf, size, &file_stat);
     if (fd < 0) return -1;
+
+    /* A dependency probe must answer the same parent-side eligibility
+     * question as the default runner. Reuse its pinned-descriptor format and
+     * shebang validation instead of accepting a file run_argv would reject
+     * before fork (AR-08 L10). The synthetic argv is sufficient because this
+     * path validates launch shape but does not execute the constructed argv. */
+    if (prepare_trusted_script_launch(fd, probe_argv, &launch) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        trusted_script_launch_cleanup(&launch);
+        errno = saved_errno;
+        return -1;
+    }
+    trusted_script_launch_cleanup(&launch);
     close(fd);
     return 0;
 }
