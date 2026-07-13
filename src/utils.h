@@ -188,6 +188,11 @@ typedef int (*command_runner_fn)(const char *const argv[],
 /* Install a runner; returns the previous one (NULL means the default). */
 command_runner_fn run_set_runner(command_runner_fn fn);
 
+/* True only when commands execute through the production descriptor-pinned
+ * runner. Filesystem transactions must not mix real path mutation with a
+ * test runner that models command side effects only in memory. */
+bool run_uses_default_runner(void);
+
 /* Run argv[0] (opened through the sanitized PATH walk, format/shebang checked,
  * then launched from a verified descriptor), argv NULL-terminated, through
  * the active runner. Returns 0 iff the child spawned and exited 0. opts/result

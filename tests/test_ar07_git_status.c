@@ -496,7 +496,7 @@ TEST(real_malformed_config_retains_gits_diagnostic) {
     CHECK(!current.valid);
 
 cleanup:
-    if (saved_cwd[0] != '\0') (void)chdir(saved_cwd);
+    if (saved_cwd[0] != '\0') CHECK_EQ_INT(chdir(saved_cwd), 0);
     restore_env("GIT_SSH_COMMAND", &ssh_command);
     restore_env("GIT_CONFIG_COUNT", &config_count);
     restore_env("GIT_CONFIG_NOSYSTEM", &nosystem);
@@ -594,7 +594,7 @@ TEST(git_boolean_grammar_matches_gits_canonical_oracle) {
     }
 
 cleanup:
-    if (saved_cwd[0] != '\0') (void)chdir(saved_cwd);
+    if (saved_cwd[0] != '\0') CHECK_EQ_INT(chdir(saved_cwd), 0);
     restore_env("GIT_SSH_COMMAND", &ssh_command);
     restore_env("GIT_CONFIG_COUNT", &config_count);
     restore_env("GIT_CONFIG_NOSYSTEM", &nosystem);
@@ -753,7 +753,7 @@ TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow) {
 
 cleanup:
     if (marker) fclose(marker);
-    if (original_cwd[0] != '\0') (void)chdir(original_cwd);
+    if (original_cwd[0] != '\0') CHECK_EQ_INT(chdir(original_cwd), 0);
     restore_env("GIT_SSH_COMMAND", &ssh_command);
     restore_env("GIT_CONFIG_COUNT", &config_count);
     restore_env("GIT_CONFIG_NOSYSTEM", &nosystem);

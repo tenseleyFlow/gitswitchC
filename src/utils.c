@@ -3271,6 +3271,10 @@ command_runner_fn run_set_runner(command_runner_fn fn) {
     return prev;
 }
 
+bool run_uses_default_runner(void) {
+    return g_runner == run_argv_real;
+}
+
 int run_argv(const char *const argv[], const run_opts_t *opts, run_result_t *result) {
     return g_runner(argv, opts, result);
 }

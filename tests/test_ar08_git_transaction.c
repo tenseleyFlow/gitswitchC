@@ -8,8 +8,12 @@
 #include "utils.h"
 
 #include <limits.h>
+#include <sys/wait.h>
+#include <time.h>
 
 void git_ops_test_reset_caches(void);
+void git_ops_test_set_restore_prelock_hook(void (*fn)(git_scope_t scope));
+void git_ops_test_set_restore_locked_hook(void (*fn)(git_scope_t scope));
 
 typedef struct {
     char *value;
@@ -192,6 +196,59 @@ static int git_replace_vector(const char *scope, const char *key,
         if (git_add(scope, key, values[i]) != 0) return -1;
     }
     return 0;
+}
+
+static int g_prelock_writer_calls;
+static pid_t g_locked_writer_pid;
+static int g_locked_writer_first_failed;
+
+static void add_name_before_restore_lock(git_scope_t scope) {
+    if (scope != GIT_SCOPE_GLOBAL || g_prelock_writer_calls != 0) return;
+    g_prelock_writer_calls++;
+    if (git_add("--global", "user.name", "race-before-lock") != 0 ||
+        git_set("--global", "audit.concurrent", "unmanaged-survives") != 0) {
+        g_prelock_writer_calls = -1;
+    }
+}
+
+/* The child proves a real `git config` writer cannot enter after the in-lock
+ * ownership read. Its first attempt must fail on the canonical lock; it then
+ * retries until the rollback publishes, at which point its later value is
+ * serialized after (and never deleted by) the transaction. */
+static void retry_name_while_restore_lock_is_held(git_scope_t scope) {
+    int ready[2];
+    char outcome = '0';
+
+    if (scope != GIT_SCOPE_GLOBAL || g_locked_writer_pid != 0) return;
+    if (pipe(ready) != 0) {
+        g_locked_writer_pid = -1;
+        return;
+    }
+    g_locked_writer_pid = fork();
+    if (g_locked_writer_pid == 0) {
+        struct timespec pause = {0, 1000000};
+        int first_rc;
+        close(ready[0]);
+        first_rc = git_add("--global", "user.name", "race-after-lock");
+        outcome = first_rc == 0 ? 'S' : 'F';
+        (void)write(ready[1], &outcome, 1);
+        close(ready[1]);
+        if (first_rc == 0) _exit(41);
+        for (int attempt = 0; attempt < 5000; attempt++) {
+            if (git_add("--global", "user.name", "race-after-lock") == 0) {
+                _exit(0);
+            }
+            (void)nanosleep(&pause, NULL);
+        }
+        _exit(42);
+    }
+    close(ready[1]);
+    if (g_locked_writer_pid < 0 || read(ready[0], &outcome, 1) != 1) {
+        g_locked_writer_first_failed = -1;
+    } else {
+        g_locked_writer_first_failed = outcome == 'F' ? 1 : -1;
+    }
+    close(ready[0]);
 }
 
 static account_t basic_account(const git_fixture_t *fixture, bool with_gpg) {
@@ -584,6 +641,218 @@ TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope) {
     fixture_cleanup(&fixture);
 }
 
+TEST(writer_in_old_compare_write_gap_is_rechecked_under_canonical_lock) {
+    git_fixture_t fixture;
+    account_t account;
+    char actual[512];
+    const char *const owned_post[] = {"AR08 Git User"};
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-gap"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    g_prelock_writer_calls = 0;
+    git_ops_test_set_restore_prelock_hook(add_name_before_restore_lock);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    git_ops_test_set_restore_prelock_hook(NULL);
+    CHECK_EQ_INT(g_prelock_writer_calls, 1);
+    CHECK(strstr(get_last_error()->message, "changed outside") != NULL);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "AR08 Git User\nrace-before-lock\n");
+    CHECK_EQ_INT(git_get_all("--global", "audit.concurrent", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "unmanaged-survives\n");
+
+    CHECK_EQ_INT(git_replace_vector("--global", "user.name", owned_post, 1), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-gap\n");
+    CHECK_EQ_INT(git_get_all("--global", "audit.concurrent", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "unmanaged-survives\n");
+    fixture_cleanup(&fixture);
+}
+
+TEST(real_git_writer_is_serialized_after_in_lock_ownership_read) {
+    git_fixture_t fixture;
+    account_t account;
+    char actual[512];
+    int status = 0;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-locked-race"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    g_locked_writer_pid = 0;
+    g_locked_writer_first_failed = 0;
+    git_ops_test_set_restore_locked_hook(
+        retry_name_while_restore_lock_is_held);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    git_ops_test_set_restore_locked_hook(NULL);
+    CHECK(g_locked_writer_pid > 0);
+    if (g_locked_writer_pid > 0) {
+        CHECK(waitpid(g_locked_writer_pid, &status, 0) == g_locked_writer_pid);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK_EQ_INT(g_locked_writer_first_failed, 1);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-locked-race\nrace-after-lock\n");
+    fixture_cleanup(&fixture);
+}
+
+TEST(global_xdg_write_target_is_locked_and_restored_exactly) {
+    git_fixture_t fixture;
+    account_t account;
+    char xdg_git[MAX_PATH_LEN];
+    char xdg_config[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(xdg_git, sizeof(xdg_git), "%s/git", fixture.xdg) <
+          sizeof(xdg_git));
+    CHECK((size_t)snprintf(xdg_config, sizeof(xdg_config), "%s/config",
+                           xdg_git) < sizeof(xdg_config));
+    CHECK_EQ_INT(mkdir(xdg_git, 0700), 0);
+    CHECK_EQ_INT(write_text_file(xdg_config,
+                                 "[user]\n\tname = before-xdg\n", 0600), 0);
+    CHECK_EQ_INT(unsetenv("GIT_CONFIG_GLOBAL"), 0);
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-xdg\n");
+    CHECK(access(fixture.global_config, F_OK) != 0);
+    fixture_cleanup(&fixture);
+}
+
+TEST(config_and_parent_symlinks_keep_identity_while_targets_restore) {
+    git_fixture_t fixture;
+    account_t account;
+    char config_target[MAX_PATH_LEN];
+    char parent_target[MAX_PATH_LEN];
+    char parent_link[MAX_PATH_LEN];
+    char parent_config[MAX_PATH_LEN];
+    char actual[256];
+    struct stat config_link_before;
+    struct stat config_link_after;
+    struct stat parent_link_before;
+    struct stat parent_link_after;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(config_target, sizeof(config_target),
+                           "%s/symlink-target.gitconfig", fixture.base) <
+          sizeof(config_target));
+    CHECK_EQ_INT(write_text_file(config_target,
+                                 "[user]\n\tname = before-file-link\n",
+                                 0600), 0);
+    CHECK_EQ_INT(symlink(config_target, fixture.global_config), 0);
+    CHECK_EQ_INT(lstat(fixture.global_config, &config_link_before), 0);
+    CHECK(S_ISLNK(config_link_before.st_mode));
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(lstat(fixture.global_config, &config_link_after), 0);
+    CHECK(S_ISLNK(config_link_after.st_mode));
+    CHECK(config_link_after.st_dev == config_link_before.st_dev);
+    CHECK(config_link_after.st_ino == config_link_before.st_ino);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-file-link\n");
+
+    CHECK_EQ_INT(unlink(fixture.global_config), 0);
+    CHECK((size_t)snprintf(parent_target, sizeof(parent_target),
+                           "%s/physical-config-dir", fixture.base) <
+          sizeof(parent_target));
+    CHECK((size_t)snprintf(parent_link, sizeof(parent_link),
+                           "%s/config-dir-link", fixture.base) <
+          sizeof(parent_link));
+    CHECK((size_t)snprintf(parent_config, sizeof(parent_config),
+                           "%s/global.gitconfig", parent_link) <
+          sizeof(parent_config));
+    CHECK_EQ_INT(mkdir(parent_target, 0700), 0);
+    CHECK_EQ_INT(symlink(parent_target, parent_link), 0);
+    CHECK_EQ_INT(lstat(parent_link, &parent_link_before), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", parent_config, 1), 0);
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-parent-link"), 0);
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(lstat(parent_link, &parent_link_after), 0);
+    CHECK(S_ISLNK(parent_link_after.st_mode));
+    CHECK(parent_link_after.st_dev == parent_link_before.st_dev);
+    CHECK(parent_link_after.st_ino == parent_link_before.st_ino);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-parent-link\n");
+    fixture_cleanup(&fixture);
+}
+
+TEST(maximum_git_lock_basename_uses_short_staging_name) {
+    git_fixture_t fixture;
+    account_t account;
+    char basename[NAME_MAX - sizeof(".lock") + 2U];
+    char config_path[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    memset(basename, 'c', sizeof(basename) - 1U);
+    basename[sizeof(basename) - 1U] = '\0';
+    CHECK(strlen(basename) + strlen(".lock") == NAME_MAX);
+    CHECK((size_t)snprintf(config_path, sizeof(config_path), "%s/%s",
+                           fixture.base, basename) < sizeof(config_path));
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", config_path, 1), 0);
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-long-name"), 0);
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-long-name\n");
+    fixture_cleanup(&fixture);
+}
+
 TEST(partial_retry_skips_completed_scopes_and_preserves_their_later_changes) {
     static const char *const scopes[] = {
         "--global", "--local", "--worktree"
@@ -799,6 +1068,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly);
     RUN_TEST(large_unrelated_config_allows_snapshot_switch_status_and_rollback);
     RUN_TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope);
+    RUN_TEST(writer_in_old_compare_write_gap_is_rechecked_under_canonical_lock);
+    RUN_TEST(real_git_writer_is_serialized_after_in_lock_ownership_read);
+    RUN_TEST(global_xdg_write_target_is_locked_and_restored_exactly);
+    RUN_TEST(config_and_parent_symlinks_keep_identity_while_targets_restore);
+    RUN_TEST(maximum_git_lock_basename_uses_short_staging_name);
     RUN_TEST(partial_retry_skips_completed_scopes_and_preserves_their_later_changes);
     RUN_TEST(preseal_writer_is_rejected_and_never_laundered_into_rollback_ownership);
     RUN_TEST(committed_git_transaction_discards_rollback_ownership);
