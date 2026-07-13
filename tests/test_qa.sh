@@ -106,10 +106,19 @@ for basic in sh uname git gcc cc clang brew awk cksum sha256sum shasum sha256 \
     basic_path=$(command -v "$basic" 2>/dev/null) || continue
     case $basic_path in /*) ln -s "$basic_path" "$notools_dir/$basic" ;; esac
 done
+build_stamp=$root/build/obj/.buildconfig
+qa_cc_identity=$(sed -n 's/^cc_resolved=//p' "$build_stamp")
+qa_target_triple=$(sed -n 's/^target_triple=//p' "$build_stamp")
+qa_cf_protection=$(sed -n 's/^cf_protection=//p' "$build_stamp")
+[ -f "$qa_cc_identity" ] && [ -n "$qa_target_triple" ] ||
+    fail "release build stamp lacks stable toolchain identity"
 for pair in "analyze:cppcheck" "security-scan:flawfinder" "memcheck:valgrind"; do
     absent_target=${pair%%:*}
     absent_tool=${pair##*:}
     if ! PATH="$notools_dir" "$make_abs" -C "$root" BUILD_TYPE=release READLINE=0 \
+        CC_IDENTITY_FILE="$qa_cc_identity" \
+        TOOLCHAIN_IDENTITY_FILES="$qa_cc_identity" \
+        TARGET_TRIPLE="$qa_target_triple" CF_PROTECTION="$qa_cf_protection" \
         "$absent_target" >"$out" 2>&1; then
         sed -n '1,200p' "$out" >&2
         fail "$absent_target failed with $absent_tool genuinely absent from PATH"
