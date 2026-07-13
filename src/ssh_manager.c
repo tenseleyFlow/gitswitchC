@@ -416,6 +416,9 @@ static int build_provenance_socket_arg(int dir_fd, const char *socket_name,
         return -1;
     }
     if (fstat(dir_fd, &runtime) != 0) return -1;
+    /* The format is a compile-time literal and every bounded-write failure is
+     * rejected before local_marker is consumed. */
+    // flawfinder: ignore
     marker_len = snprintf(local_marker, sizeof(local_marker),
                           SSH_AGENT_PROVENANCE_PREFIX "%jx-%jx",
                           (uintmax_t)runtime.st_dev,
