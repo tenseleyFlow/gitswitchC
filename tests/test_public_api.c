@@ -164,6 +164,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_note_key_available);
     REQUIRE_PUBLIC_API(gpg_manager_reset);
     REQUIRE_PUBLIC_API(gpg_manager_resolve_secret_key_listing);
+    REQUIRE_PUBLIC_API(gpg_manager_resolve_system_key);
     REQUIRE_PUBLIC_API(gpg_manager_restore_current_if);
     REQUIRE_PUBLIC_API(gpg_manager_retarget_current);
     REQUIRE_PUBLIC_API(gpg_manager_runtime_restore_pending);
@@ -187,7 +188,6 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_set_environment);
     REQUIRE_PUBLIC_API(gpg_switch_account);
     REQUIRE_PUBLIC_API(gpg_test_signing);
-    REQUIRE_PUBLIC_API(gpg_validate_key);
     REQUIRE_PUBLIC_API(is_directory);
     REQUIRE_PUBLIC_API(is_regular_file);
     REQUIRE_PUBLIC_API(is_safe_ssh_key_path);

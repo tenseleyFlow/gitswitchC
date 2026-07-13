@@ -200,6 +200,17 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
                                            char *fingerprint,
                                            size_t fingerprint_size);
 
+/** Resolve a selector against the real/system keyring through a retained,
+ * provenance-checked directory descriptor. The helper runs with cwd_fd and
+ * GNUPGHOME=. so namespace replacement cannot redirect it. Exactly one
+ * currently usable primary secret key is required; when require_signing is
+ * true it must also have usable signing capability. On success writes the
+ * canonical primary fingerprint. */
+int gpg_manager_resolve_system_key(const char *selector,
+                                   bool require_signing,
+                                   char *fingerprint,
+                                   size_t fingerprint_size);
+
 /**
  * Compute the stable GNUPGHOME path (a `current` symlink under the isolated
  * GPG base directory) that `gitswitch init` exports into the shell and that

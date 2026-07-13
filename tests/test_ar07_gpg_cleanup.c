@@ -674,6 +674,90 @@ TEST(agent_config_sync_failures_return_nonzero) {
     unsetenv("GNUPGHOME");
 }
 
+TEST(agent_config_defaults_require_confirmed_source_absence) {
+    static const char retained[] =
+        "# retain this config on source resolution failure\n"
+        "default-cache-ttl 17\n";
+    char xdg[128], base[256], home[320], installed[384];
+    char inaccessible[256], absent[256], content[512];
+    char old_home[MAX_PATH_LEN] = "";
+    char old_gnupghome[MAX_PATH_LEN] = "";
+    char overlong[MAX_PATH_LEN + 64];
+    bool had_home = getenv("HOME") != NULL;
+    bool had_gnupghome = getenv("GNUPGHOME") != NULL;
+    command_runner_fn previous;
+    int home_fd;
+
+    if (had_home) safe_strncpy(old_home, getenv("HOME"), sizeof(old_home));
+    if (had_gnupghome) {
+        safe_strncpy(old_gnupghome, getenv("GNUPGHOME"),
+                     sizeof(old_gnupghome));
+    }
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "source-errors"), 0);
+    snprintf(installed, sizeof(installed), "%s/gpg-agent.conf", home);
+    snprintf(inaccessible, sizeof(inaccessible), "%s/inaccessible", xdg);
+    snprintf(absent, sizeof(absent), "%s/confirmed-absent", xdg);
+    CHECK_EQ_INT(make_file(installed, retained), 0);
+    home_fd = open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(home_fd >= 0);
+
+    unsetenv("GNUPGHOME");
+    unsetenv("HOME");
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message, "HOME is unset") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+
+    memset(overlong, 'a', sizeof(overlong));
+    overlong[0] = '/';
+    overlong[sizeof(overlong) - 1] = '\0';
+    CHECK_EQ_INT(setenv("GNUPGHOME", overlong, 1), 0);
+    CHECK_EQ_INT(setenv("HOME", xdg, 1), 0);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message, "too long") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+
+    CHECK_EQ_INT(mkdir(inaccessible, 0700), 0);
+    CHECK_EQ_INT(chmod(inaccessible, 0000), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", inaccessible, 1), 0);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message, "Cannot open") != NULL ||
+          strstr(get_last_error()->message, "unsafe") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+    CHECK_EQ_INT(chmod(inaccessible, 0700), 0);
+
+    /* ENOENT is the sole source-resolution outcome that may compose and
+     * install defaults in place of the retained configuration. */
+    CHECK_EQ_INT(setenv("GNUPGHOME", absent, 1), 0);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
+    CHECK(read_file_to_string(installed, content, sizeof(content)) > 0);
+    CHECK(strstr(content, "GPG Agent configuration for gitswitch") != NULL);
+    CHECK(strstr(content, "default-cache-ttl 3600") != NULL);
+    CHECK(strstr(content, "retain this config") == NULL);
+    CHECK(!has_agent_conf_scratch(home));
+
+    if (home_fd >= 0) CHECK_EQ_INT(close(home_fd), 0);
+    if (had_home) setenv("HOME", old_home, 1); else unsetenv("HOME");
+    if (had_gnupghome) {
+        setenv("GNUPGHOME", old_gnupghome, 1);
+    } else {
+        unsetenv("GNUPGHOME");
+    }
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("source-errors"), 0);
+    run_set_runner(previous);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ordinary_same_mount_recursion_still_cleans);
@@ -689,4 +773,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(mounted_account_home_is_rejected_before_config_write);
     RUN_TEST(byte_identical_agent_config_performs_no_commit);
     RUN_TEST(agent_config_sync_failures_return_nonzero);
+    RUN_TEST(agent_config_defaults_require_confirmed_source_absence);
 TEST_MAIN_END()

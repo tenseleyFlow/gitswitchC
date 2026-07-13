@@ -1,5 +1,6 @@
 /* AR-07 T10: adversarial GPG activation/identity/rollback regressions. */
 #ifdef __linux__
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #endif
@@ -22,6 +23,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sched.h>
+#include <sys/mount.h>
+#endif
 
 #define PRIMARY_FPR "0123456789ABCDEF0123456789ABCDEF01234567"
 #define SECOND_FPR  "89ABCDEF0123456789ABCDEF0123456789ABCDEF"
@@ -147,6 +152,7 @@ static bool g_fake_export_used_fingerprint;
 static bool g_fake_git_used_fingerprint;
 static bool g_fake_listing_used_v5_selector;
 static bool g_fake_git_used_v5_fingerprint;
+static int g_fake_listing_calls;
 static char g_fake_git_signingkey[MAX_GPG_FINGERPRINT_LEN];
 static char g_fake_git_gpgsign[16];
 static bool g_fake_git_program_unset;
@@ -377,6 +383,145 @@ TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap) {
     CHECK(strstr(diagnostic, "one-shot 524288-byte capture limit") != NULL);
 }
 
+static char g_source_swap_original[MAX_PATH_LEN];
+static char g_source_swap_moved[MAX_PATH_LEN];
+static char g_source_swap_marker[MAX_PATH_LEN];
+static bool g_source_swap_pinned;
+static bool g_source_swap_done;
+
+static int source_swap_runner(const char *const argv[],
+                              const run_opts_t *opts,
+                              run_result_t *result) {
+    const char *const *env;
+    struct stat before;
+    struct stat after;
+    struct stat moved;
+    bool dot_home = false;
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv_has(argv, "--list-secret-keys")) return 0;
+
+    for (env = opts ? opts->extra_env : NULL; env && *env; env++) {
+        if (strcmp(*env, "GNUPGHOME=.") == 0) dot_home = true;
+    }
+    if (opts && opts->use_cwd_fd && opts->cwd_fd >= 0 && dot_home &&
+        fstat(opts->cwd_fd, &before) == 0 &&
+        rename(g_source_swap_original, g_source_swap_moved) == 0 &&
+        mkdir(g_source_swap_original, 0700) == 0 &&
+        write_string_to_file(g_source_swap_marker, "replacement\n", 0600) == 0 &&
+        fstat(opts->cwd_fd, &after) == 0 &&
+        stat(g_source_swap_moved, &moved) == 0 &&
+        before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
+        after.st_dev == moved.st_dev && after.st_ino == moved.st_ino) {
+        g_source_swap_pinned = true;
+        g_source_swap_done = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) {
+        snprintf(opts->out, opts->out_size, "%s", PRIMARY_SIGN);
+        if (result) result->out_len = strlen(opts->out);
+    }
+    return 0;
+}
+
+TEST(system_key_helper_stays_on_pinned_source_after_directory_replacement) {
+    char xdg[128];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(g_source_swap_original,
+                               sizeof(g_source_swap_original),
+                               "%s/source", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(g_source_swap_moved,
+                               sizeof(g_source_swap_moved),
+                               "%s/source.proved", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(g_source_swap_marker,
+                               sizeof(g_source_swap_marker),
+                               "%s/source/replacement", xdg), 0);
+    CHECK_EQ_INT(mkdir(g_source_swap_original, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", g_source_swap_original, 1), 0);
+    g_source_swap_pinned = false;
+    g_source_swap_done = false;
+    previous = run_set_runner(source_swap_runner);
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    run_set_runner(previous);
+
+    CHECK(g_source_swap_done);
+    CHECK(g_source_swap_pinned);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+    CHECK(path_exists(g_source_swap_marker));
+    unsetenv("GNUPGHOME");
+}
+
+#ifdef __linux__
+TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
+    char xdg[128], base[MAX_PATH_LEN], managed[MAX_PATH_LEN];
+    char alias[MAX_PATH_LEN];
+    pid_t child;
+    int status = 0;
+    bool mount_namespace_unavailable = false;
+
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(base, sizeof(base),
+                               "%s/gitswitch-gpg", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(managed, sizeof(managed),
+                               "%s/managed", base), 0);
+    CHECK_EQ_INT(safe_snprintf(alias, sizeof(alias),
+                               "%s/bind-alias", xdg), 0);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(managed, 0700), 0);
+    CHECK_EQ_INT(mkdir(alias, 0700), 0);
+
+    fflush(NULL);
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+        command_runner_fn previous;
+        int rc;
+
+        if (unshare(CLONE_NEWNS) != 0 ||
+            mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
+            mount(managed, alias, NULL, MS_BIND, NULL) != 0) {
+            _exit(77);
+        }
+        if (setenv("GNUPGHOME", alias, 1) != 0) _exit(9);
+        g_listing_result_calls = 0;
+        g_listing_result_mode = LISTING_RESULT_MATCH;
+        previous = run_set_runner(listing_result_runner);
+        rc = gpg_manager_resolve_system_key(
+            "01234567", true, fingerprint, sizeof(fingerprint));
+        run_set_runner(previous);
+        if (rc != -1 || g_listing_result_calls != 0 ||
+            strstr(get_last_error()->message,
+                   "bind-mounted alias of a managed GPG home") == NULL) {
+            (void)umount2(alias, MNT_DETACH);
+            _exit(9);
+        }
+        if (umount2(alias, MNT_DETACH) != 0) _exit(9);
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK_EQ_INT(waitpid(child, &status, 0), child);
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
+            mount_namespace_unavailable = true;
+        } else {
+            CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        }
+    }
+    if (mount_namespace_unavailable) {
+        TS_SKIP("mount-namespace",
+                "private mount namespace/bind mount unavailable");
+    }
+}
+#endif
+
 static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
                              run_result_t *result) {
     bool listing = argv_has(argv, "--list-secret-keys");
@@ -390,21 +535,24 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
     if (listing) {
-        bool pinned = opts && opts->use_cwd_fd;
+        bool source_listing;
         const char *inventory =
             g_fake_mode == FAKE_V5_FIRST_IMPORT ? V5_PRIMARY_SIGN
                                                  : PRIMARY_SIGN;
+
+        g_fake_listing_calls++;
+        source_listing = g_fake_listing_calls == 2 && !g_fake_imported;
 
         if (g_fake_mode == FAKE_V5_FIRST_IMPORT && argv_has(argv, V5_FPR)) {
             g_fake_listing_used_v5_selector = true;
         }
 
-        if (g_fake_mode == FAKE_AMBIGUOUS_SOURCE && !pinned) {
+        if (g_fake_mode == FAKE_AMBIGUOUS_SOURCE && source_listing) {
             inventory = AMBIGUOUS_KEYS;
         } else if ((g_fake_mode == FAKE_AMBIGUOUS_SOURCE ||
                     g_fake_mode == FAKE_FIRST_IMPORT ||
                     g_fake_mode == FAKE_V5_FIRST_IMPORT) &&
-                   pinned && !g_fake_imported) {
+                   !source_listing && !g_fake_imported) {
             if (result) result->exit_code = 2;
             return -1;
         }
@@ -479,38 +627,48 @@ static void fill_account(account_t *account, const char *name,
 }
 
 TEST(ambiguous_selector_exports_and_imports_nothing) {
-    char xdg[128];
+    char xdg[128], source_home[MAX_PATH_LEN];
     gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
     account_t account;
     command_runner_fn previous;
 
     CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(source_home, sizeof(source_home),
+                               "%s/source", xdg), 0);
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
     fill_account(&account, "ambiguous", "01234567", false);
     g_fake_mode = FAKE_AMBIGUOUS_SOURCE;
     g_fake_imported = false;
     g_fake_exported = false;
+    g_fake_listing_calls = 0;
     previous = run_set_runner(strict_key_runner);
     CHECK_EQ_INT(gpg_switch_account(&config, &account), -1);
     run_set_runner(previous);
     CHECK(!g_fake_exported);
     CHECK(!g_fake_imported);
     CHECK(strstr(get_last_error()->message, "Ambiguous") != NULL);
+    unsetenv("GNUPGHOME");
 }
 
 TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
-    char xdg[128];
+    char xdg[128], source_home[MAX_PATH_LEN];
     gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
     account_t account;
     command_runner_fn previous;
 
     CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
-    setenv("GNUPGHOME", "/external/original-gpg", 1);
+    CHECK_EQ_INT(safe_snprintf(source_home, sizeof(source_home),
+                               "%s/source", xdg), 0);
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
     fill_account(&account, "unique", "01234567", true);
     g_fake_mode = FAKE_FIRST_IMPORT;
     g_fake_imported = false;
     g_fake_exported = false;
     g_fake_export_used_fingerprint = false;
     g_fake_git_used_fingerprint = false;
+    g_fake_listing_calls = 0;
     previous = run_set_runner(strict_key_runner);
     CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
     CHECK_EQ_INT(gpg_configure_git_signing(&config, &account,
@@ -522,17 +680,21 @@ TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     CHECK(g_fake_git_used_fingerprint);
     CHECK_STR_EQ(config.current_key_id, PRIMARY_FPR);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
-    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/original-gpg");
+    CHECK_STR_EQ(getenv("GNUPGHOME"), source_home);
+    unsetenv("GNUPGHOME");
 }
 
 TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication) {
-    char xdg[128];
+    char xdg[128], source_home[MAX_PATH_LEN];
     gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
     account_t account;
     command_runner_fn previous;
 
     CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
-    CHECK_EQ_INT(setenv("GNUPGHOME", "/external/v5-original", 1), 0);
+    CHECK_EQ_INT(safe_snprintf(source_home, sizeof(source_home),
+                               "%s/source", xdg), 0);
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
     fill_account(&account, "v5", V5_FPR, true);
     CHECK_EQ_INT((int)strlen(V5_FPR), 64);
     CHECK_EQ_INT((int)strlen(account.gpg_key_id), 64);
@@ -543,6 +705,7 @@ TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication) {
     g_fake_export_used_fingerprint = false;
     g_fake_listing_used_v5_selector = false;
     g_fake_git_used_v5_fingerprint = false;
+    g_fake_listing_calls = 0;
     previous = run_set_runner(strict_key_runner);
 
     CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
@@ -558,7 +721,8 @@ TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication) {
     CHECK_STR_EQ(config.current_key_id, V5_FPR);
     CHECK_EQ_INT((int)strlen(config.current_key_id), 64);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
-    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/v5-original");
+    CHECK_STR_EQ(getenv("GNUPGHOME"), source_home);
+    unsetenv("GNUPGHOME");
 }
 
 TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
@@ -1296,6 +1460,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(selector_inventory_is_exact_and_canonical);
     RUN_TEST(secret_listing_result_matrix_is_causal_and_exact);
     RUN_TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap);
+    RUN_TEST(system_key_helper_stays_on_pinned_source_after_directory_replacement);
+#ifdef __linux__
+    RUN_TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch);
+#endif
     RUN_TEST(ambiguous_selector_exports_and_imports_nothing);
     RUN_TEST(unique_selector_threads_fingerprint_through_import_and_publication);
     RUN_TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication);
