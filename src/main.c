@@ -941,7 +941,7 @@ cleanup:
         fputs(pending_signal_notice, stderr);
         signals_dispatch_pending();
     }
-    return exit_code == EXIT_SUCCESS ? EXIT_SUCCESS : EXIT_FAILURE;
+    return exit_code;
 }
 
 /* Command handler implementations */
