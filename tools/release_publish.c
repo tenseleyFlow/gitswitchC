@@ -57,30 +57,19 @@ static bool same_identity(const struct stat *left, const struct stat *right)
 static int read_random(void *buffer, size_t size)
 {
     unsigned char *cursor = buffer;
-    int fd;
 
-    fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        return -1;
-    }
+    /* FreeBSD exposes /dev/urandom as a symlink to /dev/random and reports an
+     * O_NOFOLLOW open as EMLINK. Use the supported libc entropy interface so
+     * secure staging names never depend on following a device pathname.
+     * getentropy(3) limits each request to 256 bytes on every supported host. */
     while (size > 0U) {
-        ssize_t count = read(fd, cursor, size);
-        if (count > 0) {
-            cursor += (size_t)count;
-            size -= (size_t)count;
-            continue;
+        size_t count = size > 256U ? 256U : size;
+
+        if (getentropy(cursor, count) != 0) {
+            return -1;
         }
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count == 0) {
-            errno = EIO;
-        }
-        (void)close(fd);
-        return -1;
-    }
-    if (close(fd) != 0) {
-        return -1;
+        cursor += count;
+        size -= count;
     }
     return 0;
 }
@@ -169,7 +158,9 @@ static int verify_named_temp_identity(int directory_fd, const char *temp_name,
 }
 
 #if defined(GITSWITCH_RELEASE_TEST_CLEANUP_RACE) || \
-    defined(GITSWITCH_RELEASE_TEST_ADOPTION_RACE)
+    defined(GITSWITCH_RELEASE_TEST_ADOPTION_RACE) || \
+    (defined(__FreeBSD__) && \
+     defined(GITSWITCH_RELEASE_TEST_PUBLICATION_RACE))
 static int run_test_race_hook(const char *marker_variable,
                               const char *release_variable, bool *hook_used)
 {
@@ -227,6 +218,21 @@ static int run_cleanup_race_hook(void)
     return 0;
 #endif
 }
+
+#if defined(__FreeBSD__)
+static int run_publication_race_hook(void)
+{
+#if defined(GITSWITCH_RELEASE_TEST_PUBLICATION_RACE)
+    static bool hook_used;
+
+    return run_test_race_hook("GITSWITCH_RELEASE_TEST_PUBLICATION_MARKER",
+                              "GITSWITCH_RELEASE_TEST_PUBLICATION_RELEASE",
+                              &hook_used);
+#else
+    return 0;
+#endif
+}
+#endif
 
 /* FreeBSD can condition unlink on the still-open vnode with funlinkat(2).
  * Linux and Darwin cannot: after any pathname proof, a same-UID writer can
@@ -299,8 +305,27 @@ static int run_to_descriptor(int output_fd, char *const command[])
 
 #if !defined(__APPLE__)
 static int link_descriptor(int source_fd, int directory_fd,
+                           const char *source_name,
                            const char *final_name)
 {
+#if defined(__FreeBSD__)
+    /* FreeBSD reserves linkat(AT_EMPTY_PATH) for privileged callers, while a
+     * link through fdescfs is rejected as cross-device. The source necessarily
+     * has a private random name on this platform, so identity-seal that name
+     * immediately before the atomic no-replace link. The caller proves the
+     * published name still selects source_fd immediately afterward; a source
+     * substitution can therefore leave evidence but can never report success. */
+    if (source_name == NULL || source_name[0] == '\0') {
+        errno = ENOTSUP;
+        return -1;
+    }
+    if (verify_named_temp_identity(directory_fd, source_name, source_fd) != 0 ||
+        run_publication_race_hook() != 0) {
+        return -1;
+    }
+    return linkat(directory_fd, source_name, directory_fd, final_name, 0);
+#else
+    (void)source_name;
 #if defined(AT_EMPTY_PATH) && AT_EMPTY_PATH != 0
     if (linkat(source_fd, "", directory_fd, final_name, AT_EMPTY_PATH) == 0) {
         return 0;
@@ -328,6 +353,7 @@ static int link_descriptor(int source_fd, int directory_fd,
     (void)final_name;
     errno = ENOTSUP;
     return -1;
+#endif
 #endif
 }
 #endif
@@ -589,13 +615,16 @@ static int publish_descriptor_clone(int source_fd, int directory_fd,
 #endif
 
 static int publish_output(int source_fd, int directory_fd,
+                          const char *source_name,
                           const char *final_name, int *published_fd)
 {
 #if defined(__APPLE__)
+    (void)source_name;
     return publish_descriptor_clone(source_fd, directory_fd, final_name,
                                     published_fd);
 #else
-    if (link_descriptor(source_fd, directory_fd, final_name) != 0) {
+    if (link_descriptor(source_fd, directory_fd, source_name,
+                        final_name) != 0) {
         return -1;
     }
     *published_fd = source_fd;
@@ -684,7 +713,8 @@ int main(int argc, char **argv)
                 "ERROR: distribution temporary output changed before publication; replacement retained\n");
         goto cleanup;
     }
-    publish_rc = publish_output(output_fd, directory_fd, final_name,
+    publish_rc = publish_output(output_fd, directory_fd,
+                                has_name ? temp_name : NULL, final_name,
                                 &published_fd);
     if (publish_rc < 0) {
         fprintf(stderr,

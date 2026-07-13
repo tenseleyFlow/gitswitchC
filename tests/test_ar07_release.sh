@@ -708,14 +708,16 @@ check_manifest_contract()
     cp "$clean_repo/README.md" "$tmp/README.before"
     cp "$clean_repo/src/main.c" "$tmp/main.before"
 
-    # Exercise descriptor-bound publication from a named temporary on every
-    # host: success, occupied-output refusal, producer failure, and cleanup
-    # must preserve established or foreign state. FreeBSD can remove the exact
-    # open vnode with funlinkat. Linux and Darwin intentionally retain the
-    # private name because neither has a descriptor-conditioned unlink. The
-    # complete source is retained: a same-UID writer can hard-link it after any
-    # user-space proof, making even descriptor truncation unsafe.
-    # Hosted macOS runs this same contract through fclonefileat.
+    # Exercise publication from a named temporary on every host: success,
+    # occupied-output refusal, producer failure, and cleanup must preserve
+    # established or foreign state. FreeBSD identity-seals the private name
+    # around its atomic no-replace link because unprivileged descriptor linking
+    # is unavailable there, then removes the exact open vnode with funlinkat.
+    # Linux and Darwin intentionally retain the private name because neither
+    # has a descriptor-conditioned unlink. The complete source is retained: a
+    # same-UID writer can hard-link it after any user-space proof, making even
+    # descriptor truncation unsafe. Hosted macOS runs this contract through
+    # fclonefileat.
     [ -x "$named_publish_helper" ] ||
         fail "named-publish helper is unavailable: $named_publish_helper"
     copy_dir=$tmp/copy-publish
@@ -812,6 +814,57 @@ check_manifest_contract()
             [ "$(cat "$copy_temp")" = original-payload ]; } ||
             fail "Darwin adoption rejection changed a complete source"
         rm -f "$copy_archive" "$copy_temp"
+    fi
+
+    # FreeBSD cannot hard-link an open descriptor as an unprivileged process:
+    # AT_EMPTY_PATH is privilege-gated and fdescfs crosses a mount boundary.
+    # Race its identity-sealed named fallback after the pre-link proof. A
+    # substituted source may be linked, but the descriptor comparison must
+    # reject it without claiming success or changing either complete source.
+    if [ "$copy_platform" = FreeBSD ]; then
+        copy_publication_marker=$tmp/copy-publication.marker
+        copy_publication_release=$tmp/copy-publication.release
+        GITSWITCH_RELEASE_TEST_PUBLICATION_MARKER=$copy_publication_marker \
+            GITSWITCH_RELEASE_TEST_PUBLICATION_RELEASE=$copy_publication_release \
+            "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            archive.tar.gz -- /bin/sh -c 'printf original-payload' \
+            >"$out" 2>&1 &
+        copy_pid=$!
+        attempt=0
+        while [ ! -e "$copy_publication_marker" ] && \
+            kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        [ -e "$copy_publication_marker" ] ||
+            fail "FreeBSD publication did not reach its named-link race boundary"
+        set -- "$copy_dir"/.archive.tar.gz.tmp.*
+        { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+            fail "FreeBSD publication race did not expose one private source"
+        copy_temp=$1
+        mv "$copy_temp" "$tmp/original-publication-temp"
+        printf '%s' foreign-payload >"$copy_temp"
+        : >"$copy_publication_release"
+        if wait "$copy_pid"; then
+            copy_pid=
+            fail "FreeBSD publication accepted a substituted named source"
+        fi
+        copy_pid=
+        grep -F 'published distribution output changed identity' "$out" \
+            >/dev/null ||
+            fail "FreeBSD publication race did not report identity loss"
+        copy_archive_identity=$(stat -f '%d:%i' "$copy_archive") ||
+            fail "cannot identify the substituted FreeBSD artifact"
+        copy_temp_identity=$(stat -f '%d:%i' "$copy_temp") ||
+            fail "cannot identify the substituted FreeBSD source"
+        [ "$copy_archive_identity" = "$copy_temp_identity" ] ||
+            fail "FreeBSD publication fixture did not link the substituted source"
+        { [ "$(cat "$copy_archive")" = foreign-payload ] &&
+            [ "$(cat "$copy_temp")" = foreign-payload ]; } ||
+            fail "FreeBSD publication rejection changed the foreign source"
+        [ "$(cat "$tmp/original-publication-temp")" = original-payload ] ||
+            fail "FreeBSD publication rejection changed the pinned source"
+        rm -f "$copy_archive" "$copy_temp" "$tmp/original-publication-temp"
     fi
 
     # Replace the named temporary while its producer still owns the open
