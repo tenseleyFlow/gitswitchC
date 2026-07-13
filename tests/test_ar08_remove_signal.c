@@ -4,6 +4,7 @@
 #include "test.h"
 
 #include "accounts.h"
+#include "config.h"
 #include "utils.h"
 
 #include <dirent.h>
@@ -46,6 +47,12 @@ typedef struct {
 static int g_inject_stage;
 static int g_inject_signal;
 static int g_trace_fd = -1;
+static bool g_inject_config_fault;
+static config_io_boundary_t g_config_fault_boundary;
+
+static bool fail_config_at_selected_boundary(config_io_boundary_t boundary) {
+    return g_inject_config_fault && boundary == g_config_fault_boundary;
+}
 
 static int path_join(char *path, size_t size, const char *base,
                      const char *suffix) {
@@ -242,17 +249,22 @@ static int run_remove_child(const remove_fixture_t *fixture, int stage,
         int rc;
 
         close(trace_pipe[0]);
-        memset(&action, 0, sizeof(action));
-        action.sa_handler = SIG_DFL;
-        sigemptyset(&action.sa_mask);
-        (void)sigaction(signo, &action, NULL);
-        sigemptyset(&unblocked);
-        sigaddset(&unblocked, signo);
-        (void)sigprocmask(SIG_UNBLOCK, &unblocked, NULL);
+        if (signo > 0) {
+            memset(&action, 0, sizeof(action));
+            action.sa_handler = SIG_DFL;
+            sigemptyset(&action.sa_mask);
+            (void)sigaction(signo, &action, NULL);
+            sigemptyset(&unblocked);
+            sigaddset(&unblocked, signo);
+            (void)sigprocmask(SIG_UNBLOCK, &unblocked, NULL);
+        }
         (void)setenv("HOME", fixture->home, 1);
         (void)setenv("XDG_RUNTIME_DIR", fixture->runtime, 1);
         (void)setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
         (void)run_set_runner(null_runner);
+        if (g_inject_config_fault) {
+            (void)config_set_io_fault_fn(fail_config_at_selected_boundary);
+        }
         if (redirect_output(fixture->output) != 0) _exit(120);
         g_trace_fd = trace_pipe[1];
         g_inject_stage = stage;
@@ -348,6 +360,70 @@ TEST(repeated_signals_defer_through_complete_removal_transaction) {
     }
 }
 
+TEST(config_faults_keep_account_and_alias_on_preinstall_failure) {
+    static const struct {
+        config_io_boundary_t boundary;
+        bool config_installed;
+    } cases[] = {
+        { CONFIG_IO_STATE_AFTER_TEMP, false },
+        { CONFIG_IO_STATE_AFTER_WRITE, false },
+        { CONFIG_IO_STATE_BEFORE_FILE_SYNC, false },
+        { CONFIG_IO_STATE_BEFORE_CLOSE, false },
+        { CONFIG_IO_STATE_BEFORE_RENAME, false },
+        { CONFIG_IO_STATE_BEFORE_DIR_SYNC, false },
+        { CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK, false },
+        { CONFIG_IO_BACKUP_BEFORE_FILE_SYNC, false },
+        { CONFIG_IO_BACKUP_BEFORE_DIR_SYNC, false },
+        { CONFIG_IO_BACKUP_BEFORE_REOPEN, false },
+        { CONFIG_IO_DOCUMENT_BEFORE_RENAME, false },
+        { CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC, true }
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        remove_fixture_t fixture;
+        char trace[16];
+        char config[4096];
+        char hint[128];
+        char ssh_config[4096];
+        char output[4096];
+        int status;
+
+        CHECK_EQ_INT(fixture_setup(&fixture), 0);
+        g_inject_config_fault = true;
+        g_config_fault_boundary = cases[i].boundary;
+        status = run_remove_child(&fixture, 0, 0, trace, sizeof(trace));
+        g_inject_config_fault = false;
+
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) {
+            CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+        }
+        CHECK_STR_EQ(trace, "12346");
+        CHECK(read_text(fixture.config, config, sizeof(config)) > 0);
+        CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
+        CHECK(read_text(fixture.ssh_config, ssh_config,
+                        sizeof(ssh_config)) > 0);
+        CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
+        CHECK(strstr(ssh_config, "HostName example.com") != NULL);
+        CHECK(strstr(output, "Account removed successfully") == NULL);
+        CHECK(access(fixture.ssh_socket, F_OK) != 0 && errno == ENOENT);
+        CHECK(access(fixture.gpg_home, F_OK) != 0 && errno == ENOENT);
+        CHECK(!config_dir_has_temp(fixture.config_dir));
+
+        if (cases[i].config_installed) {
+            CHECK(strstr(config, "name = \"work\"") == NULL);
+            CHECK_STR_EQ(hint, "none\ninactive=v1\n");
+            CHECK(strstr(ssh_config, "github-work") == NULL);
+            CHECK(strstr(output, "installed") != NULL);
+        } else {
+            CHECK(strstr(config, "name = \"work\"") != NULL);
+            CHECK_STR_EQ(hint, "ssh\nactive=work\n");
+            CHECK(strstr(ssh_config, "github-work") != NULL);
+            CHECK(strstr(output, "alias was retained") != NULL);
+        }
+    }
+}
+
 static void custom_handler(int signo) {
     (void)signo;
 }
@@ -395,6 +471,7 @@ TEST(direct_remove_restores_callers_signal_dispositions) {
 
 int main(void) {
     RUN_TEST(repeated_signals_defer_through_complete_removal_transaction);
+    RUN_TEST(config_faults_keep_account_and_alias_on_preinstall_failure);
     RUN_TEST(direct_remove_restores_callers_signal_dispositions);
     return ts_test_finish();
 }

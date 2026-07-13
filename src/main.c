@@ -134,6 +134,7 @@ typedef struct {
     command_notice_kind_t notice_kind;
     bool switch_prepared;
     bool edit_prepared;
+    bool remove_prepared;
     bool reset_guarded;
     config_resume_hint_snapshot_t hint_snapshot;
     char previous_active[MAX_NAME_LEN];
@@ -730,7 +731,7 @@ int main(int argc, char *argv[]) {
             } else {
                 signals_rollback_begin();
                 if (mutation.save_kind == COMMAND_SAVE_FULL) {
-                    if (mutation.edit_prepared) {
+                    if (mutation.edit_prepared || mutation.remove_prepared) {
                         save_rc = config_save_transactional(
                             ctx, ctx->config.config_path, &config_installed);
                     } else {
@@ -787,6 +788,30 @@ int main(int argc, char *argv[]) {
                 safe_strncpy(edit_rollback_detail,
                              get_last_error()->message,
                              sizeof(edit_rollback_detail));
+            }
+        }
+
+        bool remove_finalize_complete = true;
+        char remove_finalize_detail[sizeof(g_last_error.message)] = "";
+        if (mutation.remove_prepared) {
+            /* The account document is the removal's publication authority.
+             * Rename success (even with later durability uncertainty) commits
+             * exclusive-alias cleanup. A proven pre-install failure aborts
+             * that cleanup and leaves the durable account/alias pair intact. */
+            if (save_rc == 0 || config_installed) {
+                if (accounts_remove_commit(ctx) != 0) {
+                    remove_finalize_complete = false;
+                    safe_strncpy(remove_finalize_detail,
+                                 get_last_error()->message,
+                                 sizeof(remove_finalize_detail));
+                    save_rc = -1;
+                    config_installed = true;
+                }
+            } else if (accounts_remove_abort(ctx) != 0) {
+                remove_finalize_complete = false;
+                safe_strncpy(remove_finalize_detail,
+                             get_last_error()->message,
+                             sizeof(remove_finalize_detail));
             }
         }
 
@@ -888,6 +913,34 @@ int main(int argc, char *argv[]) {
                               "unknown persistence error",
                               edit_rollback_detail[0] ? edit_rollback_detail :
                               "unknown rollback error");
+            }
+            exit_code = EXIT_FAILURE;
+        } else if (mutation.remove_prepared && save_rc != 0) {
+            if (config_installed && remove_finalize_complete) {
+                display_error(
+                    "Configuration installed but removal durability is uncertain",
+                    "%s; the account deletion was installed and its exclusive "
+                    "SSH alias removal was committed. Verify filesystem "
+                    "durability before retrying",
+                    save_error[0] ? save_error :
+                                    "unknown persistence error");
+            } else if (config_installed) {
+                display_error(
+                    "Account deletion installed, but SSH alias cleanup failed",
+                    "%s%s%s",
+                    save_error[0] ? save_error :
+                                    "configuration save completed",
+                    remove_finalize_detail[0] ? "; " : "",
+                    remove_finalize_detail[0] ? remove_finalize_detail : "");
+            } else {
+                display_error(
+                    "Failed to save configuration changes",
+                    "%s; the durable account remains installed and its SSH "
+                    "alias was retained%s%s",
+                    save_error[0] ? save_error :
+                                    "unknown persistence error",
+                    remove_finalize_detail[0] ? "; abort error: " : "",
+                    remove_finalize_detail[0] ? remove_finalize_detail : "");
             }
             exit_code = EXIT_FAILURE;
         } else if (save_rc != 0) {
@@ -1145,6 +1198,7 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
     if (ctx->account_count != previous_count) {
         result.save_kind = COMMAND_SAVE_FULL;
         result.notice_kind = COMMAND_NOTICE_REMOVE;
+        result.remove_prepared = true;
     }
     return result;
 }

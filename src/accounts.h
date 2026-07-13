@@ -83,14 +83,15 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
 int accounts_edit_commit(gitswitch_ctx_t *ctx);
 int accounts_edit_abort(gitswitch_ctx_t *ctx);
 
-/**
- * Remove account with confirmation
- * - Shows account details
- * - Prompts for confirmation
- * - Cleans up associated SSH/GPG resources
- * - Updates configuration
- */
+/* Remove transaction. accounts_remove() confirms, tears down runtime state,
+ * and removes the account from the in-memory model. CLI callers defer signal
+ * cleanup and must then call commit after accounts.toml was installed, or
+ * abort after a proven pre-install save failure. Commit retires only an
+ * exclusively owned SSH alias; abort deliberately leaves it paired with the
+ * retained durable account. Direct callers retain one-call behavior. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier);
+int accounts_remove_commit(gitswitch_ctx_t *ctx);
+int accounts_remove_abort(gitswitch_ctx_t *ctx);
 
 /**
  * List all configured accounts

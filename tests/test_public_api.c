@@ -42,6 +42,8 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_init);
     REQUIRE_PUBLIC_API(accounts_list);
     REQUIRE_PUBLIC_API(accounts_remove);
+    REQUIRE_PUBLIC_API(accounts_remove_abort);
+    REQUIRE_PUBLIC_API(accounts_remove_commit);
     REQUIRE_PUBLIC_API(accounts_session_cleanup);
     REQUIRE_PUBLIC_API(accounts_show_status);
     REQUIRE_PUBLIC_API(accounts_switch);

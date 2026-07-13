@@ -92,6 +92,21 @@ typedef struct {
 
 static pending_edit_t g_pending_edit = {0};
 
+/* CLI removal cannot retire an exclusive ~/.ssh/config alias until the
+ * matching account deletion crosses the accounts.toml publication point.
+ * Runtime teardown and the in-memory deletion happen during prepare; this
+ * small retained record owns only the final alias decision across main's
+ * transactional save. Direct library calls keep their historical one-call
+ * behavior by committing this record before accounts_remove() returns. */
+typedef struct {
+    bool active;
+    gitswitch_ctx_t *ctx;
+    char alias[MAX_NAME_LEN];
+    bool alias_exclusive;
+} pending_remove_t;
+
+static pending_remove_t g_pending_remove = {0};
+
 /* Internal helper functions */
 static uint32_t get_next_available_id(const gitswitch_ctx_t *ctx);
 static bool prompt_host_alias_valid(const char *alias);
@@ -2340,7 +2355,51 @@ int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
     return 0;
 }
 
-/* Remove account with confirmation and cleanup */
+int accounts_remove_commit(gitswitch_ctx_t *ctx) {
+    pending_remove_t pending;
+
+    if (!g_pending_remove.active || !ctx || g_pending_remove.ctx != ctx) {
+        set_error(ERR_INVALID_ARGS, "No prepared account removal to commit");
+        return -1;
+    }
+
+    pending = g_pending_remove;
+    memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    if (pending.alias[0] != '\0' && !pending.alias_exclusive) {
+        log_warning("Retaining shared ~/.ssh/config host-alias block for '%s'; "
+                    "another account still claims the same alias",
+                    pending.alias);
+    } else if (pending.alias[0] != '\0' &&
+               ssh_remove_host_alias(pending.alias) != 0) {
+        /* Preserve the historical best-effort cleanup contract. The durable
+         * account deletion has already been published, so failing the command
+         * now cannot roll it back and would misleadingly invite a destructive
+         * retry. The stale stanza remains visible and can be cleaned manually. */
+        log_warning("Could not remove ~/.ssh/config host-alias block for '%s': %s",
+                    pending.alias, get_last_error()->message);
+    }
+    REMOVE_TEST_CHECKPOINT(4);
+    return 0;
+}
+
+int accounts_remove_abort(gitswitch_ctx_t *ctx) {
+    if (!g_pending_remove.active || !ctx || g_pending_remove.ctx != ctx) {
+        set_error(ERR_INVALID_ARGS, "No prepared account removal to abort");
+        return -1;
+    }
+
+    /* The installed accounts.toml still contains the account, so the alias is
+     * deliberately untouched as its matching retry route. Runtime teardown
+     * cannot be undone, but the durable account remains a valid reset/remove
+     * handle for the next invocation. */
+    memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    REMOVE_TEST_CHECKPOINT(4);
+    return 0;
+}
+
+/* Remove account with confirmation and cleanup. CLI callers prepare the
+ * account/model deletion here and finalize its SSH alias only after main has
+ * classified config_save_transactional() as pre- or post-install. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *account;
     char input[64];
@@ -2360,6 +2419,11 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     
     if (!ctx || !identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_remove");
+        return -1;
+    }
+    if (g_pending_remove.active) {
+        set_error(ERR_INVALID_ARGS,
+                  "An account removal is already awaiting commit or abort");
         return -1;
     }
     
@@ -2414,8 +2478,9 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (safe_strncpy(account_name, account->name, sizeof(account_name)) != 0) {
         goto remove_done;
     }
-    /* Capture the managed SSH host alias before teardown so it can be removed
-     * from ~/.ssh/config after the account is gone (AR-06 F15). */
+    /* Capture the managed SSH host alias before teardown. Its removal is a
+     * post-persistence commit: a pre-install config failure must leave the
+     * durable account and this route together. */
     char removed_alias[MAX_NAME_LEN];
     removed_alias[0] = '\0';
     safe_strncpy(removed_alias, account->ssh_host_alias, sizeof(removed_alias));
@@ -2493,20 +2558,23 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     }
     REMOVE_TEST_CHECKPOINT(3);
 
-    /* Remove the managed ~/.ssh/config host-alias block so git traffic no
-     * longer routes to the deleted account's key (AR-06 F15). Best-effort: the
-     * account is already gone from config, so a failure here only leaves a
-     * stale (visible) stanza — warn rather than fail the whole removal. */
-    if (removed_alias[0] != '\0' && !removed_alias_exclusive) {
-        log_warning("Retaining shared ~/.ssh/config host-alias block for '%s'; "
-                    "another account still claims the same alias",
-                    removed_alias);
-    } else if (removed_alias[0] != '\0' &&
-               ssh_remove_host_alias(removed_alias) != 0) {
-        log_warning("Could not remove ~/.ssh/config host-alias block for '%s': %s",
-                    removed_alias, get_last_error()->message);
+    memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    g_pending_remove.active = true;
+    g_pending_remove.ctx = ctx;
+    g_pending_remove.alias_exclusive = removed_alias_exclusive;
+    if (safe_strncpy(g_pending_remove.alias, removed_alias,
+                     sizeof(g_pending_remove.alias)) != 0) {
+        memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+        goto remove_done;
     }
-    REMOVE_TEST_CHECKPOINT(4);
+
+    /* A direct library call has no outer save transaction and retains the
+     * historical one-call alias cleanup. The CLI sets defer_signal_cleanup and
+     * calls accounts_remove_commit/abort after transactional persistence. */
+    if (!ctx->config.defer_signal_cleanup &&
+        accounts_remove_commit(ctx) != 0) {
+        goto remove_done;
+    }
 
     result = 0;
 
