@@ -173,6 +173,62 @@ TEST(load_rejects_file_growth_after_prefix_read) {
     CHECK(strstr(contents, "[accounts.2]") != NULL);
 }
 
+TEST(system_scope_is_rejected_before_admission_or_persistence) {
+    char dir[128], account_dir[256];
+    char default_path[512], account_path[512];
+    char default_hint[512], account_hint[512];
+    gitswitch_ctx_t ctx;
+    account_t local, system, before;
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&system, 1, "alice", "a@b.com", "day job");
+    system.preferred_scope = GIT_SCOPE_SYSTEM;
+    CHECK_EQ_INT(config_add_account(&ctx, &system), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&local, 1, "alice", "a@b.com", "day job");
+    CHECK_EQ_INT(config_add_account(&ctx, &local), 0);
+    before = ctx.accounts[0];
+    CHECK_EQ_INT(config_update_account(&ctx, &system), -1); /* pre-fix: 0 */
+    CHECK(memcmp(&ctx.accounts[0], &before, sizeof(before)) == 0);
+
+    ctx.config.default_scope = GIT_SCOPE_SYSTEM;
+    CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx.accounts[0] = system;
+    CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(join_path(default_path, sizeof(default_path), dir,
+                           "/default.toml"), 0);
+    CHECK_EQ_INT(join_path(default_hint, sizeof(default_hint), dir,
+                           "/.resume-hint"), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_SYSTEM;
+    CHECK_EQ_INT(config_save(&ctx, default_path), -1); /* pre-fix: 0 */
+    CHECK(access(default_path, F_OK) != 0);
+    CHECK(access(default_hint, F_OK) != 0);
+
+    /* Use a separate private directory so an accidental resume-hint write by
+     * the first save cannot mask whether the account-scope save was pure. */
+    CHECK_EQ_INT(join_path(account_dir, sizeof(account_dir), dir,
+                           "/account-dir"), 0);
+    CHECK_EQ_INT(mkdir(account_dir, 0700), 0);
+    CHECK_EQ_INT(join_path(account_path, sizeof(account_path), account_dir,
+                           "/account.toml"), 0);
+    CHECK_EQ_INT(join_path(account_hint, sizeof(account_hint), account_dir,
+                           "/.resume-hint"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx.accounts[0] = system;
+    ctx.account_count = 1;
+    CHECK_EQ_INT(config_save(&ctx, account_path), -1); /* pre-fix: 0 */
+    CHECK(access(account_path, F_OK) != 0);
+    CHECK(access(account_hint, F_OK) != 0);
+}
+
 TEST(load_rejects_symlinked_config) {
     /* The symlink target is a file that passes every *content* check (ours,
      * 0600, valid TOML), so the old stat()-based validation followed the
@@ -1560,6 +1616,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(destructive_resolution_refuses_substring);
     RUN_TEST(load_accepts_regular_file);
     RUN_TEST(load_rejects_file_growth_after_prefix_read);
+    RUN_TEST(system_scope_is_rejected_before_admission_or_persistence);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
     RUN_TEST(config_init_rejects_nondirectory_final_components);

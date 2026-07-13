@@ -123,6 +123,7 @@ static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc)
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
+static bool config_scope_is_persistable(git_scope_t scope);
 static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
                                        const account_t *account,
                                        size_t ignore_index);
@@ -1820,6 +1821,25 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         *config_installed = false;
     }
 
+    /* GIT_SCOPE_SYSTEM remains part of the public observation model because
+     * Git may report values originating there. It is not a persistable
+     * gitswitch preference: the TOML schema and switch transaction support
+     * only local/global. Reject the whole model before resume-state capture,
+     * backup creation, or any document mutation. */
+    if (!config_scope_is_persistable(ctx->config.default_scope)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "settings.default_scope must be local or global");
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (!config_scope_is_persistable(ctx->accounts[i].preferred_scope)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account %u preferred scope must be local or global",
+                      ctx->accounts[i].id);
+            return -1;
+        }
+    }
+
     /* Refuse to rewrite the file when the load produced an incomplete view:
      * a full rewrite would silently erase the skipped/unknown sections.
      * Preserve the on-disk file and tell the user to fix them first. The
@@ -2179,6 +2199,11 @@ static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
 int config_validate(const gitswitch_ctx_t *ctx) {
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_validate");
+        return -1;
+    }
+    if (!config_scope_is_persistable(ctx->config.default_scope)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "settings.default_scope must be local or global");
         return -1;
     }
     
@@ -2556,6 +2581,14 @@ const char *config_scope_to_string(git_scope_t scope) {
         default:
             return "local";
     }
+}
+
+/* Persisted account preferences and defaults intentionally support only the
+ * two scopes the switch transaction can apply and roll back exactly. Keep the
+ * system enum for observed Git origins, but never admit it into gitswitch's
+ * own account model. */
+static bool config_scope_is_persistable(git_scope_t scope) {
+    return scope == GIT_SCOPE_LOCAL || scope == GIT_SCOPE_GLOBAL;
 }
 
 typedef struct {
@@ -3786,6 +3819,12 @@ static int validate_account_security(const account_t *account) {
         return -1;
     }
 
+    if (!config_scope_is_persistable(account->preferred_scope)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Account preferred scope must be local or global");
+        return -1;
+    }
+
     /* Validate required fields */
     if (!validate_name(account->name)) {
         set_error(ERR_ACCOUNT_INVALID, "Invalid account name: %s", account->name);
@@ -3915,6 +3954,13 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
     for (size_t i = 0; i < ctx->account_count; i++) {
         const account_t *account = &ctx->accounts[i];
         const char *ssh_hostname = account->ssh_hostname;
+
+        if (!config_scope_is_persistable(account->preferred_scope)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account %u preferred scope must be local or global",
+                      account->id);
+            return -1;
+        }
         
         log_debug("Saving account %zu: ID=%u, name='%s', email='%s'", 
                   i, account->id, account->name, account->email);
