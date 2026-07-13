@@ -21,16 +21,21 @@
 #include <unistd.h>
 
 static char g_bin[PATH_MAX];
+static char g_self[PATH_MAX];
 
 static int install_live_current_socket(const char *runtime,
                                        const char *account_name);
 
-static int resolve_binary(void) {
+static int resolve_binary_and_self(const char *argv0) {
     const char *bin = getenv("GITSWITCH_BIN");
 
     if (!bin || !*bin) bin = "build/bin/gitswitch";
     if (!realpath(bin, g_bin) || access(g_bin, X_OK) != 0) {
         fprintf(stderr, "test_ar04_lifecycle: executable not found at %s\n", bin);
+        return -1;
+    }
+    if (!argv0 || !realpath(argv0, g_self) || access(g_self, X_OK) != 0) {
+        fprintf(stderr, "test_ar04_lifecycle: cannot resolve self helper\n");
         return -1;
     }
     return 0;
@@ -223,8 +228,13 @@ static int prepare_shims(char *shim_dir, size_t size) {
         find_fixture_executable("git", git_path, sizeof(git_path)) != 0) {
         return -1;
     }
+    /* Account edit now resolves a selector to one canonical primary
+     * fingerprint. Exit-zero-with-no-output is deliberately a miss, so the
+     * old copied `true` fixture no longer supplies valid key evidence. Copy
+     * this test binary as a native helper; its helper mode below emits a
+     * minimal, structurally valid secret-key inventory. */
     snprintf(path, sizeof(path), "%s/gpg", shim_dir);
-    if (copy_executable(true_path, path) != 0) return -1;
+    if (copy_executable(g_self, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/gpgconf", shim_dir);
     if (copy_executable(true_path, path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/git", shim_dir);
@@ -959,9 +969,14 @@ TEST(sock_substrings_round_trip_and_malformed_links_fall_back) {
     remove_tree(runtime);
 }
 
-TEST_MAIN_BEGIN()
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--batch") == 0) {
+        puts("sec:u:4096:1:ABCDEF0123456789:1700000000:::-:::scESC:::+:::23::0:");
+        puts("fpr:::::::::0123456789ABCDEF01234567ABCDEF0123456789:");
+        return 0;
+    }
     error_init(LOG_LEVEL_WARNING, NULL);
-    if (resolve_binary() != 0) return 1;
+    if (resolve_binary_and_self(argc > 0 ? argv[0] : NULL) != 0) return 1;
     RUN_TEST(active_live_field_edits_are_rejected_without_mutation);
     RUN_TEST(active_description_edit_and_inactive_live_edits_still_work);
     RUN_TEST(remove_tears_down_runtime_before_deleting_account);
@@ -971,4 +986,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(remove_inactive_account_with_no_runtime_preserves_active_account);
     RUN_TEST(remove_rebinds_current_pointer_after_array_compaction);
     RUN_TEST(sock_substrings_round_trip_and_malformed_links_fall_back);
-TEST_MAIN_END()
+    error_cleanup();
+    return ts_test_finish();
+}
