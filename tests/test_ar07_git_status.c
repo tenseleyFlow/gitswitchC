@@ -78,6 +78,9 @@ static const unsigned char *fake_failure_diagnostic =
     default_failure_diagnostic;
 static size_t fake_failure_diagnostic_len =
     sizeof(default_failure_diagnostic) - 1U;
+static bool fake_repository;
+static const unsigned char *fake_repo_root;
+static size_t fake_repo_root_len;
 
 static bool fake_append(const void *bytes, size_t length) {
     if (length > sizeof(fake_listing) - fake_listing_len) return false;
@@ -97,6 +100,23 @@ static bool fake_append_record(const char *scope, const char *origin,
            fake_append(value, value_len) && fake_append(&nul, 1);
 }
 
+static int fake_write_output(const run_opts_t *opts, run_result_t *result,
+                             const unsigned char *bytes, size_t length) {
+    size_t copied;
+
+    if (!opts || !opts->out || opts->out_size == 0 || !bytes) {
+        return fake_finish(result, 1);
+    }
+    copied = length < opts->out_size - 1U ? length : opts->out_size - 1U;
+    memcpy(opts->out, bytes, copied);
+    opts->out[copied] = '\0';
+    if (result) {
+        result->out_len = copied;
+        result->out_truncated = copied < length;
+    }
+    return fake_finish(result, 0);
+}
+
 static int status_fake_runner(const char *const argv[], const run_opts_t *opts,
                               run_result_t *result) {
     if (result) memset(result, 0, sizeof(*result));
@@ -104,8 +124,20 @@ static int status_fake_runner(const char *const argv[], const run_opts_t *opts,
 
     if (!argv[0] || strcmp(argv[0], "git") != 0 || !argv[1])
         return fake_finish(result, 127);
-    if (strcmp(argv[1], "rev-parse") == 0)
+    if (strcmp(argv[1], "rev-parse") == 0) {
+        static const unsigned char git_dir[] = ".git\n";
+
+        if (!argv[2] || !fake_repository) return fake_finish(result, 1);
+        if (strcmp(argv[2], "--git-dir") == 0) {
+            return fake_write_output(opts, result, git_dir,
+                                     sizeof(git_dir) - 1U);
+        }
+        if (strcmp(argv[2], "--show-toplevel") == 0 && fake_repo_root) {
+            return fake_write_output(opts, result, fake_repo_root,
+                                     fake_repo_root_len);
+        }
         return fake_finish(result, 1);
+    }
     if (strcmp(argv[1], "config") != 0 || !argv[2])
         return fake_finish(result, 1);
 
@@ -275,6 +307,101 @@ static bool contains_bytes(const char *haystack, size_t haystack_length,
         if (memcmp(haystack + i, needle, needle_length) == 0) return true;
     }
     return false;
+}
+
+static size_t count_text(const char *haystack, const char *needle) {
+    size_t count = 0;
+    size_t needle_length = strlen(needle);
+
+    if (!haystack || needle_length == 0) return 0;
+    while ((haystack = strstr(haystack, needle)) != NULL) {
+        count++;
+        haystack += needle_length;
+    }
+    return count;
+}
+
+TEST(status_escapes_and_bounds_every_external_value) {
+    static const unsigned char hostile_name[] = {
+        'G', 'i', 't', '\n', 'N', 'a', 'm', 'e', 0x1b, '[', '3', '1', 'm'
+    };
+    static const unsigned char hostile_email[] = {
+        'm', 'a', 'i', 'l', '\\', 'x', 0xc2, 0x9b, '@', 'x'
+    };
+    static const unsigned char hostile_signing_key[] = {
+        'K', 'E', 'Y', 0xe2, 0x80, 0xae, 0xff
+    };
+    static const unsigned char encoded_c1[] = {0xc2, 0x9b};
+    static const unsigned char encoded_bidi[] = {0xe2, 0x80, 0xae};
+    char long_origin[768];
+    unsigned char long_root[768];
+    gitswitch_ctx_t context;
+    char status[8192];
+    command_runner_fn previous;
+
+    memset(long_origin, 'o', sizeof(long_origin));
+    memcpy(long_origin, "file:/cfg\\origin", strlen("file:/cfg\\origin"));
+    long_origin[20] = (char)0x1b;
+    long_origin[21] = '\n';
+    long_origin[700] = '\0';
+    memset(long_root, 'r', sizeof(long_root));
+    memcpy(long_root, "/repo\\root", strlen("/repo\\root"));
+    long_root[16] = '\n';
+    long_root[17] = 0x9b;
+    long_root[700] = '\n';
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = true;
+    fake_repo_root = long_root;
+    fake_repo_root_len = 701U;
+    CHECK(fake_append_record("global", long_origin, "user.name",
+                             (const char *)hostile_name,
+                             sizeof(hostile_name)));
+    CHECK(fake_append_record("global", long_origin, "user.email",
+                             (const char *)hostile_email,
+                             sizeof(hostile_email)));
+    CHECK(fake_append_record("global", long_origin, "user.signingkey",
+                             (const char *)hostile_signing_key,
+                             sizeof(hostile_signing_key)));
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1;
+    context.accounts[0].id = 1;
+    context.accounts[0].preferred_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].name, "Expected User",
+                              sizeof(context.accounts[0].name)), 0);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
+                              "expected@example.test",
+                              sizeof(context.accounts[0].email)), 0);
+    context.current_account = &context.accounts[0];
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status, sizeof(status)), 0);
+    run_set_runner(previous);
+    fake_repository = false;
+    fake_repo_root = NULL;
+    fake_repo_root_len = 0;
+    git_ops_test_reset_caches();
+
+    CHECK(strstr(status, "Current Name: Git\\x0AName\\x1B[31m") != NULL);
+    CHECK(strstr(status, "Current Email: mail\\\\x\\xC2\\x9B@x") != NULL);
+    CHECK(strstr(status, "GPG Signing Key: KEY\\xE2\\x80\\xAE\\xFF") !=
+          NULL);
+    CHECK(strstr(status, "file:/cfg\\\\origin") != NULL);
+    CHECK(strstr(status, "/repo\\\\root") != NULL);
+    CHECK(strstr(status, "\\x0A") != NULL);
+    CHECK(strstr(status, "\\x9B") != NULL);
+    CHECK(count_text(status, "...[truncated]") >= 2U);
+    CHECK(memchr(status, 0x1b, strlen(status)) == NULL);
+    CHECK(memchr(status, 0x9b, strlen(status)) == NULL);
+    CHECK(!contains_bytes(status, strlen(status), encoded_c1,
+                          sizeof(encoded_c1)));
+    CHECK(!contains_bytes(status, strlen(status), encoded_bidi,
+                          sizeof(encoded_bidi)));
+    CHECK(memchr(status, 0xff, strlen(status)) == NULL);
 }
 
 TEST(execution_failure_retains_diagnostic_and_status_reports_error) {
@@ -765,6 +892,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(oversized_unrelated_config_is_captured_without_losing_identity);
     RUN_TEST(malformed_effective_listing_is_an_error_not_absence);
+    RUN_TEST(status_escapes_and_bounds_every_external_value);
     RUN_TEST(execution_failure_retains_diagnostic_and_status_reports_error);
     RUN_TEST(execution_diagnostic_is_sanitized_before_error_logging);
     RUN_TEST(absent_identity_remains_a_normal_status_result);

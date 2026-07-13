@@ -2577,22 +2577,33 @@ int accounts_list(const gitswitch_ctx_t *ctx) {
     return 0;
 }
 
-/* Git origin strings contain filesystem paths. Keep diagnostics single-line
- * and terminal-safe even when a repository/config filename contains control
- * characters or arbitrary non-UTF-8 bytes. Escaping backslashes as well makes
- * the byte representation unambiguous. */
+#define STATUS_RENDER_BYTE_LIMIT 512U
+#define STATUS_RENDER_TRUNCATION "...[truncated]"
+
+/* Git values, origins, and repository paths are attacker-controlled byte
+ * strings. Keep diagnostics single-line and unambiguous by escaping every
+ * non-ASCII/backslash byte, and cap consumption so one foreign value cannot
+ * create unbounded terminal output. The maximum rendered payload is four
+ * times STATUS_RENDER_BYTE_LIMIT plus the fixed truncation marker. */
 static void print_terminal_safe(const char *text) {
     const unsigned char *cursor = (const unsigned char *)text;
+    size_t consumed = 0;
 
     if (!cursor) return;
-    for (; *cursor != '\0'; cursor++) {
-        if (*cursor >= 0x20 && *cursor <= 0x7e && *cursor != '\\') {
-            putchar((int)*cursor);
-        } else if (*cursor == '\\') {
+    for (; consumed < STATUS_RENDER_BYTE_LIMIT && cursor[consumed] != '\0';
+         consumed++) {
+        unsigned char byte = cursor[consumed];
+
+        if (byte >= 0x20 && byte <= 0x7e && byte != '\\') {
+            putchar((int)byte);
+        } else if (byte == '\\') {
             fputs("\\\\", stdout);
         } else {
-            printf("\\x%02X", (unsigned int)*cursor);
+            printf("\\x%02X", (unsigned int)byte);
         }
+    }
+    if (consumed == STATUS_RENDER_BYTE_LIMIT && cursor[consumed] != '\0') {
+        fputs(STATUS_RENDER_TRUNCATION, stdout);
     }
 }
 
@@ -2704,8 +2715,11 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             bool ssh_status_determined = true;
             bool gpg_program_matches;
 
-            printf("  Current Name: %s\n", git_config->name);
-            printf("  Current Email: %s\n", git_config->email);
+            printf("  Current Name: ");
+            print_terminal_safe(git_config->name);
+            printf("\n  Current Email: ");
+            print_terminal_safe(git_config->email);
+            printf("\n");
             printf("  Configuration Scope: %s",
                    git_config_origin_scope_to_string(
                        git_config->effective_name_scope));
@@ -2758,7 +2772,11 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 printf("  Match Status: [WARN] Git config does not match account\n");
                 if (!identity_matches) {
                     printf("    Expected: %s <%s>\n", account->name, account->email);
-                    printf("    Current:  %s <%s>\n", git_config->name, git_config->email);
+                    printf("    Current:  ");
+                    print_terminal_safe(git_config->name);
+                    printf(" <");
+                    print_terminal_safe(git_config->email);
+                    printf(">\n");
                 }
             }
 
@@ -2777,7 +2795,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             
             /* GPG signing status */
             if (strlen(git_config->signing_key) > 0) {
-                printf("  GPG Signing Key: %s\n", git_config->signing_key);
+                printf("  GPG Signing Key: ");
+                print_terminal_safe(git_config->signing_key);
+                printf("\n");
                 printf("  GPG Signing Enabled: %s\n", git_config->gpg_signing_enabled ? "[YES]" : "[NO]");
             } else {
                 printf("  GPG Signing: [NOT CONFIGURED]\n");
@@ -2791,7 +2811,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         if (git_is_repository()) {
             char repo_root[MAX_PATH_LEN];
             if (git_get_repo_root(repo_root, sizeof(repo_root)) == 0) {
-                printf("  Repository: [FOUND] %s\n", repo_root);
+                printf("  Repository: [FOUND] ");
+                print_terminal_safe(repo_root);
+                printf("\n");
             } else {
                 printf("  Repository: [REPOSITORY] Current directory is a git repository\n");
             }
@@ -2813,8 +2835,11 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                       strerror(errno));
             if (print_git_status_read_failure() != 0) status_result = -1;
         } else if (git_get_current_config(git_config) == 0) {
-            printf("  Name: %s\n", git_config->name);
-            printf("  Email: %s\n", git_config->email);
+            printf("  Name: ");
+            print_terminal_safe(git_config->name);
+            printf("\n  Email: ");
+            print_terminal_safe(git_config->email);
+            printf("\n");
             printf("  Scope: %s\n",
                    git_config_origin_scope_to_string(
                        git_config->effective_name_scope));
