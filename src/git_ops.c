@@ -127,6 +127,9 @@ typedef struct {
 static git_config_snapshot_t g_git_snapshot;
 static void git_snapshot_clear(git_config_snapshot_t *snapshot);
 
+typedef void *(*git_snapshot_value_malloc_fn)(size_t size);
+static git_snapshot_value_malloc_fn g_git_snapshot_value_malloc = malloc;
+
 typedef void (*git_restore_test_hook_fn)(git_scope_t scope);
 static git_restore_test_hook_fn g_restore_prelock_hook;
 static git_restore_test_hook_fn g_restore_locked_hook;
@@ -135,11 +138,19 @@ static git_restore_test_hook_fn g_restore_locked_hook;
  * absent from the installed API; tests declare the prototypes locally. */
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn);
 void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn);
+git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
+    git_snapshot_value_malloc_fn fn);
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
     g_restore_prelock_hook = fn;
 }
 void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn) {
     g_restore_locked_hook = fn;
+}
+git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
+    git_snapshot_value_malloc_fn fn) {
+    git_snapshot_value_malloc_fn previous = g_git_snapshot_value_malloc;
+    g_git_snapshot_value_malloc = fn ? fn : malloc;
+    return previous;
 }
 
 /* ---- Process-scoped exec caches (perf-1..4) ------------------------------
@@ -244,6 +255,7 @@ void git_ops_test_reset_caches(void) {
     g_git_validated = false;
     g_restore_prelock_hook = NULL;
     g_restore_locked_hook = NULL;
+    g_git_snapshot_value_malloc = malloc;
 }
 
 typedef struct {
@@ -619,7 +631,7 @@ static int git_snapshot_key_append(git_snapshot_key_t *key,
         key->values = grown;
         key->capacity = capacity;
     }
-    copy = malloc(value_len + 1U);
+    copy = g_git_snapshot_value_malloc(value_len + 1U);
     if (!copy) {
         set_error(ERR_MEMORY_ALLOCATION,
                   "Out of memory capturing Git configuration value");
@@ -1898,24 +1910,59 @@ static int git_transaction_require_write_allowed(git_scope_t scope,
     return 0;
 }
 
-/* Update the intended post-image only after a managed Git command reports
- * success. The replacement is allocated before the previous vector is freed,
- * so an allocation failure leaves a conservative older expectation that will
- * conflict rather than claim an unrecorded write during rollback. */
-static int git_transaction_record_vector(git_scope_t scope, const char *key,
-                                         bool present, const char *value) {
+typedef struct {
+    git_snapshot_key_t *destination;
+    git_snapshot_key_t replacement;
+} git_transaction_vector_update_t;
+
+/* Construct the complete intended post-image before a managed Git command is
+ * allowed to run. Committing the detached replacement is then infallible, so
+ * command success can never leave rollback expecting the pre-write vector. */
+static int git_transaction_prepare_vector(
+    git_scope_t scope, const char *key, bool present, const char *value,
+    git_transaction_vector_update_t *update) {
     git_scope_snapshot_t *post = git_transaction_post_scope(scope);
-    git_snapshot_key_t next;
     int key_index = cfg_key_index(key);
 
+    memset(update, 0, sizeof(*update));
     if (!post || key_index < 0) return 0;
-    memset(&next, 0, sizeof(next));
+    update->destination = &post->keys[key_index];
     if (present &&
-        git_snapshot_key_append(&next, value, strlen(value)) != 0) {
+        git_snapshot_key_append(&update->replacement, value,
+                                strlen(value)) != 0) {
+        git_snapshot_key_clear(&update->replacement);
+        update->destination = NULL;
         return -1;
     }
-    git_snapshot_key_clear(&post->keys[key_index]);
-    post->keys[key_index] = next;
+    return 0;
+}
+
+static void git_transaction_discard_vector(
+    git_transaction_vector_update_t *update) {
+    git_snapshot_key_clear(&update->replacement);
+    update->destination = NULL;
+}
+
+static void git_transaction_commit_vector(
+    git_transaction_vector_update_t *update) {
+    if (update->destination) {
+        git_snapshot_key_clear(update->destination);
+        *update->destination = update->replacement;
+    }
+    memset(update, 0, sizeof(*update));
+}
+
+/* Record a post-image for paths that perform no external write, such as a
+ * proven duplicate set or absent unset. */
+static int git_transaction_record_vector(git_scope_t scope, const char *key,
+                                         bool present, const char *value) {
+    git_transaction_vector_update_t update;
+
+    if (git_transaction_prepare_vector(scope, key, present, value,
+                                       &update) != 0) {
+        return -1;
+    }
+    git_transaction_commit_vector(&update);
     return 0;
 }
 
@@ -2963,6 +3010,7 @@ static int git_set_config_value_impl(const char *key, const char *value,
                                      git_scope_t scope, bool skip_validation) {
     char output[256];
     const char *scope_flag;
+    git_transaction_vector_update_t post_update;
 
     if (!key || !value) {
         set_error(ERR_INVALID_ARGS, "NULL key or value to git_set_config_value");
@@ -2999,18 +3047,24 @@ static int git_set_config_value_impl(const char *key, const char *value,
         return git_transaction_record_vector(scope, key, true, value);
     }
 
+    if (git_transaction_prepare_vector(scope, key, true, value,
+                                       &post_update) != 0) {
+        return -1;
+    }
     log_debug("Setting git config: %s = %s (%s)", key, value, scope_flag);
 
     if (git_run(output, sizeof(output), "config", scope_flag, key, value,
                 (const char *)NULL) != 0) {
+        git_transaction_discard_vector(&post_update);
         /* The key's on-disk state is now uncertain; never skip/serve it. */
         cfg_cache_store(s, k, CFG_UNKNOWN, false, "");
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git config %s: %s", key, output);
         return -1;
     }
 
+    git_transaction_commit_vector(&post_update);
     cfg_cache_store(s, k, CFG_WRITTEN, true, value);
-    return git_transaction_record_vector(scope, key, true, value);
+    return 0;
 }
 
 int git_set_config_value(const char *key, const char *value, git_scope_t scope) {

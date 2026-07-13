@@ -18,6 +18,9 @@
 /* Test seam from git_ops.c (deliberately not in git_ops.h: the public API is
  * unchanged; only tests need to reset the process-scoped caches). */
 void git_ops_test_reset_caches(void);
+typedef void *(*git_snapshot_value_malloc_fn)(size_t size);
+git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
+    git_snapshot_value_malloc_fn fn);
 
 /* ---- fake git: in-memory config store + exec counters ------------------- */
 
@@ -323,6 +326,7 @@ TEST(git_set_config_value_skips_duplicate_managed_write) {
 
 static char zfk_set_key[16][64], zfk_set_val[16][8192];
 static int zfk_sets;
+static int zfk_forward_sets;
 static char zfk_unset_key[16][64];
 static int zfk_unsets;
 static int zfk_fallback_reads; /* per-key reads => the -z fast path was NOT used */
@@ -382,6 +386,7 @@ static int zfk_runner(const char *const argv[], const run_opts_t *opts,
             return fk_ret(result, 0);
         }
         if (argv[4]) { /* ordinary forward set */
+            zfk_forward_sets++;
             return fk_ret(result, 0);
         }
         zfk_fallback_reads++; /* per-key read: snapshot must never fall back */
@@ -504,6 +509,44 @@ TEST(restore_unsets_keys_written_after_snapshot) {
     run_set_runner(prev);
     zfk_listing_override = NULL;
     CHECK(zfk_was_unset("user.signingkey"));
+}
+
+static void *fail_snapshot_value_malloc(size_t size) {
+    (void)size;
+    return NULL;
+}
+
+/* A managed write must not reach Git until its intended post-image is fully
+ * representable in memory. Otherwise the command can succeed while the
+ * transaction still expects the old vector, and rollback mistakes its own
+ * mutation for an external conflict. The failed attempt must also leave no
+ * CFG_WRITTEN cache entry that could suppress a later retry. */
+TEST(postimage_value_allocation_failure_precedes_managed_write) {
+    git_snapshot_value_malloc_fn previous_malloc;
+
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    zfk_forward_sets = 0;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    previous_malloc = git_ops_test_set_snapshot_value_malloc_fn(
+        fail_snapshot_value_malloc);
+    clear_error();
+
+    CHECK_EQ_INT(git_set_config_value("user.name", "Replacement Name",
+                                      GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_MEMORY_ALLOCATION);
+    CHECK_EQ_INT(zfk_forward_sets, 0);
+
+    git_ops_test_set_snapshot_value_malloc_fn(previous_malloc);
+    zfk_forward_sets = 0;
+    CHECK_EQ_INT(git_set_config_value("user.name", "Replacement Name",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(zfk_forward_sets, 1);
+
+    git_ops_test_reset_caches();
+    run_set_runner(prev);
 }
 
 /* ---- AR-03 M1: overlong values must never snapshot as proven-absent ----- */
@@ -773,6 +816,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);
     RUN_TEST(restore_unsets_keys_written_after_snapshot);
+    RUN_TEST(postimage_value_allocation_failure_precedes_managed_write);
     RUN_TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim);
     RUN_TEST(oversize_foreign_sshcommand_restores_exactly);
     RUN_TEST(git_test_config_reuses_switch_readback);
