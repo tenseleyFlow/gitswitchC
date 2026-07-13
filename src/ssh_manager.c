@@ -1837,8 +1837,8 @@ static bool same_ssh_config_ctime(const struct stat *left,
 #endif
 }
 
-static bool same_ssh_config_snapshot(const struct stat *left,
-                                     const struct stat *right) {
+static bool same_ssh_config_snapshot_except_ctime(const struct stat *left,
+                                                  const struct stat *right) {
     return left->st_dev == right->st_dev &&
            left->st_ino == right->st_ino &&
            left->st_mode == right->st_mode &&
@@ -1847,8 +1847,13 @@ static bool same_ssh_config_snapshot(const struct stat *left,
            left->st_nlink == right->st_nlink &&
            left->st_size == right->st_size &&
            same_ssh_config_mtime(left, right) &&
-           same_ssh_config_ctime(left, right) &&
            S_ISREG(right->st_mode);
+}
+
+static bool same_ssh_config_snapshot(const struct stat *left,
+                                     const struct stat *right) {
+    return same_ssh_config_snapshot_except_ctime(left, right) &&
+           same_ssh_config_ctime(left, right);
 }
 
 /* rename(2) is allowed to advance the renamed inode's ctime.  The exact
@@ -2268,6 +2273,45 @@ static int read_ssh_config_at(int dir_fd, const char *display_path,
     return 0;
 }
 
+static int ssh_config_fd_matches_bytes(int fd, const char *expected,
+                                       size_t expected_len, bool *matches) {
+    unsigned char chunk[4096];
+    size_t offset = 0;
+
+    *matches = false;
+    while (offset < expected_len) {
+        size_t wanted = expected_len - offset;
+        ssize_t n;
+
+        if (wanted > sizeof(chunk)) wanted = sizeof(chunk);
+        do {
+            n = pread(fd, chunk, wanted, (off_t)offset);
+        } while (n < 0 && errno == EINTR);
+        if (n < 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to revalidate pinned SSH config bytes");
+            return -1;
+        }
+        if (n == 0 ||
+            memcmp(chunk, expected + offset, (size_t)n) != 0) {
+            return 0;
+        }
+        offset += (size_t)n;
+    }
+
+    for (;;) {
+        ssize_t n = pread(fd, chunk, 1, (off_t)offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to confirm pinned SSH config length");
+            return -1;
+        }
+        *matches = n == 0;
+        return 0;
+    }
+}
+
 /* Refuse to rename over a path whose final component changed after the safe
  * read. For a previously absent config, any newly-created entry is a conflict;
  * for an existing config, both the retained descriptor and public name must
@@ -2276,17 +2320,86 @@ static int ssh_config_recheck_before_rename(int dir_fd,
                                             const char *display_path,
                                             bool existed,
                                             const struct stat *identity,
-                                            int pinned_fd) {
+                                            int pinned_fd,
+                                            const char *original,
+                                            size_t original_len) {
+    struct stat expected;
     struct stat pinned;
     struct stat now;
 
-    if (existed &&
-        (pinned_fd < 0 || fstat(pinned_fd, &pinned) != 0 ||
-         !same_ssh_config_snapshot(identity, &pinned))) {
-        set_error(ERR_FILE_IO,
-                  "Pinned SSH config changed before update: %s",
-                  display_path);
-        return -1;
+    expected = *identity;
+    if (existed) {
+        bool bytes_match = false;
+
+        if (pinned_fd < 0) {
+            set_error(ERR_FILE_IO,
+                      "Missing pinned SSH config descriptor: %s",
+                      display_path);
+            return -1;
+        }
+        if (fstat(pinned_fd, &pinned) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot recheck pinned SSH config: %s",
+                             display_path);
+            return -1;
+        }
+        if (!same_ssh_config_snapshot(identity, &pinned)) {
+            struct stat candidate;
+            bool stabilized = false;
+
+            /* FreeBSD can advance the retained inode's ctime while finalizing
+             * our own earlier read.  Accept only that single-field shape, and
+             * only after a bounded stable pass proves the pinned bytes and EOF
+             * are still exactly what the transaction parsed. */
+            if (!same_ssh_config_snapshot_except_ctime(identity, &pinned) ||
+                same_ssh_config_ctime(identity, &pinned) ||
+                pinned.st_size < 0 ||
+                (size_t)pinned.st_size != original_len || !original) {
+                set_error(ERR_FILE_IO,
+                          "Pinned SSH config changed before update: %s",
+                          display_path);
+                return -1;
+            }
+            candidate = pinned;
+            for (int attempt = 0; attempt < 2; attempt++) {
+                struct stat after_read;
+
+                if (ssh_config_fd_matches_bytes(pinned_fd, original,
+                                                original_len,
+                                                &bytes_match) != 0) {
+                    return -1;
+                }
+                if (!bytes_match) {
+                    break;
+                }
+                if (fstat(pinned_fd, &after_read) != 0) {
+                    set_system_error(
+                        ERR_FILE_IO,
+                        "Cannot finish pinned SSH config revalidation: %s",
+                        display_path);
+                    return -1;
+                }
+                if (same_ssh_config_snapshot(&candidate, &after_read)) {
+                    expected = after_read;
+                    stabilized = true;
+                    break;
+                }
+                if (attempt == 0 &&
+                    same_ssh_config_snapshot_except_ctime(&candidate,
+                                                          &after_read) &&
+                    !same_ssh_config_ctime(&candidate, &after_read)) {
+                    candidate = after_read;
+                    continue;
+                }
+                break;
+            }
+            if (!stabilized) {
+                set_error(ERR_FILE_IO,
+                          "Pinned SSH config bytes changed before update: %s",
+                          display_path);
+                return -1;
+            }
+        }
     }
 
     if (fstatat(dir_fd, "config", &now, AT_SYMLINK_NOFOLLOW) != 0) {
@@ -2297,21 +2410,21 @@ static int ssh_config_recheck_before_rename(int dir_fd,
                          display_path);
         return -1;
     }
-    if (!existed || !same_ssh_config_snapshot(identity, &now)) {
+    if (!existed || !same_ssh_config_snapshot(&expected, &now)) {
         set_error(ERR_FILE_IO,
                   "SSH config changed before update; refusing to replace it: %s "
                   "[existed=%d regular=%d dev=%d ino=%d mode=%d uid=%d gid=%d "
                   "nlink=%d size=%d mtime=%d ctime=%d]",
                   display_path, existed, S_ISREG(now.st_mode),
-                  identity->st_dev == now.st_dev,
-                  identity->st_ino == now.st_ino,
-                  identity->st_mode == now.st_mode,
-                  identity->st_uid == now.st_uid,
-                  identity->st_gid == now.st_gid,
-                  identity->st_nlink == now.st_nlink,
-                  identity->st_size == now.st_size,
-                  same_ssh_config_mtime(identity, &now),
-                  same_ssh_config_ctime(identity, &now));
+                  expected.st_dev == now.st_dev,
+                  expected.st_ino == now.st_ino,
+                  expected.st_mode == now.st_mode,
+                  expected.st_uid == now.st_uid,
+                  expected.st_gid == now.st_gid,
+                  expected.st_nlink == now.st_nlink,
+                  expected.st_size == now.st_size,
+                  same_ssh_config_mtime(&expected, &now),
+                  same_ssh_config_ctime(&expected, &now));
         return -1;
     }
     return 0;
@@ -2485,7 +2598,8 @@ static int ssh_write_config_atomic_at(
     int dir_fd, const char *dir_path, const struct stat *dir_identity,
     const char *display_path, const char *content, size_t content_len,
     bool config_existed, const struct stat *config_identity,
-    int pinned_config_fd) {
+    int pinned_config_fd, const char *original_content,
+    size_t original_len) {
     static const char random_chars[] =
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     char suffix[17];
@@ -2577,7 +2691,9 @@ static int ssh_write_config_atomic_at(
     if (recheck_ssh_config_directory(dir_path, dir_identity) != 0 ||
         ssh_config_recheck_before_rename(dir_fd, display_path, config_existed,
                                          config_identity,
-                                         pinned_config_fd) != 0) {
+                                         pinned_config_fd,
+                                         original_content,
+                                         original_len) != 0) {
         goto fail;
     }
     if (fstatat(dir_fd, temp_name, &current_temp,
@@ -2698,7 +2814,7 @@ int ssh_remove_host_alias(const char *alias) {
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, filtered, filtered_len,
                                    config_existed, &config_identity,
-                                   pinned_config_fd) != 0) {
+                                   pinned_config_fd, buf, buf_len) != 0) {
         goto done;
     }
     log_info("Removed %zu SSH host alias block%s: %s", removed,
@@ -2873,7 +2989,7 @@ int ssh_configure_host_alias(const account_t *account) {
     if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
                                    ssh_config_path, newbuf, newbuf_len,
                                    config_existed, &config_identity,
-                                   pinned_config_fd) != 0) {
+                                   pinned_config_fd, buf, buf_len) != 0) {
         goto done;
     }
 
