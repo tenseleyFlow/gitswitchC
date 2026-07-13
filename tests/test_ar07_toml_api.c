@@ -284,7 +284,7 @@ TEST(key_name_grammar_rejects_invalid_setters_without_mutation) {
         "has space",
         "has-hyphen",
         "has.dot",
-        "\xC3\xA9" "key"
+        ("\xC3\xA9" "key")
     };
     static toml_document_t doc;
     static toml_document_t before;
