@@ -3585,9 +3585,122 @@ int ssh_configure_host_alias(const account_t *account) {
     return ssh_configure_host_alias_result(account, NULL);
 }
 
+static bool ssh_auth_identity_is_anonymous(const char *identity,
+                                           size_t identity_len) {
+    static const char anonymous[] = "anonymous";
+    size_t i;
+
+    if (identity_len != sizeof(anonymous) - 1U) return false;
+    for (i = 0; i < identity_len; i++) {
+        unsigned char c = (unsigned char)identity[i];
+        if (c >= (unsigned char)'A' && c <= (unsigned char)'Z') {
+            c = (unsigned char)(c - (unsigned char)'A' +
+                                (unsigned char)'a');
+        }
+        if (c != (unsigned char)anonymous[i]) return false;
+    }
+    return true;
+}
+
+/* Match a complete output line with a nonempty provider identity between a
+ * fixed prefix/suffix. Embedded controls and GitLab's unauthenticated
+ * "Anonymous" discovery result are not authentication proof. */
+static bool ssh_auth_line_with_identity(const char *line, size_t line_len,
+                                        const char *prefix,
+                                        const char *suffix,
+                                        bool reject_anonymous) {
+    size_t prefix_len = strlen(prefix);
+    size_t suffix_len = strlen(suffix);
+    const char *identity;
+    size_t identity_len;
+    size_t i;
+
+    if (line_len <= prefix_len + suffix_len ||
+        memcmp(line, prefix, prefix_len) != 0 ||
+        memcmp(line + line_len - suffix_len, suffix, suffix_len) != 0) {
+        return false;
+    }
+    identity = line + prefix_len;
+    identity_len = line_len - prefix_len - suffix_len;
+    for (i = 0; i < identity_len; i++) {
+        unsigned char c = (unsigned char)identity[i];
+        if (c < 0x20U || c == 0x7fU) return false;
+    }
+    return !reject_anonymous ||
+           !ssh_auth_identity_is_anonymous(identity, identity_len);
+}
+
+/* Git hosting probes deliberately request no shell. GitHub documents a
+ * successful authentication as exit 1; GitLab and Bitbucket discovery shells
+ * return exit 0. A provider-specific complete line (or complete Bitbucket
+ * line pair) is required in addition to that normal, unsignaled exit class. */
+static bool ssh_authentication_was_proven(const char *output,
+                                          size_t output_len,
+                                          const run_result_t *result) {
+    static const char github_suffix[] =
+        "! You've successfully authenticated, but GitHub does not provide "
+        "shell access.";
+    static const char bitbucket_legacy_access[] =
+        "You can use git or hg to connect to Bitbucket. Shell access is "
+        "disabled.";
+    static const char bitbucket_current_access[] =
+        "You can use git to connect to Bitbucket. Shell access is disabled";
+    bool github = false;
+    bool gitlab = false;
+    bool bitbucket_identity = false;
+    bool bitbucket_access = false;
+    size_t offset = 0U;
+
+    if (!output || !result || !result->spawned || result->term_signal != 0 ||
+        result->out_truncated) {
+        return false;
+    }
+    while (offset < output_len) {
+        const char *line = output + offset;
+        const char *newline = memchr(line, '\n', output_len - offset);
+        size_t line_len = newline ? (size_t)(newline - line)
+                                  : output_len - offset;
+
+        if (line_len > 0U && line[line_len - 1U] == '\r') line_len--;
+        if (ssh_auth_line_with_identity(line, line_len, "Hi ",
+                                        github_suffix, false)) {
+            github = true;
+        }
+        if (ssh_auth_line_with_identity(line, line_len,
+                                        "Welcome to GitLab, ", "!", true)) {
+            gitlab = true;
+        }
+        if (ssh_auth_line_with_identity(line, line_len, "logged in as ",
+                                        ".", true) ||
+            (line_len == strlen("authenticated via ssh key.") &&
+             memcmp(line, "authenticated via ssh key.", line_len) == 0)) {
+            bitbucket_identity = true;
+        }
+        if ((line_len == sizeof(bitbucket_legacy_access) - 1U &&
+             memcmp(line, bitbucket_legacy_access, line_len) == 0) ||
+            (line_len == sizeof(bitbucket_current_access) - 1U &&
+             memcmp(line, bitbucket_current_access, line_len) == 0)) {
+            bitbucket_access = true;
+        }
+        if (!newline) break;
+        offset = (size_t)(newline - output) + 1U;
+    }
+
+    if (result->exit_code == 1) return github;
+    if (result->exit_code == 0) {
+        return gitlab || (bitbucket_identity && bitbucket_access);
+    }
+    return false;
+}
+
 /* Test SSH connection */
 int ssh_test_connection(const account_t *account, const char *host) {
-    char output[1024];
+    char output[1024] = {0};
+    run_opts_t opts;
+    run_result_t result;
+    const char *const alias_argv[] = {
+        "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+        account ? account->ssh_host_alias : NULL, NULL};
 
     if (!account || !host) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_test_connection");
@@ -3596,32 +3709,34 @@ int ssh_test_connection(const account_t *account, const char *host) {
     
     log_debug("Testing SSH connection to: %s", host);
     
-    /* Build SSH test command using -T (no TTY) for git hosting services
-     * GitHub/GitLab/Bitbucket don't allow shell commands, they return a
-     * greeting message on successful auth (exit code 1 but with success message) */
-    /* Execute SSH test (merged stderr: git hosts print their greeting there)
-     * with each option as a distinct argv element — no shell.
-     * Note: GitHub returns exit code 1 even on success (no shell access). */
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+
+    /* Git hosts print their discovery greeting on stderr. The alias path uses
+     * the managed config block's IdentitiesOnly policy; the direct path must
+     * carry the same restriction alongside -i so an unrelated agent/default
+     * identity cannot make the account-key probe succeed. */
     if (strlen(account->ssh_host_alias) > 0) {
-        (void)ssh_run(output, sizeof(output), true,
-                      "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                      account->ssh_host_alias, (const char *)NULL);
+        (void)run_argv(alias_argv, &opts, &result);
     } else {
         char expanded_key_path[MAX_PATH_LEN];
-        if (expand_path(account->ssh_key_path, expanded_key_path, sizeof(expanded_key_path)) != 0) {
+        const char *direct_argv[] = {
+            "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes", "-i", expanded_key_path, host, NULL};
+
+        if (expand_path(account->ssh_key_path, expanded_key_path,
+                        sizeof(expanded_key_path)) != 0) {
             return -1;
         }
-        (void)ssh_run(output, sizeof(output), true,
-                      "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-                      "-i", expanded_key_path, host, (const char *)NULL);
+        (void)run_argv(direct_argv, &opts, &result);
     }
 
-    /* Check for authentication success messages from common git hosting services */
-    if (strstr(output, "successfully authenticated") ||  /* GitHub */
-        strstr(output, "Welcome to GitLab") ||           /* GitLab */
-        strstr(output, "logged in as") ||                /* Bitbucket */
-        strstr(output, "Hi ") ||                         /* GitHub greeting */
-        strstr(output, "authentication successful")) {   /* Generic */
+    if (result.out_len < sizeof(output) &&
+        ssh_authentication_was_proven(output, result.out_len, &result)) {
         log_debug("SSH authentication successful to %s", host);
         return 0;
     }

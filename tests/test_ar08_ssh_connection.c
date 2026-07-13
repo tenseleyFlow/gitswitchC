@@ -1,0 +1,241 @@
+/* AR-08 T12: an SSH connection probe proves both the child outcome and a
+ * complete provider greeting. Direct probes must restrict authentication to
+ * the account key instead of silently succeeding through an unrelated agent. */
+#include "test.h"
+#include "error.h"
+#include "gitswitch.h"
+#include "ssh_manager.h"
+#include "utils.h"
+
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef enum {
+    CONNECTION_SCRIPTED = 0,
+    CONNECTION_CAUSAL_REJECT_ACCOUNT_KEY,
+    CONNECTION_CAUSAL_ACCEPT_ACCOUNT_KEY
+} connection_runner_mode_t;
+
+static connection_runner_mode_t g_mode;
+static const char *g_output;
+static int g_exit_code;
+static int g_term_signal;
+static bool g_spawned;
+static bool g_truncated;
+static char g_argv[16][MAX_PATH_LEN];
+static int g_argc;
+
+static bool argv_has_option_value(const char *option, const char *value) {
+    int i;
+
+    for (i = 0; i + 1 < g_argc; i++) {
+        if (strcmp(g_argv[i], option) == 0 &&
+            strcmp(g_argv[i + 1], value) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void publish_result(const run_opts_t *opts, run_result_t *result,
+                           const char *output, int exit_code,
+                           int term_signal, bool spawned,
+                           bool truncated) {
+    size_t output_len = output ? strlen(output) : 0U;
+    size_t copied = 0U;
+
+    if (opts && opts->out && opts->out_size > 0U) {
+        copied = output_len;
+        if (copied >= opts->out_size) copied = opts->out_size - 1U;
+        if (copied > 0U) memcpy(opts->out, output, copied);
+        opts->out[copied] = '\0';
+    }
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = spawned;
+        result->exit_code = exit_code;
+        result->term_signal = term_signal;
+        result->out_len = copied;
+        result->out_truncated = truncated || copied != output_len;
+    }
+}
+
+static int connection_runner(const char *const argv[],
+                             const run_opts_t *opts,
+                             run_result_t *result) {
+    const char *output = g_output;
+    int exit_code = g_exit_code;
+    int term_signal = g_term_signal;
+    bool spawned = g_spawned;
+    bool truncated = g_truncated;
+    bool strict_identity;
+    int i;
+
+    g_argc = 0;
+    for (i = 0; argv && argv[i] && i < 16; i++) {
+        CHECK_EQ_INT(safe_strncpy(g_argv[i], argv[i],
+                                  sizeof(g_argv[i])), 0);
+        g_argc++;
+    }
+
+    strict_identity = argv_has_option_value("-o", "IdentitiesOnly=yes");
+    if (g_mode == CONNECTION_CAUSAL_REJECT_ACCOUNT_KEY) {
+        /* Model a loaded unrelated key that the server accepts. Without the
+         * restriction the old probe reports success; with it, the rejected
+         * account key is the only offer and the probe must fail. */
+        output = strict_identity
+                     ? "git@github.com: Permission denied (publickey)."
+                     : "Hi unrelated-user! You've successfully authenticated, "
+                       "but GitHub does not provide shell access.";
+        exit_code = strict_identity ? 255 : 1;
+        term_signal = 0;
+        spawned = true;
+        truncated = false;
+    } else if (g_mode == CONNECTION_CAUSAL_ACCEPT_ACCOUNT_KEY) {
+        output = strict_identity
+                     ? "Hi intended-user! You've successfully authenticated, "
+                       "but GitHub does not provide shell access."
+                     : "git@github.com: identity restriction missing";
+        exit_code = strict_identity ? 1 : 255;
+        term_signal = 0;
+        spawned = true;
+        truncated = false;
+    }
+
+    publish_result(opts, result, output, exit_code, term_signal, spawned,
+                   truncated);
+    return spawned && term_signal == 0 && exit_code == 0 ? 0 : -1;
+}
+
+static void make_account(account_t *account, bool with_alias) {
+    memset(account, 0, sizeof(*account));
+    CHECK_EQ_INT(safe_strncpy(account->name, "work",
+                              sizeof(account->name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account->ssh_key_path,
+                              "/tmp/intended-account-key",
+                              sizeof(account->ssh_key_path)), 0);
+    if (with_alias) {
+        CHECK_EQ_INT(safe_strncpy(account->ssh_host_alias, "work-github",
+                                  sizeof(account->ssh_host_alias)), 0);
+    }
+}
+
+static int scripted_probe(const account_t *account, const char *output,
+                          int exit_code, int term_signal, bool spawned,
+                          bool truncated) {
+    g_mode = CONNECTION_SCRIPTED;
+    g_output = output;
+    g_exit_code = exit_code;
+    g_term_signal = term_signal;
+    g_spawned = spawned;
+    g_truncated = truncated;
+    return ssh_test_connection(account, "git@github.com");
+}
+
+TEST(diagnostic_fragments_never_authenticate) {
+    account_t account;
+    command_runner_fn previous;
+    const char *diagnostic =
+        "ssh: successfully authenticated is only a diagnostic; "
+        "Welcome to GitLab was expected; logged in as nobody; Hi failure; "
+        "authentication successful was not observed";
+
+    make_account(&account, true);
+    previous = run_set_runner(connection_runner);
+    CHECK_EQ_INT(scripted_probe(&account, diagnostic, 255, 0, true, false),
+                 -1);
+    CHECK_EQ_INT(scripted_probe(&account, diagnostic, 1, 0, true, false), -1);
+    CHECK_EQ_INT(scripted_probe(&account, diagnostic, 0, 0, true, false), -1);
+    run_set_runner(previous);
+}
+
+TEST(provider_greetings_require_exact_lines_and_exit_classes) {
+    account_t account;
+    command_runner_fn previous;
+    const char *github =
+        "Hi octocat! You've successfully authenticated, but GitHub does not "
+        "provide shell access.";
+    const char *gitlab = "Welcome to GitLab, @alice!";
+    const char *bitbucket_legacy =
+        "logged in as alice.\n"
+        "You can use git or hg to connect to Bitbucket. Shell access is "
+        "disabled.";
+    const char *bitbucket_current =
+        "authenticated via ssh key.\n\n"
+        "You can use git to connect to Bitbucket. Shell access is disabled";
+
+    make_account(&account, true);
+    previous = run_set_runner(connection_runner);
+
+    CHECK_EQ_INT(scripted_probe(&account, github, 1, 0, true, false), 0);
+    CHECK_EQ_INT(scripted_probe(&account, github, 0, 0, true, false), -1);
+    CHECK_EQ_INT(scripted_probe(&account, github, 1, SIGTERM, true, false),
+                 -1);
+    CHECK_EQ_INT(scripted_probe(&account, github, 1, 0, false, false), -1);
+    CHECK_EQ_INT(scripted_probe(&account, github, 1, 0, true, true), -1);
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi octocat! You've successfully authenticated, but "
+                     "GitHub does not provide shell access. trailing",
+                     1, 0, true, false),
+                 -1);
+
+    CHECK_EQ_INT(scripted_probe(&account, gitlab, 0, 0, true, false), 0);
+    CHECK_EQ_INT(scripted_probe(&account, gitlab, 1, 0, true, false), -1);
+    CHECK_EQ_INT(scripted_probe(&account, "Welcome to GitLab, Anonymous!", 0,
+                                0, true, false),
+                 -1);
+    CHECK_EQ_INT(scripted_probe(&account,
+                                "Welcome to GitLab, @alice! trailing", 0, 0,
+                                true, false),
+                 -1);
+
+    CHECK_EQ_INT(scripted_probe(&account, bitbucket_legacy, 0, 0, true,
+                                false),
+                 0);
+    CHECK_EQ_INT(scripted_probe(&account, bitbucket_current, 0, 0, true,
+                                false),
+                 0);
+    CHECK_EQ_INT(scripted_probe(&account, bitbucket_current, 1, 0, true,
+                                false),
+                 -1);
+    CHECK_EQ_INT(scripted_probe(&account, "logged in as alice.", 0, 0, true,
+                                false),
+                 -1);
+    run_set_runner(previous);
+}
+
+TEST(direct_probe_offers_only_the_intended_account_key) {
+    account_t account;
+    command_runner_fn previous;
+
+    make_account(&account, false);
+    previous = run_set_runner(connection_runner);
+
+    g_mode = CONNECTION_CAUSAL_REJECT_ACCOUNT_KEY;
+    CHECK_EQ_INT(ssh_test_connection(&account, "git@github.com"), -1);
+    CHECK_EQ_INT(g_argc, 11);
+    CHECK_STR_EQ(g_argv[0], "ssh");
+    CHECK_STR_EQ(g_argv[1], "-T");
+    CHECK_STR_EQ(g_argv[2], "-o");
+    CHECK_STR_EQ(g_argv[3], "ConnectTimeout=5");
+    CHECK_STR_EQ(g_argv[4], "-o");
+    CHECK_STR_EQ(g_argv[5], "BatchMode=yes");
+    CHECK_STR_EQ(g_argv[6], "-o");
+    CHECK_STR_EQ(g_argv[7], "IdentitiesOnly=yes");
+    CHECK_STR_EQ(g_argv[8], "-i");
+    CHECK_STR_EQ(g_argv[9], "/tmp/intended-account-key");
+    CHECK_STR_EQ(g_argv[10], "git@github.com");
+
+    g_mode = CONNECTION_CAUSAL_ACCEPT_ACCOUNT_KEY;
+    CHECK_EQ_INT(ssh_test_connection(&account, "git@github.com"), 0);
+    run_set_runner(previous);
+}
+
+TEST_MAIN_BEGIN()
+    error_init(LOG_LEVEL_WARNING, NULL);
+    RUN_TEST(diagnostic_fragments_never_authenticate);
+    RUN_TEST(provider_greetings_require_exact_lines_and_exit_classes);
+    RUN_TEST(direct_probe_offers_only_the_intended_account_key);
+TEST_MAIN_END()
