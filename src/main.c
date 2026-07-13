@@ -65,7 +65,7 @@ static void print_usage(const char *prog_name) {
     printf("  list, ls             List all configured accounts\n");
     printf("  remove, rm, delete <account>  Remove specified account\n");
     printf("  status               Show current account status\n");
-    printf("  doctor, health       Run comprehensive health check\n");
+    printf("  doctor, health       Run local configuration/key readiness checks\n");
     printf("  config               Show configuration file information\n");
     printf("  init <shell>         Emit shell integration (");
     print_supported_shells(stdout, "|");
@@ -94,11 +94,11 @@ static void print_usage(const char *prog_name) {
     printf("  %s 1                      # Switch to account ID 1\n", prog_name);
     printf("  %s work                   # Switch to account matching 'work'\n", prog_name);
     printf("  %s remove 2 --yes         # Remove account ID 2 without confirmation\n", prog_name);
-    printf("  %s doctor                 # Run health check\n", prog_name);
+    printf("  %s doctor                 # Run local readiness checks\n", prog_name);
     printf("\nKey Features:\n");
     printf("- Secure TOML configuration management\n");
     printf("- Interactive account creation with validation\n");
-    printf("- Comprehensive account health checking\n");
+    printf("- Local account configuration and key readiness checks\n");
     printf("- SSH/GPG key validation and security checks\n");
     printf("- Atomic configuration file operations\n");
     printf("- Safe file permission handling\n");
@@ -1238,7 +1238,7 @@ static int handle_doctor_command(gitswitch_ctx_t *ctx) {
         return EXIT_FAILURE;
     }
     
-    /* Check all accounts */
+    /* Run bounded local account checks; no authentication/signature probe. */
     return accounts_health_check(ctx) == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 

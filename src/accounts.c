@@ -97,8 +97,8 @@ static uint32_t get_next_available_id(const gitswitch_ctx_t *ctx);
 static bool prompt_host_alias_valid(const char *alias);
 static int validate_gpg_key_availability(const char *gpg_key_id);
 static int validate_gpg_key_availability_fresh(const char *gpg_key_id);
-static int test_ssh_key_functionality(const account_t *account);
-static int test_gpg_key_functionality(const account_t *account);
+static int check_ssh_key_local_file(const account_t *account);
+static int check_gpg_key_local_state(const account_t *account);
 
 static bool gpg_session_cleanup_needed(void) {
     return g_session.gpg_active ||
@@ -619,12 +619,14 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
 
     if (!ctx->config.resuming) {
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0 &&
-            !ssh_ok && test_ssh_key_functionality(account) != 0) {
-            log_warning("SSH key test failed for account: %s", account->name);
+            !ssh_ok && check_ssh_key_local_file(account) != 0) {
+            log_warning("SSH key local validation failed for account: %s",
+                        account->name);
         }
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0 &&
-            !gpg_ok && test_gpg_key_functionality(account) != 0) {
-            log_warning("GPG key test failed for account: %s", account->name);
+            !gpg_ok && check_gpg_key_local_state(account) != 0) {
+            log_warning("GPG key local metadata/material check failed for "
+                        "account: %s", account->name);
         }
     }
 
@@ -3024,51 +3026,46 @@ static int validate_gpg_key_availability_fresh(const char *gpg_key_id) {
     return validate_gpg_key_availability_mode(gpg_key_id, false);
 }
 
-/* Test SSH key functionality */
-static int test_ssh_key_functionality(const account_t *account) {
+/* Check only the local private-key node and its security properties. This
+ * does not contact a server, select a remote username, or prove that any
+ * service accepts the corresponding public key. */
+static int check_ssh_key_local_file(const account_t *account) {
     char expanded_path[MAX_PATH_LEN];
-    /* This is a placeholder for SSH functionality testing
-     * In a full implementation, this would:
-     * 1. Start SSH agent if needed
-     * 2. Load the key into agent
-     * 3. Test connection to a known host
-     * 4. Verify authentication works
-     */
-    log_debug("SSH key functionality test for %s: %s", 
+    log_debug("SSH key local-file check for %s: %s",
               account->name, account->ssh_key_path);
-    
+
     if (expand_path(account->ssh_key_path, expanded_path,
                     sizeof(expanded_path)) != 0) return -1;
     return ssh_validate_key_file(expanded_path);
 }
 
-/* Test GPG key functionality */
-static int test_gpg_key_functionality(const account_t *account) {
-    /* This is a placeholder for GPG functionality testing
-     * In a full implementation, this would:
-     * 1. Set up GPG environment
-     * 2. Test key can be used for signing
-     * 3. Verify key is not expired
-     * 4. Test signing a test message
-     */
-    log_debug("GPG key functionality test for %s: %s", 
+/* Re-read the selected local keyring and validate current metadata plus secret
+ * material. When signing is configured, require a currently usable signing
+ * capability. This still does not perform a cryptographic signing operation. */
+static int check_gpg_key_local_state(const account_t *account) {
+    char canonical[GPG_FINGERPRINT_BUFSIZE];
+
+    log_debug("GPG key local metadata/material check for %s: %s",
               account->name, account->gpg_key_id);
-    
-    /* For now, just check if key exists in keyring */
-    return validate_gpg_key_availability(account->gpg_key_id);
+
+    return gpg_manager_resolve_system_key(
+        account->gpg_key_id, account->gpg_signing_enabled, canonical,
+        sizeof(canonical));
 }
 
-/* Run comprehensive health check on all accounts */
+/* Run bounded local readiness checks on all accounts. */
 int accounts_health_check(const gitswitch_ctx_t *ctx) {
-    bool all_healthy = true;
+    bool all_local_checks_passed = true;
     
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to accounts_health_check");
         return -1;
     }
     
-    printf("\nAccount Health Check\n");
-    printf("══════════════════════\n");
+    printf("\nAccount Local Readiness Check\n");
+    printf("═════════════════════════════\n");
+    printf("[INFO]: Local checks only; remote SSH authentication and a test "
+           "signature are not attempted.\n");
     
     if (ctx->account_count == 0) {
         printf("[ERROR]: No accounts configured\n");
@@ -3084,39 +3081,56 @@ int accounts_health_check(const gitswitch_ctx_t *ctx) {
         printf("────────────────────────\n");
         
         if (validation_result == 0) {
-            printf("[OK]: Account configuration valid\n");
+            printf("[OK]: Account model and fields are locally valid\n");
             
-            /* Test SSH if configured */
+            /* Validate only the configured local SSH key file. */
             if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
-                if (test_ssh_key_functionality(account) == 0) {
-                    printf("[OK]: SSH key functional\n");
+                if (check_ssh_key_local_file(account) == 0) {
+                    printf("[OK]: SSH private key file passed local validation "
+                           "(authentication not tested)\n");
                 } else {
-                    printf("[ERROR]: SSH key issues detected\n");
-                    all_healthy = false;
+                    printf("[ERROR]: SSH private key file failed local "
+                           "validation (authentication not tested)\n");
+                    all_local_checks_passed = false;
                 }
             }
             
-            /* Test GPG if configured */
+            /* Validate current local GPG metadata/material without signing. */
             if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-                if (test_gpg_key_functionality(account) == 0) {
-                    printf("[OK]: GPG key functional\n");
+                if (check_gpg_key_local_state(account) == 0) {
+                    if (account->gpg_signing_enabled) {
+                        printf("[OK]: GPG key has current signing-capable "
+                               "secret material (signature not attempted)\n");
+                    } else {
+                        printf("[OK]: GPG secret key is present and locally "
+                               "usable (signing not tested)\n");
+                    }
                 } else {
-                    printf("[ERROR]: GPG key issues detected\n");
-                    all_healthy = false;
+                    if (account->gpg_signing_enabled) {
+                        printf("[ERROR]: GPG signing-key metadata/material "
+                               "check failed (signature not attempted)\n");
+                    } else {
+                        printf("[ERROR]: GPG secret-key local "
+                               "presence/usability check failed (signing not "
+                               "tested)\n");
+                    }
+                    all_local_checks_passed = false;
                 }
             }
         } else {
-            printf("[ERROR]: Account validation failed\n");
-            all_healthy = false;
+            printf("[ERROR]: Account local validation failed\n");
+            all_local_checks_passed = false;
         }
     }
     
-    printf("\n══════════════════════\n");
-    if (all_healthy) {
-        printf("[OK]: All accounts are healthy\n\n");
+    printf("\n═════════════════════════════\n");
+    if (all_local_checks_passed) {
+        printf("[OK]: All configured accounts passed the reported local "
+               "checks\n\n");
         return 0;
     } else {
-        printf("[ERROR]: Some accounts have issues\n\n");
+        printf("[ERROR]: Some configured accounts failed the reported local "
+               "checks\n\n");
         return -1;
     }
 }

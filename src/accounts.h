@@ -111,20 +111,19 @@ int accounts_show_status(const gitswitch_ctx_t *ctx);
 
 /**
  * Validate account configuration
- * - Checks required fields are present
- * - Validates email format
- * - Verifies SSH key file exists and has correct permissions
- * - Validates GPG key exists and is usable
- * - Tests connectivity if possible
+ * - Checks the shared account model and required fields
+ * - Validates name, email, and configured key-selector syntax
+ * - Verifies the local SSH private-key node and permissions when enabled
+ * - Does not contact an SSH server or inspect/use a GPG keyring
  */
 int accounts_validate(const account_t *account);
 
 /**
- * Run comprehensive health check on all accounts
- * - Validates configuration
- * - Tests SSH connectivity
- * - Verifies GPG functionality
- * - Reports issues and recommendations
+ * Run bounded local readiness checks on all accounts
+ * - Validates the account model and fields
+ * - Rechecks the local SSH private-key node and permissions
+ * - Confirms current local GPG secret material and configured capability
+ * - Does not attempt remote SSH authentication or create a test signature
  */
 int accounts_health_check(const gitswitch_ctx_t *ctx);
 

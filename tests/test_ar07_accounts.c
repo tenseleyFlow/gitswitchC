@@ -48,6 +48,19 @@ static const char account_system_listing[] =
     "sec:u:4096:1:BBBBBBBBBBBBBBBB:1700000000:::-:::scESC:::+:::23::0:\n"
     "fpr:::::::::" ACCOUNT_SYSTEM_FPR ":\n";
 
+#define HEALTH_NONSIGNING_FPR "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+#define HEALTH_EXPIRED_FPR "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+static const char health_nonsigning_listing[] =
+    "sec:u:4096:1:CCCCCCCCCCCCCCCC:1700000000:::-:::eE:::+:::23::0:\n"
+    "fpr:::::::::" HEALTH_NONSIGNING_FPR ":\n";
+static const char health_expired_listing[] =
+    "sec:u:4096:1:DDDDDDDDDDDDDDDD:1700000000:1::-:::scESC:::+:::23::0:\n"
+    "fpr:::::::::" HEALTH_EXPIRED_FPR ":\n";
+static const char *g_health_listing;
+static int g_health_gpg_list_calls;
+static int g_health_ssh_calls;
+static bool g_health_probe_pinned;
+
 static bool source_probe_uses_pinned_home(const run_opts_t *opts) {
     const char *const *env;
     bool dot_home = false;
@@ -141,6 +154,45 @@ static int failed_system_gpg_setup_runner(const char *const argv[],
     return -1;
 }
 
+static int health_local_probe_runner(const char *const argv[],
+                                     const run_opts_t *opts,
+                                     run_result_t *result) {
+    bool list_secret = false;
+
+    if (argv && argv[0] && strncmp(argv[0], "ssh", 3) == 0) {
+        g_health_ssh_calls++;
+        return null_runner(argv, opts, result);
+    }
+    if (argv && argv[0] && strcmp(argv[0], "gpg") == 0) {
+        for (size_t i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "--list-secret-keys") == 0) {
+                list_secret = true;
+                break;
+            }
+        }
+    }
+    if (!list_secret || !g_health_listing) {
+        return null_runner(argv, opts, result);
+    }
+
+    g_health_gpg_list_calls++;
+    g_health_probe_pinned = source_probe_uses_pinned_home(opts);
+    if (opts && opts->out && opts->out_size > 0) {
+        size_t length = strlen(g_health_listing);
+        size_t copied = length < opts->out_size - 1U
+                            ? length : opts->out_size - 1U;
+        memcpy(opts->out, g_health_listing, copied);
+        opts->out[copied] = '\0';
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+            result->out_len = copied;
+            result->out_truncated = copied < length;
+        }
+    }
+    return 0;
+}
+
 static int fail_predelete(int home_fd) {
     (void)home_fd;
     errno = EIO;
@@ -189,6 +241,44 @@ static int count_text(const char *text, const char *needle) {
         count++;
     }
     return count;
+}
+
+static int capture_health_output(const gitswitch_ctx_t *ctx, char *output,
+                                 size_t output_size, int *health_result) {
+    FILE *capture;
+    int saved_stdout;
+    int restore_result;
+    size_t length;
+
+    if (!ctx || !output || output_size == 0 || !health_result) return -1;
+    capture = tmpfile();
+    if (!capture) return -1;
+    saved_stdout = dup(STDOUT_FILENO);
+    if (saved_stdout < 0 || fflush(stdout) != 0) {
+        if (saved_stdout >= 0) close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+    if (dup2(fileno(capture), STDOUT_FILENO) != STDOUT_FILENO) {
+        close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+
+    *health_result = accounts_health_check(ctx);
+    if (fflush(stdout) != 0) {
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+        fclose(capture);
+        return -1;
+    }
+    restore_result = dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+    rewind(capture);
+    length = fread(output, 1, output_size - 1U, capture);
+    output[length] = '\0';
+    fclose(capture);
+    return restore_result == STDOUT_FILENO ? 0 : -1;
 }
 
 static int make_sandbox(char *root, size_t root_size, char *key_one,
@@ -704,6 +794,99 @@ TEST(gpg_signing_only_edit_preserves_the_isolated_home) {
     CHECK(path_exists(marker));
 }
 
+TEST(health_reports_only_the_local_capabilities_it_proves) {
+    char root[256], key_one[512], key_two[512], source_home[512];
+    char output[8192];
+    gitswitch_ctx_t ctx;
+    account_t account;
+    command_runner_fn previous_runner;
+    int health_result = 0;
+
+    CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
+                              key_two, sizeof(key_two)), 0);
+    CHECK((size_t)snprintf(source_home, sizeof(source_home), "%s/.gnupg",
+                           root) < sizeof(source_home));
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&account, 1, "local-only", "local@example.com", key_one,
+                 NULL);
+    account.gpg_enabled = true;
+    account.gpg_signing_enabled = true;
+    snprintf(account.gpg_key_id, sizeof(account.gpg_key_id), "%s",
+             HEALTH_NONSIGNING_FPR);
+    CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+
+    g_health_listing = health_nonsigning_listing;
+    g_health_gpg_list_calls = 0;
+    g_health_ssh_calls = 0;
+    g_health_probe_pinned = false;
+    previous_runner = run_set_runner(health_local_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, -1);
+    CHECK_EQ_INT(g_health_gpg_list_calls, 1);
+    CHECK_EQ_INT(g_health_ssh_calls, 0);
+    CHECK(g_health_probe_pinned);
+    CHECK(strstr(output, "Account Local Readiness Check") != NULL);
+    CHECK(strstr(output,
+                 "Local checks only; remote SSH authentication and a test "
+                 "signature are not attempted") != NULL);
+    CHECK(strstr(output,
+                 "SSH private key file passed local validation "
+                 "(authentication not tested)") != NULL);
+    CHECK(strstr(output,
+                 "GPG signing-key metadata/material check failed "
+                 "(signature not attempted)") != NULL);
+    CHECK(strstr(output, "SSH key functional") == NULL);
+    CHECK(strstr(output, "GPG key functional") == NULL);
+    CHECK(strstr(output, "All accounts are healthy") == NULL);
+    CHECK(strstr(output, "SSH connection verified") == NULL);
+
+    /* The same non-signing key is a valid local-presence result when signing
+     * is not requested. A successful command must still say exactly what it
+     * did not prove. */
+    ctx.accounts[0].gpg_signing_enabled = false;
+    g_health_listing = health_nonsigning_listing;
+    g_health_gpg_list_calls = 0;
+    g_health_probe_pinned = false;
+    previous_runner = run_set_runner(health_local_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, 0);
+    CHECK_EQ_INT(g_health_gpg_list_calls, 1);
+    CHECK(g_health_probe_pinned);
+    CHECK(strstr(output,
+                 "GPG secret key is present and locally usable "
+                 "(signing not tested)") != NULL);
+    CHECK(strstr(output,
+                 "All configured accounts passed the reported local checks")
+          != NULL);
+    CHECK(strstr(output, "GPG key functional") == NULL);
+
+    snprintf(ctx.accounts[0].gpg_key_id,
+             sizeof(ctx.accounts[0].gpg_key_id), "%s", HEALTH_EXPIRED_FPR);
+    g_health_listing = health_expired_listing;
+    g_health_gpg_list_calls = 0;
+    g_health_probe_pinned = false;
+    previous_runner = run_set_runner(health_local_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, -1);
+    CHECK_EQ_INT(g_health_gpg_list_calls, 1);
+    CHECK(g_health_probe_pinned);
+    CHECK(strstr(output,
+                 "GPG secret-key local presence/usability check failed "
+                 "(signing not tested)") != NULL);
+    CHECK(strstr(output, "GPG key functional") == NULL);
+    g_health_listing = NULL;
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(edit_guard_failure_restores_candidate_before_image);
     RUN_TEST(duplicate_email_is_ambiguous_for_every_account_selector);
@@ -717,4 +900,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(targeted_gpg_reset_failure_preserves_the_edit_retry_handle);
     RUN_TEST(targeted_gpg_reset_still_requires_a_fresh_system_key_source);
     RUN_TEST(gpg_signing_only_edit_preserves_the_isolated_home);
+    RUN_TEST(health_reports_only_the_local_capabilities_it_proves);
 TEST_MAIN_END()
