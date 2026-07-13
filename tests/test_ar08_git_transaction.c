@@ -962,6 +962,157 @@ TEST(preseal_writer_is_rejected_and_never_laundered_into_rollback_ownership) {
     fixture_cleanup(&fixture);
 }
 
+TEST(enabled_empty_worktree_scope_rejects_preseal_writer) {
+    git_fixture_t fixture;
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--local", "extensions.worktreeConfig", "true"), 0);
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-empty-worktree"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
+                                      GIT_SCOPE_GLOBAL), 0);
+
+    /* The worktree store exists and outranks the selected global scope even
+     * though it had no managed values when the transaction began. */
+    CHECK_EQ_INT(git_set("--worktree", "user.name", "later-worktree"), 0);
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "before post-image verification") != NULL);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "1 managed vector(s)") != NULL);
+    CHECK_EQ_INT(git_get_all("--worktree", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "later-worktree\n");
+
+    CHECK_EQ_INT(git_unset_all("--worktree", "user.name"), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-empty-worktree\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(enabled_empty_worktree_scope_preserves_postseal_writer) {
+    git_fixture_t fixture;
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--local", "extensions.worktreeConfig", "true"), 0);
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-empty-worktree"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    CHECK_EQ_INT(git_set("--worktree", "user.name", "later-worktree"), 0);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "1 managed vector(s)") != NULL);
+    CHECK_EQ_INT(git_get_all("--worktree", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "later-worktree\n");
+
+    CHECK_EQ_INT(git_unset_all("--worktree", "user.name"), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-empty-worktree\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(direct_worktree_extension_true_ignores_later_included_false) {
+    git_fixture_t fixture;
+    char include_path[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(include_path, sizeof(include_path),
+                           "%s/included.gitconfig", fixture.base) <
+          sizeof(include_path));
+    CHECK_EQ_INT(write_text_file(include_path,
+                                 "[extensions]\n\tworktreeConfig = false\n",
+                                 0600), 0);
+    CHECK_EQ_INT(git_set("--local", "extensions.worktreeConfig", "true"), 0);
+    CHECK_EQ_INT(git_set("--local", "include.path", include_path), 0);
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-direct-true"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    CHECK_EQ_INT(git_set("--worktree", "user.name", "later-worktree"), 0);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "1 managed vector(s)") != NULL);
+    CHECK_EQ_INT(git_get_all("--worktree", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "later-worktree\n");
+
+    CHECK_EQ_INT(git_unset_all("--worktree", "user.name"), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-direct-true\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(direct_worktree_extension_false_ignores_later_included_true) {
+    git_fixture_t fixture;
+    char include_path[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(include_path, sizeof(include_path),
+                           "%s/included.gitconfig", fixture.base) <
+          sizeof(include_path));
+    CHECK_EQ_INT(write_text_file(include_path,
+                                 "[extensions]\n\tworktreeConfig = true\n",
+                                 0600), 0);
+    CHECK_EQ_INT(git_set("--local", "extensions.worktreeConfig", "false"), 0);
+    CHECK_EQ_INT(git_set("--local", "include.path", include_path), 0);
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-direct-false"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    /* With no distinct store, Git aliases --worktree to --local. Tracking both
+     * would count the same later vector twice instead of the single conflict
+     * owned by the local scope. */
+    CHECK_EQ_INT(git_set("--worktree", "user.name", "later-local"), 0);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "1 managed vector(s)") != NULL);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "later-local\n");
+
+    CHECK_EQ_INT(git_unset_all("--local", "user.name"), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-direct-false\n");
+
+    fixture_cleanup(&fixture);
+}
+
 TEST(committed_git_transaction_discards_rollback_ownership) {
     git_fixture_t fixture;
     char actual[256];
@@ -1083,6 +1234,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(maximum_git_lock_basename_uses_short_staging_name);
     RUN_TEST(partial_retry_skips_completed_scopes_and_preserves_their_later_changes);
     RUN_TEST(preseal_writer_is_rejected_and_never_laundered_into_rollback_ownership);
+    RUN_TEST(enabled_empty_worktree_scope_rejects_preseal_writer);
+    RUN_TEST(enabled_empty_worktree_scope_preserves_postseal_writer);
+    RUN_TEST(direct_worktree_extension_true_ignores_later_included_false);
+    RUN_TEST(direct_worktree_extension_false_ignores_later_included_true);
     RUN_TEST(committed_git_transaction_discards_rollback_ownership);
     RUN_TEST(worktree_probe_has_a_truthful_hard_bound_before_mutation);
     RUN_TEST(git_list_config_never_returns_a_successful_prefix);

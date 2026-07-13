@@ -379,17 +379,70 @@ static int parse_effective_listing(const char *buf, size_t len,
     return 0;
 }
 
-/* Detect whether any managed value is contributed by the distinct worktree
- * scope. We intentionally inspect Git's effective scope attribution instead
- * of blindly issuing --worktree: when extensions.worktreeConfig is disabled,
- * Git aliases --worktree to --local, and treating those as two independent
- * stores would corrupt snapshot/restore semantics. */
+static int git_read_direct_worktree_extension(bool *enabled) {
+    const char *argv[] = {
+        "git", "config", "--local", "--no-includes", "--bool", "--get",
+        "extensions.worktreeConfig", NULL
+    };
+    char canonical[16];
+    run_opts_t opts;
+    run_result_t result;
+    size_t length;
+    int rc;
+
+    if (!enabled) return -1;
+    *enabled = false;
+    memset(canonical, 0, sizeof(canonical));
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = canonical;
+    opts.out_size = sizeof(canonical);
+    opts.stderr_to_devnull = true;
+    rc = run_argv(argv, &opts, &result);
+    if (rc != 0) {
+        if (result.spawned && result.term_signal == 0 &&
+            result.exit_code == 1) {
+            return 0;
+        }
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot resolve extensions.worktreeConfig before switching");
+        return -1;
+    }
+    if (result.out_truncated || result.out_len >= sizeof(canonical)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Invalid extensions.worktreeConfig Boolean output");
+        return -1;
+    }
+    length = result.out_len;
+    if (length > 0 && canonical[length - 1U] == '\n') length--;
+    if (length == sizeof("true") - 1U &&
+        memcmp(canonical, "true", length) == 0) {
+        *enabled = true;
+        return 0;
+    }
+    if (length == sizeof("false") - 1U &&
+        memcmp(canonical, "false", length) == 0) {
+        return 0;
+    }
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Git returned a noncanonical extensions.worktreeConfig Boolean");
+    return -1;
+}
+
+/* Detect whether Git has a distinct worktree configuration store. A populated
+ * managed value proves the store directly. An enabled but empty store is
+ * detected from the direct common-config extension value so its empty managed
+ * vector still participates in snapshot, seal, and rollback. We do not blindly
+ * issue --worktree: when extensions.worktreeConfig is disabled, Git aliases
+ * --worktree to --local and treating them as independent stores would corrupt
+ * snapshot/restore semantics. */
 static int git_detect_managed_worktree_scope(bool *present) {
     const char *argv[] = { "git", "config", "--show-scope", "-z", "--list", NULL };
     size_t capacity = GIT_INSPECTION_INITIAL_BYTES;
     char *list = NULL;
     size_t list_len = 0;
     size_t pos = 0;
+    bool extension_record_seen = false;
 
     if (!present) return -1;
     *present = false;
@@ -463,12 +516,17 @@ static int git_detect_managed_worktree_scope(bool *present) {
         size_t record_len = pos - record_start;
         pos++;
 
-        if (scope_len != 8 || memcmp(list + scope_start, "worktree", 8) != 0)
-            continue;
-
         const char *record = list + record_start;
         const char *newline = memchr(record, '\n', record_len);
         size_t key_len = newline ? (size_t)(newline - record) : record_len;
+        if (key_len == sizeof("extensions.worktreeConfig") - 1U &&
+            strncasecmp(record, "extensions.worktreeConfig", key_len) == 0) {
+            extension_record_seen = true;
+        }
+        if (scope_len != 8 ||
+            memcmp(list + scope_start, "worktree", 8) != 0) {
+            continue;
+        }
         for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
             size_t managed_len = strlen(g_managed_keys[i]);
             if (key_len == managed_len &&
@@ -480,6 +538,9 @@ static int git_detect_managed_worktree_scope(bool *present) {
         }
     }
     free(list);
+    if (extension_record_seen) {
+        return git_read_direct_worktree_extension(present);
+    }
     return 0;
 
 malformed:
