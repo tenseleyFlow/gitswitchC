@@ -10,8 +10,10 @@
  *      unlinking the surviving runtime's final discovery handle.
  */
 
-#define _POSIX_C_SOURCE 200809L
+/* Keep strict feature selection glibc-only: Darwin and the BSDs hide
+ * default-namespace test helpers such as mkdtemp() when it is enabled. */
 #ifdef __linux__
+#define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
 #endif
 
