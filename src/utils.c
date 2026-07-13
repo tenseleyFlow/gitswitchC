@@ -1490,12 +1490,46 @@ int write_string_to_file(const char *file_path, const char *content, mode_t mode
     return 0;
 }
 
+#ifdef GITSWITCH_TESTING
+typedef void (*copy_file_test_hook_fn)(int stage, const char *dst_path);
+copy_file_test_hook_fn gitswitch_test_set_copy_file_hook(
+    copy_file_test_hook_fn hook);
+
+static copy_file_test_hook_fn g_copy_file_test_hook;
+
+copy_file_test_hook_fn gitswitch_test_set_copy_file_hook(
+    copy_file_test_hook_fn hook) {
+    copy_file_test_hook_fn previous = g_copy_file_test_hook;
+    g_copy_file_test_hook = hook;
+    return previous;
+}
+
+#define COPY_FILE_TEST_CHECKPOINT(stage, path) \
+    do { \
+        if (g_copy_file_test_hook) g_copy_file_test_hook((stage), (path)); \
+    } while (0)
+#else
+#define COPY_FILE_TEST_CHECKPOINT(stage, path) \
+    do { (void)(stage); (void)(path); } while (0)
+#endif
+
+enum {
+    COPY_FILE_TEST_AFTER_DESTINATION_OPEN = 1,
+    COPY_FILE_TEST_AFTER_FIRST_WRITE
+};
+
 int copy_file(const char *src_path, const char *dst_path) {
-    FILE *src, *dst;
+    FILE *src = NULL;
+    FILE *dst = NULL;
     char buffer[4096];
     size_t bytes;
     int result = 0;
+    int dst_fd = -1;
+    int dst_flags = O_WRONLY | O_CREAT | O_TRUNC;
     struct stat src_stat;
+#ifdef GITSWITCH_TESTING
+    bool first_write_checkpointed = false;
+#endif
     
     if (!src_path || !dst_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to copy_file");
@@ -1508,27 +1542,88 @@ int copy_file(const char *src_path, const char *dst_path) {
         return -1;
     }
     
-    dst = fopen(dst_path, "wbe");
-    if (!dst) {
-        set_system_error(ERR_FILE_IO, "Failed to open destination file: %s", dst_path);
+    /* Capture metadata from the same source object whose bytes are copied. */
+    if (fstat(fileno(src), &src_stat) != 0) {
+        int saved_errno = errno;
         fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
         return -1;
     }
 
-    /* Capture metadata from the same source object whose bytes are copied. */
-    if (fstat(fileno(src), &src_stat) != 0) {
-        set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
+#ifdef O_CLOEXEC
+    dst_flags |= O_CLOEXEC;
+#endif
+    /* A new destination is born private even under umask(000). For an
+     * existing destination, the creation mode is ignored, so fchmod the
+     * already-open descriptor before fdopen or the first byte write. */
+    dst_fd = open(dst_path, dst_flags, 0600);
+    if (dst_fd < 0) {
+        int saved_errno = errno;
         fclose(src);
-        fclose(dst);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO, "Failed to open destination file: %s",
+                         dst_path);
         return -1;
     }
-    
+#ifndef O_CLOEXEC
+    {
+        int fd_flags = fcntl(dst_fd, F_GETFD);
+        if (fd_flags < 0 ||
+            fcntl(dst_fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            close(dst_fd);
+            fclose(src);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Failed to secure destination descriptor: %s",
+                             dst_path);
+            return -1;
+        }
+    }
+#endif
+    COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_DESTINATION_OPEN, dst_path);
+    if (fchmod(dst_fd, src_stat.st_mode & 0777) != 0) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Failed to set destination permissions: %s", dst_path);
+        return -1;
+    }
+    dst = fdopen(dst_fd, "wb");
+    if (!dst) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to open destination stream: %s", dst_path);
+        return -1;
+    }
+    dst_fd = -1; /* fdopen owns it from here. */
+
     while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
         if (fwrite(buffer, 1, bytes, dst) != bytes) {
             set_system_error(ERR_FILE_IO, "Failed to write to destination file: %s", dst_path);
             result = -1;
             break;
         }
+#ifdef GITSWITCH_TESTING
+        if (!first_write_checkpointed) {
+            if (fflush(dst) != 0) {
+                set_system_error(ERR_FILE_IO,
+                                 "Failed to flush destination file: %s",
+                                 dst_path);
+                result = -1;
+                break;
+            }
+            COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_FIRST_WRITE,
+                                      dst_path);
+            first_write_checkpointed = true;
+        }
+#endif
     }
     
     if (ferror(src)) {
@@ -1539,16 +1634,6 @@ int copy_file(const char *src_path, const char *dst_path) {
     if (result == 0 && fflush(dst) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to flush destination file: %s", dst_path);
         result = -1;
-    }
-
-    /* Pin the destination descriptor while applying ordinary permission bits;
-     * never propagate set-id or sticky bits from a copied input. */
-    if (result == 0) {
-        if (fchmod(fileno(dst), src_stat.st_mode & 0777) != 0) {
-            set_system_error(ERR_PERMISSION_DENIED,
-                             "Failed to set destination permissions: %s", dst_path);
-            result = -1;
-        }
     }
 
     if (fclose(src) != 0 && result == 0) {

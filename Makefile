@@ -245,10 +245,12 @@ TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
 AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
 AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
 AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
+AR08_COPY_UTILS_OBJECT = $(OBJDIR)/utils_ar08_copy.o
 DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR07_RESET_MAIN_OBJECT:.o=.d) \
            $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d) \
-           $(AR08_HINT_CONFIG_OBJECT:.o=.d)
+           $(AR08_HINT_CONFIG_OBJECT:.o=.d) \
+           $(AR08_COPY_UTILS_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -406,6 +408,13 @@ $(AR08_HINT_CONFIG_OBJECT): $(SRCDIR)/config.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
 		-DGITSWITCH_TESTING -c $< -o $@
 
+# The copy-permission suite observes exact descriptor checkpoints before any
+# bytes and after its first flushed test chunk; production utils.o has no hook.
+$(AR08_COPY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-08 copy permission test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING -c $< -o $@
+
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
@@ -428,6 +437,13 @@ $(BINDIR)/test_ar08_resume_hint_race: \
 		$(OBJDIR)/test_ar08_resume_hint_race.o \
 		$(AR08_HINT_CONFIG_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_ar08_copy_permissions: \
+		$(OBJDIR)/test_ar08_copy_permissions.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 
