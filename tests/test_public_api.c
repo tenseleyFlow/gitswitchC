@@ -318,6 +318,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(toml_validate_ssh_hostname);
     REQUIRE_PUBLIC_API(toml_write_file);
     REQUIRE_PUBLIC_API(toml_write_fd);
+    REQUIRE_PUBLIC_API(text_is_tty_safe);
     REQUIRE_PUBLIC_API(trim_whitespace);
     REQUIRE_PUBLIC_API(try_lock_private_file_at);
     REQUIRE_PUBLIC_API(tty_safe_codepoint);
