@@ -2845,6 +2845,7 @@ int accounts_validate(const account_t *account) {
         set_error(ERR_INVALID_ARGS, "NULL account pointer");
         return -1;
     }
+    if (config_validate_account_model(account) != 0) return -1;
     
     /* Validate required fields */
     if (!validate_name(account->name)) {

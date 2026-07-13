@@ -200,6 +200,12 @@ int config_create_default(const char *config_path);
 int config_validate(const gitswitch_ctx_t *ctx);
 
 /**
+ * Validate only the account model's flag/value relationships. This shared
+ * lossless-state gate does not inspect key files or prove key availability.
+ */
+int config_validate_account_model(const account_t *account);
+
+/**
  * Get the configuration file path (<config dir>/accounts.toml).
  * Builds the path only — it does NOT read environment variables and does NOT
  * create any directory (AR-06 F53: the old doc claimed both). Directory

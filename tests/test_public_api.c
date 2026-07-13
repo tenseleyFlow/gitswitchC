@@ -88,6 +88,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_set_io_fault_fn);
     REQUIRE_PUBLIC_API(config_update_account);
     REQUIRE_PUBLIC_API(config_validate);
+    REQUIRE_PUBLIC_API(config_validate_account_model);
     REQUIRE_PUBLIC_API(config_write_lock);
     REQUIRE_PUBLIC_API(config_write_unlock);
     REQUIRE_PUBLIC_API(copy_file);

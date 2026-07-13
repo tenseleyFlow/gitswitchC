@@ -126,6 +126,7 @@ static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc)
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
+static int normalize_account_model_for_admission(account_t *account);
 static bool config_scope_is_persistable(git_scope_t scope);
 static bool config_account_id_is_valid(uint32_t account_id);
 static bool config_capture_current_id(const gitswitch_ctx_t *ctx,
@@ -2179,6 +2180,9 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
                       ctx->accounts[i].id);
             return -1;
         }
+        if (config_validate_account_model(&ctx->accounts[i]) != 0) {
+            return -1;
+        }
     }
 
     /* Refuse to rewrite the file when the load produced an incomplete view:
@@ -2673,6 +2677,7 @@ int config_get_path(char *path_buffer, size_t buffer_size) {
 
 /* Add new account to configuration */
 int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
+    account_t candidate;
     uint32_t current_id = 0;
     bool had_current;
 
@@ -2685,22 +2690,25 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
         set_error(ERR_ACCOUNT_EXISTS, "Maximum number of accounts reached: %d", MAX_ACCOUNTS);
         return -1;
     }
+    candidate = *account;
+    if (normalize_account_model_for_admission(&candidate) != 0) return -1;
     
     /* Validate account security */
-    if (validate_account_security(account) != 0) {
+    if (validate_account_security(&candidate) != 0) {
         return -1;
     }
     
-    if (validate_account_uniqueness(ctx, account, SIZE_MAX) != 0) return -1;
+    if (validate_account_uniqueness(ctx, &candidate, SIZE_MAX) != 0) return -1;
 
     had_current = config_capture_current_id(ctx, &current_id);
 
     /* Add account */
-    ctx->accounts[ctx->account_count] = *account;
+    ctx->accounts[ctx->account_count] = candidate;
     ctx->account_count++;
     config_rebind_current_id(ctx, had_current, current_id);
     
-    log_info("Added account: %s (%s)", account->name, account->description);
+    log_info("Added account: %s (%s)", candidate.name,
+             candidate.description);
     return 0;
 }
 
@@ -2766,6 +2774,7 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
         return -1;
     }
     replacement = *account;
+    if (normalize_account_model_for_admission(&replacement) != 0) return -1;
     
     /* Find existing account */
     for (size_t i = 0; i < ctx->account_count; i++) {
@@ -4376,6 +4385,71 @@ static int validate_field_roundtrips(const char *field_name, const char *value) 
     return 0;
 }
 
+int config_validate_account_model(const account_t *account) {
+    bool has_ssh_key;
+    bool has_ssh_alias;
+    bool has_ssh_hostname;
+    bool has_gpg_key;
+
+    if (!account) {
+        set_error(ERR_INVALID_ARGS, "NULL account model to validate");
+        return -1;
+    }
+
+    has_ssh_key = account->ssh_key_path[0] != '\0';
+    has_ssh_alias = account->ssh_host_alias[0] != '\0';
+    has_ssh_hostname = account->ssh_hostname[0] != '\0';
+    has_gpg_key = account->gpg_key_id[0] != '\0';
+
+    if (account->ssh_enabled && !has_ssh_key) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "SSH is enabled but ssh_key_path is empty");
+        return -1;
+    }
+    if (!account->ssh_enabled &&
+        (has_ssh_key || has_ssh_alias || has_ssh_hostname)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "SSH is disabled but SSH key or routing fields are still set");
+        return -1;
+    }
+    if (has_ssh_alias && !has_ssh_hostname) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "SSH host alias requires an explicit canonical hostname");
+        return -1;
+    }
+
+    if (account->gpg_enabled && !has_gpg_key) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "GPG is enabled but gpg_key_id is empty");
+        return -1;
+    }
+    if (!account->gpg_enabled &&
+        (has_gpg_key || account->gpg_signing_enabled)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "GPG is disabled but a key or signing preference is still set");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Before admission, canonicalize the one supported legacy shorthand: a
+ * literal ssh_host historically doubled as its destination. Disabled states
+ * and missing key identifiers are rejected rather than silently erased. */
+static int normalize_account_model_for_admission(account_t *account) {
+    if (!account) {
+        set_error(ERR_INVALID_ARGS, "NULL account model to normalize");
+        return -1;
+    }
+    if (account->ssh_enabled && account->ssh_host_alias[0] != '\0' &&
+        account->ssh_hostname[0] == '\0' &&
+        toml_validate_ssh_hostname(account->ssh_host_alias)) {
+        return safe_strncpy(account->ssh_hostname, account->ssh_host_alias,
+                            sizeof(account->ssh_hostname));
+    }
+    return 0;
+}
+
 /* Validate account security */
 static int validate_account_security(const account_t *account) {
     char expanded_path[MAX_PATH_LEN];
@@ -4436,6 +4510,7 @@ static int validate_account_security(const account_t *account) {
                   account->ssh_host_alias);
         return -1;
     }
+    if (config_validate_account_model(account) != 0) return -1;
 
     /* validate_name rejects C0 controls and DEL but deliberately permits
      * bytes >= 0x80 so international names work — and that range is exactly
@@ -4535,7 +4610,6 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
     /* Save each account */
     for (size_t i = 0; i < ctx->account_count; i++) {
         const account_t *account = &ctx->accounts[i];
-        const char *ssh_hostname = account->ssh_hostname;
 
         if (!config_account_id_is_valid(account->id)) {
             set_error(ERR_ACCOUNT_INVALID,
@@ -4579,31 +4653,20 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         toml_set_string(doc, section_name, "preferred_scope", 
                        config_scope_to_string(account->preferred_scope));
         
-        /* Save SSH configuration. Alias-only in-memory callers are treated
-         * like legacy files when the alias is one literal destination; the
-         * save canonicalizes them by emitting ssh_hostname. Wildcard aliases
-         * cannot be inferred and fail before writing a misleading HostName. */
+        /* Admission and the save preflight require a lossless model. Legacy
+         * literal alias shorthand is normalized before admission, never while
+         * serializing a caller-owned context. */
         if (account->ssh_host_alias[0] != '\0' &&
             !toml_validate_ssh_host_alias(account->ssh_host_alias)) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid SSH host alias: %s",
                       account->ssh_host_alias);
             return -1;
         }
-        if (ssh_hostname[0] == '\0' &&
-            account->ssh_host_alias[0] != '\0') {
-            if (!toml_validate_ssh_hostname(account->ssh_host_alias)) {
-                set_error(ERR_ACCOUNT_INVALID,
-                          "Wildcard SSH host alias '%s' requires an explicit "
-                          "ssh_hostname canonical destination",
-                          account->ssh_host_alias);
-                return -1;
-            }
-            ssh_hostname = account->ssh_host_alias;
-        }
-        if (ssh_hostname[0] != '\0' &&
-            !toml_validate_ssh_hostname(ssh_hostname)) {
+        if (account->ssh_hostname[0] != '\0' &&
+            !toml_validate_ssh_hostname(account->ssh_hostname)) {
             set_error(ERR_ACCOUNT_INVALID,
-                      "Invalid SSH canonical hostname: %s", ssh_hostname);
+                      "Invalid SSH canonical hostname: %s",
+                      account->ssh_hostname);
             return -1;
         }
 
@@ -4623,9 +4686,9 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
                     return -1;
                 }
             }
-            if (ssh_hostname[0] != '\0') {
+            if (account->ssh_hostname[0] != '\0') {
                 if (toml_set_string(doc, section_name, "ssh_hostname",
-                                    ssh_hostname) != 0) {
+                                    account->ssh_hostname) != 0) {
                     set_error(ERR_CONFIG_INVALID,
                               "Failed to save SSH canonical hostname");
                     return -1;

@@ -8,6 +8,7 @@
  *   rejected at config load / account validation, never handed to display. */
 #include "test.h"
 #include "gitswitch.h"
+#include "accounts.h"
 #include "config.h"
 #include "toml_parser.h"
 #include "signals.h"
@@ -88,6 +89,51 @@ static void fill_account(account_t *a, uint32_t id, const char *name,
     strncpy(a->email, email, sizeof(a->email) - 1);
     strncpy(a->description, desc, sizeof(a->description) - 1);
     a->preferred_scope = GIT_SCOPE_LOCAL;
+}
+
+typedef enum {
+    INVALID_SSH_ENABLED_WITHOUT_KEY = 0,
+    INVALID_SSH_DISABLED_WITH_KEY,
+    INVALID_SSH_DISABLED_WITH_ALIAS,
+    INVALID_SSH_DISABLED_WITH_HOSTNAME,
+    INVALID_GPG_ENABLED_WITHOUT_KEY,
+    INVALID_GPG_DISABLED_WITH_KEY,
+    INVALID_GPG_DISABLED_WITH_SIGNING
+} invalid_account_model_t;
+
+static void fill_invalid_account_model(account_t *account,
+                                       invalid_account_model_t invalid,
+                                       const char *ssh_key) {
+    fill_account(account, 1, "invalid", "invalid@example.com", "invalid");
+    switch (invalid) {
+        case INVALID_SSH_ENABLED_WITHOUT_KEY:
+            account->ssh_enabled = true;
+            break;
+        case INVALID_SSH_DISABLED_WITH_KEY:
+            strncpy(account->ssh_key_path, ssh_key,
+                    sizeof(account->ssh_key_path) - 1U);
+            break;
+        case INVALID_SSH_DISABLED_WITH_ALIAS:
+            strncpy(account->ssh_host_alias, "github-work",
+                    sizeof(account->ssh_host_alias) - 1U);
+            break;
+        case INVALID_SSH_DISABLED_WITH_HOSTNAME:
+            strncpy(account->ssh_hostname, "github.com",
+                    sizeof(account->ssh_hostname) - 1U);
+            break;
+        case INVALID_GPG_ENABLED_WITHOUT_KEY:
+            account->gpg_enabled = true;
+            break;
+        case INVALID_GPG_DISABLED_WITH_KEY:
+            strncpy(account->gpg_key_id, "ABCDEF0123456789",
+                    sizeof(account->gpg_key_id) - 1U);
+            break;
+        case INVALID_GPG_DISABLED_WITH_SIGNING:
+            account->gpg_signing_enabled = true;
+            break;
+        default:
+            break;
+    }
 }
 
 static void seed_three_accounts(gitswitch_ctx_t *ctx) {
@@ -802,6 +848,181 @@ TEST(save_and_reload_regular_path_roundtrip) {
     CHECK_EQ_INT(config_save(&ctx, path), -1);
 }
 
+TEST(account_model_invariant_blocks_lossy_states_before_mutation) {
+    char dir[128], path[256], key[256];
+    char before[4096], after[4096];
+    gitswitch_ctx_t baseline;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_model", dir);
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") -
+                         1U),
+                 0);
+
+    memset(&baseline, 0, sizeof(baseline));
+    baseline.config.default_scope = GIT_SCOPE_LOCAL;
+    fill_account(&baseline.accounts[0], 1, "baseline",
+                 "baseline@example.com", "baseline");
+    baseline.account_count = 1;
+    CHECK_EQ_INT(config_save(&baseline, path), 0);
+    CHECK(slurp(path, before, sizeof(before)) > 0);
+
+    for (int invalid = INVALID_SSH_ENABLED_WITHOUT_KEY;
+         invalid <= INVALID_GPG_DISABLED_WITH_SIGNING; invalid++) {
+        gitswitch_ctx_t api;
+        gitswitch_ctx_t direct;
+        account_t account;
+
+        fill_invalid_account_model(&account,
+                                   (invalid_account_model_t)invalid, key);
+        memset(&api, 0, sizeof(api));
+        CHECK_EQ_INT(config_add_account(&api, &account), -1);
+        CHECK_EQ_INT(api.account_count, 0);
+        CHECK_EQ_INT(accounts_validate(&account), -1);
+
+        memset(&direct, 0, sizeof(direct));
+        direct.config.default_scope = GIT_SCOPE_LOCAL;
+        direct.accounts[0] = account;
+        direct.account_count = 1;
+        CHECK_EQ_INT(config_validate(&direct), -1);
+        CHECK_EQ_INT(config_save(&direct, path), -1);
+        CHECK(slurp(path, after, sizeof(after)) > 0);
+        CHECK_STR_EQ(after, before);
+    }
+
+    {
+        gitswitch_ctx_t api;
+        account_t account;
+
+        memset(&api, 0, sizeof(api));
+        fill_account(&account, 1, "legacy-api", "legacy@example.com",
+                     "legacy api");
+        account.ssh_enabled = true;
+        strncpy(account.ssh_key_path, key,
+                sizeof(account.ssh_key_path) - 1U);
+        strncpy(account.ssh_host_alias, "git.example.test",
+                sizeof(account.ssh_host_alias) - 1U);
+        CHECK_EQ_INT(config_add_account(&api, &account), 0);
+        CHECK_EQ_INT(api.account_count, 1);
+        if (api.account_count == 1) {
+            CHECK_STR_EQ(api.accounts[0].ssh_hostname, "git.example.test");
+
+            /* Admission normalizes the legacy literal form. A hand-built
+             * context that bypasses admission must not be changed while it is
+             * being saved. */
+            api.accounts[0].ssh_hostname[0] = '\0';
+            CHECK_EQ_INT(config_validate(&api), -1);
+            CHECK_EQ_INT(config_save(&api, path), -1);
+            CHECK(slurp(path, after, sizeof(after)) > 0);
+            CHECK_STR_EQ(after, before);
+        }
+    }
+
+    {
+        gitswitch_ctx_t api;
+        account_t account;
+
+        memset(&api, 0, sizeof(api));
+        fill_account(&account, 1, "wildcard", "wildcard@example.com",
+                     "wildcard");
+        account.ssh_enabled = true;
+        strncpy(account.ssh_key_path, key,
+                sizeof(account.ssh_key_path) - 1U);
+        strncpy(account.ssh_host_alias, "github-*",
+                sizeof(account.ssh_host_alias) - 1U);
+        CHECK_EQ_INT(config_add_account(&api, &account), -1);
+        CHECK_EQ_INT(api.account_count, 0);
+    }
+}
+
+TEST(account_model_admitted_states_roundtrip_exactly) {
+    typedef struct {
+        bool ssh_enabled;
+        const char *ssh_alias;
+        const char *ssh_hostname;
+        bool gpg_enabled;
+        bool gpg_signing_enabled;
+    } model_case_t;
+    static const model_case_t cases[] = {
+        {false, NULL, NULL, false, false},
+        {true, NULL, NULL, false, false},
+        {true, NULL, "github.com", false, false},
+        {true, "github-work", "github.com", false, false},
+        {false, NULL, NULL, true, false},
+        {false, NULL, NULL, true, true},
+        {true, "github-work", "github.com", true, true},
+    };
+    char dir[128], path[256], key[256];
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_roundtrip", dir);
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") -
+                         1U),
+                 0);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        gitswitch_ctx_t ctx;
+        gitswitch_ctx_t reloaded;
+        account_t account;
+
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.config.default_scope = GIT_SCOPE_LOCAL;
+        fill_account(&account, 1, "roundtrip", "roundtrip@example.com",
+                     "roundtrip");
+        if (cases[i].ssh_enabled) {
+            account.ssh_enabled = true;
+            strncpy(account.ssh_key_path, key,
+                    sizeof(account.ssh_key_path) - 1U);
+        }
+        if (cases[i].ssh_alias) {
+            strncpy(account.ssh_host_alias, cases[i].ssh_alias,
+                    sizeof(account.ssh_host_alias) - 1U);
+        }
+        if (cases[i].ssh_hostname) {
+            strncpy(account.ssh_hostname, cases[i].ssh_hostname,
+                    sizeof(account.ssh_hostname) - 1U);
+        }
+        if (cases[i].gpg_enabled) {
+            account.gpg_enabled = true;
+            strncpy(account.gpg_key_id, "ABCDEF0123456789",
+                    sizeof(account.gpg_key_id) - 1U);
+        }
+        account.gpg_signing_enabled = cases[i].gpg_signing_enabled;
+
+        CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+        CHECK_EQ_INT(ctx.account_count, 1);
+        CHECK_EQ_INT(config_save(&ctx, path), 0);
+
+        memset(&reloaded, 0, sizeof(reloaded));
+        CHECK_EQ_INT(config_load(&reloaded, path), 0);
+        CHECK_EQ_INT(reloaded.account_count, 1);
+        if (ctx.account_count == 1 && reloaded.account_count == 1) {
+            CHECK_EQ_INT(reloaded.accounts[0].ssh_enabled,
+                         ctx.accounts[0].ssh_enabled);
+            CHECK_STR_EQ(reloaded.accounts[0].ssh_key_path,
+                         ctx.accounts[0].ssh_key_path);
+            CHECK_STR_EQ(reloaded.accounts[0].ssh_host_alias,
+                         ctx.accounts[0].ssh_host_alias);
+            CHECK_STR_EQ(reloaded.accounts[0].ssh_hostname,
+                         ctx.accounts[0].ssh_hostname);
+            CHECK_EQ_INT(reloaded.accounts[0].gpg_enabled,
+                         ctx.accounts[0].gpg_enabled);
+            CHECK_EQ_INT(reloaded.accounts[0].gpg_signing_enabled,
+                         ctx.accounts[0].gpg_signing_enabled);
+            CHECK_STR_EQ(reloaded.accounts[0].gpg_key_id,
+                         ctx.accounts[0].gpg_key_id);
+        }
+    }
+}
+
 /* ---- AR-07 M13 prerequisite: alias and canonical host are distinct ------ */
 
 TEST(ssh_hostname_load_save_and_shared_destination_roundtrip) {
@@ -963,10 +1184,19 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
         "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
         "*.example.com", "host?", "h\xC3\xB6st.example", NULL
     };
-    char dir[128], path[256];
+    char dir[128], path[256], key[256];
     gitswitch_ctx_t ctx;
     account_t account;
 
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_hostname", dir);
+    CHECK_EQ_INT(write_config(
+                     key,
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                     sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") -
+                         1U),
+                 0);
     CHECK(strstr(default_config_template,
                  "#ssh_host = \"github.com-work\"") != NULL);
     CHECK(strstr(default_config_template,
@@ -979,6 +1209,9 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
         CHECK(!toml_validate_ssh_hostname(invalid[i]));
         memset(&ctx, 0, sizeof(ctx));
         fill_account(&account, 1, "bad-host", "bad@example.com", "d");
+        account.ssh_enabled = true;
+        strncpy(account.ssh_key_path, key,
+                sizeof(account.ssh_key_path) - 1U);
         strncpy(account.ssh_hostname, invalid[i],
                 sizeof(account.ssh_hostname) - 1);
         CHECK_EQ_INT(config_add_account(&ctx, &account), -1);
@@ -988,10 +1221,16 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     /* Canonical destinations are deliberately not unique account resources. */
     memset(&ctx, 0, sizeof(ctx));
     fill_account(&account, 1, "one", "one@example.com", "d");
+    account.ssh_enabled = true;
+    strncpy(account.ssh_key_path, key,
+            sizeof(account.ssh_key_path) - 1U);
     strncpy(account.ssh_hostname, "github.com",
             sizeof(account.ssh_hostname) - 1);
     CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
     fill_account(&account, 2, "two", "two@example.com", "d");
+    account.ssh_enabled = true;
+    strncpy(account.ssh_key_path, key,
+            sizeof(account.ssh_key_path) - 1U);
     strncpy(account.ssh_hostname, "github.com",
             sizeof(account.ssh_hostname) - 1);
     CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
@@ -999,8 +1238,6 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
 
     /* The parser's modeled schema must reject the wrong TOML type rather
      * than let retrieval treat a present key as absent. */
-    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
-    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
     {
         const char *wrong_type =
             "[settings]\n"
@@ -1872,6 +2109,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(save_refuses_symlinked_config_path);
     RUN_TEST(backup_refuses_symlinked_source);
     RUN_TEST(save_and_reload_regular_path_roundtrip);
+    RUN_TEST(account_model_invariant_blocks_lossy_states_before_mutation);
+    RUN_TEST(account_model_admitted_states_roundtrip_exactly);
     RUN_TEST(ssh_hostname_load_save_and_shared_destination_roundtrip);
     RUN_TEST(legacy_literal_ssh_host_falls_back_and_is_canonicalized);
     RUN_TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname);
