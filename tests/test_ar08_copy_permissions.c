@@ -176,8 +176,5 @@ int main(void) {
     RUN_TEST(permissive_existing_destination_is_secured_before_first_payload);
 
     error_cleanup();
-    printf("\n%s: %d run, %d failed\n",
-           ts_tests_failed ? "RESULT FAIL" : "RESULT OK",
-           ts_tests_run, ts_tests_failed);
-    return ts_tests_failed ? 1 : 0;
+    return ts_test_finish();
 }

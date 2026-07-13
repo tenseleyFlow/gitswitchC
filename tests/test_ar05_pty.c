@@ -62,8 +62,7 @@ static int g_no_pty = 0;
 
 #define SKIP_IF_NO_PTY() do {                                                \
     if (g_no_pty) {                                                          \
-        fprintf(stderr, "  (skipped: no PTY available on this system)\n");   \
-        return;                                                              \
+        TS_SKIP("pty", "PTY allocation is unavailable");                    \
     }                                                                        \
 } while (0)
 
@@ -816,8 +815,7 @@ TEST(init_fish_snippet_round_trip) {
     else if (access("/usr/local/bin/fish", X_OK) == 0) fish = "/usr/local/bin/fish";
     else if (access("/bin/fish", X_OK) == 0) fish = "/bin/fish";
     if (!fish) {
-        fprintf(stderr, "  (skipped: fish not installed)\n");
-        return;
+        TS_SKIP("fish", "fish shell is unavailable");
     }
 
     if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
@@ -902,11 +900,11 @@ TEST_MAIN_BEGIN()
     }
     {
         int probe = posix_openpt(O_RDWR | O_NOCTTY);
-        if (probe < 0) {
+        if (probe < 0 || grantpt(probe) != 0 || unlockpt(probe) != 0 ||
+            ptsname(probe) == NULL) {
             g_no_pty = 1;
-        } else {
-            close(probe);
         }
+        if (probe >= 0) close(probe);
     }
     RUN_TEST(reset_yes_bypass_clears_active_state);
     RUN_TEST(reset_targeted_nonactive_keeps_config);

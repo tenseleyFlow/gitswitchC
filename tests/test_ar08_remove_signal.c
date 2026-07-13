@@ -390,5 +390,5 @@ TEST(direct_remove_restores_callers_signal_dispositions) {
 int main(void) {
     RUN_TEST(repeated_signals_defer_through_complete_removal_transaction);
     RUN_TEST(direct_remove_restores_callers_signal_dispositions);
-    return ts_tests_failed ? 1 : 0;
+    return ts_test_finish();
 }

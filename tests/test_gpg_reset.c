@@ -438,8 +438,8 @@ TEST(gpg_manager_reset_reports_recursive_removal_failure) {
     command_runner_fn prev;
 
     if (geteuid() == 0) {
-        fprintf(stderr, "  (skip: root bypasses directory write permissions)\n");
-        return;
+        TS_SKIP("unprivileged",
+                "directory permission denial requires an unprivileged uid");
     }
     CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
     snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
@@ -655,9 +655,13 @@ TEST(create_isolated_home_refuses_persistent_xdg_base) {
     /* A directory in the build tree: persistent disk in CI and on dev boxes.
      * If this workspace is itself tmpfs-backed, the scenario can't be built
      * here — skip rather than assert a wrong premise. */
-    CHECK(getcwd(cwd, sizeof(cwd)) != NULL);
-    if (test_dir_is_tmpfs(cwd)) {
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        CHECK(false);
         return;
+    }
+    if (test_dir_is_tmpfs(cwd)) {
+        TS_SKIP("persistent-fs",
+                "persistent-filesystem premise unavailable on tmpfs workspace");
     }
     snprintf(xdg, sizeof(xdg), "%s/build/gswgpg-xdg-XXXXXX", cwd);
     CHECK(ts_mkdtemp(xdg) != NULL);

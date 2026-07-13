@@ -233,8 +233,8 @@ TEST(unwritable_repo_config_stops_global_identity_write) {
     int restore_mode_rc;
 
     if (geteuid() == 0) {
-        printf("  SKIP permission witness requires an unprivileged uid\n");
-        return;
+        TS_SKIP("unprivileged",
+                "repository permission witness requires an unprivileged uid");
     }
 
     CHECK(fixture_init(&fixture));

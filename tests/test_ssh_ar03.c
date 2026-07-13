@@ -510,8 +510,7 @@ TEST(reset_reaps_real_recorded_agent) {
     pid_t pid;
 
     if (!command_exists("ssh-agent")) {
-        fprintf(stderr, "  (skipped: no ssh-agent in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);

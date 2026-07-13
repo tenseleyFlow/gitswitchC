@@ -184,8 +184,7 @@ TEST(init_fails_on_enospc) {
     int rc;
 
     if (access("/dev/full", W_OK) != 0) {
-        fprintf(stderr, "  (skipped: no /dev/full on this platform)\n");
-        return;
+        TS_SKIP("dev-full", "/dev/full is unavailable or not writable");
     }
     if (!make_temp_dir(rt, sizeof(rt))) { CHECK(!"mkdtemp failed"); return; }
     snprintf(cmd, sizeof(cmd),
@@ -415,11 +414,10 @@ TEST(resume_never_blocks_reading_stdin) {
     master = posix_openpt(O_RDWR | O_NOCTTY);
     if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0 ||
         (pts = ptsname(master)) == NULL) {
-        fprintf(stderr, "  (skipped: no PTY available: %s)\n", strerror(errno));
         if (master >= 0) close(master);
         remove_tree(home);
         remove_tree(rt);
-        return;
+        TS_SKIP("pty", "PTY allocation is unavailable");
     }
     snprintf(slave_name, sizeof(slave_name), "%s", pts);
 
@@ -1146,8 +1144,7 @@ TEST(switch_save_failure_exits_nonzero) {
     int rc;
 
     if (getuid() == 0) {
-        fprintf(stderr, "  (skipped: running as root, permission denial won't bite)\n");
-        return;
+        TS_SKIP("unprivileged", "permission-denial test requires a non-root user");
     }
     if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
         CHECK(!"mkdtemp failed");

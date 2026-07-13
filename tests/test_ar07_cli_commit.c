@@ -379,9 +379,8 @@ TEST(save_failures_never_print_final_mutation_success) {
     };
 
     if (getuid() == 0) {
-        fprintf(stderr,
-                "  (skipped: owner-write denial is ineffective as root)\n");
-        return;
+        TS_SKIP("unprivileged",
+                "owner-write denial is ineffective as root");
     }
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -429,9 +428,8 @@ TEST(switch_save_failure_restores_git_config_active_and_exact_hint) {
     int rc;
 
     if (getuid() == 0) {
-        fprintf(stderr,
-                "  (skipped: owner-write denial is ineffective as root)\n");
-        return;
+        TS_SKIP("unprivileged",
+                "owner-write denial is ineffective as root");
     }
     CHECK_EQ_INT(make_private_dir(home, sizeof(home),
                                   "gitswitch-ar07-home"), 0);

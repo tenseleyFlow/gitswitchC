@@ -474,7 +474,8 @@ TEST(inaccessible_runtime_parent_reports_permission_failure_and_releases) {
         /* The injected matrix above remains authoritative for EACCES when a
          * privileged test runner bypasses search-permission checks. */
         CHECK_EQ_INT(runtime_lock_fixture_end(&fixture), 0);
-        return;
+        TS_SKIP("unprivileged",
+                "search-permission denial is ineffective as root");
     }
     CHECK_EQ_INT(runtime_lock_fixture_acquire(&fixture), 0);
     if (fixture.lock_fd >= 0) {

@@ -473,5 +473,5 @@ int main(void) {
     RUN_TEST(repeated_signals_defer_across_every_reset_boundary);
     RUN_TEST(manager_failure_keeps_retry_state_while_signal_is_deferred);
     RUN_TEST(case_different_active_account_clears_by_name_id_and_email);
-    return ts_tests_failed ? 1 : 0;
+    return ts_test_finish();
 }

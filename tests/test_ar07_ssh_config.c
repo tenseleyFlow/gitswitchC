@@ -341,12 +341,9 @@ static int replace_config_byte_preserving_mtime(int dir_fd,
     return close(fd);
 }
 
-TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
+TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
-    char output[32768];
     account_t account;
-    run_opts_t opts;
-    run_result_t result;
     size_t config_len = 0;
     char *content;
 
@@ -362,11 +359,22 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
         CHECK(strstr(content, "key dir/id\\backslash\"") != NULL);
         free(content);
     }
+}
+
+TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char output[32768];
+    account_t account;
+    run_opts_t opts;
+    run_result_t result;
 
     if (!command_exists("ssh")) {
-        fprintf(stderr, "  (skipped OpenSSH oracle: ssh not in trusted PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
     }
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    snprintf(key, sizeof(key), "%s/key dir/id\\backslash", home);
+    make_account(&account, key);
+    CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
     memset(&opts, 0, sizeof(opts));
     memset(&result, 0, sizeof(result));
     opts.out = output;
@@ -866,6 +874,7 @@ cleanup:
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    RUN_TEST(identityfile_quoting_and_hostname_are_serialized_safely);
     RUN_TEST(identityfile_quoting_and_hostname_match_openssh_oracle);
     RUN_TEST(openssh_percent_and_environment_expansions_are_safe);
     RUN_TEST(embedded_nul_at_every_region_fails_without_mutation);

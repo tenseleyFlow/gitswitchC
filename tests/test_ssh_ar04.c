@@ -318,20 +318,36 @@ static int listen_socket(const char *path) {
     return fd;
 }
 
-static bool unix_socket_bind_available(const char *agent_dir) {
+enum {
+    TEST_UNIX_SOCKET_BIND_ERROR = -1,
+    TEST_UNIX_SOCKET_BIND_AVAILABLE = 0,
+    TEST_UNIX_SOCKET_BIND_UNAVAILABLE = 1
+};
+
+static int unix_socket_bind_capability(const char *agent_dir) {
     char probe[192];
+    int rc;
+
     snprintf(probe, sizeof(probe), "%s/probe.sock", agent_dir);
-    if (bind_socket(probe) == 0) {
-        unlink(probe);
-        return true;
+    rc = bind_socket(probe);
+    if (rc == 0) {
+        CHECK_EQ_INT(unlink(probe), 0);
+        return TEST_UNIX_SOCKET_BIND_AVAILABLE;
     }
     if (errno == EPERM || errno == EACCES) {
-        fprintf(stderr, "  (skip: sandbox forbids AF_UNIX bind)\n");
-        return false;
+        return TEST_UNIX_SOCKET_BIND_UNAVAILABLE;
     }
     CHECK(false);
-    return false;
+    return TEST_UNIX_SOCKET_BIND_ERROR;
 }
+
+#define REQUIRE_UNIX_SOCKET_BIND(agent_dir) do {                             \
+    int _socket_capability = unix_socket_bind_capability(agent_dir);          \
+    if (_socket_capability == TEST_UNIX_SOCKET_BIND_UNAVAILABLE) {            \
+        TS_SKIP("unix-sockets", "sandbox forbids AF_UNIX bind");             \
+    }                                                                         \
+    if (_socket_capability != TEST_UNIX_SOCKET_BIND_AVAILABLE) return;        \
+} while (0)
 
 static int fake_agent_runner(const char *const argv[], const run_opts_t *opts,
                              run_result_t *result) {
@@ -438,9 +454,16 @@ static bool entry_exists(const char *path) {
     return lstat(path, &st) == 0;
 }
 
+enum {
+    TEST_REAL_AGENT_START_ERROR = -1,
+    TEST_REAL_AGENT_START_OK = 0,
+    TEST_REAL_AGENT_START_OPENSSH_UNAVAILABLE = 1,
+    TEST_REAL_AGENT_START_UNIX_SOCKETS_UNAVAILABLE = 2
+};
+
 /* Start a real listener so missing-sidecar reset coverage cannot false-pass on
- * a dead socket inode. Returns 1 for an explicit environment skip, 0 on
- * success, and -1 for an unexpected setup failure. */
+ * a dead socket inode. Capability absences are distinct from setup failures so
+ * callers can report the exact skip without masking functional errors. */
 static int start_real_agent_without_sidecar(const char *agent_dir,
                                             const char *account,
                                             char *sock, size_t sock_size,
@@ -452,11 +475,14 @@ static int start_real_agent_without_sidecar(const char *agent_dir,
     char *pid_text;
 
     if (!command_exists("ssh-agent")) {
-        fprintf(stderr, "  (skip: ssh-agent not available)\n");
-        return 1;
+        return TEST_REAL_AGENT_START_OPENSSH_UNAVAILABLE;
     }
-    if (!unix_socket_bind_available(agent_dir)) {
-        return 1;
+    int socket_capability = unix_socket_bind_capability(agent_dir);
+    if (socket_capability == TEST_UNIX_SOCKET_BIND_UNAVAILABLE) {
+        return TEST_REAL_AGENT_START_UNIX_SOCKETS_UNAVAILABLE;
+    }
+    if (socket_capability != TEST_UNIX_SOCKET_BIND_AVAILABLE) {
+        return TEST_REAL_AGENT_START_ERROR;
     }
     if ((size_t)snprintf(sock, sock_size, "%s/ssh-agent.%s.sock",
                          agent_dir, account) >= sock_size ||
@@ -762,7 +788,7 @@ TEST(fresh_agent_retarget_failure_reaps_and_restores_environment) {
     command_runner_fn previous;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
-    if (!unix_socket_bind_available(agent_dir)) return;
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
@@ -798,7 +824,7 @@ TEST(fresh_agent_environment_failure_reaps_and_restores_partial_mutation) {
     ssh_setenv_fn previous_setenv;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
-    if (!unix_socket_bind_available(agent_dir)) return;
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
@@ -864,7 +890,7 @@ TEST(reused_agent_retarget_failure_does_not_adopt_or_reap) {
     command_runner_fn previous;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
-    if (!unix_socket_bind_available(agent_dir)) return;
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
     CHECK_EQ_INT(bind_socket(sock), 0);
@@ -900,7 +926,7 @@ TEST(reused_agent_aborts_when_other_orphan_cleanup_is_incomplete) {
     ssize_t target_len;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
-    if (!unix_socket_bind_available(agent_dir)) return;
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
     snprintf(work_sock, sizeof(work_sock), "%s/ssh-agent.work.sock", agent_dir);
     snprintf(stale_pid, sizeof(stale_pid), "%s/ssh-agent.personal.pid", agent_dir);
@@ -1169,9 +1195,14 @@ TEST(targeted_reset_preserves_live_agent_when_sidecar_is_missing) {
     start_rc = start_real_agent_without_sidecar(agent_dir, "work",
                                                  sock, sizeof(sock),
                                                  current, sizeof(current), &pid);
-    if (start_rc == 1) return;
-    CHECK_EQ_INT(start_rc, 0);
-    if (start_rc != 0) return;
+    if (start_rc == TEST_REAL_AGENT_START_OPENSSH_UNAVAILABLE) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    if (start_rc == TEST_REAL_AGENT_START_UNIX_SOCKETS_UNAVAILABLE) {
+        TS_SKIP("unix-sockets", "sandbox forbids AF_UNIX bind");
+    }
+    CHECK_EQ_INT(start_rc, TEST_REAL_AGENT_START_OK);
+    if (start_rc != TEST_REAL_AGENT_START_OK) return;
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
     CHECK(!entry_exists(pidfile));
 
@@ -1199,9 +1230,14 @@ TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander) {
                                                  sock, sizeof(sock),
                                                  current, sizeof(current),
                                                  &agent_pid);
-    if (start_rc == 1) return;
-    CHECK_EQ_INT(start_rc, 0);
-    if (start_rc != 0) return;
+    if (start_rc == TEST_REAL_AGENT_START_OPENSSH_UNAVAILABLE) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    if (start_rc == TEST_REAL_AGENT_START_UNIX_SOCKETS_UNAVAILABLE) {
+        TS_SKIP("unix-sockets", "sandbox forbids AF_UNIX bind");
+    }
+    CHECK_EQ_INT(start_rc, TEST_REAL_AGENT_START_OK);
+    if (start_rc != TEST_REAL_AGENT_START_OK) return;
 
     fflush(NULL);
     bystander_pid = fork();
@@ -1242,9 +1278,14 @@ TEST(reset_all_preserves_live_agent_when_sidecar_is_missing) {
     start_rc = start_real_agent_without_sidecar(agent_dir, "personal",
                                                  sock, sizeof(sock),
                                                  current, sizeof(current), &pid);
-    if (start_rc == 1) return;
-    CHECK_EQ_INT(start_rc, 0);
-    if (start_rc != 0) return;
+    if (start_rc == TEST_REAL_AGENT_START_OPENSSH_UNAVAILABLE) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    if (start_rc == TEST_REAL_AGENT_START_UNIX_SOCKETS_UNAVAILABLE) {
+        TS_SKIP("unix-sockets", "sandbox forbids AF_UNIX bind");
+    }
+    CHECK_EQ_INT(start_rc, TEST_REAL_AGENT_START_OK);
+    if (start_rc != TEST_REAL_AGENT_START_OK) return;
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.personal.pid", agent_dir);
     CHECK(!entry_exists(pidfile));
 
@@ -1301,9 +1342,14 @@ TEST(darwin_reset_reaps_managed_agent_with_large_environment) {
     }
     free(saved_environment);
     free(large_environment);
-    if (start_rc == 1) return;
-    CHECK_EQ_INT(start_rc, 0);
-    if (start_rc != 0) return;
+    if (start_rc == TEST_REAL_AGENT_START_OPENSSH_UNAVAILABLE) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    if (start_rc == TEST_REAL_AGENT_START_UNIX_SOCKETS_UNAVAILABLE) {
+        TS_SKIP("unix-sockets", "sandbox forbids AF_UNIX bind");
+    }
+    CHECK_EQ_INT(start_rc, TEST_REAL_AGENT_START_OK);
+    if (start_rc != TEST_REAL_AGENT_START_OK) return;
 
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
     snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)pid);
@@ -1334,7 +1380,7 @@ TEST(darwin_kern_procargs_reaps_unrestricted_large_environment_agent) {
     pid_t pid = -1;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
-    if (!unix_socket_bind_available(agent_dir)) return;
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(helper, sizeof(helper), "%s/ssh-agent", agent_dir);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
@@ -1399,8 +1445,5 @@ int main(int argc, char **argv) {
     RUN_TEST(darwin_reset_reaps_managed_agent_with_large_environment);
     RUN_TEST(darwin_kern_procargs_reaps_unrestricted_large_environment_agent);
 #endif
-    printf("\n%s: %d run, %d failed\n",
-           ts_tests_failed ? "RESULT FAIL" : "RESULT OK",
-           ts_tests_run, ts_tests_failed);
-    return ts_tests_failed == 0 ? 0 : 1;
+    return ts_test_finish();
 }

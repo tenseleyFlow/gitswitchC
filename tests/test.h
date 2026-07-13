@@ -1,10 +1,11 @@
 /* Minimal dependency-free test harness for gitswitch-c.
  *
  * Each test file defines tests with TEST(), registers them in main() via
- * RUN_TEST(), and exits 0 when every test passed or 1 if any failed (AR-06 F79:
- * it is a boolean status, not the failure count), so the Makefile `test` target
- * fails the build on any failure. CHECK* macros are non-fatal (they record a
- * failure but let the rest of the test run). */
+ * RUN_TEST(), and exits 0 when every test passed or was optionally skipped, or
+ * 1 if any failed/required capability was unavailable (AR-06 F79: it is a
+ * boolean status, not the failure count), so the Makefile `test` target fails
+ * the build on any failure. CHECK* macros are non-fatal (they record a failure
+ * but let the rest of the test run). */
 #ifndef GITSWITCH_TEST_H
 #define GITSWITCH_TEST_H
 
@@ -18,8 +19,14 @@
 #include <sys/stat.h>
 
 static int ts_tests_run = 0;
+static int ts_tests_passed = 0;
 static int ts_tests_failed = 0;
+static int ts_tests_skipped = 0;
 static int ts_current_fail = 0; /* per-test failure flag */
+static int ts_current_skip_capability = -1;
+#define TS_SKIP_REASON_MAX 256
+static char ts_current_skip_reason[TS_SKIP_REASON_MAX];
+static unsigned long ts_skipped_capabilities = 0;
 
 /* AR-06 F81: unit suites mkdtemp() one or more /tmp fixtures per test and most
  * never removed the tree, leaking ~186 dirs per full run (tens of thousands
@@ -379,6 +386,127 @@ static inline char *ts_mkdtemp_trusted(char *path, size_t path_size,
     return created;
 }
 
+/* Required test capabilities use an intentionally small, stable grammar:
+ * GITSWITCH_TEST_REQUIRED_CAPS is empty/unset or a comma-separated list of
+ * exact tokens below. Whitespace, empty/duplicate elements, and unknown names
+ * are configuration errors. Exact matching is important: requiring "fish"
+ * must not turn a skipped "sh" test into a required-capability failure. */
+static inline const char *ts_capability_name(int index) {
+    static const char *const names[] = {
+        "pty",
+        "readline",
+        "bash",
+        "zsh",
+        "fish",
+        "sh",
+        "dash",
+        "ksh",
+        "openssh",
+        "gpg",
+        "unprivileged",
+        "bulk-fd-close",
+        "high-fd",
+        "freebsd-acl",
+        "mount-namespace",
+        "persistent-fs",
+        "dev-full",
+        "unix-sockets"
+    };
+    size_t count = sizeof(names) / sizeof(names[0]);
+    return index >= 0 && (size_t)index < count ? names[index] : NULL;
+}
+
+static inline int ts_capability_index(const char *name, size_t length) {
+    for (int index = 0;; index++) {
+        const char *known = ts_capability_name(index);
+        if (!known) return -1;
+        if (strlen(known) == length && memcmp(known, name, length) == 0) {
+            return index;
+        }
+    }
+}
+
+static inline int ts_parse_required_capabilities(const char *value,
+                                                 unsigned long *mask) {
+    if (!mask) return -1;
+    *mask = 0;
+    if (!value || !*value) return 0;
+
+    const char *token = value;
+    for (const char *cursor = value;; cursor++) {
+        if (*cursor != ',' && *cursor != '\0') continue;
+        size_t length = (size_t)(cursor - token);
+        int index = length > 0 ? ts_capability_index(token, length) : -1;
+        if (index < 0 || (size_t)index >= sizeof(*mask) * 8) return -1;
+        unsigned long bit = 1UL << (unsigned int)index;
+        if ((*mask & bit) != 0) return -1;
+        *mask |= bit;
+        if (*cursor == '\0') return 0;
+        token = cursor + 1;
+    }
+}
+
+static inline void ts_record_skip(const char *capability, const char *reason,
+                                  const char *file, int line) {
+    size_t capability_length = capability ? strlen(capability) : 0;
+    int index = capability_length > 0
+                    ? ts_capability_index(capability, capability_length)
+                    : -1;
+    size_t reason_length = reason ? strlen(reason) : 0;
+    if (index < 0 || reason_length == 0 ||
+        reason_length >= sizeof(ts_current_skip_reason) ||
+        strchr(reason, '\n') || strchr(reason, '\r')) {
+        ts_current_fail = 1;
+        fprintf(stderr,
+                "  FAIL %s:%d: invalid TS_SKIP capability or reason\n",
+                file, line);
+        return;
+    }
+    ts_current_skip_capability = index;
+    memcpy(ts_current_skip_reason, reason, reason_length + 1);
+}
+
+static inline int ts_test_finish(void) {
+    unsigned long required_capabilities = 0;
+    const char *required = getenv("GITSWITCH_TEST_REQUIRED_CAPS");
+    int policy_valid =
+        ts_parse_required_capabilities(required, &required_capabilities) == 0;
+    int accounting_valid =
+        ts_tests_run >= 0 && ts_tests_passed >= 0 && ts_tests_failed >= 0 &&
+        ts_tests_skipped >= 0 &&
+        ts_tests_run ==
+            ts_tests_passed + ts_tests_failed + ts_tests_skipped;
+    unsigned long required_skips =
+        required_capabilities & ts_skipped_capabilities;
+
+    if (!policy_valid) {
+        fprintf(stderr,
+                "HARNESS FAIL: invalid GITSWITCH_TEST_REQUIRED_CAPS\n");
+    }
+    if (!accounting_valid) {
+        fprintf(stderr,
+                "HARNESS FAIL: test accounting invariant violated\n");
+    }
+    if (policy_valid) {
+        for (int index = 0;; index++) {
+            const char *name = ts_capability_name(index);
+            if (!name) break;
+            if ((required_skips & (1UL << (unsigned int)index)) != 0) {
+                fprintf(stderr,
+                        "HARNESS FAIL: required capability skipped: %s\n",
+                        name);
+            }
+        }
+    }
+
+    int failed = ts_tests_failed != 0 || !policy_valid ||
+                 !accounting_valid || required_skips != 0;
+    printf("\n%s: %d run, %d passed, %d failed, %d skipped\n",
+           failed ? "RESULT FAIL" : "RESULT OK", ts_tests_run,
+           ts_tests_passed, ts_tests_failed, ts_tests_skipped);
+    return failed ? 1 : 0;
+}
+
 #define TEST(name) static void name(void)
 
 #define CHECK(cond) do {                                                       \
@@ -407,20 +535,38 @@ static inline char *ts_mkdtemp_trusted(char *path, size_t path_size,
     }                                                                        \
 } while (0)
 
+/* TS_SKIP is only valid in a void TEST() body. It records the unavailable
+ * stable capability and immediately returns from that test. */
+#define TS_SKIP(capability, reason) do {                                     \
+    ts_record_skip((capability), (reason), __FILE__, __LINE__);              \
+    return;                                                                  \
+} while (0)
+
 #define RUN_TEST(fn) do {                                                    \
     ts_current_fail = 0;                                                     \
+    ts_current_skip_capability = -1;                                         \
+    ts_current_skip_reason[0] = '\0';                                        \
     ts_tests_run++;                                                          \
     fn();                                                                    \
-    if (ts_current_fail) { ts_tests_failed++; printf("[FAIL] %s\n", #fn); }  \
-    else                 { printf("[ ok ] %s\n", #fn); }                     \
+    if (ts_current_fail) {                                                   \
+        ts_tests_failed++;                                                   \
+        printf("[FAIL] %s\n", #fn);                                         \
+    } else if (ts_current_skip_capability >= 0) {                            \
+        ts_tests_skipped++;                                                  \
+        ts_skipped_capabilities |=                                          \
+            1UL << (unsigned int)ts_current_skip_capability;                 \
+        printf("[SKIP] %s (%s: %s)\n", #fn,                                 \
+               ts_capability_name(ts_current_skip_capability),              \
+               ts_current_skip_reason);                                     \
+    } else {                                                                \
+        ts_tests_passed++;                                                   \
+        printf("[ ok ] %s\n", #fn);                                         \
+    }                                                                       \
 } while (0)
 
 #define TEST_MAIN_BEGIN() int main(void) {
 #define TEST_MAIN_END()                                                      \
-    printf("\n%s: %d run, %d failed\n",                                      \
-           ts_tests_failed ? "RESULT FAIL" : "RESULT OK",                    \
-           ts_tests_run, ts_tests_failed);                                   \
-    return ts_tests_failed == 0 ? 0 : 1;                                     \
+    return ts_test_finish();                                                 \
 }
 
 #endif /* GITSWITCH_TEST_H */

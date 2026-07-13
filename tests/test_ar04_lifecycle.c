@@ -464,11 +464,11 @@ static int run_remove(const char *home, const char *runtime,
     return run_shell(cmd);
 }
 
-TEST(remove_tears_down_runtime_before_deleting_account) {
+static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
     char home[256], runtime[256], shims[512], path[1024], target[1024];
-    char output[1024], contents[8192], cmd[4096], pid_text[64];
+    char output[1024], contents[8192], cmd[PATH_MAX + 4096], pid_text[64];
     pid_t agent_pid = -1;
-    bool real_agent = false;
+    bool agent_started = false;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
@@ -478,14 +478,14 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
     snprintf(target, sizeof(target), "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
-    if (run_shell("command -v ssh-agent >/dev/null 2>&1") == 0) {
+    if (ssh_agent_path) {
         char *pid_marker;
 
         snprintf(output, sizeof(output), "%s/ssh-agent.out", runtime);
         snprintf(cmd, sizeof(cmd),
-                 "PATH='/usr/bin:/bin:/usr/local/bin' ssh-agent -s -a '%s' "
+                 "PATH='/usr/bin:/bin:/usr/local/bin' '%s' -s -a '%s' "
                  ">'%s' 2>/dev/null",
-                 target, output);
+                 ssh_agent_path, target, output);
         CHECK_EQ_INT(run_shell(cmd), 0);
         slurp(output, contents, sizeof(contents));
         pid_marker = strstr(contents, "SSH_AGENT_PID=");
@@ -500,10 +500,9 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
                      "%s/gitswitch-ssh/ssh-agent.work.pid", runtime);
             snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)agent_pid);
             CHECK_EQ_INT(write_text(path, pid_text, 0600), 0);
-            real_agent = true;
+            agent_started = true;
         }
     } else {
-        fprintf(stderr, "  (skipped real-agent assertion: ssh-agent not installed)\n");
         CHECK_EQ_INT(write_text(target, "socket fixture\n", 0600), 0);
     }
     snprintf(path, sizeof(path), "%s/gitswitch-ssh/current.sock", runtime);
@@ -518,7 +517,7 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
 
     snprintf(output, sizeof(output), "%s/remove.out", runtime);
     CHECK_EQ_INT(run_remove(home, runtime, shims, "work", output), 0);
-    if (real_agent) {
+    if (agent_started) {
         errno = 0;
         CHECK(kill(agent_pid, 0) != 0);
         CHECK_EQ_INT(errno, ESRCH);
@@ -547,6 +546,20 @@ TEST(remove_tears_down_runtime_before_deleting_account) {
     remove_tree(runtime);
 }
 
+TEST(remove_tears_down_runtime_before_deleting_account) {
+    exercise_remove_runtime_teardown(NULL);
+}
+
+TEST(remove_reaps_real_agent_before_deleting_account) {
+    char ssh_agent_path[PATH_MAX];
+
+    if (find_fixture_executable("ssh-agent", ssh_agent_path,
+                                sizeof(ssh_agent_path)) != 0) {
+        TS_SKIP("openssh", "ssh-agent unavailable in PATH");
+    }
+    exercise_remove_runtime_teardown(ssh_agent_path);
+}
+
 TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     char home[256], runtime[256], shims[512], config_dir[1024];
     char path[1024], target[1024], output[1024], cmd[8192], contents[8192];
@@ -558,8 +571,8 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     FILE *lock_file;
 
     if (getuid() == 0) {
-        fprintf(stderr, "  (skipped: root bypasses the save permission fixture)\n");
-        return;
+        TS_SKIP("unprivileged",
+                "save permission denial requires an unprivileged uid");
     }
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
@@ -952,6 +965,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(active_live_field_edits_are_rejected_without_mutation);
     RUN_TEST(active_description_edit_and_inactive_live_edits_still_work);
     RUN_TEST(remove_tears_down_runtime_before_deleting_account);
+    RUN_TEST(remove_reaps_real_agent_before_deleting_account);
     RUN_TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown);
     RUN_TEST(remove_failure_retains_account_and_attempts_other_manager);
     RUN_TEST(remove_inactive_account_with_no_runtime_preserves_active_account);

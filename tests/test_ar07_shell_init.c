@@ -695,123 +695,143 @@ TEST(resume_hint_probe_is_noncreating_and_rejects_other_grammar) {
     CHECK(access(config_dir, F_OK) != 0 && errno == ENOENT);
 }
 
-TEST(every_available_supported_shell_accepts_its_generated_syntax) {
+static void check_generated_syntax_for_shell(size_t index) {
     char shell_path[PATH_MAX];
     char command[PATH_MAX * 3];
-    size_t i;
 
-    for (i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
-        if (resolve_executable(g_shells[i].name, shell_path,
-                               sizeof(shell_path)) != 0) {
-            fprintf(stderr, "  (skipped %s syntax: shell unavailable)\n",
-                    g_shells[i].name);
-            continue;
-        }
-        snprintf(command, sizeof(command), "'%s' %s -n '%s' >/dev/null 2>&1",
-                 shell_path,
-                 strcmp(g_shells[i].name, "bash") == 0 ? "--noprofile --norc" :
-                 strcmp(g_shells[i].name, "zsh") == 0 ? "-f" :
-                 strcmp(g_shells[i].name, "fish") == 0 ? "--no-config" : "",
-                 g_fixture.snippets[i]);
+    if (resolve_executable(g_shells[index].name, shell_path,
+                           sizeof(shell_path)) != 0) {
+        TS_SKIP(g_shells[index].name,
+                "native shell executable is unavailable");
+    }
+    int written = snprintf(
+        command, sizeof(command), "'%s' %s -n '%s' >/dev/null 2>&1",
+        shell_path,
+        strcmp(g_shells[index].name, "bash") == 0 ? "--noprofile --norc" :
+        strcmp(g_shells[index].name, "zsh") == 0 ? "-f" :
+        strcmp(g_shells[index].name, "fish") == 0 ? "--no-config" : "",
+        g_fixture.snippets[index]);
+    CHECK(written >= 0 && (size_t)written < sizeof(command));
+    if (written >= 0 && (size_t)written < sizeof(command)) {
         CHECK_EQ_INT(run_shell(command), 0);
     }
 }
 
-TEST(available_shells_resume_once_for_empty_wrong_or_extra_but_not_exact) {
+static void check_resume_matrix_for_shell(size_t index) {
     char shell_path[PATH_MAX];
-    size_t i;
 
-    for (i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
-        if (resolve_executable(g_shells[i].name, shell_path,
-                               sizeof(shell_path)) != 0) {
-            continue;
-        }
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 1, 0, false), 1);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 0, 1, false), 1);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 0, 1, false), 1);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 0, 0, false), 0);
-        CHECK_EQ_INT(evaluate_resume_case(i, "ssh", 2, 0, false), 1);
+    if (resolve_executable(g_shells[index].name, shell_path,
+                           sizeof(shell_path)) != 0) {
+        TS_SKIP(g_shells[index].name,
+                "native shell executable is unavailable");
     }
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 1, 0, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 1, false), 1);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 0, 0, false), 0);
+    CHECK_EQ_INT(evaluate_resume_case(index, "ssh", 2, 0, false), 1);
 }
 
-TEST(combined_runtime_misses_trigger_one_bounded_resume) {
-    static const char *const shells[] = {"sh", "fish"};
-    size_t i;
+static void check_combined_runtime_misses_for_shell(const char *shell) {
+    int index = shell_index(shell);
+    char shell_path[PATH_MAX];
 
-    for (i = 0; i < sizeof(shells) / sizeof(shells[0]); i++) {
-        int index = shell_index(shells[i]);
-        char shell_path[PATH_MAX];
-        if (index < 0 || resolve_executable(shells[i], shell_path,
-                                            sizeof(shell_path)) != 0) {
-            continue;
-        }
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
-                                          true), 0);
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
-                                          false), 1);
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
-                                          true), 1);
-        CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
-                                          false), 1);
+    CHECK(index >= 0);
+    if (index < 0) return;
+    if (resolve_executable(shell, shell_path, sizeof(shell_path)) != 0) {
+        TS_SKIP(shell, "native shell executable is unavailable");
     }
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
+                                      true), 0);
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 0, 0,
+                                      false), 1);
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
+                                      true), 1);
+    CHECK_EQ_INT(evaluate_resume_case((size_t)index, "ssh gpg", 1, 0,
+                                      false), 1);
 }
 
-TEST(nonregular_or_invalid_hints_never_block_or_invoke_resume) {
-    static const char *const shells[] = {"sh", "fish"};
+static void check_invalid_hints_for_shell(const char *shell) {
     char target[PATH_MAX];
     char oversized[1026];
+    char shell_path[PATH_MAX];
+    int index = shell_index(shell);
 
+    CHECK(index >= 0);
+    if (index < 0) return;
+    if (resolve_executable(shell, shell_path, sizeof(shell_path)) != 0) {
+        TS_SKIP(shell, "native shell executable is unavailable");
+    }
     CHECK_EQ_INT(join_path(target, sizeof(target), g_fixture.root,
                            "/shell-hint-target"), 0);
     memset(oversized, 'x', sizeof(oversized));
-    for (size_t i = 0; i < sizeof(shells) / sizeof(shells[0]); i++) {
-        int index = shell_index(shells[i]);
-        char shell_path[PATH_MAX];
+    CHECK_EQ_INT(write_text(g_fixture.hint,
+                            "ssh\nactive=work\n", 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 1);
 
-        if (index < 0 || resolve_executable(shells[i], shell_path,
-                                            sizeof(shell_path)) != 0) {
-            continue;
-        }
-        CHECK_EQ_INT(write_text(g_fixture.hint,
-                                "ssh\nactive=work\n", 0600), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 1);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    CHECK_EQ_INT(write_text(g_fixture.hint, "ssh", 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    CHECK_EQ_INT(write_bytes(g_fixture.hint, oversized,
+                             sizeof(oversized), 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    CHECK_EQ_INT(write_text(g_fixture.hint, "ssh\n", 0644), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
 
-        unlink(g_fixture.hint);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
-        CHECK_EQ_INT(write_text(g_fixture.hint, "ssh", 0600), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
-        CHECK_EQ_INT(write_bytes(g_fixture.hint, oversized,
-                                 sizeof(oversized), 0600), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
-        CHECK_EQ_INT(write_text(g_fixture.hint, "ssh\n", 0644), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
+    unlink(g_fixture.hint);
+    unlink(target);
+    CHECK_EQ_INT(write_text(target, "ssh\n", 0600), 0);
+    CHECK_EQ_INT(link(target, g_fixture.hint), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(symlink(target, g_fixture.hint), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(mkfifo(g_fixture.hint, 0600), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    CHECK_EQ_INT(make_socket_node(g_fixture.hint), 0);
+    CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
+                                       false, true), 0);
+    unlink(g_fixture.hint);
+    unlink(target);
+}
 
-        unlink(g_fixture.hint);
-        unlink(target);
-        CHECK_EQ_INT(write_text(target, "ssh\n", 0600), 0);
-        CHECK_EQ_INT(link(target, g_fixture.hint), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
-        unlink(g_fixture.hint);
-        CHECK_EQ_INT(symlink(target, g_fixture.hint), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
-        unlink(g_fixture.hint);
-        CHECK_EQ_INT(mkfifo(g_fixture.hint, 0600), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
-        unlink(g_fixture.hint);
-        CHECK_EQ_INT(make_socket_node(g_fixture.hint), 0);
-        CHECK_EQ_INT(evaluate_current_hint((size_t)index, 1, 1,
-                                           false, true), 0);
-        unlink(g_fixture.hint);
-        unlink(target);
-    }
+#define DEFINE_SHELL_MATRIX_TESTS(label, index)                              \
+    TEST(label##_generated_syntax) { check_generated_syntax_for_shell(index); } \
+    TEST(label##_resume_matrix) { check_resume_matrix_for_shell(index); }
+
+DEFINE_SHELL_MATRIX_TESTS(bash, 0)
+DEFINE_SHELL_MATRIX_TESTS(zsh, 1)
+DEFINE_SHELL_MATRIX_TESTS(fish, 2)
+DEFINE_SHELL_MATRIX_TESTS(sh, 3)
+DEFINE_SHELL_MATRIX_TESTS(dash, 4)
+DEFINE_SHELL_MATRIX_TESTS(ksh, 5)
+#undef DEFINE_SHELL_MATRIX_TESTS
+
+TEST(sh_combined_runtime_misses) {
+    check_combined_runtime_misses_for_shell("sh");
+}
+
+TEST(fish_combined_runtime_misses) {
+    check_combined_runtime_misses_for_shell("fish");
+}
+
+TEST(sh_invalid_hints_are_bounded) {
+    check_invalid_hints_for_shell("sh");
+}
+
+TEST(fish_invalid_hints_are_bounded) {
+    check_invalid_hints_for_shell("fish");
 }
 
 TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership) {
@@ -868,8 +888,7 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "end\n";
 
     if (resolve_executable("fish", fish_path, sizeof(fish_path)) != 0) {
-        fprintf(stderr, "  (skipped fish parent-state matrix: fish unavailable)\n");
-        return;
+        TS_SKIP("fish", "native fish executable is unavailable");
     }
     CHECK_EQ_INT(join_path(script, sizeof(script), g_fixture.root,
                            "/fish-transition.fish"), 0);
@@ -946,8 +965,7 @@ TEST(fish_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths) {
         "test \"$SSH_AUTH_SOCK:$GNUPGHOME\" = /manual/socket:/manual/gpg; or exit 25\n";
 
     if (resolve_executable("fish", fish_path, sizeof(fish_path)) != 0) {
-        fprintf(stderr, "  (skipped fish wrapper matrix: fish unavailable)\n");
-        return;
+        TS_SKIP("fish", "native fish executable is unavailable");
     }
     CHECK_EQ_INT(join_path(script, sizeof(script), g_fixture.root,
                            "/fish-wrapper.fish"), 0);
@@ -975,6 +993,11 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     bool live = true;
     pid_t agent_pid = -1;
 
+    if (resolve_executable("ssh-agent", output, sizeof(output)) != 0 ||
+        resolve_executable("ssh-add", output, sizeof(output)) != 0 ||
+        resolve_executable("ssh-keygen", output, sizeof(output)) != 0) {
+        TS_SKIP("openssh", "OpenSSH test tools are unavailable");
+    }
     if (old_runtime) saved_runtime = strdup(old_runtime);
     if (!ts_mkdtemp(root) ||
         join_path(runtime, sizeof(runtime), root, "/runtime") != 0 ||
@@ -993,12 +1016,6 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         free(saved_runtime);
         ts_rm_rf(root);
         return;
-    }
-    if (resolve_executable("ssh-agent", output, sizeof(output)) != 0 ||
-        resolve_executable("ssh-add", output, sizeof(output)) != 0 ||
-        resolve_executable("ssh-keygen", output, sizeof(output)) != 0) {
-        fprintf(stderr, "  (skipped real SSH liveness: OpenSSH tools unavailable)\n");
-        goto done;
     }
     CHECK_EQ_INT(generate_key(expected_key), 0);
     CHECK_EQ_INT(generate_key(other_key), 0);
@@ -1083,8 +1100,7 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
     if (resolve_executable("ssh-agent", after, sizeof(after)) != 0 ||
         resolve_executable("ssh-add", after, sizeof(after)) != 0 ||
         resolve_executable("ssh-keygen", after, sizeof(after)) != 0) {
-        fprintf(stderr, "  (skipped real resume: OpenSSH tools unavailable)\n");
-        return;
+        TS_SKIP("openssh", "OpenSSH test tools are unavailable");
     }
     if (!ts_mkdtemp(root)) {
         CHECK(!"real resume root setup failed");
@@ -1162,10 +1178,22 @@ int main(int argc, char **argv) {
     RUN_TEST(generated_snippets_use_only_the_bounded_resume_hint_probe);
     RUN_TEST(resume_hint_probe_accepts_only_safe_exact_artifacts);
     RUN_TEST(resume_hint_probe_is_noncreating_and_rejects_other_grammar);
-    RUN_TEST(every_available_supported_shell_accepts_its_generated_syntax);
-    RUN_TEST(available_shells_resume_once_for_empty_wrong_or_extra_but_not_exact);
-    RUN_TEST(combined_runtime_misses_trigger_one_bounded_resume);
-    RUN_TEST(nonregular_or_invalid_hints_never_block_or_invoke_resume);
+    RUN_TEST(bash_generated_syntax);
+    RUN_TEST(bash_resume_matrix);
+    RUN_TEST(zsh_generated_syntax);
+    RUN_TEST(zsh_resume_matrix);
+    RUN_TEST(fish_generated_syntax);
+    RUN_TEST(fish_resume_matrix);
+    RUN_TEST(sh_generated_syntax);
+    RUN_TEST(sh_resume_matrix);
+    RUN_TEST(dash_generated_syntax);
+    RUN_TEST(dash_resume_matrix);
+    RUN_TEST(ksh_generated_syntax);
+    RUN_TEST(ksh_resume_matrix);
+    RUN_TEST(sh_combined_runtime_misses);
+    RUN_TEST(fish_combined_runtime_misses);
+    RUN_TEST(sh_invalid_hints_are_bounded);
+    RUN_TEST(fish_invalid_hints_are_bounded);
     RUN_TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership);
     RUN_TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership);
     RUN_TEST(posix_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths);
@@ -1175,8 +1203,5 @@ int main(int argc, char **argv) {
 
     ts_rm_rf(g_fixture.root);
     error_cleanup();
-    printf("\n%s: %d run, %d failed\n",
-           ts_tests_failed ? "RESULT FAIL" : "RESULT OK",
-           ts_tests_run, ts_tests_failed);
-    return ts_tests_failed == 0 ? 0 : 1;
+    return ts_test_finish();
 }

@@ -912,8 +912,7 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
     ssize_t target_len;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -986,8 +985,7 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     ssh_reap_fn previous_reap;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1070,8 +1068,7 @@ TEST(ssh_stable_link_obstruction_aborts_integrated_switch) {
     char key_path[512];
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1119,8 +1116,7 @@ TEST(failed_switch_restarts_previous_accounts_agent) {
     /* The real ssh-agent/ssh-add must be findable for ssh_manager_init's
      * probes (the runner fakes the spawns themselves). */
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1225,8 +1221,7 @@ TEST(failed_switch_never_rewrites_existing_ssh_config) {
     FILE *f;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1272,8 +1267,7 @@ TEST(failed_switch_never_creates_ssh_config) {
     struct stat st;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1306,8 +1300,7 @@ TEST(failed_switch_preserves_concurrent_ssh_config_replacement) {
     FILE *f;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1368,8 +1361,7 @@ TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back) {
     ssize_t n;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: no ssh-agent/ssh-add in PATH)\n");
-        return;
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1561,8 +1553,7 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     ssize_t n;
 
     if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1606,8 +1597,7 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     ssize_t n;
 
     if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1642,8 +1632,7 @@ TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     char active_home[MAX_PATH_LEN];
 
     if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1691,10 +1680,11 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
     char active_gpg_home[MAX_PATH_LEN];
     ssize_t target_len;
 
-    if (!command_exists("gpg") || !command_exists("ssh-agent") ||
-        !command_exists("ssh-add")) {
-        fprintf(stderr, "  (skipped: missing gpg/ssh-agent/ssh-add in PATH)\n");
-        return;
+    if (!command_exists("gpg")) {
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
+    }
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1756,8 +1746,7 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
 
 TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
     if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1795,8 +1784,7 @@ TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
  * Git/active state changes and must not disturb the independent SSH link. */
 TEST(gpg_stable_link_obstruction_aborts_integrated_switch) {
     if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1843,8 +1831,7 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
     /* gpg_manager_init PATH-probes the real gpg binary (the runner fakes the
      * spawns themselves). */
     if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1902,8 +1889,7 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
     ssize_t n;
 
     if (!command_exists("gpg")) {
-        fprintf(stderr, "  (skipped: no gpg in PATH)\n");
-        return;
+        TS_SKIP("gpg", "gpg unavailable in trusted PATH");
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);

@@ -334,6 +334,7 @@ TEST(nested_bind_mount_is_never_traversed) {
     char external[256], marker[320];
     pid_t child;
     int status = 0;
+    bool mount_namespace_unavailable = false;
 
     CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
                            home, sizeof(home), "work"), 0);
@@ -369,13 +370,16 @@ TEST(nested_bind_mount_is_never_traversed) {
     if (child > 0) {
         CHECK_EQ_INT(waitpid(child, &status, 0), child);
         if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
-            fprintf(stderr,
-                    "  (skip: private mount namespace/bind mount unavailable)\n");
+            mount_namespace_unavailable = true;
         } else {
             CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
         }
     }
     CHECK(path_exists(marker));
+    if (mount_namespace_unavailable) {
+        TS_SKIP("mount-namespace",
+                "private mount namespace/bind mount unavailable");
+    }
 }
 #endif
 
