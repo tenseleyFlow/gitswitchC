@@ -415,11 +415,18 @@ static int abort_failed_switch_checked(const account_t *prev,
                                        bool *git_remaining,
                                        bool *ssh_remaining,
                                        bool *gpg_remaining,
-                                       bool *rollback_complete) {
+                                       bool *rollback_complete,
+                                       char *rollback_detail,
+                                       size_t rollback_detail_size) {
     bool complete = true;
     bool git_left = git_written;
     bool ssh_left = ssh_dirty;
     bool gpg_left = gpg_dirty;
+    char first_detail[sizeof(g_last_error.message)] = "";
+
+    if (rollback_detail && rollback_detail_size > 0) {
+        rollback_detail[0] = '\0';
+    }
 
     /* AR-02 #2: a second guarded signal during this rollback used to take the
      * handler's emergency-kill branch and die mid-git_config_restore, leaving
@@ -429,6 +436,8 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (git_written) {
         if (git_config_restore() != 0) {
             complete = false;
+            safe_strncpy(first_detail, get_last_error()->message,
+                         sizeof(first_detail));
             log_warning("Incomplete rollback of Git configuration: %s",
                         get_last_error()->message);
         } else {
@@ -445,6 +454,10 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (deactivate_runtime_isolation(ssh_dirty, false) != 0) {
         complete = false;
         ssh_deactivate_failed = true;
+        if (first_detail[0] == '\0') {
+            safe_strncpy(first_detail, get_last_error()->message,
+                         sizeof(first_detail));
+        }
         log_warning("Incomplete rollback of the new account's SSH state: %s",
                     get_last_error()->message);
     }
@@ -453,6 +466,10 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (restore_previous_gpg_isolation(prev_gpg_home, prev_gpg_present,
                                        gpg_dirty) != 0) {
         complete = false;
+        if (first_detail[0] == '\0') {
+            safe_strncpy(first_detail, get_last_error()->message,
+                         sizeof(first_detail));
+        }
     } else {
         gpg_left = false;
     }
@@ -463,6 +480,10 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (!ssh_deactivate_failed) {
         if (restore_previous_ssh_isolation(prev, ssh_dirty) != 0) {
             complete = false;
+            if (first_detail[0] == '\0') {
+                safe_strncpy(first_detail, get_last_error()->message,
+                             sizeof(first_detail));
+            }
         } else {
             ssh_left = false;
         }
@@ -481,6 +502,9 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (gpg_remaining) *gpg_remaining = gpg_left;
     if (rollback_complete) {
         *rollback_complete = complete;
+    }
+    if (rollback_detail && rollback_detail_size > 0 && first_detail[0]) {
+        safe_strncpy(rollback_detail, first_detail, rollback_detail_size);
     }
     if (signals_pending() && !keep_rollback_active) {
         fprintf(stderr, "\ngitswitch: interrupted — switch rolled back, previous identity kept\n");
@@ -504,7 +528,7 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
                                        runtime_lock_fd,
                                        !defer_signal_dispatch,
                                        defer_signal_dispatch,
-                                       NULL, NULL, NULL, NULL);
+                                       NULL, NULL, NULL, NULL, NULL, 0);
 }
 
 /* Best-effort probes and informational output run only after the switch's
@@ -853,7 +877,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                                         !defer_signal_dispatch,
                                         defer_signal_dispatch,
                                         NULL, NULL, NULL,
-                                        &rollback_complete);
+                                        &rollback_complete, NULL, 0);
             set_error(ERR_SYSTEM_CALL,
                       "Cannot switch away from the active runtime session: %s%s",
                       detail[0] ? detail : "cleanup retained for retry",
@@ -1063,6 +1087,42 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             gpg_ok = g_session.gpg_active;
         }
 
+        /* AR-08 M7: close the ownership gap between the last managed Git
+         * write and every later fallible transaction step. The Git layer's
+         * intended image contains only writes this process completed; a
+         * fresh mismatch here is a concurrent writer, never a post-image we
+         * may adopt and overwrite during rollback. */
+        if (write_git && git_config_seal() != 0) {
+            char seal_detail[sizeof(g_last_error.message)];
+            char rollback_detail[sizeof(g_last_error.message)] = "";
+            bool rollback_complete = true;
+
+            safe_strncpy(seal_detail, get_last_error()->message,
+                         sizeof(seal_detail));
+            abort_failed_switch_checked(
+                prev_account, prev_gpg_home, prev_gpg_present, true,
+                ssh_dirty, gpg_dirty, runtime_lock_fd,
+                !defer_signal_dispatch, defer_signal_dispatch,
+                NULL, NULL, NULL, &rollback_complete,
+                rollback_detail, sizeof(rollback_detail));
+            if (!rollback_complete) {
+                set_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Git post-image verification failed: %s; rollback "
+                    "remains incomplete and retry material was retained: %s",
+                    seal_detail[0] ? seal_detail : "unknown verification error",
+                    rollback_detail[0] ? rollback_detail
+                                       : "unknown rollback error");
+            } else {
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Git post-image verification failed; switch was "
+                          "rolled back: %s",
+                          seal_detail[0] ? seal_detail
+                                         : "unknown verification error");
+            }
+            return -1;
+        }
+
         /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
          * switch back (git config, when written, was just written — restore it
          * too; on resume nothing was written, so nothing to restore). */
@@ -1120,6 +1180,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                       account->name,
                       detail[0] ? detail : "unknown SSH config error");
             return -1;
+        }
+
+        /* No fallible external commit remains for a direct switch. Once the
+         * optional alias writer has succeeded, rollback ownership must be
+         * discarded before releasing the cross-manager lock. */
+        if (!defer_commit && write_git) {
+            git_config_commit();
         }
 
         signals_scratch_cleanup();
@@ -1263,6 +1330,10 @@ int accounts_switch_commit(gitswitch_ctx_t *ctx) {
         return -1;
     }
 
+    if (g_pending_switch.git_written) {
+        git_config_commit();
+    }
+
     runtime_state_lock_release(g_pending_switch.runtime_lock_fd);
     g_pending_switch.runtime_lock_fd = -1;
     finish_switch_success(ctx, target, &g_pending_switch.switch_target,
@@ -1280,6 +1351,7 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
     const account_t *previous = NULL;
     bool rollback_complete = true;
     int guard_rc;
+    char rollback_detail[sizeof(g_last_error.message)] = "";
 
     if (!g_pending_switch.active || !ctx || g_pending_switch.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account switch to roll back");
@@ -1306,7 +1378,8 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
                                 &pending.git_written,
                                 &pending.ssh_dirty,
                                 &pending.gpg_dirty,
-                                &rollback_complete);
+                                &rollback_complete,
+                                rollback_detail, sizeof(rollback_detail));
     pending.runtime_lock_fd = -1;
 
     safe_strncpy(ctx->config.active_account, pending.previous_active,
@@ -1329,9 +1402,12 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
          * armed as part of that retry handle: dropping either before a
          * completed abort would let a repeated signal strand mixed state. */
         g_pending_switch = pending;
-        set_error(ERR_SYSTEM_CALL,
-                  "The prepared switch could not be rolled back completely; "
-                  "inspect Git and runtime state before retrying");
+        set_error(
+            ERR_SYSTEM_CALL,
+            "The prepared switch could not be rolled back completely; "
+            "retry material and transaction signal ownership were retained: %s",
+            rollback_detail[0] ? rollback_detail
+                               : "unknown rollback error");
         return -1;
     }
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));

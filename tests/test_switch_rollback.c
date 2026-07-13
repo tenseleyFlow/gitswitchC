@@ -2342,6 +2342,98 @@ TEST(repeated_signals_wait_for_prepared_switch_rollback) {
     }
 }
 
+/* AR-08 M4/M7: a prepared abort that preserves a concurrent Git vector is
+ * intentionally incomplete and retryable. Its retained retry handle includes
+ * both signal layers: two signals delivered before the writer repairs the
+ * exact post-image cannot kill the process until the second abort restores
+ * the before-image. This is also the accounts-level witness that M7's precise
+ * conflict diagnostic survives the broader runtime cleanup path. */
+TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry) {
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        char log_path[512];
+        char line[1024];
+        int signal_number = switch_guarded_signals[signal_index];
+        int status = 0;
+        pid_t pid;
+        bool seen_incomplete = false;
+        bool restored_after_retry = false;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        CHECK((size_t)snprintf(log_path, sizeof(log_path),
+                               "%s/incomplete-abort-%d.log", g_xdg,
+                               signal_number) < sizeof(log_path));
+        seed_previous_git_identity();
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct sigaction default_action;
+            gitswitch_ctx_t ctx = make_ctx();
+
+            memset(&default_action, 0, sizeof(default_action));
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            if (sigaction(signal_number, &default_action, NULL) != 0) _exit(40);
+            g_fail_user_name_set = false;
+            g_raise_on_user_name = false;
+            g_log = fopen(log_path, "w");
+            if (!g_log) _exit(41);
+            run_set_runner(fake_runner);
+            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(42);
+
+            /* External writer after the sealed post-image. */
+            safe_strncpy(g_store_name, "later-writer",
+                         sizeof(g_store_name));
+            if (accounts_switch_abort(&ctx, false) != -1) _exit(43);
+            if (!strstr(get_last_error()->message, "1 managed vector(s)") ||
+                !strstr(get_last_error()->message, "changed outside") ||
+                !strstr(get_last_error()->message, "retry material")) {
+                _exit(44);
+            }
+            if (fputs("MARK-INCOMPLETE-ABORT\n", g_log) == EOF ||
+                fflush(g_log) != 0) {
+                _exit(45);
+            }
+
+            raise(signal_number);
+            raise(signal_number);
+            if (!signals_pending() ||
+                signals_pending_signal() != signal_number) {
+                _exit(46);
+            }
+
+            /* Repair only the conflicted key to the sealed image. The
+             * retained Git snapshot now owns it again and retry can finish. */
+            safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+            (void)accounts_switch_abort(&ctx, false);
+            _exit(47); /* completed retry dispatches the pending signal */
+        }
+
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        {
+            FILE *log = fopen(log_path, "r");
+
+            CHECK(log != NULL);
+            if (log) {
+                while (fgets(line, sizeof(line), log)) {
+                    if (strstr(line, "MARK-INCOMPLETE-ABORT")) {
+                        seen_incomplete = true;
+                    } else if (seen_incomplete && strstr(line, "user.name") &&
+                               strstr(line, "Previous Name")) {
+                        restored_after_retry = true;
+                    }
+                }
+                fclose(log);
+            }
+        }
+        CHECK(seen_incomplete);
+        CHECK(restored_after_retry);
+    }
+}
+
 /* ---- AR-03 M3: guard continuity through the post-switch window ------------ */
 
 /* A signal landing AFTER the switch completed but BEFORE main() persists the
@@ -2464,6 +2556,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(direct_switch_restores_callers_signal_dispositions);
     RUN_TEST(direct_switch_reports_signal_restoration_failure_after_commit);
     RUN_TEST(repeated_signals_wait_for_prepared_switch_rollback);
+    RUN_TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()
