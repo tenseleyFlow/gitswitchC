@@ -67,6 +67,11 @@ static bool ascii_key_continuation_is_valid(unsigned char c) {
     return ascii_key_initial_is_valid(c) || (c >= '0' && c <= '9');
 }
 
+static bool ascii_section_segment_byte_is_valid(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
+
 /* This intentionally implements the application's narrower key contract, not
  * TOML's full bare-key grammar. Keep parser and setter-created documents on
  * the same ASCII-only, round-trippable surface. */
@@ -1176,21 +1181,30 @@ static toml_section_t *find_section(toml_document_t *doc, const char *section_na
     return NULL;
 }
 
-/* Public setters must only construct section names the parser can read back.
- * Keep the root section (empty name) as an internal parser-only state; every
- * public section is a non-empty bare TOML key made from the same byte class as
- * parse_section_header(). */
+/* Public setters and explicit headers share one narrow, locale-independent
+ * grammar: nonempty dot-separated ASCII bare-key segments. Keep the empty root
+ * section as an internal parser-only state. */
 static bool section_name_is_valid(const char *section_name) {
-    if (!section_name || section_name[0] == '\0') return false;
+    size_t length = 0;
+    bool segment_has_byte = false;
 
-    size_t length = strlen(section_name);
-    if (length >= TOML_MAX_SECTION_LEN) return false;
+    if (!section_name) return false;
+    while (length < TOML_MAX_SECTION_LEN && section_name[length] != '\0') {
+        length++;
+    }
+    if (length == 0 || length >= TOML_MAX_SECTION_LEN) return false;
 
     for (size_t i = 0; i < length; i++) {
         unsigned char c = (unsigned char)section_name[i];
-        if (!isalnum(c) && c != '.' && c != '_' && c != '-') return false;
+        if (c == '.') {
+            if (!segment_has_byte) return false;
+            segment_has_byte = false;
+        } else {
+            if (!ascii_section_segment_byte_is_valid(c)) return false;
+            segment_has_byte = true;
+        }
     }
-    return true;
+    return segment_has_byte;
 }
 
 /* Find or create section */
@@ -1272,17 +1286,24 @@ static int parse_section_header(toml_parser_state_t *state, char *section_name) 
             set_parser_error(state, "Section name too long");
             return -1;
         }
-        c = advance_char(state);
-
-        if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-') {
-            section_name[name_pos++] = c;
-        } else {
-            set_parser_error(state, "Invalid character in section name");
+        if (c != '.' &&
+            !ascii_section_segment_byte_is_valid((unsigned char)c)) {
+            set_parser_error(
+                state,
+                "Invalid section name: expected dot-separated ASCII bare-key segments");
             return -1;
         }
+        section_name[name_pos++] = advance_char(state);
     }
     
     section_name[name_pos] = '\0';
+
+    if (!section_name_is_valid(section_name)) {
+        set_parser_error(
+            state,
+            "Invalid section name: segments must be nonempty ASCII bare keys");
+        return -1;
+    }
 
     skip_whitespace(state);
 
@@ -1660,7 +1681,8 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
 
     if (!section_name_is_valid(section_name)) {
         set_error(ERR_CONFIG_INVALID,
-                  "Invalid TOML section name (1-%d bare-key bytes required): %s",
+                  "Invalid TOML section name (1-%d ASCII bytes in nonempty "
+                  "dot-separated bare-key segments): %s",
                   TOML_MAX_SECTION_LEN - 1, section_name);
         return -1;
     }
@@ -1734,7 +1756,8 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
 
     if (!section_name_is_valid(section_name)) {
         set_error(ERR_CONFIG_INVALID,
-                  "Invalid TOML section name (1-%d bare-key bytes required): %s",
+                  "Invalid TOML section name (1-%d ASCII bytes in nonempty "
+                  "dot-separated bare-key segments): %s",
                   TOML_MAX_SECTION_LEN - 1, section_name);
         return -1;
     }
