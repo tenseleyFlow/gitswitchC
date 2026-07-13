@@ -157,27 +157,55 @@ TEST(file_helpers_apply_descriptor_permissions) {
     rmdir(root);
 }
 
-TEST(ensure_private_dir_pins_leaf_and_rejects_symlink) {
+TEST(ensure_private_dir_contract_matches_adoption_policy) {
     char root[] = "/tmp/gs_private_dir_XXXXXX";
-    char private_dir[512], link_path[512];
+    char created_dir[512], private_dir[512], file_path[512], link_path[512];
     struct stat st;
 
     if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(created_dir, sizeof(created_dir), "%s/created", root);
     snprintf(private_dir, sizeof(private_dir), "%s/private", root);
+    snprintf(file_path, sizeof(file_path), "%s/file", root);
     snprintf(link_path, sizeof(link_path), "%s/link", root);
 
+    /* Absent paths are created as private directories. */
+    CHECK_EQ_INT(ensure_private_dir(created_dir), 0);
+    CHECK_EQ_INT(lstat(created_dir, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK_EQ_INT(st.st_mode & 0777, 0700);
+
+    /* Existing safe modes are accepted without being broadened to 0700. */
+    CHECK_EQ_INT(chmod(created_dir, 0500), 0);
+    CHECK_EQ_INT(ensure_private_dir(created_dir), 0);
+    CHECK_EQ_INT(lstat(created_dir, &st), 0);
+    CHECK_EQ_INT(st.st_mode & 0777, 0500);
+
+    /* On platforms with pinned no-follow directory descriptors, an existing
+     * self-owned permissive directory is safely adopted and tightened. */
     CHECK_EQ_INT(mkdir(private_dir, 0700), 0);
     CHECK_EQ_INT(chmod(private_dir, 0777), 0);
+#if defined(O_NOFOLLOW) && defined(O_DIRECTORY)
     CHECK_EQ_INT(ensure_private_dir(private_dir), 0);
     CHECK_EQ_INT(lstat(private_dir, &st), 0);
     CHECK(S_ISDIR(st.st_mode));
     CHECK_EQ_INT(st.st_mode & 0777, 0700);
+#else
+    CHECK_EQ_INT(ensure_private_dir(private_dir), -1);
+    clear_error();
+#endif
 
+    /* Non-directories and final-component symlinks are always refused. */
+    CHECK_EQ_INT(write_string_to_file(file_path, "not a directory\n", 0600), 0);
+    CHECK_EQ_INT(ensure_private_dir(file_path), -1);
+    clear_error();
     CHECK_EQ_INT(symlink(private_dir, link_path), 0);
     CHECK_EQ_INT(ensure_private_dir(link_path), -1);
     clear_error();
 
     unlink(link_path);
+    unlink(file_path);
+    chmod(created_dir, 0700);
+    rmdir(created_dir);
     rmdir(private_dir);
     rmdir(root);
 }
@@ -1389,7 +1417,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(find_command_path_finds_real_binary);
     RUN_TEST(command_exists_basic);
     RUN_TEST(file_helpers_apply_descriptor_permissions);
-    RUN_TEST(ensure_private_dir_pins_leaf_and_rejects_symlink);
+    RUN_TEST(ensure_private_dir_contract_matches_adoption_policy);
     RUN_TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast);
     RUN_TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir);
     RUN_TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting);

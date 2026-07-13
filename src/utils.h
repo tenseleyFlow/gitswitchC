@@ -48,11 +48,17 @@ int create_directory_recursive(const char *path, mode_t mode);
 int get_file_permissions(const char *path, mode_t *mode);
 
 /**
- * Ensure `path` is a directory that is safe to hold private material: created
- * with mode 0700 if absent, and verified (via lstat) to be a real directory
- * (not a symlink), owned by the current uid, with no group/other permission
- * bits. Refuses (returns -1) if an existing path fails these checks — defends
- * against a hostile pre-created/redirected dir in a shared /tmp. Returns 0 ok.
+ * Ensure the final component of `path` names a real directory owned by the
+ * real uid with no group/other permission bits. An absent path is requested at
+ * mode 0700. Where no-follow directory descriptors are available, a
+ * self-owned existing directory with unsafe permission bits is pinned,
+ * identity-checked, tightened to 0700 through that descriptor, and revalidated
+ * against the pathname. Platforms without those primitives refuse a
+ * permissive existing directory instead of chmodding by pathname. Final
+ * symlinks, non-directories, foreign-owned entries, detected replacement, and
+ * open/chmod/verification failures return -1. Returns 0 only after successful
+ * creation or validation; parent-component symlinks are outside this helper's
+ * contract.
  */
 int ensure_private_dir(const char *path);
 
