@@ -50,8 +50,11 @@ HOSTCC ?= cc
 # TOOLCHAIN_IDENTITY_FILES to the complete whitespace-free path list.
 CC = gcc
 CC_LAUNCHER := $(firstword $(CC))
+# macOS still ships GNU make 3.81, whose parser treats an unescaped `#` inside
+# $(shell ...) as a comment. Use the already-required POSIX sed instead of
+# ${p##*/} here, without adding another parse-time tool dependency.
 CC_RESOLVED_DEFAULT := $(shell p=`command -v "$(CC_LAUNCHER)" 2>/dev/null` || exit 0; \
-	d=$${p%/*}; b=$${p##*/}; \
+	d=$${p%/*}; b=`printf '%s\n' "$$p" | sed 's,.*/,,'`; \
 	if test "$$d" = "$$p"; then d=.; b=$$p; fi; \
 	cd "$$d" 2>/dev/null && printf '%s/%s' "$$PWD" "$$b")
 CC_IDENTITY_FILE ?= $(CC_RESOLVED_DEFAULT)
