@@ -411,8 +411,23 @@ expect_dirty_rejected()
     fi
     grep -F 'ERROR: release manifest' "$out" >/dev/null ||
         fail "$label rejection did not identify the release manifest"
-    [ ! -e "$archive" ] ||
+    { [ ! -e "$archive" ] && [ ! -L "$archive" ]; } ||
         fail "$label rejection left a release archive behind"
+}
+
+expect_output_rejected()
+{
+    label=$1
+    repo=$2
+    make_cmd=$3
+    requested=$4
+    out=$5
+
+    if "$make_cmd" -C "$repo" DIST_ARCHIVE="$requested" dist >"$out" 2>&1; then
+        fail "$label output alias unexpectedly succeeded"
+    fi
+    grep -F 'ERROR: DIST_ARCHIVE must be exactly build/dist/' "$out" >/dev/null ||
+        fail "$label rejection did not identify the output boundary"
 }
 
 check_manifest_contract()
@@ -444,12 +459,70 @@ check_manifest_contract()
     version=$(git -C "$clean_repo" show "$commit:VERSION") ||
         fail "cannot read committed VERSION"
     dist_root=gitswitcher-$version
-    archive=$clean_repo/$dist_root.tar.gz
+    archive=$clean_repo/build/dist/$dist_root.tar.gz
     out=$tmp/make.out
+    status_before=$(git -C "$clean_repo" status --porcelain=v1 --untracked-files=all)
+    cp "$clean_repo/VERSION" "$tmp/VERSION.before"
+    cp "$clean_repo/README.md" "$tmp/README.before"
+    cp "$clean_repo/src/main.c" "$tmp/main.before"
 
     "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 ||
         fail "clean committed release failed"
     assert_archive_metadata "$archive" "$dist_root" "$version"
+
+    # An existing artifact is never replaced, even by a byte-identical rerun.
+    cp "$archive" "$tmp/archive.before"
+    if "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1; then
+        fail "existing release archive was overwritten"
+    fi
+    grep -F 'ERROR: distribution archive already exists' "$out" >/dev/null ||
+        fail "existing archive rejection was not precise"
+    cmp -s "$archive" "$tmp/archive.before" ||
+        fail "existing archive bytes changed after rejection"
+
+    # Caller-controlled output may never alias a tracked/manifest path, an
+    # absolute source path, or a lexical escape from the artifact directory.
+    rm -f "$archive"
+    expect_output_rejected "VERSION" "$clean_repo" "$make_cmd" VERSION "$out"
+    expect_output_rejected "absolute README" "$clean_repo" "$make_cmd" \
+        "$clean_repo/README.md" "$out"
+    expect_output_rejected "manifest member" "$clean_repo" "$make_cmd" \
+        src/main.c "$out"
+    expect_output_rejected "lexical escape" "$clean_repo" "$make_cmd" \
+        "build/dist/../../VERSION" "$out"
+    cmp -s "$clean_repo/VERSION" "$tmp/VERSION.before" ||
+        fail "VERSION bytes changed during output-alias rejection"
+    cmp -s "$clean_repo/README.md" "$tmp/README.before" ||
+        fail "README bytes changed during output-alias rejection"
+    cmp -s "$clean_repo/src/main.c" "$tmp/main.before" ||
+        fail "manifest source bytes changed during output-alias rejection"
+
+    # A symlink at the one valid publication name survives unchanged and its
+    # source target is never truncated or removed.
+    mkdir -p "$(dirname "$archive")"
+    ln -s ../../README.md "$archive"
+    if "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1; then
+        fail "symlink release output was replaced"
+    fi
+    [ -L "$archive" ] &&
+        [ "$(readlink "$archive")" = ../../README.md ] ||
+        fail "release output symlink changed after rejection"
+    cmp -s "$clean_repo/README.md" "$tmp/README.before" ||
+        fail "release output symlink target was modified"
+    rm -f "$archive"
+
+    # The physical absolute spelling of the dedicated output is also valid;
+    # publication still lands at the one canonical path from a fresh temp.
+    "$make_cmd" -C "$clean_repo" DIST_ARCHIVE="$archive" dist >"$out" 2>&1 ||
+        fail "valid absolute artifact path was rejected"
+    assert_archive_metadata "$archive" "$dist_root" "$version"
+    if find "$clean_repo/build/dist" -name '.*.tmp.*' -print |
+        grep . >/dev/null; then
+        fail "distribution publication left a temporary archive"
+    fi
+    status_after=$(git -C "$clean_repo" status --porcelain=v1 --untracked-files=all)
+    [ "$status_after" = "$status_before" ] ||
+        fail "distribution output matrix changed Git status"
 
     # Developer VERSION/DIST_ROOT overrides must not rename committed payload.
     rm -f "$archive"
@@ -457,10 +530,11 @@ check_manifest_contract()
         DIST_ROOT=gitswitcher-9.9.9-uncommitted dist >"$out" 2>&1 ||
         fail "commit-pinned release failed under irrelevant live overrides"
     assert_archive_metadata "$archive" "$dist_root" "$version"
-    [ ! -e "$clean_repo/gitswitcher-9.9.9-uncommitted.tar.gz" ] ||
+    [ ! -e "$clean_repo/build/dist/gitswitcher-9.9.9-uncommitted.tar.gz" ] ||
         fail "VERSION/DIST_ROOT override renamed committed release payload"
 
     # The RPM target must consume the spec embedded in that same archive.
+    rm -f "$archive"
     shim_dir=$tmp/shims
     rpm_home=$tmp/rpm-home
     mkdir -p "$shim_dir" "$rpm_home"
@@ -479,26 +553,26 @@ check_manifest_contract()
     git clone --quiet "$root" "$dirty_version" || fail "cannot clone VERSION fixture"
     printf '%s\n' '9.9.9-dirty' >"$dirty_version/VERSION"
     expect_dirty_rejected "dirty VERSION" "$dirty_version" "$make_cmd" \
-        "$dirty_version/$dist_root.tar.gz" "$out"
+        "$dirty_version/build/dist/$dist_root.tar.gz" "$out"
 
     dirty_spec=$tmp/dirty-spec
     git clone --quiet "$root" "$dirty_spec" || fail "cannot clone spec fixture"
     printf '%s\n' '# uncommitted RPM instruction' >>"$dirty_spec/gitswitcher.spec"
     expect_dirty_rejected "dirty spec" "$dirty_spec" "$make_cmd" \
-        "$dirty_spec/$dist_root.tar.gz" "$out"
+        "$dirty_spec/build/dist/$dist_root.tar.gz" "$out"
 
     dirty_manifest=$tmp/dirty-manifest
     git clone --quiet "$root" "$dirty_manifest" || fail "cannot clone manifest fixture"
     printf '%s\n' '# uncommitted release text' >>"$dirty_manifest/README.md"
     expect_dirty_rejected "dirty tracked manifest" "$dirty_manifest" \
-        "$make_cmd" "$dirty_manifest/$dist_root.tar.gz" "$out"
+        "$make_cmd" "$dirty_manifest/build/dist/$dist_root.tar.gz" "$out"
 
     untracked_manifest=$tmp/untracked-manifest
     git clone --quiet "$root" "$untracked_manifest" ||
         fail "cannot clone untracked manifest fixture"
     printf '%s\n' 'uncommitted release input' >"$untracked_manifest/src/.ar07-untracked"
     expect_dirty_rejected "untracked manifest" "$untracked_manifest" \
-        "$make_cmd" "$untracked_manifest/$dist_root.tar.gz" "$out"
+        "$make_cmd" "$untracked_manifest/build/dist/$dist_root.tar.gz" "$out"
 
     printf 'ar07-release: PASS (commit-pinned metadata and dirty-input refusal)\n'
 }

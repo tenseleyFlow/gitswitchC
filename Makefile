@@ -747,7 +747,18 @@ else
 endif
 RPM_VERSION = $(RELEASE_VERSION)
 override DIST_ROOT := $(PACKAGE)-$(RELEASE_VERSION)
-DIST_ARCHIVE ?= $(DIST_ROOT).tar.gz
+# Release output has one dedicated, ignored namespace. DIST_ARCHIVE remains a
+# compatibility/request variable, but the dist recipe accepts only this exact
+# path (relative or physical absolute spelling); it is never interpolated as
+# shell syntax. Consumers use the fixed canonical path below.
+override DIST_ARTIFACT_DIR := build/dist
+override DIST_ARCHIVE_NAME := $(DIST_ROOT).tar.gz
+override DIST_ARCHIVE_PATH := $(CURDIR)/$(DIST_ARTIFACT_DIR)/$(DIST_ARCHIVE_NAME)
+DIST_ARCHIVE ?= $(DIST_ARTIFACT_DIR)/$(DIST_ARCHIVE_NAME)
+export GITSWITCH_DIST_ARCHIVE_REQUEST = $(DIST_ARCHIVE)
+export GITSWITCH_DIST_ARCHIVE_PATH = $(DIST_ARCHIVE_PATH)
+export GITSWITCH_DIST_ARCHIVE_NAME = $(DIST_ARCHIVE_NAME)
+export GITSWITCH_DIST_ROOT = $(DIST_ROOT)
 # Reviewed allowlist. Copying only these entries inherently excludes VCS/OMX
 # state, build products, cores, logs, and previously generated archives.
 DIST_MANIFEST = src tests completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
@@ -787,12 +798,58 @@ release-manifest-check:
 # content (AR-05 L5). git archive draws from HEAD, which also inherently
 # excludes VCS state, build products, cores, logs, and prior archives.
 dist: release-manifest-check
-	@echo "Creating distribution tarball..."
-	git archive --prefix=$(DIST_ROOT)/ -o $(DIST_ARCHIVE) \
-		$(RELEASE_COMMIT) -- $(DIST_MANIFEST)
+	@set -e; \
+	root_physical=`CDPATH='' cd "$(CURDIR)" && pwd -P`; \
+	request="$$GITSWITCH_DIST_ARCHIVE_REQUEST"; \
+	expected_rel="$(DIST_ARTIFACT_DIR)/$$GITSWITCH_DIST_ARCHIVE_NAME"; \
+	expected_abs="$$root_physical/$$expected_rel"; \
+	case "$(RELEASE_VERSION)" in \
+		''|*[!A-Za-z0-9._+-]*) \
+			echo 'ERROR: committed release VERSION is not path-safe' >&2; exit 1 ;; \
+	esac; \
+	case "$$request" in \
+		"$$expected_rel"|"$$expected_abs") ;; \
+		*) echo "ERROR: DIST_ARCHIVE must be exactly $$expected_rel" >&2; exit 1 ;; \
+	esac; \
+	if git ls-files --error-unmatch -- "$$expected_rel" >/dev/null 2>&1; then \
+		echo 'ERROR: distribution output aliases a tracked path' >&2; exit 1; \
+	fi; \
+	if ! git check-ignore -q -- "$$expected_rel"; then \
+		echo 'ERROR: distribution output directory is not ignored' >&2; exit 1; \
+	fi; \
+	for component in build "$(DIST_ARTIFACT_DIR)"; do \
+		if test -L "$$component"; then \
+			echo "ERROR: distribution directory is a symlink: $$component" >&2; exit 1; \
+		fi; \
+		if test -e "$$component" && ! test -d "$$component"; then \
+			echo "ERROR: distribution directory is not a directory: $$component" >&2; exit 1; \
+		fi; \
+		test -d "$$component" || mkdir "$$component"; \
+	done; \
+	cd "$(DIST_ARTIFACT_DIR)"; \
+	actual_dir=`pwd -P`; \
+	if test "$$actual_dir" != "$$root_physical/$(DIST_ARTIFACT_DIR)"; then \
+		echo 'ERROR: distribution directory resolved outside its dedicated namespace' >&2; exit 1; \
+	fi; \
+	if test -e "$$GITSWITCH_DIST_ARCHIVE_NAME" || \
+	   test -L "$$GITSWITCH_DIST_ARCHIVE_NAME"; then \
+		echo 'ERROR: distribution archive already exists; refusing to replace it' >&2; exit 1; \
+	fi; \
+	tmp=`mktemp "./.$$GITSWITCH_DIST_ARCHIVE_NAME.tmp.XXXXXX"`; \
+	trap 'status=$$?; trap - 0 1 2 3 15; rm -f "$$tmp"; exit $$status' 0 1 2 3 15; \
+	echo "Creating distribution tarball: $$expected_rel"; \
+	git -C "$$root_physical" archive --format=tar.gz \
+		--prefix="$$GITSWITCH_DIST_ROOT/" -o "$$tmp" \
+		"$(RELEASE_COMMIT)" -- $(DIST_MANIFEST); \
+	ln "$$tmp" "$$GITSWITCH_DIST_ARCHIVE_NAME" || { \
+		echo 'ERROR: distribution archive appeared during publication' >&2; exit 1; \
+	}; \
+	rm -f "$$tmp"; \
+	trap - 0 1 2 3 15
 
 distcheck: dist
-	@sh tests/test_dist.sh "$(CURDIR)/$(DIST_ARCHIVE)" "$(DIST_ROOT)" \
+	@sh tests/test_dist.sh "$$GITSWITCH_DIST_ARCHIVE_PATH" \
+		"$$GITSWITCH_DIST_ROOT" \
 		"$(PREFIX)" "$(MAKE_COMMAND)"
 
 # Negative release-input checks run in isolated local clones, so they can dirty
@@ -873,10 +930,11 @@ rpm: dist
 	@command -v rpmbuild >/dev/null 2>&1 || (echo "rpmbuild not available - install rpm-build package" && exit 1)
 	mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES \
 		~/rpmbuild/SPECS ~/rpmbuild/SRPMS
-	cp $(DIST_ARCHIVE) ~/rpmbuild/SOURCES/
+	cp "$$GITSWITCH_DIST_ARCHIVE_PATH" ~/rpmbuild/SOURCES/
 	# Consume the review-identical spec embedded in the commit-pinned archive,
 	# never a second live-checkout input.
-	tar -xOf $(DIST_ARCHIVE) $(DIST_ROOT)/$(PACKAGE).spec > \
+	tar -xOf "$$GITSWITCH_DIST_ARCHIVE_PATH" \
+		"$$GITSWITCH_DIST_ROOT/$(PACKAGE).spec" > \
 		~/rpmbuild/SPECS/$(PACKAGE).spec
 	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
 	@echo "RPM packages created in ~/rpmbuild/RPMS/"

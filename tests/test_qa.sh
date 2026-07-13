@@ -14,7 +14,10 @@ root=$1
 make_cmd=$2
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-qa-contract.XXXXXX")
-qa_archive=$root/qa-contract-$$.tar.gz
+qa_version=$(sed -n '1p' "$root/VERSION")
+[ -n "$qa_version" ] || fail "VERSION is empty"
+qa_root=gitswitcher-$qa_version
+qa_archive=$root/build/dist/$qa_root.tar.gz
 cleanup()
 {
     status=$?
@@ -126,16 +129,17 @@ fi
 
 # `dist` runs before the validator. A deliberately invalid prefix must fail
 # and the validator's earliest exit path must still delete the new archive.
-if "$make_cmd" -C "$root" DIST_ARCHIVE="$(basename "$qa_archive")" \
-    DIST_ROOT="gitswitcher-qa-$$" PREFIX=relative distcheck >"$out" 2>&1; then
+rm -f "$qa_archive"
+if "$make_cmd" -C "$root" PREFIX=relative distcheck >"$out" 2>&1; then
     fail "distcheck accepted a relative installation prefix"
 fi
 [ ! -e "$qa_archive" ] || fail "failed distcheck left its source archive behind"
 
 # Even malformed direct invocations must install cleanup before validating
 # argc, because the archive path may already name a generated artifact.
+mkdir -p "$(dirname "$qa_archive")"
 printf 'usage-path fixture\n' >"$qa_archive"
-if sh "$root/tests/test_dist.sh" "$qa_archive" "gitswitcher-qa-$$" /usr/local \
+if sh "$root/tests/test_dist.sh" "$qa_archive" "$qa_root" /usr/local \
     >"$out" 2>&1; then
     fail "dist validator accepted a malformed three-argument invocation"
 fi
