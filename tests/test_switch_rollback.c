@@ -110,11 +110,42 @@ static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer *
 static FILE *g_log;                 /* when set, every argv is logged here */
 static char g_effective_signingkey_observed[MAX_GPG_FINGERPRINT_LEN];
 
+static const int switch_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
+#define SWITCH_GUARDED_SIGNAL_COUNT \
+    (sizeof(switch_guarded_signals) / sizeof(switch_guarded_signals[0]))
+
 static ssh_process_outcome_t refuse_session_agent_reap(
     pid_t pid, const char *socket_arg, int runtime_dir_fd) {
     (void)pid;
     (void)socket_arg;
     (void)runtime_dir_fd;
+    return SSH_PROCESS_OWNED;
+}
+
+static int g_session_reap_signal;
+static int g_session_reap_calls;
+
+/* Causal AR-08 M4 probe: inject the repeated signal from inside the exact
+ * previous-session reap boundary. The first call belongs to
+ * accounts_session_cleanup(); a later call proves the checked abort reached
+ * runtime rollback before the pending signal was re-raised. */
+static ssh_process_outcome_t signal_during_session_agent_reap(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
+    int call = ++g_session_reap_calls;
+
+    (void)pid;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    if (g_log) {
+        fprintf(g_log, "MARK-SESSION-REAP-%d-BEFORE\n", call);
+        fflush(g_log);
+    }
+    raise(g_session_reap_signal);
+    raise(g_session_reap_signal);
+    if (g_log) {
+        fprintf(g_log, "MARK-SESSION-REAP-%d-AFTER\n", call);
+        fflush(g_log);
+    }
     return SSH_PROCESS_OWNED;
 }
 
@@ -1131,6 +1162,112 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     g_fail_list_config = false;
 }
 
+/* AR-08 M4: previous-session teardown is already a mutating switch phase.
+ * Repeated signals raised from inside its reap callback must stay deferred
+ * through the checked rollback. Before the fix, rollback deferral began only
+ * after accounts_session_cleanup(), so the second raise terminated the child
+ * before the callback's AFTER marker (and before any rollback reap). */
+TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
+    char first_key[512];
+    char second_key[512];
+    command_runner_fn previous_runner;
+    gitswitch_ctx_t ctx;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    ctx = make_ctx();
+    snprintf(first_key, sizeof(first_key), "%s/key_signal_first", g_xdg);
+    CHECK_EQ_INT(write_fake_key(first_key), 0);
+    ctx.accounts[0].ssh_enabled = true;
+    safe_strncpy(ctx.accounts[0].ssh_key_path, first_key,
+                 sizeof(ctx.accounts[0].ssh_key_path));
+
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_fail_list_config = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+
+    memset(&ctx.accounts[1], 0, sizeof(ctx.accounts[1]));
+    ctx.accounts[1].id = 2;
+    safe_strncpy(ctx.accounts[1].name, "second",
+                 sizeof(ctx.accounts[1].name));
+    safe_strncpy(ctx.accounts[1].email, "second@example.com",
+                 sizeof(ctx.accounts[1].email));
+    safe_strncpy(ctx.accounts[1].description, "signal cleanup target",
+                 sizeof(ctx.accounts[1].description));
+    ctx.accounts[1].preferred_scope = GIT_SCOPE_GLOBAL;
+    ctx.accounts[1].ssh_enabled = true;
+    snprintf(second_key, sizeof(second_key), "%s/key_signal_second", g_xdg);
+    CHECK_EQ_INT(write_fake_key(second_key), 0);
+    safe_strncpy(ctx.accounts[1].ssh_key_path, second_key,
+                 sizeof(ctx.accounts[1].ssh_key_path));
+    ctx.account_count = 2;
+
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        char log_path[512];
+        char line[256];
+        bool first_after = false;
+        bool rollback_before = false;
+        int signal_number = switch_guarded_signals[signal_index];
+        int status = 0;
+        pid_t pid;
+
+        CHECK((size_t)snprintf(log_path, sizeof(log_path),
+                               "%s/session-cleanup-%d.log", g_xdg,
+                               signal_number) < sizeof(log_path));
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct sigaction default_action;
+
+            memset(&default_action, 0, sizeof(default_action));
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            if (sigaction(signal_number, &default_action, NULL) != 0) _exit(30);
+            g_log = fopen(log_path, "w");
+            if (!g_log) _exit(31);
+            g_session_reap_signal = signal_number;
+            g_session_reap_calls = 0;
+            (void)ssh_manager_set_reap_fn(signal_during_session_agent_reap);
+            (void)accounts_switch(&ctx, "second");
+            _exit(32); /* completed checked abort dispatches the signal */
+        }
+
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        {
+            FILE *log = fopen(log_path, "r");
+
+            CHECK(log != NULL);
+            if (log) {
+                while (fgets(line, sizeof(line), log)) {
+                    if (strstr(line, "MARK-SESSION-REAP-1-AFTER")) {
+                        first_after = true;
+                    }
+                    if (strstr(line, "MARK-SESSION-REAP-2-BEFORE")) {
+                        rollback_before = true;
+                    }
+                }
+                fclose(log);
+            }
+        }
+        CHECK(first_after);
+        CHECK(rollback_before);
+    }
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    g_fail_list_config = false;
+}
+
 /* Write a private-key-shaped 0600 file so ssh_validate_key_file accepts it. */
 static int write_fake_key(const char *path) {
     FILE *f = fopen(path, "w");
@@ -2011,10 +2148,6 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
 
 /* ---- AR-08 M4/M6: transaction-wide signal ownership ----------------------- */
 
-static const int switch_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
-#define SWITCH_GUARDED_SIGNAL_COUNT \
-    (sizeof(switch_guarded_signals) / sizeof(switch_guarded_signals[0]))
-
 static void switch_inherited_handler(int signal_number) {
     (void)signal_number;
 }
@@ -2312,6 +2445,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
     RUN_TEST(repeated_switch_validation_failure_keeps_live_session);
     RUN_TEST(repeated_switch_reap_failure_preserves_live_session);
+    RUN_TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort);
     RUN_TEST(ssh_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_restarts_previous_accounts_agent);
     RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);

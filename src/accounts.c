@@ -820,6 +820,15 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             return -1;
         }
 
+        /* AR-08 M4: repeat-signal deferral begins with the first possible
+         * mutation, not merely with activation of the new account. A prior
+         * successful switch can leave an owned agent in g_session, and the
+         * cleanup immediately below reaps that agent before the new runtime
+         * is started. A second signal in that cleanup window must remain
+         * pending until the old runtime has either been restored or the
+         * switch has reached a completed commit/abort. */
+        signals_rollback_begin();
+
         /* A prior successful accounts_switch() can leave an owned agent in
          * this process's session state. Stopping it is a real mutation: do it
          * only after every read-only validation has passed and the signal
@@ -862,15 +871,11 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                                        defer_signal_dispatch);
         }
 
-        /* AR-08 M4: once the first durable mutation begins, repeat-signal
-         * deferral belongs to the whole transaction — forward activation,
-         * Git publication, deferred teardown, prepared persistence, and the
-         * eventual commit or completed abort. Clearing it between any of
-         * those phases lets a second signal take the emergency-exit path and
-         * strand a mixed identity. Interactive children still receive the
-         * repeated signal through the published-child forwarding path, so
-         * this continuous deferral does not make prompts uninterruptible. */
-        signals_rollback_begin();
+        /* Repeat-signal deferral armed above remains continuous through
+         * forward activation, Git publication, deferred teardown, prepared
+         * persistence, and the eventual commit or completed abort.
+         * Interactive children still receive the repeated signal through the
+         * published-child forwarding path, so prompts remain interruptible. */
 
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
@@ -1274,6 +1279,7 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
     pending_switch_t pending;
     const account_t *previous = NULL;
     bool rollback_complete = true;
+    int guard_rc;
 
     if (!g_pending_switch.active || !ctx || g_pending_switch.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account switch to roll back");
@@ -1295,8 +1301,8 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
                                 pending.previous_gpg_present,
                                 pending.git_written, pending.ssh_dirty,
                                 pending.gpg_dirty, pending.runtime_lock_fd,
-                                !continue_persistence_rollback,
-                                continue_persistence_rollback,
+                                false,
+                                true,
                                 &pending.git_written,
                                 &pending.ssh_dirty,
                                 &pending.gpg_dirty,
@@ -1318,7 +1324,10 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
     if (!rollback_complete) {
         /* Retain exactly the unfinished rollback components. A caller may
          * repair a transient Git/runtime failure and retry abort; completed
-         * components are not replayed, and the runtime lock is reacquired. */
+         * components are not replayed, and the runtime lock is reacquired.
+         * The signal guard and repeat-signal deferral deliberately remain
+         * armed as part of that retry handle: dropping either before a
+         * completed abort would let a repeated signal strand mixed state. */
         g_pending_switch = pending;
         set_error(ERR_SYSTEM_CALL,
                   "The prepared switch could not be rolled back completely; "
@@ -1326,6 +1335,33 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
         return -1;
     }
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));
+
+    /* main() may still need to reverse its active-account file and resume
+     * hint, so CLI-owned abort keeps both layers armed until common cleanup.
+     * A standalone prepared-API caller has completed every rollback here:
+     * only now is it safe to restore caller dispositions and dispatch. */
+    if (continue_persistence_rollback) {
+        return 0;
+    }
+    signals_rollback_end();
+    guard_rc = signals_guard_end();
+    if (guard_rc != 0) {
+        char detail[sizeof(g_last_error.message)];
+        int restore_errno = errno;
+
+        safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+        errno = restore_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "Prepared switch rolled back, but restoring the caller's signal "
+            "dispositions failed: %s",
+            detail[0] ? detail : "unknown signal restoration error");
+        errno = restore_errno;
+        return -1;
+    }
+    if (signals_pending()) {
+        signals_dispatch_pending();
+    }
     return 0;
 }
 
