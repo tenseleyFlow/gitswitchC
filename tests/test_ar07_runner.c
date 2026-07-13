@@ -523,6 +523,68 @@ TEST(forced_bulk_failure_is_reported_without_fallback) {
     CHECK_EQ_INT(observation.close_syscalls, 0);
 }
 
+/* M21: AUTO must not turn an unexpected bulk-close failure into the capped
+ * numeric sweep.  A non-CLOEXEC descriptor above that old 65536 cap is the
+ * concrete leak witness; fail-closed AUTO reports the cleanup error over the
+ * checked child setup-status channel instead of executing the helper. */
+TEST(auto_bulk_failure_with_high_fd_fails_child_setup_closed) {
+    enum { HIGH_FD = 70000 };
+    struct rlimit limit;
+    int status = 0;
+
+    if (!run_test_fd_close_bulk_supported()) {
+        printf("[ info ] AUTO bulk-close failure requires a bulk-close platform\n");
+        return;
+    }
+    int limit_rc = getrlimit(RLIMIT_NOFILE, &limit);
+    CHECK_EQ_INT(limit_rc, 0);
+    if (limit_rc != 0) return;
+    bool high_fd_representable =
+        limit.rlim_max == RLIM_INFINITY || limit.rlim_max > HIGH_FD;
+    if (!high_fd_representable) {
+        printf("[ info ] hard descriptor limit cannot represent fd %d; "
+               "still checking AUTO setup-status failure\n", HIGH_FD);
+    }
+
+    pid_t worker = fork();
+    CHECK(worker >= 0);
+    if (worker < 0) return;
+    if (worker == 0) {
+        struct rlimit raised = limit;
+        const char *argv[] = {"true", NULL};
+        run_result_t result;
+        int nullfd;
+
+        if (high_fd_representable) {
+            if (raised.rlim_cur <= HIGH_FD) {
+                raised.rlim_cur = (rlim_t)HIGH_FD + 1;
+                if (setrlimit(RLIMIT_NOFILE, &raised) != 0) _exit(2);
+            }
+            nullfd = open("/dev/null", O_RDONLY);
+            if (nullfd < 0 || dup2(nullfd, HIGH_FD) != HIGH_FD) _exit(2);
+            if (nullfd != HIGH_FD) close(nullfd);
+        }
+
+        if (run_test_set_fd_close_strategy(RUN_TEST_FD_CLOSE_AUTO) != 0) {
+            _exit(2);
+        }
+        run_test_set_bulk_close_failure(EIO);
+        clear_error();
+        int rc = run_argv(argv, NULL, &result);
+        const error_context_t *error = get_last_error();
+        bool failed_closed =
+            rc == -1 && result.spawned && result.exit_code == 126 && error &&
+            strstr(error->message,
+                   "child descriptor cleanup failed") != NULL;
+
+        if (high_fd_representable) close(HIGH_FD);
+        _exit(failed_closed ? 0 : 1);
+    }
+
+    CHECK(reap_within(worker, 2000, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static void exhaust_fds_after_exec_pin(const char *resolved_path) {
     (void)resolved_path;
     while (open("/dev/null", O_RDONLY) >= 0) {
@@ -559,6 +621,42 @@ TEST(forced_incomplete_snapshot_fails_before_spawn) {
         _exit(rc != 0 && !result.spawned && error &&
                       strstr(error->message,
                              "forced child-FD snapshot is incomplete") != NULL
+                  ? 0 : 1);
+    }
+    CHECK(reap_within(worker, 1500, &status));
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+/* M21's portable AUTO choice has the same completeness obligation as forced
+ * SNAPSHOT.  Exhaust descriptors after the executable pin so enumeration is
+ * deterministically incomplete; AUTO must reject that state before fork,
+ * rather than reaching its bounded numeric child fallback. */
+TEST(auto_incomplete_snapshot_fails_before_spawn) {
+    int status = 0;
+
+    pid_t worker = fork();
+    CHECK(worker >= 0);
+    if (worker < 0) return;
+    if (worker == 0) {
+        struct rlimit limit = {.rlim_cur = 16, .rlim_max = 16};
+        const char *argv[] = {"true", NULL};
+        run_result_t result;
+
+        if (fcntl(STDIN_FILENO, F_GETFD) < 0 ||
+            fcntl(STDOUT_FILENO, F_GETFD) < 0 ||
+            fcntl(STDERR_FILENO, F_GETFD) < 0 ||
+            run_test_set_fd_close_strategy(RUN_TEST_FD_CLOSE_AUTO) != 0 ||
+            setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            _exit(2);
+        }
+        run_test_set_auto_bulk_close_unavailable(true);
+        run_test_set_exec_resolved_hook(exhaust_fds_after_exec_pin);
+        clear_error();
+        int rc = run_argv(argv, NULL, &result);
+        const error_context_t *error = get_last_error();
+        _exit(rc != 0 && !result.spawned && error &&
+                      strstr(error->message,
+                             "automatic child-FD snapshot is incomplete") != NULL
                   ? 0 : 1);
     }
     CHECK(reap_within(worker, 1500, &status));
@@ -699,7 +797,9 @@ int main(int argc, char **argv) {
     RUN_TEST(sparse_parent_descriptors_close_in_numeric_branch);
     RUN_TEST(sparse_parent_descriptors_close_in_bulk_branch_when_supported);
     RUN_TEST(forced_bulk_failure_is_reported_without_fallback);
+    RUN_TEST(auto_bulk_failure_with_high_fd_fails_child_setup_closed);
     RUN_TEST(forced_incomplete_snapshot_fails_before_spawn);
+    RUN_TEST(auto_incomplete_snapshot_fails_before_spawn);
     RUN_TEST(large_fd_limit_proves_auto_avoids_numeric_sweep);
     printf("\n%s: %d run, %d failed\n",
            ts_tests_failed ? "RESULT FAIL" : "RESULT OK",

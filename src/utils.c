@@ -1973,6 +1973,7 @@ static bool g_test_fd_close_observation_enabled;
 static bool g_test_fd_close_observation_valid;
 static run_test_fd_close_observation_t g_test_fd_close_observation;
 static int g_test_bulk_close_failure_errno;
+static bool g_test_auto_bulk_close_unavailable;
 static run_test_exec_resolved_hook_fn g_test_exec_resolved_hook;
 
 int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
@@ -2013,6 +2014,10 @@ bool run_test_get_fd_close_observation(
 
 void run_test_set_bulk_close_failure(int system_errno) {
     g_test_bulk_close_failure_errno = system_errno > 0 ? system_errno : 0;
+}
+
+void run_test_set_auto_bulk_close_unavailable(bool unavailable) {
+    g_test_auto_bulk_close_unavailable = unavailable;
 }
 
 void run_test_set_exec_resolved_hook(run_test_exec_resolved_hook_fn hook) {
@@ -2296,8 +2301,14 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     bool require_bulk_close = false;
     switch (g_test_fd_close_strategy) {
         case RUN_TEST_FD_CLOSE_AUTO:
-            use_bulk_close = child_bulk_close_available();
+            use_bulk_close = !g_test_auto_bulk_close_unavailable &&
+                             child_bulk_close_available();
             capture_fd_snapshot = !use_bulk_close;
+            /* A bulk-capable AUTO launch deliberately avoids the O(open-fds)
+             * parent snapshot.  If the selected primitive then fails, there
+             * is no complete fallback: report child setup failure instead of
+             * leaking descriptors beyond the bounded numeric sweep. */
+            require_bulk_close = use_bulk_close;
             break;
         case RUN_TEST_FD_CLOSE_SNAPSHOT:
             capture_fd_snapshot = true;
@@ -2311,17 +2322,22 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         default:
             /* Defensive equivalent of AUTO if memory corruption reaches this
              * test-only selector. */
-            use_bulk_close = child_bulk_close_available();
+            use_bulk_close = !g_test_auto_bulk_close_unavailable &&
+                             child_bulk_close_available();
             capture_fd_snapshot = !use_bulk_close;
+            require_bulk_close = use_bulk_close;
             break;
     }
     child_fd_snapshot_t fd_snapshot = {0};
     if (capture_fd_snapshot) {
         fd_snapshot = child_fd_snapshot_capture();
-        if (g_test_fd_close_strategy == RUN_TEST_FD_CLOSE_SNAPSHOT &&
-            !fd_snapshot.complete) {
+        if (!fd_snapshot.complete) {
+            const char *snapshot_kind =
+                g_test_fd_close_strategy == RUN_TEST_FD_CLOSE_SNAPSHOT
+                    ? "forced" : "automatic";
             set_error(ERR_SYSTEM_CALL,
-                      "run_argv: forced child-FD snapshot is incomplete");
+                      "run_argv: %s child-FD snapshot is incomplete",
+                      snapshot_kind);
             free(fd_snapshot.fds);
             close(exec_fd);
             trusted_script_launch_cleanup(&script_launch);

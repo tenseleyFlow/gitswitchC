@@ -200,7 +200,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
  * RUN_TEST_FD_CLOSE_AUTO; the default is zero so normal behavior is unchanged.
  * Forced strategies are strict: BULK reports a child setup failure if its
  * primitive cannot run, and SNAPSHOT fails in the parent if enumeration was
- * incomplete. AUTO alone may fall back to another safe cleanup method. */
+ * incomplete. AUTO requires either a supported bulk primitive or a complete
+ * parent snapshot: an incomplete snapshot fails before fork, and an unexpected
+ * bulk failure fails child setup because that branch has no snapshot. */
 typedef enum {
     RUN_TEST_FD_CLOSE_AUTO = 0,
     RUN_TEST_FD_CLOSE_SNAPSHOT,
@@ -225,6 +227,9 @@ bool run_test_fd_close_bulk_supported(void);
 void run_test_set_fd_close_observation(bool enabled);
 bool run_test_get_fd_close_observation(run_test_fd_close_observation_t *out);
 void run_test_set_bulk_close_failure(int system_errno);
+/* Force AUTO to exercise its portable parent-snapshot selection even when the
+ * host normally provides a bulk-close primitive. */
+void run_test_set_auto_bulk_close_unavailable(bool unavailable);
 
 /* Test-only deterministic race seam.  The callback runs in the parent after
  * the helper file is verified and pinned but before fork; production leaves
