@@ -4129,7 +4129,7 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
         "--list-secret-keys", "--fingerprint", "--fingerprint", selector,
         NULL
     };
-    char *listing = malloc(KEY_LISTING_CAP);
+    char *listing;
     run_result_t res;
     int run_rc;
     int status;
@@ -4139,6 +4139,7 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                   "Invalid GPG secret-key listing source");
         return -1;
     }
+    listing = malloc(KEY_LISTING_CAP);
     if (!listing) {
         set_error(ERR_MEMORY_ALLOCATION,
                   "Failed to allocate GPG key-listing buffer");
