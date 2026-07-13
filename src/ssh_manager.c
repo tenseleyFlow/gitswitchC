@@ -5241,7 +5241,7 @@ int ssh_manager_reset(const char *account) {
      * path construction, so reject empty and otherwise invalid account names
      * before opening or locking the runtime namespace. */
     if (account && !validate_name(account)) {
-        set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
+        set_error(ERR_INVALID_ARGS, "Invalid account name for reset");
         return -1;
     }
 

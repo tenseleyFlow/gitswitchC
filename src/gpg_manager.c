@@ -2990,7 +2990,7 @@ int gpg_manager_reset(const char *account) {
     bool failed = false;
 
     if (account && !validate_name(account)) {
-        set_error(ERR_INVALID_ARGS, "Invalid account name for reset: %s", account);
+        set_error(ERR_INVALID_ARGS, "Invalid account name for reset");
         return -1;
     }
     if (gpg_get_base_dir(base, sizeof(base)) != 0) {

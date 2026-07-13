@@ -276,6 +276,24 @@ TEST(exact_arity_rejects_invalid_forms_before_state_creation) {
     }
 }
 
+TEST(unsafe_shorthand_selector_with_extra_operand_is_not_reflected) {
+    static const char unsafe_selector[] = "safe\xE2\x80\xAE" "txt";
+    const char *argv[] = {"gitswitch", unsafe_selector, "extra", NULL};
+    char home[128], runtime[128], output_path[128], output[4096];
+    int rc;
+
+    CHECK_EQ_INT(make_private_dir(home, sizeof(home), "gitswitch-ar08-home"), 0);
+    CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime), "gitswitch-ar08-run"), 0);
+    rc = run_cli(home, runtime, argv, output_path, sizeof(output_path));
+    slurp(output_path, output, sizeof(output));
+    CHECK(rc > 0 && rc < 126);
+    CHECK(strstr(output, "invalid number of operands") != NULL);
+    CHECK(strstr(output, unsafe_selector) == NULL);
+    CHECK(directory_empty(home));
+    CHECK(directory_empty(runtime));
+    unlink(output_path);
+}
+
 TEST(legacy_init_alias_rejects_operands_without_creating_state) {
     char home[128], runtime[128], output_path[128], output[4096];
     const char *argv[] = {"gitswitch", "--ssh-agent-info", "extra", NULL};
@@ -509,6 +527,7 @@ TEST_MAIN_BEGIN()
         return 1;
     }
     RUN_TEST(exact_arity_rejects_invalid_forms_before_state_creation);
+    RUN_TEST(unsafe_shorthand_selector_with_extra_operand_is_not_reflected);
     RUN_TEST(legacy_init_alias_rejects_operands_without_creating_state);
     RUN_TEST(valid_dry_run_grammar_is_noncreating_for_every_command_shape);
     RUN_TEST(dry_run_does_not_repair_existing_config_directory_permissions);

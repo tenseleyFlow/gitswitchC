@@ -288,7 +288,12 @@ static int validate_command_arity(const char *command, int operand_count,
         return 0;
     }
 
-    fprintf(stderr, "gitswitch: invalid number of operands for '%s'\n", command);
+    if (text_is_tty_safe(command)) {
+        fprintf(stderr, "gitswitch: invalid number of operands for '%s'\n",
+                command);
+    } else {
+        fprintf(stderr, "gitswitch: invalid number of operands\n");
+    }
     if (usage == command) {
         fprintf(stderr, "Usage: gitswitch %s\n", usage);
     } else {
