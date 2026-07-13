@@ -124,6 +124,7 @@ static ssh_process_outcome_t refuse_session_agent_reap(
 
 static int g_session_reap_signal;
 static int g_session_reap_calls;
+static ssh_reap_fn g_session_reap_delegate;
 
 /* Causal AR-08 M4 probe: inject the repeated signal from inside the exact
  * previous-session reap boundary. The first call belongs to
@@ -132,21 +133,24 @@ static int g_session_reap_calls;
 static ssh_process_outcome_t signal_during_session_agent_reap(
     pid_t pid, const char *socket_arg, int runtime_dir_fd) {
     int call = ++g_session_reap_calls;
+    ssh_process_outcome_t outcome;
 
-    (void)pid;
-    (void)socket_arg;
-    (void)runtime_dir_fd;
     if (g_log) {
         fprintf(g_log, "MARK-SESSION-REAP-%d-BEFORE\n", call);
         fflush(g_log);
     }
-    raise(g_session_reap_signal);
-    raise(g_session_reap_signal);
+    if (call == 1) {
+        raise(g_session_reap_signal);
+        raise(g_session_reap_signal);
+    }
     if (g_log) {
         fprintf(g_log, "MARK-SESSION-REAP-%d-AFTER\n", call);
         fflush(g_log);
     }
-    return SSH_PROCESS_OWNED;
+    outcome = g_session_reap_delegate
+                  ? g_session_reap_delegate(pid, socket_arg, runtime_dir_fd)
+                  : SSH_PROCESS_INDETERMINATE;
+    return outcome;
 }
 
 /* Minimal fake config store so git_set_config's read-back verification sees
@@ -1242,8 +1246,8 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
          signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
         char log_path[512];
         char line[256];
-        bool first_after = false;
-        bool rollback_before = false;
+        bool cleanup_returned = false;
+        bool previous_agent_restored_after_cleanup = false;
         int signal_number = switch_guarded_signals[signal_index];
         int status = 0;
         pid_t pid;
@@ -1265,7 +1269,8 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
             if (!g_log) _exit(31);
             g_session_reap_signal = signal_number;
             g_session_reap_calls = 0;
-            (void)ssh_manager_set_reap_fn(signal_during_session_agent_reap);
+            g_session_reap_delegate =
+                ssh_manager_set_reap_fn(signal_during_session_agent_reap);
             (void)accounts_switch(&ctx, "second");
             _exit(32); /* completed checked abort dispatches the signal */
         }
@@ -1280,17 +1285,18 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
             if (log) {
                 while (fgets(line, sizeof(line), log)) {
                     if (strstr(line, "MARK-SESSION-REAP-1-AFTER")) {
-                        first_after = true;
+                        cleanup_returned = true;
                     }
-                    if (strstr(line, "MARK-SESSION-REAP-2-BEFORE")) {
-                        rollback_before = true;
+                    if (cleanup_returned && strstr(line, "ssh-agent -a") &&
+                        strstr(line, "ssh-agent.testacct.sock")) {
+                        previous_agent_restored_after_cleanup = true;
                     }
                 }
                 fclose(log);
             }
         }
-        CHECK(first_after);
-        CHECK(rollback_before);
+        CHECK(cleanup_returned);
+        CHECK(previous_agent_restored_after_cleanup);
     }
 
     CHECK_EQ_INT(accounts_session_cleanup(), 0);

@@ -2919,8 +2919,8 @@ static bool prompt_host_alias_valid(const char *alias) {
  * account's isolated home, hard-failing every cross-account switch with a
  * misleading "key not found". This is the fallback sanity check run from
  * accounts_switch() when the isolated GPG path did not already confirm the key
- * (gpg_ok), and during health checks. The isolated-home validation lives in
- * gpg_validate_key()/gpg_test_signing(). */
+ * (gpg_ok), and during health checks. Isolated-home validation belongs to the
+ * GPG manager's account-switch and signing-test paths. */
 static int validate_gpg_key_availability_mode(const char *gpg_key_id,
                                               bool allow_cached) {
     if (!gpg_key_id) {
