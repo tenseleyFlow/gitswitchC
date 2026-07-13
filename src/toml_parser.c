@@ -459,7 +459,6 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         return -1;
     }
     
-    doc->is_valid = true;
     log_debug("TOML document parsed successfully: %zu sections", doc->section_count);
     
     return 0;
@@ -691,6 +690,11 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
         set_error(ERR_INVALID_ARGS, "NULL document to validate");
         return -1;
     }
+
+    /* Validity belongs to this complete model version. Revoke it before any
+     * derived visibility changes or early return, and publish it again only
+     * after the whole schema pass succeeds. */
+    doc->is_valid = false;
 
     /* Account visibility is derived from this complete validation attempt.
      * Revoke every candidate before validating settings or any account: an
@@ -978,7 +982,8 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
         log_info("Configuration has no account sections yet - this is normal for new installations");
         /* This is not an error - allow empty configurations */
     }
-    
+
+    doc->is_valid = true;
     log_debug("TOML document schema validation passed");
     return 0;
 }
@@ -1764,6 +1769,7 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
     }
     kv->type = TOML_TYPE_STRING;
     kv->is_set = true;
+    doc->is_valid = false;
 
     return 0;
 }
@@ -1826,6 +1832,7 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
     }
     kv->type = TOML_TYPE_BOOLEAN;
     kv->is_set = true;
+    doc->is_valid = false;
 
     return 0;
 }

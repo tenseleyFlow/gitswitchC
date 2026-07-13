@@ -494,6 +494,76 @@ TEST(set_string_admitted_values_round_trip_byte_exact) {
     CHECK_EQ_INT(unlink(path), 0);
 }
 
+/* AR-09 L2: is_valid describes the current model, not whether some earlier
+ * version once validated. Rejected no-op setters preserve the state exactly;
+ * every successful mutation revokes it until a complete schema pass succeeds. */
+TEST(validity_tracks_mutation_and_complete_schema_validation) {
+    static const char unsafe[] = { 'x', 0x01, 'y', '\0' };
+    static toml_document_t doc;
+    static toml_document_t before;
+    char value[32] = "unchanged";
+    bool enabled = false;
+
+    CHECK_EQ_INT(parse("[settings]\n"
+                       "default_scope = \"local\"\n"
+                       "[accounts.1]\n"
+                       "name = \"alice\"\n"
+                       "email = \"alice@example.com\"\n",
+                       &doc), 0);
+    CHECK(doc.is_valid);
+
+    memcpy(&before, &doc, sizeof(before));
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", unsafe),
+                 -1);
+    CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+    CHECK(doc.is_valid);
+    CHECK_EQ_INT(toml_set_boolean(&doc, "bad section", "enabled", true), -1);
+    CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+    CHECK(doc.is_valid);
+
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "global"),
+                 0);
+    CHECK(!doc.is_valid);
+    CHECK_EQ_INT(toml_get_string(&doc, "settings", "default_scope", value,
+                                 sizeof(value)), -1);
+    CHECK_STR_EQ(value, "unchanged");
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK(doc.is_valid);
+    CHECK_EQ_INT(toml_get_string(&doc, "settings", "default_scope", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "global");
+
+    CHECK_EQ_INT(toml_set_boolean(&doc, "custom", "enabled", true), 0);
+    CHECK(!doc.is_valid);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK(doc.is_valid);
+    CHECK_EQ_INT(toml_get_boolean(&doc, "custom", "enabled", &enabled), 0);
+    CHECK(enabled);
+
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "system"),
+                 0);
+    CHECK(!doc.is_valid);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+    CHECK(!doc.is_valid);
+    CHECK_EQ_INT(toml_get_string(&doc, "settings", "default_scope", value,
+                                 sizeof(value)), -1);
+
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"),
+                 0);
+    CHECK(!doc.is_valid);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK(doc.is_valid);
+
+    /* The public validator also clears a stale flag when a caller has edited
+     * the public model directly instead of using a setter. */
+    memcpy(doc.sections[0].keys[0].value, "system", sizeof("system"));
+    CHECK(doc.is_valid);
+    CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+    CHECK(!doc.is_valid);
+
+    toml_cleanup_document(&doc);
+}
+
 /* M5 (loader half): a 257-511 char ssh_key passed the writer's cap, so it can
  * be the tool's OWN prior output — the schema's path-length failure must skip
  * that one account, not brick the entire config (pre-fix, every command died
@@ -558,20 +628,25 @@ TEST(repaired_skipped_account_revalidates_visibility_atomically) {
                    longpath) < (int)sizeof(src));
 
     CHECK_EQ_INT(parse(src, &doc), 0);
+    CHECK(doc.is_valid);
     CHECK(!doc.sections[1].is_set);
     CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
                                  sizeof(value)), -1);
 
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "ssh_key",
                                  "/tmp/repaired-key"), 0);
+    CHECK(!doc.is_valid);
     CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+    CHECK(!doc.is_valid);
     CHECK(!doc.sections[1].is_set);
     CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
                                  sizeof(value)), -1);
 
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
                                  "local"), 0);
+    CHECK(!doc.is_valid);
     CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK(doc.is_valid);
     CHECK(doc.sections[1].is_set);
     CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
                                  sizeof(value)), 0);
@@ -586,14 +661,18 @@ TEST(repaired_skipped_account_revalidates_visibility_atomically) {
      * this bad value after the error return. */
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
                                  "system"), 0);
+    CHECK(!doc.is_valid);
     CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+    CHECK(!doc.is_valid);
     CHECK(!doc.sections[1].is_set);
     CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
                                  sizeof(value)), -1);
 
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
                                  "global"), 0);
+    CHECK(!doc.is_valid);
     CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), 0);
+    CHECK(doc.is_valid);
     CHECK(doc.sections[1].is_set);
     CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", value,
                                  sizeof(value)), 0);
@@ -621,6 +700,7 @@ TEST(validation_preclear_hides_later_account_on_early_failure) {
                        "email = \"bob@example.com\"\n"
                        "preferred_scope = \"global\"\n",
                        &doc), 0);
+    CHECK(doc.is_valid);
     CHECK(doc.sections[1].is_set);
     CHECK(doc.sections[2].is_set);
 
@@ -630,7 +710,9 @@ TEST(validation_preclear_hides_later_account_on_early_failure) {
                                  "system"), 0);
     CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "preferred_scope",
                                  "system"), 0);
+    CHECK(!doc.is_valid);
     CHECK_EQ_INT(toml_validate_gitswitch_schema(&doc), -1);
+    CHECK(!doc.is_valid);
 
     CHECK(!doc.sections[1].is_set);
     CHECK(!doc.sections[2].is_set);
@@ -982,6 +1064,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(set_string_rejects_overlong_value_instead_of_erasing);
     RUN_TEST(set_string_rejects_unroundtrippable_values_without_mutation);
     RUN_TEST(set_string_admitted_values_round_trip_byte_exact);
+    RUN_TEST(validity_tracks_mutation_and_complete_schema_validation);
     RUN_TEST(overlong_ssh_key_skips_account_not_whole_file);
     RUN_TEST(repaired_skipped_account_revalidates_visibility_atomically);
     RUN_TEST(validation_preclear_hides_later_account_on_early_failure);

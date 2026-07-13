@@ -55,7 +55,8 @@ typedef struct {
     toml_section_t sections[TOML_MAX_SECTIONS];
     size_t section_count;
     char file_path[512];
-    bool is_valid;
+    bool is_valid; /* True only after a complete successful schema pass;
+                    * every successful public setter clears it. */
 } toml_document_t;
 
 /* Focused initialization observer used by regression tests. The parser is
@@ -136,14 +137,16 @@ int toml_get_boolean(const toml_document_t *doc, const char *section,
                      const char *key, bool *value);
 
 /**
- * Set string value in TOML document with validation
+ * Set string value in TOML document with validation.
+ * A successful mutation clears doc->is_valid until schema validation succeeds.
  */
 int toml_set_string(toml_document_t *doc, const char *section, 
                     const char *key, const char *value);
 
 
 /**
- * Set boolean value in TOML document  
+ * Set boolean value in TOML document.
+ * A successful mutation clears doc->is_valid until schema validation succeeds.
  */
 int toml_set_boolean(toml_document_t *doc, const char *section, 
                      const char *key, bool value);
@@ -168,6 +171,7 @@ int toml_write_fd(const toml_document_t *doc, int fd);
 
 /**
  * Validate TOML document structure for our specific config schema.
+ * Clears doc->is_valid before validation and sets it only on complete success.
  * Non-const: an account section whose ssh_key is over-long is marked
  * skipped (is_set cleared) instead of failing the whole document (AR-03 M5).
  */
