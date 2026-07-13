@@ -13,6 +13,7 @@ Source0:        %{name}-%{version}.tar.gz
 # BuildArch is not specified to allow building on all architectures including aarch64
 BuildRequires:  gcc
 BuildRequires:  make
+BuildRequires:  readline-devel
 
 %global debug_package %{nil}
 Requires:       git
@@ -45,7 +46,7 @@ Features:
 %build
 # Build release version with security hardening. Pass VERSION explicitly so
 # the binary reports the RPM version even when .git isn't present in %{_builddir}.
-make BUILD_TYPE=release VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
+make BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
 
 %install
 # PREFIX=%{_prefix}: RPM content belongs under /usr, not the Makefile's
@@ -57,7 +58,7 @@ make BUILD_TYPE=release VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
 # from the build, so it just packages the binary %build produced), but pass it
 # explicitly so the stamp/binary contract is unambiguous and a clean chroot
 # never repackages a debug/ASan binary.
-make install BUILD_TYPE=release DESTDIR=%{buildroot} PREFIX=%{_prefix}
+make install BUILD_TYPE=release READLINE=1 DESTDIR=%{buildroot} PREFIX=%{_prefix}
 
 %files
 %license LICENSE

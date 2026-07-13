@@ -510,9 +510,12 @@ endif
 # ShellCheck is intentionally a separate, fail-closed QA gate instead of an
 # ordinary `make test` prerequisite: builds remain package-independent while
 # CI and release reviewers can require every dialect parser explicitly.
-.PHONY: shell-static-test
+.PHONY: shell-static-test ci-policy-test
 shell-static-test:
 	@sh tests/test_shell_assets.sh "$(CURDIR)"
+
+ci-policy-test:
+	@sh tests/test_ci_policy.sh "$(CURDIR)"
 
 # The small contract fixture proves both threshold metrics are wired to gcovr's
 # documented nonzero exit bits; a no-op or report-only replacement cannot make
@@ -696,6 +699,7 @@ help:
 	@echo "  release      Build release version"
 	@echo "  test         Build and run tests"
 	@echo "  shell-static-test Lint and native-parse shipped shell assets"
+	@echo "  ci-policy-test Verify immutable, least-privilege CI policy"
 	@echo "  coverage     Run tests and enforce the GCC/gcovr coverage ratchet"
 	@echo "  coverage-contract-test Verify gcovr threshold failure plumbing"
 	@echo "  install      Install to system"
@@ -842,6 +846,7 @@ endif
 qa-contract-test:
 	@sh tests/test_qa.sh "$(CURDIR)" "$(MAKE_COMMAND)"
 	@sh tests/test_ar07_build.sh "$(CURDIR)" "$(MAKE_COMMAND)"
+	@sh tests/test_ci_policy.sh "$(CURDIR)"
 
 # AR-06 F32: the SIG-01/SIG-02/F4 end-to-end signal-interruption repro was
 # tracked but executed by nothing (not `make test`, not CI). Wire it in against

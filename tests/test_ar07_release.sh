@@ -390,6 +390,12 @@ assert_archive_metadata()
         printf '%s\n' "$spec_requires" | grep -Fx "$required_command" >/dev/null ||
             fail "archived RPM spec does not require $required_command"
     done
+    printf '%s\n' "$embedded_spec" |
+        grep -Eq '^BuildRequires:[[:space:]]+readline-devel[[:space:]]*$' ||
+        fail "archived RPM spec does not declare readline-devel"
+    printf '%s\n' "$embedded_spec" |
+        grep -E '^make .*BUILD_TYPE=release .*READLINE=1' >/dev/null ||
+        fail "archived RPM spec does not force Readline in its release build"
 }
 
 expect_dirty_rejected()

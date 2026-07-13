@@ -5,11 +5,18 @@ on:
     branches: [trunk]
   pull_request:
 
+# Every job is read-only. Individual jobs may narrow this further, but no
+# build or audit lane needs to mutate repository contents.
+permissions:
+  contents: read
+
 jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Install native test runtimes and QA dependencies
         # rpm: gives distcheck a real rpmbuild so the archive-satisfies-its-
         # own-spec lane (AR-05 L17) actually runs instead of skipping.
@@ -52,10 +59,12 @@ jobs:
           name: linux-gcc-coverage
           path: build/coverage/
           if-no-files-found: error
-      - name: Release build (FORTIFY/RELRO, warnings-as-errors)
-        run: make clean && make BUILD_TYPE=release WERROR=1
+      - name: Release build + full NDEBUG suite (FORTIFY/RELRO, warnings-as-errors)
+        run: make clean && make BUILD_TYPE=release READLINE=1 WERROR=1 test
+        env:
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Release artifact hardening (built + staged)
-        run: make BUILD_TYPE=release release-artifact-test
+        run: make BUILD_TYPE=release READLINE=1 release-artifact-test
       # AR-05 L8: symbol-level no-shell gate. An undefined-symbol reference to
       # system()/popen() in the linked binary catches ANY call path — headers,
       # whitespace variants, function pointers — that the textual tripwire
@@ -77,7 +86,7 @@ jobs:
       # a shim; without this step no actual memory checking ever executed in
       # the pipeline.
       - name: Memory check (Valgrind, release)
-        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release memcheck
+        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release READLINE=1 memcheck
       - name: Source distribution self-check
         run: make distcheck
       - name: Release input consistency and dirty-tree refusal
@@ -100,18 +109,22 @@ jobs:
       - name: Linux clang release build + hardening
         run: |
           make clean
-          make CC=clang BUILD_TYPE=release WERROR=1
-          make CC=clang BUILD_TYPE=release release-artifact-test
+          make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
+          make CC=clang BUILD_TYPE=release READLINE=1 release-artifact-test
+        env:
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
 
   freebsd:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
       - name: Build + test on FreeBSD
-        uses: cross-platform-actions/action@v0.27.0
+        uses: cross-platform-actions/action@f64727604af4814c82652164c2b79872424c8045 # v0.27.0
         with:
           operating_system: freebsd
-          version: '14.2'
+          version: '14.4'
           shell: bash
           # Tests run in release mode here: FreeBSD enables ASLR, which is
           # incompatible with ASan/PIE binaries (they abort on init). The
@@ -142,11 +155,22 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install required test runtimes
+        # macOS supplies bash/zsh/sh and OpenSSH. These packages make the
+        # remaining declared capabilities explicit instead of green-skipping
+        # them in either build configuration.
+        run: brew install dash fish gnupg ksh93 readline
       - name: Build + test (ASan/UBSan, warnings-as-errors)
-        run: make BUILD_TYPE=debug WERROR=1 test
-      - name: Release build (warnings-as-errors)
+        run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
+        env:
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+      - name: Release build + full NDEBUG suite (warnings-as-errors)
         run: |
           make clean
-          make BUILD_TYPE=release WERROR=1
-          make BUILD_TYPE=release release-artifact-test
+          make BUILD_TYPE=release READLINE=1 WERROR=1 test
+          make BUILD_TYPE=release READLINE=1 release-artifact-test
+        env:
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
