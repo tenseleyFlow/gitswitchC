@@ -35,7 +35,10 @@ SRCDIR = src
 BUILDDIR = build
 OBJDIR = $(BUILDDIR)/obj
 BINDIR = $(BUILDDIR)/bin
-TOOLBUILDDIR = $(BUILDDIR)/tools
+# Release publication is a security boundary, not a caller-selected build
+# output. Keep its host helper in one untracked namespace even when ordinary
+# build directories are redirected by a packager.
+override TOOLBUILDDIR := build/tools
 TESTDIR = tests
 DOCDIR = docs
 HOSTCC ?= cc
@@ -78,8 +81,8 @@ override TARGET_ARCH := $(firstword $(subst -, ,$(TARGET_TRIPLE)))
 
 # Platform detection (OS selects linker/ABI policy; architecture comes from
 # TARGET_TRIPLE above). UNAME_M remains diagnostic fingerprint material only.
-UNAME_S := $(shell uname -s)
-UNAME_M := $(shell uname -m)
+override UNAME_S := $(shell uname -s)
+override UNAME_M := $(shell uname -m)
 
 # Destination control-flow protection is selected by target architecture and
 # compile-probed against the actual compiler. Unsupported optional protection
@@ -397,7 +400,7 @@ $(BINDIR):
 $(TOOLBUILDDIR):
 	@mkdir -p $(TOOLBUILDDIR)
 
-DIST_PUBLISH_HELPER = $(TOOLBUILDDIR)/release-publish
+override DIST_PUBLISH_HELPER := build/tools/release-publish
 $(DIST_PUBLISH_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
 	@echo "Building descriptor-pinned release publisher..."
 	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror $< -o $@
@@ -458,21 +461,34 @@ objects=$(OBJECTS)
 source_dir=$(SRCDIR)
 test_dir=$(TESTDIR)
 endef
-export GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
-export GITSWITCH_RELEASE_POLICY_OS = $(UNAME_S)
-export GITSWITCH_RELEASE_POLICY_TRIPLE = $(TARGET_TRIPLE)
-export GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE = $(TARGET_TRIPLE_DETECTED)
-export GITSWITCH_RELEASE_POLICY_CC = $(CC_IDENTITY_FILE)
-export GITSWITCH_RELEASE_POLICY_CC_VERSION = $(CC_VERSION_ID)
-export GITSWITCH_RELEASE_POLICY_FINGERPRINT = $(TOOLCHAIN_FILE_FINGERPRINT)
-export GITSWITCH_RELEASE_POLICY_ACK = $(UNSUPPORTED_RELEASE_ACK)
-export GITSWITCH_RELEASE_POLICY_FORMAT = $(RELEASE_ARTIFACT_FORMAT)
-export GITSWITCH_RELEASE_POLICY_CFLAGS = $(SECURITY_CFLAGS_RELEASE)
-export GITSWITCH_RELEASE_POLICY_LDFLAGS = $(SECURITY_LDFLAGS_RELEASE)
-export GITSWITCH_RELEASE_EFFECTIVE_CFLAGS = $(CFLAGS) \
+override GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
+override GITSWITCH_RELEASE_POLICY_OS := $(UNAME_S)
+override GITSWITCH_RELEASE_POLICY_TRIPLE := $(TARGET_TRIPLE)
+override GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE := $(TARGET_TRIPLE_DETECTED)
+override GITSWITCH_RELEASE_POLICY_CC := $(CC_IDENTITY_FILE)
+override GITSWITCH_RELEASE_POLICY_CC_VERSION := $(CC_VERSION_ID)
+override GITSWITCH_RELEASE_POLICY_FINGERPRINT := $(TOOLCHAIN_FILE_FINGERPRINT)
+override GITSWITCH_RELEASE_POLICY_ACK := $(UNSUPPORTED_RELEASE_ACK)
+override GITSWITCH_RELEASE_POLICY_FORMAT := $(RELEASE_ARTIFACT_FORMAT)
+override GITSWITCH_RELEASE_POLICY_CFLAGS := $(SECURITY_CFLAGS_RELEASE)
+override GITSWITCH_RELEASE_POLICY_LDFLAGS := $(SECURITY_LDFLAGS_RELEASE)
+override GITSWITCH_RELEASE_EFFECTIVE_CFLAGS := $(CFLAGS) \
 	$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS)
-export GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS = $(LDFLAGS) $(LIBS) \
+override GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS := $(LDFLAGS) $(LIBS) \
 	$(RELEASE_ENFORCED_LDFLAGS)
+export GITSWITCH_BUILD_CONFIG
+export GITSWITCH_RELEASE_POLICY_OS
+export GITSWITCH_RELEASE_POLICY_TRIPLE
+export GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE
+export GITSWITCH_RELEASE_POLICY_CC
+export GITSWITCH_RELEASE_POLICY_CC_VERSION
+export GITSWITCH_RELEASE_POLICY_FINGERPRINT
+export GITSWITCH_RELEASE_POLICY_ACK
+export GITSWITCH_RELEASE_POLICY_FORMAT
+export GITSWITCH_RELEASE_POLICY_CFLAGS
+export GITSWITCH_RELEASE_POLICY_LDFLAGS
+export GITSWITCH_RELEASE_EFFECTIVE_CFLAGS
+export GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS
 
 .PHONY: release-policy-check
 release-policy-check:
@@ -973,7 +989,7 @@ help:
 	@echo "  DESTDIR      Installation prefix"
 
 # RPM package building
-PACKAGE = gitswitcher
+override PACKAGE := gitswitcher
 # Release artifacts are named and populated from one immutable commit. Regular
 # developer builds may still override VERSION, but dist/RPM metadata may not be
 # mixed with that live value. Command-line overrides are deliberately ignored
@@ -1000,13 +1016,17 @@ override DIST_ARTIFACT_DIR := build/dist
 override DIST_ARCHIVE_NAME := $(DIST_ROOT).tar.gz
 override DIST_ARCHIVE_PATH := $(CURDIR)/$(DIST_ARTIFACT_DIR)/$(DIST_ARCHIVE_NAME)
 DIST_ARCHIVE ?= $(DIST_ARTIFACT_DIR)/$(DIST_ARCHIVE_NAME)
-export GITSWITCH_DIST_ARCHIVE_REQUEST = $(DIST_ARCHIVE)
-export GITSWITCH_DIST_ARCHIVE_PATH = $(DIST_ARCHIVE_PATH)
-export GITSWITCH_DIST_ARCHIVE_NAME = $(DIST_ARCHIVE_NAME)
-export GITSWITCH_DIST_ROOT = $(DIST_ROOT)
+override GITSWITCH_DIST_ARCHIVE_REQUEST := $(DIST_ARCHIVE)
+override GITSWITCH_DIST_ARCHIVE_PATH := $(DIST_ARCHIVE_PATH)
+override GITSWITCH_DIST_ARCHIVE_NAME := $(DIST_ARCHIVE_NAME)
+override GITSWITCH_DIST_ROOT := $(DIST_ROOT)
+export GITSWITCH_DIST_ARCHIVE_REQUEST
+export GITSWITCH_DIST_ARCHIVE_PATH
+export GITSWITCH_DIST_ARCHIVE_NAME
+export GITSWITCH_DIST_ROOT
 # Reviewed allowlist. Copying only these entries inherently excludes VCS/OMX
 # state, build products, cores, logs, and previously generated archives.
-DIST_MANIFEST = src tests tools completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
+override DIST_MANIFEST := src tests tools completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
 .PHONY: release-manifest-check dist distcheck release-contract-test \
 	release-artifact-test qa-contract-test sig-repro-test rpm

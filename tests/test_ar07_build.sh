@@ -29,6 +29,7 @@ real_cc=$(command -v "${CC:-cc}") || fail "C compiler not found"
 real_ar=$(command -v ar) || fail "ar not found"
 real_git=$(command -v git) || fail "git not found"
 real_cat=$(command -v cat) || fail "cat not found"
+real_uname=$(command -v uname) || fail "uname not found"
 
 fixture=$tmp/project
 mkdir -p "$fixture/src" "$fixture/tests" "$tmp/shims" \
@@ -196,6 +197,17 @@ EOF
     chmod 0700 "$tmp/shims/$wrapper"
 done
 
+cat >"$tmp/shims/uname" <<'EOF'
+#!/bin/sh
+: "${AR07_REAL_UNAME:?}"
+if [ "${1-}" = -s ] && [ -n "${AR07_FAKE_UNAME_S-}" ]; then
+    printf '%s\n' "$AR07_FAKE_UNAME_S"
+    exit 0
+fi
+exec "$AR07_REAL_UNAME" "$@"
+EOF
+chmod 0700 "$tmp/shims/uname"
+
 target=build/bin/ar07-probe
 sources='src/main.c src/helper.c'
 out=$tmp/make.out
@@ -204,7 +216,9 @@ invoke_build()
 {
     : >"$cc_log"
     AR07_REAL_CC="$real_cc" AR07_CC_LOG="$cc_log" \
+        AR07_REAL_UNAME="$real_uname" PATH="$tmp/shims:$PATH" \
         AR07_FAKE_TRIPLE="${AR07_FAKE_TRIPLE-}" \
+        AR07_FAKE_UNAME_S="${AR07_FAKE_UNAME_S-}" \
         AR07_DROP_TARGET_FLAGS="${AR07_DROP_TARGET_FLAGS-0}" \
         "$make_cmd" -C "$fixture" TARGET=ar07-probe SOURCES="$sources" \
         VERSION=fixture-version COMMIT=fixture-commit "$@" "$target" \
@@ -328,16 +342,16 @@ grep -F "cc_file_fingerprint=$cc_b=" \
 # expansion. Supported-platform security flags are intentionally immutable;
 # unknown platforms retain an acknowledged extension surface whose complete
 # minimum is validated and reasserted after caller input.
-require_build "first platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    UNAME_S=AlienOS \
+AR07_FAKE_UNAME_S=AlienOS \
+    require_build "first platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
     UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
     RELEASE_ARTIFACT_FORMAT=elf \
     SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -DAR07_PLATFORM=1' \
     SECURITY_LDFLAGS_RELEASE='-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack'
 assert_rebuilt "first platform flags"
 assert_output 'platform=1'
-require_build "second platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
-    UNAME_S=AlienOS \
+AR07_FAKE_UNAME_S=AlienOS \
+    require_build "second platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
     UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
     RELEASE_ARTIFACT_FORMAT=elf \
     SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -DAR07_PLATFORM=2' \
@@ -388,6 +402,21 @@ grep -F 'target_triple=x86_64-unknown-linux-gnu' \
     fail "command-line target replaced the compiler-reported target"
 grep '<-fcf-protection>' "$cc_log" >/dev/null ||
     fail "command-line target controls suppressed compiler-target CET"
+
+# Host/platform facts and the shell-facing policy snapshot are derived inside
+# Make. Command-line assignments must not relabel the host or replace the
+# effective hardening evidence consumed by release-policy-check.
+host_os=$($real_uname -s)
+require_build "claimed OS and policy snapshot" BUILD_TYPE=release READLINE=0 \
+    CC="$cc_b" UNAME_S=AlienOS UNAME_M=host-lie \
+    GITSWITCH_RELEASE_POLICY_OS=AlienOS \
+    GITSWITCH_RELEASE_POLICY_FORMAT=invalid \
+    GITSWITCH_RELEASE_POLICY_TRIPLE=forged-invalid \
+    GITSWITCH_RELEASE_POLICY_DETECTED_TRIPLE=other-invalid \
+    GITSWITCH_RELEASE_EFFECTIVE_CFLAGS= \
+    GITSWITCH_RELEASE_EFFECTIVE_LDFLAGS=
+grep -F "platform_os=$host_os" "$fixture/build/obj/.buildconfig" >/dev/null ||
+    fail "command-line UNAME_S replaced the detected host OS"
 
 # The selection fixtures above intentionally log and strip a foreign flag so
 # they can link natively. Complement them with a real Clang cross-object: the
@@ -459,15 +488,15 @@ fi
 # Unknown operating systems fail closed. Even acknowledgement is insufficient
 # without an explicit inspector and the complete minimum compile/link policy;
 # the audited override then proves the escape hatch is deliberate and usable.
-if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu invoke_build \
-    BUILD_TYPE=release READLINE=0 CC="$cc_b" UNAME_S=AlienOS; then
+if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu AR07_FAKE_UNAME_S=AlienOS \
+    invoke_build BUILD_TYPE=release READLINE=0 CC="$cc_b"; then
     fail "unsupported OS produced a nominal release without acknowledgement"
 fi
 grep -F 'requires explicit acknowledgement' "$out" >/dev/null ||
     fail "unsupported OS rejection did not identify acknowledgement"
 
-if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu invoke_build \
-    BUILD_TYPE=release READLINE=0 CC="$cc_b" UNAME_S=AlienOS \
+if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu AR07_FAKE_UNAME_S=AlienOS \
+    invoke_build BUILD_TYPE=release READLINE=0 CC="$cc_b" \
     UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
     RELEASE_ARTIFACT_FORMAT=elf SECURITY_CFLAGS_RELEASE= \
     SECURITY_LDFLAGS_RELEASE=; then
@@ -479,8 +508,8 @@ grep -F 'unsupported release C flags omit' "$out" >/dev/null ||
 # Required tokens followed by their negations are not an effective policy.
 # This exact presence-only bypass previously produced ET_EXEC, lazy binding,
 # no RELRO, and an executable stack while release-policy-check returned zero.
-if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu invoke_build \
-    BUILD_TYPE=release READLINE=0 CC="$cc_b" UNAME_S=AlienOS \
+if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu AR07_FAKE_UNAME_S=AlienOS \
+    invoke_build BUILD_TYPE=release READLINE=0 CC="$cc_b" \
     UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
     RELEASE_ARTIFACT_FORMAT=elf \
     SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE -U_FORTIFY_SOURCE -fno-stack-protector -fno-pie' \
@@ -490,9 +519,9 @@ fi
 grep -F 'conflict with' "$out" >/dev/null ||
     fail "unsupported OS contradictory-policy rejection was not precise"
 
-AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu \
+AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu AR07_FAKE_UNAME_S=AlienOS \
     require_build "acknowledged unsupported OS" BUILD_TYPE=release READLINE=0 \
-    CC="$cc_b" UNAME_S=AlienOS \
+    CC="$cc_b" \
     UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
     RELEASE_ARTIFACT_FORMAT=elf \
     SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE' \
@@ -500,10 +529,12 @@ AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu \
 assert_rebuilt "acknowledged unsupported OS"
 
 if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu \
+    AR07_FAKE_UNAME_S=AlienOS AR07_REAL_UNAME="$real_uname" \
     AR07_REAL_CC="$real_cc" AR07_CC_LOG="$cc_log" \
+    PATH="$tmp/shims:$PATH" \
     "$make_cmd" -C "$fixture" TARGET=ar07-probe SOURCES="$sources" \
     VERSION=fixture-version COMMIT=fixture-commit BUILD_TYPE=release \
-    READLINE=0 CC="$cc_b" UNAME_S=AlienOS install \
+    READLINE=0 CC="$cc_b" install \
     DESTDIR="$tmp/unsupported-install" PREFIX=/usr >"$out" 2>&1; then
     fail "unsupported OS installed a nominal release without policy"
 fi

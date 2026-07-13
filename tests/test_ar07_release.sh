@@ -671,6 +671,26 @@ check_manifest_contract()
         fail "clean committed release failed"
     assert_archive_metadata "$archive" "$dist_root" "$version"
 
+    # The helper target itself is fixed inside the ignored build namespace.
+    # Before that boundary was override-protected, `-B
+    # DIST_PUBLISH_HELPER=VERSION` compiled the helper over tracked VERSION and
+    # still returned success. Exercise both primary documentation inputs and
+    # the helper-directory variable while forcing a rebuild.
+    rm -f "$archive"
+    "$make_cmd" -B -C "$clean_repo" DIST_PUBLISH_HELPER=VERSION \
+        TOOLBUILDDIR=. dist >"$out" 2>&1 ||
+        fail "fixed publisher target rejected a hostile VERSION override"
+    cmp -s "$clean_repo/VERSION" "$tmp/VERSION.before" ||
+        fail "publisher target override changed tracked VERSION"
+    assert_archive_metadata "$archive" "$dist_root" "$version"
+    rm -f "$archive"
+    "$make_cmd" -B -C "$clean_repo" DIST_PUBLISH_HELPER=README.md \
+        TOOLBUILDDIR=src dist >"$out" 2>&1 ||
+        fail "fixed publisher target rejected a hostile README override"
+    cmp -s "$clean_repo/README.md" "$tmp/README.before" ||
+        fail "publisher target override changed tracked README"
+    assert_archive_metadata "$archive" "$dist_root" "$version"
+
     # An existing artifact is never replaced, even by a byte-identical rerun.
     cp "$archive" "$tmp/archive.before"
     if "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1; then
