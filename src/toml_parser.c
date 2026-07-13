@@ -42,8 +42,9 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
 static int parse_integer_value(toml_parser_state_t *state, int *value);
 static int parse_boolean_value(toml_parser_state_t *state, bool *value);
 static void skip_whitespace(toml_parser_state_t *state);
+static int consume_line_ending(toml_parser_state_t *state);
 static int require_line_end(toml_parser_state_t *state);
-static void skip_comment(toml_parser_state_t *state);
+static int skip_comment(toml_parser_state_t *state);
 static bool is_at_end(const toml_parser_state_t *state);
 static char current_char(const toml_parser_state_t *state);
 static char advance_char(toml_parser_state_t *state);
@@ -336,7 +337,9 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         
         /* Skip comments */
         if (c == '#') {
-            skip_comment(&state);
+            if (skip_comment(&state) != 0) {
+                break;
+            }
             continue;
         }
         
@@ -425,9 +428,13 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
             continue;
         }
         
-        /* Skip empty lines */
-        if (c == '\n' || c == '\r') {
-            advance_char(&state);
+        /* Consume valid physical line endings atomically. A bare CR is an
+         * error, not an alternate newline spelling. */
+        int line_ending = consume_line_ending(&state);
+        if (line_ending < 0) {
+            break;
+        }
+        if (line_ending > 0) {
             continue;
         }
         
@@ -1514,6 +1521,37 @@ static void skip_whitespace(toml_parser_state_t *state) {
     }
 }
 
+/* Consume one physical TOML line ending. LF and CRLF both advance exactly one
+ * line; a bare CR is rejected without moving past the offending byte so the
+ * reported line and column remain precise. Returns 1 when an ending was
+ * consumed, 0 when the current byte is not an ending, and -1 on bare CR. */
+static int consume_line_ending(toml_parser_state_t *state) {
+    if (is_at_end(state)) return 0;
+
+    if (current_char(state) == '\n') {
+        state->position++;
+        state->line_number++;
+        state->column_number = 1;
+        return 1;
+    }
+
+    if (current_char(state) == '\r') {
+        size_t remaining = state->input_length - state->position;
+        if (remaining < 2 || state->input[state->position + 1] != '\n') {
+            set_parser_error(
+                state,
+                "Bare carriage return; TOML line endings must be LF or CRLF");
+            return -1;
+        }
+        state->position += 2;
+        state->line_number++;
+        state->column_number = 1;
+        return 1;
+    }
+
+    return 0;
+}
+
 /* AR-06 F70: after a value or a section header, the rest of the physical line
  * must be nothing but optional trailing whitespace and an optional comment.
  * Without this the tokenizer silently accepted multiple pairs on one line
@@ -1521,27 +1559,37 @@ static void skip_whitespace(toml_parser_state_t *state) {
  * malformed config a meaning the writer never produces. Returns 0 when the line
  * ends cleanly, -1 (with a parser error set) when trailing content remains. */
 static int require_line_end(toml_parser_state_t *state) {
+    int line_ending;
+
     skip_whitespace(state); /* trailing spaces/tabs only (not newlines) */
     if (is_at_end(state)) {
         return 0;
     }
-    char c = current_char(state);
-    if (c == '\n' || c == '\r' || c == '#') {
+
+    if (current_char(state) == '#') {
+        return skip_comment(state);
+    }
+
+    line_ending = consume_line_ending(state);
+    if (line_ending > 0) {
         return 0;
     }
+    if (line_ending < 0) return -1;
+
     set_parser_error(state,
                      "Unexpected content after value/section header on the "
                      "same line (one key/value or section header per line)");
     return -1;
 }
 
-static void skip_comment(toml_parser_state_t *state) {
-    while (!is_at_end(state) && current_char(state) != '\n') {
+static int skip_comment(toml_parser_state_t *state) {
+    while (!is_at_end(state) && current_char(state) != '\n' &&
+           current_char(state) != '\r') {
         advance_char(state);
     }
-    if (!is_at_end(state)) {
-        advance_char(state); /* Skip the newline */
-    }
+    if (is_at_end(state)) return 0;
+
+    return consume_line_ending(state) < 0 ? -1 : 0;
 }
 
 static bool is_at_end(const toml_parser_state_t *state) {

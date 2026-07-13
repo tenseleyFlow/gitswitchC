@@ -25,6 +25,26 @@ static int make_temp_toml_path(char *dir, size_t dir_size,
     return 0;
 }
 
+static int write_exact_toml_bytes(const char *path, const char *contents,
+                                  size_t length) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    size_t total = 0;
+
+    if (fd < 0) return -1;
+    while (total < length) {
+        ssize_t written = write(fd, contents + total, length - total);
+        if (written > 0) {
+            total += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            (void)close(fd);
+            return -1;
+        }
+    }
+    return close(fd);
+}
+
 TEST(parses_valid_config) {
     toml_document_t doc;
     char buf[64];
@@ -38,6 +58,139 @@ TEST(parses_valid_config) {
     CHECK_EQ_INT(rc, 0);
     CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", buf, sizeof(buf)), 0);
     CHECK_STR_EQ(buf, "alice");
+    toml_cleanup_document(&doc);
+}
+
+/* AR-09 L3: LF and CRLF are the only physical line endings admitted by TOML.
+ * A valid CRLF or mixed-ending document must describe the same model as its
+ * LF spelling, with CRLF counted as one line rather than two tokens. */
+TEST(accepts_lf_crlf_and_mixed_line_endings_equivalently) {
+    static const char lf[] =
+        "[settings]\n"
+        "default_scope = \"local\" # inline comment\n"
+        "# final comment\n";
+    static const char crlf[] =
+        "[settings]\r\n"
+        "default_scope = \"local\" # inline comment\r\n"
+        "# final comment\r\n";
+    static const char mixed[] =
+        "[settings]\r\n"
+        "default_scope = \"local\" # inline comment\n"
+        "# final comment";
+    static toml_document_t lf_doc, crlf_doc, mixed_doc;
+
+    CHECK_EQ_INT(toml_parse_string(lf, sizeof(lf) - 1U, &lf_doc), 0);
+    CHECK_EQ_INT(toml_parse_string(crlf, sizeof(crlf) - 1U, &crlf_doc), 0);
+    CHECK_EQ_INT(toml_parse_string(mixed, sizeof(mixed) - 1U, &mixed_doc), 0);
+    CHECK_EQ_INT((int)crlf_doc.section_count, (int)lf_doc.section_count);
+    CHECK_EQ_INT((int)mixed_doc.section_count, (int)lf_doc.section_count);
+    CHECK(memcmp(crlf_doc.sections, lf_doc.sections,
+                 sizeof(lf_doc.sections)) == 0);
+    CHECK(memcmp(mixed_doc.sections, lf_doc.sections,
+                 sizeof(lf_doc.sections)) == 0);
+    toml_cleanup_document(&mixed_doc);
+    toml_cleanup_document(&crlf_doc);
+    toml_cleanup_document(&lf_doc);
+}
+
+/* A CR not immediately paired with LF is malformed in every physical-line
+ * context. Keep the diagnostic anchored on that CR so a swallowed comment or
+ * miscounted line cannot decay into an unrelated schema error. */
+TEST(rejects_bare_carriage_return_line_endings) {
+    static const struct {
+        const char *input;
+        const char *location;
+    } invalid[] = {
+        { "[settings]\rdefault_scope = \"local\"\n",
+          "line 1, column 11" },
+        { "[settings]\ndefault_scope = \"local\"\r",
+          "line 2, column 24" },
+        { "[settings]\n\rdefault_scope = \"local\"\n",
+          "line 2, column 1" },
+        { "[settings]\n# comment\rdefault_scope = \"local\"\n",
+          "line 2, column 10" },
+        { "[settings]\ndefault_scope = \"local\" # comment\r",
+          "line 2, column 34" }
+    };
+    static toml_document_t doc;
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++) {
+        clear_error();
+        CHECK_EQ_INT(toml_parse_string(invalid[i].input,
+                                       strlen(invalid[i].input), &doc), -1);
+        CHECK(strstr(get_last_error()->message, "carriage return") != NULL);
+        CHECK(strstr(get_last_error()->message, invalid[i].location) != NULL);
+        toml_cleanup_document(&doc);
+    }
+}
+
+TEST(crlf_diagnostics_and_escaped_cr_remain_distinct) {
+    static const char malformed[] =
+        "[settings]\r\n"
+        "default_scope = \"local\"\r\n"
+        "?";
+    static const char escaped[] =
+        "[settings]\r\n"
+        "default_scope = \"local\"\r\n"
+        "[custom]\r\n"
+        "value = \"a\\rb\"\r\n";
+    static const char raw_cr[] =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[custom]\n"
+        "value = \"a\rb\"\n";
+    static toml_document_t doc;
+
+    CHECK_EQ_INT(toml_parse_string(malformed, sizeof(malformed) - 1U, &doc),
+                 -1);
+    CHECK(strstr(get_last_error()->message, "line 3, column 1") != NULL);
+    toml_cleanup_document(&doc);
+
+    CHECK_EQ_INT(toml_parse_string(escaped, sizeof(escaped) - 1U, &doc), 0);
+    CHECK_EQ_INT((int)doc.section_count, 2);
+    CHECK_EQ_INT((int)doc.sections[1].key_count, 1);
+    CHECK_EQ_INT((int)strlen(doc.sections[1].keys[0].value), 3);
+    CHECK(doc.sections[1].keys[0].value[0] == 'a');
+    CHECK(doc.sections[1].keys[0].value[1] == '\r');
+    CHECK(doc.sections[1].keys[0].value[2] == 'b');
+    toml_cleanup_document(&doc);
+
+    CHECK_EQ_INT(toml_parse_string(raw_cr, sizeof(raw_cr) - 1U, &doc), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "Control character in string value") != NULL);
+    toml_cleanup_document(&doc);
+}
+
+TEST(file_parser_enforces_the_same_line_ending_grammar) {
+    static const char valid[] =
+        "[settings]\r\n"
+        "default_scope = \"local\"\r\n";
+    static const char invalid[] =
+        "[settings]\rdefault_scope = \"local\"\n";
+    static toml_document_t doc;
+    char valid_dir[128], valid_path[192];
+    char invalid_dir[128], invalid_path[192];
+
+    if (make_temp_toml_path(valid_dir, sizeof(valid_dir), valid_path,
+                            sizeof(valid_path)) != 0 ||
+        write_exact_toml_bytes(valid_path, valid, sizeof(valid) - 1U) != 0) {
+        CHECK(0);
+        return;
+    }
+    CHECK_EQ_INT(toml_parse_file(valid_path, &doc), 0);
+    toml_cleanup_document(&doc);
+
+    if (make_temp_toml_path(invalid_dir, sizeof(invalid_dir), invalid_path,
+                            sizeof(invalid_path)) != 0 ||
+        write_exact_toml_bytes(invalid_path, invalid,
+                               sizeof(invalid) - 1U) != 0) {
+        CHECK(0);
+        return;
+    }
+    clear_error();
+    CHECK_EQ_INT(toml_parse_file(invalid_path, &doc), -1);
+    CHECK(strstr(get_last_error()->message, "carriage return") != NULL);
+    CHECK(strstr(get_last_error()->message, "line 1, column 11") != NULL);
     toml_cleanup_document(&doc);
 }
 
@@ -678,6 +831,10 @@ TEST(rejects_traversal_and_resynthesized_traversal_ssh_key) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(parses_valid_config);
+    RUN_TEST(accepts_lf_crlf_and_mixed_line_endings_equivalently);
+    RUN_TEST(rejects_bare_carriage_return_line_endings);
+    RUN_TEST(crlf_diagnostics_and_escaped_cr_remain_distinct);
+    RUN_TEST(file_parser_enforces_the_same_line_ending_grammar);
     RUN_TEST(rejects_overlong_string_value);
     RUN_TEST(rejects_overlong_section_name);
     RUN_TEST(get_string_rejects_value_too_long_for_dest);
