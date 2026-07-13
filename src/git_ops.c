@@ -2487,19 +2487,63 @@ static int git_read_effective_keys(git_effective_listing_t **out) {
     }
 }
 
-/* Mirror Git's complete Boolean grammar while retaining the one atomic
- * effective listing: an implicit key is true; empty, false/no/off, and every
- * in-range signed integer equal to zero are false; true/yes/on and nonzero
- * integers are true. Text keywords are case-insensitive. Numeric parsing uses
- * C base detection plus Git's optional k/m/g binary scale suffix, remains
- * within a signed-int result, and rejects trailing bytes/overflow. The focused
- * regression table compares every category to `git config --bool` itself. */
+/* Canonicalize a captured non-text Boolean without rereading the user's
+ * configuration. Git's accepted numeric range changed when its historical
+ * INT_MIN off-by-one was fixed, and vendor Git builds can lag that change.
+ * Supplying the captured bytes as an isolated default delegates only the
+ * grammar decision to the same trusted Git selected by run_argv; /dev/null
+ * prevents a concurrent config writer from changing the value being parsed. */
+static int git_canonicalize_effective_bool(const char *raw, const char *key,
+                                           bool *value) {
+    char default_arg[sizeof("--default=") + GIT_CFG_VALUE_MAX];
+    char canonical[16];
+    char context[160];
+    const char *argv[] = {
+        "git", "config", "--file", "/dev/null", "--bool",
+        default_arg, "--get", "gitswitch.boolean", NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+
+    if (safe_snprintf(default_arg, sizeof(default_arg), "--default=%s",
+                      raw) != 0 ||
+        safe_snprintf(context, sizeof(context),
+                      "Invalid effective Git Boolean value for %s", key) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective Git Boolean value is too large to canonicalize");
+        return -1;
+    }
+    memset(canonical, 0, sizeof(canonical));
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = canonical;
+    opts.out_size = sizeof(canonical);
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &result) != 0) {
+        git_set_capture_error(context, argv, &result);
+        return -1;
+    }
+    if (!result.out_truncated && result.out_len == sizeof("true\n") - 1U &&
+        memcmp(canonical, "true\n", sizeof("true\n") - 1U) == 0) {
+        *value = true;
+        return 0;
+    }
+    if (!result.out_truncated && result.out_len == sizeof("false\n") - 1U &&
+        memcmp(canonical, "false\n", sizeof("false\n") - 1U) == 0) {
+        *value = false;
+        return 0;
+    }
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Git returned a noncanonical Boolean result for %s", key);
+    return -1;
+}
+
+/* Preserve the atomic effective listing and fast-path Git's stable textual
+ * grammar: implicit/true/yes/on and empty/false/no/off. Numeric and otherwise
+ * unknown spellings go through Git above, so status follows the executable
+ * that will consume commit.gpgsign instead of guessing from a version banner. */
 static int git_parse_effective_bool(const git_kv_t *entry, const char *key,
                                     bool *value) {
-    char *end = NULL;
-    long long number;
-    long long multiplier = 1;
-
     if (!entry || !key || !value || !entry->present) {
         set_error(ERR_INVALID_ARGS, "Invalid Git Boolean query");
         return -1;
@@ -2526,40 +2570,7 @@ static int git_parse_effective_bool(const git_kv_t *entry, const char *key,
         *value = true;
         return 0;
     }
-
-    errno = 0;
-    number = strtoll(entry->value, &end, 0);
-    if (errno == 0 && end != entry->value) {
-        if (*end != '\0') {
-            if (end[1] != '\0') goto invalid;
-            switch (*end) {
-                case 'k':
-                case 'K':
-                    multiplier = 1024LL;
-                    break;
-                case 'm':
-                case 'M':
-                    multiplier = 1024LL * 1024LL;
-                    break;
-                case 'g':
-                case 'G':
-                    multiplier = 1024LL * 1024LL * 1024LL;
-                    break;
-                default:
-                    goto invalid;
-            }
-        }
-        if (number >= (long long)INT_MIN / multiplier &&
-            number <= (long long)INT_MAX / multiplier) {
-            *value = number != 0;
-            return 0;
-        }
-    }
-
-invalid:
-    set_error(ERR_GIT_CONFIG_FAILED,
-              "Invalid effective Git Boolean value for %s", key);
-    return -1;
+    return git_canonicalize_effective_bool(entry->value, key, value);
 }
 
 static int effective_key_matches(const git_effective_listing_t *listing,

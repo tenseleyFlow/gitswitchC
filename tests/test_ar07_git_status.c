@@ -72,6 +72,7 @@ static unsigned char fake_listing[70000];
 static size_t fake_listing_len;
 static int fake_listing_calls;
 static bool fake_execution_failure;
+static bool fake_reject_int_min_boolean;
 static const unsigned char default_failure_diagnostic[] =
     "fatal: injected unreadable git configuration\n";
 static const unsigned char *fake_failure_diagnostic =
@@ -117,6 +118,23 @@ static int fake_write_output(const run_opts_t *opts, run_result_t *result,
     return fake_finish(result, 0);
 }
 
+static int fake_write_error(const run_opts_t *opts, run_result_t *result,
+                            const char *diagnostic, int exit_code) {
+    size_t length = strlen(diagnostic);
+
+    if (opts && opts->merge_stderr && opts->out && opts->out_size > 0) {
+        size_t copied = length < opts->out_size - 1U
+                            ? length : opts->out_size - 1U;
+        memcpy(opts->out, diagnostic, copied);
+        opts->out[copied] = '\0';
+        if (result) {
+            result->out_len = copied;
+            result->out_truncated = copied < length;
+        }
+    }
+    return fake_finish(result, exit_code);
+}
+
 static int status_fake_runner(const char *const argv[], const run_opts_t *opts,
                               run_result_t *result) {
     if (result) memset(result, 0, sizeof(*result));
@@ -140,6 +158,32 @@ static int status_fake_runner(const char *const argv[], const run_opts_t *opts,
     }
     if (strcmp(argv[1], "config") != 0 || !argv[2])
         return fake_finish(result, 1);
+
+    if (strcmp(argv[2], "--file") == 0 && argv[3] && argv[4] &&
+        argv[5] && argv[6] && argv[7] &&
+        strcmp(argv[3], "/dev/null") == 0 &&
+        strcmp(argv[4], "--bool") == 0 &&
+        strncmp(argv[5], "--default=", strlen("--default=")) == 0 &&
+        strcmp(argv[6], "--get") == 0 &&
+        strcmp(argv[7], "gitswitch.boolean") == 0) {
+        const char *raw = argv[5] + strlen("--default=");
+        bool int_min = strcmp(raw, "-2g") == 0 ||
+                       strcmp(raw, "-2097152k") == 0;
+
+        if (int_min && !fake_reject_int_min_boolean) {
+            static const unsigned char canonical_true[] = "true\n";
+            return fake_write_output(opts, result, canonical_true,
+                                     sizeof(canonical_true) - 1U);
+        }
+        {
+            char diagnostic[256];
+            snprintf(diagnostic, sizeof(diagnostic),
+                     "fatal: bad boolean config value '%s' for "
+                     "'gitswitch.boolean'\n",
+                     raw);
+            return fake_write_error(opts, result, diagnostic, 128);
+        }
+    }
 
     if (strcmp(argv[2], "--show-origin") == 0) {
         fake_listing_calls++;
@@ -505,6 +549,51 @@ TEST(absent_identity_with_invalid_boolean_reports_error) {
     CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
 }
 
+TEST(int_min_boolean_follows_selected_gits_grammar) {
+    static const char *const int_min_spellings[] = {
+        "-2g", "-2097152k"
+    };
+    command_runner_fn previous;
+
+    previous = run_set_runner(status_fake_runner);
+    for (size_t i = 0;
+         i < sizeof(int_min_spellings) / sizeof(int_min_spellings[0]); i++) {
+        git_current_config_t current;
+
+        fake_listing_len = 0;
+        fake_listing_calls = 0;
+        fake_execution_failure = false;
+        CHECK(fake_append_record("global", "file:/ar07/global", "user.name",
+                                 "INT_MIN User", strlen("INT_MIN User")));
+        CHECK(fake_append_record("global", "file:/ar07/global", "user.email",
+                                 "int-min@example.test",
+                                 strlen("int-min@example.test")));
+        CHECK(fake_append_record("global", "file:/ar07/global",
+                                 "commit.gpgsign", int_min_spellings[i],
+                                 strlen(int_min_spellings[i])));
+
+        fake_reject_int_min_boolean = false;
+        git_ops_test_reset_caches();
+        memset(&current, 0, sizeof(current));
+        CHECK_EQ_INT(git_get_current_config(&current), 0);
+        CHECK(current.valid);
+        CHECK(current.gpg_signing_enabled);
+
+        fake_reject_int_min_boolean = true;
+        git_ops_test_reset_caches();
+        memset(&current, 0, sizeof(current));
+        CHECK_EQ_INT(git_get_current_config(&current), -1);
+        CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
+        CHECK(strstr(get_last_error()->message,
+                     "Invalid effective Git Boolean value for "
+                     "commit.gpgsign") != NULL);
+        CHECK(strstr(get_last_error()->message, int_min_spellings[i]) != NULL);
+        CHECK(!current.valid);
+    }
+    fake_reject_int_min_boolean = false;
+    run_set_runner(previous);
+}
+
 TEST(absent_identity_with_oversized_managed_value_reports_error) {
     static char oversized[GIT_CONFIG_VALUE_MAX + 1U];
     char status[8192];
@@ -678,6 +767,12 @@ TEST(git_boolean_grammar_matches_gits_canonical_oracle) {
         git_ops_test_reset_caches();
         memset(&current, 0, sizeof(current));
         int status_rc = git_get_current_config(&current);
+        if (status_rc != oracle_rc) {
+            fprintf(stderr,
+                    "  Boolean oracle mismatch for value <%s>: status=%d "
+                    "git=%d\n",
+                    values[i], status_rc, oracle_rc);
+        }
         CHECK_EQ_INT(status_rc, oracle_rc);
         if (oracle_rc == 0) {
             CHECK(current.valid);
@@ -897,6 +992,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(execution_diagnostic_is_sanitized_before_error_logging);
     RUN_TEST(absent_identity_remains_a_normal_status_result);
     RUN_TEST(absent_identity_with_invalid_boolean_reports_error);
+    RUN_TEST(int_min_boolean_follows_selected_gits_grammar);
     RUN_TEST(absent_identity_with_oversized_managed_value_reports_error);
     RUN_TEST(active_status_reports_expected_ssh_resolution_failure);
     RUN_TEST(real_malformed_config_retains_gits_diagnostic);
