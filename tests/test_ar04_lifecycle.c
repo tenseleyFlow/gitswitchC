@@ -116,6 +116,10 @@ static int prepare_home(const char *home, const char *config_body) {
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch", home);
     if (mkdir_private(path) != 0) return -1;
+    /* Child CLI invocations pin GNUPGHOME here so prompt validation never
+     * depends on the operator's keyring or on whether GNUPGHOME is inherited. */
+    snprintf(path, sizeof(path), "%s/.gnupg", home);
+    if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     if (write_text(path, config_body, 0600) != 0) return -1;
 
@@ -249,9 +253,10 @@ static int run_edit(const char *home, const char *runtime, const char *shim_dir,
     snprintf(stdin_path, sizeof(stdin_path), "%s/edit.in", runtime);
     if (write_text(stdin_path, input, 0600) != 0) return -1;
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
+             "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
+             "PATH='%s:/usr/bin:/bin' "
              "'%s' -C -y edit work <'%s' >'%s' 2>&1",
-             home, runtime, shim_dir, g_bin, stdin_path, output);
+             home, home, runtime, shim_dir, g_bin, stdin_path, output);
     return run_shell(cmd);
 }
 
@@ -468,9 +473,10 @@ static int run_remove(const char *home, const char *runtime,
     char cmd[8192];
 
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
+             "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
+             "PATH='%s:/usr/bin:/bin' "
              "'%s' -C -y remove '%s' </dev/null >'%s' 2>&1",
-             home, runtime, shim_dir, g_bin, account, output);
+             home, home, runtime, shim_dir, g_bin, account, output);
     return run_shell(cmd);
 }
 
@@ -641,10 +647,10 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
      * be recreated cleanly after the earlier teardown. */
     CHECK_EQ_INT(chmod(config_dir, 0700), 0);
     snprintf(cmd, sizeof(cmd),
-             "HOME='%s' XDG_RUNTIME_DIR='%s' "
+             "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
              "PATH='%s:/usr/local/bin:/usr/bin:/bin' "
              "'%s' -C -y work >'%s' 2>&1",
-             home, runtime, shims, g_bin, output);
+             home, home, runtime, shims, g_bin, output);
     int switch_rc = run_shell(cmd);
     slurp(output, contents, sizeof(contents));
     if (switch_rc != 0) {
