@@ -114,7 +114,11 @@ static char g_store_email[MAX_EMAIL_LEN];
 static char g_store_sshcmd[MAX_PATH_LEN * 2];
 static char g_store_signingkey[MAX_GPG_SELECTOR_LEN];
 static char g_store_gpgsign[16];
+static char g_store_gpgformat[16];
 static char g_store_gpgprogram[MAX_PATH_LEN];
+static char g_store_gpgopenpgp[MAX_PATH_LEN];
+static char g_store_gpgx509[MAX_PATH_LEN];
+static char g_store_gpgssh[MAX_PATH_LEN];
 
 /* git_ops.c deliberately keeps this test-only cache reset out of its public
  * header. Identity-sensitive cases below need a fresh snapshot/read-back view. */
@@ -224,6 +228,10 @@ static int emit_scope_config(const char *scope, const run_opts_t *opts,
     APPEND_GLOBAL_IF_SET("commit.gpgsign", g_store_gpgsign);
     APPEND_GLOBAL_IF_SET("gpg.program", g_store_gpgprogram);
     APPEND_GLOBAL_IF_SET("core.sshcommand", g_store_sshcmd);
+    APPEND_GLOBAL_IF_SET("gpg.format", g_store_gpgformat);
+    APPEND_GLOBAL_IF_SET("gpg.openpgp.program", g_store_gpgopenpgp);
+    APPEND_GLOBAL_IF_SET("gpg.x509.program", g_store_gpgx509);
+    APPEND_GLOBAL_IF_SET("gpg.ssh.program", g_store_gpgssh);
 #undef APPEND_GLOBAL_IF_SET
     if (used < opts->out_size) opts->out[used] = '\0';
     if (result) {
@@ -253,6 +261,10 @@ static int emit_effective_config(const run_opts_t *opts, run_result_t *result) {
     APPEND_IF_SET("commit.gpgsign", g_store_gpgsign);
     APPEND_IF_SET("gpg.program", g_store_gpgprogram);
     APPEND_IF_SET("core.sshcommand", g_store_sshcmd);
+    APPEND_IF_SET("gpg.format", g_store_gpgformat);
+    APPEND_IF_SET("gpg.openpgp.program", g_store_gpgopenpgp);
+    APPEND_IF_SET("gpg.x509.program", g_store_gpgx509);
+    APPEND_IF_SET("gpg.ssh.program", g_store_gpgssh);
 #undef APPEND_IF_SET
     if (result) {
         memset(result, 0, sizeof(*result));
@@ -329,6 +341,22 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
                    is_config_read(argv, "gpg.program") &&
                    g_store_gpgprogram[0]) {
             snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgprogram);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.format") &&
+                   g_store_gpgformat[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgformat);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.openpgp.program") &&
+                   g_store_gpgopenpgp[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgopenpgp);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.x509.program") &&
+                   g_store_gpgx509[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgx509);
+        } else if (is_global_config_command(argv) &&
+                   is_config_read(argv, "gpg.ssh.program") &&
+                   g_store_gpgssh[0]) {
+            snprintf(opts->out, opts->out_size, "%s\n", g_store_gpgssh);
         }
     }
 
@@ -361,6 +389,14 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         safe_strncpy(g_store_gpgsign, argv[4], sizeof(g_store_gpgsign));
     } else if (is_config_write(argv, "gpg.program")) {
         safe_strncpy(g_store_gpgprogram, argv[4], sizeof(g_store_gpgprogram));
+    } else if (is_config_write(argv, "gpg.format")) {
+        safe_strncpy(g_store_gpgformat, argv[4], sizeof(g_store_gpgformat));
+    } else if (is_config_write(argv, "gpg.openpgp.program")) {
+        safe_strncpy(g_store_gpgopenpgp, argv[4], sizeof(g_store_gpgopenpgp));
+    } else if (is_config_write(argv, "gpg.x509.program")) {
+        safe_strncpy(g_store_gpgx509, argv[4], sizeof(g_store_gpgx509));
+    } else if (is_config_write(argv, "gpg.ssh.program")) {
+        safe_strncpy(g_store_gpgssh, argv[4], sizeof(g_store_gpgssh));
     } else if (is_config_add(argv, "user.name")) {
         safe_strncpy(g_store_name, argv[5], sizeof(g_store_name));
     } else if (is_config_add(argv, "user.email")) {
@@ -373,6 +409,14 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         safe_strncpy(g_store_gpgsign, argv[5], sizeof(g_store_gpgsign));
     } else if (is_config_add(argv, "gpg.program")) {
         safe_strncpy(g_store_gpgprogram, argv[5], sizeof(g_store_gpgprogram));
+    } else if (is_config_add(argv, "gpg.format")) {
+        safe_strncpy(g_store_gpgformat, argv[5], sizeof(g_store_gpgformat));
+    } else if (is_config_add(argv, "gpg.openpgp.program")) {
+        safe_strncpy(g_store_gpgopenpgp, argv[5], sizeof(g_store_gpgopenpgp));
+    } else if (is_config_add(argv, "gpg.x509.program")) {
+        safe_strncpy(g_store_gpgx509, argv[5], sizeof(g_store_gpgx509));
+    } else if (is_config_add(argv, "gpg.ssh.program")) {
+        safe_strncpy(g_store_gpgssh, argv[5], sizeof(g_store_gpgssh));
     } else if (is_config_unset(argv, "user.name")) {
         g_store_name[0] = '\0';
     } else if (is_config_unset(argv, "user.email")) {
@@ -385,6 +429,14 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         g_store_gpgsign[0] = '\0';
     } else if (is_config_unset(argv, "gpg.program")) {
         g_store_gpgprogram[0] = '\0';
+    } else if (is_config_unset(argv, "gpg.format")) {
+        g_store_gpgformat[0] = '\0';
+    } else if (is_config_unset(argv, "gpg.openpgp.program")) {
+        g_store_gpgopenpgp[0] = '\0';
+    } else if (is_config_unset(argv, "gpg.x509.program")) {
+        g_store_gpgx509[0] = '\0';
+    } else if (is_config_unset(argv, "gpg.ssh.program")) {
+        g_store_gpgssh[0] = '\0';
     } else if (is_config_read(argv, "user.name") &&
                (!is_global_config_command(argv) || !g_store_name[0])) {
         exit_code = 1; /* not set: git reports failure */
@@ -402,6 +454,18 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         exit_code = 1;
     } else if (is_config_read(argv, "gpg.program") &&
                (!is_global_config_command(argv) || !g_store_gpgprogram[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.format") &&
+               (!is_global_config_command(argv) || !g_store_gpgformat[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.openpgp.program") &&
+               (!is_global_config_command(argv) || !g_store_gpgopenpgp[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.x509.program") &&
+               (!is_global_config_command(argv) || !g_store_gpgx509[0])) {
+        exit_code = 1;
+    } else if (is_config_read(argv, "gpg.ssh.program") &&
+               (!is_global_config_command(argv) || !g_store_gpgssh[0])) {
         exit_code = 1;
     }
 
@@ -643,7 +707,11 @@ static void seed_previous_git_identity(void) {
     g_store_sshcmd[0] = '\0';
     g_store_signingkey[0] = '\0';
     g_store_gpgsign[0] = '\0';
+    g_store_gpgformat[0] = '\0';
     g_store_gpgprogram[0] = '\0';
+    g_store_gpgopenpgp[0] = '\0';
+    g_store_gpgx509[0] = '\0';
+    g_store_gpgssh[0] = '\0';
     g_effective_signingkey_observed[0] = '\0';
     g_fail_list_config = false;
 }

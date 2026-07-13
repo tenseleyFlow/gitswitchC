@@ -32,6 +32,7 @@ static int git_get_config_value_ex(const char *key, char *value,
                                    bool *value_too_long);
 static int git_detect_managed_worktree_scope(bool *present);
 static int git_verify_merged_account(const account_t *account);
+static int git_reject_ssh_command_override(void);
 
 /* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
 
@@ -61,11 +62,25 @@ typedef struct {
                          * truncated copy nor --unset the user's original. */
 } git_kv_t;
 
-#define GIT_MANAGED_KEY_COUNT 6
+#define GIT_MANAGED_KEY_COUNT 10
 static const char *const g_managed_keys[GIT_MANAGED_KEY_COUNT] = {
     GIT_CONFIG_USER_NAME, GIT_CONFIG_USER_EMAIL, GIT_CONFIG_USER_SIGNINGKEY,
-    GIT_CONFIG_COMMIT_GPGSIGN, GIT_CONFIG_GPG_PROGRAM, GIT_CONFIG_CORE_SSHCOMMAND
+    GIT_CONFIG_COMMIT_GPGSIGN, GIT_CONFIG_GPG_PROGRAM,
+    GIT_CONFIG_CORE_SSHCOMMAND, GIT_CONFIG_GPG_FORMAT,
+    GIT_CONFIG_GPG_OPENPGP_PROGRAM, GIT_CONFIG_GPG_X509_PROGRAM,
+    GIT_CONFIG_GPG_SSH_PROGRAM
 };
+
+static const char *const g_gpg_program_keys[] = {
+    GIT_CONFIG_GPG_PROGRAM,
+    GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+    GIT_CONFIG_GPG_X509_PROGRAM,
+    GIT_CONFIG_GPG_SSH_PROGRAM
+};
+
+#define GIT_GPG_FORMAT_OPENPGP "openpgp"
+#define GIT_INSPECTION_INITIAL_BYTES (16U * 1024U)
+#define GIT_INSPECTION_MAX_BYTES (8U * 1024U * 1024U)
 static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]);
 
 typedef struct {
@@ -230,6 +245,25 @@ const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope) {
     }
 }
 
+/* Git gives GIT_SSH_COMMAND higher precedence than core.sshCommand. A switch
+ * cannot prove its selected SSH identity while that environment override is
+ * present, even when the persisted read-back is exact, so every transaction
+ * and status entry point fails closed without reflecting the untrusted value
+ * into a diagnostic. Presence matters: Git treats an explicitly empty value
+ * as an override too and then attempts to execute an empty command.
+ *
+ * Legacy GIT_SSH is deliberately not rejected. Real-Git precedence tests prove
+ * core.sshCommand outranks it; when gitswitch selects SSH, the persisted
+ * absolute core.sshCommand therefore remains authoritative. */
+static int git_reject_ssh_command_override(void) {
+    if (getenv("GIT_SSH_COMMAND") != NULL) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "GIT_SSH_COMMAND overrides Git core.sshCommand; unset it before switching or checking status");
+        return -1;
+    }
+    return 0;
+}
+
 /* Parse `git config --show-origin --show-scope -z --list`. Git emits three
  * NUL-terminated fields per record: scope, origin, then "key\nvalue". Last
  * match wins, preserving Git's effective precedence including includes and
@@ -313,37 +347,81 @@ static int parse_effective_listing(const char *buf, size_t len,
  * Git aliases --worktree to --local, and treating those as two independent
  * stores would corrupt snapshot/restore semantics. */
 static int git_detect_managed_worktree_scope(bool *present) {
-    char list[16384];
-    run_opts_t opts;
-    run_result_t res;
     const char *argv[] = { "git", "config", "--show-scope", "-z", "--list", NULL };
+    size_t capacity = GIT_INSPECTION_INITIAL_BYTES;
+    char *list = NULL;
+    size_t list_len = 0;
     size_t pos = 0;
 
     if (!present) return -1;
     *present = false;
     if (!git_is_repository()) return 0;
 
-    memset(&opts, 0, sizeof(opts));
-    memset(&res, 0, sizeof(res));
-    opts.out = list;
-    opts.out_size = sizeof(list);
-    opts.stderr_to_devnull = true;
-    if (run_argv(argv, &opts, &res) != 0 || res.out_truncated) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Cannot inspect Git worktree configuration before switching");
+    list = malloc(capacity);
+    if (!list) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory inspecting Git worktree configuration");
         return -1;
     }
+    for (;;) {
+        run_opts_t opts;
+        run_result_t res;
+        memset(&opts, 0, sizeof(opts));
+        memset(&res, 0, sizeof(res));
+        opts.out = list;
+        opts.out_size = capacity;
+        opts.stderr_to_devnull = true;
+        if (run_argv(argv, &opts, &res) != 0) {
+            free(list);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Cannot inspect Git worktree configuration before switching");
+            return -1;
+        }
+        if (!res.out_truncated) {
+            if (res.out_len >= capacity) {
+                free(list);
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Invalid Git worktree scope capture length");
+                return -1;
+            }
+            list_len = res.out_len;
+            break;
+        }
+        if (capacity >= GIT_INSPECTION_MAX_BYTES) {
+            free(list);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git worktree scope listing exceeds %u bytes",
+                      (unsigned)GIT_INSPECTION_MAX_BYTES);
+            return -1;
+        }
+        {
+            size_t grown_capacity = capacity * 2U;
+            char *grown;
+            if (grown_capacity > GIT_INSPECTION_MAX_BYTES) {
+                grown_capacity = GIT_INSPECTION_MAX_BYTES;
+            }
+            grown = realloc(list, grown_capacity);
+            if (!grown) {
+                free(list);
+                set_error(ERR_MEMORY_ALLOCATION,
+                          "Out of memory growing Git worktree scope capture");
+                return -1;
+            }
+            list = grown;
+            capacity = grown_capacity;
+        }
+    }
 
-    while (pos < res.out_len) {
+    while (pos < list_len) {
         size_t scope_start = pos;
-        while (pos < res.out_len && list[pos] != '\0') pos++;
-        if (pos >= res.out_len) goto malformed;
+        while (pos < list_len && list[pos] != '\0') pos++;
+        if (pos >= list_len) goto malformed;
         size_t scope_len = pos - scope_start;
         pos++;
 
         size_t record_start = pos;
-        while (pos < res.out_len && list[pos] != '\0') pos++;
-        if (pos >= res.out_len) goto malformed;
+        while (pos < list_len && list[pos] != '\0') pos++;
+        if (pos >= list_len) goto malformed;
         size_t record_len = pos - record_start;
         pos++;
 
@@ -358,13 +436,16 @@ static int git_detect_managed_worktree_scope(bool *present) {
             if (key_len == managed_len &&
                 strncasecmp(record, g_managed_keys[i], key_len) == 0) {
                 *present = true;
+                free(list);
                 return 0;
             }
         }
     }
+    free(list);
     return 0;
 
 malformed:
+    free(list);
     set_error(ERR_GIT_CONFIG_FAILED,
               "Malformed Git scope listing while checking worktree configuration");
     return -1;
@@ -374,6 +455,7 @@ static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         out[i].key = g_managed_keys[i];
         out[i].present = false;
+        out[i].implicit = false;
         out[i].value_unknown = false;
         out[i].value[0] = '\0';
     }
@@ -757,11 +839,12 @@ int git_config_snapshot(git_scope_t scope) {
                   "Cannot start a new Git snapshot while rollback remains incomplete");
         return -1;
     }
-    git_snapshot_clear(&g_git_snapshot);
     if (!git_scope_to_flag(scope)) {
         set_error(ERR_INVALID_ARGS, "Invalid Git snapshot scope");
         return -1;
     }
+    if (git_reject_ssh_command_override() != 0) return -1;
+    git_snapshot_clear(&g_git_snapshot);
 
     /* Worktree attribution must be known before any forward mutation. A
      * failed/unsupported scope probe is a hard stop: otherwise a higher
@@ -886,6 +969,20 @@ static int git_require_scope_key_value(const char *key, const char *expected,
     return 0;
 }
 
+static int git_require_scope_gpg_model(git_scope_t scope) {
+    if (git_require_scope_key_value(GIT_CONFIG_GPG_FORMAT,
+                                    GIT_GPG_FORMAT_OPENPGP, scope) != 0) {
+        return -1;
+    }
+    for (size_t i = 0;
+         i < sizeof(g_gpg_program_keys) / sizeof(g_gpg_program_keys[0]); i++) {
+        if (git_require_scope_key_absent(g_gpg_program_keys[i], scope) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* Verify the merged identity without relying on a scope-less read that loses
  * attribution. The selected scope must contain the exact requested values;
  * every higher-precedence scope that this switch cleared must prove absence. */
@@ -893,11 +990,6 @@ static int git_verify_effective_account(const account_t *account,
                                         git_scope_t scope,
                                         bool manage_worktree) {
     char expected_ssh[GIT_CFG_VALUE_MAX];
-    const char *const managed_keys[] = {
-        GIT_CONFIG_USER_NAME, GIT_CONFIG_USER_EMAIL,
-        GIT_CONFIG_USER_SIGNINGKEY, GIT_CONFIG_COMMIT_GPGSIGN,
-        GIT_CONFIG_GPG_PROGRAM, GIT_CONFIG_CORE_SSHCOMMAND
-    };
 
     if (git_require_scope_key_value(GIT_CONFIG_USER_NAME, account->name,
                                     scope) != 0 ||
@@ -937,21 +1029,20 @@ static int git_verify_effective_account(const account_t *account,
             return -1;
         }
     }
-    if (git_require_scope_key_absent(GIT_CONFIG_GPG_PROGRAM, scope) != 0)
-        return -1;
+    if (git_require_scope_gpg_model(scope) != 0) return -1;
 
     /* Worktree outranks local; local outranks global. Each scope that should
      * have been cleared must now be authoritatively absent, including values
      * supplied through an include at that scope. */
     if (manage_worktree) {
-        for (size_t i = 0; i < sizeof(managed_keys) / sizeof(managed_keys[0]); i++)
-            if (git_require_scope_key_absent(managed_keys[i],
+        for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++)
+            if (git_require_scope_key_absent(g_managed_keys[i],
                                              GIT_SCOPE_WORKTREE_INTERNAL) != 0)
                 return -1;
     }
     if (scope == GIT_SCOPE_GLOBAL && git_is_repository()) {
-        for (size_t i = 0; i < sizeof(managed_keys) / sizeof(managed_keys[0]); i++)
-            if (git_require_scope_key_absent(managed_keys[i],
+        for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++)
+            if (git_require_scope_key_absent(g_managed_keys[i],
                                              GIT_SCOPE_LOCAL) != 0)
                 return -1;
     }
@@ -985,6 +1076,7 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
+    if (git_reject_ssh_command_override() != 0) return -1;
     
     /* If local scope, ensure we're in a git repository */
     if (scope == GIT_SCOPE_LOCAL && !git_is_repository()) {
@@ -1059,10 +1151,26 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         }
     }
 
-    /* GPG isolation is selected through GNUPGHOME. A persisted gpg.program
-     * belongs to no account in this model and can redirect signing elsewhere. */
-    if (git_unset_config_value(GIT_CONFIG_GPG_PROGRAM, scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.program");
+    /* Git interprets user.signingKey through gpg.format. Normalize that format
+     * explicitly before verification, then clear every executable selector
+     * Git recognizes. GNUPGHOME selects the isolated OpenPGP keyring; a
+     * persisted legacy or format-specific program belongs to no account in
+     * this model. Unset first so repeated foreign values are handled exactly. */
+    if (git_unset_config_value(GIT_CONFIG_GPG_FORMAT, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.format");
+        return -1;
+    }
+    for (size_t i = 0;
+         i < sizeof(g_gpg_program_keys) / sizeof(g_gpg_program_keys[0]); i++) {
+        if (git_unset_config_value(g_gpg_program_keys[i], scope) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear %s",
+                      g_gpg_program_keys[i]);
+            return -1;
+        }
+    }
+    if (git_set_config_value(GIT_CONFIG_GPG_FORMAT,
+                             GIT_GPG_FORMAT_OPENPGP, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set gpg.format=openpgp");
         return -1;
     }
     
@@ -1173,7 +1281,7 @@ static void git_set_capture_error(const char *context,
 }
 
 /* Read effective values and their exact scope/file origins. The complete Git
- * configuration can be much larger than the six managed keys because --list
+ * configuration can be much larger than the managed keys because --list
  * includes unrelated values. Grow and retry until the binary listing is
  * complete instead of converting a fixed-buffer truncation into six absences.
  * Allocation/size overflow is an explicit error, never a clean status. */
@@ -1333,6 +1441,7 @@ static int git_verify_merged_account(const account_t *account) {
     bool ssh_present = account->ssh_enabled && account->ssh_key_path[0] != '\0';
     bool gpg_present = account->gpg_enabled && account->gpg_key_id[0] != '\0';
 
+    if (git_reject_ssh_command_override() != 0) return -1;
     if (git_read_effective_keys(&effective) != 0) return -1;
     if (ssh_present &&
         git_expected_ssh_command(account, expected_ssh,
@@ -1353,11 +1462,20 @@ static int git_verify_merged_account(const account_t *account) {
                               gpg_present && account->gpg_signing_enabled
                                   ? "true" : "false",
                               true) != 0 ||
-        effective_key_matches(effective, GIT_CONFIG_GPG_PROGRAM,
-                              NULL, false) != 0) {
+        effective_key_matches(effective, GIT_CONFIG_GPG_FORMAT,
+                              GIT_GPG_FORMAT_OPENPGP, true) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Effective merged Git configuration does not match the selected account");
         return -1;
+    }
+    for (size_t i = 0;
+         i < sizeof(g_gpg_program_keys) / sizeof(g_gpg_program_keys[0]); i++) {
+        if (effective_key_matches(effective, g_gpg_program_keys[i], NULL,
+                                  false) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Effective merged Git GPG program configuration does not match the selected account");
+            return -1;
+        }
     }
     return 0;
 }
@@ -1383,8 +1501,15 @@ int git_get_current_config(git_current_config_t *config) {
     const int k_email = cfg_key_index(GIT_CONFIG_USER_EMAIL);
     const int k_signkey = cfg_key_index(GIT_CONFIG_USER_SIGNINGKEY);
     const int k_gpgsign = cfg_key_index(GIT_CONFIG_COMMIT_GPGSIGN);
+    const int k_gpgformat = cfg_key_index(GIT_CONFIG_GPG_FORMAT);
     const int k_gpgprogram = cfg_key_index(GIT_CONFIG_GPG_PROGRAM);
+    const int k_gpgopenpgp = cfg_key_index(GIT_CONFIG_GPG_OPENPGP_PROGRAM);
+    const int k_gpgx509 = cfg_key_index(GIT_CONFIG_GPG_X509_PROGRAM);
+    const int k_gpgssh = cfg_key_index(GIT_CONFIG_GPG_SSH_PROGRAM);
     const int k_sshcommand = cfg_key_index(GIT_CONFIG_CORE_SSHCOMMAND);
+    const int gpg_program_indices[] = {
+        k_gpgprogram, k_gpgopenpgp, k_gpgx509, k_gpgssh
+    };
 
     if (!config) {
         set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
@@ -1394,9 +1519,11 @@ int git_get_current_config(git_current_config_t *config) {
     /* Initialize structure */
     memset(config, 0, sizeof(git_current_config_t));
     config->valid = false;
+    if (git_reject_ssh_command_override() != 0) return -1;
 
     if (k_name < 0 || k_email < 0 || k_signkey < 0 || k_gpgsign < 0 ||
-        k_gpgprogram < 0 || k_sshcommand < 0) {
+        k_gpgformat < 0 || k_gpgprogram < 0 || k_gpgopenpgp < 0 ||
+        k_gpgx509 < 0 || k_gpgssh < 0 || k_sshcommand < 0) {
         set_error(ERR_INVALID_ARGS, "Managed git key set is incomplete");
         return -1;
     }
@@ -1410,10 +1537,27 @@ int git_get_current_config(git_current_config_t *config) {
         effective->keys[k_email].value_unknown ||
         effective->keys[k_signkey].value_unknown ||
         effective->keys[k_gpgsign].value_unknown ||
+        effective->keys[k_gpgformat].value_unknown ||
         effective->keys[k_sshcommand].value_unknown ||
-        effective->keys[k_gpgprogram].value_unknown) {
+        effective->keys[k_gpgprogram].value_unknown ||
+        effective->keys[k_gpgopenpgp].value_unknown ||
+        effective->keys[k_gpgx509].value_unknown ||
+        effective->keys[k_gpgssh].value_unknown) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "An effective managed Git value exceeds the supported status representation");
+        return -1;
+    }
+
+    /* Absence is Git's OpenPGP default and remains status-compatible before a
+     * first switch. Any explicit non-OpenPGP value changes how Git interprets
+     * user.signingKey, so report it before a missing identity can disguise the
+     * unsafe signing model as a routine NOT FOUND state. */
+    if (effective->keys[k_gpgformat].present &&
+        (effective->keys[k_gpgformat].implicit ||
+         strcmp(effective->keys[k_gpgformat].value,
+                GIT_GPG_FORMAT_OPENPGP) != 0)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective gpg.format is not openpgp");
         return -1;
     }
 
@@ -1465,7 +1609,15 @@ int git_get_current_config(git_current_config_t *config) {
     }
 
     copy_effective_value(&config->ssh_command, effective, k_sshcommand);
-    copy_effective_value(&config->gpg_program, effective, k_gpgprogram);
+    memset(&config->gpg_program, 0, sizeof(config->gpg_program));
+    for (size_t i = 0;
+         i < sizeof(gpg_program_indices) / sizeof(gpg_program_indices[0]); i++) {
+        int index = gpg_program_indices[i];
+        if (effective->keys[index].present) {
+            copy_effective_value(&config->gpg_program, effective, index);
+            break;
+        }
+    }
 
     config->valid = true;
     return 0;
@@ -1474,14 +1626,6 @@ int git_get_current_config(git_current_config_t *config) {
 /* Clear git configuration */
 int git_clear_config(git_scope_t scope) {
     const char *scope_flag;
-    const char *const keys[] = {
-        GIT_CONFIG_USER_NAME,
-        GIT_CONFIG_USER_EMAIL,
-        GIT_CONFIG_USER_SIGNINGKEY,
-        GIT_CONFIG_COMMIT_GPGSIGN,
-        GIT_CONFIG_GPG_PROGRAM,
-        GIT_CONFIG_CORE_SSHCOMMAND
-    };
     char first_error[sizeof(g_last_error.message)] = "";
     int failures = 0;
     
@@ -1495,8 +1639,8 @@ int git_clear_config(git_scope_t scope) {
     
     /* Attempt every managed unset so one failure cannot hide additional stale
      * identity state. Preserve the first useful diagnostic after the loop. */
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        if (git_unset_config_value(keys[i], scope) != 0) {
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (git_unset_config_value(g_managed_keys[i], scope) != 0) {
             if (failures == 0) {
                 snprintf(first_error, sizeof(first_error), "%s",
                          get_last_error()->message);
@@ -1531,6 +1675,7 @@ int git_test_config(const account_t *account, git_scope_t scope) {
         set_error(ERR_INVALID_ARGS, "NULL account to git_test_config");
         return -1;
     }
+    if (git_reject_ssh_command_override() != 0) return -1;
 
     log_info("Testing git configuration for account: %s", account->name);
 
@@ -1865,6 +2010,8 @@ int git_unset_config_value(const char *key, git_scope_t scope) {
 /* List all git configuration values */
 int git_list_config(git_scope_t scope, char *output, size_t output_size) {
     const char *scope_flag;
+    run_opts_t opts;
+    run_result_t result;
 
     if (!output || output_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to git_list_config");
@@ -1877,8 +2024,29 @@ int git_list_config(git_scope_t scope, char *output, size_t output_size) {
         return -1;
     }
 
-    if (git_run(output, output_size, "config", scope_flag, "--list",
-                (const char *)NULL) != 0) {
+    {
+        const char *argv[] = {
+            "git", "config", scope_flag, "--list", NULL
+        };
+        memset(&opts, 0, sizeof(opts));
+        memset(&result, 0, sizeof(result));
+        output[0] = '\0';
+        opts.out = output;
+        opts.out_size = output_size;
+        opts.merge_stderr = true;
+        if (run_argv(argv, &opts, &result) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Failed to list git configuration");
+            return -1;
+        }
+    }
+    if (result.out_truncated) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git configuration listing was truncated by the %zu-byte output buffer",
+                  output_size);
+        return -1;
+    }
+    if (result.out_len >= output_size) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to list git configuration");
         return -1;
     }
@@ -2021,6 +2189,7 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
     if (!account || !account->ssh_enabled || strlen(account->ssh_key_path) == 0) {
         return 0; /* Nothing to configure */
     }
+    if (git_reject_ssh_command_override() != 0) return -1;
 
     if (build_expected_ssh_command(account, ssh_command, sizeof(ssh_command),
                                    expanded_key_path,

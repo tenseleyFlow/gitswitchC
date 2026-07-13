@@ -10,7 +10,11 @@
 #define GIT_CONFIG_USER_EMAIL "user.email"
 #define GIT_CONFIG_USER_SIGNINGKEY "user.signingkey"
 #define GIT_CONFIG_COMMIT_GPGSIGN "commit.gpgsign"
+#define GIT_CONFIG_GPG_FORMAT "gpg.format"
 #define GIT_CONFIG_GPG_PROGRAM "gpg.program"
+#define GIT_CONFIG_GPG_OPENPGP_PROGRAM "gpg.openpgp.program"
+#define GIT_CONFIG_GPG_X509_PROGRAM "gpg.x509.program"
+#define GIT_CONFIG_GPG_SSH_PROGRAM "gpg.ssh.program"
 #define GIT_CONFIG_CORE_SSHCOMMAND "core.sshcommand"
 
 /* Largest managed value emitted by gitswitch. core.sshCommand contains two
@@ -102,14 +106,14 @@ int git_expected_ssh_command(const account_t *account, char *command,
 int git_clear_config(git_scope_t scope);
 
 /**
- * Snapshot the gitswitch-managed config keys (user.name/email/signingkey,
- * commit.gpgsign, gpg.program, core.sshcommand) at `scope` before a switch
- * mutates them, plus the LOCAL scope when a global write would clear it and
- * any distinct WORKTREE override scope. Every repeated value is retained in
- * order. Included managed values are refused when their origin cannot be
- * restored exactly. Pair with git_config_restore() to roll back on a failed
- * switch. Single snapshot slot (the CLI is single-threaded); a new snapshot
- * replaces the previous.
+ * Snapshot the gitswitch-managed config keys (identity/signing keys,
+ * gpg.format, every Git-supported GPG program selector, and core.sshCommand)
+ * at `scope` before a switch mutates them, plus the LOCAL scope when a global
+ * write would clear it and any distinct WORKTREE override scope. Every
+ * repeated value is retained in order. Included managed values are refused
+ * when their origin cannot be restored exactly. Pair with
+ * git_config_restore() to roll back on a failed switch. Single snapshot slot
+ * (the CLI is single-threaded); a new snapshot replaces the previous.
  */
 int git_config_snapshot(git_scope_t scope);
 
