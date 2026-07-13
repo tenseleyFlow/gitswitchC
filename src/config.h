@@ -31,6 +31,10 @@ typedef enum {
     CONFIG_IO_DEFAULT_BEFORE_RENAME,
     CONFIG_IO_DEFAULT_BEFORE_DIR_SYNC,
     CONFIG_IO_BACKUP_BEFORE_FILE_SYNC,
+    /* Copy checkpoint after the first complete source chunk has been written.
+     * A test callback may mutate the source and return false; the copy must
+     * reject the now-unstable generation during its final descriptor proof. */
+    CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK,
     CONFIG_IO_BACKUP_BEFORE_DIR_SYNC,
     CONFIG_IO_BACKUP_BEFORE_REOPEN,
     CONFIG_IO_DOCUMENT_BEFORE_RENAME,

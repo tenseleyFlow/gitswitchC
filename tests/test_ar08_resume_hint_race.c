@@ -72,6 +72,25 @@ static int write_private(const char *path, const char *text) {
     return close(fd);
 }
 
+static size_t read_private(const char *path, char *text, size_t size) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    size_t total = 0;
+
+    if (fd < 0 || size == 0) {
+        if (fd >= 0) close(fd);
+        return 0;
+    }
+    while (total + 1 < size) {
+        ssize_t count = read(fd, text + total, size - total - 1);
+        if (count > 0) total += (size_t)count;
+        else if (count < 0 && errno == EINTR) continue;
+        else break;
+    }
+    close(fd);
+    text[total] = '\0';
+    return total;
+}
+
 static void replace_hint_at_checkpoint(int stage) {
     if (stage != g_inject_stage) return;
     g_inject_stage = 0;
@@ -195,6 +214,32 @@ TEST(same_inode_growth_before_open_is_bounded) {
                                           INJECT_GROW_SNAPSHOT, true), 0);
 }
 
+TEST(testing_object_retains_legacy_fault_seam_before_installation) {
+    char config_path[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+    bool installed = true;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    (void)unlink(g_hint);
+    CHECK_EQ_INT(write_private(config_path,
+                               "[settings]\ndefault_scope=\"local\"\n"), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    clear_error();
+    CHECK_EQ_INT(setenv("GITSWITCH_TEST_FAIL_RESUME_HINT_COMMIT", "1", 1), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, config_path, &installed), -1);
+    CHECK_EQ_INT(unsetenv("GITSWITCH_TEST_FAIL_RESUME_HINT_COMMIT"), 0);
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message,
+                 "Injected resume-hint commit failure") != NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\n");
+}
+
 int main(void) {
     if (error_init(LOG_LEVEL_ERROR, NULL) != 0 || fixture_setup() != 0) {
         fprintf(stderr, "test_ar08_resume_hint_race: fixture setup failed\n");
@@ -204,6 +249,7 @@ int main(void) {
     RUN_TEST(fifo_replacement_before_open_is_rejected_without_blocking);
     RUN_TEST(regular_replacement_after_read_is_rejected);
     RUN_TEST(same_inode_growth_before_open_is_bounded);
+    RUN_TEST(testing_object_retains_legacy_fault_seam_before_installation);
 
     ts_rm_rf(g_root);
     error_cleanup();

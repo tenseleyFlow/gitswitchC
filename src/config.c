@@ -14,6 +14,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <ctype.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 /* Linux, macOS and FreeBSD provide both flags. Record their availability
  * before supplying compile-only fallbacks so directory setup can use a
@@ -138,9 +141,18 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      bool *state_installed);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
+static bool config_metadata_snapshot_same(const struct stat *a,
+                                          const struct stat *b);
 static bool config_metadata_dir_is_safe(const struct stat *st);
 static bool config_metadata_file_is_safe(const struct stat *st,
                                          bool require_private_mode);
+static bool config_named_directory_matches(const char *path,
+                                           const struct stat *pinned);
+static int config_create_private_temp_at(int dir_fd, const char *target_name,
+                                         char *temp_name,
+                                         size_t temp_name_size);
+static int config_publish_noreplace_at(int dir_fd, const char *source,
+                                       const char *destination);
 
 typedef struct {
     bool exists;
@@ -894,6 +906,31 @@ static bool config_metadata_same_file(const struct stat *a, const struct stat *b
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
+/* A stable descriptor generation requires more than an unchanged inode: an
+ * in-place writer preserves dev/ino while changing the bytes. Size plus mtime
+ * and ctime catches both ordinary rewrites and same-size restoration attempts;
+ * ownership/mode/link-count keep the security contract stable too. */
+static bool config_metadata_snapshot_same(const struct stat *a,
+                                          const struct stat *b) {
+    bool same = config_metadata_same_file(a, b) &&
+                a->st_uid == b->st_uid && a->st_gid == b->st_gid &&
+                a->st_mode == b->st_mode && a->st_nlink == b->st_nlink &&
+                a->st_size == b->st_size;
+#if defined(__APPLE__)
+    return same &&
+           a->st_mtimespec.tv_sec == b->st_mtimespec.tv_sec &&
+           a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec &&
+           a->st_ctimespec.tv_sec == b->st_ctimespec.tv_sec &&
+           a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec;
+#else
+    return same &&
+           a->st_mtim.tv_sec == b->st_mtim.tv_sec &&
+           a->st_mtim.tv_nsec == b->st_mtim.tv_nsec &&
+           a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
+           a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
+#endif
+}
+
 static bool config_metadata_dir_is_safe(const struct stat *st) {
     return S_ISDIR(st->st_mode) && st->st_uid == getuid() &&
            (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
@@ -914,6 +951,96 @@ static bool config_metadata_file_is_safe(const struct stat *st,
      * modes that let another principal alter it. A successful refresh
      * replaces the legacy inode with a fresh 0600 file below. */
     return (mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+static bool config_named_directory_matches(const char *path,
+                                           const struct stat *pinned) {
+    struct stat named;
+    if (lstat(path, &named) != 0) {
+        return false;
+    }
+    if (!config_metadata_dir_is_safe(&named) ||
+        !config_metadata_same_file(&named, pinned)) {
+        errno = ESTALE;
+        return false;
+    }
+    return true;
+}
+
+/* Build a collision-resistant scratch name inside the already-pinned parent.
+ * openat()+O_EXCL is the authoritative creation step: a pathname replacement
+ * of the parent cannot redirect the descriptor we later write or publish. */
+static int config_create_private_temp_at(int dir_fd, const char *target_name,
+                                         char *temp_name,
+                                         size_t temp_name_size) {
+    static const char random_chars[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    char suffix[17];
+
+    for (unsigned int attempt = 0; attempt < 16; attempt++) {
+        int written;
+
+        if (generate_random_string(suffix, sizeof(suffix), random_chars) != 0) {
+            if (errno == 0) errno = EIO;
+            return -1;
+        }
+        written = snprintf(temp_name, temp_name_size, "%s.create.%s",
+                           target_name, suffix);
+        if (written < 0 || (size_t)written >= temp_name_size) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        int fd = openat(dir_fd, temp_name,
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                        PERM_USER_RW);
+        if (fd >= 0) return fd;
+        if (errno != EEXIST) return -1;
+    }
+    errno = EEXIST;
+    return -1;
+}
+
+/* Atomically publish source only if destination is absent. Linux's native
+ * renameat2 operation gives a one-step move. linkat+unlinkat is the portable
+ * same-directory fallback: link creation itself is atomic and no-replace, so
+ * a competing destination is never overwritten. */
+static int config_publish_noreplace_at(int dir_fd, const char *source,
+                                       const char *destination) {
+#if defined(__linux__) && defined(SYS_renameat2)
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1U << 0)
+#endif
+    if (syscall(SYS_renameat2, dir_fd, source, dir_fd, destination,
+                RENAME_NOREPLACE) == 0) {
+        return 0;
+    }
+    if (errno != ENOSYS && errno != EINVAL && errno != EOPNOTSUPP) {
+        return -1;
+    }
+#endif
+
+    if (linkat(dir_fd, source, dir_fd, destination, 0) != 0) {
+        return -1;
+    }
+    if (unlinkat(dir_fd, source, 0) != 0) {
+        int saved_errno = errno;
+        struct stat source_identity;
+        struct stat destination_identity;
+
+        /* Roll back only when the destination still names the exact hard link
+         * we just created. Never delete a concurrently substituted name. */
+        if (fstatat(dir_fd, source, &source_identity,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            fstatat(dir_fd, destination, &destination_identity,
+                    AT_SYMLINK_NOFOLLOW) == 0 &&
+            config_metadata_same_file(&source_identity,
+                                      &destination_identity)) {
+            (void)unlinkat(dir_fd, destination, 0);
+        }
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
 }
 
 static int config_lock_reject(int token_fd, const char *lockpath) {
@@ -1383,15 +1510,17 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         return -1;
     }
 
-    /* Deterministic commit-boundary fault injection for the CLI transaction
-     * regression. The active config has already been atomically installed
-     * when this helper runs, so failure here exercises the required reverse
-     * commit of config, Git/runtime state, and the exact hint before-image. */
+    /* The inherited environment must never steer release behavior. Keep the
+     * historical CLI regression seam only in the dedicated testing object;
+     * ordinary unit tests use config_set_io_fault_fn's explicit pre/post-
+     * installation boundaries instead. */
+#ifdef GITSWITCH_TESTING
     const char *fault = getenv("GITSWITCH_TEST_FAIL_RESUME_HINT_COMMIT");
     if (fault && strcmp(fault, "1") == 0) {
         set_error(ERR_FILE_IO, "Injected resume-hint commit failure");
         return -1;
     }
+#endif
 
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0 ||
         safe_strncpy(dir, hint, sizeof(dir)) != 0) {
@@ -1622,7 +1751,22 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
                                         bool make_backup,
                                         bool update_hint,
                                         bool *config_installed) {
+    char dir_path[MAX_PATH_LEN];
     char temp_path[MAX_PATH_LEN];
+    char temp_name[MAX_PATH_LEN];
+    const char *slash;
+    const char *target_name;
+    struct stat pinned_dir;
+    struct stat destination_before;
+    struct stat destination_now;
+    struct stat temp_identity;
+    struct stat temp_now;
+    bool destination_existed = false;
+    bool temp_exists = false;
+    bool temp_registered = false;
+    bool have_temp_identity = false;
+    int dir_fd = -1;
+    int temp_fd = -1;
 
     if (config_installed) {
         *config_installed = false;
@@ -1637,17 +1781,64 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         return -1;
     }
 
+    slash = strrchr(config_path, '/');
+    target_name = slash ? slash + 1 : config_path;
+    if (target_name[0] == '\0') {
+        set_error(ERR_INVALID_PATH, "Config destination has no file name");
+        return -1;
+    }
+    if (!slash) {
+        if (safe_strncpy(dir_path, ".", sizeof(dir_path)) != 0) return -1;
+    } else {
+        size_t dir_length = (size_t)(slash - config_path);
+        if (dir_length == 0) dir_length = 1;
+        if (dir_length >= sizeof(dir_path)) {
+            set_error(ERR_INVALID_PATH, "Config directory path is too long");
+            return -1;
+        }
+        memcpy(dir_path, config_path, dir_length);
+        dir_path[dir_length] = '\0';
+    }
+    dir_fd = open(dir_path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fstat(dir_fd, &pinned_dir) != 0 ||
+        !config_metadata_dir_is_safe(&pinned_dir) ||
+        !config_named_directory_matches(dir_path, &pinned_dir)) {
+        int saved_errno = errno ? errno : ESTALE;
+        if (dir_fd >= 0) close(dir_fd);
+        errno = saved_errno;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot pin config destination directory: %s",
+                         dir_path);
+        return -1;
+    }
+    errno = 0;
+    if (fstatat(dir_fd, target_name, &destination_before,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        destination_existed = true;
+        if (!config_metadata_file_is_safe(&destination_before, false)) {
+            errno = EPERM;
+            set_error(ERR_PERMISSION_DENIED,
+                      "Config destination is not a safe owned regular file: %s",
+                      config_path);
+            goto document_fail;
+        }
+    } else if (errno != ENOENT) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot identify config destination: %s", config_path);
+        goto document_fail;
+    }
+
     /* Create backup if file exists. AR-06 F51: skip it for a settings-only
      * write-back (just active_account), which happens on EVERY switch — the
      * account DATA is unchanged, the write is atomic (temp+rename), and backing
      * up on each switch churned five backups for five switches, rotating real
      * account-edit backups out of the bounded set. */
-    if (make_backup && path_exists(config_path)) {
+    if (make_backup && destination_existed) {
         if (config_backup(config_path) != 0) {
             /* A successful save promises a durable, parseable recovery copy.
              * If that promise cannot be established, the config replacement
              * must not begin. */
-            return -1;
+            goto document_fail;
         }
     }
 
@@ -1655,110 +1846,208 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
      * concurrent gitswitch processes never share a temp file — a shared
      * deterministic name lets one process truncate/rewrite the temp while the
      * other is mid-write, so the loser's rename() installs a partial config. */
-    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s.tmp.%d", config_path, (int)getpid())
-        >= sizeof(temp_path)) {
+    if ((size_t)snprintf(temp_name, sizeof(temp_name), "%s.tmp.%d",
+                         target_name, (int)getpid()) >= sizeof(temp_name) ||
+        (size_t)snprintf(temp_path, sizeof(temp_path), "%s%s%s", dir_path,
+                         strcmp(dir_path, "/") == 0 ? "" : "/",
+                         temp_name) >= sizeof(temp_path)) {
         set_error(ERR_INVALID_ARGS, "Temporary file path too long");
-        return -1;
+        goto document_fail;
     }
 
-    /* Pre-create the temp file with O_CREAT|O_EXCL (which never follows
-     * symlinks) and mode 0600, so the name is guaranteed to be a fresh
-     * regular file we own before toml_write_file() reopens it by path. The
-     * destination directory was validated above as a user-owned, non-symlink
-     * directory that nobody else can write, so no other principal can swap
-     * the name between the two opens (cfg-symlink-01). */
-    unlink(temp_path); /* clear any stale temp from a crashed run of this pid */
-    {
-        int tfd = open(temp_path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
-        if (tfd < 0) {
-            set_system_error(ERR_CONFIG_WRITE_FAILED,
-                             "Failed to create temporary config file: %s", temp_path);
-            return -1;
+    /* Retire only a provably private stale inode from a crashed reuse of this
+     * pid. Never unlink a symlink or foreign/substituted pathname. */
+    errno = 0;
+    if (fstatat(dir_fd, temp_name, &temp_now, AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!config_metadata_file_is_safe(&temp_now, true) ||
+            unlinkat(dir_fd, temp_name, 0) != 0) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing unsafe stale config temporary file: %s",
+                      temp_path);
+            goto document_fail;
         }
-        close(tfd);
+    } else if (errno != ENOENT) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot inspect config temporary file: %s", temp_path);
+        goto document_fail;
     }
+    temp_fd = openat(dir_fd, temp_name,
+                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                     PERM_USER_RW);
+    if (temp_fd < 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to create private temporary config file: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    temp_exists = true;
+    if (fchmod(temp_fd, PERM_USER_RW) != 0 ||
+        fstat(temp_fd, &temp_identity) != 0 ||
+        !config_metadata_file_is_safe(&temp_identity, true)) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to create private temporary config file: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    have_temp_identity = true;
+
     /* SIG-02 (AR-02 #27): register the temp for signal cleanup for the span
      * it exists. Only effective while a guard handler is installed (main()
      * holds one across the save-after-switch); otherwise it is an inert no-op
      * — the atomic temp+rename below protects the real file either way, this
      * only prevents an orphaned .tmp when a signal lands mid-save. */
-    signals_scratch_register(temp_path);
+    if (signals_scratch_register(temp_path) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot register config temporary file for cleanup");
+        goto document_fail;
+    }
+    temp_registered = true;
 
-    /* Write to temporary file first (already created 0600 above, so the
-     * content is never observable with looser permissions) */
-    if (toml_write_file(doc, temp_path) != 0) {
-        unlink(temp_path); /* don't leave a stale/partial .tmp behind */
-        signals_scratch_unregister(temp_path);
-        return -1;
+    /* The TOML layer serializes and fsyncs this exact descriptor but cannot
+     * publish it. Config remains the sole owner of rename and directory sync. */
+    if (toml_write_fd(doc, temp_fd) != 0) {
+        goto document_fail;
+    }
+    errno = 0;
+    if (fstat(temp_fd, &temp_now) != 0 ||
+        !config_metadata_file_is_safe(&temp_now, true) ||
+        !config_metadata_same_file(&temp_identity, &temp_now) ||
+        fstatat(dir_fd, temp_name, &temp_now, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&temp_now, true) ||
+        !config_metadata_same_file(&temp_identity, &temp_now)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Temporary config changed before publication: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    if (close(temp_fd) != 0) {
+        temp_fd = -1;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to close temporary config file: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    temp_fd = -1;
+
+    if (!config_named_directory_matches(dir_path, &pinned_dir)) {
+        errno = ESTALE;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Config destination directory changed before publication: %s",
+                         dir_path);
+        goto document_fail;
+    }
+    errno = 0;
+    if (fstatat(dir_fd, target_name, &destination_now,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        if (!destination_existed ||
+            !config_metadata_snapshot_same(&destination_before,
+                                           &destination_now)) {
+            errno = destination_existed ? ESTALE : EEXIST;
+            set_system_error(ERR_CONFIG_WRITE_FAILED,
+                             "Config destination changed before publication: %s",
+                             config_path);
+            goto document_fail;
+        }
+    } else if (destination_existed || errno != ENOENT) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Config destination changed before publication: %s",
+                         config_path);
+        goto document_fail;
     }
 
     /* Atomic move from temp to final location */
     if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_RENAME,
-                        "config document rename") ||
-        rename(temp_path, config_path) != 0) {
+                        "config document rename")) {
+        goto document_fail;
+    }
+    if ((destination_existed &&
+         renameat(dir_fd, temp_name, dir_fd, target_name) != 0) ||
+        (!destination_existed &&
+         config_publish_noreplace_at(dir_fd, temp_name, target_name) != 0)) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                         "Failed to move temporary config file to final location");
-        unlink(temp_path);
-        signals_scratch_unregister(temp_path);
-        return -1;
+        goto document_fail;
     }
-    signals_scratch_unregister(temp_path); /* renamed away: nothing to clean */
+    temp_exists = false;
+    signals_scratch_unregister(temp_path);
+    temp_registered = false;
     if (config_installed) {
         *config_installed = true;
     }
 
+    errno = 0;
+    if (fstatat(dir_fd, target_name, &destination_now,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&destination_now, true) ||
+        !config_metadata_same_file(&temp_identity, &destination_now)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Installed config failed identity verification: %s",
+                         config_path);
+        goto document_fail;
+    }
+
     /* AR-05 L11: per POSIX a rename() is only durable once the directory
-     * holding the new entry is itself fsynced. toml_write_file already
-     * fsyncs the payload, but without this a crash right after a
+     * holding the new entry is itself fsynced. toml_write_fd already fsyncs
+     * the payload, but without this a crash right after a
      * reported-successful save could silently revert the directory entry to
      * the pre-rename config (lost-but-acknowledged update; never a torn
      * file). It is a required commit now: a caller must not print success for
      * an update the filesystem has not made durable. O_NOFOLLOW matches the
      * directory validation above. */
-    {
-        char dir_path[MAX_PATH_LEN];
-        const char *slash = strrchr(config_path, '/');
-        if (slash && (size_t)(slash - config_path) < sizeof(dir_path)) {
-            size_t dir_len = (size_t)(slash - config_path);
-            if (dir_len == 0) dir_len = 1; /* config directly under "/" */
-            memcpy(dir_path, config_path, dir_len);
-            dir_path[dir_len] = '\0';
-            int dfd = open(dir_path,
-                           O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-            if (dfd >= 0) {
-                if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC,
-                                    "config document directory sync") ||
-                    fsync(dfd) != 0) {
-                    int saved_errno = errno;
-                    close(dfd);
-                    errno = saved_errno;
-                    set_system_error(ERR_CONFIG_WRITE_FAILED,
-                                     "Could not durably commit config directory: %s",
-                                     dir_path);
-                    return -1;
-                } else {
-                    close(dfd);
-                }
-            } else {
-                set_system_error(ERR_CONFIG_WRITE_FAILED,
-                                 "Could not open config directory for durable commit: %s",
-                                 dir_path);
-                return -1;
-            }
-        } else {
-            set_error(ERR_INVALID_PATH,
-                      "Cannot determine config directory for durable commit: %s",
-                      config_path);
-            return -1;
-        }
+    if (!config_named_directory_matches(dir_path, &pinned_dir) ||
+        config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC,
+                        "config document directory sync") ||
+        fsync(dir_fd) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Could not durably commit config directory: %s",
+                         dir_path);
+        goto document_fail;
     }
 
     if (update_hint &&
         config_update_resume_hint(ctx, config_path, NULL) != 0) {
-        return -1;
+        goto document_fail;
     }
+    close(dir_fd);
     log_info("Configuration document committed to: %s", config_path);
     return 0;
+
+document_fail:
+    {
+        int saved_errno = errno ? errno : EIO;
+        if (temp_exists && !have_temp_identity && temp_fd >= 0 &&
+            fstat(temp_fd, &temp_identity) == 0) {
+            have_temp_identity = true;
+        }
+        if (temp_fd >= 0) close(temp_fd);
+        if (temp_exists && dir_fd >= 0) {
+            struct stat cleanup_identity;
+            if (have_temp_identity &&
+                fstatat(dir_fd, temp_name, &cleanup_identity,
+                        AT_SYMLINK_NOFOLLOW) == 0 &&
+                config_metadata_same_file(&temp_identity,
+                                          &cleanup_identity) &&
+                config_metadata_file_is_safe(&cleanup_identity, true)) {
+                if (unlinkat(dir_fd, temp_name, 0) == 0) {
+                    temp_exists = false;
+                }
+            } else if (temp_registered) {
+                /* A substituted pathname is not ours and must never remain in
+                 * the path-only emergency cleanup registry. */
+                signals_scratch_unregister(temp_path);
+                temp_registered = false;
+            }
+        }
+        if (temp_registered && !temp_exists) {
+            signals_scratch_unregister(temp_path);
+        }
+        if (dir_fd >= 0) close(dir_fd);
+        errno = saved_errno;
+    }
+    return -1;
 }
 
 /* Fail-closed gate for full-config rewrites (AR-03 M8/M9): the on-disk file
@@ -2014,8 +2303,10 @@ int config_restore_active_account(const gitswitch_ctx_t *ctx,
 /* Create default configuration file */
 int config_create_default(const char *config_path) {
     char config_dir[MAX_PATH_LEN];
-    char temp_path[MAX_PATH_LEN];
+    char temp_path[MAX_PATH_LEN] = "";
+    char temp_name[MAX_PATH_LEN] = "";
     const char *last_slash;
+    const char *target_name;
     struct stat dir_identity;
     struct stat temp_identity;
     struct stat installed;
@@ -2024,6 +2315,8 @@ int config_create_default(const char *config_path) {
     int dir_fd = -1;
     int fd = -1;
     bool registered = false;
+    bool temp_exists = false;
+    bool have_temp_identity = false;
     
     if (!config_path) {
         set_error(ERR_INVALID_ARGS, "NULL config path to config_create_default");
@@ -2031,6 +2324,11 @@ int config_create_default(const char *config_path) {
     }
     
     last_slash = strrchr(config_path, '/');
+    target_name = last_slash ? last_slash + 1 : config_path;
+    if (target_name[0] == '\0') {
+        set_error(ERR_INVALID_PATH, "Default config path has no file name");
+        return -1;
+    }
     if (!last_slash) {
         if (safe_strncpy(config_dir, ".", sizeof(config_dir)) != 0) {
             return -1;
@@ -2067,16 +2365,31 @@ int config_create_default(const char *config_path) {
                   config_dir);
         return -1;
     }
-    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s.create.XXXXXX",
-                         config_path) >= sizeof(temp_path)) {
-        set_error(ERR_INVALID_PATH, "Default config temporary path is too long");
+    dir_fd = open(config_dir,
+                  O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fstat(dir_fd, &installed) != 0 ||
+        !config_metadata_dir_is_safe(&installed) ||
+        !config_metadata_same_file(&dir_identity, &installed)) {
+        int saved_errno = errno ? errno : ESTALE;
+        if (dir_fd >= 0) close(dir_fd);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot pin default config parent: %s", config_dir);
         return -1;
     }
-    fd = mkstemp(temp_path);
+    fd = config_create_private_temp_at(dir_fd, target_name, temp_name,
+                                       sizeof(temp_name));
     if (fd < 0) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Failed to create default config temporary file");
-        return -1;
+        goto default_fail;
+    }
+    temp_exists = true;
+    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s%s%s", config_dir,
+                         strcmp(config_dir, "/") == 0 ? "" : "/",
+                         temp_name) >= sizeof(temp_path)) {
+        set_error(ERR_INVALID_PATH, "Default config temporary path is too long");
+        goto default_fail;
     }
     if (signals_scratch_register(temp_path) != 0) {
         set_error(ERR_FILE_IO,
@@ -2090,6 +2403,7 @@ int config_create_default(const char *config_path) {
                          "Failed to secure default config temporary file");
         goto default_fail;
     }
+    have_temp_identity = true;
     if (config_io_fault(CONFIG_IO_DEFAULT_AFTER_TEMP,
                         "default config temp creation")) {
         goto default_fail;
@@ -2126,58 +2440,77 @@ int config_create_default(const char *config_path) {
     }
     fd = -1;
 
-    if (lstat(temp_path, &installed) != 0 ||
+    if (fstatat(dir_fd, temp_name, &installed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&installed, true) ||
         !config_metadata_same_file(&temp_identity, &installed) ||
         (size_t)installed.st_size != length ||
-        lstat(config_dir, &installed) != 0 ||
-        !config_metadata_dir_is_safe(&installed) ||
-        !config_metadata_same_file(&dir_identity, &installed) ||
-        lstat(config_path, &installed) == 0 || errno != ENOENT) {
+        !config_named_directory_matches(config_dir, &dir_identity) ||
+        fstatat(dir_fd, target_name, &installed, AT_SYMLINK_NOFOLLOW) == 0 ||
+        errno != ENOENT) {
         set_error(ERR_CONFIG_WRITE_FAILED,
                   "Default config destination changed before installation");
         goto default_fail;
     }
     if (config_io_fault(CONFIG_IO_DEFAULT_BEFORE_RENAME,
-                        "default config rename") ||
-        rename(temp_path, config_path) != 0) {
-        set_system_error(ERR_CONFIG_WRITE_FAILED,
-                         "Failed to install default config atomically");
+                        "default config no-replace publication")) {
         goto default_fail;
     }
+    if (config_publish_noreplace_at(dir_fd, temp_name, target_name) != 0) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Failed to install default config without replacement");
+        goto default_fail;
+    }
+    temp_exists = false;
     signals_scratch_unregister(temp_path);
     registered = false;
 
-    if (lstat(config_path, &installed) != 0 ||
+    if (fstatat(dir_fd, target_name, &installed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&installed, true) ||
         !config_metadata_same_file(&temp_identity, &installed) ||
         (size_t)installed.st_size != length) {
         set_error(ERR_CONFIG_WRITE_FAILED,
                   "Installed default config failed verification");
-        return -1;
+        goto default_fail;
     }
-    dir_fd = open(config_dir,
-                  O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (dir_fd < 0 ||
+    if (!config_named_directory_matches(config_dir, &dir_identity) ||
         config_io_fault(CONFIG_IO_DEFAULT_BEFORE_DIR_SYNC,
                         "default config directory sync") ||
         fsync(dir_fd) != 0) {
         int saved_errno = errno;
-        if (dir_fd >= 0) close(dir_fd);
+        close(dir_fd);
+        dir_fd = -1;
         errno = saved_errno;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Failed to sync default config directory");
         return -1;
     }
     close(dir_fd);
+    dir_fd = -1;
 
     log_info("Created default configuration file: %s", config_path);
     return 0;
 
 default_fail:
-    if (fd >= 0) close(fd);
-    unlink(temp_path);
-    if (registered) signals_scratch_unregister(temp_path);
+    {
+        int saved_errno = errno ? errno : EIO;
+        if (temp_exists && !have_temp_identity && fd >= 0 &&
+            fstat(fd, &temp_identity) == 0) {
+            have_temp_identity = true;
+        }
+        if (fd >= 0) close(fd);
+        if (temp_exists && dir_fd >= 0 && have_temp_identity) {
+            struct stat current_temp;
+            if (fstatat(dir_fd, temp_name, &current_temp,
+                        AT_SYMLINK_NOFOLLOW) == 0 &&
+                config_metadata_file_is_safe(&current_temp, true) &&
+                config_metadata_same_file(&temp_identity, &current_temp)) {
+                (void)unlinkat(dir_fd, temp_name, 0);
+            }
+        }
+        if (registered) signals_scratch_unregister(temp_path);
+        if (dir_fd >= 0) close(dir_fd);
+        errno = saved_errno;
+    }
     return -1;
 }
 
@@ -3182,20 +3515,38 @@ static int validate_config_write_destination(const char *config_path) {
  * paths plainly, which follows symlinks; for config backups both ends are
  * attacker-influenceable names, so this local variant is used instead. */
 static int copy_file_nofollow(const char *src_path, const char *dst_path) {
-    struct stat st;
+    struct stat before;
+    struct stat after;
+    struct stat named;
+    struct stat destination_identity;
     char buf[4096];
-    int sfd, dfd;
+    int sfd = -1;
+    int dfd = -1;
     ssize_t n;
+    bool destination_created = false;
+    bool have_destination_identity = false;
+    bool copied_first_chunk = false;
+    bool failure_reported = false;
 
+    if (lstat(src_path, &named) != 0 ||
+        !config_metadata_file_is_safe(&named, true)) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify private backup source: %s", src_path);
+        return -1;
+    }
     sfd = open(src_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (sfd < 0) {
         set_system_error(ERR_FILE_IO, "Cannot open backup source (symlink?): %s", src_path);
         return -1;
     }
-    if (fstat(sfd, &st) != 0 || !S_ISREG(st.st_mode)) {
-        set_error(ERR_FILE_IO, "Backup source is not a regular file: %s", src_path);
-        close(sfd);
-        return -1;
+    if (fstat(sfd, &before) != 0 ||
+        !config_metadata_file_is_safe(&before, true) ||
+        !config_metadata_snapshot_same(&before, &named)) {
+        errno = ESTALE;
+        set_error(ERR_FILE_IO,
+                  "Backup source changed before copying: %s", src_path);
+        failure_reported = true;
+        goto fail;
     }
 
     /* O_EXCL never follows a symlink and fails if the name exists at all, so
@@ -3211,6 +3562,13 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path) {
         errno = saved;
         return -1;
     }
+    destination_created = true;
+    if (fchmod(dfd, PERM_USER_RW) != 0 ||
+        fstat(dfd, &destination_identity) != 0 ||
+        !config_metadata_file_is_safe(&destination_identity, true)) {
+        goto fail;
+    }
+    have_destination_identity = true;
 
     while ((n = read(sfd, buf, sizeof(buf))) != 0) {
         ssize_t off = 0;
@@ -3230,28 +3588,78 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path) {
             }
             off += w;
         }
+        if (!copied_first_chunk) {
+            copied_first_chunk = true;
+            if (config_io_fault(CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK,
+                                "config backup source consistency checkpoint")) {
+                failure_reported = true;
+                goto fail;
+            }
+        }
     }
 
-    close(sfd);
+    errno = 0;
+    if (fstat(sfd, &after) != 0 || lstat(src_path, &named) != 0 ||
+        !config_metadata_file_is_safe(&after, true) ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_snapshot_same(&before, &after) ||
+        !config_metadata_snapshot_same(&before, &named)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Configuration changed while backup was copied: %s",
+                         src_path);
+        failure_reported = true;
+        goto fail;
+    }
+    if (close(sfd) != 0) {
+        sfd = -1;
+        goto fail;
+    }
     sfd = -1;
     if (config_io_fault(CONFIG_IO_BACKUP_BEFORE_FILE_SYNC,
-                        "config backup payload sync") || fsync(dfd) != 0) {
+                        "config backup payload sync")) {
+        failure_reported = true;
+        goto fail;
+    }
+    if (fsync(dfd) != 0) {
+        set_system_error(ERR_FILE_IO, "Failed to sync backup file: %s",
+                         dst_path);
+        failure_reported = true;
         goto fail;
     }
     if (close(dfd) != 0) {
         dfd = -1;
-        unlink(dst_path);
         set_system_error(ERR_FILE_IO, "Failed to finalize backup file: %s", dst_path);
-        return -1;
+        failure_reported = true;
+        goto fail;
     }
     dfd = -1;
     return 0;
 
 fail:
-    set_system_error(ERR_FILE_IO, "Failed to copy backup: %s -> %s", src_path, dst_path);
-    if (sfd >= 0) close(sfd);
-    if (dfd >= 0) close(dfd);
-    unlink(dst_path);
+    {
+        int saved_errno = errno ? errno : EIO;
+        if (!failure_reported) {
+            set_system_error(ERR_FILE_IO, "Failed to copy backup: %s -> %s",
+                             src_path, dst_path);
+        }
+        if (sfd >= 0) close(sfd);
+        if (destination_created && !have_destination_identity && dfd >= 0 &&
+            fstat(dfd, &destination_identity) == 0 &&
+            config_metadata_file_is_safe(&destination_identity, true)) {
+            have_destination_identity = true;
+        }
+        if (dfd >= 0) close(dfd);
+        if (destination_created && have_destination_identity) {
+            struct stat current_destination;
+            if (lstat(dst_path, &current_destination) == 0 &&
+                config_metadata_same_file(&destination_identity,
+                                          &current_destination)) {
+                (void)unlink(dst_path);
+            }
+        }
+        errno = saved_errno;
+    }
     return -1;
 }
 

@@ -53,6 +53,8 @@ static toml_section_t *find_section(toml_document_t *doc, const char *section_na
 static toml_section_t *find_or_create_section(toml_document_t *doc, const char *section_name);
 static toml_keyvalue_t *find_key(toml_section_t *section, const char *key_name);
 static bool section_name_is_valid(const char *section_name);
+static bool toml_same_file(const struct stat *left, const struct stat *right);
+static bool toml_temp_identity_is_private(const struct stat *identity);
 static toml_document_init_hook_fn g_document_init_hook;
 static toml_writer_test_hook_fn g_writer_test_hook;
 
@@ -1708,6 +1710,174 @@ static int write_escaped_string_value(FILE *file, const char *key, const char *v
     return 0;
 }
 
+/* Serialize, size-check, and durably flush one already-open stream. Keeping
+ * this stream-only work separate from publication lets config.c own exactly one
+ * final rename and directory fsync while toml_write_file retains its standalone
+ * atomic API. */
+static int toml_serialize_stream(const toml_document_t *doc, FILE *file,
+                                 const char **failure_context,
+                                 int *saved_errno) {
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const toml_section_t *section = &doc->sections[i];
+
+        if (fprintf(file, "[%s]\n", section->name) < 0) {
+            *failure_context = "Failed to write TOML section header";
+            *saved_errno = errno ? errno : EIO;
+            return -1;
+        }
+
+        for (size_t j = 0; j < section->key_count; j++) {
+            const toml_keyvalue_t *kv = &section->keys[j];
+            if (!kv->is_set) continue;
+
+            switch (kv->type) {
+                case TOML_TYPE_STRING:
+                    if (write_escaped_string_value(file, kv->key,
+                                                   kv->value) < 0) {
+                        *failure_context = "Failed to write TOML string value";
+                        *saved_errno = errno ? errno : EIO;
+                        return -1;
+                    }
+                    break;
+                case TOML_TYPE_INTEGER:
+                case TOML_TYPE_BOOLEAN:
+                    if (fprintf(file, "%s = %s\n", kv->key, kv->value) < 0) {
+                        *failure_context = "Failed to write TOML value";
+                        *saved_errno = errno ? errno : EIO;
+                        return -1;
+                    }
+                    break;
+                case TOML_TYPE_INVALID:
+                default:
+                    break;
+            }
+        }
+
+        if (i < doc->section_count - 1 && fputc('\n', file) == EOF) {
+            *failure_context = "Failed to write TOML section separator";
+            *saved_errno = errno ? errno : EIO;
+            return -1;
+        }
+    }
+
+    /* stdio may defer EFBIG/ENOSPC/EIO until flush or close. The parser accepts
+     * exactly TOML_MAX_FILE_SIZE bytes, so measure the escaped output itself. */
+    if (fflush(file) != 0) {
+        *failure_context = "Failed to flush temporary TOML file";
+        *saved_errno = errno ? errno : EIO;
+        return -1;
+    }
+    struct stat serialized;
+    if (fstat(fileno(file), &serialized) != 0) {
+        *failure_context = "Failed to measure serialized TOML file";
+        *saved_errno = errno ? errno : EIO;
+        return -1;
+    }
+    if (serialized.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+        *failure_context = "Serialized TOML file exceeds parser size limit";
+        *saved_errno = EFBIG;
+        return -1;
+    }
+    if (fsync(fileno(file)) != 0) {
+        *failure_context = "Failed to sync temporary TOML file";
+        *saved_errno = errno ? errno : EIO;
+        return -1;
+    }
+    return 0;
+}
+
+int toml_write_fd(const toml_document_t *doc, int fd) {
+    const char *failure_context = NULL;
+    struct stat before;
+    struct stat after;
+    FILE *file = NULL;
+    int stream_fd = -1;
+    int saved_errno = 0;
+    int result = -1;
+
+    if (!doc || fd < 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_write_fd");
+        return -1;
+    }
+    if (fstat(fd, &before) != 0) {
+        saved_errno = errno ? errno : EIO;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot identify TOML output descriptor");
+        errno = saved_errno;
+        return -1;
+    }
+    errno = 0;
+    off_t offset = lseek(fd, 0, SEEK_CUR);
+    if (offset < 0) {
+        saved_errno = errno ? errno : EIO;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot inspect TOML output descriptor offset");
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISREG(before.st_mode) || before.st_uid != getuid() ||
+        before.st_nlink != 1 ||
+        (before.st_mode & 07777) != (S_IRUSR | S_IWUSR) ||
+        before.st_size != 0 || offset != 0) {
+        saved_errno = EINVAL;
+        errno = saved_errno;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "TOML descriptor is not a fresh private file");
+        errno = saved_errno;
+        return -1;
+    }
+
+    stream_fd = dup(fd);
+    if (stream_fd < 0 || fcntl(stream_fd, F_SETFD, FD_CLOEXEC) != 0) {
+        saved_errno = errno ? errno : EIO;
+        failure_context = "Failed to duplicate TOML output descriptor";
+        goto cleanup;
+    }
+    file = fdopen(stream_fd, "w");
+    if (!file) {
+        saved_errno = errno ? errno : EIO;
+        failure_context = "Failed to open TOML output stream";
+        goto cleanup;
+    }
+    stream_fd = -1;
+
+    if (toml_serialize_stream(doc, file, &failure_context, &saved_errno) != 0) {
+        goto cleanup;
+    }
+    if (fclose(file) != 0) {
+        file = NULL;
+        saved_errno = errno ? errno : EIO;
+        failure_context = "Failed to close TOML output stream";
+        goto cleanup;
+    }
+    file = NULL;
+
+    if (fstat(fd, &after) != 0 || !toml_same_file(&before, &after) ||
+        !toml_temp_identity_is_private(&after) || after.st_size < 0 ||
+        after.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+        saved_errno = errno ? errno : ESTALE;
+        failure_context = "TOML output descriptor changed during serialization";
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (file) {
+        if (fclose(file) != 0 && !failure_context) {
+            saved_errno = errno ? errno : EIO;
+            failure_context = "Failed to close TOML output stream";
+        }
+    } else if (stream_fd >= 0) {
+        (void)close(stream_fd);
+    }
+    if (failure_context) {
+        errno = saved_errno ? saved_errno : EIO;
+        set_system_error(ERR_CONFIG_WRITE_FAILED, "%s", failure_context);
+        result = -1;
+    }
+    return result;
+}
+
 static bool toml_same_file(const struct stat *left, const struct stat *right) {
     return left && right && left->st_dev == right->st_dev &&
            left->st_ino == right->st_ino;
@@ -1921,73 +2091,7 @@ int toml_write_file(const toml_document_t *doc, const char *file_path) {
     }
     temp_fd = -1; /* owned by file */
 
-    for (size_t i = 0; i < doc->section_count; i++) {
-        const toml_section_t *section = &doc->sections[i];
-
-        if (fprintf(file, "[%s]\n", section->name) < 0) {
-            failure_context = "Failed to write TOML section header";
-            saved_errno = errno;
-            goto cleanup;
-        }
-
-        for (size_t j = 0; j < section->key_count; j++) {
-            const toml_keyvalue_t *kv = &section->keys[j];
-            if (!kv->is_set) continue;
-
-            switch (kv->type) {
-                case TOML_TYPE_STRING:
-                    if (write_escaped_string_value(file, kv->key, kv->value) < 0) {
-                        failure_context = "Failed to write TOML string value";
-                        saved_errno = errno;
-                        goto cleanup;
-                    }
-                    break;
-                case TOML_TYPE_INTEGER:
-                case TOML_TYPE_BOOLEAN:
-                    if (fprintf(file, "%s = %s\n", kv->key, kv->value) < 0) {
-                        failure_context = "Failed to write TOML value";
-                        saved_errno = errno;
-                        goto cleanup;
-                    }
-                    break;
-                case TOML_TYPE_INVALID:
-                default:
-                    break;
-            }
-        }
-
-        if (i < doc->section_count - 1 && fputc('\n', file) == EOF) {
-            failure_context = "Failed to write TOML section separator";
-            saved_errno = errno;
-            goto cleanup;
-        }
-    }
-
-    /* stdio may defer EFBIG/ENOSPC/EIO until flush or close. Check every
-     * boundary before rename. A duplicate descriptor pins the populated inode
-     * across fclose so it can still be sealed to the pathname at commit. */
-    if (fflush(file) != 0) {
-        failure_context = "Failed to flush temporary TOML file";
-        saved_errno = errno;
-        goto cleanup;
-    }
-    /* The parser accepts exactly TOML_MAX_FILE_SIZE bytes. Measure the flushed
-     * temporary inode rather than summing source strings: quotes, backslashes,
-     * and control characters expand during serialization. Never publish a
-     * document that this binary cannot read back. */
-    if (fstat(fileno(file), &current_temp) != 0) {
-        failure_context = "Failed to measure serialized TOML file";
-        saved_errno = errno;
-        goto cleanup;
-    }
-    if (current_temp.st_size > (off_t)TOML_MAX_FILE_SIZE) {
-        failure_context = "Serialized TOML file exceeds parser size limit";
-        saved_errno = EFBIG;
-        goto cleanup;
-    }
-    if (fsync(fileno(file)) != 0) {
-        failure_context = "Failed to sync temporary TOML file";
-        saved_errno = errno;
+    if (toml_serialize_stream(doc, file, &failure_context, &saved_errno) != 0) {
         goto cleanup;
     }
 

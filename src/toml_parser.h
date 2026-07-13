@@ -155,6 +155,14 @@ int toml_set_boolean(toml_document_t *doc, const char *section,
  */
 int toml_write_file(const toml_document_t *doc, const char *file_path);
 
+/**
+ * Serialize and durably flush a TOML document into a caller-owned, fresh,
+ * private regular-file descriptor. This function never creates, links,
+ * renames, or fsyncs a directory: the caller remains the sole publication
+ * owner. The descriptor stays open and continues to belong to the caller.
+ */
+int toml_write_fd(const toml_document_t *doc, int fd);
+
 
 /**
  * Validate TOML document structure for our specific config schema.

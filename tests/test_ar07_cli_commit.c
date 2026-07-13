@@ -465,7 +465,7 @@ TEST(switch_save_failure_restores_git_config_active_and_exact_hint) {
     unlink(output_path);
 }
 
-TEST(post_config_hint_failure_reverse_commits_every_switch_state) {
+TEST(production_ignores_inherited_test_fault_environment) {
     char home[128], runtime[128], config_dir[4096];
     char output_path[128], output[16384], path[8192], contents[16384];
     const char *argv[] = {"gitswitch", "--yes", "new", NULL};
@@ -482,25 +482,24 @@ TEST(post_config_hint_failure_reverse_commits_every_switch_state) {
     CHECK_EQ_INT(unsetenv("GITSWITCH_TEST_FAIL_RESUME_HINT_COMMIT"), 0);
 
     slurp(output_path, output, sizeof(output));
-    CHECK(rc > 0 && rc < 126);
-    CHECK(strstr(output, "Injected resume-hint commit failure") != NULL);
-    if (strstr(output, "previous switch state restored") == NULL) {
-        fprintf(stderr, "  post-config rollback output:\n%s\n", output);
-    }
-    CHECK(strstr(output, "previous switch state restored") != NULL);
-    CHECK(strstr(output, "Switched to:") == NULL);
+    CHECK_EQ_INT(rc, 0);
+    CHECK(strstr(output, "Injected resume-hint commit failure") == NULL);
+    CHECK(strstr(output, "previous switch state restored") == NULL);
+    CHECK(strstr(output, "Switched to: new") != NULL);
 
     snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
     slurp(path, contents, sizeof(contents));
+    /* Switch state lives exclusively in the consolidated state artifact; the
+     * legacy settings key is intentionally not rewritten on every switch. */
     CHECK(strstr(contents, "active_account = \"old\"") != NULL);
     CHECK(strstr(contents, "active_account = \"new\"") == NULL);
     snprintf(path, sizeof(path), "%s/.resume-hint", config_dir);
     slurp(path, contents, sizeof(contents));
-    CHECK_STR_EQ(contents, "none\n");
+    CHECK_STR_EQ(contents, "none\nactive=new\n");
     snprintf(path, sizeof(path), "%s/.gitconfig", home);
     slurp(path, contents, sizeof(contents));
-    CHECK(strstr(contents, "old@example.com") != NULL);
-    CHECK(strstr(contents, "new@example.com") == NULL);
+    CHECK(strstr(contents, "old@example.com") == NULL);
+    CHECK(strstr(contents, "new@example.com") != NULL);
     unlink(output_path);
 }
 
@@ -515,5 +514,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(dry_run_does_not_repair_existing_config_directory_permissions);
     RUN_TEST(save_failures_never_print_final_mutation_success);
     RUN_TEST(switch_save_failure_restores_git_config_active_and_exact_hint);
-    RUN_TEST(post_config_hint_failure_reverse_commits_every_switch_state);
+    RUN_TEST(production_ignores_inherited_test_fault_environment);
 TEST_MAIN_END()
