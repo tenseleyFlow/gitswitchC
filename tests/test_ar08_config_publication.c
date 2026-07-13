@@ -23,6 +23,8 @@ static int g_document_dirsync_calls;
 static int g_toml_publication_calls;
 static bool g_replace_source_name;
 static bool g_replace_backup_destination;
+static config_io_boundary_t g_backup_replace_boundary;
+static int g_backup_replace_calls;
 static bool g_have_competitor_identity;
 static struct stat g_competitor_identity;
 static bool g_have_backup_competitor_identity;
@@ -110,6 +112,58 @@ static void build_large_config(char *buffer, char generation) {
     buffer[position] = '\0';
 }
 
+static void substitute_backup_destination(void) {
+    char dir[1024];
+    char prefix[512];
+    char *slash;
+    DIR *stream;
+    struct dirent *entry;
+
+    if ((size_t)snprintf(dir, sizeof(dir), "%s", g_target) >= sizeof(dir)) {
+        g_hook_error = ENAMETOOLONG;
+        return;
+    }
+    slash = strrchr(dir, '/');
+    if (!slash || slash == dir || slash[1] == '\0' ||
+        (size_t)snprintf(prefix, sizeof(prefix), "%s.backup.",
+                         slash + 1) >= sizeof(prefix)) {
+        g_hook_error = EINVAL;
+        return;
+    }
+    *slash = '\0';
+    stream = opendir(dir);
+    if (!stream) {
+        g_hook_error = errno ? errno : EIO;
+        return;
+    }
+    g_backup_competitor_path[0] = '\0';
+    while ((entry = readdir(stream)) != NULL) {
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
+            if ((size_t)snprintf(g_backup_competitor_path,
+                                 sizeof(g_backup_competitor_path),
+                                 "%s/%s", dir, entry->d_name) >=
+                sizeof(g_backup_competitor_path)) {
+                g_hook_error = ENAMETOOLONG;
+            }
+            break;
+        }
+    }
+    if (closedir(stream) != 0 && g_hook_error == 0) {
+        g_hook_error = errno ? errno : EIO;
+    }
+    if (g_hook_error == 0 &&
+        (g_backup_competitor_path[0] == '\0' ||
+         rename(g_backup_competitor_path, g_saved_backup) != 0 ||
+         write_bytes(g_backup_competitor_path, g_version_b,
+                     g_version_length) != 0 ||
+         lstat(g_backup_competitor_path,
+               &g_backup_competitor_identity) != 0)) {
+        g_hook_error = errno ? errno : EIO;
+    } else if (g_hook_error == 0) {
+        g_have_backup_competitor_identity = true;
+    }
+}
+
 static bool publication_observer(config_io_boundary_t boundary) {
     if (boundary == CONFIG_IO_DEFAULT_BEFORE_RENAME) {
         static const char competitor[] = "competitor-wins\n";
@@ -121,59 +175,17 @@ static bool publication_observer(config_io_boundary_t boundary) {
         } else {
             g_have_competitor_identity = true;
         }
+    } else if (g_replace_backup_destination &&
+               boundary == g_backup_replace_boundary) {
+        if (boundary == CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK) {
+            g_backup_chunk_calls++;
+        }
+        g_backup_replace_calls++;
+        substitute_backup_destination();
     } else if (boundary == CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK) {
         g_backup_chunk_calls++;
         if (g_replace_backup_destination) {
-            char dir[1024];
-            char prefix[512];
-            char *slash;
-            DIR *stream;
-            struct dirent *entry;
-
-            if ((size_t)snprintf(dir, sizeof(dir), "%s", g_target) >=
-                sizeof(dir)) {
-                g_hook_error = ENAMETOOLONG;
-                return false;
-            }
-            slash = strrchr(dir, '/');
-            if (!slash || slash == dir || slash[1] == '\0' ||
-                (size_t)snprintf(prefix, sizeof(prefix), "%s.backup.",
-                                 slash + 1) >= sizeof(prefix)) {
-                g_hook_error = EINVAL;
-                return false;
-            }
-            *slash = '\0';
-            stream = opendir(dir);
-            if (!stream) {
-                g_hook_error = errno ? errno : EIO;
-                return false;
-            }
-            g_backup_competitor_path[0] = '\0';
-            while ((entry = readdir(stream)) != NULL) {
-                if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
-                    if ((size_t)snprintf(g_backup_competitor_path,
-                                         sizeof(g_backup_competitor_path),
-                                         "%s/%s", dir, entry->d_name) >=
-                        sizeof(g_backup_competitor_path)) {
-                        g_hook_error = ENAMETOOLONG;
-                    }
-                    break;
-                }
-            }
-            if (closedir(stream) != 0 && g_hook_error == 0) {
-                g_hook_error = errno ? errno : EIO;
-            }
-            if (g_hook_error == 0 &&
-                (g_backup_competitor_path[0] == '\0' ||
-                 rename(g_backup_competitor_path, g_saved_backup) != 0 ||
-                 write_bytes(g_backup_competitor_path, g_version_b,
-                             g_version_length) != 0 ||
-                 lstat(g_backup_competitor_path,
-                       &g_backup_competitor_identity) != 0)) {
-                g_hook_error = errno ? errno : EIO;
-            } else if (g_hook_error == 0) {
-                g_have_backup_competitor_identity = true;
-            }
+            /* A later checkpoint owns the requested destination swap. */
         } else if (g_replace_source_name) {
             if (rename(g_target, g_saved_source) != 0 ||
                 write_bytes(g_target, g_version_b, g_version_length) != 0) {
@@ -285,7 +297,8 @@ TEST(backup_rejects_when_the_parent_name_selects_a_new_inode) {
     exercise_unstable_backup(true);
 }
 
-TEST(backup_rejects_destination_name_substitution) {
+static void exercise_backup_destination_substitution(
+    config_io_boundary_t boundary) {
     char dir[256];
     char current[LARGE_CONFIG_SIZE + 1];
     struct stat competitor_after;
@@ -303,8 +316,10 @@ TEST(backup_rejects_destination_name_substitution) {
 
     g_hook_error = 0;
     g_backup_chunk_calls = 0;
+    g_backup_replace_calls = 0;
     g_replace_source_name = false;
     g_replace_backup_destination = true;
+    g_backup_replace_boundary = boundary;
     g_have_backup_competitor_identity = false;
     g_backup_competitor_path[0] = '\0';
     clear_error();
@@ -318,6 +333,7 @@ TEST(backup_rejects_destination_name_substitution) {
     CHECK_EQ_INT(result, -1);
     CHECK_EQ_INT(result_errno, ESTALE);
     CHECK_EQ_INT(g_hook_error, 0);
+    CHECK_EQ_INT(g_backup_replace_calls, 1);
     CHECK_EQ_INT(g_backup_chunk_calls, 1);
     CHECK(strstr(get_last_error()->message,
                  "Backup destination changed") != NULL);
@@ -332,6 +348,25 @@ TEST(backup_rejects_destination_name_substitution) {
                  g_version_length);
     CHECK(memcmp(current, g_version_a, g_version_length) == 0);
     CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 1);
+}
+
+TEST(backup_rejects_destination_name_substitution_during_copy) {
+    exercise_backup_destination_substitution(
+        CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK);
+}
+
+TEST(backup_rejects_destination_name_substitution_before_dirsync) {
+    exercise_backup_destination_substitution(
+        CONFIG_IO_BACKUP_BEFORE_DIR_SYNC);
+}
+
+TEST(backup_rejects_destination_name_substitution_before_reopen) {
+    exercise_backup_destination_substitution(CONFIG_IO_BACKUP_BEFORE_REOPEN);
+}
+
+TEST(backup_rejects_destination_name_substitution_during_verification) {
+    exercise_backup_destination_substitution(
+        CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ);
 }
 
 TEST(descriptor_serializer_cannot_publish_a_path) {
@@ -427,7 +462,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(default_creation_never_replaces_a_concurrent_winner);
     RUN_TEST(backup_rejects_an_in_place_mixed_generation);
     RUN_TEST(backup_rejects_when_the_parent_name_selects_a_new_inode);
-    RUN_TEST(backup_rejects_destination_name_substitution);
+    RUN_TEST(backup_rejects_destination_name_substitution_during_copy);
+    RUN_TEST(backup_rejects_destination_name_substitution_before_dirsync);
+    RUN_TEST(backup_rejects_destination_name_substitution_before_reopen);
+    RUN_TEST(backup_rejects_destination_name_substitution_during_verification);
     RUN_TEST(descriptor_serializer_cannot_publish_a_path);
     RUN_TEST(full_save_has_one_document_publisher_and_ignores_fault_environment);
 TEST_MAIN_END()

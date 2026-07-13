@@ -115,7 +115,8 @@ const char *default_config_template =
 static int open_config_validated(const char *config_path);
 static int validate_config_file_security(const char *config_path);
 static int validate_config_write_destination(const char *config_path);
-static int copy_file_nofollow(const char *src_path, const char *dst_path);
+static int copy_file_nofollow(const char *src_path, const char *dst_path,
+                              struct stat *created_identity);
 static bool sanitize_tty_text(char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
@@ -316,7 +317,9 @@ static void config_document_free(toml_document_t *doc) {
  * settings-only write-back (config_save_active_account), which must edit the
  * on-disk document rather than rebuild it (AR-03 M9). The caller owns doc
  * cleanup on both success and failure. */
-static int config_read_document(const char *config_path, toml_document_t *doc) {
+static int config_read_document_expected(const char *config_path,
+                                         toml_document_t *doc,
+                                         const struct stat *expected_identity) {
     char *buffer = NULL;
     struct stat before, after, path_after;
     size_t file_size, total = 0;
@@ -329,6 +332,15 @@ static int config_read_document(const char *config_path, toml_document_t *doc) {
     }
     if (fstat(fd, &before) != 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot stat config file: %s", config_path);
+        close(fd);
+        return -1;
+    }
+    if (expected_identity &&
+        !config_metadata_snapshot_same(expected_identity, &before)) {
+        errno = ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Backup destination changed before verification: %s",
+                         config_path);
         close(fd);
         return -1;
     }
@@ -414,6 +426,11 @@ static int config_read_document(const char *config_path, toml_document_t *doc) {
             after.st_mode == path_after.st_mode &&
             before.st_size == after.st_size &&
             after.st_size == path_after.st_size;
+        if (expected_identity) {
+            metadata_stable = metadata_stable &&
+                config_metadata_snapshot_same(expected_identity, &after) &&
+                config_metadata_snapshot_same(expected_identity, &path_after);
+        }
 #if defined(__APPLE__)
         metadata_stable = metadata_stable &&
             before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
@@ -436,9 +453,18 @@ static int config_read_document(const char *config_path, toml_document_t *doc) {
             after.st_ctim.tv_nsec == path_after.st_ctim.tv_nsec;
 #endif
         if (extra != 0 || !metadata_stable) {
-            set_error(ERR_FILE_IO,
-                      "Configuration changed while it was being read; retry: %s",
-                      config_path);
+            if (expected_identity) {
+                errno = ESTALE;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Backup destination changed during verification: %s",
+                    config_path);
+            } else {
+                set_error(
+                    ERR_FILE_IO,
+                    "Configuration changed while it was being read; retry: %s",
+                    config_path);
+            }
             close(fd);
             goto fail_buffer;
         }
@@ -458,6 +484,10 @@ fail_buffer:
     secure_zero_memory(buffer, file_size + 1);
     free(buffer);
     return -1;
+}
+
+static int config_read_document(const char *config_path, toml_document_t *doc) {
+    return config_read_document_expected(config_path, doc, NULL);
 }
 
 #define CONFIG_ACTIVE_STATE_MAX 1024U
@@ -3249,6 +3279,9 @@ int config_backup(const char *config_path) {
     uint32_t nanoseconds;
     uint64_t generation = 0;
     size_t count;
+    struct stat backup_identity;
+    struct stat named_backup;
+    bool backup_created = false;
     int dir_fd = -1;
     int rc = -1;
 
@@ -3306,7 +3339,11 @@ int config_backup(const char *config_path) {
             return -1;
         }
         errno = 0;
-        if (copy_file_nofollow(config_path, backup_path) == 0) break;
+        if (copy_file_nofollow(config_path, backup_path,
+                               &backup_identity) == 0) {
+            backup_created = true;
+            break;
+        }
         if (errno != EEXIST || generation == UINT64_MAX) return -1;
         generation++;
     }
@@ -3328,7 +3365,9 @@ int config_backup(const char *config_path) {
         goto backup_fail;
     }
     verify_doc = config_document_alloc();
-    if (!verify_doc || config_read_document(backup_path, verify_doc) != 0) {
+    if (!verify_doc ||
+        config_read_document_expected(backup_path, verify_doc,
+                                      &backup_identity) != 0) {
         if (!verify_doc && get_last_error()->code == ERR_SUCCESS) {
             set_error(ERR_MEMORY_ALLOCATION,
                       "Cannot allocate config backup verification document");
@@ -3341,19 +3380,35 @@ int config_backup(const char *config_path) {
     if (config_backup_prune(config_path, 5) != 0) {
         return -1;
     }
+    errno = 0;
+    if (lstat(backup_path, &named_backup) != 0 ||
+        !config_metadata_snapshot_same(&backup_identity, &named_backup)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Backup destination changed before completion: %s",
+                         backup_path);
+        goto backup_fail;
+    }
     log_info("Created durable configuration backup: %s", backup_path);
     return 0;
 
 backup_fail:
-    if (verify_doc) config_document_free(verify_doc);
-    if (dir_fd >= 0) close(dir_fd);
-    if (unlink(backup_path) == 0) {
-        int cleanup_fd = open(dir,
-                              O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-        if (cleanup_fd >= 0) {
-            (void)fsync(cleanup_fd);
-            close(cleanup_fd);
+    {
+        int saved_errno = errno ? errno : EIO;
+
+        if (verify_doc) config_document_free(verify_doc);
+        if (dir_fd >= 0) close(dir_fd);
+        if (backup_created && lstat(backup_path, &named_backup) == 0 &&
+            config_metadata_snapshot_same(&backup_identity, &named_backup) &&
+            unlink(backup_path) == 0) {
+            int cleanup_fd = open(
+                dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+            if (cleanup_fd >= 0) {
+                (void)fsync(cleanup_fd);
+                close(cleanup_fd);
+            }
         }
+        errno = saved_errno;
     }
     return rc;
 }
@@ -3523,7 +3578,8 @@ static int validate_config_write_destination(const char *config_path) {
  * O_EXCL with mode 0600 (cfg-symlink-01). utils' copy_file() open()s both
  * paths plainly, which follows symlinks; for config backups both ends are
  * attacker-influenceable names, so this local variant is used instead. */
-static int copy_file_nofollow(const char *src_path, const char *dst_path) {
+static int copy_file_nofollow(const char *src_path, const char *dst_path,
+                              struct stat *created_identity) {
     struct stat before;
     struct stat after;
     struct stat named;
@@ -3663,6 +3719,9 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path) {
         goto fail;
     }
     dfd = -1;
+    if (created_identity) {
+        *created_identity = destination_after;
+    }
     return 0;
 
 fail:
