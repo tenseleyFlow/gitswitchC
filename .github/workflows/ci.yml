@@ -64,7 +64,7 @@ jobs:
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Release artifact hardening (built + staged)
-        run: make BUILD_TYPE=release READLINE=1 release-artifact-test
+        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
       # AR-05 L8: symbol-level no-shell gate. An undefined-symbol reference to
       # system()/popen() in the linked binary catches ANY call path — headers,
       # whitespace variants, function pointers — that the textual tripwire
@@ -110,7 +110,7 @@ jobs:
         run: |
           make clean
           make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
-          make CC=clang BUILD_TYPE=release READLINE=1 release-artifact-test
+          make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
 
@@ -150,7 +150,7 @@ jobs:
             export READELF="$readelf_tool"
             gmake BUILD_TYPE=release WERROR=1
             gmake BUILD_TYPE=release WERROR=1 test
-            gmake BUILD_TYPE=release release-artifact-test
+            gmake BUILD_TYPE=release WERROR=1 release-artifact-test
 
   macos:
     runs-on: macos-latest
@@ -173,7 +173,7 @@ jobs:
         run: |
           make clean
           make BUILD_TYPE=release READLINE=1 WERROR=1 test
-          make BUILD_TYPE=release READLINE=1 release-artifact-test
+          make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
         env:
           # Same sole OS-specific exclusion as the debug lane above.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets

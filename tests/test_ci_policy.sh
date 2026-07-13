@@ -54,42 +54,170 @@ check_policy()
         fail "workflow grants a write permission"
     fi
 
-    # Close each checkout step at the next step boundary and require its
-    # credential policy inside that exact block.
+    # Close each checkout step at the next YAML sequence-item boundary and
+    # require exactly one effective credential policy inside that step's
+    # `with` mapping. Comments are not configuration: accepting a commented
+    # `persist-credentials: false` beside an effective true value made this
+    # gate trivially bypassable.
     awk '
-        function close_checkout() {
-            if (checkout && !no_credentials) bad = 1
+        function strip_comment(line) {
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            return line
+        }
+        function indentation(line, prefix) {
+            prefix = line
+            sub(/[^ ].*$/, "", prefix)
+            return length(prefix)
+        }
+        function close_step() {
+            if (checkout &&
+                (credential_count != 1 || credential_value != "false" ||
+                 !credential_in_with)) bad = 1
             checkout = 0
-            no_credentials = 0
+            credential_count = 0
+            credential_value = ""
+            credential_in_with = 0
+            in_with = 0
+            with_indent = -1
         }
-        /^[[:space:]]*-[[:space:]]+(name|uses|run):/ {
-            if ($0 !~ /uses:[[:space:]]*actions\/checkout@/) close_checkout()
-        }
-        /uses:[[:space:]]*actions\/checkout@/ {
-            close_checkout()
-            checkout = 1
-            count++
-            next
-        }
-        checkout && /persist-credentials:[[:space:]]*false([[:space:]]|$)/ {
-            no_credentials = 1
+        {
+            code = strip_comment($0)
+            if (code == "") next
+            if (code ~ /^[[:space:]]*-[[:space:]]+[A-Za-z0-9_-]+:/)
+                close_step()
+            if (code ~ /uses:[[:space:]]*actions\/checkout@/) {
+                if (checkout) bad = 1
+                checkout = 1
+                count++
+            }
+            if (!checkout) next
+            current_indent = indentation(code)
+            if (code ~ /^[[:space:]]+with:[[:space:]]*$/) {
+                in_with = 1
+                with_indent = current_indent
+                next
+            }
+            if (in_with && current_indent <= with_indent) in_with = 0
+            if (code ~ /^[[:space:]]+persist-credentials:[[:space:]]*/) {
+                credential_count++
+                value = code
+                sub(/^[[:space:]]*persist-credentials:[[:space:]]*/, "", value)
+                sub(/[[:space:]]+$/, "", value)
+                credential_value = value
+                if (in_with && current_indent > with_indent)
+                    credential_in_with = 1
+            }
         }
         END {
-            close_checkout()
+            close_step()
             exit !(count > 0 && !bad)
         }
-    ' "$workflow" || fail "every checkout must set persist-credentials: false"
+    ' "$workflow" ||
+        fail "every checkout must set exactly one effective persist-credentials: false"
 
-    freebsd_version=$(awk '
-        /operating_system:[[:space:]]*freebsd/ { found = 1; next }
-        found && /version:/ {
-            line = $0
-            sub(/^.*version:[[:space:]]*/, "", line)
-            gsub(/[[:space:]'\''"]/, "", line)
-            print line
-            exit
+    # Artifact inspection must consume the same WERROR=1 configuration that
+    # passed the full release suite. Omitting the knob changes .buildconfig and
+    # silently rebuilds a different production binary before inspection.
+    awk '
+        function strip_comment(line) {
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            return line
         }
-    ' "$workflow")
+        {
+            code = strip_comment($0)
+            command_count = split(code, commands, /[;&|]/)
+            for (i = 1; i <= command_count; i++) {
+                command = commands[i]
+                target_at = match(command,
+                    /(^|[[:space:]])release-artifact-test([[:space:]]|$)/)
+                if (!target_at) continue
+                count++
+                make_at = match(command, /(^|[[:space:]])g?make[[:space:]]/)
+                werror_at = match(command,
+                    /(^|[[:space:]])WERROR=1([[:space:]]|$)/)
+                if (!make_at || !werror_at ||
+                    make_at > werror_at || werror_at > target_at) bad = 1
+            }
+        }
+        END { exit !(count > 0 && !bad) }
+    ' "$workflow" ||
+        fail "every release-artifact-test invocation must preserve WERROR=1"
+
+    # Parse the FreeBSD version only from the uncommented `with` mapping of the
+    # cross-platform action step. The old forward search accepted a stale real
+    # value when a preceding comment happened to mention the supported one.
+    freebsd_version=$(awk '
+        function strip_comment(line) {
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            return line
+        }
+        function indentation(line, prefix) {
+            prefix = line
+            sub(/[^ ].*$/, "", prefix)
+            return length(prefix)
+        }
+        function scalar(line, value, quote) {
+            value = line
+            sub(/^[^:]*:[[:space:]]*/, "", value)
+            gsub(/[[:space:]"]/, "", value)
+            quote = sprintf("%c", 39)
+            gsub(quote, "", value)
+            return value
+        }
+        function close_step() {
+            if (cross_action) {
+                if (os_count != 1 || !os_in_with) bad = 1
+                if (os_value == "freebsd") {
+                    freebsd_count++
+                    if (version_count != 1 || !version_in_with ||
+                        version_value !~ /^[0-9]+\.[0-9]+$/) bad = 1
+                    else print version_value
+                }
+            }
+            cross_action = 0
+            os_count = 0
+            os_value = ""
+            os_in_with = 0
+            version_count = 0
+            version_value = ""
+            version_in_with = 0
+            in_with = 0
+            with_indent = -1
+        }
+        {
+            code = strip_comment($0)
+            if (code == "") next
+            if (code ~ /^[[:space:]]*-[[:space:]]+[A-Za-z0-9_-]+:/)
+                close_step()
+            if (code ~ /uses:[[:space:]]*cross-platform-actions\/action@/)
+                cross_action = 1
+            if (!cross_action) next
+            current_indent = indentation(code)
+            if (code ~ /^[[:space:]]+with:[[:space:]]*$/) {
+                in_with = 1
+                with_indent = current_indent
+                next
+            }
+            if (in_with && current_indent <= with_indent) in_with = 0
+            if (code ~ /^[[:space:]]+operating_system:[[:space:]]*/) {
+                os_count++
+                os_value = scalar(code)
+                if (in_with && current_indent > with_indent) os_in_with = 1
+            }
+            if (code ~ /^[[:space:]]+version:[[:space:]]*/) {
+                version_count++
+                version_value = scalar(code)
+                if (in_with && current_indent > with_indent) version_in_with = 1
+            }
+        }
+        END {
+            close_step()
+            if (freebsd_count != 1 || bad) exit 1
+        }
+    ' "$workflow") || fail "FreeBSD action policy is missing or structurally ambiguous"
     [ -n "$freebsd_version" ] || fail "FreeBSD CI version is not explicit"
     case $freebsd_version in
         14.4) freebsd_eol=2026-12-31 ;;
@@ -105,12 +233,12 @@ check_policy()
 
 expect_rejected()
 {
-    label=$1
-    workflow=$2
-    policy_date=$3
-    if WORK_ACTIONS="$tmp/check-actions" "$script" --check "$workflow" \
-        "$policy_date" >"$tmp/out" 2>&1; then
-        fail "$label fixture was accepted"
+    reject_label=$1
+    reject_workflow=$2
+    reject_policy_date=$3
+    if WORK_ACTIONS="$tmp/check-actions" "$script" --check "$reject_workflow" \
+        "$reject_policy_date" >"$tmp/out" 2>&1; then
+        fail "$reject_label fixture was accepted"
     fi
 }
 
@@ -152,12 +280,64 @@ sed 's/persist-credentials: false/persist-credentials: true/g' \
     "$workflow" >"$tmp/credentials.yml"
 expect_rejected "persisted checkout credential" "$tmp/credentials.yml" "$today"
 
+# A false value in a comment must not bless an effective true value.
+awk '
+    !changed && /persist-credentials:[[:space:]]*false/ {
+        line = $0
+        sub(/persist-credentials:[[:space:]]*false/,
+            "persist-credentials: true", line)
+        print line
+        match($0, /^[ ]*/)
+        indent = substr($0, 1, RLENGTH)
+        print indent "# persist-credentials: false"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/credentials-comment.yml"
+expect_rejected "comment-masked persisted checkout credential" \
+    "$tmp/credentials-comment.yml" "$today"
+
 sed 's/contents: read/contents: write/g' "$workflow" >"$tmp/write.yml"
 expect_rejected "write permission" "$tmp/write.yml" "$today"
 
 sed "s/version: '14.4'/version: '14.2'/g" \
     "$workflow" >"$tmp/eol.yml"
 expect_rejected "EOL FreeBSD" "$tmp/eol.yml" "$today"
+
+# Likewise, a supported release mentioned only in a comment must not mask the
+# stale effective version in the action's `with` block.
+awk '
+    /operating_system:[[:space:]]*freebsd/ && !commented {
+        print
+        match($0, /^[ ]*/)
+        indent = substr($0, 1, RLENGTH)
+        print indent "# version: '\''14.4'\''"
+        commented = 1
+        next
+    }
+    commented && /version:[[:space:]]*'\''14\.4'\''/ && !changed {
+        sub(/14\.4/, "14.2")
+        changed = 1
+    }
+    { print }
+    END { if (!commented || !changed) exit 1 }
+' "$workflow" >"$tmp/eol-comment.yml"
+expect_rejected "comment-masked EOL FreeBSD" "$tmp/eol-comment.yml" "$today"
 expect_rejected "expired support window" "$workflow" 2027-01-01
+
+# Dropping WERROR from even one artifact command changes the build stamp and
+# causes inspection to consume a freshly rebuilt, non-WERROR binary.
+awk '
+    !changed && /release-artifact-test/ && /WERROR=1/ {
+        sub(/WERROR=1[[:space:]]*/, "")
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/artifact-no-werror.yml"
+expect_rejected "artifact rebuild without WERROR" \
+    "$tmp/artifact-no-werror.yml" "$today"
 
 printf 'ci-policy: PASS (immutable, least-privilege, supported-platform workflow)\n'
