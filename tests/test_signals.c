@@ -25,6 +25,104 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Every file used to coordinate the signal tests lives below one private,
+ * randomized directory.  Keep an open descriptor to that directory so file
+ * creation and ordinary cleanup cannot be redirected through a replaced path
+ * component.  ts_mkdtemp() also pins the directory for its no-follow atexit
+ * sweep, so a preplaced/replacement symlink is unlinked rather than followed. */
+static char test_fixture_root[] = "/tmp/gitswitch-signals.XXXXXX";
+static int test_fixture_root_fd = -1;
+
+static bool test_fixture_name_is_safe(const char *name) {
+    return name && name[0] != '\0' && strcmp(name, ".") != 0 &&
+           strcmp(name, "..") != 0 && strchr(name, '/') == NULL;
+}
+
+static int test_fixture_init(void) {
+    struct stat st;
+
+    if (!ts_mkdtemp(test_fixture_root)) return -1;
+    test_fixture_root_fd = ts_open_dir_nofollow(test_fixture_root);
+    if (test_fixture_root_fd < 0) return -1;
+    if (fstat(test_fixture_root_fd, &st) != 0) {
+        int saved_errno = errno;
+        close(test_fixture_root_fd);
+        test_fixture_root_fd = -1;
+        errno = saved_errno;
+        return -1;
+    }
+    if (!S_ISDIR(st.st_mode) || (st.st_mode & 0777) != 0700) {
+        close(test_fixture_root_fd);
+        test_fixture_root_fd = -1;
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
+static int test_fixture_path(char *path, size_t path_size, const char *name) {
+    int written;
+
+    if (!path || path_size == 0 || !test_fixture_name_is_safe(name)) {
+        errno = EINVAL;
+        return -1;
+    }
+    written = snprintf(path, path_size, "%s/%s", test_fixture_root, name);
+    if (written < 0 || (size_t)written >= path_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int test_fixture_create(const char *name) {
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+    int fd;
+
+    if (test_fixture_root_fd < 0 || !test_fixture_name_is_safe(name)) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    fd = openat(test_fixture_root_fd, name, flags, 0600);
+    if (fd < 0) return -1;
+#ifndef O_CLOEXEC
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0) {
+        int saved_errno = errno;
+        close(fd);
+        (void)unlinkat(test_fixture_root_fd, name, 0);
+        errno = saved_errno;
+        return -1;
+    }
+#endif
+    if (close(fd) != 0) {
+        int saved_errno = errno;
+        (void)unlinkat(test_fixture_root_fd, name, 0);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static bool test_fixture_exists(const char *name) {
+    struct stat st;
+
+    return test_fixture_root_fd >= 0 && test_fixture_name_is_safe(name) &&
+           fstatat(test_fixture_root_fd, name, &st,
+                   AT_SYMLINK_NOFOLLOW) == 0;
+}
+
+static void test_fixture_unlink(const char *name) {
+    if (test_fixture_root_fd >= 0 && test_fixture_name_is_safe(name)) {
+        (void)unlinkat(test_fixture_root_fd, name, 0);
+    }
+}
+
 static const int test_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
 #define TEST_GUARDED_SIGNAL_COUNT \
     (sizeof(test_guarded_signals) / sizeof(test_guarded_signals[0]))
@@ -365,29 +463,79 @@ TEST(child_spawn_barrier_blocks_only_installed_guard_signals) {
     CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &original_mask, NULL), 0);
 }
 
+TEST(fixture_root_is_private_and_pinned) {
+    struct stat opened;
+    struct stat named;
+
+    CHECK(test_fixture_root_fd >= 0);
+    CHECK_EQ_INT(fstat(test_fixture_root_fd, &opened), 0);
+    CHECK_EQ_INT(lstat(test_fixture_root, &named), 0);
+    CHECK(S_ISDIR(opened.st_mode));
+    CHECK(S_ISDIR(named.st_mode));
+    CHECK_EQ_INT(opened.st_mode & 0777, 0700);
+    CHECK(ts_same_identity(&opened, &named));
+}
+
 /* SIG-02: registered scratch paths are unlinked by cleanup; unregistered ones
  * are left alone. */
 TEST(scratch_registry_unlinks_registered_paths) {
-    char keep_path[128], drop_path[128];
-    snprintf(keep_path, sizeof(keep_path), "/tmp/gsw_scratch_keep.%d", (int)getpid());
-    snprintf(drop_path, sizeof(drop_path), "/tmp/gsw_scratch_drop.%d", (int)getpid());
+    char keep_path[256], drop_path[256];
 
-    FILE *f = fopen(keep_path, "w");
-    CHECK(f != NULL);
-    if (f) fclose(f);
-    f = fopen(drop_path, "w");
-    CHECK(f != NULL);
-    if (f) fclose(f);
+    CHECK_EQ_INT(test_fixture_path(keep_path, sizeof(keep_path),
+                                   "scratch-keep"), 0);
+    CHECK_EQ_INT(test_fixture_path(drop_path, sizeof(drop_path),
+                                   "scratch-drop"), 0);
+    CHECK_EQ_INT(test_fixture_create("scratch-keep"), 0);
+    CHECK_EQ_INT(test_fixture_create("scratch-drop"), 0);
 
     CHECK_EQ_INT(signals_scratch_register(keep_path), 0);
     CHECK_EQ_INT(signals_scratch_register(drop_path), 0);
     signals_scratch_unregister(keep_path);
 
     signals_scratch_cleanup();
-    CHECK(path_exists(keep_path));  /* unregistered: untouched */
-    CHECK(!path_exists(drop_path)); /* registered: unlinked */
+    CHECK(test_fixture_exists("scratch-keep"));  /* unregistered: untouched */
+    CHECK(!test_fixture_exists("scratch-drop")); /* registered: unlinked */
 
-    unlink(keep_path);
+    test_fixture_unlink("scratch-keep");
+}
+
+/* A hostile leaf inside the private root must neither be opened for fixture
+ * output nor cause scratch cleanup to remove its external target.  O_EXCL
+ * makes the creation refusal portable; O_NOFOLLOW adds defense in depth on
+ * platforms that provide it. */
+TEST(fixture_creation_and_cleanup_do_not_follow_preplaced_symlink) {
+    char foreign[] = "/tmp/gitswitch-signals-foreign.XXXXXX";
+    char link_path[256];
+    char observed[8] = { 0 };
+    const char sentinel[] = "safe";
+    int fd = mkstemp(foreign);
+
+    CHECK(fd >= 0);
+    if (fd < 0) return;
+    CHECK_EQ_INT((int)write(fd, sentinel, sizeof(sentinel)),
+                 (int)sizeof(sentinel));
+    CHECK_EQ_INT(close(fd), 0);
+    CHECK_EQ_INT(test_fixture_path(link_path, sizeof(link_path),
+                                   "preplaced-link"), 0);
+    CHECK_EQ_INT(symlinkat(foreign, test_fixture_root_fd,
+                           "preplaced-link"), 0);
+
+    errno = 0;
+    CHECK_EQ_INT(test_fixture_create("preplaced-link"), -1);
+    CHECK(errno == EEXIST || errno == ELOOP);
+    CHECK_EQ_INT(signals_scratch_register(link_path), 0);
+    signals_scratch_cleanup();
+    CHECK(!test_fixture_exists("preplaced-link"));
+
+    fd = open(foreign, O_RDONLY);
+    CHECK(fd >= 0);
+    if (fd >= 0) {
+        CHECK_EQ_INT((int)read(fd, observed, sizeof(sentinel)),
+                     (int)sizeof(sentinel));
+        CHECK_EQ_INT(close(fd), 0);
+        CHECK(memcmp(observed, sentinel, sizeof(sentinel)) == 0);
+    }
+    (void)unlink(foreign);
 }
 
 /* Registration must fail closed on garbage input. */
@@ -422,15 +570,13 @@ TEST(dispatch_terminates_with_deferred_signal) {
  * unlinks registered scratch files (SIG-02) and dies immediately with the
  * signal's default action. */
 TEST(second_signal_is_emergency_exit_and_drops_scratch) {
-    char scratch[128];
+    char scratch[256];
     int status = 0;
     pid_t pid;
-    FILE *f;
 
-    snprintf(scratch, sizeof(scratch), "/tmp/gsw_scratch_emerg.%d", (int)getpid());
-    f = fopen(scratch, "w");
-    CHECK(f != NULL);
-    if (f) fclose(f);
+    CHECK_EQ_INT(test_fixture_path(scratch, sizeof(scratch),
+                                   "scratch-emergency"), 0);
+    CHECK_EQ_INT(test_fixture_create("scratch-emergency"), 0);
 
     fflush(NULL);
     pid = fork();
@@ -446,9 +592,9 @@ TEST(second_signal_is_emergency_exit_and_drops_scratch) {
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFSIGNALED(status));
     if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
-    CHECK(!path_exists(scratch)); /* handler unlinked it before dying */
+    CHECK(!test_fixture_exists("scratch-emergency"));
 
-    unlink(scratch); /* in case the child failed */
+    test_fixture_unlink("scratch-emergency"); /* in case the child failed */
 }
 
 /* AR-02 #2: a second signal arriving while the failed-switch ROLLBACK is
@@ -458,29 +604,25 @@ TEST(second_signal_is_emergency_exit_and_drops_scratch) {
  * with the correct death-by-signal status. Exit code 10/11/12 mark the
  * specific failure mode. */
 TEST(second_signal_during_rollback_is_deferred) {
-    char marker[128];
     int status = 0;
     pid_t pid;
 
     /* Stands in for "the rest of git_config_restore": pre-fix the child died
      * at the second raise and never created it; post-fix the whole window
      * completes first, so the marker must exist. */
-    snprintf(marker, sizeof(marker), "/tmp/gsw_rollback_done.%d", (int)getpid());
-    unlink(marker);
+    CHECK(!test_fixture_exists("rollback-done"));
 
     fflush(NULL);
     pid = fork();
     CHECK(pid >= 0);
     if (pid == 0) {
-        FILE *f;
         signals_guard_begin();
         raise(SIGINT);                     /* the signal that aborted the switch */
         if (!signals_pending()) _exit(10); /* first signal must defer */
         signals_rollback_begin();
         raise(SIGINT);                     /* second: pre-fix this killed us HERE */
         if (!signals_pending()) _exit(11); /* must still be recorded, not lost */
-        f = fopen(marker, "w");            /* "restore completed" evidence */
-        if (f) fclose(f);
+        if (test_fixture_create("rollback-done") != 0) _exit(13);
         signals_rollback_end();
         signals_dispatch_pending();        /* rollback done: now die correctly */
         _exit(12);
@@ -488,9 +630,9 @@ TEST(second_signal_during_rollback_is_deferred) {
     CHECK(waitpid(pid, &status, 0) == pid);
     CHECK(WIFSIGNALED(status));            /* still reports death-by-signal */
     if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
-    CHECK(path_exists(marker));            /* ...but only AFTER the window closed */
+    CHECK(test_fixture_exists("rollback-done"));
 
-    unlink(marker);
+    test_fixture_unlink("rollback-done");
 }
 
 /* Reap `pid` with a deadline. Returns true and fills *status if it exited
@@ -525,13 +667,12 @@ static bool wait_child_bounded(pid_t pid, int *status, int budget_ms) {
  * in waitpid for the full 30 s — the bounded reaper turns that into a FAIL
  * instead of a hang. Exit codes 10-15 mark the specific failure mode. */
 TEST(second_signal_during_rollback_kills_blocking_child) {
-    char marker[128], b;
+    char b;
     int status = 0, sync[2];
     pid_t pid;
     bool exited;
 
-    snprintf(marker, sizeof(marker), "/tmp/gsw_rollback_unblocked.%d", (int)getpid());
-    unlink(marker);
+    CHECK(!test_fixture_exists("rollback-unblocked"));
     /* Exec barrier: the write end is CLOEXEC, so the harness's read() below
      * sees EOF exactly when the grandchild's exec has replaced the inherited
      * guard handler with default dispositions. Signaling before that point
@@ -547,7 +688,6 @@ TEST(second_signal_during_rollback_kills_blocking_child) {
     if (pid == 0) {
         pid_t child, w;
         int cst = 0;
-        FILE *f;
 
         close(sync[0]);
         signals_guard_begin();
@@ -574,8 +714,7 @@ TEST(second_signal_during_rollback_kills_blocking_child) {
         if (!WIFSIGNALED(cst) || WTERMSIG(cst) != SIGTERM) _exit(15);
         if (!signals_pending()) _exit(11); /* deferred signal must survive */
 
-        f = fopen(marker, "w");            /* "rollback ran to completion" */
-        if (f) fclose(f);
+        if (test_fixture_create("rollback-unblocked") != 0) _exit(16);
         signals_rollback_end();
         signals_dispatch_pending();        /* rollback done: die correctly */
         _exit(12);
@@ -590,9 +729,9 @@ TEST(second_signal_during_rollback_kills_blocking_child) {
     CHECK(exited);                          /* pre-fix: deferred forever */
     CHECK(WIFSIGNALED(status));
     if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
-    CHECK(path_exists(marker));             /* restore finished BEFORE dying */
+    CHECK(test_fixture_exists("rollback-unblocked"));
 
-    unlink(marker);
+    test_fixture_unlink("rollback-unblocked");
 }
 
 /* L8 escalation: if the published child ignores the forwarded signal (a
@@ -664,6 +803,10 @@ TEST(rollback_child_kill_escalates_to_sigkill) {
 }
 
 TEST_MAIN_BEGIN()
+    if (test_fixture_init() != 0) {
+        perror("test_signals: create private fixture root");
+        return 1;
+    }
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(guard_begin_failures_restore_every_disposition);
     RUN_TEST(guard_begin_never_reports_restore_pending_as_active);
@@ -673,11 +816,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(guard_end_restores_default_disposition);
     RUN_TEST(guard_respects_inherited_sig_ign);
     RUN_TEST(child_spawn_barrier_blocks_only_installed_guard_signals);
+    RUN_TEST(fixture_root_is_private_and_pinned);
     RUN_TEST(scratch_registry_unlinks_registered_paths);
+    RUN_TEST(fixture_creation_and_cleanup_do_not_follow_preplaced_symlink);
     RUN_TEST(scratch_registry_rejects_invalid);
     RUN_TEST(dispatch_terminates_with_deferred_signal);
     RUN_TEST(second_signal_is_emergency_exit_and_drops_scratch);
     RUN_TEST(second_signal_during_rollback_is_deferred);
     RUN_TEST(second_signal_during_rollback_kills_blocking_child);
     RUN_TEST(rollback_child_kill_escalates_to_sigkill);
+    close(test_fixture_root_fd);
+    test_fixture_root_fd = -1;
 TEST_MAIN_END()
