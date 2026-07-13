@@ -4119,7 +4119,44 @@ size_t utf8_decode(const unsigned char *s, size_t available,
 }
 
 bool tty_safe_codepoint(uint32_t cp) {
-    return cp >= 0x20 && cp != 0x7F && !(cp >= 0x80 && cp <= 0x9F);
+    /* Unicode 16.0 Default_Ignorable_Code_Point ranges. These characters are
+     * intentionally invisible or alter the display/order of neighboring
+     * glyphs. That is useful in rich text, but unsafe in identity text printed
+     * by list/status: an account can look empty, hide a suffix, or visually
+     * reorder trusted text. Reject the complete property instead of chasing
+     * only the currently abused bidi controls. This deliberately also rejects
+     * variation selectors and joiners; account identity remains the visible
+     * base text rather than an invisible presentation sequence. Ordinary
+     * combining marks (for example U+0301) remain allowed. */
+    static const struct {
+        uint32_t first;
+        uint32_t last;
+    } default_ignorable_ranges[] = {
+        {0x00AD, 0x00AD}, {0x034F, 0x034F}, {0x061C, 0x061C},
+        {0x115F, 0x1160}, {0x17B4, 0x17B5}, {0x180B, 0x180F},
+        {0x200B, 0x200F}, {0x202A, 0x202E}, {0x2060, 0x206F},
+        {0x3164, 0x3164}, {0xFE00, 0xFE0F}, {0xFEFF, 0xFEFF},
+        {0xFFA0, 0xFFA0}, {0xFFF0, 0xFFF8},
+        {0x1BCA0, 0x1BCA3}, {0x1D173, 0x1D17A},
+        {0xE0000, 0xE0FFF}
+    };
+
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) ||
+        cp < 0x20 || cp == 0x7F || (cp >= 0x80 && cp <= 0x9F) ||
+        cp == 0x2028 || cp == 0x2029) {
+        return false;
+    }
+
+    for (size_t i = 0;
+         i < sizeof(default_ignorable_ranges) /
+                 sizeof(default_ignorable_ranges[0]);
+         i++) {
+        if (cp >= default_ignorable_ranges[i].first &&
+            cp <= default_ignorable_ranges[i].last) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool validate_key_id(const char *key_id) {

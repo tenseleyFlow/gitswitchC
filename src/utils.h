@@ -328,10 +328,13 @@ bool is_safe_ssh_key_path(const char *path);
  * remaining strlen so a truncated final sequence can never be over-read.
  *
  * tty_safe_codepoint: true if the codepoint is safe to echo to a terminal.
- * C0 controls (including ESC 0x1B and CR), DEL 0x7F, and C1 controls
- * U+0080-U+009F (0x9B is a one-byte CSI) can move the cursor, recolor output,
- * or \r-overwrite the line — enough for a hostile config field to render
- * itself as "[CURRENT] trusted-account" in list/status/whoami output.
+ * C0 controls (including ESC 0x1B and CR), DEL 0x7F, C1 controls
+ * U+0080-U+009F (0x9B is a one-byte CSI), Unicode line separators, and the
+ * Unicode 16.0 Default_Ignorable_Code_Point set are rejected. The latter
+ * includes bidi marks/embeddings/overrides/isolates, zero-width controls,
+ * joiners, fillers, tags, and variation selectors: any can hide, reorder, or
+ * ambiguously render identity text in list/status/whoami output. Visible
+ * Unicode and ordinary combining marks remain valid.
  */
 size_t utf8_decode(const unsigned char *s, size_t available,
                    uint32_t *cp_out);
