@@ -1696,6 +1696,21 @@ prepare_fail:
  * the account being edited (in which case every prompt shows the current value
  * as the default and an empty answer keeps it). Routes all input through
  * prompt_line so readline builds get line editing and TAB path completion. */
+static int account_prompt_line(char *input, size_t input_size,
+                               bool path_completion) {
+    int result;
+
+    do {
+        result = prompt_line("", input, input_size, path_completion);
+        if (result == PROMPT_LINE_TRUNCATED) {
+            printf("[ERROR]: Input is too long (maximum %zu bytes). "
+                   "Please try again: ", input_size - 1);
+        }
+    } while (result == PROMPT_LINE_TRUNCATED);
+
+    return result;
+}
+
 static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     account_t acct;
     char input[512];
@@ -1718,7 +1733,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     while (1) {
         if (edit) printf("Account Name [%s]: ", acct.name);
         else      printf("Account Name: ");
-        if (prompt_line("", input, sizeof(input), false) != 0 && !edit) {
+        if (account_prompt_line(input, sizeof(input), false) != 0 && !edit) {
             set_error(ERR_FILE_IO, "Failed to read account name");
             return -1;
         }
@@ -1739,7 +1754,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     while (1) {
         if (edit) printf("Email Address [%s]: ", acct.email);
         else      printf("Email Address: ");
-        if (prompt_line("", input, sizeof(input), false) != 0 && !edit) {
+        if (account_prompt_line(input, sizeof(input), false) != 0 && !edit) {
             set_error(ERR_FILE_IO, "Failed to read email address");
             return -1;
         }
@@ -1766,7 +1781,8 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     /* Description */
     if (edit) printf("Description [%s]: ", acct.description);
     else      printf("Description (optional): ");
-    if (prompt_line("", input, sizeof(input), false) == 0 && strlen(input) > 0) {
+    if (account_prompt_line(input, sizeof(input), false) == 0 &&
+        strlen(input) > 0) {
         safe_strncpy(acct.description, input, sizeof(acct.description));
     } else if (!edit) {
         safe_strncpy(acct.description, acct.name, sizeof(acct.description));
@@ -1779,7 +1795,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
             printf("SSH Key Path [%s] (Enter to keep, 'none' to disable): ", acct.ssh_key_path);
         else
             printf("SSH Key Path (optional, Enter to skip): ");
-        if (prompt_line("", input, sizeof(input), true) != 0) break;
+        if (account_prompt_line(input, sizeof(input), true) != 0) break;
 
         if (strlen(input) == 0) break;                 /* keep/skip */
         if (strcmp(input, "none") == 0) {              /* disable */
@@ -1826,7 +1842,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
                 printf("SSH Host Alias [%s] (Enter to keep): ", acct.ssh_host_alias);
             else
                 printf("SSH Host Alias (optional, e.g., github.com-work): ");
-            if (prompt_line("", input, sizeof(input), false) != 0 ||
+            if (account_prompt_line(input, sizeof(input), false) != 0 ||
                 strlen(input) == 0) {
                 break;                              /* keep current / skip */
             }
@@ -1849,7 +1865,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
             printf("GPG Key ID [%s] (Enter to keep, 'none' to disable): ", acct.gpg_key_id);
         else
             printf("GPG Key ID (optional, Enter to skip): ");
-        if (prompt_line("", input, sizeof(input), false) != 0) break;
+        if (account_prompt_line(input, sizeof(input), false) != 0) break;
 
         if (strlen(input) == 0) break;
         if (strcmp(input, "none") == 0) {
@@ -1872,7 +1888,8 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
 
         printf("Enable GPG signing for commits? (y/N)%s: ",
                (edit && acct.gpg_signing_enabled) ? " [Y]" : "");
-        if (prompt_line("", input, sizeof(input), false) == 0 && strlen(input) > 0) {
+        if (account_prompt_line(input, sizeof(input), false) == 0 &&
+            strlen(input) > 0) {
             acct.gpg_signing_enabled = (tolower((unsigned char)input[0]) == 'y');
         }
         break;
@@ -1882,7 +1899,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     while (1) {
         printf("Preferred Git Scope (local/global) [%s]: ",
                config_scope_to_string(acct.preferred_scope));
-        if (prompt_line("", input, sizeof(input), false) != 0) break;
+        if (account_prompt_line(input, sizeof(input), false) != 0) break;
         if (strlen(input) == 0) break;
         if (strcasecmp(input, "local") == 0 || strcasecmp(input, "l") == 0) {
             acct.preferred_scope = GIT_SCOPE_LOCAL; break;
@@ -1918,7 +1935,8 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
 
     if (!ctx->config.assume_yes) {
         printf("\n%s this account? (y/N): ", edit ? "Save changes to" : "Add");
-        if (prompt_line("", input, sizeof(input), false) != 0 || tolower((unsigned char)input[0]) != 'y') {
+        if (account_prompt_line(input, sizeof(input), false) != 0 ||
+            tolower((unsigned char)input[0]) != 'y') {
             printf("%s cancelled.\n", edit ? "Edit" : "Account creation");
             return -1;
         }

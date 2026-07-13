@@ -13,9 +13,17 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+typedef enum {
+    PROMPT_LINE_OK = 0,
+    PROMPT_LINE_EOF = -1,
+    PROMPT_LINE_TRUNCATED = -2,
+    PROMPT_LINE_ERROR = -3
+} prompt_result_t;
+
 /* Read one line after printing `prompt`. If path_completion is true, TAB
- * completes filesystem paths (readline builds only). Returns 0 on success,
- * -1 on EOF/error (buf set to ""). */
+ * completes filesystem paths (readline builds only). At most size - 1 input
+ * bytes are accepted; an overlong physical line is consumed but never exposed
+ * as a successful prefix. Every non-success result leaves buf empty. */
 int prompt_line(const char *prompt, char *buf, size_t size, bool path_completion);
 
 #endif /* PROMPT_H */
