@@ -110,10 +110,13 @@ static int bind_and_chmod_socket(const char *path) {
     return chmod(path, 0600);
 }
 
-static bool refuse_agent_reap(pid_t pid, const char *socket_arg) {
+static ssh_process_outcome_t refuse_agent_reap(pid_t pid,
+                                                const char *socket_arg,
+                                                int runtime_dir_fd) {
     (void)pid;
     (void)socket_arg;
-    return false;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_OWNED;
 }
 
 static int swap_pid_temp_path(int dir_fd, const char *temp_name) {

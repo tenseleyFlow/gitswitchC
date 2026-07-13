@@ -34,8 +34,34 @@ typedef struct {
                               * reuse avoids a passphrase re-prompt. */
 } ssh_config_t;
 
+/* One truthful process-state vocabulary for identity, liveness, and reap.
+ * OWNED means the recorded PID is conclusively the managed ssh-agent and is
+ * still alive. UNRELATED means a live PID was conclusively proved to be a
+ * different process. GONE means no process remains at that PID. Every failed,
+ * inaccessible, truncated, or permission-denied inspection is INDETERMINATE.
+ * Only UNRELATED and GONE authorize consuming a recovery sidecar. */
+typedef enum {
+    SSH_PROCESS_OWNED,
+    SSH_PROCESS_UNRELATED,
+    SSH_PROCESS_GONE,
+    SSH_PROCESS_INDETERMINATE
+} ssh_process_outcome_t;
+
 typedef int (*ssh_setenv_fn)(const char *name, const char *value, int overwrite);
-typedef bool (*ssh_reap_fn)(pid_t pid, const char *socket_arg);
+typedef ssh_process_outcome_t (*ssh_reap_fn)(pid_t pid,
+                                             const char *socket_arg,
+                                             int runtime_dir_fd);
+typedef ssh_process_outcome_t (*ssh_process_identity_fn)(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd);
+typedef int (*ssh_process_signal_fn)(pid_t pid, int signal_number);
+typedef int (*ssh_pidfd_open_fn)(pid_t pid);
+typedef int (*ssh_pidfd_signal_fn)(int pidfd, int signal_number);
+typedef struct {
+    ssh_process_identity_fn identity;
+    ssh_process_signal_fn signal;
+    ssh_pidfd_open_fn pidfd_open;
+    ssh_pidfd_signal_fn pidfd_signal;
+} ssh_reap_test_ops_t;
 typedef int (*ssh_pid_commit_hook_fn)(int dir_fd, const char *temp_name);
 typedef int (*ssh_namespace_commit_hook_fn)(int dir_fd);
 typedef int (*ssh_dirsync_fn)(int dir_fd);
@@ -96,6 +122,11 @@ ssh_setenv_fn ssh_manager_set_setenv_fn(ssh_setenv_fn fn);
 
 /* Deterministic failure/race seams used by the adversarial runtime tests. */
 ssh_reap_fn ssh_manager_set_reap_fn(ssh_reap_fn fn);
+/* Replace the process-inspection/signal boundary used by the real reaper.
+ * NULL fields select production defaults. Passing NULL restores every
+ * production default. The previous complete set is returned for restoration. */
+ssh_reap_test_ops_t ssh_manager_set_reap_test_ops(
+    const ssh_reap_test_ops_t *ops);
 ssh_pid_commit_hook_fn ssh_manager_set_pid_commit_hook_fn(
     ssh_pid_commit_hook_fn fn);
 ssh_pid_commit_hook_fn ssh_manager_set_pid_postrename_hook_fn(

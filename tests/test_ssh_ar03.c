@@ -546,6 +546,13 @@ TEST(reset_reaps_real_recorded_agent) {
      * under CI load): the fixed 50ms post-SIGTERM poll used to floor this. */
     fprintf(stderr, "  (info: real-agent reap took %ld ms)\n", ms);
 
+    /* A readable pidfd proves process exit before the parent namespace has
+     * necessarily reaped the zombie, so kill(pid, 0) can briefly succeed even
+     * though reset already has conclusive instance-level death evidence. */
+    for (int attempts = 0; attempts < 100 && kill(pid, 0) == 0; attempts++) {
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
+        nanosleep(&delay, NULL);
+    }
     errno = 0;
     CHECK(kill(pid, 0) != 0);       /* reaped: ESRCH, not just signaled */
     CHECK_EQ_INT(errno, ESRCH);

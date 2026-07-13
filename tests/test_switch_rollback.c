@@ -100,10 +100,12 @@ static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer *
 static FILE *g_log;                 /* when set, every argv is logged here */
 static char g_effective_signingkey_observed[MAX_GPG_FINGERPRINT_LEN];
 
-static bool refuse_session_agent_reap(pid_t pid, const char *socket_arg) {
+static ssh_process_outcome_t refuse_session_agent_reap(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
     (void)pid;
     (void)socket_arg;
-    return false;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_OWNED;
 }
 
 /* Minimal fake config store so git_set_config's read-back verification sees

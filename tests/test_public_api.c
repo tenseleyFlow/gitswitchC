@@ -278,6 +278,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_manager_set_quarantine_capture_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_quarantine_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_reap_fn);
+    REQUIRE_PUBLIC_API(ssh_manager_set_reap_test_ops);
     REQUIRE_PUBLIC_API(ssh_manager_set_setenv_fn);
     REQUIRE_PUBLIC_API(ssh_manager_test_cleanup_current_link);
     REQUIRE_PUBLIC_API(ssh_manager_test_probe_deadline);
