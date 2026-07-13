@@ -23,6 +23,21 @@ log_level_t g_log_level = LOG_LEVEL_INFO;
 FILE *g_log_file = NULL;
 bool g_log_to_stderr = true;
 
+/* Error setters cannot call safe_strncpy(): that helper reports failures by
+ * replacing the very context being constructed. Provenance is diagnostic, so
+ * retain the longest bounded prefix and always publish a terminated string. */
+static void copy_error_provenance(char *destination, size_t destination_size,
+                                  const char *source) {
+    const char *text = source ? source : "unknown";
+    size_t length;
+
+    if (!destination || destination_size == 0) return;
+    length = strlen(text);
+    if (length >= destination_size) length = destination_size - 1U;
+    memcpy(destination, text, length);
+    destination[length] = '\0';
+}
+
 /* Error code to string mapping */
 static const struct {
     error_code_t code;
@@ -139,9 +154,10 @@ void set_error_context(error_code_t code, const char *file, int line,
     memset(&g_last_error, 0, sizeof(g_last_error));
     
     g_last_error.code = code;
-    g_last_error.file = file;
+    copy_error_provenance(g_last_error.file, sizeof(g_last_error.file), file);
     g_last_error.line = line;
-    g_last_error.function = function;
+    copy_error_provenance(g_last_error.function,
+                          sizeof(g_last_error.function), function);
     g_last_error.system_errno = 0;
     
     /* Format the error message */
@@ -156,7 +172,8 @@ void set_error_context(error_code_t code, const char *file, int line,
     
     /* Log the error */
     log_error("Error set: %s (%s:%d in %s)", 
-              g_last_error.message, file, line, function);
+              g_last_error.message, g_last_error.file, line,
+              g_last_error.function);
 }
 
 /* Set error context including system errno */
@@ -169,9 +186,10 @@ void set_system_error_context(error_code_t code, const char *file, int line,
     memset(&g_last_error, 0, sizeof(g_last_error));
     
     g_last_error.code = code;
-    g_last_error.file = file;
+    copy_error_provenance(g_last_error.file, sizeof(g_last_error.file), file);
     g_last_error.line = line;
-    g_last_error.function = function;
+    copy_error_provenance(g_last_error.function,
+                          sizeof(g_last_error.function), function);
     g_last_error.system_errno = saved_errno;
     
     /* Format the error message */
@@ -201,7 +219,7 @@ void set_system_error_context(error_code_t code, const char *file, int line,
     /* Log the error with system details */
     log_error("System error: %s [errno=%d: %s] (%s:%d in %s)", 
               g_last_error.message, saved_errno, strerror(saved_errno),
-              file, line, function);
+              g_last_error.file, line, g_last_error.function);
 }
 
 /* Get last error information */

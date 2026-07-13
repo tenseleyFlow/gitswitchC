@@ -66,9 +66,11 @@ typedef struct {
     error_code_t code;
     char message[512];
     char details[1024];
-    const char *file;
+    /* Context-owned provenance keeps delayed formatting and ordinary struct
+     * assignment independent of the setter's caller storage. */
+    char file[MAX_PATH_LEN];
     int line;
-    const char *function;
+    char function[MAX_NAME_LEN];
     int system_errno;
 } error_context_t;
 
