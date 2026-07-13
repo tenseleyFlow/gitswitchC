@@ -124,6 +124,7 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
 static bool config_scope_is_persistable(git_scope_t scope);
+static bool config_account_id_is_valid(uint32_t account_id);
 static bool config_capture_current_id(const gitswitch_ctx_t *ctx,
                                       uint32_t *account_id);
 static void config_rebind_current_id(gitswitch_ctx_t *ctx,
@@ -1849,6 +1850,11 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         return -1;
     }
     for (size_t i = 0; i < ctx->account_count; i++) {
+        if (!config_account_id_is_valid(ctx->accounts[i].id)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account ID must be in 1..%u", UINT32_MAX);
+            return -1;
+        }
         if (!config_scope_is_persistable(ctx->accounts[i].preferred_scope)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account %u preferred scope must be local or global",
@@ -2392,6 +2398,11 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_update_account");
         return -1;
     }
+    if (!config_account_id_is_valid(account->id)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Account ID must be in 1..%u", UINT32_MAX);
+        return -1;
+    }
     replacement = *account;
     
     /* Find existing account */
@@ -2660,6 +2671,10 @@ const char *config_scope_to_string(git_scope_t scope) {
  * own account model. */
 static bool config_scope_is_persistable(git_scope_t scope) {
     return scope == GIT_SCOPE_LOCAL || scope == GIT_SCOPE_GLOBAL;
+}
+
+static bool config_account_id_is_valid(uint32_t account_id) {
+    return account_id != 0;
 }
 
 typedef struct {
@@ -3890,6 +3905,12 @@ static int validate_account_security(const account_t *account) {
         return -1;
     }
 
+    if (!config_account_id_is_valid(account->id)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Account ID must be in 1..%u", UINT32_MAX);
+        return -1;
+    }
+
     if (!config_scope_is_persistable(account->preferred_scope)) {
         set_error(ERR_ACCOUNT_INVALID,
                   "Account preferred scope must be local or global");
@@ -4026,6 +4047,11 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         const account_t *account = &ctx->accounts[i];
         const char *ssh_hostname = account->ssh_hostname;
 
+        if (!config_account_id_is_valid(account->id)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account ID must be in 1..%u", UINT32_MAX);
+            return -1;
+        }
         if (!config_scope_is_persistable(account->preferred_scope)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account %u preferred scope must be local or global",

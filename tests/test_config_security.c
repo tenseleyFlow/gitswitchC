@@ -247,6 +247,36 @@ TEST(system_scope_is_rejected_before_admission_or_persistence) {
     CHECK(access(account_hint, F_OK) != 0);
 }
 
+TEST(zero_account_id_is_rejected_before_mutation_or_persistence) {
+    char dir[128], path[512], hint[512];
+    gitswitch_ctx_t ctx;
+    account_t zero, changed, before;
+
+    fill_account(&zero, 0, "zero", "zero@x.com", "zero");
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(config_add_account(&ctx, &zero), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx.accounts[0] = zero;
+    ctx.account_count = 1;
+    before = ctx.accounts[0];
+    changed = zero;
+    snprintf(changed.name, sizeof(changed.name), "zero-changed");
+    CHECK_EQ_INT(config_update_account(&ctx, &changed), -1); /* pre-fix: 0 */
+    CHECK(memcmp(&ctx.accounts[0], &before, sizeof(before)) == 0);
+    CHECK_EQ_INT(config_validate(&ctx), -1); /* pre-fix: 0 */
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(join_path(path, sizeof(path), dir, "/accounts.toml"), 0);
+    CHECK_EQ_INT(join_path(hint, sizeof(hint), dir, "/.resume-hint"), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), -1); /* pre-fix: emits accounts.0 */
+    CHECK(access(path, F_OK) != 0);
+    CHECK(access(hint, F_OK) != 0);
+}
+
 TEST(current_pointer_rebinds_after_direct_array_compaction) {
     gitswitch_ctx_t ctx;
 
@@ -1718,6 +1748,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(load_accepts_regular_file);
     RUN_TEST(load_rejects_file_growth_after_prefix_read);
     RUN_TEST(system_scope_is_rejected_before_admission_or_persistence);
+    RUN_TEST(zero_account_id_is_rejected_before_mutation_or_persistence);
     RUN_TEST(current_pointer_rebinds_after_direct_array_compaction);
     RUN_TEST(current_pointer_rebinds_by_id_across_reloads);
     RUN_TEST(load_rejects_symlinked_config);
