@@ -249,7 +249,7 @@ TEST(retained_public_display_api_links) {
     void (*warning_fn)(const char *, ...) = display_warning;
     void (*success_fn)(const char *, ...) = display_success;
     void (*info_fn)(const char *, ...) = display_info;
-    const char *(*colorize_fn)(const char *, const char *) = display_colorize;
+    char *(*colorize_fn)(const char *, const char *) = display_colorize;
     bool (*supports_color_fn)(void) = display_supports_color;
     void (*config_info_fn)(const gitswitch_ctx_t *) = display_config_info;
 
@@ -355,30 +355,81 @@ cleanup:
     CHECK_EQ_INT(restore_environment(&saved_term), 0);
 }
 
+static void check_owned_colorized_result(const char *text, const char *type,
+                                         const char *expected) {
+    char *result = display_colorize(text, type);
+
+    CHECK(result != NULL);
+    if (!result) return;
+    CHECK(result != text);
+    CHECK_STR_EQ(result, expected);
+    free(result);
+}
+
 TEST(colorize_maps_exact_styles_resets_and_passthroughs) {
     static const char sample[] = "sample";
 
     CHECK_EQ_INT(display_init(true, false), 0);
-    CHECK_STR_EQ(display_colorize(sample, "success"),
-                 COLOR_GREEN "sample" COLOR_RESET);
-    CHECK_STR_EQ(display_colorize(sample, "error"),
-                 COLOR_RED "sample" COLOR_RESET);
-    CHECK_STR_EQ(display_colorize(sample, "warning"),
-                 COLOR_YELLOW "sample" COLOR_RESET);
-    CHECK_STR_EQ(display_colorize(sample, "info"),
-                 COLOR_BLUE "sample" COLOR_RESET);
-    CHECK_STR_EQ(display_colorize(sample, "header"),
-                 COLOR_BOLD COLOR_CYAN "sample" COLOR_RESET);
-    CHECK_STR_EQ(display_colorize(sample, "current"),
-                 COLOR_BOLD COLOR_GREEN "sample" COLOR_RESET);
-    CHECK_STR_EQ(display_colorize(sample, "inactive"),
-                 COLOR_DIM "sample" COLOR_RESET);
-    CHECK(display_colorize(sample, "unknown") == sample);
-    CHECK(display_colorize(sample, NULL) == sample);
+    check_owned_colorized_result(sample, "success",
+                                 COLOR_GREEN "sample" COLOR_RESET);
+    check_owned_colorized_result(sample, "error",
+                                 COLOR_RED "sample" COLOR_RESET);
+    check_owned_colorized_result(sample, "warning",
+                                 COLOR_YELLOW "sample" COLOR_RESET);
+    check_owned_colorized_result(sample, "info",
+                                 COLOR_BLUE "sample" COLOR_RESET);
+    check_owned_colorized_result(sample, "header",
+                                 COLOR_BOLD COLOR_CYAN "sample" COLOR_RESET);
+    check_owned_colorized_result(sample, "current",
+                                 COLOR_BOLD COLOR_GREEN "sample" COLOR_RESET);
+    check_owned_colorized_result(sample, "inactive",
+                                 COLOR_DIM "sample" COLOR_RESET);
+    check_owned_colorized_result(sample, "unknown", sample);
+    check_owned_colorized_result(sample, NULL, sample);
     CHECK(display_colorize(NULL, "success") == NULL);
 
     CHECK_EQ_INT(display_init(false, true), 0);
-    CHECK(display_colorize(sample, "success") == sample);
+    check_owned_colorized_result(sample, "success", sample);
+}
+
+/* Retaining more results than the historical rotating-slot count must not let
+ * later, larger calls overwrite or invalidate earlier output. The inputs stay
+ * live for the whole test so any change is owned by display_colorize itself. */
+TEST(colorize_results_remain_valid_across_later_growth) {
+    enum { RESULT_COUNT = 17, INPUT_CAPACITY = 160, EXPECTED_CAPACITY = 192 };
+    char inputs[RESULT_COUNT][INPUT_CAPACITY];
+    char expected[RESULT_COUNT][EXPECTED_CAPACITY];
+    char *results[RESULT_COUNT];
+
+    CHECK_EQ_INT(display_init(true, false), 0);
+    for (size_t i = 0; i < RESULT_COUNT; i++) {
+        int prefix_length = snprintf(inputs[i], sizeof(inputs[i]),
+                                     "retained-%02zu-", i);
+        size_t target_length = 24U + i * 6U;
+        size_t cursor;
+
+        CHECK(prefix_length > 0);
+        cursor = prefix_length > 0 ? (size_t)prefix_length : 0U;
+        CHECK(target_length < sizeof(inputs[i]));
+        while (cursor < target_length) {
+            inputs[i][cursor++] = (char)('a' + (int)(i % 26U));
+        }
+        inputs[i][cursor] = '\0';
+        CHECK(snprintf(expected[i], sizeof(expected[i]), "%s%s%s",
+                       COLOR_GREEN, inputs[i], COLOR_RESET) > 0);
+        results[i] = display_colorize(inputs[i], "success");
+        CHECK(results[i] != NULL);
+    }
+
+    for (size_t i = 0; i < RESULT_COUNT; i++) {
+        for (size_t j = 0; j < i; j++) {
+            CHECK(results[i] != results[j]);
+        }
+        if (results[i]) {
+            CHECK_STR_EQ(results[i], expected[i]);
+            free(results[i]);
+        }
+    }
 }
 
 typedef struct {
@@ -853,6 +904,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(explicit_color_flags_have_deterministic_precedence);
     RUN_TEST(automatic_color_requires_tty_and_color_environment);
     RUN_TEST(colorize_maps_exact_styles_resets_and_passthroughs);
+    RUN_TEST(colorize_results_remain_valid_across_later_growth);
     RUN_TEST(status_levels_and_variadic_formatting_are_exact);
     RUN_TEST(message_wrappers_obey_stdout_and_null_empty_context_contracts);
     RUN_TEST(header_bytes_and_ansi_stripped_parity_are_exact);

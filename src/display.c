@@ -114,31 +114,22 @@ bool display_supports_color(void) {
     return g_color_enabled;
 }
 
-/* Format and colorize text based on content type */
-const char *display_colorize(const char *text, const char *type) {
-    /* Rotating buffers so several calls can appear in one printf argument list
-     * (all args are evaluated before printf runs). Keep this >= the most
-     * colorize() results ever live in a single expression, or an earlier call's
-     * buffer gets clobbered by a later one before printf reads it. */
-    enum { COLORED_BUFFER_COUNT = 8 };
-    static char *colored_buffers[COLORED_BUFFER_COUNT];
-    static size_t colored_capacities[COLORED_BUFFER_COUNT];
-    static unsigned int buffer_index = 0;
-    char *colored_buffer;
-    char *resized_buffer;
-    const char *color_code = "";
+/* Format and colorize text based on content type. Each result has independent
+ * caller-owned storage, so later calls cannot invalidate a retained pointer. */
+char *display_colorize(const char *text, const char *type) {
+    char *result;
+    const char *color_code = NULL;
     size_t code_len;
     size_t text_len;
     size_t reset_len;
     size_t required;
-    unsigned int selected_buffer;
 
-    if (!g_color_enabled || !text || !type) {
-        return text;
-    }
+    if (!text) return NULL;
 
     /* Select color based on type */
-    if (strcmp(type, "success") == 0) {
+    if (!g_color_enabled || !type) {
+        color_code = NULL;
+    } else if (strcmp(type, "success") == 0) {
         color_code = COLOR_GREEN;
     } else if (strcmp(type, "error") == 0) {
         color_code = COLOR_RED;
@@ -152,46 +143,40 @@ const char *display_colorize(const char *text, const char *type) {
         color_code = COLOR_BOLD COLOR_GREEN;
     } else if (strcmp(type, "inactive") == 0) {
         color_code = COLOR_DIM;
-    } else {
-        return text; /* No coloring */
+    }
+
+    text_len = strlen(text);
+    if (!color_code) {
+        if (text_len == SIZE_MAX) return NULL;
+        result = malloc(text_len + 1U);
+        if (!result) return NULL;
+        memcpy(result, text, text_len + 1U);
+        return result;
     }
 
     code_len = strlen(color_code);
-    text_len = strlen(text);
     reset_len = strlen(COLOR_RESET);
     if (code_len > SIZE_MAX - reset_len - 1U ||
         text_len > SIZE_MAX - code_len - reset_len - 1U) {
-        return text;
+        return NULL;
     }
     required = code_len + text_len + reset_len + 1U;
 
-    /* AR-06 F54/F55 kept the reset inside a fixed buffer, but that necessarily
-     * discarded long diagnostic payloads. Grow the selected rotating slot to
-     * the exact checked size so both the complete text and reset survive.
-     * Allocation failure falls back to the complete uncolored text. */
-    selected_buffer = buffer_index;
-    buffer_index = (buffer_index + 1U) % COLORED_BUFFER_COUNT;
-    colored_buffer = colored_buffers[selected_buffer];
-    if (colored_capacities[selected_buffer] < required) {
-        resized_buffer = realloc(colored_buffer, required);
-        if (!resized_buffer) return text;
-        colored_buffer = resized_buffer;
-        colored_buffers[selected_buffer] = colored_buffer;
-        colored_capacities[selected_buffer] = required;
-    }
-
-    memcpy(colored_buffer, color_code, code_len);
-    memcpy(colored_buffer + code_len, text, text_len);
-    memcpy(colored_buffer + code_len + text_len, COLOR_RESET,
+    result = malloc(required);
+    if (!result) return NULL;
+    memcpy(result, color_code, code_len);
+    memcpy(result + code_len, text, text_len);
+    memcpy(result + code_len + text_len, COLOR_RESET,
            reset_len + 1U);
 
-    return colored_buffer;
+    return result;
 }
 
 /* Print formatted header with decorative border */
 void display_header(const char *title) {
     int title_len, padding, total_width;
     int i;
+    char *colored_title;
     
     if (!title) return;
     
@@ -214,10 +199,12 @@ void display_header(const char *title) {
      * the reset when color is on, and with color off it returns the plain
      * text — an unconditional reset would inject a raw ESC[0m into
      * --no-color/piped output (AR-03 L15). */
+    colored_title = display_colorize(title, "header");
     printf("│%*s%s%*s│\n",
            padding, "",
-           display_colorize(title, "header"),
+           colored_title ? colored_title : title,
            total_width - title_len - padding - 2, "");
+    free(colored_title);
     
     /* Bottom border */
     printf("└");
@@ -231,6 +218,8 @@ void display_header(const char *title) {
 void display_status(const char *level, const char *message, ...) {
     va_list args;
     char *formatted_message;
+    char *colored_icon;
+    char *colored_message = NULL;
     const char *icon = "";
     const char *color_type = "";
     
@@ -260,14 +249,18 @@ void display_status(const char *level, const char *message, ...) {
         color_type = "info";
     }
     
+    colored_icon = display_colorize(icon, color_type);
     if (formatted_message[0] != '\0') {
+        colored_message = display_colorize(formatted_message, color_type);
         printf("%s %s\n",
-               display_colorize(icon, color_type),
-               display_colorize(formatted_message, color_type));
+               colored_icon ? colored_icon : icon,
+               colored_message ? colored_message : formatted_message);
     } else {
-        printf("%s\n", display_colorize(icon, color_type));
+        printf("%s\n", colored_icon ? colored_icon : icon);
     }
     fflush(stdout);
+    free(colored_message);
+    free(colored_icon);
     free(formatted_message);
 }
 
@@ -347,6 +340,10 @@ void display_info(const char *message, ...) {
 
 /* Print configuration file location and status */
 void display_config_info(const gitswitch_ctx_t *ctx) {
+    const char *status_text;
+    const char *status_type;
+    char *colored_status;
+
     if (!ctx) return;
     
     printf("\n");
@@ -354,8 +351,14 @@ void display_config_info(const gitswitch_ctx_t *ctx) {
     printf("Accounts:      %zu configured\n", ctx->account_count);
     
     if (path_exists(ctx->config.config_path)) {
-        printf("Status:        %s\n", display_colorize("exists", "success"));
+        status_text = "exists";
+        status_type = "success";
     } else {
-        printf("Status:        %s\n", display_colorize("not found", "warning"));
+        status_text = "not found";
+        status_type = "warning";
     }
+    colored_status = display_colorize(status_text, status_type);
+    printf("Status:        %s\n",
+           colored_status ? colored_status : status_text);
+    free(colored_status);
 }

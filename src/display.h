@@ -73,9 +73,13 @@ void display_success(const char *message, ...) GS_PRINTF_FMT(1, 2);
 void display_info(const char *message, ...) GS_PRINTF_FMT(1, 2);
 
 /**
- * Format and colorize text based on content type
+ * Format and colorize text based on content type.
+ *
+ * Returns a newly allocated string for every non-NULL text input, including
+ * when color is disabled or the type is unknown. The caller must free it.
+ * Returns NULL for NULL text or when the result cannot be allocated.
  */
-const char *display_colorize(const char *text, const char *type);
+char *display_colorize(const char *text, const char *type);
 
 /**
  * Check if terminal supports color output
