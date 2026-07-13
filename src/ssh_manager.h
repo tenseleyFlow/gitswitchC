@@ -166,6 +166,10 @@ ssh_quarantine_hook_fn ssh_manager_set_quarantine_hook_fn(
     ssh_quarantine_hook_fn fn);
 ssh_quarantine_hook_fn ssh_manager_set_quarantine_capture_hook_fn(
     ssh_quarantine_hook_fn fn);
+ssh_quarantine_hook_fn ssh_manager_set_reset_retire_hook_fn(
+    ssh_quarantine_hook_fn fn);
+ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
+    ssh_quarantine_hook_fn fn);
 bool ssh_manager_set_force_portable_quarantine(bool force);
 ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
 ssh_probe_clock_fn ssh_manager_set_probe_clock_fn(ssh_probe_clock_fn fn);

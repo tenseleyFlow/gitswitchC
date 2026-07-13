@@ -99,6 +99,11 @@ static int sync_ssh_runtime_dir(int dir_fd, const char *operation);
 static int unlink_ssh_runtime_entry(int dir_fd, const char *name,
                                     bool missing_ok,
                                     const char *description);
+static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
+                                    const char *display_path,
+                                    const char *description,
+                                    const struct stat *expected,
+                                    bool expected_present);
 static int wait_for_ssh_probe(int fd, int timeout_ms);
 static int probe_ssh_agent_socket(const char *path, bool *reachable);
 static int reconcile_current_socket_quarantines(int dir_fd,
@@ -132,6 +137,8 @@ static ssh_current_precleanup_hook_fn g_current_precleanup_hook;
 static ssh_current_publish_hook_fn g_current_publish_hook;
 static ssh_quarantine_hook_fn g_quarantine_hook;
 static ssh_quarantine_hook_fn g_quarantine_capture_hook;
+static ssh_quarantine_hook_fn g_reset_retire_hook;
+static ssh_quarantine_hook_fn g_unrecorded_cleanup_hook;
 static bool g_force_portable_quarantine;
 static unsigned int g_agent_lock_depth;
 static int ssh_key_open_real(const char *path, int flags) {
@@ -262,6 +269,20 @@ ssh_quarantine_hook_fn ssh_manager_set_quarantine_capture_hook_fn(
     ssh_quarantine_hook_fn fn) {
     ssh_quarantine_hook_fn previous = g_quarantine_capture_hook;
     g_quarantine_capture_hook = fn;
+    return previous;
+}
+
+ssh_quarantine_hook_fn ssh_manager_set_reset_retire_hook_fn(
+    ssh_quarantine_hook_fn fn) {
+    ssh_quarantine_hook_fn previous = g_reset_retire_hook;
+    g_reset_retire_hook = fn;
+    return previous;
+}
+
+ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
+    ssh_quarantine_hook_fn fn) {
+    ssh_quarantine_hook_fn previous = g_unrecorded_cleanup_hook;
+    g_unrecorded_cleanup_hook = fn;
     return previous;
 }
 
@@ -1040,7 +1061,19 @@ static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
                                   const char *socket_path,
                                   const char *socket_dir) {
     ssh_process_outcome_t outcome = SSH_PROCESS_INDETERMINATE;
+    struct stat socket_identity;
+    bool socket_present = false;
     pid_t retry_pid = pid;
+
+    if (fstatat(dir_fd, socket_name, &socket_identity,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        socket_present = true;
+    } else if (errno != ENOENT) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot capture unrecorded SSH agent socket identity: %s",
+                         socket_path ? socket_path : socket_name);
+        return true;
+    }
 
     if (pid > 1) {
         outcome = g_ssh_reap(pid, socket_arg, dir_fd);
@@ -1067,9 +1100,16 @@ static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
 #endif
 
     if (ssh_reap_allows_cleanup(outcome)) {
-        return unlink_ssh_runtime_entry(
-                   dir_fd, socket_name, true,
-                   "unrecorded agent socket cleanup") != 0;
+        if (g_unrecorded_cleanup_hook &&
+            g_unrecorded_cleanup_hook(dir_fd, socket_name) != 0) {
+            set_error(ERR_FILE_IO,
+                      "SSH unrecorded-agent cleanup hook failed");
+            return true;
+        }
+        return unlink_ssh_reset_path_at(
+                   dir_fd, socket_name, socket_path,
+                   "unrecorded agent socket cleanup", &socket_identity,
+                   socket_present) != 0;
     }
     if (retry_pid > 1) {
         if (write_ssh_agent_pid_at(dir_fd, pid_name, retry_pid) == 0) {
@@ -1092,9 +1132,16 @@ static bool reap_unrecorded_agent(pid_t pid, const char *socket_arg,
             probe_ssh_agent_socket(socket_path, &reachable) == 0 &&
             verify_socket_dir_namespace(dir_fd, socket_dir) == 0 &&
             !reachable) {
-            return unlink_ssh_runtime_entry(
-                       dir_fd, socket_name, true,
-                       "stale unrecorded agent socket cleanup") != 0;
+            if (g_unrecorded_cleanup_hook &&
+                g_unrecorded_cleanup_hook(dir_fd, socket_name) != 0) {
+                set_error(ERR_FILE_IO,
+                          "SSH unrecorded-agent cleanup hook failed");
+                return true;
+            }
+            return unlink_ssh_reset_path_at(
+                       dir_fd, socket_name, socket_path,
+                       "stale unrecorded agent socket cleanup",
+                       &socket_identity, socket_present) != 0;
         }
     }
     log_warning("Unrecorded SSH agent state is indeterminate; retaining socket for recovery");
@@ -3717,16 +3764,17 @@ int ssh_test_connection(const account_t *account, const char *host) {
     opts.merge_stderr = true;
 
     /* Git hosts print their discovery greeting on stderr. The alias path uses
-     * the managed config block's IdentitiesOnly policy; the direct path must
-     * carry the same restriction alongside -i so an unrelated agent/default
-     * identity cannot make the account-key probe succeed. */
+     * the managed config block's IdentitiesOnly policy. A direct literal-host
+     * probe must ignore every user/system config file as well: IdentitiesOnly
+     * still permits IdentityFile entries inherited from those files. */
     if (strlen(account->ssh_host_alias) > 0) {
         (void)run_argv(alias_argv, &opts, &result);
     } else {
         char expanded_key_path[MAX_PATH_LEN];
         const char *direct_argv[] = {
-            "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-            "-o", "IdentitiesOnly=yes", "-i", expanded_key_path, host, NULL};
+            "ssh", "-T", "-F", "none", "-o", "ConnectTimeout=5", "-o",
+            "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i",
+            expanded_key_path, host, NULL};
 
         if (expand_path(account->ssh_key_path, expanded_key_path,
                         sizeof(expanded_key_path)) != 0) {
@@ -5376,6 +5424,50 @@ int ssh_manager_test_write_pid_sidecar(int dir_fd, const char *name,
     return write_ssh_agent_pid_at(dir_fd, name, pid);
 }
 
+/* Re-prove an entry immediately before removing its name. POSIX has no
+ * unlink-by-inode operation, so this is the narrowest fail-closed boundary:
+ * the caller's captured identity must still own the name after every
+ * durability wait and deterministic race hook. A changed name is preserved
+ * and reported separately so callers can restore it to a public location. */
+static int unlink_ssh_runtime_identity_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    bool missing_ok, const char *description,
+    ssh_quarantine_hook_fn predelete_hook, struct stat *observed_out) {
+    struct stat observed;
+
+    if (predelete_hook != NULL) {
+        int hook_rc = (*predelete_hook)(dir_fd, name);
+        if (hook_rc != 0) {
+            set_error(
+                ERR_FILE_IO,
+                "SSH cleanup hook failed before identity-bound removal: %s",
+                name);
+            return -1;
+        }
+    }
+    if (fstatat(dir_fd, name, &observed, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (missing_ok && errno == ENOENT) {
+            return sync_ssh_runtime_dir(
+                dir_fd, description ? description
+                                    : "identity-bound artifact absence");
+        }
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify SSH cleanup target: %s", name);
+        return -1;
+    }
+    if (!expected || !same_runtime_identity(expected, &observed)) {
+        if (observed_out) *observed_out = observed;
+        errno = ESTALE;
+        set_error(ERR_FILE_IO,
+                  "SSH cleanup target identity changed; replacement preserved: %s",
+                  name);
+        return 1;
+    }
+    return unlink_ssh_runtime_entry(
+        dir_fd, name, missing_ok,
+        description ? description : "identity-bound artifact removal");
+}
+
 /* Atomically move a reset target out of its public name without overwriting a
  * pre-existing quarantine. Native no-replace rename is the race-free path;
  * the locked hard-link fallback mirrors current.sock's portable protocol and
@@ -5386,6 +5478,7 @@ static int quarantine_ssh_reset_entry(
     struct stat source;
     struct stat captured;
 
+    if (!g_force_portable_quarantine) {
 #if defined(__linux__) && defined(SYS_renameat2)
     if (syscall(SYS_renameat2, dir_fd, name, dir_fd, quarantine,
                 RENAME_NOREPLACE) == 0) {
@@ -5402,6 +5495,7 @@ static int quarantine_ssh_reset_entry(
         return -1;
     }
 #endif
+    }
 
     if (linkat(dir_fd, name, dir_fd, quarantine, 0) != 0) return -1;
     if (fstatat(dir_fd, name, &source, AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -5409,10 +5503,10 @@ static int quarantine_ssh_reset_entry(
         !same_runtime_identity(expected, &source) ||
         !same_runtime_identity(expected, &captured) ||
         !same_runtime_identity(&source, &captured)) {
-        int saved_errno = ESTALE;
-        (void)unlinkat(dir_fd, quarantine, 0);
-        (void)sync_ssh_runtime_dir(
-            dir_fd, "failed portable reset quarantine rollback");
+        int saved_errno = errno == 0 ? ESTALE : errno;
+        (void)unlink_ssh_runtime_identity_at(
+            dir_fd, quarantine, expected, true,
+            "failed portable reset quarantine rollback", NULL, NULL);
         errno = saved_errno;
         return -1;
     }
@@ -5420,16 +5514,22 @@ static int quarantine_ssh_reset_entry(
             dir_fd, "portable reset quarantine publication") != 0) {
         return -1; /* both names retain the exact same inode */
     }
-    if (unlinkat(dir_fd, name, 0) != 0) return -1;
-    return sync_ssh_runtime_dir(dir_fd,
-                                "portable reset public-name removal");
+    {
+        int remove_rc = unlink_ssh_runtime_identity_at(
+            dir_fd, name, expected, false,
+            "portable reset public-name removal", NULL, NULL);
+        if (remove_rc > 0) errno = ESTALE;
+        return remove_rc == 0 ? 0 : -1;
+    }
 }
 
 static int restore_ssh_reset_quarantine(
     int dir_fd, const char *name, const char *quarantine,
     const struct stat *identity) {
     struct stat restored;
+    int retirement_rc;
 
+    if (!g_force_portable_quarantine) {
 #if defined(__linux__) && defined(SYS_renameat2)
     if (syscall(SYS_renameat2, dir_fd, quarantine, dir_fd, name,
                 RENAME_NOREPLACE) == 0) {
@@ -5448,6 +5548,7 @@ static int restore_ssh_reset_quarantine(
         return -1;
     }
 #endif
+    }
 
     if (linkat(dir_fd, quarantine, dir_fd, name, 0) != 0 ||
         fstatat(dir_fd, name, &restored, AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -5456,9 +5557,10 @@ static int restore_ssh_reset_quarantine(
                             "portable reset quarantine restoration") != 0) {
         return -1;
     }
-    return unlink_ssh_runtime_entry(
-        dir_fd, quarantine, false,
-        "portable reset quarantine retirement");
+    retirement_rc = unlink_ssh_runtime_identity_at(
+        dir_fd, quarantine, identity, true,
+        "portable reset quarantine retirement", g_reset_retire_hook, NULL);
+    return retirement_rc == 0 ? 0 : -1;
 }
 
 /* Remove exactly the inode classified by the reset transaction. A raced
@@ -5474,8 +5576,9 @@ static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
     char quarantine[96];
     struct stat current;
     struct stat captured;
+    struct stat replacement;
     int written;
-    int rc = -1;
+    int remove_rc;
 
     if (!expected_present) {
         if (fstatat(dir_fd, name, &current, AT_SYMLINK_NOFOLLOW) == 0) {
@@ -5538,21 +5641,24 @@ static int unlink_ssh_reset_path_at(int dir_fd, const char *name,
                   display_path ? display_path : name);
         return -1;
     }
-    rc = unlink_ssh_runtime_entry(
-        dir_fd, quarantine, false,
-        description ? description : "owned reset artifact cleanup");
-    if (rc != 0) {
+    remove_rc = unlink_ssh_runtime_identity_at(
+        dir_fd, quarantine, &captured, true,
+        description ? description : "owned reset artifact cleanup",
+        g_reset_retire_hook, &replacement);
+    if (remove_rc != 0) {
         char detail[sizeof(g_last_error.message)];
         int restore_rc;
+        const struct stat *restore_identity =
+            remove_rc > 0 ? &replacement : &captured;
 
         safe_strncpy(detail, get_last_error()->message, sizeof(detail));
         restore_rc = restore_ssh_reset_quarantine(
-            dir_fd, name, quarantine, &captured);
+            dir_fd, name, quarantine, restore_identity);
         set_error(ERR_FILE_IO, "%s; artifact %s: %s", detail,
                   restore_rc == 0 ? "restored" : "retained in quarantine",
                   display_path ? display_path : name);
     }
-    return rc;
+    return remove_rc == 0 ? 0 : -1;
 }
 
 /* Inspect current.sock without following it. Missing is success with

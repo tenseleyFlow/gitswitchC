@@ -70,6 +70,8 @@ static int connection_runner(const char *const argv[],
     bool spawned = g_spawned;
     bool truncated = g_truncated;
     bool strict_identity;
+    bool config_isolated;
+    bool exact_identity;
     int i;
 
     g_argc = 0;
@@ -80,24 +82,27 @@ static int connection_runner(const char *const argv[],
     }
 
     strict_identity = argv_has_option_value("-o", "IdentitiesOnly=yes");
+    config_isolated = argv_has_option_value("-F", "none");
+    exact_identity = strict_identity && config_isolated;
     if (g_mode == CONNECTION_CAUSAL_REJECT_ACCOUNT_KEY) {
-        /* Model a loaded unrelated key that the server accepts. Without the
-         * restriction the old probe reports success; with it, the rejected
-         * account key is the only offer and the probe must fail. */
-        output = strict_identity
+        /* Model an unrelated IdentityFile inherited from ssh_config and
+         * accepted by the server. IdentitiesOnly alone still offers it; only
+         * config isolation plus the explicit account key makes this a causal
+         * probe of the intended identity. */
+        output = exact_identity
                      ? "git@github.com: Permission denied (publickey)."
                      : "Hi unrelated-user! You've successfully authenticated, "
                        "but GitHub does not provide shell access.";
-        exit_code = strict_identity ? 255 : 1;
+        exit_code = exact_identity ? 255 : 1;
         term_signal = 0;
         spawned = true;
         truncated = false;
     } else if (g_mode == CONNECTION_CAUSAL_ACCEPT_ACCOUNT_KEY) {
-        output = strict_identity
+        output = exact_identity
                      ? "Hi intended-user! You've successfully authenticated, "
                        "but GitHub does not provide shell access."
-                     : "git@github.com: identity restriction missing";
-        exit_code = strict_identity ? 1 : 255;
+                     : "git@github.com: exact identity isolation missing";
+        exit_code = exact_identity ? 1 : 255;
         term_signal = 0;
         spawned = true;
         truncated = false;
@@ -215,22 +220,95 @@ TEST(direct_probe_offers_only_the_intended_account_key) {
 
     g_mode = CONNECTION_CAUSAL_REJECT_ACCOUNT_KEY;
     CHECK_EQ_INT(ssh_test_connection(&account, "git@github.com"), -1);
-    CHECK_EQ_INT(g_argc, 11);
+    CHECK_EQ_INT(g_argc, 13);
     CHECK_STR_EQ(g_argv[0], "ssh");
     CHECK_STR_EQ(g_argv[1], "-T");
-    CHECK_STR_EQ(g_argv[2], "-o");
-    CHECK_STR_EQ(g_argv[3], "ConnectTimeout=5");
+    CHECK_STR_EQ(g_argv[2], "-F");
+    CHECK_STR_EQ(g_argv[3], "none");
     CHECK_STR_EQ(g_argv[4], "-o");
-    CHECK_STR_EQ(g_argv[5], "BatchMode=yes");
+    CHECK_STR_EQ(g_argv[5], "ConnectTimeout=5");
     CHECK_STR_EQ(g_argv[6], "-o");
-    CHECK_STR_EQ(g_argv[7], "IdentitiesOnly=yes");
-    CHECK_STR_EQ(g_argv[8], "-i");
-    CHECK_STR_EQ(g_argv[9], "/tmp/intended-account-key");
-    CHECK_STR_EQ(g_argv[10], "git@github.com");
+    CHECK_STR_EQ(g_argv[7], "BatchMode=yes");
+    CHECK_STR_EQ(g_argv[8], "-o");
+    CHECK_STR_EQ(g_argv[9], "IdentitiesOnly=yes");
+    CHECK_STR_EQ(g_argv[10], "-i");
+    CHECK_STR_EQ(g_argv[11], "/tmp/intended-account-key");
+    CHECK_STR_EQ(g_argv[12], "git@github.com");
 
     g_mode = CONNECTION_CAUSAL_ACCEPT_ACCOUNT_KEY;
     CHECK_EQ_INT(ssh_test_connection(&account, "git@github.com"), 0);
     run_set_runner(previous);
+}
+
+static bool output_has_identity_file(const char *output, const char *path) {
+    static const char prefix[] = "identityfile ";
+    const char *line = output;
+    size_t path_len = strlen(path);
+
+    while (line && *line) {
+        const char *newline = strchr(line, '\n');
+        size_t line_len = newline ? (size_t)(newline - line) : strlen(line);
+        if (line_len > 0U && line[line_len - 1U] == '\r') line_len--;
+        if (line_len == sizeof(prefix) - 1U + path_len &&
+            memcmp(line, prefix, sizeof(prefix) - 1U) == 0 &&
+            memcmp(line + sizeof(prefix) - 1U, path, path_len) == 0) {
+            return true;
+        }
+        line = newline ? newline + 1 : NULL;
+    }
+    return false;
+}
+
+TEST(openssh_effective_config_confirms_direct_probe_isolation) {
+    static const char foreign_key[] = "/tmp/foreign-inherited-key";
+    static const char intended_key[] = "/dev/null";
+    char fixture_dir[] = "/tmp/gsar08sshconfigXXXXXX";
+    char fixture_config[MAX_PATH_LEN];
+    char output[32768];
+    run_opts_t opts;
+    run_result_t result;
+
+    if (!command_exists("ssh")) {
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
+    }
+    CHECK(ts_mkdtemp(fixture_dir) != NULL);
+    if (!path_exists(fixture_dir)) return;
+    CHECK_EQ_INT(safe_snprintf(fixture_config, sizeof(fixture_config),
+                               "%s/config", fixture_dir), 0);
+    CHECK_EQ_INT(write_string_to_file(
+                     fixture_config,
+                     "Host exact-probe.invalid\n"
+                     "  IdentityFile /tmp/foreign-inherited-key\n",
+                     0600), 0);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+    {
+        const char *const inherited_argv[] = {
+            "ssh", "-G", "-F", fixture_config, "-o",
+            "IdentitiesOnly=yes", "-i", intended_key,
+            "exact-probe.invalid", NULL};
+        CHECK_EQ_INT(run_argv(inherited_argv, &opts, &result), 0);
+    }
+    CHECK(!result.out_truncated);
+    CHECK(output_has_identity_file(output, intended_key));
+    CHECK(output_has_identity_file(output, foreign_key));
+
+    memset(output, 0, sizeof(output));
+    memset(&result, 0, sizeof(result));
+    {
+        const char *const isolated_argv[] = {
+            "ssh", "-G", "-F", "none", "-o",
+            "IdentitiesOnly=yes", "-i", intended_key,
+            "exact-probe.invalid", NULL};
+        CHECK_EQ_INT(run_argv(isolated_argv, &opts, &result), 0);
+    }
+    CHECK(!result.out_truncated);
+    CHECK(output_has_identity_file(output, intended_key));
+    CHECK(!output_has_identity_file(output, foreign_key));
 }
 
 TEST_MAIN_BEGIN()
@@ -238,4 +316,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(diagnostic_fragments_never_authenticate);
     RUN_TEST(provider_greetings_require_exact_lines_and_exit_classes);
     RUN_TEST(direct_probe_offers_only_the_intended_account_key);
+    RUN_TEST(openssh_effective_config_confirms_direct_probe_isolation);
 TEST_MAIN_END()
