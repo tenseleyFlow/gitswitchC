@@ -56,17 +56,37 @@
  * previously pending signal. Idempotent while a guard is active. SA_RESTART
  * is used so a signal doesn't interrupt the parent blocked in poll/waitpid on
  * an in-flight child (run_argv already retries EINTR; restarting avoids
- * surprising every other syscall in the window). Returns 0.
+ * surprising every other syscall in the window). Returns 0 on success and -1
+ * if any disposition query or installation fails. A failed begin restores
+ * every disposition it already changed and preserves the originating errno;
+ * only an inherited SIG_IGN is intentionally skipped.
  */
 int signals_guard_begin(void);
+
+/* Deterministic, one-shot fault injection for each sigaction(2) stage used by
+ * the guard. Failures are stored independently by stage, so a test can arm an
+ * installation failure and the rollback restoration failure it triggers at
+ * the same time. Passing SIGNALS_TEST_SIGACTION_NONE clears every stage. */
+typedef enum {
+    SIGNALS_TEST_SIGACTION_NONE = 0,
+    SIGNALS_TEST_SIGACTION_QUERY,
+    SIGNALS_TEST_SIGACTION_INSTALL,
+    SIGNALS_TEST_SIGACTION_RESTORE
+} signals_test_sigaction_stage_t;
+
+void signals_test_fail_sigaction(int signal_number,
+                                 signals_test_sigaction_stage_t stage,
+                                 int system_errno);
 
 /**
  * Restore the dispositions saved by signals_guard_begin(). Idempotent. Does
  * NOT clear a pending signal — callers finish their teardown first and then
  * either signals_dispatch_pending() (failure path) or deliberately complete
- * the already-applied switch (success path).
+ * the already-applied switch (success path). Returns 0 once every installed
+ * disposition is restored, or -1 while one or more restorations remain
+ * pending; failed entries stay recorded so a later call can retry them.
  */
-void signals_guard_end(void);
+int signals_guard_end(void);
 
 /**
  * Mark the failed-switch rollback window. Between begin and end, the handler

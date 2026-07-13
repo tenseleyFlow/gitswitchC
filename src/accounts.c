@@ -805,7 +805,15 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * success path still clears the scratch registry, so a registration
          * here would never cover the save (AR-02 #27). config_save registers
          * its own temp path under the guard this function leaves armed. */
-        signals_guard_begin();
+        if (signals_guard_begin() != 0) {
+            error_context_t guard_error = *get_last_error();
+            int guard_errno = errno;
+
+            runtime_state_lock_release(runtime_lock_fd);
+            g_last_error = guard_error;
+            errno = guard_errno;
+            return -1;
+        }
 
         /* A prior successful accounts_switch() can leave an owned agent in
          * this process's session state. Stopping it is a real mutation: do it
@@ -1533,7 +1541,29 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
         return -1;
     }
     g_pending_edit.active = true;
-    signals_guard_begin();
+    if (signals_guard_begin() != 0) {
+        error_context_t guard_error = *get_last_error();
+        int guard_errno = errno;
+        char rollback_error[sizeof(g_last_error.message)] = "";
+
+        /* config_update_account has changed only the process-local slot. No
+         * SSH/GPG retirement or alias operation has started, so abort restores
+         * the exact before-image without crossing an external boundary. */
+        if (accounts_edit_abort(ctx) != 0) {
+            safe_strncpy(rollback_error, get_last_error()->message,
+                         sizeof(rollback_error));
+            set_error(ERR_SYSTEM_CALL,
+                      "Signal guard setup failed (%s), and the in-memory "
+                      "account before-image could not be restored (%s)",
+                      guard_error.message,
+                      rollback_error[0] ? rollback_error :
+                          "unknown edit rollback error");
+        } else {
+            g_last_error = guard_error;
+        }
+        errno = guard_errno;
+        return -1;
+    }
     signals_rollback_begin();
 
     if (retire_ssh || retire_gpg) {

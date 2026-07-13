@@ -714,30 +714,35 @@ int main(int argc, char *argv[]) {
         if (mutation.save_kind != COMMAND_SAVE_NONE) {
             log_debug("Saving configuration after %s command (account_count=%zu)",
                       command, ctx->account_count);
-            signals_guard_begin();
-            signals_rollback_begin();
-            if (mutation.save_kind == COMMAND_SAVE_FULL) {
-                if (mutation.edit_prepared) {
-                    save_rc = config_save_transactional(
-                        ctx, ctx->config.config_path, &config_installed);
-                } else {
-                    save_rc = config_save(ctx, ctx->config.config_path);
-                }
-            } else if (mutation.switch_prepared) {
-                save_rc = config_save_active_account_transactional(
-                    ctx, ctx->config.config_path, &config_installed);
-            } else if (mutation.reset_guarded) {
-                save_rc = config_save_active_account_transactional(
-                    ctx, ctx->config.config_path, &config_installed);
-            } else {
-                save_rc = config_save_active_account(
-                    ctx, ctx->config.config_path);
-            }
-            if (save_rc != 0) {
+            if (signals_guard_begin() != 0) {
+                save_rc = -1;
                 safe_strncpy(save_error, get_last_error()->message,
                              sizeof(save_error));
+            } else {
+                signals_rollback_begin();
+                if (mutation.save_kind == COMMAND_SAVE_FULL) {
+                    if (mutation.edit_prepared) {
+                        save_rc = config_save_transactional(
+                            ctx, ctx->config.config_path, &config_installed);
+                    } else {
+                        save_rc = config_save(ctx, ctx->config.config_path);
+                    }
+                } else if (mutation.switch_prepared) {
+                    save_rc = config_save_active_account_transactional(
+                        ctx, ctx->config.config_path, &config_installed);
+                } else if (mutation.reset_guarded) {
+                    save_rc = config_save_active_account_transactional(
+                        ctx, ctx->config.config_path, &config_installed);
+                } else {
+                    save_rc = config_save_active_account(
+                        ctx, ctx->config.config_path);
+                }
+                if (save_rc != 0) {
+                    safe_strncpy(save_error, get_last_error()->message,
+                                 sizeof(save_error));
+                }
+                signals_scratch_cleanup();
             }
-            signals_scratch_cleanup();
         }
 
         if (mutation.switch_prepared && save_rc == 0) {

@@ -25,6 +25,260 @@
 #include <time.h>
 #include <unistd.h>
 
+static const int test_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
+#define TEST_GUARDED_SIGNAL_COUNT \
+    (sizeof(test_guarded_signals) / sizeof(test_guarded_signals[0]))
+
+static void inherited_test_handler(int signal_number) {
+    (void)signal_number;
+}
+
+/* struct sigaction can contain implementation padding/restorer fields, so
+ * compare every disposition property controlled by this suite rather than
+ * byte-comparing the object representation. */
+static bool test_actions_equal(const struct sigaction *left,
+                               const struct sigaction *right) {
+    static const int mask_signals[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM
+    };
+
+    if (left->sa_handler != right->sa_handler ||
+        left->sa_flags != right->sa_flags) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(mask_signals) / sizeof(mask_signals[0]); i++) {
+        if (sigismember(&left->sa_mask, mask_signals[i]) !=
+            sigismember(&right->sa_mask, mask_signals[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void install_distinct_test_actions(struct sigaction *observed) {
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = inherited_test_handler;
+        sigemptyset(&action.sa_mask);
+        sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+        sigaddset(&action.sa_mask,
+                  test_guarded_signals[(i + 1) % TEST_GUARDED_SIGNAL_COUNT]);
+        action.sa_flags = i == 1 ? SA_RESTART : 0;
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], &action, NULL), 0);
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &observed[i]), 0);
+    }
+}
+
+static void restore_test_actions(const struct sigaction *actions) {
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], &actions[i], NULL), 0);
+    }
+}
+
+static void check_current_actions(const struct sigaction *expected) {
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction current;
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &current), 0);
+        CHECK(test_actions_equal(&current, &expected[i]));
+    }
+}
+
+/* AR-08 M22: every query/install position is a transactional boundary.  A
+ * failure must restore every earlier disposition before returning, retain the
+ * originating errno/error context, and leave the guard retryable. */
+TEST(guard_begin_failures_restore_every_disposition) {
+    static const signals_test_sigaction_stage_t stages[] = {
+        SIGNALS_TEST_SIGACTION_QUERY,
+        SIGNALS_TEST_SIGACTION_INSTALL
+    };
+    static const char *stage_names[] = { "query", "install" };
+    struct sigaction original[TEST_GUARDED_SIGNAL_COUNT];
+    struct sigaction baseline[TEST_GUARDED_SIGNAL_COUNT];
+
+    signals_guard_end();
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &original[i]), 0);
+    }
+    install_distinct_test_actions(baseline);
+
+    for (size_t stage = 0; stage < sizeof(stages) / sizeof(stages[0]); stage++) {
+        for (size_t target = 0; target < TEST_GUARDED_SIGNAL_COUNT; target++) {
+            char signal_text[32];
+            int injected_errno = stage == 0 ? EIO : EPERM;
+
+            clear_error();
+            errno = 0;
+            signals_test_fail_sigaction(test_guarded_signals[target],
+                                        stages[stage], injected_errno);
+            int rc = signals_guard_begin();
+            int returned_errno = errno;
+            error_context_t failure = *get_last_error();
+
+            CHECK_EQ_INT(rc, -1);
+            CHECK_EQ_INT(returned_errno, injected_errno);
+            CHECK_EQ_INT(failure.code, ERR_SYSTEM_CALL);
+            CHECK_EQ_INT(failure.system_errno, injected_errno);
+            CHECK(strstr(failure.message, stage_names[stage]) != NULL);
+            snprintf(signal_text, sizeof(signal_text), "%d",
+                     test_guarded_signals[target]);
+            CHECK(strstr(failure.message, signal_text) != NULL);
+
+            /* This check deliberately precedes guard_end(): begin itself, not
+             * eventual caller cleanup, owns the transactional restoration. */
+            check_current_actions(baseline);
+            signals_guard_end(); /* also repairs the pre-fix implementation */
+            signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+            check_current_actions(baseline);
+
+            clear_error();
+            CHECK_EQ_INT(signals_guard_begin(), 0);
+            signals_guard_end();
+            check_current_actions(baseline);
+        }
+    }
+
+    restore_test_actions(original);
+}
+
+/* A restoration error is a third state, not an active guard.  Retain the
+ * exact failed entry, reject every begin that encounters or repairs that
+ * partial state, and allow only a later clean begin to report success. */
+TEST(guard_begin_never_reports_restore_pending_as_active) {
+    struct sigaction original[TEST_GUARDED_SIGNAL_COUNT];
+    struct sigaction baseline[TEST_GUARDED_SIGNAL_COUNT];
+    struct sigaction current;
+    error_context_t failure;
+    int rc;
+
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &original[i]), 0);
+    }
+    install_distinct_test_actions(baseline);
+
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_INSTALL,
+                                EPERM);
+    signals_test_fail_sigaction(SIGINT, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+    clear_error();
+    errno = 0;
+    rc = signals_guard_begin();
+    failure = *get_last_error();
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(errno, EPERM);
+    CHECK_EQ_INT(failure.code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(failure.system_errno, EPERM);
+    CHECK(strstr(failure.message, "also failed to restore") != NULL);
+    CHECK_EQ_INT(sigaction(SIGINT, NULL, &current), 0);
+    CHECK(!test_actions_equal(&current, &baseline[0]));
+
+    /* A second restoration failure must remain pending, not get erased by
+     * begin's idempotent-active fast path. */
+    signals_test_fail_sigaction(SIGINT, SIGNALS_TEST_SIGACTION_RESTORE,
+                                EAGAIN);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(signals_guard_begin(), -1);
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK_EQ_INT(sigaction(SIGINT, NULL, &current), 0);
+    CHECK(!test_actions_equal(&current, &baseline[0]));
+
+    /* The next call repairs the retained entry but still cannot claim this
+     * dirty entry as a successful begin.  Only a fresh retry may activate. */
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(signals_guard_begin(), -1);
+    CHECK_EQ_INT(errno, EBUSY);
+    check_current_actions(baseline);
+    CHECK_EQ_INT(signals_guard_begin(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    check_current_actions(baseline);
+
+    restore_test_actions(original);
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
+/* guard_end has the same fail-closed retry contract: restore what it can,
+ * retain only failed entries, and report failure until the last one is back. */
+TEST(guard_end_retains_failed_restoration_for_retry) {
+    struct sigaction original[TEST_GUARDED_SIGNAL_COUNT];
+    struct sigaction baseline[TEST_GUARDED_SIGNAL_COUNT];
+    struct sigaction current;
+
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &original[i]), 0);
+    }
+    install_distinct_test_actions(baseline);
+    CHECK_EQ_INT(signals_guard_begin(), 0);
+
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+    errno = 0;
+    CHECK_EQ_INT(signals_guard_end(), -1);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK_EQ_INT(sigaction(SIGTERM, NULL, &current), 0);
+    CHECK(!test_actions_equal(&current, &baseline[1]));
+
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE,
+                                EAGAIN);
+    errno = 0;
+    CHECK_EQ_INT(signals_guard_end(), -1);
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK_EQ_INT(sigaction(SIGTERM, NULL, &current), 0);
+    CHECK(!test_actions_equal(&current, &baseline[1]));
+
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    check_current_actions(baseline);
+    restore_test_actions(original);
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
+/* SIG_IGN is the sole non-error skip.  Arm an install failure for each
+ * ignored signal: success proves begin never attempted that installation,
+ * while exact post-end comparison proves the inherited action survived. */
+TEST(guard_begin_skips_only_inherited_sig_ign) {
+    struct sigaction original[TEST_GUARDED_SIGNAL_COUNT];
+    struct sigaction baseline[TEST_GUARDED_SIGNAL_COUNT];
+
+    signals_guard_end();
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &original[i]), 0);
+    }
+    install_distinct_test_actions(baseline);
+
+    for (size_t target = 0; target < TEST_GUARDED_SIGNAL_COUNT; target++) {
+        struct sigaction ignored;
+        struct sigaction before[TEST_GUARDED_SIGNAL_COUNT];
+        struct sigaction during;
+
+        restore_test_actions(baseline);
+        memset(&ignored, 0, sizeof(ignored));
+        ignored.sa_handler = SIG_IGN;
+        sigemptyset(&ignored.sa_mask);
+        sigaddset(&ignored.sa_mask, SIGUSR1);
+        ignored.sa_flags = SA_RESTART;
+        CHECK_EQ_INT(sigaction(test_guarded_signals[target], &ignored, NULL), 0);
+        for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+            CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &before[i]), 0);
+        }
+
+        signals_test_fail_sigaction(test_guarded_signals[target],
+                                    SIGNALS_TEST_SIGACTION_INSTALL, EIO);
+        CHECK_EQ_INT(signals_guard_begin(), 0);
+        CHECK_EQ_INT(sigaction(test_guarded_signals[target], NULL, &during), 0);
+        CHECK(during.sa_handler == SIG_IGN);
+        signals_guard_end();
+        signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+        check_current_actions(before);
+    }
+
+    restore_test_actions(original);
+}
+
 /* A raised SIGINT inside the guard must be recorded, not kill the process —
  * this is the entire SIG-01 mechanism (the mainline rolls back and re-raises). */
 TEST(guard_defers_first_signal) {
@@ -362,6 +616,10 @@ TEST(rollback_child_kill_escalates_to_sigkill) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
+    RUN_TEST(guard_begin_failures_restore_every_disposition);
+    RUN_TEST(guard_begin_never_reports_restore_pending_as_active);
+    RUN_TEST(guard_end_retains_failed_restoration_for_retry);
+    RUN_TEST(guard_begin_skips_only_inherited_sig_ign);
     RUN_TEST(guard_defers_first_signal);
     RUN_TEST(guard_end_restores_default_disposition);
     RUN_TEST(guard_respects_inherited_sig_ign);

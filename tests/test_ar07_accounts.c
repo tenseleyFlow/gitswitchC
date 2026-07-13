@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <signal.h>
 
 static const char private_key_text[] =
     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
@@ -163,6 +164,52 @@ static void fill_account(account_t *account, uint32_t id, const char *name,
 static void end_edit_guard(void) {
     signals_rollback_end();
     signals_guard_end();
+}
+
+/* AR-08 M22: edit preparation has already updated the in-memory account when
+ * it arms the rollback guard.  A guard failure must therefore put the exact
+ * before-image back and surface the signal error instead of publishing a
+ * prepared mutation. */
+TEST(edit_guard_failure_restores_candidate_before_image) {
+    gitswitch_ctx_t ctx;
+    account_t original;
+    account_t changed;
+    error_context_t failure;
+    int rc;
+    int returned_errno;
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&original, 1, "one", "one@example.com", NULL, NULL);
+    CHECK_EQ_INT(config_add_account(&ctx, &original), 0);
+    original = ctx.accounts[0];
+    changed = original;
+    snprintf(changed.description, sizeof(changed.description), "%s",
+             "candidate description");
+
+    signals_guard_end();
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_INSTALL,
+                                EPERM);
+    clear_error();
+    errno = 0;
+    rc = accounts_edit_candidate_prepare(&ctx, &changed);
+    returned_errno = errno;
+    failure = *get_last_error();
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(returned_errno, EPERM);
+    CHECK_EQ_INT(failure.code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(failure.system_errno, EPERM);
+    CHECK(memcmp(&ctx.accounts[0], &original, sizeof(original)) == 0);
+    CHECK_EQ_INT((int)ctx.account_count, 1);
+    CHECK(ctx.current_account == NULL);
+
+    /* Leave the suite clean under both the pre-fix success and fixed failure
+     * outcomes; inspect mutation/error state above before this cleanup. */
+    if (rc == 0) {
+        (void)accounts_edit_abort(&ctx);
+    }
+    end_edit_guard();
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
 }
 
 TEST(duplicate_email_is_ambiguous_for_every_account_selector) {
@@ -560,6 +607,7 @@ TEST(gpg_signing_only_edit_preserves_the_isolated_home) {
 }
 
 TEST_MAIN_BEGIN()
+    RUN_TEST(edit_guard_failure_restores_candidate_before_image);
     RUN_TEST(duplicate_email_is_ambiguous_for_every_account_selector);
     RUN_TEST(alias_collisions_are_rejected_on_add_update_and_load);
     RUN_TEST(case_varied_alias_blocks_reconcile_and_shared_remove_is_non_destructive);

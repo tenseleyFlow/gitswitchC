@@ -680,6 +680,48 @@ TEST(snapshot_failure_aborts_before_any_git_write) {
     CHECK(symlink_present(g_gpg_link));
 }
 
+/* AR-08 M22: signals_guard_begin() is the final fail-before-mutation boundary
+ * in accounts_switch.  Failure after one earlier handler was installed must
+ * return the original error without tearing down runtime, writing Git, or
+ * publishing a new active account. */
+TEST(signal_guard_failure_aborts_before_switch_mutation) {
+    error_context_t failure;
+    int returned_errno;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    gitswitch_ctx_t ctx = make_ctx();
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+
+    signals_guard_end();
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_INSTALL,
+                                EPERM);
+    clear_error();
+    errno = 0;
+    command_runner_fn previous = run_set_runner(fake_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    returned_errno = errno;
+    failure = *get_last_error();
+    run_set_runner(previous);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(returned_errno, EPERM);
+    CHECK_EQ_INT(failure.code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(failure.system_errno, EPERM);
+    CHECK_EQ_INT(g_user_name_writes, 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(ctx.current_account == NULL);
+    CHECK(ctx.config.active_account[0] == '\0');
+    CHECK(symlink_present(g_ssh_sock));
+    CHECK(symlink_present(g_gpg_link));
+
+    signals_guard_end();
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
 /* AR-07 M24: the exact config listing is acquired before runtime activation,
  * not merely before the first Git write. A failed read must not spawn an
  * agent and then rely on runtime rollback to hide the ordering mistake. */
@@ -1999,6 +2041,7 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(snapshot_failure_aborts_before_any_git_write);
+    RUN_TEST(signal_guard_failure_aborts_before_switch_mutation);
     RUN_TEST(snapshot_listing_failure_aborts_before_ssh_activation);
     RUN_TEST(failed_git_config_keeps_previous_runtime_isolation);
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
