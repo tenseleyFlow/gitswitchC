@@ -93,6 +93,10 @@ typedef int (*gpg_unsetenv_fn)(const char *name);
  * has removed `current` and immediately before the required final base scan. */
 typedef int (*gpg_cleanup_predelete_fn)(int home_fd);
 typedef int (*gpg_reset_final_hook_fn)(int base_fd);
+/* Runs after reset captures the exact `current` symlink and before it moves
+ * that pathname into a private quarantine. Tests use this boundary to prove
+ * that a same-uid writer replacing `current` is restored, never unlinked. */
+typedef int (*gpg_reset_current_hook_fn)(int base_fd);
 /* Deterministic mount-identity and managed-writer durability seams. NULL
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
@@ -117,6 +121,8 @@ gpg_cleanup_predelete_fn
 gpg_manager_set_cleanup_predelete_fn(gpg_cleanup_predelete_fn fn);
 gpg_reset_final_hook_fn
 gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn);
+gpg_reset_current_hook_fn
+gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn);
 gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn
@@ -241,7 +247,11 @@ int gpg_manager_system_keyring_home(char *buf, size_t size);
  * remain forensically recoverable (AR-02 #26). Cleanup fails closed and keeps
  * the affected home when it cannot prove one mount boundary and one link per
  * non-directory entry. A full reset also rejects unknown base entries and
- * verifies that only its exact lock survives. Resets a single account when
+ * verifies that only its exact lock survives. Namespace changes are synced
+ * through the pinned base before success; a failed sync returns nonzero so an
+ * otherwise empty retry can repair durability. `current` is removed through
+ * an identity-aware quarantine, preserving a same-uid writer that replaced it
+ * after capture. Resets a single account when
  * `account` is a nonempty name accepted by validate_name(); callers must pass
  * the canonical stored account name. Resets all accounts only when `account`
  * is NULL. Invalid non-NULL input fails with ERR_INVALID_ARGS before any

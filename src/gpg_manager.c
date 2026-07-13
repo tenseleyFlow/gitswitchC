@@ -75,6 +75,17 @@ typedef struct {
     const char *name;
     const char *path;
 } gpg_pinned_home_t;
+typedef struct {
+    bool injected;
+    uint64_t injected_id;
+#ifdef __linux__
+    unsigned long long mount_id;
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    fsid_t fsid;
+#else
+    int unsupported;
+#endif
+} gpg_mount_identity_t;
 static int gpg_run_pinned(const gpg_pinned_home_t *home,
                           const gpg_config_t *cfg, run_result_t *res_out,
                           char *output, size_t output_size, ...);
@@ -90,6 +101,9 @@ static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
                                         int base_fd, const char *base,
                                         int *home_fd_out);
 static int gpg_validate_pinned_home(const gpg_pinned_home_t *home);
+static int gpg_mount_identity_fd(int fd, gpg_mount_identity_t *identity);
+static bool gpg_same_mount(const gpg_mount_identity_t *left,
+                           const gpg_mount_identity_t *right);
 static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_resolve_source_key(const char *selector, bool require_signing,
                                   char *fingerprint,
@@ -121,6 +135,7 @@ static gpg_setenv_fn g_gpg_setenv = setenv;
 static gpg_unsetenv_fn g_gpg_unsetenv = unsetenv;
 static gpg_cleanup_predelete_fn g_cleanup_predelete;
 static gpg_reset_final_hook_fn g_reset_final_hook;
+static gpg_reset_current_hook_fn g_reset_current_hook;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
@@ -202,6 +217,13 @@ gpg_reset_final_hook_fn
 gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn) {
     gpg_reset_final_hook_fn previous = g_reset_final_hook;
     g_reset_final_hook = fn;
+    return previous;
+}
+
+gpg_reset_current_hook_fn
+gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn) {
+    gpg_reset_current_hook_fn previous = g_reset_current_hook;
+    g_reset_current_hook = fn;
     return previous;
 }
 
@@ -1176,6 +1198,8 @@ static int gpg_validate_pinned_home(const gpg_pinned_home_t *home) {
     struct stat child_named;
     struct stat home_opened;
     struct stat home_named;
+    gpg_mount_identity_t base_mount;
+    gpg_mount_identity_t home_mount;
 
     if (!home || home->base_fd < 0 || home->home_fd < 0 ||
         !home->base || !*home->base || !home->name || !*home->name ||
@@ -1209,6 +1233,19 @@ static int gpg_validate_pinned_home(const gpg_pinned_home_t *home) {
         home_named.st_ino != home_opened.st_ino) {
         set_error(ERR_PERMISSION_DENIED,
                   "GPG home pathname no longer names the pinned directory: %s",
+                  home->path);
+        return -1;
+    }
+    if (gpg_mount_identity_fd(home->base_fd, &base_mount) != 0 ||
+        gpg_mount_identity_fd(home->home_fd, &home_mount) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot prove isolated GPG home mount boundary: %s",
+                         home->path);
+        return -1;
+    }
+    if (!gpg_same_mount(&base_mount, &home_mount)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing isolated GPG home mounted outside its memory-backed base: %s",
                   home->path);
         return -1;
     }
@@ -2343,18 +2380,6 @@ out:
     return rc;
 }
 
-typedef struct {
-    bool injected;
-    uint64_t injected_id;
-#ifdef __linux__
-    unsigned long long mount_id;
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-    fsid_t fsid;
-#else
-    int unsupported;
-#endif
-} gpg_mount_identity_t;
-
 /* Capture the kernel mount identity for a pinned directory. Linux st_dev is
  * deliberately not used: a bind mount of the same filesystem (or even the
  * same inode) keeps st_dev while crossing into a distinct mount. statx's mount
@@ -2974,6 +2999,119 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     return 0;
 }
 
+/* Remove only the exact `current` inode reset inspected. Moving the public
+ * name to an unpredictable quarantine is the atomic ownership boundary: if a
+ * same-uid writer replaced it after capture, the moved inode will not compare
+ * equal and is restored with no-replace semantics. A writer that appears after
+ * the move remains at `current` while reset retires only its private inode. */
+static int gpg_remove_captured_current_locked(
+    int base_fd, const char *base, const gpg_link_identity_t *captured,
+    bool *changed) {
+    char quarantine[GPG_QUARANTINE_NAME_LEN] = "";
+    gpg_link_identity_t moved;
+    gpg_link_identity_t current;
+    int current_rc;
+    int quarantine_rc;
+
+    if (base_fd < 0 || !base || !*base || !captured || !captured->valid ||
+        !changed) {
+        set_error(ERR_INVALID_ARGS, "Invalid captured GNUPGHOME reset state");
+        return -1;
+    }
+    *changed = false;
+    if (gpg_make_private_name(quarantine, sizeof(quarantine),
+                              GPG_ROLLBACK_PREFIX) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, quarantine) != 0) {
+        return -1;
+    }
+    if (g_reset_current_hook && g_reset_current_hook(base_fd) != 0) {
+        set_error(ERR_FILE_IO, "GPG reset current-link hook failed");
+        return -1;
+    }
+    if (g_rename_noreplace(base_fd, "current", base_fd, quarantine) != 0) {
+        int saved_errno = errno;
+        if (saved_errno == ENOENT) {
+            *changed = true;
+            set_error(ERR_FILE_IO,
+                      "Stable GNUPGHOME changed during reset; later absence preserved");
+        } else if (saved_errno == ENOTSUP ||
+#if EOPNOTSUPP != ENOTSUP
+                   saved_errno == EOPNOTSUPP ||
+#endif
+                   saved_errno == ENOSYS || saved_errno == EINVAL) {
+            set_error(ERR_FILE_IO,
+                      "Platform lacks atomic no-replace GPG reset quarantine");
+        } else {
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot quarantine stable GNUPGHOME during reset");
+        }
+        return -1;
+    }
+    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &moved);
+    if (quarantine_rc != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot identify quarantined GNUPGHOME; reset state retained for retry");
+        return -1;
+    }
+
+    if (!gpg_same_link(&moved, captured)) {
+        current_rc = gpg_capture_link_at(base_fd, "current", &current);
+        if (current_rc < 0) return -1;
+        if (current_rc == 0) {
+            set_error(ERR_FILE_IO,
+                      "A newer GNUPGHOME writer blocks restoration; foreign quarantine retained: %s",
+                      quarantine);
+            return -1;
+        }
+        if (g_rename_noreplace(base_fd, quarantine, base_fd, "current") != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot restore GNUPGHOME link replaced during reset");
+            return -1;
+        }
+        current_rc = gpg_capture_link_at(base_fd, "current", &current);
+        if (current_rc != 0 || !gpg_same_link(&current, &moved)) {
+            set_error(ERR_FILE_IO,
+                      "Restored GNUPGHOME link changed during reset recovery");
+            return -1;
+        }
+        /* FreeBSD's no-replace fallback may retain the private hard-link alias.
+         * Remove it only while it is still the exact foreign inode restored. */
+        quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &current);
+        if (quarantine_rc < 0) return -1;
+        if (quarantine_rc == 0) {
+            if (!gpg_same_link(&current, &moved) ||
+                unlinkat(base_fd, quarantine, 0) != 0) {
+                set_error(ERR_FILE_IO,
+                          "Restored GNUPGHOME quarantine changed; preserving it");
+                return -1;
+            }
+        }
+        *changed = true;
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed during reset; later writer preserved: %s",
+                  moved.target);
+        return 0;
+    }
+
+    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &current);
+    if (quarantine_rc != 0 || !gpg_same_link(&current, &moved) ||
+        unlinkat(base_fd, quarantine, 0) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Captured GNUPGHOME quarantine changed; preserving replacement");
+        return -1;
+    }
+    current_rc = gpg_capture_link_at(base_fd, "current", &current);
+    if (current_rc < 0) return -1;
+    if (current_rc == 0) {
+        *changed = true;
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed during reset; later writer preserved: %s",
+                  current.target);
+    }
+    return 0;
+}
+
 /* Tear down isolated GPG homes: one account, or all when account is NULL.
  * Kills the per-home gpg-agents and deletes (unlinks) the homes, then drops
  * the stable `current` symlink if it dangles. NB: deletion is remove(), not a
@@ -3116,20 +3254,21 @@ int gpg_manager_reset(const char *account) {
     if (gpg_current_path_from_base(base, current, sizeof(current)) != 0) {
         failed = true;
     } else {
-        char target[MAX_PATH_LEN];
-        int current_rc = gpg_read_current_locked(base_fd, base, target,
-                                                  sizeof(target));
+        gpg_link_identity_t captured_current;
+        int current_rc = gpg_capture_link_at(base_fd, "current",
+                                             &captured_current);
         if (current_rc == 0) {
             if (!account && !failed) {
-                if (unlinkat(base_fd, "current", 0) != 0 && errno != ENOENT) {
-                    set_system_error(ERR_FILE_IO,
-                                     "Failed to remove stable GNUPGHOME link: %s",
-                                     current);
+                bool current_changed = false;
+                if (gpg_remove_captured_current_locked(
+                        base_fd, base, &captured_current,
+                        &current_changed) != 0 || current_changed) {
                     failed = true;
                 }
                 goto reset_finalize;
             }
-            const char *component = gpg_managed_component(base, target);
+            const char *component = gpg_managed_component(
+                base, captured_current.target);
             struct stat target_st;
             bool remove_current = component == NULL;
             if (component &&
@@ -3140,7 +3279,7 @@ int gpg_manager_reset(const char *account) {
                 } else {
                     set_system_error(ERR_FILE_IO,
                                      "Cannot inspect managed GNUPGHOME target: %s",
-                                     target);
+                                     captured_current.target);
                     failed = true;
                 }
             } else if (component &&
@@ -3149,12 +3288,13 @@ int gpg_manager_reset(const char *account) {
                         (target_st.st_mode & 077) != 0)) {
                 remove_current = true;
             }
-            if (remove_current &&
-                unlinkat(base_fd, "current", 0) != 0 && errno != ENOENT) {
-                set_system_error(ERR_FILE_IO,
-                                 "Failed to remove invalid GNUPGHOME link: %s",
-                                 current);
-                failed = true;
+            if (remove_current) {
+                bool current_changed = false;
+                if (gpg_remove_captured_current_locked(
+                        base_fd, base, &captured_current,
+                        &current_changed) != 0 || current_changed) {
+                    failed = true;
+                }
             }
         } else if (current_rc < 0) {
             failed = true;
@@ -3167,6 +3307,27 @@ reset_finalize:
             failed = true;
         } else if (gpg_verify_reset_all_final_locked(base_fd, lock_fd,
                                                      base) != 0) {
+            failed = true;
+        }
+    }
+    {
+        char prior[sizeof(g_last_error.message)] = "";
+        if (failed) {
+            safe_strncpy(prior, get_last_error()->message, sizeof(prior));
+        }
+        /* Every successful reset — including an otherwise byte-for-byte retry
+         * after an earlier fsync failure — repairs the durability boundary of
+         * home/current namespace changes before releasing the manager lock. */
+        if (g_sync_base(base_fd) != 0) {
+            char sync_error[sizeof(g_last_error.message)];
+            set_system_error(
+                ERR_FILE_IO,
+                "GPG reset changed the namespace but the base directory is not durable; retry reset");
+            safe_strncpy(sync_error, get_last_error()->message,
+                         sizeof(sync_error));
+            if (prior[0] != '\0') {
+                set_error(ERR_FILE_IO, "%s; %s", prior, sync_error);
+            }
             failed = true;
         }
     }
@@ -4249,7 +4410,8 @@ static int append_conf_bytes(unsigned char *dest, size_t capacity,
 
 /* Return 1 only for a byte-identical, private regular destination; 0 means a
  * safe atomic replacement is needed, and -1 means comparison raced or failed.
- * The match path opens no write descriptor and performs no fsync or rename. */
+ * The comparator opens no write descriptor and performs no fsync or rename;
+ * its caller still syncs the directory before accepting an identical retry. */
 static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
                                   size_t desired_len) {
     struct stat before;
@@ -4751,6 +4913,15 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     match = gpg_agent_conf_matches(home_fd, desired, desired_len);
     if (match < 0) goto fail;
     if (match > 0) {
+        /* Matching bytes do not prove that a prior rename is directory-durable.
+         * Re-sync the pinned home so a retry after post-rename fsync failure
+         * repairs that uncertain namespace commit before reporting success. */
+        if (g_agent_conf_sync(home_fd, true) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to synchronize unchanged installed gpg-agent.conf");
+            goto fail;
+        }
         free(desired);
         log_debug("Reused unchanged GPG agent configuration: %s",
                   gpg_agent_conf_path);

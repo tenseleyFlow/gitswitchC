@@ -107,6 +107,34 @@ static int touch(const char *path) {
     return 0;
 }
 
+static int g_reset_sync_calls;
+static bool g_fail_reset_sync;
+
+static int record_reset_sync(int base_fd) {
+    struct stat st;
+    g_reset_sync_calls++;
+    if (fstat(base_fd, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
+    if (g_fail_reset_sync) {
+        errno = EIO;
+        return -1;
+    }
+    return fsync(base_fd);
+}
+
+static const char *g_reset_replacement_target;
+static struct stat g_reset_replacement_identity;
+
+static int replace_current_after_reset_capture(int base_fd) {
+    if (!g_reset_replacement_target ||
+        unlinkat(base_fd, "current", 0) != 0 ||
+        symlinkat(g_reset_replacement_target, base_fd, "current") != 0 ||
+        fstatat(base_fd, "current", &g_reset_replacement_identity,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 static const char *g_swap_base;
 static const char *g_swap_moved;
 static const char *g_swap_replacement_home;
@@ -627,6 +655,124 @@ TEST(gpg_manager_reset_deletes_only_pinned_home_after_base_replacement) {
     CHECK(path_exists(replacement_marker));
 }
 
+TEST(targeted_reset_sync_failure_is_retryable) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    struct stat st;
+    gpg_sync_base_fn old_sync;
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    g_reset_sync_calls = 0;
+    g_fail_reset_sync = true;
+    old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
+    previous = run_set_runner(null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("work"), -1);
+    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK(strstr(get_last_error()->message, "not durable") != NULL);
+    CHECK(lstat(home, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    g_fail_reset_sync = false;
+    CHECK_EQ_INT(gpg_manager_reset("work"), 0);
+    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    run_set_runner(previous);
+    gpg_manager_set_sync_base_fn(old_sync);
+}
+
+TEST(full_reset_sync_failure_is_retryable) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    struct stat st;
+    gpg_sync_base_fn old_sync;
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    g_reset_sync_calls = 0;
+    g_fail_reset_sync = true;
+    old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
+    previous = run_set_runner(null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK(strstr(get_last_error()->message, "not durable") != NULL);
+    CHECK(lstat(home, &st) != 0 && errno == ENOENT);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    g_fail_reset_sync = false;
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    run_set_runner(previous);
+    gpg_manager_set_sync_base_fn(old_sync);
+}
+
+TEST(targeted_reset_restores_current_replaced_after_capture) {
+    char xdg[128], base[256], work[320], other[320], marker[384];
+    char current[320], target[MAX_PATH_LEN];
+    struct stat survived;
+    ssize_t target_len;
+    gpg_reset_current_hook_fn old_hook;
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(work, sizeof(work), "%s/work", base);
+    snprintf(other, sizeof(other), "%s/other", base);
+    snprintf(marker, sizeof(marker), "%s/private.key", other);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(work, 0700), 0);
+    CHECK_EQ_INT(mkdir(other, 0700), 0);
+    CHECK_EQ_INT(touch(marker), 0);
+    CHECK_EQ_INT(symlink(work, current), 0);
+
+    g_reset_replacement_target = other;
+    memset(&g_reset_replacement_identity, 0,
+           sizeof(g_reset_replacement_identity));
+    old_hook = gpg_manager_set_reset_current_hook_fn(
+        replace_current_after_reset_capture);
+    previous = run_set_runner(null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("work"), -1);
+    gpg_manager_set_reset_current_hook_fn(old_hook);
+
+    CHECK(strstr(get_last_error()->message, "later writer preserved") != NULL);
+    CHECK_EQ_INT(lstat(current, &survived), 0);
+    CHECK_EQ_INT(survived.st_dev, g_reset_replacement_identity.st_dev);
+    CHECK_EQ_INT(survived.st_ino, g_reset_replacement_identity.st_ino);
+    target_len = readlink(current, target, sizeof(target) - 1);
+    CHECK(target_len > 0);
+    if (target_len > 0) {
+        target[target_len] = '\0';
+        CHECK_STR_EQ(target, other);
+    }
+    CHECK(path_exists(marker));
+
+    /* The partial result is truthful and leaves no hidden quarantine: a retry
+     * sees the unrelated live selection, preserves it, and succeeds. */
+    CHECK_EQ_INT(gpg_manager_reset("work"), 0);
+    CHECK_EQ_INT(lstat(current, &survived), 0);
+    CHECK_EQ_INT(survived.st_dev, g_reset_replacement_identity.st_dev);
+    CHECK_EQ_INT(survived.st_ino, g_reset_replacement_identity.st_ino);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(previous);
+    g_reset_replacement_target = NULL;
+}
+
 /* Test-local mirror of the manager's tmpfs probe, so the assertions below can
  * adapt to where the suite happens to run instead of hard-assuming /tmp is
  * tmpfs (it isn't on FreeBSD/macOS CI) or the workspace is disk (it usually is). */
@@ -709,5 +855,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_manager_reset_all_drops_external_live_target);
     RUN_TEST(gpg_manager_targeted_reset_drops_external_current_target);
     RUN_TEST(gpg_manager_reset_deletes_only_pinned_home_after_base_replacement);
+    RUN_TEST(targeted_reset_sync_failure_is_retryable);
+    RUN_TEST(full_reset_sync_failure_is_retryable);
+    RUN_TEST(targeted_reset_restores_current_replaced_after_capture);
     RUN_TEST(create_isolated_home_refuses_persistent_xdg_base);
 TEST_MAIN_END()
