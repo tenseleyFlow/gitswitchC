@@ -3528,6 +3528,8 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path) {
     struct stat after;
     struct stat named;
     struct stat destination_identity;
+    struct stat destination_after;
+    struct stat destination_named;
     char buf[4096];
     int sfd = -1;
     int dfd = -1;
@@ -3632,6 +3634,24 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path) {
     }
     if (fsync(dfd) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to sync backup file: %s",
+                         dst_path);
+        failure_reported = true;
+        goto fail;
+    }
+    errno = 0;
+    if (fstat(dfd, &destination_after) != 0 ||
+        lstat(dst_path, &destination_named) != 0 ||
+        !config_metadata_file_is_safe(&destination_after, true) ||
+        !config_metadata_file_is_safe(&destination_named, true) ||
+        !config_metadata_same_file(&destination_identity,
+                                   &destination_after) ||
+        !config_metadata_same_file(&destination_identity,
+                                   &destination_named) ||
+        destination_after.st_size != before.st_size ||
+        destination_named.st_size != before.st_size) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Backup destination changed while being copied: %s",
                          dst_path);
         failure_reported = true;
         goto fail;

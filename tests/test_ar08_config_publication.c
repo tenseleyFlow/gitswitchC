@@ -22,8 +22,13 @@ static int g_document_rename_calls;
 static int g_document_dirsync_calls;
 static int g_toml_publication_calls;
 static bool g_replace_source_name;
+static bool g_replace_backup_destination;
 static bool g_have_competitor_identity;
 static struct stat g_competitor_identity;
+static bool g_have_backup_competitor_identity;
+static struct stat g_backup_competitor_identity;
+static char g_saved_backup[1024];
+static char g_backup_competitor_path[1024];
 
 static int private_dir(char *path, size_t size) {
     if ((size_t)snprintf(path, size,
@@ -118,7 +123,58 @@ static bool publication_observer(config_io_boundary_t boundary) {
         }
     } else if (boundary == CONFIG_IO_BACKUP_AFTER_FIRST_CHUNK) {
         g_backup_chunk_calls++;
-        if (g_replace_source_name) {
+        if (g_replace_backup_destination) {
+            char dir[1024];
+            char prefix[512];
+            char *slash;
+            DIR *stream;
+            struct dirent *entry;
+
+            if ((size_t)snprintf(dir, sizeof(dir), "%s", g_target) >=
+                sizeof(dir)) {
+                g_hook_error = ENAMETOOLONG;
+                return false;
+            }
+            slash = strrchr(dir, '/');
+            if (!slash || slash == dir || slash[1] == '\0' ||
+                (size_t)snprintf(prefix, sizeof(prefix), "%s.backup.",
+                                 slash + 1) >= sizeof(prefix)) {
+                g_hook_error = EINVAL;
+                return false;
+            }
+            *slash = '\0';
+            stream = opendir(dir);
+            if (!stream) {
+                g_hook_error = errno ? errno : EIO;
+                return false;
+            }
+            g_backup_competitor_path[0] = '\0';
+            while ((entry = readdir(stream)) != NULL) {
+                if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
+                    if ((size_t)snprintf(g_backup_competitor_path,
+                                         sizeof(g_backup_competitor_path),
+                                         "%s/%s", dir, entry->d_name) >=
+                        sizeof(g_backup_competitor_path)) {
+                        g_hook_error = ENAMETOOLONG;
+                    }
+                    break;
+                }
+            }
+            if (closedir(stream) != 0 && g_hook_error == 0) {
+                g_hook_error = errno ? errno : EIO;
+            }
+            if (g_hook_error == 0 &&
+                (g_backup_competitor_path[0] == '\0' ||
+                 rename(g_backup_competitor_path, g_saved_backup) != 0 ||
+                 write_bytes(g_backup_competitor_path, g_version_b,
+                             g_version_length) != 0 ||
+                 lstat(g_backup_competitor_path,
+                       &g_backup_competitor_identity) != 0)) {
+                g_hook_error = errno ? errno : EIO;
+            } else if (g_hook_error == 0) {
+                g_have_backup_competitor_identity = true;
+            }
+        } else if (g_replace_source_name) {
             if (rename(g_target, g_saved_source) != 0 ||
                 write_bytes(g_target, g_version_b, g_version_length) != 0) {
                 g_hook_error = errno ? errno : EIO;
@@ -229,6 +285,55 @@ TEST(backup_rejects_when_the_parent_name_selects_a_new_inode) {
     exercise_unstable_backup(true);
 }
 
+TEST(backup_rejects_destination_name_substitution) {
+    char dir[256];
+    char current[LARGE_CONFIG_SIZE + 1];
+    struct stat competitor_after;
+    int result;
+    int result_errno;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(g_target, sizeof(g_target), "%s/accounts.toml", dir);
+    snprintf(g_saved_backup, sizeof(g_saved_backup), "%s/copied.fd", dir);
+    build_large_config(g_version_a, 'A');
+    build_large_config(g_version_b, 'B');
+    g_version_length = strlen(g_version_a);
+    CHECK_EQ_INT(g_version_length, strlen(g_version_b));
+    CHECK_EQ_INT(write_bytes(g_target, g_version_a, g_version_length), 0);
+
+    g_hook_error = 0;
+    g_backup_chunk_calls = 0;
+    g_replace_source_name = false;
+    g_replace_backup_destination = true;
+    g_have_backup_competitor_identity = false;
+    g_backup_competitor_path[0] = '\0';
+    clear_error();
+    config_set_io_fault_fn(publication_observer);
+    errno = 0;
+    result = config_backup(g_target);
+    result_errno = errno;
+    config_set_io_fault_fn(NULL);
+    g_replace_backup_destination = false;
+
+    CHECK_EQ_INT(result, -1);
+    CHECK_EQ_INT(result_errno, ESTALE);
+    CHECK_EQ_INT(g_hook_error, 0);
+    CHECK_EQ_INT(g_backup_chunk_calls, 1);
+    CHECK(strstr(get_last_error()->message,
+                 "Backup destination changed") != NULL);
+    CHECK(g_have_backup_competitor_identity);
+    CHECK_EQ_INT(lstat(g_backup_competitor_path, &competitor_after), 0);
+    CHECK(ts_same_identity(&g_backup_competitor_identity,
+                           &competitor_after));
+    CHECK_EQ_INT(read_bytes(g_backup_competitor_path, current,
+                            sizeof(current)), g_version_length);
+    CHECK(memcmp(current, g_version_b, g_version_length) == 0);
+    CHECK_EQ_INT(read_bytes(g_saved_backup, current, sizeof(current)),
+                 g_version_length);
+    CHECK(memcmp(current, g_version_a, g_version_length) == 0);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 1);
+}
+
 TEST(descriptor_serializer_cannot_publish_a_path) {
     char dir[256];
     char target[512];
@@ -322,6 +427,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(default_creation_never_replaces_a_concurrent_winner);
     RUN_TEST(backup_rejects_an_in_place_mixed_generation);
     RUN_TEST(backup_rejects_when_the_parent_name_selects_a_new_inode);
+    RUN_TEST(backup_rejects_destination_name_substitution);
     RUN_TEST(descriptor_serializer_cannot_publish_a_path);
     RUN_TEST(full_save_has_one_document_publisher_and_ignores_fault_environment);
 TEST_MAIN_END()
