@@ -483,6 +483,11 @@ TEST(snapshot_seeds_cache_and_clear_elides_proven_absent) {
  * later write re-created must still be genuinely unset — only PROVABLE
  * no-ops may be skipped. */
 TEST(restore_unsets_keys_written_after_snapshot) {
+    static const char forward_listing[] =
+        "user.name\nAlpha\nBeta"          "\0"
+        "user.email\nreal@x.com"          "\0"
+        "user.signingkey\nAAAA1111BBBB2222" "\0"
+        "core.sshcommand\nssh -i /k -o IdentitiesOnly=yes" "\0";
     git_ops_test_reset_caches();
     zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
     command_runner_fn prev = run_set_runner(zfk_runner);
@@ -491,10 +496,13 @@ TEST(restore_unsets_keys_written_after_snapshot) {
     /* Forward switch writes a key the listing showed absent... */
     CHECK_EQ_INT(git_set_config_value("user.signingkey", "AAAA1111BBBB2222",
                                       GIT_SCOPE_GLOBAL), 0);
+    zfk_listing_override = forward_listing;
+    zfk_listing_override_len = sizeof(forward_listing) - 1U;
     /* ...so the rollback's unset of it is real and must exec. */
     CHECK_EQ_INT(git_config_restore(), 0);
 
     run_set_runner(prev);
+    zfk_listing_override = NULL;
     CHECK(zfk_was_unset("user.signingkey"));
 }
 
@@ -544,6 +552,8 @@ TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim) {
      * the PRESENT key was proven absent and elided it. */
     CHECK_EQ_INT(git_clear_config(GIT_SCOPE_GLOBAL), 0);
     CHECK(zfk_was_unset("core.sshcommand"));
+    zfk_listing_override = "";
+    zfk_listing_override_len = 0;
     /* A failed switch's rollback restores the original value verbatim —
      * pre-fix the snapshot said present=false, so the restore left the key
      * unset (and the per-key fallback would have written back a silently
@@ -580,6 +590,8 @@ TEST(oversize_foreign_sshcommand_restores_exactly) {
     CHECK_EQ_INT(git_clear_config(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(zfk_count_unsets("core.sshcommand"), 1);
 
+    zfk_listing_override = "";
+    zfk_listing_override_len = 0;
     CHECK_EQ_INT(git_config_restore(), 0);
     int is = zfk_find_set("core.sshcommand");
     CHECK(is >= 0);

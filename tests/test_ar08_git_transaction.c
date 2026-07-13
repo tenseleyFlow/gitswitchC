@@ -1,5 +1,5 @@
-/* AR-08 T8: Git signing model, bounded worktree inspection, effective SSH
- * environment precedence, and truthful list truncation. */
+/* AR-08 T8/M7: Git signing model, bounded worktree inspection, effective SSH
+ * environment precedence, truthful list truncation, and rollback ownership. */
 #define _POSIX_C_SOURCE 200809L
 
 #include "test.h"
@@ -185,6 +185,15 @@ static int git_get_all(const char *scope, const char *key, char *output,
     return rc;
 }
 
+static int git_replace_vector(const char *scope, const char *key,
+                              const char *const values[], size_t count) {
+    if (git_unset_all(scope, key) != 0) return -1;
+    for (size_t i = 0; i < count; i++) {
+        if (git_add(scope, key, values[i]) != 0) return -1;
+    }
+    return 0;
+}
+
 static account_t basic_account(const git_fixture_t *fixture, bool with_gpg) {
     account_t account;
     memset(&account, 0, sizeof(account));
@@ -330,6 +339,7 @@ TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it) {
     git_ops_test_reset_caches();
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
     memset(&current, 0, sizeof(current));
     CHECK_EQ_INT(git_get_current_config(&current), 0);
     CHECK(current.ssh_command.present);
@@ -390,6 +400,7 @@ TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
     account = basic_account(&fixture, true);
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
     CHECK_EQ_INT(git_get_all("--global", "gpg.format", actual,
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "openpgp\n");
@@ -467,6 +478,7 @@ TEST(large_unrelated_config_allows_snapshot_switch_status_and_rollback) {
     account = basic_account(&fixture, false);
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
     memset(&current, 0, sizeof(current));
     CHECK_EQ_INT(git_get_current_config(&current), 0);
     CHECK_STR_EQ(current.name, account.name);
@@ -479,6 +491,222 @@ TEST(large_unrelated_config_allows_snapshot_switch_status_and_rollback) {
                              sizeof(restored)), 0);
     CHECK(strlen(restored) == sizeof(value)); /* value plus Git newline */
     CHECK(restored[0] == (char)('a' + (37 % 26)));
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope) {
+    static const char *const scopes[] = {
+        "--global", "--local", "--worktree"
+    };
+    static const char *const before[3][2] = {
+        {"global-before-1", NULL},
+        {"local-before-1", "local-before-2"},
+        {"worktree-before-1", "worktree-before-2"}
+    };
+    static const size_t before_count[] = {1, 2, 2};
+    static const char *const later[3][2] = {
+        {"global-later-1", "global-later-2"},
+        {"local-later-1", "local-later-2"},
+        {"worktree-later-1", "worktree-later-2"}
+    };
+    git_fixture_t fixture;
+    account_t account;
+    char actual[512];
+    char expected[512];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--local", "extensions.worktreeConfig", "true"), 0);
+    for (size_t i = 0; i < 3; i++) {
+        for (size_t j = 0; j < before_count[i]; j++) {
+            CHECK_EQ_INT(git_add(scopes[i], "user.name", before[i][j]), 0);
+        }
+    }
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    /* A later writer appends to each exact ordered vector after the
+     * transaction's post-image has been sealed. A second seal is deliberately
+     * a no-op: it must not launder those values into transaction ownership. */
+    for (size_t i = 0; i < 3; i++) {
+        CHECK_EQ_INT(git_add(scopes[i], "user.name", later[i][0]), 0);
+        CHECK_EQ_INT(git_add(scopes[i], "user.name", later[i][1]), 0);
+    }
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "3 managed vector(s)") != NULL);
+    CHECK(strstr(get_last_error()->message, "changed outside") != NULL);
+    CHECK(strstr(get_last_error()->message, "retry material retained") != NULL);
+    for (size_t i = 0; i < 3; i++) {
+        if (i == 0) {
+            (void)snprintf(expected, sizeof(expected), "%s\n%s\n%s\n",
+                           account.name, later[i][0], later[i][1]);
+        } else {
+            (void)snprintf(expected, sizeof(expected), "%s\n%s\n",
+                           later[i][0], later[i][1]);
+        }
+        CHECK_EQ_INT(git_get_all(scopes[i], "user.name", actual,
+                                 sizeof(actual)), 0);
+        CHECK_STR_EQ(actual, expected);
+    }
+
+    /* An unchanged retry remains non-destructive. Once each conflicted vector
+     * is repaired to the sealed post-image, the retained before-image can be
+     * applied exactly in every scope. */
+    CHECK_EQ_INT(git_config_restore(), -1);
+    {
+        const char *const global_post[] = {account.name};
+        CHECK_EQ_INT(git_replace_vector("--global", "user.name",
+                                        global_post, 1), 0);
+        CHECK_EQ_INT(git_replace_vector("--local", "user.name", NULL, 0), 0);
+        CHECK_EQ_INT(git_replace_vector("--worktree", "user.name", NULL, 0), 0);
+    }
+    CHECK_EQ_INT(git_config_restore(), 0);
+    for (size_t i = 0; i < 3; i++) {
+        if (before_count[i] == 1) {
+            (void)snprintf(expected, sizeof(expected), "%s\n", before[i][0]);
+        } else {
+            (void)snprintf(expected, sizeof(expected), "%s\n%s\n",
+                           before[i][0], before[i][1]);
+        }
+        CHECK_EQ_INT(git_get_all(scopes[i], "user.name", actual,
+                                 sizeof(actual)), 0);
+        CHECK_STR_EQ(actual, expected);
+    }
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(partial_retry_skips_completed_scopes_and_preserves_their_later_changes) {
+    static const char *const scopes[] = {
+        "--global", "--local", "--worktree"
+    };
+    static const char *const before[] = {
+        "global-before", "local-before", "worktree-before"
+    };
+    git_fixture_t fixture;
+    account_t account;
+    char lock_path[MAX_PATH_LEN];
+    char actual[512];
+    char expected[512];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--local", "extensions.worktreeConfig", "true"), 0);
+    for (size_t i = 0; i < 3; i++) {
+        CHECK_EQ_INT(git_set(scopes[i], "user.name", before[i]), 0);
+    }
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path), "%s.lock",
+                           fixture.global_config) < sizeof(lock_path));
+    CHECK_EQ_INT(write_text_file(lock_path, "held\n", 0600), 0);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "restore operation(s) failed") != NULL);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    (void)snprintf(expected, sizeof(expected), "%s\n", account.name);
+    CHECK_STR_EQ(actual, expected);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "local-before\n");
+    CHECK_EQ_INT(git_get_all("--worktree", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "worktree-before\n");
+
+    /* These writers arrive after their scopes completed rollback. The retry
+     * owns only the still-incomplete global keys and must never revisit the
+     * completed local/worktree keys. */
+    CHECK_EQ_INT(git_add("--local", "user.name", "local-after-rollback"), 0);
+    CHECK_EQ_INT(git_add("--worktree", "user.name",
+                         "worktree-after-rollback"), 0);
+    CHECK_EQ_INT(unlink(lock_path), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "global-before\n");
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "local-before\nlocal-after-rollback\n");
+    CHECK_EQ_INT(git_get_all("--worktree", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "worktree-before\nworktree-after-rollback\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(preseal_writer_is_rejected_and_never_laundered_into_rollback_ownership) {
+    git_fixture_t fixture;
+    char actual[512];
+    const char *const intended[] = {"owned-post"};
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-preseal"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, intended[0],
+                                      GIT_SCOPE_GLOBAL), 0);
+
+    /* Deterministic external writer in the exact gap between the final owned
+     * write and seal. Seal compares against the recorded intended vector; it
+     * must not adopt this reread and later overwrite it during rollback. */
+    CHECK_EQ_INT(git_add("--global", "user.name", "external-preseal"), 0);
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "before post-image verification") != NULL);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "1 managed vector(s)") != NULL);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "owned-post\nexternal-preseal\n");
+
+    CHECK_EQ_INT(git_replace_vector("--global", "user.name", intended, 1), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-preseal\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(committed_git_transaction_discards_rollback_ownership) {
+    git_fixture_t fixture;
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-commit"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "committed-value",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "too-late",
+                                      GIT_SCOPE_GLOBAL), -1);
+    CHECK(strstr(get_last_error()->message, "sealed") != NULL);
+    git_config_commit();
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "committed-value\n");
 
     fixture_cleanup(&fixture);
 }
@@ -570,6 +798,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);
     RUN_TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly);
     RUN_TEST(large_unrelated_config_allows_snapshot_switch_status_and_rollback);
+    RUN_TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope);
+    RUN_TEST(partial_retry_skips_completed_scopes_and_preserves_their_later_changes);
+    RUN_TEST(preseal_writer_is_rejected_and_never_laundered_into_rollback_ownership);
+    RUN_TEST(committed_git_transaction_discards_rollback_ownership);
     RUN_TEST(worktree_probe_has_a_truthful_hard_bound_before_mutation);
     RUN_TEST(git_list_config_never_returns_a_successful_prefix);
 TEST_MAIN_END()

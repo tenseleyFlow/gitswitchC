@@ -131,8 +131,10 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(get_timestamp);
     REQUIRE_PUBLIC_API(get_timestamp_string);
     REQUIRE_PUBLIC_API(git_clear_config);
+    REQUIRE_PUBLIC_API(git_config_commit);
     REQUIRE_PUBLIC_API(git_config_origin_scope_to_string);
     REQUIRE_PUBLIC_API(git_config_restore);
+    REQUIRE_PUBLIC_API(git_config_seal);
     REQUIRE_PUBLIC_API(git_config_snapshot);
     REQUIRE_PUBLIC_API(git_configure_gpg);
     REQUIRE_PUBLIC_API(git_configure_ssh);

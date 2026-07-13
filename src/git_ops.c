@@ -87,6 +87,11 @@ typedef struct {
     char **values;
     size_t count;
     size_t capacity;
+    /* Rollback progress is retained across retry. Before restore starts, the
+     * transaction owns the sealed post-image. After a successful unset, it
+     * owns exactly the prefix of this before-image that has been re-added. */
+    size_t restore_prefix;
+    bool restore_started;
     bool restored;
 } git_snapshot_key_t;
 
@@ -101,6 +106,10 @@ typedef struct {
     git_scope_snapshot_t primary;
     git_scope_snapshot_t local;
     git_scope_snapshot_t worktree;
+    git_scope_snapshot_t post_primary;
+    git_scope_snapshot_t post_local;
+    git_scope_snapshot_t post_worktree;
+    bool postimage_sealed;
     bool valid;
     bool restore_incomplete;
 } git_config_snapshot_t;
@@ -467,13 +476,17 @@ static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]) {
 #define GIT_SNAPSHOT_INITIAL_BYTES (16U * 1024U)
 #define GIT_SNAPSHOT_MAX_BYTES (8U * 1024U * 1024U)
 
+static void git_snapshot_key_clear(git_snapshot_key_t *key) {
+    if (!key) return;
+    for (size_t i = 0; i < key->count; i++) free(key->values[i]);
+    free(key->values);
+    memset(key, 0, sizeof(*key));
+}
+
 static void git_scope_snapshot_clear(git_scope_snapshot_t *scope) {
     if (!scope) return;
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        for (size_t j = 0; j < scope->keys[i].count; j++) {
-            free(scope->keys[i].values[j]);
-        }
-        free(scope->keys[i].values);
+        git_snapshot_key_clear(&scope->keys[i]);
     }
     memset(scope, 0, sizeof(*scope));
 }
@@ -483,6 +496,9 @@ static void git_snapshot_clear(git_config_snapshot_t *snapshot) {
     git_scope_snapshot_clear(&snapshot->primary);
     git_scope_snapshot_clear(&snapshot->local);
     git_scope_snapshot_clear(&snapshot->worktree);
+    git_scope_snapshot_clear(&snapshot->post_primary);
+    git_scope_snapshot_clear(&snapshot->post_local);
+    git_scope_snapshot_clear(&snapshot->post_worktree);
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
@@ -522,6 +538,25 @@ static int git_snapshot_key_append(git_snapshot_key_t *key,
     memcpy(copy, value, value_len);
     copy[value_len] = '\0';
     key->values[key->count++] = copy;
+    return 0;
+}
+
+static int git_scope_snapshot_clone(const git_scope_snapshot_t *source,
+                                    git_scope_snapshot_t *dest) {
+    git_scope_snapshot_t next;
+
+    memset(&next, 0, sizeof(next));
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        for (size_t j = 0; j < source->keys[i].count; j++) {
+            const char *value = source->keys[i].values[j];
+            if (git_snapshot_key_append(&next.keys[i], value,
+                                        strlen(value)) != 0) {
+                git_scope_snapshot_clear(&next);
+                return -1;
+            }
+        }
+    }
+    *dest = next;
     return 0;
 }
 
@@ -681,16 +716,34 @@ static int git_read_snapshot_listing(git_scope_t scope, bool includes,
     }
 }
 
+static bool git_snapshot_key_equal(const git_snapshot_key_t *a,
+                                   const git_snapshot_key_t *b) {
+    if (a->count != b->count) return false;
+    for (size_t i = 0; i < a->count; i++) {
+        if (strcmp(a->values[i], b->values[i]) != 0) return false;
+    }
+    return true;
+}
+
 static bool git_scope_snapshot_equal(const git_scope_snapshot_t *a,
                                      const git_scope_snapshot_t *b) {
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        if (a->keys[i].count != b->keys[i].count) return false;
-        for (size_t j = 0; j < a->keys[i].count; j++) {
-            if (strcmp(a->keys[i].values[j], b->keys[i].values[j]) != 0)
-                return false;
-        }
+        if (!git_snapshot_key_equal(&a->keys[i], &b->keys[i])) return false;
     }
     return true;
+}
+
+static int git_scope_snapshot_difference_count(
+    const git_scope_snapshot_t *expected,
+    const git_scope_snapshot_t *observed) {
+    int differences = 0;
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (!git_snapshot_key_equal(&expected->keys[i],
+                                    &observed->keys[i])) {
+            differences++;
+        }
+    }
+    return differences;
 }
 
 /* Restore can only write the selected scope's own file. Compare an explicit
@@ -775,27 +828,79 @@ static int git_add_snapshot_value(git_scope_t scope, const char *key,
                   scope_flag, output[0] ? output : "unknown error");
         return -1;
     }
+    /* The ordered vector is in-progress until every --add completes. Do not
+     * leave the preceding successful --unset cached as proven absence. */
+    cfg_cache_store(cfg_scope_index(scope), cfg_key_index(key),
+                    CFG_UNKNOWN, true, "");
     return 0;
 }
 
-/* Each not-yet-complete key is rebuilt as checked unset-all plus ordered adds.
- * A failed key remains armed for retry; completed keys retain an explicit
- * progress bit and are skipped on later idempotent restore attempts (M27). */
-static int git_restore_scope_snapshot(git_scope_t scope,
-                                      git_scope_snapshot_t *snapshot) {
-    int failures = 0;
+typedef struct {
+    int conflicts;
+    int write_failures;
+} git_restore_result_t;
+
+/* Before its first rollback write, a key is owned only while it still equals
+ * the sealed post-image. Once the checked unset succeeds, the owned state is
+ * exactly the prefix of the before-image whose --add operations succeeded.
+ * Comparing that prefix on retry distinguishes our own partial restore from a
+ * later writer without weakening AR-07's retry guarantee. */
+static bool git_restore_key_still_owned(const git_snapshot_key_t *current,
+                                        const git_snapshot_key_t *before,
+                                        const git_snapshot_key_t *post) {
+    if (!before->restore_started) {
+        return git_snapshot_key_equal(current, post);
+    }
+    if (current->count != before->restore_prefix) return false;
+    for (size_t i = 0; i < before->restore_prefix; i++) {
+        if (strcmp(current->values[i], before->values[i]) != 0) return false;
+    }
+    return true;
+}
+
+/* Each not-yet-complete key is compare-checked, then rebuilt as checked
+ * unset-all plus ordered adds. Conflicts are preserved byte-for-byte and a
+ * failed key remains armed with exact prefix progress for retry. Completed
+ * keys are skipped on later attempts, so changes made after that key was
+ * successfully rolled back are outside this transaction and survive. */
+static git_restore_result_t git_restore_scope_snapshot(
+    git_scope_t scope, git_scope_snapshot_t *before,
+    const git_scope_snapshot_t *post,
+    const git_scope_snapshot_t *current) {
+    git_restore_result_t result = {0};
 
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        git_snapshot_key_t *key = &snapshot->keys[i];
+        git_snapshot_key_t *key = &before->keys[i];
         bool failed = false;
 
-        if (key->restored) continue;
+        if (key->restored) {
+            /* This key is no longer transaction-owned. If a later writer
+             * changed it after the successful partial rollback, invalidate
+             * our scalar write cache while deliberately leaving the value
+             * untouched. */
+            if (!git_snapshot_key_equal(&current->keys[i], key)) {
+                cfg_cache_store(cfg_scope_index(scope), (int)i, CFG_UNKNOWN,
+                                current->keys[i].count != 0, "");
+            }
+            continue;
+        }
+        if (!git_restore_key_still_owned(&current->keys[i], key,
+                                         &post->keys[i])) {
+            log_warning("Rollback preserved externally changed Git config %s (%s)",
+                        g_managed_keys[i], git_scope_to_flag(scope));
+            cfg_cache_store(cfg_scope_index(scope), (int)i, CFG_UNKNOWN,
+                            current->keys[i].count != 0, "");
+            result.conflicts++;
+            continue;
+        }
         if (git_unset_config_value_impl(g_managed_keys[i], scope, true) != 0) {
             log_warning("Rollback failed to clear %s: %s",
                         g_managed_keys[i], get_last_error()->message);
-            failures++;
+            result.write_failures++;
             continue;
         }
+        key->restore_started = true;
+        key->restore_prefix = 0;
         for (size_t j = 0; j < key->count; j++) {
             if (git_add_snapshot_value(scope, g_managed_keys[i],
                                        key->values[j]) != 0) {
@@ -804,9 +909,10 @@ static int git_restore_scope_snapshot(git_scope_t scope,
                 failed = true;
                 break;
             }
+            key->restore_prefix = j + 1U;
         }
         if (failed) {
-            failures++;
+            result.write_failures++;
             continue;
         }
 
@@ -822,7 +928,74 @@ static int git_restore_scope_snapshot(git_scope_t scope,
         }
         key->restored = true;
     }
-    return failures;
+    return result;
+}
+
+static int git_capture_transaction_scopes(git_scope_snapshot_t *primary,
+                                          git_scope_snapshot_t *local,
+                                          git_scope_snapshot_t *worktree) {
+    if (git_capture_scope_snapshot(g_git_snapshot.scope, primary) != 0 ||
+        (g_git_snapshot.local_also &&
+         git_capture_scope_snapshot(GIT_SCOPE_LOCAL, local) != 0) ||
+        (g_git_snapshot.worktree_also &&
+         git_capture_scope_snapshot(GIT_SCOPE_WORKTREE_INTERNAL,
+                                    worktree) != 0)) {
+        git_scope_snapshot_clear(primary);
+        git_scope_snapshot_clear(local);
+        git_scope_snapshot_clear(worktree);
+        return -1;
+    }
+    return 0;
+}
+
+static git_scope_snapshot_t *git_transaction_post_scope(git_scope_t scope) {
+    if (!g_git_snapshot.valid) return NULL;
+    if (scope == g_git_snapshot.scope) return &g_git_snapshot.post_primary;
+    if (g_git_snapshot.local_also && scope == GIT_SCOPE_LOCAL) {
+        return &g_git_snapshot.post_local;
+    }
+    if (g_git_snapshot.worktree_also &&
+        scope == GIT_SCOPE_WORKTREE_INTERNAL) {
+        return &g_git_snapshot.post_worktree;
+    }
+    return NULL;
+}
+
+static int git_transaction_require_write_allowed(git_scope_t scope,
+                                                 const char *key) {
+    if (cfg_key_index(key) < 0 || !git_transaction_post_scope(scope)) return 0;
+    if (g_git_snapshot.restore_incomplete) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot modify a Git transaction with incomplete rollback");
+        return -1;
+    }
+    if (g_git_snapshot.postimage_sealed) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot modify a sealed Git configuration transaction");
+        return -1;
+    }
+    return 0;
+}
+
+/* Update the intended post-image only after a managed Git command reports
+ * success. The replacement is allocated before the previous vector is freed,
+ * so an allocation failure leaves a conservative older expectation that will
+ * conflict rather than claim an unrecorded write during rollback. */
+static int git_transaction_record_vector(git_scope_t scope, const char *key,
+                                         bool present, const char *value) {
+    git_scope_snapshot_t *post = git_transaction_post_scope(scope);
+    git_snapshot_key_t next;
+    int key_index = cfg_key_index(key);
+
+    if (!post || key_index < 0) return 0;
+    memset(&next, 0, sizeof(next));
+    if (present &&
+        git_snapshot_key_append(&next, value, strlen(value)) != 0) {
+        return -1;
+    }
+    git_snapshot_key_clear(&post->keys[key_index]);
+    post->keys[key_index] = next;
+    return 0;
 }
 
 int git_config_snapshot(git_scope_t scope) {
@@ -862,7 +1035,13 @@ int git_config_snapshot(git_scope_t scope) {
          git_capture_scope_snapshot(GIT_SCOPE_LOCAL, &next.local) != 0) ||
         (next.worktree_also &&
          git_capture_scope_snapshot(GIT_SCOPE_WORKTREE_INTERNAL,
-                                    &next.worktree) != 0)) {
+                                    &next.worktree) != 0) ||
+        git_scope_snapshot_clone(&next.primary, &next.post_primary) != 0 ||
+        (next.local_also &&
+         git_scope_snapshot_clone(&next.local, &next.post_local) != 0) ||
+        (next.worktree_also &&
+         git_scope_snapshot_clone(&next.worktree,
+                                  &next.post_worktree) != 0)) {
         git_snapshot_clear(&next);
         return -1;
     }
@@ -880,35 +1059,123 @@ int git_config_snapshot(git_scope_t scope) {
     return 0;
 }
 
+int git_config_seal(void) {
+    git_scope_snapshot_t observed_primary;
+    git_scope_snapshot_t observed_local;
+    git_scope_snapshot_t observed_worktree;
+    int differences;
+
+    memset(&observed_primary, 0, sizeof(observed_primary));
+    memset(&observed_local, 0, sizeof(observed_local));
+    memset(&observed_worktree, 0, sizeof(observed_worktree));
+    if (!g_git_snapshot.valid) {
+        set_error(ERR_INVALID_ARGS, "No Git snapshot to seal");
+        return -1;
+    }
+    if (g_git_snapshot.postimage_sealed) return 0;
+    if (git_capture_transaction_scopes(&observed_primary, &observed_local,
+                                       &observed_worktree) != 0) {
+        return -1;
+    }
+    differences = git_scope_snapshot_difference_count(
+        &g_git_snapshot.post_primary, &observed_primary);
+    if (g_git_snapshot.local_also) {
+        differences += git_scope_snapshot_difference_count(
+            &g_git_snapshot.post_local, &observed_local);
+    }
+    if (g_git_snapshot.worktree_also) {
+        differences += git_scope_snapshot_difference_count(
+            &g_git_snapshot.post_worktree, &observed_worktree);
+    }
+    git_scope_snapshot_clear(&observed_primary);
+    git_scope_snapshot_clear(&observed_local);
+    git_scope_snapshot_clear(&observed_worktree);
+    if (differences != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot seal Git transaction: %d managed vector(s) changed outside this transaction before post-image verification",
+                  differences);
+        return -1;
+    }
+    g_git_snapshot.postimage_sealed = true;
+    return 0;
+}
+
 int git_config_restore(void) {
-    int failures = 0;
+    git_scope_snapshot_t current_primary;
+    git_scope_snapshot_t current_local;
+    git_scope_snapshot_t current_worktree;
+    git_restore_result_t result = {0};
 
     if (!g_git_snapshot.valid) return 0;
+    memset(&current_primary, 0, sizeof(current_primary));
+    memset(&current_local, 0, sizeof(current_local));
+    memset(&current_worktree, 0, sizeof(current_worktree));
     log_info("Rolling back git configuration after a failed switch");
+
+    /* Capture every managed scope before writing any of them. A read failure
+     * cannot be treated as absence, and it must not leave a new partial
+     * rollback merely because a later scope could not be ownership-checked. */
+    if (git_capture_transaction_scopes(&current_primary, &current_local,
+                                       &current_worktree) != 0) {
+        char detail[sizeof(g_last_error.message)];
+        safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+        g_git_snapshot.restore_incomplete = true;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback incomplete: could not verify current managed vectors; retry material retained: %s",
+                  detail[0] ? detail : "unknown Git inspection error");
+        return -1;
+    }
+
     /* Restore override scopes before the primary scope. */
     if (g_git_snapshot.worktree_also) {
-        failures += git_restore_scope_snapshot(GIT_SCOPE_WORKTREE_INTERNAL,
-                                               &g_git_snapshot.worktree);
+        git_restore_result_t scope_result = git_restore_scope_snapshot(
+            GIT_SCOPE_WORKTREE_INTERNAL, &g_git_snapshot.worktree,
+            &g_git_snapshot.post_worktree, &current_worktree);
+        result.conflicts += scope_result.conflicts;
+        result.write_failures += scope_result.write_failures;
     }
     if (g_git_snapshot.local_also) {
-        failures += git_restore_scope_snapshot(GIT_SCOPE_LOCAL,
-                                               &g_git_snapshot.local);
+        git_restore_result_t scope_result = git_restore_scope_snapshot(
+            GIT_SCOPE_LOCAL, &g_git_snapshot.local,
+            &g_git_snapshot.post_local, &current_local);
+        result.conflicts += scope_result.conflicts;
+        result.write_failures += scope_result.write_failures;
     }
-    failures += git_restore_scope_snapshot(g_git_snapshot.scope,
-                                           &g_git_snapshot.primary);
-    if (failures > 0) {
+    {
+        git_restore_result_t scope_result = git_restore_scope_snapshot(
+            g_git_snapshot.scope, &g_git_snapshot.primary,
+            &g_git_snapshot.post_primary, &current_primary);
+        result.conflicts += scope_result.conflicts;
+        result.write_failures += scope_result.write_failures;
+    }
+    git_scope_snapshot_clear(&current_primary);
+    git_scope_snapshot_clear(&current_local);
+    git_scope_snapshot_clear(&current_worktree);
+    if (result.conflicts > 0 || result.write_failures > 0) {
         /* Retain the exact snapshot and per-key progress until every key has
          * succeeded. Consuming it here made transient lock failures
          * irrecoverable on a second rollback attempt (AR-07 M27). */
         g_git_snapshot.restore_incomplete = true;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback incomplete: %d managed vector(s) changed outside this transaction; %d restore operation(s) failed; concurrent changes were preserved and retry material retained",
+                  result.conflicts, result.write_failures);
         fprintf(stderr,
-                "gitswitch: [!!] git rollback incomplete — %d config key(s) could "
-                "not be restored; retry after repairing the Git config lock\n",
-                failures);
+                "gitswitch: [!!] git rollback incomplete — %d managed vector(s) "
+                "changed outside this transaction; %d restore operation(s) failed; "
+                "concurrent changes were preserved and retry material retained\n",
+                result.conflicts, result.write_failures);
         return -1;
     }
     git_snapshot_clear(&g_git_snapshot);
     return 0;
+}
+
+void git_config_commit(void) {
+    /* The caller invokes this only after every external transaction commit,
+     * including the SSH alias rename, has succeeded. Discarding heap-owned
+     * rollback images is infallible and deliberately offers no late error
+     * branch that could force an unsafe rollback past that commit point. */
+    git_snapshot_clear(&g_git_snapshot);
 }
 
 /* Initialize git operations */
@@ -1770,6 +2037,7 @@ static int git_set_config_value_impl(const char *key, const char *value,
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
+    if (git_transaction_require_write_allowed(scope, key) != 0) return -1;
 
     /* perf-3: on a GPG switch, user.signingkey and commit.gpgsign are written
      * once by git_configure_gpg and again (same values) by gpg_manager's
@@ -1784,7 +2052,7 @@ static int git_set_config_value_impl(const char *key, const char *value,
     if (s >= 0 && k >= 0 && g_cfg_cache[s][k].state == CFG_WRITTEN &&
         g_cfg_cache[s][k].present && strcmp(g_cfg_cache[s][k].value, value) == 0) {
         log_debug("Skipping git config %s: identical value already written by this process", key);
-        return 0;
+        return git_transaction_record_vector(scope, key, true, value);
     }
 
     log_debug("Setting git config: %s = %s (%s)", key, value, scope_flag);
@@ -1798,7 +2066,7 @@ static int git_set_config_value_impl(const char *key, const char *value,
     }
 
     cfg_cache_store(s, k, CFG_WRITTEN, true, value);
-    return 0;
+    return git_transaction_record_vector(scope, key, true, value);
 }
 
 int git_set_config_value(const char *key, const char *value, git_scope_t scope) {
@@ -1836,7 +2104,6 @@ static int git_get_config_value_ex(const char *key, char *value,
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
-
     /* perf-2: after git_set_config's read-back verification, git_test_config
      * re-read the exact same user.name/user.email — two more execs per switch
      * for values git reported moments earlier in this process. Serve reads
@@ -1948,6 +2215,10 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
+    if (!force &&
+        git_transaction_require_write_allowed(scope, key) != 0) {
+        return -1;
+    }
 
     /* Skip an unset the cache proves is a no-op: this process already unset
      * the key itself (CFG_WRITTEN/absent — the original duplicate-unset
@@ -1961,7 +2232,7 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
         (g_cfg_cache[s][k].state == CFG_WRITTEN ||
          g_cfg_cache[s][k].state == CFG_READBACK)) {
         log_debug("Skipping git config --unset %s: known absent in this process", key);
-        return 0;
+        return git_transaction_record_vector(scope, key, false, "");
     }
 
     log_debug("Unsetting git config: %s (%s)", key, scope_flag);
@@ -1993,6 +2264,9 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
          * poisoning), and surface the failure to the caller. */
         if (res.exit_code == 0 || res.exit_code == 5) {
             cfg_cache_store(s, k, CFG_WRITTEN, false, "");
+            if (!force) {
+                return git_transaction_record_vector(scope, key, false, "");
+            }
             return 0;
         }
         cfg_cache_store(s, k, CFG_UNKNOWN, true, "");

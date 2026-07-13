@@ -118,11 +118,30 @@ int git_clear_config(git_scope_t scope);
 int git_config_snapshot(git_scope_t scope);
 
 /**
+ * Verify the active transaction's exact intended post-write vectors against a
+ * fresh Git read. The intended image is updated only by this process's
+ * successful managed writes, so a concurrent value arriving before this call
+ * is rejected rather than adopted. Call after all forward Git writes and
+ * before later transaction steps can fail. Idempotent after successful seal.
+ */
+int git_config_seal(void);
+
+/**
  * Restore the most recent git_config_snapshot(), rebuilding every key with its
- * exact ordered values. A failed restore retains the snapshot and completed
- * per-key progress for retry. No-op if nothing was snapshotted.
+ * exact ordered values only while the current vector still matches the sealed
+ * transaction-owned state. A failed restore preserves concurrent changes and
+ * retains the snapshot plus exact per-key progress for retry. Partially failed
+ * forward writes are compared against the intended image recorded through the
+ * last successful managed operation. No-op if nothing was snapshotted.
  */
 int git_config_restore(void);
+
+/**
+ * Infallibly commit the active Git transaction by discarding its in-memory
+ * rollback images. Call only after every external commit point has succeeded;
+ * no-op when no snapshot is active.
+ */
+void git_config_commit(void);
 
 /* AR-06 F59: git_validate_repository() and git_get_config_scope() were removed
  * — dead public API with zero callers. */

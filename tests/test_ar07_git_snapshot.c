@@ -320,6 +320,15 @@ TEST(failed_restore_retains_snapshot_and_retries_only_incomplete_key) {
         CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), -1);
         CHECK_EQ_INT(g_list_calls, list_calls);
     }
+    /* The failed second --add left the exact transaction-owned prefix in the
+     * real config. Reflect that state in the fake listing: retry is permitted
+     * only while the vector still equals this recorded progress. */
+    memset(g_direct, 0, sizeof(g_direct));
+    g_direct_len = 0;
+    CHECK(append_record(g_direct, &g_direct_len,
+                        "user.email", "first@old"));
+    memcpy(g_expanded, g_direct, g_direct_len);
+    g_expanded_len = g_direct_len;
     CHECK_EQ_INT(git_config_restore(), 0);
     /* user.name completed once; failed user.email was force-cleared/replayed. */
     CHECK_STR_EQ(g_unset_key[0], "user.name");
