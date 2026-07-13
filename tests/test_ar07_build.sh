@@ -35,6 +35,7 @@ mkdir -p "$fixture/src" "$fixture/tests" "$tmp/shims" \
     "$tmp/fake-readline/include/readline" "$tmp/fake-readline/lib"
 cp "$root/Makefile" "$fixture/Makefile"
 cp "$root/VERSION" "$fixture/VERSION"
+cp "$root/src/release_hardening.h" "$fixture/src/release_hardening.h"
 
 cat >"$fixture/src/narrow.h" <<'EOF'
 #ifndef AR07_NARROW_H
@@ -144,18 +145,29 @@ EOF
 
 cc_log=$tmp/compiler.log
 for wrapper in cc-a cc-b; do
-    cat >"$tmp/shims/$wrapper" <<'EOF'
+cat >"$tmp/shims/$wrapper" <<'EOF'
 #!/bin/sh
 : "${AR07_REAL_CC:?}"
 : "${AR07_CC_LOG:?}"
+if [ "${1-}" = "-dumpmachine" ] && [ -n "${AR07_FAKE_TRIPLE:-}" ]; then
+    printf '%s\n' "$AR07_FAKE_TRIPLE"
+    exit 0
+fi
 kind=other
 has_object=0
+is_probe=0
 for arg do
     if [ "$arg" = "-c" ]; then
         kind=compile
     fi
-    case $arg in *.o) has_object=1 ;; esac
+    case $arg in
+        *.o) has_object=1 ;;
+        -|/dev/null) is_probe=1 ;;
+    esac
 done
+if [ "$kind" = compile ] && [ "$is_probe" -eq 1 ]; then
+    kind=probe
+fi
 if [ "$kind" = other ] && [ "$has_object" -eq 1 ]; then
     kind=link
 fi
@@ -164,6 +176,21 @@ for arg do
     printf ' <%s>' "$arg" >>"$AR07_CC_LOG"
 done
 printf '\n' >>"$AR07_CC_LOG"
+if [ "${AR07_DROP_TARGET_FLAGS:-0}" -eq 1 ]; then
+    args_file=${TMPDIR:-/tmp}/gitswitch-ar07-cc-args.$$
+    trap 'rm -f "$args_file"' 0 1 2 3 15
+    : >"$args_file"
+    for arg do
+        case $arg in
+            -fcf-protection|-mbranch-protection=standard) continue ;;
+        esac
+        printf '%s\n' "$arg" >>"$args_file"
+    done
+    set --
+    while IFS= read -r arg; do
+        set -- "$@" "$arg"
+    done <"$args_file"
+fi
 exec "$AR07_REAL_CC" "$@"
 EOF
     chmod 0700 "$tmp/shims/$wrapper"
@@ -177,6 +204,8 @@ invoke_build()
 {
     : >"$cc_log"
     AR07_REAL_CC="$real_cc" AR07_CC_LOG="$cc_log" \
+        AR07_FAKE_TRIPLE="${AR07_FAKE_TRIPLE-}" \
+        AR07_DROP_TARGET_FLAGS="${AR07_DROP_TARGET_FLAGS-0}" \
         "$make_cmd" -C "$fixture" TARGET=ar07-probe SOURCES="$sources" \
         VERSION=fixture-version COMMIT=fixture-commit "$@" "$target" \
         >"$out" 2>&1
@@ -222,11 +251,14 @@ require_build "initial CFLAGS" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
     LDFLAGS= LIBS=
 assert_rebuilt "initial CFLAGS"
 assert_output 'cflag=1 cppflag=1'
+cp "$fixture/build/obj/.buildconfig" "$tmp/buildconfig.before-noop"
 
 require_build "no-op" BUILD_TYPE=debug READLINE=0 CC="$cc_a" \
     CFLAGS='-std=gnu11 -DAR07_CFLAG=1' CPPFLAGS=-DAR07_CPPFLAG=1 \
     LDFLAGS= LIBS=
 if grep -E '^(compile|link) ' "$cc_log" >/dev/null; then
+    diff -u "$tmp/buildconfig.before-noop" \
+        "$fixture/build/obj/.buildconfig" >&2 || true
     fail "identical configuration rebuilt instead of remaining a no-op"
 fi
 
@@ -274,6 +306,24 @@ assert_rebuilt "compiler"
 grep '^compile wrapper=cc-b ' "$cc_log" >/dev/null ||
     fail "changed compiler wrapper did not compile the objects"
 
+# Changing the same wrapper file in place must also invalidate the stamp: the
+# command spelling/path/version/triple remain identical, only policy bytes
+# change.
+cp "$fixture/build/obj/.buildconfig" "$tmp/buildconfig.before-wrapper-mutation"
+printf '%s\n' '# in-place policy mutation' >>"$cc_b"
+require_build "in-place compiler wrapper" BUILD_TYPE=debug READLINE=0 CC="$cc_b" \
+    CFLAGS='-std=gnu11 -DAR07_USE_LIB' CPPFLAGS= LDFLAGS= \
+    LIBS="$tmp/lib-two.a"
+if ! grep '^compile ' "$cc_log" >/dev/null; then
+    diff -u "$tmp/buildconfig.before-wrapper-mutation" \
+        "$fixture/build/obj/.buildconfig" >&2 || true
+    sed -n '/^cc_/p' "$fixture/build/obj/.buildconfig" >&2
+fi
+assert_rebuilt "in-place compiler wrapper"
+grep -F "cc_file_fingerprint=$cc_b=" \
+    "$fixture/build/obj/.buildconfig" >/dev/null ||
+    fail "build fingerprint omits the resolved wrapper content digest"
+
 # Exercise a platform hardening input through the real release flag expansion.
 require_build "first platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
     SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=1 -fPIE'
@@ -283,6 +333,73 @@ require_build "second platform flags" BUILD_TYPE=release READLINE=0 CC="$cc_b" \
     SECURITY_CFLAGS_RELEASE='-DAR07_PLATFORM=2 -fPIE'
 assert_rebuilt "second platform flags"
 assert_output 'platform=2'
+
+# Host architecture must not influence destination hardening. These wrappers
+# report the opposite target and strip the foreign ISA flag only when invoking
+# the native fixture compiler; the compiler log therefore proves Make selected
+# the destination flag while the real compile/link still completes.
+AR07_FAKE_TRIPLE=aarch64-unknown-linux-gnu AR07_DROP_TARGET_FLAGS=1 \
+    require_build "AArch64 target on x86 host" BUILD_TYPE=release READLINE=0 \
+    CC="$cc_b" UNAME_M=x86_64
+assert_rebuilt "AArch64 target on x86 host"
+grep '<-mbranch-protection=standard>' "$cc_log" >/dev/null ||
+    fail "AArch64 target did not select branch protection"
+if grep '<-fcf-protection>' "$cc_log" >/dev/null; then
+    fail "AArch64 target inherited x86 host CET flags"
+fi
+grep -F 'target_triple=aarch64-unknown-linux-gnu' \
+    "$fixture/build/obj/.buildconfig" >/dev/null ||
+    fail "AArch64 target triple missing from build fingerprint"
+
+AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu AR07_DROP_TARGET_FLAGS=1 \
+    require_build "x86 target on AArch64 host" BUILD_TYPE=release READLINE=0 \
+    CC="$cc_b" UNAME_M=aarch64
+assert_rebuilt "x86 target on AArch64 host"
+grep '<-fcf-protection>' "$cc_log" >/dev/null ||
+    fail "x86 target did not select CET protection"
+if grep '<-mbranch-protection=standard>' "$cc_log" >/dev/null; then
+    fail "x86 target inherited AArch64 host branch-protection flags"
+fi
+
+# Unknown operating systems fail closed. Even acknowledgement is insufficient
+# without an explicit inspector and the complete minimum compile/link policy;
+# the audited override then proves the escape hatch is deliberate and usable.
+if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu invoke_build \
+    BUILD_TYPE=release READLINE=0 CC="$cc_b" UNAME_S=AlienOS; then
+    fail "unsupported OS produced a nominal release without acknowledgement"
+fi
+grep -F 'requires explicit acknowledgement' "$out" >/dev/null ||
+    fail "unsupported OS rejection did not identify acknowledgement"
+
+if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu invoke_build \
+    BUILD_TYPE=release READLINE=0 CC="$cc_b" UNAME_S=AlienOS \
+    UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
+    RELEASE_ARTIFACT_FORMAT=elf SECURITY_CFLAGS_RELEASE= \
+    SECURITY_LDFLAGS_RELEASE=; then
+    fail "unsupported OS accepted empty explicit hardening flags"
+fi
+grep -F 'unsupported release C flags omit' "$out" >/dev/null ||
+    fail "unsupported OS empty-flag rejection was not precise"
+
+AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu \
+    require_build "acknowledged unsupported OS" BUILD_TYPE=release READLINE=0 \
+    CC="$cc_b" UNAME_S=AlienOS \
+    UNSUPPORTED_RELEASE_ACK=I_ACKNOWLEDGE_UNSUPPORTED_RELEASE \
+    RELEASE_ARTIFACT_FORMAT=elf \
+    SECURITY_CFLAGS_RELEASE='-D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE' \
+    SECURITY_LDFLAGS_RELEASE='-pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack'
+assert_rebuilt "acknowledged unsupported OS"
+
+if AR07_FAKE_TRIPLE=x86_64-unknown-linux-gnu \
+    AR07_REAL_CC="$real_cc" AR07_CC_LOG="$cc_log" \
+    "$make_cmd" -C "$fixture" TARGET=ar07-probe SOURCES="$sources" \
+    VERSION=fixture-version COMMIT=fixture-commit BUILD_TYPE=release \
+    READLINE=0 CC="$cc_b" UNAME_S=AlienOS install \
+    DESTDIR="$tmp/unsupported-install" PREFIX=/usr >"$out" 2>&1; then
+    fail "unsupported OS installed a nominal release without policy"
+fi
+grep -F 'requires explicit acknowledgement' "$out" >/dev/null ||
+    fail "unsupported release install did not fail at the policy boundary"
 
 # Stabilize the fake readline search hints while disabled, then change only the
 # READLINE request. Both 0->1 and 1->0 must replace the conditional code path.

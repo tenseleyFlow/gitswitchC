@@ -38,27 +38,66 @@ BINDIR = $(BUILDDIR)/bin
 TESTDIR = tests
 DOCDIR = docs
 
-# Platform detection
+# Compiler identity and target policy. Hardening follows the compiler's target,
+# never the machine running Make. The launcher itself is content-fingerprinted
+# so an in-place wrapper/toolchain policy change invalidates every shared
+# object. Multi-launcher commands (for example, ccache plus a compiler) may set
+# TOOLCHAIN_IDENTITY_FILES to the complete whitespace-free path list.
+CC = gcc
+CC_LAUNCHER := $(firstword $(CC))
+CC_RESOLVED_DEFAULT := $(shell p=`command -v "$(CC_LAUNCHER)" 2>/dev/null` || exit 0; \
+	d=$${p%/*}; b=$${p##*/}; \
+	if test "$$d" = "$$p"; then d=.; b=$$p; fi; \
+	cd "$$d" 2>/dev/null && printf '%s/%s' "$$PWD" "$$b")
+CC_IDENTITY_FILE ?= $(CC_RESOLVED_DEFAULT)
+TOOLCHAIN_IDENTITY_FILES ?= $(CC_IDENTITY_FILE)
+TOOLCHAIN_FILE_FINGERPRINT := $(shell set -e; \
+	for f in $(TOOLCHAIN_IDENTITY_FILES); do \
+		test -f "$$f" || exit 1; \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			digest=`sha256sum "$$f" | awk '{print $$1}'`; \
+		elif command -v shasum >/dev/null 2>&1; then \
+			digest=`shasum -a 256 "$$f" | awk '{print $$1}'`; \
+		elif command -v sha256 >/dev/null 2>&1; then \
+			digest=`sha256 -q "$$f"`; \
+		else \
+			digest=`cksum "$$f" | awk '{print $$1 ":" $$2}'`; \
+		fi; \
+		printf '%s=%s;' "$$f" "$$digest"; \
+	done)
+CC_VERSION_ID := $(shell $(CC) --version 2>/dev/null | sed -n '1p')
+ifeq ($(origin TARGET_TRIPLE),undefined)
+    TARGET_TRIPLE := $(shell $(CC) -dumpmachine 2>/dev/null | sed -n '1p')
+else
+    override TARGET_TRIPLE := $(strip $(TARGET_TRIPLE))
+endif
+TARGET_ARCH := $(firstword $(subst -, ,$(TARGET_TRIPLE)))
+
+# Platform detection (OS selects linker/ABI policy; architecture comes from
+# TARGET_TRIPLE above). UNAME_M remains diagnostic fingerprint material only.
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 
-# Control-flow integrity flag, gated by architecture (AR-06 F12). -fcf-protection
-# is Intel CET and x86-only: gcc AND clang HARD-ERROR with
-# "'-fcf-protection=full' is not supported for this target" on aarch64, so the
-# unconditional flag broke every non-x86 build — while the spec advertises
-# aarch64 support. Use the ARM equivalent (-mbranch-protection=standard, PAC/BTI)
-# on aarch64, and nothing on other arches, so the hardening is applied where the
-# toolchain supports it instead of failing the build.
-ifneq ($(filter x86_64 i386 i486 i586 i686,$(UNAME_M)),)
-    CF_PROTECTION := -fcf-protection
-else ifneq ($(filter aarch64 arm64,$(UNAME_M)),)
-    CF_PROTECTION := -mbranch-protection=standard
+# Destination control-flow protection is selected by target architecture and
+# compile-probed against the actual compiler. Unsupported optional protection
+# is omitted; host uname can neither add the wrong ISA flag nor remove the
+# destination-appropriate one.
+ifneq ($(filter x86_64 i386 i486 i586 i686,$(TARGET_ARCH)),)
+    CF_PROTECTION_CANDIDATE := -fcf-protection
+else ifneq ($(filter aarch64 arm64,$(TARGET_ARCH)),)
+    CF_PROTECTION_CANDIDATE := -mbranch-protection=standard
+else
+    CF_PROTECTION_CANDIDATE :=
+endif
+ifneq ($(CF_PROTECTION_CANDIDATE),)
+    CF_PROTECTION := $(shell printf 'int gitswitch_cf_probe(void){return 0;}\n' | \
+	$(CC) $(CF_PROTECTION_CANDIDATE) -x c -c -o /dev/null - \
+	>/dev/null 2>&1 && printf '%s' '$(CF_PROTECTION_CANDIDATE)')
 else
     CF_PROTECTION :=
 endif
 
 # Compiler and flags
-CC = gcc
 # Compiler family, needed before the flag set: macOS 'gcc' is clang, and a
 # few spellings/diagnostics differ (see the clang block further down).
 CC_IS_CLANG := $(shell $(CC) --version 2>/dev/null | grep -c clang)
@@ -74,6 +113,20 @@ ifneq ($(CC_IS_CLANG),0)
     STRICT_ALIASING_FLAG = -Wstrict-aliasing
 else
     STRICT_ALIASING_FLAG = -Wstrict-aliasing=3
+endif
+
+# Supported platforms have a fixed native artifact inspector. An unsupported
+# release must supply both an audited format and an explicit acknowledgement;
+# release-policy-check below also validates its complete minimum flag set.
+UNSUPPORTED_RELEASE_ACK ?=
+ifeq ($(UNAME_S),Linux)
+    override RELEASE_ARTIFACT_FORMAT := elf
+else ifeq ($(UNAME_S),FreeBSD)
+    override RELEASE_ARTIFACT_FORMAT := elf
+else ifeq ($(UNAME_S),Darwin)
+    override RELEASE_ARTIFACT_FORMAT := macho
+else
+    RELEASE_ARTIFACT_FORMAT ?=
 endif
 
 CFLAGS = -std=gnu11 -Wall -Wextra -Wstrict-prototypes \
@@ -138,6 +191,13 @@ DEBUG_LDFLAGS = -fsanitize=address -fsanitize=undefined $(SECURITY_LDFLAGS_DEBUG
 # -s (strip) lives in RELEASE_LDFLAGS, not here: it is a link-only flag, and
 # CFLAGS feeds the compile step too, where clang errors on it as an unused
 # command-line argument under WERROR (gcc silently ignores it).
+# This final, non-overridable release suffix applies to every production and
+# test translation unit. The forced header makes a missing effective stack
+# policy a compile error in that exact TU; the flag is deliberately last so a
+# caller cannot neutralize it through CFLAGS or platform flag ordering.
+RELEASE_REQUIRED_CFLAGS = -fstack-protector-strong \
+                          -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+                          -include $(SRCDIR)/release_hardening.h
 RELEASE_FLAGS = -O2 -DNDEBUG $(SECURITY_CFLAGS_RELEASE)
 RELEASE_LDFLAGS = -s $(SECURITY_LDFLAGS_RELEASE)
 COVERAGE_FLAGS = -g -O0 --coverage -fprofile-abs-path
@@ -162,8 +222,9 @@ COVERAGE_MIN_BRANCHES ?= 58
 # Default to debug build
 BUILD_TYPE ?= debug
 ifeq ($(BUILD_TYPE),release)
-    CFLAGS += $(RELEASE_FLAGS)
-    LDFLAGS += $(RELEASE_LDFLAGS)
+    RELEASE_ENFORCED_CFLAGS = $(RELEASE_FLAGS)
+    RELEASE_ENFORCED_LDFLAGS = $(RELEASE_LDFLAGS)
+    TU_HARDENING_FLAGS = $(RELEASE_REQUIRED_CFLAGS)
 else ifeq ($(BUILD_TYPE),coverage)
     CFLAGS += $(COVERAGE_FLAGS)
     LDFLAGS += $(COVERAGE_LDFLAGS)
@@ -312,17 +373,27 @@ $(BINDIR):
 # replaced only on change, preserving true no-op incremental builds.
 BUILDTYPE_STAMP = $(OBJDIR)/.buildconfig
 define BUILD_STAMP_CONTENT
-$(BUILD_TYPE)|buildconfig-v2
+$(BUILD_TYPE)|buildconfig-v3
 version=$(VERSION)
 commit=$(COMMIT)
 cc=$(CC)
+cc_launcher=$(CC_LAUNCHER)
+cc_resolved=$(CC_IDENTITY_FILE)
+cc_identity_files=$(TOOLCHAIN_IDENTITY_FILES)
+cc_file_fingerprint=$(TOOLCHAIN_FILE_FINGERPRINT)
+cc_version=$(CC_VERSION_ID)
 cc_is_clang=$(CC_IS_CLANG)
+target_triple=$(TARGET_TRIPLE)
+target_arch=$(TARGET_ARCH)
 cppflags=$(CPPFLAGS)
 cflags=$(CFLAGS)
+release_enforced_cflags=$(RELEASE_ENFORCED_CFLAGS)
+release_required_cflags=$(RELEASE_REQUIRED_CFLAGS)
 frame_size_warning=$(FRAME_SIZE_WARNING)
 includes=$(INCLUDES)
 depflags=$(DEPFLAGS)
 ldflags=$(LDFLAGS)
+release_enforced_ldflags=$(RELEASE_ENFORCED_LDFLAGS)
 libs=$(LIBS)
 readline_request=$(READLINE)
 readline_effective=$(READLINE_OK)
@@ -330,6 +401,8 @@ readline_hint_cflags=$(READLINE_HINT_CFLAGS)
 readline_hint_libs=$(READLINE_HINT_LIBS)
 platform_os=$(UNAME_S)
 platform_arch=$(UNAME_M)
+release_artifact_format=$(RELEASE_ARTIFACT_FORMAT)
+unsupported_release_ack=$(UNSUPPORTED_RELEASE_ACK)
 cf_protection=$(CF_PROTECTION)
 security_cflags_debug=$(SECURITY_CFLAGS_DEBUG)
 security_ldflags_debug=$(SECURITY_LDFLAGS_DEBUG)
@@ -342,6 +415,61 @@ source_dir=$(SRCDIR)
 test_dir=$(TESTDIR)
 endef
 export GITSWITCH_BUILD_CONFIG = $(BUILD_STAMP_CONTENT)
+export GITSWITCH_RELEASE_POLICY_OS = $(UNAME_S)
+export GITSWITCH_RELEASE_POLICY_TRIPLE = $(TARGET_TRIPLE)
+export GITSWITCH_RELEASE_POLICY_CC = $(CC_IDENTITY_FILE)
+export GITSWITCH_RELEASE_POLICY_CC_VERSION = $(CC_VERSION_ID)
+export GITSWITCH_RELEASE_POLICY_FINGERPRINT = $(TOOLCHAIN_FILE_FINGERPRINT)
+export GITSWITCH_RELEASE_POLICY_ACK = $(UNSUPPORTED_RELEASE_ACK)
+export GITSWITCH_RELEASE_POLICY_FORMAT = $(RELEASE_ARTIFACT_FORMAT)
+export GITSWITCH_RELEASE_POLICY_CFLAGS = $(SECURITY_CFLAGS_RELEASE)
+export GITSWITCH_RELEASE_POLICY_LDFLAGS = $(SECURITY_LDFLAGS_RELEASE)
+
+.PHONY: release-policy-check
+release-policy-check:
+	@set -e; \
+	printf '%s\n' "$$GITSWITCH_RELEASE_POLICY_TRIPLE" | \
+		grep -Eq '^[A-Za-z0-9_.+]+(-[A-Za-z0-9_.+]+)+$$' || { \
+		echo 'ERROR: compiler target triple is empty or invalid' >&2; exit 1; \
+	}; \
+	test -f "$$GITSWITCH_RELEASE_POLICY_CC" && \
+	test -n "$$GITSWITCH_RELEASE_POLICY_CC_VERSION" && \
+	test -n "$$GITSWITCH_RELEASE_POLICY_FINGERPRINT" || { \
+		echo 'ERROR: compiler path, version, and content fingerprint are required' >&2; exit 1; \
+	}; \
+	case "$$GITSWITCH_RELEASE_POLICY_OS" in \
+		Linux|FreeBSD) \
+			test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = elf || { \
+				echo 'ERROR: ELF platform lost its release inspection policy' >&2; exit 1; \
+			} ;; \
+		Darwin) \
+			test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = macho || { \
+				echo 'ERROR: Darwin lost its release inspection policy' >&2; exit 1; \
+			} ;; \
+		*) \
+			test "$$GITSWITCH_RELEASE_POLICY_ACK" = I_ACKNOWLEDGE_UNSUPPORTED_RELEASE || { \
+				echo "ERROR: unsupported release OS '$$GITSWITCH_RELEASE_POLICY_OS' requires explicit acknowledgement" >&2; exit 1; \
+			}; \
+			case "$$GITSWITCH_RELEASE_POLICY_FORMAT" in elf|macho) ;; \
+				*) echo 'ERROR: unsupported release requires elf or macho inspection policy' >&2; exit 1 ;; \
+			esac; \
+			for required in -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE; do \
+				case " $$GITSWITCH_RELEASE_POLICY_CFLAGS " in *" $$required "*) ;; \
+					*) echo "ERROR: unsupported release C flags omit $$required" >&2; exit 1 ;; \
+				esac; \
+			done; \
+			if test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = elf; then \
+				for required in -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack; do \
+					case " $$GITSWITCH_RELEASE_POLICY_LDFLAGS " in *" $$required "*) ;; \
+						*) echo "ERROR: unsupported ELF release linker flags omit $$required" >&2; exit 1 ;; \
+					esac; \
+				done; \
+			fi ;; \
+	esac
+
+ifeq ($(BUILD_TYPE),release)
+$(BUILDTYPE_STAMP): release-policy-check
+endif
 $(BUILDTYPE_STAMP): buildtype-force | $(OBJDIR)
 	@set -e; \
 	tmp="$@.tmp.$$$$"; \
@@ -360,12 +488,14 @@ buildtype-force:
 # Compile source files
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling $<..."
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # Link main executable
 $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 	@echo "Linking $@..."
-	$(CC) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $(OBJECTS) -o $@ $(LIBS) \
+		$(RELEASE_ENFORCED_LDFLAGS)
 	@echo "Build complete: $@"
 
 # Install target.
@@ -380,6 +510,9 @@ $(BINDIR)/$(TARGET): $(OBJECTS) | $(BINDIR)
 # caller must build explicitly first (`make release` / `make`). BUILD_TYPE is
 # irrelevant here — no rebuild happens.
 .PHONY: install
+ifeq ($(BUILD_TYPE),release)
+install: release-policy-check
+endif
 install:
 	@if [ ! -x "$(BINDIR)/$(TARGET)" ]; then \
 		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
@@ -388,6 +521,16 @@ install:
 	@bt=`sed -n '1s/|.*//p' $(BUILDTYPE_STAMP) 2>/dev/null`; \
 	if [ "$$bt" != "release" ]; then \
 		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
+	else \
+		built_os=`sed -n 's/^platform_os=//p' $(BUILDTYPE_STAMP)`; \
+		case "$$built_os" in Linux|Darwin|FreeBSD) ;; \
+			*) built_ack=`sed -n 's/^unsupported_release_ack=//p' $(BUILDTYPE_STAMP)`; \
+			   built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
+			   test "$$built_ack" = I_ACKNOWLEDGE_UNSUPPORTED_RELEASE && \
+			   { test "$$built_format" = elf || test "$$built_format" = macho; } || { \
+				echo 'ERROR: refusing release install without a recorded supported/acknowledged inspection policy' >&2; exit 1; \
+			   } ;; \
+		esac; \
 	fi
 	@echo "Installing $(TARGET)..."
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -414,7 +557,8 @@ uninstall:
 # Test compilation
 $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) -c $< -o $@
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The reset suite calls the real CLI entry point in isolated child processes
 # while installing deterministic in-process boundary hooks. Rename only this
@@ -422,60 +566,64 @@ $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 $(AR07_RESET_MAIN_OBJECT): $(SRCDIR)/main.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling AR-07 reset CLI test entry..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
-		-DGITSWITCH_TESTING -Dmain=gitswitch_cli_main -c $< -o $@
+		-DGITSWITCH_TESTING -Dmain=gitswitch_cli_main \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The removal signal suite needs checkpoints inside accounts_remove(), while
 # production accounts.o remains free of test hooks.
 $(AR08_REMOVE_ACCOUNTS_OBJECT): $(SRCDIR)/accounts.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling AR-08 removal signal test object..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
-		-DGITSWITCH_TESTING -c $< -o $@
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The resume-hint race suite replaces the artifact at exact parser boundaries.
 # Keep its hook out of the production config object and binary.
 $(AR08_HINT_CONFIG_OBJECT): $(SRCDIR)/config.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling AR-08 resume-hint race test object..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
-		-DGITSWITCH_TESTING -c $< -o $@
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The copy-permission suite observes exact descriptor checkpoints before any
 # bytes and after its first flushed test chunk; production utils.o has no hook.
 $(AR08_COPY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling AR-08 copy permission test object..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
-		-DGITSWITCH_TESTING -c $< -o $@
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
 
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar08_remove_signal: $(OBJDIR)/test_ar08_remove_signal.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(AR08_REMOVE_ACCOUNTS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/accounts.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar08_resume_hint_race: \
 		$(OBJDIR)/test_ar08_resume_hint_race.o \
 		$(AR08_HINT_CONFIG_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar08_copy_permissions: \
 		$(OBJDIR)/test_ar08_copy_permissions.o \
 		$(AR08_COPY_UTILS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
-	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 # These suites execute the worktree production CLI instead of a linked test
 # entry point. Keep the dependency explicit for focused invocations: the
@@ -891,10 +1039,13 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 		exit 1; \
 	fi; \
 	echo 'Release stack check passed: help/version/config at 256 KiB'; \
+	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
 		"$$stage$(PREFIX)/bin/$(TARGET)"; \
+	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh neuter "$(CC)" \
-		"$(SECURITY_CFLAGS_RELEASE)"
+		"$(SECURITY_CFLAGS_RELEASE)" \
+		"$(CURDIR)/$(SRCDIR)/release_hardening.h"
 else
 release-artifact-test:
 	@echo "ERROR: release-artifact-test requires BUILD_TYPE=release" >&2

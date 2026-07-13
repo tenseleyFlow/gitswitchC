@@ -100,23 +100,30 @@ check_artifact_pair()
     [ "$built_version" = "$staged_version" ] ||
         fail "built and staged binaries report different versions"
 
-    platform=$(uname -s)
-    case $platform in
-        Linux|FreeBSD)
+    format=${GITSWITCH_RELEASE_FORMAT-}
+    if [ -z "$format" ]; then
+        case $(uname -s) in
+            Linux|FreeBSD) format=elf ;;
+            Darwin) format=macho ;;
+            *) fail "unsupported artifact-inspection platform: $(uname -s)" ;;
+        esac
+    fi
+    case $format in
+        elf)
             check_elf "$built"
             check_elf "$staged"
             ;;
-        Darwin)
+        macho)
             check_macho "$built"
             check_macho "$staged"
             ;;
         *)
-            fail "unsupported artifact-inspection platform: $platform"
+            fail "unsupported artifact-inspection format: $format"
             ;;
     esac
 
     printf 'ar07-release: PASS (%s built and staged artifacts verified)\n' \
-        "$platform"
+        "$format"
 }
 
 expect_artifact_rejection()
@@ -139,12 +146,15 @@ expect_artifact_rejection()
 
 check_neuter_contract()
 {
-    [ "$#" -eq 2 ] ||
-        fail "usage: $0 neuter COMPILER RELEASE_SECURITY_CFLAGS"
+    [ "$#" -eq 3 ] ||
+        fail "usage: $0 neuter COMPILER RELEASE_SECURITY_CFLAGS HARDENING_HEADER"
     compiler=$1
     release_security_cflags=$2
+    hardening_header=$3
     command -v "$compiler" >/dev/null 2>&1 ||
         fail "neuter compiler is unavailable: $compiler"
+    [ -f "$hardening_header" ] ||
+        fail "release hardening header is unavailable: $hardening_header"
 
     # This assertion is intentionally coupled to the Makefile's real release
     # compile flags. Artifact inspection cannot portably observe FORTIFY on all
@@ -222,7 +232,14 @@ check_neuter_contract()
         fail "configured FORTIFY compile intent is not accepted by the compiler"
     fi
 
-    platform=$(uname -s)
+    format=${GITSWITCH_RELEASE_FORMAT-}
+    if [ -z "$format" ]; then
+        case $(uname -s) in
+            Linux|FreeBSD) format=elf ;;
+            Darwin) format=macho ;;
+            *) fail "unsupported hardening-neuter platform: $(uname -s)" ;;
+        esac
+    fi
     nonpie=$tmp/neuter-nonpie
     nocanary=$tmp/neuter-no-canary
     norelro=$tmp/neuter-no-relro
@@ -230,8 +247,8 @@ check_neuter_contract()
     execstack=$tmp/neuter-exec-stack
     have_nonpie_neuter=false
     have_execstack_neuter=false
-    case $platform in
-        Linux|FreeBSD)
+    case $format in
+        elf)
             if ! "$compiler" -std=c11 -O0 -fno-stack-protector -fno-pie \
                 "$source_file" -no-pie -o "$nonpie" >"$tmp/nonpie.log" 2>&1; then
                 cat "$tmp/nonpie.log" >&2
@@ -268,7 +285,7 @@ check_neuter_contract()
             fi
             have_execstack_neuter=true
             ;;
-        Darwin)
+        macho)
             # Apple ld forces arm64 dynamic executables to be PIE and accepts
             # -no_pie only with a warning. A real non-PIE negative fixture is
             # therefore constructible only on Intel Darwin; the positive PIE
@@ -315,9 +332,73 @@ check_neuter_contract()
             esac
             ;;
         *)
-            fail "unsupported hardening-neuter platform: $platform"
+            fail "unsupported hardening-neuter format: $format"
             ;;
     esac
+
+    # Per-translation-unit proof. A mixed build whose second object disables
+    # protection must fail at compilation, before a canary from the first
+    # object can make the final executable look protected. The fully protected
+    # two-object control must link and satisfy the native artifact inspector.
+    printf '%s\n' \
+        'extern volatile char *ar08_hardening_escape;' \
+        'int ar08_hardened_helper(int value)' \
+        '{' \
+        '    volatile char witness[64];' \
+        '    witness[0] = (char)value;' \
+        '    ar08_hardening_escape = witness;' \
+        '    return witness[0];' \
+        '}' >"$tmp/hardened-helper.c"
+    printf '%s\n' \
+        'volatile char *ar08_hardening_escape;' \
+        'int ar08_hardened_helper(int);' \
+        'int main(int argc, char **argv)' \
+        '{' \
+        '    volatile char witness[64];' \
+        '    (void)argv;' \
+        '    witness[0] = (char)argc;' \
+        '    ar08_hardening_escape = witness;' \
+        '    return ar08_hardened_helper(witness[0]) == 127;' \
+        '}' >"$tmp/hardened-main.c"
+    "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+        -include "$hardening_header" -fstack-protector-strong \
+        -c "$tmp/hardened-main.c" -o "$tmp/hardened-main.o" ||
+        fail "fully protected main translation unit did not compile"
+    if "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+        -include "$hardening_header" -fstack-protector-strong \
+        -fno-stack-protector \
+        -c "$tmp/hardened-helper.c" -o "$tmp/mixed-unprotected.o" \
+        >"$tmp/mixed.log" 2>&1; then
+        fail "mixed protected/unprotected translation units passed the compile gate"
+    fi
+    grep -F 'release translation unit lacks required stack-protector policy' \
+        "$tmp/mixed.log" >/dev/null || {
+        cat "$tmp/mixed.log" >&2
+        fail "mixed translation-unit fixture failed for an unrelated reason"
+    }
+    "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+        -include "$hardening_header" -fstack-protector-strong \
+        -c "$tmp/hardened-helper.c" -o "$tmp/hardened-helper.o" ||
+        fail "fully protected helper translation unit did not compile"
+    full_binary=$tmp/hardened-multi-tu
+    case $format in
+        elf)
+            "$compiler" -fPIE "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
+                -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
+                -o "$full_binary" || fail "fully protected ELF fixture did not link"
+            ;;
+        macho)
+            "$compiler" "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
+                -Wl,-pie -o "$full_binary" ||
+                fail "fully protected Mach-O fixture did not link"
+            ;;
+    esac
+    cp "$full_binary" "$tmp/hardened-multi-tu-staged"
+    GITSWITCH_RELEASE_FORMAT=$format sh "$script" artifact "$full_binary" \
+        "$tmp/hardened-multi-tu-staged" >"$tmp/hardened-check.log" 2>&1 || {
+        cat "$tmp/hardened-check.log" >&2
+        fail "fully protected multi-translation-unit fixture was rejected"
+    }
 
     if [ "$have_nonpie_neuter" = true ]; then
         cp "$nonpie" "$tmp/neuter-nonpie-staged"
@@ -331,8 +412,8 @@ check_neuter_contract()
         "$tmp/neuter-no-canary-staged" \
         'lacks stack-protector instrumentation' "$tmp/nocanary-check.log"
 
-    case $platform in
-        Linux|FreeBSD)
+    case $format in
+        elf)
             cp "$norelro" "$tmp/neuter-no-relro-staged"
             expect_artifact_rejection "no-RELRO" "$script" "$norelro" \
                 "$tmp/neuter-no-relro-staged" \
@@ -354,7 +435,7 @@ check_neuter_contract()
     fi
 
     printf 'ar07-release: PASS (%s FORTIFY and artifact neuters rejected)\n' \
-        "$platform"
+        "$format"
 }
 
 assert_archive_metadata()

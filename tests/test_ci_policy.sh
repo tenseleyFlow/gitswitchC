@@ -31,9 +31,10 @@ check_policy()
             *) fail "external action lacks an immutable ref: $action_line" ;;
         esac
         ref=${action##*@}
-        [ "${#ref}" -eq 40 ] &&
-            ! printf '%s\n' "$ref" | grep '[^0-9a-f]' >/dev/null ||
+        if [ "${#ref}" -ne 40 ] ||
+            printf '%s\n' "$ref" | grep '[^0-9a-f]' >/dev/null; then
             fail "external action is not pinned to a full lowercase SHA: $action_line"
+        fi
         case $action_line in
             *'# v'*) ;;
             *) fail "pinned action lacks a maintained version comment: $action_line" ;;
