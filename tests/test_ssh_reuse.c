@@ -336,7 +336,24 @@ static int fake_quoting_agent_runner(const char *const argv[],
         return 0;
     }
     if (strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
-        strcmp(argv[1], "-l") != 0) {
+        strcmp(argv[1], "-l") == 0) {
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s agent-key (ED25519)\n", FP_A);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
+        strcmp(argv[1], "-lf") == 0) {
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s user@host (ED25519)\n", FP_A);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-add") == 0 && argv[1]) {
         const char *sock_env = NULL;
         if (opts && opts->extra_env) {
             for (size_t i = 0; opts->extra_env[i]; i++) {

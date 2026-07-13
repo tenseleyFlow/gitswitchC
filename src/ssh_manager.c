@@ -1196,8 +1196,9 @@ static int ssh_key_fingerprint(const char *key_path, char *buf, size_t size) {
  * knowing the agent is alive wasted a fork+exec on every such miss. Anything
  * indeterminate falls back to false (restart + load) rather than risk
  * adopting the wrong agent. */
-static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
-                               const char *key_path) {
+static bool ssh_agent_has_exact_key(int dir_fd, bool use_cwd_fd,
+                                    const char *socket_arg,
+                                    const char *key_path) {
     char want_fp[256];
     char envbuf[MAX_PATH_LEN + 20];
     char out[2048];
@@ -1206,7 +1207,8 @@ static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
     run_opts_t opts;
     run_result_t res;
 
-    if ((size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s",
+    if (!socket_arg || !*socket_arg || !key_path || !*key_path ||
+        (size_t)snprintf(envbuf, sizeof(envbuf), "SSH_AUTH_SOCK=%s",
                          socket_arg) >= sizeof(envbuf)) {
         return false;
     }
@@ -1217,7 +1219,7 @@ static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
     opts.stderr_to_devnull = true;
     opts.extra_env = env;
     opts.cwd_fd = dir_fd;
-    opts.use_cwd_fd = true;
+    opts.use_cwd_fd = use_cwd_fd;
     if (run_argv(argv, &opts, &res) != 0) {
         return false; /* exit 1 (no identities) / 2 (no agent) */
     }
@@ -1253,6 +1255,11 @@ static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
         }
     }
     return identities == 1 && ours;
+}
+
+static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
+                               const char *key_path) {
+    return ssh_agent_has_exact_key(dir_fd, true, socket_arg, key_path);
 }
 
 bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
@@ -1396,11 +1403,21 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
             /* Clear existing keys and add new one to system agent */
             if (strlen(ssh_config->agent_socket_path) > 0) {
                 log_debug("Clearing system SSH agent keys");
-                ssh_clear_agent_keys(ssh_config);
+                if (ssh_clear_agent_keys(ssh_config) != 0) {
+                    return -1;
+                }
                 
                 log_debug("Adding key to system SSH agent: %s", expanded_key_path);
                 if (ssh_add_key(ssh_config, expanded_key_path) != 0) {
                     set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to load key into system SSH agent");
+                    return -1;
+                }
+                if (!ssh_agent_has_exact_key(
+                        -1, false, ssh_config->agent_socket_path,
+                        expanded_key_path)) {
+                    set_error(ERR_SSH_KEY_LOAD_FAILED,
+                              "System SSH agent does not contain exactly the "
+                              "requested key after replacement");
                     return -1;
                 }
             } else {
@@ -1873,6 +1890,12 @@ int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account)
     if (ssh_add_key_pinned(dir_fd, socket_name, reuse_key_path) != 0) {
         goto fresh_commit_failed;
     }
+    if (!ssh_socket_has_key(dir_fd, socket_name, reuse_key_path)) {
+        set_error(ERR_SSH_KEY_LOAD_FAILED,
+                  "Fresh isolated SSH agent does not contain exactly the "
+                  "requested key");
+        goto fresh_commit_failed;
+    }
     ssh_config->key_already_loaded = true;
     if (verify_socket_dir_namespace(dir_fd, socket_dir) != 0) {
         goto fresh_commit_failed;
@@ -2098,15 +2121,18 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
         return -1;
     }
     
-    /* Execute ssh-add -D to delete all keys */
+    /* Execute ssh-add -D to delete all keys. A nonzero result is not evidence
+     * that the agent was already empty: it can also mean the agent was
+     * unreachable or rejected the operation. Loading into that unproved state
+     * would violate system mode's exact replacement contract. */
     if (ssh_run(output, sizeof(output), false, "ssh-add", "-D",
                 (const char *)NULL) != 0) {
-        log_warning("Failed to clear SSH agent keys (agent may be empty)");
-        /* This is not necessarily an error - agent might be empty */
-    } else {
-        log_debug("SSH agent keys cleared successfully");
+        set_error(ERR_SSH_KEY_LOAD_FAILED,
+                  "Failed to clear SSH agent before key replacement: %s",
+                  output);
+        return -1;
     }
-    
+    log_debug("SSH agent keys cleared successfully");
     return 0;
 }
 
@@ -2131,9 +2157,10 @@ int ssh_add_key(ssh_config_t *ssh_config, const char *key_path) {
         return -1;
     }
 
-    /* Execute ssh-add with the key path as a distinct argv element (no shell):
-     * a path containing shell metacharacters can no longer be interpreted. */
-    if (ssh_run(output, sizeof(output), false, "ssh-add", key_path,
+    /* `-k` disables ssh-add's implicit sibling-certificate autoload. The
+     * switch contract is one exact private-key identity, not an unmodeled
+     * key-plus-certificate pair. Keep the path as one argv element. */
+    if (ssh_run(output, sizeof(output), false, "ssh-add", "-k", key_path,
                 (const char *)NULL) != 0) {
         set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to add SSH key: %s", output);
         return -1;
@@ -3681,7 +3708,7 @@ static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
 /* Load a key through a descriptor-pinned relative agent socket. */
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path) {
-    const char *argv[] = {"ssh-add", key_path, NULL};
+    const char *argv[] = {"ssh-add", "-k", key_path, NULL};
     const char *env[2] = {NULL, NULL};
     char envbuf[MAX_PATH_LEN + 20];
     char output[512];

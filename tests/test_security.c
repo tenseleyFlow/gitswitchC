@@ -58,9 +58,10 @@ TEST(ssh_add_key_path_is_one_argv_element) {
     run_set_runner(prev);
 
     CHECK_EQ_INT(rc, 0);
-    CHECK_EQ_INT(rec_argc, 2);              /* {"ssh-add", payload} */
+    CHECK_EQ_INT(rec_argc, 3);              /* {"ssh-add", "-k", payload} */
     CHECK_STR_EQ(rec_argv[0], "ssh-add");
-    CHECK_STR_EQ(rec_argv[1], payload);     /* intact: no shell splitting */
+    CHECK_STR_EQ(rec_argv[1], "-k");        /* no sibling certificate */
+    CHECK_STR_EQ(rec_argv[2], payload);     /* intact: no shell splitting */
 }
 
 /* find_command_path must resolve via a PATH walk (no shell); a name containing

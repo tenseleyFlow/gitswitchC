@@ -576,13 +576,15 @@ static int bind_fake_agent_socket_for_runner(const char *path,
     return rc;
 }
 
-/* Extends fake_runner with a working fake ssh-agent (binds the -a socket) and
- * a happy ssh-add, so accounts_switch can walk the full SSH activation and
- * the rollback can genuinely re-start the previous account's agent. git
- * handling is delegated to fake_runner. The reported agent PID is far above
- * any platform's pid_max so the later teardown's reaper can never find — let
- * alone signal — a real process behind it. */
+/* Extends fake_runner with a working fake ssh-agent (binds the -a socket), a
+ * happy ssh-add, and matching identity/fingerprint probes, so accounts_switch
+ * can walk the full SSH activation and the rollback can genuinely re-start
+ * the previous account's agent. git handling is delegated to fake_runner.
+ * The reported agent PID is far above any platform's pid_max so the later
+ * teardown's reaper can never find — let alone signal — a real process behind
+ * it. */
 #define FAKE_AGENT_PID 1073741824
+#define FAKE_AGENT_FP "SHA256:rollback-fixture-fingerprint"
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
     if (strcmp(argv[0], "ssh-agent") == 0) {
@@ -612,8 +614,34 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         }
         return 0;
     }
-    if (strcmp(argv[0], "ssh-add") == 0 || strcmp(argv[0], "ssh-keygen") == 0) {
-        if (strcmp(argv[0], "ssh-add") == 0) g_ssh_activation_commands++;
+    if (strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
+        strcmp(argv[1], "-l") == 0) {
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+        }
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s loaded-key (ED25519)\n", FAKE_AGENT_FP);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
+        strcmp(argv[1], "-lf") == 0) {
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+        }
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s key-file (ED25519)\n", FAKE_AGENT_FP);
+            if (result) result->out_len = strlen(opts->out);
+        }
+        return 0;
+    }
+    if (strcmp(argv[0], "ssh-add") == 0) {
+        g_ssh_activation_commands++;
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
