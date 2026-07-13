@@ -561,6 +561,9 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
     CHECK(strstr(bash, "--resume-check") == NULL);
     CHECK(strstr(zsh, "--resume-check") == NULL);
     CHECK(strstr(fish, "--resume-check") == NULL);
+    CHECK(strstr(bash, "--resume-hint-probe") == NULL);
+    CHECK(strstr(zsh, "--resume-hint-probe") == NULL);
+    CHECK(strstr(fish, "--resume-hint-probe") == NULL);
 }
 
 TEST(bash_completion_executes_getopt_style_operand_state) {

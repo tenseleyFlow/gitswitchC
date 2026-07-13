@@ -133,6 +133,12 @@ int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_pa
  */
 int config_resume_hint_path(char *buf, size_t size);
 
+/* Read-only login-shell probe for the consolidated active-state artifact.
+ * Missing state normalizes to "none". A safe, self-owned 0600 regular file is
+ * parsed with the same exact grammar as config load; unsafe or malformed state
+ * fails with no output value. */
+int config_resume_hint_probe(char *needs, size_t size);
+
 /* Exact before-image for the consolidated active-state/resume-hint file. A CLI switch captures it
  * before runtime/Git mutation so a failed active-state commit can restore the
  * previous bytes (or previous absence) exactly. Snapshot values must be

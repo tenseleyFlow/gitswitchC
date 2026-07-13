@@ -402,6 +402,7 @@ static int prepare_init_fixture(const char *home, const char *runtime,
     snprintf(path, sizeof(path), "%s/gitswitch", shim_dir);
     if (write_text(path,
                    "#!/bin/sh\n"
+                   "if [ \"$1\" = --resume-hint-probe ]; then exec \"$GS_REAL_BIN\" \"$@\"; fi\n"
                    "if [ \"$1\" = resume ]; then printf 'resume\\n' >>\"$GS_TEST_RESUME_LOG\"; fi\n"
                    "exit 0\n", 0700) != 0) {
         return -1;
@@ -445,7 +446,8 @@ static int evaluate_resume_case(const char *home, const char *runtime,
     char cmd[PATH_MAX * 6];
     char hint_body[64];
 
-    snprintf(hint_body, sizeof(hint_body), "%s\n", hint_value);
+    if (*hint_value == '\0') hint_body[0] = '\0';
+    else snprintf(hint_body, sizeof(hint_body), "%s\n", hint_value);
     if (write_text(hint_path, hint_body, 0600) != 0) return -1;
     unlink(resume_log);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", runtime);
@@ -459,9 +461,10 @@ static int evaluate_resume_case(const char *home, const char *runtime,
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' XDG_RUNTIME_DIR='%s' ENV=/dev/null "
              "PATH='%s:/usr/bin:/bin' GS_TEST_SSH_RC=%d "
-             "GS_TEST_RESUME_LOG='%s' /bin/sh -ic \". '%s'\" "
+             "GS_TEST_RESUME_LOG='%s' GS_REAL_BIN='%s' "
+             "/bin/sh -ic \". '%s'\" "
              ">/dev/null 2>&1",
-             home, runtime, shim_dir, ssh_rc, resume_log, snippet);
+             home, runtime, shim_dir, ssh_rc, resume_log, g_bin, snippet);
     if (run_shell(cmd) != 0) return -1;
     return count_resume_log(resume_log);
 }
@@ -480,7 +483,7 @@ static const char *find_fish_binary(void) {
     return NULL;
 }
 
-static int evaluate_fish_resume_case(const char *runtime,
+static int evaluate_fish_resume_case(const char *home, const char *runtime,
                                      const char *snippet,
                                      const char *shim_dir,
                                      const char *hint_path,
@@ -491,7 +494,8 @@ static int evaluate_fish_resume_case(const char *runtime,
     char cmd[PATH_MAX * 6];
     char hint_body[64];
 
-    snprintf(hint_body, sizeof(hint_body), "%s\n", hint_value);
+    if (*hint_value == '\0') hint_body[0] = '\0';
+    else snprintf(hint_body, sizeof(hint_body), "%s\n", hint_value);
     if (write_text(hint_path, hint_body, 0600) != 0) return -1;
     unlink(resume_log);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", runtime);
@@ -503,10 +507,11 @@ static int evaluate_fish_resume_case(const char *runtime,
     }
 
     snprintf(cmd, sizeof(cmd),
-             "env XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
-             "GS_TEST_SSH_RC=%d GS_TEST_RESUME_LOG='%s' "
+             "env HOME='%s' XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' "
+             "GS_TEST_SSH_RC=%d GS_TEST_RESUME_LOG='%s' GS_REAL_BIN='%s' "
              "'%s' --no-config -ic \"source '%s'\" >/dev/null 2>&1",
-             runtime, shim_dir, ssh_rc, resume_log, fish_bin, snippet);
+             home, runtime, shim_dir, ssh_rc, resume_log, g_bin, fish_bin,
+             snippet);
     if (run_shell(cmd) != 0) return -1;
     return count_resume_log(resume_log);
 }
@@ -542,9 +547,9 @@ TEST(combined_resume_hint_probes_both_resources_once) {
     CHECK_EQ_INT(evaluate_resume_case(home, runtime, snippet, shims, hint, log_path,
                                       "legacy", 0, 1), 0);
     CHECK_EQ_INT(evaluate_resume_case(home, runtime, snippet, shims, hint, log_path,
-                                      "legacy", 2, 1), 1);
+                                      "legacy", 2, 1), 0);
     CHECK_EQ_INT(evaluate_resume_case(home, runtime, snippet, shims, hint, log_path,
-                                      "legacy", 0, 0), 1);
+                                      "legacy", 0, 0), 0);
     CHECK_EQ_INT(evaluate_resume_case(home, runtime, snippet, shims, hint, log_path,
                                       "", 0, 1), 0);
     CHECK_EQ_INT(evaluate_resume_case(home, runtime, snippet, shims, hint, log_path,
@@ -574,53 +579,55 @@ TEST(fish_combined_resume_hint_checks_both_resources_once) {
     slurp(fish_snippet, contents, sizeof(contents));
     CHECK(strstr(contents, "case gpg") != NULL);
     CHECK(strstr(contents, "case 'ssh gpg'") != NULL);
-    CHECK(strstr(contents, "case '*'") != NULL);
+    CHECK(strstr(contents, "command gitswitch --resume-hint-probe") != NULL);
+    CHECK(strstr(contents, ".resume-hint") == NULL);
+    CHECK(strstr(contents, "read -l __gitswitch_needs") == NULL);
     CHECK(strstr(contents, "case '*gpg*'") == NULL);
 
     fish_bin = find_fish_binary();
     if (!fish_bin) {
         fprintf(stderr, "  (skipped dynamic fish matrix: fish not installed)\n");
     } else {
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "none", 2, 0,
                                                fish_bin), 0);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "ssh", 0, 0,
                                                fish_bin), 0);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "ssh", 2, 1,
                                                fish_bin), 1);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "gpg", 0, 1,
                                                fish_bin), 0);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "gpg", 0, 0,
                                                fish_bin), 1);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "ssh gpg", 0, 1,
                                                fish_bin), 0);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "ssh gpg", 2, 1,
                                                fish_bin), 1);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "ssh gpg", 0, 0,
                                                fish_bin), 1);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "ssh gpg", 2, 0,
                                                fish_bin), 1);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "legacy", 0, 1,
                                                fish_bin), 0);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "legacy", 2, 1,
-                                               fish_bin), 1);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+                                               fish_bin), 0);
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "legacy", 0, 0,
-                                               fish_bin), 1);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+                                               fish_bin), 0);
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "", 0, 1,
                                                fish_bin), 0);
-        CHECK_EQ_INT(evaluate_fish_resume_case(runtime, fish_snippet, shims, hint,
+        CHECK_EQ_INT(evaluate_fish_resume_case(home, runtime, fish_snippet, shims, hint,
                                                log_path, "", 0, 0,
                                                fish_bin), 1);
     }

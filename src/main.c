@@ -28,6 +28,7 @@
 #define OPT_SSH_AGENT_INFO 0x100
 #define OPT_NAMES 0x101
 #define OPT_RESUME_CHECK 0x102
+#define OPT_RESUME_HINT_PROBE 0x103
 
 static const char *const g_supported_shells[] = {
     "bash", "zsh", "fish", "sh", "dash", "ksh"
@@ -356,6 +357,7 @@ int main(int argc, char *argv[]) {
     bool names_only = false;
     bool legacy_agent_info = false;
     bool resume_check = false;
+    bool resume_hint_probe = false;
     const char *command = NULL;
     const char *arg1 = NULL;
     int exit_code = EXIT_SUCCESS;
@@ -381,6 +383,9 @@ int main(int argc, char *argv[]) {
          * unadvertised; `init` uses it to distinguish a status-0 wrong/extra
          * key agent from the exact saved runtime. */
         {"resume-check", no_argument, 0, OPT_RESUME_CHECK},
+        /* Internal, read-only parser for the login-shell resume decision. It
+         * validates the artifact without letting shell code open it directly. */
+        {"resume-hint-probe", no_argument, 0, OPT_RESUME_HINT_PROBE},
         {0, 0, 0, 0}
     };
     
@@ -434,6 +439,9 @@ int main(int argc, char *argv[]) {
             case OPT_RESUME_CHECK:
                 resume_check = true;
                 break;
+            case OPT_RESUME_HINT_PROBE:
+                resume_hint_probe = true;
+                break;
             default:
                 print_usage(argv[0]);
                 error_cleanup();
@@ -463,20 +471,26 @@ int main(int argc, char *argv[]) {
      * command form, including the legacy init alias, is otherwise checked here
      * before display/config initialization can cause observable work. */
     if (!show_help && !show_version) {
-        if ((legacy_agent_info || resume_check) && command) {
+        int internal_modes = (legacy_agent_info ? 1 : 0) +
+                             (resume_check ? 1 : 0) +
+                             (resume_hint_probe ? 1 : 0);
+        const char *internal_name = legacy_agent_info ? "--ssh-agent-info" :
+            (resume_check ? "--resume-check" : "--resume-hint-probe");
+
+        if (internal_modes > 0 && command) {
             fprintf(stderr,
                     "gitswitch: %s does not accept operands\n",
-                    legacy_agent_info ? "--ssh-agent-info" : "--resume-check");
+                    internal_name);
             error_cleanup();
             return EXIT_FAILURE;
         }
-        if (legacy_agent_info && resume_check) {
+        if (internal_modes > 1) {
             fprintf(stderr,
-                    "gitswitch: --ssh-agent-info and --resume-check are mutually exclusive\n");
+                    "gitswitch: internal shell probes are mutually exclusive\n");
             error_cleanup();
             return EXIT_FAILURE;
         }
-        if (!legacy_agent_info &&
+        if (internal_modes == 0 &&
             validate_command_arity(command,
                                    command ? argc - optind - 1 : 0,
                                    arg1) != 0) {
@@ -491,6 +505,18 @@ int main(int argc, char *argv[]) {
         print_version();
         error_cleanup();
         return EXIT_SUCCESS;
+    }
+
+    if (resume_hint_probe && !show_help) {
+        char needs[8];
+        int rc = config_resume_hint_probe(needs, sizeof(needs));
+
+        if (rc == 0 &&
+            (printf("%s\n", needs) < 0 || fflush(stdout) != 0)) {
+            rc = -1;
+        }
+        error_cleanup();
+        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     /* Initialize display system */
@@ -1488,32 +1514,21 @@ static int handle_init_command(const char *shell) {
         have_gpg_home = false;
     }
 
-    /* Path of the resume-hint marker, used to gate the per-shell resume probe:
-     * with no saved account the marker is absent, so a machine that has never
-     * switched skips the ssh-add + `gitswitch resume` spawn on every shell. If
-     * the path can't be computed or contains a quote, fall back to the old
-     * unconditional probe rather than emitting broken shell. */
-    char hint_path[MAX_PATH_LEN];
-    bool have_hint = (config_resume_hint_path(hint_path, sizeof(hint_path)) == 0) &&
-                     (strchr(hint_path, '\'') == NULL);
-
     if (strcmp(shell, "fish") == 0) {
         /* AR-06 F63: unlike POSIX single quotes (fully literal), fish single
          * quotes still interpret \\ and \' — a backslash in a single-quoted
          * path could escape the closing quote or alter the path. The up-front
          * check only refused a literal quote. These are gitswitch-controlled
          * runtime paths, so a backslash is pathological: refuse it for the
-         * mandatory SSH socket, and drop the optional GPG/hint wiring (mirroring
-         * how a quote is handled) rather than emit a subtly wrong path. */
+         * mandatory SSH socket, and drop the optional GPG wiring (mirroring how
+         * a quote is handled) rather than emit a subtly wrong path. */
         bool fish_gpg = have_gpg_home && strchr(gpg_home, '\\') == NULL;
-        bool fish_hint = have_hint && strchr(hint_path, '\\') == NULL;
         if (strchr(sock_path, '\\')) {
             fprintf(stderr, "gitswitch: refusing to emit SSH_AUTH_SOCK path "
                             "containing a backslash for fish\n");
             return EXIT_FAILURE;
         }
         have_gpg_home = fish_gpg;
-        have_hint = fish_hint;
         printf("# gitswitch shell integration (fish)\n");
         printf("set -l __gitswitch_auth_sock '%s'\n", sock_path);
         printf("function __gitswitch_ssh_needs_resume\n");
@@ -1535,69 +1550,45 @@ static int handle_init_command(const char *shell) {
          * echoing it here would nag on every shell when there is nothing saved,
          * since a no-op resume never creates the socket the probe looks for. */
         printf("if status is-interactive\n");
-        if (have_hint) {
-            /* Only probe/resume when there's a saved account to resume. Exact
-             * cases avoid the old overlapping wildcard bug where "ssh gpg"
-             * matched the SSH arm first and never checked GPG. Unknown legacy
-             * content is treated conservatively as requiring both runtimes. */
-            printf("    if test -e '%s'\n", hint_path);
-            printf("        read -l __gitswitch_needs < '%s'\n", hint_path);
-            printf("        switch \"$__gitswitch_needs\"\n");
-            printf("            case none\n");
-            printf("            case ssh\n");
-            printf("                if __gitswitch_ssh_needs_resume\n");
+        printf("    set -l __gitswitch_needs (command gitswitch --resume-hint-probe 2>/dev/null)\n");
+        printf("    set -l __gitswitch_probe_status $status\n");
+        printf("    if test $__gitswitch_probe_status -eq 0\n");
+        printf("        switch \"$__gitswitch_needs\"\n");
+        printf("            case none\n");
+        printf("            case ssh\n");
+        printf("                if __gitswitch_ssh_needs_resume\n");
+        printf("                    command gitswitch resume >/dev/null\n");
+        printf("                end\n");
+        if (have_gpg_home) {
+            printf("            case gpg\n");
+            printf("                if not test -d '%s'; or not command gitswitch --resume-check >/dev/null 2>&1\n",
+                   gpg_home);
             printf("                    command gitswitch resume >/dev/null\n");
             printf("                end\n");
-            if (have_gpg_home) {
-                printf("            case gpg\n");
-                printf("                if not test -d '%s'; or not command gitswitch --resume-check >/dev/null 2>&1\n",
-                       gpg_home);
-                printf("                    command gitswitch resume >/dev/null\n");
-                printf("                end\n");
-            } else {
-                printf("            case gpg\n");
-                printf("                command gitswitch resume >/dev/null\n");
-            }
-            printf("            case 'ssh gpg'\n");
-            printf("                set -l __gitswitch_resume 0\n");
-            printf("                if __gitswitch_ssh_needs_resume\n");
-            printf("                    set __gitswitch_resume 1\n");
-            printf("                end\n");
-            if (have_gpg_home) {
-                printf("                if not test -d '%s'\n", gpg_home);
-                printf("                    set __gitswitch_resume 1\n");
-                printf("                end\n");
-            } else {
-                printf("                set __gitswitch_resume 1\n");
-            }
-            printf("                if test $__gitswitch_resume -eq 1\n");
-            printf("                    command gitswitch resume >/dev/null\n");
-            printf("                end\n");
-            printf("                set -e __gitswitch_resume\n");
-            printf("            case '*'\n");
-            printf("                set -l __gitswitch_resume 0\n");
-            printf("                if __gitswitch_ssh_needs_resume\n");
-            printf("                    set __gitswitch_resume 1\n");
-            printf("                end\n");
-            if (have_gpg_home) {
-                printf("                if not test -d '%s'\n", gpg_home);
-                printf("                    set __gitswitch_resume 1\n");
-                printf("                end\n");
-            } else {
-                printf("                set __gitswitch_resume 1\n");
-            }
-            printf("                if test $__gitswitch_resume -eq 1\n");
-            printf("                    command gitswitch resume >/dev/null\n");
-            printf("                end\n");
-            printf("                set -e __gitswitch_resume\n");
-            printf("        end\n");            /* close switch */
-            printf("        set -e __gitswitch_needs\n");
-            printf("    end\n");                /* close `if test -e <hint>` */
         } else {
-            printf("    if __gitswitch_ssh_needs_resume\n");
-            printf("        command gitswitch resume >/dev/null\n");
-            printf("    end\n");
+            printf("            case gpg\n");
+            printf("                command gitswitch resume >/dev/null\n");
         }
+        printf("            case 'ssh gpg'\n");
+        printf("                set -l __gitswitch_resume 0\n");
+        printf("                if __gitswitch_ssh_needs_resume\n");
+        printf("                    set __gitswitch_resume 1\n");
+        printf("                end\n");
+        if (have_gpg_home) {
+            printf("                if not test -d '%s'\n", gpg_home);
+            printf("                    set __gitswitch_resume 1\n");
+            printf("                end\n");
+        } else {
+            printf("                set __gitswitch_resume 1\n");
+        }
+        printf("                if test $__gitswitch_resume -eq 1\n");
+        printf("                    command gitswitch resume >/dev/null\n");
+        printf("                end\n");
+        printf("                set -e __gitswitch_resume\n");
+        printf("        end\n");
+        printf("    end\n");
+        printf("    set -e __gitswitch_probe_status\n");
+        printf("    set -e __gitswitch_needs\n");
         printf("end\n");
         emit_fish_refresh(sock_path, gpg_home, have_gpg_home);
         printf("__gitswitch_refresh\n");
@@ -1631,55 +1622,31 @@ static int handle_init_command(const char *shell) {
          * from `resume` itself (stderr) only when there is an account to
          * restore — see the fish branch above for why. */
         printf("case $- in *i*)\n");
-        if (have_hint) {
-            /* Exact cases keep combined accounts from being swallowed by the
-             * SSH branch. Empty/unknown legacy content probes both runtimes. */
-            printf("    if [ -e '%s' ]; then\n", hint_path);
-            /* AR-06 F64: the stderr redirect must precede the input redirect —
-             * shells apply redirections left to right, so `< file 2>/dev/null`
-             * leaves a failed open of `file` (removed between the -e test and
-             * the read) reported on the ORIGINAL stderr. Put 2>/dev/null first
-             * so it actually suppresses the open error. */
-            printf("        IFS= read -r __gitswitch_needs 2>/dev/null < '%s' || __gitswitch_needs=\n", hint_path);
-            printf("        case \"$__gitswitch_needs\" in\n");
-            printf("        none) : ;;\n");
-            printf("        ssh)\n");
-            printf("            __gitswitch_ssh_needs_resume && command gitswitch resume >/dev/null ;;\n");
-            if (have_gpg_home) {
-                printf("        gpg)\n");
-                printf("            [ -d '%s' ] && command gitswitch --resume-check >/dev/null 2>&1 || command gitswitch resume >/dev/null ;;\n",
-                       gpg_home);
-            } else {
-                printf("        gpg) command gitswitch resume >/dev/null ;;\n");
-            }
-            printf("        'ssh gpg')\n");
-            printf("            __gitswitch_resume=0\n");
-            printf("            __gitswitch_ssh_needs_resume && __gitswitch_resume=1\n");
-            if (have_gpg_home) {
-                printf("            [ -d '%s' ] || __gitswitch_resume=1\n", gpg_home);
-            } else {
-                printf("            __gitswitch_resume=1\n");
-            }
-            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || command gitswitch resume >/dev/null\n");
-            printf("            unset __gitswitch_resume ;;\n");
-            printf("        *)\n");
-            printf("            __gitswitch_resume=0\n");
-            printf("            __gitswitch_ssh_needs_resume && __gitswitch_resume=1\n");
-            if (have_gpg_home) {
-                printf("            [ -d '%s' ] || __gitswitch_resume=1\n", gpg_home);
-            } else {
-                printf("            __gitswitch_resume=1\n");
-            }
-            printf("            [ \"$__gitswitch_resume\" -eq 0 ] || command gitswitch resume >/dev/null\n");
-            printf("            unset __gitswitch_resume ;;\n");
-            printf("        esac\n");
-            printf("        unset __gitswitch_needs\n");
-            printf("    fi ;;\n");
+        printf("    if __gitswitch_needs=$(command gitswitch --resume-hint-probe 2>/dev/null); then\n");
+        printf("        case \"$__gitswitch_needs\" in\n");
+        printf("        none) : ;;\n");
+        printf("        ssh)\n");
+        printf("            __gitswitch_ssh_needs_resume && command gitswitch resume >/dev/null ;;\n");
+        if (have_gpg_home) {
+            printf("        gpg)\n");
+            printf("            [ -d '%s' ] && command gitswitch --resume-check >/dev/null 2>&1 || command gitswitch resume >/dev/null ;;\n",
+                   gpg_home);
         } else {
-            printf("    if __gitswitch_ssh_needs_resume; then\n");
-            printf("        command gitswitch resume >/dev/null\n");
-            printf("    fi ;;\n");
+            printf("        gpg) command gitswitch resume >/dev/null ;;\n");
         }
+        printf("        'ssh gpg')\n");
+        printf("            __gitswitch_resume=0\n");
+        printf("            __gitswitch_ssh_needs_resume && __gitswitch_resume=1\n");
+        if (have_gpg_home) {
+            printf("            [ -d '%s' ] || __gitswitch_resume=1\n", gpg_home);
+        } else {
+            printf("            __gitswitch_resume=1\n");
+        }
+        printf("            [ \"$__gitswitch_resume\" -eq 0 ] || command gitswitch resume >/dev/null\n");
+        printf("            unset __gitswitch_resume ;;\n");
+        printf("        esac\n");
+        printf("    fi\n");
+        printf("    unset __gitswitch_needs ;;\n");
         printf("esac\n");
         emit_posix_refresh(sock_path, gpg_home, have_gpg_home);
         printf("__gitswitch_refresh\n");

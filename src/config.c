@@ -46,6 +46,28 @@
 #include "signals.h"
 #include "ssh_manager.h"
 
+#ifdef GITSWITCH_TESTING
+typedef void (*resume_hint_test_hook_fn)(int stage);
+resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
+    resume_hint_test_hook_fn hook);
+
+static resume_hint_test_hook_fn g_resume_hint_test_hook;
+
+resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
+    resume_hint_test_hook_fn hook) {
+    resume_hint_test_hook_fn previous = g_resume_hint_test_hook;
+    g_resume_hint_test_hook = hook;
+    return previous;
+}
+
+#define RESUME_HINT_TEST_CHECKPOINT(stage) \
+    do { \
+        if (g_resume_hint_test_hook) g_resume_hint_test_hook((stage)); \
+    } while (0)
+#else
+#define RESUME_HINT_TEST_CHECKPOINT(stage) ((void)(stage))
+#endif
+
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
 "# gitswitch-c Configuration File\n"
@@ -122,7 +144,8 @@ typedef struct {
 } config_active_state_t;
 
 static int config_read_active_state(const char *config_path,
-                                    config_active_state_t *state);
+                                    config_active_state_t *state,
+                                    bool require_private_mode);
 
 typedef enum {
     CONFIG_INIT_NORMAL = 0,
@@ -380,7 +403,8 @@ static int config_state_path_for_config(const char *config_path,
 }
 
 static int config_read_active_state(const char *config_path,
-                                    config_active_state_t *state) {
+                                    config_active_state_t *state,
+                                    bool require_private_mode) {
     char hint[MAX_PATH_LEN];
     char dir[MAX_PATH_LEN];
     char buffer[CONFIG_ACTIVE_STATE_MAX + 1];
@@ -428,7 +452,8 @@ static int config_read_active_state(const char *config_path,
                   dir);
         return -1;
     }
-    if (!config_metadata_file_is_safe(&before, false) || before.st_size < 0 ||
+    if (!config_metadata_file_is_safe(&before, require_private_mode) ||
+        before.st_size < 0 ||
         (uintmax_t)before.st_size > CONFIG_ACTIVE_STATE_MAX) {
         set_error(ERR_PERMISSION_DENIED,
                   "Active-state artifact is not a small stable owned file: %s",
@@ -436,10 +461,12 @@ static int config_read_active_state(const char *config_path,
         return -1;
     }
 
-    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    RESUME_HINT_TEST_CHECKPOINT(1);
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
-        !config_metadata_file_is_safe(&opened, false) ||
-        !config_metadata_same_file(&before, &opened)) {
+        !config_metadata_file_is_safe(&opened, require_private_mode) ||
+        !config_metadata_same_file(&before, &opened) || opened.st_size < 0 ||
+        (uintmax_t)opened.st_size > CONFIG_ACTIVE_STATE_MAX) {
         int saved_errno = errno;
         if (fd >= 0) close(fd);
         errno = saved_errno;
@@ -460,10 +487,14 @@ static int config_read_active_state(const char *config_path,
             return -1;
         }
     }
+    RESUME_HINT_TEST_CHECKPOINT(2);
     if (fstat(fd, &after) != 0 ||
+        !config_metadata_file_is_safe(&after, require_private_mode) ||
         !config_metadata_same_file(&opened, &after) ||
         after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
-        !config_metadata_same_file(&opened, &after)) {
+        !config_metadata_file_is_safe(&after, require_private_mode) ||
+        !config_metadata_same_file(&opened, &after) ||
+        after.st_size != opened.st_size) {
         close(fd);
         set_error(ERR_FILE_IO,
                   "Active-state artifact changed while being read: %s", hint);
@@ -471,6 +502,13 @@ static int config_read_active_state(const char *config_path,
     }
     close(fd);
     buffer[total] = '\0';
+
+    if (memchr(buffer, '\0', total) != NULL) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: embedded NUL byte",
+                  hint);
+        return -1;
+    }
 
     /* The first resume-hint implementation wrote a zero-byte marker. It still
      * proves that the legacy settings.active_account was intentionally active,
@@ -658,7 +696,7 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
      * runtime-needs marker) migrates from settings.active_account. Reset writes
      * the tombstone atomically, so absence can safely retain its pre-T12 meaning
      * without resurrecting a post-T12 reset. */
-    if (config_read_active_state(config_path, &active_state) != 0) {
+    if (config_read_active_state(config_path, &active_state, false) != 0) {
         return -1;
     }
     if (active_state.exists && active_state.inactive_tombstone) {
@@ -852,6 +890,33 @@ int config_resume_hint_path(char *buf, size_t size) {
     return 0;
 }
 
+int config_resume_hint_probe(char *needs, size_t size) {
+    config_active_state_t state;
+    char config_path[MAX_PATH_LEN];
+    const char *normalized;
+
+    if (!needs || size == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid resume-hint probe output");
+        return -1;
+    }
+    needs[0] = '\0';
+    if (config_get_path(config_path, sizeof(config_path)) != 0 ||
+        config_read_active_state(config_path, &state, true) != 0) {
+        return -1;
+    }
+    if (!state.exists) {
+        normalized = "none";
+    } else if (state.legacy_needs_only && state.needs[0] == '\0') {
+        /* The zero-byte historical marker did not encode which runtime was
+         * active. Preserve migration behavior without letting the shell read
+         * the artifact itself: conservatively inspect both managers. */
+        normalized = "ssh gpg";
+    } else {
+        normalized = state.needs;
+    }
+    return safe_strncpy(needs, normalized, size);
+}
+
 #define CONFIG_RESUME_HINT_SNAPSHOT_MAX 4096U
 
 void config_resume_hint_snapshot_clear(
@@ -901,10 +966,12 @@ static int config_resume_hint_snapshot_capture_at(
         return -1;
     }
 
-    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    RESUME_HINT_TEST_CHECKPOINT(3);
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, false) ||
-        !config_metadata_same_file(&before, &opened)) {
+        !config_metadata_same_file(&before, &opened) || opened.st_size < 0 ||
+        (uintmax_t)opened.st_size > CONFIG_RESUME_HINT_SNAPSHOT_MAX) {
         int saved_errno = errno;
         if (fd >= 0) close(fd);
         errno = saved_errno;
@@ -939,9 +1006,13 @@ static int config_resume_hint_snapshot_capture_at(
             return -1;
         }
     }
-    if (fstat(fd, &after) != 0 || !config_metadata_same_file(&opened, &after) ||
+    if (fstat(fd, &after) != 0 ||
+        !config_metadata_file_is_safe(&after, false) ||
+        !config_metadata_same_file(&opened, &after) ||
         after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
-        !config_metadata_same_file(&opened, &after)) {
+        !config_metadata_file_is_safe(&after, false) ||
+        !config_metadata_same_file(&opened, &after) ||
+        after.st_size != opened.st_size) {
         close(fd);
         free(data);
         snapshot->length = 0;
@@ -1231,7 +1302,7 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                   "Cannot safely update the resume hint: config directory is unavailable");
         return -1;
     }
-    if (config_read_active_state(config_path, &existing_state) != 0) {
+    if (config_read_active_state(config_path, &existing_state, false) != 0) {
         return -1;
     }
     if (ctx->config.active_account[0] == '\0') {

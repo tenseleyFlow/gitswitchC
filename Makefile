@@ -244,9 +244,11 @@ TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
 AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
 AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
+AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
 DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR07_RESET_MAIN_OBJECT:.o=.d) \
-           $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d)
+           $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d) \
+           $(AR08_HINT_CONFIG_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -397,6 +399,13 @@ $(AR08_REMOVE_ACCOUNTS_OBJECT): $(SRCDIR)/accounts.c $(BUILDTYPE_STAMP) | $(OBJD
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
 		-DGITSWITCH_TESTING -c $< -o $@
 
+# The resume-hint race suite replaces the artifact at exact parser boundaries.
+# Keep its hook out of the production config object and binary.
+$(AR08_HINT_CONFIG_OBJECT): $(SRCDIR)/config.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-08 resume-hint race test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING -c $< -o $@
+
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
@@ -412,6 +421,13 @@ $(BINDIR)/test_ar08_remove_signal: $(OBJDIR)/test_ar08_remove_signal.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(AR08_REMOVE_ACCOUNTS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/accounts.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_ar08_resume_hint_race: \
+		$(OBJDIR)/test_ar08_resume_hint_race.o \
+		$(AR08_HINT_CONFIG_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 
@@ -763,4 +779,4 @@ rpm: dist
 
 # Prevent make from removing intermediate files
 .SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT) \
-	$(AR08_REMOVE_ACCOUNTS_OBJECT)
+	$(AR08_REMOVE_ACCOUNTS_OBJECT) $(AR08_HINT_CONFIG_OBJECT)
