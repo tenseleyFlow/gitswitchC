@@ -220,6 +220,16 @@ static ssh_process_outcome_t replace_socket_then_gone(
                                  : SSH_PROCESS_INDETERMINATE;
 }
 
+static ssh_process_outcome_t remove_socket_then_gone(
+    pid_t pid, const char *socket_arg, int runtime_dir_fd) {
+    (void)pid;
+    (void)socket_arg;
+    g_race_hook_succeeded =
+        unlinkat(runtime_dir_fd, "ssh-agent.work.sock", 0) == 0;
+    return g_race_hook_succeeded ? SSH_PROCESS_GONE
+                                 : SSH_PROCESS_INDETERMINATE;
+}
+
 static void cleanup_retained_fixture(const ssh_fixture_t *fixture) {
     ssh_reap_fn previous = ssh_manager_set_reap_fn(reap_gone);
     (void)setenv("XDG_RUNTIME_DIR", fixture->xdg, 1);
@@ -507,6 +517,31 @@ TEST(socket_replacement_before_cleanup_survives_with_stable_link) {
     CHECK(!path_exists(fixture.sidecar));
     CHECK(strstr(get_last_error()->message, "retained state for retry") !=
           NULL);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
+TEST(reaped_agent_socket_self_removal_is_idempotent) {
+    ssh_fixture_t fixture;
+    ssh_reap_fn previous;
+    char current[256];
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar08selfunlink"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    CHECK_EQ_INT(safe_snprintf(current, sizeof(current), "%s/current.sock",
+                               fixture.runtime), 0);
+    CHECK_EQ_INT(symlink(fixture.socket, current), 0);
+    g_race_hook_succeeded = false;
+    previous = ssh_manager_set_reap_fn(remove_socket_then_gone);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_fn(previous);
+
+    CHECK(g_race_hook_succeeded);
+    CHECK(!path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(!path_exists(current));
     close(fixture.dir_fd);
     ts_rm_rf(fixture.xdg);
 }
@@ -1044,6 +1079,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(runtime_namespace_replacement_fails_without_mutating_either_tree);
     RUN_TEST(sidecar_replacement_before_cleanup_is_restored_and_retained);
     RUN_TEST(socket_replacement_before_cleanup_survives_with_stable_link);
+    RUN_TEST(reaped_agent_socket_self_removal_is_idempotent);
     RUN_TEST(final_quarantine_substitution_is_not_deleted);
     RUN_TEST(portable_final_quarantine_substitution_is_not_deleted);
     RUN_TEST(portable_restore_retirement_substitution_is_preserved);

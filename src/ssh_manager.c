@@ -5822,6 +5822,29 @@ int ssh_manager_reset(const char *account) {
             failed = true;
             can_remove_runtime = false;
         }
+        if (can_remove_runtime && socket_present) {
+            struct stat after_reap;
+
+            /* A real ssh-agent removes its listening socket while exiting.
+             * Refresh only the presence bit after the cleanup-authorizing
+             * reap: if any entry remains, keep the original identity so the
+             * quarantine path detects and preserves a raced replacement. If
+             * it is absent, unlink_ssh_reset_path_at performs a second
+             * descriptor-relative absence proof before reporting success. */
+            if (fstatat(dir_fd, sock_name, &after_reap,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                if (errno == ENOENT) {
+                    socket_present = false;
+                } else {
+                    set_system_error(
+                        ERR_FILE_IO,
+                        "Cannot refresh SSH agent socket after reap: %s",
+                        sock_path);
+                    failed = true;
+                    can_remove_runtime = false;
+                }
+            }
+        }
     }
 
     /* A missing sidecar is idempotent only when the socket is absent or
