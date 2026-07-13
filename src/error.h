@@ -61,11 +61,17 @@ typedef enum {
     LOG_LEVEL_CRITICAL
 } log_level_t;
 
+#define ERROR_MESSAGE_TRUNCATION_MARKER " [truncated]"
+
 /* Error context for detailed error reporting */
 typedef struct {
     error_code_t code;
     char message[512];
+    /* Incomplete diagnostics always end in the public marker above so legacy
+     * string-only consumers cannot mistake a bounded prefix for full text. */
+    bool message_truncated;
     char details[1024];
+    bool details_truncated;
     /* Context-owned provenance keeps delayed formatting and ordinary struct
      * assignment independent of the setter's caller storage. */
     char file[MAX_PATH_LEN];
@@ -118,16 +124,22 @@ int error_init(log_level_t level, const char *log_file_path);
 void error_cleanup(void);
 
 /**
- * Set error context with detailed information
+ * Set error context with detailed information.
+ * Returns 0 when the complete diagnostic was stored, or -1 when formatting
+ * failed or bounded storage required an explicit truncation marker. The
+ * underlying error code and a terminated, truthful diagnostic are published
+ * in either case.
  */
-void set_error_context(error_code_t code, const char *file, int line,
-                       const char *function, const char *fmt, ...) GS_PRINTF_FMT(5, 6);
+int set_error_context(error_code_t code, const char *file, int line,
+                      const char *function, const char *fmt, ...) GS_PRINTF_FMT(5, 6);
 
 /**
- * Set error context including system errno
+ * Set error context including system errno, with the same 0/-1 completeness
+ * result as set_error_context(). The captured system errno is never replaced
+ * by a diagnostic-formatting failure.
  */
-void set_system_error_context(error_code_t code, const char *file, int line,
-                              const char *function, const char *fmt, ...) GS_PRINTF_FMT(5, 6);
+int set_system_error_context(error_code_t code, const char *file, int line,
+                             const char *function, const char *fmt, ...) GS_PRINTF_FMT(5, 6);
 
 /**
  * Get last error information

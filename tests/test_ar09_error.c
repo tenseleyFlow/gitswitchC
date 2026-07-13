@@ -132,6 +132,135 @@ TEST(clear_error_clears_owned_provenance) {
     CHECK(error->message[0] == '\0');
 }
 
+TEST(exact_fit_error_message_remains_complete) {
+    char source[sizeof(g_last_error.message)];
+    const error_context_t *error;
+
+    memset(source, 'e', sizeof(source) - 1U);
+    source[sizeof(source) - 1U] = '\0';
+    CHECK_EQ_INT(set_error_context(ERR_UNKNOWN, "boundary.c", 9,
+                                   "boundary_function", "%s", source),
+                 0);
+
+    error = get_last_error();
+    CHECK_EQ_INT((int)strlen(error->message), (int)sizeof(source) - 1);
+    CHECK_STR_EQ(error->message, source);
+    CHECK(!error->message_truncated);
+    CHECK(strstr(error->message, "[truncated]") == NULL);
+}
+
+TEST(oversized_error_message_reports_truncation) {
+    char source[sizeof(g_last_error.message) + 1U];
+    char formatted[2048];
+    const error_context_t *error;
+
+    memset(source, 'o', sizeof(source) - 1U);
+    source[sizeof(source) - 1U] = '\0';
+    CHECK_EQ_INT(set_error_context(ERR_UNKNOWN, "boundary.c", 10,
+                                   "boundary_function", "%s", source),
+                 -1);
+
+    error = get_last_error();
+    CHECK(error->message[sizeof(error->message) - 1U] == '\0');
+    CHECK(error->message_truncated);
+    CHECK(strstr(error->message, "[truncated]") != NULL);
+    memset(formatted, 0, sizeof(formatted));
+    format_error_message(formatted, sizeof(formatted), error);
+    CHECK(strstr(formatted, "[truncated]") != NULL);
+}
+
+TEST(exact_fit_system_suffix_remains_complete) {
+    char source[sizeof(g_last_error.message)];
+    const char *system_text = strerror(ENOENT);
+    int suffix_length;
+    size_t base_length;
+    const error_context_t *error;
+
+    suffix_length = snprintf(NULL, 0, " (%s)", system_text);
+    CHECK(suffix_length > 0);
+    base_length = sizeof(g_last_error.message) - 1U -
+                  (size_t)suffix_length;
+    memset(source, 's', base_length);
+    source[base_length] = '\0';
+    errno = ENOENT;
+    CHECK_EQ_INT(set_system_error_context(ERR_FILE_IO, "boundary.c", 11,
+                                          "boundary_function", "%s", source),
+                 0);
+
+    error = get_last_error();
+    CHECK_EQ_INT(error->system_errno, ENOENT);
+    CHECK(!error->message_truncated);
+    CHECK(!error->details_truncated);
+    CHECK_EQ_INT((int)strlen(error->message),
+                 (int)sizeof(error->message) - 1);
+    CHECK(strstr(error->message, system_text) != NULL);
+    CHECK(strstr(error->message, "[truncated]") == NULL);
+    CHECK(strstr(error->details, "errno=") != NULL);
+}
+
+TEST(oversized_system_suffix_reports_truncation) {
+    char source[sizeof(g_last_error.message)];
+    char formatted[2048];
+    const char *system_text = strerror(ENOENT);
+    int suffix_length;
+    size_t base_length;
+    const error_context_t *error;
+
+    suffix_length = snprintf(NULL, 0, " (%s)", system_text);
+    CHECK(suffix_length > 0);
+    base_length = sizeof(g_last_error.message) - (size_t)suffix_length;
+    memset(source, 's', base_length);
+    source[base_length] = '\0';
+    errno = ENOENT;
+    CHECK_EQ_INT(set_system_error_context(ERR_FILE_IO, "boundary.c", 12,
+                                          "boundary_function", "%s", source),
+                 -1);
+
+    error = get_last_error();
+    CHECK_EQ_INT(error->system_errno, ENOENT);
+    CHECK(error->message_truncated);
+    CHECK(!error->details_truncated);
+    CHECK(strstr(error->details, "errno=") != NULL);
+    CHECK(strstr(error->message, "[truncated]") != NULL);
+    memset(formatted, 0, sizeof(formatted));
+    format_error_message(formatted, sizeof(formatted), error);
+    CHECK(strstr(formatted, "[truncated]") != NULL);
+    CHECK(strstr(formatted, "errno=") != NULL);
+}
+
+TEST(error_context_preserves_aliased_previous_message) {
+    CHECK_EQ_INT(set_error_context(ERR_FILE_IO, "inner.c", 13,
+                                   "inner_function", "inner diagnostic"),
+                 0);
+    CHECK_EQ_INT(set_error_context(ERR_UNKNOWN, "outer.c", 14,
+                                   "outer_function", "outer: %s",
+                                   get_last_error()->message),
+                 0);
+
+    CHECK_STR_EQ(get_last_error()->message, "outer: inner diagnostic");
+}
+
+TEST(very_large_message_and_saved_context_keep_truncation_state) {
+    char source[4097];
+    error_context_t saved;
+
+    memset(source, 'v', sizeof(source) - 1U);
+    source[sizeof(source) - 1U] = '\0';
+    CHECK_EQ_INT(set_error_context(ERR_UNKNOWN, "large.c", 15,
+                                   "large_function", "%s", source),
+                 -1);
+    saved = *get_last_error();
+    CHECK(saved.message_truncated);
+    CHECK(strstr(saved.message, "[truncated]") != NULL);
+
+    CHECK_EQ_INT(set_error_context(ERR_UNKNOWN, "next.c", 16,
+                                   "next_function", "complete"),
+                 0);
+    CHECK(!get_last_error()->message_truncated);
+    CHECK(saved.message_truncated);
+    CHECK(strstr(saved.message, "[truncated]") != NULL);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
@@ -141,4 +270,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(null_provenance_is_owned_and_printable);
     RUN_TEST(overlong_provenance_is_bounded_and_terminated);
     RUN_TEST(clear_error_clears_owned_provenance);
+    RUN_TEST(exact_fit_error_message_remains_complete);
+    RUN_TEST(oversized_error_message_reports_truncation);
+    RUN_TEST(exact_fit_system_suffix_remains_complete);
+    RUN_TEST(oversized_system_suffix_reports_truncation);
+    RUN_TEST(error_context_preserves_aliased_previous_message);
+    RUN_TEST(very_large_message_and_saved_context_keep_truncation_state);
 TEST_MAIN_END()
