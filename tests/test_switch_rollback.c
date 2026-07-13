@@ -49,6 +49,7 @@
 static char g_xdg[256];
 static char g_ssh_sock[512];   /* <xdg>/gitswitch-ssh/current.sock */
 static char g_gpg_link[512];   /* <xdg>/gitswitch-gpg/current */
+static char g_gpg_source_home[512]; /* external source keyring fixture */
 
 /* Create a fresh fake XDG_RUNTIME_DIR holding the pre-switch runtime state of
  * a "previous" account: a current.sock symlink and a GNUPGHOME `current`
@@ -90,6 +91,19 @@ static int setup_empty_runtime_dir(void) {
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_empty_XXXXXX");
     if (!ts_mkdtemp(g_xdg)) return -1;
     return setenv("XDG_RUNTIME_DIR", g_xdg, 1);
+}
+
+/* The GPG runner below fakes key inventory and transfer, but production still
+ * pins and validates the source keyring directory around every child spawn.
+ * Give those tests a private external source so they never depend on the
+ * operator's GNUPGHOME or on whether HOME/.gnupg exists. */
+static int setup_gpg_source_home(void) {
+    if (safe_snprintf(g_gpg_source_home, sizeof(g_gpg_source_home),
+                      "%s/system-gnupg", g_xdg) != 0) {
+        return -1;
+    }
+    if (mkdir(g_gpg_source_home, 0700) != 0) return -1;
+    return setenv("GNUPGHOME", g_gpg_source_home, 1);
 }
 
 static bool symlink_present(const char *path) {
@@ -2020,6 +2034,7 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
@@ -2053,6 +2068,7 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
         CHECK(strstr(target, "/prevhome") != NULL);
     }
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    unsetenv("GNUPGHOME");
 }
 
 TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
@@ -2064,6 +2080,7 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
@@ -2089,6 +2106,7 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
         target[n] = '\0';
         CHECK(strstr(target, "/prevhome") != NULL);
     }
+    unsetenv("GNUPGHOME");
 }
 
 TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
@@ -2099,8 +2117,8 @@ TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
-    CHECK_EQ_INT(setenv("GNUPGHOME", "/external/original-gpg", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
     account->gpg_enabled = true;
@@ -2130,7 +2148,7 @@ TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     gpg_fail_session_env_restore = false;
     gpg_manager_set_setenv_fn(NULL);
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
-    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/original-gpg");
+    CHECK_STR_EQ(getenv("GNUPGHOME"), g_gpg_source_home);
 
     run_set_runner(previous_runner);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
@@ -2151,8 +2169,8 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
-    CHECK_EQ_INT(setenv("GNUPGHOME", "/external/repeated-before", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *first = &ctx.accounts[0];
     snprintf(first_key, sizeof(first_key), "%s/repeated-first-key", g_xdg);
@@ -2201,7 +2219,7 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
     gpg_fail_session_env_restore = false;
     gpg_manager_set_setenv_fn(NULL);
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
-    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/repeated-before");
+    CHECK_STR_EQ(getenv("GNUPGHOME"), g_gpg_source_home);
     run_set_runner(previous_runner);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
     unsetenv("GNUPGHOME");
@@ -2213,6 +2231,7 @@ TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
     gitswitch_ctx_t ctx = make_ctx();
     account_t *account = &ctx.accounts[0];
@@ -2240,6 +2259,7 @@ TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
     CHECK(g_store_gpgprogram[0] == '\0');
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    unsetenv("GNUPGHOME");
 }
 
 /* M2 at the accounts_switch boundary for GPG: an obstructing non-symlink at
@@ -2251,6 +2271,7 @@ TEST(gpg_stable_link_obstruction_aborts_integrated_switch) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     CHECK_EQ_INT(unlink(g_gpg_link), 0);
     CHECK_EQ_INT(mkdir(g_gpg_link, 0700), 0);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
@@ -2279,6 +2300,7 @@ TEST(gpg_stable_link_obstruction_aborts_integrated_switch) {
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(is_directory(g_gpg_link));
     CHECK(symlink_present(g_ssh_sock));
+    unsetenv("GNUPGHOME");
 }
 
 /* Mirror of failed_switch_restarts_previous_accounts_agent for the GPG side
@@ -2298,6 +2320,7 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     /* The fake runtime dir lives under /tmp: opt out of the tmpfs fail-closed
      * guard so the test is independent of where /tmp is mounted. */
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
@@ -2340,6 +2363,7 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
         base = base ? base + 1 : target;
         CHECK_STR_EQ(base, "prevhome");
     }
+    unsetenv("GNUPGHOME");
 }
 
 /* A failed transaction may share XDG_RUNTIME_DIR with a later writer whose
@@ -2356,6 +2380,7 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
     }
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
     snprintf(later_home, sizeof(later_home), "%s/gitswitch-gpg/later", g_xdg);
     CHECK_EQ_INT(mkdir(later_home, 0700), 0);
@@ -2390,6 +2415,7 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
         target[n] = '\0';
         CHECK_STR_EQ(target, later_home);
     }
+    unsetenv("GNUPGHOME");
 }
 
 /* ---- AR-08 M4/M6: transaction-wide signal ownership ----------------------- */
