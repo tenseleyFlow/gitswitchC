@@ -228,10 +228,14 @@ static void retry_name_while_restore_lock_is_held(git_scope_t scope) {
     if (g_locked_writer_pid == 0) {
         struct timespec pause = {0, 1000000};
         int first_rc;
+        ssize_t written;
         close(ready[0]);
         first_rc = git_add("--global", "user.name", "race-after-lock");
         outcome = first_rc == 0 ? 'S' : 'F';
-        (void)write(ready[1], &outcome, 1);
+        do {
+            written = write(ready[1], &outcome, 1);
+        } while (written < 0 && errno == EINTR);
+        if (written != 1) _exit(43);
         close(ready[1]);
         if (first_rc == 0) _exit(41);
         for (int attempt = 0; attempt < 5000; attempt++) {
