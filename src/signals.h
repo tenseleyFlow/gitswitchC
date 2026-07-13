@@ -22,12 +22,12 @@
  *     the git rollback by design — running git from a handler is not
  *     async-signal-safe — so the escape hatch trades atomicity for liveness
  *     only when the user insists twice.
- *   - EXCEPT while the rollback itself is running (signals_rollback_begin/
- *     end): the emergency exit there would abandon git_config_restore mid-way
- *     and permanently persist the aborted account's identity (AR-02 #2), so
- *     further signals stay recorded until the restore completes and the
- *     mainline dispatches. Interactive children spawned by the rollback keep
- *     default dispositions, so Ctrl-C still interrupts them.
+ *   - EXCEPT while a transaction-critical mutation or rollback is running
+ *     (signals_rollback_begin/end): the emergency exit there would abandon
+ *     forward publication, prepared persistence, or git_config_restore
+ *     mid-way and persist a mixed identity (AR-08 M4 / AR-02 #2), so further
+ *     signals stay recorded until commit or completed abort. Interactive
+ *     children keep default dispositions, so Ctrl-C still interrupts them.
  *   - That rollback deferral is BOUNDED, not absolute (AR-03 L8): a
  *     PROCESS-TARGETED kill never reaches the child's terminal group, so a
  *     rollback blocked at a re-prompting ssh-add passphrase read used to
@@ -90,11 +90,12 @@ void signals_test_fail_sigaction(int signal_number,
 int signals_guard_end(void);
 
 /**
- * Mark the failed-switch rollback window. Between begin and end, the handler
- * defers even a second guarded signal (no emergency exit) so the multi-exec
- * git_config_restore can never be abandoned half-done (AR-02 #2). Callers
- * must pair these around the whole rollback sequence, before dispatching any
- * pending signal.
+ * Mark a transaction-critical mutation/rollback window. Between begin and
+ * end, the handler defers even a second guarded signal (no emergency exit) so
+ * forward publication, prepared persistence, and multi-exec restoration can
+ * never be abandoned half-done (AR-08 M4 / AR-02 #2). Calls are idempotent,
+ * not nesting; the transaction owner ends the state once at commit or after
+ * completed abort, before dispatching any pending signal.
  */
 void signals_rollback_begin(void);
 void signals_rollback_end(void);

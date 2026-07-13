@@ -32,11 +32,11 @@ static const int g_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
  * guaranteed readable/writable atomically with respect to a signal handler. */
 static volatile sig_atomic_t g_pending_signal = 0;
 
-/* Nonzero while the mainline is running the failed-switch rollback. The
- * handler's second-signal emergency exit must not fire in that window: dying
- * mid-git_config_restore (up to 12 sequential git execs) persists a chimera
- * identity — the exact half-applied state the rollback exists to undo
- * (AR-02 #2). Set/cleared only in normal context. */
+/* Nonzero while the mainline owns a transaction-critical mutation/rollback
+ * window. The handler's second-signal emergency exit must not fire between
+ * forward publication and prepared commit/abort, nor mid-git_config_restore:
+ * either gap can persist a chimera identity (AR-08 M4 / AR-02 #2).
+ * Set/cleared only in normal context. */
 static volatile sig_atomic_t g_rollback_in_progress = 0;
 
 /* AR-03 L8: the pid of the subprocess run_argv is currently blocked on, or 0.

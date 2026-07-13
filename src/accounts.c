@@ -862,18 +862,14 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                                        defer_signal_dispatch);
         }
 
-        /* AR-05 M4: the FORWARD mutation window (SSH agent spawn/repoint, GPG
-         * `current` retarget, git identity write) needs the same second-signal
-         * deferral the rollback and deferred-teardown blocks already get. A
-         * second directed signal here used to take the handler's emergency
-         * exit: no git_config_restore, no deactivate_runtime_isolation —
-         * current.sock/GNUPGHOME left on the NEW account while git named the
-         * OLD one, plus a daemonized ssh-agent holding the freshly-decrypted
-         * key leaked until reboot. With the flag up, the repeat signal instead
-         * forwards to the in-flight child (killing a stuck ssh-add/pinentry
-         * prompt), the blocked step fails or returns, and the mainline reaches
-         * its signals_pending() checkpoint and runs abort_failed_switch —
-         * which re-arms and then clears the flag itself before returning. */
+        /* AR-08 M4: once the first durable mutation begins, repeat-signal
+         * deferral belongs to the whole transaction — forward activation,
+         * Git publication, deferred teardown, prepared persistence, and the
+         * eventual commit or completed abort. Clearing it between any of
+         * those phases lets a second signal take the emergency-exit path and
+         * strand a mixed identity. Interactive children still receive the
+         * repeated signal through the published-child forwarding path, so
+         * this continuous deferral does not make prompts uninterruptible. */
         signals_rollback_begin();
 
         /* --- 2. SSH agent isolation (mutation; fatal on failure) --- */
@@ -1062,11 +1058,6 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             gpg_ok = g_session.gpg_active;
         }
 
-        /* Forward mutations are complete and mutually consistent (runtime and
-         * git identity both name the new account), so the M4 deferral window
-         * closes here; the deferred-teardown block below re-arms its own. */
-        signals_rollback_end();
-
         /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
          * switch back (git config, when written, was just written — restore it
          * too; on resume nothing was written, so nothing to restore). */
@@ -1079,16 +1070,10 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 
         /* NOW run the teardown deferred from steps 2-3 — only once the switch
          * is known-good may the previous account's agent / keyring entry
-         * point be dropped (F4). L7: the reap is multi-step (identify,
-         * SIGTERM, confirm, unlink current.sock/GNUPGHOME current), so a
-         * SECOND guarded signal mid-teardown must not take the handler's
-         * emergency exit — that leaves the previous account's live agent
-         * behind the just-applied new git identity. Same deferral the failed-
-         * switch rollback gets. */
-        signals_rollback_begin();
+         * point be dropped (F4). The transaction-wide repeat-signal deferral
+         * stays armed across this multi-step reap and the prepared handoff. */
         int deactivation_rc = deactivate_runtime_isolation(
             ssh_teardown_deferred, gpg_teardown_deferred);
-        signals_rollback_end();
         if (deactivation_rc != 0) {
             char detail[sizeof(g_last_error.message)];
             safe_strncpy(detail, get_last_error()->message, sizeof(detail));
@@ -1162,16 +1147,10 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             runtime_lock_fd = -1;
         }
 
-        /* M3: the guard deliberately STAYS armed here. Dropping it used to
-         * open an unguarded stretch — the tip block below, main()'s
-         * active_account bookkeeping, everything up to config_save — where a
-         * fresh SIGINT/HUP/TERM killed with the default action: git config
-         * and the runtime symlinks named the new account while accounts.toml
-         * kept the old active_account, so the next boot's resume restored the
-         * wrong identity. The guard now runs continuously from the mutation
-         * start through main()'s save-after-switch (its signals_guard_begin
-         * is a no-op re-begin that preserves a deferred signal), and main()
-         * ends it once the state is persisted. */
+        /* Prepared and CLI-owned flows deliberately retain both the guard and
+         * repeat-signal deferral through active-account persistence. A direct
+         * library call closes both below after its in-memory commit and
+         * best-effort probes are complete. */
         if (signals_pending()) {
             log_warning("Signal received after the switch completed; "
                         "deferring until the new state is persisted");
@@ -1207,6 +1186,33 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 
     finish_switch_success(ctx, account, &switch_target, scope, write_git,
                           ssh_ok, gpg_ok);
+
+    /* AR-08 M6: accounts_switch() is a complete one-call API. A successful
+     * direct call must not leave this process running gitswitch's handlers or
+     * transaction deferral. CLI-owned/resume and prepared flows explicitly
+     * retain that ownership for main()'s persistence and common cleanup.
+     * Restore failures are reported truthfully after the already-committed
+     * switch; the signal layer retains failed entries for a later retry. */
+    if (!ctx->config.dry_run && !defer_signal_dispatch) {
+        signals_rollback_end();
+        if (signals_guard_end() != 0) {
+            char detail[sizeof(g_last_error.message)];
+            int restore_errno = errno;
+
+            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            errno = restore_errno;
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Account switch committed, but restoring the caller's signal "
+                "dispositions failed: %s",
+                detail[0] ? detail : "unknown signal restoration error");
+            errno = restore_errno;
+            return -1;
+        }
+        if (signals_pending()) {
+            signals_dispatch_pending();
+        }
+    }
     return 0;
 }
 

@@ -82,6 +82,16 @@ static int setup_runtime_dir(void) {
     return 0;
 }
 
+/* A transaction with no pre-existing runtime identity is the smallest exact
+ * fixture for signal-lifecycle tests: prepare/abort can prove a complete Git
+ * rollback without manufacturing an SSH agent solely for restoration. */
+static int setup_empty_runtime_dir(void) {
+    if (accounts_session_cleanup() != 0) return -1;
+    snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_empty_XXXXXX");
+    if (!ts_mkdtemp(g_xdg)) return -1;
+    return setenv("XDG_RUNTIME_DIR", g_xdg, 1);
+}
+
 static bool symlink_present(const char *path) {
     struct stat st;
     return lstat(path, &st) == 0;
@@ -1999,19 +2009,217 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
     }
 }
 
+/* ---- AR-08 M4/M6: transaction-wide signal ownership ----------------------- */
+
+static const int switch_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
+#define SWITCH_GUARDED_SIGNAL_COUNT \
+    (sizeof(switch_guarded_signals) / sizeof(switch_guarded_signals[0]))
+
+static void switch_inherited_handler(int signal_number) {
+    (void)signal_number;
+}
+
+/* sigaction has implementation padding, so compare the semantic fields and
+ * every mask member this fixture deliberately varies. */
+static bool switch_actions_equal(const struct sigaction *left,
+                                 const struct sigaction *right) {
+    static const int mask_signals[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM
+    };
+
+    if (left->sa_handler != right->sa_handler ||
+        left->sa_flags != right->sa_flags) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(mask_signals) / sizeof(mask_signals[0]); i++) {
+        if (sigismember(&left->sa_mask, mask_signals[i]) !=
+            sigismember(&right->sa_mask, mask_signals[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* AR-08 M6: the one-call API owns its complete signal lifecycle. This test
+ * intentionally performs no signals_guard_end() cleanup after the switch;
+ * every caller disposition and pending-state bit must already be restored. */
+TEST(direct_switch_restores_callers_signal_dispositions) {
+    struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+    struct sigaction expected[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction action;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &original[i]), 0);
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = switch_inherited_handler;
+        sigemptyset(&action.sa_mask);
+        sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+        sigaddset(&action.sa_mask,
+                  switch_guarded_signals[(i + 1) %
+                                         SWITCH_GUARDED_SIGNAL_COUNT]);
+        action.sa_flags = i == 1 ? SA_RESTART : 0;
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &action, NULL), 0);
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &expected[i]), 0);
+    }
+
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(fake_runner);
+    rc = accounts_switch(&ctx, "testacct");
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK(!signals_pending());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL, &observed), 0);
+        CHECK(switch_actions_equal(&observed, &expected[i]));
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &original[i], NULL),
+                     0);
+    }
+}
+
+/* Restoration itself can fail after the durable switch has committed. The
+ * API must report that exact partial-success truth and retain the unrestored
+ * disposition for a checked retry instead of returning a false success. */
+TEST(direct_switch_reports_signal_restoration_failure_after_commit) {
+    struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+    int returned_errno;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &original[i]), 0);
+    }
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+    previous_runner = run_set_runner(fake_runner);
+    errno = 0;
+    rc = accounts_switch(&ctx, "testacct");
+    returned_errno = errno;
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(returned_errno, EIO);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(strstr(get_last_error()->message, "switch committed") != NULL);
+    CHECK(strstr(get_last_error()->message, "signal dispositions failed") !=
+          NULL);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK(!signals_pending());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL, &observed), 0);
+        CHECK(switch_actions_equal(&observed, &original[i]));
+    }
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
+/* AR-08 M4: prepare has already published Git/runtime state but persistence
+ * has not committed. Two signals at this exact handoff must remain deferred;
+ * abort restores the prior Git vector and only then re-raises normally. The
+ * pre-fix implementation cleared repeat deferral before returning prepare,
+ * so the second raise killed the child before any restore command appeared. */
+TEST(repeated_signals_wait_for_prepared_switch_rollback) {
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        char log_path[512];
+        int signal_number = switch_guarded_signals[signal_index];
+        int status = 0;
+        pid_t pid;
+        bool seen_handoff = false;
+        bool restored_after_handoff = false;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        CHECK((size_t)snprintf(log_path, sizeof(log_path),
+                               "%s/handoff-%d.log", g_xdg,
+                               signal_number) < sizeof(log_path));
+        seed_previous_git_identity();
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            struct sigaction default_action;
+            gitswitch_ctx_t ctx = make_ctx();
+
+            memset(&default_action, 0, sizeof(default_action));
+            default_action.sa_handler = SIG_DFL;
+            sigemptyset(&default_action.sa_mask);
+            if (sigaction(signal_number, &default_action, NULL) != 0) _exit(20);
+            g_fail_user_name_set = false;
+            g_raise_on_user_name = false;
+            g_log = fopen(log_path, "w");
+            if (!g_log) _exit(21);
+            run_set_runner(fake_runner);
+            if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(22);
+            if (fputs("MARK-HANDOFF\n", g_log) == EOF || fflush(g_log) != 0)
+                _exit(23);
+            raise(signal_number);
+            raise(signal_number);
+            if (!signals_pending() ||
+                signals_pending_signal() != signal_number) _exit(24);
+            (void)accounts_switch_abort(&ctx, false);
+            _exit(25); /* completed abort dispatches the pending signal */
+        }
+
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        {
+            char line[1024];
+            FILE *log = fopen(log_path, "r");
+
+            CHECK(log != NULL);
+            if (log) {
+                while (fgets(line, sizeof(line), log)) {
+                    if (strstr(line, "MARK-HANDOFF")) {
+                        seen_handoff = true;
+                    } else if (seen_handoff && strstr(line, "user.name") &&
+                               strstr(line, "Previous Name")) {
+                        restored_after_handoff = true;
+                    }
+                }
+                fclose(log);
+            }
+        }
+        CHECK(seen_handoff);
+        CHECK(restored_after_handoff);
+    }
+}
+
 /* ---- AR-03 M3: guard continuity through the post-switch window ------------ */
 
 /* A signal landing AFTER the switch completed but BEFORE main() persists the
  * new active_account must be deferred, and main()'s re-arm around config_save
- * must not discard it. Pre-fix, accounts_switch dropped the guard on its
- * success path, so the raise() below killed the child with the new identity
- * applied and the old active_account persisted — the split state boot resume
- * then reactivates. The child mimics main()'s exact post-switch sequence. */
+ * must not discard it. The child uses the prepared API that the CLI now owns,
+ * then aborts so the deferred signal is re-raised after rollback. */
 TEST(deferred_signal_survives_post_switch_window) {
     int status = 0;
     pid_t pid;
 
-    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
 
     fflush(NULL);
     pid = fork();
@@ -2022,21 +2230,20 @@ TEST(deferred_signal_survives_post_switch_window) {
         g_raise_on_user_name = false;
         g_log = NULL;
         run_set_runner(fake_runner);
-        if (accounts_switch(&ctx, "testacct") != 0) _exit(8);
-        /* Ctrl-C in the tip-block/config-save gap. Pre-fix: default action,
-         * child dies here by SIGINT. */
+        if (accounts_switch_prepare(&ctx, "testacct") != 0) _exit(8);
+        /* Ctrl-C in the prepared persistence gap. */
         raise(SIGINT);
         if (!signals_pending()) _exit(7);
         /* main()'s re-arm around config_save: a no-op re-begin while active —
          * it must NOT reset the deferred signal. */
         signals_guard_begin();
         if (!signals_pending() || signals_pending_signal() != SIGINT) _exit(6);
-        signals_guard_end();
-        _exit(0);
+        (void)accounts_switch_abort(&ctx, false);
+        _exit(5); /* abort dispatches */
     }
     CHECK(waitpid(pid, &status, 0) == pid);
-    CHECK(WIFEXITED(status));
-    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
 }
 
 /* SIG-01: a SIGINT during the git-config write must be deferred, the rollback
@@ -2120,6 +2327,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_retargets_gpg_current_to_previous_home);
     RUN_TEST(failed_switch_does_not_overwrite_later_gpg_writer);
+    RUN_TEST(direct_switch_restores_callers_signal_dispositions);
+    RUN_TEST(direct_switch_reports_signal_restoration_failure_after_commit);
+    RUN_TEST(repeated_signals_wait_for_prepared_switch_rollback);
     RUN_TEST(deferred_signal_survives_post_switch_window);
     RUN_TEST(sigint_mid_git_config_rolls_back_then_reraises);
 TEST_MAIN_END()
