@@ -34,6 +34,14 @@
 #include "signals.h"
 #include "toml_parser.h"
 
+#ifdef GITSWITCH_TESTING
+void gitswitch_test_remove_checkpoint(int stage);
+#define REMOVE_TEST_CHECKPOINT(stage) \
+    gitswitch_test_remove_checkpoint((stage))
+#else
+#define REMOVE_TEST_CHECKPOINT(stage) ((void)(stage))
+#endif
+
 /* Active session state - tracks SSH/GPG resources for proper cleanup */
 typedef struct {
     ssh_config_t ssh_config;
@@ -1960,6 +1968,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     int ssh_rc;
     int gpg_rc;
     int runtime_lock_fd;
+    int result = -1;
     
     if (!ctx || !identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_remove");
@@ -2000,9 +2009,22 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
             return 0;
         }
     }
+
+    /* Confirmation is the destructive commit point. From here through the
+     * caller's durable configuration save, config unlock, and secure context
+     * cleanup, termination signals must be deferred. Repeats remain deferred
+     * as rollback-class work: an emergency exit between SSH/GPG teardown,
+     * model deletion, alias removal, and persistence would leave a split
+     * identity. CLI callers own the outer transaction tail; direct callers
+     * release the guard at remove_done below. */
+    signals_rollback_begin();
+    if (signals_guard_begin() != 0) {
+        signals_rollback_end();
+        return -1;
+    }
     
     if (safe_strncpy(account_name, account->name, sizeof(account_name)) != 0) {
-        return -1;
+        goto remove_done;
     }
     /* Capture the managed SSH host alias before teardown so it can be removed
      * from ~/.ssh/config after the account is gone (AR-06 F15). */
@@ -2027,7 +2049,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
      * state so `remove` or targeted `reset` can be retried safely. */
     runtime_lock_fd = runtime_state_lock_acquire();
     if (runtime_lock_fd < 0) {
-        return -1;
+        goto remove_done;
     }
     ssh_rc = ssh_manager_reset(account_name);
     if (ssh_rc != 0) {
@@ -2035,12 +2057,14 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
                  get_last_error()->message[0] ? get_last_error()->message
                                               : "unknown SSH teardown error");
     }
+    REMOVE_TEST_CHECKPOINT(1);
     gpg_rc = gpg_manager_reset(account_name);
     if (gpg_rc != 0) {
         snprintf(gpg_error, sizeof(gpg_error), "%s",
                  get_last_error()->message[0] ? get_last_error()->message
                                               : "unknown GPG teardown error");
     }
+    REMOVE_TEST_CHECKPOINT(2);
     runtime_state_lock_release(runtime_lock_fd);
     if (ssh_rc != 0 || gpg_rc != 0) {
         if (ssh_rc != 0) {
@@ -2054,12 +2078,12 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         set_error(ERR_SYSTEM_CALL,
                   "Runtime cleanup failed for account '%s'; account retained for retry",
                   account_name);
-        return -1;
+        goto remove_done;
     }
     
     /* Only a complete teardown permits deleting the configuration handle. */
     if (config_remove_account(ctx, account_id) != 0) {
-        return -1;
+        goto remove_done;
     }
 
     if (was_current || !had_current) {
@@ -2079,6 +2103,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (was_active) {
         ctx->config.active_account[0] = '\0';
     }
+    REMOVE_TEST_CHECKPOINT(3);
 
     /* Remove the managed ~/.ssh/config host-alias block so git traffic no
      * longer routes to the deleted account's key (AR-06 F15). Best-effort: the
@@ -2093,8 +2118,17 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         log_warning("Could not remove ~/.ssh/config host-alias block for '%s': %s",
                     removed_alias, get_last_error()->message);
     }
+    REMOVE_TEST_CHECKPOINT(4);
 
-    return 0;
+    result = 0;
+
+remove_done:
+    if (!ctx->config.defer_signal_cleanup) {
+        signals_rollback_end();
+        signals_guard_end();
+        if (signals_pending()) signals_dispatch_pending();
+    }
+    return result;
 }
 
 /* List all configured accounts */

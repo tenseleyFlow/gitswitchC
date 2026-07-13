@@ -243,8 +243,10 @@ TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
 AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
+AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
 DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
-           $(AR07_RESET_MAIN_OBJECT:.o=.d)
+           $(AR07_RESET_MAIN_OBJECT:.o=.d) \
+           $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -388,6 +390,13 @@ $(AR07_RESET_MAIN_OBJECT): $(SRCDIR)/main.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
 		-DGITSWITCH_TESTING -Dmain=gitswitch_cli_main -c $< -o $@
 
+# The removal signal suite needs checkpoints inside accounts_remove(), while
+# production accounts.o remains free of test hooks.
+$(AR08_REMOVE_ACCOUNTS_OBJECT): $(SRCDIR)/accounts.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-08 removal signal test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING -c $< -o $@
+
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
@@ -396,6 +405,13 @@ $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) |
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
+
+$(BINDIR)/test_ar08_remove_signal: $(OBJDIR)/test_ar08_remove_signal.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR08_REMOVE_ACCOUNTS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/accounts.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS)
 
@@ -746,4 +762,5 @@ rpm: dist
 	@echo "RPM packages created in ~/rpmbuild/RPMS/"
 
 # Prevent make from removing intermediate files
-.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT)
+.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT) \
+	$(AR08_REMOVE_ACCOUNTS_OBJECT)

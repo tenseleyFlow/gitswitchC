@@ -151,11 +151,15 @@ enum {
 
 #ifdef GITSWITCH_TESTING
 typedef void (*reset_test_hook_fn)(int stage);
+typedef void (*remove_test_hook_fn)(int stage);
 reset_test_hook_fn gitswitch_test_set_reset_hook(reset_test_hook_fn hook);
+remove_test_hook_fn gitswitch_test_set_remove_hook(remove_test_hook_fn hook);
+void gitswitch_test_remove_checkpoint(int stage);
 int gitswitch_test_context_allocations(void);
 int gitswitch_test_context_allocation_total(void);
 
 static reset_test_hook_fn g_reset_test_hook;
+static remove_test_hook_fn g_remove_test_hook;
 static int g_context_allocations;
 static int g_context_allocation_total;
 
@@ -163,6 +167,16 @@ reset_test_hook_fn gitswitch_test_set_reset_hook(reset_test_hook_fn hook) {
     reset_test_hook_fn previous = g_reset_test_hook;
     g_reset_test_hook = hook;
     return previous;
+}
+
+remove_test_hook_fn gitswitch_test_set_remove_hook(remove_test_hook_fn hook) {
+    remove_test_hook_fn previous = g_remove_test_hook;
+    g_remove_test_hook = hook;
+    return previous;
+}
+
+void gitswitch_test_remove_checkpoint(int stage) {
+    if (g_remove_test_hook) g_remove_test_hook(stage);
 }
 
 int gitswitch_test_context_allocations(void) {
@@ -177,6 +191,14 @@ int gitswitch_test_context_allocation_total(void) {
 static void reset_test_checkpoint(int stage) {
 #ifdef GITSWITCH_TESTING
     if (g_reset_test_hook) g_reset_test_hook(stage);
+#else
+    (void)stage;
+#endif
+}
+
+static void remove_test_checkpoint(int stage) {
+#ifdef GITSWITCH_TESTING
+    gitswitch_test_remove_checkpoint(stage);
 #else
     (void)stage;
 #endif
@@ -829,6 +851,10 @@ int main(int argc, char *argv[]) {
             reset_test_checkpoint(RESET_TEST_AFTER_ACTIVE_COMMIT);
         }
 
+        if (mutation.notice_kind == COMMAND_NOTICE_REMOVE && save_rc == 0) {
+            remove_test_checkpoint(5);
+        }
+
         if (exit_code == EXIT_SUCCESS && !pending_signal_notice &&
             !signals_pending()) {
             emit_command_success(ctx, &mutation);
@@ -860,6 +886,9 @@ cleanup:
 #ifdef GITSWITCH_TESTING
         g_context_allocations--;
 #endif
+    }
+    if (mutation.notice_kind == COMMAND_NOTICE_REMOVE) {
+        remove_test_checkpoint(6);
     }
 
     /* Note: We intentionally do NOT clean up SSH agents on exit.
