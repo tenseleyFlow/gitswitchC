@@ -253,9 +253,4 @@ const char *config_scope_to_string(git_scope_t scope);
  */
 int config_backup(const char *config_path);
 
-/**
- * Migrate configuration from older format versions
- */
-int config_migrate(const char *config_path);
-
 #endif /* CONFIG_H */
