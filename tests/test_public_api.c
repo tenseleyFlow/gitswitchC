@@ -184,7 +184,6 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_unsetenv_fn);
     REQUIRE_PUBLIC_API(gpg_manager_setup_agent_config_for_test);
     REQUIRE_PUBLIC_API(gpg_manager_snapshot_current);
-    REQUIRE_PUBLIC_API(gpg_manager_system_keyring_home);
     REQUIRE_PUBLIC_API(gpg_set_environment);
     REQUIRE_PUBLIC_API(gpg_switch_account);
     REQUIRE_PUBLIC_API(gpg_test_signing);

@@ -5100,16 +5100,6 @@ static void gpg_close_source_home(gpg_source_home_t *source) {
     source->fd = -1;
 }
 
-/* Public wrapper (AR-06 F05/F06): callers outside this TU (accounts.c's
- * system-keyring availability probe) need the same real-home resolution the
- * export path uses, so they can override an inherited managed GNUPGHOME. */
-int gpg_manager_system_keyring_home(char *buf, size_t size) {
-    if (!buf || size == 0) {
-        return -1;
-    }
-    return gpg_user_source_home(buf, size);
-}
-
 /* Set up gpg-agent.conf for the isolated environment.
  *
  * Inherits the user's real gpg-agent.conf (their pinentry choice — e.g. a GUI

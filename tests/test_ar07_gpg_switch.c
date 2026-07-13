@@ -769,80 +769,157 @@ TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
     g_fake_git_failure = FAKE_GIT_OK;
 }
 
-TEST(managed_home_classification_uses_exact_components) {
-    char xdg[128], canonical_xdg[MAX_PATH_LEN], home[256], base[512];
-    char external[MAX_PATH_LEN], expected[MAX_PATH_LEN];
-    char expected_external[MAX_PATH_LEN];
-    char alias[MAX_PATH_LEN], dangling_managed[MAX_PATH_LEN];
-    char fallback[MAX_PATH_LEN], missing_child[MAX_PATH_LEN];
-    char managed_child[MAX_PATH_LEN];
+static struct stat g_expected_source_identity;
+static int g_source_identity_calls;
+static bool g_source_identity_pinned;
+
+static int source_identity_runner(const char *const argv[],
+                                  const run_opts_t *opts,
+                                  run_result_t *result) {
+    const char *const *env;
+    struct stat actual;
+    bool dot_home = false;
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv_has(argv, "--list-secret-keys")) return 0;
+
+    g_source_identity_calls++;
+    for (env = opts ? opts->extra_env : NULL; env && *env; env++) {
+        if (strcmp(*env, "GNUPGHOME=.") == 0) dot_home = true;
+    }
+    g_source_identity_pinned =
+        opts && opts->use_cwd_fd && opts->cwd_fd >= 0 && dot_home &&
+        fstat(opts->cwd_fd, &actual) == 0 &&
+        actual.st_dev == g_expected_source_identity.st_dev &&
+        actual.st_ino == g_expected_source_identity.st_ino;
+    if (opts && opts->out && opts->out_size > 0) {
+        snprintf(opts->out, opts->out_size, "%s", PRIMARY_SIGN);
+        if (result) result->out_len = strlen(opts->out);
+    }
+    return 0;
+}
+
+TEST(system_resolver_classifies_managed_aliases_before_helper_launch) {
+    char xdg[128], home[MAX_PATH_LEN], base[MAX_PATH_LEN];
+    char external[MAX_PATH_LEN], alias[MAX_PATH_LEN];
+    char dangling_managed[MAX_PATH_LEN], fallback[MAX_PATH_LEN];
+    char missing_child[MAX_PATH_LEN], managed_child[MAX_PATH_LEN];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    command_runner_fn previous;
 
     CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
-    if (!realpath(xdg, canonical_xdg)) {
-        CHECK(!"runtime canonicalization failed");
-        return;
-    }
-    snprintf(home, sizeof(home), "%s/home", xdg);
+    CHECK_EQ_INT(safe_snprintf(home, sizeof(home), "%s/home", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(fallback, sizeof(fallback), "%s/.gnupg",
+                               home), 0);
+    CHECK_EQ_INT(safe_snprintf(external, sizeof(external),
+                               "%s/gitswitch-gpg-backup", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(base, sizeof(base), "%s/gitswitch-gpg",
+                               xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(managed_child, sizeof(managed_child),
+                               "%s/account", base), 0);
+    CHECK_EQ_INT(safe_snprintf(dangling_managed,
+                               sizeof(dangling_managed), "%s/current",
+                               base), 0);
+    CHECK_EQ_INT(safe_snprintf(alias, sizeof(alias),
+                               "%s/dangling-gpg-source", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(missing_child, sizeof(missing_child),
+                               "%s/missing-child", base), 0);
     CHECK_EQ_INT(mkdir(home, 0700), 0);
-    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
-    snprintf(external, sizeof(external), "%s/gitswitch-gpg-backup", xdg);
-    if (safe_snprintf(expected, sizeof(expected), "%s/home/.gnupg",
-                      canonical_xdg) != 0 ||
-        safe_snprintf(expected_external, sizeof(expected_external),
-                      "%s/gitswitch-gpg-backup", canonical_xdg) != 0) {
-        CHECK(!"canonical expected path is too long");
-        return;
-    }
-    CHECK_EQ_INT(setenv("GNUPGHOME", external, 1), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(base, sizeof(base)), 0);
-    CHECK_STR_EQ(base, expected_external);
-
-    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    CHECK_EQ_INT(mkdir(fallback, 0700), 0);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
     CHECK_EQ_INT(mkdir(base, 0700), 0);
-    snprintf(external, sizeof(external), "%s/current", base);
-    CHECK_EQ_INT(setenv("GNUPGHOME", external, 1), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(external, sizeof(external)), 0);
-    CHECK_STR_EQ(external, expected);
-
-    snprintf(managed_child, sizeof(managed_child), "%s/account", base);
     CHECK_EQ_INT(mkdir(managed_child, 0700), 0);
-    CHECK_EQ_INT(setenv("GNUPGHOME", managed_child, 1), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(external, sizeof(external)), 0);
-    CHECK_STR_EQ(external, expected);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    previous = run_set_runner(source_identity_runner);
 
-    /* realpath() cannot classify a dangling external-looking alias.  Resolve
-     * the symlink itself so an alias to managed current remains rejected even
-     * before a later switch creates that current target. */
-    snprintf(alias, sizeof(alias), "%s/dangling-gpg-source", xdg);
-    snprintf(dangling_managed, sizeof(dangling_managed), "%s/current", base);
+    /* A similarly prefixed but external directory is the exact object passed
+     * to GPG, pinned by descriptor rather than returned as a path to a caller. */
+    CHECK_EQ_INT(stat(external, &g_expected_source_identity), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", external, 1), 0);
+    g_source_identity_calls = 0;
+    g_source_identity_pinned = false;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_EQ_INT(g_source_identity_calls, 1);
+    CHECK(g_source_identity_pinned);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+
+    /* Every managed spelling, including a dangling external alias, falls back
+     * to the separately pinned HOME/.gnupg object. */
+    CHECK_EQ_INT(stat(fallback, &g_expected_source_identity), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", dangling_managed, 1), 0);
+    g_source_identity_calls = 0;
+    g_source_identity_pinned = false;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_EQ_INT(g_source_identity_calls, 1);
+    CHECK(g_source_identity_pinned);
+
+    CHECK_EQ_INT(setenv("GNUPGHOME", managed_child, 1), 0);
+    g_source_identity_calls = 0;
+    g_source_identity_pinned = false;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_EQ_INT(g_source_identity_calls, 1);
+    CHECK(g_source_identity_pinned);
+
     CHECK_EQ_INT(symlink(dangling_managed, alias), 0);
     CHECK_EQ_INT(setenv("GNUPGHOME", alias, 1), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(external, sizeof(external)), 0);
-    CHECK_STR_EQ(external, expected);
+    g_source_identity_calls = 0;
+    g_source_identity_pinned = false;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_EQ_INT(g_source_identity_calls, 1);
+    CHECK(g_source_identity_pinned);
 
-    /* Falling back from an inherited managed GNUPGHOME is not permission to
-     * trust HOME/.gnupg blindly. Resolve and classify that path through the
-     * same exact alias logic for live and not-yet-created managed targets. */
-    snprintf(fallback, sizeof(fallback), "%s/.gnupg", home);
+    /* Falling back from a managed GNUPGHOME is not permission to follow a
+     * HOME/.gnupg alias back into either live or not-yet-created managed state.
+     * These failures must happen before the helper is launched. */
+    CHECK_EQ_INT(rmdir(fallback), 0);
     CHECK_EQ_INT(gpg_manager_retarget_current(managed_child), 0);
     CHECK_EQ_INT(symlink(dangling_managed, fallback), 0);
     CHECK_EQ_INT(setenv("GNUPGHOME", dangling_managed, 1), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(alias, sizeof(alias)), -1);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
     CHECK_EQ_INT(unlink(fallback), 0);
 
     CHECK_EQ_INT(gpg_manager_drop_current(), 0);
     CHECK_EQ_INT(symlink(dangling_managed, fallback), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(alias, sizeof(alias)), -1);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
     CHECK_EQ_INT(unlink(fallback), 0);
 
     CHECK_EQ_INT(symlink(managed_child, fallback), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(alias, sizeof(alias)), -1);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
     CHECK_EQ_INT(unlink(fallback), 0);
 
-    snprintf(missing_child, sizeof(missing_child), "%s/missing-child", base);
     CHECK_EQ_INT(symlink(missing_child, fallback), 0);
-    CHECK_EQ_INT(gpg_manager_system_keyring_home(alias, sizeof(alias)), -1);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
     CHECK_EQ_INT(unlink(fallback), 0);
+
+    run_set_runner(previous);
 }
 
 TEST(busy_runtime_never_claims_requested_account_live) {
@@ -1468,7 +1545,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(unique_selector_threads_fingerprint_through_import_and_publication);
     RUN_TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication);
     RUN_TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal);
-    RUN_TEST(managed_home_classification_uses_exact_components);
+    RUN_TEST(system_resolver_classifies_managed_aliases_before_helper_launch);
     RUN_TEST(busy_runtime_never_claims_requested_account_live);
     RUN_TEST(failed_retarget_retains_dirty_state_until_controlled_retry);
     RUN_TEST(rollback_cas_preserves_same_target_and_distinct_later_writers);

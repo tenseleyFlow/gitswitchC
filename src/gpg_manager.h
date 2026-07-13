@@ -229,19 +229,6 @@ int gpg_manager_get_home_path(char *buf, size_t size);
 int gpg_manager_get_home_path_quiet(char *buf, size_t size);
 
 /**
- * Resolve the user's REAL/system gpg home for operations documented to consult
- * the system keyring (secret-key export, availability probe). Returns the
- * configured $GNUPGHOME when it is NOT one of our managed isolated homes,
- * otherwise $HOME/.gnupg. This exists because `gitswitch init` exports
- * GNUPGHOME=<base>/current into interactive shells; a child that merely
- * inherits it would read the previously-active account's isolated home instead
- * of the real keyring and fail closed (AR-06 F05/F06). Callers pass the result
- * as an explicit GNUPGHOME override so the inherited managed value can't
- * misdirect them. Returns 0 on success, -1 on overflow or missing $HOME.
- */
-int gpg_manager_system_keyring_home(char *buf, size_t size);
-
-/**
  * Tear down isolated GPG homes (kill per-home gpg-agents and delete the
  * homes, removing the on-disk secret-key copies). Deletion is unlink, not a
  * secure overwrite: on the default memory-backed storage that destroys the
