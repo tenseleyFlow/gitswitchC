@@ -76,6 +76,7 @@ typedef struct {
 
 static sigaction_test_fault_t
     g_test_sigaction_faults[SIGNALS_TEST_SIGACTION_RESTORE + 1];
+static signals_test_guard_end_hook_fn g_test_guard_end_hook;
 
 void signals_test_fail_sigaction(int signal_number,
                                  signals_test_sigaction_stage_t stage,
@@ -88,6 +89,14 @@ void signals_test_fail_sigaction(int signal_number,
     }
     g_test_sigaction_faults[stage].signal_number = signal_number;
     g_test_sigaction_faults[stage].system_errno = system_errno;
+}
+
+signals_test_guard_end_hook_fn signals_test_set_guard_end_hook(
+    signals_test_guard_end_hook_fn hook) {
+    signals_test_guard_end_hook_fn previous = g_test_guard_end_hook;
+
+    g_test_guard_end_hook = hook;
+    return previous;
 }
 
 static int guard_sigaction(int signal_number, const struct sigaction *action,
@@ -406,9 +415,15 @@ begin_failed:
 int signals_guard_end(void) {
     int restore_signal;
     int restore_errno;
+    signals_test_guard_end_hook_fn checkpoint;
 
     if (g_guard_state == GUARD_INACTIVE) {
         return 0;
+    }
+    checkpoint = g_test_guard_end_hook;
+    g_test_guard_end_hook = NULL;
+    if (checkpoint) {
+        checkpoint();
     }
     if (!restore_partial_guard(&restore_signal, &restore_errno)) {
         g_guard_state = GUARD_RESTORE_PENDING;
@@ -432,17 +447,33 @@ int signals_pending_signal(void) {
     return (int)g_pending_signal;
 }
 
-void signals_dispatch_pending(void) {
+int signals_dispatch_pending(void) {
     int sig = (int)g_pending_signal;
     if (sig == 0) {
-        return;
+        return 0;
     }
-    signals_guard_end();
+    /* Restoration is part of dispatch, not a best-effort prelude. Clearing
+     * and raising while even one saved disposition remains unrestored can
+     * route the signal back through our own handler, return to the caller,
+     * and silently discard both the interruption and guard ownership. */
+    if (signals_guard_end() != 0) {
+        return -1;
+    }
     g_pending_signal = 0;
     /* Re-raise under the restored (normally default) disposition so the
      * process reports death-by-signal — scripts and shells relying on the
      * 128+N convention see the truth, not a made-up exit code. */
-    (void)raise(sig);
+    if (raise(sig) != 0) {
+        int raise_errno = errno;
+
+        g_pending_signal = (sig_atomic_t)sig;
+        errno = raise_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Failed to dispatch deferred signal %d", sig);
+        errno = raise_errno;
+        return -1;
+    }
+    return 0;
 }
 
 int signals_scratch_register(const char *path) {

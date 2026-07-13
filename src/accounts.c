@@ -398,6 +398,53 @@ static int ssh_user_config_preflight(const account_t *account) {
     return 0;
 }
 
+/* Complete signal ownership with exactly one restoration attempt. A pending
+ * signal is dispatched only after every saved disposition is back; on any
+ * restoration failure both the guard's failed bitmap and the pending signal
+ * remain owned by signals.c for an explicit checked retry. */
+static int finish_signal_guard_checked(const char *operation) {
+    char detail[sizeof(g_last_error.message)];
+    int pending_signal = signals_pending_signal();
+    int cleanup_rc;
+    int cleanup_errno;
+
+    if (pending_signal != 0) {
+        cleanup_rc = signals_dispatch_pending();
+    } else {
+        cleanup_rc = signals_guard_end();
+        /* A guarded signal can land after the initial pending-state read but
+         * before guard_end restores its handler. Exact restoration succeeded,
+         * so recheck and dispatch that newly recorded signal rather than
+         * returning a successful API call with stale pending ownership. */
+        if (cleanup_rc == 0 && signals_pending()) {
+            cleanup_rc = signals_dispatch_pending();
+        }
+    }
+    if (cleanup_rc == 0) {
+        return 0;
+    }
+    cleanup_errno = errno;
+    pending_signal = signals_pending_signal();
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    errno = cleanup_errno;
+    if (pending_signal != 0) {
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "%s; pending signal %d remains deferred and signal-guard "
+            "ownership was retained for retry: %s",
+            operation, pending_signal,
+            detail[0] ? detail : "unknown signal restoration error");
+    } else {
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "%s; signal-guard ownership was retained for retry: %s",
+            operation,
+            detail[0] ? detail : "unknown signal restoration error");
+    }
+    errno = cleanup_errno;
+    return -1;
+}
+
 /* Common exit path for a switch that failed — or was interrupted by a signal —
  * after mutations began. Restores the pre-switch state in dependency order
  * (git identity first, then runtime isolation), cleans scratch files, drops
@@ -493,9 +540,6 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (!keep_rollback_active) {
         signals_rollback_end();
     }
-    if (end_guard) {
-        signals_guard_end();
-    }
     runtime_state_lock_release(runtime_lock_fd);
     if (git_remaining) *git_remaining = git_left;
     if (ssh_remaining) *ssh_remaining = ssh_left;
@@ -510,10 +554,16 @@ static int abort_failed_switch_checked(const account_t *prev,
         fprintf(stderr, "\ngitswitch: interrupted — switch rolled back, previous identity kept\n");
         set_error(ERR_SYSTEM_CALL, "Switch interrupted by signal %d",
                   signals_pending_signal());
-        signals_dispatch_pending(); /* terminates via the signal's default action */
+        if (end_guard &&
+            finish_signal_guard_checked("Switch rollback completed") != 0) {
+            return -1;
+        }
     } else if (signals_pending()) {
         log_warning("Switch interruption remains deferred until config and "
                     "resume-hint rollback completes");
+    } else if (end_guard &&
+               finish_signal_guard_checked("Switch rollback completed") != 0) {
+        return -1;
     }
     return -1;
 }
@@ -1286,9 +1336,10 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                     }
                     if (!defer_signal_dispatch) {
                         signals_rollback_end();
-                        (void)signals_guard_end();
-                        if (signals_pending()) {
-                            signals_dispatch_pending();
+                        if (finish_signal_guard_checked(
+                                "SSH alias publication failed after the "
+                                "switch rollback completed") != 0) {
+                            return -1;
                         }
                     }
                     set_error(ERR_FILE_IO,
@@ -1392,22 +1443,10 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
      * switch; the signal layer retains failed entries for a later retry. */
     if (!ctx->config.dry_run && !defer_signal_dispatch) {
         signals_rollback_end();
-        if (signals_guard_end() != 0) {
-            char detail[sizeof(g_last_error.message)];
-            int restore_errno = errno;
-
-            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-            errno = restore_errno;
-            set_system_error(
-                ERR_SYSTEM_CALL,
-                "Account switch committed, but restoring the caller's signal "
-                "dispositions failed: %s",
-                detail[0] ? detail : "unknown signal restoration error");
-            errno = restore_errno;
+        if (finish_signal_guard_checked(
+                "Account switch committed, but restoring the caller's "
+                "signal dispositions failed") != 0) {
             return -1;
-        }
-        if (signals_pending()) {
-            signals_dispatch_pending();
         }
     }
     if (alias_publication_retained) {
@@ -1580,23 +1619,11 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
         return 0;
     }
     signals_rollback_end();
-    guard_rc = signals_guard_end();
+    guard_rc = finish_signal_guard_checked(
+        "Prepared switch rolled back, but restoring the caller's signal "
+        "dispositions failed");
     if (guard_rc != 0) {
-        char detail[sizeof(g_last_error.message)];
-        int restore_errno = errno;
-
-        safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-        errno = restore_errno;
-        set_system_error(
-            ERR_SYSTEM_CALL,
-            "Prepared switch rolled back, but restoring the caller's signal "
-            "dispositions failed: %s",
-            detail[0] ? detail : "unknown signal restoration error");
-        errno = restore_errno;
         return -1;
-    }
-    if (signals_pending()) {
-        signals_dispatch_pending();
     }
     return 0;
 }
@@ -1968,8 +1995,11 @@ prepare_fail:
          * tail has released the config lock and securely freed its context. */
         if (!ctx->config.defer_signal_cleanup) {
             signals_rollback_end();
-            signals_guard_end();
-            if (signals_pending()) signals_dispatch_pending();
+            if (finish_signal_guard_checked(
+                    "Account edit failed and rolled back, but restoring the "
+                    "caller's signal dispositions failed") != 0) {
+                return -1;
+            }
         }
         return -1;
     }
@@ -2287,20 +2317,21 @@ int accounts_edit_interactive_prepare(gitswitch_ctx_t *ctx,
  * transaction retain the historical one-call in-memory edit behavior. */
 int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
     if (accounts_edit_interactive_prepare(ctx, identifier) != 0) {
-        signals_rollback_end();
-        signals_guard_end();
-        if (signals_pending()) signals_dispatch_pending();
         return -1;
     }
     if (accounts_edit_commit(ctx) != 0) {
         signals_rollback_end();
-        signals_guard_end();
-        if (signals_pending()) signals_dispatch_pending();
+        (void)finish_signal_guard_checked(
+            "Account edit commit failed, and restoring the caller's signal "
+            "dispositions also failed");
         return -1;
     }
     signals_rollback_end();
-    signals_guard_end();
-    if (signals_pending()) signals_dispatch_pending();
+    if (finish_signal_guard_checked(
+            "Account edit committed, but restoring the caller's signal "
+            "dispositions failed") != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -2477,8 +2508,11 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
 remove_done:
     if (!ctx->config.defer_signal_cleanup) {
         signals_rollback_end();
-        signals_guard_end();
-        if (signals_pending()) signals_dispatch_pending();
+        if (finish_signal_guard_checked(
+                "Account removal finished, but restoring the caller's "
+                "signal dispositions failed") != 0) {
+            result = -1;
+        }
     }
     return result;
 }

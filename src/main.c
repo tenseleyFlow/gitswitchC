@@ -344,6 +344,7 @@ int main(int argc, char *argv[]) {
     gitswitch_ctx_t *ctx = NULL;
     command_result_t mutation = command_result(EXIT_SUCCESS);
     bool has_mutation_result = false;
+    bool signal_guard_cleanup_failed = false;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
     int opt;
@@ -960,10 +961,35 @@ cleanup:
     signals_rollback_end();
 
     /* Restore inherited dispositions only after every owned lock and the heap
-     * context have been released. A signal arriving before this restoration is
-     * recorded; one arriving after follows the caller's original disposition. */
-    signals_guard_end();
+     * context have been released. Dispatch owns the sole restoration attempt
+     * when a signal is pending; pre-ending here would turn a one-shot restore
+     * failure into an unchecked immediate retry that could erase the pending
+     * interruption. */
+    if (!signals_pending() && signals_guard_end() != 0) {
+        int retained_signal = signals_pending_signal();
+        const char *restore_detail = get_last_error()->message[0]
+                                         ? get_last_error()->message
+                                         : "unknown signal restoration error";
 
+        if (retained_signal != 0) {
+            fprintf(stderr,
+                    "gitswitch: command cleanup completed, but restoring "
+                    "signal dispositions failed; pending signal %d and guard "
+                    "ownership were retained: %s\n",
+                    retained_signal, restore_detail);
+        } else {
+            fprintf(stderr,
+                    "gitswitch: command cleanup completed, but restoring "
+                    "signal dispositions failed; guard ownership was "
+                    "retained: %s\n",
+                    restore_detail);
+        }
+        signal_guard_cleanup_failed = true;
+        exit_code = EXIT_FAILURE;
+    }
+
+    /* Recheck after a successful guard_end: a signal may have run our handler
+     * between the initial pending test and restoration of its disposition. */
     if (signals_pending() && !pending_signal_notice) {
         pending_signal_notice = mutation.reset_guarded
             ? "gitswitch: interrupted — reset transaction cleanup completed\n"
@@ -973,9 +999,18 @@ cleanup:
     /* Cleanup error handling */
     error_cleanup();
 
-    if (pending_signal_notice && signals_pending()) {
+    if (!signal_guard_cleanup_failed && pending_signal_notice &&
+        signals_pending()) {
         fputs(pending_signal_notice, stderr);
-        signals_dispatch_pending();
+        if (signals_dispatch_pending() != 0) {
+            fprintf(stderr,
+                    "gitswitch: deferred signal remains pending because "
+                    "restoring its saved disposition failed: %s\n",
+                    get_last_error()->message[0]
+                        ? get_last_error()->message
+                        : "unknown signal restoration error");
+            exit_code = EXIT_FAILURE;
+        }
     }
     return exit_code;
 }

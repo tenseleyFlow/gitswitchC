@@ -79,6 +79,12 @@ void signals_test_fail_sigaction(int signal_number,
                                  signals_test_sigaction_stage_t stage,
                                  int system_errno);
 
+/* One-shot checkpoint immediately before guard_end starts restoration. It is
+ * used to reproduce the pending-check/restoration race deterministically. */
+typedef void (*signals_test_guard_end_hook_fn)(void);
+signals_test_guard_end_hook_fn signals_test_set_guard_end_hook(
+    signals_test_guard_end_hook_fn hook);
+
 /**
  * Restore the dispositions saved by signals_guard_begin(). Idempotent. Does
  * NOT clear a pending signal — callers finish their teardown first and then
@@ -141,11 +147,15 @@ bool signals_pending(void);
 int signals_pending_signal(void);
 
 /**
- * If a signal is pending: end the guard (restoring default dispositions) and
- * re-raise it, terminating the process with the correct signal exit status.
- * No-op when nothing is pending. Call only after rollback/teardown is done.
+ * If a signal is pending: end the guard (restoring the caller's exact saved
+ * dispositions) and re-raise it, terminating the process with the correct
+ * signal exit status. If exact restoration fails, return -1 without clearing
+ * or raising the pending signal; the failed guard entries and signal remain
+ * owned for an explicit checked retry. Returns 0 when nothing is pending or
+ * when a non-terminating inherited handler accepted the re-raised signal.
+ * Call only after rollback/teardown is done.
  */
-void signals_dispatch_pending(void);
+int signals_dispatch_pending(void);
 
 /* --- SIG-02: scratch-file registry -----------------------------------------
  *

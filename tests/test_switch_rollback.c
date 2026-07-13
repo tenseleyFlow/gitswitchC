@@ -2366,8 +2366,15 @@ TEST(failed_switch_does_not_overwrite_later_gpg_writer) {
 
 /* ---- AR-08 M4/M6: transaction-wide signal ownership ----------------------- */
 
+static volatile sig_atomic_t g_guard_end_checkpoint_signal;
+static int g_guard_end_hook_signal;
+
 static void switch_inherited_handler(int signal_number) {
-    (void)signal_number;
+    g_guard_end_checkpoint_signal = signal_number;
+}
+
+static void raise_during_guard_end(void) {
+    raise(g_guard_end_hook_signal);
 }
 
 /* sigaction has implementation padding, so compare the semantic fields and
@@ -2486,6 +2493,116 @@ TEST(direct_switch_reports_signal_restoration_failure_after_commit) {
         CHECK(switch_actions_equal(&observed, &original[i]));
     }
     signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
+/* A signal can arrive after a direct API caller's first pending-state read but
+ * while guard_end is still restoring handlers. The successful return path
+ * must recheck and dispatch it instead of leaking stale pending ownership. */
+TEST(direct_switch_dispatches_signal_arriving_during_guard_end) {
+    for (size_t signal_index = 0;
+         signal_index < SWITCH_GUARDED_SIGNAL_COUNT; signal_index++) {
+        struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+        struct sigaction expected[SWITCH_GUARDED_SIGNAL_COUNT];
+        int signal_number = switch_guarded_signals[signal_index];
+        gitswitch_ctx_t ctx;
+        command_runner_fn previous_runner;
+        int rc;
+
+        CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+        for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+            struct sigaction action;
+
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                                   &original[i]), 0);
+            memset(&action, 0, sizeof(action));
+            action.sa_handler = switch_inherited_handler;
+            sigemptyset(&action.sa_mask);
+            sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+            action.sa_flags = i == 2 ? SA_RESTART : 0;
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &action, NULL),
+                         0);
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                                   &expected[i]), 0);
+        }
+        ctx = make_ctx();
+        seed_previous_git_identity();
+        g_fail_user_name_set = false;
+        g_raise_on_user_name = false;
+        g_log = NULL;
+        g_guard_end_checkpoint_signal = 0;
+        g_guard_end_hook_signal = signal_number;
+        previous_runner = run_set_runner(fake_runner);
+        (void)signals_test_set_guard_end_hook(raise_during_guard_end);
+        rc = accounts_switch(&ctx, "testacct");
+        run_set_runner(previous_runner);
+
+        CHECK_EQ_INT(rc, 0);
+        CHECK_EQ_INT(g_guard_end_checkpoint_signal, signal_number);
+        CHECK(!signals_pending());
+        for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+            struct sigaction observed;
+
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                                   &observed), 0);
+            CHECK(switch_actions_equal(&observed, &expected[i]));
+            CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &original[i],
+                                   NULL), 0);
+        }
+    }
+}
+
+/* Causal restoration-failure witness for the checked abort path. Before the
+ * fix, abort ignored guard_end's failure and dispatch immediately retried it,
+ * killing the child and erasing the only observable retry boundary. */
+TEST(interrupted_switch_retains_pending_signal_on_restore_failure) {
+    char retained_marker[512];
+    int status = 0;
+    pid_t pid;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK((size_t)snprintf(retained_marker, sizeof(retained_marker),
+                           "%s/guard-restore-retained", g_xdg) <
+          sizeof(retained_marker));
+    seed_previous_git_identity();
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct sigaction default_action;
+        gitswitch_ctx_t ctx = make_ctx();
+        int marker_fd;
+        int rc;
+
+        memset(&default_action, 0, sizeof(default_action));
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        if (sigaction(SIGINT, &default_action, NULL) != 0) _exit(60);
+        g_fail_user_name_set = false;
+        g_raise_on_user_name = true;
+        g_log = NULL;
+        signals_test_fail_sigaction(SIGINT,
+                                    SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        run_set_runner(fake_runner);
+        errno = 0;
+        rc = accounts_switch(&ctx, "testacct");
+        if (rc != -1 || errno != EIO) _exit(61);
+        if (!signals_pending() || signals_pending_signal() != SIGINT) {
+            _exit(62);
+        }
+        if (!strstr(get_last_error()->message, "retained for retry")) {
+            _exit(63);
+        }
+        marker_fd = open(retained_marker,
+                         O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (marker_fd < 0 || close(marker_fd) != 0) _exit(64);
+        (void)signals_dispatch_pending(); /* explicit retry must terminate */
+        _exit(65);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
+    CHECK(access(retained_marker, F_OK) == 0);
+    (void)unlink(retained_marker);
 }
 
 /* AR-08 M4: prepare has already published Git/runtime state but persistence
@@ -2776,6 +2893,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(failed_switch_does_not_overwrite_later_gpg_writer);
     RUN_TEST(direct_switch_restores_callers_signal_dispositions);
     RUN_TEST(direct_switch_reports_signal_restoration_failure_after_commit);
+    RUN_TEST(direct_switch_dispatches_signal_arriving_during_guard_end);
+    RUN_TEST(interrupted_switch_retains_pending_signal_on_restore_failure);
     RUN_TEST(repeated_signals_wait_for_prepared_switch_rollback);
     RUN_TEST(incomplete_prepared_abort_retains_signal_ownership_until_retry);
     RUN_TEST(deferred_signal_survives_post_switch_window);

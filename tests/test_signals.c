@@ -566,6 +566,46 @@ TEST(dispatch_terminates_with_deferred_signal) {
     if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
 }
 
+/* Dispatch must never turn restoration into two unchecked attempts (one in
+ * the caller and one before raise). The first injected failure returns with
+ * both pending-signal and guard ownership intact; only the explicit retry may
+ * restore the final disposition and terminate by the original signal. */
+TEST(dispatch_retains_pending_until_exact_restoration_succeeds) {
+    int status = 0;
+    pid_t pid;
+
+    test_fixture_unlink("dispatch-restore-retained");
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct sigaction default_action;
+
+        memset(&default_action, 0, sizeof(default_action));
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        if (sigaction(SIGTERM, &default_action, NULL) != 0) _exit(20);
+        if (signals_guard_begin() != 0) _exit(21);
+        raise(SIGTERM);
+        if (!signals_pending()) _exit(22);
+        signals_test_fail_sigaction(SIGTERM,
+                                    SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        errno = 0;
+        if (signals_dispatch_pending() != -1 || errno != EIO) _exit(23);
+        if (!signals_pending() || signals_pending_signal() != SIGTERM) {
+            _exit(24);
+        }
+        if (test_fixture_create("dispatch-restore-retained") != 0) _exit(25);
+        (void)signals_dispatch_pending(); /* checked retry must terminate */
+        _exit(26);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
+    CHECK(test_fixture_exists("dispatch-restore-retained"));
+    test_fixture_unlink("dispatch-restore-retained");
+}
+
 /* A second signal while one is pending is the emergency exit: the handler
  * unlinks registered scratch files (SIG-02) and dies immediately with the
  * signal's default action. */
@@ -821,6 +861,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(fixture_creation_and_cleanup_do_not_follow_preplaced_symlink);
     RUN_TEST(scratch_registry_rejects_invalid);
     RUN_TEST(dispatch_terminates_with_deferred_signal);
+    RUN_TEST(dispatch_retains_pending_until_exact_restoration_succeeds);
     RUN_TEST(second_signal_is_emergency_exit_and_drops_scratch);
     RUN_TEST(second_signal_during_rollback_is_deferred);
     RUN_TEST(second_signal_during_rollback_kills_blocking_child);
