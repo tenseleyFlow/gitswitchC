@@ -159,7 +159,7 @@ check_neuter_contract()
     [ "$fortify_define" = "-D_FORTIFY_SOURCE=2" ] ||
         fail "release compile flags do not request _FORTIFY_SOURCE=2"
 
-    script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd) ||
+    script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd) ||
         fail "cannot resolve release-check script directory"
     script=$script_dir/$(basename "$0")
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-release-neuter.XXXXXX") ||
@@ -433,7 +433,7 @@ check_manifest_contract()
 
     clean_repo=$tmp/clean
     git clone --quiet "$root" "$clean_repo" || fail "cannot clone clean HEAD"
-    commit=$(git -C "$clean_repo" rev-parse --verify HEAD^{commit}) ||
+    commit=$(git -C "$clean_repo" rev-parse --verify 'HEAD^{commit}') ||
         fail "cannot resolve cloned HEAD"
     version=$(git -C "$clean_repo" show "$commit:VERSION") ||
         fail "cannot read committed VERSION"

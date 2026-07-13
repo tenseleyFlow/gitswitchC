@@ -486,6 +486,13 @@ test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@echo "All tests passed!"
 endif
 
+# ShellCheck is intentionally a separate, fail-closed QA gate instead of an
+# ordinary `make test` prerequisite: builds remain package-independent while
+# CI and release reviewers can require every dialect parser explicitly.
+.PHONY: shell-static-test
+shell-static-test:
+	@sh tests/test_shell_assets.sh "$(CURDIR)"
+
 # Static analysis
 .PHONY: analyze
 analyze:
@@ -635,6 +642,7 @@ help:
 	@echo "  debug        Build debug version"
 	@echo "  release      Build release version"
 	@echo "  test         Build and run tests"
+	@echo "  shell-static-test Lint and native-parse shipped shell assets"
 	@echo "  install      Install to system"
 	@echo "  uninstall    Remove from system"
 	@echo "  clean        Remove build files"

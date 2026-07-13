@@ -29,6 +29,9 @@ trap 'exit 1' 1 2 3 15
 shim_dir=$tmp/shims
 mkdir "$shim_dir"
 for tool in cppcheck flawfinder valgrind; do
+    # These expansions belong to the generated shim and must remain literal
+    # until that shim is executed by the contract test.
+    # shellcheck disable=SC2016
     printf '%s\n' \
         '#!/bin/sh' \
         'if [ -n "${QA_ARG_LOG:-}" ]; then printf "%s\n" "$*" >"$QA_ARG_LOG"; fi' \

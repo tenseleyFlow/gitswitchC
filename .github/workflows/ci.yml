@@ -19,7 +19,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             bash dash fish gnupg ksh libreadline-dev openssh-client zsh \
-            cppcheck flawfinder rpm
+            cppcheck flawfinder rpm shellcheck
+      - name: Shell assets (ShellCheck + native parsers)
+        run: make shell-static-test
       # Fast textual tripwire only — headers included, but whitespace variants,
       # function-pointer indirection, and macro wrapping evade a grep. The
       # authoritative gate is the symbol check on the built binary below

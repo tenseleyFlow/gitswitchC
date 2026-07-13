@@ -31,7 +31,7 @@ set -u
 # specific mode is required.
 umask 077
 
-ROOT=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)
+ROOT=$(CDPATH='' cd "$(dirname "$0")/.." && pwd -P)
 BIN="$ROOT/build/bin/gitswitch"
 [ -x "$BIN" ] || { echo "build first: make (missing $BIN)"; exit 1; }
 
@@ -44,6 +44,8 @@ fail() { echo "FAIL: $1"; FAILURES=$((FAILURES + 1)); }
 
 SBX=
 ACTIVE_PID=
+# Invoked indirectly by the EXIT and signal traps installed below.
+# shellcheck disable=SC2329
 cleanup() {
     [ -n "$SBX" ] || return 0
     case $ACTIVE_PID in
@@ -67,6 +69,8 @@ cleanup() {
     rm -rf "$SBX"
 }
 
+# Invoked indirectly by the signal traps installed below.
+# shellcheck disable=SC2329
 on_signal() {
     status=$1
     trap - 0 HUP INT TERM
@@ -85,7 +89,7 @@ trap 'on_signal 143' TERM
 # canonical spelling is used for both ancestry validation and the new root, so
 # a lexical symlink cannot smuggle the fixture below HOME or the worktree.
 canonical_dir() {
-    (CDPATH= cd "$1" 2>/dev/null && pwd -P)
+    (CDPATH='' cd "$1" 2>/dev/null && pwd -P)
 }
 
 # Match the production executable resolver's ownership and basic mode policy:
@@ -168,15 +172,12 @@ select_private_root() {
     # candidate lets the selection chain try the conventional runtime roots.
     if (
         unset GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_CEILING_DIRECTORIES
-        HOME=$SBX
-        GIT_CONFIG_GLOBAL=/dev/null
-        GIT_CONFIG_NOSYSTEM=1
-        GIT_DISCOVERY_ACROSS_FILESYSTEM=1
-        export HOME GIT_CONFIG_GLOBAL GIT_CONFIG_NOSYSTEM \
-            GIT_DISCOVERY_ACROSS_FILESYSTEM
         inside=$(
-            "$REAL_GIT" -c 'safe.directory=*' -C "$SBX" \
-                rev-parse --is-inside-work-tree 2>/dev/null
+            HOME=$SBX GIT_CONFIG_GLOBAL=/dev/null \
+                GIT_CONFIG_NOSYSTEM=1 \
+                GIT_DISCOVERY_ACROSS_FILESYSTEM=1 \
+                "$REAL_GIT" -c 'safe.directory=*' -C "$SBX" \
+                    rev-parse --is-inside-work-tree 2>/dev/null
         ) || exit 1
         [ "$inside" = true ]
     ); then
@@ -353,9 +354,12 @@ if agent_ls | grep -q "$FP_A"; then
 else
     fail "previous agent lost after failed switch to no-SSH target"
 fi
-[ "$(git config --global user.name)" = "ssha" ] \
-    && pass "git identity rolled back to ssha" \
-    || fail "git identity not rolled back (got $(git config --global user.name))"
+rolled_back_name=$(git config --global user.name)
+if [ "$rolled_back_name" = "ssha" ]; then
+    pass "git identity rolled back to ssha"
+else
+    fail "git identity not rolled back (got $rolled_back_name)"
+fi
 
 # (b) Failed switch to an SSH-ENABLED target: starting keyB's agent reaps
 #     keyA's, so the rollback must RE-ACTIVATE the previous agent.
