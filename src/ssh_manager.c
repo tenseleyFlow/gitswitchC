@@ -2493,6 +2493,13 @@ static bool ssh_config_next_line(const char *buf, size_t len, size_t offset,
     line->start = offset;
     if (newline) {
         line->text_len = (size_t)(newline - (buf + offset));
+        /* Treat the CR in a conventional CRLF terminator as syntax, not as
+         * part of the marker/directive text. line->end still spans both
+         * bytes, so untouched ranges retain their original byte encoding. */
+        if (line->text_len > 0U &&
+            buf[line->start + line->text_len - 1U] == '\r') {
+            line->text_len--;
+        }
         line->end = (size_t)(newline - buf) + 1U;
     } else {
         line->text_len = len - offset;

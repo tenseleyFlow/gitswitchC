@@ -550,6 +550,110 @@ TEST(valid_duplicates_collapse_to_one_then_remove_to_zero) {
     }
 }
 
+TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes) {
+    static const char preserved[] =
+        "Host user-top\r\n  User alice\r\n"
+        "# >>> gitswitch other >>>\r\nHost other\r\n"
+        "  HostName other.example\r\n"
+        "  IdentityFile \"/other\"\r\n  IdentitiesOnly yes\r\n"
+        "# <<< gitswitch other <<<\r\n"
+        "Host user-tail\r\n  User bob\r\n";
+    static const char original[] =
+        "Host user-top\r\n  User alice\r\n"
+        BEGIN_MARK "\r\nHost " TEST_ALIAS "\r\n"
+        "  HostName stale-one.example\r\n"
+        "  IdentityFile \"/stale/one\"\r\n  IdentitiesOnly yes\r\n"
+        END_MARK "\r\n"
+        "# >>> gitswitch other >>>\r\nHost other\r\n"
+        "  HostName other.example\r\n"
+        "  IdentityFile \"/other\"\r\n  IdentitiesOnly yes\r\n"
+        "# <<< gitswitch other <<<\r\n"
+        BEGIN_MARK "\r\nHost " TEST_ALIAS "\r\n"
+        "  HostName stale-two.example\r\n"
+        "  IdentityFile \"/stale/two\"\r\n  IdentitiesOnly yes\r\n"
+        END_MARK "\r\n"
+        "Host user-tail\r\n  User bob\r\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char output[32768];
+    account_t account;
+    run_opts_t opts;
+    run_result_t result;
+    size_t length = 0;
+    char *content;
+
+    if (!command_exists("ssh")) {
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/new key", home);
+    make_account(&account, key);
+    CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
+
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(length > sizeof(preserved) - 1U);
+        CHECK(length <= sizeof(preserved) - 1U ||
+              memcmp(content, preserved, sizeof(preserved) - 1U) == 0);
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 1);
+        CHECK_EQ_INT(count_text(content, END_MARK), 1);
+        CHECK(strstr(content, "stale-one.example") == NULL);
+        CHECK(strstr(content, "stale-two.example") == NULL);
+        free(content);
+    }
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+    {
+        const char *const argv[] = {
+            "ssh", "-G", "-F", config, TEST_ALIAS, NULL
+        };
+        CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+    }
+    CHECK(!result.out_truncated);
+    CHECK(output_has_value(output, "hostname", TEST_HOSTNAME));
+    CHECK(output_has_value(output, "identityfile", key));
+}
+
+TEST(crlf_remove_preserves_all_unmanaged_bytes) {
+    static const char before[] = "Host before\r\n  User alice\r\n";
+    static const char after[] = "Host after\r\n  User bob\r\n";
+    static const char original[] =
+        "Host before\r\n  User alice\r\n"
+        BEGIN_MARK "\r\nHost " TEST_ALIAS "\r\n"
+        "  HostName github.com\r\n"
+        "  IdentityFile \"/stale/key\"\r\n  IdentitiesOnly yes\r\n"
+        END_MARK "\r\n"
+        "Host after\r\n  User bob\r\n";
+    char home[96], config[MAX_PATH_LEN];
+    char expected[sizeof(before) + sizeof(after)];
+    size_t expected_len;
+    size_t length = 0;
+    char *content;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(ssh_remove_host_alias(TEST_ALIAS), 0);
+    expected_len = (sizeof(before) - 1U) + (sizeof(after) - 1U);
+    memcpy(expected, before, sizeof(before) - 1U);
+    memcpy(expected + sizeof(before) - 1U, after, sizeof(after) - 1U);
+
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK_EQ_INT(length, expected_len);
+        CHECK(length != expected_len ||
+              memcmp(content, expected, expected_len) == 0);
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 0);
+        CHECK_EQ_INT(count_text(content, END_MARK), 0);
+        free(content);
+    }
+}
+
 TEST(byte_identical_config_skips_all_write_and_sync_work) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
     account_t account;
@@ -923,6 +1027,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(exact_marker_parser_preserves_incidental_substrings);
     RUN_TEST(malformed_nested_and_mismatched_blocks_fail_closed);
     RUN_TEST(valid_duplicates_collapse_to_one_then_remove_to_zero);
+    RUN_TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes);
+    RUN_TEST(crlf_remove_preserves_all_unmanaged_bytes);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
     RUN_TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp);
     RUN_TEST(postrename_verification_failure_reports_installed_unverified);
