@@ -9,25 +9,69 @@
 # `compgen -W`, which word-splits AND re-expands its wordlist — the latter would
 # execute a name like `$(...)` on TAB and mangle any name containing a space.
 
-# Populate COMPREPLY with the live account names that prefix-match "$cur",
-# quoting each candidate so names with spaces complete as a single word.
+# Backslash-quote only shell metacharacters, leaving every other byte intact.
+# Bash's printf %q switches to $'\ooo' fragments for UTF-8 bytes in the C
+# locale; on the next TAB those fragments become the prefix and no longer
+# match the raw name. `complete -o filenames` would make Bash quote raw values,
+# but also appends '/' when an account happens to name a local directory.
+# This byte-preserving form works in Bash 3.2 and is exactly reversible below.
+_gitswitch_quote_candidate() {
+    local value=$1 quoted="" ch
+    while [[ -n $value ]]; do
+        ch=${value%"${value#?}"}
+        value=${value#?}
+        case $ch in
+        ' '|"'"|'"'|\\|'('|')'|'['|']'|'{'|'}'|'*'|'?'|'!'|'$'|'`'|'&'|'|'|';'|'<'|'>'|'#'|'~')
+            quoted+="\\$ch"
+            ;;
+        *)
+            quoted+=$ch
+            ;;
+        esac
+    done
+    _gitswitch_quote_result=$quoted
+}
+
+_gitswitch_unquote_candidate() {
+    local value=$1 unquoted="" ch escaped=0
+    while [[ -n $value ]]; do
+        ch=${value%"${value#?}"}
+        value=${value#?}
+        if ((escaped)); then
+            unquoted+=$ch
+            escaped=0
+        elif [[ $ch == \\ ]]; then
+            escaped=1
+        else
+            unquoted+=$ch
+        fi
+    done
+    # Preserve a literal trailing backslash instead of silently deleting it.
+    if ((escaped)); then
+        unquoted+=\\
+    fi
+    _gitswitch_unquote_result=$unquoted
+}
+
+# Populate COMPREPLY with the live account names that prefix-match "$cur".
 _gitswitch_complete_accounts() {
     local cur=$1 n
+    local _gitswitch_quote_result _gitswitch_unquote_result
     local -a names=()
     # Read one name per line WITHOUT mapfile: mapfile is bash >= 4, but stock
     # macOS ships bash 3.2, where it fails with a visible error (AR-06 F37).
     while IFS= read -r n; do
         names+=("$n")
     done < <(command gitswitch --names list 2>/dev/null)
-    # $cur carries readline's own backslash-escapes once a previous TAB has
-    # completed a name containing spaces/metacharacters (our printf '%q' output
-    # inserted them). Prefix-matching the raw, unescaped names against that
-    # escaped $cur matched nothing on the SECOND TAB (AR-06 F13). Strip the
-    # escapes for the comparison; the emitted candidate is still %q-quoted.
-    local dq=${cur//\\/}
+    # A previous TAB can feed our backslash-quoted common prefix back as $cur.
+    # Decode pairs rather than deleting every backslash: `\\` represents one
+    # literal backslash while `\ `, `\'`, etc. represent shell metacharacters.
+    _gitswitch_unquote_candidate "$cur"
     for n in "${names[@]}"; do
-        if [[ -z $dq || $n == "$dq"* ]]; then
-            COMPREPLY+=("$(printf '%q' "$n")")
+        if [[ -z $_gitswitch_unquote_result ||
+            $n == "$_gitswitch_unquote_result"* ]]; then
+            _gitswitch_quote_candidate "$n"
+            COMPREPLY+=("$_gitswitch_quote_result")
         fi
     done
 }

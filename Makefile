@@ -59,20 +59,32 @@ CC_RESOLVED_DEFAULT := $(shell p=`command -v "$(CC_LAUNCHER)" 2>/dev/null` || ex
 	cd "$$d" 2>/dev/null && printf '%s/%s' "$$PWD" "$$b")
 CC_IDENTITY_FILE ?= $(CC_RESOLVED_DEFAULT)
 TOOLCHAIN_IDENTITY_FILES ?= $(CC_IDENTITY_FILE)
-TOOLCHAIN_FILE_FINGERPRINT := $(shell set -e; \
+override TOOLCHAIN_FINGERPRINT_FAILURE := __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__
+TOOLCHAIN_FILE_FINGERPRINT := $(shell ( \
+	fingerprint=; \
+	test -n "$(strip $(TOOLCHAIN_IDENTITY_FILES))" || exit 1; \
 	for f in $(TOOLCHAIN_IDENTITY_FILES); do \
-		test -f "$$f" || exit 1; \
+		test -f "$$f" && test -r "$$f" || exit 1; \
 		if command -v sha256sum >/dev/null 2>&1; then \
-			digest=`sha256sum "$$f" | awk '{print $$1}'`; \
+			digest_output=`sha256sum "$$f"` || exit 1; \
+			digest=$${digest_output%% *}; \
 		elif command -v shasum >/dev/null 2>&1; then \
-			digest=`shasum -a 256 "$$f" | awk '{print $$1}'`; \
+			digest_output=`shasum -a 256 "$$f"` || exit 1; \
+			digest=$${digest_output%% *}; \
 		elif command -v sha256 >/dev/null 2>&1; then \
-			digest=`sha256 -q "$$f"`; \
+			digest=`sha256 -q "$$f"` || exit 1; \
 		else \
-			digest=`cksum "$$f" | awk '{print $$1 ":" $$2}'`; \
+			digest_output=`cksum "$$f"` || exit 1; \
+			set -- $$digest_output; \
+			test -n "$$1" && test -n "$$2" || exit 1; \
+			digest=$$1:$$2; \
 		fi; \
-		printf '%s=%s;' "$$f" "$$digest"; \
-	done)
+		test -n "$$digest" || exit 1; \
+		fingerprint=$$fingerprint$$f=$$digest\;; \
+	done; \
+	test -n "$$fingerprint" || exit 1; \
+	printf '%s' "$$fingerprint"; \
+) || printf '%s' '$(TOOLCHAIN_FINGERPRINT_FAILURE)')
 CC_VERSION_ID := $(shell $(CC) --version 2>/dev/null | sed -n '1p')
 override TARGET_TRIPLE_DETECTED := $(shell $(CC) -dumpmachine 2>/dev/null | sed -n '1p')
 # A claimed target is security policy, not caller metadata: accepting a
@@ -376,11 +388,17 @@ AR07_RESET_MAIN_OBJECT = $(OBJDIR)/main_ar07_reset.o
 AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
 AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
 AR08_COPY_UTILS_OBJECT = $(OBJDIR)/utils_ar08_copy.o
+AR09_SECURITY_UTILS_OBJECT = $(OBJDIR)/utils_ar09_security.o
+AR09_DISPATCH_SIGNALS_OBJECT = $(OBJDIR)/signals_ar09_dispatch.o
+AR09_DISPATCH_TEST_OBJECT = $(OBJDIR)/test_signals_ar09_dispatch.o
 DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR07_RESET_MAIN_OBJECT:.o=.d) \
            $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d) \
            $(AR08_HINT_CONFIG_OBJECT:.o=.d) \
-           $(AR08_COPY_UTILS_OBJECT:.o=.d)
+           $(AR08_COPY_UTILS_OBJECT:.o=.d) \
+           $(AR09_SECURITY_UTILS_OBJECT:.o=.d) \
+           $(AR09_DISPATCH_SIGNALS_OBJECT:.o=.d) \
+           $(AR09_DISPATCH_TEST_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -418,7 +436,8 @@ $(DIST_PUBLISH_NAMED_TEST_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
 		-DGITSWITCH_RELEASE_TEST_FD_PRESSURE=1 \
 		-DGITSWITCH_RELEASE_TEST_ADOPTION_RACE=1 \
 		-DGITSWITCH_RELEASE_TEST_PUBLICATION_RACE=1 \
-		-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 $< -o $@
+		-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 \
+		-DGITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS=5000 $< -o $@
 
 # Build-config stamp: objects/tests share build/obj and build/bin across every
 # configuration. Record every effective compile/link input, not just the build
@@ -517,10 +536,14 @@ release-policy-check:
 		echo 'ERROR: claimed release target differs from compiler target' >&2; exit 1; \
 	}; \
 	test -f "$$GITSWITCH_RELEASE_POLICY_CC" && \
-	test -n "$$GITSWITCH_RELEASE_POLICY_CC_VERSION" && \
-	test -n "$$GITSWITCH_RELEASE_POLICY_FINGERPRINT" || { \
-		echo 'ERROR: compiler path, version, and content fingerprint are required' >&2; exit 1; \
+	test -n "$$GITSWITCH_RELEASE_POLICY_CC_VERSION" || { \
+		echo 'ERROR: compiler path and version are required' >&2; exit 1; \
 	}; \
+	case "$$GITSWITCH_RELEASE_POLICY_FINGERPRINT" in \
+		''|$(TOOLCHAIN_FINGERPRINT_FAILURE)) \
+			echo 'ERROR: complete compiler content fingerprint is required' >&2; exit 1 ;; \
+		*) ;; \
+	esac; \
 	case "$$GITSWITCH_RELEASE_POLICY_OS" in \
 		Linux|FreeBSD) \
 			test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = elf || { \
@@ -705,11 +728,35 @@ $(AR08_HINT_CONFIG_OBJECT): $(SRCDIR)/config.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
-# The copy-permission suite observes exact descriptor checkpoints before any
-# bytes and after its first flushed test chunk; production utils.o has no hook.
+# The copy/read, runner, and terminal-echo suites use deterministic descriptor,
+# sigaction, and tcsetattr checkpoints; production utils.o contains none of
+# those test-only hooks.
 $(AR08_COPY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling AR-08 copy permission test object..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
+# The runtime-lock classification suite injects synthetic ownership and ACL
+# facts so lifetime mutability is deterministic on every supported host.
+$(AR09_SECURITY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-09 runtime classification test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
+# Deferred-dispatch failure injection is test-build-only. Compile both sides
+# of that private API into dedicated objects so the production binary and
+# installed signals header surface contain no active fault state.
+$(AR09_DISPATCH_SIGNALS_OBJECT): $(SRCDIR)/signals.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-09 signal dispatch test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
+$(AR09_DISPATCH_TEST_OBJECT): $(TESTDIR)/test_signals.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-09 signal dispatch test suite..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
 		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
@@ -745,10 +792,38 @@ $(BINDIR)/test_ar08_copy_permissions: \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+$(BINDIR)/test_ar08_echo: \
+		$(OBJDIR)/test_ar08_echo.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_ar07_runner: \
+		$(OBJDIR)/test_ar07_runner.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_security: \
+		$(OBJDIR)/test_security.o \
+		$(AR09_SECURITY_UTILS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_signals: \
+		$(AR09_DISPATCH_TEST_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 # These suites execute the worktree production CLI instead of a linked test
 # entry point. Keep the dependency explicit for focused invocations: the
 # aggregate `make test` prerequisite must not be the only thing preventing a
-# stale or missing build/bin/gitswitch from being exercised (AR-08 M47).
+# stale or missing selected-build CLI from being exercised (AR-08 M47).
 $(CLI_E2E_TEST_TARGETS): | $(BINDIR)/$(TARGET)
 
 # Dependency files are optional on the first build and authoritative
@@ -757,9 +832,10 @@ $(CLI_E2E_TEST_TARGETS): | $(BINDIR)/$(TARGET)
 -include $(DEPFILES)
 
 # Build and run tests. The main binary is a dependency because the CLI-level
-# tests (tests/test_cli.c) exec build/bin/gitswitch: main.c is excluded from
-# the test link (it defines main), so its command handlers are only reachable
-# end-to-end through the binary itself.
+# tests exec the selected-build CLI: main.c is excluded from the test link (it
+# defines main), so its command handlers are only reachable end-to-end through
+# the binary itself. Override any inherited GITSWITCH_BIN so an alternate
+# BUILDDIR can never test a stale CLI from another build.
 .PHONY: test
 ifeq ($(strip $(TEST_SOURCES)),)
 test:
@@ -768,9 +844,11 @@ test:
 else
 test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@echo "Running tests..."
-	@for test in $(TEST_TARGETS); do \
+	@GITSWITCH_BIN="$(abspath $(BINDIR)/$(TARGET))"; \
+	export GITSWITCH_BIN; \
+	for test in $(TEST_TARGETS); do \
 		echo "Running $$test..."; \
-		$$test || exit 1; \
+		"$$test" || exit 1; \
 	done
 	@echo "All tests passed!"
 endif
@@ -1169,11 +1247,12 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
 		"$$stage$(PREFIX)/bin/$(TARGET)" "$(TARGET_TRIPLE)"; \
+	# Exercise the compiler-argv contract even when CC itself is one word. \
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
-	sh tests/test_ar07_release.sh neuter "$(CC)" \
+	sh tests/test_ar07_release.sh neuter \
 		"$(SECURITY_CFLAGS_RELEASE)" \
 		"$(CURDIR)/$(SRCDIR)/release_hardening.h" \
-		"$(MAKE_COMMAND)"
+		"$(MAKE_COMMAND)" -- env $(CC)
 else
 release-artifact-test:
 	@echo "ERROR: release-artifact-test requires BUILD_TYPE=release" >&2

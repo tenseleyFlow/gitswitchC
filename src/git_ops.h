@@ -18,15 +18,16 @@
 #define GIT_CONFIG_CORE_SSHCOMMAND "core.sshcommand"
 
 /* Largest managed value emitted by gitswitch. core.sshCommand contains two
- * inputs shorter than MAX_PATH_LEN. A canonical executable can consist
- * entirely of apostrophes, so POSIX single-quote serialization needs at most
- * 4 * (MAX_PATH_LEN - 1) bytes for it. is_safe_ssh_key_path() rejects quotes,
- * so its serialized key contributes at most MAX_PATH_LEN - 1 bytes. The 256
- * bytes cover both pairs of quote delimiters, fixed options, and the NUL.
- * Public status records and the scalar cache use this lossless capacity;
- * transactional snapshots remain dynamically allocated for arbitrary foreign
- * values. */
-#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN * 5 + 256)
+ * inputs shorter than MAX_PATH_LEN plus an optional canonical hostname shorter
+ * than MAX_NAME_LEN. A canonical executable can consist entirely of
+ * apostrophes, so POSIX single-quote serialization needs at most
+ * 4 * (MAX_PATH_LEN - 1) bytes for it. is_safe_ssh_key_path() and the hostname
+ * validator reject quotes, so their serialized payloads contribute at most
+ * MAX_PATH_LEN - 1 and MAX_NAME_LEN - 1 bytes. The 256 bytes cover quote
+ * delimiters, fixed options, and the NUL. Public status records and the scalar
+ * cache use this lossless capacity; transactional snapshots remain dynamically
+ * allocated for arbitrary foreign values. */
+#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN * 5 + MAX_NAME_LEN + 256)
 
 typedef enum {
     GIT_CONFIG_ORIGIN_UNKNOWN = 0,
@@ -93,9 +94,11 @@ const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope);
 /**
  * Build the exact core.sshCommand expected for an SSH-enabled account.
  * This resolves `ssh` through the hardened executable trust walk, expands the
- * key path, and serializes both absolute arguments safely. It does not require
- * the key file to exist, so read-only status can compare persisted Git state
- * without introducing a filesystem mutation.
+ * key path, isolates OpenSSH from shared configuration, and serializes both
+ * absolute arguments safely. For a managed alias it also pins the validated
+ * canonical hostname. It does not require the key file to exist, so read-only
+ * status can compare persisted Git state without introducing a filesystem
+ * mutation.
  */
 int git_expected_ssh_command(const account_t *account, char *command,
                              size_t command_size);
@@ -111,9 +114,12 @@ int git_clear_config(git_scope_t scope);
  * at `scope` before a switch mutates them, plus the LOCAL scope when a global
  * write would clear it and any distinct WORKTREE override scope. Every
  * repeated value is retained in order. Included managed values are refused
- * when their origin cannot be restored exactly. Pair with
- * git_config_restore() to roll back on a failed switch. Single snapshot slot
- * (the CLI is single-threaded); a new snapshot replaces the previous.
+ * when their origin cannot be restored exactly. Real-Git transactions also
+ * retain descriptor-backed repository and configuration-namespace
+ * generations so a later pathname replacement cannot inherit rollback
+ * ownership merely by copying the same values. Pair with git_config_restore()
+ * to roll back on a failed switch. Single snapshot slot (the CLI is
+ * single-threaded); a new snapshot replaces the previous.
  */
 int git_config_snapshot(git_scope_t scope);
 
@@ -121,18 +127,22 @@ int git_config_snapshot(git_scope_t scope);
  * Verify the active transaction's exact intended post-write vectors against a
  * fresh Git read. The intended image is updated only by this process's
  * successful managed writes, so a concurrent value arriving before this call
- * is rejected rather than adopted. Call after all forward Git writes and
- * before later transaction steps can fail. Idempotent after successful seal.
+ * is rejected rather than adopted. For real Git, sealing also pins the exact
+ * installed config-file generation that rollback may replace. Call after all
+ * forward Git writes and before later transaction steps can fail. Idempotent
+ * after successful seal.
  */
 int git_config_seal(void);
 
 /**
  * Restore the most recent git_config_snapshot(), rebuilding every key with its
  * exact ordered values only while the current vector still matches the sealed
- * transaction-owned state. A failed restore preserves concurrent changes and
- * retains the snapshot plus exact per-key progress for retry. Partially failed
- * forward writes are compared against the intended image recorded through the
- * last successful managed operation. No-op if nothing was snapshotted.
+ * transaction-owned state and the repository, config namespace, and sealed
+ * config-file generations still identify the original destination. A failed
+ * restore preserves concurrent changes and retains the snapshot plus exact
+ * per-key progress for retry. Partially failed forward writes are compared
+ * against the intended image recorded through the last successful managed
+ * operation. No-op if nothing was snapshotted.
  */
 int git_config_restore(void);
 
@@ -147,10 +157,13 @@ void git_config_commit(void);
  * — dead public API with zero callers. */
 
 /**
- * Test git configuration
- * - Creates a test commit (dry-run)
- * - Validates signing if enabled
- * - Verifies SSH access to remotes if applicable
+ * Validate that Git's fresh merged effective configuration exactly represents
+ * the selected account: identity, managed SSH command, signing key and enabled
+ * state, OpenPGP format, and absence of managed GPG program overrides. When
+ * GPG is enabled, also require the selected secret key to be locally
+ * available. `scope` must be a valid public scope but does not limit the
+ * effective read. This function creates no commit or signature and performs
+ * no remote authentication or other network access.
  */
 int git_test_config(const account_t *account, git_scope_t scope);
 
@@ -197,7 +210,9 @@ int git_configure_gpg(const account_t *account, git_scope_t scope);
 bool git_is_repository(void);
 
 /**
- * Get repository root directory
+ * Get the complete repository root directory, stripping only Git's final line
+ * ending. Valid path whitespace is preserved. On failure, path is empty when
+ * path/path_size denote writable storage; incomplete or oversized results fail.
  */
 int git_get_repo_root(char *path, size_t path_size);
 

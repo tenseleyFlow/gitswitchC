@@ -56,9 +56,21 @@ extern char **environ;
 #define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 0
 #endif
 
-/* Static variables for terminal state management */
-static struct termios g_original_termios;
-static bool g_echo_disabled = false;
+typedef struct {
+    bool active;
+    int fd;
+    dev_t dev;
+    ino_t ino;
+    dev_t rdev;
+    struct termios original;
+} terminal_echo_state_t;
+
+/* Echo recovery owns the exact terminal it changed, not whichever object is
+ * later installed as standard input.  Publish this state only after the
+ * no-echo transition succeeds. */
+static terminal_echo_state_t g_terminal_echo_state = {
+    .fd = -1
+};
 
 #define RUNTIME_LOCK_CONTEXTS 8
 #define PRIVATE_LOCK_INODES 64
@@ -87,6 +99,7 @@ typedef struct {
     bool active;
     int lock_fd;
     uint64_t lock_generation;
+    size_t anchor_slot;
     int parent_fd;
     int dir_fd;
     dev_t parent_dev;
@@ -102,6 +115,18 @@ static private_lock_context_t g_private_lock_contexts[PRIVATE_LOCK_CONTEXTS];
 static pid_t g_private_lock_pid;
 static pid_t g_runtime_lock_pid;
 static uint64_t g_private_lock_next_generation;
+
+static int dup_cloexec(int fd, int minimum);
+static int private_lock_inode_acquire(int owned_fd, bool nonblocking,
+                                      size_t *slot_out);
+static void private_lock_inode_release(size_t slot);
+static bool exec_fd_acl_is_trusted(int fd);
+#ifdef GITSWITCH_TESTING
+bool runtime_entry_test_may_be_replaced(
+    uid_t uid, mode_t parent_mode, uid_t parent_uid,
+    bool parent_acl_trusted, uid_t child_uid, bool child_acl_trusted,
+    bool child_owner_can_add_delete_acl);
+#endif
 
 /* String utilities */
 
@@ -459,11 +484,227 @@ static int open_directory_nofollow(const char *path, struct stat *opened) {
     return fd;
 }
 
+/* Conservatively decide whether this uid could replace the child entry. Mode
+ * checks deliberately over-approximate group access: an unnecessary ancestor
+ * lock only narrows concurrency, while missing one can split the namespace.
+ * Sticky directories still protect entries not owned by this uid. Nontrivial
+ * or unreadable ACLs are treated as permitting replacement. */
+static bool runtime_entry_permissions_may_be_replaced(
+    uid_t uid, const struct stat *parent, bool parent_acl_trusted,
+    const struct stat *child, bool child_acl_trusted,
+    bool child_owner_can_add_delete_acl) {
+    bool writable;
+
+    if (uid == (uid_t)0) return true;
+    /* An owner can add write permission later, so current mode bits cannot
+     * make an owned ancestor stable for the lifetime of the transaction. */
+    if (parent->st_uid == uid) return true;
+    /* Darwin and NFSv4 child owners can later add a DELETE ACL even when the
+     * current ACL is trivial. Keep this capability platform-scoped so Linux
+     * paths do not acquire an unnecessarily broad system-directory lock. */
+    if (child_owner_can_add_delete_acl && child->st_uid == uid) return true;
+    /* Darwin and NFSv4 ACLs may grant deletion on the child itself even when
+     * the parent mode/ACL appears immutable. Ambiguous ACLs serialize. */
+    if (!parent_acl_trusted || !child_acl_trusted) return true;
+    writable =
+        (parent->st_mode & (S_IWGRP | S_IXGRP)) ==
+            (S_IWGRP | S_IXGRP) ||
+        (parent->st_mode & (S_IWOTH | S_IXOTH)) ==
+            (S_IWOTH | S_IXOTH);
+    if (!writable) return false;
+    if ((parent->st_mode & S_ISVTX) != 0 && parent->st_uid != uid &&
+        child->st_uid != uid) {
+        return false;
+    }
+    return true;
+}
+
+static bool runtime_entry_may_be_replaced(int parent_fd, int child_fd,
+                                          const struct stat *parent,
+                                          const struct stat *child) {
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    const bool child_owner_can_add_delete_acl = true;
+#else
+    const bool child_owner_can_add_delete_acl = false;
+#endif
+
+    return runtime_entry_permissions_may_be_replaced(
+        getuid(), parent, exec_fd_acl_is_trusted(parent_fd), child,
+        exec_fd_acl_is_trusted(child_fd), child_owner_can_add_delete_acl);
+}
+
+#ifdef GITSWITCH_TESTING
+bool runtime_entry_test_may_be_replaced(
+    uid_t uid, mode_t parent_mode, uid_t parent_uid,
+    bool parent_acl_trusted, uid_t child_uid, bool child_acl_trusted,
+    bool child_owner_can_add_delete_acl) {
+    struct stat parent;
+    struct stat child;
+
+    memset(&parent, 0, sizeof(parent));
+    memset(&child, 0, sizeof(child));
+    parent.st_mode = S_IFDIR | parent_mode;
+    parent.st_uid = parent_uid;
+    child.st_mode = S_IFDIR | 0700;
+    child.st_uid = child_uid;
+    return runtime_entry_permissions_may_be_replaced(
+        uid, &parent, parent_acl_trusted, &child, child_acl_trusted,
+        child_owner_can_add_delete_acl);
+}
+#endif
+
+static void runtime_path_release_anchor(size_t *anchor_slot) {
+    if (anchor_slot && *anchor_slot != PRIVATE_LOCK_INODES) {
+        private_lock_inode_release(*anchor_slot);
+        *anchor_slot = PRIVATE_LOCK_INODES;
+    }
+}
+
+/* Open an absolute, lexically normalized runtime path one component at a
+ * time.  Whole-path O_NOFOLLOW protects only the leaf; using openat() from a
+ * pinned parent makes the same no-link rule apply to every directory entry.
+ * Each opened descriptor is also matched to the entry observed without
+ * following links before the walk advances. When anchor_slot is non-NULL,
+ * acquire and retain a non-blocking lock on the parent of the first entry this
+ * uid could replace. Every cooperating traversal then shares that stable
+ * prefix even if a lower ordinary directory is renamed and recreated. */
+static int open_runtime_path_nofollow(const char *path, struct stat *opened,
+                                      size_t *anchor_slot,
+                                      bool *anchor_lock_failed) {
+    char component[MAX_PATH_LEN];
+    struct stat current_stat;
+    int current_fd;
+
+    if (anchor_slot) *anchor_slot = PRIVATE_LOCK_INODES;
+    if (anchor_lock_failed) *anchor_lock_failed = false;
+    if (!path || path[0] != '/' || !opened ||
+        (anchor_slot && !anchor_lock_failed)) {
+        errno = EINVAL;
+        return -1;
+    }
+    current_fd = open_directory_nofollow("/", &current_stat);
+    if (current_fd < 0) return -1;
+
+    const char *cursor = path + 1;
+    while (*cursor) {
+        const char *separator = strchr(cursor, '/');
+        size_t length = separator ? (size_t)(separator - cursor)
+                                  : strlen(cursor);
+        struct stat entry_stat;
+        struct stat next_stat;
+        int flags = O_RDONLY;
+        int next_fd;
+
+        if (length == 0 || length >= sizeof(component)) {
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = length == 0 ? EINVAL : ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(component, cursor, length);
+        component[length] = '\0';
+#ifdef O_DIRECTORY
+        flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+        flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+        flags |= O_CLOEXEC;
+#endif
+        next_fd = openat(current_fd, component, flags);
+        if (next_fd < 0) {
+            int saved_errno = errno;
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = saved_errno;
+            return -1;
+        }
+        if (fstat(next_fd, &next_stat) != 0 ||
+            fstatat(current_fd, component, &entry_stat,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            int saved_errno = errno;
+            close(next_fd);
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = saved_errno;
+            return -1;
+        }
+        if (!S_ISDIR(next_stat.st_mode) || !S_ISDIR(entry_stat.st_mode) ||
+            !same_fs_identity(&next_stat, &entry_stat)) {
+            close(next_fd);
+            close(current_fd);
+            runtime_path_release_anchor(anchor_slot);
+            errno = EACCES;
+            return -1;
+        }
+        if (anchor_slot && *anchor_slot == PRIVATE_LOCK_INODES &&
+            runtime_entry_may_be_replaced(current_fd, next_fd, &current_stat,
+                                          &next_stat)) {
+            int anchor_fd = dup_cloexec(current_fd, 0);
+            if (anchor_fd < 0 ||
+                private_lock_inode_acquire(anchor_fd, true,
+                                           anchor_slot) != 0) {
+                int saved_errno = errno;
+                *anchor_lock_failed = true;
+                close(next_fd);
+                close(current_fd);
+                runtime_path_release_anchor(anchor_slot);
+                errno = saved_errno;
+                return -1;
+            }
+            if (fstatat(current_fd, component, &entry_stat,
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                int saved_errno = errno;
+                close(next_fd);
+                close(current_fd);
+                runtime_path_release_anchor(anchor_slot);
+                errno = saved_errno;
+                return -1;
+            }
+            if (!S_ISDIR(entry_stat.st_mode) ||
+                !same_fs_identity(&next_stat, &entry_stat)) {
+                close(next_fd);
+                close(current_fd);
+                runtime_path_release_anchor(anchor_slot);
+                errno = EACCES;
+                return -1;
+            }
+        }
+        close(current_fd);
+        current_fd = next_fd;
+        current_stat = next_stat;
+        cursor = separator ? separator + 1 : cursor + length;
+    }
+    *opened = current_stat;
+    return current_fd;
+}
+
+static bool runtime_path_component_error(int error) {
+    if (error == EACCES || error == EPERM || error == ENOTDIR ||
+        error == ELOOP) {
+        return true;
+    }
+#ifdef EMLINK
+    if (error == EMLINK) return true;
+#endif
+    return false;
+}
+
+static bool runtime_lock_is_contended_error(int error) {
+    bool contended = error == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+    contended = contended || error == EAGAIN;
+#endif
+    return contended;
+}
+
 /* Normalize only lexical no-op components in XDG_RUNTIME_DIR.  In particular,
- * do not call realpath(): the final component must remain visible to lstat so
- * `link`, `link/`, and `link/.` all receive the same no-symlink decision.
- * Parent traversal is rejected rather than normalized because `..` across an
- * intermediate symlink has filesystem-dependent meaning. */
+ * do not call realpath(): every component must remain visible to the later
+ * descriptor-relative no-follow walk, so `link`, `link/`, and `link/.` all
+ * receive the same decision. Parent traversal is rejected rather than
+ * normalized because `..` across an intermediate link has filesystem-
+ * dependent meaning. */
 static int normalize_runtime_path(const char *input, char *output,
                                   size_t output_size) {
     if (!input || input[0] != '/' || !output || output_size < 2) {
@@ -504,16 +745,41 @@ static int normalize_runtime_path(const char *input, char *output,
     return 0;
 }
 
-int open_runtime_parent(char *path, size_t path_size) {
+/* Darwin exposes /tmp as the system-owned /private/tmp alias. Test fixtures
+ * and callers commonly spell private runtime directories below /tmp, so
+ * translate that one documented platform alias before the strict no-follow
+ * walk. No caller-controlled component below it is resolved. */
+static int canonicalize_runtime_tmp_prefix(const char *normalized,
+                                           char *canonical,
+                                           size_t canonical_size) {
+    if (strncmp(normalized, "/tmp", 4) != 0 ||
+        (normalized[4] != '\0' && normalized[4] != '/')) {
+        return safe_strncpy(canonical, normalized, canonical_size);
+    }
+
+    char *tmp_target = realpath("/tmp", NULL);
+    if (!tmp_target) return -1;
+    int written = snprintf(canonical, canonical_size, "%s%s", tmp_target,
+                           normalized + 4);
+    free(tmp_target);
+    if (written < 0 || (size_t)written >= canonical_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int open_runtime_parent_impl(char *path, size_t path_size,
+                                    size_t *anchor_slot) {
     const char *xdg = getenv("XDG_RUNTIME_DIR");
     char normalized_xdg[MAX_PATH_LEN];
+    char canonical_xdg[MAX_PATH_LEN];
     const char *configured_xdg = xdg;
-    struct stat before;
     struct stat opened;
-    struct stat after;
-    bool use_xdg = false;
+    bool anchor_lock_failed = false;
     int fd;
 
+    if (anchor_slot) *anchor_slot = PRIVATE_LOCK_INODES;
     if (!path || path_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid runtime-parent output buffer");
         return -1;
@@ -537,50 +803,72 @@ int open_runtime_parent(char *path, size_t path_size) {
                       xdg);
             return -1;
         }
-        configured_xdg = normalized_xdg;
+        if (canonicalize_runtime_tmp_prefix(normalized_xdg, canonical_xdg,
+                                            sizeof(canonical_xdg)) != 0) {
+            if (errno == ENAMETOOLONG) {
+                set_error(
+                    ERR_INVALID_PATH,
+                    "XDG_RUNTIME_DIR has an oversized system-temporary path: %s",
+                    xdg);
+            } else {
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot resolve system temporary alias");
+            }
+            return -1;
+        }
+        configured_xdg = canonical_xdg;
     }
 
     if (xdg && *xdg) {
-        if (lstat(configured_xdg, &before) == 0) {
-            use_xdg = true;
-        } else if (errno != ENOENT) {
-            set_system_error(ERR_FILE_IO,
-                             "Cannot inspect XDG_RUNTIME_DIR: %s",
-                             configured_xdg);
+        fd = open_runtime_path_nofollow(configured_xdg, &opened,
+                                        anchor_slot, &anchor_lock_failed);
+        if (fd >= 0) {
+            if (opened.st_uid != getuid() ||
+                (opened.st_mode & 0777) != PERM_USER_RWX) {
+                close(fd);
+                runtime_path_release_anchor(anchor_slot);
+                set_error(ERR_PERMISSION_DENIED,
+                          "XDG_RUNTIME_DIR must be an accessible 0700 self-owned directory: %s",
+                          configured_xdg);
+                return -1;
+            }
+            if (safe_strncpy(path, configured_xdg, path_size) != 0) {
+                close(fd);
+                runtime_path_release_anchor(anchor_slot);
+                set_error(ERR_INVALID_PATH, "XDG_RUNTIME_DIR path is too long");
+                return -1;
+            }
+            return fd;
+        }
+        int open_error = errno;
+        if (anchor_lock_failed) {
+            errno = open_error;
+            if (runtime_lock_is_contended_error(open_error)) {
+                set_error(ERR_FILE_IO,
+                          "Another gitswitch holds the shared runtime lock "
+                          "(possibly waiting at a passphrase/PIN prompt); try "
+                          "again after that command finishes");
+            } else {
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Cannot lock stable XDG_RUNTIME_DIR ancestor: %s",
+                    configured_xdg);
+            }
             return -1;
         }
-    }
-
-    if (use_xdg) {
-        if (!S_ISDIR(before.st_mode) || S_ISLNK(before.st_mode) ||
-            before.st_uid != getuid() ||
-            (before.st_mode & 0777) != PERM_USER_RWX) {
-            set_error(ERR_PERMISSION_DENIED,
-                      "XDG_RUNTIME_DIR must be an accessible 0700 self-owned directory: %s",
-                      configured_xdg);
+        if (open_error != ENOENT) {
+            if (runtime_path_component_error(open_error)) {
+                set_error(ERR_PERMISSION_DENIED,
+                          "XDG_RUNTIME_DIR contains an unsafe path component: %s",
+                          configured_xdg);
+            } else {
+                errno = open_error;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot inspect XDG_RUNTIME_DIR: %s",
+                                 configured_xdg);
+            }
             return -1;
         }
-        if (safe_strncpy(path, configured_xdg, path_size) != 0) {
-            set_error(ERR_INVALID_PATH, "XDG_RUNTIME_DIR path is too long");
-            return -1;
-        }
-        fd = open_directory_nofollow(path, &opened);
-        if (fd < 0 || opened.st_uid != getuid() ||
-            (opened.st_mode & 0777) != PERM_USER_RWX ||
-            !same_fs_identity(&before, &opened)) {
-            if (fd >= 0) close(fd);
-            set_error(ERR_PERMISSION_DENIED,
-                      "XDG_RUNTIME_DIR changed or is unsafe: %s", path);
-            return -1;
-        }
-        if (lstat(path, &after) != 0 || !S_ISDIR(after.st_mode) ||
-            !same_fs_identity(&opened, &after)) {
-            close(fd);
-            set_error(ERR_PERMISSION_DENIED,
-                      "XDG_RUNTIME_DIR changed while being opened: %s", path);
-            return -1;
-        }
-        return fd;
     }
 
     /* /tmp is a symlink to /private/tmp on macOS.  Open its canonical target
@@ -606,11 +894,20 @@ int open_runtime_parent(char *path, size_t path_size) {
     return fd;
 }
 
-/* Configured XDG roots are required to be non-symlinks and are checked with
- * lstat. The fixed /tmp fallback may itself be a platform symlink (Darwin), so
- * namespace identity checks compare its followed target to the pinned fd. */
+int open_runtime_parent(char *path, size_t path_size) {
+    return open_runtime_parent_impl(path, path_size, NULL);
+}
+
+/* Configured XDG roots are re-opened through the same component-wise no-follow
+ * walk used for acquisition. The fixed /tmp fallback may itself be a platform
+ * symlink (Darwin), so its identity check follows that one supported alias. */
 static int runtime_parent_named_stat(const char *path, struct stat *st) {
-    return strcmp(path, "/tmp") == 0 ? stat(path, st) : lstat(path, st);
+    if (strcmp(path, "/tmp") == 0) return stat(path, st);
+
+    int fd = open_runtime_path_nofollow(path, st, NULL, NULL);
+    if (fd < 0) return -1;
+    close(fd);
+    return 0;
 }
 
 static const char *runtime_lock_stat_failure_kind(int error) {
@@ -742,8 +1039,11 @@ static bool private_lock_fd_has_identity(int fd, dev_t dev, ino_t ino) {
     return fd >= 0 && fstat(fd, &st) == 0 && st.st_dev == dev && st.st_ino == ino;
 }
 
-static int private_lock_dup_cloexec(int fd) {
-    int copy = dup(fd);
+static int dup_cloexec(int fd, int minimum) {
+#ifdef F_DUPFD_CLOEXEC
+    return fcntl(fd, F_DUPFD_CLOEXEC, minimum);
+#else
+    int copy = fcntl(fd, F_DUPFD, minimum);
     if (copy >= 0 && fcntl(copy, F_SETFD, FD_CLOEXEC) != 0) {
         int saved_errno = errno;
         close(copy);
@@ -751,6 +1051,7 @@ static int private_lock_dup_cloexec(int fd) {
         return -1;
     }
     return copy;
+#endif
 }
 
 /* flock state is inherited across fork because parent and child initially
@@ -906,7 +1207,7 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     dir_flags |= O_NOFOLLOW;
 #endif
     parent_fd = openat(dir_fd, "..", dir_flags);
-    leaf_fd = private_lock_dup_cloexec(dir_fd);
+    leaf_fd = dup_cloexec(dir_fd, 0);
     if (parent_fd < 0 || leaf_fd < 0 || fstat(leaf_fd, &leaf) != 0 ||
         !S_ISDIR(leaf.st_mode)) {
         int saved_errno = errno;
@@ -965,7 +1266,7 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
         errno = EACCES;
         goto fail;
     }
-    token_fd = private_lock_dup_cloexec(g_private_lock_inodes[file_slot].fd);
+    token_fd = dup_cloexec(g_private_lock_inodes[file_slot].fd, 0);
     if (token_fd < 0) goto fail;
     if (private_lock_allocate_generation(&token_generation) != 0) goto fail;
 
@@ -1114,11 +1415,14 @@ int runtime_state_lock_acquire(void) {
     int parent_fd = -1;
     int dir_fd = -1;
     int lock_fd = -1;
+    size_t anchor_slot = PRIVATE_LOCK_INODES;
     uint64_t lock_generation = 0;
     int written;
 
     runtime_lock_prepare_process();
-    parent_fd = open_runtime_parent(runtime_parent, sizeof(runtime_parent));
+    parent_fd = open_runtime_parent_impl(runtime_parent,
+                                         sizeof(runtime_parent),
+                                         &anchor_slot);
     if (parent_fd < 0) {
         return -1;
     }
@@ -1130,6 +1434,7 @@ int runtime_state_lock_acquire(void) {
                              "gitswitch-runtime-%d", getuid()) >=
             sizeof(fallback_name)) {
             close(parent_fd);
+            private_lock_inode_release(anchor_slot);
             set_error(ERR_INVALID_PATH, "Shared runtime lock name is too long");
             return -1;
         }
@@ -1139,12 +1444,14 @@ int runtime_state_lock_acquire(void) {
                        runtime_parent, child_name);
     if (written < 0 || (size_t)written >= sizeof(lock_dir)) {
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         set_error(ERR_INVALID_PATH, "Shared runtime lock path is too long");
         return -1;
     }
     dir_fd = open_private_subdir_at(parent_fd, child_name, true, NULL);
     if (dir_fd < 0) {
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         return -1;
     }
     /* Non-blocking (AR-05 L13): the holder keeps this lock across ssh-add
@@ -1157,12 +1464,10 @@ int runtime_state_lock_acquire(void) {
      * the same actionable message instead. */
     lock_fd = try_lock_private_file_at(dir_fd, ".lock");
     if (lock_fd < 0) {
-        bool contended = errno == EWOULDBLOCK;
-#if EAGAIN != EWOULDBLOCK
-        contended = contended || errno == EAGAIN;
-#endif
+        bool contended = runtime_lock_is_contended_error(errno);
         close(dir_fd);
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         if (contended) {
             set_error(ERR_FILE_IO,
                       "Another gitswitch holds the shared runtime lock "
@@ -1179,6 +1484,7 @@ int runtime_state_lock_acquire(void) {
         unlock_private_file(lock_fd);
         close(dir_fd);
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         errno = EINVAL;
         set_error(ERR_SYSTEM_CALL,
                   "Shared runtime lock token was not registered");
@@ -1204,6 +1510,7 @@ int runtime_state_lock_acquire(void) {
         (void)private_lock_release_generation(lock_fd, lock_generation);
         close(dir_fd);
         close(parent_fd);
+        private_lock_inode_release(anchor_slot);
         set_error(ERR_PERMISSION_DENIED,
                   "Shared runtime lock namespace changed during acquisition");
         return -1;
@@ -1214,6 +1521,7 @@ int runtime_state_lock_acquire(void) {
             g_runtime_locks[i].active = true;
             g_runtime_locks[i].lock_fd = lock_fd;
             g_runtime_locks[i].lock_generation = lock_generation;
+            g_runtime_locks[i].anchor_slot = anchor_slot;
             g_runtime_locks[i].parent_fd = parent_fd;
             g_runtime_locks[i].dir_fd = dir_fd;
             g_runtime_locks[i].parent_dev = parent_st.st_dev;
@@ -1230,6 +1538,7 @@ int runtime_state_lock_acquire(void) {
     (void)private_lock_release_generation(lock_fd, lock_generation);
     close(dir_fd);
     close(parent_fd);
+    private_lock_inode_release(anchor_slot);
     set_error(ERR_SYSTEM_CALL, "Too many nested shared runtime locks");
     return -1;
 }
@@ -1330,6 +1639,7 @@ void runtime_state_lock_release(int fd) {
                     fd, g_runtime_locks[i].lock_generation);
                 close(g_runtime_locks[i].dir_fd);
                 close(g_runtime_locks[i].parent_fd);
+                private_lock_inode_release(g_runtime_locks[i].anchor_slot);
                 memset(&g_runtime_locks[i], 0, sizeof(g_runtime_locks[i]));
                 return;
         }
@@ -1407,6 +1717,35 @@ int get_file_permissions(const char *path, mode_t *mode) {
 
 /* File utilities */
 
+enum {
+    READ_FILE_TEST_BEFORE_INITIAL_READ = 1,
+    READ_FILE_TEST_BEFORE_EXACT_FIT_PROBE
+};
+
+#ifdef GITSWITCH_TESTING
+typedef void (*read_file_test_hook_fn)(int stage, int file_fd);
+read_file_test_hook_fn gitswitch_test_set_read_file_hook(
+    read_file_test_hook_fn hook);
+
+static read_file_test_hook_fn g_read_file_test_hook;
+
+read_file_test_hook_fn gitswitch_test_set_read_file_hook(
+    read_file_test_hook_fn hook) {
+    read_file_test_hook_fn previous = g_read_file_test_hook;
+    g_read_file_test_hook = hook;
+    return previous;
+}
+
+#define READ_FILE_TEST_CHECKPOINT(stage, file) \
+    do { \
+        if (g_read_file_test_hook) \
+            g_read_file_test_hook((stage), fileno(file)); \
+    } while (0)
+#else
+#define READ_FILE_TEST_CHECKPOINT(stage, file) \
+    do { (void)(stage); (void)(file); } while (0)
+#endif
+
 int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size) {
     FILE *file;
     size_t bytes_read;
@@ -1424,7 +1763,8 @@ int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size)
         set_system_error(ERR_FILE_IO, "Failed to open file for reading: %s", file_path);
         return -1;
     }
-    
+
+    READ_FILE_TEST_CHECKPOINT(READ_FILE_TEST_BEFORE_INITIAL_READ, file);
     bytes_read = fread(buffer, 1, buffer_size - 1, file);
     if (ferror(file)) {
         set_system_error(ERR_FILE_IO, "Failed to read from file: %s", file_path);
@@ -1433,14 +1773,37 @@ int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size)
     }
 
     /* If we filled the buffer, the file MIGHT be exactly buffer_size-1 bytes
-     * (a perfect fit) or larger. feof isn't set here — fread stopped at the
-     * byte limit without reading past the data — so the old `!feof` test
-     * wrongly rejected an exact-fit file (AR-06 F75). Probe one more byte:
-     * EOF means it fit exactly; any byte means it is genuinely too large. */
-    if (bytes_read == buffer_size - 1 && fgetc(file) != EOF) {
-        set_error(ERR_FILE_IO, "File too large for buffer: %s", file_path);
-        fclose(file);
-        return -1;
+     * (a perfect fit) or larger. An EOF flag is not a portable discriminator:
+     * stdio may or may not set it while satisfying an exact-size fread. Clear
+     * the stream state and perform one real probe: clean EOF means an exact
+     * fit, a byte means too large, and ferror means the probe failed. */
+    if (bytes_read == buffer_size - 1) {
+        int probe;
+        int probe_errno;
+
+        /* Some stdio implementations mark EOF while satisfying an exact-size
+         * fread. Clear that sticky state so this is a real discriminating
+         * read, including when the file grew after the buffered read. */
+        clearerr(file);
+        READ_FILE_TEST_CHECKPOINT(READ_FILE_TEST_BEFORE_EXACT_FIT_PROBE,
+                                  file);
+        errno = 0;
+        probe = fgetc(file);
+        probe_errno = errno;
+        if (probe != EOF) {
+            set_error(ERR_FILE_IO, "File too large for buffer: %s", file_path);
+            fclose(file);
+            return -1;
+        }
+        if (ferror(file)) {
+            int saved_errno = probe_errno ? probe_errno : EIO;
+
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO, "Failed to read from file: %s",
+                             file_path);
+            fclose(file);
+            return -1;
+        }
     }
 
     buffer[bytes_read] = '\0';
@@ -1515,7 +1878,8 @@ copy_file_test_hook_fn gitswitch_test_set_copy_file_hook(
 
 enum {
     COPY_FILE_TEST_AFTER_DESTINATION_OPEN = 1,
-    COPY_FILE_TEST_AFTER_FIRST_WRITE
+    COPY_FILE_TEST_AFTER_FIRST_WRITE,
+    COPY_FILE_TEST_BEFORE_DESTINATION_OPEN
 };
 
 int copy_file(const char *src_path, const char *dst_path) {
@@ -1525,8 +1889,9 @@ int copy_file(const char *src_path, const char *dst_path) {
     size_t bytes;
     int result = 0;
     int dst_fd = -1;
-    int dst_flags = O_WRONLY | O_CREAT | O_TRUNC;
+    int dst_flags = O_WRONLY | O_CREAT;
     struct stat src_stat;
+    struct stat dst_stat;
 #ifdef GITSWITCH_TESTING
     bool first_write_checkpointed = false;
 #endif
@@ -1554,6 +1919,7 @@ int copy_file(const char *src_path, const char *dst_path) {
 #ifdef O_CLOEXEC
     dst_flags |= O_CLOEXEC;
 #endif
+    COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_BEFORE_DESTINATION_OPEN, dst_path);
     /* A new destination is born private even under umask(000). For an
      * existing destination, the creation mode is ignored, so fchmod the
      * already-open descriptor before fdopen or the first byte write. */
@@ -1582,6 +1948,32 @@ int copy_file(const char *src_path, const char *dst_path) {
         }
     }
 #endif
+    if (fstat(dst_fd, &dst_stat) != 0) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO, "Failed to inspect destination file: %s",
+                         dst_path);
+        return -1;
+    }
+    if (src_stat.st_dev == dst_stat.st_dev &&
+        src_stat.st_ino == dst_stat.st_ino) {
+        close(dst_fd);
+        fclose(src);
+        set_error(ERR_INVALID_ARGS,
+                  "Source and destination refer to the same file");
+        return -1;
+    }
+    if (ftruncate(dst_fd, 0) != 0) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to truncate destination file: %s", dst_path);
+        return -1;
+    }
     COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_DESTINATION_OPEN, dst_path);
     if (fchmod(dst_fd, src_stat.st_mode & 0777) != 0) {
         int saved_errno = errno;
@@ -2166,6 +2558,60 @@ static run_test_post_fork_pre_publish_hook_fn
     g_test_post_fork_pre_publish_hook;
 static int g_test_fork_failure_errno;
 
+/* AR-09 M27: sigaction preserves the caller's complete SIGPIPE contract;
+ * these stages also provide one-shot failure boundaries to the test build. */
+enum {
+    RUN_SIGPIPE_ACTION_INSTALL = 1,
+    RUN_SIGPIPE_ACTION_RESTORE,
+    RUN_SIGPIPE_ACTION_STAGE_COUNT
+};
+
+#ifdef GITSWITCH_TESTING
+static int
+    g_test_run_sigpipe_action_errno[RUN_SIGPIPE_ACTION_STAGE_COUNT];
+
+void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno);
+
+void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno) {
+    if (stage <= 0 || stage >= RUN_SIGPIPE_ACTION_STAGE_COUNT ||
+        system_errno <= 0) {
+        memset(g_test_run_sigpipe_action_errno, 0,
+               sizeof(g_test_run_sigpipe_action_errno));
+        return;
+    }
+    g_test_run_sigpipe_action_errno[stage] = system_errno;
+}
+#endif
+
+static int run_sigpipe_action(const struct sigaction *action,
+                              struct sigaction *old_action, int stage) {
+#ifdef GITSWITCH_TESTING
+    if (stage > 0 && stage < RUN_SIGPIPE_ACTION_STAGE_COUNT &&
+        g_test_run_sigpipe_action_errno[stage] != 0) {
+        int injected_errno = g_test_run_sigpipe_action_errno[stage];
+        g_test_run_sigpipe_action_errno[stage] = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#else
+    (void)stage;
+#endif
+    return sigaction(SIGPIPE, action, old_action);
+}
+
+static void report_secondary_sigpipe_restore_failure(int restore_errno) {
+    if (restore_errno <= 0) return;
+
+    int primary_errno = errno;
+    error_context_t primary_error = g_last_error;
+    log_warning(
+        "run_argv: secondary failure restoring previous SIGPIPE disposition "
+        "(restore errno=%d: %s)",
+        restore_errno, strerror(restore_errno));
+    g_last_error = primary_error;
+    errno = primary_errno;
+}
+
 int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
     switch (strategy) {
         case RUN_TEST_FD_CLOSE_AUTO:
@@ -2421,6 +2867,33 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         return -1;
     }
 
+    if (opts->input && opts->use_stdin_fd) {
+        set_error(ERR_INVALID_ARGS,
+                  "run_argv: byte input and stdin_fd are mutually exclusive");
+        return -1;
+    }
+    if (opts->use_stdin_fd) {
+        struct stat stdin_st;
+        int stdin_flags;
+
+        if (opts->stdin_fd < 0 || fstat(opts->stdin_fd, &stdin_st) != 0 ||
+            !S_ISREG(stdin_st.st_mode) || stdin_st.st_uid != getuid()) {
+            set_error(ERR_INVALID_ARGS,
+                      "run_argv: stdin_fd is not a readable self-owned regular file");
+            return -1;
+        }
+        stdin_flags = fcntl(opts->stdin_fd, F_GETFL, 0);
+        if (stdin_flags < 0 || (stdin_flags & O_ACCMODE) == O_WRONLY
+#ifdef O_PATH
+            || (stdin_flags & O_PATH) == O_PATH
+#endif
+        ) {
+            set_error(ERR_INVALID_ARGS,
+                      "run_argv: stdin_fd is not a readable self-owned regular file");
+            return -1;
+        }
+    }
+
     /* Some helpers can consume sensitive state only through a pathname (for
      * example GNUPGHOME). Let callers pin that directory before fork and make
      * the child enter the descriptor-backed directory, so a same-uid namespace
@@ -2489,7 +2962,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
     if (g_test_exec_resolved_hook) g_test_exec_resolved_hook(exec_path);
 
-    bool want_in = (opts->input != NULL);
+    bool pipe_input = opts->input != NULL;
+    bool fd_input = opts->use_stdin_fd;
+    bool want_in = pipe_input || fd_input;
     bool want_out = (opts->out && opts->out_size > 0);
     bool need_devnull = !want_in || !want_out ||
                         (!opts->merge_stderr && opts->stderr_to_devnull);
@@ -2556,7 +3031,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
-    if (want_in && make_internal_pipe(in_pipe) != 0) {
+    if (pipe_input && make_internal_pipe(in_pipe) != 0) {
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot create child stdin pipe");
         if (devnull >= 0) close(devnull);
@@ -2569,7 +3044,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot create child stdout pipe");
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -2579,7 +3054,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot create child setup-status pipe");
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         free(fd_snapshot.fds);
         close(exec_fd);
@@ -2591,7 +3066,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     if (signals_block_for_child_spawn(&pre_spawn_mask) != 0) {
         int block_errno = errno;
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
@@ -2621,7 +3096,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             mask_restore_errno = errno;
         }
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
@@ -2674,7 +3149,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             }
         }
 
-        int stdin_source = want_in ? in_pipe[0] : devnull;
+        int stdin_source = fd_input
+                               ? opts->stdin_fd
+                               : (pipe_input ? in_pipe[0] : devnull);
         int stdout_source = want_out ? out_pipe[1] : devnull;
         if (dup2(stdin_source, STDIN_FILENO) < 0) {
             child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
@@ -2929,7 +3406,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         } while (waited < 0 && errno == EINTR);
         signals_child_reaped();
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
@@ -2946,7 +3423,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     close(exec_fd);
     trusted_script_launch_cleanup(&script_launch);
     if (devnull >= 0) close(devnull);
-    if (want_in) close(in_pipe[0]);
+    if (pipe_input) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
     close(status_pipe[1]);
 
@@ -2964,9 +3441,42 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         g_test_fd_close_observation_valid = true;
     }
 
-    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+    /* Parent pipe writes need SIGPIPE suppressed, but only for this bounded
+     * I/O window. Save and later restore the full action, including metadata
+     * that signal(3) silently discards. */
+    struct sigaction ignored_sigpipe;
+    struct sigaction saved_sigpipe;
+    memset(&ignored_sigpipe, 0, sizeof(ignored_sigpipe));
+    memset(&saved_sigpipe, 0, sizeof(saved_sigpipe));
+    ignored_sigpipe.sa_handler = SIG_IGN;
+    (void)sigemptyset(&ignored_sigpipe.sa_mask);
+    if (run_sigpipe_action(&ignored_sigpipe, &saved_sigpipe,
+                           RUN_SIGPIPE_ACTION_INSTALL) != 0) {
+        int install_errno = errno;
+        int install_status = 0;
+        pid_t waited;
 
-    int infd = want_in ? in_pipe[1] : -1;
+        if (pipe_input) close(in_pipe[1]);
+        if (want_out) close(out_pipe[0]);
+        (void)kill(pid, SIGKILL);
+        do {
+            waited = waitpid(pid, &install_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        signals_child_reaped();
+        if (waited == pid && WIFEXITED(install_status)) {
+            result->exit_code = WEXITSTATUS(install_status);
+        } else if (waited == pid && WIFSIGNALED(install_status)) {
+            result->term_signal = WTERMSIG(install_status);
+        }
+        errno = install_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot install temporary SIGPIPE disposition");
+        errno = install_errno;
+        return -1;
+    }
+
+    int infd = pipe_input ? in_pipe[1] : -1;
     int outfd = want_out ? out_pipe[0] : -1;
     size_t in_off = 0, out_off = 0;
     bool input_failed = false;
@@ -3185,7 +3695,13 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * for kernel reuse, and the handler must not signal a stranger. */
         signals_child_reaped();
     }
-    signal(SIGPIPE, old_sigpipe);
+    int errno_before_sigpipe_restore = errno;
+    int sigpipe_restore_errno = 0;
+    if (run_sigpipe_action(&saved_sigpipe, NULL,
+                           RUN_SIGPIPE_ACTION_RESTORE) != 0) {
+        sigpipe_restore_errno = errno;
+    }
+    errno = errno_before_sigpipe_restore;
 
     if (child_reaped && WIFEXITED(status)) {
         result->exit_code = WEXITSTATUS(status);
@@ -3195,7 +3711,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
 
     if (child_status_rc > 0) {
-        errno = child_status.system_errno;
+        int primary_errno = child_status.system_errno;
+        errno = primary_errno;
         switch ((child_stage_t)child_status.stage) {
             case CHILD_STAGE_STDIO:
                 set_system_error(ERR_SYSTEM_CALL,
@@ -3223,21 +3740,30 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                           "run_argv: child returned an unknown setup failure");
                 break;
         }
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (child_status_rc < 0) {
-        errno = child_status_errno;
+        int primary_errno = child_status_errno;
+        errno = primary_errno;
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: child setup-status channel failed");
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (wait_failed) {
-        errno = wait_errno;
+        int primary_errno = wait_errno;
+        errno = primary_errno;
         set_system_error(ERR_SYSTEM_CALL, "waitpid() failed");
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (io_failed) {
-        errno = io_errno;
+        int primary_errno = io_errno;
+        errno = primary_errno;
         if (nonblock_setup_failed) {
             set_system_error(
                 ERR_SYSTEM_CALL,
@@ -3246,21 +3772,37 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             set_system_error(ERR_SYSTEM_CALL,
                              "run_argv: subprocess pipe I/O failed");
         }
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (input_failed) {
         set_error(ERR_SYSTEM_COMMAND_FAILED,
                   "run_argv: child stdin closed before all input was delivered "
                   "(%zu/%zu bytes)", in_off, opts->input_len);
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (output_stalled) {
         set_error(ERR_SYSTEM_COMMAND_FAILED,
                   "run_argv: captured stdout remained open after the direct "
                   "child exited");
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
-    return (result->spawned && result->exit_code == 0) ? 0 : -1;
+    if (!result->spawned || result->exit_code != 0) {
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        return -1;
+    }
+    if (sigpipe_restore_errno != 0) {
+        errno = sigpipe_restore_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot restore previous SIGPIPE disposition");
+        errno = sigpipe_restore_errno;
+        return -1;
+    }
+    return 0;
 }
 
 static command_runner_fn g_runner = run_argv_real;
@@ -4372,45 +4914,184 @@ int get_terminal_size(int *width, int *height) {
     return 0;
 }
 
-int disable_echo(void) {
-    struct termios new_termios;
+#ifdef GITSWITCH_TESTING
+typedef void (*echo_tcsetattr_test_hook_fn)(int fd);
 
-    if (g_echo_disabled) return 0;
+static int g_test_echo_tcsetattr_errno;
+static echo_tcsetattr_test_hook_fn g_test_echo_tcsetattr_hook;
 
-    if (tcgetattr(STDIN_FILENO, &g_original_termios) != 0) {
-        int saved_errno = errno;
-        set_system_error(ERR_SYSTEM_CALL,
-                         "Failed to read terminal state before disabling echo");
-        errno = saved_errno;
-        return -1; /* Can't save original, don't disable echo. */
+void gitswitch_test_fail_echo_tcsetattr(int system_errno);
+echo_tcsetattr_test_hook_fn gitswitch_test_set_echo_tcsetattr_hook(
+    echo_tcsetattr_test_hook_fn hook);
+
+void gitswitch_test_fail_echo_tcsetattr(int system_errno) {
+    g_test_echo_tcsetattr_errno = system_errno > 0 ? system_errno : 0;
+}
+
+echo_tcsetattr_test_hook_fn gitswitch_test_set_echo_tcsetattr_hook(
+    echo_tcsetattr_test_hook_fn hook) {
+    echo_tcsetattr_test_hook_fn previous = g_test_echo_tcsetattr_hook;
+    g_test_echo_tcsetattr_hook = hook;
+    return previous;
+}
+#endif
+
+static int terminal_echo_tcsetattr(int fd, const struct termios *termios) {
+#ifdef GITSWITCH_TESTING
+    if (g_test_echo_tcsetattr_hook) {
+        echo_tcsetattr_test_hook_fn hook = g_test_echo_tcsetattr_hook;
+        g_test_echo_tcsetattr_hook = NULL;
+        hook(fd);
     }
-
-    new_termios = g_original_termios;
-    new_termios.c_lflag &= ~ECHO;
-
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) != 0) {
-        int saved_errno = errno;
-        set_system_error(ERR_SYSTEM_CALL, "Failed to disable terminal echo");
-        errno = saved_errno;
+    if (g_test_echo_tcsetattr_errno != 0) {
+        int injected_errno = g_test_echo_tcsetattr_errno;
+        g_test_echo_tcsetattr_errno = 0;
+        errno = injected_errno;
         return -1;
     }
-    g_echo_disabled = true;
+#endif
+    return tcsetattr(fd, TCSANOW, termios);
+}
+
+static bool terminal_echo_identity_matches(const struct stat *st) {
+    return st && st->st_dev == g_terminal_echo_state.dev &&
+           st->st_ino == g_terminal_echo_state.ino &&
+           st->st_rdev == g_terminal_echo_state.rdev;
+}
+
+static int terminal_echo_fail(const char *action, const char *reason,
+                              int system_errno) {
+    errno = system_errno;
+    set_system_error(ERR_SYSTEM_CALL, "Failed to %s: %s", action, reason);
+    errno = system_errno;
+    return -1;
+}
+
+static int terminal_echo_validate_owner(const char *action) {
+    struct stat retained;
+    struct stat current;
+
+    if (fstat(g_terminal_echo_state.fd, &retained) != 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail(action,
+                                  "retained terminal descriptor is unavailable",
+                                  saved_errno);
+    }
+    if (!terminal_echo_identity_matches(&retained)) {
+        return terminal_echo_fail(action,
+                                  "retained terminal descriptor changed identity",
+                                  ESTALE);
+    }
+    if (fstat(STDIN_FILENO, &current) != 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail(action,
+                                  "standard input is unavailable",
+                                  saved_errno);
+    }
+    if (!terminal_echo_identity_matches(&current)) {
+        return terminal_echo_fail(action,
+                                  "standard input identifies another terminal",
+                                  ESTALE);
+    }
+    return 0;
+}
+
+int disable_echo(void) {
+    struct termios original;
+    struct termios new_termios;
+    struct stat retained;
+    struct stat current;
+    int retained_fd;
+
+    if (g_terminal_echo_state.active) {
+        if (terminal_echo_validate_owner("disable terminal echo") != 0) {
+            return -1;
+        }
+        clear_error();
+        return 0;
+    }
+
+    retained_fd = dup_cloexec(STDIN_FILENO, STDERR_FILENO + 1);
+    if (retained_fd < 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail("disable terminal echo",
+                                  "could not retain standard input",
+                                  saved_errno);
+    }
+
+    if (fstat(retained_fd, &retained) != 0 ||
+        fstat(STDIN_FILENO, &current) != 0) {
+        int saved_errno = errno;
+        close(retained_fd);
+        return terminal_echo_fail("disable terminal echo",
+                                  "could not inspect terminal identity",
+                                  saved_errno);
+    }
+    if (retained.st_dev != current.st_dev ||
+        retained.st_ino != current.st_ino ||
+        retained.st_rdev != current.st_rdev) {
+        close(retained_fd);
+        return terminal_echo_fail("disable terminal echo",
+                                  "standard input changed while being retained",
+                                  ESTALE);
+    }
+
+    if (tcgetattr(retained_fd, &original) != 0) {
+        int saved_errno = errno;
+        close(retained_fd);
+        return terminal_echo_fail(
+            "disable terminal echo",
+            "could not read the original terminal state", saved_errno);
+    }
+
+    new_termios = original;
+    new_termios.c_lflag &= ~ECHO;
+
+    if (terminal_echo_tcsetattr(retained_fd, &new_termios) != 0) {
+        int saved_errno = errno;
+        close(retained_fd);
+        return terminal_echo_fail("disable terminal echo",
+                                  "terminal rejected the no-echo state",
+                                  saved_errno);
+    }
+
+    g_terminal_echo_state.fd = retained_fd;
+    g_terminal_echo_state.dev = retained.st_dev;
+    g_terminal_echo_state.ino = retained.st_ino;
+    g_terminal_echo_state.rdev = retained.st_rdev;
+    g_terminal_echo_state.original = original;
+    g_terminal_echo_state.active = true;
+    clear_error();
     return 0;
 }
 
 int enable_echo(void) {
-    if (!g_echo_disabled) return 0;
+    int retained_fd;
 
-    /* Keep the recovery flag set until the kernel accepts the restore. A
-     * transient descriptor/PTY failure must remain retryable rather than
-     * turning every later enable_echo() call into a false-success no-op. */
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios) != 0) {
-        int saved_errno = errno;
-        set_system_error(ERR_SYSTEM_CALL, "Failed to restore terminal echo");
-        errno = saved_errno;
+    if (!g_terminal_echo_state.active) {
+        clear_error();
+        return 0;
+    }
+
+    if (terminal_echo_validate_owner("restore terminal echo") != 0) {
         return -1;
     }
-    g_echo_disabled = false;
+
+    /* Keep ownership until the retained terminal accepts the restore. A
+     * transient failure must remain retryable and a replacement standard
+     * input must never receive another terminal's saved attributes. */
+    if (terminal_echo_tcsetattr(g_terminal_echo_state.fd,
+                                &g_terminal_echo_state.original) != 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail("restore terminal echo",
+                                  "terminal rejected the original state",
+                                  saved_errno);
+    }
+
+    retained_fd = g_terminal_echo_state.fd;
+    memset(&g_terminal_echo_state, 0, sizeof(g_terminal_echo_state));
+    g_terminal_echo_state.fd = -1;
+    close(retained_fd);
     clear_error();
     return 0;
 }

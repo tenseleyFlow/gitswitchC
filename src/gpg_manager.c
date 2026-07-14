@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -64,10 +63,6 @@ typedef struct {
 static int gpg_retarget_current_locked(int base_fd, const char *base,
                                        const char *real_home,
                                        gpg_retarget_result_t *result);
-static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
-                          const char *env_out[2]);
-static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
-                   char *output, size_t output_size, ...);
 typedef struct {
     int base_fd;
     int home_fd;
@@ -92,9 +87,6 @@ typedef struct {
     struct stat identity;
     gpg_mount_identity_t mount;
 } gpg_source_home_t;
-static int gpg_run_pinned(const gpg_pinned_home_t *home,
-                          const gpg_config_t *cfg, run_result_t *res_out,
-                          char *output, size_t output_size, ...);
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                                         const gpg_pinned_home_t *home,
                                         const char *selector,
@@ -375,13 +367,12 @@ int gpg_manager_cleanup(gpg_config_t *gpg_config) {
     
     log_debug("Cleaning up GPG manager");
 
-    /* Intentionally NOT deleting the isolated GNUPGHOME. Isolated homes are
-     * keyed by account and persist across switches (mirroring how the SSH agent
-     * persists): the user's shell points GNUPGHOME at the <base>/current
-     * symlink, so removing a home could pull the rug out from under a shell
-     * still pointed at it. Homes are reused on switch-back, and re-import is
-     * skipped when the key is already present. A deliberate teardown command
-     * (not yet implemented) is the right place to reclaim them. */
+    /* This cleanup completes one switch transaction; it deliberately does not
+     * delete persistent per-account GNUPGHOMEs. The user's shell may still
+     * resolve GNUPGHOME through <base>/current, and switch-back reuses an
+     * existing validated home without re-importing its key. Explicit
+     * `gitswitch reset [account]` invokes gpg_manager_reset(), which owns agent
+     * shutdown, home deletion, stable-link retirement, and durability. */
 
     if (gpg_config->runtime_restore_pending) {
         const char *expected = gpg_config->rollback.published.valid
@@ -837,10 +828,10 @@ int gpg_manager_get_home_path_quiet(char *buf, size_t size) {
 }
 
 /* Acquire an exclusive, blocking flock on <base>/.lock, serializing every
- * writer of the GPG runtime state — the `current` symlink retarget/drop and
- * gpg_manager_reset's enumeration + dangling-link cleanup — against each
- * other across processes (AR-02 #9: an unlocked reset's cleanup could TOCTOU
- * a concurrent switch and unlink the live link it had just installed).
+ * writer of the GPG runtime state — `current` retarget/drop and reset's home
+ * enumeration, teardown, and current-link retirement — against each other
+ * across processes (AR-02 #9: an unlocked reset could TOCTOU a concurrent
+ * switch and unlink the live link it had just installed).
  * Mirrors ssh_manager.c's lock_agent_dir. Returns the held fd, or -1; callers
  * that found an existing validated base must fail rather than mutate it
  * unlocked. Dotfile names cannot collide with an account home: validate_name
@@ -2009,10 +2000,10 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
  * GNUPGHOME so a shell that exports GNUPGHOME=<base>/current (via
  * `gitswitch init`) transparently follows each switch. Mirrors the SSH
  * current.sock retargeting in ssh_manager.c. Held under the per-dir lock so
- * the retarget cannot interleave with a concurrent reset's dangling-link
- * cleanup (AR-02 #9). The forward switch does NOT come through here: it
- * retargets via gpg_retarget_current_locked under the lock it already holds
- * across create+import (AR-03 L12) — flock on a second fd for the same lock
+ * the retarget cannot interleave with a concurrent reset's home teardown or
+ * current-link retirement (AR-02 #9). The forward switch does NOT come through
+ * here: it retargets via gpg_retarget_current_locked under the lock it already
+ * holds across create+import (AR-03 L12) — flock on a second fd for the same lock
  * file would self-deadlock. Returns failure rather than retargeting unlocked. */
 int gpg_manager_retarget_current(const char *real_home) {
     char base[MAX_PATH_LEN];
@@ -2043,7 +2034,9 @@ int gpg_manager_retarget_current(const char *real_home) {
 
 /* Drop the stable `current` symlink (switching to a GPG-less account, or
  * rolling one back). Locked for the same reason as the retarget: an unlocked
- * unlink could delete the fresh link a concurrent switch just installed. */
+ * unlink could delete the fresh link a concurrent switch just installed.
+ * Success proves the directory entry durable; an already-absent retry syncs
+ * the base again so it can repair a prior unlink whose sync failed. */
 int gpg_manager_drop_current(void) {
     char base[MAX_PATH_LEN];
     char link_path[MAX_PATH_LEN];
@@ -2052,6 +2045,7 @@ int gpg_manager_drop_current(void) {
     int lock_fd = -1;
     int base_rc;
     int rc = 0;
+    bool current_absent = false;
 
     if (gpg_get_base_dir(base, sizeof(base)) != 0 ||
         gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0) {
@@ -2071,14 +2065,29 @@ int gpg_manager_drop_current(void) {
             set_system_error(ERR_FILE_IO, "Cannot inspect stable GNUPGHOME link: %s",
                              link_path);
             rc = -1;
+        } else {
+            current_absent = true;
         }
     } else if (!S_ISLNK(link_st.st_mode)) {
         set_error(ERR_FILE_IO, "Stable GNUPGHOME entry is not a symlink: %s",
                   link_path);
         rc = -1;
-    } else if (unlinkat(base_fd, "current", 0) != 0 && errno != ENOENT) {
-        set_system_error(ERR_FILE_IO, "Failed to remove stable GNUPGHOME link: %s",
-                         link_path);
+    } else if (unlinkat(base_fd, "current", 0) != 0) {
+        if (errno == ENOENT) {
+            current_absent = true;
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to remove stable GNUPGHOME link: %s",
+                             link_path);
+            rc = -1;
+        }
+    } else {
+        current_absent = true;
+    }
+    if (rc == 0 && current_absent && g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Stable GNUPGHOME removal is not durable; retry runtime deactivation");
         rc = -1;
     }
     unlock_gpg_dir(base_fd, lock_fd);
@@ -3122,12 +3131,16 @@ static int gpg_remove_captured_current_locked(
 }
 
 /* Tear down isolated GPG homes: one account, or all when account is NULL.
- * Kills the per-home gpg-agents and deletes (unlinks) the homes, then drops
- * the stable `current` symlink if it dangles. NB: deletion is remove(), not a
- * secure overwrite — on the memory-backed storage the create path requires by
- * default, unlinking genuinely destroys the bytes, but on the explicitly
- * opted-in non-tmpfs path (GITSWITCH_ALLOW_TMP_GPG) the secret-key bytes may
- * remain recoverable on disk after deletion (AR-02 #26). */
+ * Each removable home has its agent stopped before its contents are unlinked.
+ * A successful full reset retires every captured `current` symlink, regardless
+ * of target. A targeted or incomplete full reset retires `current` only when
+ * its target is no longer a live, safe managed home (including a home just
+ * deleted); it preserves another live managed selection and retains a failed
+ * home as an exact retry target. Identity-aware quarantine preserves a later
+ * writer in either scope. Deletion is unlink, not a secure overwrite:
+ * memory-backed storage destroys the bytes, while the opted-in non-tmpfs path
+ * (GITSWITCH_ALLOW_TMP_GPG) may leave secret-key bytes forensically
+ * recoverable after deletion (AR-02 #26). */
 int gpg_manager_reset(const char *account) {
     char base[MAX_PATH_LEN];
     char current[MAX_PATH_LEN];
@@ -3593,105 +3606,11 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
     return 0;
 }
 
-/* Return true if `gpg --with-colons` output contains a secret-key record
- * (primary `sec` or subkey `ssb`) whose capability field (field 12, the 12th
- * ':'-separated field) advertises signing. Lowercase 's' means this key can
- * sign; uppercase 'S' on a primary means a signing-capable subkey exists. */
-bool gpg_colons_have_sign_capability(const char *colons) {
-    const char *line;
-
-    if (!colons) {
-        return false;
-    }
-
-    for (line = colons; line && *line; ) {
-        const char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
-
-        if (line_len >= 3 &&
-            (strncmp(line, "sec", 3) == 0 || strncmp(line, "ssb", 3) == 0)) {
-            const char *line_end = line + line_len;
-            const char *field_start = line;
-            const char *p;
-            int field = 0;
-
-            for (p = line; p <= line_end; p++) {
-                if (p == line_end || *p == ':') {
-                    if (field == 11) {  /* field 12, 0-indexed: capabilities */
-                        const char *c;
-                        for (c = field_start; c < p; c++) {
-                            if (*c == 's' || *c == 'S') {
-                                return true;
-                            }
-                        }
-                        break;
-                    }
-                    field++;
-                    field_start = p + 1;
-                }
-            }
-        }
-
-        if (!eol) {
-            break;
-        }
-        line = eol + 1;
-    }
-
-    return false;
-}
-
-/* Verify the isolated keyring can sign for key_id, without unlocking the key.
- * The previous implementation ran an interactive `gpg --clearsign`, which
- * forced a pinentry PIN prompt on every switch and failed outright when the
- * configured pinentry path was wrong. Instead, confirm a signing-capable secret
- * key is present via the colon-delimited listing: PIN-free, pinentry-free, and
- * sufficient — real signing is exercised when the user actually commits. */
-int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
-    char output[4096];
-    run_result_t res;
-    int result;
-
-    if (!gpg_config || !key_id) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_test_signing");
-        return -1;
-    }
-
-    log_debug("Verifying signing capability for key: %s", key_id);
-
-    result = gpg_run(gpg_config, &res, output, sizeof(output),
-                     "gpg", "--list-secret-keys", "--with-colons", key_id,
-                     (const char *)NULL);
-    if (result != 0) {
-        set_error(ERR_GPG_SIGNING_FAILED, "No secret key available for signing: %s", key_id);
-        return -1;
-    }
-
-    if (!gpg_colons_have_sign_capability(output)) {
-        /* A truncated capture is INCOMPLETE evidence, not proof of absence
-         * (AR-03 L4): a large multi-uid/multi-subkey key can armor its
-         * signing `ssb` record past the capture buffer, into the dropped
-         * tail. The listing's exit 0 already proved the secret key is
-         * present, and this capability check is advisory — real signing is
-         * exercised when the user actually commits — so treat truncation as
-         * inconclusive rather than report a spurious failure. */
-        if (res.out_truncated) {
-            log_debug("Signing-capability listing truncated for key %s; "
-                      "treating as inconclusive, not a failure", key_id);
-            gpg_manager_note_key_available(key_id);
-            return 0;
-        }
-        set_error(ERR_GPG_SIGNING_FAILED, "Key has no signing-capable secret key: %s", key_id);
-        return -1;
-    }
-
-    log_debug("Signing capability confirmed for key: %s", key_id);
-    gpg_manager_note_key_available(key_id);
-    return 0;
-}
-
-/* AR-06 F61: gpg_generate_key() was removed here — dead public API with zero
- * callers (gitswitch never generated keys; it isolates existing ones). */
+/* AR-06 F61 / AR-09 L12: gpg_generate_key(), gpg_test_signing(), and the
+ * loose capability-letter parser were removed as dead or misleading public
+ * APIs. The switch's one authoritative inventory path uses
+ * gpg_manager_resolve_secret_key_listing(), rejects incomplete evidence, and
+ * verifies the canonical fingerprint again after import. */
 
 /* Set environment variables for GPG operation */
 int gpg_set_environment(gpg_config_t *gpg_config) {
@@ -3733,71 +3652,6 @@ int gpg_set_environment(gpg_config_t *gpg_config) {
     return 0;
 }
 
-/* Internal helper functions */
-
-/* Build a one-entry GNUPGHOME extra-env array for isolated mode (else empty). */
-static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
-                          const char *env_out[2]) {
-    env_out[0] = NULL;
-    env_out[1] = NULL;
-    if (cfg && cfg->mode == GPG_MODE_ISOLATED && strlen(cfg->gnupg_home) > 0) {
-        if ((size_t)snprintf(envbuf, envbuf_size, "GNUPGHOME=%s", cfg->gnupg_home) < envbuf_size) {
-            env_out[0] = envbuf;
-        }
-    }
-}
-
-/* Run `gpg`/argv (NULL-terminated varargs, argv[0] is the first vararg), no
- * shell, with GNUPGHOME set from cfg in isolated mode. Captures merged
- * stdout+stderr. Returns 0 iff the child exits 0. res_out (optional, may be
- * NULL) receives the full run_result_t — callers that parse the capture as
- * evidence must check its out_truncated flag, since a truncated listing is
- * INCOMPLETE, not authoritative (AR-03 L4). */
-static int gpg_runv(const gpg_pinned_home_t *home,
-                    const gpg_config_t *cfg, run_result_t *res_out,
-                    char *output, size_t output_size, va_list ap) {
-    const char *argv[24];
-    size_t n = 0;
-    const char *a;
-    run_opts_t opts;
-    run_result_t res;
-    char envbuf[MAX_PATH_LEN + 16];
-    const char *env[2];
-    int rc;
-
-    while ((a = va_arg(ap, const char *)) != NULL) {
-        if (n >= sizeof(argv) / sizeof(argv[0]) - 1) {
-            set_error(ERR_INVALID_ARGS, "Too many gpg arguments");
-            return -1;
-        }
-        argv[n++] = a;
-    }
-    argv[n] = NULL;
-
-    if (home && gpg_validate_pinned_home(home) != 0) {
-        return -1;
-    }
-    memset(&opts, 0, sizeof(opts));
-    opts.out = output;
-    opts.out_size = output_size;
-    opts.merge_stderr = true;
-    if (home) {
-        env[0] = "GNUPGHOME=.";
-        env[1] = NULL;
-        opts.cwd_fd = home->home_fd;
-        opts.use_cwd_fd = true;
-    } else {
-        gpg_build_env(cfg, envbuf, sizeof(envbuf), env);
-    }
-    if (env[0]) opts.extra_env = env;
-
-    rc = run_argv(argv, &opts, res_out ? res_out : &res);
-    if (home && gpg_validate_pinned_home(home) != 0) {
-        return -1;
-    }
-    return rc;
-}
-
 int gpg_manager_resolve_system_key(const char *selector,
                                    bool require_signing,
                                    char *fingerprint,
@@ -3810,29 +3664,6 @@ int gpg_manager_resolve_system_key(const char *selector,
     fingerprint[0] = '\0';
     return gpg_resolve_source_key(selector, require_signing, fingerprint,
                                   fingerprint_size);
-}
-
-static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
-                   char *output, size_t output_size, ...) {
-    va_list ap;
-    int rc;
-
-    va_start(ap, output_size);
-    rc = gpg_runv(NULL, cfg, res_out, output, output_size, ap);
-    va_end(ap);
-    return rc;
-}
-
-static int gpg_run_pinned(const gpg_pinned_home_t *home,
-                          const gpg_config_t *cfg, run_result_t *res_out,
-                          char *output, size_t output_size, ...) {
-    va_list ap;
-    int rc;
-
-    va_start(ap, output_size);
-    rc = gpg_runv(home, cfg, res_out, output, output_size, ap);
-    va_end(ap);
-    return rc;
 }
 
 static bool gpg_colon_field(const char *line, size_t line_len, size_t wanted,
@@ -3860,8 +3691,16 @@ static bool gpg_record_is_currently_usable(const char *line, size_t line_len) {
     size_t field_len;
     time_t now = time(NULL);
 
-    if (!gpg_colon_field(line, line_len, 1, &field, &field_len) ||
-        field_len == 0 || strchr("redin?", field[0]) != NULL) {
+    if (!gpg_colon_field(line, line_len, 1, &field, &field_len)) {
+        return false;
+    }
+    /* GnuPG's stable colon-format contract explicitly leaves field 2 empty
+     * for secret-key listings before 2.1. Empty therefore means that this
+     * particular validity signal is unavailable, not that the key is
+     * unusable. Explicit failure codes still fail closed, while expiry,
+     * disabled capability, and secret-material availability are validated
+     * independently below and by the caller. */
+    if (field_len > 0 && strchr("redin?", field[0]) != NULL) {
         return false;
     }
     if (gpg_colon_field(line, line_len, 6, &field, &field_len) &&
@@ -3954,6 +3793,16 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
         size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
         const char *record;
         size_t record_len;
+
+        /* A capture made with --status-fd=1 deliberately interleaves GnuPG's
+         * machine status records with the colon inventory. They are parsed as
+         * result evidence by the caller and are not colon records; in
+         * particular, they must not break the required sec -> fpr adjacency. */
+        if (line_len >= 9 && memcmp(line, "[GNUPG:] ", 9) == 0) {
+            if (!eol) break;
+            line = eol + 1;
+            continue;
+        }
 
         if (gpg_colon_field(line, line_len, 0, &record, &record_len)) {
             /* The canonical primary fpr immediately follows sec in GnuPG's
@@ -4063,21 +3912,147 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
     return 0;
 }
 
-/* Classify the runner result without collapsing transport/setup failures into
- * an ordinary key miss. GnuPG documents exit status 2 for the no-secret-key
- * result of --list-secret-keys; every other nonzero state is operational
- * failure, including pre-spawn rejection, child setup/exec failure, signal
- * termination, and a runner I/O failure after an exit-0 child. */
+typedef struct {
+    bool malformed;
+    bool keylist_error_seen;
+    bool keylist_error_conflict;
+    unsigned long long keylist_error;
+    bool gpg_exit_failure_seen;
+} gpg_listing_status_t;
+
+enum { GPG_KEY_LISTING_CAP = 512 * 1024 };
+
+static bool gpg_status_next_token(const char **cursor, const char *end,
+                                  const char **token, size_t *token_len) {
+    const char *start;
+
+    while (*cursor < end && **cursor == ' ') (*cursor)++;
+    if (*cursor >= end) return false;
+    start = *cursor;
+    while (*cursor < end && **cursor != ' ') (*cursor)++;
+    *token = start;
+    *token_len = (size_t)(*cursor - start);
+    return *token_len > 0;
+}
+
+static bool gpg_status_error_code(const char *token, size_t token_len,
+                                  unsigned long long *value_out) {
+    unsigned long long value = 0;
+    size_t i;
+
+    if (!token || token_len == 0 || !value_out) return false;
+    for (i = 0; i < token_len; i++) {
+        unsigned int digit;
+        if (token[i] < '0' || token[i] > '9') return false;
+        digit = (unsigned int)(token[i] - '0');
+        if (value > (0xffffffffULL - digit) / 10ULL) return false;
+        value = value * 10ULL + digit;
+    }
+    *value_out = value;
+    return true;
+}
+
+static bool gpg_status_token_is(const char *token, size_t token_len,
+                                const char *expected) {
+    size_t expected_len = strlen(expected);
+    return token_len == expected_len &&
+           memcmp(token, expected, expected_len) == 0;
+}
+
+/* Parse only the status records needed to classify key listing. Unknown
+ * records are forward-compatible. ERROR and FAILURE records are structural
+ * evidence, so an incomplete or non-decimal form makes the capture unusable. */
+static void gpg_collect_listing_status(const char *capture,
+                                       gpg_listing_status_t *status) {
+    const char *line;
+
+    memset(status, 0, sizeof(*status));
+    for (line = capture; line && *line; ) {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+
+        if (line_len >= 9 && memcmp(line, "[GNUPG:] ", 9) == 0) {
+            const char *cursor = line + 9;
+            const char *end = line + line_len;
+            const char *kind;
+            const char *location;
+            const char *code_token;
+            size_t kind_len;
+            size_t location_len;
+            size_t code_len;
+            unsigned long long code;
+            bool is_error;
+            bool is_failure;
+
+            if (!eol ||
+                !gpg_status_next_token(&cursor, end, &kind, &kind_len)) {
+                status->malformed = true;
+                break;
+            }
+            is_error = gpg_status_token_is(kind, kind_len, "ERROR");
+            is_failure = gpg_status_token_is(kind, kind_len, "FAILURE");
+            if ((is_error || is_failure) &&
+                (!gpg_status_next_token(&cursor, end, &location,
+                                        &location_len) ||
+                 !gpg_status_next_token(&cursor, end, &code_token,
+                                        &code_len) ||
+                 !gpg_status_error_code(code_token, code_len, &code))) {
+                status->malformed = true;
+                break;
+            }
+            if (is_error &&
+                gpg_status_token_is(location, location_len,
+                                    "keylist.getkey")) {
+                if (status->keylist_error_seen &&
+                    status->keylist_error != code) {
+                    status->keylist_error_conflict = true;
+                }
+                status->keylist_error_seen = true;
+                status->keylist_error = code;
+            } else if (is_failure &&
+                       gpg_status_token_is(location, location_len,
+                                           "gpg-exit")) {
+                status->gpg_exit_failure_seen = true;
+            }
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+}
+
+/* Classify the runner result without collapsing transport/setup or keyring
+ * failures into an ordinary key miss. Exit status 2 is shared by multiple
+ * GnuPG failures; only complete machine status proving keylist.getkey's
+ * GPG_ERR_NO_SECKEY (17) plus the terminal gpg-exit failure is a miss. */
 static int gpg_classify_secret_listing_run(int run_rc,
                                            const run_result_t *res,
+                                           const char *capture,
                                            const char *selector) {
-    if (!res || !selector) {
+    gpg_listing_status_t status;
+
+    if (!res || !capture || !selector) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid GPG key-listing result classification");
         return -1;
     }
+    if (res->out_truncated) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG key-list/status output exceeds the one-shot %d-byte "
+                  "capture limit for %s",
+                  GPG_KEY_LISTING_CAP, selector);
+        return -1;
+    }
     if (run_rc == 0) {
         if (res->spawned && res->exit_code == 0 && res->term_signal == 0) {
+            gpg_collect_listing_status(capture, &status);
+            if (status.malformed || status.keylist_error_conflict ||
+                status.keylist_error_seen || status.gpg_exit_failure_seen) {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key helper returned inconsistent "
+                          "structured success for %s",
+                          selector);
+                return -1;
+            }
             return 0;
         }
         set_error(ERR_GPG_KEY_FAILED,
@@ -4086,7 +4061,39 @@ static int gpg_classify_secret_listing_run(int run_rc,
         return -1;
     }
     if (res->spawned && res->term_signal == 0 && res->exit_code == 2) {
-        return 1;
+        gpg_collect_listing_status(capture, &status);
+        if (status.malformed) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key helper returned malformed structured "
+                      "status output for %s",
+                      selector);
+            return -1;
+        }
+        if (status.keylist_error_conflict) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key helper returned contradictory structured "
+                      "status output for %s",
+                      selector);
+            return -1;
+        }
+        /* libgpg-error stores the portable code in the low 16 bits; the high
+         * source bits may be present or omitted in a status record. */
+        if (status.keylist_error_seen &&
+            (status.keylist_error & 0xffffULL) == 17ULL &&
+            status.gpg_exit_failure_seen) {
+            return 1;
+        }
+        if (status.keylist_error_seen) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key keyring/status error code %llu for %s",
+                      status.keylist_error & 0xffffULL, selector);
+        } else {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key helper exited 2 without complete "
+                      "structured no-secret-key evidence for %s",
+                      selector);
+        }
+        return -1;
     }
     if (!res->spawned) {
         set_error(ERR_GPG_KEY_FAILED,
@@ -4122,14 +4129,15 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                                       bool require_signing,
                                       char *fingerprint,
                                       size_t fingerprint_size) {
-    enum { KEY_LISTING_CAP = 512 * 1024 };
     const char *env[2] = {"GNUPGHOME=.", NULL};
     const char *argv[] = {
-        "gpg", "--batch", "--with-colons", "--fixed-list-mode",
+        "gpg", "--batch", "--status-fd=1", "--with-colons",
+        "--fixed-list-mode",
         "--list-secret-keys", "--fingerprint", "--fingerprint", selector,
         NULL
     };
     char *listing;
+    run_opts_t opts;
     run_result_t res;
     int run_rc;
     int status;
@@ -4139,62 +4147,62 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                   "Invalid GPG secret-key listing source");
         return -1;
     }
-    listing = malloc(KEY_LISTING_CAP);
+    listing = malloc(GPG_KEY_LISTING_CAP);
     if (!listing) {
         set_error(ERR_MEMORY_ALLOCATION,
                   "Failed to allocate GPG key-listing buffer");
         return -1;
     }
+    (void)gpg_config;
+    memset(&opts, 0, sizeof(opts));
+    opts.out = listing;
+    opts.out_size = GPG_KEY_LISTING_CAP;
+    opts.stderr_to_devnull = true;
+    opts.extra_env = env;
     memset(&res, 0, sizeof(res));
     res.exit_code = -1;
     if (home) {
-        run_rc = gpg_run_pinned(home, gpg_config, &res, listing,
-                                KEY_LISTING_CAP,
-                                "gpg", "--batch", "--with-colons",
-                                "--fixed-list-mode", "--list-secret-keys",
-                                "--fingerprint", "--fingerprint", selector,
-                                (const char *)NULL);
-    } else {
-        run_opts_t opts;
-        if (gpg_validate_source_home(source) != 0) {
-            secure_zero_memory(listing, KEY_LISTING_CAP);
+        if (gpg_validate_pinned_home(home) != 0) {
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
             return -1;
         }
-        memset(&opts, 0, sizeof(opts));
-        opts.out = listing;
-        opts.out_size = KEY_LISTING_CAP;
-        opts.stderr_to_devnull = true;
-        opts.extra_env = env;
+        opts.cwd_fd = home->home_fd;
+        opts.use_cwd_fd = true;
+        run_rc = run_argv(argv, &opts, &res);
+        if (gpg_validate_pinned_home(home) != 0) {
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
+            free(listing);
+            return -1;
+        }
+    } else {
+        if (gpg_validate_source_home(source) != 0) {
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
+            free(listing);
+            return -1;
+        }
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
         run_rc = run_argv(argv, &opts, &res);
         if (gpg_validate_source_home(source) != 0) {
-            secure_zero_memory(listing, KEY_LISTING_CAP);
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
             return -1;
         }
     }
-    status = gpg_classify_secret_listing_run(run_rc, &res, selector);
+    status = gpg_classify_secret_listing_run(run_rc, &res, listing, selector);
     if (status != 0) {
-        secure_zero_memory(listing, KEY_LISTING_CAP);
+        secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
         free(listing);
         return status;
     }
-    if (!res.out_truncated) {
+    {
         int parse_rc = gpg_manager_resolve_secret_key_listing(
             listing, require_signing, fingerprint, fingerprint_size);
-        secure_zero_memory(listing, KEY_LISTING_CAP);
+        secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
         free(listing);
         return parse_rc;
     }
-    secure_zero_memory(listing, KEY_LISTING_CAP);
-    free(listing);
-    set_error(ERR_GPG_KEY_FAILED,
-              "GPG secret-key inventory exceeds the one-shot %d-byte "
-              "capture limit",
-              KEY_LISTING_CAP);
-    return -1;
 }
 
 static int gpg_resolve_source_key(const char *selector, bool require_signing,
@@ -5130,6 +5138,7 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     struct stat fd_now;
     struct stat entry;
     bool have_created_identity = false;
+    bool temp_registered = false;
     bool installed = false;
     int source_fd = -1;
     int fd = -1;
@@ -5348,7 +5357,12 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
         set_error(ERR_INVALID_PATH, "GPG agent config path too long");
         goto fail;
     }
-    (void)signals_scratch_register(temp_path);
+    if (signals_scratch_register(temp_path) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Failed to register temporary gpg-agent.conf for cleanup");
+        goto fail;
+    }
+    temp_registered = true;
     if (gpg_write_all(fd, desired, desired_len) != 0 ||
         g_agent_conf_sync(fd, false) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to flush temporary gpg-agent.conf");
@@ -5381,6 +5395,7 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     }
     installed = true;
     signals_scratch_unregister(temp_path);
+    temp_registered = false;
     if (fstatat(home_fd, "gpg-agent.conf", &entry,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         entry.st_dev != created.st_dev || entry.st_ino != created.st_ino ||
@@ -5419,7 +5434,7 @@ fail:
         entry.st_dev == created.st_dev && entry.st_ino == created.st_ino) {
         (void)unlinkat(home_fd, temp_name, 0);
     }
-    if (temp_path[0]) signals_scratch_unregister(temp_path);
+    if (temp_registered) signals_scratch_unregister(temp_path);
     free(desired);
     return -1;
 }

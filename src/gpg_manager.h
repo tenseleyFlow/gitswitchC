@@ -142,8 +142,9 @@ int gpg_manager_setup_agent_config_for_test(int home_fd,
 int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode);
 
 /** Restore manager-owned environment/runtime retry state, then clear the
- * configuration. Returns -1 without clearing retry metadata if restoration
- * fails. */
+ * transaction configuration. Persistent per-account homes are deliberately
+ * retained for switch-back; gpg_manager_reset() owns explicit reclamation.
+ * Returns -1 without clearing retry metadata if restoration fails. */
 int gpg_manager_cleanup(gpg_config_t *gpg_config);
 
 /**
@@ -176,13 +177,10 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, 
                               git_scope_t scope);
 
-/**
- * Test GPG signing by creating a test signature
- */
-int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id);
-
-/* AR-06 F61: gpg_generate_key() was removed — dead public API with zero
- * callers. */
+/* AR-06 F61 / AR-09 L12: gpg_generate_key() and gpg_test_signing() were
+ * removed as dead/misleading public APIs. The latter created no signature and
+ * accepted incomplete capability output; the switch uses the strict resolver
+ * below as its authoritative readiness proof. */
 
 /** Install GNUPGHOME transactionally and retain its previous value for
  * gpg_manager_cleanup(). */
@@ -193,8 +191,11 @@ int gpg_set_environment(gpg_config_t *gpg_config);
 bool gpg_manager_runtime_restore_pending(const gpg_config_t *gpg_config);
 
 /** Strict parser used by the switch and exposed for mutation-sensitive colon
- * record tests. Resolves exactly one usable primary secret key, writes its
- * canonical fingerprint, and optionally requires a usable signing record. */
+ * record tests. Accepts GnuPG's fixed colon-format secret records, including
+ * the documented pre-2.1 form whose validity field is empty, while requiring
+ * independent expiry, capability, and secret-material evidence. Resolves
+ * exactly one usable primary secret key, writes its canonical fingerprint,
+ * and optionally requires a usable signing record. */
 int gpg_manager_resolve_secret_key_listing(const char *listing,
                                            bool require_signing,
                                            char *fingerprint,
@@ -204,8 +205,10 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
  * provenance-checked directory descriptor. The helper runs with cwd_fd and
  * GNUPGHOME=. so namespace replacement cannot redirect it. Exactly one
  * currently usable primary secret key is required; when require_signing is
- * true it must also have usable signing capability. On success writes the
- * canonical primary fingerprint. */
+ * true it must also have usable signing capability. A missing selector is
+ * recognized only from complete machine-readable no-secret-key status;
+ * keyring, helper, malformed-status, and truncated-output failures remain
+ * operational errors. On success writes the canonical primary fingerprint. */
 int gpg_manager_resolve_system_key(const char *selector,
                                    bool require_signing,
                                    char *fingerprint,
@@ -238,9 +241,12 @@ int gpg_manager_get_home_path_quiet(char *buf, size_t size);
  * non-directory entry. A full reset also rejects unknown base entries and
  * verifies that only its exact lock survives. Namespace changes are synced
  * through the pinned base before success; a failed sync returns nonzero so an
- * otherwise empty retry can repair durability. `current` is removed through
- * an identity-aware quarantine, preserving a same-uid writer that replaced it
- * after capture. Resets a single account when
+ * otherwise empty retry can repair durability. A successful full reset
+ * retires every captured `current` symlink. A targeted or incomplete full
+ * reset retires it only when it no longer names a live, safe managed home,
+ * preserving an unrelated live selection. Removal uses an identity-aware
+ * quarantine, preserving a same-uid writer that replaced the captured link.
+ * Resets a single account when
  * `account` is a nonempty name accepted by validate_name(); callers must pass
  * the canonical stored account name. Resets all accounts only when `account`
  * is NULL. Invalid non-NULL input fails with ERR_INVALID_ARGS before any
@@ -261,10 +267,12 @@ int gpg_manager_isolated_home_present(const char *account, bool *present);
 /**
  * Atomically (re)point the stable GNUPGHOME `current` symlink at `real_home`,
  * or drop it entirely — both under the GPG base dir's cross-process lock so
- * neither can interleave with gpg_manager_reset's dangling-link cleanup
- * (AR-02 #9). Used by the switch's rollback/teardown paths; the forward
- * switch retargets internally via the same locked path. Non-fatal helpers:
- * both return 0 on success, -1 otherwise.
+ * neither can interleave with gpg_manager_reset's home teardown or
+ * current-link retirement (AR-02 #9). Used by the switch's rollback/teardown
+ * paths; the forward switch retargets internally via the same locked path.
+ * Dropping `current` syncs the pinned base before success and re-syncs an
+ * already-absent name so a retry can repair a prior durability failure.
+ * Non-fatal helpers: both return 0 on success, -1 otherwise.
  */
 int gpg_manager_retarget_current(const char *real_home);
 int gpg_manager_drop_current(void);
@@ -307,11 +315,5 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
  */
 void gpg_manager_note_key_available(const char *key_id);
 bool gpg_manager_key_available_cached(const char *key_id);
-
-/**
- * Return true if `gpg --with-colons` output contains a secret key (sec/ssb)
- * whose capability field advertises signing ('s' or 'S'). Exposed for testing.
- */
-bool gpg_colons_have_sign_capability(const char *colons);
 
 #endif /* GPG_MANAGER_H */

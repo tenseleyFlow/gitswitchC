@@ -23,6 +23,139 @@ log_level_t g_log_level = LOG_LEVEL_INFO;
 FILE *g_log_file = NULL;
 bool g_log_to_stderr = true;
 
+/* Error setters cannot call safe_strncpy(): that helper reports failures by
+ * replacing the very context being constructed. Fixed diagnostic literals and
+ * provenance use this non-reporting copy and always remain terminated. */
+static void copy_bounded_text(char *destination, size_t destination_size,
+                              const char *source) {
+    const char *text = source ? source : "unknown";
+    size_t length;
+
+    if (!destination || destination_size == 0) return;
+    length = strlen(text);
+    if (length >= destination_size) length = destination_size - 1U;
+    memcpy(destination, text, length);
+    destination[length] = '\0';
+}
+
+static void mark_text_truncated(char *destination, size_t destination_size) {
+    static const char marker[] = ERROR_MESSAGE_TRUNCATION_MARKER;
+    const size_t marker_length = sizeof(marker) - 1U;
+    size_t offset;
+
+    if (!destination || destination_size == 0) return;
+    if (destination_size <= marker_length) {
+        destination[destination_size - 1U] = '\0';
+        return;
+    }
+
+    offset = strnlen(destination, destination_size);
+    if (offset + marker_length >= destination_size) {
+        offset = destination_size - marker_length - 1U;
+    }
+    memcpy(destination + offset, marker, marker_length + 1U);
+}
+
+/* Assemble user-facing diagnostics without asking snprintf() to prove that
+ * several independently bounded context fields fit one caller-sized buffer.
+ * Besides avoiding compiler-specific -Wformat-truncation false positives,
+ * this makes display-level truncation explicit instead of returning an
+ * indistinguishable prefix. */
+static bool append_display_span(char *destination, size_t destination_size,
+                                size_t *used, const char *source,
+                                size_t source_length) {
+    size_t available;
+    size_t copied;
+
+    if (!destination || destination_size == 0 || !used || !source) {
+        return false;
+    }
+    if (*used >= destination_size - 1U) {
+        return source_length == 0;
+    }
+
+    available = destination_size - *used - 1U;
+    copied = source_length < available ? source_length : available;
+    if (copied > 0) {
+        memcpy(destination + *used, source, copied);
+        *used += copied;
+    }
+    destination[*used] = '\0';
+    return copied == source_length;
+}
+
+static bool append_display_field(char *destination, size_t destination_size,
+                                 size_t *used, const char *source,
+                                 size_t source_capacity) {
+    size_t source_length;
+    bool terminated;
+
+    if (!source || source_capacity == 0) {
+        static const char unknown[] = "unknown";
+        return append_display_span(destination, destination_size, used,
+                                   unknown, sizeof(unknown) - 1U);
+    }
+    source_length = strnlen(source, source_capacity);
+    terminated = source_length < source_capacity;
+    return append_display_span(destination, destination_size, used, source,
+                               source_length) && terminated;
+}
+
+static int store_error_message(error_context_t *error, const char *fmt,
+                               va_list args) {
+    int formatted_length;
+
+    formatted_length = vsnprintf( /* Flawfinder: ignore — bounded destination;
+                                   * error and truncation checked below */
+        error->message, sizeof(error->message), fmt, args);
+    if (formatted_length < 0) {
+        copy_bounded_text(error->message, sizeof(error->message),
+                          "[error message formatting failed]");
+        return -1;
+    }
+    if ((size_t)formatted_length >= sizeof(error->message)) {
+        mark_text_truncated(error->message, sizeof(error->message));
+        error->message_truncated = true;
+        return -1;
+    }
+    return 0;
+}
+
+static int append_system_diagnostic(error_context_t *error,
+                                    int saved_errno) {
+    const char *system_message = strerror(saved_errno);
+    size_t message_length;
+    size_t remaining;
+    int formatted_length;
+    int result = 0;
+
+    formatted_length = snprintf(error->details, sizeof(error->details),
+                                "System error: %s (errno=%d)",
+                                system_message, saved_errno);
+    if (formatted_length < 0) {
+        copy_bounded_text(error->details, sizeof(error->details),
+                          "[system error formatting failed]");
+        result = -1;
+    } else if ((size_t)formatted_length >= sizeof(error->details)) {
+        mark_text_truncated(error->details, sizeof(error->details));
+        error->details_truncated = true;
+        result = -1;
+    }
+
+    if (error->message_truncated) return -1;
+
+    message_length = strlen(error->message);
+    remaining = sizeof(error->message) - message_length;
+    formatted_length = snprintf(error->message + message_length, remaining,
+                                " (%s)", system_message);
+    if (formatted_length < 0 || (size_t)formatted_length >= remaining) {
+        mark_text_truncated(error->message, sizeof(error->message));
+        error->message_truncated = true;
+        result = -1;
+    }
+    return result;
+}
+
 /* Error code to string mapping */
 static const struct {
     error_code_t code;
@@ -131,77 +264,73 @@ void error_cleanup(void) {
 }
 
 /* Set error context with detailed information */
-void set_error_context(error_code_t code, const char *file, int line,
-                       const char *function, const char *fmt, ...) {
+int set_error_context(error_code_t code, const char *file, int line,
+                      const char *function, const char *fmt, ...) {
+    error_context_t next = {0};
     va_list args;
-    
-    /* Clear previous error */
-    memset(&g_last_error, 0, sizeof(g_last_error));
-    
-    g_last_error.code = code;
-    g_last_error.file = file;
-    g_last_error.line = line;
-    g_last_error.function = function;
-    g_last_error.system_errno = 0;
+    int result = 0;
+
+    next.code = code;
+    copy_bounded_text(next.file, sizeof(next.file), file);
+    next.line = line;
+    copy_bounded_text(next.function, sizeof(next.function), function);
+    next.system_errno = 0;
     
     /* Format the error message */
     if (fmt) {
         va_start(args, fmt);
-        vsnprintf(g_last_error.message, sizeof(g_last_error.message), fmt, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+        result = store_error_message(&next, fmt, args);
         va_end(args);
     } else {
-        strncpy(g_last_error.message, error_code_to_string(code), 
-                sizeof(g_last_error.message) - 1);
+        copy_bounded_text(next.message, sizeof(next.message),
+                          error_code_to_string(code));
     }
-    
+
+    g_last_error = next;
+
     /* Log the error */
     log_error("Error set: %s (%s:%d in %s)", 
-              g_last_error.message, file, line, function);
+              g_last_error.message, g_last_error.file, line,
+              g_last_error.function);
+    return result;
 }
 
 /* Set error context including system errno */
-void set_system_error_context(error_code_t code, const char *file, int line,
-                              const char *function, const char *fmt, ...) {
+int set_system_error_context(error_code_t code, const char *file, int line,
+                             const char *function, const char *fmt, ...) {
+    error_context_t next = {0};
     va_list args;
     int saved_errno = errno; /* Save errno before any other operations */
-    
-    /* Clear previous error */
-    memset(&g_last_error, 0, sizeof(g_last_error));
-    
-    g_last_error.code = code;
-    g_last_error.file = file;
-    g_last_error.line = line;
-    g_last_error.function = function;
-    g_last_error.system_errno = saved_errno;
+    int result = 0;
+
+    next.code = code;
+    copy_bounded_text(next.file, sizeof(next.file), file);
+    next.line = line;
+    copy_bounded_text(next.function, sizeof(next.function), function);
+    next.system_errno = saved_errno;
     
     /* Format the error message */
     if (fmt) {
         va_start(args, fmt);
-        vsnprintf(g_last_error.message, sizeof(g_last_error.message), fmt, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+        result = store_error_message(&next, fmt, args);
         va_end(args);
     } else {
-        strncpy(g_last_error.message, error_code_to_string(code), 
-                sizeof(g_last_error.message) - 1);
+        copy_bounded_text(next.message, sizeof(next.message),
+                          error_code_to_string(code));
     }
-    
+
     /* Add system error details */
     if (saved_errno != 0) {
-        int msg_len = strlen(g_last_error.message);
-        snprintf(g_last_error.details, sizeof(g_last_error.details),
-                 "System error: %s (errno=%d)", strerror(saved_errno), saved_errno);
-        
-        /* Append system error to message if there's room */
-        if (msg_len < (int)(sizeof(g_last_error.message) - 50)) {
-            snprintf(g_last_error.message + msg_len, 
-                    sizeof(g_last_error.message) - msg_len,
-                    " (%s)", strerror(saved_errno));
-        }
+        if (append_system_diagnostic(&next, saved_errno) != 0) result = -1;
     }
-    
+
+    g_last_error = next;
+
     /* Log the error with system details */
     log_error("System error: %s [errno=%d: %s] (%s:%d in %s)", 
               g_last_error.message, saved_errno, strerror(saved_errno),
-              file, line, function);
+              g_last_error.file, line, g_last_error.function);
+    return result;
 }
 
 /* Get last error information */
@@ -300,25 +429,59 @@ void set_log_to_stderr(bool enable) {
 /* Format error message for user display */
 void format_error_message(char *buffer, size_t buffer_size, 
                           const error_context_t *error) {
+    char line_text[32];
+    size_t used = 0;
+    int line_length;
+    bool complete = true;
+
     if (!buffer || buffer_size == 0 || !error) {
         return;
     }
-    
+
+    buffer[0] = '\0';
+    complete = append_display_span(buffer, buffer_size, &used, "Error: ",
+                                   sizeof("Error: ") - 1U) && complete;
+    complete = append_display_field(buffer, buffer_size, &used,
+                                    error->message,
+                                    sizeof(error->message)) && complete;
     if (error->system_errno != 0) {
-        snprintf(buffer, buffer_size, 
-                "Error: %s\nDetails: %s\nLocation: %s:%d in %s()",
-                error->message, error->details, 
-                error->file, error->line, error->function);
-    } else {
-        snprintf(buffer, buffer_size,
-                "Error: %s\nLocation: %s:%d in %s()",
-                error->message, error->file, error->line, error->function);
+        complete = append_display_span(buffer, buffer_size, &used,
+                                       "\nDetails: ",
+                                       sizeof("\nDetails: ") - 1U) && complete;
+        complete = append_display_field(buffer, buffer_size, &used,
+                                        error->details,
+                                        sizeof(error->details)) && complete;
     }
+    complete = append_display_span(buffer, buffer_size, &used, "\nLocation: ",
+                                   sizeof("\nLocation: ") - 1U) && complete;
+    complete = append_display_field(buffer, buffer_size, &used, error->file,
+                                    sizeof(error->file)) && complete;
+    complete = append_display_span(buffer, buffer_size, &used, ":",
+                                   sizeof(":") - 1U) && complete;
+    line_length = snprintf(line_text, sizeof(line_text), "%d", error->line);
+    if (line_length < 0 || (size_t)line_length >= sizeof(line_text)) {
+        complete = false;
+    } else {
+        complete = append_display_span(buffer, buffer_size, &used, line_text,
+                                       (size_t)line_length) && complete;
+    }
+    complete = append_display_span(buffer, buffer_size, &used, " in ",
+                                   sizeof(" in ") - 1U) && complete;
+    complete = append_display_field(buffer, buffer_size, &used,
+                                    error->function,
+                                    sizeof(error->function)) && complete;
+    complete = append_display_span(buffer, buffer_size, &used, "()",
+                                   sizeof("()") - 1U) && complete;
+    if (!complete) mark_text_truncated(buffer, buffer_size);
 }
 
 /* Print formatted error to stderr */
 void print_error(const char *prefix) {
-    char error_msg[2048];
+    /* Enough for every stored field plus labels and the widest decimal line;
+     * format_error_message still marks truncation for smaller public callers. */
+    char error_msg[sizeof(g_last_error.message) + sizeof(g_last_error.details) +
+                   sizeof(g_last_error.file) + sizeof(g_last_error.function) +
+                   96U];
     
     if (g_last_error.code == ERR_SUCCESS) {
         return; /* No error to print */

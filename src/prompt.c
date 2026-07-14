@@ -52,7 +52,14 @@ static int prompt_line_stdio(const char *prompt, char *buf, size_t size) {
     }
 
     if (!fgets(buf, (int)size, stdin)) {
-        return ferror(stdin) ? PROMPT_LINE_ERROR : PROMPT_LINE_EOF;
+        int saved_errno = errno;
+        int result = ferror(stdin) ? PROMPT_LINE_ERROR : PROMPT_LINE_EOF;
+        /* A failed fgets may already have copied a prefix. Never expose that
+         * indeterminate partial answer to callers, and do not let cleanup
+         * obscure the underlying input error. */
+        buf[0] = '\0';
+        errno = saved_errno;
+        return result;
     }
 
     /* No newline is ambiguous: size - 1 bytes are a valid exact-boundary line

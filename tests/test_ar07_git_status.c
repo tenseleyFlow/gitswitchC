@@ -7,6 +7,7 @@
 #include "accounts.h"
 #include "error.h"
 #include "git_ops.h"
+#include "ssh_manager.h"
 #include "utils.h"
 
 #include <fcntl.h>
@@ -662,6 +663,196 @@ TEST(active_status_reports_expected_ssh_resolution_failure) {
     CHECK(strstr(status, "No trusted SSH executable") != NULL);
 }
 
+static int denied_status_key_open(const char *path, int flags) {
+    (void)path;
+    (void)flags;
+    errno = EACCES;
+    return -1;
+}
+
+TEST(active_status_propagates_required_key_inspection_failure) {
+    gitswitch_ctx_t context;
+    char key_path[] = "/tmp/gsw_ar09_status_key_XXXXXX";
+    char expected_ssh[GIT_CONFIG_VALUE_MAX];
+    char status[8192];
+    command_runner_fn previous_runner;
+    ssh_key_open_fn previous_open;
+    int key_fd;
+    int status_rc;
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", "file:/ar09/global", "user.name",
+                             "Inspection User", strlen("Inspection User")));
+    CHECK(fake_append_record("global", "file:/ar09/global", "user.email",
+                             "inspection@example.test",
+                             strlen("inspection@example.test")));
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1;
+    context.accounts[0].id = 10;
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].name, "Inspection User",
+                              sizeof(context.accounts[0].name)), 0);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
+                              "inspection@example.test",
+                              sizeof(context.accounts[0].email)), 0);
+    context.accounts[0].ssh_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path,
+                              "/private/ar09/status-key",
+                              sizeof(context.accounts[0].ssh_key_path)), 0);
+    context.current_account = &context.accounts[0];
+
+    git_ops_test_reset_caches();
+    previous_runner = run_set_runner(status_fake_runner);
+    previous_open = ssh_manager_set_key_open_fn(denied_status_key_open);
+    status_rc = capture_status_output_for(&context, status, sizeof(status));
+    ssh_manager_set_key_open_fn(previous_open);
+    run_set_runner(previous_runner);
+    git_ops_test_reset_caches();
+
+    CHECK_EQ_INT(status_rc, -1);
+    CHECK(strstr(status, "Key File: [ERROR] Unable to inspect safely") != NULL);
+    CHECK(strstr(status, "Cannot safely open SSH key file") != NULL);
+    /* Prove the exit failure came from key inspection, not from expected SSH
+     * executable discovery or the independent Git status read. */
+    CHECK(strstr(status, "Effective SSH Command: [MISMATCH]") != NULL);
+    CHECK(strstr(status, "Match Status: [ERROR]") == NULL);
+
+    key_fd = mkstemp(key_path);
+    CHECK(key_fd >= 0);
+    if (key_fd < 0) return;
+    CHECK_EQ_INT(fchmod(key_fd, 0600), 0);
+    CHECK_EQ_INT(write(key_fd,
+                       "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                       strlen("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n")),
+                 (ssize_t)strlen(
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n"));
+    CHECK_EQ_INT(close(key_fd), 0);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path, key_path,
+                              sizeof(context.accounts[0].ssh_key_path)), 0);
+    CHECK_EQ_INT(git_expected_ssh_command(&context.accounts[0], expected_ssh,
+                                          sizeof(expected_ssh)), 0);
+
+    fake_listing_len = 0;
+    CHECK(fake_append_record("global", "file:/ar09/global", "user.name",
+                             "Inspection User", strlen("Inspection User")));
+    CHECK(fake_append_record("global", "file:/ar09/global", "user.email",
+                             "inspection@example.test",
+                             strlen("inspection@example.test")));
+    CHECK(fake_append_record("global", "file:/ar09/global",
+                             "core.sshcommand", expected_ssh,
+                             strlen(expected_ssh)));
+    git_ops_test_reset_caches();
+    previous_runner = run_set_runner(status_fake_runner);
+    status_rc = capture_status_output_for(&context, status, sizeof(status));
+    run_set_runner(previous_runner);
+    git_ops_test_reset_caches();
+
+    CHECK_EQ_INT(status_rc, 0);
+    CHECK(strstr(status, "Key File: [FOUND]") != NULL);
+    CHECK(strstr(status, "Permissions: [SECURE] (600)") != NULL);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+    CHECK_EQ_INT(unlink(key_path), 0);
+}
+
+static int capture_signing_status(const account_t *account,
+                                  const char *signing_key,
+                                  const char *gpg_signing,
+                                  char *status, size_t status_size) {
+    gitswitch_ctx_t context;
+    command_runner_fn previous;
+    int status_rc;
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", "file:/ar09/global", "user.name",
+                             account->name, strlen(account->name)));
+    CHECK(fake_append_record("global", "file:/ar09/global", "user.email",
+                             account->email, strlen(account->email)));
+    if (signing_key) {
+        CHECK(fake_append_record("global", "file:/ar09/global",
+                                 "user.signingkey", signing_key,
+                                 strlen(signing_key)));
+    }
+    if (gpg_signing) {
+        CHECK(fake_append_record("global", "file:/ar09/global",
+                                 "commit.gpgsign", gpg_signing,
+                                 strlen(gpg_signing)));
+    }
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1;
+    context.accounts[0] = *account;
+    context.current_account = &context.accounts[0];
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    status_rc = capture_status_output_for(&context, status, status_size);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+    return status_rc;
+}
+
+TEST(active_status_includes_every_selected_signing_field) {
+    static const char canonical_key[] =
+        "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
+    static const char wrong_key[] =
+        "0123456789ABCDEF0123456789ABCDEFFEDCBA98";
+    account_t account;
+    char status[8192];
+
+    memset(&account, 0, sizeof(account));
+    account.id = 9;
+    CHECK_EQ_INT(safe_strncpy(account.name, "Signing User",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "signing@example.test",
+                              sizeof(account.email)), 0);
+    account.gpg_enabled = true;
+    account.gpg_signing_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "0x89abcdef",
+                              sizeof(account.gpg_key_id)), 0);
+
+    /* A successful switch publishes the canonical primary fingerprint even
+     * when the persisted account retains a shorter, 0x-prefixed selector. */
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, NULL, "true",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, wrong_key, "true",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    account.gpg_signing_enabled = false;
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+
+    account.gpg_enabled = false;
+    CHECK_EQ_INT(capture_signing_status(&account, NULL, "false",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, NULL, "true",
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+}
+
 static int setup_isolated_git(char *base, size_t base_size,
                               char *config_path, size_t config_size,
                               char *saved_cwd, size_t cwd_size) {
@@ -995,6 +1186,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(int_min_boolean_follows_selected_gits_grammar);
     RUN_TEST(absent_identity_with_oversized_managed_value_reports_error);
     RUN_TEST(active_status_reports_expected_ssh_resolution_failure);
+    RUN_TEST(active_status_propagates_required_key_inspection_failure);
+    RUN_TEST(active_status_includes_every_selected_signing_field);
     RUN_TEST(real_malformed_config_retains_gits_diagnostic);
     RUN_TEST(git_boolean_grammar_matches_gits_canonical_oracle);
     RUN_TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow);

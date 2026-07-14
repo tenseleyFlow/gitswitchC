@@ -87,6 +87,12 @@ source_root=$tmp/$dist_root
 for required in src tests completions VERSION LICENSE README.md Makefile gitswitcher.spec; do
     [ -e "$source_root/$required" ] || fail "required manifest entry missing: $required"
 done
+# Release publication is built before distcheck enters the archive, so a
+# mutable DIST_MANIFEST could omit its source without breaking the ordinary
+# debug/release build below. Keep this independent completeness assertion tied
+# to the release operation that a consumer of the archive must reproduce.
+[ -f "$source_root/tools/release_publish.c" ] ||
+    fail "required release publisher source missing: tools/release_publish.c"
 for completion in gitswitch.bash gitswitch.zsh gitswitch.fish; do
     [ -f "$source_root/completions/$completion" ] || fail "completion missing: $completion"
 done
@@ -186,12 +192,53 @@ if command -v rpmbuild >/dev/null 2>&1; then
     payload=$(rpm -qlp "$main_rpm" 2>/dev/null) ||
         fail "cannot list payload of $main_rpm"
     for want in \
-        /bin/gitswitch \
-        /share/bash-completion/completions/gitswitch \
-        /share/zsh/site-functions/_gitswitch \
-        /share/fish/vendor_completions.d/gitswitch.fish; do
-        printf '%s\n' "$payload" | grep -q -- "$want\$" ||
+        /usr/bin/gitswitch \
+        /usr/share/bash-completion/completions/gitswitch \
+        /usr/share/zsh/site-functions/_gitswitch \
+        /usr/share/fish/vendor_completions.d/gitswitch.fish; do
+        printf '%s\n' "$payload" | grep -Fx -- "$want" >/dev/null ||
             fail "built RPM payload is missing $want"
+    done
+    if printf '%s\n' "$payload" | grep -E '^/usr/local(/|$)' >/dev/null; then
+        fail "built RPM payload incorrectly owns /usr/local content"
+    fi
+    license_payload=$(rpm -qL -p "$main_rpm" 2>/dev/null) ||
+        fail "cannot query license ownership of $main_rpm"
+    documentation_payload=$(rpm -qd -p "$main_rpm" 2>/dev/null) ||
+        fail "cannot query documentation ownership of $main_rpm"
+    package_name=$(rpm -qp --qf '%{NAME}' "$main_rpm" 2>/dev/null) ||
+        fail "cannot query package name of $main_rpm"
+    package_version=$(rpm -qp --qf '%{VERSION}' "$main_rpm" 2>/dev/null) ||
+        fail "cannot query package version of $main_rpm"
+    license_path=
+    for owned_path in $license_payload; do
+        case $owned_path in
+            "/usr/share/licenses/$package_name/LICENSE"|\
+            "/usr/share/licenses/$package_name-$package_version/LICENSE")
+                [ -z "$license_path" ] ||
+                    fail "built RPM declares LICENSE more than once"
+                license_path=$owned_path
+                ;;
+        esac
+    done
+    [ -n "$license_path" ] ||
+        fail "built RPM does not declare LICENSE with %license under /usr"
+    documentation_path=
+    for owned_path in $documentation_payload; do
+        case $owned_path in
+            "/usr/share/doc/$package_name/README.md"|\
+            "/usr/share/doc/$package_name-$package_version/README.md")
+                [ -z "$documentation_path" ] ||
+                    fail "built RPM declares README.md more than once"
+                documentation_path=$owned_path
+                ;;
+        esac
+    done
+    [ -n "$documentation_path" ] ||
+        fail "built RPM does not declare README.md with %doc under /usr"
+    for metadata_path in "$license_path" "$documentation_path"; do
+        printf '%s\n' "$payload" | grep -Fx -- "$metadata_path" >/dev/null ||
+            fail "built RPM metadata path is absent from its payload: $metadata_path"
     done
     requirements=$(rpm -qp --requires "$main_rpm" 2>/dev/null) ||
         fail "cannot query runtime requirements of $main_rpm"

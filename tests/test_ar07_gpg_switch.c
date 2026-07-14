@@ -37,6 +37,9 @@
 #define PRIMARY_SIGN \
     "sec:u:4096:1:0123456789ABCDEF:1700000000:::-:::scESC:::+:::23::0:\n" \
     "fpr:::::::::" PRIMARY_FPR ":\n"
+#define SECOND_SIGN \
+    "sec:u:4096:1:89ABCDEF01234567:1700000000:::-:::scESC:::+:::23::0:\n" \
+    "fpr:::::::::" SECOND_FPR ":\n"
 #define V5_PRIMARY_SIGN \
     "sec:u:4096:1:0123456789ABCDEF:1700000000:::-:::scESC:::+:::23::0:\n" \
     "fpr:::::::::" V5_FPR ":\n"
@@ -47,10 +50,27 @@
     PRIMARY_SIGN \
     "sec:u:4096:1:89ABCDEF01234567:1700000000:::-:::scESC:::+:::23::0:\n" \
     "fpr:::::::::" SECOND_FPR ":\n"
+#define STATUS_NO_SECRET_KEY \
+    "[GNUPG:] ERROR keylist.getkey 17\n" \
+    "[GNUPG:] FAILURE gpg-exit 33554433\n"
+#define STATUS_INVALID_KEYBOX \
+    "[GNUPG:] ERROR keylist.getkey 14\n" \
+    "[GNUPG:] FAILURE gpg-exit 33554433\n"
 
 static int make_runtime(char *xdg, size_t size) {
+    char canonical[MAX_PATH_LEN];
+    size_t length;
+
     if (snprintf(xdg, size, "/tmp/gswar07gpg_XXXXXX") >= (int)size ||
-        !ts_mkdtemp(xdg) || chmod(xdg, 0700) != 0 ||
+        !ts_mkdtemp(xdg) || !realpath(xdg, canonical)) {
+        return -1;
+    }
+    length = strlen(canonical);
+    if (length >= size) {
+        return -1;
+    }
+    memcpy(xdg, canonical, length + 1U);
+    if (chmod(xdg, 0700) != 0 ||
         setenv("XDG_RUNTIME_DIR", xdg, 1) != 0 ||
         setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0) {
         return -1;
@@ -128,6 +148,10 @@ TEST(strict_capability_parser_rejects_unusable_keys) {
 
 TEST(selector_inventory_is_exact_and_canonical) {
     char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    const char *status_interleaved =
+        "sec:u:4096:1:0123456789ABCDEF:1700000000:::-:::scESC:::+:::23::0:\n"
+        "[GNUPG:] KEY_CONSIDERED " PRIMARY_FPR " 0\n"
+        "fpr:::::::::" PRIMARY_FPR ":\n";
 
     CHECK_EQ_INT(gpg_manager_resolve_secret_key_listing(
                      AMBIGUOUS_KEYS, false, fingerprint,
@@ -138,12 +162,17 @@ TEST(selector_inventory_is_exact_and_canonical) {
                      PRIMARY_SIGN, true, fingerprint,
                      sizeof(fingerprint)), 0);
     CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+    CHECK_EQ_INT(gpg_manager_resolve_secret_key_listing(
+                     status_interleaved, true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
 }
 
 enum fake_mode {
     FAKE_PRESENT,
     FAKE_V5_FIRST_IMPORT,
     FAKE_AMBIGUOUS_SOURCE,
+    FAKE_MISMATCHED_IMPORT,
     FAKE_FIRST_IMPORT
 };
 static enum fake_mode g_fake_mode;
@@ -181,6 +210,8 @@ static void fill_account(account_t *account, const char *name,
 enum listing_result_mode {
     LISTING_RESULT_MATCH,
     LISTING_RESULT_MISS,
+    LISTING_RESULT_INVALID_KEYBOX,
+    LISTING_RESULT_TRUNCATED_STATUS,
     LISTING_RESULT_SPAWN_FAILURE,
     LISTING_RESULT_SETUP_FAILURE,
     LISTING_RESULT_SIGNAL_FAILURE,
@@ -194,6 +225,7 @@ static int g_listing_result_calls;
 static int g_listing_result_exports;
 static int g_listing_result_imports;
 static size_t g_listing_result_capacity;
+static bool g_listing_status_requested;
 
 static int listing_result_runner(const char *const argv[],
                                  const run_opts_t *opts,
@@ -211,11 +243,37 @@ static int listing_result_runner(const char *const argv[],
 
     if (listing) {
         g_listing_result_calls++;
+        g_listing_status_requested =
+            g_listing_status_requested || argv_has(argv, "--status-fd=1");
         if (g_listing_result_calls == 1) {
             g_listing_result_capacity = opts ? opts->out_size : 0;
             switch (g_listing_result_mode) {
                 case LISTING_RESULT_MISS:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size, "%s",
+                                 STATUS_NO_SECRET_KEY);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
                     if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_INVALID_KEYBOX:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size, "%s",
+                                 STATUS_INVALID_KEYBOX);
+                        if (result) result->out_len = strlen(opts->out);
+                    }
+                    if (result) result->exit_code = 2;
+                    return -1;
+                case LISTING_RESULT_TRUNCATED_STATUS:
+                    if (opts && opts->out && opts->out_size > 0) {
+                        snprintf(opts->out, opts->out_size,
+                                 "[GNUPG:] ERROR keylist.getkey 17\n"
+                                 "[GNUPG:] FAILURE gpg-ex");
+                        if (result) {
+                            result->out_len = strlen(opts->out);
+                            result->exit_code = 2;
+                        }
+                    }
                     return -1;
                 case LISTING_RESULT_SPAWN_FAILURE:
                     if (result) {
@@ -303,6 +361,7 @@ static int run_listing_result_case(enum listing_result_mode mode,
     g_listing_result_exports = 0;
     g_listing_result_imports = 0;
     g_listing_result_capacity = 0;
+    g_listing_status_requested = false;
     clear_error();
     previous = run_set_runner(listing_result_runner);
     rc = gpg_switch_account(&config, &account);
@@ -317,6 +376,46 @@ static int run_listing_result_case(enum listing_result_mode mode,
         (void)gpg_manager_cleanup(&config);
     }
     run_set_runner(previous);
+    unsetenv("GNUPGHOME");
+    return rc;
+}
+
+static int run_system_listing_result_case(enum listing_result_mode mode,
+                                          error_code_t *error_code,
+                                          char *fingerprint,
+                                          size_t fingerprint_size,
+                                          char *diagnostic,
+                                          size_t diagnostic_size) {
+    char xdg[128];
+    char source_home[MAX_PATH_LEN];
+    char resolved[GPG_FINGERPRINT_BUFSIZE];
+    command_runner_fn previous;
+    int rc;
+
+    if (make_runtime(xdg, sizeof(xdg)) != 0 ||
+        safe_snprintf(source_home, sizeof(source_home), "%s/source", xdg) != 0 ||
+        mkdir(source_home, 0700) != 0 ||
+        setenv("GNUPGHOME", source_home, 1) != 0) {
+        return -2;
+    }
+    g_listing_result_mode = mode;
+    g_listing_result_calls = 0;
+    g_listing_result_exports = 0;
+    g_listing_result_imports = 0;
+    g_listing_result_capacity = 0;
+    g_listing_status_requested = false;
+    clear_error();
+    previous = run_set_runner(listing_result_runner);
+    rc = gpg_manager_resolve_system_key(
+        "01234567", true, resolved, sizeof(resolved));
+    run_set_runner(previous);
+    if (error_code) *error_code = get_last_error()->code;
+    if (fingerprint && fingerprint_size > 0) {
+        safe_strncpy(fingerprint, resolved, fingerprint_size);
+    }
+    if (diagnostic && diagnostic_size > 0) {
+        safe_strncpy(diagnostic, get_last_error()->message, diagnostic_size);
+    }
     unsetenv("GNUPGHOME");
     return rc;
 }
@@ -342,6 +441,7 @@ TEST(secret_listing_result_matrix_is_causal_and_exact) {
     CHECK_EQ_INT(run_listing_result_case(
                      LISTING_RESULT_MATCH, &listings, &exports, &imports,
                      &capacity, diagnostic, sizeof(diagnostic)), 0);
+    CHECK(g_listing_status_requested);
     CHECK_EQ_INT(listings, 1);
     CHECK_EQ_INT(exports, 0);
     CHECK_EQ_INT(imports, 0);
@@ -352,6 +452,7 @@ TEST(secret_listing_result_matrix_is_causal_and_exact) {
     CHECK_EQ_INT(run_listing_result_case(
                      LISTING_RESULT_MISS, &listings, &exports, &imports,
                      &capacity, diagnostic, sizeof(diagnostic)), 0);
+    CHECK(g_listing_status_requested);
     CHECK_EQ_INT(listings, 3);
     CHECK_EQ_INT(exports, 1);
     CHECK_EQ_INT(imports, 1);
@@ -365,6 +466,46 @@ TEST(secret_listing_result_matrix_is_causal_and_exact) {
         CHECK_EQ_INT(imports, 0);
         CHECK(strstr(diagnostic, failures[i].diagnostic) != NULL);
     }
+}
+
+TEST(structured_status_distinguishes_absence_from_keyring_failure) {
+    char diagnostic[512];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    error_code_t error_code;
+
+    CHECK_EQ_INT(run_system_listing_result_case(
+                     LISTING_RESULT_MATCH, &error_code, fingerprint,
+                     sizeof(fingerprint), diagnostic, sizeof(diagnostic)), 0);
+    CHECK(g_listing_status_requested);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+
+    CHECK_EQ_INT(run_system_listing_result_case(
+                     LISTING_RESULT_MISS, &error_code, fingerprint,
+                     sizeof(fingerprint), diagnostic, sizeof(diagnostic)), -1);
+    CHECK(g_listing_status_requested);
+    CHECK_EQ_INT(error_code, ERR_GPG_KEY_NOT_FOUND);
+    CHECK(strstr(diagnostic, "resolved no secret key") != NULL);
+
+    CHECK_EQ_INT(run_system_listing_result_case(
+                     LISTING_RESULT_INVALID_KEYBOX, &error_code, fingerprint,
+                     sizeof(fingerprint), diagnostic, sizeof(diagnostic)), -1);
+    CHECK(g_listing_status_requested);
+    CHECK_EQ_INT(error_code, ERR_GPG_KEY_FAILED);
+    CHECK(strstr(diagnostic, "error code 14") != NULL);
+
+    CHECK_EQ_INT(run_system_listing_result_case(
+                     LISTING_RESULT_TRUNCATED_STATUS, &error_code, fingerprint,
+                     sizeof(fingerprint), diagnostic, sizeof(diagnostic)), -1);
+    CHECK(g_listing_status_requested);
+    CHECK_EQ_INT(error_code, ERR_GPG_KEY_FAILED);
+    CHECK(strstr(diagnostic, "status output") != NULL);
+
+    CHECK_EQ_INT(run_system_listing_result_case(
+                     LISTING_RESULT_SETUP_FAILURE, &error_code, fingerprint,
+                     sizeof(fingerprint), diagnostic, sizeof(diagnostic)), -1);
+    CHECK(g_listing_status_requested);
+    CHECK_EQ_INT(error_code, ERR_GPG_KEY_FAILED);
+    CHECK(strstr(diagnostic, "child setup or exec") != NULL);
 }
 
 TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap) {
@@ -550,10 +691,19 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
 
         if (g_fake_mode == FAKE_AMBIGUOUS_SOURCE && source_listing) {
             inventory = AMBIGUOUS_KEYS;
+        } else if (g_fake_mode == FAKE_MISMATCHED_IMPORT &&
+                   g_fake_imported) {
+            inventory = SECOND_SIGN;
         } else if ((g_fake_mode == FAKE_AMBIGUOUS_SOURCE ||
+                    g_fake_mode == FAKE_MISMATCHED_IMPORT ||
                     g_fake_mode == FAKE_FIRST_IMPORT ||
                     g_fake_mode == FAKE_V5_FIRST_IMPORT) &&
                    !source_listing && !g_fake_imported) {
+            if (opts && opts->out && opts->out_size > 0) {
+                snprintf(opts->out, opts->out_size, "%s",
+                         STATUS_NO_SECRET_KEY);
+                if (result) result->out_len = strlen(opts->out);
+            }
             if (result) result->exit_code = 2;
             return -1;
         }
@@ -654,6 +804,7 @@ TEST(ambiguous_selector_exports_and_imports_nothing) {
 
 TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     char xdg[128], source_home[MAX_PATH_LEN];
+    char isolated_home[MAX_PATH_LEN];
     gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
     account_t account;
     command_runner_fn previous;
@@ -680,8 +831,41 @@ TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     CHECK(g_fake_export_used_fingerprint);
     CHECK(g_fake_git_used_fingerprint);
     CHECK_STR_EQ(config.current_key_id, PRIMARY_FPR);
+    CHECK_EQ_INT(safe_strncpy(isolated_home, config.gnupg_home,
+                              sizeof(isolated_home)), 0);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
+    /* Cleanup ends the transaction and restores its process environment; the
+     * explicit reset lifecycle, not cleanup, owns persistent-home deletion. */
+    CHECK(path_exists(isolated_home));
     CHECK_STR_EQ(getenv("GNUPGHOME"), source_home);
+    unsetenv("GNUPGHOME");
+}
+
+TEST(post_import_fingerprint_mismatch_is_not_signing_readiness) {
+    char xdg[128], source_home[MAX_PATH_LEN];
+    gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
+    account_t account;
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(source_home, sizeof(source_home),
+                               "%s/source", xdg), 0);
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
+    fill_account(&account, "mismatch", "01234567", true);
+    g_fake_mode = FAKE_MISMATCHED_IMPORT;
+    g_fake_imported = false;
+    g_fake_exported = false;
+    g_fake_listing_calls = 0;
+    previous = run_set_runner(strict_key_runner);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), -1);
+    run_set_runner(previous);
+
+    CHECK(g_fake_exported);
+    CHECK(g_fake_imported);
+    CHECK(config.current_key_id[0] == '\0');
+    CHECK(strstr(get_last_error()->message,
+                 "did not validate as fingerprint") != NULL);
     unsetenv("GNUPGHOME");
 }
 
@@ -1537,6 +1721,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(strict_capability_parser_rejects_unusable_keys);
     RUN_TEST(selector_inventory_is_exact_and_canonical);
     RUN_TEST(secret_listing_result_matrix_is_causal_and_exact);
+    RUN_TEST(structured_status_distinguishes_absence_from_keyring_failure);
     RUN_TEST(truncated_secret_listing_is_one_shot_at_the_documented_cap);
     RUN_TEST(system_key_helper_stays_on_pinned_source_after_directory_replacement);
 #ifdef __linux__
@@ -1544,6 +1729,7 @@ TEST_MAIN_BEGIN()
 #endif
     RUN_TEST(ambiguous_selector_exports_and_imports_nothing);
     RUN_TEST(unique_selector_threads_fingerprint_through_import_and_publication);
+    RUN_TEST(post_import_fingerprint_mismatch_is_not_signing_readiness);
     RUN_TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication);
     RUN_TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal);
     RUN_TEST(system_resolver_classifies_managed_aliases_before_helper_launch);

@@ -64,11 +64,14 @@ int ensure_private_dir(const char *path);
 
 /**
  * Open and pin the runtime parent used by SSH/GPG state.  A configured
- * XDG_RUNTIME_DIR is accepted only when it is absolute and names a real,
- * self-owned 0700 directory; the returned descriptor names the validated
- * inode even if its pathname is subsequently renamed.  When XDG_RUNTIME_DIR
- * is absent or empty, the system /tmp target is opened and the absolute /tmp
- * spelling is returned for the uid-specific fallback directories.
+ * XDG_RUNTIME_DIR is accepted only when it is absolute, every component can
+ * be opened descriptor-relative without following links, and the leaf is a
+ * self-owned 0700 directory.  The system-owned /tmp alias is canonicalized on
+ * platforms that provide one; no component below it is resolved. The returned
+ * descriptor names the validated inode even if its pathname is subsequently
+ * renamed.  When XDG_RUNTIME_DIR is absent or empty, the system /tmp target is
+ * opened and the absolute /tmp spelling is returned for the uid-specific
+ * fallback directories.
  */
 int open_runtime_parent(char *path, size_t path_size);
 
@@ -96,8 +99,10 @@ void unlock_private_file(int token_fd);
 /**
  * Serialize cross-manager SSH/GPG runtime transactions for processes sharing
  * XDG_RUNTIME_DIR (or the same uid-specific /tmp fallback), even when their
- * different HOME values give them different configuration locks. The caller
- * owns the returned descriptor until runtime_state_lock_release().
+ * different HOME values give them different configuration locks. Configured
+ * paths retain a lock on their first user-replaceable ancestor so renaming and
+ * recreating a lower directory cannot create a second lock namespace. The
+ * caller owns the returned descriptor until runtime_state_lock_release().
  */
 int runtime_state_lock_acquire(void);
 void runtime_state_lock_release(int fd);
@@ -162,6 +167,8 @@ typedef struct {
     size_t      out_size;           /* size of out; output is NUL-terminated, truncated to fit */
     const char *input;              /* bytes written to child stdin; NULL => stdin is /dev/null */
     size_t      input_len;          /* length of input (not strlen; binary-safe) */
+    int         stdin_fd;           /* readable self-owned regular fd; caller retains ownership */
+    bool        use_stdin_fd;       /* duplicate current offset to child fd 0; mutually exclusive with input */
     bool        merge_stderr;       /* true => child stderr merged into captured stdout (2>&1) */
     bool        stderr_to_devnull;  /* when !merge_stderr: silence child stderr */
     const char *const *extra_env;   /* NULL-terminated "KEY=VALUE" entries set in the child (e.g. GNUPGHOME) */
@@ -366,9 +373,16 @@ int ensure_config_directory_exists(void);
  */
 bool is_terminal(int fd);
 int get_terminal_size(int *width, int *height);
-/* Echo transitions are idempotent. Failures return -1 with errno mirrored in
- * the global error context; a failed restore remains pending so callers can
- * retry enable_echo() after repairing the terminal descriptor. */
+/* Echo transitions are bound to the terminal currently installed as standard
+ * input. disable_echo() retains a close-on-exec descriptor above the three
+ * standard-stream slots and records the terminal's device/inode identity
+ * before changing it. Repeated disable on that same terminal is idempotent.
+ * While a restore is pending, either operation rejects a different/reused
+ * standard-input descriptor without changing either terminal. enable_echo()
+ * restores only through the retained descriptor after validating both
+ * identities; a failed restore keeps ownership for retry and closes the
+ * retained descriptor only after success. Failures return -1 with errno
+ * mirrored in the global error context. */
 int disable_echo(void);
 int enable_echo(void);
 

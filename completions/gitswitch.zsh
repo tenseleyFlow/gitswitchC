@@ -32,8 +32,19 @@ _gitswitch_scan() {
     done
 }
 
+# Query live names only after the state scanner has established that the
+# current word accepts an account operand. Besides avoiding needless process
+# launches for options and fixed-value operands, keeping the escape adjacent to
+# the query preserves literal colons for _describe's value:description grammar.
+_gitswitch_describe_accounts() {
+    local -a accounts
+
+    accounts=("${(@)${(f)$(command gitswitch --names list 2>/dev/null)}//:/\\:}")
+    _describe -t accounts 'account' accounts
+}
+
 _gitswitch() {
-    local -a subcommands options accounts
+    local -a subcommands options
 
     subcommands=(
         'add:Add new account interactively'
@@ -77,12 +88,6 @@ _gitswitch() {
         '-v[Show version]'
     )
 
-    # Live account names; silence errors so a broken config yields no matches
-    # rather than an error. Escape any ':' in a name: _describe reads each item
-    # as 'value:description', so an unescaped colon truncated the name to the
-    # text before it (AR-06 F38).
-    accounts=("${(@)${(f)$(command gitswitch --names list 2>/dev/null)}//:/\\:}")
-
     # Scan complete words with getopt_long's permutation rules. All public
     # options are argument-free and can occur before/after operands. The exact
     # `--` delimiter ends option recognition, so a following dash-prefixed word
@@ -105,7 +110,7 @@ _gitswitch() {
     # or a bare account name to switch to.
     if [[ -z "$seen_cmd" ]]; then
         _describe -t commands 'gitswitch command' subcommands
-        _describe -t accounts 'account' accounts
+        _gitswitch_describe_accounts
         if (( options_enabled )); then
             _values 'option' $options
         fi
@@ -115,7 +120,7 @@ _gitswitch() {
     if (( operand_count == 0 )); then
         case "$seen_cmd" in
         edit|remove|rm|delete|reset|switch)
-            _describe -t accounts 'account' accounts
+            _gitswitch_describe_accounts
             ;;
         init)
             _values 'shell' fish bash zsh sh dash ksh

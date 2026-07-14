@@ -78,6 +78,19 @@ static int test_join_path(char *dest, size_t size, const char *base,
 
 #define join_path test_join_path
 
+static int canonicalize_temp_root(char *path, size_t size) {
+    char canonical[PATH_MAX];
+    size_t length;
+
+    /* Darwin exposes /tmp through /private/tmp.  Keep fixture paths in the
+     * same physical namespace used by the production runtime safety walk. */
+    if (!realpath(path, canonical)) return -1;
+    length = strlen(canonical);
+    if (length >= size) return -1;
+    memcpy(path, canonical, length + 1U);
+    return 0;
+}
+
 static int mkdir_private(const char *path) {
     if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
     return chmod(path, 0700);
@@ -141,11 +154,20 @@ static int run_shell_bounded(const char *command, long timeout_ms) {
 
     if (child < 0) return -1;
     if (child == 0) {
-        (void)setpgid(0, 0);
+        int null_fd;
+
+        /* These probes never consume input.  Detach them from a caller's
+         * controlling terminal before starting an interactive shell.  A
+         * mere background process group is insufficient because POSIX sh
+         * may still perform job-control terminal operations and stop itself
+         * instead of letting the bounded command finish. */
+        if (setsid() < 0) _exit(127);
+        null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0) _exit(127);
+        if (null_fd != STDIN_FILENO) close(null_fd);
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127);
     }
-    (void)setpgid(child, child);
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) goto timeout;
     for (;;) {
         pid_t waited = waitpid(child, &status, WNOHANG);
@@ -276,7 +298,8 @@ static int fixture_setup(shell_fixture_t *fixture) {
     if ((size_t)snprintf(fixture->root, sizeof(fixture->root),
                          "/tmp/gitswitch-ar07-shell.XXXXXX") >=
             sizeof(fixture->root) ||
-        !ts_mkdtemp(fixture->root)) {
+        !ts_mkdtemp(fixture->root) ||
+        canonicalize_temp_root(fixture->root, sizeof(fixture->root)) != 0) {
         return -1;
     }
     if (join_path(fixture->home, sizeof(fixture->home), fixture->root,
@@ -1005,6 +1028,7 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     }
     if (old_runtime) saved_runtime = strdup(old_runtime);
     if (!ts_mkdtemp(root) ||
+        canonicalize_temp_root(root, sizeof(root)) != 0 ||
         join_path(runtime, sizeof(runtime), root, "/runtime") != 0 ||
         join_path(agent_dir, sizeof(agent_dir), runtime,
                   "/gitswitch-ssh") != 0 ||
@@ -1109,6 +1133,11 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
     }
     if (!ts_mkdtemp(root)) {
         CHECK(!"real resume root setup failed");
+        return;
+    }
+    if (canonicalize_temp_root(root, sizeof(root)) != 0) {
+        CHECK(!"real resume root canonicalization failed");
+        ts_rm_rf(root);
         return;
     }
     if (join_path(home, sizeof(home), root, "/home") != 0 ||

@@ -9,6 +9,38 @@ fail()
     exit 1
 }
 
+elf_has_immediate_binding()
+{
+    # Accept DT_BIND_NOW itself, or an exact NOW/BIND_NOW flag token carried
+    # by DT_FLAGS/DT_FLAGS_1. Dynamic strings in unrelated tags (RUNPATH,
+    # SONAME, NEEDED, and so on) are data, not binding-policy evidence.
+    awk '
+        function has_now_token(value, count, position, tokens) {
+            gsub(/[^[:alnum:]_]+/, " ", value)
+            count = split(value, tokens, /[[:space:]]+/)
+            for (position = 1; position <= count; position++) {
+                if (tokens[position] == "NOW" ||
+                    tokens[position] == "BIND_NOW") {
+                    return 1
+                }
+            }
+            return 0
+        }
+        /^[[:space:]]*(0x)?[[:xdigit:]]+[[:space:]]+(\(BIND_NOW\)|BIND_NOW)([[:space:]]|$)/ {
+            found = 1
+        }
+        {
+            if (match($0, /^[[:space:]]*(0x)?[[:xdigit:]]+[[:space:]]+(\(FLAGS(_1)?\)|FLAGS(_1)?)([[:space:]]|$)/)) {
+                value = substr($0, RLENGTH + 1)
+                if (has_now_token(value)) {
+                    found = 1
+                }
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
 check_elf()
 {
     binary=$1
@@ -80,8 +112,7 @@ check_elf()
 
     elf_dynamic=$("$readelf_cmd" -d "$binary") ||
         fail "readelf could not read dynamic section: $binary"
-    printf '%s\n' "$elf_dynamic" |
-        grep -Eq 'BIND_NOW|FLAGS(_1)?[[:space:]].*NOW' ||
+    printf '%s\n' "$elf_dynamic" | elf_has_immediate_binding ||
         fail "release binary lacks immediate binding (NOW): $binary"
 
     elf_programs=$("$readelf_cmd" -W -l "$binary") ||
@@ -209,14 +240,16 @@ expect_artifact_rejection()
 
 check_neuter_contract()
 {
-    [ "$#" -eq 4 ] ||
-        fail "usage: $0 neuter COMPILER RELEASE_SECURITY_CFLAGS HARDENING_HEADER MAKE"
-    compiler=$1
-    release_security_cflags=$2
-    hardening_header=$3
-    make_cmd=$4
-    command -v "$compiler" >/dev/null 2>&1 ||
-        fail "neuter compiler is unavailable: $compiler"
+    { [ "$#" -ge 5 ] && [ "$4" = -- ]; } ||
+        fail "usage: $0 neuter RELEASE_SECURITY_CFLAGS HARDENING_HEADER MAKE -- COMPILER [ARG...]"
+    release_security_cflags=$1
+    hardening_header=$2
+    make_cmd=$3
+    shift 4
+    compiler_launcher=$1
+    compiler_command=$*
+    command -v "$compiler_launcher" >/dev/null 2>&1 ||
+        fail "neuter compiler launcher is unavailable: $compiler_launcher"
     [ -f "$hardening_header" ] ||
         fail "release hardening header is unavailable: $hardening_header"
 
@@ -281,7 +314,7 @@ check_neuter_contract()
     # compiler specs. Explicitly undefine it so this negative control measures
     # the Makefile flag we own, not ambient compiler policy. The positive
     # control applies the audited definition after the undefine.
-    if "$compiler" -std=c11 -O2 -U_FORTIFY_SOURCE -c "$fortify_source" \
+    if "$@" -std=c11 -O2 -U_FORTIFY_SOURCE -c "$fortify_source" \
         -o "$tmp/fortify-neutered.o" >"$tmp/fortify-neutered.log" 2>&1; then
         fail "FORTIFY-neutered compile fixture was accepted"
     fi
@@ -289,7 +322,7 @@ check_neuter_contract()
         cat "$tmp/fortify-neutered.log" >&2
         fail "FORTIFY-neutered fixture failed for an unrelated reason"
     }
-    if ! "$compiler" -std=c11 -O2 -U_FORTIFY_SOURCE "$fortify_define" \
+    if ! "$@" -std=c11 -O2 -U_FORTIFY_SOURCE "$fortify_define" \
         -c "$fortify_source" \
         -o "$tmp/fortify-enabled.o" >"$tmp/fortify-enabled.log" 2>&1; then
         cat "$tmp/fortify-enabled.log" >&2
@@ -313,34 +346,34 @@ check_neuter_contract()
     have_execstack_neuter=false
     case $format in
         elf)
-            if ! "$compiler" -std=c11 -O0 -fno-stack-protector -fno-pie \
+            if ! "$@" -std=c11 -O0 -fno-stack-protector -fno-pie \
                 "$source_file" -no-pie -o "$nonpie" >"$tmp/nonpie.log" 2>&1; then
                 cat "$tmp/nonpie.log" >&2
                 fail "cannot build ELF non-PIE neuter fixture"
             fi
             have_nonpie_neuter=true
-            if ! "$compiler" -std=c11 -O0 -fno-stack-protector -fPIE \
+            if ! "$@" -std=c11 -O0 -fno-stack-protector -fPIE \
                 "$source_file" -pie -Wl,-z,relro -Wl,-z,now \
                 -Wl,-z,noexecstack -o "$nocanary" \
                 >"$tmp/nocanary.log" 2>&1; then
                 cat "$tmp/nocanary.log" >&2
                 fail "cannot build ELF no-canary neuter fixture"
             fi
-            if ! "$compiler" -std=c11 -O0 -fstack-protector-strong -fPIE \
+            if ! "$@" -std=c11 -O0 -fstack-protector-strong -fPIE \
                 "$source_file" -pie -Wl,-z,norelro -Wl,-z,now \
                 -Wl,-z,noexecstack -o "$norelro" \
                 >"$tmp/norelro.log" 2>&1; then
                 cat "$tmp/norelro.log" >&2
                 fail "cannot build ELF no-RELRO neuter fixture"
             fi
-            if ! "$compiler" -std=c11 -O0 -fstack-protector-strong -fPIE \
+            if ! "$@" -std=c11 -O0 -fstack-protector-strong -fPIE \
                 "$source_file" -pie -Wl,-z,relro -Wl,-z,lazy \
-                -Wl,-z,noexecstack -o "$nonow" \
+                -Wl,-z,noexecstack -Wl,-rpath,BIND_NOW -o "$nonow" \
                 >"$tmp/nonow.log" 2>&1; then
                 cat "$tmp/nonow.log" >&2
                 fail "cannot build ELF lazy-binding neuter fixture"
             fi
-            if ! "$compiler" -std=c11 -O0 -fstack-protector-strong -fPIE \
+            if ! "$@" -std=c11 -O0 -fstack-protector-strong -fPIE \
                 "$source_file" -pie -Wl,-z,relro -Wl,-z,now \
                 -Wl,-z,execstack -o "$execstack" \
                 >"$tmp/execstack.log" 2>&1; then
@@ -356,7 +389,7 @@ check_neuter_contract()
             # assertion above still applies to every supported architecture.
             case $(uname -m) in
                 x86_64|i386)
-                    if ! "$compiler" -std=c11 -O0 -fno-stack-protector \
+                    if ! "$@" -std=c11 -O0 -fno-stack-protector \
                         "$source_file" -Wl,-no_pie -o "$nonpie" \
                         >"$tmp/nonpie.log" 2>&1; then
                         cat "$tmp/nonpie.log" >&2
@@ -372,7 +405,7 @@ check_neuter_contract()
                     fail "unsupported Darwin architecture: $(uname -m)"
                     ;;
             esac
-            if ! "$compiler" -std=c11 -O0 -fno-stack-protector \
+            if ! "$@" -std=c11 -O0 -fno-stack-protector \
                 "$source_file" -Wl,-pie -o "$nocanary" \
                 >"$tmp/nocanary.log" 2>&1; then
                 cat "$tmp/nocanary.log" >&2
@@ -384,7 +417,7 @@ check_neuter_contract()
             # can be constructed with native supported linker options.
             case $(uname -m) in
                 x86_64|i386)
-                    if ! "$compiler" -std=c11 -O0 \
+                    if ! "$@" -std=c11 -O0 \
                         -fstack-protector-strong "$source_file" -Wl,-pie \
                         -Wl,-allow_stack_execute -o "$execstack" \
                         >"$tmp/execstack.log" 2>&1; then
@@ -424,11 +457,11 @@ check_neuter_contract()
         '    ar08_hardening_escape = witness;' \
         '    return ar08_hardened_helper(witness[0]) == 127;' \
         '}' >"$tmp/hardened-main.c"
-    "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+    "$@" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
         -include "$hardening_header" -fstack-protector-strong \
         -c "$tmp/hardened-main.c" -o "$tmp/hardened-main.o" ||
         fail "fully protected main translation unit did not compile"
-    if "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+    if "$@" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
         -include "$hardening_header" -fstack-protector-strong \
         -fno-stack-protector \
         -c "$tmp/hardened-helper.c" -o "$tmp/mixed-unprotected.o" \
@@ -440,19 +473,19 @@ check_neuter_contract()
         cat "$tmp/mixed.log" >&2
         fail "mixed translation-unit fixture failed for an unrelated reason"
     }
-    "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+    "$@" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
         -include "$hardening_header" -fstack-protector-strong \
         -c "$tmp/hardened-helper.c" -o "$tmp/hardened-helper.o" ||
         fail "fully protected helper translation unit did not compile"
     full_binary=$tmp/hardened-multi-tu
     case $format in
         elf)
-            "$compiler" -fPIE "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
+            "$@" -fPIE "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
                 -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
                 -o "$full_binary" || fail "fully protected ELF fixture did not link"
             ;;
         macho)
-            "$compiler" "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
+            "$@" "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
                 -Wl,-pie -o "$full_binary" ||
                 fail "fully protected Mach-O fixture did not link"
             ;;
@@ -478,6 +511,80 @@ check_neuter_contract()
         fail "cannot copy VERSION into hardening-neuter fixture"
     cp "$hardening_header" "$make_fixture/src/release_hardening.h" ||
         fail "cannot copy hardening header into Make fixture"
+
+    # The build stamp must never bless a partial identity list. Make's
+    # $(shell ...) discards command status, so the recipe emits one explicit
+    # sentinel and the release-policy target rejects it before compilation.
+    identity_one=$tmp/toolchain-identity-one
+    identity_two=$tmp/toolchain-identity-two
+    identity_missing=$tmp/toolchain-identity-missing
+    printf '%s\n' launcher-v1 >"$identity_one"
+    printf '%s\n' compiler-v1 >"$identity_two"
+    identity_files="$identity_one $identity_two"
+    read_toolchain_fingerprint()
+    {
+        identity_list=$1
+        "$make_cmd" -s -C "$make_fixture" CC="$compiler_command" \
+            BUILD_TYPE=release TOOLCHAIN_IDENTITY_FILES="$identity_list" \
+            info | sed -n 's/^Toolchain fingerprint: //p'
+    }
+    expect_toolchain_rejection()
+    {
+        identity_label=$1
+        identity_list=$2
+        identity_log=$tmp/toolchain-$identity_label.log
+
+        if "$make_cmd" -s -C "$make_fixture" CC="$compiler_command" \
+            BUILD_TYPE=release TOOLCHAIN_IDENTITY_FILES="$identity_list" \
+            release-policy-check >"$identity_log" 2>&1; then
+            fail "$identity_label toolchain identity list passed release policy"
+        fi
+        grep -F 'complete compiler content fingerprint is required' \
+            "$identity_log" >/dev/null || {
+            cat "$identity_log" >&2
+            fail "$identity_label toolchain list failed for an unrelated reason"
+        }
+    }
+
+    fingerprint_before=$(read_toolchain_fingerprint "$identity_files")
+    case $fingerprint_before in
+        *"$identity_one="*"$identity_two="*) ;;
+        *) fail "complete toolchain identity list produced an incomplete fingerprint" ;;
+    esac
+    "$make_cmd" -s -C "$make_fixture" CC="$compiler_command" \
+        BUILD_TYPE=release TOOLCHAIN_IDENTITY_FILES="$identity_files" \
+        release-policy-check ||
+        fail "complete toolchain identity list failed release policy"
+
+    missing_fingerprint=$(read_toolchain_fingerprint \
+        "$identity_one $identity_missing")
+    [ "$missing_fingerprint" = __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__ ] ||
+        fail "missing identity file produced a valid-looking partial fingerprint"
+    expect_toolchain_rejection missing "$identity_one $identity_missing"
+
+    empty_fingerprint=$(read_toolchain_fingerprint "")
+    [ "$empty_fingerprint" = __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__ ] ||
+        fail "empty identity list did not produce the failure sentinel"
+    expect_toolchain_rejection empty ""
+
+    chmod 000 "$identity_two" || fail "cannot make identity fixture unreadable"
+    if [ ! -r "$identity_two" ]; then
+        unreadable_fingerprint=$(read_toolchain_fingerprint "$identity_files")
+        [ "$unreadable_fingerprint" = __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__ ] ||
+            fail "unreadable identity file produced a valid-looking fingerprint"
+        expect_toolchain_rejection unreadable "$identity_files"
+    fi
+    chmod 600 "$identity_two" || fail "cannot restore identity fixture mode"
+
+    printf '%s\n' compiler-v2 >"$identity_two"
+    fingerprint_after=$(read_toolchain_fingerprint "$identity_files")
+    [ "$fingerprint_after" != "$fingerprint_before" ] ||
+        fail "changed identity file did not change the complete fingerprint"
+    case $fingerprint_after in
+        *"$identity_one="*"$identity_two="*) ;;
+        *) fail "changed complete identity list lost one of its inputs" ;;
+    esac
+
     cat >"$make_fixture/src/neuter.c" <<'EOF'
 #include <stdio.h>
 static volatile char *ar08_make_escape;
@@ -496,8 +603,9 @@ EOF
         macho) hostile_ldflags=-Wl,-no_pie ;;
     esac
     make_log=$tmp/make-neuter.log
-    if ! "$make_cmd" -C "$make_fixture" CC="$compiler" \
+    if ! "$make_cmd" -C "$make_fixture" CC="$compiler_command" \
         TARGET=neuter-probe SOURCES=src/neuter.c \
+        BUILDDIR=build \
         VERSION=0.0.0 COMMIT=neuter BUILD_TYPE=release READLINE=0 \
         CFLAGS='-std=gnu11 -O2 -fno-stack-protector -fno-pie' \
         LDFLAGS="$hostile_ldflags" \
@@ -511,7 +619,7 @@ EOF
     fi
     make_binary=$make_fixture/build/bin/neuter-probe
     cp "$make_binary" "$tmp/make-neuter-staged"
-    make_target_triple=$("$compiler" -dumpmachine) ||
+    make_target_triple=$("$@" -dumpmachine) ||
         fail "cannot read compiler target for Make hardening fixture"
     GITSWITCH_RELEASE_FORMAT=$format sh "$script" artifact "$make_binary" \
         "$tmp/make-neuter-staged" "$make_target_triple" \
@@ -763,6 +871,84 @@ check_manifest_contract()
     if [ -n "$copy_retained_temp" ]; then
         rm -f "$copy_retained_temp"
     fi
+
+    # The direct producer may exit while a background descendant still owns
+    # its stdout. Success is not complete until that inherited stream reaches
+    # EOF: otherwise the helper can publish and return while the descendant is
+    # still extending the supposedly completed artifact.
+    copy_stream_marker=$tmp/copy-stream.marker
+    # The spawned descendant, not this parent shell, expands the marker.
+    # shellcheck disable=SC2016
+    AR09_COPY_STREAM_MARKER=$copy_stream_marker \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c '
+            printf stream-prefix
+            (
+                sleep 1
+                printf -- "-suffix"
+                : >"$AR09_COPY_STREAM_MARKER"
+            ) &
+        ' >"$out" 2>&1 ||
+        fail "publisher rejected a delayed inherited producer stream"
+    [ -e "$copy_stream_marker" ] ||
+        fail "publisher returned before the inherited producer stream closed"
+    [ "$(cat "$copy_archive")" = stream-prefix-suffix ] ||
+        fail "publisher reported success before capturing the complete stream"
+    rm -f "$copy_archive"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD stream publication did not retire its exact temporary"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "stream publication did not retain exactly one private source"
+            [ "$(cat "$1")" = stream-prefix-suffix ] ||
+                fail "retained stream source is incomplete"
+            rm -f "$1"
+            ;;
+    esac
+
+    # A descendant that never closes the inherited stream must not hang the
+    # release indefinitely or leave a canonical artifact. The named test
+    # helper uses a five-second build-time deadline; production retains a much
+    # larger bounded deadline suitable for real archives.
+    copy_timeout_marker=$tmp/copy-stream-timeout.marker
+    # shellcheck disable=SC2016
+    if AR09_COPY_TIMEOUT_MARKER=$copy_timeout_marker \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c '
+            printf partial-stream
+            (
+                : >"$AR09_COPY_TIMEOUT_MARKER"
+                sleep 30
+                printf late-stream
+            ) &
+        ' >"$out" 2>&1; then
+        fail "publisher accepted a producer stream that never reached EOF"
+    fi
+    [ -e "$copy_timeout_marker" ] ||
+        fail "stream-timeout descendant did not start"
+    grep -F 'archive command timed out before output stream completion' \
+        "$out" >/dev/null ||
+        fail "stream timeout did not report its incomplete-output boundary"
+    { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+        fail "stream timeout left a canonical artifact"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD stream timeout did not retire its exact temporary"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "stream timeout did not retain exactly one private source"
+            [ "$(cat "$1")" = partial-stream ] ||
+                fail "stream-timeout retained source changed bytes"
+            rm -f "$1"
+            ;;
+    esac
 
     # On Darwin, race fclonefileat's committed clone before the helper adopts
     # it: replace the final with a hard link to the named source. Clone ID,

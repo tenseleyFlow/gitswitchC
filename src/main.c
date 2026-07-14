@@ -55,7 +55,16 @@ static bool shell_is_supported(const char *shell) {
     return false;
 }
 
-static void print_usage(const char *prog_name) {
+/* A successful printf can mean only that bytes reached stdio's user-space
+ * buffer.  Finish each informational response while main can still turn a
+ * write or final-flush failure into the process status. */
+static int finish_stdout_output(void) {
+    int flush_result = fflush(stdout);
+
+    return flush_result == 0 && !ferror(stdout) ? 0 : -1;
+}
+
+static int print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
     printf("\nComplete Git Identity Management\n");
     printf("Safe git identity switching with actual git configuration management\n");
@@ -78,7 +87,8 @@ static void print_usage(const char *prog_name) {
     printf("  --global, -g         Use global git scope\n");
     printf("  --local, -l          Use local git scope (default)\n");
     printf("  --dry-run, -n        Show what would be done without executing\n");
-    printf("  --yes, -y            Assume 'yes' to confirmation prompts (remove/reset)\n");
+    printf("  --yes, -y            Assume 'yes' to confirmation prompts "
+           "(add/edit/remove/reset)\n");
     printf("  --names              With 'list': print only account names (one per line)\n");
     printf("  --verbose, -V        Enable verbose output\n");
     printf("  --debug, -d          Enable debug logging\n");
@@ -105,9 +115,11 @@ static void print_usage(const char *prog_name) {
     printf("- Actual git configuration switching\n");
     printf("- Repository detection and scope management\n");
     printf("- Git configuration validation and testing\n");
+    return finish_stdout_output();
 }
-static void print_version(void) {
+static int print_version(void) {
     printf("%s %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
+    return finish_stdout_output();
 }
 typedef enum {
     COMMAND_SAVE_NONE = 0,
@@ -303,6 +315,53 @@ static int validate_command_arity(const char *command, int operand_count,
     return -1;
 }
 
+/* getopt_long's permutation mode is an implementation extension, and some
+ * implementations disable it when POSIXLY_CORRECT is present.  Build the
+ * option/operand ordering the CLI documents before calling getopt_long so its
+ * option recognition remains portable and environment-independent.  Both
+ * partitions are stable, and the first explicit `--` remains between them so
+ * option-looking operands after it are never reclassified. */
+static char **option_first_argv_copy(int argc, char *const argv[]) {
+    size_t delimiter = (size_t)argc;
+    size_t used = 0;
+    char **copy;
+
+    if (argc <= 0 || !argv) {
+        errno = EINVAL;
+        return NULL;
+    }
+    copy = calloc((size_t)argc + 1, sizeof(*copy));
+    if (!copy) {
+        return NULL;
+    }
+
+    copy[used++] = argv[0];
+    for (size_t i = 1; i < (size_t)argc; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            delimiter = i;
+            break;
+        }
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            copy[used++] = argv[i];
+        }
+    }
+    if (delimiter < (size_t)argc) {
+        copy[used++] = argv[delimiter];
+    }
+    for (size_t i = 1; i < delimiter; i++) {
+        if (argv[i][0] != '-' || argv[i][1] == '\0') {
+            copy[used++] = argv[i];
+        }
+    }
+    if (delimiter < (size_t)argc) {
+        for (size_t i = delimiter + 1; i < (size_t)argc; i++) {
+            copy[used++] = argv[i];
+        }
+    }
+    copy[used] = NULL;
+    return copy;
+}
+
 static command_result_t command_result(int status) {
     command_result_t result;
 
@@ -367,6 +426,7 @@ int main(int argc, char *argv[]) {
     bool resume_hint_probe = false;
     const char *command = NULL;
     const char *arg1 = NULL;
+    int operand_count = 0;
     int exit_code = EXIT_SUCCESS;
     
     static struct option long_options[] = {
@@ -406,8 +466,17 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     
-    /* Parse command line options */
-    while ((opt = getopt_long(argc, argv, "hvcCVdngly", long_options, NULL)) != -1) {
+    /* Parse command line options.  The private pointer copy is intentionally
+     * reordered rather than the process environment: changing
+     * POSIXLY_CORRECT would be observable to libraries and is not thread-safe. */
+    char **option_argv = option_first_argv_copy(argc, argv);
+    if (!option_argv) {
+        fprintf(stderr, "gitswitch: could not allocate option parser state\n");
+        error_cleanup();
+        return EXIT_FAILURE;
+    }
+    while ((opt = getopt_long(argc, option_argv, "hvcCVdngly",
+                              long_options, NULL)) != -1) {
         switch (opt) {
             case 'h':
                 show_help = true;
@@ -450,12 +519,24 @@ int main(int argc, char *argv[]) {
                 resume_hint_probe = true;
                 break;
             default:
-                print_usage(argv[0]);
+                (void)print_usage(argv[0]);
+                free(option_argv);
                 error_cleanup();
                 return EXIT_FAILURE;
         }
     }
     
+    /* option_argv already has every pre-`--` option ahead of the stable
+     * positional tail, regardless of the host getopt implementation. */
+    if (optind < argc) {
+        command = option_argv[optind];
+        if (optind + 1 < argc) {
+            arg1 = option_argv[optind + 1];
+        }
+        operand_count = argc - optind - 1;
+    }
+    free(option_argv);
+
     /* AR-06 F62: --global and --local are contradictory. Silently letting
      * --global win hid a user's mistake and could write the wrong scope; fail
      * with a clear message instead. */
@@ -463,15 +544,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
         error_cleanup();
         return EXIT_FAILURE;
-    }
-
-    /* getopt_long has already permuted recognized options out of the
-     * positional tail, including options written after a command operand. */
-    if (optind < argc) {
-        command = argv[optind];
-        if (optind + 1 < argc) {
-            arg1 = argv[optind + 1];
-        }
     }
 
     /* Help/version remain unconditional informational exits. Every executable
@@ -498,9 +570,7 @@ int main(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
         if (internal_modes == 0 &&
-            validate_command_arity(command,
-                                   command ? argc - optind - 1 : 0,
-                                   arg1) != 0) {
+            validate_command_arity(command, operand_count, arg1) != 0) {
             error_cleanup();
             return EXIT_FAILURE;
         }
@@ -509,9 +579,9 @@ int main(int argc, char *argv[]) {
     /* Handle informational commands before display/config initialization and,
      * critically, before allocating the large application context. */
     if (show_version) {
-        print_version();
+        int rc = print_version();
         error_cleanup();
-        return EXIT_SUCCESS;
+        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (resume_hint_probe && !show_help) {
@@ -534,9 +604,9 @@ int main(int argc, char *argv[]) {
     }
     
     if (show_help) {
-        print_usage(argv[0]);
+        int rc = print_usage(argv[0]);
         error_cleanup();
-        return EXIT_SUCCESS;
+        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (legacy_agent_info) {
@@ -549,8 +619,8 @@ int main(int argc, char *argv[]) {
      * from env-based paths — and it runs on every interactive shell startup.
      * Dispatch it before config_init so it stays cheap and a broken config
      * (e.g. accounts.toml chmod'd wrong) can't blank the shell integration. */
-    if (optind < argc && strcmp(argv[optind], "init") == 0) {
-        const char *shell = (optind + 1 < argc) ? argv[optind + 1] : detect_shell_from_env();
+    if (command && strcmp(command, "init") == 0) {
+        const char *shell = arg1 ? arg1 : detect_shell_from_env();
         int rc = handle_init_command(shell);
         error_cleanup();
         return rc;
@@ -587,7 +657,7 @@ int main(int argc, char *argv[]) {
      * silently proceeding unlocked would reopen the exact lost-update and
      * split-identity races the lock exists to prevent (AR-02 #17). */
     {
-        const char *c = (optind < argc) ? argv[optind] : NULL;
+        const char *c = command;
         bool read_only = resume_check || (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
@@ -738,8 +808,10 @@ int main(int argc, char *argv[]) {
                         save_rc = config_save(ctx, ctx->config.config_path);
                     }
                 } else if (mutation.switch_prepared) {
-                    save_rc = config_save_active_account_transactional(
-                        ctx, ctx->config.config_path, &config_installed);
+                    save_rc =
+                        config_save_active_account_transactional_guarded(
+                            ctx, ctx->config.config_path, &config_installed,
+                            &mutation.hint_snapshot);
                 } else if (mutation.reset_guarded) {
                     save_rc = config_save_active_account_transactional(
                         ctx, ctx->config.config_path, &config_installed);
@@ -829,18 +901,10 @@ int main(int argc, char *argv[]) {
             safe_strncpy(ctx->config.active_account,
                          mutation.previous_active,
                          sizeof(ctx->config.active_account));
-            if (config_installed &&
-                config_restore_active_account(ctx,
-                                              ctx->config.config_path) != 0) {
-                rollback_complete = false;
-                safe_strncpy(rollback_detail, get_last_error()->message,
-                             sizeof(rollback_detail));
-            }
-            /* The writer cannot touch the hint before the config rename. When
-             * no new config inode was installed the before-image is already
-             * intact (and may live in the same unwritable directory that
-             * caused the save failure), so do not manufacture a rollback
-             * failure by rewriting unchanged state. */
+            /* Restore the exact captured bytes only while the active-state
+             * inode installed by this switch is still current. A later writer
+             * is a rollback conflict and retains ownership of its generation;
+             * the outer config/runtime locks cover cooperating writers. */
             if (config_installed &&
                 config_resume_hint_snapshot_restore(
                     &mutation.hint_snapshot) != 0) {
@@ -1342,7 +1406,8 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
     mode_t file_mode;
     if (get_file_permissions(ctx->config.config_path, &file_mode) == 0) {
         if ((file_mode & 077) == 0) {
-            display_success("Configuration file permissions are secure (600)");
+            display_success("Configuration file permissions are secure (%04o)",
+                            (unsigned int)(file_mode & 0777));
         } else {
             display_warning("Configuration file has unsafe permissions (%o)", file_mode & 0777);
         }

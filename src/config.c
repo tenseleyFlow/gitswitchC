@@ -124,6 +124,10 @@ static bool sanitize_tty_text(char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
                             bool apply_active_state, bool detect_runtime);
+static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
+                                    const char *config_path,
+                                    bool apply_active_state,
+                                    bool detect_runtime);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
@@ -142,11 +146,18 @@ static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
                                        size_t ignore_index);
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
-                                     bool *state_installed);
+                                     bool *state_installed,
+                                     bool require_loaded_source,
+                                     config_resume_hint_snapshot_t *rollback_snapshot);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
+static void config_unlink_created_temp(const char *path,
+                                       const struct stat *created,
+                                       bool have_created_identity);
 static bool config_metadata_snapshot_same(const struct stat *a,
                                           const struct stat *b);
+static int config_require_loaded_source_generation(
+    const gitswitch_ctx_t *ctx, const char *config_path);
 static bool config_metadata_ctime_only_change(const struct stat *before,
                                               const struct stat *after);
 static bool config_refresh_publication_identity(
@@ -261,7 +272,9 @@ int config_init_names(gitswitch_ctx_t *ctx) {
 
 static config_document_malloc_fn g_config_document_malloc = malloc;
 static config_io_fault_fn g_config_io_fault;
+static config_metadata_test_hook_fn g_config_metadata_test_hook;
 static config_backup_clock_fn g_config_backup_clock;
+static config_backup_readdir_fn g_config_backup_readdir = readdir;
 
 config_document_malloc_fn config_set_document_malloc_fn(
     config_document_malloc_fn fn) {
@@ -276,10 +289,24 @@ config_io_fault_fn config_set_io_fault_fn(config_io_fault_fn fn) {
     return previous;
 }
 
+config_metadata_test_hook_fn config_set_metadata_test_hook_fn(
+    config_metadata_test_hook_fn fn) {
+    config_metadata_test_hook_fn previous = g_config_metadata_test_hook;
+    g_config_metadata_test_hook = fn;
+    return previous;
+}
+
 config_backup_clock_fn config_set_backup_clock_fn(
     config_backup_clock_fn fn) {
     config_backup_clock_fn previous = g_config_backup_clock;
     g_config_backup_clock = fn;
+    return previous;
+}
+
+config_backup_readdir_fn config_set_backup_readdir_fn(
+    config_backup_readdir_fn fn) {
+    config_backup_readdir_fn previous = g_config_backup_readdir;
+    g_config_backup_readdir = fn ? fn : readdir;
     return previous;
 }
 
@@ -329,7 +356,8 @@ static void config_document_free(toml_document_t *doc) {
  * cleanup on both success and failure. */
 static int config_read_document_expected(const char *config_path,
                                          toml_document_t *doc,
-                                         const struct stat *expected_identity) {
+                                         const struct stat *expected_identity,
+                                         struct stat *loaded_identity) {
     char *buffer = NULL;
     struct stat before, after, path_after;
     size_t file_size, total = 0;
@@ -484,6 +512,10 @@ static int config_read_document_expected(const char *config_path,
         goto fail_buffer;
     }
 
+    if (loaded_identity) {
+        *loaded_identity = after;
+    }
+
     /* Config content can reference key material paths; don't leave a stray
      * copy on the heap (mirrors toml_parse_file's cleanup discipline). */
     secure_zero_memory(buffer, file_size + 1);
@@ -496,8 +528,10 @@ fail_buffer:
     return -1;
 }
 
-static int config_read_document(const char *config_path, toml_document_t *doc) {
-    return config_read_document_expected(config_path, doc, NULL);
+static int config_read_document(const char *config_path, toml_document_t *doc,
+                                struct stat *loaded_identity) {
+    return config_read_document_expected(config_path, doc, NULL,
+                                         loaded_identity);
 }
 
 #define CONFIG_ACTIVE_STATE_MAX 1024U
@@ -614,7 +648,8 @@ static int config_read_active_state(const char *config_path,
     fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, require_private_mode) ||
-        !config_metadata_same_file(&before, &opened) || opened.st_size < 0 ||
+        !config_metadata_snapshot_same(&before, &opened) ||
+        opened.st_size < 0 ||
         (uintmax_t)opened.st_size > CONFIG_ACTIVE_STATE_MAX) {
         int saved_errno = errno;
         if (fd >= 0) close(fd);
@@ -639,11 +674,10 @@ static int config_read_active_state(const char *config_path,
     RESUME_HINT_TEST_CHECKPOINT(2);
     if (fstat(fd, &after) != 0 ||
         !config_metadata_file_is_safe(&after, require_private_mode) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
+        !config_metadata_snapshot_same(&opened, &after) ||
+        lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, require_private_mode) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size) {
+        !config_metadata_snapshot_same(&opened, &after)) {
         close(fd);
         set_error(ERR_FILE_IO,
                   "Active-state artifact changed while being read: %s", hint);
@@ -748,16 +782,61 @@ static const char *config_account_runtime_needs(const account_t *account) {
     return "none";
 }
 
-/* Load configuration from TOML file. Preview-only callers skip live-runtime
- * discovery because its cross-process lock may create/chmod a lock inode. */
+/* Reload into a private context and publish the complete replacement only
+ * after document, account, active-state, and runtime reconciliation all
+ * succeed. In particular, a late validation failure must not pair the old
+ * account model with freshly reset rewrite guards. The context is too large
+ * for the product's bounded stack policy, so stage it on the heap. */
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
                             bool apply_active_state, bool detect_runtime) {
-    toml_document_t *toml_doc;
-    config_active_state_t active_state;
-    char legacy_active[MAX_NAME_LEN] = "";
-    char scope_str[32];
+    gitswitch_ctx_t *staged;
     uint32_t current_id = 0;
     bool had_current;
+    int result;
+
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
+        return -1;
+    }
+
+    staged = malloc(sizeof(*staged));
+    if (!staged) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Failed to allocate staged configuration context");
+        return -1;
+    }
+
+    had_current = config_capture_current_id(ctx, &current_id);
+    memcpy(staged, ctx, sizeof(*staged));
+    config_rebind_current_id(staged, had_current, current_id);
+
+    result = config_load_mode_inplace(staged, config_path,
+                                      apply_active_state, detect_runtime);
+    if (result != 0) {
+        secure_zero_memory(staged, sizeof(*staged));
+        free(staged);
+        return -1;
+    }
+
+    had_current = config_capture_current_id(staged, &current_id);
+    memcpy(ctx, staged, sizeof(*ctx));
+    config_rebind_current_id(ctx, had_current, current_id);
+    secure_zero_memory(staged, sizeof(*staged));
+    free(staged);
+    return 0;
+}
+
+/* Load configuration from TOML file. Preview-only callers skip live-runtime
+ * discovery because its cross-process lock may create/chmod a lock inode. */
+static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
+                                    const char *config_path,
+                                    bool apply_active_state,
+                                    bool detect_runtime) {
+    toml_document_t *toml_doc;
+    config_active_state_t active_state;
+    struct stat loaded_identity;
+    char legacy_active[MAX_NAME_LEN] = "";
+    char scope_str[32];
 
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
@@ -769,19 +848,18 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
         return -1;
     }
 
-    /* AR-06 F49: these are cumulative counters that load_accounts_from_toml and
-     * count_unknown_keys only ever increment. A reload on an already-populated
-     * ctx (e.g. after a save, or a second config_load) would otherwise carry the
-     * previous load's counts forward and wrongly refuse a rewrite. Reset them
-     * for this fresh load. */
-    ctx->accounts_skipped_on_load = 0;
-    ctx->unknown_sections_on_load = 0;
-    ctx->unknown_keys_on_load = 0;
-
-    if (config_read_document(config_path, toml_doc) != 0) {
+    if (config_read_document(config_path, toml_doc, &loaded_identity) != 0) {
         config_document_free(toml_doc);
         return -1;
     }
+
+    /* AR-06 F49: these are cumulative counters that load_accounts_from_toml and
+     * count_unknown_keys only ever increment. Reset them only after the new
+     * document is completely read: an entry-boundary rejection must leave the
+     * caller's existing context byte-for-byte untouched. */
+    ctx->accounts_skipped_on_load = 0;
+    ctx->unknown_sections_on_load = 0;
+    ctx->unknown_keys_on_load = 0;
 
     /* Load settings section */
     clear_error();
@@ -820,13 +898,13 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
         return -1;
     }
 
-    /* load_accounts_from_toml rebuilds the fixed array from index zero. Never
-     * let an interior pointer survive that rebuild by address: section order
-     * can move the same account to a different slot, or put a different
-     * account at the old address. Capture only a pointer proven to name a
-     * current array element, clear it before mutation, then rebind by the
-     * unique stable ID. */
-    had_current = config_capture_current_id(ctx, &current_id);
+    /* The pre-reload current pointer is not runtime evidence. Clear it before
+     * rebuilding the fixed array and leave it clear until live current.sock or
+     * validated persisted active state selects an account below. Rebinding by
+     * the old stable ID here would make accounts_detect_current() take its
+     * already-set fast path and silently ignore a different live account, a
+     * renamed identity, or complete runtime absence. The outer transaction
+     * still preserves the old pointer exactly if any reload phase fails. */
     ctx->current_account = NULL;
 
     /* Load accounts */
@@ -834,7 +912,6 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
         config_document_free(toml_doc);
         return -1;
     }
-    config_rebind_current_id(ctx, had_current, current_id);
 
     /* AR-06 F02: also detect unmodeled KEYS inside recognized sections, so a
      * full rewrite is refused before it silently erases them. */
@@ -842,6 +919,8 @@ static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
 
     /* Store config path */
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
+    ctx->config.source_generation = loaded_identity;
+    ctx->config.source_generation_valid = true;
 
     config_document_free(toml_doc);
 
@@ -945,6 +1024,23 @@ static bool config_metadata_same_file(const struct stat *a, const struct stat *b
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
+/* Error cleanup must not remove a same-UID process's replacement merely
+ * because it reused our private temporary pathname.  Every caller captures
+ * the created descriptor's identity before registration and reaches this
+ * helper while the surrounding publication lock is still held. */
+static void config_unlink_created_temp(const char *path,
+                                       const struct stat *created,
+                                       bool have_created_identity) {
+    struct stat named;
+
+    if (!path || !created || !have_created_identity) return;
+    if (lstat(path, &named) == 0 &&
+        config_metadata_file_is_safe(&named, false) &&
+        config_metadata_same_file(created, &named)) {
+        (void)unlink(path);
+    }
+}
+
 /* A stable descriptor generation requires more than an unchanged inode: an
  * in-place writer preserves dev/ino while changing the bytes. Size plus mtime
  * and ctime catches both ordinary rewrites and same-size restoration attempts;
@@ -970,10 +1066,39 @@ static bool config_metadata_snapshot_same(const struct stat *a,
 #endif
 }
 
-/* FreeBSD UFS may materialize a ctime update for a read source only when the
- * backup directory is synced. Do not weaken the normal generation comparator:
- * this predicate is used only with the exact backup created from the strict
- * pre-copy generation below. */
+/* Active-state-only saves describe the account model already loaded into the
+ * context; unlike a full save, they do not replace that model. Require the
+ * same strict source snapshot (and the same caller path spelling) so an
+ * intervening valid accounts.toml generation is preserved as a conflict. */
+static int config_require_loaded_source_generation(
+    const gitswitch_ctx_t *ctx, const char *config_path) {
+    struct stat current;
+
+    if (!ctx || !config_path || !ctx->config.source_generation_valid ||
+        strcmp(ctx->config.config_path, config_path) != 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Active-state publication requires a context loaded from the exact config path");
+        return -1;
+    }
+    errno = 0;
+    if (lstat(config_path, &current) != 0 ||
+        !config_metadata_file_is_safe(&current, true) ||
+        !config_metadata_snapshot_same(&ctx->config.source_generation,
+                                       &current)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Configuration changed since it was loaded; refusing active-state publication: %s",
+            config_path);
+        return -1;
+    }
+    return 0;
+}
+
+/* FreeBSD UFS may materialize a ctime update only when a related directory is
+ * synced. Do not weaken the normal generation comparator: callers may use
+ * this predicate only when an independent exact-content proof binds the file
+ * to the generation they already captured. */
 static bool config_metadata_ctime_only_change(const struct stat *before,
                                               const struct stat *after) {
     bool same_without_ctime = config_metadata_same_file(before, after) &&
@@ -1077,19 +1202,29 @@ static bool config_refresh_publication_identity(
     }
 
     source_fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0) goto refresh_done;
     backup_fd = open(backup_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (source_fd < 0 || backup_fd < 0 ||
-        fstat(source_fd, &source_after) != 0 ||
-        fstat(backup_fd, &backup_before) != 0 ||
-        !config_metadata_file_is_safe(&source_after, true) ||
-        !config_metadata_file_is_safe(&backup_before, true) ||
-        !config_metadata_snapshot_same(&source_before, &source_after) ||
-        !config_metadata_snapshot_same(backup_identity, &backup_before) ||
-        source_after.st_size < 0 ||
-        source_after.st_size > (off_t)TOML_MAX_FILE_SIZE ||
-        source_after.st_size != backup_before.st_size) {
-        errno = errno ? errno : ESTALE;
+    if (backup_fd < 0 || fstat(source_fd, &source_after) != 0 ||
+        fstat(backup_fd, &backup_before) != 0) {
         goto refresh_done;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(
+                CONFIG_METADATA_TEST_REFRESH_INITIAL);
+        errno = 0;
+        if (forced_mismatch ||
+            !config_metadata_file_is_safe(&source_after, true) ||
+            !config_metadata_file_is_safe(&backup_before, true) ||
+            !config_metadata_snapshot_same(&source_before, &source_after) ||
+            !config_metadata_snapshot_same(backup_identity, &backup_before) ||
+            source_after.st_size < 0 ||
+            source_after.st_size > (off_t)TOML_MAX_FILE_SIZE ||
+            source_after.st_size != backup_before.st_size) {
+            errno = ESTALE;
+            goto refresh_done;
+        }
     }
 
     while (offset < source_after.st_size) {
@@ -1108,21 +1243,34 @@ static bool config_refresh_publication_identity(
     if (fstat(source_fd, &source_after) != 0 ||
         lstat(config_path, &source_named) != 0 ||
         fstat(backup_fd, &backup_after) != 0 ||
-        lstat(backup_path, &backup_named) != 0 ||
-        !config_metadata_snapshot_same(&source_before, &source_after) ||
-        !config_metadata_snapshot_same(&source_before, &source_named) ||
-        !config_metadata_snapshot_same(backup_identity, &backup_after) ||
-        !config_metadata_snapshot_same(backup_identity, &backup_named)) {
-        errno = errno ? errno : ESTALE;
+        lstat(backup_path, &backup_named) != 0) {
         goto refresh_done;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(CONFIG_METADATA_TEST_REFRESH_FINAL);
+        errno = 0;
+        if (forced_mismatch ||
+            !config_metadata_snapshot_same(&source_before, &source_after) ||
+            !config_metadata_snapshot_same(&source_before, &source_named) ||
+            !config_metadata_snapshot_same(backup_identity, &backup_after) ||
+            !config_metadata_snapshot_same(backup_identity, &backup_named)) {
+            errno = ESTALE;
+            goto refresh_done;
+        }
     }
 
     *publication_identity = source_after;
     matches = true;
 
 refresh_done:
-    if (source_fd >= 0) close(source_fd);
-    if (backup_fd >= 0) close(backup_fd);
+    {
+        int saved_errno = matches ? 0 : (errno ? errno : ESTALE);
+        if (source_fd >= 0) close(source_fd);
+        if (backup_fd >= 0) close(backup_fd);
+        if (!matches) errno = saved_errno;
+    }
     secure_zero_memory(source_buffer, sizeof(source_buffer));
     secure_zero_memory(backup_buffer, sizeof(backup_buffer));
     return matches;
@@ -1227,8 +1375,33 @@ static int config_lock_reject(int token_fd, const char *lockpath) {
     return -1;
 }
 
-int config_write_lock(void) {
-    char dir[MAX_PATH_LEN];
+static int config_directory_for_path(const char *config_path, char *dir,
+                                     size_t dir_size) {
+    const char *slash;
+    size_t dir_length;
+
+    if (!config_path || !config_path[0] || !dir || dir_size == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid config path for write locking");
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(config_path, '/');
+    if (!slash) {
+        return safe_strncpy(dir, ".", dir_size);
+    }
+    dir_length = (size_t)(slash - config_path);
+    if (dir_length == 0) dir_length = 1;
+    if (dir_length >= dir_size) {
+        set_error(ERR_INVALID_PATH, "Config directory path is too long");
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(dir, config_path, dir_length);
+    dir[dir_length] = '\0';
+    return 0;
+}
+
+static int config_write_lock_directory(const char *dir) {
     char lockpath[MAX_PATH_LEN];
     struct stat dir_identity;
     struct stat before;
@@ -1237,7 +1410,6 @@ int config_write_lock(void) {
     int token_fd = -1;
 
     errno = 0; /* Never misclassify a validation failure using stale errno. */
-    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
     if (create_config_directory_secure(dir) != 0) return -1;
     if (lstat(dir, &dir_identity) != 0 ||
         !config_metadata_dir_is_safe(&dir_identity)) {
@@ -1287,6 +1459,42 @@ int config_write_lock(void) {
         return config_lock_reject(token_fd, lockpath);
     }
     return token_fd;
+}
+
+static int config_write_lock_path(const char *config_path) {
+    char dir[MAX_PATH_LEN];
+    int token_fd;
+
+    if (config_directory_for_path(config_path, dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    token_fd = config_write_lock_directory(dir);
+    if (token_fd < 0) {
+        int saved_errno = errno;
+        bool contended = saved_errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+        contended = contended || saved_errno == EAGAIN;
+#endif
+        if (contended) {
+            set_error(ERR_CONFIG_WRITE_FAILED,
+                      "Another writer is committing configuration state for %s",
+                      config_path);
+        } else {
+            errno = saved_errno;
+            set_system_error(ERR_CONFIG_WRITE_FAILED,
+                             "Cannot acquire the configuration publication lock for %s",
+                             config_path);
+        }
+        errno = saved_errno;
+    }
+    return token_fd;
+}
+
+int config_write_lock(void) {
+    char dir[MAX_PATH_LEN];
+
+    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
+    return config_write_lock_directory(dir);
 }
 
 void config_write_unlock(int token_fd) {
@@ -1358,6 +1566,10 @@ static int config_resume_hint_snapshot_capture_at(
         return -1;
     }
     config_resume_hint_snapshot_clear(snapshot);
+    if (safe_strncpy(snapshot->config_path, config_path,
+                     sizeof(snapshot->config_path)) != 0) {
+        return -1;
+    }
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0) {
         return -1;
     }
@@ -1382,7 +1594,8 @@ static int config_resume_hint_snapshot_capture_at(
     fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, false) ||
-        !config_metadata_same_file(&before, &opened) || opened.st_size < 0 ||
+        !config_metadata_snapshot_same(&before, &opened) ||
+        opened.st_size < 0 ||
         (uintmax_t)opened.st_size > CONFIG_RESUME_HINT_SNAPSHOT_MAX) {
         int saved_errno = errno;
         if (fd >= 0) close(fd);
@@ -1418,13 +1631,13 @@ static int config_resume_hint_snapshot_capture_at(
             return -1;
         }
     }
+    RESUME_HINT_TEST_CHECKPOINT(4);
     if (fstat(fd, &after) != 0 ||
         !config_metadata_file_is_safe(&after, false) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
+        !config_metadata_snapshot_same(&opened, &after) ||
+        lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, false) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size) {
+        !config_metadata_snapshot_same(&opened, &after)) {
         close(fd);
         free(data);
         snapshot->length = 0;
@@ -1452,6 +1665,118 @@ int config_resume_hint_snapshot_capture(
     return config_resume_hint_snapshot_capture_at(config_path, snapshot);
 }
 
+static int config_resume_hint_snapshot_bind_post_image(
+    const char *config_path, config_resume_hint_snapshot_t *snapshot) {
+    if (!snapshot || !snapshot->valid ||
+        strcmp(snapshot->config_path, config_path) != 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Rollback snapshot does not belong to the config path being saved");
+        errno = EINVAL;
+        return -1;
+    }
+    snapshot->post_image_bound = true;
+    snapshot->post_image_installed = false;
+    snapshot->post_image_valid = false;
+    memset(&snapshot->post_image, 0, sizeof(snapshot->post_image));
+    secure_zero_memory(snapshot->post_image_data,
+                       sizeof(snapshot->post_image_data));
+    snapshot->post_image_length = 0;
+    return 0;
+}
+
+static bool config_resume_hint_post_image_content_same(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot,
+    const struct stat *current) {
+    struct stat opened;
+    struct stat after;
+    struct stat named;
+    unsigned char data[MAX_NAME_LEN + 32U];
+    unsigned char extra;
+    ssize_t extra_count;
+    int fd = -1;
+    bool matches = false;
+
+    if (!hint || !snapshot || !current || !snapshot->post_image_valid ||
+        snapshot->post_image_length > sizeof(data) || current->st_size < 0 ||
+        (uintmax_t)current->st_size != snapshot->post_image_length) {
+        return false;
+    }
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(current, &opened) ||
+        !config_pread_full(fd, data, snapshot->post_image_length, 0)) {
+        goto cleanup;
+    }
+    do {
+        extra_count = pread(fd, &extra, 1,
+                            (off_t)snapshot->post_image_length);
+    } while (extra_count < 0 && errno == EINTR);
+    if (extra_count == 0 &&
+        memcmp(data, snapshot->post_image_data,
+               snapshot->post_image_length) == 0 &&
+        fstat(fd, &after) == 0 && lstat(hint, &named) == 0 &&
+        config_metadata_file_is_safe(&after, true) &&
+        config_metadata_file_is_safe(&named, true) &&
+        config_metadata_snapshot_same(&opened, &after) &&
+        config_metadata_snapshot_same(&opened, &named)) {
+        matches = true;
+    }
+
+cleanup:
+    secure_zero_memory(data, sizeof(data));
+    if (fd >= 0) close(fd);
+    return matches;
+}
+
+static bool config_resume_hint_post_image_is_current(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot) {
+    struct stat current;
+
+    if (lstat(hint, &current) != 0 ||
+        !config_metadata_file_is_safe(&current, true)) {
+        return false;
+    }
+    if (config_metadata_snapshot_same(&snapshot->post_image, &current)) {
+        return true;
+    }
+    /* FreeBSD UFS can materialize the ctime of a freshly renamed file after
+     * the first lstat. Preserve the strict generation guard for every other
+     * metadata change, and admit that one transition only after a stable,
+     * descriptor-bound comparison proves the complete installed bytes. */
+    return config_metadata_ctime_only_change(&snapshot->post_image, &current) &&
+           config_resume_hint_post_image_content_same(hint, snapshot,
+                                                       &current);
+}
+
+static int config_resume_hint_snapshot_require_post_image(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot) {
+    if (!snapshot->post_image_bound) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Resume-hint rollback snapshot has no bound post-image");
+        return -1;
+    }
+    if (!snapshot->post_image_installed || !snapshot->post_image_valid) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Active-state rollback has no verified installed generation: %s",
+            hint);
+        return -1;
+    }
+    errno = 0;
+    if (!config_resume_hint_post_image_is_current(hint, snapshot)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Active-state rollback conflict; installed generation is no longer current: %s",
+            hint);
+        return -1;
+    }
+    return 0;
+}
+
 static int config_resume_hint_snapshot_restore_at(
     const char *config_path,
     const config_resume_hint_snapshot_t *snapshot) {
@@ -1461,13 +1786,25 @@ static int config_resume_hint_snapshot_restore_at(
     struct stat dir_identity;
     struct stat current;
     struct stat installed;
+    struct stat temp_identity;
     size_t total = 0;
     int dir_fd = -1;
     int fd = -1;
+    bool have_temp_identity = false;
+    bool temp_registered = false;
 
-    if (!config_path || !snapshot || !snapshot->valid) {
-        set_error(ERR_INVALID_ARGS, "Invalid resume-hint snapshot");
+    if (!config_path || !snapshot || !snapshot->valid ||
+        !snapshot->post_image_bound ||
+        strcmp(snapshot->config_path, config_path) != 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Resume-hint rollback requires a bound snapshot for this config path");
         return -1;
+    }
+    /* A guarded save that did not install a state inode has nothing to undo.
+     * In particular, do not turn a later independent write into rollback input
+     * merely because a downstream transaction phase failed. */
+    if (snapshot->post_image_bound && !snapshot->post_image_installed) {
+        return 0;
     }
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0 ||
         safe_strncpy(dir, hint, sizeof(dir)) != 0) {
@@ -1500,6 +1837,11 @@ static int config_resume_hint_snapshot_restore_at(
     }
 
     if (!snapshot->existed) {
+        if (config_resume_hint_snapshot_require_post_image(hint, snapshot) !=
+            0) {
+            close(dir_fd);
+            return -1;
+        }
         if (unlink(hint) != 0 && errno != ENOENT) {
             close(dir_fd);
             set_system_error(ERR_FILE_IO,
@@ -1515,6 +1857,10 @@ static int config_resume_hint_snapshot_restore_at(
         }
         close(dir_fd);
         return 0;
+    }
+    if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
+        close(dir_fd);
+        return -1;
     }
     if (lstat(hint, &current) == 0) {
         if (!config_metadata_file_is_safe(&current, false)) {
@@ -1544,7 +1890,19 @@ static int config_resume_hint_snapshot_restore_at(
                          "Cannot create resume-hint rollback file: %s", temp);
         return -1;
     }
-    (void)signals_scratch_register(temp);
+    if (fstat(fd, &temp_identity) != 0 ||
+        !config_metadata_file_is_safe(&temp_identity, true)) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify resume-hint rollback file: %s", temp);
+        goto restore_fail;
+    }
+    have_temp_identity = true;
+    if (signals_scratch_register(temp) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot register resume-hint rollback file for cleanup");
+        goto restore_fail;
+    }
+    temp_registered = true;
     if (fchmod(fd, (mode_t)snapshot->mode) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot restore resume-hint permissions: %s", temp);
@@ -1575,12 +1933,20 @@ static int config_resume_hint_snapshot_restore_at(
         goto restore_fail;
     }
     fd = -1;
+    /* Recheck after preparing and syncing the before-image. The public save
+     * lock makes this check plus rename one protocol for cooperating writers;
+     * bypassing same-uid writers retain only the documented final interval. */
+    if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
+        goto restore_fail;
+    }
+    RESUME_HINT_TEST_CHECKPOINT(5);
     if (rename(temp, hint) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install restored resume hint: %s", hint);
         goto restore_fail;
     }
     signals_scratch_unregister(temp);
+    temp_registered = false;
     if (fsync(dir_fd) != 0 || lstat(hint, &installed) != 0 ||
         !config_metadata_file_is_safe(&installed, false) ||
         (installed.st_mode & 0777) != (mode_t)snapshot->mode ||
@@ -1639,8 +2005,8 @@ static int config_resume_hint_snapshot_restore_at(
 
 restore_fail:
     if (fd >= 0) close(fd);
-    unlink(temp);
-    signals_scratch_unregister(temp);
+    config_unlink_created_temp(temp, &temp_identity, have_temp_identity);
+    if (temp_registered) signals_scratch_unregister(temp);
     close(dir_fd);
     return -1;
 }
@@ -1648,11 +2014,19 @@ restore_fail:
 int config_resume_hint_snapshot_restore(
     const config_resume_hint_snapshot_t *snapshot) {
     char config_path[MAX_PATH_LEN];
+    int write_lock_fd;
+    int result;
 
     if (config_get_path(config_path, sizeof(config_path)) != 0) {
         return -1;
     }
-    return config_resume_hint_snapshot_restore_at(config_path, snapshot);
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
+        return -1;
+    }
+    result = config_resume_hint_snapshot_restore_at(config_path, snapshot);
+    config_write_unlock(write_lock_fd);
+    return result;
 }
 
 /* Atomically replace the consolidated active-state artifact. Its first line
@@ -1661,7 +2035,9 @@ int config_resume_hint_snapshot_restore(
  * tombstone that prevents a stale legacy settings key from being resurrected. */
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
-                                     bool *state_installed) {
+                                     bool *state_installed,
+                                     bool require_loaded_source,
+                                     config_resume_hint_snapshot_t *rollback_snapshot) {
     config_active_state_t existing_state;
     const account_t *active_account = NULL;
     const char *needs;
@@ -1674,6 +2050,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     struct stat temp_identity;
     struct stat after;
     bool existed = false;
+    bool have_temp_identity = false;
+    bool temp_registered = false;
     int fd = -1;
 
     if (state_installed) {
@@ -1682,6 +2060,15 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid arguments to active-state commit");
+        return -1;
+    }
+    if (rollback_snapshot &&
+        config_resume_hint_snapshot_bind_post_image(
+            config_path, rollback_snapshot) != 0) {
+        return -1;
+    }
+    if (require_loaded_source &&
+        config_require_loaded_source_generation(ctx, config_path) != 0) {
         return -1;
     }
 
@@ -1801,16 +2188,22 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                          "Cannot create temporary resume hint: %s", hint);
         return -1;
     }
-    (void)signals_scratch_register(temp);
-    if (config_io_fault(CONFIG_IO_STATE_AFTER_TEMP,
-                        "active-state temp creation")) {
-        goto hint_fail;
-    }
     if (fchmod(fd, PERM_USER_RW) != 0 ||
         fstat(fd, &temp_identity) != 0 ||
         !config_metadata_file_is_safe(&temp_identity, true)) {
         set_system_error(ERR_FILE_IO,
                          "Cannot secure temporary resume hint: %s", temp);
+        goto hint_fail;
+    }
+    have_temp_identity = true;
+    if (signals_scratch_register(temp) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot register active-state temporary file for cleanup");
+        goto hint_fail;
+    }
+    temp_registered = true;
+    if (config_io_fault(CONFIG_IO_STATE_AFTER_TEMP,
+                        "active-state temp creation")) {
         goto hint_fail;
     }
 
@@ -1875,14 +2268,33 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     }
 
     if (config_io_fault(CONFIG_IO_STATE_BEFORE_RENAME,
-                        "active-state rename") || rename(temp, hint) != 0) {
+                        "active-state rename")) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot install resume hint atomically: %s", hint);
+        goto hint_fail;
+    }
+    if (require_loaded_source &&
+        config_require_loaded_source_generation(ctx, config_path) != 0) {
+        goto hint_fail;
+    }
+    /* Every public config/state save holds the destination's internal lock
+     * from API entry through this rename. Cooperating CLI and direct-API
+     * writers therefore cannot enter the final check/replace gap. A same-uid
+     * writer that bypasses these APIs is outside that protocol; strict
+     * metadata checks detect it through the checkpoint immediately above,
+     * bounding the unsupported race to this single rename interval. */
+    if (rename(temp, hint) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install resume hint atomically: %s", hint);
         goto hint_fail;
     }
     signals_scratch_unregister(temp);
+    temp_registered = false;
     if (state_installed) {
         *state_installed = true;
+    }
+    if (rollback_snapshot) {
+        rollback_snapshot->post_image_installed = true;
     }
 
     if (lstat(hint, &after) != 0 ||
@@ -1891,6 +2303,17 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         set_error(ERR_FILE_IO,
                   "Cannot verify installed resume hint: %s", hint);
         return -1;
+    }
+    if (rollback_snapshot) {
+        if (length > sizeof(rollback_snapshot->post_image_data)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Installed resume-hint post-image is too long");
+            return -1;
+        }
+        rollback_snapshot->post_image = after;
+        memcpy(rollback_snapshot->post_image_data, content, length);
+        rollback_snapshot->post_image_length = length;
+        rollback_snapshot->post_image_valid = true;
     }
     {
         int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
@@ -1908,12 +2331,21 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         }
         close(dir_fd);
     }
+    if (rollback_snapshot) {
+        if (!config_resume_hint_post_image_is_current(hint,
+                                                      rollback_snapshot)) {
+            set_error(ERR_FILE_IO,
+                      "Installed resume-hint generation changed during durability commit: %s",
+                      hint);
+            return -1;
+        }
+    }
     return 0;
 
 hint_fail:
     if (fd >= 0) close(fd);
-    unlink(temp);
-    signals_scratch_unregister(temp);
+    config_unlink_created_temp(temp, &temp_identity, have_temp_identity);
+    if (temp_registered) signals_scratch_unregister(temp);
     return -1;
 }
 
@@ -1975,16 +2407,30 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         dir_path[dir_length] = '\0';
     }
     dir_fd = open(dir_path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (dir_fd < 0 || fstat(dir_fd, &pinned_dir) != 0 ||
-        !config_metadata_dir_is_safe(&pinned_dir) ||
-        !config_named_directory_matches(dir_path, &pinned_dir)) {
-        int saved_errno = errno ? errno : ESTALE;
+    if (dir_fd < 0 || fstat(dir_fd, &pinned_dir) != 0) {
+        int saved_errno = errno;
         if (dir_fd >= 0) close(dir_fd);
         errno = saved_errno;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Cannot pin config destination directory: %s",
                          dir_path);
         return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(CONFIG_METADATA_TEST_DOCUMENT_DIR);
+        errno = 0;
+        if (forced_mismatch || !config_metadata_dir_is_safe(&pinned_dir) ||
+            !config_named_directory_matches(dir_path, &pinned_dir)) {
+            int saved_errno = errno ? errno : ESTALE;
+            close(dir_fd);
+            errno = saved_errno;
+            set_system_error(ERR_CONFIG_WRITE_FAILED,
+                             "Cannot pin config destination directory: %s",
+                             dir_path);
+            return -1;
+        }
     }
     errno = 0;
     if (fstatat(dir_fd, target_name, &destination_before,
@@ -2132,7 +2578,12 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
 
-    /* Atomic move from temp to final location */
+    /* Atomic move from temp to final location. The public save's internal
+     * destination lock spans the final generation check above and this
+     * replacement, so cooperating and direct-API writers cannot commit in
+     * between. Uncooperative same-uid pathname writers are detected through
+     * the check above; only this final check-to-rename interval is outside the
+     * documented writer protocol. */
     if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_RENAME,
                         "config document rename")) {
         goto document_fail;
@@ -2183,7 +2634,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     }
 
     if (update_hint &&
-        config_update_resume_hint(ctx, config_path, NULL) != 0) {
+        config_update_resume_hint(ctx, config_path, NULL, false, NULL) != 0) {
         goto document_fail;
     }
     close(dir_fd);
@@ -2288,11 +2739,15 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx) {
 static int config_save_mode(const gitswitch_ctx_t *ctx,
                             const char *config_path,
                             bool update_hint,
-                            bool *config_installed) {
-    config_resume_hint_snapshot_t state_before = {0};
-    toml_document_t *toml_doc;
+                            bool *config_installed,
+                            config_resume_hint_snapshot_t *rollback_snapshot) {
+    config_resume_hint_snapshot_t local_state_before = {0};
+    config_resume_hint_snapshot_t *state_before = rollback_snapshot
+        ? rollback_snapshot : &local_state_before;
+    toml_document_t *toml_doc = NULL;
     bool document_installed = false;
     bool state_installed = false;
+    int write_lock_fd = -1;
     int result = -1;
 
     if (!ctx || !config_path) {
@@ -2301,6 +2756,10 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     }
     if (config_installed) {
         *config_installed = false;
+    }
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
+        return -1;
     }
 
     /* GIT_SCOPE_SYSTEM remains part of the public observation model because
@@ -2311,22 +2770,22 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     if (!config_scope_is_persistable(ctx->config.default_scope)) {
         set_error(ERR_CONFIG_INVALID,
                   "settings.default_scope must be local or global");
-        return -1;
+        goto cleanup;
     }
     for (size_t i = 0; i < ctx->account_count; i++) {
         if (!config_account_id_is_valid(ctx->accounts[i].id)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account ID must be in 1..%u", UINT32_MAX);
-            return -1;
+            goto cleanup;
         }
         if (!config_scope_is_persistable(ctx->accounts[i].preferred_scope)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account %u preferred scope must be local or global",
                       ctx->accounts[i].id);
-            return -1;
+            goto cleanup;
         }
         if (config_validate_account_model(&ctx->accounts[i]) != 0) {
-            return -1;
+            goto cleanup;
         }
     }
 
@@ -2339,13 +2798,13 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
      * way to detect the silent drop. */
     if (config_check_rewritable(ctx) != 0) {
         display_warning("Not saving config: %s", get_last_error()->message);
-        return -1;
+        goto cleanup;
     }
 
     /* Initialize the heap-allocated TOML document exactly once. */
     toml_doc = config_document_alloc();
     if (!toml_doc) {
-        return -1;
+        goto cleanup;
     }
     toml_init_document(toml_doc);
 
@@ -2368,16 +2827,25 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
      * directory sync reports uncertainty, retain matching new state so the two
      * visible files never disagree about the installed account model. */
     if (update_hint) {
-        if (config_resume_hint_snapshot_capture_at(config_path,
-                                                    &state_before) != 0) {
+        if ((!rollback_snapshot &&
+             config_resume_hint_snapshot_capture_at(config_path,
+                                                     state_before) != 0) ||
+            (rollback_snapshot &&
+             (!rollback_snapshot->valid ||
+              strcmp(rollback_snapshot->config_path, config_path) != 0))) {
+            if (rollback_snapshot) {
+                set_error(ERR_INVALID_ARGS,
+                          "Rollback snapshot does not belong to the config path being saved");
+            }
             goto cleanup;
         }
         if (config_update_resume_hint(ctx, config_path,
-                                      &state_installed) != 0) {
+                                      &state_installed, false,
+                                      state_before) != 0) {
             if (state_installed) {
                 error_context_t state_error = *get_last_error();
                 if (config_resume_hint_snapshot_restore_at(config_path,
-                                                           &state_before) != 0) {
+                                                           state_before) != 0) {
                     char restore_error[sizeof(g_last_error.message)];
                     safe_strncpy(restore_error, get_last_error()->message,
                                  sizeof(restore_error));
@@ -2400,7 +2868,7 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         !document_installed) {
         error_context_t write_error = *get_last_error();
         if (config_resume_hint_snapshot_restore_at(config_path,
-                                                   &state_before) != 0) {
+                                                   state_before) != 0) {
             char restore_error[sizeof(g_last_error.message)];
             safe_strncpy(restore_error, get_last_error()->message,
                          sizeof(restore_error));
@@ -2413,13 +2881,18 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     }
 
 cleanup:
-    config_resume_hint_snapshot_clear(&state_before);
+    if (!rollback_snapshot) {
+        config_resume_hint_snapshot_clear(&local_state_before);
+    }
     config_document_free(toml_doc);
+    if (write_lock_fd >= 0) {
+        config_write_unlock(write_lock_fd);
+    }
     return result;
 }
 
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
-    return config_save_mode(ctx, config_path, true, NULL);
+    return config_save_mode(ctx, config_path, true, NULL, NULL);
 }
 
 int config_save_transactional(const gitswitch_ctx_t *ctx,
@@ -2431,7 +2904,7 @@ int config_save_transactional(const gitswitch_ctx_t *ctx,
         return -1;
     }
     *config_installed = false;
-    return config_save_mode(ctx, config_path, true, config_installed);
+    return config_save_mode(ctx, config_path, true, config_installed, NULL);
 }
 
 /* Persist only the consolidated state artifact. This intentionally does not
@@ -2440,24 +2913,39 @@ int config_save_transactional(const gitswitch_ctx_t *ctx,
  * from a non-reconstructable config. */
 static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
                                            const char *config_path,
-                                           bool *config_installed) {
+                                           bool *config_installed,
+                                           config_resume_hint_snapshot_t *rollback_snapshot) {
+    int write_lock_fd;
+    int result;
+
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save_active_account");
+        return -1;
+    }
+    if (config_installed) {
+        *config_installed = false;
+    }
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
         return -1;
     }
 
     /* No file yet: nothing to preserve, and the write-back needs a document
      * to edit — the full rebuild is both safe and required to create one. */
     if (!path_exists(config_path)) {
-        return config_save_mode(ctx, config_path, true,
-                                config_installed);
+        result = config_save_mode(ctx, config_path, true,
+                                  config_installed, rollback_snapshot);
+    } else {
+        result = config_update_resume_hint(ctx, config_path, config_installed,
+                                           true, rollback_snapshot);
     }
-    return config_update_resume_hint(ctx, config_path, config_installed);
+    config_write_unlock(write_lock_fd);
+    return result;
 }
 
 int config_save_active_account(const gitswitch_ctx_t *ctx,
                                const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
 }
 
 int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
@@ -2470,12 +2958,28 @@ int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
     }
     *config_installed = false;
     return config_save_active_account_mode(ctx, config_path,
-                                           config_installed);
+                                           config_installed, NULL);
+}
+
+int config_save_active_account_transactional_guarded(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot) {
+    if (!config_installed || !rollback_snapshot ||
+        !rollback_snapshot->valid) {
+        set_error(ERR_INVALID_ARGS,
+                  "Guarded active save requires install state and a valid rollback snapshot");
+        return -1;
+    }
+    *config_installed = false;
+    return config_save_active_account_mode(ctx, config_path,
+                                           config_installed,
+                                           rollback_snapshot);
 }
 
 int config_restore_active_account(const gitswitch_ctx_t *ctx,
                                   const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
 }
 
 /* Create default configuration file */
@@ -2545,15 +3049,28 @@ int config_create_default(const char *config_path) {
     }
     dir_fd = open(config_dir,
                   O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (dir_fd < 0 || fstat(dir_fd, &installed) != 0 ||
-        !config_metadata_dir_is_safe(&installed) ||
-        !config_metadata_same_file(&dir_identity, &installed)) {
-        int saved_errno = errno ? errno : ESTALE;
+    if (dir_fd < 0 || fstat(dir_fd, &installed) != 0) {
+        int saved_errno = errno;
         if (dir_fd >= 0) close(dir_fd);
         errno = saved_errno;
         set_system_error(ERR_PERMISSION_DENIED,
                          "Cannot pin default config parent: %s", config_dir);
         return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(CONFIG_METADATA_TEST_DEFAULT_DIR);
+        errno = 0;
+        if (forced_mismatch || !config_metadata_dir_is_safe(&installed) ||
+            !config_metadata_same_file(&dir_identity, &installed)) {
+            close(dir_fd);
+            errno = ESTALE;
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Cannot pin default config parent: %s",
+                             config_dir);
+            return -1;
+        }
     }
     fd = config_create_private_temp_at(dir_fd, target_name, temp_name,
                                        sizeof(temp_name));
@@ -3335,10 +3852,28 @@ static int config_backup_collect(const char *config_path,
         set_system_error(ERR_FILE_IO, "Cannot enumerate config backups");
         return -1;
     }
-    while ((item = readdir(stream)) != NULL) {
+    for (;;) {
         config_backup_entry_t parsed = {0};
         const char *suffix;
         struct stat st;
+
+        /* readdir() uses NULL for both EOF and failure. Clear errno for every
+         * call and preserve an enumeration failure across closedir(): rotation
+         * must never prune from a partial candidate set. */
+        errno = 0;
+        item = g_config_backup_readdir(stream);
+        if (!item) {
+            int enumeration_errno = errno;
+            if (enumeration_errno != 0) {
+                (void)closedir(stream);
+                errno = enumeration_errno;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Failed while enumerating config backup directory");
+                return -1;
+            }
+            break;
+        }
         if (strncmp(item->d_name, prefix, prefix_length) != 0) continue;
         suffix = item->d_name + prefix_length;
         if (!config_backup_parse_new(suffix, &parsed) &&
@@ -3534,7 +4069,7 @@ static int config_backup_internal(const char *config_path,
     verify_doc = config_document_alloc();
     if (!verify_doc ||
         config_read_document_expected(backup_path, verify_doc,
-                                      &backup_identity) != 0) {
+                                      &backup_identity, NULL) != 0) {
         if (!verify_doc && get_last_error()->code == ERR_SUCCESS) {
             set_error(ERR_MEMORY_ALLOCATION,
                       "Cannot allocate config backup verification document");
@@ -3647,8 +4182,18 @@ static int open_config_validated(const char *config_path) {
                   "Configuration file is a symlink; refusing to follow it: %s", config_path);
         return -1;
     }
+    if (!S_ISREG(link_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is not a regular file: %s",
+                  config_path);
+        return -1;
+    }
 
-    fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* Stable nonregular nodes were rejected before open. O_NONBLOCK is inert
+     * for regular files and prevents a raced FIFO/device from wedging before
+     * the replacement descriptor type can be rejected by fstat(). */
+    fd = open(config_path,
+              O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot open config file: %s", config_path);
         return -1;

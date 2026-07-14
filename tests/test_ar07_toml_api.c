@@ -2,6 +2,7 @@
  * regressions. */
 #include "test.h"
 
+#include "error.h"
 #include "signals.h"
 #include "toml_parser.h"
 
@@ -21,6 +22,15 @@ static int make_fixture(char *dir, size_t dir_size,
     written = snprintf(path, path_size, "%s/config.toml", dir);
     if (written < 0 || (size_t)written >= path_size) return -1;
     return 0;
+}
+
+static int g_metadata_mismatch_calls;
+
+static bool force_fd_metadata_mismatch(toml_metadata_test_stage_t stage) {
+    if (stage != TOML_METADATA_TEST_FD_REVALIDATE) return false;
+    g_metadata_mismatch_calls++;
+    errno = E2BIG;
+    return true;
 }
 
 static int write_exact_file(const char *path, const char *contents) {
@@ -233,8 +243,19 @@ static int build_maximum_reloadable_document(toml_document_t *doc) {
 }
 
 TEST(setters_reject_invalid_sections_without_mutating_document) {
+    static const char *const empty_segment_names[] = {
+        "",
+        ".",
+        ".settings",
+        "settings.",
+        "accounts..1",
+        "a...b",
+        "\"quoted\"",
+        ("caf\xC3\xA9")
+    };
     static toml_document_t doc;
     static toml_document_t before;
+    static toml_document_t parsed;
     char legal[TOML_MAX_SECTION_LEN];
     char oversized[TOML_MAX_SECTION_LEN + 1];
     char dir[128];
@@ -243,7 +264,9 @@ TEST(setters_reject_invalid_sections_without_mutating_document) {
 
     memset(legal, 'a', sizeof(legal) - 1);
     legal[sizeof(legal) - 1] = '\0';
-    memset(oversized, 'b', sizeof(oversized) - 1);
+    oversized[0] = 'a';
+    oversized[1] = '.';
+    memset(oversized + 2, 'b', sizeof(oversized) - 3);
     oversized[sizeof(oversized) - 1] = '\0';
 
     toml_init_document(&doc);
@@ -260,6 +283,31 @@ TEST(setters_reject_invalid_sections_without_mutating_document) {
     CHECK_EQ_INT(toml_set_boolean(&doc, "bad]section", "enabled", true), -1);
     CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
 
+    clear_error();
+    CHECK_EQ_INT(parse_named_section("", " ", &parsed), -1);
+    CHECK(strstr(get_last_error()->message, "section name") != NULL);
+    toml_cleanup_document(&parsed);
+
+    for (size_t i = 0;
+         i < sizeof(empty_segment_names) / sizeof(empty_segment_names[0]);
+         i++) {
+        memcpy(&doc, &before, sizeof(doc));
+        CHECK_EQ_INT(toml_set_string(&doc, empty_segment_names[i], "value",
+                                     "x"), -1);
+        CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+
+        memcpy(&doc, &before, sizeof(doc));
+        CHECK_EQ_INT(toml_set_boolean(&doc, empty_segment_names[i],
+                                      "enabled", true), -1);
+        CHECK(memcmp(&doc, &before, sizeof(doc)) == 0);
+
+        clear_error();
+        CHECK_EQ_INT(parse_named_section(empty_segment_names[i], "", &parsed),
+                     -1);
+        CHECK(strstr(get_last_error()->message, "section name") != NULL);
+        toml_cleanup_document(&parsed);
+    }
+
     CHECK_EQ_INT(toml_set_string(&doc, legal, "value", "x"), 0);
     CHECK_EQ_INT(toml_set_boolean(&doc, legal, "enabled", true), 0);
     CHECK_EQ_INT((int)doc.section_count, 2);
@@ -275,6 +323,84 @@ TEST(setters_reject_invalid_sections_without_mutating_document) {
     }
     toml_cleanup_document(&doc);
     toml_cleanup_document(&before);
+}
+
+TEST(dotted_section_names_round_trip_across_parser_and_setters) {
+    static const char *const custom_names[] = {
+        "1",
+        "-",
+        "_",
+        "a-b._c.123"
+    };
+    static toml_document_t doc;
+    static toml_document_t loaded;
+    static toml_document_t parsed;
+    char max_dotted[TOML_MAX_SECTION_LEN];
+    char dir[128];
+    char path[192];
+    char value[64] = "";
+    bool enabled = false;
+
+    max_dotted[0] = 'a';
+    max_dotted[1] = '.';
+    memset(max_dotted + 2, 'b', sizeof(max_dotted) - 3);
+    max_dotted[sizeof(max_dotted) - 1] = '\0';
+
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope", "local"),
+                 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "name", "alice"), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, "accounts.1", "email",
+                                 "alice@example.com"), 0);
+    for (size_t i = 0; i < sizeof(custom_names) / sizeof(custom_names[0]); i++) {
+        CHECK_EQ_INT(toml_set_string(&doc, custom_names[i], "value", "custom"),
+                     0);
+    }
+    CHECK_EQ_INT(toml_set_boolean(&doc, "a-b._c.123", "enabled", true), 0);
+    CHECK_EQ_INT(toml_set_string(&doc, max_dotted, "value", "boundary"), 0);
+    CHECK_EQ_INT((int)doc.section_count, 7);
+    CHECK_STR_EQ(doc.sections[1].name, "accounts.1");
+    for (size_t i = 0; i < sizeof(custom_names) / sizeof(custom_names[0]); i++) {
+        CHECK_STR_EQ(doc.sections[2 + i].name, custom_names[i]);
+    }
+    CHECK_STR_EQ(doc.sections[6].name, max_dotted);
+
+    for (size_t i = 0; i < sizeof(custom_names) / sizeof(custom_names[0]); i++) {
+        CHECK_EQ_INT(parse_named_section(custom_names[i], " \t", &parsed), 0);
+        CHECK_EQ_INT((int)parsed.section_count, 2);
+        CHECK_STR_EQ(parsed.sections[1].name, custom_names[i]);
+        toml_cleanup_document(&parsed);
+    }
+
+    if (make_fixture(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        toml_cleanup_document(&doc);
+        return;
+    }
+    CHECK_EQ_INT(toml_write_file(&doc, path), 0);
+    CHECK_EQ_INT(toml_parse_file(path, &loaded), 0);
+    CHECK_EQ_INT((int)loaded.section_count, 7);
+    CHECK_EQ_INT(toml_get_string(&loaded, "settings", "default_scope", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "local");
+    CHECK_EQ_INT(toml_get_string(&loaded, "accounts.1", "name", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "alice");
+    for (size_t i = 0; i < sizeof(custom_names) / sizeof(custom_names[0]); i++) {
+        CHECK_EQ_INT(toml_get_string(&loaded, custom_names[i], "value", value,
+                                     sizeof(value)), 0);
+        CHECK_STR_EQ(value, "custom");
+    }
+    CHECK_EQ_INT(toml_get_boolean(&loaded, "a-b._c.123", "enabled", &enabled),
+                 0);
+    CHECK(enabled);
+    CHECK_EQ_INT(toml_get_string(&loaded, max_dotted, "value", value,
+                                 sizeof(value)), 0);
+    CHECK_STR_EQ(value, "boundary");
+    CHECK_EQ_INT(count_writer_temps(dir), 0);
+    toml_cleanup_document(&loaded);
+    toml_cleanup_document(&doc);
+    CHECK_EQ_INT(unlink(path), 0);
 }
 
 TEST(key_name_grammar_rejects_invalid_setters_without_mutation) {
@@ -694,8 +820,47 @@ TEST(temp_namespace_replacement_is_never_published_or_unlinked) {
     toml_cleanup_document(&doc);
 }
 
+TEST(descriptor_metadata_mismatch_uses_stable_estale_diagnostic) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[192];
+    toml_metadata_test_hook_fn previous;
+    int fd = -1;
+
+    if (make_fixture(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        return;
+    }
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "active_account",
+                                 "audit"), 0);
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    CHECK(fd >= 0);
+    if (fd < 0) {
+        toml_cleanup_document(&doc);
+        ts_rm_rf(dir);
+        return;
+    }
+
+    g_metadata_mismatch_calls = 0;
+    previous = toml_set_metadata_test_hook_fn(force_fd_metadata_mismatch);
+    clear_error();
+    CHECK_EQ_INT(toml_write_fd(&doc, fd), -1);
+    toml_set_metadata_test_hook_fn(previous);
+
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(fcntl(fd, F_GETFD) >= 0);
+
+    CHECK_EQ_INT(close(fd), 0);
+    CHECK_EQ_INT(unlink(path), 0);
+    toml_cleanup_document(&doc);
+    ts_rm_rf(dir);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(setters_reject_invalid_sections_without_mutating_document);
+    RUN_TEST(dotted_section_names_round_trip_across_parser_and_setters);
     RUN_TEST(key_name_grammar_rejects_invalid_setters_without_mutation);
     RUN_TEST(key_name_grammar_accepts_ascii_boundaries_and_round_trips);
     RUN_TEST(section_boundary_classifies_trailing_whitespace_before_overflow);
@@ -705,4 +870,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(normal_atomic_replacement_reloads_and_does_not_follow_symlink);
     RUN_TEST(parent_namespace_replacement_fails_and_cleans_pinned_temp);
     RUN_TEST(temp_namespace_replacement_is_never_published_or_unlinked);
+    RUN_TEST(descriptor_metadata_mismatch_uses_stable_estale_diagnostic);
 TEST_MAIN_END()

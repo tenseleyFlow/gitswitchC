@@ -62,9 +62,9 @@ make install BUILD_TYPE=release READLINE=1 DESTDIR=%{buildroot} PREFIX=%{_prefix
 
 %files
 %license LICENSE
-# AR-06 F40: %doc owns the docdir tree it installs README into, so the
-# %{_docdir}/%{name} directory is no longer unowned (the prior manual
-# install + bare file listing left the parent dir unpackaged).
+# AR-06 F40: %doc owns the platform-canonical docdir tree it installs README
+# into (commonly %{name} or %{name}-%{version}), so the containing directory is
+# no longer unowned (the prior manual install + bare file listing left it out).
 %doc README.md
 %{_bindir}/gitswitch
 %{_datadir}/bash-completion/completions/gitswitch

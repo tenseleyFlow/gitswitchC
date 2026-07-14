@@ -82,10 +82,22 @@ static int resolve_binary(void) {
 /* ---------------------------------------------------------------- sandbox */
 
 static const char *make_temp_dir(char *buf, size_t size) {
+    char canonical[4096];
+    size_t length;
+
     snprintf(buf, size, "/tmp/gswar5-XXXXXX");
     if (!ts_mkdtemp(buf)) {
         return NULL;
     }
+
+    /* Darwin presents /tmp through /private/tmp. Keep every endpoint created
+     * by the fixture in the physical namespace that production exports after
+     * its descriptor-safe runtime walk, so PTY output and socket targets use
+     * the same spelling without weakening the alias coverage. */
+    if (!realpath(buf, canonical)) return NULL;
+    length = strlen(canonical);
+    if (length >= size) return NULL;
+    memcpy(buf, canonical, length + 1U);
     return buf;
 }
 

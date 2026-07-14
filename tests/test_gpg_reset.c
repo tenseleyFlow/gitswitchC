@@ -94,7 +94,9 @@ static int failing_gpgconf_runner(const char *const argv[], const run_opts_t *op
 /* Fresh scratch XDG_RUNTIME_DIR; returns 0 on success. */
 static int make_xdg(char *dir, size_t size) {
     snprintf(dir, size, "/tmp/gswgpgrst_XXXXXX");
-    if (!ts_mkdtemp(dir)) return -1;
+    if (!ts_mkdtemp(dir) || ts_canonicalize_dir_path(dir, size) != 0) {
+        return -1;
+    }
     if (chmod(dir, 0700) != 0) return -1;
     setenv("XDG_RUNTIME_DIR", dir, 1);
     return 0;
@@ -351,10 +353,10 @@ TEST(gpg_manager_reset_single_account_refuses_symlinked_home) {
 }
 
 /* AR-02 #9: gpg_manager_reset must serialize on the base dir's .lock — the
- * same lock the switch's `current` retarget takes — so its dangling-symlink
- * cleanup cannot TOCTOU a concurrent switch. A child process holds the lock
- * and only writes its "done" marker after a deliberate delay; a reset that
- * genuinely blocks on the lock returns only after that marker exists, while
+ * same lock the switch's `current` retarget takes — so home teardown and
+ * current-link retirement cannot TOCTOU a concurrent switch. A child holds
+ * the lock and writes its "done" marker only after a deliberate delay; a reset
+ * that genuinely blocks on the lock returns only after that marker exists, while
  * the pre-fix (lockless) reset returned immediately. */
 TEST(gpg_manager_reset_blocks_on_base_lock) {
     char xdg[128], base[256], lock_path[512], held[512], done[512];
@@ -655,6 +657,36 @@ TEST(gpg_manager_reset_deletes_only_pinned_home_after_base_replacement) {
     CHECK(path_exists(replacement_marker));
 }
 
+TEST(drop_current_sync_failure_is_retryable) {
+    char xdg[128], base[256], home[320], current[320];
+    struct stat st;
+    gpg_sync_base_fn old_sync;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(home, sizeof(home), "%s/work", base);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    g_reset_sync_calls = 0;
+    g_fail_reset_sync = true;
+    old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
+    CHECK_EQ_INT(gpg_manager_drop_current(), -1);
+    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK(strstr(get_last_error()->message, "not durable") != NULL);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    /* The retry must sync even though the first attempt already unlinked the
+     * name; otherwise there is no way to repair an uncertain directory entry. */
+    g_fail_reset_sync = false;
+    CHECK_EQ_INT(gpg_manager_drop_current(), 0);
+    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+    gpg_manager_set_sync_base_fn(old_sync);
+}
+
 TEST(targeted_reset_sync_failure_is_retryable) {
     char xdg[128], base[256], home[320], marker[384], current[320];
     struct stat st;
@@ -855,6 +887,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_manager_reset_all_drops_external_live_target);
     RUN_TEST(gpg_manager_targeted_reset_drops_external_current_target);
     RUN_TEST(gpg_manager_reset_deletes_only_pinned_home_after_base_replacement);
+    RUN_TEST(drop_current_sync_failure_is_retryable);
     RUN_TEST(targeted_reset_sync_failure_is_retryable);
     RUN_TEST(full_reset_sync_failure_is_retryable);
     RUN_TEST(targeted_reset_restores_current_replaced_after_capture);

@@ -18,7 +18,10 @@
 
 /* SSH agent management modes */
 typedef enum {
-    SSH_AGENT_SYSTEM,      /* Use system SSH agent */
+    /* Deprecated compatibility token. Initialization and switching reject
+     * this mode before mutation because a shared agent's cleared private
+     * identities cannot be exported and restored transactionally. */
+    SSH_AGENT_SYSTEM,
     SSH_AGENT_ISOLATED,    /* Use isolated SSH agent per account */
     SSH_AGENT_NONE         /* No SSH agent management */
 } ssh_agent_mode_t;
@@ -71,7 +74,14 @@ typedef int (*ssh_current_cleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_precleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
 typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
+typedef enum {
+    SSH_METADATA_TEST_RUNTIME_PIN = 1,
+    SSH_METADATA_TEST_RESET_QUARANTINE
+} ssh_metadata_test_stage_t;
+typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
+typedef void (*ssh_key_snapshot_clear_hook_fn)(const void *data, size_t length,
+                                               int retained_fd);
 typedef int64_t (*ssh_probe_clock_fn)(void);
 typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
 
@@ -103,7 +113,9 @@ typedef struct {
 /* Function prototypes */
 
 /**
- * Initialize SSH manager with specified mode
+ * Initialize SSH manager with specified mode. SSH_AGENT_SYSTEM is retained as
+ * a source-compatibility token but is unsupported and returns an error without
+ * changing ssh_config; use SSH_AGENT_ISOLATED or SSH_AGENT_NONE.
  */
 int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode);
 
@@ -114,7 +126,7 @@ int ssh_manager_cleanup(ssh_config_t *ssh_config);
 
 /**
  * Switch to account's SSH configuration with proper isolation
- * - Clears current SSH agent keys if using isolated mode
+ * - Rejects deprecated SSH_AGENT_SYSTEM before reading keys or mutating state
  * - Loads account's SSH key into appropriate agent
  * - Updates SSH_AUTH_SOCK environment if needed
  * - Validates key is properly loaded
@@ -124,6 +136,8 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account);
 /**
  * Start isolated SSH agent for account
  * Returns socket path and PID for cleanup
+ * This low-level legacy entry point does not validate the key pathname. Use
+ * ssh_switch_account() for the descriptor-admitted validation/use contract.
  */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account);
 
@@ -171,7 +185,13 @@ ssh_quarantine_hook_fn ssh_manager_set_reset_retire_hook_fn(
 ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
     ssh_quarantine_hook_fn fn);
 bool ssh_manager_set_force_portable_quarantine(bool force);
+ssh_metadata_test_hook_fn ssh_manager_set_metadata_test_hook_fn(
+    ssh_metadata_test_hook_fn fn);
 ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
+/* Observe the already-zeroed snapshot immediately before free/close. This is
+ * a deterministic test seam; NULL restores the production no-op. */
+ssh_key_snapshot_clear_hook_fn ssh_manager_set_key_snapshot_clear_hook_fn(
+    ssh_key_snapshot_clear_hook_fn fn);
 ssh_probe_clock_fn ssh_manager_set_probe_clock_fn(ssh_probe_clock_fn fn);
 ssh_probe_poll_fn ssh_manager_set_probe_poll_fn(ssh_probe_poll_fn fn);
 
@@ -181,20 +201,25 @@ ssh_probe_poll_fn ssh_manager_set_probe_poll_fn(ssh_probe_poll_fn fn);
 int ssh_stop_agent(ssh_config_t *ssh_config);
 
 /**
- * Clear all keys from SSH agent
+ * Explicitly clear all keys from the selected SSH agent. This primitive is
+ * destructive and nontransactional; cleared private identities cannot be
+ * exported or restored. Account switching never calls it.
  */
 int ssh_clear_agent_keys(ssh_config_t *ssh_config);
 
 /**
- * Add key to SSH agent with validation
- * - Verifies key file exists and has correct permissions
- * - Loads key into agent
- * - Confirms key was loaded successfully
+ * Low-level compatibility primitive that passes key_path verbatim as one argv
+ * element to `ssh-add -k`. It does not inspect or validate the pathname and
+ * does not prove the agent's final identity set; success means only that
+ * ssh-add exited successfully. Use ssh_switch_account() for descriptor-backed
+ * key validation and exact-set verification.
  */
 int ssh_add_key(ssh_config_t *ssh_config, const char *key_path);
 
 /**
- * List loaded SSH keys for verification
+ * List loaded SSH keys for verification. Success guarantees that the complete
+ * textual listing fit in output (with one final newline removed). Truncated or
+ * binary output fails and leaves output empty.
  */
 int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size);
 
@@ -245,7 +270,9 @@ int ssh_configure_host_alias_result(
 int ssh_remove_host_alias(const char *alias);
 
 /**
- * Test SSH connection to verify authentication
+ * Test SSH connection to verify authentication. The probe ignores shared
+ * OpenSSH configuration and offers only account->ssh_key_path. A managed alias
+ * additionally requires and pins account->ssh_hostname as its destination.
  */
 int ssh_test_connection(const account_t *account, const char *host);
 

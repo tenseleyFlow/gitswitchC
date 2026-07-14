@@ -7,6 +7,7 @@
 #include "error.h"
 #include "gitswitch.h"
 #include "gpg_manager.h"
+#include "scratch_registry_test.h"
 #include "utils.h"
 
 #include <dirent.h>
@@ -758,6 +759,66 @@ TEST(agent_config_defaults_require_confirmed_source_absence) {
     run_set_runner(previous);
 }
 
+TEST(agent_config_registration_failure_is_atomic_and_retryable) {
+    static const char source[] =
+        "default-cache-ttl 31\n"
+        "pinentry-program /usr/bin/pinentry-test\n";
+    char scratch[TEST_SCRATCH_PROBE_MAX][TEST_SCRATCH_PATH_SIZE];
+    char xdg[128], base[256], home[320], source_home[256];
+    char source_conf[320], installed[384], content[256];
+    char old_gnupghome[MAX_PATH_LEN] = "";
+    bool had_gnupghome = getenv("GNUPGHOME") != NULL;
+    command_runner_fn previous;
+    size_t registered;
+    int home_fd;
+    int before;
+
+    if (had_gnupghome) {
+        safe_strncpy(old_gnupghome, getenv("GNUPGHOME"),
+                     sizeof(old_gnupghome));
+    }
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "scratchfull"), 0);
+    snprintf(source_home, sizeof(source_home), "%s/source-home", xdg);
+    snprintf(source_conf, sizeof(source_conf), "%s/gpg-agent.conf",
+             source_home);
+    snprintf(installed, sizeof(installed), "%s/gpg-agent.conf", home);
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    CHECK_EQ_INT(make_file(source_conf, source), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
+    home_fd = open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(home_fd >= 0);
+
+    before = test_open_fd_count();
+    registered = test_scratch_fill(scratch, "gpg-full");
+    CHECK(registered > 0 && registered < TEST_SCRATCH_PROBE_MAX);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message, "register") != NULL);
+    errno = 0;
+    CHECK(lstat(installed, &(struct stat){0}) != 0 && errno == ENOENT);
+    CHECK(!has_agent_conf_scratch(home));
+
+    test_scratch_release(scratch, registered);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(source) - 1));
+    CHECK_STR_EQ(content, source);
+    CHECK(!has_agent_conf_scratch(home));
+
+    if (home_fd >= 0) CHECK_EQ_INT(close(home_fd), 0);
+    if (had_gnupghome) {
+        setenv("GNUPGHOME", old_gnupghome, 1);
+    } else {
+        unsetenv("GNUPGHOME");
+    }
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("scratchfull"), 0);
+    run_set_runner(previous);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ordinary_same_mount_recursion_still_cleans);
@@ -774,4 +835,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(byte_identical_agent_config_performs_no_commit);
     RUN_TEST(agent_config_sync_failures_return_nonzero);
     RUN_TEST(agent_config_defaults_require_confirmed_source_absence);
+    RUN_TEST(agent_config_registration_failure_is_atomic_and_retryable);
 TEST_MAIN_END()

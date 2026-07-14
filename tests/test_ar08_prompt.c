@@ -142,6 +142,23 @@ TEST(success_clears_stale_error_state) {
     fclose(stream);
 }
 
+TEST(empty_line_is_accepted_as_an_empty_answer) {
+    char buffer[8] = "dirty";
+    FILE *stream = input_stream("\n");
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_OK);
+        CHECK_STR_EQ(buffer, "");
+        end_input(&redirected);
+    }
+    fclose(stream);
+}
+
 TEST(input_error_is_distinct_from_eof) {
     char buffer[8] = "secret";
     FILE *stream = input_stream("");
@@ -167,7 +184,7 @@ TEST(input_error_is_distinct_from_eof) {
     fclose(stream);
 }
 
-#if defined(__GLIBC__) && !defined(HAVE_READLINE)
+#if defined(__GLIBC__)
 typedef struct {
     const char *bytes;
     size_t length;
@@ -184,6 +201,71 @@ static ssize_t failing_cookie_read(void *opaque, char *buffer, size_t size) {
     return -1;
 }
 
+static int begin_cookie_input(FILE *cookie_stream, FILE **saved_stdin,
+                              FILE **non_tty_stream,
+                              redirected_stream_t *redirected) {
+    *non_tty_stream = input_stream("");
+    if (!*non_tty_stream ||
+        begin_input(*non_tty_stream, redirected) != 0) {
+        if (*non_tty_stream) fclose(*non_tty_stream);
+        *non_tty_stream = NULL;
+        return -1;
+    }
+    *saved_stdin = stdin;
+    stdin = cookie_stream;
+    clearerr(stdin);
+    return 0;
+}
+
+static void end_cookie_input(FILE *saved_stdin, FILE *non_tty_stream,
+                             redirected_stream_t *redirected) {
+    stdin = saved_stdin;
+    end_input(redirected);
+    fclose(non_tty_stream);
+}
+
+TEST(partial_initial_read_error_clears_the_caller_buffer) {
+    char buffer[8] = "secret";
+    failing_cookie_t cookie = {
+        .bytes = "abc",
+        .length = sizeof("abc") - 1,
+        .offset = 0
+    };
+    cookie_io_functions_t functions = {
+        .read = failing_cookie_read,
+        .write = NULL,
+        .seek = NULL,
+        .close = NULL
+    };
+    FILE *stream = fopencookie(&cookie, "r", functions);
+    FILE *saved_stdin = NULL;
+    FILE *non_tty_stream = NULL;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(setvbuf(stream, NULL, _IONBF, 0), 0);
+    CHECK_EQ_INT(begin_cookie_input(stream, &saved_stdin, &non_tty_stream,
+                                    &redirected), 0);
+    if (saved_stdin) {
+        set_error(ERR_UNKNOWN, "preserve context across partial read error");
+        errno = 0;
+        int result = prompt_line("", buffer, sizeof(buffer), false);
+        int saved_errno = errno;
+
+        CHECK_EQ_INT(result, PROMPT_LINE_ERROR);
+        CHECK_STR_EQ(buffer, "");
+        CHECK(ferror(stdin));
+        CHECK_EQ_INT(saved_errno, EIO);
+        CHECK_EQ_INT(get_last_error()->code, ERR_UNKNOWN);
+        CHECK_STR_EQ(get_last_error()->message,
+                     "preserve context across partial read error");
+        end_cookie_input(saved_stdin, non_tty_stream, &redirected);
+    }
+    fclose(stream);
+    clearerr(stdin);
+}
+
 TEST(drain_error_is_not_reported_as_truncation) {
     char buffer[8] = "secret";
     failing_cookie_t cookie = {
@@ -198,20 +280,24 @@ TEST(drain_error_is_not_reported_as_truncation) {
         .close = NULL
     };
     FILE *stream = fopencookie(&cookie, "r", functions);
-    FILE *saved_stdin = stdin;
+    FILE *saved_stdin = NULL;
+    FILE *non_tty_stream = NULL;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
 
     CHECK(stream != NULL);
     if (!stream) return;
     CHECK_EQ_INT(setvbuf(stream, NULL, _IONBF, 0), 0);
-    stdin = stream;
-    clearerr(stdin);
-    set_error(ERR_UNKNOWN, "preserve error across failed drain");
-    CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
-                 PROMPT_LINE_ERROR);
-    CHECK_STR_EQ(buffer, "");
-    CHECK(ferror(stdin));
-    CHECK_EQ_INT(get_last_error()->code, ERR_UNKNOWN);
-    stdin = saved_stdin;
+    CHECK_EQ_INT(begin_cookie_input(stream, &saved_stdin, &non_tty_stream,
+                                    &redirected), 0);
+    if (saved_stdin) {
+        set_error(ERR_UNKNOWN, "preserve error across failed drain");
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_ERROR);
+        CHECK_STR_EQ(buffer, "");
+        CHECK(ferror(stdin));
+        CHECK_EQ_INT(get_last_error()->code, ERR_UNKNOWN);
+        end_cookie_input(saved_stdin, non_tty_stream, &redirected);
+    }
     fclose(stream);
     clearerr(stdin);
 }
@@ -232,6 +318,314 @@ static size_t count_occurrences(const char *text, const char *needle) {
         text += needle_size;
     }
     return count;
+}
+
+typedef enum {
+    OPTIONAL_DESCRIPTION,
+    OPTIONAL_SSH_KEY,
+    OPTIONAL_SSH_ALIAS,
+    OPTIONAL_GPG_KEY,
+    OPTIONAL_GPG_SIGNING,
+    OPTIONAL_SCOPE,
+    OPTIONAL_PROMPT_COUNT
+} optional_prompt_stage_t;
+
+static const char *optional_prompt_error(optional_prompt_stage_t stage) {
+    switch (stage) {
+        case OPTIONAL_DESCRIPTION: return "account description";
+        case OPTIONAL_SSH_KEY: return "SSH key path";
+        case OPTIONAL_SSH_ALIAS: return "SSH host alias";
+        case OPTIONAL_GPG_KEY: return "GPG key ID";
+        case OPTIONAL_GPG_SIGNING: return "GPG signing preference";
+        case OPTIONAL_SCOPE: return "preferred Git scope";
+        case OPTIONAL_PROMPT_COUNT: break;
+        default: break;
+    }
+    return "unknown optional prompt";
+}
+
+static int build_optional_prompt_prefix(char *buffer, size_t size,
+                                        bool edit,
+                                        optional_prompt_stage_t stage,
+                                        const char *key_path) {
+    const char *required = edit ? "\n\n"
+                                : "matrix\nmatrix@example.com\n";
+    int length;
+
+    switch (stage) {
+        case OPTIONAL_DESCRIPTION:
+            length = snprintf(buffer, size, "%s", required);
+            break;
+        case OPTIONAL_SSH_KEY:
+            length = snprintf(buffer, size, "%s\n", required);
+            break;
+        case OPTIONAL_SSH_ALIAS:
+            length = snprintf(buffer, size, "%s\n%s\n", required,
+                              key_path);
+            break;
+        case OPTIONAL_GPG_KEY:
+            length = snprintf(buffer, size, "%s\n\n", required);
+            break;
+        case OPTIONAL_GPG_SIGNING:
+            length = snprintf(buffer, size, "%s\n\n%s\n", required,
+                              "ABCDEF0123456789");
+            break;
+        case OPTIONAL_SCOPE:
+            length = snprintf(buffer, size, "%s\n\n\n", required);
+            break;
+        case OPTIONAL_PROMPT_COUNT:
+        default:
+            return -1;
+    }
+    return length >= 0 && (size_t)length < size ? 0 : -1;
+}
+
+static void initialize_prompt_context(gitswitch_ctx_t *ctx, bool edit) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->config.assume_yes = true;
+    ctx->config.default_scope = GIT_SCOPE_GLOBAL;
+    if (!edit) return;
+
+    ctx->account_count = 1;
+    ctx->accounts[0].id = 7;
+    snprintf(ctx->accounts[0].name, sizeof(ctx->accounts[0].name), "%s",
+             "original");
+    snprintf(ctx->accounts[0].email, sizeof(ctx->accounts[0].email), "%s",
+             "original@example.com");
+    snprintf(ctx->accounts[0].description,
+             sizeof(ctx->accounts[0].description), "%s",
+             "original description");
+    ctx->accounts[0].preferred_scope = GIT_SCOPE_LOCAL;
+}
+
+static int invoke_account_prompt_flow(gitswitch_ctx_t *ctx, bool edit) {
+    FILE *capture = tmpfile();
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    int result;
+
+    if (!capture || fflush(stdout) != 0 ||
+        redirect_fd(capture, STDOUT_FILENO, &redirected) != 0) {
+        if (capture) fclose(capture);
+        return -2;
+    }
+    result = edit ? accounts_edit_interactive(ctx, "original")
+                  : accounts_add_interactive(ctx);
+    CHECK_EQ_INT(fflush(stdout), 0);
+    restore_fd(STDOUT_FILENO, &redirected);
+    fclose(capture);
+    return result;
+}
+
+static int create_prompt_key(char *root, char *key_path,
+                             size_t key_path_size) {
+    FILE *key;
+    int length;
+    int write_failed;
+    int close_failed;
+
+    if (!ts_mkdtemp(root) || chmod(root, 0700) != 0) {
+        return -1;
+    }
+    length = snprintf(key_path, key_path_size, "%s/id_matrix", root);
+    if (length < 0 || (size_t)length >= key_path_size) return -1;
+    key = fopen(key_path, "w");
+    if (!key) return -1;
+    write_failed = fputs("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                         key) == EOF;
+    close_failed = fclose(key) != 0;
+    if (write_failed || close_failed || chmod(key_path, 0600) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static void exercise_optional_prompt_eof(bool edit,
+                                         optional_prompt_stage_t stage,
+                                         const char *key_path) {
+    char prefix[1024];
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t before;
+    error_context_t error;
+    FILE *stream;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    int result = -2;
+
+    CHECK_EQ_INT(build_optional_prompt_prefix(prefix, sizeof(prefix), edit,
+                                              stage, key_path), 0);
+    stream = input_stream(prefix);
+    CHECK(stream != NULL);
+    if (!stream) return;
+    initialize_prompt_context(&ctx, edit);
+    before = ctx;
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) result = invoke_account_prompt_flow(&ctx, edit);
+    error = *get_last_error();
+    end_input(&redirected);
+    fclose(stream);
+
+    CHECK_EQ_INT(result, -1);
+    CHECK_EQ_INT(error.code, ERR_FILE_IO);
+    CHECK(strstr(error.message, optional_prompt_error(stage)) != NULL);
+    CHECK(memcmp(&ctx, &before, sizeof(ctx)) == 0);
+}
+
+#if defined(__GLIBC__)
+static void exercise_optional_prompt_read_error(
+    bool edit, optional_prompt_stage_t stage, const char *key_path) {
+    char prefix[1024];
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t before;
+    error_context_t error;
+    failing_cookie_t cookie;
+    cookie_io_functions_t functions = {
+        .read = failing_cookie_read,
+        .write = NULL,
+        .seek = NULL,
+        .close = NULL
+    };
+    FILE *stream;
+    FILE *saved_stdin = NULL;
+    FILE *non_tty_stream = NULL;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    int result = -2;
+
+    CHECK_EQ_INT(build_optional_prompt_prefix(prefix, sizeof(prefix), edit,
+                                              stage, key_path), 0);
+    cookie.bytes = prefix;
+    cookie.length = strlen(prefix);
+    cookie.offset = 0;
+    stream = fopencookie(&cookie, "r", functions);
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(setvbuf(stream, NULL, _IONBF, 0), 0);
+    initialize_prompt_context(&ctx, edit);
+    before = ctx;
+    CHECK_EQ_INT(begin_cookie_input(stream, &saved_stdin, &non_tty_stream,
+                                    &redirected), 0);
+    if (saved_stdin) result = invoke_account_prompt_flow(&ctx, edit);
+    error = *get_last_error();
+    if (saved_stdin) {
+        end_cookie_input(saved_stdin, non_tty_stream, &redirected);
+    }
+    fclose(stream);
+    clearerr(stdin);
+
+    CHECK_EQ_INT(result, -1);
+    CHECK_EQ_INT(error.code, ERR_FILE_IO);
+    CHECK(strstr(error.message, optional_prompt_error(stage)) != NULL);
+    CHECK(memcmp(&ctx, &before, sizeof(ctx)) == 0);
+}
+#endif
+
+TEST(optional_prompt_failures_never_publish_add_or_edit_candidates) {
+    char root[] = "/tmp/gsw-prompt-m1-XXXXXX";
+    char key_path[256];
+    int key_result = create_prompt_key(root, key_path, sizeof(key_path));
+
+    CHECK_EQ_INT(key_result, 0);
+    if (key_result != 0) return;
+    gpg_manager_note_key_available("ABCDEF0123456789");
+    for (int edit = 0; edit <= 1; edit++) {
+        for (optional_prompt_stage_t stage = OPTIONAL_DESCRIPTION;
+             stage < OPTIONAL_PROMPT_COUNT; stage++) {
+            exercise_optional_prompt_eof(edit != 0, stage, key_path);
+#if defined(__GLIBC__)
+            exercise_optional_prompt_read_error(edit != 0, stage, key_path);
+#endif
+        }
+    }
+}
+
+TEST(successful_blank_optional_answers_apply_only_documented_defaults) {
+    gitswitch_ctx_t ctx;
+    FILE *stream = input_stream(
+        "blank-defaults\nblank@example.com\n\n\n\n\n");
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    int result = -2;
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    initialize_prompt_context(&ctx, false);
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) result = invoke_account_prompt_flow(&ctx, false);
+    end_input(&redirected);
+    fclose(stream);
+
+    CHECK_EQ_INT(result, 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) {
+        CHECK_STR_EQ(ctx.accounts[0].description, "blank-defaults");
+        CHECK(!ctx.accounts[0].ssh_enabled);
+        CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, "");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "");
+        CHECK(!ctx.accounts[0].gpg_enabled);
+        CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "");
+        CHECK(!ctx.accounts[0].gpg_signing_enabled);
+        CHECK_EQ_INT(ctx.accounts[0].preferred_scope, GIT_SCOPE_GLOBAL);
+    }
+}
+
+TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing) {
+    char root[] = "/tmp/gsw-prompt-m1-nested-XXXXXX";
+    char key_path[256];
+    char answers[1024];
+    gitswitch_ctx_t ctx;
+    FILE *stream;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    int result = -2;
+    int key_result;
+    int answer_length;
+
+    key_result = create_prompt_key(root, key_path, sizeof(key_path));
+    CHECK_EQ_INT(key_result, 0);
+    if (key_result != 0) return;
+    gpg_manager_note_key_available("ABCDEF0123456789");
+    answer_length = snprintf(
+        answers, sizeof(answers),
+        "nested\nnested@example.com\n\n%s\n\n%s\n\n\n",
+        key_path, "ABCDEF0123456789");
+    CHECK(answer_length >= 0 && (size_t)answer_length < sizeof(answers));
+    if (answer_length < 0 || (size_t)answer_length >= sizeof(answers)) return;
+    stream = input_stream(answers);
+    CHECK(stream != NULL);
+    if (!stream) return;
+    initialize_prompt_context(&ctx, false);
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) result = invoke_account_prompt_flow(&ctx, false);
+    end_input(&redirected);
+    fclose(stream);
+
+    CHECK_EQ_INT(result, 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) {
+        CHECK(ctx.accounts[0].ssh_enabled);
+        CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, key_path);
+        CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "");
+        CHECK(ctx.accounts[0].gpg_enabled);
+        CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "ABCDEF0123456789");
+        CHECK(!ctx.accounts[0].gpg_signing_enabled);
+        CHECK_EQ_INT(ctx.accounts[0].preferred_scope, GIT_SCOPE_GLOBAL);
+    }
+}
+
+TEST(successful_blank_edit_answers_preserve_the_account) {
+    gitswitch_ctx_t ctx;
+    account_t before;
+    FILE *stream = input_stream("\n\n\n\n\n\n");
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+    int result = -2;
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    initialize_prompt_context(&ctx, true);
+    before = ctx.accounts[0];
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) result = invoke_account_prompt_flow(&ctx, true);
+    end_input(&redirected);
+    fclose(stream);
+
+    CHECK_EQ_INT(result, 0);
+    CHECK(memcmp(&ctx.accounts[0], &before, sizeof(before)) == 0);
 }
 
 TEST(account_flow_reprompts_without_accepting_any_prefix) {
@@ -339,9 +733,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(oversized_line_is_rejected_and_next_line_recovers);
     RUN_TEST(unterminated_exact_boundary_and_eof_keep_their_semantics);
     RUN_TEST(success_clears_stale_error_state);
+    RUN_TEST(empty_line_is_accepted_as_an_empty_answer);
     RUN_TEST(input_error_is_distinct_from_eof);
-#if defined(__GLIBC__) && !defined(HAVE_READLINE)
+#if defined(__GLIBC__)
+    RUN_TEST(partial_initial_read_error_clears_the_caller_buffer);
     RUN_TEST(drain_error_is_not_reported_as_truncation);
 #endif
+    RUN_TEST(optional_prompt_failures_never_publish_add_or_edit_candidates);
+    RUN_TEST(successful_blank_optional_answers_apply_only_documented_defaults);
+    RUN_TEST(successful_nested_blank_answers_do_not_invent_alias_or_signing);
+    RUN_TEST(successful_blank_edit_answers_preserve_the_account);
     RUN_TEST(account_flow_reprompts_without_accepting_any_prefix);
 TEST_MAIN_END()

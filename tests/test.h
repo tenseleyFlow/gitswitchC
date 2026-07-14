@@ -323,6 +323,71 @@ static inline char *ts_mkdtemp(char *tmpl) {
     return created;
 }
 
+/* Replace a created directory's lexical spelling with the physical pathname
+ * reported by the kernel.  Darwin exposes /tmp through /private/tmp, while
+ * production intentionally canonicalizes runtime parents before comparing
+ * managed socket and keyring paths.  Runtime-facing fixtures must therefore
+ * derive every child and absolute symlink target from the same namespace.
+ *
+ * Use an fd to restore the caller's cwd even if its pathname changes during
+ * this single-threaded setup step.  ts_mkdtemp() retains its own pinned
+ * identity and path copy, so rewriting the caller's buffer does not weaken
+ * the no-follow atexit cleanup contract. */
+static inline int ts_canonicalize_dir_path(char *path, size_t path_size) {
+    char canonical[4096];
+    size_t length;
+    int flags = O_RDONLY;
+    int cwd_fd;
+    int saved_errno;
+
+    if (!path || path_size == 0 || path[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    cwd_fd = open(".", flags);
+    if (cwd_fd < 0) return -1;
+    if (ts_set_cloexec(cwd_fd) != 0) {
+        saved_errno = errno;
+        close(cwd_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (chdir(path) != 0) {
+        saved_errno = errno;
+        close(cwd_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!getcwd(canonical, sizeof(canonical))) {
+        saved_errno = errno;
+        if (fchdir(cwd_fd) != 0) saved_errno = errno;
+        close(cwd_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (fchdir(cwd_fd) != 0) {
+        saved_errno = errno;
+        close(cwd_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    close(cwd_fd);
+
+    length = strlen(canonical);
+    if (length >= path_size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(path, canonical, length + 1U);
+    return 0;
+}
+
 /* Create an executable-fixture root below canonical HOME rather than sticky
  * /tmp. The production executable resolver intentionally rejects every leaf
  * below a group/world-writable ancestor, so tests that place PATH shims,

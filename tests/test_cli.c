@@ -52,7 +52,7 @@ static int resolve_binary(void) {
  * per-call static buffer (tests are sequential). */
 static const char *make_temp_dir(char *buf, size_t size) {
     snprintf(buf, size, "/tmp/gitswitch-test-XXXXXX");
-    if (!ts_mkdtemp(buf)) {
+    if (!ts_mkdtemp(buf) || ts_canonicalize_dir_path(buf, size) != 0) {
         return NULL;
     }
     return buf;

@@ -2,6 +2,7 @@
 #include "test.h"
 #include "config.h"
 #include "error.h"
+#include "scratch_registry_test.h"
 #include "signals.h"
 
 #include <errno.h>
@@ -28,6 +29,13 @@ static const char two_accounts_legacy[] =
     "[accounts.2]\n"
     "name = \"Bob\"\n"
     "email = \"bob@example.com\"\n";
+
+static const char replacement_account[] =
+    "[settings]\n"
+    "default_scope = \"local\"\n"
+    "[accounts.9]\n"
+    "name = \"carol\"\n"
+    "email = \"carol@example.com\"\n";
 
 static int private_dir(char *path, size_t size) {
     if ((size_t)snprintf(path, size, "/tmp/gsw-ar07-config.XXXXXX") >= size) {
@@ -111,8 +119,41 @@ static int count_open_fds(void) {
 }
 
 static config_io_boundary_t fault_target;
+static char generation_swap_source[256];
+static char generation_swap_replacement[256];
+static int generation_swap_error;
+static config_io_boundary_t rollback_replace_boundary;
+static char rollback_replace_hint[256];
+static char rollback_replace_source[256];
+static int rollback_replace_error;
+
 static bool inject_fault(config_io_boundary_t boundary) {
     return boundary == fault_target;
+}
+
+static bool replace_source_at_state_publication(
+    config_io_boundary_t boundary) {
+    if (boundary == CONFIG_IO_STATE_BEFORE_RENAME &&
+        generation_swap_source[0] != '\0') {
+        if (rename(generation_swap_replacement,
+                   generation_swap_source) != 0) {
+            generation_swap_error = errno ? errno : EIO;
+        }
+        generation_swap_source[0] = '\0';
+    }
+    return false;
+}
+
+static bool replace_state_before_rollback(config_io_boundary_t boundary) {
+    if (boundary != rollback_replace_boundary ||
+        rollback_replace_hint[0] == '\0') {
+        return false;
+    }
+    if (rename(rollback_replace_source, rollback_replace_hint) != 0) {
+        rollback_replace_error = errno ? errno : EIO;
+    }
+    rollback_replace_hint[0] = '\0';
+    return true;
 }
 
 static bool kill_at_default_boundary(config_io_boundary_t boundary) {
@@ -127,6 +168,45 @@ static int fixed_clock(uint64_t *seconds, uint32_t *nanoseconds) {
     *seconds = 1234;
     *nanoseconds = 567;
     return 0;
+}
+
+static config_backup_readdir_fn backup_readdir_underlying;
+static unsigned int backup_readdir_scan;
+static unsigned int backup_readdir_candidates;
+static bool backup_readdir_failed;
+
+static struct dirent *fail_second_backup_scan_mid_enumeration(DIR *dir) {
+    struct dirent *entry;
+
+    if (backup_readdir_scan == 1 && backup_readdir_candidates == 6) {
+        backup_readdir_failed = true;
+        errno = EIO;
+        return NULL;
+    }
+    errno = 0;
+    entry = backup_readdir_underlying(dir);
+    if (!entry) {
+        if (errno == 0) {
+            backup_readdir_scan++;
+            backup_readdir_candidates = 0;
+        }
+        return NULL;
+    }
+    if (backup_readdir_scan == 1 &&
+        strncmp(entry->d_name, "accounts.toml.backup.",
+                strlen("accounts.toml.backup.")) == 0) {
+        backup_readdir_candidates++;
+    }
+    return entry;
+}
+
+static int backup_generation_path(char *path, size_t size,
+                                  const char *config_path,
+                                  unsigned long long generation) {
+    int needed = snprintf(path, size,
+                          "%s.backup.%020llu.%09u.%020llu",
+                          config_path, 1234ULL, 567U, generation);
+    return needed < 0 || (size_t)needed >= size ? -1 : 0;
 }
 
 static void expect_load_error(const char *body, const char *needle) {
@@ -304,6 +384,66 @@ TEST(backups_are_durable_monotonic_and_bounded) {
     for (int i = 2; i < 7; i++) CHECK(seen[i]);
 }
 
+TEST(backup_pruning_requires_complete_directory_enumeration) {
+    char dir[128], path[256], backup[512], body[512];
+    config_backup_clock_fn previous_clock;
+    int backup_rc;
+    int diagnostic_errno;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    for (unsigned long long generation = 0; generation < 7; generation++) {
+        CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path,
+                                            generation), 0);
+        snprintf(body, sizeof(body),
+                 "[settings]\ndefault_scope=\"local\"\n"
+                 "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+                 "description=\"v%llu\"\n", generation);
+        CHECK_EQ_INT(write_private(backup, body), 0);
+    }
+
+    backup_readdir_scan = 0;
+    backup_readdir_candidates = 0;
+    backup_readdir_failed = false;
+    previous_clock = config_set_backup_clock_fn(fixed_clock);
+    backup_readdir_underlying = config_set_backup_readdir_fn(
+        fail_second_backup_scan_mid_enumeration);
+    clear_error();
+    backup_rc = config_backup(path);
+    diagnostic_errno = get_last_error()->system_errno;
+    config_set_backup_readdir_fn(backup_readdir_underlying);
+    config_set_backup_clock_fn(previous_clock);
+
+    CHECK_EQ_INT(backup_rc, -1);
+    CHECK(backup_readdir_failed);
+    CHECK_EQ_INT(diagnostic_errno, EIO);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 7);
+    for (unsigned long long generation = 0; generation < 7; generation++) {
+        CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path,
+                                            generation), 0);
+        CHECK_EQ_INT(access(backup, F_OK), 0);
+    }
+    CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path, 7), 0);
+    CHECK(access(backup, F_OK) != 0);
+
+    previous_clock = config_set_backup_clock_fn(fixed_clock);
+    clear_error();
+    CHECK_EQ_INT(config_backup(path), 0);
+    config_set_backup_clock_fn(previous_clock);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 5);
+    for (unsigned long long generation = 0; generation < 8; generation++) {
+        CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path,
+                                            generation), 0);
+        if (generation < 3) {
+            CHECK(access(backup, F_OK) != 0);
+        } else {
+            CHECK_EQ_INT(access(backup, F_OK), 0);
+        }
+    }
+    ts_rm_rf(dir);
+}
+
 static void exercise_backup_fault(config_io_boundary_t boundary) {
     char dir[128], path[256];
 
@@ -365,6 +505,55 @@ TEST(backup_faults_abort_and_full_save_rolls_state_back) {
     CHECK_STR_EQ(after_text, "none\nactive=alice\n");
 }
 
+TEST(full_save_rollback_preserves_a_later_state_generation) {
+    const config_io_boundary_t boundaries[] = {
+        CONFIG_IO_STATE_BEFORE_DIR_SYNC,
+        CONFIG_IO_DOCUMENT_BEFORE_RENAME
+    };
+
+    for (size_t i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
+        char dir[128], path[256], hint[256], replacement[256], text[1024];
+        struct stat config_before, config_after;
+        struct stat replacement_before, state_after;
+        gitswitch_ctx_t ctx;
+
+        CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+        snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+        snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+        snprintf(replacement, sizeof(replacement), "%s/later-state", dir);
+        CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+        CHECK_EQ_INT(write_private(hint, "none\n"), 0);
+        CHECK_EQ_INT(write_private(replacement,
+                                   "none\nactive=Bob\n"), 0);
+        CHECK_EQ_INT(lstat(path, &config_before), 0);
+        CHECK_EQ_INT(lstat(replacement, &replacement_before), 0);
+        memset(&ctx, 0, sizeof(ctx));
+        CHECK_EQ_INT(config_load(&ctx, path), 0);
+
+        rollback_replace_boundary = boundaries[i];
+        snprintf(rollback_replace_hint, sizeof(rollback_replace_hint),
+                 "%s", hint);
+        snprintf(rollback_replace_source, sizeof(rollback_replace_source),
+                 "%s", replacement);
+        rollback_replace_error = 0;
+        config_set_io_fault_fn(replace_state_before_rollback);
+        clear_error();
+        CHECK_EQ_INT(config_save(&ctx, path), -1);
+        config_set_io_fault_fn(NULL);
+
+        CHECK_EQ_INT(rollback_replace_error, 0);
+        CHECK(strstr(get_last_error()->message, "rollback failed") != NULL);
+        CHECK_EQ_INT(lstat(path, &config_after), 0);
+        CHECK(same_identity(&config_before, &config_after));
+        CHECK_EQ_INT(lstat(hint, &state_after), 0);
+        CHECK(same_identity(&replacement_before, &state_after));
+        CHECK(read_text(hint, text, sizeof(text)) > 0);
+        CHECK_STR_EQ(text, "none\nactive=Bob\n");
+        CHECK_EQ_INT(count_prefix(dir, ".resume-hint.restore."), 0);
+        CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    }
+}
+
 TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
     char dir[128], path[256], hint[256], text[1024];
     struct stat config_before, config_after, state_before, state_after;
@@ -412,6 +601,76 @@ TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
     CHECK_STR_EQ(text, "none\ninactive=v1\n");
     CHECK_EQ_INT(lstat(path, &config_after), 0);
     CHECK(same_identity(&config_before, &config_after));
+}
+
+TEST(active_state_save_is_bound_to_loaded_config_generation) {
+    char dir[128], path[256], replacement[256], hint[256], text[1024];
+    gitswitch_ctx_t ctx;
+    bool installed = true;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(replacement, sizeof(replacement), "%s/replacement.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "Bob");
+
+    /* Replace the source after load with a complete, valid generation that
+     * does not contain Bob. Publishing stale active state must not alter either
+     * the intervening document or the prior state artifact. */
+    CHECK_EQ_INT(write_private(replacement, replacement_account), 0);
+    CHECK_EQ_INT(rename(replacement, path), 0);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1); /* pre-fix: 0 */
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message,
+                 "changed since it was loaded") != NULL);
+    CHECK(read_text(path, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, replacement_account);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+
+    /* Reloading records the new generation; unchanged-source publication then
+     * succeeds normally. */
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "carol");
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=carol\n");
+
+    /* Exercise the last pre-publication generation check as well: the fault
+     * callback swaps accounts.toml after the state temp is durable but before
+     * its rename. The new source wins, while the prior inactive state remains. */
+    CHECK_EQ_INT(write_private(replacement, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\ninactive=v1\n"), 0);
+    snprintf(generation_swap_source, sizeof(generation_swap_source),
+             "%s", path);
+    snprintf(generation_swap_replacement,
+             sizeof(generation_swap_replacement), "%s", replacement);
+    generation_swap_error = 0;
+    installed = true;
+    config_set_io_fault_fn(replace_source_at_state_publication);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1); /* pre-fix: 0 */
+    config_set_io_fault_fn(NULL);
+    CHECK_EQ_INT(generation_swap_error, 0);
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message,
+                 "changed since it was loaded") != NULL);
+    CHECK(read_text(path, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, two_accounts_legacy);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
 }
 
 TEST(historical_active_state_migrates_without_reset_resurrection) {
@@ -559,14 +818,57 @@ TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds) {
     CHECK_STR_EQ(text, "none\nactive=Bob\n");
 }
 
+TEST(active_state_registration_failure_is_atomic_and_retryable) {
+    char scratch[TEST_SCRATCH_PROBE_MAX][TEST_SCRATCH_PATH_SIZE];
+    char dir[128], path[256], hint[256], text[1024];
+    gitswitch_ctx_t ctx;
+    size_t registered;
+    bool installed = true;
+    int before;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+
+    before = test_open_fd_count();
+    registered = test_scratch_fill(scratch, "state-full");
+    CHECK(registered > 0 && registered < TEST_SCRATCH_PROBE_MAX);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1);
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message, "register") != NULL);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+
+    test_scratch_release(scratch, registered);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(schema_rejects_lossy_types_and_dependent_keys);
     RUN_TEST(default_create_fault_matrix_is_atomic_and_closes_fds);
     RUN_TEST(default_create_signal_death_is_truthful_at_every_boundary);
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
+    RUN_TEST(backup_pruning_requires_complete_directory_enumeration);
     RUN_TEST(backup_faults_abort_and_full_save_rolls_state_back);
+    RUN_TEST(full_save_rollback_preserves_a_later_state_generation);
     RUN_TEST(active_state_only_save_preserves_accounts_and_is_idempotent);
+    RUN_TEST(active_state_save_is_bound_to_loaded_config_generation);
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
     RUN_TEST(active_state_rejects_corruption_and_crash_mismatches);
     RUN_TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds);
+    RUN_TEST(active_state_registration_failure_is_atomic_and_retryable);
 TEST_MAIN_END()

@@ -18,6 +18,19 @@ static char g_binary[PATH_MAX];
 static int g_runner_calls;
 static int g_probe_calls;
 
+static int path_join(char *out, size_t out_size, const char *left,
+                     const char *right);
+
+static int resolve_binary(void) {
+    const char *configured = getenv("GITSWITCH_BIN");
+
+    if (configured && *configured) {
+        return realpath(configured, g_binary) ? 0 : -1;
+    }
+    return path_join(g_binary, sizeof(g_binary), g_root,
+                     "build/bin/gitswitch");
+}
+
 static int write_text(const char *path, const char *text, mode_t mode) {
     FILE *file = fopen(path, "w");
     size_t length = text ? strlen(text) : 0;
@@ -34,6 +47,7 @@ static int write_text(const char *path, const char *text, mode_t mode) {
 static int read_text(const char *path, char *out, size_t out_size) {
     FILE *file;
     size_t used;
+    int extra;
 
     if (!out || out_size == 0) return -1;
     out[0] = '\0';
@@ -44,8 +58,98 @@ static int read_text(const char *path, char *out, size_t out_size) {
         fclose(file);
         return -1;
     }
+    extra = fgetc(file);
+    if (extra != EOF) {
+        (void)fclose(file);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (ferror(file)) {
+        int saved_errno = errno == 0 ? EIO : errno;
+
+        (void)fclose(file);
+        errno = saved_errno;
+        return -1;
+    }
     out[used] = '\0';
     return fclose(file);
+}
+
+static int read_text_alloc(const char *path, char **out) {
+    FILE *file;
+    char *text;
+    size_t capacity = 4096;
+    size_t used = 0;
+
+    if (!path || !out) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out = NULL;
+    file = fopen(path, "r");
+    if (!file) return -1;
+    text = malloc(capacity + 1);
+    if (!text) {
+        int saved_errno = errno;
+
+        (void)fclose(file);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        size_t count;
+
+        if (used == capacity) {
+            size_t next_capacity;
+            char *larger;
+
+            if (capacity > (SIZE_MAX - 1U) / 2U) {
+                errno = EFBIG;
+                goto fail;
+            }
+            next_capacity = capacity * 2U;
+            larger = realloc(text, next_capacity + 1U);
+            if (!larger) goto fail;
+            text = larger;
+            capacity = next_capacity;
+        }
+        count = fread(text + used, 1, capacity - used, file);
+        used += count;
+        if (count > 0) continue;
+        if (ferror(file)) {
+            if (errno == 0) errno = EIO;
+            goto fail;
+        }
+        if (!feof(file)) {
+            errno = EIO;
+            goto fail;
+        }
+        break;
+    }
+    if (memchr(text, '\0', used) != NULL) {
+        errno = EILSEQ;
+        goto fail;
+    }
+    text[used] = '\0';
+    if (fclose(file) != 0) {
+        int saved_errno = errno;
+
+        free(text);
+        errno = saved_errno;
+        return -1;
+    }
+    *out = text;
+    return 0;
+
+fail:
+    {
+        int saved_errno = errno;
+
+        (void)fclose(file);
+        free(text);
+        errno = saved_errno;
+        return -1;
+    }
 }
 
 static int path_join(char *out, size_t out_size, const char *left,
@@ -449,6 +553,7 @@ static int make_home_fixture(char *root, size_t root_size,
 
     if (snprintf(root, root_size, "/tmp/gitswitch-ar07-completion.XXXXXX") < 0 ||
         !ts_mkdtemp(root) ||
+        ts_canonicalize_dir_path(root, root_size) != 0 ||
         path_join(home, home_size, root, "home") != 0 ||
         path_join(runtime, runtime_size, root, "runtime") != 0 ||
         mkdir(home, 0700) != 0 || mkdir(runtime, 0700) != 0 ||
@@ -513,9 +618,10 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
         "doctor", "health", "config", "init", "resume", "reset", "switch",
     };
     char bash_path[PATH_MAX], zsh_path[PATH_MAX], fish_path[PATH_MAX];
-    char bash[32768], zsh[32768], fish[32768];
+    char *bash = NULL, *zsh = NULL, *fish = NULL;
     char bash_options[2048], zsh_options[2048], fish_options[2048];
     char bash_commands[1024], zsh_commands[1024], fish_commands[1024];
+    int bash_rc, zsh_rc, fish_rc;
 
     CHECK_EQ_INT(path_join(bash_path, sizeof(bash_path), g_root,
                            "completions/gitswitch.bash"), 0);
@@ -523,9 +629,18 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
                            "completions/gitswitch.zsh"), 0);
     CHECK_EQ_INT(path_join(fish_path, sizeof(fish_path), g_root,
                            "completions/gitswitch.fish"), 0);
-    CHECK_EQ_INT(read_text(bash_path, bash, sizeof(bash)), 0);
-    CHECK_EQ_INT(read_text(zsh_path, zsh, sizeof(zsh)), 0);
-    CHECK_EQ_INT(read_text(fish_path, fish, sizeof(fish)), 0);
+    bash_rc = read_text_alloc(bash_path, &bash);
+    zsh_rc = read_text_alloc(zsh_path, &zsh);
+    fish_rc = read_text_alloc(fish_path, &fish);
+    CHECK_EQ_INT(bash_rc, 0);
+    CHECK_EQ_INT(zsh_rc, 0);
+    CHECK_EQ_INT(fish_rc, 0);
+    if (bash_rc != 0 || zsh_rc != 0 || fish_rc != 0) {
+        free(bash);
+        free(zsh);
+        free(fish);
+        return;
+    }
 
     CHECK_EQ_INT(extract_bash_assignment(bash, "options", bash_options,
                                          sizeof(bash_options)), 0);
@@ -564,6 +679,63 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
     CHECK(strstr(bash, "--resume-hint-probe") == NULL);
     CHECK(strstr(zsh, "--resume-hint-probe") == NULL);
     CHECK(strstr(fish, "--resume-hint-probe") == NULL);
+    free(bash);
+    free(zsh);
+    free(fish);
+}
+
+TEST(completion_source_reader_covers_the_legacy_boundary) {
+    static const struct {
+        size_t offset;
+        const char *forbidden;
+    } cases[] = {
+        {1024U, "--ssh-agent-info"},
+        {32760U, "--resume-check"},
+        {49152U, "--resume-hint-probe"},
+    };
+    const size_t source_size = 64U * 1024U;
+    char root[PATH_MAX], path[PATH_MAX];
+    char *source = malloc(source_size + 1U);
+    char *loaded = NULL;
+
+    CHECK(source != NULL);
+    if (!source) return;
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar09-completion-source.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(path, sizeof(path), root, "large-valid.bash"), 0);
+    memset(source, '#', source_size);
+    source[source_size - 1U] = '\n';
+    source[source_size] = '\0';
+    CHECK_EQ_INT(write_text(path, source, 0600), 0);
+    CHECK_EQ_INT(read_text_alloc(path, &loaded), 0);
+    CHECK(loaded != NULL);
+    if (loaded) {
+        CHECK_EQ_INT(strlen(loaded), source_size);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            CHECK(strstr(loaded, cases[i].forbidden) == NULL);
+        }
+        free(loaded);
+        loaded = NULL;
+    }
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t forbidden_length = strlen(cases[i].forbidden);
+
+        memset(source, '#', source_size);
+        source[source_size - 1U] = '\n';
+        memcpy(source + cases[i].offset, cases[i].forbidden,
+               forbidden_length);
+        CHECK_EQ_INT(write_text(path, source, 0600), 0);
+        CHECK_EQ_INT(read_text_alloc(path, &loaded), 0);
+        CHECK(loaded != NULL);
+        if (loaded) {
+            CHECK(strstr(loaded, cases[i].forbidden) != NULL);
+            free(loaded);
+            loaded = NULL;
+        }
+    }
+    free(source);
 }
 
 TEST(bash_completion_executes_getopt_style_operand_state) {
@@ -592,6 +764,64 @@ TEST(bash_completion_executes_getopt_style_operand_state) {
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n"
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n"
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n<>\n");
+}
+
+TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
+    const char *bash = find_shell("bash");
+    char root[PATH_MAX], stub[PATH_MAX], script[16384], output[16384];
+    const char *stub_source =
+        "#!/bin/sh\n"
+        "[ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
+        "[ \"$2\" = list ] || exit 64\n"
+        "cat <<'NAMES'\n"
+        "Café One\n"
+        "Café Two\n"
+        "Quote'Name\n"
+        "Double\"Name\n"
+        "Back\\Slash\n"
+        "Paren (Work)\n"
+        "NAMES\n";
+    int written;
+
+    CHECK(bash != NULL);
+    if (!bash) return;
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar09-bash-completion.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(stub, sizeof(stub), root, "gitswitch"), 0);
+    CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
+    written = snprintf(
+        script, sizeof(script),
+        "export LC_ALL=C; PATH='%s':$PATH; "
+        "_init_completion(){ return 1; }; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
+        "dump(){ printf '<%%s>\\n' \"${COMPREPLY[@]}\"; }; "
+        "probe(){ COMPREPLY=(); _gitswitch_complete_accounts \"$1\"; dump; }; "
+        "probe ''; printf '%%s\\n' ALL-END; "
+        "probe 'Café\\ '; printf '%%s\\n' UTF8-END; "
+        "probe \"Quote\\'N\"; printf '%%s\\n' QUOTE-END; "
+        "probe 'Double\\\"N'; printf '%%s\\n' DOUBLE-END; "
+        "probe 'Back\\\\S'; printf '%%s\\n' BACKSLASH-END; "
+        "probe 'Paren\\ \\(W'; printf '%%s\\n' PAREN-END",
+        root);
+    CHECK(written >= 0 && (size_t)written < sizeof(script));
+    if (written < 0 || (size_t)written >= sizeof(script)) return;
+
+    CHECK_EQ_INT(run_script(bash, false, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(
+        output,
+        "<Café\\ One>\n"
+        "<Café\\ Two>\n"
+        "<Quote\\'Name>\n"
+        "<Double\\\"Name>\n"
+        "<Back\\\\Slash>\n"
+        "<Paren\\ \\(Work\\)>\n"
+        "ALL-END\n"
+        "<Café\\ One>\n<Café\\ Two>\nUTF8-END\n"
+        "<Quote\\'Name>\nQUOTE-END\n"
+        "<Double\\\"Name>\nDOUBLE-END\n"
+        "<Back\\\\Slash>\nBACKSLASH-END\n"
+        "<Paren\\ \\(Work\\)>\nPAREN-END\n");
 }
 
 TEST(zsh_completion_executes_runtime_expansion_and_state_scanner) {
@@ -625,6 +855,84 @@ TEST(zsh_completion_executes_runtime_expansion_and_state_scanner) {
     CHECK(strstr(output, "S:edit:0:0\n") != NULL);
     CHECK(strstr(output, "S:edit:1:0\n") != NULL);
     CHECK(strstr(output, "S:switch:0:1\n") != NULL);
+}
+
+TEST(zsh_completion_queries_accounts_only_for_account_operands) {
+    const char *zsh = find_shell("zsh");
+    char root[PATH_MAX], stub[PATH_MAX], count_path[PATH_MAX];
+    char stub_source[2048], script[16384], output[16384];
+    int written;
+
+    if (!zsh) {
+        TS_SKIP("zsh", "zsh shell is unavailable");
+    }
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar09-zsh-completion.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(stub, sizeof(stub), root, "gitswitch"), 0);
+    CHECK_EQ_INT(path_join(count_path, sizeof(count_path), root, "calls"), 0);
+    written = snprintf(
+        stub_source, sizeof(stub_source),
+        "#!/bin/sh\n"
+        "count=0\n"
+        "if [ -r '%s' ]; then IFS= read -r count <'%s'; fi\n"
+        "count=$((count + 1))\n"
+        "printf '%%s\\n' \"$count\" >'%s'\n"
+        "[ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
+        "[ \"$2\" = list ] || exit 64\n"
+        "printf '%%s\\n' Alpha 'Colon:Name' 'Space Name'\n",
+        count_path, count_path, count_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(stub_source));
+    if (written < 0 || (size_t)written >= sizeof(stub_source)) return;
+    CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
+    CHECK_EQ_INT(write_text(count_path, "0\n", 0600), 0);
+
+    written = snprintf(
+        script, sizeof(script),
+        "_describe(){ if [[ $2 == accounts ]]; then "
+        "local array_name=$4; local -a described; "
+        "described=(\"${(@P)array_name}\"); "
+        "print -r -- \"A:${(j:|:)described}\"; fi; }; "
+        "_values(){ :; }; commands[gitswitch]='%s'; "
+        "typeset count_file='%s'; "
+        "words=(gitswitch --version); CURRENT=2; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.zsh\"; "
+        "print -r -- \"C:source:$(<$count_file)\"; "
+        "probe(){ local label=$1; shift; print -r -- 0 >$count_file; "
+        "words=(\"$@\"); CURRENT=${#words}; _gitswitch; "
+        "print -r -- \"C:$label:$(<$count_file)\"; }; "
+        "probe option-only gitswitch --ver; "
+        "probe init-shell gitswitch init ''; "
+        "probe list-no-operand gitswitch list ''; "
+        "probe consumed-account gitswitch edit Alpha ''; "
+        "probe option-after-command gitswitch edit --ver; "
+        "probe delimiter-command gitswitch -- -g ''; "
+        "probe bare-account gitswitch ''; "
+        "for cmd in edit remove rm delete reset switch; do "
+        "probe account-$cmd gitswitch -g $cmd ''; done; "
+        "probe delimited-account gitswitch edit -- '';",
+        stub, count_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(script));
+    if (written < 0 || (size_t)written >= sizeof(script)) return;
+
+    CHECK_EQ_INT(run_script(zsh, false, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(
+        output,
+        "C:source:0\n"
+        "C:option-only:0\n"
+        "C:init-shell:0\n"
+        "C:list-no-operand:0\n"
+        "C:consumed-account:0\n"
+        "C:option-after-command:0\n"
+        "C:delimiter-command:0\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:bare-account:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-edit:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-remove:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-rm:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-delete:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-reset:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-switch:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:delimited-account:1\n");
 }
 
 TEST(fish_completion_executes_getopt_style_operand_state) {
@@ -860,16 +1168,18 @@ TEST(cli_names_permutations_match_and_switch_is_reserved) {
 
 TEST_MAIN_BEGIN()
     if (!getcwd(g_root, sizeof(g_root)) ||
-        path_join(g_binary, sizeof(g_binary), g_root,
-                  "build/bin/gitswitch") != 0 ||
+        resolve_binary() != 0 ||
         setenv("GS_T16_ROOT", g_root, 1) != 0 ||
         error_init(LOG_LEVEL_WARNING, NULL) != 0) {
         fprintf(stderr, "RESULT FAIL: T16 test setup failed\n");
         return 1;
     }
+    RUN_TEST(completion_source_reader_covers_the_legacy_boundary);
     RUN_TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden);
     RUN_TEST(bash_completion_executes_getopt_style_operand_state);
+    RUN_TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale);
     RUN_TEST(zsh_completion_executes_runtime_expansion_and_state_scanner);
+    RUN_TEST(zsh_completion_queries_accounts_only_for_account_operands);
     RUN_TEST(fish_completion_executes_getopt_style_operand_state);
     RUN_TEST(names_loader_preserves_account_admission_without_runtime_work);
     RUN_TEST(names_loader_validates_toml_but_ignores_external_active_artifact);

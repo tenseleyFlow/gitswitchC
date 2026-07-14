@@ -1,5 +1,5 @@
 /* git_ops tests: SSH key-path injection hardening (ssh-1) and the
- * process-scoped exec caches (perf-1..4).
+ * process-scoped write/snapshot bookkeeping (perf-1, perf-3, perf-4).
  *
  * All git invocations are intercepted with a fake runner (run_set_runner)
  * that models an in-memory `git config` store and COUNTS execs, so the perf
@@ -18,6 +18,9 @@
 /* Test seam from git_ops.c (deliberately not in git_ops.h: the public API is
  * unchanged; only tests need to reset the process-scoped caches). */
 void git_ops_test_reset_caches(void);
+typedef void *(*git_snapshot_value_malloc_fn)(size_t size);
+git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
+    git_snapshot_value_malloc_fn fn);
 
 /* ---- fake git: in-memory config store + exec counters ------------------- */
 
@@ -31,13 +34,19 @@ static struct {
 
 static int fk_execs;           /* every subprocess the code under test spawned */
 static int fk_identity_reads;  /* `git config <scope> user.name|user.email` reads */
+static int fk_effective_reads; /* atomic merged managed-key listing reads */
 static bool fk_is_repo;        /* what `git rev-parse --git-dir` reports */
+static const char *fk_repo_root_output;
+static int fk_repo_root_exit;
 
 static void fk_reset(void) {
     memset(fk_store, 0, sizeof(fk_store));
     fk_execs = 0;
     fk_identity_reads = 0;
+    fk_effective_reads = 0;
     fk_is_repo = false;
+    fk_repo_root_output = NULL;
+    fk_repo_root_exit = 1;
 }
 
 static int fk_find(const char *scope, const char *key) {
@@ -99,13 +108,36 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
         return fk_ret(result, 1);
     }
 
+    if (strcmp(argv[1], "rev-parse") == 0 && argv[2] &&
+        strcmp(argv[2], "--show-toplevel") == 0) {
+        size_t length;
+        size_t copied;
+
+        if (fk_repo_root_exit != 0 || !fk_repo_root_output) {
+            return fk_ret(result, fk_repo_root_exit ? fk_repo_root_exit : 1);
+        }
+        length = strlen(fk_repo_root_output);
+        copied = opts && opts->out && opts->out_size > 0
+            ? (length < opts->out_size - 1U ? length : opts->out_size - 1U)
+            : 0;
+        if (copied > 0) memcpy(opts->out, fk_repo_root_output, copied);
+        if (opts && opts->out && opts->out_size > 0) opts->out[copied] = '\0';
+        if (result) {
+            result->out_len = copied;
+            result->out_truncated = copied != length;
+        }
+        return fk_ret(result, 0);
+    }
+
     if (strcmp(argv[1], "rev-parse") == 0) {
         return fk_ret(result, fk_is_repo ? 0 : 1);
     }
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
-        if (strcmp(argv[2], "--show-origin") == 0)
+        if (strcmp(argv[2], "--show-origin") == 0) {
+            fk_effective_reads++;
             return fk_emit_effective_listing(opts, result);
+        }
         const char *scope = argv[2];
 
         /* Production emits --unset-all (AR-06 F03); accept the legacy spelling
@@ -265,6 +297,157 @@ TEST(git_is_repository_caches_result) {
     run_set_runner(prev);
 }
 
+/* ---- M23: repository root is complete, exact, and fail-cleared ---------- */
+
+TEST(git_get_repo_root_requires_complete_exact_output) {
+    char path[64];
+    char tiny[5];
+    char oversized[MAX_PATH_LEN + 64U];
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+
+    fk_repo_root_exit = 0;
+    fk_repo_root_output = "/tmp/project\n";
+    memset(path, 'x', sizeof(path));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), 0);
+    CHECK_STR_EQ(path, "/tmp/project");
+
+    /* Only Git's one line ending is removed; a valid trailing path space is
+     * data and must not be normalized away. */
+    fk_repo_root_output = "/tmp/project \n";
+    memset(path, 'x', sizeof(path));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), 0);
+    CHECK_STR_EQ(path, "/tmp/project ");
+
+    /* A complete result that does not fit the caller is an error and cannot
+     * leave the caller's prior bytes looking usable. */
+    fk_repo_root_output = "/tmp/project\n";
+    memcpy(tiny, "old!", sizeof(tiny));
+    CHECK_EQ_INT(git_get_repo_root(tiny, sizeof(tiny)), -1);
+    CHECK_EQ_INT(tiny[0], '\0');
+
+    fk_repo_root_output = "";
+    memcpy(path, "old", sizeof("old"));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), -1);
+    CHECK_EQ_INT(path[0], '\0');
+
+    fk_repo_root_exit = 1;
+    fk_repo_root_output = NULL;
+    memcpy(path, "old", sizeof("old"));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), -1);
+    CHECK_EQ_INT(path[0], '\0');
+
+    memset(oversized, 'r', sizeof(oversized));
+    oversized[sizeof(oversized) - 2U] = '\n';
+    oversized[sizeof(oversized) - 1U] = '\0';
+    fk_repo_root_exit = 0;
+    fk_repo_root_output = oversized;
+    memcpy(path, "old", sizeof("old"));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), -1);
+    CHECK_EQ_INT(path[0], '\0');
+
+    run_set_runner(prev);
+}
+
+/* ---- L30: effective configuration capture has an operational ceiling --- */
+
+#define TEST_GIT_INSPECTION_MAX_BYTES (8U * 1024U * 1024U)
+
+static bool l30_complete_at_limit;
+static size_t l30_largest_capture;
+static int l30_capture_calls;
+
+static int l30_effective_runner(const char *const argv[],
+                                const run_opts_t *opts,
+                                run_result_t *result) {
+    static const char large_prefix[] =
+        "global\0file:/fake/config\0unrelated.large\n";
+    static const char managed_tail[] =
+        "\0global\0file:/fake/config\0user.name\nLimit User\0"
+        "global\0file:/fake/config\0user.email\nlimit@example.test\0";
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv[0] || strcmp(argv[0], "git") != 0 ||
+        !argv[1] || strcmp(argv[1], "config") != 0 ||
+        !argv[2] || strcmp(argv[2], "--show-origin") != 0 ||
+        !opts || !opts->out || opts->out_size == 0) {
+        return fk_ret(result, 1);
+    }
+
+    l30_capture_calls++;
+    if (opts->out_size > l30_largest_capture)
+        l30_largest_capture = opts->out_size;
+
+    /* Prevent the unfixed implementation from growing forever: crossing the
+     * documented ceiling becomes an observable runner failure. */
+    if (opts->out_size > TEST_GIT_INSPECTION_MAX_BYTES)
+        return fk_ret(result, 2);
+
+    if (l30_complete_at_limit &&
+        opts->out_size == TEST_GIT_INSPECTION_MAX_BYTES) {
+        size_t prefix_length = sizeof(large_prefix) - 1U;
+        size_t tail_length = sizeof(managed_tail) - 1U;
+        size_t output_length = opts->out_size - 1U;
+        size_t filler_length = output_length - prefix_length - tail_length;
+        memcpy(opts->out, large_prefix, prefix_length);
+        memset(opts->out + prefix_length, 'x', filler_length);
+        memcpy(opts->out + prefix_length + filler_length,
+               managed_tail, tail_length);
+        opts->out[output_length] = '\0';
+        if (result) {
+            result->out_len = output_length;
+            result->out_truncated = false;
+        }
+        return fk_ret(result, 0);
+    }
+
+    if (result) {
+        result->out_len = opts->out_size - 1U;
+        result->out_truncated = true;
+    }
+    return fk_ret(result, 0);
+}
+
+TEST(effective_config_capture_enforces_maximum) {
+    git_current_config_t current;
+    command_runner_fn prev;
+
+    git_ops_test_reset_caches();
+    unsetenv("GIT_SSH_COMMAND");
+    prev = run_set_runner(l30_effective_runner);
+
+    /* A complete result delivered at the ceiling remains valid. */
+    l30_complete_at_limit = true;
+    l30_largest_capture = 0;
+    l30_capture_calls = 0;
+    memset(&current, 0, sizeof(current));
+    CHECK_EQ_INT(git_get_current_config(&current), 0);
+    CHECK(current.valid);
+    CHECK_STR_EQ(current.name, "Limit User");
+    CHECK_STR_EQ(current.email, "limit@example.test");
+    CHECK(l30_largest_capture == TEST_GIT_INSPECTION_MAX_BYTES);
+    CHECK(l30_capture_calls > 1);
+
+    /* One byte beyond the ceiling fails without exposing partial status. */
+    l30_complete_at_limit = false;
+    l30_largest_capture = 0;
+    l30_capture_calls = 0;
+    memset(&current, 'x', sizeof(current));
+    CHECK_EQ_INT(git_get_current_config(&current), -1);
+    CHECK(!current.valid);
+    CHECK_EQ_INT(current.name[0], '\0');
+    CHECK(l30_largest_capture == TEST_GIT_INSPECTION_MAX_BYTES);
+    CHECK(strstr(get_last_error()->message, "exceeds") != NULL);
+
+    run_set_runner(prev);
+}
+
 /* ---- perf-3: identical managed-key writes collapse to one exec ---------- */
 
 TEST(git_set_config_value_skips_duplicate_managed_write) {
@@ -290,23 +473,30 @@ TEST(git_set_config_value_skips_duplicate_managed_write) {
     CHECK_EQ_INT(fk_execs, 3);
     CHECK_STR_EQ(buf, "DEADBEEFCAFE1234");
 
-    /* ...but a repeated read of the observed value is served from cache. */
+    /* A later public read must execute again and observe an external writer,
+     * rather than treating the first read as process-lifetime authority. */
+    int signing = fk_find("--global", "user.signingkey");
+    CHECK(signing >= 0);
+    if (signing >= 0) {
+        snprintf(fk_store[signing].value, sizeof(fk_store[signing].value),
+                 "%s", "EXTERNAL0123456");
+    }
     buf[0] = '\0';
     CHECK_EQ_INT(git_get_config_value("user.signingkey", buf, sizeof(buf), GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 3);
-    CHECK_STR_EQ(buf, "DEADBEEFCAFE1234");
+    CHECK_EQ_INT(fk_execs, 4);
+    CHECK_STR_EQ(buf, "EXTERNAL0123456");
 
     /* Duplicate unsets also collapse; a set after an unset must exec again. */
     CHECK_EQ_INT(git_unset_config_value("user.signingkey", GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 4);
-    CHECK_EQ_INT(git_unset_config_value("user.signingkey", GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 4);
-    CHECK_EQ_INT(git_set_config_value("user.signingkey", "DEADBEEFCAFE1234", GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(fk_execs, 5);
+    CHECK_EQ_INT(git_unset_config_value("user.signingkey", GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(fk_execs, 5);
+    CHECK_EQ_INT(git_set_config_value("user.signingkey", "DEADBEEFCAFE1234", GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(fk_execs, 6);
 
     /* A different value never skips. */
     CHECK_EQ_INT(git_set_config_value("user.signingkey", "0123456789ABCDEF", GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 6);
+    CHECK_EQ_INT(fk_execs, 7);
     int idx = fk_find("--global", "user.signingkey");
     CHECK(idx >= 0);
     if (idx >= 0) CHECK_STR_EQ(fk_store[idx].value, "0123456789ABCDEF");
@@ -323,6 +513,7 @@ TEST(git_set_config_value_skips_duplicate_managed_write) {
 
 static char zfk_set_key[16][64], zfk_set_val[16][8192];
 static int zfk_sets;
+static int zfk_forward_sets;
 static char zfk_unset_key[16][64];
 static int zfk_unsets;
 static int zfk_fallback_reads; /* per-key reads => the -z fast path was NOT used */
@@ -382,6 +573,7 @@ static int zfk_runner(const char *const argv[], const run_opts_t *opts,
             return fk_ret(result, 0);
         }
         if (argv[4]) { /* ordinary forward set */
+            zfk_forward_sets++;
             return fk_ret(result, 0);
         }
         zfk_fallback_reads++; /* per-key read: snapshot must never fall back */
@@ -506,6 +698,44 @@ TEST(restore_unsets_keys_written_after_snapshot) {
     CHECK(zfk_was_unset("user.signingkey"));
 }
 
+static void *fail_snapshot_value_malloc(size_t size) {
+    (void)size;
+    return NULL;
+}
+
+/* A managed write must not reach Git until its intended post-image is fully
+ * representable in memory. Otherwise the command can succeed while the
+ * transaction still expects the old vector, and rollback mistakes its own
+ * mutation for an external conflict. The failed attempt must also leave no
+ * CFG_WRITTEN cache entry that could suppress a later retry. */
+TEST(postimage_value_allocation_failure_precedes_managed_write) {
+    git_snapshot_value_malloc_fn previous_malloc;
+
+    git_ops_test_reset_caches();
+    zfk_sets = zfk_unsets = zfk_fallback_reads = 0;
+    zfk_forward_sets = 0;
+    command_runner_fn prev = run_set_runner(zfk_runner);
+
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    previous_malloc = git_ops_test_set_snapshot_value_malloc_fn(
+        fail_snapshot_value_malloc);
+    clear_error();
+
+    CHECK_EQ_INT(git_set_config_value("user.name", "Replacement Name",
+                                      GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_MEMORY_ALLOCATION);
+    CHECK_EQ_INT(zfk_forward_sets, 0);
+
+    git_ops_test_set_snapshot_value_malloc_fn(previous_malloc);
+    zfk_forward_sets = 0;
+    CHECK_EQ_INT(git_set_config_value("user.name", "Replacement Name",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(zfk_forward_sets, 1);
+
+    git_ops_test_reset_caches();
+    run_set_runner(prev);
+}
+
 /* ---- AR-03 M1: overlong values must never snapshot as proven-absent ----- */
 /* gitswitch itself writes core.sshCommand values past 512 bytes (~85 bytes of
  * fixed ssh options plus a single-quoted key path of up to MAX_PATH_LEN), and
@@ -609,9 +839,9 @@ TEST(oversize_foreign_sshcommand_restores_exactly) {
     zfk_listing_override = NULL;
 }
 
-/* ---- perf-2: git_test_config reuses git_set_config's read-back ---------- */
+/* ---- M22: public validation never trusts a process-lifetime read -------- */
 
-TEST(git_test_config_reuses_switch_readback) {
+TEST(git_test_config_rechecks_external_identity) {
     git_ops_test_reset_caches();
     fk_reset();
     command_runner_fn prev = run_set_runner(fake_git_runner);
@@ -621,22 +851,98 @@ TEST(git_test_config_reuses_switch_readback) {
     safe_strncpy(acct.name, "Test User", sizeof(acct.name));
     safe_strncpy(acct.email, "test@example.com", sizeof(acct.email));
 
-    /* Full switch write: sets identity, then verifies by reading it back
-     * from git — exactly two identity reads. */
+    /* Full switch write verifies both the selected scope and one fresh merged
+     * effective listing. */
     CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(fk_identity_reads, 2);
+    CHECK_EQ_INT(fk_effective_reads, 1);
 
-    /* The post-switch validation used to re-exec both reads; it must now be
-     * served from the values git reported to the verify step above. */
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_identity_reads, 2);
-
-    /* Outcome unchanged: the fake store holds the switched identity. */
+    /* Model another process changing Git after the forward read-back. The
+     * next public validation must execute and reject the new value; the old
+     * process-global positive cache incorrectly returned success here. */
     int in = fk_find("--global", "user.name");
     int ie = fk_find("--global", "user.email");
     CHECK(in >= 0 && ie >= 0);
-    if (in >= 0) CHECK_STR_EQ(fk_store[in].value, "Test User");
+    if (in >= 0) {
+        snprintf(fk_store[in].value, sizeof(fk_store[in].value), "%s",
+                 "External User");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(fk_identity_reads, 2);
+    CHECK_EQ_INT(fk_effective_reads, 2);
+    if (in >= 0) CHECK_STR_EQ(fk_store[in].value, "External User");
     if (ie >= 0) CHECK_STR_EQ(fk_store[ie].value, "test@example.com");
+
+    run_set_runner(prev);
+}
+
+/* ---- L13: public Git validation enforces the selected signing model ----- */
+
+TEST(git_test_config_rejects_wrong_effective_signing_state) {
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    account_t acct;
+    int signing_key;
+    int signing_enabled;
+
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "GPG User", sizeof(acct.name));
+    safe_strncpy(acct.email, "gpg@example.com", sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "BEEFCAFE01234567",
+                 sizeof(acct.gpg_key_id));
+
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    gpg_manager_note_key_available(acct.gpg_key_id);
+    signing_key = fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY);
+    signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
+    CHECK(signing_key >= 0 && signing_enabled >= 0);
+
+    /* A nonempty key is not sufficient: it must be the selected key. */
+    if (signing_key >= 0) {
+        snprintf(fk_store[signing_key].value,
+                 sizeof(fk_store[signing_key].value), "%s",
+                 "AAAAAAAAAAAAAAAA");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    /* Signing enabled/disabled is selected account state, not a warning. */
+    if (signing_key >= 0) {
+        snprintf(fk_store[signing_key].value,
+                 sizeof(fk_store[signing_key].value), "%s",
+                 acct.gpg_key_id);
+    }
+    if (signing_enabled >= 0) {
+        snprintf(fk_store[signing_enabled].value,
+                 sizeof(fk_store[signing_enabled].value), "%s", "false");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    acct.gpg_signing_enabled = false;
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
+    CHECK(signing_enabled >= 0);
+    if (signing_enabled >= 0) {
+        snprintf(fk_store[signing_enabled].value,
+                 sizeof(fk_store[signing_enabled].value), "%s", "true");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    /* A non-signing account must reject stale signing state as well. */
+    acct.gpg_enabled = false;
+    acct.gpg_signing_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    signing_key = fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY);
+    signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
+    CHECK(signing_key < 0 && signing_enabled >= 0);
+    if (signing_enabled >= 0) {
+        snprintf(fk_store[signing_enabled].value,
+                 sizeof(fk_store[signing_enabled].value), "%s", "true");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
 
     run_set_runner(prev);
 }
@@ -769,13 +1075,17 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_configure_ssh_rejects_single_quote_in_keypath);
     RUN_TEST(git_ops_init_spawns_no_subprocess);
     RUN_TEST(git_is_repository_caches_result);
+    RUN_TEST(git_get_repo_root_requires_complete_exact_output);
+    RUN_TEST(effective_config_capture_enforces_maximum);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);
     RUN_TEST(restore_unsets_keys_written_after_snapshot);
+    RUN_TEST(postimage_value_allocation_failure_precedes_managed_write);
     RUN_TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim);
     RUN_TEST(oversize_foreign_sshcommand_restores_exactly);
-    RUN_TEST(git_test_config_reuses_switch_readback);
+    RUN_TEST(git_test_config_rechecks_external_identity);
+    RUN_TEST(git_test_config_rejects_wrong_effective_signing_state);
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()

@@ -4,6 +4,7 @@
 #define CONFIG_H
 
 #include "gitswitch.h"
+#include <dirent.h>
 
 /* Configuration file format version */
 #define CONFIG_FORMAT_VERSION "1.0"
@@ -54,6 +55,20 @@ typedef enum {
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);
 config_io_fault_fn config_set_io_fault_fn(config_io_fault_fn fn);
 
+/* Focused metadata-mismatch observer for deterministic errno regressions.
+ * A callback returns true to model a pure identity mismatch after every
+ * required filesystem observation has succeeded. Production leaves it NULL. */
+typedef enum {
+    CONFIG_METADATA_TEST_REFRESH_INITIAL = 1,
+    CONFIG_METADATA_TEST_REFRESH_FINAL,
+    CONFIG_METADATA_TEST_DOCUMENT_DIR,
+    CONFIG_METADATA_TEST_DEFAULT_DIR
+} config_metadata_test_stage_t;
+typedef bool (*config_metadata_test_hook_fn)(
+    config_metadata_test_stage_t stage);
+config_metadata_test_hook_fn config_set_metadata_test_hook_fn(
+    config_metadata_test_hook_fn fn);
+
 /* Supplies the (seconds,nanoseconds) generation base for backup names. The
  * default reads CLOCK_REALTIME. Tests can pin both values to force collisions;
  * the writer still creates distinct monotonic generations with O_EXCL. */
@@ -61,6 +76,12 @@ typedef int (*config_backup_clock_fn)(uint64_t *seconds,
                                       uint32_t *nanoseconds);
 config_backup_clock_fn config_set_backup_clock_fn(
     config_backup_clock_fn fn);
+
+/* Narrow directory-enumeration seam for backup-rotation failure tests. NULL
+ * restores libc readdir(). Production callers leave the default installed. */
+typedef struct dirent *(*config_backup_readdir_fn)(DIR *dir);
+config_backup_readdir_fn config_set_backup_readdir_fn(
+    config_backup_readdir_fn fn);
 
 /* Function prototypes */
 
@@ -104,6 +125,15 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
  * skipped account sections or found unrecognized ones (AR-03 M9): the refusal
  * must be distinguishable from success or callers report "saved" for a change
  * that was silently discarded.
+ *
+ * Every public save acquires a nonblocking, destination-local publication lock
+ * before observing or changing the state/config pair and holds it through the
+ * final rename, rollback, and durability checks. Concurrent gitswitch/API
+ * writers therefore fail with EAGAIN/EWOULDBLOCK instead of losing a committed
+ * generation. Same-uid code that writes these paths without using this API is
+ * outside the cooperating-writer protocol: strict metadata checks detect such
+ * changes through the final pre-rename checkpoint, so the unsupported race is
+ * explicitly bounded to the last check-to-rename interval.
  */
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
 /* Full-document transactional save. `config_installed` becomes true once the
@@ -129,7 +159,9 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx);
  * and mtime remain unchanged. The artifact's first line remains the legacy
  * runtime-needs token consumed by shell integrations; its second line records
  * either the exact active account or a versioned inactive tombstone. Falls back
- * to config_save when no config exists.
+ * to config_save when no config exists. For an existing config, the context
+ * must come from a successful load of that exact path and the source generation
+ * must still be installed; otherwise the save fails closed.
  */
 int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path);
 
@@ -147,31 +179,52 @@ int config_resume_hint_path(char *buf, size_t size);
  * fails with no output value. */
 int config_resume_hint_probe(char *needs, size_t size);
 
-/* Exact before-image for the consolidated active-state/resume-hint file. A CLI switch captures it
- * before runtime/Git mutation so a failed active-state commit can restore the
- * previous bytes (or previous absence) exactly. Snapshot values must be
- * zero-initialized before their first capture and cleared after final use. */
+/* Exact before-image for the consolidated active-state/resume-hint file. A CLI
+ * switch captures it before runtime/Git mutation so a failed active-state
+ * commit can restore the previous bytes (or previous absence) exactly.
+ * Guarded transactional saves also bind the snapshot to the exact post-image
+ * they installed; restore then fails closed if any later generation replaced
+ * or rewrote that post-image. Snapshot values must be zero-initialized before
+ * their first capture and cleared after final use. */
 typedef struct {
     bool valid;
     bool existed;
     unsigned char *data;
     size_t length;
     unsigned int mode;
+    char config_path[MAX_PATH_LEN];
+    bool post_image_bound;
+    bool post_image_installed;
+    bool post_image_valid;
+    struct stat post_image;
+    unsigned char post_image_data[MAX_NAME_LEN + 32U];
+    size_t post_image_length;
 } config_resume_hint_snapshot_t;
 
 int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot);
+/* Restore accepts only a snapshot subsequently bound by
+ * config_save_active_account_transactional_guarded (or the internal full-save
+ * transaction). An unbound snapshot cannot identify which later state belongs
+ * to its caller and is rejected instead of overwriting it. */
 int config_resume_hint_snapshot_restore(
     const config_resume_hint_snapshot_t *snapshot);
 void config_resume_hint_snapshot_clear(config_resume_hint_snapshot_t *snapshot);
 
 /* Transaction-aware active-account save. config_installed is true once the
  * new state-artifact inode has been renamed into place, even if its subsequent
- * directory sync fails. The rollback variant writes only that artifact;
- * callers may then restore the exact snapshot to recover legacy bytes/mode as
- * well. */
+ * directory sync fails. Use the guarded variant when later transaction phases
+ * may need to restore an exact snapshot. */
 int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
                                              const char *config_path,
                                              bool *config_installed);
+/* Switch-transaction variant: rollback_snapshot must be a valid before-image
+ * captured for config_path. The save records its installed state generation in
+ * that snapshot so config_resume_hint_snapshot_restore can perform a guarded
+ * compare-before-restore instead of overwriting a later writer. */
+int config_save_active_account_transactional_guarded(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot);
 int config_restore_active_account(const gitswitch_ctx_t *ctx,
                                   const char *config_path);
 

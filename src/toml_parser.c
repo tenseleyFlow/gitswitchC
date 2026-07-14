@@ -42,8 +42,9 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
 static int parse_integer_value(toml_parser_state_t *state, int *value);
 static int parse_boolean_value(toml_parser_state_t *state, bool *value);
 static void skip_whitespace(toml_parser_state_t *state);
+static int consume_line_ending(toml_parser_state_t *state);
 static int require_line_end(toml_parser_state_t *state);
-static void skip_comment(toml_parser_state_t *state);
+static int skip_comment(toml_parser_state_t *state);
 static bool is_at_end(const toml_parser_state_t *state);
 static char current_char(const toml_parser_state_t *state);
 static char advance_char(toml_parser_state_t *state);
@@ -57,6 +58,7 @@ static bool toml_same_file(const struct stat *left, const struct stat *right);
 static bool toml_temp_identity_is_private(const struct stat *identity);
 static toml_document_init_hook_fn g_document_init_hook;
 static toml_writer_test_hook_fn g_writer_test_hook;
+static toml_metadata_test_hook_fn g_metadata_test_hook;
 
 static bool ascii_key_initial_is_valid(unsigned char c) {
     return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
@@ -64,6 +66,11 @@ static bool ascii_key_initial_is_valid(unsigned char c) {
 
 static bool ascii_key_continuation_is_valid(unsigned char c) {
     return ascii_key_initial_is_valid(c) || (c >= '0' && c <= '9');
+}
+
+static bool ascii_section_segment_byte_is_valid(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '-';
 }
 
 /* This intentionally implements the application's narrower key contract, not
@@ -96,6 +103,13 @@ toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
     return previous;
 }
 
+toml_metadata_test_hook_fn toml_set_metadata_test_hook_fn(
+    toml_metadata_test_hook_fn fn) {
+    toml_metadata_test_hook_fn previous = g_metadata_test_hook;
+    g_metadata_test_hook = fn;
+    return previous;
+}
+
 /* Initialize TOML document structure */
 void toml_init_document(toml_document_t *doc) {
     if (!doc) return;
@@ -109,10 +123,11 @@ void toml_init_document(toml_document_t *doc) {
 /* Parse TOML from file with comprehensive security validation */
 int toml_parse_file(const char *file_path, toml_document_t *doc) {
     FILE *file = NULL;
-    struct stat file_stat;
+    struct stat path_stat, file_stat;
     char *buffer = NULL;
     size_t file_size = 0;
     size_t bytes_read;
+    int fd = -1;
     int result = -1;
     bool delegated_to_string_parser = false;
     
@@ -132,14 +147,57 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
         goto cleanup;
     }
     
-    /* Get file statistics for security checks */
-    if (stat(file_path, &file_stat) != 0) {
+    /* Refuse a named symlink before open for a precise diagnostic. O_NOFOLLOW
+     * below is still authoritative against replacement in this gap. */
+    if (lstat(file_path, &path_stat) != 0) {
         set_system_error(ERR_CONFIG_NOT_FOUND, "Cannot access config file: %s", file_path);
         goto cleanup;
     }
-    
+    if (S_ISLNK(path_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is a symlink; refusing to follow it: %s",
+                  file_path);
+        goto cleanup;
+    }
+    if (!S_ISREG(path_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is not a regular file: %s", file_path);
+        goto cleanup;
+    }
+
+    /* Open once and validate the exact descriptor that will be read.
+     * O_NONBLOCK protects the replacement race after the path-level type gate;
+     * the identity comparison also preserves no-follow behavior on platforms
+     * where O_NOFOLLOW is unavailable. */
+    fd = open(file_path,
+              O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        set_system_error(ERR_CONFIG_NOT_FOUND,
+                         "Failed to open config file: %s", file_path);
+        goto cleanup;
+    }
+    if (fstat(fd, &file_stat) != 0) {
+        set_system_error(ERR_CONFIG_NOT_FOUND,
+                         "Failed to stat opened config file: %s", file_path);
+        goto cleanup;
+    }
+    if (!S_ISREG(file_stat.st_mode)) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Configuration file is not a regular file: %s", file_path);
+        goto cleanup;
+    }
+    if (path_stat.st_dev != file_stat.st_dev ||
+        path_stat.st_ino != file_stat.st_ino) {
+        errno = ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Configuration file changed before open: %s",
+                         file_path);
+        goto cleanup;
+    }
+
     /* Security: Check file size limit */
-    if (file_stat.st_size > TOML_MAX_FILE_SIZE) {
+    if (file_stat.st_size < 0 ||
+        file_stat.st_size > (off_t)TOML_MAX_FILE_SIZE) {
         /* Cast to long: off_t is long long on macOS/clang (Wformat error under
          * -Werror) but long on Linux; the value is bounded small here (just
          * over the max), so no truncation. Mirrors config.c's size check. */
@@ -157,12 +215,14 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     
     file_size = (size_t)file_stat.st_size;
     
-    /* Open file for reading */
-    file = fopen(file_path, "r");
+    /* fdopen takes ownership of the already-validated descriptor. */
+    file = fdopen(fd, "r");
     if (!file) {
-        set_system_error(ERR_CONFIG_NOT_FOUND, "Failed to open config file: %s", file_path);
+        set_system_error(ERR_CONFIG_NOT_FOUND,
+                         "Failed to stream config file: %s", file_path);
         goto cleanup;
     }
+    fd = -1;
     
     /* Allocate buffer for file content */
     buffer = safe_malloc(file_size + 1);
@@ -196,6 +256,7 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     
 cleanup:
     if (file) fclose(file);
+    if (fd >= 0) close(fd);
     if (buffer) {
         secure_zero_memory(buffer, file_size + 1);
         free(buffer);
@@ -289,7 +350,9 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         
         /* Skip comments */
         if (c == '#') {
-            skip_comment(&state);
+            if (skip_comment(&state) != 0) {
+                break;
+            }
             continue;
         }
         
@@ -378,9 +441,13 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
             continue;
         }
         
-        /* Skip empty lines */
-        if (c == '\n' || c == '\r') {
-            advance_char(&state);
+        /* Consume valid physical line endings atomically. A bare CR is an
+         * error, not an alternate newline spelling. */
+        int line_ending = consume_line_ending(&state);
+        if (line_ending < 0) {
+            break;
+        }
+        if (line_ending > 0) {
             continue;
         }
         
@@ -400,7 +467,6 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         return -1;
     }
     
-    doc->is_valid = true;
     log_debug("TOML document parsed successfully: %zu sections", doc->section_count);
     
     return 0;
@@ -632,6 +698,11 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
         set_error(ERR_INVALID_ARGS, "NULL document to validate");
         return -1;
     }
+
+    /* Validity belongs to this complete model version. Revoke it before any
+     * derived visibility changes or early return, and publish it again only
+     * after the whole schema pass succeeds. */
+    doc->is_valid = false;
 
     /* Account visibility is derived from this complete validation attempt.
      * Revoke every candidate before validating settings or any account: an
@@ -919,7 +990,8 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
         log_info("Configuration has no account sections yet - this is normal for new installations");
         /* This is not an error - allow empty configurations */
     }
-    
+
+    doc->is_valid = true;
     log_debug("TOML document schema validation passed");
     return 0;
 }
@@ -967,6 +1039,15 @@ bool toml_validate_safe_characters(const char *input, size_t length) {
     }
 
     return true;
+}
+
+/* A stored string is already decoded: quotes, backslashes, and the three
+ * supported escaped controls are data, while every other byte must satisfy
+ * the same strict UTF-8 and terminal-safety contract as the raw document.
+ * Keep this length-aware so parser output and public setters share one rule. */
+static bool decoded_string_value_is_valid(const char *value, size_t length) {
+    return value && length < TOML_MAX_VALUE_LEN &&
+           toml_validate_safe_characters(value, length);
 }
 
 /* Sanitize string value. Strips what a value must never carry into callers:
@@ -1122,21 +1203,30 @@ static toml_section_t *find_section(toml_document_t *doc, const char *section_na
     return NULL;
 }
 
-/* Public setters must only construct section names the parser can read back.
- * Keep the root section (empty name) as an internal parser-only state; every
- * public section is a non-empty bare TOML key made from the same byte class as
- * parse_section_header(). */
+/* Public setters and explicit headers share one narrow, locale-independent
+ * grammar: nonempty dot-separated ASCII bare-key segments. Keep the empty root
+ * section as an internal parser-only state. */
 static bool section_name_is_valid(const char *section_name) {
-    if (!section_name || section_name[0] == '\0') return false;
+    size_t length = 0;
+    bool segment_has_byte = false;
 
-    size_t length = strlen(section_name);
-    if (length >= TOML_MAX_SECTION_LEN) return false;
+    if (!section_name) return false;
+    while (length < TOML_MAX_SECTION_LEN && section_name[length] != '\0') {
+        length++;
+    }
+    if (length == 0 || length >= TOML_MAX_SECTION_LEN) return false;
 
     for (size_t i = 0; i < length; i++) {
         unsigned char c = (unsigned char)section_name[i];
-        if (!isalnum(c) && c != '.' && c != '_' && c != '-') return false;
+        if (c == '.') {
+            if (!segment_has_byte) return false;
+            segment_has_byte = false;
+        } else {
+            if (!ascii_section_segment_byte_is_valid(c)) return false;
+            segment_has_byte = true;
+        }
     }
-    return true;
+    return segment_has_byte;
 }
 
 /* Find or create section */
@@ -1218,17 +1308,24 @@ static int parse_section_header(toml_parser_state_t *state, char *section_name) 
             set_parser_error(state, "Section name too long");
             return -1;
         }
-        c = advance_char(state);
-
-        if (isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-') {
-            section_name[name_pos++] = c;
-        } else {
-            set_parser_error(state, "Invalid character in section name");
+        if (c != '.' &&
+            !ascii_section_segment_byte_is_valid((unsigned char)c)) {
+            set_parser_error(
+                state,
+                "Invalid section name: expected dot-separated ASCII bare-key segments");
             return -1;
         }
+        section_name[name_pos++] = advance_char(state);
     }
     
     section_name[name_pos] = '\0';
+
+    if (!section_name_is_valid(section_name)) {
+        set_parser_error(
+            state,
+            "Invalid section name: segments must be nonempty ASCII bare keys");
+        return -1;
+    }
 
     skip_whitespace(state);
 
@@ -1375,6 +1472,12 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
         return -1;
     }
 
+    if (!decoded_string_value_is_valid(value, value_pos)) {
+        set_parser_error(state,
+                         "String value contains invalid control or UTF-8 data");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -1467,6 +1570,37 @@ static void skip_whitespace(toml_parser_state_t *state) {
     }
 }
 
+/* Consume one physical TOML line ending. LF and CRLF both advance exactly one
+ * line; a bare CR is rejected without moving past the offending byte so the
+ * reported line and column remain precise. Returns 1 when an ending was
+ * consumed, 0 when the current byte is not an ending, and -1 on bare CR. */
+static int consume_line_ending(toml_parser_state_t *state) {
+    if (is_at_end(state)) return 0;
+
+    if (current_char(state) == '\n') {
+        state->position++;
+        state->line_number++;
+        state->column_number = 1;
+        return 1;
+    }
+
+    if (current_char(state) == '\r') {
+        size_t remaining = state->input_length - state->position;
+        if (remaining < 2 || state->input[state->position + 1] != '\n') {
+            set_parser_error(
+                state,
+                "Bare carriage return; TOML line endings must be LF or CRLF");
+            return -1;
+        }
+        state->position += 2;
+        state->line_number++;
+        state->column_number = 1;
+        return 1;
+    }
+
+    return 0;
+}
+
 /* AR-06 F70: after a value or a section header, the rest of the physical line
  * must be nothing but optional trailing whitespace and an optional comment.
  * Without this the tokenizer silently accepted multiple pairs on one line
@@ -1474,27 +1608,37 @@ static void skip_whitespace(toml_parser_state_t *state) {
  * malformed config a meaning the writer never produces. Returns 0 when the line
  * ends cleanly, -1 (with a parser error set) when trailing content remains. */
 static int require_line_end(toml_parser_state_t *state) {
+    int line_ending;
+
     skip_whitespace(state); /* trailing spaces/tabs only (not newlines) */
     if (is_at_end(state)) {
         return 0;
     }
-    char c = current_char(state);
-    if (c == '\n' || c == '\r' || c == '#') {
+
+    if (current_char(state) == '#') {
+        return skip_comment(state);
+    }
+
+    line_ending = consume_line_ending(state);
+    if (line_ending > 0) {
         return 0;
     }
+    if (line_ending < 0) return -1;
+
     set_parser_error(state,
                      "Unexpected content after value/section header on the "
                      "same line (one key/value or section header per line)");
     return -1;
 }
 
-static void skip_comment(toml_parser_state_t *state) {
-    while (!is_at_end(state) && current_char(state) != '\n') {
+static int skip_comment(toml_parser_state_t *state) {
+    while (!is_at_end(state) && current_char(state) != '\n' &&
+           current_char(state) != '\r') {
         advance_char(state);
     }
-    if (!is_at_end(state)) {
-        advance_char(state); /* Skip the newline */
-    }
+    if (is_at_end(state)) return 0;
+
+    return consume_line_ending(state) < 0 ? -1 : 0;
 }
 
 static bool is_at_end(const toml_parser_state_t *state) {
@@ -1557,6 +1701,7 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
                     const char *key_name, const char *value) {
     toml_section_t *section;
     toml_keyvalue_t *kv;
+    size_t value_length;
     
     if (!doc || !section_name || !key_name || !value) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_set_string");
@@ -1565,7 +1710,8 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
 
     if (!section_name_is_valid(section_name)) {
         set_error(ERR_CONFIG_INVALID,
-                  "Invalid TOML section name (1-%d bare-key bytes required): %s",
+                  "Invalid TOML section name (1-%d ASCII bytes in nonempty "
+                  "dot-separated bare-key segments): %s",
                   TOML_MAX_SECTION_LEN - 1, section_name);
         return -1;
     }
@@ -1584,11 +1730,20 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
                   section_name, TOML_MAX_KEY_LEN - 1);
         return -1;
     }
-    if (strlen(value) >= TOML_MAX_VALUE_LEN) {
+    value_length = strnlen(value, TOML_MAX_VALUE_LEN);
+    if (value_length == TOML_MAX_VALUE_LEN) {
         set_error(ERR_CONFIG_INVALID,
-                  "Value for %s.%s is too long (%zu bytes, max %d); refusing to "
-                  "store it truncated or empty",
-                  section_name, key_name, strlen(value), TOML_MAX_VALUE_LEN - 1);
+                  "Value for %s.%s is too long (at least %d bytes, max %d); "
+                  "refusing to store it truncated or empty",
+                  section_name, key_name, TOML_MAX_VALUE_LEN,
+                  TOML_MAX_VALUE_LEN - 1);
+        return -1;
+    }
+    if (!decoded_string_value_is_valid(value, value_length)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Value for %s.%s contains an unsupported control byte or "
+                  "malformed/unsafe UTF-8",
+                  section_name, key_name);
         return -1;
     }
 
@@ -1622,6 +1777,7 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
     }
     kv->type = TOML_TYPE_STRING;
     kv->is_set = true;
+    doc->is_valid = false;
 
     return 0;
 }
@@ -1639,7 +1795,8 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
 
     if (!section_name_is_valid(section_name)) {
         set_error(ERR_CONFIG_INVALID,
-                  "Invalid TOML section name (1-%d bare-key bytes required): %s",
+                  "Invalid TOML section name (1-%d ASCII bytes in nonempty "
+                  "dot-separated bare-key segments): %s",
                   TOML_MAX_SECTION_LEN - 1, section_name);
         return -1;
     }
@@ -1683,6 +1840,7 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
     }
     kv->type = TOML_TYPE_BOOLEAN;
     kv->is_set = true;
+    doc->is_valid = false;
 
     return 0;
 }
@@ -1852,12 +2010,24 @@ int toml_write_fd(const toml_document_t *doc, int fd) {
     }
     file = NULL;
 
-    if (fstat(fd, &after) != 0 || !toml_same_file(&before, &after) ||
-        !toml_temp_identity_is_private(&after) || after.st_size < 0 ||
-        after.st_size > (off_t)TOML_MAX_FILE_SIZE) {
-        saved_errno = errno ? errno : ESTALE;
-        failure_context = "TOML output descriptor changed during serialization";
+    if (fstat(fd, &after) != 0) {
+        saved_errno = errno;
+        failure_context = "Cannot revalidate TOML output descriptor";
         goto cleanup;
+    }
+    {
+        bool forced_mismatch =
+            g_metadata_test_hook &&
+            g_metadata_test_hook(TOML_METADATA_TEST_FD_REVALIDATE);
+        errno = 0;
+        if (forced_mismatch || !toml_same_file(&before, &after) ||
+            !toml_temp_identity_is_private(&after) || after.st_size < 0 ||
+            after.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+            saved_errno = ESTALE;
+            failure_context =
+                "TOML output descriptor changed during serialization";
+            goto cleanup;
+        }
     }
     result = 0;
 

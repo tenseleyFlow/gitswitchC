@@ -6,6 +6,7 @@
 #include "test.h"
 #include "error.h"
 #include "gitswitch.h"
+#include "scratch_registry_test.h"
 #include "ssh_manager.h"
 #include "utils.h"
 
@@ -676,6 +677,47 @@ TEST(byte_identical_config_skips_all_write_and_sync_work) {
     CHECK(same_mtime(&before, &after));
 }
 
+TEST(config_registration_failure_is_atomic_and_retryable) {
+    char scratch[TEST_SCRATCH_PROBE_MAX][TEST_SCRATCH_PATH_SIZE];
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    ssh_config_publication_state_t publication;
+    size_t registered;
+    size_t length = 0;
+    char *content;
+    int before;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
+    make_account(&account, key);
+
+    before = test_open_fd_count();
+    registered = test_scratch_fill(scratch, "ssh-full");
+    CHECK(registered > 0 && registered < TEST_SCRATCH_PROBE_MAX);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK(strstr(get_last_error()->message, "register") != NULL);
+    errno = 0;
+    CHECK(access(config, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+
+    test_scratch_release(scratch, registered);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(strstr(content, BEGIN_MARK) != NULL);
+        free(content);
+    }
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
 TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     account_t account;
@@ -1030,6 +1072,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes);
     RUN_TEST(crlf_remove_preserves_all_unmanaged_bytes);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
+    RUN_TEST(config_registration_failure_is_atomic_and_retryable);
     RUN_TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp);
     RUN_TEST(postrename_verification_failure_reports_installed_unverified);
     RUN_TEST(ctime_only_drift_revalidates_exact_pinned_bytes);

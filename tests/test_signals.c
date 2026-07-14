@@ -131,6 +131,70 @@ static void inherited_test_handler(int signal_number) {
     (void)signal_number;
 }
 
+static volatile sig_atomic_t dispatch_handler_calls;
+static volatile sig_atomic_t dispatch_handler_pending;
+static volatile sig_atomic_t unrelated_handler_calls;
+
+static void dispatch_observing_handler(int signal_number) {
+    (void)signal_number;
+    dispatch_handler_calls++;
+    dispatch_handler_pending = (sig_atomic_t)signals_pending_signal();
+}
+
+static void unrelated_observing_handler(int signal_number) {
+    (void)signal_number;
+    unrelated_handler_calls++;
+}
+
+static bool dispatch_test_masks_equal(const sigset_t *left,
+                                      const sigset_t *right) {
+    static const int observed_signals[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM, SIGPIPE, SIGCHLD
+    };
+
+    for (size_t i = 0;
+         i < sizeof(observed_signals) / sizeof(observed_signals[0]); i++) {
+        if (sigismember(left, observed_signals[i]) !=
+            sigismember(right, observed_signals[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int dispatch_test_install_handler(
+    int signal_number, void (*handler)(int), struct sigaction *original) {
+    struct sigaction action;
+
+    if (sigaction(signal_number, NULL, original) != 0) return -1;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = handler;
+    sigemptyset(&action.sa_mask);
+    sigaddset(&action.sa_mask, SIGUSR2);
+    action.sa_flags = SA_RESTART;
+    return sigaction(signal_number, &action, NULL);
+}
+
+static int dispatch_test_defer(int signal_number) {
+    sigset_t target;
+
+    if (sigemptyset(&target) != 0 || sigaddset(&target, signal_number) != 0 ||
+        sigprocmask(SIG_UNBLOCK, &target, NULL) != 0) {
+        return -1;
+    }
+    if (signals_guard_begin() != 0 || raise(signal_number) != 0) return -1;
+    return signals_pending_signal() == signal_number ? 0 : -1;
+}
+
+static void dispatch_test_restore(int signal_number,
+                                  const struct sigaction *original_action,
+                                  const sigset_t *original_mask) {
+    signals_test_fail_dispatch(SIGNALS_TEST_DISPATCH_NONE, 0);
+    (void)signals_guard_end();
+    (void)sigprocmask(SIG_SETMASK, original_mask, NULL);
+    (void)sigaction(signal_number, original_action, NULL);
+}
+
 /* struct sigaction can contain implementation padding/restorer fields, so
  * compare every disposition property controlled by this suite rather than
  * byte-comparing the object representation. */
@@ -606,6 +670,256 @@ TEST(dispatch_retains_pending_until_exact_restoration_succeeds) {
     test_fixture_unlink("dispatch-restore-retained");
 }
 
+/* AR-09 M29: dispatch is synchronous even when the caller had the selected
+ * signal blocked. The inherited handler must run before dispatch returns,
+ * observe the still-published library signal, and leave the complete caller
+ * mask unchanged. Run the same contract from both caller mask states. */
+TEST(dispatch_returning_handler_observes_pending_and_restores_mask) {
+    struct sigaction original_action;
+    sigset_t original_mask;
+
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &original_mask), 0);
+    CHECK_EQ_INT(dispatch_test_install_handler(
+                     SIGTERM, dispatch_observing_handler, &original_action),
+                 0);
+
+    for (int initially_blocked = 0; initially_blocked <= 1;
+         initially_blocked++) {
+        sigset_t caller_mask = original_mask;
+        sigset_t observed_mask;
+
+        sigdelset(&caller_mask, SIGTERM);
+        sigaddset(&caller_mask, SIGUSR1);
+        sigdelset(&caller_mask, SIGUSR2);
+        CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &caller_mask, NULL), 0);
+        dispatch_handler_calls = 0;
+        dispatch_handler_pending = 0;
+        CHECK_EQ_INT(dispatch_test_defer(SIGTERM), 0);
+        if (initially_blocked) {
+            sigaddset(&caller_mask, SIGTERM);
+            CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &caller_mask, NULL), 0);
+        }
+
+        CHECK_EQ_INT(signals_dispatch_pending(), 0);
+        CHECK_EQ_INT(dispatch_handler_calls, 1);
+        CHECK_EQ_INT(dispatch_handler_pending, SIGTERM);
+        CHECK(!signals_pending());
+        CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+        CHECK(dispatch_test_masks_equal(&observed_mask, &caller_mask));
+    }
+
+    dispatch_test_restore(SIGTERM, &original_action, &original_mask);
+}
+
+/* A blocked caller mask must not convert default-action dispatch into a
+ * successful return with a kernel-pending signal. The selected signal is
+ * temporarily unblocked and terminates the child before dispatch can return. */
+TEST(dispatch_blocked_default_disposition_terminates) {
+    int status = 0;
+    pid_t pid;
+
+    fflush(NULL);
+    pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        struct sigaction default_action;
+        sigset_t target;
+
+        memset(&default_action, 0, sizeof(default_action));
+        default_action.sa_handler = SIG_DFL;
+        sigemptyset(&default_action.sa_mask);
+        if (sigaction(SIGTERM, &default_action, NULL) != 0) _exit(30);
+        if (dispatch_test_defer(SIGTERM) != 0) _exit(31);
+        sigemptyset(&target);
+        sigaddset(&target, SIGTERM);
+        if (sigprocmask(SIG_BLOCK, &target, NULL) != 0) _exit(32);
+        (void)signals_dispatch_pending();
+        _exit(33);
+    }
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status));
+    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
+}
+
+/* Temporarily delivering SIGTERM must not disturb an unrelated signal that
+ * was both blocked and kernel-pending at entry. This kills implementations
+ * that replace the live mask with an empty/full convenience mask. */
+TEST(dispatch_preserves_unrelated_blocked_pending_signal) {
+    struct sigaction original_term;
+    struct sigaction original_usr1;
+    struct sigaction ignore;
+    sigset_t original_mask;
+    sigset_t caller_mask;
+    sigset_t observed_mask;
+    sigset_t pending;
+
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &original_mask), 0);
+    CHECK_EQ_INT(dispatch_test_install_handler(
+                     SIGTERM, dispatch_observing_handler, &original_term),
+                 0);
+    CHECK_EQ_INT(dispatch_test_install_handler(
+                     SIGUSR1, unrelated_observing_handler, &original_usr1),
+                 0);
+    caller_mask = original_mask;
+    sigdelset(&caller_mask, SIGTERM);
+    sigaddset(&caller_mask, SIGUSR1);
+    sigdelset(&caller_mask, SIGUSR2);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &caller_mask, NULL), 0);
+    unrelated_handler_calls = 0;
+    dispatch_handler_calls = 0;
+    dispatch_handler_pending = 0;
+    CHECK_EQ_INT(raise(SIGUSR1), 0);
+    CHECK_EQ_INT(sigpending(&pending), 0);
+    CHECK_EQ_INT(sigismember(&pending, SIGUSR1), 1);
+    CHECK_EQ_INT(unrelated_handler_calls, 0);
+    CHECK_EQ_INT(dispatch_test_defer(SIGTERM), 0);
+    sigaddset(&caller_mask, SIGTERM);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &caller_mask, NULL), 0);
+
+    CHECK_EQ_INT(signals_dispatch_pending(), 0);
+    CHECK_EQ_INT(dispatch_handler_calls, 1);
+    CHECK_EQ_INT(dispatch_handler_pending, SIGTERM);
+    CHECK_EQ_INT(unrelated_handler_calls, 0);
+    CHECK_EQ_INT(sigpending(&pending), 0);
+    CHECK_EQ_INT(sigismember(&pending, SIGUSR1), 1);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK(dispatch_test_masks_equal(&observed_mask, &caller_mask));
+
+    /* Ignoring a blocked pending signal discards it, so restoring the harness
+     * mask below cannot deliver a cleanup artifact. */
+    memset(&ignore, 0, sizeof(ignore));
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    CHECK_EQ_INT(sigaction(SIGUSR1, &ignore, NULL), 0);
+    dispatch_test_restore(SIGTERM, &original_term, &original_mask);
+    CHECK_EQ_INT(sigaction(SIGUSR1, &original_usr1, NULL), 0);
+}
+
+/* A raise failure occurs before delivery: retain library ownership, restore
+ * the exact caller mask, and let one explicit retry deliver exactly once. */
+TEST(dispatch_raise_failure_retains_pending_for_retry) {
+    struct sigaction original_action;
+    sigset_t original_mask;
+    sigset_t caller_mask;
+    sigset_t observed_mask;
+
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &original_mask), 0);
+    CHECK_EQ_INT(dispatch_test_install_handler(
+                     SIGTERM, dispatch_observing_handler, &original_action),
+                 0);
+    dispatch_handler_calls = 0;
+    dispatch_handler_pending = 0;
+    CHECK_EQ_INT(dispatch_test_defer(SIGTERM), 0);
+    caller_mask = original_mask;
+    sigaddset(&caller_mask, SIGTERM);
+    sigaddset(&caller_mask, SIGUSR1);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &caller_mask, NULL), 0);
+    signals_test_fail_dispatch(SIGNALS_TEST_DISPATCH_RAISE, EAGAIN);
+
+    errno = 0;
+    CHECK_EQ_INT(signals_dispatch_pending(), -1);
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK(signals_pending());
+    CHECK_EQ_INT(signals_pending_signal(), SIGTERM);
+    CHECK_EQ_INT(dispatch_handler_calls, 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK(dispatch_test_masks_equal(&observed_mask, &caller_mask));
+
+    CHECK_EQ_INT(signals_dispatch_pending(), 0);
+    CHECK_EQ_INT(dispatch_handler_calls, 1);
+    CHECK_EQ_INT(dispatch_handler_pending, SIGTERM);
+    CHECK(!signals_pending());
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK(dispatch_test_masks_equal(&observed_mask, &caller_mask));
+    dispatch_test_restore(SIGTERM, &original_action, &original_mask);
+}
+
+/* Once a returning handler accepted the signal, a mask-restore failure owns
+ * only restoration. Retry must repair the saved mask without raising again. */
+TEST(dispatch_restore_failure_after_delivery_does_not_reraise) {
+    struct sigaction original_action;
+    sigset_t original_mask;
+    sigset_t caller_mask;
+    sigset_t observed_mask;
+
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &original_mask), 0);
+    CHECK_EQ_INT(dispatch_test_install_handler(
+                     SIGTERM, dispatch_observing_handler, &original_action),
+                 0);
+    dispatch_handler_calls = 0;
+    dispatch_handler_pending = 0;
+    CHECK_EQ_INT(dispatch_test_defer(SIGTERM), 0);
+    caller_mask = original_mask;
+    sigaddset(&caller_mask, SIGTERM);
+    sigaddset(&caller_mask, SIGUSR1);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &caller_mask, NULL), 0);
+    signals_test_fail_dispatch(SIGNALS_TEST_DISPATCH_MASK_RESTORE, EIO);
+
+    errno = 0;
+    CHECK_EQ_INT(signals_dispatch_pending(), -1);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK_EQ_INT(dispatch_handler_calls, 1);
+    CHECK_EQ_INT(dispatch_handler_pending, SIGTERM);
+    CHECK(!signals_pending());
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK_EQ_INT(sigismember(&observed_mask, SIGTERM), 0);
+
+    CHECK_EQ_INT(signals_dispatch_pending(), 0);
+    CHECK_EQ_INT(dispatch_handler_calls, 1);
+    CHECK(!signals_pending());
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK(dispatch_test_masks_equal(&observed_mask, &caller_mask));
+    dispatch_test_restore(SIGTERM, &original_action, &original_mask);
+}
+
+/* When raise and mask restoration both fail, raise remains the reported
+ * primary error. Retry repairs the saved mask before delivering once. */
+TEST(dispatch_raise_and_restore_failure_preserves_primary_error) {
+    struct sigaction original_action;
+    sigset_t original_mask;
+    sigset_t caller_mask;
+    sigset_t observed_mask;
+    error_context_t failure;
+    char restore_errno_text[64];
+
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &original_mask), 0);
+    CHECK_EQ_INT(dispatch_test_install_handler(
+                     SIGTERM, dispatch_observing_handler, &original_action),
+                 0);
+    dispatch_handler_calls = 0;
+    dispatch_handler_pending = 0;
+    CHECK_EQ_INT(dispatch_test_defer(SIGTERM), 0);
+    caller_mask = original_mask;
+    sigaddset(&caller_mask, SIGTERM);
+    sigaddset(&caller_mask, SIGUSR1);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &caller_mask, NULL), 0);
+    signals_test_fail_dispatch(SIGNALS_TEST_DISPATCH_RAISE, EAGAIN);
+    signals_test_fail_dispatch(SIGNALS_TEST_DISPATCH_MASK_RESTORE, EIO);
+    clear_error();
+
+    errno = 0;
+    CHECK_EQ_INT(signals_dispatch_pending(), -1);
+    failure = *get_last_error();
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK_EQ_INT(failure.code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(failure.system_errno, EAGAIN);
+    CHECK(snprintf(restore_errno_text, sizeof(restore_errno_text),
+                   "restore errno=%d", EIO) > 0);
+    CHECK(strstr(failure.message, restore_errno_text) != NULL);
+    CHECK(signals_pending());
+    CHECK_EQ_INT(dispatch_handler_calls, 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK_EQ_INT(sigismember(&observed_mask, SIGTERM), 0);
+
+    CHECK_EQ_INT(signals_dispatch_pending(), 0);
+    CHECK_EQ_INT(dispatch_handler_calls, 1);
+    CHECK_EQ_INT(dispatch_handler_pending, SIGTERM);
+    CHECK(!signals_pending());
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK(dispatch_test_masks_equal(&observed_mask, &caller_mask));
+    dispatch_test_restore(SIGTERM, &original_action, &original_mask);
+}
+
 /* A second signal while one is pending is the emergency exit: the handler
  * unlinks registered scratch files (SIG-02) and dies immediately with the
  * signal's default action. */
@@ -862,6 +1176,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(scratch_registry_rejects_invalid);
     RUN_TEST(dispatch_terminates_with_deferred_signal);
     RUN_TEST(dispatch_retains_pending_until_exact_restoration_succeeds);
+    RUN_TEST(dispatch_returning_handler_observes_pending_and_restores_mask);
+    RUN_TEST(dispatch_blocked_default_disposition_terminates);
+    RUN_TEST(dispatch_preserves_unrelated_blocked_pending_signal);
+    RUN_TEST(dispatch_raise_failure_retains_pending_for_retry);
+    RUN_TEST(dispatch_restore_failure_after_delivery_does_not_reraise);
+    RUN_TEST(dispatch_raise_and_restore_failure_preserves_primary_error);
     RUN_TEST(second_signal_is_emergency_exit_and_drops_scratch);
     RUN_TEST(second_signal_during_rollback_is_deferred);
     RUN_TEST(second_signal_during_rollback_kills_blocking_child);

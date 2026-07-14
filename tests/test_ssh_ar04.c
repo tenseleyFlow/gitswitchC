@@ -402,7 +402,9 @@ static int fail_agent_pid_setenv(const char *name, const char *value,
 
 static int setup_runtime(char *agent_dir, size_t size) {
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswssh4XXXXXX");
-    if (!ts_mkdtemp(g_xdg) || chmod(g_xdg, 0700) != 0) return -1;
+    if (!ts_mkdtemp(g_xdg) ||
+        ts_canonicalize_dir_path(g_xdg, sizeof(g_xdg)) != 0 ||
+        chmod(g_xdg, 0700) != 0) return -1;
     if (setenv("XDG_RUNTIME_DIR", g_xdg, 1) != 0) return -1;
     if ((size_t)snprintf(agent_dir, size, "%s/gitswitch-ssh", g_xdg) >= size) {
         return -1;
