@@ -20,14 +20,16 @@ resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
 enum {
     HINT_TEST_BEFORE_OPEN = 1,
     HINT_TEST_BEFORE_FINAL_REVALIDATE,
-    HINT_TEST_BEFORE_SNAPSHOT_OPEN
+    HINT_TEST_BEFORE_SNAPSHOT_OPEN,
+    HINT_TEST_BEFORE_SNAPSHOT_FINAL_REVALIDATE
 };
 
 enum {
     INJECT_REPLACE_FIFO = 1,
     INJECT_REPLACE_REGULAR,
     INJECT_GROW_ACTIVE,
-    INJECT_GROW_SNAPSHOT
+    INJECT_GROW_SNAPSHOT,
+    INJECT_REWRITE_SAME_SIZE
 };
 
 static char g_root[PATH_MAX];
@@ -91,6 +93,40 @@ static size_t read_private(const char *path, char *text, size_t size) {
     return total;
 }
 
+static int rewrite_same_inode_and_size(const char *path) {
+    static const char replacement[] = "gpg\nactive=next\n";
+    const struct timespec forced_times[2] = {{1, 0}, {1, 0}};
+    struct stat before;
+    struct stat after;
+    size_t total = 0;
+    int fd;
+    int result = 0;
+
+    if (lstat(path, &before) != 0 ||
+        before.st_size != (off_t)(sizeof(replacement) - 1)) {
+        return -1;
+    }
+    fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    while (total < sizeof(replacement) - 1) {
+        ssize_t written = write(fd, replacement + total,
+                                sizeof(replacement) - 1 - total);
+        if (written > 0) total += (size_t)written;
+        else if (written < 0 && errno == EINTR) continue;
+        else { close(fd); return -1; }
+    }
+    if (futimens(fd, forced_times) != 0) result = -1;
+    if (fsync(fd) != 0) result = -1;
+    if (close(fd) != 0) result = -1;
+    if (result != 0) return -1;
+    if (lstat(path, &after) != 0 || before.st_dev != after.st_dev ||
+        before.st_ino != after.st_ino || before.st_size != after.st_size ||
+        after.st_mtime != forced_times[1].tv_sec) {
+        return -1;
+    }
+    return 0;
+}
+
 static void replace_hint_at_checkpoint(int stage) {
     if (stage != g_inject_stage) return;
     g_inject_stage = 0;
@@ -105,6 +141,13 @@ static void replace_hint_at_checkpoint(int stage) {
     if (g_inject_action == INJECT_REPLACE_REGULAR) {
         if (rename(g_hint, g_saved) != 0 ||
             write_private(g_hint, "ssh\nactive=replacement\n") != 0) {
+            g_hook_error = errno ? errno : EIO;
+        }
+        return;
+    }
+
+    if (g_inject_action == INJECT_REWRITE_SAME_SIZE) {
+        if (rewrite_same_inode_and_size(g_hint) != 0) {
             g_hook_error = errno ? errno : EIO;
         }
         return;
@@ -212,6 +255,18 @@ TEST(same_inode_growth_before_open_is_bounded) {
                                           INJECT_GROW_ACTIVE, false), 0);
     CHECK_EQ_INT(run_reader_at_checkpoint(HINT_TEST_BEFORE_SNAPSHOT_OPEN,
                                           INJECT_GROW_SNAPSHOT, true), 0);
+}
+
+TEST(same_inode_same_size_rewrites_are_rejected) {
+    CHECK_EQ_INT(run_reader_at_checkpoint(HINT_TEST_BEFORE_OPEN,
+                                          INJECT_REWRITE_SAME_SIZE, false), 0);
+    CHECK_EQ_INT(run_reader_at_checkpoint(HINT_TEST_BEFORE_FINAL_REVALIDATE,
+                                          INJECT_REWRITE_SAME_SIZE, false), 0);
+    CHECK_EQ_INT(run_reader_at_checkpoint(HINT_TEST_BEFORE_SNAPSHOT_OPEN,
+                                          INJECT_REWRITE_SAME_SIZE, true), 0);
+    CHECK_EQ_INT(run_reader_at_checkpoint(
+                     HINT_TEST_BEFORE_SNAPSHOT_FINAL_REVALIDATE,
+                     INJECT_REWRITE_SAME_SIZE, true), 0);
 }
 
 TEST(testing_object_retains_legacy_fault_seam_before_installation) {
@@ -335,6 +390,7 @@ int main(void) {
     RUN_TEST(fifo_replacement_before_open_is_rejected_without_blocking);
     RUN_TEST(regular_replacement_after_read_is_rejected);
     RUN_TEST(same_inode_growth_before_open_is_bounded);
+    RUN_TEST(same_inode_same_size_rewrites_are_rejected);
     RUN_TEST(testing_object_retains_legacy_fault_seam_before_installation);
     RUN_TEST(unbound_snapshot_cannot_overwrite_a_later_state);
     RUN_TEST(guarded_snapshot_restores_unchanged_post_image_exactly);

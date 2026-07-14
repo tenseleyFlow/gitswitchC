@@ -629,7 +629,8 @@ static int config_read_active_state(const char *config_path,
     fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, require_private_mode) ||
-        !config_metadata_same_file(&before, &opened) || opened.st_size < 0 ||
+        !config_metadata_snapshot_same(&before, &opened) ||
+        opened.st_size < 0 ||
         (uintmax_t)opened.st_size > CONFIG_ACTIVE_STATE_MAX) {
         int saved_errno = errno;
         if (fd >= 0) close(fd);
@@ -654,11 +655,10 @@ static int config_read_active_state(const char *config_path,
     RESUME_HINT_TEST_CHECKPOINT(2);
     if (fstat(fd, &after) != 0 ||
         !config_metadata_file_is_safe(&after, require_private_mode) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
+        !config_metadata_snapshot_same(&opened, &after) ||
+        lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, require_private_mode) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size) {
+        !config_metadata_snapshot_same(&opened, &after)) {
         close(fd);
         set_error(ERR_FILE_IO,
                   "Active-state artifact changed while being read: %s", hint);
@@ -1535,7 +1535,8 @@ static int config_resume_hint_snapshot_capture_at(
     fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, false) ||
-        !config_metadata_same_file(&before, &opened) || opened.st_size < 0 ||
+        !config_metadata_snapshot_same(&before, &opened) ||
+        opened.st_size < 0 ||
         (uintmax_t)opened.st_size > CONFIG_RESUME_HINT_SNAPSHOT_MAX) {
         int saved_errno = errno;
         if (fd >= 0) close(fd);
@@ -1571,13 +1572,13 @@ static int config_resume_hint_snapshot_capture_at(
             return -1;
         }
     }
+    RESUME_HINT_TEST_CHECKPOINT(4);
     if (fstat(fd, &after) != 0 ||
         !config_metadata_file_is_safe(&after, false) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size || lstat(hint, &after) != 0 ||
+        !config_metadata_snapshot_same(&opened, &after) ||
+        lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, false) ||
-        !config_metadata_same_file(&opened, &after) ||
-        after.st_size != opened.st_size) {
+        !config_metadata_snapshot_same(&opened, &after)) {
         close(fd);
         free(data);
         snapshot->length = 0;
