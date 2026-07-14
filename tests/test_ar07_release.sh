@@ -511,6 +511,80 @@ check_neuter_contract()
         fail "cannot copy VERSION into hardening-neuter fixture"
     cp "$hardening_header" "$make_fixture/src/release_hardening.h" ||
         fail "cannot copy hardening header into Make fixture"
+
+    # The build stamp must never bless a partial identity list. Make's
+    # $(shell ...) discards command status, so the recipe emits one explicit
+    # sentinel and the release-policy target rejects it before compilation.
+    identity_one=$tmp/toolchain-identity-one
+    identity_two=$tmp/toolchain-identity-two
+    identity_missing=$tmp/toolchain-identity-missing
+    printf '%s\n' launcher-v1 >"$identity_one"
+    printf '%s\n' compiler-v1 >"$identity_two"
+    identity_files="$identity_one $identity_two"
+    read_toolchain_fingerprint()
+    {
+        identity_list=$1
+        "$make_cmd" -s -C "$make_fixture" CC="$compiler_command" \
+            BUILD_TYPE=release TOOLCHAIN_IDENTITY_FILES="$identity_list" \
+            info | sed -n 's/^Toolchain fingerprint: //p'
+    }
+    expect_toolchain_rejection()
+    {
+        identity_label=$1
+        identity_list=$2
+        identity_log=$tmp/toolchain-$identity_label.log
+
+        if "$make_cmd" -s -C "$make_fixture" CC="$compiler_command" \
+            BUILD_TYPE=release TOOLCHAIN_IDENTITY_FILES="$identity_list" \
+            release-policy-check >"$identity_log" 2>&1; then
+            fail "$identity_label toolchain identity list passed release policy"
+        fi
+        grep -F 'complete compiler content fingerprint is required' \
+            "$identity_log" >/dev/null || {
+            cat "$identity_log" >&2
+            fail "$identity_label toolchain list failed for an unrelated reason"
+        }
+    }
+
+    fingerprint_before=$(read_toolchain_fingerprint "$identity_files")
+    case $fingerprint_before in
+        *"$identity_one="*"$identity_two="*) ;;
+        *) fail "complete toolchain identity list produced an incomplete fingerprint" ;;
+    esac
+    "$make_cmd" -s -C "$make_fixture" CC="$compiler_command" \
+        BUILD_TYPE=release TOOLCHAIN_IDENTITY_FILES="$identity_files" \
+        release-policy-check ||
+        fail "complete toolchain identity list failed release policy"
+
+    missing_fingerprint=$(read_toolchain_fingerprint \
+        "$identity_one $identity_missing")
+    [ "$missing_fingerprint" = __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__ ] ||
+        fail "missing identity file produced a valid-looking partial fingerprint"
+    expect_toolchain_rejection missing "$identity_one $identity_missing"
+
+    empty_fingerprint=$(read_toolchain_fingerprint "")
+    [ "$empty_fingerprint" = __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__ ] ||
+        fail "empty identity list did not produce the failure sentinel"
+    expect_toolchain_rejection empty ""
+
+    chmod 000 "$identity_two" || fail "cannot make identity fixture unreadable"
+    if [ ! -r "$identity_two" ]; then
+        unreadable_fingerprint=$(read_toolchain_fingerprint "$identity_files")
+        [ "$unreadable_fingerprint" = __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__ ] ||
+            fail "unreadable identity file produced a valid-looking fingerprint"
+        expect_toolchain_rejection unreadable "$identity_files"
+    fi
+    chmod 600 "$identity_two" || fail "cannot restore identity fixture mode"
+
+    printf '%s\n' compiler-v2 >"$identity_two"
+    fingerprint_after=$(read_toolchain_fingerprint "$identity_files")
+    [ "$fingerprint_after" != "$fingerprint_before" ] ||
+        fail "changed identity file did not change the complete fingerprint"
+    case $fingerprint_after in
+        *"$identity_one="*"$identity_two="*) ;;
+        *) fail "changed complete identity list lost one of its inputs" ;;
+    esac
+
     cat >"$make_fixture/src/neuter.c" <<'EOF'
 #include <stdio.h>
 static volatile char *ar08_make_escape;

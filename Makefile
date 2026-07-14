@@ -59,20 +59,32 @@ CC_RESOLVED_DEFAULT := $(shell p=`command -v "$(CC_LAUNCHER)" 2>/dev/null` || ex
 	cd "$$d" 2>/dev/null && printf '%s/%s' "$$PWD" "$$b")
 CC_IDENTITY_FILE ?= $(CC_RESOLVED_DEFAULT)
 TOOLCHAIN_IDENTITY_FILES ?= $(CC_IDENTITY_FILE)
-TOOLCHAIN_FILE_FINGERPRINT := $(shell set -e; \
+override TOOLCHAIN_FINGERPRINT_FAILURE := __GITSWITCH_INCOMPLETE_TOOLCHAIN_IDENTITY__
+TOOLCHAIN_FILE_FINGERPRINT := $(shell ( \
+	fingerprint=; \
+	test -n "$(strip $(TOOLCHAIN_IDENTITY_FILES))" || exit 1; \
 	for f in $(TOOLCHAIN_IDENTITY_FILES); do \
-		test -f "$$f" || exit 1; \
+		test -f "$$f" && test -r "$$f" || exit 1; \
 		if command -v sha256sum >/dev/null 2>&1; then \
-			digest=`sha256sum "$$f" | awk '{print $$1}'`; \
+			digest_output=`sha256sum "$$f"` || exit 1; \
+			digest=$${digest_output%% *}; \
 		elif command -v shasum >/dev/null 2>&1; then \
-			digest=`shasum -a 256 "$$f" | awk '{print $$1}'`; \
+			digest_output=`shasum -a 256 "$$f"` || exit 1; \
+			digest=$${digest_output%% *}; \
 		elif command -v sha256 >/dev/null 2>&1; then \
-			digest=`sha256 -q "$$f"`; \
+			digest=`sha256 -q "$$f"` || exit 1; \
 		else \
-			digest=`cksum "$$f" | awk '{print $$1 ":" $$2}'`; \
+			digest_output=`cksum "$$f"` || exit 1; \
+			set -- $$digest_output; \
+			test "$$#" -ge 2 || exit 1; \
+			digest=$$1:$$2; \
 		fi; \
-		printf '%s=%s;' "$$f" "$$digest"; \
-	done)
+		test -n "$$digest" || exit 1; \
+		fingerprint=$$fingerprint$$f=$$digest\;; \
+	done; \
+	test -n "$$fingerprint" || exit 1; \
+	printf '%s' "$$fingerprint"; \
+) || printf '%s' '$(TOOLCHAIN_FINGERPRINT_FAILURE)')
 CC_VERSION_ID := $(shell $(CC) --version 2>/dev/null | sed -n '1p')
 override TARGET_TRIPLE_DETECTED := $(shell $(CC) -dumpmachine 2>/dev/null | sed -n '1p')
 # A claimed target is security policy, not caller metadata: accepting a
@@ -523,10 +535,14 @@ release-policy-check:
 		echo 'ERROR: claimed release target differs from compiler target' >&2; exit 1; \
 	}; \
 	test -f "$$GITSWITCH_RELEASE_POLICY_CC" && \
-	test -n "$$GITSWITCH_RELEASE_POLICY_CC_VERSION" && \
-	test -n "$$GITSWITCH_RELEASE_POLICY_FINGERPRINT" || { \
-		echo 'ERROR: compiler path, version, and content fingerprint are required' >&2; exit 1; \
+	test -n "$$GITSWITCH_RELEASE_POLICY_CC_VERSION" || { \
+		echo 'ERROR: compiler path and version are required' >&2; exit 1; \
 	}; \
+	case "$$GITSWITCH_RELEASE_POLICY_FINGERPRINT" in \
+		''|$(TOOLCHAIN_FINGERPRINT_FAILURE)) \
+			echo 'ERROR: complete compiler content fingerprint is required' >&2; exit 1 ;; \
+		*) ;; \
+	esac; \
 	case "$$GITSWITCH_RELEASE_POLICY_OS" in \
 		Linux|FreeBSD) \
 			test "$$GITSWITCH_RELEASE_POLICY_FORMAT" = elf || { \
