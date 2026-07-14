@@ -199,13 +199,12 @@ git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     return previous;
 }
 
-/* ---- Process-scoped exec caches (perf-1..4) ------------------------------
+/* ---- Process-scoped write/snapshot bookkeeping (perf-1,3,4) -------------
  *
  * A single switch used to spawn the same git subprocesses several times over:
  * `git --version` on every init, `git rev-parse --git-dir` from every caller
- * that asked "am I in a repo?", the post-switch name/email read-back twice
- * (git_set_config's verify and then git_test_config), and the GPG keys
- * written twice (git_configure_gpg and gpg_manager's
+ * that asked "am I in a repo?", and the GPG keys written twice
+ * (git_configure_gpg and gpg_manager's
  * gpg_configure_git_signing). On the interactive switch hot path each exec is
  * a fork+execvp round trip, so these are cached for the process lifetime.
  *
@@ -219,17 +218,15 @@ git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
  *  - Repo-ness is keyed by cwd (getcwd is one syscall, not a fork), so a
  *    future chdir cannot be served a stale answer; a .git appearing or
  *    vanishing under an unchanged cwd mid-process is not a supported flow.
- *  - Config entries are only trusted in two provable states: a value THIS
- *    process successfully wrote (safe to skip an identical re-write — the
- *    second exec could only repeat the first), and a value actually read back
- *    from git (safe to serve to a later read). A write never satisfies a
- *    read: git_set_config's read-back verification must observe git itself,
- *    not our own write buffer, or the verify would be a self-fulfilling no-op.
+ *  - Config bookkeeping can suppress only a duplicate write performed by this
+ *    process or an unset that an exact transaction snapshot proved absent.
+ *    Public reads always execute Git: a process-lifetime positive read cache
+ *    cannot detect another process changing the configuration afterward.
  */
 typedef enum {
     CFG_UNKNOWN = 0,  /* nothing cacheable known; always exec */
     CFG_WRITTEN,      /* we set/unset this key ourselves (skip duplicate writes only) */
-    CFG_READBACK      /* value observed in `git config` output (may serve reads) */
+    CFG_OBSERVED      /* exact snapshot observation; only absence may skip unset */
 } cfg_state_t;
 
 #define GIT_SCOPE_COUNT 4
@@ -268,11 +265,11 @@ static int cfg_key_index(const char *key) {
     return -1;
 }
 
-/* Record a cache entry; a present value too long to cache degrades to
- * CFG_UNKNOWN with present kept TRUE. Never truncate — a truncated cached
- * value could satisfy or suppress the wrong operation later — and never
- * record the key absent: "proven absent" is exactly what lets
- * git_unset_config_value elide a --unset that is in fact real (AR-03 M1). */
+/* Record bookkeeping; a present value too long to retain degrades to
+ * CFG_UNKNOWN with present kept TRUE. Never truncate — a truncated value
+ * could suppress the wrong operation later. Absence may suppress an unset
+ * only when its state proves this process wrote it or an exact transaction
+ * snapshot observed it. */
 static void cfg_cache_store(int s, int k, cfg_state_t state, bool present,
                             const char *value) {
     if (s < 0 || k < 0) {
@@ -966,9 +963,9 @@ static void git_seed_snapshot_cache(git_scope_t scope,
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         const git_snapshot_key_t *key = &snapshot->keys[i];
         if (key->count == 0) {
-            cfg_cache_store(s, (int)i, CFG_READBACK, false, "");
+            cfg_cache_store(s, (int)i, CFG_OBSERVED, false, "");
         } else if (key->count == 1) {
-            cfg_cache_store(s, (int)i, CFG_READBACK, true, key->values[0]);
+            cfg_cache_store(s, (int)i, CFG_OBSERVED, true, key->values[0]);
         } else {
             /* A scalar cache cannot faithfully represent multiplicity. */
             cfg_cache_store(s, (int)i, CFG_UNKNOWN, true, "");
@@ -3678,7 +3675,7 @@ static int git_set_config_value_impl(const char *key, const char *value,
      * gpg_configure_git_signing. Skip a write ONLY when this process already
      * ran the identical write successfully — re-execing it could only repeat
      * the first result, so the config outcome is provably unchanged. A value
-     * merely read back (CFG_READBACK) never suppresses a write: e.g. on a
+     * merely observed (CFG_OBSERVED) never suppresses a write: e.g. on a
      * multi-valued key the read succeeds but the write would fail, and that
      * failure must surface. */
     int s = cfg_scope_index(scope);
@@ -3725,7 +3722,7 @@ int git_set_config_value(const char *key, const char *value, git_scope_t scope) 
 static int git_get_config_value_ex(const char *key, char *value,
                                    size_t value_size, git_scope_t scope,
                                    bool *value_too_long) {
-    /* Big enough for any value we can cache, plus git's trailing newline —
+    /* Big enough for any managed status value plus git's trailing newline;
      * anything larger trips out_truncated below rather than silent loss. */
     char output[GIT_CFG_VALUE_MAX + 8];
     const char *scope_flag;
@@ -3744,22 +3741,13 @@ static int git_get_config_value_ex(const char *key, char *value,
         set_error(ERR_INVALID_ARGS, "Invalid git scope");
         return -1;
     }
-    /* perf-2: after git_set_config's read-back verification, git_test_config
-     * re-read the exact same user.name/user.email — two more execs per switch
-     * for values git reported moments earlier in this process. Serve reads
-     * from values previously OBSERVED in git output (CFG_READBACK only; our
-     * own writes never satisfy a read, so read-back verification still
-     * genuinely round-trips through git). Only positive observations are
-     * cached: a failed read can mean "absent" or "git broke", and caching the
-     * ambiguity would be guessing. */
+    /* M22: every public read executes Git. A value observed earlier in this
+     * process is not authority after another process can edit the same config
+     * file. Keep only conservative write/snapshot bookkeeping, and invalidate
+     * it from the result below so a read boundary cannot make a later write or
+     * unset skip based on older state. */
     int s = cfg_scope_index(scope);
     int k = cfg_key_index(key);
-    if (s >= 0 && k >= 0 && g_cfg_cache[s][k].state == CFG_READBACK &&
-        g_cfg_cache[s][k].present &&
-        strlen(g_cfg_cache[s][k].value) < value_size) {
-        memcpy(value, g_cfg_cache[s][k].value, strlen(g_cfg_cache[s][k].value) + 1);
-        return 0;
-    }
 
     /* Direct run_argv (not git_run) so run_result_t.out_truncated is visible
      * — git_run discards the result struct. */
@@ -3783,8 +3771,8 @@ static int git_get_config_value_ex(const char *key, char *value,
         bool clean_absent = (res.spawned && res.term_signal == 0 &&
                              res.exit_code == 1);
         value[0] = '\0';
+        cfg_cache_store(s, k, CFG_UNKNOWN, !clean_absent, "");
         if (!clean_absent && value_too_long) {
-            cfg_cache_store(s, k, CFG_UNKNOWN, true, "");
             *value_too_long = true;
         }
         return -1;
@@ -3815,11 +3803,9 @@ static int git_get_config_value_ex(const char *key, char *value,
     }
     /* safe_strncpy writes nothing and returns -1 when the value is too long for
      * the caller's buffer. Propagate that as failure (and NUL the buffer) so
-     * callers can't read an uninitialized stack buffer while we report success.
-     * The FULL value was still observed here, so it is cacheable regardless of
-     * the caller's buffer size. */
+     * callers can't read an uninitialized stack buffer while we report success. */
     if (safe_strncpy(value, output, value_size) != 0) {
-        cfg_cache_store(s, k, CFG_READBACK, true, output);
+        cfg_cache_store(s, k, CFG_UNKNOWN, true, "");
         if (value_too_long) {
             *value_too_long = true;
         }
@@ -3827,7 +3813,7 @@ static int git_get_config_value_ex(const char *key, char *value,
         return -1;
     }
 
-    cfg_cache_store(s, k, CFG_READBACK, true, value);
+    cfg_cache_store(s, k, CFG_UNKNOWN, true, "");
     return 0;
 }
 
@@ -3863,14 +3849,14 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
     /* Skip an unset the cache proves is a no-op: this process already unset
      * the key itself (CFG_WRITTEN/absent — the original duplicate-unset
      * skip), or a complete --list -z snapshot observed the key absent
-     * (CFG_READBACK/absent, seeded by exact snapshot capture — AR-02 #15: the
+     * (CFG_OBSERVED/absent, seeded by exact snapshot capture — AR-02 #15: the
      * global-switch clear-local step used to blindly re-exec six unsets the
      * snapshot one exec earlier had just proved unnecessary). */
     int s = cfg_scope_index(scope);
     int k = cfg_key_index(key);
     if (!force && s >= 0 && k >= 0 && !g_cfg_cache[s][k].present &&
         (g_cfg_cache[s][k].state == CFG_WRITTEN ||
-         g_cfg_cache[s][k].state == CFG_READBACK)) {
+         g_cfg_cache[s][k].state == CFG_OBSERVED)) {
         log_debug("Skipping git config --unset %s: known absent in this process", key);
         return git_transaction_record_vector(scope, key, false, "");
     }
@@ -4125,10 +4111,9 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
     }
 
     /* AR-05 M5: round-trip the value through git, matching the user.name/
-     * user.email verification in git_set_config. Reads are never served
-     * from this process's own writes (only CFG_READBACK entries), so this
-     * genuinely re-execs git and proves the authoritative SSH identity is
-     * the one just written. */
+     * user.email verification in git_set_config. Public reads always execute
+     * Git, so this proves the authoritative SSH identity is the one just
+     * written. */
     char readback[sizeof(ssh_command)];
     if (git_get_config_value(GIT_CONFIG_CORE_SSHCOMMAND, readback,
                              sizeof(readback), scope) != 0 ||

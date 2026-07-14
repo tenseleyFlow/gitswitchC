@@ -1,5 +1,5 @@
 /* git_ops tests: SSH key-path injection hardening (ssh-1) and the
- * process-scoped exec caches (perf-1..4).
+ * process-scoped write/snapshot bookkeeping (perf-1, perf-3, perf-4).
  *
  * All git invocations are intercepted with a fake runner (run_set_runner)
  * that models an in-memory `git config` store and COUNTS execs, so the perf
@@ -293,23 +293,30 @@ TEST(git_set_config_value_skips_duplicate_managed_write) {
     CHECK_EQ_INT(fk_execs, 3);
     CHECK_STR_EQ(buf, "DEADBEEFCAFE1234");
 
-    /* ...but a repeated read of the observed value is served from cache. */
+    /* A later public read must execute again and observe an external writer,
+     * rather than treating the first read as process-lifetime authority. */
+    int signing = fk_find("--global", "user.signingkey");
+    CHECK(signing >= 0);
+    if (signing >= 0) {
+        snprintf(fk_store[signing].value, sizeof(fk_store[signing].value),
+                 "%s", "EXTERNAL0123456");
+    }
     buf[0] = '\0';
     CHECK_EQ_INT(git_get_config_value("user.signingkey", buf, sizeof(buf), GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 3);
-    CHECK_STR_EQ(buf, "DEADBEEFCAFE1234");
+    CHECK_EQ_INT(fk_execs, 4);
+    CHECK_STR_EQ(buf, "EXTERNAL0123456");
 
     /* Duplicate unsets also collapse; a set after an unset must exec again. */
     CHECK_EQ_INT(git_unset_config_value("user.signingkey", GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 4);
-    CHECK_EQ_INT(git_unset_config_value("user.signingkey", GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 4);
-    CHECK_EQ_INT(git_set_config_value("user.signingkey", "DEADBEEFCAFE1234", GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(fk_execs, 5);
+    CHECK_EQ_INT(git_unset_config_value("user.signingkey", GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(fk_execs, 5);
+    CHECK_EQ_INT(git_set_config_value("user.signingkey", "DEADBEEFCAFE1234", GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(fk_execs, 6);
 
     /* A different value never skips. */
     CHECK_EQ_INT(git_set_config_value("user.signingkey", "0123456789ABCDEF", GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_execs, 6);
+    CHECK_EQ_INT(fk_execs, 7);
     int idx = fk_find("--global", "user.signingkey");
     CHECK(idx >= 0);
     if (idx >= 0) CHECK_STR_EQ(fk_store[idx].value, "0123456789ABCDEF");
@@ -652,9 +659,9 @@ TEST(oversize_foreign_sshcommand_restores_exactly) {
     zfk_listing_override = NULL;
 }
 
-/* ---- perf-2: git_test_config reuses git_set_config's read-back ---------- */
+/* ---- M22: public validation never trusts a process-lifetime read -------- */
 
-TEST(git_test_config_reuses_switch_readback) {
+TEST(git_test_config_rechecks_external_identity) {
     git_ops_test_reset_caches();
     fk_reset();
     command_runner_fn prev = run_set_runner(fake_git_runner);
@@ -669,16 +676,19 @@ TEST(git_test_config_reuses_switch_readback) {
     CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(fk_identity_reads, 2);
 
-    /* The post-switch validation used to re-exec both reads; it must now be
-     * served from the values git reported to the verify step above. */
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), 0);
-    CHECK_EQ_INT(fk_identity_reads, 2);
-
-    /* Outcome unchanged: the fake store holds the switched identity. */
+    /* Model another process changing Git after the forward read-back. The
+     * next public validation must execute and reject the new value; the old
+     * process-global positive cache incorrectly returned success here. */
     int in = fk_find("--global", "user.name");
     int ie = fk_find("--global", "user.email");
     CHECK(in >= 0 && ie >= 0);
-    if (in >= 0) CHECK_STR_EQ(fk_store[in].value, "Test User");
+    if (in >= 0) {
+        snprintf(fk_store[in].value, sizeof(fk_store[in].value), "%s",
+                 "External User");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(fk_identity_reads, 4);
+    if (in >= 0) CHECK_STR_EQ(fk_store[in].value, "External User");
     if (ie >= 0) CHECK_STR_EQ(fk_store[ie].value, "test@example.com");
 
     run_set_runner(prev);
@@ -819,7 +829,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(postimage_value_allocation_failure_precedes_managed_write);
     RUN_TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim);
     RUN_TEST(oversize_foreign_sshcommand_restores_exactly);
-    RUN_TEST(git_test_config_reuses_switch_readback);
+    RUN_TEST(git_test_config_rechecks_external_identity);
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()
