@@ -60,8 +60,10 @@ jobs:
           name: linux-gcc-coverage
           path: build/coverage/
           if-no-files-found: error
+      - name: Clean before the GCC release build
+        run: make clean
       - name: Release build + full NDEBUG suite (FORTIFY/RELRO, warnings-as-errors)
-        run: make clean && make BUILD_TYPE=release READLINE=1 WERROR=1 test
+        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Release artifact hardening (built + staged)
@@ -107,13 +109,14 @@ jobs:
         run: make BUILD_TYPE=release sig-repro-test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: openssh
-      - name: Linux clang release build + hardening
-        run: |
-          make clean
-          make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
-          make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+      - name: Clean before the clang release build
+        run: make clean
+      - name: Linux clang release build + full NDEBUG suite
+        run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+      - name: Linux clang release artifact hardening
+        run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
 
   freebsd:
     runs-on: ubuntu-latest
@@ -131,6 +134,9 @@ jobs:
           # incompatible with ASan/PIE binaries (they abort on init). The
           # Linux/macOS jobs provide the ASan/UBSan coverage.
           run: |
+            # Keep every standalone release gate fatal within this shared VM
+            # script; the policy checker verifies this precedes all three.
+            set -eu
             # git: the git_ops perf tests prove availability via a PATH walk
             # and assert no subprocess spawn — they need a real git binary,
             # which the Linux/macOS runners ship but this VM does not.
@@ -173,14 +179,16 @@ jobs:
           # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin
           # and remain covered by Linux; every portable runtime is mandatory.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+      - name: Clean before the release build
+        run: make clean
       - name: Release build + full NDEBUG suite (warnings-as-errors)
-        run: |
-          make clean
-          make BUILD_TYPE=release READLINE=1 WERROR=1 test
-          make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
-          # Exercises Darwin's descriptor-bound atomic clone publisher,
-          # including adoption, retained-source, and cleanup-race behavior.
-          make release-contract-test
+        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
           # Same sole OS-specific exclusion as the debug lane above.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+      - name: Release artifact hardening (built + staged)
+        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+      # Exercises Darwin's descriptor-bound atomic clone publisher, including
+      # adoption, retained-source, and cleanup-race behavior.
+      - name: Release input consistency and dirty-tree refusal
+        run: make release-contract-test

@@ -21,8 +21,9 @@ check_policy()
     # still being structural: comments and quotes are lexed, block and simple
     # flow permission/step/input mappings are equivalent, job overrides are
     # inspected, and ambiguous constructs (aliases, merges, duplicate critical
-    # keys) fail closed. Block scalar bodies are skipped so shell text cannot
-    # masquerade as YAML nodes.
+    # keys) fail closed. Required release gates receive an additional executable
+    # subset: exact commands must be reachable, standalone run entries on the
+    # reviewed runner/configuration rather than comments or inert YAML text.
     awk '
         function reject(reason) {
             rejected = 1
@@ -323,6 +324,225 @@ check_policy()
                 reject("on.push.branches must contain at least one item")
             branch_sequence_active = 0
         }
+        function required_release_job(job) {
+            return job == "linux" || job == "macos" || job == "freebsd"
+        }
+        function clear_step_commands(i) {
+            for (i in step_command_text) delete step_command_text[i]
+            for (i in step_command_source) delete step_command_source[i]
+            for (i in step_command_eligible) delete step_command_eligible[i]
+            for (i in step_command_serial) delete step_command_serial[i]
+            step_command_count = 0
+        }
+        function add_step_command(text, source, eligible) {
+            if (text == "") return
+            step_command_count++
+            command_serial++
+            step_command_text[step_command_count] = text
+            step_command_source[step_command_count] = source
+            step_command_eligible[step_command_count] = eligible
+            step_command_serial[step_command_count] = command_serial
+        }
+        function shell_trailing_continuation(value, count, i) {
+            value = rtrim(value)
+            if (value ~ /(&&|\|\||\|)$/) return 1
+            count = 0
+            for (i = length(value); i > 0 && substr(value, i, 1) == "\\"; i--)
+                count++
+            return count % 2
+        }
+        function record_block_command(raw_line, source, line, i, c, escaped,
+                                      quote_at_start, continued_at_start,
+                                      depth_at_start, eligible) {
+            line = ltrim(raw_line)
+            quote_at_start = shell_quote
+            continued_at_start = shell_continued
+            depth_at_start = shell_control_depth
+            escaped = 0
+            shell_code = ""
+            for (i = 1; i <= length(line); i++) {
+                c = substr(line, i, 1)
+                if (shell_quote == 1) {
+                    shell_code = shell_code c
+                    if (c == single_quote) shell_quote = 0
+                    continue
+                }
+                if (shell_quote == 2) {
+                    shell_code = shell_code c
+                    if (escaped) escaped = 0
+                    else if (c == "\\") escaped = 1
+                    else if (c == "\"") shell_quote = 0
+                    continue
+                }
+                if (c == single_quote) shell_quote = 1
+                else if (c == "\"") shell_quote = 2
+                else if (c == "#" &&
+                         (i == 1 || substr(line, i - 1, 1) ~ /[[:space:]]/))
+                    break
+                shell_code = shell_code c
+            }
+            shell_code = trim(shell_code)
+            if (shell_code == "") return
+
+            if (shell_code ~ /<</ || shell_code ~ /`/)
+                step_unsafe_script = 1
+            if (shell_code ~ /[({][[:space:]]*$/)
+                step_unsafe_script = 1
+            if (source == "action" && current_job == "freebsd" &&
+                (shell_code ~ /^(alias|eval|source|trap)[[:space:]]/ ||
+                 shell_code ~ /^\.[[:space:]]/ ||
+                 shell_code ~ /^(export[[:space:]]+)?(PATH|MAKEFLAGS|MFLAGS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=/ ||
+                 shell_code ~ /^(function[[:space:]]+)?g?make[[:space:]]*(\(\))?[[:space:]]*\{/ ||
+                 shell_code ~ /^hash[[:space:]].*g?make/ ||
+                 shell_code ~ /^set[[:space:]]+\+e([[:space:]]|$)/ ||
+                 shell_code ~ /^set[[:space:]]+\+o[[:space:]]+errexit([[:space:]]|$)/ ||
+                 shell_code ~ /^shopt[[:space:]].*expand_aliases/))
+                step_unsafe_script = 1
+            if (required_release_job(current_job) &&
+                shell_code ~ /GITHUB_(ENV|PATH)/)
+                release_job_dynamic_env[current_job] = 1
+            if (depth_at_start == 0 &&
+                shell_code ~ /(^|[;&|][[:space:]]*)(exit|return)([[:space:]]|$)/)
+                step_terminates_early = 1
+            if (depth_at_start == 0 &&
+                shell_code ~ /(^|[;&|][[:space:]]*)exec[[:space:]]+[^0-9<]/)
+                step_terminates_early = 1
+
+            if (shell_code ~ /^(fi|done|esac)([;[:space:]]|$)/ ||
+                shell_code == "}") {
+                if (shell_control_depth > 0) shell_control_depth--
+            }
+            eligible = quote_at_start == 0 && shell_quote == 0 &&
+                !continued_at_start &&
+                !shell_trailing_continuation(shell_code) &&
+                shell_control_depth == 0
+            add_step_command(shell_code, source, eligible)
+            if (shell_code ~ /^(if|for|while|until|case|select)[[:space:]]/ ||
+                shell_code ~ /^[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(\)[[:space:]]*\{/) {
+                shell_control_depth++
+            }
+            shell_continued = shell_trailing_continuation(shell_code)
+        }
+        function start_run_block(source, style) {
+            if (source == "direct") step_direct_run_count++
+            else step_action_run_count++
+            block_scalar_purpose = source
+            shell_quote = 0
+            shell_continued = 0
+            shell_control_depth = 0
+            if (substr(style, 1, 1) != "|") step_unsafe_script = 1
+        }
+        function record_scalar_run(source, value) {
+            decode_scalar(value)
+            if (!scalar_ok || scalar_value == "") reject()
+            if (source == "direct") step_direct_run_count++
+            else step_action_run_count++
+            if (required_release_job(current_job) &&
+                scalar_value ~ /GITHUB_(ENV|PATH)/)
+                release_job_dynamic_env[current_job] = 1
+            add_step_command(scalar_value, source, 1)
+        }
+        function add_release_gate(key, serial) {
+            release_gate_count[key]++
+            if (release_gate_count[key] == 1) release_gate_serial[key] = serial
+        }
+        function classify_release_step(normalized_action, i, command, source,
+                                       gate, step_gate_count,
+                                       freebsd_errexit_count,
+                                       freebsd_errexit_serial,
+                                       first_gate_serial,
+                                       direct_release_test) {
+            normalized_action = tolower(step_action)
+            step_gate_count = 0
+            first_gate_serial = 0
+            for (i = 1; i <= step_command_count; i++) {
+                if (!step_command_eligible[i]) continue
+                command = step_command_text[i]
+                source = step_command_source[i]
+                gate = ""
+                if (current_job == "freebsd" && source == "action" &&
+                    command == "set -eu") {
+                    freebsd_errexit_count++
+                    freebsd_errexit_serial = step_command_serial[i]
+                }
+                if (current_job == "linux" && source == "direct") {
+                    if (command == "make BUILD_TYPE=release READLINE=1 WERROR=1 test")
+                        gate = "linux-gcc-test"
+                    else if (command == "make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
+                        gate = "linux-gcc-artifact"
+                    else if (command == "make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test")
+                        gate = "linux-clang-test"
+                    else if (command == "make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
+                        gate = "linux-clang-artifact"
+                    else if (command == "make release-contract-test")
+                        gate = "linux-contract"
+                } else if (current_job == "macos" && source == "direct") {
+                    if (command == "make BUILD_TYPE=release READLINE=1 WERROR=1 test")
+                        gate = "macos-test"
+                    else if (command == "make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
+                        gate = "macos-artifact"
+                    else if (command == "make release-contract-test")
+                        gate = "macos-contract"
+                } else if (current_job == "freebsd" && source == "action" &&
+                           normalized_action ~ /^cross-platform-actions\/action@/) {
+                    if (command == "gmake BUILD_TYPE=release WERROR=1 test")
+                        gate = "freebsd-test"
+                    else if (command == "gmake BUILD_TYPE=release WERROR=1 release-artifact-test")
+                        gate = "freebsd-artifact"
+                    else if (command == "gmake release-contract-test")
+                        gate = "freebsd-contract"
+                }
+                if (gate != "") {
+                    add_release_gate(gate, step_command_serial[i])
+                    step_gate_count++
+                    if (!first_gate_serial)
+                        first_gate_serial = step_command_serial[i]
+                    if (gate == "linux-gcc-test" ||
+                        gate == "linux-clang-test" || gate == "macos-test")
+                        direct_release_test = 1
+                }
+            }
+            if (step_gate_count == 0) return
+            if (step_if_count != 0)
+                reject("required release gate step must be unconditional")
+            if (step_continue_count > 1 ||
+                (step_continue_count == 1 && step_continue_value != "false"))
+                reject("required release gate step cannot continue on error")
+            if (step_shell_count != 0)
+                reject("required release gate step cannot override its shell")
+            if (step_unsafe_script || step_terminates_early)
+                reject("required release gate command is not provably reachable")
+            if (current_job == "freebsd") {
+                freebsd_release_step_count++
+                if (step_direct_run_count != 0 || step_action_run_count != 1)
+                    reject("FreeBSD release gates must run inside the reviewed VM action")
+                if (step_env_unsafe || step_env_map_count != 0 ||
+                    step_env_count != 0)
+                    reject("required release gate environment is missing or unsafe")
+                if (freebsd_errexit_count != 1 ||
+                    freebsd_errexit_serial >= first_gate_serial)
+                    reject("FreeBSD release gates require an earlier set -eu")
+            } else if (step_direct_run_count != 1 || step_action_run_count != 0 ||
+                       step_command_count != 1 || step_gate_count != 1) {
+                reject("required release gate must be the sole command in its step")
+            } else if (step_env_unsafe ||
+                       (direct_release_test &&
+                        (step_env_map_count != 1 || step_env_count != 1 ||
+                         step_caps_count != 1 ||
+                         step_caps_value != "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets")) ||
+                       (!direct_release_test &&
+                        (step_env_map_count != 0 || step_env_count != 0))) {
+                reject("required release gate environment is missing or unsafe")
+            }
+        }
+        function require_release_gate(key) {
+            if (release_gate_count[key] != 1)
+                reject("missing or duplicate exact release gate: " key)
+        }
+        function require_release_order(earlier, later) {
+            if (release_gate_serial[earlier] >= release_gate_serial[later])
+                reject("required release gates are out of order")
+        }
         function last_at(value, i, at) {
             at = 0
             for (i = 1; i <= length(value); i++)
@@ -381,6 +601,26 @@ check_policy()
             step_version_count = 0
             step_version_value = ""
             step_version_in_with = 0
+            step_action_shell_count = 0
+            step_action_shell_value = ""
+            step_action_shell_in_with = 0
+            step_direct_run_count = 0
+            step_action_run_count = 0
+            step_if_count = 0
+            step_continue_count = 0
+            step_continue_value = ""
+            step_shell_count = 0
+            step_unsafe_script = 0
+            step_terminates_early = 0
+            step_in_env = 0
+            step_env_indent = -1
+            step_env_map_count = 0
+            step_env_count = 0
+            step_env_unsafe = 0
+            step_caps_count = 0
+            step_caps_value = ""
+            block_scalar_purpose = ""
+            clear_step_commands()
         }
         function close_step(normalized_action) {
             if (!step_active) return
@@ -397,12 +637,18 @@ check_policy()
                 if (step_os_count != 1 || !step_os_in_with ||
                     step_os_value != "freebsd" ||
                     step_version_count != 1 || !step_version_in_with ||
-                    step_version_value !~ /^[0-9]+\.[0-9]+$/) reject()
+                    step_version_value !~ /^[0-9]+\.[0-9]+$/ ||
+                    step_action_shell_count != 1 ||
+                    !step_action_shell_in_with ||
+                    step_action_shell_value != "bash") reject()
                 freebsd_action_count++
                 freebsd_version = step_version_value
             }
+            classify_release_step()
             step_active = 0
             step_in_with = 0
+            step_in_env = 0
+            block_scalar_purpose = ""
         }
         function close_job() {
             close_step()
@@ -432,6 +678,12 @@ check_policy()
                 if (!scalar_ok) reject()
                 step_version_value = scalar_value
                 if (inside) step_version_in_with = 1
+            } else if (key == "shell") {
+                step_action_shell_count++
+                decode_scalar(value)
+                if (!scalar_ok) reject()
+                step_action_shell_value = scalar_value
+                if (inside) step_action_shell_in_with = 1
             }
         }
         function parse_flow_with_piece(piece, colon, key, value) {
@@ -578,12 +830,17 @@ check_policy()
         }
         {
             raw = $0
-            if (block_scalar_indent >= 0) {
-                if (raw ~ /^[[:space:]]*$/ || raw ~ /^[[:space:]]*#/) next
-                if (indentation(raw) > block_scalar_indent) next
-                block_scalar_indent = -1
-            }
             if (raw ~ /\t/) reject()
+            if (block_scalar_indent >= 0) {
+                if (raw ~ /^[[:space:]]*$/ ||
+                    indentation(raw) > block_scalar_indent) {
+                    if (block_scalar_purpose != "")
+                        record_block_command(raw, block_scalar_purpose)
+                    next
+                }
+                block_scalar_indent = -1
+                block_scalar_purpose = ""
+            }
             code = lex(raw)
             if (!lex_ok) reject()
             if (trim(code) == "") next
@@ -700,6 +957,28 @@ check_policy()
                 next
             }
 
+            if (entry_key == "defaults" && current_indent == 0)
+                reject("workflow shell defaults are unsupported")
+            if (entry_key == "env" && current_indent == 0)
+                reject("workflow environment overrides are unsupported")
+            if (current_job != "" && current_indent == 4 &&
+                required_release_job(current_job)) {
+                if (entry_key == "runs-on") {
+                    release_runner_count[current_job]++
+                    decode_scalar(entry_value)
+                    if (!scalar_ok || scalar_value == "") reject()
+                    release_runner_value[current_job] = scalar_value
+                } else if (entry_key == "if") {
+                    reject("required release job must be unconditional")
+                } else if (entry_key == "defaults") {
+                    reject("required release job cannot override shell defaults")
+                } else if (entry_key == "env") {
+                    reject("required release job cannot override its environment")
+                } else if (entry_key == "container") {
+                    reject("required release job cannot override its execution container")
+                }
+            }
+
             if (entry_key == "permissions") {
                 if (entry_sequence) reject()
                 if (current_indent == 0) {
@@ -732,6 +1011,70 @@ check_policy()
             }
             if (step_active && step_in_with &&
                 current_indent <= step_with_indent) step_in_with = 0
+            if (step_active && step_in_env &&
+                current_indent <= step_env_indent) step_in_env = 0
+
+            step_direct_field = step_active &&
+                ((current_indent == 6 && entry_sequence) ||
+                 (current_indent == 8 && !entry_sequence))
+            step_action_input = step_active && step_in_with &&
+                current_indent == step_with_indent + 2 && !entry_sequence
+
+            if (step_active && step_in_env &&
+                current_indent == step_env_indent + 2 && !entry_sequence) {
+                step_env_count++
+                decode_scalar(entry_value)
+                if (!scalar_ok || scalar_value == "") step_env_unsafe = 1
+                if (entry_key == "GITSWITCH_TEST_REQUIRED_CAPS") {
+                    step_caps_count++
+                    step_caps_value = scalar_value
+                } else {
+                    step_env_unsafe = 1
+                }
+                next
+            }
+
+            if (step_direct_field && entry_key == "env") {
+                step_env_map_count++
+                if (entry_value != "") {
+                    step_env_unsafe = 1
+                } else {
+                    step_in_env = 1
+                    step_env_indent = current_indent
+                }
+                next
+            }
+
+            if (step_direct_field && entry_key == "if") {
+                step_if_count++
+                decode_scalar(entry_value)
+                if (!scalar_ok || scalar_value == "") reject()
+                next
+            }
+            if (step_direct_field && entry_key == "continue-on-error") {
+                step_continue_count++
+                decode_scalar(entry_value)
+                if (!scalar_ok || scalar_value == "") reject()
+                step_continue_value = scalar_value
+                next
+            }
+            if (step_direct_field && entry_key == "shell") {
+                step_shell_count++
+                decode_scalar(entry_value)
+                if (!scalar_ok || scalar_value == "") reject()
+                next
+            }
+            if ((step_direct_field || step_action_input) &&
+                entry_key == "run") {
+                run_source = step_direct_field ? "direct" : "action"
+                if (entry_value ~ /^[|>][-+0-9]*$/) {
+                    start_run_block(run_source, entry_value)
+                    block_scalar_indent = current_indent
+                } else {
+                    record_scalar_run(run_source, entry_value)
+                }
+                next
+            }
 
             if (entry_key == "uses") {
                 validate_use(entry_value, lex_comment)
@@ -762,7 +1105,8 @@ check_policy()
             }
             if (step_active &&
                 (entry_key == "persist-credentials" ||
-                 entry_key == "operating_system" || entry_key == "version")) {
+                 entry_key == "operating_system" || entry_key == "version" ||
+                 entry_key == "shell")) {
                 record_step_input(entry_key, entry_value,
                     step_in_with && current_indent == step_with_indent + 2)
                 next
@@ -779,6 +1123,37 @@ check_policy()
             close_branch_sequence()
             close_permissions()
             close_job()
+            require_release_gate("linux-gcc-test")
+            require_release_gate("linux-gcc-artifact")
+            require_release_gate("linux-contract")
+            require_release_gate("linux-clang-test")
+            require_release_gate("linux-clang-artifact")
+            require_release_gate("macos-test")
+            require_release_gate("macos-artifact")
+            require_release_gate("macos-contract")
+            require_release_gate("freebsd-test")
+            require_release_gate("freebsd-artifact")
+            require_release_gate("freebsd-contract")
+            if (release_runner_count["linux"] != 1 ||
+                release_runner_value["linux"] != "ubuntu-latest" ||
+                release_runner_count["macos"] != 1 ||
+                release_runner_value["macos"] != "macos-latest" ||
+                release_runner_count["freebsd"] != 1 ||
+                release_runner_value["freebsd"] != "ubuntu-latest")
+                reject("required release job runner is missing or incorrect")
+            if (release_job_dynamic_env["linux"] ||
+                release_job_dynamic_env["macos"] ||
+                release_job_dynamic_env["freebsd"])
+                reject("required release jobs cannot persist environment overrides")
+            if (freebsd_release_step_count != 1)
+                reject("FreeBSD release gates must share one reviewed VM action step")
+            require_release_order("linux-gcc-test", "linux-gcc-artifact")
+            require_release_order("linux-gcc-artifact", "linux-contract")
+            require_release_order("linux-clang-test", "linux-clang-artifact")
+            require_release_order("macos-test", "macos-artifact")
+            require_release_order("macos-artifact", "macos-contract")
+            require_release_order("freebsd-test", "freebsd-artifact")
+            require_release_order("freebsd-artifact", "freebsd-contract")
             if (!top_permissions_seen || !jobs_seen || job_count == 0 ||
                 use_count == 0 || external_use_count == 0 ||
                 checkout_count == 0 || freebsd_action_count != 1) exit 1
@@ -790,106 +1165,6 @@ check_policy()
     }
     freebsd_version=$(sed -n 's/^freebsd-version=//p' "$work_actions")
     [ -n "$freebsd_version" ] || fail "FreeBSD CI version is not explicit"
-
-    # Artifact inspection must consume the same WERROR=1 configuration that
-    # passed the full release suite. Omitting the knob changes .buildconfig and
-    # silently rebuilds a different production binary before inspection.
-    awk '
-        function strip_comment(line) {
-            sub(/[[:space:]]*#.*/, "", line)
-            sub(/[[:space:]]+$/, "", line)
-            return line
-        }
-        {
-            code = strip_comment($0)
-            command_count = split(code, commands, /[;&|]/)
-            for (i = 1; i <= command_count; i++) {
-                command = commands[i]
-                target_at = match(command,
-                    /(^|[[:space:]])release-artifact-test([[:space:]]|$)/)
-                if (!target_at) continue
-                count++
-                make_at = match(command, /(^|[[:space:]])g?make[[:space:]]/)
-                werror_at = match(command,
-                    /(^|[[:space:]])WERROR=1([[:space:]]|$)/)
-                if (!make_at || !werror_at ||
-                    make_at > werror_at || werror_at > target_at) bad = 1
-            }
-        }
-        END { exit !(count > 0 && !bad) }
-    ' "$workflow" ||
-        fail "every release-artifact-test invocation must preserve WERROR=1"
-
-    # Linux descriptor publication normally uses AT_EMPTY_PATH/O_TMPFILE.
-    # Darwin and FreeBSD have distinct fclonefileat/funlinkat paths, so both
-    # hosted jobs must execute the release contract. Parse only effective run
-    # scalars: comments, env values, names, and other job text are not commands.
-    awk '
-        function strip_comment(line) {
-            sub(/[[:space:]]*#.*/, "", line)
-            sub(/[[:space:]]+$/, "", line)
-            return line
-        }
-        function indentation(line, prefix) {
-            prefix = line
-            sub(/[^ ].*$/, "", prefix)
-            return length(prefix)
-        }
-        function inspect_command(code, command_count, commands, i,
-                                 command, target_at, normalized) {
-            command_count = split(code, commands, /[;&|]/)
-            for (i = 1; i <= command_count; i++) {
-                command = commands[i]
-                target_at = match(command,
-                    /(^|[[:space:]])release-contract-test([[:space:]]|$)/)
-                if (!target_at) continue
-                normalized = command
-                sub(/^[[:space:]]+/, "", normalized)
-                sub(/[[:space:]]+$/, "", normalized)
-                if (normalized !~ /^g?make[[:space:]]+release-contract-test$/)
-                    bad = 1
-                if (job == "macos") macos_count++
-                if (job == "freebsd") freebsd_count++
-            }
-        }
-        {
-            code = strip_comment($0)
-            if (code ~ /^  [A-Za-z0-9_-]+:[[:space:]]*$/) {
-                job = code
-                sub(/^  /, "", job)
-                sub(/:[[:space:]]*$/, "", job)
-                in_run = 0
-                if (job == "macos") macos_jobs++
-                if (job == "freebsd") freebsd_jobs++
-                next
-            }
-            if (job != "macos" && job != "freebsd") next
-            if (in_run) {
-                if (code == "" || indentation(code) > run_indent) {
-                    if (code != "") {
-                        sub(/^[[:space:]]+/, "", code)
-                        inspect_command(code)
-                    }
-                    next
-                }
-                in_run = 0
-            }
-            if (code ~ /^[[:space:]]+run:[[:space:]]*/) {
-                run_indent = indentation(code)
-                sub(/^[[:space:]]+run:[[:space:]]*/, "", code)
-                if (code ~ /^[|>][-+0-9]*[[:space:]]*$/) {
-                    in_run = 1
-                } else if (code != "") {
-                    inspect_command(code)
-                }
-            }
-        }
-        END {
-            exit !(macos_jobs == 1 && freebsd_jobs == 1 &&
-                   macos_count == 1 && freebsd_count == 1 && !bad)
-        }
-    ' "$workflow" ||
-        fail "macOS and FreeBSD CI must each execute one release-contract-test"
 
     case $freebsd_version in
         14.4) freebsd_eol=2026-12-31 ;;
@@ -942,6 +1217,157 @@ expect_accepted()
         "$accept_policy_date" >"$tmp/out" 2>&1; then
         fail "$accept_label fixture was rejected: $(sed -n '1p' "$tmp/out")"
     fi
+}
+
+mutate_release_command()
+{
+    mutate_job=$1
+    mutate_from=$2
+    mutate_to=$3
+    mutate_output=$4
+    awk -v wanted_job="$mutate_job" -v from="$mutate_from" -v to="$mutate_to" '
+        function ltrim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            return value
+        }
+        /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+            job = $0
+            sub(/^  /, "", job)
+            sub(/:[[:space:]]*$/, "", job)
+        }
+        job == wanted_job && !changed {
+            body = ltrim($0)
+            if (body == "run: " from) {
+                match($0, /^[ ]*/)
+                print substr($0, 1, RLENGTH) "run: " to
+                changed = 1
+                next
+            }
+            if (body == from) {
+                match($0, /^[ ]*/)
+                print substr($0, 1, RLENGTH) to
+                changed = 1
+                next
+            }
+        }
+        { print }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$mutate_output"
+}
+
+mutate_release_runner()
+{
+    mutate_job=$1
+    mutate_runner=$2
+    mutate_output=$3
+    awk -v wanted_job="$mutate_job" -v runner="$mutate_runner" '
+        /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+            job = $0
+            sub(/^  /, "", job)
+            sub(/:[[:space:]]*$/, "", job)
+        }
+        job == wanted_job && !changed &&
+            /^    runs-on:[[:space:]]*/ {
+            print "    runs-on: " runner
+            changed = 1
+            next
+        }
+        { print }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$mutate_output"
+}
+
+rename_release_job()
+{
+    mutate_job=$1
+    mutate_output=$2
+    awk -v wanted_job="$mutate_job" '
+        $0 == "  " wanted_job ":" && !changed {
+            print "  disabled-" wanted_job ":"
+            changed = 1
+            next
+        }
+        { print }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$mutate_output"
+}
+
+add_release_job_field()
+{
+    mutate_job=$1
+    mutate_field=$2
+    mutate_output=$3
+    awk -v wanted_job="$mutate_job" -v field="$mutate_field" '
+        { print }
+        $0 == "  " wanted_job ":" && !changed {
+            print "    " field
+            changed = 1
+        }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$mutate_output"
+}
+
+add_release_step_field()
+{
+    mutate_job=$1
+    mutate_command=$2
+    mutate_field=$3
+    mutate_output=$4
+    awk -v wanted_job="$mutate_job" -v command="$mutate_command" \
+        -v field="$mutate_field" '
+        function ltrim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            return value
+        }
+        /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+            job = $0
+            sub(/^  /, "", job)
+            sub(/:[[:space:]]*$/, "", job)
+        }
+        {
+            print
+            if (job != wanted_job || changed) next
+            body = ltrim($0)
+            if (wanted_job == "freebsd" &&
+                body ~ /^uses:[[:space:]]+cross-platform-actions\/action@/) {
+                print "        " field
+                changed = 1
+            } else if (body == "run: " command) {
+                match($0, /^[ ]*/)
+                print substr($0, 1, RLENGTH) field
+                changed = 1
+            }
+        }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$mutate_output"
+}
+
+mutate_release_caps()
+{
+    mutate_job=$1
+    mutate_command=$2
+    mutate_output=$3
+    awk -v wanted_job="$mutate_job" -v command="$mutate_command" '
+        function ltrim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            return value
+        }
+        /^  [A-Za-z0-9_-]+:[[:space:]]*$/ {
+            job = $0
+            sub(/^  /, "", job)
+            sub(/:[[:space:]]*$/, "", job)
+        }
+        job == wanted_job && ltrim($0) == "run: " command { target = 1 }
+        target && !changed &&
+            ltrim($0) ~ /^GITSWITCH_TEST_REQUIRED_CAPS:/ {
+            match($0, /^[ ]*/)
+            print substr($0, 1, RLENGTH) "GITSWITCH_TEST_REQUIRED_CAPS: pty"
+            changed = 1
+            next
+        }
+        { print }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$mutate_output"
 }
 
 if [ "${1-}" = "--check" ]; then
@@ -1522,90 +1948,527 @@ awk '
 expect_rejected "comment-masked EOL FreeBSD" "$tmp/eol-comment.yml" "$today"
 expect_rejected "expired support window" "$workflow" 2027-01-01
 
-# Dropping WERROR from even one artifact command changes the build stamp and
-# causes inspection to consume a freshly rebuilt, non-WERROR binary.
+# Every required platform/configuration/command tuple is an independent policy
+# fact. Replacing any one command must fail even when an identical command is
+# still present in another job or non-executable text mentions the target.
+release_matrix_index=0
+while IFS='|' read -r matrix_job matrix_gate matrix_command; do
+    release_matrix_index=$((release_matrix_index + 1))
+    matrix_fixture=$tmp/release-command-$release_matrix_index.yml
+    mutate_release_command "$matrix_job" "$matrix_command" true \
+        "$matrix_fixture"
+    expect_structural_rejected_for "missing $matrix_gate executable gate" \
+        "$matrix_fixture" "$today" \
+        "missing or duplicate exact release gate: $matrix_gate"
+done <<'EOF'
+linux|linux-gcc-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+linux|linux-gcc-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+linux|linux-contract|make release-contract-test
+linux|linux-clang-test|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
+linux|linux-clang-artifact|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+macos|macos-contract|make release-contract-test
+freebsd|freebsd-test|gmake BUILD_TYPE=release WERROR=1 test
+freebsd|freebsd-artifact|gmake BUILD_TYPE=release WERROR=1 release-artifact-test
+freebsd|freebsd-contract|gmake release-contract-test
+EOF
+
+# The exact configuration is part of each build/test and artifact gate. Exercise
+# every required knob on every affected platform/compiler/command combination.
+config_matrix_index=0
+while IFS='|' read -r matrix_job matrix_gate matrix_command matrix_token \
+    matrix_replacement; do
+    config_matrix_index=$((config_matrix_index + 1))
+    matrix_fixture=$tmp/release-config-$config_matrix_index.yml
+    matrix_mutated=$(printf '%s\n' "$matrix_command" |
+        sed "s/$matrix_token/$matrix_replacement/")
+    [ "$matrix_mutated" != "$matrix_command" ] ||
+        fail "release configuration mutation did not change $matrix_gate"
+    mutate_release_command "$matrix_job" "$matrix_command" "$matrix_mutated" \
+        "$matrix_fixture"
+    expect_structural_rejected_for \
+        "$matrix_gate with mutated $matrix_token configuration" \
+        "$matrix_fixture" "$today" \
+        "missing or duplicate exact release gate: $matrix_gate"
+done <<'EOF'
+linux|linux-gcc-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
+linux|linux-gcc-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|READLINE=1|READLINE=0
+linux|linux-gcc-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|WERROR=1|WERROR=0
+linux|linux-gcc-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
+linux|linux-gcc-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|READLINE=1|READLINE=0
+linux|linux-gcc-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|WERROR=1|WERROR=0
+linux|linux-clang-test|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test|CC=clang|CC=gcc
+linux|linux-clang-test|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
+linux|linux-clang-test|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test|READLINE=1|READLINE=0
+linux|linux-clang-test|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test|WERROR=1|WERROR=0
+linux|linux-clang-artifact|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|CC=clang|CC=gcc
+linux|linux-clang-artifact|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
+linux|linux-clang-artifact|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|READLINE=1|READLINE=0
+linux|linux-clang-artifact|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|WERROR=1|WERROR=0
+macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
+macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|READLINE=1|READLINE=0
+macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|WERROR=1|WERROR=0
+macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
+macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|READLINE=1|READLINE=0
+macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|WERROR=1|WERROR=0
+freebsd|freebsd-test|gmake BUILD_TYPE=release WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
+freebsd|freebsd-test|gmake BUILD_TYPE=release WERROR=1 test|WERROR=1|WERROR=0
+freebsd|freebsd-artifact|gmake BUILD_TYPE=release WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
+freebsd|freebsd-artifact|gmake BUILD_TYPE=release WERROR=1 release-artifact-test|WERROR=1|WERROR=0
+EOF
+
+# Required jobs are exact platform facts: a renamed/missing job, a wrong runner,
+# or any job-level condition makes the release evidence non-mandatory.
+for matrix_job in linux macos freebsd; do
+    rename_release_job "$matrix_job" "$tmp/missing-$matrix_job-job.yml"
+    expect_structural_rejected "missing $matrix_job release job" \
+        "$tmp/missing-$matrix_job-job.yml" "$today"
+    mutate_release_runner "$matrix_job" windows-latest \
+        "$tmp/wrong-$matrix_job-runner.yml"
+    expect_structural_rejected_for "wrong $matrix_job release runner" \
+        "$tmp/wrong-$matrix_job-runner.yml" "$today" \
+        "required release job runner is missing or incorrect"
+    add_release_job_field "$matrix_job" "if: false" \
+        "$tmp/false-$matrix_job-job.yml"
+    expect_structural_rejected_for "false $matrix_job release job condition" \
+        "$tmp/false-$matrix_job-job.yml" "$today" \
+        "required release job must be unconditional"
+done
+
 awk '
-    !changed && /release-artifact-test/ && /WERROR=1/ {
-        sub(/WERROR=1[[:space:]]*/, "")
+    { print }
+    $0 == "  linux:" && !changed {
+        print "    defaults:"
+        print "      run:"
+        print "        shell: bash"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/linux-job-shell-default.yml"
+expect_structural_rejected_for "Linux job release shell default" \
+    "$tmp/linux-job-shell-default.yml" "$today" \
+    "required release job cannot override shell defaults"
+
+add_release_job_field linux "container: alpine:latest" \
+    "$tmp/linux-release-container.yml"
+expect_structural_rejected_for "Linux release execution container" \
+    "$tmp/linux-release-container.yml" "$today" \
+    "required release job cannot override its execution container"
+
+# Step-level conditions, error suppression, and shell overrides are checked on
+# all three execution surfaces. Explicit continue-on-error:false remains safe.
+while IFS='|' read -r matrix_job matrix_command; do
+    add_release_step_field "$matrix_job" "$matrix_command" "if: false" \
+        "$tmp/false-$matrix_job-release-step.yml"
+    expect_structural_rejected_for "false $matrix_job release step condition" \
+        "$tmp/false-$matrix_job-release-step.yml" "$today" \
+        "required release gate step must be unconditional"
+    add_release_step_field "$matrix_job" "$matrix_command" \
+        "continue-on-error: true" \
+        "$tmp/continue-$matrix_job-release-step.yml"
+    expect_structural_rejected_for "$matrix_job release error suppression" \
+        "$tmp/continue-$matrix_job-release-step.yml" "$today" \
+        "required release gate step cannot continue on error"
+    add_release_step_field "$matrix_job" "$matrix_command" "shell: bash" \
+        "$tmp/shell-$matrix_job-release-step.yml"
+    expect_structural_rejected_for "$matrix_job release shell override" \
+        "$tmp/shell-$matrix_job-release-step.yml" "$today" \
+        "required release gate step cannot override its shell"
+done <<'EOF'
+linux|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+macos|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+freebsd|gmake BUILD_TYPE=release WERROR=1 test
+EOF
+
+add_release_step_field linux \
+    "make BUILD_TYPE=release READLINE=1 WERROR=1 test" \
+    "continue-on-error: false" "$tmp/explicit-no-continue.yml"
+expect_accepted "explicit release continue-on-error false" \
+    "$tmp/explicit-no-continue.yml" "$today"
+
+# Environment and shell defaults can change what an otherwise exact command
+# means. The canonical release subset forbids workflow/job overrides, allows
+# only the exact runtime-capability env on release test steps, and pins the VM
+# action input shell to bash.
+awk '
+    $0 == "jobs:" && !changed {
+        print "env:"
+        print "  MAKEFLAGS: -i"
         changed = 1
     }
     { print }
     END { if (!changed) exit 1 }
-' "$workflow" >"$tmp/artifact-no-werror.yml"
-expect_rejected "artifact rebuild without WERROR" \
-    "$tmp/artifact-no-werror.yml" "$today"
+' "$workflow" >"$tmp/workflow-env-override.yml"
+expect_structural_rejected_for "workflow release environment override" \
+    "$tmp/workflow-env-override.yml" "$today" \
+    "workflow environment overrides are unsupported"
 
-# Removing the effective Darwin publication exercise must be detected even
-# while the Linux release-contract lane remains present.
 awk '
-    /^  macos:[[:space:]]*$/ { in_macos = 1 }
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
-        in_macos = 0
-    }
-    in_macos && !changed && /release-contract-test/ {
-        sub(/make[[:space:]]+release-contract-test/, "true")
+    $0 == "jobs:" && !changed {
+        print "defaults:"
+        print "  run:"
+        print "    shell: bash"
         changed = 1
     }
     { print }
     END { if (!changed) exit 1 }
-' "$workflow" >"$tmp/macos-no-release-contract.yml"
-expect_rejected "macOS without release contract" \
-    "$tmp/macos-no-release-contract.yml" "$today"
+' "$workflow" >"$tmp/workflow-shell-default.yml"
+expect_structural_rejected_for "workflow release shell default" \
+    "$tmp/workflow-shell-default.yml" "$today" \
+    "workflow shell defaults are unsupported"
 
-# Non-command text in the same job must not mask removal of the executable
-# macOS contract command.
+for matrix_job in linux macos freebsd; do
+    awk -v wanted_job="$matrix_job" '
+        { print }
+        $0 == "  " wanted_job ":" && !changed {
+            print "    env:"
+            print "      MAKEFLAGS: -i"
+            changed = 1
+        }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$tmp/job-env-$matrix_job.yml"
+    expect_structural_rejected_for "$matrix_job job environment override" \
+        "$tmp/job-env-$matrix_job.yml" "$today" \
+        "required release job cannot override its environment"
+done
+
+while IFS='|' read -r matrix_job matrix_command; do
+    mutate_release_caps "$matrix_job" "$matrix_command" \
+        "$tmp/caps-$matrix_job-$(printf '%s' "$matrix_command" | cksum | awk '{print $1}').yml"
+    matrix_fixture=$tmp/caps-$matrix_job-$(printf '%s' "$matrix_command" |
+        cksum | awk '{print $1}').yml
+    expect_structural_rejected_for "$matrix_job release runtime-capability downgrade" \
+        "$matrix_fixture" "$today" \
+        "required release gate environment is missing or unsafe"
+done <<'EOF'
+linux|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+linux|make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
+macos|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+EOF
+
+# Count the env mapping itself as well as its entries. Duplicate YAML keys have
+# loader-dependent first/last-key semantics; neither an empty map before nor an
+# empty map after the exact capability map may erase or ambiguously shadow it.
 awk '
-    /^  macos:[[:space:]]*$/ { in_macos = 1 }
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
-        in_macos = 0
+    { print }
+    $0 == "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test" {
+        target = 1
     }
-    in_macos && !changed && /make[[:space:]]+release-contract-test/ {
-        sub(/make[[:space:]]+release-contract-test/, "true")
+    target && !changed &&
+        $0 ~ /^          GITSWITCH_TEST_REQUIRED_CAPS:/ {
+        print "        env:"
         changed = 1
     }
-    in_macos && changed && !injected && /^[[:space:]]+env:[[:space:]]*$/ {
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/duplicate-env-after-caps.yml"
+expect_structural_rejected_for "duplicate release env after exact caps" \
+    "$tmp/duplicate-env-after-caps.yml" "$today" \
+    "required release gate environment is missing or unsafe"
+
+awk '
+    !changed &&
+        $0 == "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test" {
+        print "        env:"
         print
-        print "          FAKE_POLICY_TEXT: make release-contract-test"
-        injected = 1
+        changed = 1
         next
     }
     { print }
-    END { if (!changed || !injected) exit 1 }
-' "$workflow" >"$tmp/macos-env-text-only.yml"
-expect_rejected "macOS env text without release contract" \
-    "$tmp/macos-env-text-only.yml" "$today"
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/duplicate-env-before-caps.yml"
+expect_structural_rejected_for "duplicate release env before exact caps" \
+    "$tmp/duplicate-env-before-caps.yml" "$today" \
+    "required release gate environment is missing or unsafe"
 
-# Mentioning the make command as echo data is not execution either.
+awk '
+    $0 == "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test" {
+        target = 1
+    }
+    target && !changed &&
+        $0 ~ /^          GITSWITCH_TEST_REQUIRED_CAPS:/ {
+        print "          GITSWITCH_TEST_REQUIRED_CAPS: '\''pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets'\''"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/single-quoted-release-env.yml"
+expect_accepted "single exact release env mapping" \
+    "$tmp/single-quoted-release-env.yml" "$today"
+
+while IFS='|' read -r matrix_job matrix_command; do
+    add_release_step_field "$matrix_job" "$matrix_command" \
+        "env: { MAKEFLAGS: -i }" "$tmp/step-env-$matrix_job.yml"
+    expect_structural_rejected_for "$matrix_job release step environment override" \
+        "$tmp/step-env-$matrix_job.yml" "$today" \
+        "required release gate environment is missing or unsafe"
+done <<'EOF'
+linux|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+macos|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+freebsd|gmake BUILD_TYPE=release WERROR=1 release-artifact-test
+EOF
+
+awk '
+    !changed && $0 == "          shell: bash" {
+        print "          shell: sh"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-wrong-shell.yml"
+expect_structural_rejected "FreeBSD action shell downgrade" \
+    "$tmp/freebsd-wrong-shell.yml" "$today"
+
+# A prior step cannot persist MAKEFLAGS/PATH through the runner environment and
+# silently reinterpret later exact commands.
+awk '
+    $0 == "      - name: Clean before the GCC release build" && !changed {
+        print "      - name: Persisted release override decoy"
+        print "        run: printf '\''%s\\n'\'' '\''MAKEFLAGS=-i'\'' >> \"$GITHUB_ENV\""
+        changed = 1
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/persisted-release-env.yml"
+expect_structural_rejected_for "persisted release environment override" \
+    "$tmp/persisted-release-env.yml" "$today" \
+    "required release jobs cannot persist environment overrides"
+
+# The shared FreeBSD action script must establish fatal simple-command failures
+# before every gate and cannot redefine gmake or its controlling environment.
+mutate_release_command freebsd "set -eu" true "$tmp/freebsd-no-errexit.yml"
+expect_structural_rejected_for "FreeBSD release gates without errexit" \
+    "$tmp/freebsd-no-errexit.yml" "$today" \
+    "FreeBSD release gates require an earlier set -eu"
+
+for unsafe_line in "alias gmake=true" "gmake() { true; }" \
+    "export MAKEFLAGS=-i" "hash -p /usr/bin/true gmake"; do
+    unsafe_id=$(printf '%s\n' "$unsafe_line" | cksum | awk '{print $1}')
+    awk -v injected="$unsafe_line" '
+        { print }
+        !changed && $0 == "            set -eu" {
+            print "            " injected
+            changed = 1
+        }
+        END { if (!changed) exit 1 }
+    ' "$workflow" >"$tmp/freebsd-command-override-$unsafe_id.yml"
+    expect_structural_rejected "FreeBSD gmake override: $unsafe_line" \
+        "$tmp/freebsd-command-override-$unsafe_id.yml" "$today"
+done
+
+awk '
+    !changed &&
+        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
+        print "            cat <<'\''POLICY'\''"
+        print "            gmake BUILD_TYPE=release WERROR=1 test"
+        print "            POLICY"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-quoted-heredoc.yml"
+expect_structural_rejected_for "FreeBSD quoted-heredoc release decoy" \
+    "$tmp/freebsd-quoted-heredoc.yml" "$today" \
+    "required release gate command is not provably reachable"
+
+# Same-line shell control operators cannot turn inert or suppressed commands into
+# evidence. Exact commands in comments, names, env values, or echo arguments are
+# likewise non-executable decoys.
+mutate_release_command linux \
+    "make BUILD_TYPE=release READLINE=1 WERROR=1 test" \
+    "false && make BUILD_TYPE=release READLINE=1 WERROR=1 test" \
+    "$tmp/linux-false-and.yml"
+expect_structural_rejected_for "Linux false-and release bypass" \
+    "$tmp/linux-false-and.yml" "$today" \
+    "missing or duplicate exact release gate: linux-gcc-test"
+
+mutate_release_command macos "make release-contract-test" \
+    "make release-contract-test || true" "$tmp/macos-or-true.yml"
+expect_structural_rejected_for "macOS suppressed release contract" \
+    "$tmp/macos-or-true.yml" "$today" \
+    "missing or duplicate exact release gate: macos-contract"
+
+mutate_release_command linux \
+    "make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test" \
+    "true # make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test" \
+    "$tmp/linux-comment-decoy.yml"
+expect_structural_rejected_for "Linux comment-only artifact decoy" \
+    "$tmp/linux-comment-decoy.yml" "$today" \
+    "missing or duplicate exact release gate: linux-gcc-artifact"
+
+mutate_release_command freebsd "gmake release-contract-test" \
+    "# gmake release-contract-test" "$tmp/freebsd-comment-decoy.yml"
+expect_structural_rejected_for "FreeBSD block comment contract decoy" \
+    "$tmp/freebsd-comment-decoy.yml" "$today" \
+    "missing or duplicate exact release gate: freebsd-contract"
+
+mutate_release_command macos "make release-contract-test" \
+    "echo make release-contract-test" "$tmp/macos-echo-decoy.yml"
+expect_structural_rejected_for "macOS echo contract decoy" \
+    "$tmp/macos-echo-decoy.yml" "$today" \
+    "missing or duplicate exact release gate: macos-contract"
+
 awk '
     /^  macos:[[:space:]]*$/ { in_macos = 1 }
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
         in_macos = 0
     }
-    in_macos && !changed && /make[[:space:]]+release-contract-test/ {
-        sub(/make[[:space:]]+release-contract-test/,
-            "echo make release-contract-test")
+    in_macos && !named &&
+        $0 == "      - name: Release input consistency and dirty-tree refusal" {
+        print "      - name: make release-contract-test"
+        named = 1
+        next
+    }
+    in_macos && !changed && $0 == "        run: make release-contract-test" {
+        print "        run: true"
         changed = 1
+        next
+    }
+    { print }
+    END { if (!named || !changed) exit 1 }
+' "$workflow" >"$tmp/macos-name-decoy.yml"
+expect_structural_rejected_for "macOS name-only contract decoy" \
+    "$tmp/macos-name-decoy.yml" "$today" \
+    "missing or duplicate exact release gate: macos-contract"
+
+awk '
+    /^  macos:[[:space:]]*$/ { in_macos = 1 }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
+        in_macos = 0
+    }
+    in_macos && !changed && $0 == "        run: make release-contract-test" {
+        print "        run: true"
+        print "        env:"
+        print "          FAKE_POLICY_TEXT: make release-contract-test"
+        changed = 1
+        next
     }
     { print }
     END { if (!changed) exit 1 }
-' "$workflow" >"$tmp/macos-echo-release-contract.yml"
-expect_rejected "macOS echo without release contract" \
-    "$tmp/macos-echo-release-contract.yml" "$today"
+' "$workflow" >"$tmp/macos-env-decoy.yml"
+expect_structural_rejected_for "macOS env-only contract decoy" \
+    "$tmp/macos-env-decoy.yml" "$today" \
+    "missing or duplicate exact release gate: macos-contract"
 
-# The FreeBSD funlinkat path must remain both Werror-compiled and executed.
+# A direct gate must be the only command in its run step. Folded scripts and
+# FreeBSD block commands hidden behind continuations/conditionals are rejected.
+awk '
+    !changed &&
+        $0 == "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test" {
+        print "        run: |"
+        print "          false"
+        print "          make BUILD_TYPE=release READLINE=1 WERROR=1 test"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/linux-multicommand-gate.yml"
+expect_structural_rejected_for "Linux multi-command release step" \
+    "$tmp/linux-multicommand-gate.yml" "$today" \
+    "required release gate must be the sole command in its step"
+
 awk '
     /^  freebsd:[[:space:]]*$/ { in_freebsd = 1 }
-    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  freebsd:/ {
-        in_freebsd = 0
+    in_freebsd && !changed && $0 == "          run: |" {
+        print "          run: >"
+        changed = 1
+        next
     }
-    in_freebsd && !changed && /gmake[[:space:]]+release-contract-test/ {
-        sub(/gmake[[:space:]]+release-contract-test/, "true")
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-folded-run.yml"
+expect_structural_rejected_for "folded FreeBSD release script" \
+    "$tmp/freebsd-folded-run.yml" "$today" \
+    "required release gate command is not provably reachable"
+
+awk '
+    !changed &&
+        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
+        print "            false && \\"
+        print "              gmake BUILD_TYPE=release WERROR=1 test"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-continuation-bypass.yml"
+expect_structural_rejected_for "FreeBSD continuation release bypass" \
+    "$tmp/freebsd-continuation-bypass.yml" "$today" \
+    "missing or duplicate exact release gate: freebsd-test"
+
+awk '
+    !changed &&
+        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
+        print "            if false; then"
+        print "              gmake BUILD_TYPE=release WERROR=1 test"
+        print "            fi"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-conditional-bypass.yml"
+expect_structural_rejected_for "FreeBSD conditional release bypass" \
+    "$tmp/freebsd-conditional-bypass.yml" "$today" \
+    "missing or duplicate exact release gate: freebsd-test"
+
+awk '
+    !changed &&
+        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
+        print "            exit 0"
+        print
         changed = 1
     }
     { print }
     END { if (!changed) exit 1 }
-' "$workflow" >"$tmp/freebsd-no-release-contract.yml"
-expect_rejected "FreeBSD without release contract" \
-    "$tmp/freebsd-no-release-contract.yml" "$today"
+' "$workflow" >"$tmp/freebsd-early-exit.yml"
+expect_structural_rejected_for "FreeBSD early-exit release bypass" \
+    "$tmp/freebsd-early-exit.yml" "$today" \
+    "required release gate command is not provably reachable"
+
+# A duplicated fact and a reordered test/artifact pair are both invalid: passing
+# the artifact check must follow the exact release suite it is inspecting.
+awk '
+    { print }
+    !changed &&
+        $0 == "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test" {
+        print "      - name: Duplicate release artifact decoy"
+        print "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/duplicate-linux-release-gate.yml"
+expect_structural_rejected_for "duplicate Linux release gate" \
+    "$tmp/duplicate-linux-release-gate.yml" "$today" \
+    "missing or duplicate exact release gate: linux-gcc-artifact"
+
+awk '
+    /^  macos:[[:space:]]*$/ { in_macos = 1 }
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
+        in_macos = 0
+    }
+    !first &&
+        in_macos &&
+        $0 == "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test" {
+        print "        run: make release-contract-test"
+        first = 1
+        next
+    }
+    in_macos && first && !second &&
+        $0 == "        run: make release-contract-test" {
+        print "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test"
+        second = 1
+        next
+    }
+    { print }
+    END { if (!first || !second) exit 1 }
+' "$workflow" >"$tmp/reordered-macos-release-gates.yml"
+expect_structural_rejected_for "reordered macOS release gates" \
+    "$tmp/reordered-macos-release-gates.yml" "$today" \
+    "required release gates are out of order"
 
 printf 'ci-policy: PASS (immutable, least-privilege, supported-platform workflow)\n'
