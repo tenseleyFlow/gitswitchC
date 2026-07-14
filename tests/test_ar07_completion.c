@@ -18,6 +18,19 @@ static char g_binary[PATH_MAX];
 static int g_runner_calls;
 static int g_probe_calls;
 
+static int path_join(char *out, size_t out_size, const char *left,
+                     const char *right);
+
+static int resolve_binary(void) {
+    const char *configured = getenv("GITSWITCH_BIN");
+
+    if (configured && *configured) {
+        return realpath(configured, g_binary) ? 0 : -1;
+    }
+    return path_join(g_binary, sizeof(g_binary), g_root,
+                     "build/bin/gitswitch");
+}
+
 static int write_text(const char *path, const char *text, mode_t mode) {
     FILE *file = fopen(path, "w");
     size_t length = text ? strlen(text) : 0;
@@ -1154,8 +1167,7 @@ TEST(cli_names_permutations_match_and_switch_is_reserved) {
 
 TEST_MAIN_BEGIN()
     if (!getcwd(g_root, sizeof(g_root)) ||
-        path_join(g_binary, sizeof(g_binary), g_root,
-                  "build/bin/gitswitch") != 0 ||
+        resolve_binary() != 0 ||
         setenv("GS_T16_ROOT", g_root, 1) != 0 ||
         error_init(LOG_LEVEL_WARNING, NULL) != 0) {
         fprintf(stderr, "RESULT FAIL: T16 test setup failed\n");

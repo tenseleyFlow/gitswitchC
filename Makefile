@@ -823,7 +823,7 @@ $(BINDIR)/test_signals: \
 # These suites execute the worktree production CLI instead of a linked test
 # entry point. Keep the dependency explicit for focused invocations: the
 # aggregate `make test` prerequisite must not be the only thing preventing a
-# stale or missing build/bin/gitswitch from being exercised (AR-08 M47).
+# stale or missing selected-build CLI from being exercised (AR-08 M47).
 $(CLI_E2E_TEST_TARGETS): | $(BINDIR)/$(TARGET)
 
 # Dependency files are optional on the first build and authoritative
@@ -832,9 +832,10 @@ $(CLI_E2E_TEST_TARGETS): | $(BINDIR)/$(TARGET)
 -include $(DEPFILES)
 
 # Build and run tests. The main binary is a dependency because the CLI-level
-# tests (tests/test_cli.c) exec build/bin/gitswitch: main.c is excluded from
-# the test link (it defines main), so its command handlers are only reachable
-# end-to-end through the binary itself.
+# tests exec the selected-build CLI: main.c is excluded from the test link (it
+# defines main), so its command handlers are only reachable end-to-end through
+# the binary itself. Override any inherited GITSWITCH_BIN so an alternate
+# BUILDDIR can never test a stale CLI from another build.
 .PHONY: test
 ifeq ($(strip $(TEST_SOURCES)),)
 test:
@@ -843,9 +844,11 @@ test:
 else
 test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@echo "Running tests..."
-	@for test in $(TEST_TARGETS); do \
+	@GITSWITCH_BIN="$(abspath $(BINDIR)/$(TARGET))"; \
+	export GITSWITCH_BIN; \
+	for test in $(TEST_TARGETS); do \
 		echo "Running $$test..."; \
-		$$test || exit 1; \
+		"$$test" || exit 1; \
 	done
 	@echo "All tests passed!"
 endif
