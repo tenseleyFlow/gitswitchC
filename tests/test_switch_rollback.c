@@ -69,7 +69,8 @@ static int setup_runtime_dir(void) {
     if (accounts_session_cleanup() != 0) return -1;
 
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_XXXXXX");
-    if (!ts_mkdtemp(g_xdg)) return -1;
+    if (!ts_mkdtemp(g_xdg) ||
+        ts_canonicalize_dir_path(g_xdg, sizeof(g_xdg)) != 0) return -1;
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
 
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", g_xdg);
@@ -94,7 +95,8 @@ static int setup_runtime_dir(void) {
 static int setup_empty_runtime_dir(void) {
     if (accounts_session_cleanup() != 0) return -1;
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gsw_rollback_empty_XXXXXX");
-    if (!ts_mkdtemp(g_xdg)) return -1;
+    if (!ts_mkdtemp(g_xdg) ||
+        ts_canonicalize_dir_path(g_xdg, sizeof(g_xdg)) != 0) return -1;
     return setenv("XDG_RUNTIME_DIR", g_xdg, 1);
 }
 

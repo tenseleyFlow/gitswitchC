@@ -111,7 +111,9 @@ static int fixture_setup(remove_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
     if (snprintf(fixture->root, sizeof(fixture->root),
                  "/tmp/gitswitch-ar08-remove.XXXXXX") < 0 ||
-        !ts_mkdtemp(fixture->root)) return -1;
+        !ts_mkdtemp(fixture->root) ||
+        ts_canonicalize_dir_path(fixture->root,
+                                 sizeof(fixture->root)) != 0) return -1;
     if (path_join(fixture->home, sizeof(fixture->home), fixture->root,
                   "/home") != 0 || mkdir(fixture->home, 0700) != 0 ||
         path_join(fixture->runtime, sizeof(fixture->runtime), fixture->root,

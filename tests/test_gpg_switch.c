@@ -49,6 +49,16 @@
 static int g_gpg_execs;
 static const char *env_lookup(const char *const *envp, const char *prefix);
 
+static int make_xdg(char *path, size_t path_size, const char *template) {
+    if (!path || !template ||
+        safe_snprintf(path, path_size, "%s", template) != 0) {
+        return -1;
+    }
+    if (!ts_mkdtemp(path)) return -1;
+    if (ts_canonicalize_dir_path(path, path_size) != 0) return -1;
+    return chmod(path, 0700);
+}
+
 static int read_link_target(const char *path, char *target, size_t size) {
     ssize_t n;
 
@@ -195,9 +205,7 @@ TEST(repeat_isolated_switch_spawns_gpg_once) {
     ssize_t n;
     int rc;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX"), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
 
@@ -242,9 +250,7 @@ TEST(isolated_switch_fails_when_current_cannot_be_retargeted) {
     account_t acct;
     command_runner_fn prev;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX"), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
     setenv("GNUPGHOME", "/before/gpg-home", 1);
@@ -345,9 +351,7 @@ TEST(truncated_secret_key_export_is_never_imported) {
     command_runner_fn prev;
     int rc;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX"), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
 
@@ -520,8 +524,9 @@ static int run_first_time_import(char *home_expect, size_t home_expect_size) {
     if (had_home) snprintf(saved_home, sizeof(saved_home), "%s", prev_home);
     if (had_gnupghome) snprintf(saved_gnupghome, sizeof(saved_gnupghome), "%s", prev_gnupghome);
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
-    if (!ts_mkdtemp(xdg) || chmod(xdg, 0700) != 0) return -99;
+    if (make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX") != 0) {
+        return -99;
+    }
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
 
@@ -622,9 +627,7 @@ TEST(retarget_current_refuses_missing_home) {
     struct stat st;
     ssize_t n;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX"), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
 
     snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
@@ -726,9 +729,7 @@ TEST(inherited_agent_config_read_stays_on_pinned_source_directory) {
     gpg_config_t cfg;
     account_t acct;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsrcpin_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgsrcpin_XXXXXX"), 0);
     CHECK_EQ_INT(safe_snprintf(g_source_dir_swap_original,
                                sizeof(g_source_dir_swap_original),
                                "%s/source", xdg), 0);
@@ -783,9 +784,7 @@ TEST(inherited_readonly_agent_config_is_installed_atomically_at_0600) {
     gpg_config_t cfg;
     account_t acct;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgconf_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgconf_XXXXXX"), 0);
     snprintf(source_home, sizeof(source_home), "%s/user-gnupg", xdg);
     snprintf(source_conf, sizeof(source_conf), "%s/gpg-agent.conf", source_home);
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);
@@ -830,9 +829,7 @@ TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
     int waited_ms = 0;
     bool finished = false;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgfifo_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgfifo_XXXXXX"), 0);
     snprintf(source_home, sizeof(source_home), "%s/user-gnupg", xdg);
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);
     if (!realpath(source_home, canonical_source_home)) {
@@ -913,9 +910,7 @@ TEST(inherited_agent_config_refuses_symlink_and_oversize_source) {
     gpg_config_t cfg;
     account_t acct;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgconf_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgconf_XXXXXX"), 0);
     snprintf(source_home, sizeof(source_home), "%s/user-gnupg", xdg);
     snprintf(source_conf, sizeof(source_conf), "%s/gpg-agent.conf", source_home);
     snprintf(victim, sizeof(victim), "%s/precious", xdg);
@@ -965,9 +960,7 @@ TEST(agent_config_temp_substitution_is_rejected_without_deleting_replacement) {
     gpg_config_t cfg;
     account_t acct;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgcommit_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgcommit_XXXXXX"), 0);
     snprintf(source_home, sizeof(source_home), "%s/source-home", xdg);
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
@@ -1023,9 +1016,7 @@ TEST(gpg_switch_refuses_retarget_after_base_namespace_replacement) {
     account_t acct;
     command_runner_fn prev;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgswap_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgswap_XXXXXX"), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
     CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
     CHECK_EQ_INT(setenv("GNUPGHOME", "/before/gpg-home", 1), 0);
@@ -1080,9 +1071,7 @@ TEST(gpg_retarget_revalidates_public_base_after_commit) {
     struct stat st;
     gpg_retarget_commit_hook_fn previous;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgpost_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgpost_XXXXXX"), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", xdg, 1), 0);
     snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
     snprintf(moved, sizeof(moved), "%s/gitswitch-gpg.old", xdg);
@@ -1115,9 +1104,7 @@ TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap) {
     bool changed = false;
     bool live = false;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgcas_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgcas_XXXXXX"), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
     snprintf(current, sizeof(current), "%s/current", base);
@@ -1203,9 +1190,7 @@ TEST(gpg_current_snapshot_blocks_on_base_lock) {
     int status = 0;
     int waited = 0;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpglock_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpglock_XXXXXX"), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
     snprintf(home, sizeof(home), "%s/locked", base);
@@ -1300,9 +1285,7 @@ TEST(truncated_idempotency_probe_is_not_signing_evidence) {
     command_runner_fn prev;
     int rc;
 
-    snprintf(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX");
-    CHECK(ts_mkdtemp(xdg) != NULL);
-    CHECK_EQ_INT(chmod(xdg, 0700), 0);
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg), "/tmp/gswgpgsw_XXXXXX"), 0);
     setenv("XDG_RUNTIME_DIR", xdg, 1);
     setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
 

@@ -152,6 +152,32 @@ TEST(normal_cleanup_removes_nested_fixture_without_residue) {
     CHECK(!path_is_present(root));
 }
 
+TEST(canonical_fixture_path_resolves_parent_alias) {
+    char physical[4096] =
+        "/tmp/gitswitch-ar08-harness-canonical-XXXXXX";
+    char alias[4096];
+    char child[4096];
+    size_t physical_length;
+
+    CHECK(ts_mkdtemp(physical) != NULL);
+    CHECK_EQ_INT(ts_canonicalize_dir_path(physical, sizeof(physical)), 0);
+    physical_length = strlen(physical);
+    CHECK((size_t)snprintf(alias, sizeof(alias), "%s.alias", physical) <
+          sizeof(alias));
+    CHECK_EQ_INT(symlink(physical, alias), 0);
+    CHECK((size_t)snprintf(child, sizeof(child), "%s/child-XXXXXX", alias) <
+          sizeof(child));
+    CHECK(ts_mkdtemp(child) != NULL);
+    CHECK_EQ_INT(ts_canonicalize_dir_path(child, sizeof(child)), 0);
+    CHECK(strncmp(child, physical, physical_length) == 0);
+    CHECK(child[physical_length] == '/');
+    CHECK(strstr(child, ".alias") == NULL);
+
+    ts_rm_rf(child);
+    CHECK_EQ_INT(unlink(alias), 0);
+    ts_rm_rf(physical);
+}
+
 TEST(trusted_fixture_reports_restore_chdir_failure) {
     char home[] = "/tmp/gitswitch-ar08-harness-home-XXXXXX";
     char original_cwd[4096], path[4096];
@@ -187,5 +213,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(tracked_root_replacement_never_traverses_foreign_target);
     RUN_TEST(child_replacement_between_classification_and_descent_is_contained);
     RUN_TEST(normal_cleanup_removes_nested_fixture_without_residue);
+    RUN_TEST(canonical_fixture_path_resolves_parent_alias);
     RUN_TEST(trusted_fixture_reports_restore_chdir_failure);
 TEST_MAIN_END()

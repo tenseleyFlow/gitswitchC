@@ -553,6 +553,7 @@ static int make_home_fixture(char *root, size_t root_size,
 
     if (snprintf(root, root_size, "/tmp/gitswitch-ar07-completion.XXXXXX") < 0 ||
         !ts_mkdtemp(root) ||
+        ts_canonicalize_dir_path(root, root_size) != 0 ||
         path_join(home, home_size, root, "home") != 0 ||
         path_join(runtime, runtime_size, root, "runtime") != 0 ||
         mkdir(home, 0700) != 0 || mkdir(runtime, 0700) != 0 ||

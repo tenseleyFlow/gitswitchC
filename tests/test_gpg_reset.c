@@ -94,7 +94,9 @@ static int failing_gpgconf_runner(const char *const argv[], const run_opts_t *op
 /* Fresh scratch XDG_RUNTIME_DIR; returns 0 on success. */
 static int make_xdg(char *dir, size_t size) {
     snprintf(dir, size, "/tmp/gswgpgrst_XXXXXX");
-    if (!ts_mkdtemp(dir)) return -1;
+    if (!ts_mkdtemp(dir) || ts_canonicalize_dir_path(dir, size) != 0) {
+        return -1;
+    }
     if (chmod(dir, 0700) != 0) return -1;
     setenv("XDG_RUNTIME_DIR", dir, 1);
     return 0;

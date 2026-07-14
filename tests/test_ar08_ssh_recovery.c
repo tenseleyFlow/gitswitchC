@@ -59,7 +59,10 @@ static int make_fixture(ssh_fixture_t *fixture, const char *stem) {
     written = snprintf(fixture->xdg, sizeof(fixture->xdg),
                        "/tmp/%sXXXXXX", stem);
     if (written < 0 || (size_t)written >= sizeof(fixture->xdg) ||
-        !ts_mkdtemp(fixture->xdg) || chmod(fixture->xdg, 0700) != 0 ||
+        !ts_mkdtemp(fixture->xdg) ||
+        ts_canonicalize_dir_path(fixture->xdg,
+                                 sizeof(fixture->xdg)) != 0 ||
+        chmod(fixture->xdg, 0700) != 0 ||
         setenv("XDG_RUNTIME_DIR", fixture->xdg, 1) != 0) {
         return -1;
     }

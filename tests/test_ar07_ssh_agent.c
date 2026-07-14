@@ -416,7 +416,9 @@ static int unavailable_git_runner(const char *const argv[],
 static int make_private_dir(char *path, size_t path_size) {
     if (path_size < sizeof("/tmp/gswar07sshXXXXXX")) return -1;
     snprintf(path, path_size, "/tmp/gswar07sshXXXXXX");
-    if (!ts_mkdtemp(path) || chmod(path, 0700) != 0) return -1;
+    if (!ts_mkdtemp(path) ||
+        ts_canonicalize_dir_path(path, path_size) != 0 ||
+        chmod(path, 0700) != 0) return -1;
     return open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 }
 
