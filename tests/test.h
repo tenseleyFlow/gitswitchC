@@ -629,7 +629,13 @@ static inline int ts_test_finish(void) {
     }                                                                       \
 } while (0)
 
-#define TEST_MAIN_BEGIN() int main(void) {
+/* AR-10: suites sandbox HOME themselves but inherited GNUPGHOME leaked
+ * through, so any operator shell pointing at a gitswitch-managed (possibly
+ * dangling, e.g. post-reboot) GPG home turned source-keyring probes into
+ * false suite failures that CI's bare environment never sees. Tests that
+ * need GNUPGHOME set it explicitly. */
+#define TEST_MAIN_BEGIN() int main(void) {                                   \
+    (void)unsetenv("GNUPGHOME");
 #define TEST_MAIN_END()                                                      \
     return ts_test_finish();                                                 \
 }
