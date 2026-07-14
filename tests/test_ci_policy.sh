@@ -589,6 +589,7 @@ check_policy()
             step_active = 1
             step_use_count = 0
             step_action = ""
+            step_action_comment = ""
             step_with_seen = 0
             step_in_with = 0
             step_with_indent = -1
@@ -628,10 +629,14 @@ check_policy()
             normalized_action = tolower(step_action)
             if (normalized_action ~ /^actions\/checkout@/) {
                 checkout_count++
+                checkout_job_count[current_job]++
                 if (step_persist_count != 1 ||
                     step_persist_value != "false" ||
                     !step_persist_in_with)
                     reject("checkout action must set persist-credentials: false")
+                if (step_action != canonical_checkout_action ||
+                    step_action_comment != canonical_checkout_comment)
+                    reject("checkout action/ref/comment must match canonical v7.0.0 pin")
             }
             if (normalized_action ~ /^cross-platform-actions\/action@/) {
                 if (step_os_count != 1 || !step_os_in_with ||
@@ -762,6 +767,7 @@ check_policy()
                 validate_use(value, comment)
                 step_use_count++
                 step_action = scalar_value
+                step_action_comment = trim(comment)
                 return
             }
             if (key == "with") {
@@ -827,6 +833,8 @@ check_policy()
         BEGIN {
             single_quote = sprintf("%c", 39)
             block_scalar_indent = -1
+            canonical_checkout_action = "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
+            canonical_checkout_comment = "v7.0.0"
         }
         {
             raw = $0
@@ -1087,6 +1095,7 @@ check_policy()
                             (current_indent == 8 && !entry_sequence))) {
                     step_use_count++
                     step_action = scalar_value
+                    step_action_comment = trim(lex_comment)
                 } else reject()
                 next
             }
@@ -1154,6 +1163,11 @@ check_policy()
             require_release_order("macos-artifact", "macos-contract")
             require_release_order("freebsd-test", "freebsd-artifact")
             require_release_order("freebsd-artifact", "freebsd-contract")
+            if (checkout_count != 3 ||
+                checkout_job_count["linux"] != 1 ||
+                checkout_job_count["macos"] != 1 ||
+                checkout_job_count["freebsd"] != 1)
+                reject("each required release job needs exactly one canonical checkout step")
             if (!top_permissions_seen || !jobs_seen || job_count == 0 ||
                 use_count == 0 || external_use_count == 0 ||
                 checkout_count == 0 || freebsd_action_count != 1) exit 1
@@ -1400,6 +1414,28 @@ check_policy "$workflow" "$today"
 # Mutation-sensitive controls make this a policy gate, not a grep that merely
 # happens to accept the current workflow.
 script=$(CDPATH='' cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+# A full, immutable SHA is necessary but not sufficient for the foundational
+# checkout action. All required jobs must use the single reviewed release,
+# including its exact human-auditable version comment.
+awk -v current_ref=9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 \
+    -v old_ref=11bd71901bbe5b1630ceea73d27597364c9af683 '
+    !changed && index($0, "uses: actions/checkout@" current_ref) {
+        line = $0
+        sub("actions/checkout@" current_ref,
+            "actions/checkout@" old_ref, line)
+        sub(/# v7[.]0[.]0/, "# v4.2.2", line)
+        if (line == $0) exit 1
+        print line
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/older-checkout.yml"
+expect_structural_rejected_for "older immutable checkout pin" \
+    "$tmp/older-checkout.yml" "$today" \
+    "checkout action/ref/comment must match canonical v7.0.0 pin"
 
 # The only scalar block sequence in the canonical workflow subset is the
 # direct child list at on.push.branches. Multiple items close cleanly when the
