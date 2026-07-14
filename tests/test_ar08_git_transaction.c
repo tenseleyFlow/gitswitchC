@@ -251,9 +251,120 @@ static int git_replace_vector(const char *scope, const char *key,
 static int g_prelock_writer_calls;
 static pid_t g_locked_writer_pid;
 static int g_locked_writer_first_failed;
+static int g_locked_ctime_drift_calls;
+static int g_locked_ctime_drift_result;
+static int g_locked_retained_link_calls;
+static int g_locked_retained_link_result;
+static int g_locked_content_rewrite_calls;
+static int g_locked_content_rewrite_result;
+static char g_locked_config[MAX_PATH_LEN];
+static char g_locked_hardlink[MAX_PATH_LEN];
 static int g_postpublish_writer_calls;
 static char g_postpublish_config[MAX_PATH_LEN];
 static char g_postpublish_installed[MAX_PATH_LEN];
+
+static void drift_config_ctime_while_restore_lock_is_held(
+    git_scope_t scope) {
+    if (scope != GIT_SCOPE_GLOBAL || g_locked_ctime_drift_calls != 0) return;
+    g_locked_ctime_drift_calls++;
+    g_locked_ctime_drift_result = -1;
+    if (link(g_locked_config, g_locked_hardlink) != 0) return;
+    if (unlink(g_locked_hardlink) != 0) {
+        (void)unlink(g_locked_hardlink);
+        return;
+    }
+    g_locked_ctime_drift_result = 0;
+}
+
+static void retain_config_hardlink_while_restore_lock_is_held(
+    git_scope_t scope) {
+    if (scope != GIT_SCOPE_GLOBAL || g_locked_retained_link_calls != 0) {
+        return;
+    }
+    g_locked_retained_link_calls++;
+    g_locked_retained_link_result = link(g_locked_config,
+                                         g_locked_hardlink);
+}
+
+static int rewrite_unrelated_config_value(void) {
+    static const char before[] = "stable-before";
+    static const char after[] = "stable-after!";
+    struct stat original;
+    struct timespec times[2];
+    char *contents = NULL;
+    char *match;
+    size_t length;
+    size_t offset = 0;
+    int fd = -1;
+    int result = -1;
+    int flags = O_RDWR;
+
+    _Static_assert(sizeof(before) == sizeof(after),
+                   "rewrite fixture values must have equal length");
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    fd = open(g_locked_config, flags);
+    if (fd < 0 || ts_set_cloexec(fd) != 0 || fstat(fd, &original) != 0 ||
+        original.st_size < 0 || (uintmax_t)original.st_size > SIZE_MAX - 1U) {
+        goto cleanup;
+    }
+    length = (size_t)original.st_size;
+    contents = malloc(length + 1U);
+    if (!contents) goto cleanup;
+    while (offset < length) {
+        ssize_t count = pread(fd, contents + offset, length - offset,
+                              (off_t)offset);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) goto cleanup;
+        offset += (size_t)count;
+    }
+    contents[length] = '\0';
+    match = strstr(contents, before);
+    if (!match || strstr(match + sizeof(before) - 1U, before)) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    offset = (size_t)(match - contents);
+    if (pwrite(fd, after, sizeof(after) - 1U, (off_t)offset) !=
+            (ssize_t)(sizeof(after) - 1U) ||
+        fsync(fd) != 0) {
+        goto cleanup;
+    }
+#if defined(__APPLE__)
+    times[0] = original.st_atimespec;
+    times[1] = original.st_mtimespec;
+#else
+    times[0] = original.st_atim;
+    times[1] = original.st_mtim;
+#endif
+    if (futimens(fd, times) != 0 || fsync(fd) != 0) goto cleanup;
+    result = 0;
+
+cleanup:
+    {
+        int saved_errno = errno;
+        free(contents);
+        if (fd >= 0 && close(fd) != 0 && result == 0) {
+            result = -1;
+            saved_errno = errno;
+        }
+        errno = saved_errno;
+    }
+    return result;
+}
+
+static void rewrite_config_content_while_restore_lock_is_held(
+    git_scope_t scope) {
+    if (scope != GIT_SCOPE_GLOBAL || g_locked_content_rewrite_calls != 0) {
+        return;
+    }
+    g_locked_content_rewrite_calls++;
+    g_locked_content_rewrite_result = rewrite_unrelated_config_value();
+}
 
 static void add_name_before_restore_lock(git_scope_t scope) {
     if (scope != GIT_SCOPE_GLOBAL || g_prelock_writer_calls != 0) return;
@@ -827,6 +938,130 @@ TEST(real_git_writer_is_serialized_after_in_lock_ownership_read) {
     CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "before-locked-race\nrace-after-lock\n");
+    fixture_cleanup(&fixture);
+}
+
+TEST(ctime_only_drift_under_restore_lock_keeps_exact_generation_owned) {
+    git_fixture_t fixture;
+    account_t account;
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-ctime-drift"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK(safe_strncpy(g_locked_config, fixture.global_config,
+                       sizeof(g_locked_config)) == 0);
+    CHECK((size_t)snprintf(g_locked_hardlink, sizeof(g_locked_hardlink),
+                           "%s.ctime-drift", fixture.global_config) <
+          sizeof(g_locked_hardlink));
+
+    g_locked_ctime_drift_calls = 0;
+    g_locked_ctime_drift_result = -1;
+    git_ops_test_set_restore_locked_hook(
+        drift_config_ctime_while_restore_lock_is_held);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    git_ops_test_set_restore_locked_hook(NULL);
+    CHECK_EQ_INT(g_locked_ctime_drift_calls, 1);
+    CHECK_EQ_INT(g_locked_ctime_drift_result, 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-ctime-drift\n");
+
+    git_config_commit();
+    fixture_cleanup(&fixture);
+}
+
+TEST(persistent_hardlink_under_restore_lock_invalidates_generation) {
+    git_fixture_t fixture;
+    account_t account;
+    struct stat config_stat;
+    struct stat retained_stat;
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-retained-link"),
+                 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK(safe_strncpy(g_locked_config, fixture.global_config,
+                       sizeof(g_locked_config)) == 0);
+    CHECK((size_t)snprintf(g_locked_hardlink, sizeof(g_locked_hardlink),
+                           "%s.retained-link", fixture.global_config) <
+          sizeof(g_locked_hardlink));
+
+    g_locked_retained_link_calls = 0;
+    g_locked_retained_link_result = -1;
+    git_ops_test_set_restore_locked_hook(
+        retain_config_hardlink_while_restore_lock_is_held);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    git_ops_test_set_restore_locked_hook(NULL);
+    CHECK_EQ_INT(g_locked_retained_link_calls, 1);
+    CHECK_EQ_INT(g_locked_retained_link_result, 0);
+    CHECK(strstr(get_last_error()->message,
+                 "destination generation") != NULL);
+    CHECK_EQ_INT(stat(fixture.global_config, &config_stat), 0);
+    CHECK_EQ_INT(stat(g_locked_hardlink, &retained_stat), 0);
+    CHECK(config_stat.st_dev == retained_stat.st_dev);
+    CHECK(config_stat.st_ino == retained_stat.st_ino);
+    CHECK(config_stat.st_nlink >= 2);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "AR08 Git User\n");
+
+    git_config_commit();
+    CHECK_EQ_INT(unlink(g_locked_hardlink), 0);
+    fixture_cleanup(&fixture);
+}
+
+TEST(same_metadata_content_rewrite_under_restore_lock_is_rejected) {
+    git_fixture_t fixture;
+    account_t account;
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--global", "user.name", "before-content-race"), 0);
+    CHECK_EQ_INT(git_set("--global", "audit.unrelated", "stable-before"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    account = basic_account(&fixture, false);
+    CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK(safe_strncpy(g_locked_config, fixture.global_config,
+                       sizeof(g_locked_config)) == 0);
+
+    g_locked_content_rewrite_calls = 0;
+    g_locked_content_rewrite_result = -1;
+    git_ops_test_set_restore_locked_hook(
+        rewrite_config_content_while_restore_lock_is_held);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    git_ops_test_set_restore_locked_hook(NULL);
+    CHECK_EQ_INT(g_locked_content_rewrite_calls, 1);
+    CHECK_EQ_INT(g_locked_content_rewrite_result, 0);
+    CHECK(strstr(get_last_error()->message, "changed outside") != NULL);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "AR08 Git User\n");
+    CHECK_EQ_INT(git_get_all("--global", "audit.unrelated", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "stable-after!\n");
+
+    git_config_commit();
     fixture_cleanup(&fixture);
 }
 
@@ -1790,6 +2025,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope);
     RUN_TEST(writer_in_old_compare_write_gap_is_rechecked_under_canonical_lock);
     RUN_TEST(real_git_writer_is_serialized_after_in_lock_ownership_read);
+    RUN_TEST(ctime_only_drift_under_restore_lock_keeps_exact_generation_owned);
+    RUN_TEST(persistent_hardlink_under_restore_lock_invalidates_generation);
+    RUN_TEST(same_metadata_content_rewrite_under_restore_lock_is_rejected);
     RUN_TEST(global_xdg_write_target_is_locked_and_restored_exactly);
     RUN_TEST(config_and_parent_symlinks_keep_identity_while_targets_restore);
     RUN_TEST(maximum_git_lock_basename_uses_short_staging_name);
