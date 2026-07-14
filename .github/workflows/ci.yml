@@ -104,8 +104,11 @@ jobs:
       # qa-contract-test below only proves the recipe's failure plumbing via
       # a shim; without this step no actual memory checking ever executed in
       # the pipeline.
+      # AR-10 L36: WERROR=1 matches the release gates above, so the
+      # build-config stamp is identical and Valgrind checks the exact objects
+      # those gates validated instead of forcing a divergent rebuild.
       - name: Memory check (Valgrind, release)
-        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release READLINE=1 memcheck
+        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release READLINE=1 WERROR=1 memcheck
       - name: Source distribution self-check
         run: make distcheck
       - name: Release input consistency and dirty-tree refusal
@@ -121,8 +124,9 @@ jobs:
       # the identity write. It was tracked but executed by nothing; run it here
       # (Linux, which ships ssh-agent) so a regression in the mid-switch signal
       # window is caught in CI.
+      # AR-10 L36: same flag set as the release gates for stamp identity.
       - name: Signal-interruption repro (SIG-01/SIG-02/F4)
-        run: make BUILD_TYPE=release sig-repro-test
+        run: make BUILD_TYPE=release READLINE=1 WERROR=1 sig-repro-test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: openssh
       - name: Clean before the clang release build
@@ -156,7 +160,15 @@ jobs:
           # git: the git_ops perf tests prove availability via a PATH walk
           # and assert no subprocess spawn — they need a real git binary,
           # which the Linux/macOS runners ship but this VM does not.
-          sudo pkg install -y gmake gcc git binutils
+          # AR-10 L35: the shells, gnupg, and readline used to be absent, so
+          # every gpg/shell-integration suite green-skipped on the sole
+          # FreeBSD gate. Provision them and require the capabilities below
+          # (inline export: step-level env maps are forbidden on this job).
+          # ksh stays best-effort: FreeBSD's ksh93 packaging does not reliably
+          # install a binary literally named `ksh`, which is what the suites
+          # resolve.
+          sudo pkg install -y gmake gcc git binutils \
+            bash dash fish gnupg readline zsh
           # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
           # run_argv passes the verified script as /dev/fd/4 and never falls
           # back to its mutable pathname. The minimal CI image does not mount
@@ -172,6 +184,10 @@ jobs:
           "$readelf_tool" -h /bin/sh >/dev/null
           export READELF="$readelf_tool"
           gmake BUILD_TYPE=release WERROR=1
+          # AR-10 L35: provisioned runtimes are mandatory, matching the
+          # Linux/macOS lanes (minus ksh per above; mount-namespace is
+          # Linux-only).
+          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets
           gmake BUILD_TYPE=release WERROR=1 test
           gmake BUILD_TYPE=release WERROR=1 release-artifact-test
           # Compiles and exercises FreeBSD's descriptor-conditioned
