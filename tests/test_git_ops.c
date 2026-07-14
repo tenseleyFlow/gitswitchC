@@ -35,12 +35,16 @@ static struct {
 static int fk_execs;           /* every subprocess the code under test spawned */
 static int fk_identity_reads;  /* `git config <scope> user.name|user.email` reads */
 static bool fk_is_repo;        /* what `git rev-parse --git-dir` reports */
+static const char *fk_repo_root_output;
+static int fk_repo_root_exit;
 
 static void fk_reset(void) {
     memset(fk_store, 0, sizeof(fk_store));
     fk_execs = 0;
     fk_identity_reads = 0;
     fk_is_repo = false;
+    fk_repo_root_output = NULL;
+    fk_repo_root_exit = 1;
 }
 
 static int fk_find(const char *scope, const char *key) {
@@ -100,6 +104,27 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
 
     if (strcmp(argv[0], "git") != 0 || !argv[1]) {
         return fk_ret(result, 1);
+    }
+
+    if (strcmp(argv[1], "rev-parse") == 0 && argv[2] &&
+        strcmp(argv[2], "--show-toplevel") == 0) {
+        size_t length;
+        size_t copied;
+
+        if (fk_repo_root_exit != 0 || !fk_repo_root_output) {
+            return fk_ret(result, fk_repo_root_exit ? fk_repo_root_exit : 1);
+        }
+        length = strlen(fk_repo_root_output);
+        copied = opts && opts->out && opts->out_size > 0
+            ? (length < opts->out_size - 1U ? length : opts->out_size - 1U)
+            : 0;
+        if (copied > 0) memcpy(opts->out, fk_repo_root_output, copied);
+        if (opts && opts->out && opts->out_size > 0) opts->out[copied] = '\0';
+        if (result) {
+            result->out_len = copied;
+            result->out_truncated = copied != length;
+        }
+        return fk_ret(result, 0);
     }
 
     if (strcmp(argv[1], "rev-parse") == 0) {
@@ -264,6 +289,60 @@ TEST(git_is_repository_caches_result) {
     CHECK(git_is_repository());
     CHECK(git_is_repository());
     CHECK_EQ_INT(fk_execs, 1); /* one rev-parse, then served from the cwd cache */
+
+    run_set_runner(prev);
+}
+
+/* ---- M23: repository root is complete, exact, and fail-cleared ---------- */
+
+TEST(git_get_repo_root_requires_complete_exact_output) {
+    char path[64];
+    char tiny[5];
+    char oversized[MAX_PATH_LEN + 64U];
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+
+    fk_repo_root_exit = 0;
+    fk_repo_root_output = "/tmp/project\n";
+    memset(path, 'x', sizeof(path));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), 0);
+    CHECK_STR_EQ(path, "/tmp/project");
+
+    /* Only Git's one line ending is removed; a valid trailing path space is
+     * data and must not be normalized away. */
+    fk_repo_root_output = "/tmp/project \n";
+    memset(path, 'x', sizeof(path));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), 0);
+    CHECK_STR_EQ(path, "/tmp/project ");
+
+    /* A complete result that does not fit the caller is an error and cannot
+     * leave the caller's prior bytes looking usable. */
+    fk_repo_root_output = "/tmp/project\n";
+    memcpy(tiny, "old!", sizeof(tiny));
+    CHECK_EQ_INT(git_get_repo_root(tiny, sizeof(tiny)), -1);
+    CHECK_EQ_INT(tiny[0], '\0');
+
+    fk_repo_root_output = "";
+    memcpy(path, "old", sizeof("old"));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), -1);
+    CHECK_EQ_INT(path[0], '\0');
+
+    fk_repo_root_exit = 1;
+    fk_repo_root_output = NULL;
+    memcpy(path, "old", sizeof("old"));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), -1);
+    CHECK_EQ_INT(path[0], '\0');
+
+    memset(oversized, 'r', sizeof(oversized));
+    oversized[sizeof(oversized) - 2U] = '\n';
+    oversized[sizeof(oversized) - 1U] = '\0';
+    fk_repo_root_exit = 0;
+    fk_repo_root_output = oversized;
+    memcpy(path, "old", sizeof("old"));
+    CHECK_EQ_INT(git_get_repo_root(path, sizeof(path)), -1);
+    CHECK_EQ_INT(path[0], '\0');
 
     run_set_runner(prev);
 }
@@ -822,6 +901,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_configure_ssh_rejects_single_quote_in_keypath);
     RUN_TEST(git_ops_init_spawns_no_subprocess);
     RUN_TEST(git_is_repository_caches_result);
+    RUN_TEST(git_get_repo_root_requires_complete_exact_output);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);

@@ -204,7 +204,9 @@ int git_configure_gpg(const account_t *account, git_scope_t scope);
 bool git_is_repository(void);
 
 /**
- * Get repository root directory
+ * Get the complete repository root directory, stripping only Git's final line
+ * ending. Valid path whitespace is preserved. On failure, path is empty when
+ * path/path_size denote writable storage; incomplete or oversized results fail.
  */
 int git_get_repo_root(char *path, size_t path_size);
 

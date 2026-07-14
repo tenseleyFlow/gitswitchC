@@ -4180,24 +4180,60 @@ bool git_is_repository(void) {
     return is_repo;
 }
 
-/* Get repository root directory */
+/* Get the complete repository root without normalizing valid path bytes. */
 int git_get_repo_root(char *path, size_t path_size) {
     char output[MAX_PATH_LEN];
-    
+    const char *argv[] = {
+        "git", "rev-parse", "--show-toplevel", NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+    size_t length;
+
     if (!path || path_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to git_get_repo_root");
         return -1;
     }
-    
-    if (git_run(output, sizeof(output), "rev-parse", "--show-toplevel",
-                (const char *)NULL) != 0) {
+
+    /* A failed lookup never leaves prior caller storage looking usable. */
+    path[0] = '\0';
+    memset(output, 0, sizeof(output));
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+
+    if (run_argv(argv, &opts, &result) != 0) {
         set_error(ERR_GIT_NOT_REPOSITORY, "Not in a git repository");
         return -1;
     }
-    
-    trim_whitespace(output);
-    safe_strncpy(path, output, path_size);
-    
+
+    if (result.out_truncated || result.out_len >= sizeof(output) ||
+        memchr(output, '\0', result.out_len) != NULL) {
+        set_error(ERR_GIT_REPOSITORY_INVALID,
+                  "Git returned an incomplete repository root");
+        return -1;
+    }
+
+    length = result.out_len;
+    if (length > 0 && output[length - 1U] == '\n') {
+        length--;
+        if (length > 0 && output[length - 1U] == '\r') length--;
+    }
+    if (length == 0) {
+        set_error(ERR_GIT_REPOSITORY_INVALID,
+                  "Git returned an empty repository root");
+        return -1;
+    }
+    if (length >= path_size) {
+        set_error(ERR_GIT_REPOSITORY_INVALID,
+                  "Repository root does not fit the destination buffer");
+        return -1;
+    }
+
+    memcpy(path, output, length);
+    path[length] = '\0';
     return 0;
 }
 
