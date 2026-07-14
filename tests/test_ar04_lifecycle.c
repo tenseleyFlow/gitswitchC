@@ -42,10 +42,22 @@ static int resolve_binary_and_self(const char *argv0) {
 }
 
 static int make_temp_dir(char *buf, size_t size) {
+    char canonical[PATH_MAX];
+    size_t length;
+
     if (snprintf(buf, size, "/tmp/gitswitch-ar04-life-XXXXXX") < 0 ||
         !ts_mkdtemp(buf)) {
         return -1;
     }
+
+    /* Darwin exposes /tmp through the /private/tmp filesystem alias.  Keep
+     * fixture paths in the same physical namespace used by the production
+     * runtime safety walk so socket ownership and symlink targets compare
+     * consistently across platforms. */
+    if (!realpath(buf, canonical)) return -1;
+    length = strlen(canonical);
+    if (length >= size) return -1;
+    memcpy(buf, canonical, length + 1U);
     return 0;
 }
 
