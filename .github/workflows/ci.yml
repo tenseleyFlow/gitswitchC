@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [trunk]
+    branches:
+      - trunk
   pull_request:
 
 # Every job is read-only. Individual jobs may narrow this further, but no
