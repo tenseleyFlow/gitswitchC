@@ -21,7 +21,8 @@ enum {
     HINT_TEST_BEFORE_OPEN = 1,
     HINT_TEST_BEFORE_FINAL_REVALIDATE,
     HINT_TEST_BEFORE_SNAPSHOT_OPEN,
-    HINT_TEST_BEFORE_SNAPSHOT_FINAL_REVALIDATE
+    HINT_TEST_BEFORE_SNAPSHOT_FINAL_REVALIDATE,
+    HINT_TEST_BEFORE_RESTORE_RENAME
 };
 
 enum {
@@ -29,7 +30,8 @@ enum {
     INJECT_REPLACE_REGULAR,
     INJECT_GROW_ACTIVE,
     INJECT_GROW_SNAPSHOT,
-    INJECT_REWRITE_SAME_SIZE
+    INJECT_REWRITE_SAME_SIZE,
+    INJECT_PAUSE_RESTORE
 };
 
 static char g_root[PATH_MAX];
@@ -39,6 +41,9 @@ static char g_saved[PATH_MAX];
 static int g_inject_stage;
 static int g_inject_action;
 static int g_hook_error;
+static int g_pause_ready_fd = -1;
+static int g_pause_resume_fd = -1;
+static int g_io_rewrite_error;
 
 static int append_bytes(const char *path, size_t length) {
     char bytes[512];
@@ -93,24 +98,27 @@ static size_t read_private(const char *path, char *text, size_t size) {
     return total;
 }
 
-static int rewrite_same_inode_and_size(const char *path) {
-    static const char replacement[] = "gpg\nactive=next\n";
+static int rewrite_same_inode_and_size(const char *path,
+                                       const char *replacement) {
     const struct timespec forced_times[2] = {{1, 0}, {1, 0}};
     struct stat before;
     struct stat after;
+    size_t replacement_length;
     size_t total = 0;
     int fd;
     int result = 0;
 
+    if (!replacement) return -1;
+    replacement_length = strlen(replacement);
     if (lstat(path, &before) != 0 ||
-        before.st_size != (off_t)(sizeof(replacement) - 1)) {
+        before.st_size != (off_t)replacement_length) {
         return -1;
     }
     fd = open(path, O_WRONLY | O_CLOEXEC);
     if (fd < 0) return -1;
-    while (total < sizeof(replacement) - 1) {
+    while (total < replacement_length) {
         ssize_t written = write(fd, replacement + total,
-                                sizeof(replacement) - 1 - total);
+                                replacement_length - total);
         if (written > 0) total += (size_t)written;
         else if (written < 0 && errno == EINTR) continue;
         else { close(fd); return -1; }
@@ -125,6 +133,27 @@ static int rewrite_same_inode_and_size(const char *path) {
         return -1;
     }
     return 0;
+}
+
+static int transfer_byte(int fd, bool write_byte) {
+    unsigned char byte = 1;
+
+    for (;;) {
+        ssize_t result = write_byte ? write(fd, &byte, 1) : read(fd, &byte, 1);
+        if (result == 1) return 0;
+        if (result < 0 && errno == EINTR) continue;
+        return -1;
+    }
+}
+
+static bool rewrite_state_during_directory_sync(
+    config_io_boundary_t boundary) {
+    if (boundary != CONFIG_IO_STATE_BEFORE_DIR_SYNC) return false;
+    if (rewrite_same_inode_and_size(g_hint,
+                                    "none\nactive=later\n") != 0) {
+        g_io_rewrite_error = errno ? errno : EIO;
+    }
+    return false;
 }
 
 static void replace_hint_at_checkpoint(int stage) {
@@ -147,7 +176,16 @@ static void replace_hint_at_checkpoint(int stage) {
     }
 
     if (g_inject_action == INJECT_REWRITE_SAME_SIZE) {
-        if (rewrite_same_inode_and_size(g_hint) != 0) {
+        if (rewrite_same_inode_and_size(g_hint,
+                                        "gpg\nactive=next\n") != 0) {
+            g_hook_error = errno ? errno : EIO;
+        }
+        return;
+    }
+
+    if (g_inject_action == INJECT_PAUSE_RESTORE) {
+        if (transfer_byte(g_pause_ready_fd, true) != 0 ||
+            transfer_byte(g_pause_resume_fd, false) != 0) {
             g_hook_error = errno ? errno : EIO;
         }
         return;
@@ -349,6 +387,153 @@ TEST(guarded_snapshot_restores_unchanged_post_image_exactly) {
     config_resume_hint_snapshot_clear(&saved);
 }
 
+TEST(guarded_save_does_not_adopt_an_in_place_rewrite) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+
+    g_io_rewrite_error = 0;
+    config_set_io_fault_fn(rewrite_state_during_directory_sync);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), -1);
+    config_set_io_fault_fn(NULL);
+    CHECK(installed);
+    CHECK_EQ_INT(g_io_rewrite_error, 0);
+    CHECK(strstr(get_last_error()->message,
+                 "changed during durability commit") != NULL);
+
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
+    CHECK(strstr(get_last_error()->message, "rollback conflict") != NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=later\n");
+    config_resume_hint_snapshot_clear(&saved);
+}
+
+TEST(public_restore_serializes_its_final_compare_and_rename) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n"
+        "[accounts.2]\n"
+        "name=\"bob\"\n"
+        "email=\"bob@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    int ready[2] = {-1, -1};
+    int resume[2] = {-1, -1};
+    int child_status;
+    pid_t child;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+    if (pipe(ready) != 0) {
+        CHECK_EQ_INT(-1, 0);
+        config_resume_hint_snapshot_clear(&saved);
+        return;
+    }
+    if (pipe(resume) != 0) {
+        CHECK_EQ_INT(-1, 0);
+        close(ready[0]);
+        close(ready[1]);
+        config_resume_hint_snapshot_clear(&saved);
+        return;
+    }
+
+    child = fork();
+    if (child < 0) {
+        CHECK(child >= 0);
+        close(ready[0]);
+        close(ready[1]);
+        close(resume[0]);
+        close(resume[1]);
+        config_resume_hint_snapshot_clear(&saved);
+        return;
+    }
+    if (child == 0) {
+        int save_result;
+        int save_errno;
+
+        close(ready[1]);
+        close(resume[0]);
+        if (transfer_byte(ready[0], false) != 0) _exit(30);
+        snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+                 "%s", "bob");
+        clear_error();
+        save_result = config_save_active_account(&ctx, config_path);
+        save_errno = errno;
+        if (transfer_byte(resume[1], true) != 0) _exit(31);
+        close(ready[0]);
+        close(resume[1]);
+        if (save_result != -1) _exit(32);
+        if (save_errno != EWOULDBLOCK
+#if EAGAIN != EWOULDBLOCK
+            && save_errno != EAGAIN
+#endif
+        ) {
+            _exit(33);
+        }
+        _exit(0);
+    }
+
+    close(ready[0]);
+    close(resume[1]);
+    g_pause_ready_fd = ready[1];
+    g_pause_resume_fd = resume[0];
+    g_inject_stage = HINT_TEST_BEFORE_RESTORE_RENAME;
+    g_inject_action = INJECT_PAUSE_RESTORE;
+    g_hook_error = 0;
+    (void)gitswitch_test_set_resume_hint_hook(replace_hint_at_checkpoint);
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    (void)gitswitch_test_set_resume_hint_hook(NULL);
+    close(ready[1]);
+    close(resume[0]);
+    g_pause_ready_fd = -1;
+    g_pause_resume_fd = -1;
+    child_status = wait_bounded(child, 1500L);
+    CHECK_EQ_INT(g_hook_error, 0);
+    CHECK_EQ_INT(child_status, 0);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    config_resume_hint_snapshot_clear(&saved);
+}
+
 TEST(guarded_noop_save_does_not_claim_a_state_generation) {
     static const char config_body[] =
         "[settings]\n"
@@ -394,6 +579,8 @@ int main(void) {
     RUN_TEST(testing_object_retains_legacy_fault_seam_before_installation);
     RUN_TEST(unbound_snapshot_cannot_overwrite_a_later_state);
     RUN_TEST(guarded_snapshot_restores_unchanged_post_image_exactly);
+    RUN_TEST(guarded_save_does_not_adopt_an_in_place_rewrite);
+    RUN_TEST(public_restore_serializes_its_final_compare_and_rename);
     RUN_TEST(guarded_noop_save_does_not_claim_a_state_generation);
 
     ts_rm_rf(g_root);

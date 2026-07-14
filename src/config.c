@@ -1801,6 +1801,7 @@ static int config_resume_hint_snapshot_restore_at(
     if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
         goto restore_fail;
     }
+    RESUME_HINT_TEST_CHECKPOINT(5);
     if (rename(temp, hint) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install restored resume hint: %s", hint);
@@ -1874,11 +1875,19 @@ restore_fail:
 int config_resume_hint_snapshot_restore(
     const config_resume_hint_snapshot_t *snapshot) {
     char config_path[MAX_PATH_LEN];
+    int write_lock_fd;
+    int result;
 
     if (config_get_path(config_path, sizeof(config_path)) != 0) {
         return -1;
     }
-    return config_resume_hint_snapshot_restore_at(config_path, snapshot);
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
+        return -1;
+    }
+    result = config_resume_hint_snapshot_restore_at(config_path, snapshot);
+    config_write_unlock(write_lock_fd);
+    return result;
 }
 
 /* Atomically replace the consolidated active-state artifact. Its first line
@@ -2170,12 +2179,13 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     if (rollback_snapshot) {
         if (lstat(hint, &after) != 0 ||
             !config_metadata_file_is_safe(&after, true) ||
-            !config_metadata_same_file(&temp_identity, &after)) {
+            !config_metadata_snapshot_same(&rollback_snapshot->post_image,
+                                           &after)) {
             set_error(ERR_FILE_IO,
-                      "Cannot bind durable resume-hint generation: %s", hint);
+                      "Installed resume-hint generation changed during durability commit: %s",
+                      hint);
             return -1;
         }
-        rollback_snapshot->post_image = after;
     }
     return 0;
 
