@@ -52,6 +52,29 @@
 #error "GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS must be positive"
 #endif
 
+/* AR-10 M2: main() opens its working descriptors immediately, so when the
+ * caller execs this helper with any of fds 0/1/2 closed, the directory,
+ * staging, and published descriptors land in the standard slots. Every later
+ * fprintf(stderr, ...) then writes into whichever file owns fd 2 — on the
+ * named-temp fallback path the post-publication retire WARNING landed on the
+ * staging inode, a hard link to the just-published archive, appending the
+ * diagnostic INTO the published artifact after fsync while still exiting 0.
+ * Pin the standard slots to /dev/null before any other open. Deliberately no
+ * O_CLOEXEC: the producer child must inherit real descriptors too. */
+static int reserve_standard_descriptors(void)
+{
+    for (;;) {
+        int fd = open("/dev/null", O_RDWR);
+        if (fd < 0) {
+            return -1;
+        }
+        if (fd > STDERR_FILENO) {
+            (void)close(fd);
+            return 0;
+        }
+    }
+}
+
 static void usage(const char *program)
 {
     fprintf(stderr,
@@ -922,6 +945,12 @@ int main(int argc, char **argv)
     struct stat existing;
     struct stat output_stat;
     int result = EXIT_FAILURE;
+
+    /* Must precede every other descriptor acquisition; see the helper. On
+     * failure there is no guaranteed-safe stderr to report on. */
+    if (reserve_standard_descriptors() != 0) {
+        return EXIT_FAILURE;
+    }
 
     if (argc < 6 || strcmp(argv[4], "--") != 0) {
         usage(argv[0]);
