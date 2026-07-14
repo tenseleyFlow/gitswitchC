@@ -867,7 +867,14 @@ TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
     previous_reap = ssh_manager_set_reap_fn(classify_agent_gone);
     previous_dirsync = ssh_manager_set_dirsync_fn(stop_counting_dirsync);
     CHECK_EQ_INT(ssh_stop_agent(&cfg), -1);
-    CHECK_EQ_INT(g_stop_dirsync_calls, 1);
+    /* Descriptor pins need only the failed socket-removal sync.  Darwin's
+     * fallback socket pin is a private hard-link anchor, whose retirement
+     * adds a required directory sync while preserving the primary failure. */
+    CHECK(g_stop_dirsync_calls >= 1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+    CHECK(strstr(get_last_error()->message,
+                 "stopped agent socket cleanup") != NULL);
     CHECK(cfg.agent_owned);
     CHECK_EQ_INT(cfg.agent_pid, 12345);
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
