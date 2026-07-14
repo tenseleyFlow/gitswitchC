@@ -892,6 +892,31 @@ check_manifest_contract()
         fail "fully closed-descriptor publication corrupted the published artifact"
     rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
 
+    # AR-10 L30: the producer's own process group is the helper's lifetime
+    # boundary, but it also removes the producer from the terminal foreground
+    # group — a SIGTERM/SIGINT to the helper used to kill only the helper and
+    # abandon the still-running producer group (which then wrote the marker).
+    # The forwarding handler must take the group down with the helper.
+    orphan_marker=$tmp/orphan.marker
+    rm -f "$orphan_marker"
+    # The spawned producer, not this parent shell, expands the marker.
+    # shellcheck disable=SC2016
+    AR10_ORPHAN_MARKER=$orphan_marker \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" archive.tar.gz \
+        -- /bin/sh -c 'printf partial; sleep 3; : >"$AR10_ORPHAN_MARKER"' \
+        >"$out" 2>&1 &
+    orphan_publisher=$!
+    sleep 1
+    kill -TERM "$orphan_publisher" 2>/dev/null || :
+    orphan_status=0
+    wait "$orphan_publisher" 2>/dev/null || orphan_status=$?
+    [ "$orphan_status" -ge 128 ] ||
+        fail "signalled publisher did not die by its forwarded signal"
+    sleep 3
+    [ ! -e "$orphan_marker" ] ||
+        fail "signalled publisher abandoned its producer process group"
+    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+
     # The direct producer may exit while a background descendant still owns
     # its stdout. Success is not complete until that inherited stream reaches
     # EOF: otherwise the helper can publish and return while the descendant is

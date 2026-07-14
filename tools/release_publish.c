@@ -435,6 +435,54 @@ static int copy_producer_stream(int input_fd, int output_fd,
     }
 }
 
+/* AR-10 L30: the producer runs in its own process group as the helper's
+ * lifetime boundary — which also removes it from the terminal's foreground
+ * group, so a Ctrl-C (or any SIGINT/SIGTERM/SIGHUP delivered to the helper)
+ * used to kill only the helper and abandon the still-running producer group.
+ * The handler makes the boundary hold: kill the group, then die by the same
+ * signal with default disposition so the caller observes a truthful
+ * signal-death status. kill/signal/raise are all async-signal-safe. */
+static volatile pid_t fatal_signal_producer = 0;
+
+static void forward_fatal_signal(int signal_number)
+{
+    pid_t child = fatal_signal_producer;
+
+    if (child > 0) {
+        (void)kill(-child, SIGKILL);
+        (void)kill(child, SIGKILL);
+    }
+    (void)signal(signal_number, SIG_DFL);
+    (void)raise(signal_number);
+}
+
+/* Preserve an inherited SIG_IGN (nohup semantics); otherwise forward. */
+static int install_fatal_signal_forwarding(void)
+{
+    static const int fatal_signals[] = { SIGINT, SIGTERM, SIGHUP };
+    size_t index;
+
+    for (index = 0;
+         index < sizeof(fatal_signals) / sizeof(fatal_signals[0]); index++) {
+        struct sigaction current;
+        struct sigaction forwarding;
+
+        if (sigaction(fatal_signals[index], NULL, &current) != 0) {
+            return -1;
+        }
+        if (current.sa_handler == SIG_IGN) {
+            continue;
+        }
+        memset(&forwarding, 0, sizeof(forwarding));
+        forwarding.sa_handler = forward_fatal_signal;
+        if (sigemptyset(&forwarding.sa_mask) != 0 ||
+            sigaction(fatal_signals[index], &forwarding, NULL) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int wait_for_producer(pid_t child, int64_t deadline, int *status)
 {
     for (;;) {
@@ -487,6 +535,7 @@ static void terminate_producer(pid_t child)
     do {
         waited = waitpid(child, &status, 0);
     } while (waited < 0 && errno == EINTR);
+    fatal_signal_producer = 0;
     errno = saved_errno;
 }
 
@@ -537,6 +586,9 @@ static int run_to_descriptor(int output_fd, char *const command[])
         execvp(command[0], command);
         _exit(errno == ENOENT ? 127 : 126);
     }
+    /* Publish the producer to the fatal-signal forwarder before anything in
+     * this parent can fail or block. */
+    fatal_signal_producer = child;
     (void)close(pipe_fds[1]);
     /* Close the fork/setpgid race from the parent side as well. EACCES/ESRCH
      * only mean the child already crossed that boundary or exited; the child
@@ -585,6 +637,9 @@ static int run_to_descriptor(int output_fd, char *const command[])
         terminate_producer(child);
         return -1;
     }
+    /* Reaped: the group may still hold inherited-descriptor descendants, but
+     * the direct producer pid is no longer this process's to kill. */
+    fatal_signal_producer = 0;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         if (WIFEXITED(status)) {
             fprintf(stderr, "ERROR: archive command exited with status %d\n",
@@ -949,6 +1004,11 @@ int main(int argc, char **argv)
     /* Must precede every other descriptor acquisition; see the helper. On
      * failure there is no guaranteed-safe stderr to report on. */
     if (reserve_standard_descriptors() != 0) {
+        return EXIT_FAILURE;
+    }
+    if (install_fatal_signal_forwarding() != 0) {
+        fprintf(stderr, "ERROR: cannot install signal forwarding: %s\n",
+                strerror(errno));
         return EXIT_FAILURE;
     }
 
