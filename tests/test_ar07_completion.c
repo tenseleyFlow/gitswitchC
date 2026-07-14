@@ -752,6 +752,64 @@ TEST(bash_completion_executes_getopt_style_operand_state) {
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n<>\n");
 }
 
+TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
+    const char *bash = find_shell("bash");
+    char root[PATH_MAX], stub[PATH_MAX], script[16384], output[16384];
+    const char *stub_source =
+        "#!/bin/sh\n"
+        "[ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
+        "[ \"$2\" = list ] || exit 64\n"
+        "cat <<'NAMES'\n"
+        "Café One\n"
+        "Café Two\n"
+        "Quote'Name\n"
+        "Double\"Name\n"
+        "Back\\Slash\n"
+        "Paren (Work)\n"
+        "NAMES\n";
+    int written;
+
+    CHECK(bash != NULL);
+    if (!bash) return;
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar09-bash-completion.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(stub, sizeof(stub), root, "gitswitch"), 0);
+    CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
+    written = snprintf(
+        script, sizeof(script),
+        "export LC_ALL=C; PATH='%s':$PATH; "
+        "_init_completion(){ return 1; }; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
+        "dump(){ printf '<%%s>\\n' \"${COMPREPLY[@]}\"; }; "
+        "probe(){ COMPREPLY=(); _gitswitch_complete_accounts \"$1\"; dump; }; "
+        "probe ''; printf '%%s\\n' ALL-END; "
+        "probe 'Café\\ '; printf '%%s\\n' UTF8-END; "
+        "probe \"Quote\\'N\"; printf '%%s\\n' QUOTE-END; "
+        "probe 'Double\\\"N'; printf '%%s\\n' DOUBLE-END; "
+        "probe 'Back\\\\S'; printf '%%s\\n' BACKSLASH-END; "
+        "probe 'Paren\\ \\(W'; printf '%%s\\n' PAREN-END",
+        root);
+    CHECK(written >= 0 && (size_t)written < sizeof(script));
+    if (written < 0 || (size_t)written >= sizeof(script)) return;
+
+    CHECK_EQ_INT(run_script(bash, false, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(
+        output,
+        "<Café\\ One>\n"
+        "<Café\\ Two>\n"
+        "<Quote\\'Name>\n"
+        "<Double\\\"Name>\n"
+        "<Back\\\\Slash>\n"
+        "<Paren\\ \\(Work\\)>\n"
+        "ALL-END\n"
+        "<Café\\ One>\n<Café\\ Two>\nUTF8-END\n"
+        "<Quote\\'Name>\nQUOTE-END\n"
+        "<Double\\\"Name>\nDOUBLE-END\n"
+        "<Back\\\\Slash>\nBACKSLASH-END\n"
+        "<Paren\\ \\(Work\\)>\nPAREN-END\n");
+}
+
 TEST(zsh_completion_executes_runtime_expansion_and_state_scanner) {
     const char *zsh = find_shell("zsh");
     char output[16384];
@@ -1106,6 +1164,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(completion_source_reader_covers_the_legacy_boundary);
     RUN_TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden);
     RUN_TEST(bash_completion_executes_getopt_style_operand_state);
+    RUN_TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale);
     RUN_TEST(zsh_completion_executes_runtime_expansion_and_state_scanner);
     RUN_TEST(zsh_completion_queries_accounts_only_for_account_operands);
     RUN_TEST(fish_completion_executes_getopt_style_operand_state);
