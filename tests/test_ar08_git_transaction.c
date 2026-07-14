@@ -387,10 +387,11 @@ static void replace_config_after_rollback_publish(git_scope_t scope) {
 }
 
 /* The child proves a real `git config` writer cannot enter after the in-lock
- * ownership read. Its first attempt must fail on the canonical lock; it then
- * retries until the rollback publishes, at which point its later value is
- * serialized after (and never deleted by) the transaction. */
-static void retry_name_while_restore_lock_is_held(git_scope_t scope) {
+ * ownership read. It exits after that required failure so it cannot race the
+ * rollback's post-publication generation adoption. The parent issues the
+ * later write only after restore returns, proving it is serialized after (and
+ * never deleted by) the transaction. */
+static void attempt_name_while_restore_lock_is_held(git_scope_t scope) {
     int ready[2];
     char outcome = '0';
 
@@ -401,7 +402,6 @@ static void retry_name_while_restore_lock_is_held(git_scope_t scope) {
     }
     g_locked_writer_pid = fork();
     if (g_locked_writer_pid == 0) {
-        struct timespec pause = {0, 1000000};
         int first_rc;
         ssize_t written;
         close(ready[0]);
@@ -413,13 +413,7 @@ static void retry_name_while_restore_lock_is_held(git_scope_t scope) {
         if (written != 1) _exit(43);
         close(ready[1]);
         if (first_rc == 0) _exit(41);
-        for (int attempt = 0; attempt < 5000; attempt++) {
-            if (git_add("--global", "user.name", "race-after-lock") == 0) {
-                _exit(0);
-            }
-            (void)nanosleep(&pause, NULL);
-        }
-        _exit(42);
+        _exit(0);
     }
     close(ready[1]);
     if (g_locked_writer_pid < 0 || read(ready[0], &outcome, 1) != 1) {
@@ -925,7 +919,7 @@ TEST(real_git_writer_is_serialized_after_in_lock_ownership_read) {
     g_locked_writer_pid = 0;
     g_locked_writer_first_failed = 0;
     git_ops_test_set_restore_locked_hook(
-        retry_name_while_restore_lock_is_held);
+        attempt_name_while_restore_lock_is_held);
     CHECK_EQ_INT(git_config_restore(), 0);
     git_ops_test_set_restore_locked_hook(NULL);
     CHECK(g_locked_writer_pid > 0);
@@ -935,6 +929,7 @@ TEST(real_git_writer_is_serialized_after_in_lock_ownership_read) {
         if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
     }
     CHECK_EQ_INT(g_locked_writer_first_failed, 1);
+    CHECK_EQ_INT(git_add("--global", "user.name", "race-after-lock"), 0);
     CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "before-locked-race\nrace-after-lock\n");
