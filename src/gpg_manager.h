@@ -190,8 +190,11 @@ int gpg_set_environment(gpg_config_t *gpg_config);
 bool gpg_manager_runtime_restore_pending(const gpg_config_t *gpg_config);
 
 /** Strict parser used by the switch and exposed for mutation-sensitive colon
- * record tests. Resolves exactly one usable primary secret key, writes its
- * canonical fingerprint, and optionally requires a usable signing record. */
+ * record tests. Accepts GnuPG's fixed colon-format secret records, including
+ * the documented pre-2.1 form whose validity field is empty, while requiring
+ * independent expiry, capability, and secret-material evidence. Resolves
+ * exactly one usable primary secret key, writes its canonical fingerprint,
+ * and optionally requires a usable signing record. */
 int gpg_manager_resolve_secret_key_listing(const char *listing,
                                            bool require_signing,
                                            char *fingerprint,

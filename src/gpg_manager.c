@@ -3670,8 +3670,16 @@ static bool gpg_record_is_currently_usable(const char *line, size_t line_len) {
     size_t field_len;
     time_t now = time(NULL);
 
-    if (!gpg_colon_field(line, line_len, 1, &field, &field_len) ||
-        field_len == 0 || strchr("redin?", field[0]) != NULL) {
+    if (!gpg_colon_field(line, line_len, 1, &field, &field_len)) {
+        return false;
+    }
+    /* GnuPG's stable colon-format contract explicitly leaves field 2 empty
+     * for secret-key listings before 2.1. Empty therefore means that this
+     * particular validity signal is unavailable, not that the key is
+     * unusable. Explicit failure codes still fail closed, while expiry,
+     * disabled capability, and secret-material availability are validated
+     * independently below and by the caller. */
+    if (field_len > 0 && strchr("redin?", field[0]) != NULL) {
         return false;
     }
     if (gpg_colon_field(line, line_len, 6, &field, &field_len) &&
