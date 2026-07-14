@@ -2736,6 +2736,30 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         goto remove_done;
     }
     
+    /* AR-10 M1: a prior switch to this account published durable credential
+     * legs (core.sshCommand with IdentitiesOnly=yes, user.signingkey /
+     * commit.gpgsign / gpg.format) that git_ops documents as authoritative
+     * for every fetch/push and commit. Runtime teardown alone leaves them
+     * selecting the retired identity: pushes keep authenticating with the
+     * removed account's key and signing config outlives it. Scrub exactly
+     * the legs still attributable to this account. Best-effort: the durable
+     * removal must stay committable, so a failed unset warns loudly instead
+     * of aborting — the residue stays visible in `status`. */
+    {
+        size_t identity_cleared = 0;
+        if (git_retire_account_identity(account, &identity_cleared) != 0) {
+            fprintf(stderr,
+                    "gitswitch: WARNING: durable Git configuration may still "
+                    "select removed account '%s': %s\n",
+                    account_name, get_last_error()->message);
+        }
+        if (identity_cleared > 0) {
+            printf("Cleared %zu durable Git identity setting(s) that "
+                   "selected '%s'.\n",
+                   identity_cleared, account_name);
+        }
+    }
+
     /* Only a complete teardown permits deleting the configuration handle. */
     if (config_remove_account(ctx, account_id) != 0) {
         goto remove_done;
@@ -2914,35 +2938,11 @@ static int print_git_status_read_failure(void) {
  * selected key. */
 static bool status_signing_key_matches(const account_t *account,
                                        const git_current_config_t *git_config) {
-    const char *selector;
-    const char *configured;
-    size_t selector_len;
-    size_t configured_len;
-    size_t i;
-    bool expected;
-
     if (!account || !git_config) return false;
-    expected = account->gpg_enabled && account->gpg_key_id[0] != '\0';
-    configured = git_config->signing_key;
-    if (!expected) return configured[0] == '\0';
-
-    selector = account->gpg_key_id;
-    if (selector[0] == '0' &&
-        (selector[1] == 'x' || selector[1] == 'X')) {
-        selector += 2;
+    if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') {
+        return git_config->signing_key[0] == '\0';
     }
-    selector_len = strlen(selector);
-    configured_len = strlen(configured);
-    if (selector_len == 0 ||
-        (configured_len != 40 && configured_len != 64) ||
-        selector_len > configured_len) {
-        return false;
-    }
-    for (i = 0; i < configured_len; i++) {
-        if (!isxdigit((unsigned char)configured[i])) return false;
-    }
-    return strncasecmp(configured + configured_len - selector_len,
-                       selector, selector_len) == 0;
+    return git_signing_key_selects_account(account, git_config->signing_key);
 }
 
 /* Show current account status */
@@ -3198,6 +3198,33 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             printf("  Scope: %s\n",
                    git_config_origin_scope_to_string(
                        git_config->effective_name_scope));
+            /* AR-10 M1: the credential legs stay authoritative for fetch/push
+             * and signing even with no active account. Render them here so
+             * residue from a removed/reset account cannot hide in exactly the
+             * state that retirement produces. */
+            printf("  Effective SSH Command: %s",
+                   git_config->ssh_command.present ? "[SET]" : "[ABSENT]");
+            print_git_value_origin(&git_config->ssh_command);
+            printf("\n");
+            printf("  GPG Signing Key: ");
+            if (git_config->signing_key[0] != '\0') {
+                print_terminal_safe(git_config->signing_key);
+            } else {
+                printf("[ABSENT]");
+            }
+            printf("\n");
+            printf("  GPG Signing Enabled: %s\n",
+                   git_config->gpg_signing_enabled ? "[YES]" : "[NO]");
+            printf("  Effective GPG Program: %s",
+                   git_config->gpg_program.present ? "[SET]" : "[ABSENT]");
+            print_git_value_origin(&git_config->gpg_program);
+            printf("\n");
+            if (git_config->ssh_command.present ||
+                git_config->signing_key[0] != '\0' ||
+                git_config->gpg_signing_enabled) {
+                printf("  [WARN] Durable Git credential configuration is set "
+                       "while no account is active.\n");
+            }
         } else {
             if (print_git_status_read_failure() != 0) status_result = -1;
         }

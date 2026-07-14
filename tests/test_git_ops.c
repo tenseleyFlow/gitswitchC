@@ -1069,6 +1069,169 @@ TEST(snapshot_preserves_surrounding_whitespace) {
     if (in >= 0) CHECK_STR_EQ(f58_set_val[in], "  spaced  name  ");
 }
 
+/* ---- AR-10 M1: durable-identity retirement on remove/reset -------------- */
+
+#define RETIRE_FPR "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333"
+#define RETIRE_FOREIGN_FPR "9999888877776666555544443333222211110000"
+
+static void retire_fill_account(account_t *acct, const char *ssh_key_path) {
+    memset(acct, 0, sizeof(*acct));
+    acct->id = 1;
+    safe_strncpy(acct->name, "retired", sizeof(acct->name));
+    safe_strncpy(acct->email, "retired@example.com", sizeof(acct->email));
+    acct->gpg_enabled = true;
+    acct->gpg_signing_enabled = true;
+    /* The saved selector is the short suffix form; the switch published the
+     * canonical fingerprint — the retire comparison must bridge the two. */
+    safe_strncpy(acct->gpg_key_id, RETIRE_FPR + 24, sizeof(acct->gpg_key_id));
+    if (ssh_key_path) {
+        acct->ssh_enabled = true;
+        safe_strncpy(acct->ssh_key_path, ssh_key_path,
+                     sizeof(acct->ssh_key_path));
+    }
+}
+
+static void fk_seed(const char *scope, const char *key, const char *value) {
+    int i;
+    for (i = 0; i < FK_MAX && fk_store[i].used; i++) {}
+    if (i == FK_MAX) return;
+    snprintf(fk_store[i].scope, sizeof(fk_store[i].scope), "%s", scope);
+    snprintf(fk_store[i].key, sizeof(fk_store[i].key), "%s", key);
+    snprintf(fk_store[i].value, sizeof(fk_store[i].value), "%s", value);
+    fk_store[i].used = true;
+}
+
+TEST(retire_clears_signing_legs_that_select_the_account) {
+    account_t acct;
+    size_t cleared = 0;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    retire_fill_account(&acct, NULL);
+    fk_seed("--global", "user.name", "Retired User");
+    fk_seed("--global", "user.email", "retired@example.com");
+    fk_seed("--global", "user.signingkey", RETIRE_FPR);
+    fk_seed("--global", "commit.gpgsign", "true");
+    fk_seed("--global", "gpg.format", "openpgp");
+    /* A foreign SSH command must survive: the account is not SSH-enabled, so
+     * nothing attributes it. */
+    fk_seed("--global", "core.sshcommand", "ssh -i /someone/elses/key");
+
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    int rc = git_retire_account_identity(&acct, &cleared);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT((int)cleared, 3);
+    CHECK(fk_find("--global", "user.signingkey") < 0);
+    CHECK(fk_find("--global", "commit.gpgsign") < 0);
+    CHECK(fk_find("--global", "gpg.format") < 0);
+    /* Plain identity and unattributed credentials are left untouched. */
+    CHECK(fk_find("--global", "user.name") >= 0);
+    CHECK(fk_find("--global", "user.email") >= 0);
+    CHECK(fk_find("--global", "core.sshcommand") >= 0);
+}
+
+TEST(retire_leaves_foreign_signing_key_in_place) {
+    account_t acct;
+    size_t cleared = 99;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    retire_fill_account(&acct, NULL);
+    fk_seed("--global", "user.signingkey", RETIRE_FOREIGN_FPR);
+    fk_seed("--global", "commit.gpgsign", "true");
+
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    int rc = git_retire_account_identity(&acct, &cleared);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT((int)cleared, 0);
+    CHECK(fk_find("--global", "user.signingkey") >= 0);
+    CHECK(fk_find("--global", "commit.gpgsign") >= 0);
+}
+
+TEST(retire_clears_exactly_matching_ssh_command) {
+    char dir[64];
+    char key_path[512];
+    char expected[GIT_CONFIG_VALUE_MAX];
+    account_t acct;
+    size_t cleared = 0;
+
+    snprintf(dir, sizeof(dir), "/tmp/gsw_retire_XXXXXX");
+    CHECK(ts_mkdtemp(dir) != NULL);
+    snprintf(key_path, sizeof(key_path), "%s/id_ed25519", dir);
+    CHECK(fk_touch(key_path));
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    retire_fill_account(&acct, key_path);
+    acct.gpg_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+
+    if (git_expected_ssh_command(&acct, expected, sizeof(expected)) != 0) {
+        TS_SKIP("openssh", "no trusted ssh executable on this host");
+    }
+    fk_seed("--global", "core.sshcommand", expected);
+    fk_seed("--global", "user.name", "Retired User");
+
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    int rc = git_retire_account_identity(&acct, &cleared);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT((int)cleared, 1);
+    CHECK(fk_find("--global", "core.sshcommand") < 0);
+    CHECK(fk_find("--global", "user.name") >= 0);
+}
+
+TEST(retire_leaves_foreign_ssh_command_in_place) {
+    char dir[64];
+    char key_path[512];
+    account_t acct;
+    size_t cleared = 99;
+
+    snprintf(dir, sizeof(dir), "/tmp/gsw_retire_XXXXXX");
+    CHECK(ts_mkdtemp(dir) != NULL);
+    snprintf(key_path, sizeof(key_path), "%s/id_ed25519", dir);
+    CHECK(fk_touch(key_path));
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    retire_fill_account(&acct, key_path);
+    acct.gpg_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+    fk_seed("--global", "core.sshcommand", "ssh -i /someone/elses/key");
+
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    int rc = git_retire_account_identity(&acct, &cleared);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT((int)cleared, 0);
+    CHECK(fk_find("--global", "core.sshcommand") >= 0);
+}
+
+TEST(signing_key_selector_rules_are_strict) {
+    account_t acct;
+
+    retire_fill_account(&acct, NULL);
+    /* Canonical fingerprint whose suffix is the saved selector: selected. */
+    CHECK(git_signing_key_selects_account(&acct, RETIRE_FPR));
+    /* 0x prefix on the saved selector is stripped. */
+    safe_strncpy(acct.gpg_key_id, "0x22223333", sizeof(acct.gpg_key_id));
+    CHECK(git_signing_key_selects_account(&acct, RETIRE_FPR));
+    /* Suffix mismatch, noncanonical length, and non-hex are all rejected. */
+    CHECK(!git_signing_key_selects_account(&acct, RETIRE_FOREIGN_FPR));
+    CHECK(!git_signing_key_selects_account(&acct, "22223333"));
+    CHECK(!git_signing_key_selects_account(
+        &acct, "ZZZZBBBBCCCCDDDDEEEEFFFF0000111122223333"));
+    /* An account with no selector attributes nothing. */
+    acct.gpg_enabled = false;
+    CHECK(!git_signing_key_selects_account(&acct, RETIRE_FPR));
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(snapshot_preserves_surrounding_whitespace);
@@ -1088,4 +1251,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_test_config_rejects_wrong_effective_signing_state);
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
+    RUN_TEST(retire_clears_signing_legs_that_select_the_account);
+    RUN_TEST(retire_leaves_foreign_signing_key_in_place);
+    RUN_TEST(retire_clears_exactly_matching_ssh_command);
+    RUN_TEST(retire_leaves_foreign_ssh_command_in_place);
+    RUN_TEST(signing_key_selector_rules_are_strict);
 TEST_MAIN_END()

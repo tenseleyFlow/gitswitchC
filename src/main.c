@@ -2169,6 +2169,48 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         return result;
     }
 
+    /* AR-10 M1: reset tears down the runtime state but previously left the
+     * durable Git credential legs a switch published (core.sshCommand,
+     * user.signingkey, commit.gpgsign, gpg.format). That is worse than
+     * remove: gpg_manager_reset just deleted the isolated GNUPGHOME while a
+     * persisted commit.gpgsign=true keeps instructing Git to sign, so later
+     * commits fail or silently fall back to the system keyring — and pushes
+     * keep authenticating with the reset account's key. Scrub the legs still
+     * attributable to the reset account(s); best-effort, the reset itself
+     * already succeeded. */
+    {
+        size_t identity_cleared = 0;
+        if (target_account) {
+            if (git_retire_account_identity(target_account,
+                                            &identity_cleared) != 0) {
+                fprintf(stderr,
+                        "gitswitch: WARNING: durable Git configuration may "
+                        "still select reset account '%s': %s\n",
+                        target, get_last_error()->message);
+            }
+            if (identity_cleared > 0) {
+                printf("Cleared %zu durable Git identity setting(s) that "
+                       "selected '%s'.\n", identity_cleared, target);
+            }
+        } else {
+            for (size_t i = 0; i < ctx->account_count; i++) {
+                size_t account_cleared = 0;
+                if (git_retire_account_identity(&ctx->accounts[i],
+                                                &account_cleared) != 0) {
+                    fprintf(stderr,
+                            "gitswitch: WARNING: durable Git configuration "
+                            "may still select reset account '%s': %s\n",
+                            ctx->accounts[i].name, get_last_error()->message);
+                }
+                if (account_cleared > 0) {
+                    printf("Cleared %zu durable Git identity setting(s) that "
+                           "selected '%s'.\n",
+                           account_cleared, ctx->accounts[i].name);
+                }
+            }
+        }
+    }
+
     /* When the reset covered the saved active account (or everything), clear
      * the persisted active_account: main()'s settings-only save then records
      * the clear with an explicit inactive .resume-hint tombstone (AR-03 T4).
