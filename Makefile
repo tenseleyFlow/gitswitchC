@@ -436,7 +436,8 @@ $(DIST_PUBLISH_NAMED_TEST_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
 		-DGITSWITCH_RELEASE_TEST_FD_PRESSURE=1 \
 		-DGITSWITCH_RELEASE_TEST_ADOPTION_RACE=1 \
 		-DGITSWITCH_RELEASE_TEST_PUBLICATION_RACE=1 \
-		-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 $< -o $@
+		-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 \
+		-DGITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS=5000 $< -o $@
 
 # Build-config stamp: objects/tests share build/obj and build/bin across every
 # configuration. Record every effective compile/link input, not just the build

@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -40,6 +42,14 @@
 
 #ifndef AT_SYMLINK_NOFOLLOW
 #define AT_SYMLINK_NOFOLLOW 0
+#endif
+
+#ifndef GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS
+#define GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS 300000
+#endif
+
+#if GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS <= 0
+#error "GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS must be positive"
 #endif
 
 static void usage(const char *program)
@@ -263,18 +273,240 @@ static int retire_named_temp(int directory_fd, const char *temp_name,
 #endif
 }
 
-static int run_to_descriptor(int output_fd, char *const command[])
+static int create_producer_pipe(int pipe_fds[2])
 {
+    int index;
+    int saved_errno;
+
+    if (pipe(pipe_fds) != 0) {
+        return -1;
+    }
+    for (index = 0; index < 2; index++) {
+        int flags = fcntl(pipe_fds[index], F_GETFD);
+
+        if (flags < 0 ||
+            fcntl(pipe_fds[index], F_SETFD, flags | FD_CLOEXEC) != 0) {
+            saved_errno = errno;
+            (void)close(pipe_fds[0]);
+            (void)close(pipe_fds[1]);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int monotonic_milliseconds(int64_t *milliseconds)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return -1;
+    }
+    if (now.tv_sec < 0 ||
+        (uint64_t)now.tv_sec >
+            ((uint64_t)INT64_MAX - (uint64_t)(now.tv_nsec / 1000000L)) /
+                1000U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    *milliseconds = ((int64_t)now.tv_sec * 1000) +
+                    (int64_t)(now.tv_nsec / 1000000L);
+    return 0;
+}
+
+/* Return one while time remains, zero at the deadline, and minus one when the
+ * monotonic clock itself cannot be sampled. */
+static int deadline_remaining(int64_t deadline, int *remaining)
+{
+    int64_t difference;
+    int64_t now;
+
+    if (monotonic_milliseconds(&now) != 0) {
+        return -1;
+    }
+    difference = deadline - now;
+    if (difference <= 0) {
+        *remaining = 0;
+        return 0;
+    }
+    *remaining = difference > INT_MAX ? INT_MAX : (int)difference;
+    return 1;
+}
+
+static int write_all(int fd, const unsigned char *buffer, size_t size)
+{
+    size_t offset = 0U;
+
+    while (offset < size) {
+        ssize_t written = write(fd, buffer + offset, size - offset);
+
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (written == 0) {
+            errno = EIO;
+            return -1;
+        }
+        offset += (size_t)written;
+    }
+    return 0;
+}
+
+static int copy_producer_stream(int input_fd, int output_fd,
+                                int64_t deadline)
+{
+    unsigned char buffer[64U * 1024U];
+    struct pollfd input;
+
+    input.fd = input_fd;
+    input.events = POLLIN;
+    input.revents = 0;
+    for (;;) {
+        int remaining;
+        int remaining_rc = deadline_remaining(deadline, &remaining);
+        int poll_rc;
+        ssize_t count;
+
+        if (remaining_rc <= 0) {
+            if (remaining_rc == 0) {
+                errno = ETIMEDOUT;
+            }
+            return -1;
+        }
+        input.revents = 0;
+        poll_rc = poll(&input, 1, remaining);
+        if (poll_rc < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        if (poll_rc == 0) {
+            errno = ETIMEDOUT;
+            return -1;
+        }
+        if ((input.revents & POLLNVAL) != 0) {
+            errno = EBADF;
+            return -1;
+        }
+        if ((input.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
+            errno = EIO;
+            return -1;
+        }
+        do {
+            count = read(input_fd, buffer, sizeof(buffer));
+        } while (count < 0 && errno == EINTR);
+        if (count < 0) {
+            return -1;
+        }
+        if (count == 0) {
+            return 0;
+        }
+        if (write_all(output_fd, buffer, (size_t)count) != 0) {
+            return -1;
+        }
+    }
+}
+
+static int wait_for_producer(pid_t child, int64_t deadline, int *status)
+{
+    for (;;) {
+        pid_t waited = waitpid(child, status, WNOHANG);
+
+        if (waited == child) {
+            return 0;
+        }
+        if (waited < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        {
+            int remaining;
+            int remaining_rc = deadline_remaining(deadline, &remaining);
+            int pause_ms;
+            int poll_rc;
+
+            if (remaining_rc <= 0) {
+                if (remaining_rc == 0) {
+                    errno = ETIMEDOUT;
+                }
+                return -1;
+            }
+            pause_ms = remaining > 50 ? 50 : remaining;
+            poll_rc = poll(NULL, 0, pause_ms);
+            if (poll_rc < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return -1;
+            }
+        }
+    }
+}
+
+static void terminate_producer(pid_t child)
+{
+    int saved_errno = errno;
     int status;
     pid_t waited;
-    pid_t child = fork();
+
+    /* The child creates this process group before it can exec or write output,
+     * so ordinary descendants remain inside the lifetime boundary. Killing the
+     * direct PID as well covers an early setpgid failure. */
+    (void)kill(-child, SIGKILL);
+    (void)kill(child, SIGKILL);
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    errno = saved_errno;
+}
+
+static int run_to_descriptor(int output_fd, char *const command[])
+{
+    int pipe_fds[2];
+    int status;
+    int saved_errno;
+    int64_t deadline;
+    int64_t started;
+    pid_t child;
+
+    if (create_producer_pipe(pipe_fds) != 0) {
+        return -1;
+    }
+    child = fork();
 
     if (child < 0) {
+        saved_errno = errno;
+        (void)close(pipe_fds[0]);
+        (void)close(pipe_fds[1]);
+        errno = saved_errno;
         return -1;
     }
     if (child == 0) {
-        if (dup2(output_fd, STDOUT_FILENO) < 0) {
+        int descriptor_flags;
+
+        (void)close(pipe_fds[0]);
+        if (setpgid(0, 0) != 0) {
             _exit(126);
+        }
+        if (pipe_fds[1] == STDOUT_FILENO) {
+            descriptor_flags = fcntl(STDOUT_FILENO, F_GETFD);
+            if (descriptor_flags < 0 ||
+                fcntl(STDOUT_FILENO, F_SETFD,
+                      descriptor_flags & ~FD_CLOEXEC) != 0) {
+                _exit(126);
+            }
+        } else if (dup2(pipe_fds[1], STDOUT_FILENO) < 0) {
+            _exit(126);
+        }
+        if (pipe_fds[1] != STDOUT_FILENO) {
+            (void)close(pipe_fds[1]);
         }
         if (output_fd != STDOUT_FILENO) {
             (void)close(output_fd);
@@ -282,10 +514,52 @@ static int run_to_descriptor(int output_fd, char *const command[])
         execvp(command[0], command);
         _exit(errno == ENOENT ? 127 : 126);
     }
-    do {
-        waited = waitpid(child, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    if (waited < 0) {
+    (void)close(pipe_fds[1]);
+    /* Close the fork/setpgid race from the parent side as well. EACCES/ESRCH
+     * only mean the child already crossed that boundary or exited; the child
+     * itself cannot exec until its own setpgid succeeds. */
+    (void)setpgid(child, child);
+    if (monotonic_milliseconds(&started) != 0) {
+        saved_errno = errno;
+        (void)close(pipe_fds[0]);
+        errno = saved_errno;
+        terminate_producer(child);
+        return -1;
+    }
+    if (started > INT64_MAX -
+                      (int64_t)GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS) {
+        (void)close(pipe_fds[0]);
+        errno = EOVERFLOW;
+        terminate_producer(child);
+        return -1;
+    }
+    deadline = started + (int64_t)GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS;
+    if (copy_producer_stream(pipe_fds[0], output_fd, deadline) != 0) {
+        saved_errno = errno;
+        (void)close(pipe_fds[0]);
+        if (saved_errno == ETIMEDOUT) {
+            fprintf(stderr,
+                    "ERROR: archive command timed out before output stream completion\n");
+        } else {
+            fprintf(stderr, "ERROR: cannot capture archive command output: %s\n",
+                    strerror(saved_errno));
+        }
+        errno = saved_errno;
+        terminate_producer(child);
+        return -1;
+    }
+    (void)close(pipe_fds[0]);
+    if (wait_for_producer(child, deadline, &status) != 0) {
+        saved_errno = errno;
+        if (saved_errno == ETIMEDOUT) {
+            fprintf(stderr,
+                    "ERROR: archive command timed out before output stream completion\n");
+        } else {
+            fprintf(stderr, "ERROR: cannot wait for archive command: %s\n",
+                    strerror(saved_errno));
+        }
+        errno = saved_errno;
+        terminate_producer(child);
         return -1;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {

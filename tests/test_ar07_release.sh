@@ -872,6 +872,84 @@ check_manifest_contract()
         rm -f "$copy_retained_temp"
     fi
 
+    # The direct producer may exit while a background descendant still owns
+    # its stdout. Success is not complete until that inherited stream reaches
+    # EOF: otherwise the helper can publish and return while the descendant is
+    # still extending the supposedly completed artifact.
+    copy_stream_marker=$tmp/copy-stream.marker
+    # The spawned descendant, not this parent shell, expands the marker.
+    # shellcheck disable=SC2016
+    AR09_COPY_STREAM_MARKER=$copy_stream_marker \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c '
+            printf stream-prefix
+            (
+                sleep 1
+                printf -- "-suffix"
+                : >"$AR09_COPY_STREAM_MARKER"
+            ) &
+        ' >"$out" 2>&1 ||
+        fail "publisher rejected a delayed inherited producer stream"
+    [ -e "$copy_stream_marker" ] ||
+        fail "publisher returned before the inherited producer stream closed"
+    [ "$(cat "$copy_archive")" = stream-prefix-suffix ] ||
+        fail "publisher reported success before capturing the complete stream"
+    rm -f "$copy_archive"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD stream publication did not retire its exact temporary"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "stream publication did not retain exactly one private source"
+            [ "$(cat "$1")" = stream-prefix-suffix ] ||
+                fail "retained stream source is incomplete"
+            rm -f "$1"
+            ;;
+    esac
+
+    # A descendant that never closes the inherited stream must not hang the
+    # release indefinitely or leave a canonical artifact. The named test
+    # helper uses a five-second build-time deadline; production retains a much
+    # larger bounded deadline suitable for real archives.
+    copy_timeout_marker=$tmp/copy-stream-timeout.marker
+    # shellcheck disable=SC2016
+    if AR09_COPY_TIMEOUT_MARKER=$copy_timeout_marker \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c '
+            printf partial-stream
+            (
+                : >"$AR09_COPY_TIMEOUT_MARKER"
+                sleep 30
+                printf late-stream
+            ) &
+        ' >"$out" 2>&1; then
+        fail "publisher accepted a producer stream that never reached EOF"
+    fi
+    [ -e "$copy_timeout_marker" ] ||
+        fail "stream-timeout descendant did not start"
+    grep -F 'archive command timed out before output stream completion' \
+        "$out" >/dev/null ||
+        fail "stream timeout did not report its incomplete-output boundary"
+    { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+        fail "stream timeout left a canonical artifact"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD stream timeout did not retire its exact temporary"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "stream timeout did not retain exactly one private source"
+            [ "$(cat "$1")" = partial-stream ] ||
+                fail "stream-timeout retained source changed bytes"
+            rm -f "$1"
+            ;;
+    esac
+
     # On Darwin, race fclonefileat's committed clone before the helper adopts
     # it: replace the final with a hard link to the named source. Clone ID,
     # bytes, mode, and pathname identity all match, so the explicit distinct-
