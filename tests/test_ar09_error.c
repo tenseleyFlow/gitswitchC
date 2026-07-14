@@ -299,6 +299,42 @@ TEST(display_format_rejects_unterminated_context_fields_truthfully) {
     CHECK(strstr(formatted, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
 }
 
+/* AR-10 L9: a failed re-init must keep the previous sink and level live —
+ * the old order closed the working stream and committed the level before the
+ * fopen could fail. Observable contract: the failed call returns -1 and a
+ * subsequent log line still lands in the ORIGINAL log file. */
+TEST(failed_error_init_retains_previous_log_sink) {
+    char dir[64];
+    char good[128];
+    char bad[128];
+    char content[512];
+    FILE *stream;
+    size_t got;
+
+    snprintf(dir, sizeof(dir), "/tmp/gswar10err_XXXXXX");
+    CHECK(ts_mkdtemp(dir) != NULL);
+    snprintf(good, sizeof(good), "%s/good.log", dir);
+    /* Unopenable: path through a nonexistent directory. */
+    snprintf(bad, sizeof(bad), "%s/missing-dir/bad.log", dir);
+
+    CHECK_EQ_INT(error_init(LOG_LEVEL_INFO, good), 0);
+    CHECK_EQ_INT(error_init(LOG_LEVEL_INFO, bad), -1);
+    log_info("post-failure line lands in the original sink");
+
+    stream = fopen(good, "r");
+    CHECK(stream != NULL);
+    if (stream) {
+        got = fread(content, 1, sizeof(content) - 1U, stream);
+        content[got] = '\0';
+        fclose(stream);
+        CHECK(strstr(content,
+                     "post-failure line lands in the original sink") != NULL);
+    }
+
+    /* Restore the suite's quiet logging configuration. */
+    CHECK_EQ_INT(error_init(LOG_LEVEL_CRITICAL, NULL), 0);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
@@ -316,4 +352,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(very_large_message_and_saved_context_keep_truncation_state);
     RUN_TEST(display_format_marks_its_own_bounded_truncation);
     RUN_TEST(display_format_rejects_unterminated_context_fields_truthfully);
+    RUN_TEST(failed_error_init_retains_previous_log_sink);
 TEST_MAIN_END()
