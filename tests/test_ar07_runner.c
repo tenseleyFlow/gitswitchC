@@ -17,6 +17,292 @@
 
 static char g_self_path[MAX_PATH_LEN];
 
+/* AR-09 M27: exact SIGPIPE disposition restoration and failure precedence. */
+enum {
+    RUN_SIGPIPE_ACTION_INSTALL = 1,
+    RUN_SIGPIPE_ACTION_RESTORE
+};
+
+void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno);
+
+typedef enum {
+    SIGPIPE_DISPOSITION_DEFAULT = 0,
+    SIGPIPE_DISPOSITION_IGNORE,
+    SIGPIPE_DISPOSITION_CUSTOM
+} sigpipe_disposition_t;
+
+static volatile sig_atomic_t g_sigpipe_witness_calls;
+
+static void sigpipe_witness_handler(int signal_number) {
+    (void)signal_number;
+    g_sigpipe_witness_calls++;
+}
+
+static bool sigactions_semantically_equal(const struct sigaction *left,
+                                          const struct sigaction *right) {
+    if (!left || !right || left->sa_flags != right->sa_flags) return false;
+#ifdef SA_SIGINFO
+    if ((left->sa_flags & SA_SIGINFO) != 0) {
+        if (left->sa_sigaction != right->sa_sigaction) return false;
+    } else
+#endif
+    if (left->sa_handler != right->sa_handler) {
+        return false;
+    }
+
+#ifdef NSIG
+    const int signal_limit = NSIG;
+#else
+    const int signal_limit = 128;
+#endif
+    for (int signal_number = 1; signal_number < signal_limit;
+         signal_number++) {
+        int left_member = sigismember(&left->sa_mask, signal_number);
+        int right_member = sigismember(&right->sa_mask, signal_number);
+        if (left_member != right_member) return false;
+    }
+    return true;
+}
+
+static int install_sigpipe_disposition(sigpipe_disposition_t disposition,
+                                       struct sigaction *original,
+                                       struct sigaction *installed) {
+    struct sigaction action;
+
+    if (sigaction(SIGPIPE, NULL, original) != 0) return -1;
+    memset(&action, 0, sizeof(action));
+    if (sigemptyset(&action.sa_mask) != 0) return -1;
+    switch (disposition) {
+        case SIGPIPE_DISPOSITION_DEFAULT:
+            action.sa_handler = SIG_DFL;
+            break;
+        case SIGPIPE_DISPOSITION_IGNORE:
+            action.sa_handler = SIG_IGN;
+            break;
+        case SIGPIPE_DISPOSITION_CUSTOM:
+            action.sa_handler = sigpipe_witness_handler;
+            if (sigaddset(&action.sa_mask, SIGUSR1) != 0) return -1;
+            action.sa_flags = SA_RESTART;
+            break;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+    if (sigaction(SIGPIPE, &action, NULL) != 0) return -1;
+    return sigaction(SIGPIPE, NULL, installed);
+}
+
+static int sigpipe_round_trip_worker(sigpipe_disposition_t disposition) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original;
+    struct sigaction installed;
+    struct sigaction after;
+    run_result_t result;
+
+    if (install_sigpipe_disposition(disposition, &original, &installed) != 0) {
+        return 10;
+    }
+    int run_rc = run_argv(argv, NULL, &result);
+    int query_rc = sigaction(SIGPIPE, NULL, &after);
+    int restore_rc = sigaction(SIGPIPE, &original, NULL);
+    if (run_rc != 0 || !result.spawned || result.exit_code != 0) return 11;
+    if (query_rc != 0 || restore_rc != 0) return 12;
+    if (!sigactions_semantically_equal(&installed, &after)) return 13;
+    return 0;
+}
+
+static bool sigpipe_round_trip_passes(sigpipe_disposition_t disposition) {
+    int status = 0;
+
+    fflush(NULL);
+    pid_t worker = fork();
+    if (worker < 0) return false;
+    if (worker == 0) _exit(sigpipe_round_trip_worker(disposition));
+    return waitpid(worker, &status, 0) == worker && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
+static bool no_children_remain(void) {
+    int status = 0;
+    errno = 0;
+    return waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
+}
+
+static bool isolated_runner_check_passes(int (*check)(void)) {
+    int status = 0;
+
+    fflush(NULL);
+    pid_t worker = fork();
+    if (worker < 0) return false;
+    if (worker == 0) _exit(check());
+    return waitpid(worker, &status, 0) == worker && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
+static bool file_contains_text(const char *path, const char *needle) {
+    char content[8192];
+    FILE *file = fopen(path, "r");
+
+    if (!file) return false;
+    size_t length = fread(content, 1, sizeof(content) - 1, file);
+    bool read_ok = !ferror(file);
+    int close_rc = fclose(file);
+    content[length] = '\0';
+    return read_ok && close_rc == 0 && strstr(content, needle) != NULL;
+}
+
+static int sigpipe_install_failure_worker(void) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original;
+    struct sigaction installed;
+    struct sigaction after;
+    run_result_t result;
+
+    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM, &original,
+                                    &installed) != 0) {
+        return 20;
+    }
+    gitswitch_test_fail_run_sigpipe_action(RUN_SIGPIPE_ACTION_INSTALL, EIO);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, NULL, &result);
+    int returned_errno = errno;
+    error_context_t failure = *get_last_error();
+    int query_rc = sigaction(SIGPIPE, NULL, &after);
+    bool exact_state = query_rc == 0 &&
+                       sigactions_semantically_equal(&installed, &after);
+    bool child_reaped = no_children_remain();
+    int cleanup_rc = sigaction(SIGPIPE, &original, NULL);
+
+    if (cleanup_rc != 0) return 21;
+    if (run_rc != -1 || !result.spawned) return 22;
+    if (returned_errno != EIO || failure.system_errno != EIO ||
+        failure.code != ERR_SYSTEM_CALL) {
+        return 23;
+    }
+    if (!strstr(failure.message, "install temporary SIGPIPE disposition")) {
+        return 24;
+    }
+    if (!exact_state) return 25;
+    if (!child_reaped) return 26;
+    return 0;
+}
+
+static int sigpipe_restore_failure_worker(void) {
+    const char *argv[] = {"true", NULL};
+    struct sigaction original;
+    struct sigaction installed;
+    struct sigaction after;
+    run_result_t result;
+
+    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM, &original,
+                                    &installed) != 0) {
+        return 30;
+    }
+    gitswitch_test_fail_run_sigpipe_action(RUN_SIGPIPE_ACTION_RESTORE, EIO);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, NULL, &result);
+    int returned_errno = errno;
+    error_context_t failure = *get_last_error();
+    int query_rc = sigaction(SIGPIPE, NULL, &after);
+    bool restore_was_skipped = query_rc == 0 && after.sa_handler == SIG_IGN;
+    bool child_reaped = no_children_remain();
+    int cleanup_rc = sigaction(SIGPIPE, &original, NULL);
+
+    if (cleanup_rc != 0) return 31;
+    if (run_rc != -1 || !result.spawned || result.exit_code != 0) return 32;
+    if (returned_errno != EIO || failure.system_errno != EIO ||
+        failure.code != ERR_SYSTEM_CALL) {
+        return 33;
+    }
+    if (!strstr(failure.message, "restore previous SIGPIPE disposition")) {
+        return 34;
+    }
+    if (!restore_was_skipped) return 35;
+    if (!child_reaped) return 36;
+    return 0;
+}
+
+static int sigpipe_restore_secondary_to_child_failure_worker(void) {
+    char log_path[] = "/tmp/gs_sigpipe_secondary_XXXXXX";
+    char invalid_env[300];
+    const char *env[] = {invalid_env, NULL};
+    const char *argv[] = {"true", NULL};
+    struct sigaction original;
+    struct sigaction installed;
+    run_opts_t opts;
+    run_result_t result;
+
+    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM, &original,
+                                    &installed) != 0) {
+        return 40;
+    }
+    int log_fd = mkstemp(log_path);
+    if (log_fd < 0 || close(log_fd) != 0) return 41;
+    if (set_log_file(log_path) != 0) {
+        (void)unlink(log_path);
+        return 42;
+    }
+    memset(invalid_env, 'K', sizeof(invalid_env));
+    invalid_env[270] = '=';
+    invalid_env[271] = 'x';
+    invalid_env[272] = '\0';
+    memset(&opts, 0, sizeof(opts));
+    opts.extra_env = env;
+
+    gitswitch_test_fail_run_sigpipe_action(RUN_SIGPIPE_ACTION_RESTORE, EIO);
+    clear_error();
+    errno = 0;
+    int run_rc = run_argv(argv, &opts, &result);
+    int returned_errno = errno;
+    error_context_t failure = *get_last_error();
+    bool child_reaped = no_children_remain();
+    int reset_log_rc = set_log_file(NULL);
+    bool secondary_visible = file_contains_text(
+        log_path,
+        "secondary failure restoring previous SIGPIPE disposition");
+    (void)unlink(log_path);
+    int cleanup_rc = sigaction(SIGPIPE, &original, NULL);
+
+    if (reset_log_rc != 0 || cleanup_rc != 0) return 43;
+    if (run_rc != -1 || !result.spawned || result.exit_code != 126) return 44;
+    if (returned_errno != EINVAL || failure.system_errno != EINVAL ||
+        failure.code != ERR_SYSTEM_CALL) {
+        return 45;
+    }
+    if (!strstr(failure.message, "child environment setup failed")) return 46;
+    if (strstr(failure.message, "SIGPIPE")) return 47;
+    if (!secondary_visible) return 48;
+    if (!child_reaped) return 49;
+    return 0;
+}
+
+TEST(sigpipe_default_disposition_round_trips_exactly) {
+    CHECK(sigpipe_round_trip_passes(SIGPIPE_DISPOSITION_DEFAULT));
+}
+
+TEST(sigpipe_ignore_disposition_round_trips_exactly) {
+    CHECK(sigpipe_round_trip_passes(SIGPIPE_DISPOSITION_IGNORE));
+}
+
+TEST(sigpipe_custom_handler_mask_and_flags_round_trip_exactly) {
+    CHECK(sigpipe_round_trip_passes(SIGPIPE_DISPOSITION_CUSTOM));
+}
+
+TEST(sigpipe_install_failure_preserves_state_and_reaps_child) {
+    CHECK(isolated_runner_check_passes(sigpipe_install_failure_worker));
+}
+
+TEST(sigpipe_restore_failure_is_reported_after_successful_child) {
+    CHECK(isolated_runner_check_passes(sigpipe_restore_failure_worker));
+}
+
+TEST(sigpipe_restore_failure_does_not_replace_primary_child_error) {
+    CHECK(isolated_runner_check_passes(
+        sigpipe_restore_secondary_to_child_failure_worker));
+}
+
 static int fd_probe_main(void) {
     const int inherited_fds[] = {64, 128, 200};
     for (size_t i = 0;
@@ -793,6 +1079,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "test_ar07_runner: cannot resolve own executable\n");
         return 2;
     }
+    RUN_TEST(sigpipe_default_disposition_round_trips_exactly);
+    RUN_TEST(sigpipe_ignore_disposition_round_trips_exactly);
+    RUN_TEST(sigpipe_custom_handler_mask_and_flags_round_trip_exactly);
+    RUN_TEST(sigpipe_install_failure_preserves_state_and_reaps_child);
+    RUN_TEST(sigpipe_restore_failure_is_reported_after_successful_child);
+    RUN_TEST(sigpipe_restore_failure_does_not_replace_primary_child_error);
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
     RUN_TEST(early_stdin_close_is_a_runner_failure);

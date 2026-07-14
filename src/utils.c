@@ -2542,6 +2542,60 @@ static run_test_post_fork_pre_publish_hook_fn
     g_test_post_fork_pre_publish_hook;
 static int g_test_fork_failure_errno;
 
+/* AR-09 M27: sigaction preserves the caller's complete SIGPIPE contract;
+ * these stages also provide one-shot failure boundaries to the test build. */
+enum {
+    RUN_SIGPIPE_ACTION_INSTALL = 1,
+    RUN_SIGPIPE_ACTION_RESTORE,
+    RUN_SIGPIPE_ACTION_STAGE_COUNT
+};
+
+#ifdef GITSWITCH_TESTING
+static int
+    g_test_run_sigpipe_action_errno[RUN_SIGPIPE_ACTION_STAGE_COUNT];
+
+void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno);
+
+void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno) {
+    if (stage <= 0 || stage >= RUN_SIGPIPE_ACTION_STAGE_COUNT ||
+        system_errno <= 0) {
+        memset(g_test_run_sigpipe_action_errno, 0,
+               sizeof(g_test_run_sigpipe_action_errno));
+        return;
+    }
+    g_test_run_sigpipe_action_errno[stage] = system_errno;
+}
+#endif
+
+static int run_sigpipe_action(const struct sigaction *action,
+                              struct sigaction *old_action, int stage) {
+#ifdef GITSWITCH_TESTING
+    if (stage > 0 && stage < RUN_SIGPIPE_ACTION_STAGE_COUNT &&
+        g_test_run_sigpipe_action_errno[stage] != 0) {
+        int injected_errno = g_test_run_sigpipe_action_errno[stage];
+        g_test_run_sigpipe_action_errno[stage] = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#else
+    (void)stage;
+#endif
+    return sigaction(SIGPIPE, action, old_action);
+}
+
+static void report_secondary_sigpipe_restore_failure(int restore_errno) {
+    if (restore_errno <= 0) return;
+
+    int primary_errno = errno;
+    error_context_t primary_error = g_last_error;
+    log_warning(
+        "run_argv: secondary failure restoring previous SIGPIPE disposition "
+        "(restore errno=%d: %s)",
+        restore_errno, strerror(restore_errno));
+    g_last_error = primary_error;
+    errno = primary_errno;
+}
+
 int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
     switch (strategy) {
         case RUN_TEST_FD_CLOSE_AUTO:
@@ -3340,7 +3394,40 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         g_test_fd_close_observation_valid = true;
     }
 
-    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+    /* Parent pipe writes need SIGPIPE suppressed, but only for this bounded
+     * I/O window. Save and later restore the full action, including metadata
+     * that signal(3) silently discards. */
+    struct sigaction ignored_sigpipe;
+    struct sigaction saved_sigpipe;
+    memset(&ignored_sigpipe, 0, sizeof(ignored_sigpipe));
+    memset(&saved_sigpipe, 0, sizeof(saved_sigpipe));
+    ignored_sigpipe.sa_handler = SIG_IGN;
+    (void)sigemptyset(&ignored_sigpipe.sa_mask);
+    if (run_sigpipe_action(&ignored_sigpipe, &saved_sigpipe,
+                           RUN_SIGPIPE_ACTION_INSTALL) != 0) {
+        int install_errno = errno;
+        int install_status = 0;
+        pid_t waited;
+
+        if (want_in) close(in_pipe[1]);
+        if (want_out) close(out_pipe[0]);
+        (void)kill(pid, SIGKILL);
+        do {
+            waited = waitpid(pid, &install_status, 0);
+        } while (waited < 0 && errno == EINTR);
+        signals_child_reaped();
+        if (waited == pid && WIFEXITED(install_status)) {
+            result->exit_code = WEXITSTATUS(install_status);
+        } else if (waited == pid && WIFSIGNALED(install_status)) {
+            result->term_signal = WTERMSIG(install_status);
+        }
+        errno = install_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot install temporary SIGPIPE disposition");
+        errno = install_errno;
+        return -1;
+    }
 
     int infd = want_in ? in_pipe[1] : -1;
     int outfd = want_out ? out_pipe[0] : -1;
@@ -3561,7 +3648,13 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * for kernel reuse, and the handler must not signal a stranger. */
         signals_child_reaped();
     }
-    signal(SIGPIPE, old_sigpipe);
+    int errno_before_sigpipe_restore = errno;
+    int sigpipe_restore_errno = 0;
+    if (run_sigpipe_action(&saved_sigpipe, NULL,
+                           RUN_SIGPIPE_ACTION_RESTORE) != 0) {
+        sigpipe_restore_errno = errno;
+    }
+    errno = errno_before_sigpipe_restore;
 
     if (child_reaped && WIFEXITED(status)) {
         result->exit_code = WEXITSTATUS(status);
@@ -3571,7 +3664,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
 
     if (child_status_rc > 0) {
-        errno = child_status.system_errno;
+        int primary_errno = child_status.system_errno;
+        errno = primary_errno;
         switch ((child_stage_t)child_status.stage) {
             case CHILD_STAGE_STDIO:
                 set_system_error(ERR_SYSTEM_CALL,
@@ -3599,21 +3693,30 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                           "run_argv: child returned an unknown setup failure");
                 break;
         }
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (child_status_rc < 0) {
-        errno = child_status_errno;
+        int primary_errno = child_status_errno;
+        errno = primary_errno;
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: child setup-status channel failed");
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (wait_failed) {
-        errno = wait_errno;
+        int primary_errno = wait_errno;
+        errno = primary_errno;
         set_system_error(ERR_SYSTEM_CALL, "waitpid() failed");
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (io_failed) {
-        errno = io_errno;
+        int primary_errno = io_errno;
+        errno = primary_errno;
         if (nonblock_setup_failed) {
             set_system_error(
                 ERR_SYSTEM_CALL,
@@ -3622,21 +3725,37 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             set_system_error(ERR_SYSTEM_CALL,
                              "run_argv: subprocess pipe I/O failed");
         }
+        errno = primary_errno;
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (input_failed) {
         set_error(ERR_SYSTEM_COMMAND_FAILED,
                   "run_argv: child stdin closed before all input was delivered "
                   "(%zu/%zu bytes)", in_off, opts->input_len);
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
     if (output_stalled) {
         set_error(ERR_SYSTEM_COMMAND_FAILED,
                   "run_argv: captured stdout remained open after the direct "
                   "child exited");
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
         return -1;
     }
-    return (result->spawned && result->exit_code == 0) ? 0 : -1;
+    if (!result->spawned || result->exit_code != 0) {
+        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        return -1;
+    }
+    if (sigpipe_restore_errno != 0) {
+        errno = sigpipe_restore_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "run_argv: cannot restore previous SIGPIPE disposition");
+        errno = sigpipe_restore_errno;
+        return -1;
+    }
+    return 0;
 }
 
 static command_runner_fn g_runner = run_argv_real;
