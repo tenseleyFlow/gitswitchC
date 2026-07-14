@@ -18,6 +18,7 @@
 void git_ops_test_reset_caches(void);
 void git_ops_test_set_restore_prelock_hook(void (*fn)(git_scope_t scope));
 void git_ops_test_set_restore_locked_hook(void (*fn)(git_scope_t scope));
+void git_ops_test_set_restore_postpublish_hook(void (*fn)(git_scope_t scope));
 
 typedef struct {
     char *value;
@@ -193,6 +194,34 @@ static int git_get_all(const char *scope, const char *key, char *output,
     return rc;
 }
 
+static int git_get_file_all(const char *path, const char *key, char *output,
+                            size_t output_size) {
+    const char *const argv[] = {
+        "git", "config", "--file", path, "--get-all", key, NULL
+    };
+    run_result_t result;
+    int rc = run_command(argv, output, output_size, false, &result);
+    if (rc == 0 && result.out_truncated) return -1;
+    return rc;
+}
+
+static int git_set_file(const char *path, const char *key,
+                        const char *value) {
+    const char *const argv[] = {
+        "git", "config", "--file", path, key, value, NULL
+    };
+    return run_git(argv);
+}
+
+static int retain_file_generation(const char *path, char *retained,
+                                  size_t retained_size) {
+    if ((size_t)snprintf(retained, retained_size, "%s.retained", path) >=
+        retained_size) {
+        return -1;
+    }
+    return link(path, retained);
+}
+
 static int git_replace_vector(const char *scope, const char *key,
                               const char *const values[], size_t count) {
     if (git_unset_all(scope, key) != 0) return -1;
@@ -205,6 +234,9 @@ static int git_replace_vector(const char *scope, const char *key,
 static int g_prelock_writer_calls;
 static pid_t g_locked_writer_pid;
 static int g_locked_writer_first_failed;
+static int g_postpublish_writer_calls;
+static char g_postpublish_config[MAX_PATH_LEN];
+static char g_postpublish_installed[MAX_PATH_LEN];
 
 static void add_name_before_restore_lock(git_scope_t scope) {
     if (scope != GIT_SCOPE_GLOBAL || g_prelock_writer_calls != 0) return;
@@ -212,6 +244,17 @@ static void add_name_before_restore_lock(git_scope_t scope) {
     if (git_add("--global", "user.name", "race-before-lock") != 0 ||
         git_set("--global", "audit.concurrent", "unmanaged-survives") != 0) {
         g_prelock_writer_calls = -1;
+    }
+}
+
+static void replace_config_after_rollback_publish(git_scope_t scope) {
+    if (scope != GIT_SCOPE_LOCAL || g_postpublish_writer_calls != 0) return;
+    g_postpublish_writer_calls++;
+    if (rename(g_postpublish_config, g_postpublish_installed) != 0 ||
+        git_set_file(g_postpublish_config, "user.name", "later-replacement") != 0 ||
+        git_set_file(g_postpublish_config, "audit.replacement",
+                     "must-survive") != 0) {
+        g_postpublish_writer_calls = -1;
     }
 }
 
@@ -291,6 +334,31 @@ static int read_file(const char *path, char *output, size_t output_size) {
     if (ferror(file) || fclose(file) != 0) return -1;
     output[length] = '\0';
     return 0;
+}
+
+static int count_open_descriptors(void) {
+    const char *directories[] = { "/proc/self/fd", "/dev/fd" };
+
+    for (size_t i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+        DIR *directory = opendir(directories[i]);
+        struct dirent *entry;
+        int count = 0;
+        if (!directory) continue;
+        errno = 0;
+        while ((entry = readdir(directory)) != NULL) {
+            if (strcmp(entry->d_name, ".") != 0 &&
+                strcmp(entry->d_name, "..") != 0) {
+                count++;
+            }
+        }
+        {
+            int read_errno = errno;
+            int close_rc = closedir(directory);
+            if (read_errno != 0 || close_rc != 0) return -1;
+        }
+        return count;
+    }
+    return -1;
 }
 
 static int create_marker_helper(const char *path, const char *marker,
@@ -577,6 +645,8 @@ TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope) {
     };
     git_fixture_t fixture;
     account_t account;
+    char config_paths[3][MAX_PATH_LEN];
+    char retained_paths[3][MAX_PATH_LEN];
     char actual[512];
     char expected[512];
 
@@ -596,6 +666,19 @@ TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope) {
     account = basic_account(&fixture, false);
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK(safe_strncpy(config_paths[0], fixture.global_config,
+                       sizeof(config_paths[0])) == 0);
+    CHECK((size_t)snprintf(config_paths[1], sizeof(config_paths[1]),
+                           "%s/.git/config", fixture.repo) <
+          sizeof(config_paths[1]));
+    CHECK((size_t)snprintf(config_paths[2], sizeof(config_paths[2]),
+                           "%s/.git/config.worktree", fixture.repo) <
+          sizeof(config_paths[2]));
+    for (size_t i = 0; i < 3; i++) {
+        CHECK_EQ_INT(retain_file_generation(config_paths[i],
+                                            retained_paths[i],
+                                            sizeof(retained_paths[i])), 0);
+    }
 
     /* A later writer appends to each exact ordered vector after the
      * transaction's post-image has been sealed. A second seal is deliberately
@@ -622,16 +705,12 @@ TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope) {
         CHECK_STR_EQ(actual, expected);
     }
 
-    /* An unchanged retry remains non-destructive. Once each conflicted vector
-     * is repaired to the sealed post-image, the retained before-image can be
-     * applied exactly in every scope. */
+    /* An unchanged retry remains non-destructive. Value-only repair cannot
+     * transfer rollback ownership to a new inode; reinstall each exact sealed
+     * generation before applying the retained before-image. */
     CHECK_EQ_INT(git_config_restore(), -1);
-    {
-        const char *const global_post[] = {account.name};
-        CHECK_EQ_INT(git_replace_vector("--global", "user.name",
-                                        global_post, 1), 0);
-        CHECK_EQ_INT(git_replace_vector("--local", "user.name", NULL, 0), 0);
-        CHECK_EQ_INT(git_replace_vector("--worktree", "user.name", NULL, 0), 0);
+    for (size_t i = 0; i < 3; i++) {
+        CHECK_EQ_INT(rename(retained_paths[i], config_paths[i]), 0);
     }
     CHECK_EQ_INT(git_config_restore(), 0);
     for (size_t i = 0; i < 3; i++) {
@@ -652,8 +731,9 @@ TEST(rollback_preserves_concurrent_ordered_vectors_in_every_managed_scope) {
 TEST(writer_in_old_compare_write_gap_is_rechecked_under_canonical_lock) {
     git_fixture_t fixture;
     account_t account;
+    char retained_config[MAX_PATH_LEN];
+    char concurrent_config[MAX_PATH_LEN];
     char actual[512];
-    const char *const owned_post[] = {"AR08 Git User"};
 
     if (!fixture_init(&fixture)) {
         CHECK(false);
@@ -665,6 +745,12 @@ TEST(writer_in_old_compare_write_gap_is_rechecked_under_canonical_lock) {
     account = basic_account(&fixture, false);
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(retain_file_generation(fixture.global_config,
+                                        retained_config,
+                                        sizeof(retained_config)), 0);
+    CHECK((size_t)snprintf(concurrent_config, sizeof(concurrent_config),
+                           "%s.concurrent", fixture.global_config) <
+          sizeof(concurrent_config));
 
     g_prelock_writer_calls = 0;
     git_ops_test_set_restore_prelock_hook(add_name_before_restore_lock);
@@ -679,13 +765,14 @@ TEST(writer_in_old_compare_write_gap_is_rechecked_under_canonical_lock) {
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "unmanaged-survives\n");
 
-    CHECK_EQ_INT(git_replace_vector("--global", "user.name", owned_post, 1), 0);
+    CHECK_EQ_INT(rename(fixture.global_config, concurrent_config), 0);
+    CHECK_EQ_INT(rename(retained_config, fixture.global_config), 0);
     CHECK_EQ_INT(git_config_restore(), 0);
     CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "before-gap\n");
-    CHECK_EQ_INT(git_get_all("--global", "audit.concurrent", actual,
-                             sizeof(actual)), 0);
+    CHECK_EQ_INT(git_get_file_all(concurrent_config, "audit.concurrent",
+                                  actual, sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "unmanaged-survives\n");
     fixture_cleanup(&fixture);
 }
@@ -1000,6 +1087,7 @@ TEST(enabled_empty_worktree_scope_rejects_preseal_writer) {
 
 TEST(enabled_empty_worktree_scope_preserves_postseal_writer) {
     git_fixture_t fixture;
+    char worktree_config[MAX_PATH_LEN];
     char actual[256];
 
     if (!fixture_init(&fixture)) {
@@ -1013,6 +1101,9 @@ TEST(enabled_empty_worktree_scope_preserves_postseal_writer) {
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
                                       GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK((size_t)snprintf(worktree_config, sizeof(worktree_config),
+                           "%s/.git/config.worktree", fixture.repo) <
+          sizeof(worktree_config));
 
     CHECK_EQ_INT(git_set("--worktree", "user.name", "later-worktree"), 0);
     CHECK_EQ_INT(git_config_restore(), -1);
@@ -1021,7 +1112,7 @@ TEST(enabled_empty_worktree_scope_preserves_postseal_writer) {
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "later-worktree\n");
 
-    CHECK_EQ_INT(git_unset_all("--worktree", "user.name"), 0);
+    CHECK_EQ_INT(unlink(worktree_config), 0);
     CHECK_EQ_INT(git_config_restore(), 0);
     CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
                              sizeof(actual)), 0);
@@ -1033,6 +1124,7 @@ TEST(enabled_empty_worktree_scope_preserves_postseal_writer) {
 TEST(direct_worktree_extension_true_ignores_later_included_false) {
     git_fixture_t fixture;
     char include_path[MAX_PATH_LEN];
+    char worktree_config[MAX_PATH_LEN];
     char actual[256];
 
     if (!fixture_init(&fixture)) {
@@ -1053,6 +1145,9 @@ TEST(direct_worktree_extension_true_ignores_later_included_false) {
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
                                       GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK((size_t)snprintf(worktree_config, sizeof(worktree_config),
+                           "%s/.git/config.worktree", fixture.repo) <
+          sizeof(worktree_config));
 
     CHECK_EQ_INT(git_set("--worktree", "user.name", "later-worktree"), 0);
     CHECK_EQ_INT(git_config_restore(), -1);
@@ -1061,7 +1156,7 @@ TEST(direct_worktree_extension_true_ignores_later_included_false) {
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "later-worktree\n");
 
-    CHECK_EQ_INT(git_unset_all("--worktree", "user.name"), 0);
+    CHECK_EQ_INT(unlink(worktree_config), 0);
     CHECK_EQ_INT(git_config_restore(), 0);
     CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
                              sizeof(actual)), 0);
@@ -1073,6 +1168,8 @@ TEST(direct_worktree_extension_true_ignores_later_included_false) {
 TEST(direct_worktree_extension_false_ignores_later_included_true) {
     git_fixture_t fixture;
     char include_path[MAX_PATH_LEN];
+    char local_config[MAX_PATH_LEN];
+    char retained_config[MAX_PATH_LEN];
     char actual[256];
 
     if (!fixture_init(&fixture)) {
@@ -1093,6 +1190,11 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
     CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "owned-post",
                                       GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK((size_t)snprintf(local_config, sizeof(local_config),
+                           "%s/.git/config", fixture.repo) <
+          sizeof(local_config));
+    CHECK_EQ_INT(retain_file_generation(local_config, retained_config,
+                                        sizeof(retained_config)), 0);
 
     /* With no distinct store, Git aliases --worktree to --local. Tracking both
      * would count the same later vector twice instead of the single conflict
@@ -1104,7 +1206,7 @@ TEST(direct_worktree_extension_false_ignores_later_included_true) {
                              sizeof(actual)), 0);
     CHECK_STR_EQ(actual, "later-local\n");
 
-    CHECK_EQ_INT(git_unset_all("--local", "user.name"), 0);
+    CHECK_EQ_INT(rename(retained_config, local_config), 0);
     CHECK_EQ_INT(git_config_restore(), 0);
     CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
                              sizeof(actual)), 0);
@@ -1221,6 +1323,409 @@ TEST(git_list_config_never_returns_a_successful_prefix) {
     fixture_cleanup(&fixture);
 }
 
+TEST(replaced_repository_with_identical_managed_vectors_is_never_rolled_back) {
+    git_fixture_t fixture;
+    char original_repo[MAX_PATH_LEN];
+    char replacement_repo[MAX_PATH_LEN];
+    char replacement_config[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(original_repo, sizeof(original_repo), "%s.original",
+                           fixture.repo) < sizeof(original_repo));
+    CHECK((size_t)snprintf(replacement_repo, sizeof(replacement_repo),
+                           "%s.replacement", fixture.repo) <
+          sizeof(replacement_repo));
+    CHECK((size_t)snprintf(replacement_config, sizeof(replacement_config),
+                           "%s/.git/config", replacement_repo) <
+          sizeof(replacement_config));
+    CHECK_EQ_INT(git_add("--local", "user.name", "before-generation-1"), 0);
+    CHECK_EQ_INT(git_add("--local", "user.name", "before-generation-2"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_unset_config_value(GIT_CONFIG_USER_NAME,
+                                        GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME,
+                                      "sealed-replacement-value",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    CHECK_EQ_INT(rename(fixture.repo, original_repo), 0);
+    CHECK_EQ_INT(mkdir(fixture.repo, 0700), 0);
+    CHECK_EQ_INT(chdir(fixture.repo), 0);
+    {
+        const char *const init[] = { "git", "init", "-q", NULL };
+        CHECK_EQ_INT(run_git(init), 0);
+    }
+    CHECK_EQ_INT(git_set("--local", "user.name",
+                         "sealed-replacement-value"), 0);
+    CHECK_EQ_INT(git_set("--local", "audit.replacement",
+                         "must-survive"), 0);
+
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "generation") != NULL);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "sealed-replacement-value\n");
+    CHECK_EQ_INT(git_get_all("--local", "audit.replacement", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    CHECK_EQ_INT(chdir(fixture.base), 0);
+    CHECK_EQ_INT(rename(fixture.repo, replacement_repo), 0);
+    CHECK_EQ_INT(rename(original_repo, fixture.repo), 0);
+    CHECK_EQ_INT(chdir(fixture.repo), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-generation-1\nbefore-generation-2\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "sealed-replacement-value\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "audit.replacement",
+                                  actual, sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(replaced_config_namespace_with_identical_vectors_is_never_rolled_back) {
+    git_fixture_t fixture;
+    char config_dir[MAX_PATH_LEN];
+    char original_dir[MAX_PATH_LEN];
+    char replacement_dir[MAX_PATH_LEN];
+    char live_config[MAX_PATH_LEN];
+    char replacement_config[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(config_dir, sizeof(config_dir), "%s/config-home",
+                           fixture.base) < sizeof(config_dir));
+    CHECK((size_t)snprintf(original_dir, sizeof(original_dir), "%s.original",
+                           config_dir) < sizeof(original_dir));
+    CHECK((size_t)snprintf(replacement_dir, sizeof(replacement_dir),
+                           "%s.replacement", config_dir) <
+          sizeof(replacement_dir));
+    CHECK((size_t)snprintf(live_config, sizeof(live_config), "%s/config",
+                           config_dir) < sizeof(live_config));
+    CHECK((size_t)snprintf(replacement_config, sizeof(replacement_config),
+                           "%s/config", replacement_dir) <
+          sizeof(replacement_config));
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", live_config, 1), 0);
+    CHECK_EQ_INT(git_add("--global", "user.name", "global-before-1"), 0);
+    CHECK_EQ_INT(git_add("--global", "user.name", "global-before-2"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_unset_config_value(GIT_CONFIG_USER_NAME,
+                                        GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME,
+                                      "sealed-global-replacement",
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    CHECK_EQ_INT(rename(config_dir, original_dir), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(git_set("--global", "user.name",
+                         "sealed-global-replacement"), 0);
+    CHECK_EQ_INT(git_set("--global", "audit.replacement",
+                         "must-survive"), 0);
+
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "generation") != NULL);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "sealed-global-replacement\n");
+    CHECK_EQ_INT(git_get_all("--global", "audit.replacement", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    CHECK_EQ_INT(rename(config_dir, replacement_dir), 0);
+    CHECK_EQ_INT(rename(original_dir, config_dir), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--global", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "global-before-1\nglobal-before-2\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "sealed-global-replacement\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "audit.replacement",
+                                  actual, sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(replaced_config_file_with_identical_vectors_is_never_rolled_back) {
+    git_fixture_t fixture;
+    char config[MAX_PATH_LEN];
+    char original_config[MAX_PATH_LEN];
+    char replacement_config[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(config, sizeof(config), "%s/.git/config",
+                           fixture.repo) < sizeof(config));
+    CHECK((size_t)snprintf(original_config, sizeof(original_config),
+                           "%s.original", config) < sizeof(original_config));
+    CHECK((size_t)snprintf(replacement_config, sizeof(replacement_config),
+                           "%s.replacement", config) <
+          sizeof(replacement_config));
+    CHECK_EQ_INT(git_set("--local", "user.name", "file-before"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME,
+                                      "sealed-file-replacement",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    CHECK_EQ_INT(rename(config, original_config), 0);
+    CHECK_EQ_INT(git_set_file(config, "user.name",
+                              "sealed-file-replacement"), 0);
+    CHECK_EQ_INT(git_set_file(config, "audit.replacement", "must-survive"), 0);
+
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "generation") != NULL);
+    CHECK_EQ_INT(git_get_file_all(config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "sealed-file-replacement\n");
+    CHECK_EQ_INT(git_get_file_all(config, "audit.replacement", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    CHECK_EQ_INT(rename(config, replacement_config), 0);
+    CHECK_EQ_INT(rename(original_config, config), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "file-before\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "sealed-file-replacement\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "audit.replacement",
+                                  actual, sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(replaced_config_file_with_one_conflict_is_never_partially_rebased) {
+    git_fixture_t fixture;
+    char config[MAX_PATH_LEN];
+    char original_config[MAX_PATH_LEN];
+    char replacement_config[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(config, sizeof(config), "%s/.git/config",
+                           fixture.repo) < sizeof(config));
+    CHECK((size_t)snprintf(original_config, sizeof(original_config),
+                           "%s.original", config) < sizeof(original_config));
+    CHECK((size_t)snprintf(replacement_config, sizeof(replacement_config),
+                           "%s.replacement", config) <
+          sizeof(replacement_config));
+    CHECK_EQ_INT(git_set("--local", "user.name", "before-name"), 0);
+    CHECK_EQ_INT(git_set("--local", "user.email", "before@example.test"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "post-name",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_EMAIL,
+                                      "post@example.test",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    /* One conflicting managed vector must not authorize rollback of another
+     * vector in an unrelated file generation at the same pathname. */
+    CHECK_EQ_INT(rename(config, original_config), 0);
+    CHECK_EQ_INT(git_set_file(config, "user.name", "unrelated-conflict"), 0);
+    CHECK_EQ_INT(git_set_file(config, "user.email", "post@example.test"), 0);
+    CHECK_EQ_INT(git_set_file(config, "audit.replacement", "must-survive"), 0);
+
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "generation") != NULL);
+    CHECK_EQ_INT(git_get_file_all(config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "unrelated-conflict\n");
+    CHECK_EQ_INT(git_get_file_all(config, "user.email", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "post@example.test\n");
+
+    CHECK_EQ_INT(rename(config, replacement_config), 0);
+    CHECK_EQ_INT(rename(original_config, config), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-name\n");
+    CHECK_EQ_INT(git_get_all("--local", "user.email", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before@example.test\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "user.email", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "post@example.test\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "audit.replacement",
+                                  actual, sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation) {
+    git_fixture_t fixture;
+    char config[MAX_PATH_LEN];
+    char retained_config[MAX_PATH_LEN];
+    char conflicted_config[MAX_PATH_LEN];
+    char replacement_config[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(config, sizeof(config), "%s/.git/config",
+                           fixture.repo) < sizeof(config));
+    CHECK((size_t)snprintf(conflicted_config, sizeof(conflicted_config),
+                           "%s.conflicted", config) <
+          sizeof(conflicted_config));
+    CHECK((size_t)snprintf(replacement_config, sizeof(replacement_config),
+                           "%s.replacement", config) <
+          sizeof(replacement_config));
+    CHECK_EQ_INT(git_set("--local", "user.name", "before-name"), 0);
+    CHECK_EQ_INT(git_set("--local", "user.email", "before@example.test"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME, "post-name",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_EMAIL,
+                                      "post@example.test",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(retain_file_generation(config, retained_config,
+                                        sizeof(retained_config)), 0);
+
+    /* A real conflict on one generation cannot grant a reusable allowance to
+     * a later replacement generation, even when every managed value is then
+     * repaired to the sealed post-image. */
+    CHECK_EQ_INT(git_add("--local", "user.name", "legitimate-conflict"), 0);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK_EQ_INT(rename(config, conflicted_config), 0);
+    CHECK_EQ_INT(git_set_file(config, "user.name", "post-name"), 0);
+    CHECK_EQ_INT(git_set_file(config, "user.email", "post@example.test"), 0);
+    CHECK_EQ_INT(git_set_file(config, "audit.replacement", "must-survive"), 0);
+
+    CHECK_EQ_INT(git_config_restore(), -1);
+    CHECK(strstr(get_last_error()->message, "generation") != NULL);
+    CHECK_EQ_INT(git_get_file_all(config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "post-name\n");
+    CHECK_EQ_INT(git_get_file_all(config, "audit.replacement", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    CHECK_EQ_INT(rename(config, replacement_config), 0);
+    CHECK_EQ_INT(rename(retained_config, config), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-name\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "post-name\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "audit.replacement",
+                                  actual, sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(postpublish_path_race_retains_the_installed_generation_for_retry) {
+    git_fixture_t fixture;
+    char replacement_config[MAX_PATH_LEN];
+    char actual[256];
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK((size_t)snprintf(g_postpublish_config,
+                           sizeof(g_postpublish_config), "%s/.git/config",
+                           fixture.repo) < sizeof(g_postpublish_config));
+    CHECK((size_t)snprintf(g_postpublish_installed,
+                           sizeof(g_postpublish_installed), "%s.installed",
+                           g_postpublish_config) <
+          sizeof(g_postpublish_installed));
+    CHECK((size_t)snprintf(replacement_config, sizeof(replacement_config),
+                           "%s.replacement", g_postpublish_config) <
+          sizeof(replacement_config));
+    CHECK_EQ_INT(git_set("--local", "user.name", "before-publish-race"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_USER_NAME,
+                                      "owned-post-publish-race",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    /* The rollback has already installed its before-image when another writer
+     * replaces the pathname. Its verified publication descriptor must become
+     * the retained generation without reopening that now-unrelated pathname. */
+    g_postpublish_writer_calls = 0;
+    git_ops_test_set_restore_postpublish_hook(
+        replace_config_after_rollback_publish);
+    CHECK_EQ_INT(git_config_restore(), -1);
+    git_ops_test_set_restore_postpublish_hook(NULL);
+    CHECK_EQ_INT(g_postpublish_writer_calls, 1);
+    CHECK(strstr(get_last_error()->message, "generation") != NULL);
+    CHECK_EQ_INT(git_get_file_all(g_postpublish_config, "user.name", actual,
+                                  sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "later-replacement\n");
+
+    CHECK_EQ_INT(rename(g_postpublish_config, replacement_config), 0);
+    CHECK_EQ_INT(rename(g_postpublish_installed, g_postpublish_config), 0);
+    CHECK_EQ_INT(git_config_restore(), 0);
+    CHECK_EQ_INT(git_get_all("--local", "user.name", actual,
+                             sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "before-publish-race\n");
+    CHECK_EQ_INT(git_get_file_all(replacement_config, "audit.replacement",
+                                  actual, sizeof(actual)), 0);
+    CHECK_STR_EQ(actual, "must-survive\n");
+
+    fixture_cleanup(&fixture);
+}
+
+TEST(snapshot_commit_releases_all_generation_descriptors) {
+    git_fixture_t fixture;
+    int before;
+    int after;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    before = count_open_descriptors();
+    for (int iteration = 0; iteration < 32; iteration++) {
+        CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
+        CHECK_EQ_INT(git_config_seal(), 0);
+        git_config_commit();
+    }
+    after = count_open_descriptors();
+    if (before >= 0 && after >= 0) CHECK_EQ_INT(after, before);
+
+    fixture_cleanup(&fixture);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);
@@ -1241,4 +1746,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(committed_git_transaction_discards_rollback_ownership);
     RUN_TEST(worktree_probe_has_a_truthful_hard_bound_before_mutation);
     RUN_TEST(git_list_config_never_returns_a_successful_prefix);
+    RUN_TEST(replaced_repository_with_identical_managed_vectors_is_never_rolled_back);
+    RUN_TEST(replaced_config_namespace_with_identical_vectors_is_never_rolled_back);
+    RUN_TEST(replaced_config_file_with_identical_vectors_is_never_rolled_back);
+    RUN_TEST(replaced_config_file_with_one_conflict_is_never_partially_rebased);
+    RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
+    RUN_TEST(postpublish_path_race_retains_the_installed_generation_for_retry);
+    RUN_TEST(snapshot_commit_releases_all_generation_descriptors);
 TEST_MAIN_END()

@@ -62,6 +62,11 @@ static int git_reject_ssh_command_override(void);
  * preference without a separate product decision. */
 #define GIT_SCOPE_WORKTREE_INTERNAL ((git_scope_t)3)
 
+static const char *git_scope_diagnostic_label(git_scope_t scope) {
+    const char *flag = git_scope_to_flag(scope);
+    return flag ? flag : "(invalid scope)";
+}
+
 typedef struct {
     const char *key;
     char value[GIT_CFG_VALUE_MAX];
@@ -109,6 +114,31 @@ typedef struct {
     git_snapshot_key_t keys[GIT_MANAGED_KEY_COUNT];
 } git_scope_snapshot_t;
 
+/* A rollback destination is more than its managed values. Keep the resolved
+ * configuration namespace and repository generation pinned for the lifetime
+ * of the transaction. The sealed config descriptor identifies the exact
+ * post-image that rollback is allowed to replace; Git's normal lock+rename
+ * writes legitimately change that file inode before seal, so it is pinned at
+ * seal rather than mistaken for an immutable snapshot-time inode. */
+typedef struct {
+    git_scope_t scope;
+    char logical_path[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN];
+    char parent[MAX_PATH_LEN];
+    char leaf[NAME_MAX + 1U];
+    int parent_fd;
+    struct stat parent_stat;
+    char repository_path[MAX_PATH_LEN];
+    int repository_fd;
+    struct stat repository_stat;
+    bool repository_present;
+    int post_config_fd;
+    struct stat post_config_stat;
+    bool post_config_identity_valid;
+    bool post_config_present;
+    bool valid;
+} git_scope_generation_t;
+
 typedef struct {
     git_scope_t scope;
     bool local_also;
@@ -119,6 +149,9 @@ typedef struct {
     git_scope_snapshot_t post_primary;
     git_scope_snapshot_t post_local;
     git_scope_snapshot_t post_worktree;
+    git_scope_generation_t primary_generation;
+    git_scope_generation_t local_generation;
+    git_scope_generation_t worktree_generation;
     bool postimage_sealed;
     bool valid;
     bool restore_incomplete;
@@ -126,6 +159,14 @@ typedef struct {
 
 static git_config_snapshot_t g_git_snapshot;
 static void git_snapshot_clear(git_config_snapshot_t *snapshot);
+static int git_scope_generation_capture(git_scope_t scope,
+                                        git_scope_generation_t *generation);
+static int git_scope_generation_verify_namespace(
+    const git_scope_generation_t *generation);
+static int git_scope_generation_pin_post_config(
+    git_scope_generation_t *generation);
+static int git_scope_generation_verify_post_config(
+    const git_scope_generation_t *generation);
 
 typedef void *(*git_snapshot_value_malloc_fn)(size_t size);
 static git_snapshot_value_malloc_fn g_git_snapshot_value_malloc = malloc;
@@ -133,11 +174,13 @@ static git_snapshot_value_malloc_fn g_git_snapshot_value_malloc = malloc;
 typedef void (*git_restore_test_hook_fn)(git_scope_t scope);
 static git_restore_test_hook_fn g_restore_prelock_hook;
 static git_restore_test_hook_fn g_restore_locked_hook;
+static git_restore_test_hook_fn g_restore_postpublish_hook;
 
 /* Test seams for deterministic real-Git race coverage. They are deliberately
  * absent from the installed API; tests declare the prototypes locally. */
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn);
 void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn);
+void git_ops_test_set_restore_postpublish_hook(git_restore_test_hook_fn fn);
 git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     git_snapshot_value_malloc_fn fn);
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
@@ -145,6 +188,9 @@ void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
 }
 void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn) {
     g_restore_locked_hook = fn;
+}
+void git_ops_test_set_restore_postpublish_hook(git_restore_test_hook_fn fn) {
+    g_restore_postpublish_hook = fn;
 }
 git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     git_snapshot_value_malloc_fn fn) {
@@ -255,6 +301,7 @@ void git_ops_test_reset_caches(void) {
     g_git_validated = false;
     g_restore_prelock_hook = NULL;
     g_restore_locked_hook = NULL;
+    g_restore_postpublish_hook = NULL;
     g_git_snapshot_value_malloc = malloc;
 }
 
@@ -593,6 +640,25 @@ static void git_scope_snapshot_clear(git_scope_snapshot_t *scope) {
     memset(scope, 0, sizeof(*scope));
 }
 
+static void git_scope_generation_clear(git_scope_generation_t *generation) {
+    if (!generation) return;
+    if (generation->valid && generation->parent_fd >= 0) {
+        (void)close(generation->parent_fd);
+    }
+    if (generation->valid && generation->repository_fd >= 0) {
+        (void)close(generation->repository_fd);
+    }
+    if (generation->post_config_identity_valid &&
+        generation->post_config_present &&
+        generation->post_config_fd >= 0) {
+        (void)close(generation->post_config_fd);
+    }
+    memset(generation, 0, sizeof(*generation));
+    generation->parent_fd = -1;
+    generation->repository_fd = -1;
+    generation->post_config_fd = -1;
+}
+
 static void git_snapshot_clear(git_config_snapshot_t *snapshot) {
     if (!snapshot) return;
     git_scope_snapshot_clear(&snapshot->primary);
@@ -601,6 +667,9 @@ static void git_snapshot_clear(git_config_snapshot_t *snapshot) {
     git_scope_snapshot_clear(&snapshot->post_primary);
     git_scope_snapshot_clear(&snapshot->post_local);
     git_scope_snapshot_clear(&snapshot->post_worktree);
+    git_scope_generation_clear(&snapshot->primary_generation);
+    git_scope_generation_clear(&snapshot->local_generation);
+    git_scope_generation_clear(&snapshot->worktree_generation);
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
@@ -939,6 +1008,7 @@ static int git_add_snapshot_value(git_scope_t scope, const char *key,
 
 typedef struct {
     int conflicts;
+    int generation_conflicts;
     int write_failures;
 } git_restore_result_t;
 
@@ -1047,9 +1117,11 @@ typedef struct {
     char stage_leaf[96];
     char stage_path[MAX_PATH_LEN];
     int dir_fd;
+    int published_fd;
     struct stat parent_stat;
     struct stat logical_stat;
     struct stat original_stat;
+    struct stat published_stat;
     mode_t target_mode;
     uid_t target_uid;
     gid_t target_gid;
@@ -1059,6 +1131,7 @@ typedef struct {
     bool lock_created;
     bool stage_created;
     bool published;
+    bool generation_conflict;
 } git_scope_lock_t;
 
 static int git_absolute_path(const char *path, char *out, size_t out_size) {
@@ -1239,6 +1312,26 @@ static bool git_same_file_version(const struct stat *left,
 #endif
 }
 
+/* A retained descriptor makes dev+ino an unambiguous file generation. Omit
+ * ctime from retry matching because merely renaming that same pinned inode out
+ * of the way and reinstating it changes ctime without changing the generation
+ * or content that the descriptor names. */
+static bool git_same_pinned_file_generation(const struct stat *left,
+                                            const struct stat *right) {
+    if (left->st_dev != right->st_dev || left->st_ino != right->st_ino ||
+        left->st_mode != right->st_mode || left->st_uid != right->st_uid ||
+        left->st_gid != right->st_gid || left->st_size != right->st_size) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec;
+#endif
+}
+
 static int git_copy_fd(int source_fd, int dest_fd, size_t max_bytes) {
     char buffer[16384];
     size_t total = 0;
@@ -1268,37 +1361,13 @@ static int git_copy_fd(int source_fd, int dest_fd, size_t max_bytes) {
     }
 }
 
-static void git_scope_lock_close(git_scope_lock_t *lock) {
-    if (!lock) return;
-    if (lock->stage_created && lock->dir_fd >= 0) {
-        (void)unlinkat(lock->dir_fd, lock->stage_leaf, 0);
-    }
-    if (lock->lock_created && !lock->published && lock->dir_fd >= 0) {
-        (void)unlinkat(lock->dir_fd, lock->lock_leaf, 0);
-    }
-    if (lock->dir_fd >= 0) close(lock->dir_fd);
-    lock->dir_fd = -1;
-}
-
-/* Acquire exactly the lock name used by Git for this config file, then copy
- * the full current file into it. The in-lock copy is the merge base, so every
- * unmanaged edit that completed before lock acquisition survives publication. */
-static int git_scope_lock_acquire(git_scope_t scope,
-                                  git_scope_lock_t *lock) {
-    static unsigned long stage_nonce;
+static int git_scope_lock_resolve_paths(git_scope_t scope,
+                                        git_scope_lock_t *lock) {
     char resolved_parent[MAX_PATH_LEN];
     char logical_leaf[NAME_MAX + 1U];
     char *logical_slash;
     char *slash;
-    int lock_fd = -1;
-    int source_fd = -1;
-    int stage_fd = -1;
-    struct stat named;
-    struct stat opened;
-    struct stat created;
 
-    memset(lock, 0, sizeof(*lock));
-    lock->dir_fd = -1;
     if (git_resolve_scope_config_path(scope, lock->logical_path,
                                       sizeof(lock->logical_path)) != 0) {
         return -1;
@@ -1372,12 +1441,409 @@ static int git_scope_lock_acquire(git_scope_t scope,
                   "Git configuration lock path is too long");
         return -1;
     }
-    lock->dir_fd = open(lock->parent,
-                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    return 0;
+}
+
+static bool git_same_object_identity(const struct stat *left,
+                                     const struct stat *right) {
+    return left->st_dev == right->st_dev &&
+           left->st_ino == right->st_ino &&
+           ((left->st_mode & S_IFMT) == (right->st_mode & S_IFMT));
+}
+
+static int git_dup_cloexec(int fd) {
+#if defined(F_DUPFD_CLOEXEC)
+    int duplicate = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate >= 0 || errno != EINVAL) return duplicate;
+#endif
+    {
+        int fallback_duplicate = dup(fd);
+        if (fallback_duplicate < 0) return -1;
+        if (fcntl(fallback_duplicate, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            (void)close(fallback_duplicate);
+            errno = saved_errno;
+            return -1;
+        }
+        return fallback_duplicate;
+    }
+}
+
+static int git_resolve_repository_generation_path(char *out,
+                                                  size_t out_size) {
+    const char *const top_absolute[] = {
+        "git", "rev-parse", "--path-format=absolute", "--show-toplevel",
+        NULL
+    };
+    const char *const top_fallback[] = {
+        "git", "rev-parse", "--show-toplevel", NULL
+    };
+    const char *const gitdir_absolute[] = {
+        "git", "rev-parse", "--absolute-git-dir", NULL
+    };
+    const char *const gitdir_fallback[] = {
+        "git", "rev-parse", "--git-dir", NULL
+    };
+    char candidate[MAX_PATH_LEN];
+    char canonical[MAX_PATH_LEN];
+
+    if ((git_query_single_path(top_absolute, candidate,
+                               sizeof(candidate)) == 0 ||
+         git_query_single_path(top_fallback, candidate,
+                               sizeof(candidate)) == 0 ||
+         git_query_single_path(gitdir_absolute, candidate,
+                               sizeof(candidate)) == 0 ||
+         git_query_single_path(gitdir_fallback, candidate,
+                               sizeof(candidate)) == 0) &&
+        realpath(candidate, canonical) != NULL &&
+        safe_strncpy(out, canonical, out_size) == 0) {
+        return 0;
+    }
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Cannot resolve repository generation for Git rollback");
+    return -1;
+}
+
+static int git_scope_generation_verify_namespace_resolved(
+    const git_scope_generation_t *generation,
+    const git_scope_lock_t *resolved) {
+    char repository_path[MAX_PATH_LEN];
+    int live_parent_fd = -1;
+    int live_repository_fd = -1;
+    struct stat pinned_parent;
+    struct stat live_parent;
+    struct stat pinned_repository;
+    struct stat live_repository;
+    bool matches = false;
+
+    if (!generation || !generation->valid || !resolved) return 0;
+    if (generation->scope != GIT_SCOPE_LOCAL &&
+        generation->scope != GIT_SCOPE_GLOBAL &&
+        generation->scope != GIT_SCOPE_SYSTEM &&
+        generation->scope != GIT_SCOPE_WORKTREE_INTERNAL) {
+        goto changed;
+    }
+    if (strcmp(generation->logical_path, resolved->logical_path) != 0 ||
+        strcmp(generation->path, resolved->path) != 0 ||
+        strcmp(generation->parent, resolved->parent) != 0 ||
+        strcmp(generation->leaf, resolved->leaf) != 0 ||
+        fstat(generation->parent_fd, &pinned_parent) != 0 ||
+        !git_same_object_identity(&generation->parent_stat, &pinned_parent)) {
+        goto changed;
+    }
+    live_parent_fd = open(resolved->parent,
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (live_parent_fd < 0 || fstat(live_parent_fd, &live_parent) != 0 ||
+        !git_same_object_identity(&generation->parent_stat, &live_parent)) {
+        goto changed;
+    }
+    if (generation->repository_present) {
+        if (fstat(generation->repository_fd, &pinned_repository) != 0 ||
+            !git_same_object_identity(&generation->repository_stat,
+                                      &pinned_repository) ||
+            git_resolve_repository_generation_path(repository_path,
+                                                   sizeof(repository_path)) != 0 ||
+            strcmp(repository_path, generation->repository_path) != 0) {
+            goto changed;
+        }
+        live_repository_fd = open(
+            repository_path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (live_repository_fd < 0 ||
+            fstat(live_repository_fd, &live_repository) != 0 ||
+            !git_same_object_identity(&generation->repository_stat,
+                                      &live_repository)) {
+            goto changed;
+        }
+    }
+    matches = true;
+
+changed:
+    if (live_parent_fd >= 0) (void)close(live_parent_fd);
+    if (live_repository_fd >= 0) (void)close(live_repository_fd);
+    if (!matches) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback destination generation changed for %s",
+                  git_scope_diagnostic_label(generation->scope));
+        return -1;
+    }
+    return 0;
+}
+
+static int git_scope_generation_verify_namespace(
+    const git_scope_generation_t *generation) {
+    git_scope_lock_t resolved;
+
+    if (!generation || !generation->valid) return 0;
+    memset(&resolved, 0, sizeof(resolved));
+    resolved.dir_fd = -1;
+    if (git_scope_lock_resolve_paths(generation->scope, &resolved) != 0 ||
+        git_scope_generation_verify_namespace_resolved(generation,
+                                                       &resolved) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback destination generation changed for %s",
+                  git_scope_diagnostic_label(generation->scope));
+        return -1;
+    }
+    return 0;
+}
+
+static int git_scope_generation_capture(git_scope_t scope,
+                                        git_scope_generation_t *generation) {
+    git_scope_lock_t resolved;
+
+    if (!generation) return -1;
+    memset(generation, 0, sizeof(*generation));
+    generation->parent_fd = -1;
+    generation->repository_fd = -1;
+    generation->post_config_fd = -1;
+    memset(&resolved, 0, sizeof(resolved));
+    resolved.dir_fd = -1;
+    if (git_scope_lock_resolve_paths(scope, &resolved) != 0) return -1;
+    generation->scope = scope;
+    safe_strncpy(generation->logical_path, resolved.logical_path,
+                 sizeof(generation->logical_path));
+    safe_strncpy(generation->path, resolved.path,
+                 sizeof(generation->path));
+    safe_strncpy(generation->parent, resolved.parent,
+                 sizeof(generation->parent));
+    safe_strncpy(generation->leaf, resolved.leaf,
+                 sizeof(generation->leaf));
+    generation->parent_fd = open(
+        generation->parent,
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (generation->parent_fd < 0 ||
+        fstat(generation->parent_fd, &generation->parent_stat) != 0 ||
+        !S_ISDIR(generation->parent_stat.st_mode)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot pin Git configuration generation for %s",
+                  git_scope_diagnostic_label(scope));
+        if (generation->parent_fd >= 0) {
+            (void)close(generation->parent_fd);
+            generation->parent_fd = -1;
+        }
+        return -1;
+    }
+    generation->valid = true;
+    if (scope == GIT_SCOPE_LOCAL ||
+        scope == GIT_SCOPE_WORKTREE_INTERNAL) {
+        if (git_resolve_repository_generation_path(
+                generation->repository_path,
+                sizeof(generation->repository_path)) != 0) {
+            git_scope_generation_clear(generation);
+            return -1;
+        }
+        generation->repository_fd = open(
+            generation->repository_path,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (generation->repository_fd < 0 ||
+            fstat(generation->repository_fd,
+                  &generation->repository_stat) != 0 ||
+            !S_ISDIR(generation->repository_stat.st_mode)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Cannot pin repository generation for Git rollback");
+            git_scope_generation_clear(generation);
+            return -1;
+        }
+        generation->repository_present = true;
+    }
+    if (git_scope_generation_verify_namespace_resolved(generation,
+                                                       &resolved) != 0) {
+        git_scope_generation_clear(generation);
+        return -1;
+    }
+    return 0;
+}
+
+static int git_scope_generation_pin_post_config_pinned(
+    git_scope_generation_t *generation) {
+    struct stat named;
+    struct stat opened;
+    int config_fd = -1;
+    bool present;
+
+    if (!generation || !generation->valid) return 0;
+    if (fstatat(generation->parent_fd, generation->leaf, &named,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        present = true;
+        if (!S_ISREG(named.st_mode)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Cannot pin non-regular Git post-image for %s",
+                      git_scope_diagnostic_label(generation->scope));
+            return -1;
+        }
+        config_fd = openat(generation->parent_fd, generation->leaf,
+                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (config_fd < 0 || fstat(config_fd, &opened) != 0 ||
+            !git_same_file_version(&named, &opened)) {
+            if (config_fd >= 0) (void)close(config_fd);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git post-image changed while it was being pinned for %s",
+                      git_scope_diagnostic_label(generation->scope));
+            return -1;
+        }
+    } else if (errno == ENOENT) {
+        present = false;
+        memset(&opened, 0, sizeof(opened));
+    } else {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot inspect Git post-image for %s",
+                  git_scope_diagnostic_label(generation->scope));
+        return -1;
+    }
+    if (generation->post_config_identity_valid &&
+        generation->post_config_present &&
+        generation->post_config_fd >= 0) {
+        (void)close(generation->post_config_fd);
+    }
+    generation->post_config_fd = config_fd;
+    generation->post_config_stat = opened;
+    generation->post_config_present = present;
+    generation->post_config_identity_valid = true;
+    return 0;
+}
+
+static int git_scope_generation_pin_post_config(
+    git_scope_generation_t *generation) {
+    if (git_scope_generation_verify_namespace(generation) != 0) return -1;
+    return git_scope_generation_pin_post_config_pinned(generation);
+}
+
+static int git_scope_generation_adopt_published_config(
+    git_scope_generation_t *generation, git_scope_lock_t *lock) {
+    struct stat pinned;
+    struct stat named;
+
+    if (!generation || !generation->valid ||
+        !generation->post_config_identity_valid) {
+        return 0;
+    }
+    if (!lock || !lock->published || lock->published_fd < 0 ||
+        fstat(lock->published_fd, &pinned) != 0 ||
+        !git_same_pinned_file_generation(&lock->published_stat, &pinned)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot retain the installed Git rollback generation for %s",
+                  git_scope_diagnostic_label(generation->scope));
+        return -1;
+    }
+
+    if (generation->post_config_present && generation->post_config_fd >= 0) {
+        (void)close(generation->post_config_fd);
+    }
+    generation->post_config_fd = lock->published_fd;
+    lock->published_fd = -1;
+    generation->post_config_stat = pinned;
+    generation->post_config_present = true;
+    generation->post_config_identity_valid = true;
+
+    if (fstatat(generation->parent_fd, generation->leaf, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !git_same_pinned_file_generation(&generation->post_config_stat,
+                                         &named)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback generation changed immediately after publication for %s",
+                  git_scope_diagnostic_label(generation->scope));
+        return -1;
+    }
+    return 0;
+}
+
+static int git_scope_generation_verify_post_config(
+    const git_scope_generation_t *generation) {
+    struct stat pinned;
+    struct stat named;
+
+    if (!generation || !generation->valid ||
+        !generation->post_config_identity_valid) {
+        return 0;
+    }
+    if (generation->post_config_present) {
+        if (generation->post_config_fd < 0 ||
+            fstat(generation->post_config_fd, &pinned) != 0 ||
+            fstatat(generation->parent_fd, generation->leaf, &named,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !git_same_file_version(&generation->post_config_stat, &pinned) ||
+            !git_same_file_version(&generation->post_config_stat, &named)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git rollback post-image generation changed for %s",
+                      git_scope_diagnostic_label(generation->scope));
+            return -1;
+        }
+    } else if (fstatat(generation->parent_fd, generation->leaf, &named,
+                       AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback post-image generation changed for %s",
+                  git_scope_diagnostic_label(generation->scope));
+        return -1;
+    }
+    return 0;
+}
+
+static void git_scope_lock_close(git_scope_lock_t *lock) {
+    if (!lock) return;
+    if (lock->stage_created && lock->dir_fd >= 0) {
+        (void)unlinkat(lock->dir_fd, lock->stage_leaf, 0);
+    }
+    if (lock->lock_created && !lock->published && lock->dir_fd >= 0) {
+        (void)unlinkat(lock->dir_fd, lock->lock_leaf, 0);
+    }
+    if (lock->published_fd >= 0) close(lock->published_fd);
+    lock->published_fd = -1;
+    if (lock->dir_fd >= 0) close(lock->dir_fd);
+    lock->dir_fd = -1;
+}
+
+/* Acquire exactly the lock name used by Git for this config file, then copy
+ * the full current file into it. The in-lock copy is the merge base, so every
+ * unmanaged edit that completed before lock acquisition survives publication. */
+static int git_scope_lock_acquire(git_scope_t scope,
+                                  git_scope_lock_t *lock,
+                                  const git_scope_generation_t *generation) {
+    static unsigned long stage_nonce;
+    int lock_fd = -1;
+    int source_fd = -1;
+    int stage_fd = -1;
+    struct stat named;
+    struct stat opened;
+    struct stat created;
+
+    memset(lock, 0, sizeof(*lock));
+    lock->dir_fd = -1;
+    lock->published_fd = -1;
+    if (git_scope_lock_resolve_paths(scope, lock) != 0) {
+        if (generation && generation->valid) {
+            lock->generation_conflict = true;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git rollback destination generation changed for %s",
+                      git_scope_diagnostic_label(scope));
+        }
+        return -1;
+    }
+    if (generation && generation->valid) {
+        if (git_scope_generation_verify_namespace_resolved(generation,
+                                                           lock) != 0) {
+            lock->generation_conflict = true;
+            return -1;
+        }
+        lock->dir_fd = git_dup_cloexec(generation->parent_fd);
+    } else {
+        lock->dir_fd = open(lock->parent,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    }
     if (lock->dir_fd < 0 || fstat(lock->dir_fd, &lock->parent_stat) != 0) {
         set_system_error(ERR_GIT_CONFIG_FAILED,
                          "Cannot pin Git configuration directory: %s",
                          lock->parent);
+        git_scope_lock_close(lock);
+        return -1;
+    }
+    if (generation && generation->valid &&
+        !git_same_object_identity(&generation->parent_stat,
+                                  &lock->parent_stat)) {
+        lock->generation_conflict = true;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback destination generation changed for %s",
+                  git_scope_diagnostic_label(scope));
         git_scope_lock_close(lock);
         return -1;
     }
@@ -1721,11 +2187,12 @@ static int git_scope_lock_publish(git_scope_lock_t *lock) {
                          lock->lock_path);
         return -1;
     }
-    if (close(verify_fd) != 0) {
-        set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Cannot close installed Git rollback lock");
-        return -1;
-    }
+    /* Keep the already-verified descriptor across the publishing rename.
+     * Reopening the pathname afterward can fail or race with the next writer,
+     * leaving retry ownership stuck on the pre-restore inode. */
+    lock->published_fd = verify_fd;
+    lock->published_stat = opened_lock;
+    verify_fd = -1;
     if (renameat(lock->dir_fd, lock->lock_leaf,
                  lock->dir_fd, lock->leaf) != 0) {
         set_system_error(ERR_GIT_CONFIG_FAILED,
@@ -1742,6 +2209,35 @@ static int git_scope_lock_publish(git_scope_lock_t *lock) {
     return 0;
 }
 
+static bool git_scope_snapshot_restore_complete(
+    const git_scope_snapshot_t *snapshot) {
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (!snapshot->keys[i].restored) return false;
+    }
+    return true;
+}
+
+static bool git_scope_lock_matches_post_generation(
+    const git_scope_lock_t *lock,
+    const git_scope_generation_t *generation) {
+    struct stat pinned;
+
+    if (!generation || !generation->valid ||
+        !generation->post_config_identity_valid) {
+        return true;
+    }
+    if (lock->original_present != generation->post_config_present) {
+        return false;
+    }
+    if (!lock->original_present) return true;
+    return generation->post_config_fd >= 0 &&
+           fstat(generation->post_config_fd, &pinned) == 0 &&
+           git_same_pinned_file_generation(&generation->post_config_stat,
+                                           &pinned) &&
+           git_same_pinned_file_generation(&generation->post_config_stat,
+                                           &lock->original_stat);
+}
+
 /* Production rollback owns the same per-file lock as `git config`. The fresh
  * ownership read, full-file merge, and atomic publication therefore form one
  * serialized transaction. Custom test runners retain the command-mode helper
@@ -1749,7 +2245,8 @@ static int git_scope_lock_publish(git_scope_lock_t *lock) {
  * configurations. */
 static git_restore_result_t git_restore_scope_snapshot_atomic(
     git_scope_t scope, git_scope_snapshot_t *before,
-    const git_scope_snapshot_t *post) {
+    const git_scope_snapshot_t *post,
+    git_scope_generation_t *generation) {
     git_restore_result_t result = {0};
     git_scope_lock_t lock;
     git_scope_snapshot_t current;
@@ -1757,12 +2254,19 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
     git_scope_snapshot_t observed;
     bool restore_key[GIT_MANAGED_KEY_COUNT] = {false};
     bool any_restore = false;
+    bool track_post_generation = generation && generation->valid &&
+                                 generation->post_config_identity_valid;
 
     memset(&current, 0, sizeof(current));
     memset(&expected, 0, sizeof(expected));
     memset(&observed, 0, sizeof(observed));
-    if (git_scope_lock_acquire(scope, &lock) != 0) {
-        result.write_failures++;
+    if (git_scope_snapshot_restore_complete(before)) return result;
+    if (git_scope_lock_acquire(scope, &lock, generation) != 0) {
+        if (lock.generation_conflict) {
+            result.generation_conflicts++;
+        } else {
+            result.write_failures++;
+        }
         return result;
     }
     if (git_capture_scope_snapshot(scope, &current) != 0 ||
@@ -1784,7 +2288,8 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
         if (!git_restore_key_still_owned(&current.keys[i], key,
                                          &post->keys[i])) {
             log_warning("Rollback preserved externally changed Git config %s (%s)",
-                        g_managed_keys[i], git_scope_to_flag(scope));
+                        g_managed_keys[i],
+                        git_scope_diagnostic_label(scope));
             cfg_cache_store(cfg_scope_index(scope), (int)i, CFG_UNKNOWN,
                             current.keys[i].count != 0, "");
             result.conflicts++;
@@ -1800,6 +2305,16 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
                 goto done;
             }
         }
+    }
+    /* A value conflict proves only that this transaction does not own that
+     * vector. It cannot transfer whole-file ownership to a different inode,
+     * either now or on a later retry. */
+    if (!git_scope_lock_matches_post_generation(&lock, generation)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback post-image generation changed for %s",
+                  git_scope_diagnostic_label(scope));
+        result.generation_conflicts++;
+        goto done;
     }
     if (!any_restore) goto done;
 
@@ -1829,6 +2344,12 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
          * prefix ownership, never completion, until the parent directory sync
          * succeeds on a later checked retry. */
         if (lock.published) {
+            if (track_post_generation &&
+                git_scope_generation_adopt_published_config(generation,
+                                                            &lock) != 0) {
+                log_warning("Could not retain the installed Git rollback generation: %s",
+                            get_last_error()->message);
+            }
             for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
                 if (!restore_key[i]) continue;
                 before->keys[i].restore_started = true;
@@ -1836,6 +2357,19 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
             }
         }
         result.write_failures++;
+        goto done;
+    }
+    if (g_restore_postpublish_hook) g_restore_postpublish_hook(scope);
+    if (generation && generation->valid &&
+        ((track_post_generation &&
+          git_scope_generation_adopt_published_config(generation, &lock) != 0) ||
+         git_scope_generation_verify_namespace(generation) != 0)) {
+        for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+            if (!restore_key[i]) continue;
+            before->keys[i].restore_started = true;
+            before->keys[i].restore_prefix = before->keys[i].count;
+        }
+        result.generation_conflicts++;
         goto done;
     }
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
@@ -1879,6 +2413,94 @@ static int git_capture_transaction_scopes(git_scope_snapshot_t *primary,
         return -1;
     }
     return 0;
+}
+
+static int git_snapshot_capture_generations(git_config_snapshot_t *snapshot) {
+    if (!run_uses_default_runner()) return 0;
+    if (git_scope_generation_capture(snapshot->scope,
+                                     &snapshot->primary_generation) != 0 ||
+        (snapshot->local_also &&
+         git_scope_generation_capture(GIT_SCOPE_LOCAL,
+                                      &snapshot->local_generation) != 0) ||
+        (snapshot->worktree_also &&
+         git_scope_generation_capture(GIT_SCOPE_WORKTREE_INTERNAL,
+                                      &snapshot->worktree_generation) != 0)) {
+        return -1;
+    }
+    return 0;
+}
+
+static int git_snapshot_verify_generations(
+    const git_config_snapshot_t *snapshot, bool verify_post_config) {
+    const git_scope_generation_t *generations[] = {
+        &snapshot->primary_generation,
+        &snapshot->local_generation,
+        &snapshot->worktree_generation
+    };
+
+    for (size_t i = 0; i < sizeof(generations) / sizeof(generations[0]); i++) {
+        const git_scope_generation_t *generation = generations[i];
+        if (!generation->valid) continue;
+        if (git_scope_generation_verify_namespace(generation) != 0 ||
+            (verify_post_config &&
+             git_scope_generation_verify_post_config(generation) != 0)) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int git_snapshot_pin_post_configs(git_config_snapshot_t *snapshot) {
+    git_scope_generation_t *generations[] = {
+        &snapshot->primary_generation,
+        &snapshot->local_generation,
+        &snapshot->worktree_generation
+    };
+
+    for (size_t i = 0; i < sizeof(generations) / sizeof(generations[0]); i++) {
+        if (generations[i]->valid &&
+            git_scope_generation_pin_post_config(generations[i]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void git_snapshot_clear_post_configs(git_config_snapshot_t *snapshot) {
+    git_scope_generation_t *generations[] = {
+        &snapshot->primary_generation,
+        &snapshot->local_generation,
+        &snapshot->worktree_generation
+    };
+
+    for (size_t i = 0; i < sizeof(generations) / sizeof(generations[0]); i++) {
+        git_scope_generation_t *generation = generations[i];
+        if (generation->post_config_identity_valid &&
+            generation->post_config_present &&
+            generation->post_config_fd >= 0) {
+            (void)close(generation->post_config_fd);
+        }
+        generation->post_config_fd = -1;
+        memset(&generation->post_config_stat, 0,
+               sizeof(generation->post_config_stat));
+        generation->post_config_identity_valid = false;
+        generation->post_config_present = false;
+    }
+}
+
+static git_scope_generation_t *git_transaction_generation(git_scope_t scope) {
+    if (!g_git_snapshot.valid) return NULL;
+    if (scope == g_git_snapshot.scope) {
+        return &g_git_snapshot.primary_generation;
+    }
+    if (g_git_snapshot.local_also && scope == GIT_SCOPE_LOCAL) {
+        return &g_git_snapshot.local_generation;
+    }
+    if (g_git_snapshot.worktree_also &&
+        scope == GIT_SCOPE_WORKTREE_INTERNAL) {
+        return &g_git_snapshot.worktree_generation;
+    }
+    return NULL;
 }
 
 static git_scope_snapshot_t *git_transaction_post_scope(git_scope_t scope) {
@@ -1998,7 +2620,8 @@ int git_config_snapshot(git_scope_t scope) {
     next.scope = scope;
     next.local_also = (scope == GIT_SCOPE_GLOBAL && git_is_repository());
     next.worktree_also = manage_worktree;
-    if (git_capture_scope_snapshot(scope, &next.primary) != 0 ||
+    if (git_snapshot_capture_generations(&next) != 0 ||
+        git_capture_scope_snapshot(scope, &next.primary) != 0 ||
         (next.local_also &&
          git_capture_scope_snapshot(GIT_SCOPE_LOCAL, &next.local) != 0) ||
         (next.worktree_also &&
@@ -2009,7 +2632,8 @@ int git_config_snapshot(git_scope_t scope) {
          git_scope_snapshot_clone(&next.local, &next.post_local) != 0) ||
         (next.worktree_also &&
          git_scope_snapshot_clone(&next.worktree,
-                                  &next.post_worktree) != 0)) {
+                                  &next.post_worktree) != 0) ||
+        git_snapshot_verify_generations(&next, false) != 0) {
         git_snapshot_clear(&next);
         return -1;
     }
@@ -2041,8 +2665,15 @@ int git_config_seal(void) {
         return -1;
     }
     if (g_git_snapshot.postimage_sealed) return 0;
-    if (git_capture_transaction_scopes(&observed_primary, &observed_local,
-                                       &observed_worktree) != 0) {
+    if (git_snapshot_verify_generations(&g_git_snapshot, false) != 0 ||
+        git_snapshot_pin_post_configs(&g_git_snapshot) != 0 ||
+        git_capture_transaction_scopes(&observed_primary, &observed_local,
+                                       &observed_worktree) != 0 ||
+        git_snapshot_verify_generations(&g_git_snapshot, true) != 0) {
+        git_scope_snapshot_clear(&observed_primary);
+        git_scope_snapshot_clear(&observed_local);
+        git_scope_snapshot_clear(&observed_worktree);
+        git_snapshot_clear_post_configs(&g_git_snapshot);
         return -1;
     }
     differences = git_scope_snapshot_difference_count(
@@ -2059,6 +2690,7 @@ int git_config_seal(void) {
     git_scope_snapshot_clear(&observed_local);
     git_scope_snapshot_clear(&observed_worktree);
     if (differences != 0) {
+        git_snapshot_clear_post_configs(&g_git_snapshot);
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Cannot seal Git transaction: %d managed vector(s) changed outside this transaction before post-image verification",
                   differences);
@@ -2099,51 +2731,61 @@ int git_config_restore(void) {
         git_restore_result_t scope_result = run_uses_default_runner()
             ? git_restore_scope_snapshot_atomic(
                   GIT_SCOPE_WORKTREE_INTERNAL, &g_git_snapshot.worktree,
-                  &g_git_snapshot.post_worktree)
+                  &g_git_snapshot.post_worktree,
+                  git_transaction_generation(GIT_SCOPE_WORKTREE_INTERNAL))
             : git_restore_scope_snapshot(
                   GIT_SCOPE_WORKTREE_INTERNAL, &g_git_snapshot.worktree,
                   &g_git_snapshot.post_worktree, &current_worktree);
         result.conflicts += scope_result.conflicts;
+        result.generation_conflicts += scope_result.generation_conflicts;
         result.write_failures += scope_result.write_failures;
     }
     if (g_git_snapshot.local_also) {
         git_restore_result_t scope_result = run_uses_default_runner()
             ? git_restore_scope_snapshot_atomic(
                   GIT_SCOPE_LOCAL, &g_git_snapshot.local,
-                  &g_git_snapshot.post_local)
+                  &g_git_snapshot.post_local,
+                  git_transaction_generation(GIT_SCOPE_LOCAL))
             : git_restore_scope_snapshot(
                   GIT_SCOPE_LOCAL, &g_git_snapshot.local,
                   &g_git_snapshot.post_local, &current_local);
         result.conflicts += scope_result.conflicts;
+        result.generation_conflicts += scope_result.generation_conflicts;
         result.write_failures += scope_result.write_failures;
     }
     {
         git_restore_result_t scope_result = run_uses_default_runner()
             ? git_restore_scope_snapshot_atomic(
                   g_git_snapshot.scope, &g_git_snapshot.primary,
-                  &g_git_snapshot.post_primary)
+                  &g_git_snapshot.post_primary,
+                  git_transaction_generation(g_git_snapshot.scope))
             : git_restore_scope_snapshot(
                   g_git_snapshot.scope, &g_git_snapshot.primary,
                   &g_git_snapshot.post_primary, &current_primary);
         result.conflicts += scope_result.conflicts;
+        result.generation_conflicts += scope_result.generation_conflicts;
         result.write_failures += scope_result.write_failures;
     }
     git_scope_snapshot_clear(&current_primary);
     git_scope_snapshot_clear(&current_local);
     git_scope_snapshot_clear(&current_worktree);
-    if (result.conflicts > 0 || result.write_failures > 0) {
+    if (result.conflicts > 0 || result.generation_conflicts > 0 ||
+        result.write_failures > 0) {
         /* Retain the exact snapshot and per-key progress until every key has
          * succeeded. Consuming it here made transient lock failures
          * irrecoverable on a second rollback attempt (AR-07 M27). */
         g_git_snapshot.restore_incomplete = true;
         set_error(ERR_GIT_CONFIG_FAILED,
-                  "Git rollback incomplete: %d managed vector(s) changed outside this transaction; %d restore operation(s) failed; concurrent changes were preserved and retry material retained",
-                  result.conflicts, result.write_failures);
+                  "Git rollback incomplete: %d managed vector(s) changed outside this transaction; %d destination generation(s) changed; %d restore operation(s) failed; concurrent changes were preserved and retry material retained",
+                  result.conflicts, result.generation_conflicts,
+                  result.write_failures);
         fprintf(stderr,
                 "gitswitch: [!!] git rollback incomplete — %d managed vector(s) "
-                "changed outside this transaction; %d restore operation(s) failed; "
+                "changed outside this transaction; %d destination generation(s) "
+                "changed; %d restore operation(s) failed; "
                 "concurrent changes were preserved and retry material retained\n",
-                result.conflicts, result.write_failures);
+                result.conflicts, result.generation_conflicts,
+                result.write_failures);
         return -1;
     }
     git_snapshot_clear(&g_git_snapshot);
