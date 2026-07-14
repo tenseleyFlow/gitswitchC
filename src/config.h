@@ -158,31 +158,50 @@ int config_resume_hint_path(char *buf, size_t size);
  * fails with no output value. */
 int config_resume_hint_probe(char *needs, size_t size);
 
-/* Exact before-image for the consolidated active-state/resume-hint file. A CLI switch captures it
- * before runtime/Git mutation so a failed active-state commit can restore the
- * previous bytes (or previous absence) exactly. Snapshot values must be
- * zero-initialized before their first capture and cleared after final use. */
+/* Exact before-image for the consolidated active-state/resume-hint file. A CLI
+ * switch captures it before runtime/Git mutation so a failed active-state
+ * commit can restore the previous bytes (or previous absence) exactly.
+ * Guarded transactional saves also bind the snapshot to the exact post-image
+ * they installed; restore then fails closed if any later generation replaced
+ * or rewrote that post-image. Snapshot values must be zero-initialized before
+ * their first capture and cleared after final use. */
 typedef struct {
     bool valid;
     bool existed;
     unsigned char *data;
     size_t length;
     unsigned int mode;
+    char config_path[MAX_PATH_LEN];
+    bool post_image_bound;
+    bool post_image_installed;
+    bool post_image_valid;
+    struct stat post_image;
 } config_resume_hint_snapshot_t;
 
 int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot);
+/* Restore accepts only a snapshot subsequently bound by
+ * config_save_active_account_transactional_guarded (or the internal full-save
+ * transaction). An unbound snapshot cannot identify which later state belongs
+ * to its caller and is rejected instead of overwriting it. */
 int config_resume_hint_snapshot_restore(
     const config_resume_hint_snapshot_t *snapshot);
 void config_resume_hint_snapshot_clear(config_resume_hint_snapshot_t *snapshot);
 
 /* Transaction-aware active-account save. config_installed is true once the
  * new state-artifact inode has been renamed into place, even if its subsequent
- * directory sync fails. The rollback variant writes only that artifact;
- * callers may then restore the exact snapshot to recover legacy bytes/mode as
- * well. */
+ * directory sync fails. Use the guarded variant when later transaction phases
+ * may need to restore an exact snapshot. */
 int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
                                              const char *config_path,
                                              bool *config_installed);
+/* Switch-transaction variant: rollback_snapshot must be a valid before-image
+ * captured for config_path. The save records its installed state generation in
+ * that snapshot so config_resume_hint_snapshot_restore can perform a guarded
+ * compare-before-restore instead of overwriting a later writer. */
+int config_save_active_account_transactional_guarded(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot);
 int config_restore_active_account(const gitswitch_ctx_t *ctx,
                                   const char *config_path);
 

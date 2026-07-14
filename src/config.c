@@ -147,7 +147,8 @@ static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed,
-                                     bool require_loaded_source);
+                                     bool require_loaded_source,
+                                     config_resume_hint_snapshot_t *rollback_snapshot);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
 static bool config_metadata_snapshot_same(const struct stat *a,
@@ -1506,6 +1507,10 @@ static int config_resume_hint_snapshot_capture_at(
         return -1;
     }
     config_resume_hint_snapshot_clear(snapshot);
+    if (safe_strncpy(snapshot->config_path, config_path,
+                     sizeof(snapshot->config_path)) != 0) {
+        return -1;
+    }
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0) {
         return -1;
     }
@@ -1600,6 +1605,54 @@ int config_resume_hint_snapshot_capture(
     return config_resume_hint_snapshot_capture_at(config_path, snapshot);
 }
 
+static int config_resume_hint_snapshot_bind_post_image(
+    const char *config_path, config_resume_hint_snapshot_t *snapshot) {
+    if (!snapshot || !snapshot->valid ||
+        strcmp(snapshot->config_path, config_path) != 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Rollback snapshot does not belong to the config path being saved");
+        errno = EINVAL;
+        return -1;
+    }
+    snapshot->post_image_bound = true;
+    snapshot->post_image_installed = false;
+    snapshot->post_image_valid = false;
+    memset(&snapshot->post_image, 0, sizeof(snapshot->post_image));
+    return 0;
+}
+
+static int config_resume_hint_snapshot_require_post_image(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot) {
+    struct stat current;
+
+    if (!snapshot->post_image_bound) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Resume-hint rollback snapshot has no bound post-image");
+        return -1;
+    }
+    if (!snapshot->post_image_installed || !snapshot->post_image_valid) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Active-state rollback has no verified installed generation: %s",
+            hint);
+        return -1;
+    }
+    errno = 0;
+    if (lstat(hint, &current) != 0 ||
+        !config_metadata_file_is_safe(&current, true) ||
+        !config_metadata_snapshot_same(&snapshot->post_image, &current)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Active-state rollback conflict; installed generation is no longer current: %s",
+            hint);
+        return -1;
+    }
+    return 0;
+}
+
 static int config_resume_hint_snapshot_restore_at(
     const char *config_path,
     const config_resume_hint_snapshot_t *snapshot) {
@@ -1613,9 +1666,18 @@ static int config_resume_hint_snapshot_restore_at(
     int dir_fd = -1;
     int fd = -1;
 
-    if (!config_path || !snapshot || !snapshot->valid) {
-        set_error(ERR_INVALID_ARGS, "Invalid resume-hint snapshot");
+    if (!config_path || !snapshot || !snapshot->valid ||
+        !snapshot->post_image_bound ||
+        strcmp(snapshot->config_path, config_path) != 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Resume-hint rollback requires a bound snapshot for this config path");
         return -1;
+    }
+    /* A guarded save that did not install a state inode has nothing to undo.
+     * In particular, do not turn a later independent write into rollback input
+     * merely because a downstream transaction phase failed. */
+    if (snapshot->post_image_bound && !snapshot->post_image_installed) {
+        return 0;
     }
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0 ||
         safe_strncpy(dir, hint, sizeof(dir)) != 0) {
@@ -1648,6 +1710,11 @@ static int config_resume_hint_snapshot_restore_at(
     }
 
     if (!snapshot->existed) {
+        if (config_resume_hint_snapshot_require_post_image(hint, snapshot) !=
+            0) {
+            close(dir_fd);
+            return -1;
+        }
         if (unlink(hint) != 0 && errno != ENOENT) {
             close(dir_fd);
             set_system_error(ERR_FILE_IO,
@@ -1663,6 +1730,10 @@ static int config_resume_hint_snapshot_restore_at(
         }
         close(dir_fd);
         return 0;
+    }
+    if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
+        close(dir_fd);
+        return -1;
     }
     if (lstat(hint, &current) == 0) {
         if (!config_metadata_file_is_safe(&current, false)) {
@@ -1723,6 +1794,12 @@ static int config_resume_hint_snapshot_restore_at(
         goto restore_fail;
     }
     fd = -1;
+    /* Recheck after preparing and syncing the before-image. The public save
+     * lock makes this check plus rename one protocol for cooperating writers;
+     * bypassing same-uid writers retain only the documented final interval. */
+    if (config_resume_hint_snapshot_require_post_image(hint, snapshot) != 0) {
+        goto restore_fail;
+    }
     if (rename(temp, hint) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install restored resume hint: %s", hint);
@@ -1810,7 +1887,8 @@ int config_resume_hint_snapshot_restore(
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed,
-                                     bool require_loaded_source) {
+                                     bool require_loaded_source,
+                                     config_resume_hint_snapshot_t *rollback_snapshot) {
     config_active_state_t existing_state;
     const account_t *active_account = NULL;
     const char *needs;
@@ -1831,6 +1909,11 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid arguments to active-state commit");
+        return -1;
+    }
+    if (rollback_snapshot &&
+        config_resume_hint_snapshot_bind_post_image(
+            config_path, rollback_snapshot) != 0) {
         return -1;
     }
     if (require_loaded_source &&
@@ -2052,6 +2135,9 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     if (state_installed) {
         *state_installed = true;
     }
+    if (rollback_snapshot) {
+        rollback_snapshot->post_image_installed = true;
+    }
 
     if (lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, true) ||
@@ -2059,6 +2145,10 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         set_error(ERR_FILE_IO,
                   "Cannot verify installed resume hint: %s", hint);
         return -1;
+    }
+    if (rollback_snapshot) {
+        rollback_snapshot->post_image = after;
+        rollback_snapshot->post_image_valid = true;
     }
     {
         int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY |
@@ -2075,6 +2165,16 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             return -1;
         }
         close(dir_fd);
+    }
+    if (rollback_snapshot) {
+        if (lstat(hint, &after) != 0 ||
+            !config_metadata_file_is_safe(&after, true) ||
+            !config_metadata_same_file(&temp_identity, &after)) {
+            set_error(ERR_FILE_IO,
+                      "Cannot bind durable resume-hint generation: %s", hint);
+            return -1;
+        }
+        rollback_snapshot->post_image = after;
     }
     return 0;
 
@@ -2356,7 +2456,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     }
 
     if (update_hint &&
-        config_update_resume_hint(ctx, config_path, NULL, false) != 0) {
+        config_update_resume_hint(ctx, config_path, NULL, false, NULL) != 0) {
         goto document_fail;
     }
     close(dir_fd);
@@ -2461,8 +2561,11 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx) {
 static int config_save_mode(const gitswitch_ctx_t *ctx,
                             const char *config_path,
                             bool update_hint,
-                            bool *config_installed) {
-    config_resume_hint_snapshot_t state_before = {0};
+                            bool *config_installed,
+                            config_resume_hint_snapshot_t *rollback_snapshot) {
+    config_resume_hint_snapshot_t local_state_before = {0};
+    config_resume_hint_snapshot_t *state_before = rollback_snapshot
+        ? rollback_snapshot : &local_state_before;
     toml_document_t *toml_doc = NULL;
     bool document_installed = false;
     bool state_installed = false;
@@ -2546,16 +2649,25 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
      * directory sync reports uncertainty, retain matching new state so the two
      * visible files never disagree about the installed account model. */
     if (update_hint) {
-        if (config_resume_hint_snapshot_capture_at(config_path,
-                                                    &state_before) != 0) {
+        if ((!rollback_snapshot &&
+             config_resume_hint_snapshot_capture_at(config_path,
+                                                     state_before) != 0) ||
+            (rollback_snapshot &&
+             (!rollback_snapshot->valid ||
+              strcmp(rollback_snapshot->config_path, config_path) != 0))) {
+            if (rollback_snapshot) {
+                set_error(ERR_INVALID_ARGS,
+                          "Rollback snapshot does not belong to the config path being saved");
+            }
             goto cleanup;
         }
         if (config_update_resume_hint(ctx, config_path,
-                                      &state_installed, false) != 0) {
+                                      &state_installed, false,
+                                      state_before) != 0) {
             if (state_installed) {
                 error_context_t state_error = *get_last_error();
                 if (config_resume_hint_snapshot_restore_at(config_path,
-                                                           &state_before) != 0) {
+                                                           state_before) != 0) {
                     char restore_error[sizeof(g_last_error.message)];
                     safe_strncpy(restore_error, get_last_error()->message,
                                  sizeof(restore_error));
@@ -2578,7 +2690,7 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         !document_installed) {
         error_context_t write_error = *get_last_error();
         if (config_resume_hint_snapshot_restore_at(config_path,
-                                                   &state_before) != 0) {
+                                                   state_before) != 0) {
             char restore_error[sizeof(g_last_error.message)];
             safe_strncpy(restore_error, get_last_error()->message,
                          sizeof(restore_error));
@@ -2591,7 +2703,9 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     }
 
 cleanup:
-    config_resume_hint_snapshot_clear(&state_before);
+    if (!rollback_snapshot) {
+        config_resume_hint_snapshot_clear(&local_state_before);
+    }
     config_document_free(toml_doc);
     if (write_lock_fd >= 0) {
         config_write_unlock(write_lock_fd);
@@ -2600,7 +2714,7 @@ cleanup:
 }
 
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
-    return config_save_mode(ctx, config_path, true, NULL);
+    return config_save_mode(ctx, config_path, true, NULL, NULL);
 }
 
 int config_save_transactional(const gitswitch_ctx_t *ctx,
@@ -2612,7 +2726,7 @@ int config_save_transactional(const gitswitch_ctx_t *ctx,
         return -1;
     }
     *config_installed = false;
-    return config_save_mode(ctx, config_path, true, config_installed);
+    return config_save_mode(ctx, config_path, true, config_installed, NULL);
 }
 
 /* Persist only the consolidated state artifact. This intentionally does not
@@ -2621,7 +2735,8 @@ int config_save_transactional(const gitswitch_ctx_t *ctx,
  * from a non-reconstructable config. */
 static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
                                            const char *config_path,
-                                           bool *config_installed) {
+                                           bool *config_installed,
+                                           config_resume_hint_snapshot_t *rollback_snapshot) {
     int write_lock_fd;
     int result;
 
@@ -2641,10 +2756,10 @@ static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
      * to edit — the full rebuild is both safe and required to create one. */
     if (!path_exists(config_path)) {
         result = config_save_mode(ctx, config_path, true,
-                                  config_installed);
+                                  config_installed, rollback_snapshot);
     } else {
         result = config_update_resume_hint(ctx, config_path, config_installed,
-                                           true);
+                                           true, rollback_snapshot);
     }
     config_write_unlock(write_lock_fd);
     return result;
@@ -2652,7 +2767,7 @@ static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
 
 int config_save_active_account(const gitswitch_ctx_t *ctx,
                                const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
 }
 
 int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
@@ -2665,12 +2780,28 @@ int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
     }
     *config_installed = false;
     return config_save_active_account_mode(ctx, config_path,
-                                           config_installed);
+                                           config_installed, NULL);
+}
+
+int config_save_active_account_transactional_guarded(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot) {
+    if (!config_installed || !rollback_snapshot ||
+        !rollback_snapshot->valid) {
+        set_error(ERR_INVALID_ARGS,
+                  "Guarded active save requires install state and a valid rollback snapshot");
+        return -1;
+    }
+    *config_installed = false;
+    return config_save_active_account_mode(ctx, config_path,
+                                           config_installed,
+                                           rollback_snapshot);
 }
 
 int config_restore_active_account(const gitswitch_ctx_t *ctx,
                                   const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
 }
 
 /* Create default configuration file */

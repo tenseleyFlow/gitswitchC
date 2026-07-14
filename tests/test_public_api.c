@@ -83,6 +83,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_save);
     REQUIRE_PUBLIC_API(config_save_active_account);
     REQUIRE_PUBLIC_API(config_save_active_account_transactional);
+    REQUIRE_PUBLIC_API(config_save_active_account_transactional_guarded);
     REQUIRE_PUBLIC_API(config_save_transactional);
     REQUIRE_PUBLIC_API(config_scope_to_string);
     REQUIRE_PUBLIC_API(config_set_backup_clock_fn);

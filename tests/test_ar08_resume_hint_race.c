@@ -241,6 +241,91 @@ TEST(testing_object_retains_legacy_fault_seam_before_installation) {
     CHECK_STR_EQ(text, "none\ninactive=v1\n");
 }
 
+TEST(unbound_snapshot_cannot_overwrite_a_later_state) {
+    config_resume_hint_snapshot_t saved = {0};
+    char text[64];
+
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\nactive=later\n"), 0);
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
+    CHECK(strstr(get_last_error()->message, "bound snapshot") != NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=later\n");
+    config_resume_hint_snapshot_clear(&saved);
+}
+
+TEST(guarded_snapshot_restores_unchanged_post_image_exactly) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    struct stat restored;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    CHECK_EQ_INT(chmod(g_hint, 0640), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(lstat(g_hint, &restored), 0);
+    CHECK_EQ_INT(restored.st_mode & 0777, 0640);
+    config_resume_hint_snapshot_clear(&saved);
+}
+
+TEST(guarded_noop_save_does_not_claim_a_state_generation) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+    bool installed = true;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\nactive=alice\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(!installed);
+
+    CHECK_EQ_INT(write_private(g_hint, "none\nactive=later\n"), 0);
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=later\n");
+    config_resume_hint_snapshot_clear(&saved);
+}
+
 int main(void) {
     if (error_init(LOG_LEVEL_ERROR, NULL) != 0 || fixture_setup() != 0) {
         fprintf(stderr, "test_ar08_resume_hint_race: fixture setup failed\n");
@@ -251,6 +336,9 @@ int main(void) {
     RUN_TEST(regular_replacement_after_read_is_rejected);
     RUN_TEST(same_inode_growth_before_open_is_bounded);
     RUN_TEST(testing_object_retains_legacy_fault_seam_before_installation);
+    RUN_TEST(unbound_snapshot_cannot_overwrite_a_later_state);
+    RUN_TEST(guarded_snapshot_restores_unchanged_post_image_exactly);
+    RUN_TEST(guarded_noop_save_does_not_claim_a_state_generation);
 
     ts_rm_rf(g_root);
     error_cleanup();

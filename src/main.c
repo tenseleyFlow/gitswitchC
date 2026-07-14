@@ -808,8 +808,10 @@ int main(int argc, char *argv[]) {
                         save_rc = config_save(ctx, ctx->config.config_path);
                     }
                 } else if (mutation.switch_prepared) {
-                    save_rc = config_save_active_account_transactional(
-                        ctx, ctx->config.config_path, &config_installed);
+                    save_rc =
+                        config_save_active_account_transactional_guarded(
+                            ctx, ctx->config.config_path, &config_installed,
+                            &mutation.hint_snapshot);
                 } else if (mutation.reset_guarded) {
                     save_rc = config_save_active_account_transactional(
                         ctx, ctx->config.config_path, &config_installed);
@@ -899,18 +901,10 @@ int main(int argc, char *argv[]) {
             safe_strncpy(ctx->config.active_account,
                          mutation.previous_active,
                          sizeof(ctx->config.active_account));
-            if (config_installed &&
-                config_restore_active_account(ctx,
-                                              ctx->config.config_path) != 0) {
-                rollback_complete = false;
-                safe_strncpy(rollback_detail, get_last_error()->message,
-                             sizeof(rollback_detail));
-            }
-            /* The writer cannot touch the hint before the config rename. When
-             * no new config inode was installed the before-image is already
-             * intact (and may live in the same unwritable directory that
-             * caused the save failure), so do not manufacture a rollback
-             * failure by rewriting unchanged state. */
+            /* Restore the exact captured bytes only while the active-state
+             * inode installed by this switch is still current. A later writer
+             * is a rollback conflict and retains ownership of its generation;
+             * the outer config/runtime locks cover cooperating writers. */
             if (config_installed &&
                 config_resume_hint_snapshot_restore(
                     &mutation.hint_snapshot) != 0) {

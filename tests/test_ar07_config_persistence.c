@@ -121,6 +121,10 @@ static config_io_boundary_t fault_target;
 static char generation_swap_source[256];
 static char generation_swap_replacement[256];
 static int generation_swap_error;
+static config_io_boundary_t rollback_replace_boundary;
+static char rollback_replace_hint[256];
+static char rollback_replace_source[256];
+static int rollback_replace_error;
 
 static bool inject_fault(config_io_boundary_t boundary) {
     return boundary == fault_target;
@@ -137,6 +141,18 @@ static bool replace_source_at_state_publication(
         generation_swap_source[0] = '\0';
     }
     return false;
+}
+
+static bool replace_state_before_rollback(config_io_boundary_t boundary) {
+    if (boundary != rollback_replace_boundary ||
+        rollback_replace_hint[0] == '\0') {
+        return false;
+    }
+    if (rename(rollback_replace_source, rollback_replace_hint) != 0) {
+        rollback_replace_error = errno ? errno : EIO;
+    }
+    rollback_replace_hint[0] = '\0';
+    return true;
 }
 
 static bool kill_at_default_boundary(config_io_boundary_t boundary) {
@@ -387,6 +403,55 @@ TEST(backup_faults_abort_and_full_save_rolls_state_back) {
     CHECK(strstr(after_text, "active_account") == NULL);
     CHECK(read_text(hint, after_text, sizeof(after_text)) > 0);
     CHECK_STR_EQ(after_text, "none\nactive=alice\n");
+}
+
+TEST(full_save_rollback_preserves_a_later_state_generation) {
+    const config_io_boundary_t boundaries[] = {
+        CONFIG_IO_STATE_BEFORE_DIR_SYNC,
+        CONFIG_IO_DOCUMENT_BEFORE_RENAME
+    };
+
+    for (size_t i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
+        char dir[128], path[256], hint[256], replacement[256], text[1024];
+        struct stat config_before, config_after;
+        struct stat replacement_before, state_after;
+        gitswitch_ctx_t ctx;
+
+        CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+        snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+        snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+        snprintf(replacement, sizeof(replacement), "%s/later-state", dir);
+        CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+        CHECK_EQ_INT(write_private(hint, "none\n"), 0);
+        CHECK_EQ_INT(write_private(replacement,
+                                   "none\nactive=Bob\n"), 0);
+        CHECK_EQ_INT(lstat(path, &config_before), 0);
+        CHECK_EQ_INT(lstat(replacement, &replacement_before), 0);
+        memset(&ctx, 0, sizeof(ctx));
+        CHECK_EQ_INT(config_load(&ctx, path), 0);
+
+        rollback_replace_boundary = boundaries[i];
+        snprintf(rollback_replace_hint, sizeof(rollback_replace_hint),
+                 "%s", hint);
+        snprintf(rollback_replace_source, sizeof(rollback_replace_source),
+                 "%s", replacement);
+        rollback_replace_error = 0;
+        config_set_io_fault_fn(replace_state_before_rollback);
+        clear_error();
+        CHECK_EQ_INT(config_save(&ctx, path), -1);
+        config_set_io_fault_fn(NULL);
+
+        CHECK_EQ_INT(rollback_replace_error, 0);
+        CHECK(strstr(get_last_error()->message, "rollback failed") != NULL);
+        CHECK_EQ_INT(lstat(path, &config_after), 0);
+        CHECK(same_identity(&config_before, &config_after));
+        CHECK_EQ_INT(lstat(hint, &state_after), 0);
+        CHECK(same_identity(&replacement_before, &state_after));
+        CHECK(read_text(hint, text, sizeof(text)) > 0);
+        CHECK_STR_EQ(text, "none\nactive=Bob\n");
+        CHECK_EQ_INT(count_prefix(dir, ".resume-hint.restore."), 0);
+        CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    }
 }
 
 TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
@@ -659,6 +724,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(default_create_signal_death_is_truthful_at_every_boundary);
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
     RUN_TEST(backup_faults_abort_and_full_save_rolls_state_back);
+    RUN_TEST(full_save_rollback_preserves_a_later_state_generation);
     RUN_TEST(active_state_only_save_preserves_accounts_and_is_idempotent);
     RUN_TEST(active_state_save_is_bound_to_loaded_config_generation);
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
