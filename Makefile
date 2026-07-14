@@ -1227,11 +1227,12 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
 		"$$stage$(PREFIX)/bin/$(TARGET)" "$(TARGET_TRIPLE)"; \
+	# Exercise the compiler-argv contract even when CC itself is one word. \
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
-	sh tests/test_ar07_release.sh neuter "$(CC)" \
+	sh tests/test_ar07_release.sh neuter \
 		"$(SECURITY_CFLAGS_RELEASE)" \
 		"$(CURDIR)/$(SRCDIR)/release_hardening.h" \
-		"$(MAKE_COMMAND)"
+		"$(MAKE_COMMAND)" -- env $(CC)
 else
 release-artifact-test:
 	@echo "ERROR: release-artifact-test requires BUILD_TYPE=release" >&2

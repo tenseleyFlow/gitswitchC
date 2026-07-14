@@ -9,6 +9,38 @@ fail()
     exit 1
 }
 
+elf_has_immediate_binding()
+{
+    # Accept DT_BIND_NOW itself, or an exact NOW/BIND_NOW flag token carried
+    # by DT_FLAGS/DT_FLAGS_1. Dynamic strings in unrelated tags (RUNPATH,
+    # SONAME, NEEDED, and so on) are data, not binding-policy evidence.
+    awk '
+        function has_now_token(value, count, position, tokens) {
+            gsub(/[^[:alnum:]_]+/, " ", value)
+            count = split(value, tokens, /[[:space:]]+/)
+            for (position = 1; position <= count; position++) {
+                if (tokens[position] == "NOW" ||
+                    tokens[position] == "BIND_NOW") {
+                    return 1
+                }
+            }
+            return 0
+        }
+        /^[[:space:]]*(0x)?[[:xdigit:]]+[[:space:]]+(\(BIND_NOW\)|BIND_NOW)([[:space:]]|$)/ {
+            found = 1
+        }
+        {
+            if (match($0, /^[[:space:]]*(0x)?[[:xdigit:]]+[[:space:]]+(\(FLAGS(_1)?\)|FLAGS(_1)?)([[:space:]]|$)/)) {
+                value = substr($0, RLENGTH + 1)
+                if (has_now_token(value)) {
+                    found = 1
+                }
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
 check_elf()
 {
     binary=$1
@@ -80,8 +112,7 @@ check_elf()
 
     elf_dynamic=$("$readelf_cmd" -d "$binary") ||
         fail "readelf could not read dynamic section: $binary"
-    printf '%s\n' "$elf_dynamic" |
-        grep -Eq 'BIND_NOW|FLAGS(_1)?[[:space:]].*NOW' ||
+    printf '%s\n' "$elf_dynamic" | elf_has_immediate_binding ||
         fail "release binary lacks immediate binding (NOW): $binary"
 
     elf_programs=$("$readelf_cmd" -W -l "$binary") ||
@@ -209,14 +240,16 @@ expect_artifact_rejection()
 
 check_neuter_contract()
 {
-    [ "$#" -eq 4 ] ||
-        fail "usage: $0 neuter COMPILER RELEASE_SECURITY_CFLAGS HARDENING_HEADER MAKE"
-    compiler=$1
-    release_security_cflags=$2
-    hardening_header=$3
-    make_cmd=$4
-    command -v "$compiler" >/dev/null 2>&1 ||
-        fail "neuter compiler is unavailable: $compiler"
+    { [ "$#" -ge 5 ] && [ "$4" = -- ]; } ||
+        fail "usage: $0 neuter RELEASE_SECURITY_CFLAGS HARDENING_HEADER MAKE -- COMPILER [ARG...]"
+    release_security_cflags=$1
+    hardening_header=$2
+    make_cmd=$3
+    shift 4
+    compiler_launcher=$1
+    compiler_command=$*
+    command -v "$compiler_launcher" >/dev/null 2>&1 ||
+        fail "neuter compiler launcher is unavailable: $compiler_launcher"
     [ -f "$hardening_header" ] ||
         fail "release hardening header is unavailable: $hardening_header"
 
@@ -281,7 +314,7 @@ check_neuter_contract()
     # compiler specs. Explicitly undefine it so this negative control measures
     # the Makefile flag we own, not ambient compiler policy. The positive
     # control applies the audited definition after the undefine.
-    if "$compiler" -std=c11 -O2 -U_FORTIFY_SOURCE -c "$fortify_source" \
+    if "$@" -std=c11 -O2 -U_FORTIFY_SOURCE -c "$fortify_source" \
         -o "$tmp/fortify-neutered.o" >"$tmp/fortify-neutered.log" 2>&1; then
         fail "FORTIFY-neutered compile fixture was accepted"
     fi
@@ -289,7 +322,7 @@ check_neuter_contract()
         cat "$tmp/fortify-neutered.log" >&2
         fail "FORTIFY-neutered fixture failed for an unrelated reason"
     }
-    if ! "$compiler" -std=c11 -O2 -U_FORTIFY_SOURCE "$fortify_define" \
+    if ! "$@" -std=c11 -O2 -U_FORTIFY_SOURCE "$fortify_define" \
         -c "$fortify_source" \
         -o "$tmp/fortify-enabled.o" >"$tmp/fortify-enabled.log" 2>&1; then
         cat "$tmp/fortify-enabled.log" >&2
@@ -313,34 +346,34 @@ check_neuter_contract()
     have_execstack_neuter=false
     case $format in
         elf)
-            if ! "$compiler" -std=c11 -O0 -fno-stack-protector -fno-pie \
+            if ! "$@" -std=c11 -O0 -fno-stack-protector -fno-pie \
                 "$source_file" -no-pie -o "$nonpie" >"$tmp/nonpie.log" 2>&1; then
                 cat "$tmp/nonpie.log" >&2
                 fail "cannot build ELF non-PIE neuter fixture"
             fi
             have_nonpie_neuter=true
-            if ! "$compiler" -std=c11 -O0 -fno-stack-protector -fPIE \
+            if ! "$@" -std=c11 -O0 -fno-stack-protector -fPIE \
                 "$source_file" -pie -Wl,-z,relro -Wl,-z,now \
                 -Wl,-z,noexecstack -o "$nocanary" \
                 >"$tmp/nocanary.log" 2>&1; then
                 cat "$tmp/nocanary.log" >&2
                 fail "cannot build ELF no-canary neuter fixture"
             fi
-            if ! "$compiler" -std=c11 -O0 -fstack-protector-strong -fPIE \
+            if ! "$@" -std=c11 -O0 -fstack-protector-strong -fPIE \
                 "$source_file" -pie -Wl,-z,norelro -Wl,-z,now \
                 -Wl,-z,noexecstack -o "$norelro" \
                 >"$tmp/norelro.log" 2>&1; then
                 cat "$tmp/norelro.log" >&2
                 fail "cannot build ELF no-RELRO neuter fixture"
             fi
-            if ! "$compiler" -std=c11 -O0 -fstack-protector-strong -fPIE \
+            if ! "$@" -std=c11 -O0 -fstack-protector-strong -fPIE \
                 "$source_file" -pie -Wl,-z,relro -Wl,-z,lazy \
-                -Wl,-z,noexecstack -o "$nonow" \
+                -Wl,-z,noexecstack -Wl,-rpath,BIND_NOW -o "$nonow" \
                 >"$tmp/nonow.log" 2>&1; then
                 cat "$tmp/nonow.log" >&2
                 fail "cannot build ELF lazy-binding neuter fixture"
             fi
-            if ! "$compiler" -std=c11 -O0 -fstack-protector-strong -fPIE \
+            if ! "$@" -std=c11 -O0 -fstack-protector-strong -fPIE \
                 "$source_file" -pie -Wl,-z,relro -Wl,-z,now \
                 -Wl,-z,execstack -o "$execstack" \
                 >"$tmp/execstack.log" 2>&1; then
@@ -356,7 +389,7 @@ check_neuter_contract()
             # assertion above still applies to every supported architecture.
             case $(uname -m) in
                 x86_64|i386)
-                    if ! "$compiler" -std=c11 -O0 -fno-stack-protector \
+                    if ! "$@" -std=c11 -O0 -fno-stack-protector \
                         "$source_file" -Wl,-no_pie -o "$nonpie" \
                         >"$tmp/nonpie.log" 2>&1; then
                         cat "$tmp/nonpie.log" >&2
@@ -372,7 +405,7 @@ check_neuter_contract()
                     fail "unsupported Darwin architecture: $(uname -m)"
                     ;;
             esac
-            if ! "$compiler" -std=c11 -O0 -fno-stack-protector \
+            if ! "$@" -std=c11 -O0 -fno-stack-protector \
                 "$source_file" -Wl,-pie -o "$nocanary" \
                 >"$tmp/nocanary.log" 2>&1; then
                 cat "$tmp/nocanary.log" >&2
@@ -384,7 +417,7 @@ check_neuter_contract()
             # can be constructed with native supported linker options.
             case $(uname -m) in
                 x86_64|i386)
-                    if ! "$compiler" -std=c11 -O0 \
+                    if ! "$@" -std=c11 -O0 \
                         -fstack-protector-strong "$source_file" -Wl,-pie \
                         -Wl,-allow_stack_execute -o "$execstack" \
                         >"$tmp/execstack.log" 2>&1; then
@@ -424,11 +457,11 @@ check_neuter_contract()
         '    ar08_hardening_escape = witness;' \
         '    return ar08_hardened_helper(witness[0]) == 127;' \
         '}' >"$tmp/hardened-main.c"
-    "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+    "$@" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
         -include "$hardening_header" -fstack-protector-strong \
         -c "$tmp/hardened-main.c" -o "$tmp/hardened-main.o" ||
         fail "fully protected main translation unit did not compile"
-    if "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+    if "$@" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
         -include "$hardening_header" -fstack-protector-strong \
         -fno-stack-protector \
         -c "$tmp/hardened-helper.c" -o "$tmp/mixed-unprotected.o" \
@@ -440,19 +473,19 @@ check_neuter_contract()
         cat "$tmp/mixed.log" >&2
         fail "mixed translation-unit fixture failed for an unrelated reason"
     }
-    "$compiler" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
+    "$@" -std=c11 -O2 -DGITSWITCH_REQUIRE_STRONG_SSP=1 \
         -include "$hardening_header" -fstack-protector-strong \
         -c "$tmp/hardened-helper.c" -o "$tmp/hardened-helper.o" ||
         fail "fully protected helper translation unit did not compile"
     full_binary=$tmp/hardened-multi-tu
     case $format in
         elf)
-            "$compiler" -fPIE "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
+            "$@" -fPIE "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
                 -pie -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack \
                 -o "$full_binary" || fail "fully protected ELF fixture did not link"
             ;;
         macho)
-            "$compiler" "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
+            "$@" "$tmp/hardened-main.o" "$tmp/hardened-helper.o" \
                 -Wl,-pie -o "$full_binary" ||
                 fail "fully protected Mach-O fixture did not link"
             ;;
@@ -496,8 +529,9 @@ EOF
         macho) hostile_ldflags=-Wl,-no_pie ;;
     esac
     make_log=$tmp/make-neuter.log
-    if ! "$make_cmd" -C "$make_fixture" CC="$compiler" \
+    if ! "$make_cmd" -C "$make_fixture" CC="$compiler_command" \
         TARGET=neuter-probe SOURCES=src/neuter.c \
+        BUILDDIR=build \
         VERSION=0.0.0 COMMIT=neuter BUILD_TYPE=release READLINE=0 \
         CFLAGS='-std=gnu11 -O2 -fno-stack-protector -fno-pie' \
         LDFLAGS="$hostile_ldflags" \
@@ -511,7 +545,7 @@ EOF
     fi
     make_binary=$make_fixture/build/bin/neuter-probe
     cp "$make_binary" "$tmp/make-neuter-staged"
-    make_target_triple=$("$compiler" -dumpmachine) ||
+    make_target_triple=$("$@" -dumpmachine) ||
         fail "cannot read compiler target for Make hardening fixture"
     GITSWITCH_RELEASE_FORMAT=$format sh "$script" artifact "$make_binary" \
         "$tmp/make-neuter-staged" "$make_target_triple" \
