@@ -13,6 +13,14 @@ fail()
 root=$1
 make_cmd=$2
 
+# GNU make 3.81 (the system Make on supported macOS runners) treats `#` inside
+# $(shell ...) as a Make comment even when it belongs to a shell parameter such
+# as $#. Keep the fingerprint block free of that parser hazard.
+if sed -n '/^TOOLCHAIN_FILE_FINGERPRINT := /,/^CC_VERSION_ID := /p' \
+    "$root/Makefile" | grep -F '$$#' >/dev/null; then
+    fail "toolchain fingerprint uses a GNU make 3.81-incompatible shell count"
+fi
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-ar07-build.XXXXXX") ||
     fail "cannot create temporary directory"
 cleanup()

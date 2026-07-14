@@ -76,7 +76,7 @@ TOOLCHAIN_FILE_FINGERPRINT := $(shell ( \
 		else \
 			digest_output=`cksum "$$f"` || exit 1; \
 			set -- $$digest_output; \
-			test "$$#" -ge 2 || exit 1; \
+			test -n "$$1" && test -n "$$2" || exit 1; \
 			digest=$$1:$$2; \
 		fi; \
 		test -n "$$digest" || exit 1; \
