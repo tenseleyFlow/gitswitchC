@@ -351,10 +351,10 @@ TEST(gpg_manager_reset_single_account_refuses_symlinked_home) {
 }
 
 /* AR-02 #9: gpg_manager_reset must serialize on the base dir's .lock — the
- * same lock the switch's `current` retarget takes — so its dangling-symlink
- * cleanup cannot TOCTOU a concurrent switch. A child process holds the lock
- * and only writes its "done" marker after a deliberate delay; a reset that
- * genuinely blocks on the lock returns only after that marker exists, while
+ * same lock the switch's `current` retarget takes — so home teardown and
+ * current-link retirement cannot TOCTOU a concurrent switch. A child holds
+ * the lock and writes its "done" marker only after a deliberate delay; a reset
+ * that genuinely blocks on the lock returns only after that marker exists, while
  * the pre-fix (lockless) reset returned immediately. */
 TEST(gpg_manager_reset_blocks_on_base_lock) {
     char xdg[128], base[256], lock_path[512], held[512], done[512];

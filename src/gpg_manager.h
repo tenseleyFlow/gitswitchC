@@ -142,8 +142,9 @@ int gpg_manager_setup_agent_config_for_test(int home_fd,
 int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode);
 
 /** Restore manager-owned environment/runtime retry state, then clear the
- * configuration. Returns -1 without clearing retry metadata if restoration
- * fails. */
+ * transaction configuration. Persistent per-account homes are deliberately
+ * retained for switch-back; gpg_manager_reset() owns explicit reclamation.
+ * Returns -1 without clearing retry metadata if restoration fails. */
 int gpg_manager_cleanup(gpg_config_t *gpg_config);
 
 /**
@@ -240,9 +241,12 @@ int gpg_manager_get_home_path_quiet(char *buf, size_t size);
  * non-directory entry. A full reset also rejects unknown base entries and
  * verifies that only its exact lock survives. Namespace changes are synced
  * through the pinned base before success; a failed sync returns nonzero so an
- * otherwise empty retry can repair durability. `current` is removed through
- * an identity-aware quarantine, preserving a same-uid writer that replaced it
- * after capture. Resets a single account when
+ * otherwise empty retry can repair durability. A successful full reset
+ * retires every captured `current` symlink. A targeted or incomplete full
+ * reset retires it only when it no longer names a live, safe managed home,
+ * preserving an unrelated live selection. Removal uses an identity-aware
+ * quarantine, preserving a same-uid writer that replaced the captured link.
+ * Resets a single account when
  * `account` is a nonempty name accepted by validate_name(); callers must pass
  * the canonical stored account name. Resets all accounts only when `account`
  * is NULL. Invalid non-NULL input fails with ERR_INVALID_ARGS before any
@@ -263,9 +267,10 @@ int gpg_manager_isolated_home_present(const char *account, bool *present);
 /**
  * Atomically (re)point the stable GNUPGHOME `current` symlink at `real_home`,
  * or drop it entirely — both under the GPG base dir's cross-process lock so
- * neither can interleave with gpg_manager_reset's dangling-link cleanup
- * (AR-02 #9). Used by the switch's rollback/teardown paths; the forward
- * switch retargets internally via the same locked path. Non-fatal helpers:
+ * neither can interleave with gpg_manager_reset's home teardown or
+ * current-link retirement (AR-02 #9). Used by the switch's rollback/teardown
+ * paths; the forward switch retargets internally via the same locked path.
+ * Non-fatal helpers:
  * both return 0 on success, -1 otherwise.
  */
 int gpg_manager_retarget_current(const char *real_home);

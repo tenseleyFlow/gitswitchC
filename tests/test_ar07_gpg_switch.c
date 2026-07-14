@@ -793,6 +793,7 @@ TEST(ambiguous_selector_exports_and_imports_nothing) {
 
 TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     char xdg[128], source_home[MAX_PATH_LEN];
+    char isolated_home[MAX_PATH_LEN];
     gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
     account_t account;
     command_runner_fn previous;
@@ -819,7 +820,12 @@ TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     CHECK(g_fake_export_used_fingerprint);
     CHECK(g_fake_git_used_fingerprint);
     CHECK_STR_EQ(config.current_key_id, PRIMARY_FPR);
+    CHECK_EQ_INT(safe_strncpy(isolated_home, config.gnupg_home,
+                              sizeof(isolated_home)), 0);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
+    /* Cleanup ends the transaction and restores its process environment; the
+     * explicit reset lifecycle, not cleanup, owns persistent-home deletion. */
+    CHECK(path_exists(isolated_home));
     CHECK_STR_EQ(getenv("GNUPGHOME"), source_home);
     unsetenv("GNUPGHOME");
 }

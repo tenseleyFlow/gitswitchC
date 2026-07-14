@@ -367,13 +367,12 @@ int gpg_manager_cleanup(gpg_config_t *gpg_config) {
     
     log_debug("Cleaning up GPG manager");
 
-    /* Intentionally NOT deleting the isolated GNUPGHOME. Isolated homes are
-     * keyed by account and persist across switches (mirroring how the SSH agent
-     * persists): the user's shell points GNUPGHOME at the <base>/current
-     * symlink, so removing a home could pull the rug out from under a shell
-     * still pointed at it. Homes are reused on switch-back, and re-import is
-     * skipped when the key is already present. A deliberate teardown command
-     * (not yet implemented) is the right place to reclaim them. */
+    /* This cleanup completes one switch transaction; it deliberately does not
+     * delete persistent per-account GNUPGHOMEs. The user's shell may still
+     * resolve GNUPGHOME through <base>/current, and switch-back reuses an
+     * existing validated home without re-importing its key. Explicit
+     * `gitswitch reset [account]` invokes gpg_manager_reset(), which owns agent
+     * shutdown, home deletion, stable-link retirement, and durability. */
 
     if (gpg_config->runtime_restore_pending) {
         const char *expected = gpg_config->rollback.published.valid
@@ -829,10 +828,10 @@ int gpg_manager_get_home_path_quiet(char *buf, size_t size) {
 }
 
 /* Acquire an exclusive, blocking flock on <base>/.lock, serializing every
- * writer of the GPG runtime state — the `current` symlink retarget/drop and
- * gpg_manager_reset's enumeration + dangling-link cleanup — against each
- * other across processes (AR-02 #9: an unlocked reset's cleanup could TOCTOU
- * a concurrent switch and unlink the live link it had just installed).
+ * writer of the GPG runtime state — `current` retarget/drop and reset's home
+ * enumeration, teardown, and current-link retirement — against each other
+ * across processes (AR-02 #9: an unlocked reset could TOCTOU a concurrent
+ * switch and unlink the live link it had just installed).
  * Mirrors ssh_manager.c's lock_agent_dir. Returns the held fd, or -1; callers
  * that found an existing validated base must fail rather than mutate it
  * unlocked. Dotfile names cannot collide with an account home: validate_name
@@ -2001,10 +2000,10 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
  * GNUPGHOME so a shell that exports GNUPGHOME=<base>/current (via
  * `gitswitch init`) transparently follows each switch. Mirrors the SSH
  * current.sock retargeting in ssh_manager.c. Held under the per-dir lock so
- * the retarget cannot interleave with a concurrent reset's dangling-link
- * cleanup (AR-02 #9). The forward switch does NOT come through here: it
- * retargets via gpg_retarget_current_locked under the lock it already holds
- * across create+import (AR-03 L12) — flock on a second fd for the same lock
+ * the retarget cannot interleave with a concurrent reset's home teardown or
+ * current-link retirement (AR-02 #9). The forward switch does NOT come through
+ * here: it retargets via gpg_retarget_current_locked under the lock it already
+ * holds across create+import (AR-03 L12) — flock on a second fd for the same lock
  * file would self-deadlock. Returns failure rather than retargeting unlocked. */
 int gpg_manager_retarget_current(const char *real_home) {
     char base[MAX_PATH_LEN];
@@ -3114,12 +3113,16 @@ static int gpg_remove_captured_current_locked(
 }
 
 /* Tear down isolated GPG homes: one account, or all when account is NULL.
- * Kills the per-home gpg-agents and deletes (unlinks) the homes, then drops
- * the stable `current` symlink if it dangles. NB: deletion is remove(), not a
- * secure overwrite — on the memory-backed storage the create path requires by
- * default, unlinking genuinely destroys the bytes, but on the explicitly
- * opted-in non-tmpfs path (GITSWITCH_ALLOW_TMP_GPG) the secret-key bytes may
- * remain recoverable on disk after deletion (AR-02 #26). */
+ * Each removable home has its agent stopped before its contents are unlinked.
+ * A successful full reset retires every captured `current` symlink, regardless
+ * of target. A targeted or incomplete full reset retires `current` only when
+ * its target is no longer a live, safe managed home (including a home just
+ * deleted); it preserves another live managed selection and retains a failed
+ * home as an exact retry target. Identity-aware quarantine preserves a later
+ * writer in either scope. Deletion is unlink, not a secure overwrite:
+ * memory-backed storage destroys the bytes, while the opted-in non-tmpfs path
+ * (GITSWITCH_ALLOW_TMP_GPG) may leave secret-key bytes forensically
+ * recoverable after deletion (AR-02 #26). */
 int gpg_manager_reset(const char *account) {
     char base[MAX_PATH_LEN];
     char current[MAX_PATH_LEN];
