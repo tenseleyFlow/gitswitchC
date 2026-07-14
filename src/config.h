@@ -4,6 +4,7 @@
 #define CONFIG_H
 
 #include "gitswitch.h"
+#include <dirent.h>
 
 /* Configuration file format version */
 #define CONFIG_FORMAT_VERSION "1.0"
@@ -75,6 +76,12 @@ typedef int (*config_backup_clock_fn)(uint64_t *seconds,
                                       uint32_t *nanoseconds);
 config_backup_clock_fn config_set_backup_clock_fn(
     config_backup_clock_fn fn);
+
+/* Narrow directory-enumeration seam for backup-rotation failure tests. NULL
+ * restores libc readdir(). Production callers leave the default installed. */
+typedef struct dirent *(*config_backup_readdir_fn)(DIR *dir);
+config_backup_readdir_fn config_set_backup_readdir_fn(
+    config_backup_readdir_fn fn);
 
 /* Function prototypes */
 

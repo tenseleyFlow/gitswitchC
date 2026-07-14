@@ -274,6 +274,7 @@ static config_document_malloc_fn g_config_document_malloc = malloc;
 static config_io_fault_fn g_config_io_fault;
 static config_metadata_test_hook_fn g_config_metadata_test_hook;
 static config_backup_clock_fn g_config_backup_clock;
+static config_backup_readdir_fn g_config_backup_readdir = readdir;
 
 config_document_malloc_fn config_set_document_malloc_fn(
     config_document_malloc_fn fn) {
@@ -299,6 +300,13 @@ config_backup_clock_fn config_set_backup_clock_fn(
     config_backup_clock_fn fn) {
     config_backup_clock_fn previous = g_config_backup_clock;
     g_config_backup_clock = fn;
+    return previous;
+}
+
+config_backup_readdir_fn config_set_backup_readdir_fn(
+    config_backup_readdir_fn fn) {
+    config_backup_readdir_fn previous = g_config_backup_readdir;
+    g_config_backup_readdir = fn ? fn : readdir;
     return previous;
 }
 
@@ -3775,10 +3783,28 @@ static int config_backup_collect(const char *config_path,
         set_system_error(ERR_FILE_IO, "Cannot enumerate config backups");
         return -1;
     }
-    while ((item = readdir(stream)) != NULL) {
+    for (;;) {
         config_backup_entry_t parsed = {0};
         const char *suffix;
         struct stat st;
+
+        /* readdir() uses NULL for both EOF and failure. Clear errno for every
+         * call and preserve an enumeration failure across closedir(): rotation
+         * must never prune from a partial candidate set. */
+        errno = 0;
+        item = g_config_backup_readdir(stream);
+        if (!item) {
+            int enumeration_errno = errno;
+            if (enumeration_errno != 0) {
+                (void)closedir(stream);
+                errno = enumeration_errno;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Failed while enumerating config backup directory");
+                return -1;
+            }
+            break;
+        }
         if (strncmp(item->d_name, prefix, prefix_length) != 0) continue;
         suffix = item->d_name + prefix_length;
         if (!config_backup_parse_new(suffix, &parsed) &&

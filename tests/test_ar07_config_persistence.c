@@ -170,6 +170,45 @@ static int fixed_clock(uint64_t *seconds, uint32_t *nanoseconds) {
     return 0;
 }
 
+static config_backup_readdir_fn backup_readdir_underlying;
+static unsigned int backup_readdir_scan;
+static unsigned int backup_readdir_candidates;
+static bool backup_readdir_failed;
+
+static struct dirent *fail_second_backup_scan_mid_enumeration(DIR *dir) {
+    struct dirent *entry;
+
+    if (backup_readdir_scan == 1 && backup_readdir_candidates == 6) {
+        backup_readdir_failed = true;
+        errno = EIO;
+        return NULL;
+    }
+    errno = 0;
+    entry = backup_readdir_underlying(dir);
+    if (!entry) {
+        if (errno == 0) {
+            backup_readdir_scan++;
+            backup_readdir_candidates = 0;
+        }
+        return NULL;
+    }
+    if (backup_readdir_scan == 1 &&
+        strncmp(entry->d_name, "accounts.toml.backup.",
+                strlen("accounts.toml.backup.")) == 0) {
+        backup_readdir_candidates++;
+    }
+    return entry;
+}
+
+static int backup_generation_path(char *path, size_t size,
+                                  const char *config_path,
+                                  unsigned long long generation) {
+    int needed = snprintf(path, size,
+                          "%s.backup.%020llu.%09u.%020llu",
+                          config_path, 1234ULL, 567U, generation);
+    return needed < 0 || (size_t)needed >= size ? -1 : 0;
+}
+
 static void expect_load_error(const char *body, const char *needle) {
     char dir[128], path[256];
     gitswitch_ctx_t ctx;
@@ -343,6 +382,66 @@ TEST(backups_are_durable_monotonic_and_bounded) {
     CHECK_EQ_INT(count, 5);
     CHECK(!seen[0] && !seen[1]);
     for (int i = 2; i < 7; i++) CHECK(seen[i]);
+}
+
+TEST(backup_pruning_requires_complete_directory_enumeration) {
+    char dir[128], path[256], backup[512], body[512];
+    config_backup_clock_fn previous_clock;
+    int backup_rc;
+    int diagnostic_errno;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    for (unsigned long long generation = 0; generation < 7; generation++) {
+        CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path,
+                                            generation), 0);
+        snprintf(body, sizeof(body),
+                 "[settings]\ndefault_scope=\"local\"\n"
+                 "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+                 "description=\"v%llu\"\n", generation);
+        CHECK_EQ_INT(write_private(backup, body), 0);
+    }
+
+    backup_readdir_scan = 0;
+    backup_readdir_candidates = 0;
+    backup_readdir_failed = false;
+    previous_clock = config_set_backup_clock_fn(fixed_clock);
+    backup_readdir_underlying = config_set_backup_readdir_fn(
+        fail_second_backup_scan_mid_enumeration);
+    clear_error();
+    backup_rc = config_backup(path);
+    diagnostic_errno = get_last_error()->system_errno;
+    config_set_backup_readdir_fn(backup_readdir_underlying);
+    config_set_backup_clock_fn(previous_clock);
+
+    CHECK_EQ_INT(backup_rc, -1);
+    CHECK(backup_readdir_failed);
+    CHECK_EQ_INT(diagnostic_errno, EIO);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 7);
+    for (unsigned long long generation = 0; generation < 7; generation++) {
+        CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path,
+                                            generation), 0);
+        CHECK_EQ_INT(access(backup, F_OK), 0);
+    }
+    CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path, 7), 0);
+    CHECK(access(backup, F_OK) != 0);
+
+    previous_clock = config_set_backup_clock_fn(fixed_clock);
+    clear_error();
+    CHECK_EQ_INT(config_backup(path), 0);
+    config_set_backup_clock_fn(previous_clock);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 5);
+    for (unsigned long long generation = 0; generation < 8; generation++) {
+        CHECK_EQ_INT(backup_generation_path(backup, sizeof(backup), path,
+                                            generation), 0);
+        if (generation < 3) {
+            CHECK(access(backup, F_OK) != 0);
+        } else {
+            CHECK_EQ_INT(access(backup, F_OK), 0);
+        }
+    }
+    ts_rm_rf(dir);
 }
 
 static void exercise_backup_fault(config_io_boundary_t boundary) {
@@ -763,6 +862,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(default_create_fault_matrix_is_atomic_and_closes_fds);
     RUN_TEST(default_create_signal_death_is_truthful_at_every_boundary);
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
+    RUN_TEST(backup_pruning_requires_complete_directory_enumeration);
     RUN_TEST(backup_faults_abort_and_full_save_rolls_state_back);
     RUN_TEST(full_save_rollback_preserves_a_later_state_generation);
     RUN_TEST(active_state_only_save_preserves_accounts_and_is_idempotent);
