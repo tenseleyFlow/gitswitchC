@@ -258,6 +258,7 @@ static bool g_fail_list_config;     /* fail exact snapshot acquisition */
 static bool g_mutate_name_before_seal;
 static int g_worktree_probe_failures; /* fail the next N --show-scope probes */
 static int g_user_name_writes;
+static int g_fake_runner_calls;
 static int g_ssh_activation_commands;
 static bool g_fail_ssh_add;
 static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
@@ -480,6 +481,7 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
                        run_result_t *result) {
     int exit_code = 0;
 
+    g_fake_runner_calls++;
     if (is_effective_config_list(argv))
         return emit_effective_config(opts, result);
     if (argv[0] && argv[1] && argv[2] &&
@@ -967,6 +969,7 @@ static account_t *add_previous_account(gitswitch_ctx_t *ctx) {
 static void seed_previous_git_identity(void) {
     git_ops_test_reset_caches();
     g_user_name_writes = 0;
+    g_fake_runner_calls = 0;
     safe_strncpy(g_store_name, "Previous Name", sizeof(g_store_name));
     safe_strncpy(g_store_email, "prev@example.com", sizeof(g_store_email));
     g_store_sshcmd[0] = '\0';
@@ -2720,6 +2723,244 @@ static bool switch_actions_equal(const struct sigaction *left,
     return true;
 }
 
+/* AR-09 M5: a clean prepared transaction owns the singleton Git snapshot,
+ * cross-manager runtime lock, and guarded signal dispositions.  Every switch
+ * entry point must reject before even validating its arguments while that
+ * record exists.  Mismatched finalizers likewise cannot consume it; the
+ * matching commit and abort paths remain usable, and clearing either record
+ * reopens admission. */
+TEST(clean_pending_switch_excludes_competing_entry_matrix) {
+    struct sigaction guarded[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t owner;
+    gitswitch_ctx_t owner_before;
+    gitswitch_ctx_t contender;
+    gitswitch_ctx_t contender_before;
+    command_runner_fn previous_runner;
+    int runner_calls;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    contender = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+
+    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(!runtime_lock_available_to_child());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &guarded[i]), 0);
+    }
+    owner_before = owner;
+    contender.config.dry_run = true;
+    contender_before = contender;
+    runner_calls = g_fake_runner_calls;
+
+    /* Same owner, different owner, and invalid arguments all lose to the
+     * pending-owner check.  The dry-run contender proves prepare's public
+     * precondition checks also occur after singleton admission. */
+    CHECK_EQ_INT(accounts_switch(&owner, "testacct"), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch(&contender, "testacct"), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch(NULL, NULL), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch_prepare(&contender, NULL), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch_prepare(NULL, NULL), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+
+    CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
+    CHECK(memcmp(&contender, &contender_before, sizeof(contender)) == 0);
+    CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK_EQ_INT(git_config_seal(), 0);
+    CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
+    CHECK(!runtime_lock_available_to_child());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &observed), 0);
+        CHECK(switch_actions_equal(&observed, &guarded[i]));
+    }
+
+    CHECK_EQ_INT(accounts_switch_commit(&contender), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&contender, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
+    CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(!runtime_lock_available_to_child());
+
+    CHECK_EQ_INT(accounts_switch_commit(&owner), 0);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
+    signals_rollback_end();
+    CHECK_EQ_INT(signals_guard_end(), 0);
+
+    /* A fresh prepared transaction is admitted after commit and its matching
+     * abort clears normally.  A subsequent one-call switch proves both
+     * finalization paths reopen the public admission gate. */
+    owner = make_ctx();
+    seed_previous_git_identity();
+    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+
+    contender = make_ctx();
+    CHECK_EQ_INT(accounts_switch(&contender, "testacct"), 0);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(runtime_lock_available_to_child());
+    run_set_runner(previous_runner);
+}
+
+/* An abort-only M4 retry record is still an active pending switch.  In this
+ * state the runtime lock has deliberately been released, so an unguarded
+ * resume-style direct call used to enter the transaction and close the
+ * original signal guard.  Reject both APIs before validation, preserve the
+ * conflict-safe Git retry image, and admit a new switch only after the
+ * matching abort consumes it. */
+TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
+    struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+    struct sigaction expected[SWITCH_GUARDED_SIGNAL_COUNT];
+    struct sigaction guarded[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t owner;
+    gitswitch_ctx_t owner_before;
+    gitswitch_ctx_t contender;
+    gitswitch_ctx_t contender_before;
+    command_runner_fn previous_runner;
+    int runner_calls;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction action;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &original[i]), 0);
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = switch_inherited_handler;
+        sigemptyset(&action.sa_mask);
+        sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+        sigaddset(&action.sa_mask,
+                  switch_guarded_signals[(i + 1) %
+                                         SWITCH_GUARDED_SIGNAL_COUNT]);
+        action.sa_flags = i == 1 ? SA_RESTART : 0;
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &action, NULL), 0);
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &expected[i]), 0);
+    }
+
+    owner = make_ctx();
+    contender = make_ctx();
+    contender.config.resuming = true;
+    seed_previous_git_identity();
+    g_mutate_name_before_seal = true;
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    g_mutate_name_before_seal = false;
+    CHECK(strstr(get_last_error()->message,
+                 "rollback ownership remains published") != NULL);
+    CHECK_STR_EQ(g_store_name, "preseal-writer");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &guarded[i]), 0);
+    }
+    owner_before = owner;
+    contender_before = contender;
+    runner_calls = g_fake_runner_calls;
+
+    CHECK_EQ_INT(accounts_switch(&owner, "testacct"), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch(&contender, "testacct"), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch(NULL, NULL), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch_prepare(&contender, NULL), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+    CHECK_EQ_INT(accounts_switch_prepare(NULL, NULL), -1);
+    CHECK(strstr(get_last_error()->message, "already pending") != NULL);
+
+    CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
+    CHECK(memcmp(&contender, &contender_before, sizeof(contender)) == 0);
+    CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
+    CHECK_STR_EQ(g_store_name, "preseal-writer");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &observed), 0);
+        CHECK(switch_actions_equal(&observed, &guarded[i]));
+    }
+
+    CHECK_EQ_INT(accounts_switch_commit(&contender), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&contender, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
+    CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
+    CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
+    CHECK_STR_EQ(g_store_name, "preseal-writer");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &observed), 0);
+        CHECK(switch_actions_equal(&observed, &guarded[i]));
+    }
+
+    safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &observed), 0);
+        CHECK(switch_actions_equal(&observed, &expected[i]));
+    }
+
+    contender = make_ctx();
+    CHECK_EQ_INT(accounts_switch(&contender, "testacct"), 0);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(runtime_lock_available_to_child());
+    run_set_runner(previous_runner);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &original[i], NULL),
+                     0);
+    }
+}
+
 static void fail_guard_restore_retry(void) {
     signals_test_fail_sigaction(SIGINT, SIGNALS_TEST_SIGACTION_RESTORE,
                                 EAGAIN);
@@ -3493,6 +3734,8 @@ TEST_MAIN_BEGIN()
         fprintf(stderr, "HARNESS FAIL: cannot restore PATH after GPG tests\n");
         return 1;
     }
+    RUN_TEST(clean_pending_switch_excludes_competing_entry_matrix);
+    RUN_TEST(abort_only_pending_switch_excludes_competing_entry_matrix);
     RUN_TEST(guard_begin_partial_restore_is_synchronously_released);
     RUN_TEST(guard_begin_restore_retry_publishes_abort_only_handle);
     RUN_TEST(failed_prepare_releases_callers_signal_dispositions);

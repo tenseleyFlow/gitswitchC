@@ -803,6 +803,30 @@ static void set_retained_alias_publication_error(
               detail && detail[0] ? detail : "unknown SSH config error");
 }
 
+/* g_pending_switch owns singleton Git, runtime-lock, and signal-guard state.
+ * Admission must precede even public argument validation: an invalid, preview,
+ * or resume-style competing call is still forbidden from observing or
+ * consuming any part of that transaction.  Only its matching commit/abort
+ * APIs may inspect the retained record. */
+static int reject_pending_switch_entry(void) {
+    if (!g_pending_switch.active) return 0;
+
+    if (g_pending_switch.abort_only) {
+        set_error(
+            ERR_SYSTEM_CALL,
+            "An account switch rollback is already pending; retry it with "
+            "its matching accounts_switch_abort() before starting another "
+            "switch");
+    } else {
+        set_error(
+            ERR_SYSTEM_CALL,
+            "An account switch is already pending; finish it with its "
+            "matching accounts_switch_commit() or accounts_switch_abort() "
+            "before starting another switch");
+    }
+    return -1;
+}
+
 /* Switch to specified account with SSH isolation and validation. */
 static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                                 bool defer_commit) {
@@ -827,11 +851,6 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         return -1;
     }
     defer_signal_dispatch = defer_commit || ctx->config.defer_signal_cleanup;
-    if (defer_commit && g_pending_switch.active) {
-        set_error(ERR_SYSTEM_CALL,
-                  "A prepared account switch is already awaiting commit");
-        return -1;
-    }
 
     /* Find the account. On the boot-resume path the identifier is the persisted
      * exact name, so resolve it literally (AR-06 F22) — the id-first fuzzy
@@ -1613,10 +1632,12 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 }
 
 int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
+    if (reject_pending_switch_entry() != 0) return -1;
     return accounts_switch_impl(ctx, identifier, false);
 }
 
 int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
+    if (reject_pending_switch_entry() != 0) return -1;
     if (!ctx || ctx->config.dry_run || ctx->config.resuming) {
         set_error(ERR_INVALID_ARGS,
                   "A transactional switch requires a non-preview CLI switch");
