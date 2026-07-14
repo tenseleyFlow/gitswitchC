@@ -4908,6 +4908,17 @@ int get_terminal_size(int *width, int *height) {
         return -1;
     }
 
+    /* AR-10 L33: a fresh pty reports 0x0 with a SUCCEEDING ioctl. Accepting
+     * that as a valid size collapsed display layout (display_init only falls
+     * back to 80x24 on nonzero return); report failure so callers use their
+     * defaults. */
+    if (ws.ws_col == 0 || ws.ws_row == 0) {
+        set_error(ERR_SYSTEM_CALL,
+                  "Terminal reported a zero dimension (%ux%u)",
+                  (unsigned)ws.ws_col, (unsigned)ws.ws_row);
+        return -1;
+    }
+
     *width = ws.ws_col;
     *height = ws.ws_row;
 

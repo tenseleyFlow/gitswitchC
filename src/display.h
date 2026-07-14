@@ -6,8 +6,6 @@
 #include <stdbool.h>
 #include "gitswitch.h"
 
-/* Forward declarations - only declare what we need for Phase 2 */
-
 /* Color codes */
 #define COLOR_RESET   "\033[0m"
 #define COLOR_RED     "\033[31m"
@@ -44,13 +42,6 @@ void display_header(const char *title);
  * Print status message with appropriate color and icon
  */
 void display_status(const char *level, const char *message, ...) GS_PRINTF_FMT(2, 3);
-
-/* These functions will be implemented in later phases
-void display_current_status(const git_current_config_t *config);
-void display_ssh_status(const ssh_config_t *ssh_config);
-void display_gpg_status(const gpg_config_t *gpg_config);
-void display_validation_results(const account_validation_t *validation);
-*/
 
 /**
  * Print error message with context
