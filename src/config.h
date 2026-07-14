@@ -197,6 +197,8 @@ typedef struct {
     bool post_image_installed;
     bool post_image_valid;
     struct stat post_image;
+    unsigned char post_image_data[MAX_NAME_LEN + 32U];
+    size_t post_image_length;
 } config_resume_hint_snapshot_t;
 
 int config_resume_hint_snapshot_capture(config_resume_hint_snapshot_t *snapshot);

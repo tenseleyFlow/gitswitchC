@@ -1095,10 +1095,10 @@ static int config_require_loaded_source_generation(
     return 0;
 }
 
-/* FreeBSD UFS may materialize a ctime update for a read source only when the
- * backup directory is synced. Do not weaken the normal generation comparator:
- * this predicate is used only with the exact backup created from the strict
- * pre-copy generation below. */
+/* FreeBSD UFS may materialize a ctime update only when a related directory is
+ * synced. Do not weaken the normal generation comparator: callers may use
+ * this predicate only when an independent exact-content proof binds the file
+ * to the generation they already captured. */
 static bool config_metadata_ctime_only_change(const struct stat *before,
                                               const struct stat *after) {
     bool same_without_ctime = config_metadata_same_file(before, after) &&
@@ -1678,13 +1678,79 @@ static int config_resume_hint_snapshot_bind_post_image(
     snapshot->post_image_installed = false;
     snapshot->post_image_valid = false;
     memset(&snapshot->post_image, 0, sizeof(snapshot->post_image));
+    secure_zero_memory(snapshot->post_image_data,
+                       sizeof(snapshot->post_image_data));
+    snapshot->post_image_length = 0;
     return 0;
+}
+
+static bool config_resume_hint_post_image_content_same(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot,
+    const struct stat *current) {
+    struct stat opened;
+    struct stat after;
+    struct stat named;
+    unsigned char data[MAX_NAME_LEN + 32U];
+    unsigned char extra;
+    ssize_t extra_count;
+    int fd = -1;
+    bool matches = false;
+
+    if (!hint || !snapshot || !current || !snapshot->post_image_valid ||
+        snapshot->post_image_length > sizeof(data) || current->st_size < 0 ||
+        (uintmax_t)current->st_size != snapshot->post_image_length) {
+        return false;
+    }
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(current, &opened) ||
+        !config_pread_full(fd, data, snapshot->post_image_length, 0)) {
+        goto cleanup;
+    }
+    do {
+        extra_count = pread(fd, &extra, 1,
+                            (off_t)snapshot->post_image_length);
+    } while (extra_count < 0 && errno == EINTR);
+    if (extra_count == 0 &&
+        memcmp(data, snapshot->post_image_data,
+               snapshot->post_image_length) == 0 &&
+        fstat(fd, &after) == 0 && lstat(hint, &named) == 0 &&
+        config_metadata_file_is_safe(&after, true) &&
+        config_metadata_file_is_safe(&named, true) &&
+        config_metadata_snapshot_same(&opened, &after) &&
+        config_metadata_snapshot_same(&opened, &named)) {
+        matches = true;
+    }
+
+cleanup:
+    secure_zero_memory(data, sizeof(data));
+    if (fd >= 0) close(fd);
+    return matches;
+}
+
+static bool config_resume_hint_post_image_is_current(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot) {
+    struct stat current;
+
+    if (lstat(hint, &current) != 0 ||
+        !config_metadata_file_is_safe(&current, true)) {
+        return false;
+    }
+    if (config_metadata_snapshot_same(&snapshot->post_image, &current)) {
+        return true;
+    }
+    /* FreeBSD UFS can materialize the ctime of a freshly renamed file after
+     * the first lstat. Preserve the strict generation guard for every other
+     * metadata change, and admit that one transition only after a stable,
+     * descriptor-bound comparison proves the complete installed bytes. */
+    return config_metadata_ctime_only_change(&snapshot->post_image, &current) &&
+           config_resume_hint_post_image_content_same(hint, snapshot,
+                                                       &current);
 }
 
 static int config_resume_hint_snapshot_require_post_image(
     const char *hint, const config_resume_hint_snapshot_t *snapshot) {
-    struct stat current;
-
     if (!snapshot->post_image_bound) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
@@ -1700,9 +1766,7 @@ static int config_resume_hint_snapshot_require_post_image(
         return -1;
     }
     errno = 0;
-    if (lstat(hint, &current) != 0 ||
-        !config_metadata_file_is_safe(&current, true) ||
-        !config_metadata_snapshot_same(&snapshot->post_image, &current)) {
+    if (!config_resume_hint_post_image_is_current(hint, snapshot)) {
         errno = errno ? errno : ESTALE;
         set_system_error(
             ERR_FILE_IO,
@@ -2241,7 +2305,14 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         return -1;
     }
     if (rollback_snapshot) {
+        if (length > sizeof(rollback_snapshot->post_image_data)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Installed resume-hint post-image is too long");
+            return -1;
+        }
         rollback_snapshot->post_image = after;
+        memcpy(rollback_snapshot->post_image_data, content, length);
+        rollback_snapshot->post_image_length = length;
         rollback_snapshot->post_image_valid = true;
     }
     {
@@ -2261,10 +2332,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         close(dir_fd);
     }
     if (rollback_snapshot) {
-        if (lstat(hint, &after) != 0 ||
-            !config_metadata_file_is_safe(&after, true) ||
-            !config_metadata_snapshot_same(&rollback_snapshot->post_image,
-                                           &after)) {
+        if (!config_resume_hint_post_image_is_current(hint,
+                                                      rollback_snapshot)) {
             set_error(ERR_FILE_IO,
                       "Installed resume-hint generation changed during durability commit: %s",
                       hint);

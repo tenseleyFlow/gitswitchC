@@ -409,6 +409,95 @@ TEST(guarded_snapshot_restores_unchanged_post_image_exactly) {
     config_resume_hint_snapshot_clear(&saved);
 }
 
+TEST(guarded_snapshot_accepts_ctime_only_materialization) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+
+    /* Model FreeBSD UFS reporting the installed inode's finalized ctime only
+     * after the first seal. The exact post-image bytes still authorize the
+     * rollback; the adjacent different-byte rewrite test remains fail-closed. */
+#ifdef __APPLE__
+    saved.post_image.st_ctimespec.tv_nsec ^= 1L;
+#else
+    saved.post_image.st_ctim.tv_nsec ^= 1L;
+#endif
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    config_resume_hint_snapshot_clear(&saved);
+}
+
+TEST(guarded_snapshot_rejects_changed_bytes_under_ctime_only_drift) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    struct stat rewritten;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+    CHECK_EQ_INT(rewrite_same_inode_and_size(g_hint,
+                                             "none\nactive=later\n"), 0);
+    CHECK_EQ_INT(lstat(g_hint, &rewritten), 0);
+
+    /* Force the metadata predicate down its ctime-only branch. The installed
+     * byte witness still describes alice, so the stable read of later must
+     * reject rollback rather than laundering the rewrite into ownership. */
+    saved.post_image = rewritten;
+#ifdef __APPLE__
+    saved.post_image.st_ctimespec.tv_nsec ^= 1L;
+#else
+    saved.post_image.st_ctim.tv_nsec ^= 1L;
+#endif
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
+    CHECK(strstr(get_last_error()->message, "rollback conflict") != NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=later\n");
+    config_resume_hint_snapshot_clear(&saved);
+}
+
 TEST(snapshot_restore_registration_failure_preserves_post_image_and_retries) {
     static const char config_body[] =
         "[settings]\n"
@@ -655,6 +744,8 @@ int main(void) {
     RUN_TEST(testing_object_retains_legacy_fault_seam_before_installation);
     RUN_TEST(unbound_snapshot_cannot_overwrite_a_later_state);
     RUN_TEST(guarded_snapshot_restores_unchanged_post_image_exactly);
+    RUN_TEST(guarded_snapshot_accepts_ctime_only_materialization);
+    RUN_TEST(guarded_snapshot_rejects_changed_bytes_under_ctime_only_drift);
     RUN_TEST(snapshot_restore_registration_failure_preserves_post_image_and_retries);
     RUN_TEST(guarded_save_does_not_adopt_an_in_place_rewrite);
     RUN_TEST(public_restore_serializes_its_final_compare_and_rename);
