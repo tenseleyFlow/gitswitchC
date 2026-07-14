@@ -14,6 +14,9 @@ Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  readline-devel
+# AR-10 L28: %check runs the C suite; several integration suites drive the
+# real git binary inside sandboxed HOMEs.
+BuildRequires:  git
 
 %global debug_package %{nil}
 Requires:       git
@@ -59,6 +62,15 @@ make BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm %{?_smp_mflags}
 # explicitly so the stamp/binary contract is unambiguous and a clean chroot
 # never repackages a debug/ASan binary.
 make install BUILD_TYPE=release READLINE=1 DESTDIR=%{buildroot} PREFIX=%{_prefix}
+
+%check
+# AR-10 L28: the package ships from a tests-first repository yet the RPM never
+# ran a single test in the build chroot, so an arch-specific miscompile could
+# produce a green RPM. Run the C suite against the exact release objects
+# %build produced (flags must match %build so the build-config stamp reuses
+# them). Runtime-dependent suites (shells, gpg, ssh, ptys) skip gracefully
+# when the chroot lacks those runtimes; the assertion suites always run.
+make test BUILD_TYPE=release READLINE=1 VERSION=%{version} COMMIT=rpm
 
 %files
 %license LICENSE
