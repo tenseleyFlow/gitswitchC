@@ -2034,7 +2034,9 @@ int gpg_manager_retarget_current(const char *real_home) {
 
 /* Drop the stable `current` symlink (switching to a GPG-less account, or
  * rolling one back). Locked for the same reason as the retarget: an unlocked
- * unlink could delete the fresh link a concurrent switch just installed. */
+ * unlink could delete the fresh link a concurrent switch just installed.
+ * Success proves the directory entry durable; an already-absent retry syncs
+ * the base again so it can repair a prior unlink whose sync failed. */
 int gpg_manager_drop_current(void) {
     char base[MAX_PATH_LEN];
     char link_path[MAX_PATH_LEN];
@@ -2043,6 +2045,7 @@ int gpg_manager_drop_current(void) {
     int lock_fd = -1;
     int base_rc;
     int rc = 0;
+    bool current_absent = false;
 
     if (gpg_get_base_dir(base, sizeof(base)) != 0 ||
         gpg_current_path_from_base(base, link_path, sizeof(link_path)) != 0) {
@@ -2062,14 +2065,29 @@ int gpg_manager_drop_current(void) {
             set_system_error(ERR_FILE_IO, "Cannot inspect stable GNUPGHOME link: %s",
                              link_path);
             rc = -1;
+        } else {
+            current_absent = true;
         }
     } else if (!S_ISLNK(link_st.st_mode)) {
         set_error(ERR_FILE_IO, "Stable GNUPGHOME entry is not a symlink: %s",
                   link_path);
         rc = -1;
-    } else if (unlinkat(base_fd, "current", 0) != 0 && errno != ENOENT) {
-        set_system_error(ERR_FILE_IO, "Failed to remove stable GNUPGHOME link: %s",
-                         link_path);
+    } else if (unlinkat(base_fd, "current", 0) != 0) {
+        if (errno == ENOENT) {
+            current_absent = true;
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to remove stable GNUPGHOME link: %s",
+                             link_path);
+            rc = -1;
+        }
+    } else {
+        current_absent = true;
+    }
+    if (rc == 0 && current_absent && g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Stable GNUPGHOME removal is not durable; retry runtime deactivation");
         rc = -1;
     }
     unlock_gpg_dir(base_fd, lock_fd);

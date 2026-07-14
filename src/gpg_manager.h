@@ -270,8 +270,9 @@ int gpg_manager_isolated_home_present(const char *account, bool *present);
  * neither can interleave with gpg_manager_reset's home teardown or
  * current-link retirement (AR-02 #9). Used by the switch's rollback/teardown
  * paths; the forward switch retargets internally via the same locked path.
- * Non-fatal helpers:
- * both return 0 on success, -1 otherwise.
+ * Dropping `current` syncs the pinned base before success and re-syncs an
+ * already-absent name so a retry can repair a prior durability failure.
+ * Non-fatal helpers: both return 0 on success, -1 otherwise.
  */
 int gpg_manager_retarget_current(const char *real_home);
 int gpg_manager_drop_current(void);
