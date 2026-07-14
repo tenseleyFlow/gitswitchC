@@ -28,6 +28,7 @@
 #include "error.h"
 #include "utils.h"
 #include "display.h"
+#include "toml_parser.h"
 
 /* Internal helper functions */
 static int git_run(char *output, size_t output_size, ...);
@@ -3989,14 +3990,15 @@ static int ssh_command_append_quoted(char *command, size_t command_size,
 }
 
 #define SSH_COMMAND_OPTIONS                                                   \
-    " -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"             \
+    " -F none -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"     \
     " -o LogLevel=ERROR"
+#define SSH_COMMAND_HOSTNAME_OPTION " -o HostName="
 
-/* GIT_CONFIG_VALUE_MAX reserves 256 bytes beyond the two serialized path
- * payloads. Prove at compile time that the exact fixed spelling, four quote
- * delimiters, and terminating NUL fit inside that reserve. */
+/* GIT_CONFIG_VALUE_MAX reserves 256 bytes beyond the serialized path and
+ * hostname payloads. Prove at compile time that the exact fixed spelling, six
+ * quote delimiters, and terminating NUL fit inside that reserve. */
 _Static_assert((sizeof(" -i ") - 1U) + (sizeof(SSH_COMMAND_OPTIONS) - 1U) +
-                       4U + 1U <=
+                       (sizeof(SSH_COMMAND_HOSTNAME_OPTION) - 1U) + 6U + 1U <=
                    256U,
                "GIT_CONFIG_VALUE_MAX fixed SSH command reserve is too small");
 
@@ -4006,6 +4008,7 @@ static int build_expected_ssh_command(const account_t *account,
                                       size_t expanded_path_size) {
     char ssh_path[MAX_PATH_LEN];
     size_t used = 0;
+    bool has_alias;
 
     if (!account || !account->ssh_enabled || strlen(account->ssh_key_path) == 0) {
         set_error(ERR_INVALID_ARGS,
@@ -4015,6 +4018,17 @@ static int build_expected_ssh_command(const account_t *account,
     if (!command || command_size == 0 || !expanded_path ||
         expanded_path_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid SSH command output buffer");
+        return -1;
+    }
+    command[0] = '\0';
+
+    has_alias = account->ssh_host_alias[0] != '\0';
+    if (has_alias &&
+        (!toml_validate_ssh_host_alias(account->ssh_host_alias) ||
+         !toml_validate_ssh_hostname(account->ssh_hostname))) {
+        set_error(ERR_INVALID_ARGS,
+                  "Managed SSH alias requires a valid alias and canonical "
+                  "hostname");
         return -1;
     }
 
@@ -4055,13 +4069,19 @@ static int build_expected_ssh_command(const account_t *account,
         }
     }
 
-    command[0] = '\0';
     if (ssh_command_append_quoted(command, command_size, &used, ssh_path) != 0 ||
         ssh_command_append(command, command_size, &used, " -i ") != 0 ||
         ssh_command_append_quoted(command, command_size, &used,
                                   expanded_path) != 0 ||
         ssh_command_append(command, command_size, &used,
                            SSH_COMMAND_OPTIONS) != 0) {
+        return -1;
+    }
+    if (has_alias &&
+        (ssh_command_append(command, command_size, &used,
+                            SSH_COMMAND_HOSTNAME_OPTION) != 0 ||
+         ssh_command_append_quoted(command, command_size, &used,
+                                   account->ssh_hostname) != 0)) {
         return -1;
     }
     return 0;

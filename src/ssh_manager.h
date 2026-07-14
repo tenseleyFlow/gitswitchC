@@ -253,7 +253,9 @@ int ssh_configure_host_alias_result(
 int ssh_remove_host_alias(const char *alias);
 
 /**
- * Test SSH connection to verify authentication
+ * Test SSH connection to verify authentication. The probe ignores shared
+ * OpenSSH configuration and offers only account->ssh_key_path. A managed alias
+ * additionally requires and pins account->ssh_hostname as its destination.
  */
 int ssh_test_connection(const account_t *account, const char *host);
 

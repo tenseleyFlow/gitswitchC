@@ -18,15 +18,16 @@
 #define GIT_CONFIG_CORE_SSHCOMMAND "core.sshcommand"
 
 /* Largest managed value emitted by gitswitch. core.sshCommand contains two
- * inputs shorter than MAX_PATH_LEN. A canonical executable can consist
- * entirely of apostrophes, so POSIX single-quote serialization needs at most
- * 4 * (MAX_PATH_LEN - 1) bytes for it. is_safe_ssh_key_path() rejects quotes,
- * so its serialized key contributes at most MAX_PATH_LEN - 1 bytes. The 256
- * bytes cover both pairs of quote delimiters, fixed options, and the NUL.
- * Public status records and the scalar cache use this lossless capacity;
- * transactional snapshots remain dynamically allocated for arbitrary foreign
- * values. */
-#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN * 5 + 256)
+ * inputs shorter than MAX_PATH_LEN plus an optional canonical hostname shorter
+ * than MAX_NAME_LEN. A canonical executable can consist entirely of
+ * apostrophes, so POSIX single-quote serialization needs at most
+ * 4 * (MAX_PATH_LEN - 1) bytes for it. is_safe_ssh_key_path() and the hostname
+ * validator reject quotes, so their serialized payloads contribute at most
+ * MAX_PATH_LEN - 1 and MAX_NAME_LEN - 1 bytes. The 256 bytes cover quote
+ * delimiters, fixed options, and the NUL. Public status records and the scalar
+ * cache use this lossless capacity; transactional snapshots remain dynamically
+ * allocated for arbitrary foreign values. */
+#define GIT_CONFIG_VALUE_MAX (MAX_PATH_LEN * 5 + MAX_NAME_LEN + 256)
 
 typedef enum {
     GIT_CONFIG_ORIGIN_UNKNOWN = 0,
@@ -93,9 +94,11 @@ const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope);
 /**
  * Build the exact core.sshCommand expected for an SSH-enabled account.
  * This resolves `ssh` through the hardened executable trust walk, expands the
- * key path, and serializes both absolute arguments safely. It does not require
- * the key file to exist, so read-only status can compare persisted Git state
- * without introducing a filesystem mutation.
+ * key path, isolates OpenSSH from shared configuration, and serializes both
+ * absolute arguments safely. For a managed alias it also pins the validated
+ * canonical hostname. It does not require the key file to exist, so read-only
+ * status can compare persisted Git state without introducing a filesystem
+ * mutation.
  */
 int git_expected_ssh_command(const account_t *account, char *command,
                              size_t command_size);

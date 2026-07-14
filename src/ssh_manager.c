@@ -4117,14 +4117,17 @@ static bool ssh_authentication_was_proven(const char *output,
 /* Test SSH connection */
 int ssh_test_connection(const account_t *account, const char *host) {
     char output[1024] = {0};
+    char expanded_key_path[MAX_PATH_LEN];
+    char hostname_option[sizeof("HostName=") + MAX_NAME_LEN];
     run_opts_t opts;
     run_result_t result;
-    const char *const alias_argv[] = {
-        "ssh", "-T", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
-        account ? account->ssh_host_alias : NULL, NULL};
 
     if (!account || !host) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_test_connection");
+        return -1;
+    }
+    if (expand_path(account->ssh_key_path, expanded_key_path,
+                    sizeof(expanded_key_path)) != 0) {
         return -1;
     }
     
@@ -4137,23 +4140,37 @@ int ssh_test_connection(const account_t *account, const char *host) {
     opts.out_size = sizeof(output);
     opts.merge_stderr = true;
 
-    /* Git hosts print their discovery greeting on stderr. The alias path uses
-     * the managed config block's IdentitiesOnly policy. A direct literal-host
-     * probe must ignore every user/system config file as well: IdentitiesOnly
-     * still permits IdentityFile entries inherited from those files. */
+    /* Git hosts print their discovery greeting on stderr. Every probe ignores
+     * user and system configuration: IdentitiesOnly still permits inherited
+     * IdentityFile entries, and a preceding Host block can win HostName's
+     * first-obtained-value semantics. Managed aliases therefore carry their
+     * validated destination as an argv option instead of trusting the shared
+     * ~/.ssh/config block. */
     if (strlen(account->ssh_host_alias) > 0) {
+        const char *alias_argv[] = {
+            "ssh", "-T", "-F", "none", "-o", "ConnectTimeout=5", "-o",
+            "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i",
+            expanded_key_path, "-o", hostname_option,
+            account->ssh_host_alias, NULL};
+
+        if (!valid_ssh_host_alias(account->ssh_host_alias) ||
+            !toml_validate_ssh_hostname(account->ssh_hostname)) {
+            set_error(ERR_INVALID_ARGS,
+                      "Managed SSH alias requires a valid alias and canonical "
+                      "hostname");
+            return -1;
+        }
+        if (safe_snprintf(hostname_option, sizeof(hostname_option),
+                          "HostName=%s", account->ssh_hostname) != 0) {
+            return -1;
+        }
         (void)run_argv(alias_argv, &opts, &result);
     } else {
-        char expanded_key_path[MAX_PATH_LEN];
         const char *direct_argv[] = {
             "ssh", "-T", "-F", "none", "-o", "ConnectTimeout=5", "-o",
             "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i",
             expanded_key_path, host, NULL};
 
-        if (expand_path(account->ssh_key_path, expanded_key_path,
-                        sizeof(expanded_key_path)) != 0) {
-            return -1;
-        }
         (void)run_argv(direct_argv, &opts, &result);
     }
 
