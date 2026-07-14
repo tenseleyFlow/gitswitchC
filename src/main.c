@@ -78,7 +78,8 @@ static void print_usage(const char *prog_name) {
     printf("  --global, -g         Use global git scope\n");
     printf("  --local, -l          Use local git scope (default)\n");
     printf("  --dry-run, -n        Show what would be done without executing\n");
-    printf("  --yes, -y            Assume 'yes' to confirmation prompts (remove/reset)\n");
+    printf("  --yes, -y            Assume 'yes' to confirmation prompts "
+           "(add/edit/remove/reset)\n");
     printf("  --names              With 'list': print only account names (one per line)\n");
     printf("  --verbose, -V        Enable verbose output\n");
     printf("  --debug, -d          Enable debug logging\n");

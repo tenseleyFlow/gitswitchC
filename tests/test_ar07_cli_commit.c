@@ -328,6 +328,27 @@ TEST(option_order_is_independent_of_posixly_correct) {
     }
 }
 
+TEST(help_names_every_yes_confirmation_bypass) {
+    static const char expected[] =
+        "  --yes, -y            Assume 'yes' to confirmation prompts "
+        "(add/edit/remove/reset)\n";
+    const char *argv[] = {"gitswitch", "--help", NULL};
+    char home[128], runtime[128], output_path[128], output[8192];
+    int rc;
+
+    CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                  "gitswitch-ar09-home"), 0);
+    CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                  "gitswitch-ar09-run"), 0);
+    rc = run_cli(home, runtime, argv, output_path, sizeof(output_path));
+    CHECK_EQ_INT(rc, 0);
+    slurp(output_path, output, sizeof(output));
+    CHECK(strstr(output, expected) != NULL);
+    CHECK(directory_empty(home));
+    CHECK(directory_empty(runtime));
+    unlink(output_path);
+}
+
 TEST(exact_arity_rejects_invalid_forms_before_state_creation) {
     cli_case_t cases[] = {
         {"add extra", {"gitswitch", "add", "extra", NULL}},
@@ -620,6 +641,7 @@ TEST_MAIN_BEGIN()
         return 1;
     }
     RUN_TEST(option_order_is_independent_of_posixly_correct);
+    RUN_TEST(help_names_every_yes_confirmation_bypass);
     RUN_TEST(exact_arity_rejects_invalid_forms_before_state_creation);
     RUN_TEST(unsafe_shorthand_selector_with_extra_operand_is_not_reflected);
     RUN_TEST(legacy_init_alias_rejects_operands_without_creating_state);
