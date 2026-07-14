@@ -2989,7 +2989,16 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             } else if (inspection_rc == 0) {
                 printf("  Key File: [NOT FOUND]\n");
             } else {
-                printf("  Key File: [ERROR] Unable to inspect safely\n");
+                const error_context_t *inspection_error = get_last_error();
+
+                status_result = -1;
+                printf("  Key File: [ERROR] Unable to inspect safely");
+                if (inspection_error &&
+                    inspection_error->message[0] != '\0') {
+                    printf(": ");
+                    print_terminal_safe(inspection_error->message);
+                }
+                printf("\n");
             }
             
             if (strlen(account->ssh_host_alias) > 0) {
