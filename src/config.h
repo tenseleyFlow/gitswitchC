@@ -104,6 +104,15 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
  * skipped account sections or found unrecognized ones (AR-03 M9): the refusal
  * must be distinguishable from success or callers report "saved" for a change
  * that was silently discarded.
+ *
+ * Every public save acquires a nonblocking, destination-local publication lock
+ * before observing or changing the state/config pair and holds it through the
+ * final rename, rollback, and durability checks. Concurrent gitswitch/API
+ * writers therefore fail with EAGAIN/EWOULDBLOCK instead of losing a committed
+ * generation. Same-uid code that writes these paths without using this API is
+ * outside the cooperating-writer protocol: strict metadata checks detect such
+ * changes through the final pre-rename checkpoint, so the unsupported race is
+ * explicitly bounded to the last check-to-rename interval.
  */
 int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
 /* Full-document transactional save. `config_installed` becomes true once the

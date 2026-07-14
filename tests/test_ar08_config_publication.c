@@ -8,6 +8,7 @@
 
 #include <poll.h>
 #include <stdint.h>
+#include <sys/wait.h>
 
 #define LARGE_CONFIG_SIZE 9000U
 
@@ -36,6 +37,19 @@ static char g_backup_competitor_path[1024];
 static bool g_rewrite_backup_destination;
 static int g_rewrite_backup_destination_calls;
 static int g_backup_clock_calls;
+static int g_concurrent_writer_start_fd = -1;
+static int g_concurrent_writer_result_fd = -1;
+
+typedef struct {
+    int result;
+    int result_errno;
+    int installed;
+} concurrent_writer_result_t;
+
+static concurrent_writer_result_t g_concurrent_writer_result;
+static bool g_concurrent_writer_result_received;
+static config_io_boundary_t g_concurrent_writer_boundary =
+    CONFIG_IO_DOCUMENT_BEFORE_RENAME;
 
 typedef enum {
     SOURCE_AFTER_COPY_NONE = 0,
@@ -72,6 +86,32 @@ static int write_bytes(const char *path, const char *data, size_t length) {
 
 static int write_text(const char *path, const char *text) {
     return write_bytes(path, text, strlen(text));
+}
+
+static int write_pipe_bytes(int fd, const void *data, size_t length) {
+    const unsigned char *bytes = data;
+    size_t total = 0;
+
+    while (total < length) {
+        ssize_t written = write(fd, bytes + total, length - total);
+        if (written > 0) total += (size_t)written;
+        else if (written < 0 && errno == EINTR) continue;
+        else return -1;
+    }
+    return 0;
+}
+
+static int read_pipe_bytes(int fd, void *data, size_t length) {
+    unsigned char *bytes = data;
+    size_t total = 0;
+
+    while (total < length) {
+        ssize_t received = read(fd, bytes + total, length - total);
+        if (received > 0) total += (size_t)received;
+        else if (received < 0 && errno == EINTR) continue;
+        else return -1;
+    }
+    return 0;
 }
 
 static bool same_ctime(const struct stat *left, const struct stat *right) {
@@ -319,6 +359,23 @@ static void substitute_backup_destination(void) {
 }
 
 static bool publication_observer(config_io_boundary_t boundary) {
+    if (boundary == g_concurrent_writer_boundary &&
+        g_concurrent_writer_start_fd >= 0 &&
+        g_concurrent_writer_result_fd >= 0 &&
+        !g_concurrent_writer_result_received) {
+        const unsigned char start = 1;
+        concurrent_writer_result_t result;
+
+        if (write_pipe_bytes(g_concurrent_writer_start_fd, &start,
+                             sizeof(start)) != 0 ||
+            read_pipe_bytes(g_concurrent_writer_result_fd, &result,
+                            sizeof(result)) != 0) {
+            g_hook_error = errno ? errno : EIO;
+        } else {
+            g_concurrent_writer_result = result;
+            g_concurrent_writer_result_received = true;
+        }
+    }
     if (boundary == CONFIG_IO_DEFAULT_BEFORE_RENAME) {
         static const char competitor[] = "competitor-wins\n";
         g_default_publish_calls++;
@@ -866,6 +923,142 @@ TEST(full_save_has_one_document_publisher_and_ignores_fault_environment) {
     CHECK_EQ_INT(count_prefix(dir, ".gitswitch-toml."), 0);
 }
 
+static void initialize_concurrent_writer_context(gitswitch_ctx_t *ctx,
+                                                 git_scope_t scope,
+                                                 bool with_account,
+                                                 bool active) {
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->config.default_scope = scope;
+    if (!with_account) return;
+
+    ctx->account_count = 1;
+    ctx->accounts[0].id = 1;
+    ctx->accounts[0].preferred_scope = GIT_SCOPE_LOCAL;
+    snprintf(ctx->accounts[0].name, sizeof(ctx->accounts[0].name), "alice");
+    snprintf(ctx->accounts[0].email, sizeof(ctx->accounts[0].email),
+             "alice@example.com");
+    if (active) {
+        snprintf(ctx->config.active_account,
+                 sizeof(ctx->config.active_account), "alice");
+    }
+}
+
+static void exercise_concurrent_public_save(
+    config_io_boundary_t checkpoint, bool active_transition) {
+    char dir[256];
+    char path[512];
+    char hint[512];
+    char text[1024];
+    int start_pipe[2] = {-1, -1};
+    int result_pipe[2] = {-1, -1};
+    int status = 0;
+    pid_t child = -1;
+    gitswitch_ctx_t initial;
+    gitswitch_ctx_t first;
+    bool installed = false;
+    int first_result;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    initialize_concurrent_writer_context(&initial, GIT_SCOPE_LOCAL,
+                                         active_transition, false);
+    CHECK_EQ_INT(config_save_transactional(&initial, path, &installed), 0);
+    CHECK(installed);
+    CHECK_EQ_INT(pipe(start_pipe), 0);
+    CHECK_EQ_INT(pipe(result_pipe), 0);
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child == 0) {
+        unsigned char start = 0;
+        concurrent_writer_result_t result;
+        gitswitch_ctx_t second;
+        bool second_installed = false;
+
+        close(start_pipe[1]);
+        close(result_pipe[0]);
+        config_set_io_fault_fn(NULL);
+        if (read_pipe_bytes(start_pipe[0], &start, sizeof(start)) != 0 ||
+            start != 1) {
+            _exit(2);
+        }
+        initialize_concurrent_writer_context(&second, GIT_SCOPE_LOCAL,
+                                             active_transition, false);
+        errno = 0;
+        result.result = config_save_transactional(&second, path,
+                                                  &second_installed);
+        result.result_errno = errno;
+        result.installed = second_installed ? 1 : 0;
+        if (write_pipe_bytes(result_pipe[1], &result, sizeof(result)) != 0) {
+            _exit(3);
+        }
+        close(start_pipe[0]);
+        close(result_pipe[1]);
+        _exit(0);
+    }
+    if (child < 0) {
+        if (start_pipe[0] >= 0) close(start_pipe[0]);
+        if (start_pipe[1] >= 0) close(start_pipe[1]);
+        if (result_pipe[0] >= 0) close(result_pipe[0]);
+        if (result_pipe[1] >= 0) close(result_pipe[1]);
+        return;
+    }
+
+    close(start_pipe[0]);
+    close(result_pipe[1]);
+    g_concurrent_writer_start_fd = start_pipe[1];
+    g_concurrent_writer_result_fd = result_pipe[0];
+    g_hook_error = 0;
+    g_document_rename_calls = 0;
+    g_concurrent_writer_boundary = checkpoint;
+    memset(&g_concurrent_writer_result, 0,
+           sizeof(g_concurrent_writer_result));
+    g_concurrent_writer_result_received = false;
+    initialize_concurrent_writer_context(&first, GIT_SCOPE_GLOBAL,
+                                         active_transition,
+                                         active_transition);
+    installed = false;
+    config_set_io_fault_fn(publication_observer);
+    first_result = config_save_transactional(&first, path, &installed);
+    config_set_io_fault_fn(NULL);
+    close(start_pipe[1]);
+    close(result_pipe[0]);
+    g_concurrent_writer_start_fd = -1;
+    g_concurrent_writer_result_fd = -1;
+    g_concurrent_writer_boundary = CONFIG_IO_DOCUMENT_BEFORE_RENAME;
+
+    CHECK_EQ_INT(waitpid(child, &status, 0), child);
+    CHECK(WIFEXITED(status));
+    CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK_EQ_INT(g_hook_error, 0);
+    CHECK_EQ_INT(g_document_rename_calls, 1);
+    CHECK_EQ_INT(first_result, 0);
+    CHECK(installed);
+    CHECK(g_concurrent_writer_result_received);
+    CHECK_EQ_INT(g_concurrent_writer_result.result, -1);
+    CHECK(g_concurrent_writer_result.result_errno == EWOULDBLOCK ||
+          g_concurrent_writer_result.result_errno == EAGAIN);
+    CHECK_EQ_INT(g_concurrent_writer_result.installed, 0);
+    CHECK(read_bytes(path, text, sizeof(text)) > 0);
+    CHECK(strstr(text, "default_scope = \"global\"") != NULL);
+    CHECK(read_bytes(hint, text, sizeof(text)) > 0);
+    if (active_transition) {
+        CHECK_STR_EQ(text, "none\nactive=alice\n");
+    } else {
+        CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    }
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.tmp."), 0);
+}
+
+TEST(concurrent_public_save_cannot_commit_inside_document_replace_gap) {
+    exercise_concurrent_public_save(CONFIG_IO_DOCUMENT_BEFORE_RENAME, false);
+}
+
+TEST(concurrent_public_save_cannot_commit_inside_state_replace_gap) {
+    exercise_concurrent_public_save(CONFIG_IO_STATE_BEFORE_RENAME, true);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(default_creation_never_replaces_a_concurrent_winner);
     RUN_TEST(backup_rejects_an_in_place_mixed_generation);
@@ -881,4 +1074,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_save_rejects_pre_copy_rewrite_with_restored_mtime);
     RUN_TEST(rejected_full_save_preserves_five_retained_backups);
     RUN_TEST(full_save_has_one_document_publisher_and_ignores_fault_environment);
+    RUN_TEST(concurrent_public_save_cannot_commit_inside_document_replace_gap);
+    RUN_TEST(concurrent_public_save_cannot_commit_inside_state_replace_gap);
 TEST_MAIN_END()

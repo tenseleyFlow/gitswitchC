@@ -1315,8 +1315,33 @@ static int config_lock_reject(int token_fd, const char *lockpath) {
     return -1;
 }
 
-int config_write_lock(void) {
-    char dir[MAX_PATH_LEN];
+static int config_directory_for_path(const char *config_path, char *dir,
+                                     size_t dir_size) {
+    const char *slash;
+    size_t dir_length;
+
+    if (!config_path || !config_path[0] || !dir || dir_size == 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid config path for write locking");
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(config_path, '/');
+    if (!slash) {
+        return safe_strncpy(dir, ".", dir_size);
+    }
+    dir_length = (size_t)(slash - config_path);
+    if (dir_length == 0) dir_length = 1;
+    if (dir_length >= dir_size) {
+        set_error(ERR_INVALID_PATH, "Config directory path is too long");
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(dir, config_path, dir_length);
+    dir[dir_length] = '\0';
+    return 0;
+}
+
+static int config_write_lock_directory(const char *dir) {
     char lockpath[MAX_PATH_LEN];
     struct stat dir_identity;
     struct stat before;
@@ -1325,7 +1350,6 @@ int config_write_lock(void) {
     int token_fd = -1;
 
     errno = 0; /* Never misclassify a validation failure using stale errno. */
-    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
     if (create_config_directory_secure(dir) != 0) return -1;
     if (lstat(dir, &dir_identity) != 0 ||
         !config_metadata_dir_is_safe(&dir_identity)) {
@@ -1375,6 +1399,42 @@ int config_write_lock(void) {
         return config_lock_reject(token_fd, lockpath);
     }
     return token_fd;
+}
+
+static int config_write_lock_path(const char *config_path) {
+    char dir[MAX_PATH_LEN];
+    int token_fd;
+
+    if (config_directory_for_path(config_path, dir, sizeof(dir)) != 0) {
+        return -1;
+    }
+    token_fd = config_write_lock_directory(dir);
+    if (token_fd < 0) {
+        int saved_errno = errno;
+        bool contended = saved_errno == EWOULDBLOCK;
+#if EAGAIN != EWOULDBLOCK
+        contended = contended || saved_errno == EAGAIN;
+#endif
+        if (contended) {
+            set_error(ERR_CONFIG_WRITE_FAILED,
+                      "Another writer is committing configuration state for %s",
+                      config_path);
+        } else {
+            errno = saved_errno;
+            set_system_error(ERR_CONFIG_WRITE_FAILED,
+                             "Cannot acquire the configuration publication lock for %s",
+                             config_path);
+        }
+        errno = saved_errno;
+    }
+    return token_fd;
+}
+
+int config_write_lock(void) {
+    char dir[MAX_PATH_LEN];
+
+    if (get_config_directory(dir, sizeof(dir)) != 0) return -1;
+    return config_write_lock_directory(dir);
 }
 
 void config_write_unlock(int token_fd) {
@@ -1977,6 +2037,12 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         config_require_loaded_source_generation(ctx, config_path) != 0) {
         goto hint_fail;
     }
+    /* Every public config/state save holds the destination's internal lock
+     * from API entry through this rename. Cooperating CLI and direct-API
+     * writers therefore cannot enter the final check/replace gap. A same-uid
+     * writer that bypasses these APIs is outside that protocol; strict
+     * metadata checks detect it through the checkpoint immediately above,
+     * bounding the unsupported race to this single rename interval. */
     if (rename(temp, hint) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install resume hint atomically: %s", hint);
@@ -2234,7 +2300,12 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
 
-    /* Atomic move from temp to final location */
+    /* Atomic move from temp to final location. The public save's internal
+     * destination lock spans the final generation check above and this
+     * replacement, so cooperating and direct-API writers cannot commit in
+     * between. Uncooperative same-uid pathname writers are detected through
+     * the check above; only this final check-to-rename interval is outside the
+     * documented writer protocol. */
     if (config_io_fault(CONFIG_IO_DOCUMENT_BEFORE_RENAME,
                         "config document rename")) {
         goto document_fail;
@@ -2392,9 +2463,10 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
                             bool update_hint,
                             bool *config_installed) {
     config_resume_hint_snapshot_t state_before = {0};
-    toml_document_t *toml_doc;
+    toml_document_t *toml_doc = NULL;
     bool document_installed = false;
     bool state_installed = false;
+    int write_lock_fd = -1;
     int result = -1;
 
     if (!ctx || !config_path) {
@@ -2403,6 +2475,10 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     }
     if (config_installed) {
         *config_installed = false;
+    }
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
+        return -1;
     }
 
     /* GIT_SCOPE_SYSTEM remains part of the public observation model because
@@ -2413,22 +2489,22 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     if (!config_scope_is_persistable(ctx->config.default_scope)) {
         set_error(ERR_CONFIG_INVALID,
                   "settings.default_scope must be local or global");
-        return -1;
+        goto cleanup;
     }
     for (size_t i = 0; i < ctx->account_count; i++) {
         if (!config_account_id_is_valid(ctx->accounts[i].id)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account ID must be in 1..%u", UINT32_MAX);
-            return -1;
+            goto cleanup;
         }
         if (!config_scope_is_persistable(ctx->accounts[i].preferred_scope)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account %u preferred scope must be local or global",
                       ctx->accounts[i].id);
-            return -1;
+            goto cleanup;
         }
         if (config_validate_account_model(&ctx->accounts[i]) != 0) {
-            return -1;
+            goto cleanup;
         }
     }
 
@@ -2441,13 +2517,13 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
      * way to detect the silent drop. */
     if (config_check_rewritable(ctx) != 0) {
         display_warning("Not saving config: %s", get_last_error()->message);
-        return -1;
+        goto cleanup;
     }
 
     /* Initialize the heap-allocated TOML document exactly once. */
     toml_doc = config_document_alloc();
     if (!toml_doc) {
-        return -1;
+        goto cleanup;
     }
     toml_init_document(toml_doc);
 
@@ -2517,6 +2593,9 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
 cleanup:
     config_resume_hint_snapshot_clear(&state_before);
     config_document_free(toml_doc);
+    if (write_lock_fd >= 0) {
+        config_write_unlock(write_lock_fd);
+    }
     return result;
 }
 
@@ -2543,18 +2622,32 @@ int config_save_transactional(const gitswitch_ctx_t *ctx,
 static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
                                            const char *config_path,
                                            bool *config_installed) {
+    int write_lock_fd;
+    int result;
+
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save_active_account");
+        return -1;
+    }
+    if (config_installed) {
+        *config_installed = false;
+    }
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
         return -1;
     }
 
     /* No file yet: nothing to preserve, and the write-back needs a document
      * to edit — the full rebuild is both safe and required to create one. */
     if (!path_exists(config_path)) {
-        return config_save_mode(ctx, config_path, true,
-                                config_installed);
+        result = config_save_mode(ctx, config_path, true,
+                                  config_installed);
+    } else {
+        result = config_update_resume_hint(ctx, config_path, config_installed,
+                                           true);
     }
-    return config_update_resume_hint(ctx, config_path, config_installed, true);
+    config_write_unlock(write_lock_fd);
+    return result;
 }
 
 int config_save_active_account(const gitswitch_ctx_t *ctx,
