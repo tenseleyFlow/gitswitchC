@@ -90,6 +90,18 @@ static int prompt_line_stdio(const char *prompt, char *buf, size_t size) {
     return PROMPT_LINE_OK;
 }
 
+/* See prompt.h (AR-10 L20). Deliberately the plain stdio reader on every
+ * build: a final destructive confirmation gains nothing from line editing,
+ * and identical byte-level semantics across builds matter more. */
+int prompt_confirm_exact_yes(void) {
+    char input[64];
+    int result = prompt_line_stdio(NULL, input, sizeof(input));
+
+    if (result == PROMPT_LINE_TRUNCATED) return 0;
+    if (result != PROMPT_LINE_OK) return -1;
+    return strcmp(input, "yes") == 0 ? 1 : 0;
+}
+
 #ifdef HAVE_READLINE
 #include <stdlib.h>
 #include <readline/readline.h>
