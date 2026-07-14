@@ -1809,7 +1809,8 @@ copy_file_test_hook_fn gitswitch_test_set_copy_file_hook(
 
 enum {
     COPY_FILE_TEST_AFTER_DESTINATION_OPEN = 1,
-    COPY_FILE_TEST_AFTER_FIRST_WRITE
+    COPY_FILE_TEST_AFTER_FIRST_WRITE,
+    COPY_FILE_TEST_BEFORE_DESTINATION_OPEN
 };
 
 int copy_file(const char *src_path, const char *dst_path) {
@@ -1819,8 +1820,9 @@ int copy_file(const char *src_path, const char *dst_path) {
     size_t bytes;
     int result = 0;
     int dst_fd = -1;
-    int dst_flags = O_WRONLY | O_CREAT | O_TRUNC;
+    int dst_flags = O_WRONLY | O_CREAT;
     struct stat src_stat;
+    struct stat dst_stat;
 #ifdef GITSWITCH_TESTING
     bool first_write_checkpointed = false;
 #endif
@@ -1848,6 +1850,7 @@ int copy_file(const char *src_path, const char *dst_path) {
 #ifdef O_CLOEXEC
     dst_flags |= O_CLOEXEC;
 #endif
+    COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_BEFORE_DESTINATION_OPEN, dst_path);
     /* A new destination is born private even under umask(000). For an
      * existing destination, the creation mode is ignored, so fchmod the
      * already-open descriptor before fdopen or the first byte write. */
@@ -1876,6 +1879,32 @@ int copy_file(const char *src_path, const char *dst_path) {
         }
     }
 #endif
+    if (fstat(dst_fd, &dst_stat) != 0) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO, "Failed to inspect destination file: %s",
+                         dst_path);
+        return -1;
+    }
+    if (src_stat.st_dev == dst_stat.st_dev &&
+        src_stat.st_ino == dst_stat.st_ino) {
+        close(dst_fd);
+        fclose(src);
+        set_error(ERR_INVALID_ARGS,
+                  "Source and destination refer to the same file");
+        return -1;
+    }
+    if (ftruncate(dst_fd, 0) != 0) {
+        int saved_errno = errno;
+        close(dst_fd);
+        fclose(src);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to truncate destination file: %s", dst_path);
+        return -1;
+    }
     COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_DESTINATION_OPEN, dst_path);
     if (fchmod(dst_fd, src_stat.st_mode & 0777) != 0) {
         int saved_errno = errno;
