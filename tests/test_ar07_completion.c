@@ -627,6 +627,84 @@ TEST(zsh_completion_executes_runtime_expansion_and_state_scanner) {
     CHECK(strstr(output, "S:switch:0:1\n") != NULL);
 }
 
+TEST(zsh_completion_queries_accounts_only_for_account_operands) {
+    const char *zsh = find_shell("zsh");
+    char root[PATH_MAX], stub[PATH_MAX], count_path[PATH_MAX];
+    char stub_source[2048], script[16384], output[16384];
+    int written;
+
+    if (!zsh) {
+        TS_SKIP("zsh", "zsh shell is unavailable");
+    }
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar09-zsh-completion.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(stub, sizeof(stub), root, "gitswitch"), 0);
+    CHECK_EQ_INT(path_join(count_path, sizeof(count_path), root, "calls"), 0);
+    written = snprintf(
+        stub_source, sizeof(stub_source),
+        "#!/bin/sh\n"
+        "count=0\n"
+        "if [ -r '%s' ]; then IFS= read -r count <'%s'; fi\n"
+        "count=$((count + 1))\n"
+        "printf '%%s\\n' \"$count\" >'%s'\n"
+        "[ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
+        "[ \"$2\" = list ] || exit 64\n"
+        "printf '%%s\\n' Alpha 'Colon:Name' 'Space Name'\n",
+        count_path, count_path, count_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(stub_source));
+    if (written < 0 || (size_t)written >= sizeof(stub_source)) return;
+    CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
+    CHECK_EQ_INT(write_text(count_path, "0\n", 0600), 0);
+
+    written = snprintf(
+        script, sizeof(script),
+        "_describe(){ if [[ $2 == accounts ]]; then "
+        "local array_name=$4; local -a described; "
+        "described=(\"${(@P)array_name}\"); "
+        "print -r -- \"A:${(j:|:)described}\"; fi; }; "
+        "_values(){ :; }; commands[gitswitch]='%s'; "
+        "typeset count_file='%s'; "
+        "words=(gitswitch --version); CURRENT=2; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.zsh\"; "
+        "print -r -- \"C:source:$(<$count_file)\"; "
+        "probe(){ local label=$1; shift; print -r -- 0 >$count_file; "
+        "words=(\"$@\"); CURRENT=${#words}; _gitswitch; "
+        "print -r -- \"C:$label:$(<$count_file)\"; }; "
+        "probe option-only gitswitch --ver; "
+        "probe init-shell gitswitch init ''; "
+        "probe list-no-operand gitswitch list ''; "
+        "probe consumed-account gitswitch edit Alpha ''; "
+        "probe option-after-command gitswitch edit --ver; "
+        "probe delimiter-command gitswitch -- -g ''; "
+        "probe bare-account gitswitch ''; "
+        "for cmd in edit remove rm delete reset switch; do "
+        "probe account-$cmd gitswitch -g $cmd ''; done; "
+        "probe delimited-account gitswitch edit -- '';",
+        stub, count_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(script));
+    if (written < 0 || (size_t)written >= sizeof(script)) return;
+
+    CHECK_EQ_INT(run_script(zsh, false, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(
+        output,
+        "C:source:0\n"
+        "C:option-only:0\n"
+        "C:init-shell:0\n"
+        "C:list-no-operand:0\n"
+        "C:consumed-account:0\n"
+        "C:option-after-command:0\n"
+        "C:delimiter-command:0\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:bare-account:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-edit:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-remove:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-rm:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-delete:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-reset:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:account-switch:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:delimited-account:1\n");
+}
+
 TEST(fish_completion_executes_getopt_style_operand_state) {
     const char *fish = find_shell("fish");
     char output[16384];
@@ -870,6 +948,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden);
     RUN_TEST(bash_completion_executes_getopt_style_operand_state);
     RUN_TEST(zsh_completion_executes_runtime_expansion_and_state_scanner);
+    RUN_TEST(zsh_completion_queries_accounts_only_for_account_operands);
     RUN_TEST(fish_completion_executes_getopt_style_operand_state);
     RUN_TEST(names_loader_preserves_account_admission_without_runtime_work);
     RUN_TEST(names_loader_validates_toml_but_ignores_external_active_artifact);
