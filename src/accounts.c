@@ -2907,6 +2907,44 @@ static int print_git_status_read_failure(void) {
     return -1;
 }
 
+/* A saved account may retain the shorter hexadecimal selector that the user
+ * entered, while a successful isolated switch always publishes GnuPG's
+ * canonical 40- or 64-digit primary fingerprint to Git. Compare those two
+ * representations without accepting a noncanonical Git value as proof of the
+ * selected key. */
+static bool status_signing_key_matches(const account_t *account,
+                                       const git_current_config_t *git_config) {
+    const char *selector;
+    const char *configured;
+    size_t selector_len;
+    size_t configured_len;
+    size_t i;
+    bool expected;
+
+    if (!account || !git_config) return false;
+    expected = account->gpg_enabled && account->gpg_key_id[0] != '\0';
+    configured = git_config->signing_key;
+    if (!expected) return configured[0] == '\0';
+
+    selector = account->gpg_key_id;
+    if (selector[0] == '0' &&
+        (selector[1] == 'x' || selector[1] == 'X')) {
+        selector += 2;
+    }
+    selector_len = strlen(selector);
+    configured_len = strlen(configured);
+    if (selector_len == 0 ||
+        (configured_len != 40 && configured_len != 64) ||
+        selector_len > configured_len) {
+        return false;
+    }
+    for (i = 0; i < configured_len; i++) {
+        if (!isxdigit((unsigned char)configured[i])) return false;
+    }
+    return strncasecmp(configured + configured_len - selector_len,
+                       selector, selector_len) == 0;
+}
+
 /* Show current account status */
 int accounts_show_status(const gitswitch_ctx_t *ctx) {
     int status_result = 0;
@@ -2986,6 +3024,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             bool ssh_matches;
             bool ssh_status_determined = true;
             bool gpg_program_matches;
+            bool signing_key_matches;
+            bool signing_enabled_matches;
+            bool signing_expected;
 
             printf("  Current Name: ");
             print_terminal_safe(git_config->name);
@@ -3029,6 +3070,13 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             /* gitswitch selects an isolated keyring through GNUPGHOME and
              * intentionally expects no persisted gpg.program override. */
             gpg_program_matches = !git_config->gpg_program.present;
+            signing_expected = account->gpg_enabled &&
+                               account->gpg_key_id[0] != '\0';
+            signing_key_matches =
+                status_signing_key_matches(account, git_config);
+            signing_enabled_matches =
+                git_config->gpg_signing_enabled ==
+                (signing_expected && account->gpg_signing_enabled);
             
             /* Check if git config matches account */
             if (!ssh_status_determined) {
@@ -3038,7 +3086,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                     print_terminal_safe(ssh_status_error);
                 }
                 printf("\n");
-            } else if (identity_matches && ssh_matches && gpg_program_matches) {
+            } else if (identity_matches && ssh_matches &&
+                       gpg_program_matches && signing_key_matches &&
+                       signing_enabled_matches) {
                 printf("  Match Status: [OK] Git config matches account\n");
             } else {
                 printf("  Match Status: [WARN] Git config does not match account\n");
@@ -3049,6 +3099,30 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                     printf(" <");
                     print_terminal_safe(git_config->email);
                     printf(">\n");
+                }
+                if (!signing_key_matches) {
+                    if (signing_expected) {
+                        printf("    Expected GPG Signing Key: canonical fingerprint selected by ");
+                        print_terminal_safe(account->gpg_key_id);
+                        printf("\n");
+                    } else {
+                        printf("    Expected GPG Signing Key: [ABSENT]\n");
+                    }
+                    printf("    Current GPG Signing Key:  ");
+                    if (git_config->signing_key[0] != '\0') {
+                        print_terminal_safe(git_config->signing_key);
+                        printf("\n");
+                    } else {
+                        printf("[ABSENT]\n");
+                    }
+                }
+                if (!signing_enabled_matches) {
+                    printf("    Expected GPG Signing Enabled: %s\n",
+                           signing_expected && account->gpg_signing_enabled
+                               ? "[YES]" : "[NO]");
+                    printf("    Current GPG Signing Enabled:  %s\n",
+                           git_config->gpg_signing_enabled
+                               ? "[YES]" : "[NO]");
                 }
             }
 
