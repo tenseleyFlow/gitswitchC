@@ -201,10 +201,11 @@ int ssh_stop_agent(ssh_config_t *ssh_config);
 int ssh_clear_agent_keys(ssh_config_t *ssh_config);
 
 /**
- * Add key to SSH agent with validation
- * - Verifies key file exists and has correct permissions
- * - Loads key into agent
- * - Confirms key was loaded successfully
+ * Low-level compatibility primitive that passes key_path verbatim as one argv
+ * element to `ssh-add -k`. It does not inspect or validate the pathname and
+ * does not prove the agent's final identity set; success means only that
+ * ssh-add exited successfully. Use ssh_switch_account() for descriptor-backed
+ * key validation and exact-set verification.
  */
 int ssh_add_key(ssh_config_t *ssh_config, const char *key_path);
 

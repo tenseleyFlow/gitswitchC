@@ -2509,7 +2509,9 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
     return 0;
 }
 
-/* Add key to SSH agent */
+/* Low-level compatibility primitive. The caller owns key admission; keep the
+ * supplied path as one argv element and make success mean only that ssh-add
+ * accepted the command. ssh_switch_account() owns validated exact-set loading. */
 int ssh_add_key(ssh_config_t *ssh_config, const char *key_path) {
     char output[512];
 
@@ -2530,16 +2532,15 @@ int ssh_add_key(ssh_config_t *ssh_config, const char *key_path) {
         return -1;
     }
 
-    /* `-k` disables ssh-add's implicit sibling-certificate autoload. The
-     * switch contract is one exact private-key identity, not an unmodeled
-     * key-plus-certificate pair. Keep the path as one argv element. */
+    /* `-k` disables ssh-add's implicit sibling-certificate autoload. Keep the
+     * caller-supplied path as one argv element. */
     if (ssh_run(output, sizeof(output), false, "ssh-add", "-k", key_path,
                 (const char *)NULL) != 0) {
         set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to add SSH key: %s", output);
         return -1;
     }
 
-    log_info("SSH key added successfully: %s", key_path);
+    log_info("ssh-add accepted SSH key path: %s", key_path);
     return 0;
 }
 
