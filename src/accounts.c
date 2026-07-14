@@ -76,6 +76,7 @@ static active_session_t g_session = {0};
  * across the configuration commit. */
 typedef struct {
     bool active;
+    bool abort_only;
     gitswitch_ctx_t *ctx;
     account_t previous_account;
     bool had_previous_account;
@@ -521,6 +522,15 @@ static int abort_failed_switch_checked(const account_t *prev,
         } else {
             git_left = false;
         }
+    } else {
+        /* Snapshot capture precedes the guarded runtime phases.  A failure
+         * before the first possible Git write has no post-image to restore,
+         * but it must still consume that read-only before-image before this
+         * path releases the remaining transaction owners.  commit is an
+         * infallible ownership discard and does not disturb the causal error.
+         * Written/partially-written paths stay in the restore branch above so
+         * an incomplete rollback retains its exact retry image. */
+        git_config_commit();
     }
     /* Undo the new account's half-applied SSH/GPG activation: leaving
      * current.sock / GNUPGHOME pointed at the new account while the git
@@ -610,6 +620,71 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
                                        !defer_signal_dispatch,
                                        defer_signal_dispatch,
                                        NULL, NULL, NULL, NULL, NULL, 0);
+}
+
+/* A failed prepared switch has not handed ownership to its caller. Publish
+ * the rollback record first, then drive the same checked abort API a caller
+ * would use. A complete abort clears the record synchronously; an incomplete
+ * Git/runtime or signal-disposition cleanup leaves an explicit retry handle
+ * instead of stranding process-global transaction state. Returns true only
+ * when that retry handle remains published. Direct switches retain their
+ * historical failure cleanup through abort_failed_switch(). */
+static bool abort_switch_failure(pending_switch_t *prepared,
+                                 const account_t *prev,
+                                 const char *prev_gpg_home,
+                                 bool prev_gpg_present, bool git_written,
+                                 bool ssh_dirty, bool gpg_dirty,
+                                 int runtime_lock_fd,
+                                 bool defer_signal_dispatch) {
+    error_context_t failure;
+    char failure_detail[sizeof(g_last_error.message)];
+    char rollback_detail[sizeof(g_last_error.message)];
+    int failure_errno;
+    int rollback_errno;
+
+    if (!prepared) {
+        abort_failed_switch(prev, prev_gpg_home, prev_gpg_present,
+                            git_written, ssh_dirty, gpg_dirty,
+                            runtime_lock_fd, defer_signal_dispatch);
+        return false;
+    }
+
+    /* A restored caller handler is allowed to return from the deferred
+     * dispatch.  In that case this prepared API also returns -1, so preserve
+     * the interruption itself as the causal failure instead of whatever
+     * successful sub-operation happened to touch the error context last. */
+    if (signals_pending()) {
+        set_error(ERR_SYSTEM_CALL, "Switch interrupted by signal %d",
+                  signals_pending_signal());
+    }
+    failure = *get_last_error();
+    failure_errno = errno;
+    safe_strncpy(failure_detail, failure.message, sizeof(failure_detail));
+    prepared->git_written = git_written;
+    prepared->ssh_dirty = ssh_dirty;
+    prepared->gpg_dirty = gpg_dirty;
+    prepared->runtime_lock_fd = runtime_lock_fd;
+    prepared->abort_only = true;
+    g_pending_switch = *prepared;
+
+    (void)accounts_switch_abort(prepared->ctx, false);
+    if (!g_pending_switch.active || g_pending_switch.ctx != prepared->ctx) {
+        g_last_error = failure;
+        errno = failure_errno;
+        return false;
+    }
+
+    rollback_errno = errno;
+    safe_strncpy(rollback_detail, get_last_error()->message,
+                 sizeof(rollback_detail));
+    set_error(
+        ERR_SYSTEM_CALL,
+        "Account switch preparation failed (%s); rollback ownership remains "
+        "published for accounts_switch_abort() retry: %s",
+        failure_detail[0] ? failure_detail : "unknown preparation error",
+        rollback_detail[0] ? rollback_detail : "unknown rollback error");
+    errno = rollback_errno;
+    return true;
 }
 
 /* Best-effort probes and informational output run only after the switch's
@@ -869,6 +944,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         char prev_active[MAX_NAME_LEN] = "";
         char prev_gpg_home[MAX_PATH_LEN] = "";
         bool prev_gpg_present = false;
+        pending_switch_t prepared_owner = {0};
         safe_strncpy(prev_active, ctx->config.active_account,
                      sizeof(prev_active));
         if (gpg_manager_snapshot_current(prev_gpg_home,
@@ -876,6 +952,22 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                                          &prev_gpg_present) != 0) {
             runtime_state_lock_release(runtime_lock_fd);
             return -1;
+        }
+        if (defer_commit) {
+            prepared_owner.active = true;
+            prepared_owner.ctx = ctx;
+            if (prev_account) {
+                prepared_owner.previous_account = *prev_account;
+                prepared_owner.had_previous_account = true;
+            }
+            safe_strncpy(prepared_owner.previous_active, prev_active,
+                         sizeof(prepared_owner.previous_active));
+            safe_strncpy(prepared_owner.previous_gpg_home, prev_gpg_home,
+                         sizeof(prepared_owner.previous_gpg_home));
+            prepared_owner.previous_gpg_present = prev_gpg_present;
+            prepared_owner.target_id = account->id;
+            prepared_owner.switch_target = switch_target;
+            prepared_owner.scope = scope;
         }
         /* Mutation tracking for rollback: `dirty` means the runtime state was
          * (or may have been) repointed at the NEW account; `deferred` means
@@ -981,7 +1073,21 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             error_context_t guard_error = *get_last_error();
             int guard_errno = errno;
 
-            runtime_state_lock_release(runtime_lock_fd);
+            if (write_git) {
+                git_config_commit();
+            }
+            g_last_error = guard_error;
+            errno = guard_errno;
+            if (defer_commit) {
+                if (abort_switch_failure(
+                        &prepared_owner, prev_account, prev_gpg_home,
+                        prev_gpg_present, false, false, false,
+                        runtime_lock_fd, defer_signal_dispatch)) {
+                    return -1;
+                }
+            } else {
+                runtime_state_lock_release(runtime_lock_fd);
+            }
             g_last_error = guard_error;
             errno = guard_errno;
             return -1;
@@ -1014,13 +1120,20 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
              * Route through the central checked abort path so that exact SSH
              * mutation is reactivated, while the untouched manager-owned GPG
              * retry record remains in g_session for accounts_session_cleanup(). */
-            abort_failed_switch_checked(prev_account, prev_gpg_home,
-                                        prev_gpg_present, false, ssh_dirty,
-                                        false, runtime_lock_fd,
-                                        !defer_signal_dispatch,
-                                        defer_signal_dispatch,
-                                        NULL, NULL, NULL,
-                                        &rollback_complete, NULL, 0);
+            if (defer_commit) {
+                if (abort_switch_failure(
+                        &prepared_owner, prev_account, prev_gpg_home,
+                        prev_gpg_present, false, ssh_dirty, false,
+                        runtime_lock_fd, defer_signal_dispatch)) {
+                    return -1;
+                }
+            } else {
+                abort_failed_switch_checked(
+                    prev_account, prev_gpg_home, prev_gpg_present, false,
+                    ssh_dirty, false, runtime_lock_fd,
+                    !defer_signal_dispatch, defer_signal_dispatch,
+                    NULL, NULL, NULL, &rollback_complete, NULL, 0);
+            }
             set_error(ERR_SYSTEM_CALL,
                       "Cannot switch away from the active runtime session: %s%s",
                       detail[0] ? detail : "cleanup retained for retry",
@@ -1032,10 +1145,11 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         /* A signal may have arrived while the previous owned agent was being
          * stopped. Roll it back before attempting any new activation. */
         if (signals_pending()) {
-            return abort_failed_switch(prev_account, prev_gpg_home,
-                                       prev_gpg_present, false, ssh_dirty, false,
-                                       runtime_lock_fd,
-                                       defer_signal_dispatch);
+            (void)abort_switch_failure(
+                defer_commit ? &prepared_owner : NULL,
+                prev_account, prev_gpg_home, prev_gpg_present, false,
+                ssh_dirty, false, runtime_lock_fd, defer_signal_dispatch);
+            return -1;
         }
 
         /* Repeat-signal deferral armed above remains continuous through
@@ -1060,10 +1174,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
              * stopped the prior owned agent. */
             if (ssh_manager_init(&g_session.ssh_config, SSH_AGENT_ISOLATED) != 0) {
                 printf("  [!!] SSH key failed to load\n");
-                abort_failed_switch(prev_account, prev_gpg_home,
-                                    prev_gpg_present, false, ssh_dirty, false,
-                                    runtime_lock_fd,
-                                    defer_signal_dispatch);
+                if (abort_switch_failure(
+                        defer_commit ? &prepared_owner : NULL,
+                        prev_account, prev_gpg_home, prev_gpg_present, false,
+                        ssh_dirty, false, runtime_lock_fd,
+                        defer_signal_dispatch)) {
+                    return -1;
+                }
                 set_error(ERR_SSH_KEY_LOAD_FAILED,
                           "Failed to set up SSH for account: %s", account->name);
                 return -1;
@@ -1072,10 +1189,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             if (ssh_switch_account(&g_session.ssh_config, &runtime_target) != 0) {
                 printf("  [!!] SSH key failed to load\n");
                 (void)ssh_manager_cleanup(&g_session.ssh_config);
-                abort_failed_switch(prev_account, prev_gpg_home,
-                                    prev_gpg_present, false, ssh_dirty, false,
-                                    runtime_lock_fd,
-                                    defer_signal_dispatch);
+                if (abort_switch_failure(
+                        defer_commit ? &prepared_owner : NULL,
+                        prev_account, prev_gpg_home, prev_gpg_present, false,
+                        ssh_dirty, false, runtime_lock_fd,
+                        defer_signal_dispatch)) {
+                    return -1;
+                }
                 set_error(ERR_SSH_KEY_LOAD_FAILED,
                           "Failed to set up SSH for account: %s", account->name);
                 return -1;
@@ -1095,10 +1215,11 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         /* A signal during SSH activation: the previous agent may already be
          * gone and current.sock repointed — roll back and restore it. */
         if (signals_pending()) {
-            return abort_failed_switch(prev_account, prev_gpg_home,
-                                       prev_gpg_present, false, ssh_dirty, false,
-                                       runtime_lock_fd,
-                                       defer_signal_dispatch);
+            (void)abort_switch_failure(
+                defer_commit ? &prepared_owner : NULL,
+                prev_account, prev_gpg_home, prev_gpg_present, false,
+                ssh_dirty, false, runtime_lock_fd, defer_signal_dispatch);
+            return -1;
         }
 
         /* --- 3. GPG isolated home (mutation; fatal on failure) --- */
@@ -1132,11 +1253,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                  * current.sock pointing at this account with no matching GPG.
                  * A failed retarget may already have published current; its
                  * retained manager record makes that fact explicit here. */
-                abort_failed_switch(prev_account, prev_gpg_home,
-                                    prev_gpg_present, false, ssh_dirty,
-                                    gpg_dirty,
-                                    runtime_lock_fd,
-                                    defer_signal_dispatch);
+                if (abort_switch_failure(
+                        defer_commit ? &prepared_owner : NULL,
+                        prev_account, prev_gpg_home, prev_gpg_present, false,
+                        ssh_dirty, gpg_dirty, runtime_lock_fd,
+                        defer_signal_dispatch)) {
+                    return -1;
+                }
                 if (cleanup_rc != 0 && gpg_session_cleanup_needed()) {
                     set_error(ERR_GPG_KEY_FAILED,
                               "Failed to set up GPG for account %s: %s; "
@@ -1165,10 +1288,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             if (safe_strncpy(switch_target.gpg_key_id,
                              g_session.gpg_config.current_key_id,
                              sizeof(switch_target.gpg_key_id)) != 0) {
-                abort_failed_switch(prev_account, prev_gpg_home,
-                                    prev_gpg_present, false, ssh_dirty,
-                                    gpg_dirty, runtime_lock_fd,
-                                    defer_signal_dispatch);
+                if (abort_switch_failure(
+                        defer_commit ? &prepared_owner : NULL,
+                        prev_account, prev_gpg_home, prev_gpg_present, false,
+                        ssh_dirty, gpg_dirty, runtime_lock_fd,
+                        defer_signal_dispatch)) {
+                    return -1;
+                }
                 set_error(ERR_GPG_KEY_FAILED,
                           "Canonical GPG fingerprint exceeds account runtime storage");
                 return -1;
@@ -1185,29 +1311,37 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * while git still names the old one — roll back before that mismatch
          * can outlive the process. */
         if (signals_pending()) {
-            return abort_failed_switch(prev_account, prev_gpg_home,
-                                       prev_gpg_present, false, ssh_dirty, gpg_dirty,
-                                       runtime_lock_fd,
-                                       defer_signal_dispatch);
+            (void)abort_switch_failure(
+                defer_commit ? &prepared_owner : NULL,
+                prev_account, prev_gpg_home, prev_gpg_present, false,
+                ssh_dirty, gpg_dirty, runtime_lock_fd,
+                defer_signal_dispatch);
+            return -1;
         }
 
         /* --- 4. Git identity (preflight-snapshotted and reversible) --- */
         if (write_git) {
             if (git_set_config(&switch_target, scope) != 0) {
-                abort_failed_switch(prev_account, prev_gpg_home,
-                                    prev_gpg_present, true, ssh_dirty, gpg_dirty,
-                                    runtime_lock_fd,
-                                    defer_signal_dispatch);
+                if (abort_switch_failure(
+                        defer_commit ? &prepared_owner : NULL,
+                        prev_account, prev_gpg_home, prev_gpg_present, true,
+                        ssh_dirty, gpg_dirty, runtime_lock_fd,
+                        defer_signal_dispatch)) {
+                    return -1;
+                }
                 set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git configuration");
                 return -1;
             }
             if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
                 if (gpg_configure_git_signing(&g_session.gpg_config,
                                               &switch_target, scope) != 0) {
-                    abort_failed_switch(prev_account, prev_gpg_home,
-                                        prev_gpg_present, true, ssh_dirty, gpg_dirty,
-                                        runtime_lock_fd,
-                                        defer_signal_dispatch);
+                    if (abort_switch_failure(
+                            defer_commit ? &prepared_owner : NULL,
+                            prev_account, prev_gpg_home, prev_gpg_present,
+                            true, ssh_dirty, gpg_dirty, runtime_lock_fd,
+                            defer_signal_dispatch)) {
+                        return -1;
+                    }
                     set_error(ERR_GIT_CONFIG_FAILED, "Failed to configure git GPG signing");
                     return -1;
                 }
@@ -1237,32 +1371,21 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * may adopt and overwrite during rollback. */
         if (write_git && git_config_seal() != 0) {
             char seal_detail[sizeof(g_last_error.message)];
-            char rollback_detail[sizeof(g_last_error.message)] = "";
-            bool rollback_complete = true;
 
             safe_strncpy(seal_detail, get_last_error()->message,
                          sizeof(seal_detail));
-            abort_failed_switch_checked(
-                prev_account, prev_gpg_home, prev_gpg_present, true,
-                ssh_dirty, gpg_dirty, runtime_lock_fd,
-                !defer_signal_dispatch, defer_signal_dispatch,
-                NULL, NULL, NULL, &rollback_complete,
-                rollback_detail, sizeof(rollback_detail));
-            if (!rollback_complete) {
-                set_error(
-                    ERR_GIT_CONFIG_FAILED,
-                    "Git post-image verification failed: %s; rollback "
-                    "remains incomplete and retry material was retained: %s",
-                    seal_detail[0] ? seal_detail : "unknown verification error",
-                    rollback_detail[0] ? rollback_detail
-                                       : "unknown rollback error");
-            } else {
-                set_error(ERR_GIT_CONFIG_FAILED,
-                          "Git post-image verification failed; switch was "
-                          "rolled back: %s",
-                          seal_detail[0] ? seal_detail
-                                         : "unknown verification error");
+            if (abort_switch_failure(
+                    defer_commit ? &prepared_owner : NULL,
+                    prev_account, prev_gpg_home, prev_gpg_present, true,
+                    ssh_dirty, gpg_dirty, runtime_lock_fd,
+                    defer_signal_dispatch)) {
+                return -1;
             }
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git post-image verification failed; switch was "
+                      "rolled back: %s",
+                      seal_detail[0] ? seal_detail
+                                     : "unknown verification error");
             return -1;
         }
 
@@ -1270,10 +1393,12 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * switch back (git config, when written, was just written — restore it
          * too; on resume nothing was written, so nothing to restore). */
         if (signals_pending()) {
-            return abort_failed_switch(prev_account, prev_gpg_home,
-                                       prev_gpg_present, write_git,
-                                       ssh_dirty, gpg_dirty, runtime_lock_fd,
-                                       defer_signal_dispatch);
+            (void)abort_switch_failure(
+                defer_commit ? &prepared_owner : NULL,
+                prev_account, prev_gpg_home, prev_gpg_present, write_git,
+                ssh_dirty, gpg_dirty, runtime_lock_fd,
+                defer_signal_dispatch);
+            return -1;
         }
 
         /* NOW run the teardown deferred from steps 2-3 — only once the switch
@@ -1287,10 +1412,13 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             safe_strncpy(detail, get_last_error()->message, sizeof(detail));
             ssh_dirty = ssh_dirty || ssh_teardown_deferred;
             gpg_dirty = gpg_dirty || gpg_teardown_deferred;
-            abort_failed_switch(prev_account, prev_gpg_home,
-                                prev_gpg_present, write_git,
-                                ssh_dirty, gpg_dirty, runtime_lock_fd,
-                                defer_signal_dispatch);
+            if (abort_switch_failure(
+                    defer_commit ? &prepared_owner : NULL,
+                    prev_account, prev_gpg_home, prev_gpg_present, write_git,
+                    ssh_dirty, gpg_dirty, runtime_lock_fd,
+                    defer_signal_dispatch)) {
+                return -1;
+            }
             set_error(ERR_SYSTEM_CALL,
                       "Failed to deactivate previous runtime state while switching to '%s': %s",
                       account->name, detail[0] ? detail : "unknown teardown error");
@@ -1336,6 +1464,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                     if (!rollback_complete) {
                         memset(&g_pending_switch, 0, sizeof(g_pending_switch));
                         g_pending_switch.active = true;
+                        g_pending_switch.abort_only = true;
                         g_pending_switch.ctx = ctx;
                         if (prev_account) {
                             g_pending_switch.previous_account = *prev_account;
@@ -1405,27 +1534,14 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 
         signals_scratch_cleanup();
         if (defer_commit) {
-            memset(&g_pending_switch, 0, sizeof(g_pending_switch));
-            g_pending_switch.active = true;
-            g_pending_switch.ctx = ctx;
-            if (prev_account) {
-                g_pending_switch.previous_account = *prev_account;
-                g_pending_switch.had_previous_account = true;
-            }
-            safe_strncpy(g_pending_switch.previous_active, prev_active,
-                         sizeof(g_pending_switch.previous_active));
-            safe_strncpy(g_pending_switch.previous_gpg_home, prev_gpg_home,
-                         sizeof(g_pending_switch.previous_gpg_home));
-            g_pending_switch.previous_gpg_present = prev_gpg_present;
-            g_pending_switch.git_written = write_git;
-            g_pending_switch.ssh_dirty = ssh_dirty;
-            g_pending_switch.gpg_dirty = gpg_dirty;
-            g_pending_switch.runtime_lock_fd = runtime_lock_fd;
-            g_pending_switch.target_id = account->id;
-            g_pending_switch.switch_target = switch_target;
-            g_pending_switch.scope = scope;
-            g_pending_switch.ssh_ok = ssh_ok;
-            g_pending_switch.gpg_ok = gpg_ok;
+            prepared_owner.git_written = write_git;
+            prepared_owner.ssh_dirty = ssh_dirty;
+            prepared_owner.gpg_dirty = gpg_dirty;
+            prepared_owner.runtime_lock_fd = runtime_lock_fd;
+            prepared_owner.switch_target = switch_target;
+            prepared_owner.ssh_ok = ssh_ok;
+            prepared_owner.gpg_ok = gpg_ok;
+            g_pending_switch = prepared_owner;
         } else {
             /* Direct callers retain the historical one-call commit. Release
              * the cross-manager lock before best-effort probes. */
@@ -1524,6 +1640,12 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
 
     if (!g_pending_switch.active || !ctx || g_pending_switch.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account switch to commit");
+        return -1;
+    }
+    if (g_pending_switch.abort_only) {
+        set_error(ERR_INVALID_ARGS,
+                  "A failed switch preparation can only be retried through "
+                  "accounts_switch_abort");
         return -1;
     }
     for (size_t i = 0; i < ctx->account_count; i++) {
@@ -1647,13 +1769,12 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
                                : "unknown rollback error");
         return -1;
     }
-    memset(&g_pending_switch, 0, sizeof(g_pending_switch));
-
     /* main() may still need to reverse its active-account file and resume
      * hint, so CLI-owned abort keeps both layers armed until common cleanup.
      * A standalone prepared-API caller has completed every rollback here:
      * only now is it safe to restore caller dispositions and dispatch. */
     if (continue_persistence_rollback) {
+        memset(&g_pending_switch, 0, sizeof(g_pending_switch));
         return 0;
     }
     signals_rollback_end();
@@ -1661,8 +1782,19 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
         "Prepared switch rolled back, but restoring the caller's signal "
         "dispositions failed");
     if (guard_rc != 0) {
+        /* Git/runtime rollback is complete, but signals.c still owns at least
+         * one failed disposition (or pending dispatch step). Keep an
+         * abort-only zero-dirty record so the caller has a checked API that
+         * can retry that final process-global cleanup. */
+        pending.abort_only = true;
+        pending.git_written = false;
+        pending.ssh_dirty = false;
+        pending.gpg_dirty = false;
+        pending.runtime_lock_fd = -1;
+        g_pending_switch = pending;
         return -1;
     }
+    memset(&g_pending_switch, 0, sizeof(g_pending_switch));
     return 0;
 }
 

@@ -98,6 +98,27 @@ static int setup_empty_runtime_dir(void) {
     return setenv("XDG_RUNTIME_DIR", g_xdg, 1);
 }
 
+/* Runtime locks are process-scoped on some supported kernels, so a fresh
+ * child is the authoritative probe that a failed preparation did not retain
+ * the cross-manager lock. */
+static bool runtime_lock_available_to_child(void) {
+    int status = 0;
+    pid_t pid;
+
+    fflush(NULL);
+    pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int lock_fd = runtime_state_lock_acquire();
+
+        if (lock_fd < 0) _exit(1);
+        runtime_state_lock_release(lock_fd);
+        _exit(0);
+    }
+    if (waitpid(pid, &status, 0) != pid) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 /* The GPG runner below fakes key inventory and transfer, but production still
  * pins and validates the source keyring directory around every child spawn.
  * Give those tests a private external source so they never depend on the
@@ -234,9 +255,11 @@ static bool symlink_present(const char *path) {
 static bool g_fail_user_name_set;   /* fail `git config <scope> user.name X` */
 static bool g_raise_on_user_name;   /* raise SIGINT during that same command */
 static bool g_fail_list_config;     /* fail exact snapshot acquisition */
+static bool g_mutate_name_before_seal;
 static int g_worktree_probe_failures; /* fail the next N --show-scope probes */
 static int g_user_name_writes;
 static int g_ssh_activation_commands;
+static bool g_fail_ssh_add;
 static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
 static FILE *g_log;                 /* when set, every argv is logged here */
 static char g_effective_signingkey_observed[MAX_GPG_FINGERPRINT_LEN];
@@ -475,6 +498,11 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
         return 0; /* no distinct worktree values in this fixture */
     }
     if (is_config_list(argv)) {
+        if (g_mutate_name_before_seal && g_user_name_writes > 0) {
+            safe_strncpy(g_store_name, "preseal-writer",
+                         sizeof(g_store_name));
+            g_mutate_name_before_seal = false;
+        }
         if (g_fail_list_config) {
             if (result) {
                 memset(result, 0, sizeof(*result));
@@ -776,9 +804,10 @@ static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
         if (result) {
             memset(result, 0, sizeof(*result));
             result->spawned = true;
+            result->exit_code = g_fail_ssh_add ? 1 : 0;
         }
         if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
-        return 0;
+        return g_fail_ssh_add ? -1 : 0;
     }
     return fake_runner(argv, opts, result);
 }
@@ -950,6 +979,8 @@ static void seed_previous_git_identity(void) {
     g_store_gpgssh[0] = '\0';
     g_effective_signingkey_observed[0] = '\0';
     g_fail_list_config = false;
+    g_mutate_name_before_seal = false;
+    g_fail_ssh_add = false;
 }
 
 static int write_fake_key(const char *path);
@@ -984,13 +1015,14 @@ TEST(snapshot_failure_aborts_before_any_git_write) {
     CHECK(symlink_present(g_gpg_link));
 }
 
-/* AR-08 M22: signals_guard_begin() is the final fail-before-mutation boundary
- * in accounts_switch.  Failure after one earlier handler was installed must
- * return the original error without tearing down runtime, writing Git, or
- * publishing a new active account. */
+/* AR-08 M22 / AR-09 M4 phase 1: signals_guard_begin() is the final
+ * fail-before-mutation boundary. Failure after one earlier handler was
+ * installed must discard the already-captured Git snapshot, release the
+ * runtime lock, and return without publishing an abort handle. */
 TEST(signal_guard_failure_aborts_before_switch_mutation) {
     error_context_t failure;
     int returned_errno;
+    int seal_rc;
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
     gitswitch_ctx_t ctx = make_ctx();
@@ -1005,9 +1037,10 @@ TEST(signal_guard_failure_aborts_before_switch_mutation) {
     clear_error();
     errno = 0;
     command_runner_fn previous = run_set_runner(fake_runner);
-    int rc = accounts_switch(&ctx, "testacct");
+    int rc = accounts_switch_prepare(&ctx, "testacct");
     returned_errno = errno;
     failure = *get_last_error();
+    seal_rc = git_config_seal();
     run_set_runner(previous);
 
     CHECK_EQ_INT(rc, -1);
@@ -1021,8 +1054,15 @@ TEST(signal_guard_failure_aborts_before_switch_mutation) {
     CHECK(ctx.config.active_account[0] == '\0');
     CHECK(symlink_present(g_ssh_sock));
     CHECK(symlink_present(g_gpg_link));
+    CHECK_EQ_INT(seal_rc, -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
 
-    signals_guard_end();
+    CHECK_EQ_INT(signals_guard_end(), 0);
     signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
 }
 
@@ -1106,10 +1146,11 @@ TEST(successful_switch_still_tears_down_previous_isolation) {
     CHECK(!symlink_present(g_gpg_link));
 }
 
-/* AR-04 transaction closeout: Git has already been committed when teardown of
- * a disabled target's previous runtime runs. If that teardown cannot acquire
- * the SSH lock, the command must fail and roll Git plus the GPG stable link
- * back to the previous account instead of publishing a mixed identity. */
+/* AR-04 transaction closeout / AR-09 M4 phase 7: Git has already been written
+ * when teardown of a disabled target's previous runtime runs. A persistent
+ * teardown obstruction makes the immediate rollback incomplete, so failed
+ * prepare must publish an abort-only retry record after releasing its shared
+ * lock; removing the obstruction lets the explicit retry finish. */
 TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
     char lock_path[512];
     char gpg_target[512];
@@ -1127,7 +1168,7 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
     g_log = NULL;
 
     command_runner_fn previous_runner = run_set_runner(fake_runner);
-    int rc = accounts_switch(&ctx, "testacct");
+    int rc = accounts_switch_prepare(&ctx, "testacct");
     run_set_runner(previous_runner);
     g_fail_list_config = false;
 
@@ -1144,7 +1185,19 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
         CHECK(strstr(gpg_target, "/prevhome") != NULL);
     }
     CHECK(strstr(get_last_error()->message,
-                 "Failed to deactivate previous runtime state") != NULL);
+                 "rollback ownership remains published") != NULL);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
+
+    CHECK_EQ_INT(rmdir(lock_path), 0);
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    run_set_runner(previous_runner);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
 }
 
 /* AR-02 #12: a switch to an SSH-enabled target whose SSH setup fails at
@@ -1158,6 +1211,7 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     const char *env_path;
     char *saved_path;
     bool saved_path_present;
+    error_context_t failure;
     FILE *kf;
 
     CHECK_EQ_INT(setup_runtime_dir(), 0);
@@ -1199,7 +1253,8 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     g_raise_on_user_name = false;
     g_log = NULL;
     command_runner_fn prev = run_set_runner(fake_runner);
-    int rc = accounts_switch(&ctx, "testacct");
+    int rc = accounts_switch_prepare(&ctx, "testacct");
+    failure = *get_last_error();
     run_set_runner(prev);
     CHECK_EQ_INT(saved_path_present ? setenv("PATH", saved_path, 1)
                                     : unsetenv("PATH"),
@@ -1212,10 +1267,64 @@ TEST(ssh_init_failure_keeps_previous_runtime_isolation) {
     free(saved_path);
 
     CHECK_EQ_INT(rc, -1);
+    CHECK(strstr(failure.message, "Failed to set up SSH for account") != NULL);
     /* The previous account's entry points were never disturbed and must
      * survive; pre-fix the abort path reaped them. */
     CHECK(symlink_present(g_ssh_sock));
     CHECK(symlink_present(g_gpg_link));
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
+}
+
+/* AR-09 M4 phase 3: ssh_manager_init may succeed and ssh_switch_account may
+ * then fail at ssh-add. This is the first phase with newly-created runtime
+ * state; its failed prepare must reap that state and release every transaction
+ * owner synchronously. */
+TEST(prepared_ssh_switch_failure_releases_transaction_ownership) {
+    char key_path[512];
+    error_context_t failure;
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
+        TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    ctx = make_ctx();
+    CHECK((size_t)snprintf(key_path, sizeof(key_path), "%s/key_target",
+                           g_xdg) < sizeof(key_path));
+    CHECK_EQ_INT(write_fake_key(key_path), 0);
+    ctx.accounts[0].ssh_enabled = true;
+    safe_strncpy(ctx.accounts[0].ssh_key_path, key_path,
+                 sizeof(ctx.accounts[0].ssh_key_path));
+    seed_previous_git_identity();
+    g_fail_ssh_add = true;
+    previous_runner = run_set_runner(ssh_git_runner);
+    rc = accounts_switch_prepare(&ctx, "testacct");
+    failure = *get_last_error();
+    run_set_runner(previous_runner);
+    g_fail_ssh_add = false;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(strstr(failure.message, "Failed to set up SSH for account") != NULL);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(ctx.current_account == NULL);
+    CHECK(ctx.config.active_account[0] == '\0');
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
 }
 
 /* A repeated switch used to call accounts_session_cleanup() before taking its
@@ -1286,10 +1395,10 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
     g_fail_list_config = false;
 }
 
-/* If guarded cleanup of the prior owned agent cannot prove it dead, a
- * repeated switch must stop immediately. The old live session is still the
- * only truthful state: retain its PID/socket/environment and leave both the
- * caller's active-account metadata and current.sock untouched for retry. */
+/* AR-09 M4 phase 2: if guarded cleanup of the prior owned agent cannot prove
+ * it dead, a prepared repeated switch must stop and publish an abort-only
+ * retry. The old live session remains the only truthful state until that
+ * checked abort finishes. */
 TEST(repeated_switch_reap_failure_preserves_live_session) {
     char first_key[512];
     char second_key[512];
@@ -1348,8 +1457,15 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     ctx.account_count = 2;
 
     previous_reap = ssh_manager_set_reap_fn(refuse_session_agent_reap);
-    CHECK_EQ_INT(accounts_switch(&ctx, "second"), -1);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "second"), -1);
     ssh_manager_set_reap_fn(previous_reap);
+
+    CHECK(strstr(get_last_error()->message,
+                 "rollback ownership remains published") != NULL);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
 
     CHECK(ctx.current_account == first);
     CHECK_STR_EQ(ctx.config.active_account, "testacct");
@@ -1363,6 +1479,10 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
         CHECK(path_exists(target_after));
     }
 
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     run_set_runner(previous_runner);
     g_fail_list_config = false;
@@ -2157,6 +2277,7 @@ static int gpg_fault_setenv(const char *name, const char *value,
 
 TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     char target[512];
+    error_context_t failure;
     ssize_t n;
 
     if (!gpg_test_command_available()) {
@@ -2183,6 +2304,7 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     command_runner_fn previous_runner = run_set_runner(gpg_git_runner);
 
     int rc = accounts_switch(&ctx, "testacct");
+    failure = *get_last_error();
 
     run_set_runner(previous_runner);
     gpg_manager_set_retarget_commit_hook_fn(NULL);
@@ -2190,7 +2312,10 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
 
     CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(get_last_error()->message, "rollback failed") != NULL);
+    CHECK(strstr(failure.message, "rollback failed") != NULL);
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
     n = readlink(g_gpg_link, target, sizeof(target) - 1);
     CHECK(n > 0);
     if (n > 0) {
@@ -2201,8 +2326,12 @@ TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
     unsetenv("GNUPGHOME");
 }
 
+/* AR-09 M4 phase 4: GPG activation can fail after the guard and snapshot are
+ * owned but before Git publication. Exercise the prepared entry point so the
+ * manager cleanup and transaction cleanup are one synchronous failure. */
 TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     char target[MAX_PATH_LEN];
+    error_context_t failure;
     ssize_t n;
 
     if (!gpg_test_command_available()) {
@@ -2222,12 +2351,14 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
     g_gpg_secret_listing = SEC_CERT_ONLY;
     command_runner_fn previous_runner = run_set_runner(gpg_git_runner);
 
-    int rc = accounts_switch(&ctx, "testacct");
+    int rc = accounts_switch_prepare(&ctx, "testacct");
+    failure = *get_last_error();
 
     run_set_runner(previous_runner);
     g_gpg_secret_listing = SEC_SIGN;
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
     CHECK_EQ_INT(rc, -1);
+    CHECK(strstr(failure.message, "Failed to set up GPG for account") != NULL);
     CHECK_EQ_INT(g_user_name_writes, 0);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     n = readlink(g_gpg_link, target, sizeof(target) - 1);
@@ -2236,6 +2367,13 @@ TEST(signing_capability_failure_precedes_runtime_and_git_publication) {
         target[n] = '\0';
         CHECK(strstr(target, "/prevhome") != NULL);
     }
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
     unsetenv("GNUPGHOME");
 }
 
@@ -2580,6 +2718,271 @@ static bool switch_actions_equal(const struct sigaction *left,
         }
     }
     return true;
+}
+
+static void fail_guard_restore_retry(void) {
+    signals_test_fail_sigaction(SIGINT, SIGNALS_TEST_SIGACTION_RESTORE,
+                                EAGAIN);
+}
+
+/* AR-09 M4 guard-begin subphase: installation can fail after a prior handler
+ * was replaced, and that partial restoration can fail too. The prepared API
+ * must drive a checked restoration retry, discard its Git snapshot, and
+ * return with no handle when that retry completes. */
+TEST(guard_begin_partial_restore_is_synchronously_released) {
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_INSTALL,
+                                EPERM);
+    signals_test_fail_sigaction(SIGINT, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    rc = accounts_switch_prepare(&ctx, "testacct");
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
+/* If the checked restoration retry also fails, the preparation still has a
+ * live process-global obligation. Publish an abort-only record, reject commit,
+ * and let a later accounts_switch_abort() finish that exact disposition. */
+TEST(guard_begin_restore_retry_publishes_abort_only_handle) {
+    struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+    struct sigaction expected[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction action;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &original[i]), 0);
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = switch_inherited_handler;
+        sigemptyset(&action.sa_mask);
+        sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+        action.sa_flags = i == 1 ? SA_RESTART : 0;
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &action, NULL), 0);
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &expected[i]), 0);
+    }
+
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_INSTALL,
+                                EPERM);
+    signals_test_fail_sigaction(SIGINT, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+    signals_test_set_guard_end_hook(fail_guard_restore_retry);
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    rc = accounts_switch_prepare(&ctx, "testacct");
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK(strstr(get_last_error()->message,
+                 "rollback ownership remains published") != NULL);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(git_config_seal(), -1);
+    CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
+          NULL);
+    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
+
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK(runtime_lock_available_to_child());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL, &observed), 0);
+        CHECK(switch_actions_equal(&observed, &expected[i]));
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &original[i], NULL),
+                     0);
+    }
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
+}
+
+/* AR-09 M4: a preparation failure is not a successful handoff. If rollback
+ * finishes synchronously, the prepared API must also release its signal
+ * ownership before returning; there is no published transaction for abort to
+ * reach afterwards. */
+TEST(failed_prepare_releases_callers_signal_dispositions) {
+    struct sigaction original[SWITCH_GUARDED_SIGNAL_COUNT];
+    struct sigaction expected[SWITCH_GUARDED_SIGNAL_COUNT];
+    struct sigaction observed[SWITCH_GUARDED_SIGNAL_COUNT];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction action;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &original[i]), 0);
+        memset(&action, 0, sizeof(action));
+        action.sa_handler = switch_inherited_handler;
+        sigemptyset(&action.sa_mask);
+        sigaddset(&action.sa_mask, i == 0 ? SIGUSR1 : SIGUSR2);
+        sigaddset(&action.sa_mask,
+                  switch_guarded_signals[(i + 1) %
+                                         SWITCH_GUARDED_SIGNAL_COUNT]);
+        action.sa_flags = i == 1 ? SA_RESTART : 0;
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &action, NULL), 0);
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &expected[i]), 0);
+    }
+
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    g_fail_user_name_set = true;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(fake_runner);
+    rc = accounts_switch_prepare(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_fail_user_name_set = false;
+
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &observed[i]), 0);
+    }
+
+    /* Keep a failing pre-remediation run from contaminating later cases. */
+    signals_rollback_end();
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], &original[i], NULL),
+                     0);
+    }
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(ctx.current_account == NULL);
+    CHECK(ctx.config.active_account[0] == '\0');
+    CHECK(!signals_pending());
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK(switch_actions_equal(&observed[i], &expected[i]));
+    }
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
+}
+
+/* AR-09 M4: a caller-owned handler may return after the prepared failure path
+ * restores and dispatches a deferred signal.  The API still returns failure in
+ * that case, so its diagnostic must identify the interruption rather than
+ * resurrecting an unrelated pre-signal error from the successful Git step. */
+TEST(prepared_interruption_preserves_failure_diagnostic) {
+    struct sigaction original;
+    struct sigaction action;
+    error_context_t failure;
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK_EQ_INT(sigaction(SIGINT, NULL, &original), 0);
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = switch_inherited_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = SA_RESTART;
+    CHECK_EQ_INT(sigaction(SIGINT, &action, NULL), 0);
+
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    g_guard_end_checkpoint_signal = 0;
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = true;
+    g_log = NULL;
+    previous_runner = run_set_runner(fake_runner);
+    clear_error();
+    rc = accounts_switch_prepare(&ctx, "testacct");
+    failure = *get_last_error();
+    run_set_runner(previous_runner);
+    g_raise_on_user_name = false;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(g_guard_end_checkpoint_signal, SIGINT);
+    CHECK_EQ_INT(failure.code, ERR_SYSTEM_CALL);
+    CHECK(strstr(failure.message, "Switch interrupted by signal") != NULL);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(!signals_pending());
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
+
+    CHECK_EQ_INT(sigaction(SIGINT, &original, NULL), 0);
+}
+
+/* AR-09 M4 phase 6: a writer arriving between managed Git publication and
+ * post-image sealing makes rollback intentionally conflict-safe. Failed
+ * preparation must expose that exact retained snapshot through an abort-only
+ * handle; after the writer restores the sealed image, retry can recover the
+ * before-image and release signal ownership. */
+TEST(prepared_seal_failure_retains_abort_retry_handle) {
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    g_mutate_name_before_seal = true;
+    previous_runner = run_set_runner(fake_runner);
+    rc = accounts_switch_prepare(&ctx, "testacct");
+    run_set_runner(previous_runner);
+    g_mutate_name_before_seal = false;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_STR_EQ(g_store_name, "preseal-writer");
+    /* Non-conflicting vectors are restored immediately; only the externally
+     * changed name remains in the retained retry record. */
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(strstr(get_last_error()->message,
+                 "rollback ownership remains published") != NULL);
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
+    CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
+
+    safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    run_set_runner(previous_runner);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(ctx.current_account == NULL);
+    CHECK(ctx.config.active_account[0] == '\0');
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
 }
 
 /* AR-08 M6: the one-call API owns its complete signal lifecycle. This test
@@ -3054,6 +3457,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(successful_switch_still_tears_down_previous_isolation);
     RUN_TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg);
     RUN_TEST(ssh_init_failure_keeps_previous_runtime_isolation);
+    RUN_TEST(prepared_ssh_switch_failure_releases_transaction_ownership);
     RUN_TEST(repeated_switch_validation_failure_keeps_live_session);
     RUN_TEST(repeated_switch_reap_failure_preserves_live_session);
     RUN_TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort);
@@ -3089,6 +3493,11 @@ TEST_MAIN_BEGIN()
         fprintf(stderr, "HARNESS FAIL: cannot restore PATH after GPG tests\n");
         return 1;
     }
+    RUN_TEST(guard_begin_partial_restore_is_synchronously_released);
+    RUN_TEST(guard_begin_restore_retry_publishes_abort_only_handle);
+    RUN_TEST(failed_prepare_releases_callers_signal_dispositions);
+    RUN_TEST(prepared_interruption_preserves_failure_diagnostic);
+    RUN_TEST(prepared_seal_failure_retains_abort_retry_handle);
     RUN_TEST(direct_switch_restores_callers_signal_dispositions);
     RUN_TEST(direct_switch_reports_signal_restoration_failure_after_commit);
     RUN_TEST(direct_switch_dispatches_signal_arriving_during_guard_end);
