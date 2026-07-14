@@ -1083,7 +1083,7 @@ static void retire_fill_account(account_t *acct, const char *ssh_key_path) {
     acct->gpg_signing_enabled = true;
     /* The saved selector is the short suffix form; the switch published the
      * canonical fingerprint — the retire comparison must bridge the two. */
-    safe_strncpy(acct->gpg_key_id, RETIRE_FPR + 24, sizeof(acct->gpg_key_id));
+    safe_strncpy(acct->gpg_key_id, &RETIRE_FPR[24], sizeof(acct->gpg_key_id));
     if (ssh_key_path) {
         acct->ssh_enabled = true;
         safe_strncpy(acct->ssh_key_path, ssh_key_path,

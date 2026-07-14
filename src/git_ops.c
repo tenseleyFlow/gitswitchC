@@ -3980,7 +3980,9 @@ bool git_signing_key_selects_account(const account_t *account,
 }
 
 /* Unset one attributed credential key for git_retire_account_identity,
- * preserving the first diagnostic and counting only keys that were present. */
+ * preserving the first diagnostic and counting only keys that were present.
+ * first_error must be larger than an error message plus the "scope key: "
+ * prefix (see the caller) so the diagnostic never truncates. */
 static void git_retire_unset(const char *key, git_scope_t scope,
                              size_t *removed, int *failures,
                              char *first_error, size_t first_error_size) {
@@ -4003,7 +4005,9 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
     char expected_ssh[GIT_CFG_VALUE_MAX] = "";
     bool expected_ssh_known = false;
     char value[GIT_CFG_VALUE_MAX];
-    char first_error[sizeof(g_last_error.message)] = "";
+    /* Wide enough for a full error message plus the "scope key: " prefix
+     * git_retire_unset prepends (gcc's -Wformat-truncation checks this). */
+    char first_error[sizeof(g_last_error.message) + 64] = "";
     int failures = 0;
     size_t removed = 0;
 
