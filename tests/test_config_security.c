@@ -146,6 +146,26 @@ static void seed_three_accounts(gitswitch_ctx_t *ctx) {
     ctx->current_account = &ctx->accounts[1];
 }
 
+static void seed_reload_sentinel(gitswitch_ctx_t *ctx) {
+    seed_three_accounts(ctx);
+    ctx->config.default_scope = GIT_SCOPE_GLOBAL;
+    snprintf(ctx->config.config_path, sizeof(ctx->config.config_path),
+             "/sentinel/original.toml");
+    snprintf(ctx->config.active_account, sizeof(ctx->config.active_account),
+             "current-old");
+    ctx->config.verbose = true;
+    ctx->config.dry_run = true;
+    ctx->config.color_output = true;
+    ctx->config.force_global = true;
+    ctx->config.force_local = false;
+    ctx->config.resuming = true;
+    ctx->config.assume_yes = true;
+    ctx->config.defer_signal_cleanup = true;
+    ctx->accounts_skipped_on_load = 71;
+    ctx->unknown_sections_on_load = 72;
+    ctx->unknown_keys_on_load = 73;
+}
+
 static bool current_pointer_is_valid(const gitswitch_ctx_t *ctx) {
     if (!ctx->current_account) return true;
     for (size_t i = 0; i < ctx->account_count; i++) {
@@ -342,6 +362,63 @@ TEST(current_pointer_rebinds_after_direct_array_compaction) {
     CHECK(current_pointer_is_valid(&ctx));
     CHECK(ctx.current_account == &ctx.accounts[1]);
     CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+}
+
+TEST(failed_reload_preserves_complete_context) {
+    static const char missing_scope[] =
+        "[settings]\n"
+        "[accounts.1]\nname = \"alice\"\nemail = \"a@b.com\"\n";
+    static const char unsafe_legacy_active[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "active_account = \"bad/name\"\n"
+        "[accounts.1]\nname = \"alice\"\nemail = \"a@b.com\"\n";
+    static const char replacement[] =
+        "[settings]\ndefault_scope = \"local\"\n"
+        "[accounts.1]\nname = \"alice\"\nemail = \"a@b.com\"\n";
+    static const char malformed_state[] = "garbage\n";
+    static const char mismatched_state[] = "ssh\nactive=alice\n";
+    char dir[128], path[256], hint[256];
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t *before;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(join_path(path, sizeof(path), dir, "/accounts.toml"), 0);
+    CHECK_EQ_INT(join_path(hint, sizeof(hint), dir, "/.resume-hint"), 0);
+
+    seed_reload_sentinel(&ctx);
+    before = malloc(sizeof(*before));
+    CHECK(before != NULL);
+    if (!before) return;
+    memcpy(before, &ctx, sizeof(*before));
+
+    /* Each case crosses a later mutation boundary in the pre-fix loader:
+     * counter reset, settings mutation, model replacement, then active-state
+     * validation. A failed reload is one transaction, so none may become
+     * observable to the caller. */
+    CHECK_EQ_INT(write_config(path, missing_scope, sizeof(missing_scope) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), -1);
+    CHECK(memcmp(&ctx, before, sizeof(ctx)) == 0);
+    memcpy(&ctx, before, sizeof(ctx));
+
+    CHECK_EQ_INT(write_config(path, unsafe_legacy_active,
+                              sizeof(unsafe_legacy_active) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), -1);
+    CHECK(memcmp(&ctx, before, sizeof(ctx)) == 0);
+    memcpy(&ctx, before, sizeof(ctx));
+
+    CHECK_EQ_INT(write_config(path, replacement, sizeof(replacement) - 1U), 0);
+    CHECK_EQ_INT(write_config(hint, malformed_state,
+                              sizeof(malformed_state) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), -1);
+    CHECK(memcmp(&ctx, before, sizeof(ctx)) == 0);
+    memcpy(&ctx, before, sizeof(ctx));
+
+    CHECK_EQ_INT(write_config(hint, mismatched_state,
+                              sizeof(mismatched_state) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), -1);
+    CHECK(memcmp(&ctx, before, sizeof(ctx)) == 0);
+
+    free(before);
 }
 
 TEST(current_pointer_rebinds_by_id_across_reloads) {
@@ -2097,6 +2174,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(system_scope_is_rejected_before_admission_or_persistence);
     RUN_TEST(zero_account_id_is_rejected_before_mutation_or_persistence);
     RUN_TEST(current_pointer_rebinds_after_direct_array_compaction);
+    RUN_TEST(failed_reload_preserves_complete_context);
     RUN_TEST(current_pointer_rebinds_by_id_across_reloads);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);

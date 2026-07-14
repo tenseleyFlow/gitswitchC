@@ -124,6 +124,10 @@ static bool sanitize_tty_text(char *text);
 static int create_config_directory_secure(const char *config_dir);
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
                             bool apply_active_state, bool detect_runtime);
+static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
+                                    const char *config_path,
+                                    bool apply_active_state,
+                                    bool detect_runtime);
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
@@ -748,10 +752,56 @@ static const char *config_account_runtime_needs(const account_t *account) {
     return "none";
 }
 
-/* Load configuration from TOML file. Preview-only callers skip live-runtime
- * discovery because its cross-process lock may create/chmod a lock inode. */
+/* Reload into a private context and publish the complete replacement only
+ * after document, account, active-state, and runtime reconciliation all
+ * succeed. In particular, a late validation failure must not pair the old
+ * account model with freshly reset rewrite guards. The context is too large
+ * for the product's bounded stack policy, so stage it on the heap. */
 static int config_load_mode(gitswitch_ctx_t *ctx, const char *config_path,
                             bool apply_active_state, bool detect_runtime) {
+    gitswitch_ctx_t *staged;
+    uint32_t current_id = 0;
+    bool had_current;
+    int result;
+
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
+        return -1;
+    }
+
+    staged = malloc(sizeof(*staged));
+    if (!staged) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Failed to allocate staged configuration context");
+        return -1;
+    }
+
+    had_current = config_capture_current_id(ctx, &current_id);
+    memcpy(staged, ctx, sizeof(*staged));
+    config_rebind_current_id(staged, had_current, current_id);
+
+    result = config_load_mode_inplace(staged, config_path,
+                                      apply_active_state, detect_runtime);
+    if (result != 0) {
+        secure_zero_memory(staged, sizeof(*staged));
+        free(staged);
+        return -1;
+    }
+
+    had_current = config_capture_current_id(staged, &current_id);
+    memcpy(ctx, staged, sizeof(*ctx));
+    config_rebind_current_id(ctx, had_current, current_id);
+    secure_zero_memory(staged, sizeof(*staged));
+    free(staged);
+    return 0;
+}
+
+/* Load configuration from TOML file. Preview-only callers skip live-runtime
+ * discovery because its cross-process lock may create/chmod a lock inode. */
+static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
+                                    const char *config_path,
+                                    bool apply_active_state,
+                                    bool detect_runtime) {
     toml_document_t *toml_doc;
     config_active_state_t active_state;
     char legacy_active[MAX_NAME_LEN] = "";
