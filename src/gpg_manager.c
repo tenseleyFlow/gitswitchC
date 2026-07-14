@@ -15,7 +15,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
@@ -64,10 +63,6 @@ typedef struct {
 static int gpg_retarget_current_locked(int base_fd, const char *base,
                                        const char *real_home,
                                        gpg_retarget_result_t *result);
-static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
-                          const char *env_out[2]);
-static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
-                   char *output, size_t output_size, ...);
 typedef struct {
     int base_fd;
     int home_fd;
@@ -3590,105 +3585,11 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
     return 0;
 }
 
-/* Return true if `gpg --with-colons` output contains a secret-key record
- * (primary `sec` or subkey `ssb`) whose capability field (field 12, the 12th
- * ':'-separated field) advertises signing. Lowercase 's' means this key can
- * sign; uppercase 'S' on a primary means a signing-capable subkey exists. */
-bool gpg_colons_have_sign_capability(const char *colons) {
-    const char *line;
-
-    if (!colons) {
-        return false;
-    }
-
-    for (line = colons; line && *line; ) {
-        const char *eol = strchr(line, '\n');
-        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
-
-        if (line_len >= 3 &&
-            (strncmp(line, "sec", 3) == 0 || strncmp(line, "ssb", 3) == 0)) {
-            const char *line_end = line + line_len;
-            const char *field_start = line;
-            const char *p;
-            int field = 0;
-
-            for (p = line; p <= line_end; p++) {
-                if (p == line_end || *p == ':') {
-                    if (field == 11) {  /* field 12, 0-indexed: capabilities */
-                        const char *c;
-                        for (c = field_start; c < p; c++) {
-                            if (*c == 's' || *c == 'S') {
-                                return true;
-                            }
-                        }
-                        break;
-                    }
-                    field++;
-                    field_start = p + 1;
-                }
-            }
-        }
-
-        if (!eol) {
-            break;
-        }
-        line = eol + 1;
-    }
-
-    return false;
-}
-
-/* Verify the isolated keyring can sign for key_id, without unlocking the key.
- * The previous implementation ran an interactive `gpg --clearsign`, which
- * forced a pinentry PIN prompt on every switch and failed outright when the
- * configured pinentry path was wrong. Instead, confirm a signing-capable secret
- * key is present via the colon-delimited listing: PIN-free, pinentry-free, and
- * sufficient — real signing is exercised when the user actually commits. */
-int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id) {
-    char output[4096];
-    run_result_t res;
-    int result;
-
-    if (!gpg_config || !key_id) {
-        set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_test_signing");
-        return -1;
-    }
-
-    log_debug("Verifying signing capability for key: %s", key_id);
-
-    result = gpg_run(gpg_config, &res, output, sizeof(output),
-                     "gpg", "--list-secret-keys", "--with-colons", key_id,
-                     (const char *)NULL);
-    if (result != 0) {
-        set_error(ERR_GPG_SIGNING_FAILED, "No secret key available for signing: %s", key_id);
-        return -1;
-    }
-
-    if (!gpg_colons_have_sign_capability(output)) {
-        /* A truncated capture is INCOMPLETE evidence, not proof of absence
-         * (AR-03 L4): a large multi-uid/multi-subkey key can armor its
-         * signing `ssb` record past the capture buffer, into the dropped
-         * tail. The listing's exit 0 already proved the secret key is
-         * present, and this capability check is advisory — real signing is
-         * exercised when the user actually commits — so treat truncation as
-         * inconclusive rather than report a spurious failure. */
-        if (res.out_truncated) {
-            log_debug("Signing-capability listing truncated for key %s; "
-                      "treating as inconclusive, not a failure", key_id);
-            gpg_manager_note_key_available(key_id);
-            return 0;
-        }
-        set_error(ERR_GPG_SIGNING_FAILED, "Key has no signing-capable secret key: %s", key_id);
-        return -1;
-    }
-
-    log_debug("Signing capability confirmed for key: %s", key_id);
-    gpg_manager_note_key_available(key_id);
-    return 0;
-}
-
-/* AR-06 F61: gpg_generate_key() was removed here — dead public API with zero
- * callers (gitswitch never generated keys; it isolates existing ones). */
+/* AR-06 F61 / AR-09 L12: gpg_generate_key(), gpg_test_signing(), and the
+ * loose capability-letter parser were removed as dead or misleading public
+ * APIs. The switch's one authoritative inventory path uses
+ * gpg_manager_resolve_secret_key_listing(), rejects incomplete evidence, and
+ * verifies the canonical fingerprint again after import. */
 
 /* Set environment variables for GPG operation */
 int gpg_set_environment(gpg_config_t *gpg_config) {
@@ -3730,71 +3631,6 @@ int gpg_set_environment(gpg_config_t *gpg_config) {
     return 0;
 }
 
-/* Internal helper functions */
-
-/* Build a one-entry GNUPGHOME extra-env array for isolated mode (else empty). */
-static void gpg_build_env(const gpg_config_t *cfg, char *envbuf, size_t envbuf_size,
-                          const char *env_out[2]) {
-    env_out[0] = NULL;
-    env_out[1] = NULL;
-    if (cfg && cfg->mode == GPG_MODE_ISOLATED && strlen(cfg->gnupg_home) > 0) {
-        if ((size_t)snprintf(envbuf, envbuf_size, "GNUPGHOME=%s", cfg->gnupg_home) < envbuf_size) {
-            env_out[0] = envbuf;
-        }
-    }
-}
-
-/* Run `gpg`/argv (NULL-terminated varargs, argv[0] is the first vararg), no
- * shell, with GNUPGHOME set from cfg in isolated mode. Captures merged
- * stdout+stderr. Returns 0 iff the child exits 0. res_out (optional, may be
- * NULL) receives the full run_result_t — callers that parse the capture as
- * evidence must check its out_truncated flag, since a truncated listing is
- * INCOMPLETE, not authoritative (AR-03 L4). */
-static int gpg_runv(const gpg_pinned_home_t *home,
-                    const gpg_config_t *cfg, run_result_t *res_out,
-                    char *output, size_t output_size, va_list ap) {
-    const char *argv[24];
-    size_t n = 0;
-    const char *a;
-    run_opts_t opts;
-    run_result_t res;
-    char envbuf[MAX_PATH_LEN + 16];
-    const char *env[2];
-    int rc;
-
-    while ((a = va_arg(ap, const char *)) != NULL) {
-        if (n >= sizeof(argv) / sizeof(argv[0]) - 1) {
-            set_error(ERR_INVALID_ARGS, "Too many gpg arguments");
-            return -1;
-        }
-        argv[n++] = a;
-    }
-    argv[n] = NULL;
-
-    if (home && gpg_validate_pinned_home(home) != 0) {
-        return -1;
-    }
-    memset(&opts, 0, sizeof(opts));
-    opts.out = output;
-    opts.out_size = output_size;
-    opts.merge_stderr = true;
-    if (home) {
-        env[0] = "GNUPGHOME=.";
-        env[1] = NULL;
-        opts.cwd_fd = home->home_fd;
-        opts.use_cwd_fd = true;
-    } else {
-        gpg_build_env(cfg, envbuf, sizeof(envbuf), env);
-    }
-    if (env[0]) opts.extra_env = env;
-
-    rc = run_argv(argv, &opts, res_out ? res_out : &res);
-    if (home && gpg_validate_pinned_home(home) != 0) {
-        return -1;
-    }
-    return rc;
-}
-
 int gpg_manager_resolve_system_key(const char *selector,
                                    bool require_signing,
                                    char *fingerprint,
@@ -3807,17 +3643,6 @@ int gpg_manager_resolve_system_key(const char *selector,
     fingerprint[0] = '\0';
     return gpg_resolve_source_key(selector, require_signing, fingerprint,
                                   fingerprint_size);
-}
-
-static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
-                   char *output, size_t output_size, ...) {
-    va_list ap;
-    int rc;
-
-    va_start(ap, output_size);
-    rc = gpg_runv(NULL, cfg, res_out, output, output_size, ap);
-    va_end(ap);
-    return rc;
 }
 
 static bool gpg_colon_field(const char *line, size_t line_len, size_t wanted,

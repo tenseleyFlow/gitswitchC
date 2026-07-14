@@ -37,6 +37,9 @@
 #define PRIMARY_SIGN \
     "sec:u:4096:1:0123456789ABCDEF:1700000000:::-:::scESC:::+:::23::0:\n" \
     "fpr:::::::::" PRIMARY_FPR ":\n"
+#define SECOND_SIGN \
+    "sec:u:4096:1:89ABCDEF01234567:1700000000:::-:::scESC:::+:::23::0:\n" \
+    "fpr:::::::::" SECOND_FPR ":\n"
 #define V5_PRIMARY_SIGN \
     "sec:u:4096:1:0123456789ABCDEF:1700000000:::-:::scESC:::+:::23::0:\n" \
     "fpr:::::::::" V5_FPR ":\n"
@@ -158,6 +161,7 @@ enum fake_mode {
     FAKE_PRESENT,
     FAKE_V5_FIRST_IMPORT,
     FAKE_AMBIGUOUS_SOURCE,
+    FAKE_MISMATCHED_IMPORT,
     FAKE_FIRST_IMPORT
 };
 static enum fake_mode g_fake_mode;
@@ -676,7 +680,11 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
 
         if (g_fake_mode == FAKE_AMBIGUOUS_SOURCE && source_listing) {
             inventory = AMBIGUOUS_KEYS;
+        } else if (g_fake_mode == FAKE_MISMATCHED_IMPORT &&
+                   g_fake_imported) {
+            inventory = SECOND_SIGN;
         } else if ((g_fake_mode == FAKE_AMBIGUOUS_SOURCE ||
+                    g_fake_mode == FAKE_MISMATCHED_IMPORT ||
                     g_fake_mode == FAKE_FIRST_IMPORT ||
                     g_fake_mode == FAKE_V5_FIRST_IMPORT) &&
                    !source_listing && !g_fake_imported) {
@@ -813,6 +821,34 @@ TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     CHECK_STR_EQ(config.current_key_id, PRIMARY_FPR);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
     CHECK_STR_EQ(getenv("GNUPGHOME"), source_home);
+    unsetenv("GNUPGHOME");
+}
+
+TEST(post_import_fingerprint_mismatch_is_not_signing_readiness) {
+    char xdg[128], source_home[MAX_PATH_LEN];
+    gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
+    account_t account;
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(source_home, sizeof(source_home),
+                               "%s/source", xdg), 0);
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
+    fill_account(&account, "mismatch", "01234567", true);
+    g_fake_mode = FAKE_MISMATCHED_IMPORT;
+    g_fake_imported = false;
+    g_fake_exported = false;
+    g_fake_listing_calls = 0;
+    previous = run_set_runner(strict_key_runner);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), -1);
+    run_set_runner(previous);
+
+    CHECK(g_fake_exported);
+    CHECK(g_fake_imported);
+    CHECK(config.current_key_id[0] == '\0');
+    CHECK(strstr(get_last_error()->message,
+                 "did not validate as fingerprint") != NULL);
     unsetenv("GNUPGHOME");
 }
 
@@ -1676,6 +1712,7 @@ TEST_MAIN_BEGIN()
 #endif
     RUN_TEST(ambiguous_selector_exports_and_imports_nothing);
     RUN_TEST(unique_selector_threads_fingerprint_through_import_and_publication);
+    RUN_TEST(post_import_fingerprint_mismatch_is_not_signing_readiness);
     RUN_TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication);
     RUN_TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal);
     RUN_TEST(system_resolver_classifies_managed_aliases_before_helper_launch);

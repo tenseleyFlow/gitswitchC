@@ -153,7 +153,6 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_set_config_value);
     REQUIRE_PUBLIC_API(git_test_config);
     REQUIRE_PUBLIC_API(git_unset_config_value);
-    REQUIRE_PUBLIC_API(gpg_colons_have_sign_capability);
     REQUIRE_PUBLIC_API(gpg_configure_git_signing);
     REQUIRE_PUBLIC_API(gpg_create_isolated_home);
     REQUIRE_PUBLIC_API(gpg_manager_cleanup);
@@ -189,7 +188,6 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_snapshot_current);
     REQUIRE_PUBLIC_API(gpg_set_environment);
     REQUIRE_PUBLIC_API(gpg_switch_account);
-    REQUIRE_PUBLIC_API(gpg_test_signing);
     REQUIRE_PUBLIC_API(is_directory);
     REQUIRE_PUBLIC_API(is_regular_file);
     REQUIRE_PUBLIC_API(is_safe_ssh_key_path);

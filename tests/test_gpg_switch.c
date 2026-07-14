@@ -216,8 +216,8 @@ TEST(repeat_isolated_switch_spawns_gpg_once) {
     run_set_runner(prev);
 
     CHECK_EQ_INT(rc, 0);
-    /* One spawn proves presence AND signing capability (pre-fix: two — the
-     * plain idempotency listing plus gpg_test_signing's --with-colons rerun). */
+    /* One strict inventory proves presence, usable secret material, canonical
+     * identity, and signing capability without a weaker follow-up probe. */
     CHECK_EQ_INT(g_gpg_execs, 1);
 
     /* The stable `current` symlink was retargeted at this account's home. */
@@ -377,7 +377,7 @@ TEST(truncated_secret_key_export_is_never_imported) {
 /* The whole point of the export/import pair is directional: export reads the
  * SYSTEM keyring (an explicit real-home GNUPGHOME), import writes the ISOLATED
  * home (GNUPGHOME=<base>/<account>). Before this test, neutering the
- * import's gpg_build_env/extra_env plumbing — so the decrypted secret key
+ * import's descriptor-relative GNUPGHOME=./extra_env plumbing — so the key
  * lands in the user's persistent ~/.gnupg instead of the memory-backed
  * isolated home — passed the entire suite. */
 
@@ -1330,55 +1330,6 @@ TEST(truncated_idempotency_probe_is_not_signing_evidence) {
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
 }
 
-/* Fixed listing + truncation flag for driving gpg_test_signing directly. */
-static const char *g_sig_listing;
-static bool        g_sig_truncated;
-
-static int fixed_listing_runner(const char *const argv[],
-                                const run_opts_t *opts,
-                                run_result_t *result) {
-    (void)argv;
-    if (result) {
-        memset(result, 0, sizeof(*result));
-        result->spawned = true;
-    }
-    if (opts && opts->out && opts->out_size > 0) {
-        snprintf(opts->out, opts->out_size, "%s", g_sig_listing);
-        if (result) {
-            result->out_len = strlen(opts->out);
-            result->out_truncated = g_sig_truncated;
-        }
-    }
-    return 0;
-}
-
-TEST(gpg_test_signing_treats_truncated_listing_as_inconclusive) {
-    gpg_config_t cfg;
-    command_runner_fn prev;
-
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.mode = GPG_MODE_SYSTEM;
-
-    prev = run_set_runner(fixed_listing_runner);
-
-    /* Truncated capture without a visible 's': inconclusive, NOT a failure
-     * (pre-fix: -1, surfacing as a spurious switch-time warning). */
-    g_sig_listing = SEC_CERT_ONLY;
-    g_sig_truncated = true;
-    CHECK_EQ_INT(gpg_test_signing(&cfg, "1111111111111111"), 0);
-
-    /* A COMPLETE capture without 's' stays an authoritative failure — the
-     * truncation carve-out must not fail open on real capability absence. */
-    g_sig_truncated = false;
-    CHECK_EQ_INT(gpg_test_signing(&cfg, "1111111111111111"), -1);
-
-    /* Positive control: a complete, capable listing passes. */
-    g_sig_listing = SEC_SIGN;
-    CHECK_EQ_INT(gpg_test_signing(&cfg, "FEEDFACE01234567"), 0);
-
-    run_set_runner(prev);
-}
-
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(repeat_isolated_switch_spawns_gpg_once);
@@ -1397,5 +1348,4 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap);
     RUN_TEST(gpg_current_snapshot_blocks_on_base_lock);
     RUN_TEST(truncated_idempotency_probe_is_not_signing_evidence);
-    RUN_TEST(gpg_test_signing_treats_truncated_listing_as_inconclusive);
 TEST_MAIN_END()

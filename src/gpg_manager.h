@@ -176,13 +176,10 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, 
                               git_scope_t scope);
 
-/**
- * Test GPG signing by creating a test signature
- */
-int gpg_test_signing(gpg_config_t *gpg_config, const char *key_id);
-
-/* AR-06 F61: gpg_generate_key() was removed — dead public API with zero
- * callers. */
+/* AR-06 F61 / AR-09 L12: gpg_generate_key() and gpg_test_signing() were
+ * removed as dead/misleading public APIs. The latter created no signature and
+ * accepted incomplete capability output; the switch uses the strict resolver
+ * below as its authoritative readiness proof. */
 
 /** Install GNUPGHOME transactionally and retain its previous value for
  * gpg_manager_cleanup(). */
@@ -309,11 +306,5 @@ int gpg_manager_restore_current_if(gpg_config_t *gpg_config,
  */
 void gpg_manager_note_key_available(const char *key_id);
 bool gpg_manager_key_available_cached(const char *key_id);
-
-/**
- * Return true if `gpg --with-colons` output contains a secret key (sec/ssb)
- * whose capability field advertises signing ('s' or 'S'). Exposed for testing.
- */
-bool gpg_colons_have_sign_capability(const char *colons);
 
 #endif /* GPG_MANAGER_H */
