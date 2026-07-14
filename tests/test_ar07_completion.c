@@ -34,6 +34,7 @@ static int write_text(const char *path, const char *text, mode_t mode) {
 static int read_text(const char *path, char *out, size_t out_size) {
     FILE *file;
     size_t used;
+    int extra;
 
     if (!out || out_size == 0) return -1;
     out[0] = '\0';
@@ -44,8 +45,98 @@ static int read_text(const char *path, char *out, size_t out_size) {
         fclose(file);
         return -1;
     }
+    extra = fgetc(file);
+    if (extra != EOF) {
+        (void)fclose(file);
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (ferror(file)) {
+        int saved_errno = errno == 0 ? EIO : errno;
+
+        (void)fclose(file);
+        errno = saved_errno;
+        return -1;
+    }
     out[used] = '\0';
     return fclose(file);
+}
+
+static int read_text_alloc(const char *path, char **out) {
+    FILE *file;
+    char *text;
+    size_t capacity = 4096;
+    size_t used = 0;
+
+    if (!path || !out) {
+        errno = EINVAL;
+        return -1;
+    }
+    *out = NULL;
+    file = fopen(path, "r");
+    if (!file) return -1;
+    text = malloc(capacity + 1);
+    if (!text) {
+        int saved_errno = errno;
+
+        (void)fclose(file);
+        errno = saved_errno;
+        return -1;
+    }
+    for (;;) {
+        size_t count;
+
+        if (used == capacity) {
+            size_t next_capacity;
+            char *larger;
+
+            if (capacity > (SIZE_MAX - 1U) / 2U) {
+                errno = EFBIG;
+                goto fail;
+            }
+            next_capacity = capacity * 2U;
+            larger = realloc(text, next_capacity + 1U);
+            if (!larger) goto fail;
+            text = larger;
+            capacity = next_capacity;
+        }
+        count = fread(text + used, 1, capacity - used, file);
+        used += count;
+        if (count > 0) continue;
+        if (ferror(file)) {
+            if (errno == 0) errno = EIO;
+            goto fail;
+        }
+        if (!feof(file)) {
+            errno = EIO;
+            goto fail;
+        }
+        break;
+    }
+    if (memchr(text, '\0', used) != NULL) {
+        errno = EILSEQ;
+        goto fail;
+    }
+    text[used] = '\0';
+    if (fclose(file) != 0) {
+        int saved_errno = errno;
+
+        free(text);
+        errno = saved_errno;
+        return -1;
+    }
+    *out = text;
+    return 0;
+
+fail:
+    {
+        int saved_errno = errno;
+
+        (void)fclose(file);
+        free(text);
+        errno = saved_errno;
+        return -1;
+    }
 }
 
 static int path_join(char *out, size_t out_size, const char *left,
@@ -513,9 +604,10 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
         "doctor", "health", "config", "init", "resume", "reset", "switch",
     };
     char bash_path[PATH_MAX], zsh_path[PATH_MAX], fish_path[PATH_MAX];
-    char bash[32768], zsh[32768], fish[32768];
+    char *bash = NULL, *zsh = NULL, *fish = NULL;
     char bash_options[2048], zsh_options[2048], fish_options[2048];
     char bash_commands[1024], zsh_commands[1024], fish_commands[1024];
+    int bash_rc, zsh_rc, fish_rc;
 
     CHECK_EQ_INT(path_join(bash_path, sizeof(bash_path), g_root,
                            "completions/gitswitch.bash"), 0);
@@ -523,9 +615,18 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
                            "completions/gitswitch.zsh"), 0);
     CHECK_EQ_INT(path_join(fish_path, sizeof(fish_path), g_root,
                            "completions/gitswitch.fish"), 0);
-    CHECK_EQ_INT(read_text(bash_path, bash, sizeof(bash)), 0);
-    CHECK_EQ_INT(read_text(zsh_path, zsh, sizeof(zsh)), 0);
-    CHECK_EQ_INT(read_text(fish_path, fish, sizeof(fish)), 0);
+    bash_rc = read_text_alloc(bash_path, &bash);
+    zsh_rc = read_text_alloc(zsh_path, &zsh);
+    fish_rc = read_text_alloc(fish_path, &fish);
+    CHECK_EQ_INT(bash_rc, 0);
+    CHECK_EQ_INT(zsh_rc, 0);
+    CHECK_EQ_INT(fish_rc, 0);
+    if (bash_rc != 0 || zsh_rc != 0 || fish_rc != 0) {
+        free(bash);
+        free(zsh);
+        free(fish);
+        return;
+    }
 
     CHECK_EQ_INT(extract_bash_assignment(bash, "options", bash_options,
                                          sizeof(bash_options)), 0);
@@ -564,6 +665,63 @@ TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden) {
     CHECK(strstr(bash, "--resume-hint-probe") == NULL);
     CHECK(strstr(zsh, "--resume-hint-probe") == NULL);
     CHECK(strstr(fish, "--resume-hint-probe") == NULL);
+    free(bash);
+    free(zsh);
+    free(fish);
+}
+
+TEST(completion_source_reader_covers_the_legacy_boundary) {
+    static const struct {
+        size_t offset;
+        const char *forbidden;
+    } cases[] = {
+        {1024U, "--ssh-agent-info"},
+        {32760U, "--resume-check"},
+        {49152U, "--resume-hint-probe"},
+    };
+    const size_t source_size = 64U * 1024U;
+    char root[PATH_MAX], path[PATH_MAX];
+    char *source = malloc(source_size + 1U);
+    char *loaded = NULL;
+
+    CHECK(source != NULL);
+    if (!source) return;
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar09-completion-source.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(path, sizeof(path), root, "large-valid.bash"), 0);
+    memset(source, '#', source_size);
+    source[source_size - 1U] = '\n';
+    source[source_size] = '\0';
+    CHECK_EQ_INT(write_text(path, source, 0600), 0);
+    CHECK_EQ_INT(read_text_alloc(path, &loaded), 0);
+    CHECK(loaded != NULL);
+    if (loaded) {
+        CHECK_EQ_INT(strlen(loaded), source_size);
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            CHECK(strstr(loaded, cases[i].forbidden) == NULL);
+        }
+        free(loaded);
+        loaded = NULL;
+    }
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t forbidden_length = strlen(cases[i].forbidden);
+
+        memset(source, '#', source_size);
+        source[source_size - 1U] = '\n';
+        memcpy(source + cases[i].offset, cases[i].forbidden,
+               forbidden_length);
+        CHECK_EQ_INT(write_text(path, source, 0600), 0);
+        CHECK_EQ_INT(read_text_alloc(path, &loaded), 0);
+        CHECK(loaded != NULL);
+        if (loaded) {
+            CHECK(strstr(loaded, cases[i].forbidden) != NULL);
+            free(loaded);
+            loaded = NULL;
+        }
+    }
+    free(source);
 }
 
 TEST(bash_completion_executes_getopt_style_operand_state) {
@@ -945,6 +1103,7 @@ TEST_MAIN_BEGIN()
         fprintf(stderr, "RESULT FAIL: T16 test setup failed\n");
         return 1;
     }
+    RUN_TEST(completion_source_reader_covers_the_legacy_boundary);
     RUN_TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden);
     RUN_TEST(bash_completion_executes_getopt_style_operand_state);
     RUN_TEST(zsh_completion_executes_runtime_expansion_and_state_scanner);
