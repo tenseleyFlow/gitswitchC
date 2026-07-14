@@ -58,8 +58,19 @@
     "[GNUPG:] FAILURE gpg-exit 33554433\n"
 
 static int make_runtime(char *xdg, size_t size) {
+    char canonical[MAX_PATH_LEN];
+    size_t length;
+
     if (snprintf(xdg, size, "/tmp/gswar07gpg_XXXXXX") >= (int)size ||
-        !ts_mkdtemp(xdg) || chmod(xdg, 0700) != 0 ||
+        !ts_mkdtemp(xdg) || !realpath(xdg, canonical)) {
+        return -1;
+    }
+    length = strlen(canonical);
+    if (length >= size) {
+        return -1;
+    }
+    memcpy(xdg, canonical, length + 1U);
+    if (chmod(xdg, 0700) != 0 ||
         setenv("XDG_RUNTIME_DIR", xdg, 1) != 0 ||
         setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0) {
         return -1;
