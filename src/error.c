@@ -56,6 +56,51 @@ static void mark_text_truncated(char *destination, size_t destination_size) {
     memcpy(destination + offset, marker, marker_length + 1U);
 }
 
+/* Assemble user-facing diagnostics without asking snprintf() to prove that
+ * several independently bounded context fields fit one caller-sized buffer.
+ * Besides avoiding compiler-specific -Wformat-truncation false positives,
+ * this makes display-level truncation explicit instead of returning an
+ * indistinguishable prefix. */
+static bool append_display_span(char *destination, size_t destination_size,
+                                size_t *used, const char *source,
+                                size_t source_length) {
+    size_t available;
+    size_t copied;
+
+    if (!destination || destination_size == 0 || !used || !source) {
+        return false;
+    }
+    if (*used >= destination_size - 1U) {
+        return source_length == 0;
+    }
+
+    available = destination_size - *used - 1U;
+    copied = source_length < available ? source_length : available;
+    if (copied > 0) {
+        memcpy(destination + *used, source, copied);
+        *used += copied;
+    }
+    destination[*used] = '\0';
+    return copied == source_length;
+}
+
+static bool append_display_field(char *destination, size_t destination_size,
+                                 size_t *used, const char *source,
+                                 size_t source_capacity) {
+    size_t source_length;
+    bool terminated;
+
+    if (!source || source_capacity == 0) {
+        static const char unknown[] = "unknown";
+        return append_display_span(destination, destination_size, used,
+                                   unknown, sizeof(unknown) - 1U);
+    }
+    source_length = strnlen(source, source_capacity);
+    terminated = source_length < source_capacity;
+    return append_display_span(destination, destination_size, used, source,
+                               source_length) && terminated;
+}
+
 static int store_error_message(error_context_t *error, const char *fmt,
                                va_list args) {
     int formatted_length;
@@ -384,25 +429,59 @@ void set_log_to_stderr(bool enable) {
 /* Format error message for user display */
 void format_error_message(char *buffer, size_t buffer_size, 
                           const error_context_t *error) {
+    char line_text[32];
+    size_t used = 0;
+    int line_length;
+    bool complete = true;
+
     if (!buffer || buffer_size == 0 || !error) {
         return;
     }
-    
+
+    buffer[0] = '\0';
+    complete = append_display_span(buffer, buffer_size, &used, "Error: ",
+                                   sizeof("Error: ") - 1U) && complete;
+    complete = append_display_field(buffer, buffer_size, &used,
+                                    error->message,
+                                    sizeof(error->message)) && complete;
     if (error->system_errno != 0) {
-        snprintf(buffer, buffer_size, 
-                "Error: %s\nDetails: %s\nLocation: %s:%d in %s()",
-                error->message, error->details, 
-                error->file, error->line, error->function);
-    } else {
-        snprintf(buffer, buffer_size,
-                "Error: %s\nLocation: %s:%d in %s()",
-                error->message, error->file, error->line, error->function);
+        complete = append_display_span(buffer, buffer_size, &used,
+                                       "\nDetails: ",
+                                       sizeof("\nDetails: ") - 1U) && complete;
+        complete = append_display_field(buffer, buffer_size, &used,
+                                        error->details,
+                                        sizeof(error->details)) && complete;
     }
+    complete = append_display_span(buffer, buffer_size, &used, "\nLocation: ",
+                                   sizeof("\nLocation: ") - 1U) && complete;
+    complete = append_display_field(buffer, buffer_size, &used, error->file,
+                                    sizeof(error->file)) && complete;
+    complete = append_display_span(buffer, buffer_size, &used, ":",
+                                   sizeof(":") - 1U) && complete;
+    line_length = snprintf(line_text, sizeof(line_text), "%d", error->line);
+    if (line_length < 0 || (size_t)line_length >= sizeof(line_text)) {
+        complete = false;
+    } else {
+        complete = append_display_span(buffer, buffer_size, &used, line_text,
+                                       (size_t)line_length) && complete;
+    }
+    complete = append_display_span(buffer, buffer_size, &used, " in ",
+                                   sizeof(" in ") - 1U) && complete;
+    complete = append_display_field(buffer, buffer_size, &used,
+                                    error->function,
+                                    sizeof(error->function)) && complete;
+    complete = append_display_span(buffer, buffer_size, &used, "()",
+                                   sizeof("()") - 1U) && complete;
+    if (!complete) mark_text_truncated(buffer, buffer_size);
 }
 
 /* Print formatted error to stderr */
 void print_error(const char *prefix) {
-    char error_msg[2048];
+    /* Enough for every stored field plus labels and the widest decimal line;
+     * format_error_message still marks truncation for smaller public callers. */
+    char error_msg[sizeof(g_last_error.message) + sizeof(g_last_error.details) +
+                   sizeof(g_last_error.file) + sizeof(g_last_error.function) +
+                   96U];
     
     if (g_last_error.code == ERR_SUCCESS) {
         return; /* No error to print */

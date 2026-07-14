@@ -261,6 +261,44 @@ TEST(very_large_message_and_saved_context_keep_truncation_state) {
     CHECK(strstr(saved.message, "[truncated]") != NULL);
 }
 
+TEST(display_format_marks_its_own_bounded_truncation) {
+    struct {
+        unsigned char before;
+        char formatted[96];
+        unsigned char after;
+    } guarded = {0xA5, {0}, 0x5A};
+    error_context_t error = {0};
+
+    memset(error.message, 'm', sizeof(error.message) - 1U);
+    memset(error.details, 'd', sizeof(error.details) - 1U);
+    memset(error.file, 'f', sizeof(error.file) - 1U);
+    memset(error.function, 'n', sizeof(error.function) - 1U);
+    error.system_errno = ENOENT;
+    error.line = 2147483647;
+
+    format_error_message(guarded.formatted, sizeof(guarded.formatted), &error);
+
+    CHECK_EQ_INT(guarded.before, 0xA5);
+    CHECK_EQ_INT(guarded.after, 0x5A);
+    CHECK(guarded.formatted[sizeof(guarded.formatted) - 1U] == '\0');
+    CHECK(strstr(guarded.formatted, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
+}
+
+TEST(display_format_rejects_unterminated_context_fields_truthfully) {
+    char formatted[256];
+    error_context_t error = {0};
+
+    memset(error.message, 'm', sizeof(error.message));
+    memcpy(error.file, "source.c", sizeof("source.c"));
+    memcpy(error.function, "function", sizeof("function"));
+    error.line = 17;
+
+    format_error_message(formatted, sizeof(formatted), &error);
+
+    CHECK(formatted[sizeof(formatted) - 1U] == '\0');
+    CHECK(strstr(formatted, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
@@ -276,4 +314,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(oversized_system_suffix_reports_truncation);
     RUN_TEST(error_context_preserves_aliased_previous_message);
     RUN_TEST(very_large_message_and_saved_context_keep_truncation_state);
+    RUN_TEST(display_format_marks_its_own_bounded_truncation);
+    RUN_TEST(display_format_rejects_unterminated_context_fields_truthfully);
 TEST_MAIN_END()
