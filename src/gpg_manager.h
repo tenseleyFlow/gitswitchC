@@ -204,8 +204,10 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
  * provenance-checked directory descriptor. The helper runs with cwd_fd and
  * GNUPGHOME=. so namespace replacement cannot redirect it. Exactly one
  * currently usable primary secret key is required; when require_signing is
- * true it must also have usable signing capability. On success writes the
- * canonical primary fingerprint. */
+ * true it must also have usable signing capability. A missing selector is
+ * recognized only from complete machine-readable no-secret-key status;
+ * keyring, helper, malformed-status, and truncated-output failures remain
+ * operational errors. On success writes the canonical primary fingerprint. */
 int gpg_manager_resolve_system_key(const char *selector,
                                    bool require_signing,
                                    char *fingerprint,

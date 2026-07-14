@@ -92,9 +92,6 @@ typedef struct {
     struct stat identity;
     gpg_mount_identity_t mount;
 } gpg_source_home_t;
-static int gpg_run_pinned(const gpg_pinned_home_t *home,
-                          const gpg_config_t *cfg, run_result_t *res_out,
-                          char *output, size_t output_size, ...);
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                                         const gpg_pinned_home_t *home,
                                         const char *selector,
@@ -3823,18 +3820,6 @@ static int gpg_run(const gpg_config_t *cfg, run_result_t *res_out,
     return rc;
 }
 
-static int gpg_run_pinned(const gpg_pinned_home_t *home,
-                          const gpg_config_t *cfg, run_result_t *res_out,
-                          char *output, size_t output_size, ...) {
-    va_list ap;
-    int rc;
-
-    va_start(ap, output_size);
-    rc = gpg_runv(home, cfg, res_out, output, output_size, ap);
-    va_end(ap);
-    return rc;
-}
-
 static bool gpg_colon_field(const char *line, size_t line_len, size_t wanted,
                             const char **field, size_t *field_len) {
     const char *start = line;
@@ -3955,6 +3940,16 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
         const char *record;
         size_t record_len;
 
+        /* A capture made with --status-fd=1 deliberately interleaves GnuPG's
+         * machine status records with the colon inventory. They are parsed as
+         * result evidence by the caller and are not colon records; in
+         * particular, they must not break the required sec -> fpr adjacency. */
+        if (line_len >= 9 && memcmp(line, "[GNUPG:] ", 9) == 0) {
+            if (!eol) break;
+            line = eol + 1;
+            continue;
+        }
+
         if (gpg_colon_field(line, line_len, 0, &record, &record_len)) {
             /* The canonical primary fpr immediately follows sec in GnuPG's
              * fixed colon listing.  Never carry this expectation across an
@@ -4063,21 +4058,147 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
     return 0;
 }
 
-/* Classify the runner result without collapsing transport/setup failures into
- * an ordinary key miss. GnuPG documents exit status 2 for the no-secret-key
- * result of --list-secret-keys; every other nonzero state is operational
- * failure, including pre-spawn rejection, child setup/exec failure, signal
- * termination, and a runner I/O failure after an exit-0 child. */
+typedef struct {
+    bool malformed;
+    bool keylist_error_seen;
+    bool keylist_error_conflict;
+    unsigned long long keylist_error;
+    bool gpg_exit_failure_seen;
+} gpg_listing_status_t;
+
+enum { GPG_KEY_LISTING_CAP = 512 * 1024 };
+
+static bool gpg_status_next_token(const char **cursor, const char *end,
+                                  const char **token, size_t *token_len) {
+    const char *start;
+
+    while (*cursor < end && **cursor == ' ') (*cursor)++;
+    if (*cursor >= end) return false;
+    start = *cursor;
+    while (*cursor < end && **cursor != ' ') (*cursor)++;
+    *token = start;
+    *token_len = (size_t)(*cursor - start);
+    return *token_len > 0;
+}
+
+static bool gpg_status_error_code(const char *token, size_t token_len,
+                                  unsigned long long *value_out) {
+    unsigned long long value = 0;
+    size_t i;
+
+    if (!token || token_len == 0 || !value_out) return false;
+    for (i = 0; i < token_len; i++) {
+        unsigned int digit;
+        if (token[i] < '0' || token[i] > '9') return false;
+        digit = (unsigned int)(token[i] - '0');
+        if (value > (0xffffffffULL - digit) / 10ULL) return false;
+        value = value * 10ULL + digit;
+    }
+    *value_out = value;
+    return true;
+}
+
+static bool gpg_status_token_is(const char *token, size_t token_len,
+                                const char *expected) {
+    size_t expected_len = strlen(expected);
+    return token_len == expected_len &&
+           memcmp(token, expected, expected_len) == 0;
+}
+
+/* Parse only the status records needed to classify key listing. Unknown
+ * records are forward-compatible. ERROR and FAILURE records are structural
+ * evidence, so an incomplete or non-decimal form makes the capture unusable. */
+static void gpg_collect_listing_status(const char *capture,
+                                       gpg_listing_status_t *status) {
+    const char *line;
+
+    memset(status, 0, sizeof(*status));
+    for (line = capture; line && *line; ) {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+
+        if (line_len >= 9 && memcmp(line, "[GNUPG:] ", 9) == 0) {
+            const char *cursor = line + 9;
+            const char *end = line + line_len;
+            const char *kind;
+            const char *location;
+            const char *code_token;
+            size_t kind_len;
+            size_t location_len;
+            size_t code_len;
+            unsigned long long code;
+            bool is_error;
+            bool is_failure;
+
+            if (!eol ||
+                !gpg_status_next_token(&cursor, end, &kind, &kind_len)) {
+                status->malformed = true;
+                break;
+            }
+            is_error = gpg_status_token_is(kind, kind_len, "ERROR");
+            is_failure = gpg_status_token_is(kind, kind_len, "FAILURE");
+            if ((is_error || is_failure) &&
+                (!gpg_status_next_token(&cursor, end, &location,
+                                        &location_len) ||
+                 !gpg_status_next_token(&cursor, end, &code_token,
+                                        &code_len) ||
+                 !gpg_status_error_code(code_token, code_len, &code))) {
+                status->malformed = true;
+                break;
+            }
+            if (is_error &&
+                gpg_status_token_is(location, location_len,
+                                    "keylist.getkey")) {
+                if (status->keylist_error_seen &&
+                    status->keylist_error != code) {
+                    status->keylist_error_conflict = true;
+                }
+                status->keylist_error_seen = true;
+                status->keylist_error = code;
+            } else if (is_failure &&
+                       gpg_status_token_is(location, location_len,
+                                           "gpg-exit")) {
+                status->gpg_exit_failure_seen = true;
+            }
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+}
+
+/* Classify the runner result without collapsing transport/setup or keyring
+ * failures into an ordinary key miss. Exit status 2 is shared by multiple
+ * GnuPG failures; only complete machine status proving keylist.getkey's
+ * GPG_ERR_NO_SECKEY (17) plus the terminal gpg-exit failure is a miss. */
 static int gpg_classify_secret_listing_run(int run_rc,
                                            const run_result_t *res,
+                                           const char *capture,
                                            const char *selector) {
-    if (!res || !selector) {
+    gpg_listing_status_t status;
+
+    if (!res || !capture || !selector) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid GPG key-listing result classification");
         return -1;
     }
+    if (res->out_truncated) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG key-list/status output exceeds the one-shot %d-byte "
+                  "capture limit for %s",
+                  GPG_KEY_LISTING_CAP, selector);
+        return -1;
+    }
     if (run_rc == 0) {
         if (res->spawned && res->exit_code == 0 && res->term_signal == 0) {
+            gpg_collect_listing_status(capture, &status);
+            if (status.malformed || status.keylist_error_conflict ||
+                status.keylist_error_seen || status.gpg_exit_failure_seen) {
+                set_error(ERR_GPG_KEY_FAILED,
+                          "GPG secret-key helper returned inconsistent "
+                          "structured success for %s",
+                          selector);
+                return -1;
+            }
             return 0;
         }
         set_error(ERR_GPG_KEY_FAILED,
@@ -4086,7 +4207,39 @@ static int gpg_classify_secret_listing_run(int run_rc,
         return -1;
     }
     if (res->spawned && res->term_signal == 0 && res->exit_code == 2) {
-        return 1;
+        gpg_collect_listing_status(capture, &status);
+        if (status.malformed) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key helper returned malformed structured "
+                      "status output for %s",
+                      selector);
+            return -1;
+        }
+        if (status.keylist_error_conflict) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key helper returned contradictory structured "
+                      "status output for %s",
+                      selector);
+            return -1;
+        }
+        /* libgpg-error stores the portable code in the low 16 bits; the high
+         * source bits may be present or omitted in a status record. */
+        if (status.keylist_error_seen &&
+            (status.keylist_error & 0xffffULL) == 17ULL &&
+            status.gpg_exit_failure_seen) {
+            return 1;
+        }
+        if (status.keylist_error_seen) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key keyring/status error code %llu for %s",
+                      status.keylist_error & 0xffffULL, selector);
+        } else {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG secret-key helper exited 2 without complete "
+                      "structured no-secret-key evidence for %s",
+                      selector);
+        }
+        return -1;
     }
     if (!res->spawned) {
         set_error(ERR_GPG_KEY_FAILED,
@@ -4122,14 +4275,15 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                                       bool require_signing,
                                       char *fingerprint,
                                       size_t fingerprint_size) {
-    enum { KEY_LISTING_CAP = 512 * 1024 };
     const char *env[2] = {"GNUPGHOME=.", NULL};
     const char *argv[] = {
-        "gpg", "--batch", "--with-colons", "--fixed-list-mode",
+        "gpg", "--batch", "--status-fd=1", "--with-colons",
+        "--fixed-list-mode",
         "--list-secret-keys", "--fingerprint", "--fingerprint", selector,
         NULL
     };
     char *listing;
+    run_opts_t opts;
     run_result_t res;
     int run_rc;
     int status;
@@ -4139,62 +4293,62 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                   "Invalid GPG secret-key listing source");
         return -1;
     }
-    listing = malloc(KEY_LISTING_CAP);
+    listing = malloc(GPG_KEY_LISTING_CAP);
     if (!listing) {
         set_error(ERR_MEMORY_ALLOCATION,
                   "Failed to allocate GPG key-listing buffer");
         return -1;
     }
+    (void)gpg_config;
+    memset(&opts, 0, sizeof(opts));
+    opts.out = listing;
+    opts.out_size = GPG_KEY_LISTING_CAP;
+    opts.stderr_to_devnull = true;
+    opts.extra_env = env;
     memset(&res, 0, sizeof(res));
     res.exit_code = -1;
     if (home) {
-        run_rc = gpg_run_pinned(home, gpg_config, &res, listing,
-                                KEY_LISTING_CAP,
-                                "gpg", "--batch", "--with-colons",
-                                "--fixed-list-mode", "--list-secret-keys",
-                                "--fingerprint", "--fingerprint", selector,
-                                (const char *)NULL);
-    } else {
-        run_opts_t opts;
-        if (gpg_validate_source_home(source) != 0) {
-            secure_zero_memory(listing, KEY_LISTING_CAP);
+        if (gpg_validate_pinned_home(home) != 0) {
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
             return -1;
         }
-        memset(&opts, 0, sizeof(opts));
-        opts.out = listing;
-        opts.out_size = KEY_LISTING_CAP;
-        opts.stderr_to_devnull = true;
-        opts.extra_env = env;
+        opts.cwd_fd = home->home_fd;
+        opts.use_cwd_fd = true;
+        run_rc = run_argv(argv, &opts, &res);
+        if (gpg_validate_pinned_home(home) != 0) {
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
+            free(listing);
+            return -1;
+        }
+    } else {
+        if (gpg_validate_source_home(source) != 0) {
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
+            free(listing);
+            return -1;
+        }
         opts.cwd_fd = source->fd;
         opts.use_cwd_fd = true;
         run_rc = run_argv(argv, &opts, &res);
         if (gpg_validate_source_home(source) != 0) {
-            secure_zero_memory(listing, KEY_LISTING_CAP);
+            secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
             free(listing);
             return -1;
         }
     }
-    status = gpg_classify_secret_listing_run(run_rc, &res, selector);
+    status = gpg_classify_secret_listing_run(run_rc, &res, listing, selector);
     if (status != 0) {
-        secure_zero_memory(listing, KEY_LISTING_CAP);
+        secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
         free(listing);
         return status;
     }
-    if (!res.out_truncated) {
+    {
         int parse_rc = gpg_manager_resolve_secret_key_listing(
             listing, require_signing, fingerprint, fingerprint_size);
-        secure_zero_memory(listing, KEY_LISTING_CAP);
+        secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
         free(listing);
         return parse_rc;
     }
-    secure_zero_memory(listing, KEY_LISTING_CAP);
-    free(listing);
-    set_error(ERR_GPG_KEY_FAILED,
-              "GPG secret-key inventory exceeds the one-shot %d-byte "
-              "capture limit",
-              KEY_LISTING_CAP);
-    return -1;
 }
 
 static int gpg_resolve_source_key(const char *selector, bool require_signing,

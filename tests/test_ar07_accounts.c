@@ -18,6 +18,10 @@
 #include <stdint.h>
 #include <signal.h>
 
+#define STATUS_NO_SECRET_KEY \
+    "[GNUPG:] ERROR keylist.getkey 17\n" \
+    "[GNUPG:] FAILURE gpg-exit 33554433\n"
+
 static const char private_key_text[] =
     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
 static const char public_key_text[] =
@@ -86,11 +90,20 @@ static int missing_system_gpg_key_runner(const char *const argv[],
             }
         }
     }
-    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (opts && opts->out && opts->out_size > 0) {
+        if (list_secret) {
+            snprintf(opts->out, opts->out_size, "%s", STATUS_NO_SECRET_KEY);
+        } else {
+            opts->out[0] = '\0';
+        }
+    }
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
         result->exit_code = list_secret ? 2 : 0;
+        if (list_secret && opts && opts->out) {
+            result->out_len = strlen(opts->out);
+        }
     }
     if (list_secret) {
         g_source_probe_count++;

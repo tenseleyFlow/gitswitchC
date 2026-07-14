@@ -42,6 +42,9 @@
 #define SEC_SIGN \
     "sec:-:4096:1:FEEDFACE01234567:1700000000:::-:::scESC:::+:::23::0:\n" \
     "fpr:::::::::0123456789ABCDEF0123456789ABCDEF01234567:\n"
+#define STATUS_NO_SECRET_KEY \
+    "[GNUPG:] ERROR keylist.getkey 17\n" \
+    "[GNUPG:] FAILURE gpg-exit 33554433\n"
 
 static int g_gpg_execs;
 static const char *env_lookup(const char *const *envp, const char *prefix);
@@ -325,6 +328,10 @@ static int truncating_export_runner(const char *const argv[],
             if (result) result->out_len = strlen(opts->out);
             return 0; /* canonical source inventory */
         }
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size, "%s", STATUS_NO_SECRET_KEY);
+            if (result) result->out_len = strlen(opts->out);
+        }
         if (result) result->exit_code = 2;
         return -1; /* absent from the isolated home */
     }
@@ -437,6 +444,10 @@ static int import_flow_runner(const char *const argv[], const run_opts_t *opts,
                 if (result) result->out_len = strlen(opts->out);
             }
             return 0; /* source resolution or post-import validation */
+        }
+        if (opts && opts->out && opts->out_size > 0) {
+            snprintf(opts->out, opts->out_size, "%s", STATUS_NO_SECRET_KEY);
+            if (result) result->out_len = strlen(opts->out);
         }
         if (result) result->exit_code = 2;
         return -1; /* first pinned probe forces the export/import path */
