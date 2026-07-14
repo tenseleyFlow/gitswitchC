@@ -25,6 +25,43 @@
 #include <sys/mount.h>
 #endif
 
+#ifdef __linux__
+/* AR-10 L31: bare unshare(CLONE_NEWNS) needs CAP_SYS_ADMIN, so these
+ * security regressions green-skipped on every non-root host — including
+ * every CI lane, none of which required the capability. Fall back to a user
+ * namespace: mapping the caller's own ids grants CAP_SYS_ADMIN over a fresh
+ * mount namespace, so the bind-mount assertions actually run unprivileged.
+ * Callers still _exit(77)->skip when both routes are unavailable (e.g.
+ * kernels with unprivileged user namespaces disabled). */
+static int write_exact(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY);
+    ssize_t length = (ssize_t)strlen(text);
+
+    if (fd < 0) return -1;
+    if (write(fd, text, (size_t)length) != length) {
+        (void)close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+static int enter_private_mount_namespace(void) {
+    char map[64];
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+
+    if (unshare(CLONE_NEWNS) == 0) return 0;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return -1;
+    /* setgroups must be denied before an unprivileged gid_map write. */
+    if (write_exact("/proc/self/setgroups", "deny") != 0) return -1;
+    snprintf(map, sizeof(map), "%u %u 1", (unsigned)uid, (unsigned)uid);
+    if (write_exact("/proc/self/uid_map", map) != 0) return -1;
+    snprintf(map, sizeof(map), "%u %u 1", (unsigned)gid, (unsigned)gid);
+    if (write_exact("/proc/self/gid_map", map) != 0) return -1;
+    return 0;
+}
+#endif
+
 static int g_runner_calls;
 
 static int recording_null_runner(const char *const argv[],
@@ -352,7 +389,7 @@ TEST(nested_bind_mount_is_never_traversed) {
     if (child == 0) {
         command_runner_fn previous;
         int rc;
-        if (unshare(CLONE_NEWNS) != 0 ||
+        if (enter_private_mount_namespace() != 0 ||
             mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
             mount(external, nested, NULL, MS_BIND, NULL) != 0) {
             _exit(77);
@@ -403,7 +440,7 @@ TEST(bind_mounted_account_home_is_rejected_before_config_write) {
         account_t account;
         int rc;
 
-        if (unshare(CLONE_NEWNS) != 0 ||
+        if (enter_private_mount_namespace() != 0 ||
             mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
             mount(external, home, NULL, MS_BIND, NULL) != 0) {
             _exit(77);

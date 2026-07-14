@@ -24,6 +24,11 @@ jobs:
         # dash also provides the Ubuntu /bin/sh implementation;
         # openssh-client provides ssh, ssh-agent, ssh-add, and ssh-keygen.
         run: |
+          # AR-10 L31: Ubuntu 24.04 restricts unprivileged user namespaces
+          # via AppArmor. The mount-namespace security regressions run
+          # unprivileged through a user-namespace fallback and are REQUIRED
+          # capabilities on this job's test steps, so permit userns here.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo apt-get update
           sudo apt-get install -y \
             bash dash fish gnupg ksh libreadline-dev openssh-client zsh \
@@ -48,13 +53,13 @@ jobs:
         # disabled readline build fails instead of becoming a green skip.
         run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       - name: Source coverage (GCC/gcovr, measured line + branch ratchet)
         run: make coverage
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Upload source coverage reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -67,7 +72,7 @@ jobs:
       - name: Release build + full NDEBUG suite (FORTIFY/RELRO, warnings-as-errors)
         run: make BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Release artifact hardening (built + staged)
         run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
       # AR-05 L8: symbol-level no-shell gate. An undefined-symbol reference to
@@ -125,7 +130,7 @@ jobs:
       - name: Linux clang release build + full NDEBUG suite
         run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Linux clang release artifact hardening
         run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
 
@@ -188,8 +193,10 @@ jobs:
       - name: Build + test (ASan/UBSan, warnings-as-errors)
         run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
-          # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin
-          # and remain covered by Linux; every portable runtime is mandatory.
+          # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin.
+          # AR-10 L31: the Linux lanes list mount-namespace as a REQUIRED
+          # capability (with a userns fallback), so "covered by Linux" is now
+          # enforced rather than assumed; every portable runtime is mandatory.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Clean before the release build
         run: make clean
