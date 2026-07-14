@@ -202,7 +202,9 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config);
 int ssh_add_key(ssh_config_t *ssh_config, const char *key_path);
 
 /**
- * List loaded SSH keys for verification
+ * List loaded SSH keys for verification. Success guarantees that the complete
+ * textual listing fit in output (with one final newline removed). Truncated or
+ * binary output fails and leaves output empty.
  */
 int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size);
 

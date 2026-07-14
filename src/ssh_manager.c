@@ -2465,10 +2465,16 @@ static int ssh_add_key_snapshot(ssh_config_t *ssh_config,
 
 /* List loaded SSH keys */
 int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size) {
+    const char *const argv[] = {"ssh-add", "-l", NULL};
+    run_opts_t opts;
+    run_result_t result;
+    int rc;
+
     if (!ssh_config || !output || output_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_list_keys");
         return -1;
     }
+    output[0] = '\0';
     
     if (strlen(ssh_config->agent_socket_path) == 0) {
         safe_strncpy(output, "No SSH agent available", output_size);
@@ -2480,13 +2486,36 @@ int ssh_list_keys(ssh_config_t *ssh_config, char *output, size_t output_size) {
         return -1;
     }
     
-    /* Execute ssh-add -l */
-    if (ssh_run(output, output_size, false, "ssh-add", "-l",
-                (const char *)NULL) != 0) {
+    /* Execute ssh-add -l with the complete runner result. A caller-supplied
+     * buffer is the public storage contract, so an oversized listing cannot be
+     * recaptured invisibly; fail with an empty result instead of publishing a
+     * prefix that could hide a later identity. */
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    opts.out = output;
+    opts.out_size = output_size;
+    rc = run_argv(argv, &opts, &result);
+    if (result.out_truncated || result.out_len >= output_size) {
+        output[0] = '\0';
+        set_error(ERR_SSH_AGENT_FAILED,
+                  "SSH key listing was incomplete; increase the output buffer");
+        return -1;
+    }
+    if (memchr(output, '\0', result.out_len) != NULL) {
+        output[0] = '\0';
+        set_error(ERR_SSH_AGENT_FAILED,
+                  "SSH key listing contained invalid binary data");
+        return -1;
+    }
+    if (rc != 0) {
         safe_strncpy(output, "No keys loaded in SSH agent", output_size);
         return -1;
     }
-    
+
+    if (result.out_len > 0U && output[result.out_len - 1U] == '\n') {
+        output[result.out_len - 1U] = '\0';
+    }
     return 0;
 }
 
