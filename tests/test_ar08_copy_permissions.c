@@ -15,11 +15,19 @@
 typedef void (*copy_file_test_hook_fn)(int stage, const char *dst_path);
 copy_file_test_hook_fn gitswitch_test_set_copy_file_hook(
     copy_file_test_hook_fn hook);
+typedef void (*read_file_test_hook_fn)(int stage, int file_fd);
+read_file_test_hook_fn gitswitch_test_set_read_file_hook(
+    read_file_test_hook_fn hook);
 
 enum {
     COPY_FILE_TEST_AFTER_DESTINATION_OPEN = 1,
     COPY_FILE_TEST_AFTER_FIRST_WRITE,
     COPY_FILE_TEST_BEFORE_DESTINATION_OPEN
+};
+
+enum {
+    READ_FILE_TEST_BEFORE_INITIAL_READ = 1,
+    READ_FILE_TEST_BEFORE_EXACT_FIT_PROBE
 };
 
 typedef struct {
@@ -45,6 +53,9 @@ static const char *g_replacement_source;
 static const char *g_replacement_displaced;
 static int g_replacement_hook_calls;
 static int g_replacement_hook_error;
+static int g_read_fault_stage;
+static int g_read_hook_calls;
+static int g_read_hook_error;
 
 static int write_text_mode(const char *path, const char *content, mode_t mode) {
     size_t length = strlen(content);
@@ -142,6 +153,24 @@ static void replace_destination_before_open(int stage, const char *dst_path) {
         rename(dst_path, g_replacement_displaced) != 0 ||
         link(g_replacement_source, dst_path) != 0) {
         g_replacement_hook_error = errno ? errno : EIO;
+    }
+}
+
+static void replace_read_descriptor_with_write_only(int stage, int file_fd) {
+    int replacement_fd;
+
+    if (stage != g_read_fault_stage) return;
+    g_read_hook_calls++;
+    replacement_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (replacement_fd < 0) {
+        g_read_hook_error = errno ? errno : EIO;
+        return;
+    }
+    if (dup2(replacement_fd, file_fd) < 0) {
+        g_read_hook_error = errno ? errno : EIO;
+    }
+    if (close(replacement_fd) != 0 && g_read_hook_error == 0) {
+        g_read_hook_error = errno ? errno : EIO;
     }
 }
 
@@ -445,6 +474,71 @@ TEST(destination_replaced_with_alias_before_open_is_rejected) {
     CHECK(file_state_matches(&displaced_before, &displaced_after));
 }
 
+TEST(read_file_accepts_seven_bytes_in_eight_byte_buffer) {
+    char root[] = "/tmp/gs_read_fit_XXXXXX";
+    char path[512];
+    char content[8];
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(path, sizeof(path), "%s/file", root) <
+          sizeof(path));
+    CHECK_EQ_INT(write_text_mode(path, "1234567", 0600), 0);
+
+    CHECK_EQ_INT(read_file_to_string(path, content, sizeof(content)), 7);
+    CHECK_STR_EQ(content, "1234567");
+    CHECK_EQ_INT(content[7], '\0');
+}
+
+TEST(read_file_rejects_eight_bytes_in_eight_byte_buffer) {
+    char root[] = "/tmp/gs_read_large_XXXXXX";
+    char path[512];
+    char content[8];
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(path, sizeof(path), "%s/file", root) <
+          sizeof(path));
+    CHECK_EQ_INT(write_text_mode(path, "12345678", 0600), 0);
+
+    clear_error();
+    CHECK_EQ_INT(read_file_to_string(path, content, sizeof(content)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, 0);
+}
+
+static void exercise_read_error(int fault_stage) {
+    char root[] = "/tmp/gs_read_error_XXXXXX";
+    char path[512];
+    char content[8] = "stale";
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(path, sizeof(path), "%s/file", root) <
+          sizeof(path));
+    CHECK_EQ_INT(write_text_mode(path, "1234567", 0600), 0);
+
+    g_read_fault_stage = fault_stage;
+    g_read_hook_calls = 0;
+    g_read_hook_error = 0;
+    (void)gitswitch_test_set_read_file_hook(
+        replace_read_descriptor_with_write_only);
+    clear_error();
+    CHECK_EQ_INT(read_file_to_string(path, content, sizeof(content)), -1);
+    (void)gitswitch_test_set_read_file_hook(NULL);
+    g_read_fault_stage = 0;
+
+    CHECK_EQ_INT(g_read_hook_calls, 1);
+    CHECK_EQ_INT(g_read_hook_error, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, EBADF);
+}
+
+TEST(read_file_reports_injected_initial_read_error) {
+    exercise_read_error(READ_FILE_TEST_BEFORE_INITIAL_READ);
+}
+
+TEST(read_file_reports_injected_exact_fit_probe_error) {
+    exercise_read_error(READ_FILE_TEST_BEFORE_EXACT_FIT_PROBE);
+}
+
 int main(void) {
     if (error_init(LOG_LEVEL_ERROR, NULL) != 0) return 1;
 
@@ -456,7 +550,12 @@ int main(void) {
     RUN_TEST(distinct_existing_destination_is_replaced_in_place);
     RUN_TEST(empty_backup_suffix_is_rejected_without_mutation);
     RUN_TEST(destination_replaced_with_alias_before_open_is_rejected);
+    RUN_TEST(read_file_accepts_seven_bytes_in_eight_byte_buffer);
+    RUN_TEST(read_file_rejects_eight_bytes_in_eight_byte_buffer);
+    RUN_TEST(read_file_reports_injected_initial_read_error);
+    RUN_TEST(read_file_reports_injected_exact_fit_probe_error);
 
+    (void)gitswitch_test_set_read_file_hook(NULL);
     error_cleanup();
     return ts_test_finish();
 }

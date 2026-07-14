@@ -1701,6 +1701,35 @@ int get_file_permissions(const char *path, mode_t *mode) {
 
 /* File utilities */
 
+enum {
+    READ_FILE_TEST_BEFORE_INITIAL_READ = 1,
+    READ_FILE_TEST_BEFORE_EXACT_FIT_PROBE
+};
+
+#ifdef GITSWITCH_TESTING
+typedef void (*read_file_test_hook_fn)(int stage, int file_fd);
+read_file_test_hook_fn gitswitch_test_set_read_file_hook(
+    read_file_test_hook_fn hook);
+
+static read_file_test_hook_fn g_read_file_test_hook;
+
+read_file_test_hook_fn gitswitch_test_set_read_file_hook(
+    read_file_test_hook_fn hook) {
+    read_file_test_hook_fn previous = g_read_file_test_hook;
+    g_read_file_test_hook = hook;
+    return previous;
+}
+
+#define READ_FILE_TEST_CHECKPOINT(stage, file) \
+    do { \
+        if (g_read_file_test_hook) \
+            g_read_file_test_hook((stage), fileno(file)); \
+    } while (0)
+#else
+#define READ_FILE_TEST_CHECKPOINT(stage, file) \
+    do { (void)(stage); (void)(file); } while (0)
+#endif
+
 int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size) {
     FILE *file;
     size_t bytes_read;
@@ -1718,7 +1747,8 @@ int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size)
         set_system_error(ERR_FILE_IO, "Failed to open file for reading: %s", file_path);
         return -1;
     }
-    
+
+    READ_FILE_TEST_CHECKPOINT(READ_FILE_TEST_BEFORE_INITIAL_READ, file);
     bytes_read = fread(buffer, 1, buffer_size - 1, file);
     if (ferror(file)) {
         set_system_error(ERR_FILE_IO, "Failed to read from file: %s", file_path);
@@ -1727,14 +1757,37 @@ int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size)
     }
 
     /* If we filled the buffer, the file MIGHT be exactly buffer_size-1 bytes
-     * (a perfect fit) or larger. feof isn't set here — fread stopped at the
-     * byte limit without reading past the data — so the old `!feof` test
-     * wrongly rejected an exact-fit file (AR-06 F75). Probe one more byte:
-     * EOF means it fit exactly; any byte means it is genuinely too large. */
-    if (bytes_read == buffer_size - 1 && fgetc(file) != EOF) {
-        set_error(ERR_FILE_IO, "File too large for buffer: %s", file_path);
-        fclose(file);
-        return -1;
+     * (a perfect fit) or larger. An EOF flag is not a portable discriminator:
+     * stdio may or may not set it while satisfying an exact-size fread. Clear
+     * the stream state and perform one real probe: clean EOF means an exact
+     * fit, a byte means too large, and ferror means the probe failed. */
+    if (bytes_read == buffer_size - 1) {
+        int probe;
+        int probe_errno;
+
+        /* Some stdio implementations mark EOF while satisfying an exact-size
+         * fread. Clear that sticky state so this is a real discriminating
+         * read, including when the file grew after the buffered read. */
+        clearerr(file);
+        READ_FILE_TEST_CHECKPOINT(READ_FILE_TEST_BEFORE_EXACT_FIT_PROBE,
+                                  file);
+        errno = 0;
+        probe = fgetc(file);
+        probe_errno = errno;
+        if (probe != EOF) {
+            set_error(ERR_FILE_IO, "File too large for buffer: %s", file_path);
+            fclose(file);
+            return -1;
+        }
+        if (ferror(file)) {
+            int saved_errno = probe_errno ? probe_errno : EIO;
+
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO, "Failed to read from file: %s",
+                             file_path);
+            fclose(file);
+            return -1;
+        }
     }
 
     buffer[bytes_read] = '\0';
