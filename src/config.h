@@ -129,7 +129,9 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx);
  * and mtime remain unchanged. The artifact's first line remains the legacy
  * runtime-needs token consumed by shell integrations; its second line records
  * either the exact active account or a versioned inactive tombstone. Falls back
- * to config_save when no config exists.
+ * to config_save when no config exists. For an existing config, the context
+ * must come from a successful load of that exact path and the source generation
+ * must still be installed; otherwise the save fails closed.
  */
 int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path);
 

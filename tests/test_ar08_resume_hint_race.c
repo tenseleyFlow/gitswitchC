@@ -226,8 +226,9 @@ TEST(testing_object_retains_legacy_fault_seam_before_installation) {
     (void)unlink(g_hint);
     CHECK_EQ_INT(write_private(config_path,
                                "[settings]\ndefault_scope=\"local\"\n"), 0);
-    CHECK_EQ_INT(write_private(g_hint, "none\n"), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
     memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
     clear_error();
     CHECK_EQ_INT(setenv("GITSWITCH_TEST_FAIL_RESUME_HINT_COMMIT", "1", 1), 0);
     CHECK_EQ_INT(config_save_active_account_transactional(
@@ -237,7 +238,7 @@ TEST(testing_object_retains_legacy_fault_seam_before_installation) {
     CHECK(strstr(get_last_error()->message,
                  "Injected resume-hint commit failure") != NULL);
     CHECK(read_private(g_hint, text, sizeof(text)) > 0);
-    CHECK_STR_EQ(text, "none\n");
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
 }
 
 int main(void) {

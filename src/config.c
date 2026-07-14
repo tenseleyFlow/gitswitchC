@@ -146,11 +146,14 @@ static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
                                        size_t ignore_index);
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
-                                     bool *state_installed);
+                                     bool *state_installed,
+                                     bool require_loaded_source);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
 static bool config_metadata_snapshot_same(const struct stat *a,
                                           const struct stat *b);
+static int config_require_loaded_source_generation(
+    const gitswitch_ctx_t *ctx, const char *config_path);
 static bool config_metadata_ctime_only_change(const struct stat *before,
                                               const struct stat *after);
 static bool config_refresh_publication_identity(
@@ -333,7 +336,8 @@ static void config_document_free(toml_document_t *doc) {
  * cleanup on both success and failure. */
 static int config_read_document_expected(const char *config_path,
                                          toml_document_t *doc,
-                                         const struct stat *expected_identity) {
+                                         const struct stat *expected_identity,
+                                         struct stat *loaded_identity) {
     char *buffer = NULL;
     struct stat before, after, path_after;
     size_t file_size, total = 0;
@@ -488,6 +492,10 @@ static int config_read_document_expected(const char *config_path,
         goto fail_buffer;
     }
 
+    if (loaded_identity) {
+        *loaded_identity = after;
+    }
+
     /* Config content can reference key material paths; don't leave a stray
      * copy on the heap (mirrors toml_parse_file's cleanup discipline). */
     secure_zero_memory(buffer, file_size + 1);
@@ -500,8 +508,10 @@ fail_buffer:
     return -1;
 }
 
-static int config_read_document(const char *config_path, toml_document_t *doc) {
-    return config_read_document_expected(config_path, doc, NULL);
+static int config_read_document(const char *config_path, toml_document_t *doc,
+                                struct stat *loaded_identity) {
+    return config_read_document_expected(config_path, doc, NULL,
+                                         loaded_identity);
 }
 
 #define CONFIG_ACTIVE_STATE_MAX 1024U
@@ -804,6 +814,7 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
                                     bool detect_runtime) {
     toml_document_t *toml_doc;
     config_active_state_t active_state;
+    struct stat loaded_identity;
     char legacy_active[MAX_NAME_LEN] = "";
     char scope_str[32];
 
@@ -817,7 +828,7 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
         return -1;
     }
 
-    if (config_read_document(config_path, toml_doc) != 0) {
+    if (config_read_document(config_path, toml_doc, &loaded_identity) != 0) {
         config_document_free(toml_doc);
         return -1;
     }
@@ -888,6 +899,8 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
 
     /* Store config path */
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
+    ctx->config.source_generation = loaded_identity;
+    ctx->config.source_generation_valid = true;
 
     config_document_free(toml_doc);
 
@@ -1014,6 +1027,35 @@ static bool config_metadata_snapshot_same(const struct stat *a,
            a->st_ctim.tv_sec == b->st_ctim.tv_sec &&
            a->st_ctim.tv_nsec == b->st_ctim.tv_nsec;
 #endif
+}
+
+/* Active-state-only saves describe the account model already loaded into the
+ * context; unlike a full save, they do not replace that model. Require the
+ * same strict source snapshot (and the same caller path spelling) so an
+ * intervening valid accounts.toml generation is preserved as a conflict. */
+static int config_require_loaded_source_generation(
+    const gitswitch_ctx_t *ctx, const char *config_path) {
+    struct stat current;
+
+    if (!ctx || !config_path || !ctx->config.source_generation_valid ||
+        strcmp(ctx->config.config_path, config_path) != 0) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Active-state publication requires a context loaded from the exact config path");
+        return -1;
+    }
+    errno = 0;
+    if (lstat(config_path, &current) != 0 ||
+        !config_metadata_file_is_safe(&current, true) ||
+        !config_metadata_snapshot_same(&ctx->config.source_generation,
+                                       &current)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Configuration changed since it was loaded; refusing active-state publication: %s",
+            config_path);
+        return -1;
+    }
+    return 0;
 }
 
 /* FreeBSD UFS may materialize a ctime update for a read source only when the
@@ -1707,7 +1749,8 @@ int config_resume_hint_snapshot_restore(
  * tombstone that prevents a stale legacy settings key from being resurrected. */
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
-                                     bool *state_installed) {
+                                     bool *state_installed,
+                                     bool require_loaded_source) {
     config_active_state_t existing_state;
     const account_t *active_account = NULL;
     const char *needs;
@@ -1728,6 +1771,10 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid arguments to active-state commit");
+        return -1;
+    }
+    if (require_loaded_source &&
+        config_require_loaded_source_generation(ctx, config_path) != 0) {
         return -1;
     }
 
@@ -1921,7 +1968,16 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     }
 
     if (config_io_fault(CONFIG_IO_STATE_BEFORE_RENAME,
-                        "active-state rename") || rename(temp, hint) != 0) {
+                        "active-state rename")) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot install resume hint atomically: %s", hint);
+        goto hint_fail;
+    }
+    if (require_loaded_source &&
+        config_require_loaded_source_generation(ctx, config_path) != 0) {
+        goto hint_fail;
+    }
+    if (rename(temp, hint) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install resume hint atomically: %s", hint);
         goto hint_fail;
@@ -2229,7 +2285,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     }
 
     if (update_hint &&
-        config_update_resume_hint(ctx, config_path, NULL) != 0) {
+        config_update_resume_hint(ctx, config_path, NULL, false) != 0) {
         goto document_fail;
     }
     close(dir_fd);
@@ -2419,7 +2475,7 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
             goto cleanup;
         }
         if (config_update_resume_hint(ctx, config_path,
-                                      &state_installed) != 0) {
+                                      &state_installed, false) != 0) {
             if (state_installed) {
                 error_context_t state_error = *get_last_error();
                 if (config_resume_hint_snapshot_restore_at(config_path,
@@ -2498,7 +2554,7 @@ static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
         return config_save_mode(ctx, config_path, true,
                                 config_installed);
     }
-    return config_update_resume_hint(ctx, config_path, config_installed);
+    return config_update_resume_hint(ctx, config_path, config_installed, true);
 }
 
 int config_save_active_account(const gitswitch_ctx_t *ctx,
@@ -3580,7 +3636,7 @@ static int config_backup_internal(const char *config_path,
     verify_doc = config_document_alloc();
     if (!verify_doc ||
         config_read_document_expected(backup_path, verify_doc,
-                                      &backup_identity) != 0) {
+                                      &backup_identity, NULL) != 0) {
         if (!verify_doc && get_last_error()->code == ERR_SUCCESS) {
             set_error(ERR_MEMORY_ALLOCATION,
                       "Cannot allocate config backup verification document");

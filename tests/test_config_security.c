@@ -1986,11 +1986,12 @@ TEST(resume_hint_reflects_account_runtime_needs) {
     slurp(hint, buf, sizeof(buf));
     CHECK_STR_EQ(buf, "gpg\nactive=alice\n");
 
-    /* Cleared active account (reset path): install the explicit inactive
-     * tombstone. Its first-line `none` keeps login-shell probes no-op while the
-     * second line prevents a stale legacy settings key from resurrecting. */
+    /* Cleared active account: install the explicit inactive tombstone. This
+     * fixture builds a synthetic context (including a fake GPG selector)
+     * rather than loading it, so use the full-save path; active-only saves of
+     * an existing document are intentionally bound to a loaded generation. */
     ctx.config.active_account[0] = '\0';
-    CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
     slurp(hint, buf, sizeof(buf));
     CHECK_STR_EQ(buf, "none\ninactive=v1\n");
 

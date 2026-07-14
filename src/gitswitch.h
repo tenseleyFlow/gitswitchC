@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <sys/stat.h>
 
 /* Version information. The real version is injected via -DGITSWITCH_VERSION
  * from the VERSION file by the Makefile; this sentinel only appears when a
@@ -88,6 +89,11 @@ typedef struct {
 typedef struct {
     git_scope_t default_scope;
     char config_path[MAX_PATH_LEN];
+    /* Runtime-only generation of the exact accounts.toml object admitted by
+     * config_load. Active-state-only publication must remain bound to this
+     * source so a stale context cannot describe a replaced account model. */
+    bool source_generation_valid;
+    struct stat source_generation;
     char active_account[MAX_NAME_LEN];  /* Last-switched account, persisted for boot resume */
     bool verbose;
     bool dry_run;

@@ -29,6 +29,13 @@ static const char two_accounts_legacy[] =
     "name = \"Bob\"\n"
     "email = \"bob@example.com\"\n";
 
+static const char replacement_account[] =
+    "[settings]\n"
+    "default_scope = \"local\"\n"
+    "[accounts.9]\n"
+    "name = \"carol\"\n"
+    "email = \"carol@example.com\"\n";
+
 static int private_dir(char *path, size_t size) {
     if ((size_t)snprintf(path, size, "/tmp/gsw-ar07-config.XXXXXX") >= size) {
         return -1;
@@ -111,8 +118,25 @@ static int count_open_fds(void) {
 }
 
 static config_io_boundary_t fault_target;
+static char generation_swap_source[256];
+static char generation_swap_replacement[256];
+static int generation_swap_error;
+
 static bool inject_fault(config_io_boundary_t boundary) {
     return boundary == fault_target;
+}
+
+static bool replace_source_at_state_publication(
+    config_io_boundary_t boundary) {
+    if (boundary == CONFIG_IO_STATE_BEFORE_RENAME &&
+        generation_swap_source[0] != '\0') {
+        if (rename(generation_swap_replacement,
+                   generation_swap_source) != 0) {
+            generation_swap_error = errno ? errno : EIO;
+        }
+        generation_swap_source[0] = '\0';
+    }
+    return false;
 }
 
 static bool kill_at_default_boundary(config_io_boundary_t boundary) {
@@ -414,6 +438,76 @@ TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
     CHECK(same_identity(&config_before, &config_after));
 }
 
+TEST(active_state_save_is_bound_to_loaded_config_generation) {
+    char dir[128], path[256], replacement[256], hint[256], text[1024];
+    gitswitch_ctx_t ctx;
+    bool installed = true;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(replacement, sizeof(replacement), "%s/replacement.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\ninactive=v1\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "Bob");
+
+    /* Replace the source after load with a complete, valid generation that
+     * does not contain Bob. Publishing stale active state must not alter either
+     * the intervening document or the prior state artifact. */
+    CHECK_EQ_INT(write_private(replacement, replacement_account), 0);
+    CHECK_EQ_INT(rename(replacement, path), 0);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1); /* pre-fix: 0 */
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message,
+                 "changed since it was loaded") != NULL);
+    CHECK(read_text(path, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, replacement_account);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+
+    /* Reloading records the new generation; unchanged-source publication then
+     * succeeds normally. */
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "carol");
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=carol\n");
+
+    /* Exercise the last pre-publication generation check as well: the fault
+     * callback swaps accounts.toml after the state temp is durable but before
+     * its rename. The new source wins, while the prior inactive state remains. */
+    CHECK_EQ_INT(write_private(replacement, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\ninactive=v1\n"), 0);
+    snprintf(generation_swap_source, sizeof(generation_swap_source),
+             "%s", path);
+    snprintf(generation_swap_replacement,
+             sizeof(generation_swap_replacement), "%s", replacement);
+    generation_swap_error = 0;
+    installed = true;
+    config_set_io_fault_fn(replace_source_at_state_publication);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1); /* pre-fix: 0 */
+    config_set_io_fault_fn(NULL);
+    CHECK_EQ_INT(generation_swap_error, 0);
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message,
+                 "changed since it was loaded") != NULL);
+    CHECK(read_text(path, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, two_accounts_legacy);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+}
+
 TEST(historical_active_state_migrates_without_reset_resurrection) {
     char dir[128], path[256], hint[256], text[1024];
     struct stat state_before, state_after;
@@ -566,6 +660,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(backups_are_durable_monotonic_and_bounded);
     RUN_TEST(backup_faults_abort_and_full_save_rolls_state_back);
     RUN_TEST(active_state_only_save_preserves_accounts_and_is_idempotent);
+    RUN_TEST(active_state_save_is_bound_to_loaded_config_generation);
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
     RUN_TEST(active_state_rejects_corruption_and_crash_mismatches);
     RUN_TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds);
