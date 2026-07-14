@@ -68,9 +68,6 @@ static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path,
                               const ssh_key_snapshot_t *snapshot);
-static int ssh_add_key_snapshot(ssh_config_t *ssh_config,
-                                const char *key_path,
-                                const ssh_key_snapshot_t *snapshot);
 static int ssh_start_isolated_agent_with_key(
     ssh_config_t *ssh_config, const account_t *account,
     const ssh_key_snapshot_t *snapshot);
@@ -1473,6 +1470,14 @@ bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
     return ssh_socket_has_key(dir_fd, socket_arg, key_path);
 }
 
+static int reject_system_agent_mode(void) {
+    set_error(
+        ERR_INVALID_ARGS,
+        "System SSH agent replacement mode is deprecated and unsupported: "
+        "gitswitch cannot restore cleared private identities; use isolated "
+        "or no-agent mode");
+    return -1;
+}
 
 /* Initialize SSH manager */
 int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
@@ -1480,6 +1485,11 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
         set_error(ERR_INVALID_ARGS, "NULL ssh_config to ssh_manager_init");
         return -1;
     }
+    /* Retain the legacy enum token for source compatibility, but reject it
+     * before touching caller storage or probing the host. The agent protocol
+     * cannot export private identities, so `ssh-add -D` has no truthful
+     * rollback if a later load, verification, or alias publication fails. */
+    if (mode == SSH_AGENT_SYSTEM) return reject_system_agent_mode();
     
     log_debug("Initializing SSH manager with mode: %d", mode);
     
@@ -1511,15 +1521,7 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
     /* Set up based on mode */
     switch (mode) {
         case SSH_AGENT_SYSTEM:
-            /* Use existing SSH_AUTH_SOCK */
-            if (getenv("SSH_AUTH_SOCK")) {
-                safe_strncpy(ssh_config->agent_socket_path, getenv("SSH_AUTH_SOCK"),
-                           sizeof(ssh_config->agent_socket_path));
-                log_info("Using system SSH agent at: %s", ssh_config->agent_socket_path);
-            } else {
-                log_warning("No system SSH agent found (SSH_AUTH_SOCK not set)");
-            }
-            break;
+            return reject_system_agent_mode();
             
         case SSH_AGENT_ISOLATED:
             /* Will create isolated agents on demand */
@@ -1587,6 +1589,9 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_switch_account");
         return -1;
     }
+    if (ssh_config->mode == SSH_AGENT_SYSTEM) {
+        return reject_system_agent_mode();
+    }
     
     /* Skip if SSH not enabled for this account */
     if (!account->ssh_enabled || strlen(account->ssh_key_path) == 0) {
@@ -1612,31 +1617,8 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
     /* Handle based on mode */
     switch (ssh_config->mode) {
         case SSH_AGENT_SYSTEM:
-            /* Clear existing keys and add new one to system agent */
-            if (strlen(ssh_config->agent_socket_path) > 0) {
-                log_debug("Clearing system SSH agent keys");
-                if (ssh_clear_agent_keys(ssh_config) != 0) {
-                    goto done;
-                }
-                
-                log_debug("Adding key to system SSH agent: %s", expanded_key_path);
-                if (ssh_add_key_snapshot(ssh_config, expanded_key_path,
-                                         &key_snapshot) != 0) {
-                    set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to load key into system SSH agent");
-                    goto done;
-                }
-                if (!ssh_agent_has_exact_key_generation(
-                        -1, false, ssh_config->agent_socket_path,
-                        expanded_key_path, &key_snapshot)) {
-                    set_error(ERR_SSH_KEY_LOAD_FAILED,
-                              "System SSH agent does not contain exactly the "
-                              "requested key after replacement");
-                    goto done;
-                }
-            } else {
-                log_warning("No system SSH agent available");
-            }
-            break;
+            rc = reject_system_agent_mode();
+            goto done;
             
         case SSH_AGENT_ISOLATED:
             /* Start the isolated agent and load its key while the socket
@@ -2511,10 +2493,11 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
         return -1;
     }
     
-    /* Execute ssh-add -D to delete all keys. A nonzero result is not evidence
-     * that the agent was already empty: it can also mean the agent was
-     * unreachable or rejected the operation. Loading into that unproved state
-     * would violate system mode's exact replacement contract. */
+    /* Execute ssh-add -D to delete all keys. This low-level operation is
+     * intentionally destructive and nontransactional; ssh_switch_account()
+     * never calls it. A nonzero result is not evidence that the agent was
+     * already empty: it can also mean the agent was unreachable or rejected
+     * the operation. */
     if (ssh_run(output, sizeof(output), false, "ssh-add", "-D",
                 (const char *)NULL) != 0) {
         set_error(ERR_SSH_KEY_LOAD_FAILED,
@@ -2556,45 +2539,6 @@ int ssh_add_key(ssh_config_t *ssh_config, const char *key_path) {
         return -1;
     }
 
-    log_info("SSH key added successfully: %s", key_path);
-    return 0;
-}
-
-/* Load the already-admitted key generation through stdin. OpenSSH treats a
- * lone `-` as a private-key stream; passphrase acquisition remains on its
- * normal /dev/tty or SSH_ASKPASS channel after the runner closes this pipe.
- * run_argv writes directly from the caller-owned buffer and never logs it. */
-static int ssh_add_key_snapshot(ssh_config_t *ssh_config,
-                                const char *key_path,
-                                const ssh_key_snapshot_t *snapshot) {
-    const char *argv[] = {"ssh-add", "-k", "-", NULL};
-    char output[512];
-    run_opts_t opts;
-    run_result_t res;
-
-    if (!ssh_config || !key_path || !*key_path || !snapshot ||
-        !snapshot->data || snapshot->length == 0) {
-        set_error(ERR_INVALID_ARGS,
-                  "Invalid descriptor-backed SSH key-load arguments");
-        return -1;
-    }
-    if (ssh_config->agent_socket_path[0] == '\0') {
-        set_error(ERR_SSH_AGENT_NOT_FOUND, "No SSH agent available");
-        return -1;
-    }
-    if (setup_ssh_environment(ssh_config) != 0) return -1;
-
-    memset(&opts, 0, sizeof(opts));
-    memset(&res, 0, sizeof(res));
-    opts.out = output;
-    opts.out_size = sizeof(output);
-    opts.input = snapshot->data;
-    opts.input_len = snapshot->length;
-    if (run_argv(argv, &opts, &res) != 0) {
-        set_error(ERR_SSH_KEY_LOAD_FAILED, "Failed to add SSH key: %s",
-                  output);
-        return -1;
-    }
     log_info("SSH key added successfully: %s", key_path);
     return 0;
 }

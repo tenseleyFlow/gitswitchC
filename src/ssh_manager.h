@@ -18,7 +18,10 @@
 
 /* SSH agent management modes */
 typedef enum {
-    SSH_AGENT_SYSTEM,      /* Use system SSH agent */
+    /* Deprecated compatibility token. Initialization and switching reject
+     * this mode before mutation because a shared agent's cleared private
+     * identities cannot be exported and restored transactionally. */
+    SSH_AGENT_SYSTEM,
     SSH_AGENT_ISOLATED,    /* Use isolated SSH agent per account */
     SSH_AGENT_NONE         /* No SSH agent management */
 } ssh_agent_mode_t;
@@ -105,7 +108,9 @@ typedef struct {
 /* Function prototypes */
 
 /**
- * Initialize SSH manager with specified mode
+ * Initialize SSH manager with specified mode. SSH_AGENT_SYSTEM is retained as
+ * a source-compatibility token but is unsupported and returns an error without
+ * changing ssh_config; use SSH_AGENT_ISOLATED or SSH_AGENT_NONE.
  */
 int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode);
 
@@ -116,7 +121,7 @@ int ssh_manager_cleanup(ssh_config_t *ssh_config);
 
 /**
  * Switch to account's SSH configuration with proper isolation
- * - Clears current SSH agent keys if using isolated mode
+ * - Rejects deprecated SSH_AGENT_SYSTEM before reading keys or mutating state
  * - Loads account's SSH key into appropriate agent
  * - Updates SSH_AUTH_SOCK environment if needed
  * - Validates key is properly loaded
@@ -189,7 +194,9 @@ ssh_probe_poll_fn ssh_manager_set_probe_poll_fn(ssh_probe_poll_fn fn);
 int ssh_stop_agent(ssh_config_t *ssh_config);
 
 /**
- * Clear all keys from SSH agent
+ * Explicitly clear all keys from the selected SSH agent. This primitive is
+ * destructive and nontransactional; cleared private identities cannot be
+ * exported or restored. Account switching never calls it.
  */
 int ssh_clear_agent_keys(ssh_config_t *ssh_config);
 
