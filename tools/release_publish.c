@@ -583,7 +583,7 @@ static int run_to_descriptor(int output_fd, char *const command[])
         if (output_fd != STDOUT_FILENO) {
             (void)close(output_fd);
         }
-        execvp(command[0], command);
+        execvp(command[0], command); /* Flawfinder: ignore — argv-vector exec of the operator's archive command; no shell, vector from the Makefile recipe */
         _exit(errno == ENOENT ? 127 : 126);
     }
     /* Publish the producer to the fatal-signal forwarder before anything in

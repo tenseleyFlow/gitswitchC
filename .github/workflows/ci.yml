@@ -35,9 +35,11 @@ jobs:
       # authoritative gate is the symbol check on the built binary below
       # (AR-05 L8).
       - name: No-shell gate (source tripwire)
+        # AR-10 L27: tools/ (the release publisher) is inside the release
+        # pipeline's trust boundary and is held to the same no-shell rule.
         run: |
-          if grep -rn -e 'popen(' -e 'system(' src/*.c src/*.h; then
-            echo "ERROR: shell-based process execution reintroduced in src/" >&2
+          if grep -rn -e 'popen(' -e 'system(' src/*.c src/*.h tools/*.c; then
+            echo "ERROR: shell-based process execution reintroduced in src/ or tools/" >&2
             exit 1
           fi
       - name: Build + test (ASan/UBSan, warnings-as-errors, runtimes required)
@@ -82,6 +84,15 @@ jobs:
           syms=$(nm -D --undefined-only build/bin/gitswitch) || { echo "ERROR: nm failed on release binary" >&2; exit 1; }
           if printf '%s\n' "$syms" | grep -E '(^| )(system|popen)(@|$)'; then
             echo "ERROR: release binary references system()/popen()" >&2
+            exit 1
+          fi
+          # AR-10 L27: the release publisher executes inside the pipeline's
+          # trust boundary; hold its linked binary to the same symbol gate.
+          make build/tools/release-publish
+          test -x build/tools/release-publish || { echo "ERROR: release publisher build/tools/release-publish missing or not executable" >&2; exit 1; }
+          syms=$(nm -D --undefined-only build/tools/release-publish) || { echo "ERROR: nm failed on release publisher" >&2; exit 1; }
+          if printf '%s\n' "$syms" | grep -E '(^| )(system|popen)(@|$)'; then
+            echo "ERROR: release publisher references system()/popen()" >&2
             exit 1
           fi
       # AR-05 L3: run REAL Valgrind against the release binaries. The

@@ -900,7 +900,7 @@ analyze:
 	@if command -v cppcheck >/dev/null 2>&1; then \
 		cppcheck --enable=warning,performance,portability \
 			--error-exitcode=1 --std=c11 \
-			--suppress=missingIncludeSystem $(SRCDIR); \
+			--suppress=missingIncludeSystem $(SRCDIR) tools; \
 	else \
 		echo "cppcheck not installed - skipping static analysis"; \
 	fi
@@ -920,12 +920,13 @@ format:
 # (AR-05 L1). Every pre-existing level-4 hit was triaged and carries an
 # inline "Flawfinder: ignore" with its rationale, so a NEW level-4 use of a
 # strcpy/format/exec-class function now fails this target until it is either
-# fixed or explicitly annotated.
+# fixed or explicitly annotated. AR-10 L27: tools/ (the release publisher)
+# ships in the pipeline's trust boundary and is scanned under the same gate.
 .PHONY: security-scan
 security-scan:
 	@echo "Running security scan..."
 	@if command -v flawfinder >/dev/null 2>&1; then \
-		flawfinder --error-level=4 $(SRCDIR); \
+		flawfinder --error-level=4 $(SRCDIR) tools; \
 	else \
 		echo "flawfinder not installed - skipping security scan"; \
 	fi
