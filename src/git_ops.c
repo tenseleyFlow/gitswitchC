@@ -3563,72 +3563,45 @@ int git_clear_config(git_scope_t scope) {
  * code, and git_get_config_scope's system-scope arm implied a scope model the
  * rest of git_ops does not use). */
 
-/* Test git configuration */
+/* Validate the account model Git will actually consume. */
 int git_test_config(const account_t *account, git_scope_t scope) {
-    char verify_name[MAX_NAME_LEN];
-    char verify_email[MAX_EMAIL_LEN];
-
     if (!account) {
         set_error(ERR_INVALID_ARGS, "NULL account to git_test_config");
         return -1;
     }
-    if (git_reject_ssh_command_override() != 0) return -1;
+    if (!git_scope_to_flag(scope)) {
+        set_error(ERR_INVALID_ARGS, "Invalid git scope");
+        return -1;
+    }
 
     log_info("Testing git configuration for account: %s", account->name);
 
-    /* Get configuration from the specified scope and verify it matches */
-    if (git_get_config_value(GIT_CONFIG_USER_NAME, verify_name, sizeof(verify_name), scope) != 0 ||
-        git_get_config_value(GIT_CONFIG_USER_EMAIL, verify_email, sizeof(verify_email), scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to read git configuration from %s scope",
-                  git_scope_to_flag(scope));
-        return -1;
-    }
+    /* Reuse the switch path's strict merged-account model: exact identity,
+     * SSH command, signing key/state and format, with every managed GPG
+     * program override absent. A selected-scope-only read is insufficient
+     * because a higher-precedence scope may override the values Git uses. */
+    if (git_verify_merged_account(account) != 0) return -1;
 
-    if (strcmp(verify_name, account->name) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Git user.name does not match account: expected '%s', got '%s'",
-                  account->name, verify_name);
-        return -1;
-    }
-
-    if (strcmp(verify_email, account->email) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Git user.email does not match account: expected '%s', got '%s'",
-                  account->email, verify_email);
-        return -1;
-    }
-    
-    /* Test GPG configuration if enabled */
-    if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-        char signing_key[MAX_GPG_FINGERPRINT_LEN];
-        char gpg_sign[16];
-
-        if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, signing_key, sizeof(signing_key), scope) != 0 ||
-            strlen(signing_key) == 0) {
-            set_error(ERR_GIT_CONFIG_FAILED, "GPG signing key not configured in git");
+    /* Check local key availability when signing is configured. This does not
+     * create a commit or signature; functional signing must be tested by a
+     * caller that explicitly owns those side effects. Which keyring gpg
+     * consults is decided by GNUPGHOME — by the time a switch validates itself
+     * that is already the account's isolated home. The probe is skipped when
+     * an earlier spawn already proved the key's presence (AR-02 #14). */
+    if (account->gpg_enabled && account->gpg_key_id[0] != '\0' &&
+        !gpg_manager_key_available_cached(account->gpg_key_id)) {
+        const char *gpg_argv[] = {
+            "gpg", "--list-secret-keys", account->gpg_key_id, NULL
+        };
+        run_opts_t gpg_opts;
+        memset(&gpg_opts, 0, sizeof(gpg_opts));
+        gpg_opts.stderr_to_devnull = true;
+        if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
+            set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s",
+                      account->gpg_key_id);
             return -1;
         }
-
-        if (git_get_config_value(GIT_CONFIG_COMMIT_GPGSIGN, gpg_sign, sizeof(gpg_sign), scope) != 0 ||
-            strcmp(gpg_sign, "true") != 0) {
-            log_warning("GPG signing is configured but not enabled");
-        }
-
-        /* Test GPG key availability (no shell). Which keyring gpg consults is
-         * decided by GNUPGHOME — by the time a switch validates itself that is
-         * already the account's isolated home, not the system keyring the old
-         * comment claimed. Skipped entirely when a gpg spawn earlier in this
-         * process already proved the key's presence, which on the switch path
-         * is always true (AR-02 #14). */
-        if (!gpg_manager_key_available_cached(account->gpg_key_id)) {
-            const char *gpg_argv[] = {"gpg", "--list-secret-keys", account->gpg_key_id, NULL};
-            run_opts_t gpg_opts;
-            memset(&gpg_opts, 0, sizeof(gpg_opts));
-            gpg_opts.stderr_to_devnull = true;
-            if (run_argv(gpg_argv, &gpg_opts, NULL) != 0) {
-                set_error(ERR_GPG_KEY_NOT_FOUND, "GPG key not available: %s", account->gpg_key_id);
-                return -1;
-            }
-            gpg_manager_note_key_available(account->gpg_key_id);
-        }
+        gpg_manager_note_key_available(account->gpg_key_id);
     }
 
     log_info("Git configuration test passed for %s", account->name);

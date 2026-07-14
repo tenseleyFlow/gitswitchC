@@ -154,10 +154,13 @@ void git_config_commit(void);
  * — dead public API with zero callers. */
 
 /**
- * Test git configuration
- * - Creates a test commit (dry-run)
- * - Validates signing if enabled
- * - Verifies SSH access to remotes if applicable
+ * Validate that Git's fresh merged effective configuration exactly represents
+ * the selected account: identity, managed SSH command, signing key and enabled
+ * state, OpenPGP format, and absence of managed GPG program overrides. When
+ * GPG is enabled, also require the selected secret key to be locally
+ * available. `scope` must be a valid public scope but does not limit the
+ * effective read. This function creates no commit or signature and performs
+ * no remote authentication or other network access.
  */
 int git_test_config(const account_t *account, git_scope_t scope);
 

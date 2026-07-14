@@ -34,6 +34,7 @@ static struct {
 
 static int fk_execs;           /* every subprocess the code under test spawned */
 static int fk_identity_reads;  /* `git config <scope> user.name|user.email` reads */
+static int fk_effective_reads; /* atomic merged managed-key listing reads */
 static bool fk_is_repo;        /* what `git rev-parse --git-dir` reports */
 static const char *fk_repo_root_output;
 static int fk_repo_root_exit;
@@ -42,6 +43,7 @@ static void fk_reset(void) {
     memset(fk_store, 0, sizeof(fk_store));
     fk_execs = 0;
     fk_identity_reads = 0;
+    fk_effective_reads = 0;
     fk_is_repo = false;
     fk_repo_root_output = NULL;
     fk_repo_root_exit = 1;
@@ -132,8 +134,10 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
     }
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
-        if (strcmp(argv[2], "--show-origin") == 0)
+        if (strcmp(argv[2], "--show-origin") == 0) {
+            fk_effective_reads++;
             return fk_emit_effective_listing(opts, result);
+        }
         const char *scope = argv[2];
 
         /* Production emits --unset-all (AR-06 F03); accept the legacy spelling
@@ -750,10 +754,11 @@ TEST(git_test_config_rechecks_external_identity) {
     safe_strncpy(acct.name, "Test User", sizeof(acct.name));
     safe_strncpy(acct.email, "test@example.com", sizeof(acct.email));
 
-    /* Full switch write: sets identity, then verifies by reading it back
-     * from git — exactly two identity reads. */
+    /* Full switch write verifies both the selected scope and one fresh merged
+     * effective listing. */
     CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(fk_identity_reads, 2);
+    CHECK_EQ_INT(fk_effective_reads, 1);
 
     /* Model another process changing Git after the forward read-back. The
      * next public validation must execute and reject the new value; the old
@@ -766,9 +771,81 @@ TEST(git_test_config_rechecks_external_identity) {
                  "External User");
     }
     CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
-    CHECK_EQ_INT(fk_identity_reads, 4);
+    CHECK_EQ_INT(fk_identity_reads, 2);
+    CHECK_EQ_INT(fk_effective_reads, 2);
     if (in >= 0) CHECK_STR_EQ(fk_store[in].value, "External User");
     if (ie >= 0) CHECK_STR_EQ(fk_store[ie].value, "test@example.com");
+
+    run_set_runner(prev);
+}
+
+/* ---- L13: public Git validation enforces the selected signing model ----- */
+
+TEST(git_test_config_rejects_wrong_effective_signing_state) {
+    git_ops_test_reset_caches();
+    fk_reset();
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    account_t acct;
+    int signing_key;
+    int signing_enabled;
+
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "GPG User", sizeof(acct.name));
+    safe_strncpy(acct.email, "gpg@example.com", sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "BEEFCAFE01234567",
+                 sizeof(acct.gpg_key_id));
+
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    gpg_manager_note_key_available(acct.gpg_key_id);
+    signing_key = fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY);
+    signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
+    CHECK(signing_key >= 0 && signing_enabled >= 0);
+
+    /* A nonempty key is not sufficient: it must be the selected key. */
+    if (signing_key >= 0) {
+        snprintf(fk_store[signing_key].value,
+                 sizeof(fk_store[signing_key].value), "%s",
+                 "AAAAAAAAAAAAAAAA");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    /* Signing enabled/disabled is selected account state, not a warning. */
+    if (signing_key >= 0) {
+        snprintf(fk_store[signing_key].value,
+                 sizeof(fk_store[signing_key].value), "%s",
+                 acct.gpg_key_id);
+    }
+    if (signing_enabled >= 0) {
+        snprintf(fk_store[signing_enabled].value,
+                 sizeof(fk_store[signing_enabled].value), "%s", "false");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    acct.gpg_signing_enabled = false;
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
+    CHECK(signing_enabled >= 0);
+    if (signing_enabled >= 0) {
+        snprintf(fk_store[signing_enabled].value,
+                 sizeof(fk_store[signing_enabled].value), "%s", "true");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+
+    /* A non-signing account must reject stale signing state as well. */
+    acct.gpg_enabled = false;
+    acct.gpg_signing_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    signing_key = fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY);
+    signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
+    CHECK(signing_key < 0 && signing_enabled >= 0);
+    if (signing_enabled >= 0) {
+        snprintf(fk_store[signing_enabled].value,
+                 sizeof(fk_store[signing_enabled].value), "%s", "true");
+    }
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
 
     run_set_runner(prev);
 }
@@ -910,6 +987,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(overlong_sshcommand_snapshots_present_and_restores_verbatim);
     RUN_TEST(oversize_foreign_sshcommand_restores_exactly);
     RUN_TEST(git_test_config_rechecks_external_identity);
+    RUN_TEST(git_test_config_rejects_wrong_effective_signing_state);
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
 TEST_MAIN_END()
