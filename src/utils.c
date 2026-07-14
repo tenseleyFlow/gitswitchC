@@ -56,9 +56,21 @@ extern char **environ;
 #define GITSWITCH_HAVE_DIRECTORY_NOFOLLOW 0
 #endif
 
-/* Static variables for terminal state management */
-static struct termios g_original_termios;
-static bool g_echo_disabled = false;
+typedef struct {
+    bool active;
+    int fd;
+    dev_t dev;
+    ino_t ino;
+    dev_t rdev;
+    struct termios original;
+} terminal_echo_state_t;
+
+/* Echo recovery owns the exact terminal it changed, not whichever object is
+ * later installed as standard input.  Publish this state only after the
+ * no-echo transition succeeds. */
+static terminal_echo_state_t g_terminal_echo_state = {
+    .fd = -1
+};
 
 #define RUNTIME_LOCK_CONTEXTS 8
 #define PRIVATE_LOCK_INODES 64
@@ -104,7 +116,7 @@ static pid_t g_private_lock_pid;
 static pid_t g_runtime_lock_pid;
 static uint64_t g_private_lock_next_generation;
 
-static int private_lock_dup_cloexec(int fd);
+static int dup_cloexec(int fd, int minimum);
 static int private_lock_inode_acquire(int owned_fd, bool nonblocking,
                                       size_t *slot_out);
 static void private_lock_inode_release(size_t slot);
@@ -629,7 +641,7 @@ static int open_runtime_path_nofollow(const char *path, struct stat *opened,
         if (anchor_slot && *anchor_slot == PRIVATE_LOCK_INODES &&
             runtime_entry_may_be_replaced(current_fd, next_fd, &current_stat,
                                           &next_stat)) {
-            int anchor_fd = private_lock_dup_cloexec(current_fd);
+            int anchor_fd = dup_cloexec(current_fd, 0);
             if (anchor_fd < 0 ||
                 private_lock_inode_acquire(anchor_fd, true,
                                            anchor_slot) != 0) {
@@ -1027,8 +1039,11 @@ static bool private_lock_fd_has_identity(int fd, dev_t dev, ino_t ino) {
     return fd >= 0 && fstat(fd, &st) == 0 && st.st_dev == dev && st.st_ino == ino;
 }
 
-static int private_lock_dup_cloexec(int fd) {
-    int copy = dup(fd);
+static int dup_cloexec(int fd, int minimum) {
+#ifdef F_DUPFD_CLOEXEC
+    return fcntl(fd, F_DUPFD_CLOEXEC, minimum);
+#else
+    int copy = fcntl(fd, F_DUPFD, minimum);
     if (copy >= 0 && fcntl(copy, F_SETFD, FD_CLOEXEC) != 0) {
         int saved_errno = errno;
         close(copy);
@@ -1036,6 +1051,7 @@ static int private_lock_dup_cloexec(int fd) {
         return -1;
     }
     return copy;
+#endif
 }
 
 /* flock state is inherited across fork because parent and child initially
@@ -1191,7 +1207,7 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     dir_flags |= O_NOFOLLOW;
 #endif
     parent_fd = openat(dir_fd, "..", dir_flags);
-    leaf_fd = private_lock_dup_cloexec(dir_fd);
+    leaf_fd = dup_cloexec(dir_fd, 0);
     if (parent_fd < 0 || leaf_fd < 0 || fstat(leaf_fd, &leaf) != 0 ||
         !S_ISDIR(leaf.st_mode)) {
         int saved_errno = errno;
@@ -1250,7 +1266,7 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
         errno = EACCES;
         goto fail;
     }
-    token_fd = private_lock_dup_cloexec(g_private_lock_inodes[file_slot].fd);
+    token_fd = dup_cloexec(g_private_lock_inodes[file_slot].fd, 0);
     if (token_fd < 0) goto fail;
     if (private_lock_allocate_generation(&token_generation) != 0) goto fail;
 
@@ -4867,45 +4883,184 @@ int get_terminal_size(int *width, int *height) {
     return 0;
 }
 
-int disable_echo(void) {
-    struct termios new_termios;
+#ifdef GITSWITCH_TESTING
+typedef void (*echo_tcsetattr_test_hook_fn)(int fd);
 
-    if (g_echo_disabled) return 0;
+static int g_test_echo_tcsetattr_errno;
+static echo_tcsetattr_test_hook_fn g_test_echo_tcsetattr_hook;
 
-    if (tcgetattr(STDIN_FILENO, &g_original_termios) != 0) {
-        int saved_errno = errno;
-        set_system_error(ERR_SYSTEM_CALL,
-                         "Failed to read terminal state before disabling echo");
-        errno = saved_errno;
-        return -1; /* Can't save original, don't disable echo. */
+void gitswitch_test_fail_echo_tcsetattr(int system_errno);
+echo_tcsetattr_test_hook_fn gitswitch_test_set_echo_tcsetattr_hook(
+    echo_tcsetattr_test_hook_fn hook);
+
+void gitswitch_test_fail_echo_tcsetattr(int system_errno) {
+    g_test_echo_tcsetattr_errno = system_errno > 0 ? system_errno : 0;
+}
+
+echo_tcsetattr_test_hook_fn gitswitch_test_set_echo_tcsetattr_hook(
+    echo_tcsetattr_test_hook_fn hook) {
+    echo_tcsetattr_test_hook_fn previous = g_test_echo_tcsetattr_hook;
+    g_test_echo_tcsetattr_hook = hook;
+    return previous;
+}
+#endif
+
+static int terminal_echo_tcsetattr(int fd, const struct termios *termios) {
+#ifdef GITSWITCH_TESTING
+    if (g_test_echo_tcsetattr_hook) {
+        echo_tcsetattr_test_hook_fn hook = g_test_echo_tcsetattr_hook;
+        g_test_echo_tcsetattr_hook = NULL;
+        hook(fd);
     }
-
-    new_termios = g_original_termios;
-    new_termios.c_lflag &= ~ECHO;
-
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_termios) != 0) {
-        int saved_errno = errno;
-        set_system_error(ERR_SYSTEM_CALL, "Failed to disable terminal echo");
-        errno = saved_errno;
+    if (g_test_echo_tcsetattr_errno != 0) {
+        int injected_errno = g_test_echo_tcsetattr_errno;
+        g_test_echo_tcsetattr_errno = 0;
+        errno = injected_errno;
         return -1;
     }
-    g_echo_disabled = true;
+#endif
+    return tcsetattr(fd, TCSANOW, termios);
+}
+
+static bool terminal_echo_identity_matches(const struct stat *st) {
+    return st && st->st_dev == g_terminal_echo_state.dev &&
+           st->st_ino == g_terminal_echo_state.ino &&
+           st->st_rdev == g_terminal_echo_state.rdev;
+}
+
+static int terminal_echo_fail(const char *action, const char *reason,
+                              int system_errno) {
+    errno = system_errno;
+    set_system_error(ERR_SYSTEM_CALL, "Failed to %s: %s", action, reason);
+    errno = system_errno;
+    return -1;
+}
+
+static int terminal_echo_validate_owner(const char *action) {
+    struct stat retained;
+    struct stat current;
+
+    if (fstat(g_terminal_echo_state.fd, &retained) != 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail(action,
+                                  "retained terminal descriptor is unavailable",
+                                  saved_errno);
+    }
+    if (!terminal_echo_identity_matches(&retained)) {
+        return terminal_echo_fail(action,
+                                  "retained terminal descriptor changed identity",
+                                  ESTALE);
+    }
+    if (fstat(STDIN_FILENO, &current) != 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail(action,
+                                  "standard input is unavailable",
+                                  saved_errno);
+    }
+    if (!terminal_echo_identity_matches(&current)) {
+        return terminal_echo_fail(action,
+                                  "standard input identifies another terminal",
+                                  ESTALE);
+    }
+    return 0;
+}
+
+int disable_echo(void) {
+    struct termios original;
+    struct termios new_termios;
+    struct stat retained;
+    struct stat current;
+    int retained_fd;
+
+    if (g_terminal_echo_state.active) {
+        if (terminal_echo_validate_owner("disable terminal echo") != 0) {
+            return -1;
+        }
+        clear_error();
+        return 0;
+    }
+
+    retained_fd = dup_cloexec(STDIN_FILENO, STDERR_FILENO + 1);
+    if (retained_fd < 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail("disable terminal echo",
+                                  "could not retain standard input",
+                                  saved_errno);
+    }
+
+    if (fstat(retained_fd, &retained) != 0 ||
+        fstat(STDIN_FILENO, &current) != 0) {
+        int saved_errno = errno;
+        close(retained_fd);
+        return terminal_echo_fail("disable terminal echo",
+                                  "could not inspect terminal identity",
+                                  saved_errno);
+    }
+    if (retained.st_dev != current.st_dev ||
+        retained.st_ino != current.st_ino ||
+        retained.st_rdev != current.st_rdev) {
+        close(retained_fd);
+        return terminal_echo_fail("disable terminal echo",
+                                  "standard input changed while being retained",
+                                  ESTALE);
+    }
+
+    if (tcgetattr(retained_fd, &original) != 0) {
+        int saved_errno = errno;
+        close(retained_fd);
+        return terminal_echo_fail(
+            "disable terminal echo",
+            "could not read the original terminal state", saved_errno);
+    }
+
+    new_termios = original;
+    new_termios.c_lflag &= ~ECHO;
+
+    if (terminal_echo_tcsetattr(retained_fd, &new_termios) != 0) {
+        int saved_errno = errno;
+        close(retained_fd);
+        return terminal_echo_fail("disable terminal echo",
+                                  "terminal rejected the no-echo state",
+                                  saved_errno);
+    }
+
+    g_terminal_echo_state.fd = retained_fd;
+    g_terminal_echo_state.dev = retained.st_dev;
+    g_terminal_echo_state.ino = retained.st_ino;
+    g_terminal_echo_state.rdev = retained.st_rdev;
+    g_terminal_echo_state.original = original;
+    g_terminal_echo_state.active = true;
+    clear_error();
     return 0;
 }
 
 int enable_echo(void) {
-    if (!g_echo_disabled) return 0;
+    int retained_fd;
 
-    /* Keep the recovery flag set until the kernel accepts the restore. A
-     * transient descriptor/PTY failure must remain retryable rather than
-     * turning every later enable_echo() call into a false-success no-op. */
-    if (tcsetattr(STDIN_FILENO, TCSANOW, &g_original_termios) != 0) {
-        int saved_errno = errno;
-        set_system_error(ERR_SYSTEM_CALL, "Failed to restore terminal echo");
-        errno = saved_errno;
+    if (!g_terminal_echo_state.active) {
+        clear_error();
+        return 0;
+    }
+
+    if (terminal_echo_validate_owner("restore terminal echo") != 0) {
         return -1;
     }
-    g_echo_disabled = false;
+
+    /* Keep ownership until the retained terminal accepts the restore. A
+     * transient failure must remain retryable and a replacement standard
+     * input must never receive another terminal's saved attributes. */
+    if (terminal_echo_tcsetattr(g_terminal_echo_state.fd,
+                                &g_terminal_echo_state.original) != 0) {
+        int saved_errno = errno;
+        return terminal_echo_fail("restore terminal echo",
+                                  "terminal rejected the original state",
+                                  saved_errno);
+    }
+
+    retained_fd = g_terminal_echo_state.fd;
+    memset(&g_terminal_echo_state, 0, sizeof(g_terminal_echo_state));
+    g_terminal_echo_state.fd = -1;
+    close(retained_fd);
     clear_error();
     return 0;
 }

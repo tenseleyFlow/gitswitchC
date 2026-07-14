@@ -371,9 +371,16 @@ int ensure_config_directory_exists(void);
  */
 bool is_terminal(int fd);
 int get_terminal_size(int *width, int *height);
-/* Echo transitions are idempotent. Failures return -1 with errno mirrored in
- * the global error context; a failed restore remains pending so callers can
- * retry enable_echo() after repairing the terminal descriptor. */
+/* Echo transitions are bound to the terminal currently installed as standard
+ * input. disable_echo() retains a close-on-exec descriptor above the three
+ * standard-stream slots and records the terminal's device/inode identity
+ * before changing it. Repeated disable on that same terminal is idempotent.
+ * While a restore is pending, either operation rejects a different/reused
+ * standard-input descriptor without changing either terminal. enable_echo()
+ * restores only through the retained descriptor after validating both
+ * identities; a failed restore keeps ownership for retry and closes the
+ * retained descriptor only after success. Failures return -1 with errno
+ * mirrored in the global error context. */
 int disable_echo(void);
 int enable_echo(void);
 

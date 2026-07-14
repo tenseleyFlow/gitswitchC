@@ -711,8 +711,9 @@ $(AR08_HINT_CONFIG_OBJECT): $(SRCDIR)/config.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
-# The copy/read and runner suites use deterministic descriptor/sigaction
-# checkpoints; production utils.o contains none of those test-only hooks.
+# The copy/read, runner, and terminal-echo suites use deterministic descriptor,
+# sigaction, and tcsetattr checkpoints; production utils.o contains none of
+# those test-only hooks.
 $(AR08_COPY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling AR-08 copy permission test object..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
@@ -769,6 +770,13 @@ $(BINDIR)/test_ar08_resume_hint_race: \
 
 $(BINDIR)/test_ar08_copy_permissions: \
 		$(OBJDIR)/test_ar08_copy_permissions.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_ar08_echo: \
+		$(OBJDIR)/test_ar08_echo.o \
 		$(AR08_COPY_UTILS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
