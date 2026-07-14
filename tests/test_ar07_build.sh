@@ -178,7 +178,7 @@ for arg do
 done
 printf '\n' >>"$AR07_CC_LOG"
 if [ "${AR07_DROP_TARGET_FLAGS:-0}" -eq 1 ]; then
-    args_file=${TMPDIR:-/tmp}/gitswitch-ar07-cc-args.$$
+    args_file=$AR07_CC_LOG.args.$$
     trap 'rm -f "$args_file"' 0 1 2 3 15
     : >"$args_file"
     for arg do
@@ -191,6 +191,7 @@ if [ "${AR07_DROP_TARGET_FLAGS:-0}" -eq 1 ]; then
     while IFS= read -r arg; do
         set -- "$@" "$arg"
     done <"$args_file"
+    rm -f "$args_file"
 fi
 exec "$AR07_REAL_CC" "$@"
 EOF
@@ -635,6 +636,11 @@ grep -F 'version=override-version' "$fixture/build/obj/.buildconfig" >/dev/null 
     fail "VERSION override was not preserved in the build fingerprint"
 grep -F 'commit=override-commit' "$fixture/build/obj/.buildconfig" >/dev/null ||
     fail "COMMIT override was not preserved in the build fingerprint"
+
+for args_residue in "$cc_log".args.*; do
+    [ ! -e "$args_residue" ] ||
+        fail "compiler wrapper left argument scratch behind"
+done
 
 printf '%s\n' \
     'ar07-build: PASS (complete fingerprints, precise depfiles, frozen probes)'
