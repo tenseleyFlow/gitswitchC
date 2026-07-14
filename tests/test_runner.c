@@ -38,8 +38,12 @@ static void raise_second_rollback_signal_before_pid_publication(void) {
     sigset_t current;
     sigset_t expected = g_expected_parent_mask;
 
+    /* The spawn window blocks every guard-INSTALLED signal: SIGINT, SIGTERM,
+     * and (AR-10 L16) SIGQUIT; SIGHUP is SIG_IGN in this fixture, so the
+     * guard deliberately skipped it. */
     sigaddset(&expected, SIGINT);
     sigaddset(&expected, SIGTERM);
+    sigaddset(&expected, SIGQUIT);
     g_post_fork_hook_called = 1;
     g_post_fork_hook_mask_exact =
         sigprocmask(SIG_SETMASK, NULL, &current) == 0 &&
