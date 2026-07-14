@@ -351,6 +351,103 @@ TEST(git_get_repo_root_requires_complete_exact_output) {
     run_set_runner(prev);
 }
 
+/* ---- L30: effective configuration capture has an operational ceiling --- */
+
+#define TEST_GIT_INSPECTION_MAX_BYTES (8U * 1024U * 1024U)
+
+static bool l30_complete_at_limit;
+static size_t l30_largest_capture;
+static int l30_capture_calls;
+
+static int l30_effective_runner(const char *const argv[],
+                                const run_opts_t *opts,
+                                run_result_t *result) {
+    static const char large_prefix[] =
+        "global\0file:/fake/config\0unrelated.large\n";
+    static const char managed_tail[] =
+        "\0global\0file:/fake/config\0user.name\nLimit User\0"
+        "global\0file:/fake/config\0user.email\nlimit@example.test\0";
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv[0] || strcmp(argv[0], "git") != 0 ||
+        !argv[1] || strcmp(argv[1], "config") != 0 ||
+        !argv[2] || strcmp(argv[2], "--show-origin") != 0 ||
+        !opts || !opts->out || opts->out_size == 0) {
+        return fk_ret(result, 1);
+    }
+
+    l30_capture_calls++;
+    if (opts->out_size > l30_largest_capture)
+        l30_largest_capture = opts->out_size;
+
+    /* Prevent the unfixed implementation from growing forever: crossing the
+     * documented ceiling becomes an observable runner failure. */
+    if (opts->out_size > TEST_GIT_INSPECTION_MAX_BYTES)
+        return fk_ret(result, 2);
+
+    if (l30_complete_at_limit &&
+        opts->out_size == TEST_GIT_INSPECTION_MAX_BYTES) {
+        size_t prefix_length = sizeof(large_prefix) - 1U;
+        size_t tail_length = sizeof(managed_tail) - 1U;
+        size_t output_length = opts->out_size - 1U;
+        size_t filler_length = output_length - prefix_length - tail_length;
+        memcpy(opts->out, large_prefix, prefix_length);
+        memset(opts->out + prefix_length, 'x', filler_length);
+        memcpy(opts->out + prefix_length + filler_length,
+               managed_tail, tail_length);
+        opts->out[output_length] = '\0';
+        if (result) {
+            result->out_len = output_length;
+            result->out_truncated = false;
+        }
+        return fk_ret(result, 0);
+    }
+
+    if (result) {
+        result->out_len = opts->out_size - 1U;
+        result->out_truncated = true;
+    }
+    return fk_ret(result, 0);
+}
+
+TEST(effective_config_capture_enforces_maximum) {
+    git_current_config_t current;
+    command_runner_fn prev;
+
+    git_ops_test_reset_caches();
+    unsetenv("GIT_SSH_COMMAND");
+    prev = run_set_runner(l30_effective_runner);
+
+    /* A complete result delivered at the ceiling remains valid. */
+    l30_complete_at_limit = true;
+    l30_largest_capture = 0;
+    l30_capture_calls = 0;
+    memset(&current, 0, sizeof(current));
+    CHECK_EQ_INT(git_get_current_config(&current), 0);
+    CHECK(current.valid);
+    CHECK_STR_EQ(current.name, "Limit User");
+    CHECK_STR_EQ(current.email, "limit@example.test");
+    CHECK(l30_largest_capture == TEST_GIT_INSPECTION_MAX_BYTES);
+    CHECK(l30_capture_calls > 1);
+
+    /* One byte beyond the ceiling fails without exposing partial status. */
+    l30_complete_at_limit = false;
+    l30_largest_capture = 0;
+    l30_capture_calls = 0;
+    memset(&current, 'x', sizeof(current));
+    CHECK_EQ_INT(git_get_current_config(&current), -1);
+    CHECK(!current.valid);
+    CHECK_EQ_INT(current.name[0], '\0');
+    CHECK(l30_largest_capture == TEST_GIT_INSPECTION_MAX_BYTES);
+    CHECK(strstr(get_last_error()->message, "exceeds") != NULL);
+
+    run_set_runner(prev);
+}
+
 /* ---- perf-3: identical managed-key writes collapse to one exec ---------- */
 
 TEST(git_set_config_value_skips_duplicate_managed_write) {
@@ -979,6 +1076,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_ops_init_spawns_no_subprocess);
     RUN_TEST(git_is_repository_caches_result);
     RUN_TEST(git_get_repo_root_requires_complete_exact_output);
+    RUN_TEST(effective_config_capture_enforces_maximum);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);

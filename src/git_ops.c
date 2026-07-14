@@ -94,6 +94,11 @@ static const char *const g_gpg_program_keys[] = {
 };
 
 #define GIT_GPG_FORMAT_OPENPGP "openpgp"
+/* Git's complete listing includes arbitrary unrelated user configuration, so
+ * inspection grows well beyond the managed-value representation. Bound both
+ * consumers at 8 MiB: over 30 times the maximum combined size of all managed
+ * values, while preventing an attacker-controlled config/include graph from
+ * driving unbounded allocation in this single-purpose CLI. */
 #define GIT_INSPECTION_INITIAL_BYTES (16U * 1024U)
 #define GIT_INSPECTION_MAX_BYTES (8U * 1024U * 1024U)
 static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]);
@@ -3168,11 +3173,12 @@ static void git_set_capture_error(const char *context,
 
 /* Read effective values and their exact scope/file origins. The complete Git
  * configuration can be much larger than the managed keys because --list
- * includes unrelated values. Grow and retry until the binary listing is
- * complete instead of converting a fixed-buffer truncation into six absences.
- * Allocation/size overflow is an explicit error, never a clean status. */
+ * includes unrelated values. Grow and retry up to the shared inspection
+ * ceiling instead of converting fixed-buffer truncation into false absence or
+ * permitting unbounded allocation. Oversize and allocation failures are
+ * explicit errors and never publish partial status. */
 static int git_read_effective_keys(git_effective_listing_t **out) {
-    size_t capacity = 16384U;
+    size_t capacity = GIT_INSPECTION_INITIAL_BYTES;
     char *list = NULL;
     const char *argv[] = {
         "git", "config", "--show-origin", "--show-scope", "-z", "--list", NULL
@@ -3204,6 +3210,12 @@ static int git_read_effective_keys(git_effective_listing_t **out) {
             return -1;
         }
         if (!res.out_truncated) {
+            if (res.out_len >= capacity) {
+                free(list);
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Invalid effective Git configuration capture length");
+                return -1;
+            }
             int parse_rc = parse_effective_listing(
                 list, res.out_len, &g_effective_listing);
             free(list);
@@ -3216,21 +3228,29 @@ static int git_read_effective_keys(git_effective_listing_t **out) {
             return 0;
         }
 
-        if (capacity > SIZE_MAX / 2U) {
+        if (capacity >= GIT_INSPECTION_MAX_BYTES) {
             free(list);
             set_error(ERR_GIT_CONFIG_FAILED,
-                      "Effective Git configuration is too large to inspect");
+                      "Effective Git configuration exceeds the %u-byte inspection limit",
+                      (unsigned)GIT_INSPECTION_MAX_BYTES);
             return -1;
         }
-        capacity *= 2U;
-        char *grown = realloc(list, capacity);
-        if (!grown) {
-            free(list);
-            set_error(ERR_MEMORY_ALLOCATION,
-                      "Out of memory growing effective Git configuration capture");
-            return -1;
+        {
+            size_t grown_capacity = capacity * 2U;
+            char *grown;
+            if (grown_capacity > GIT_INSPECTION_MAX_BYTES) {
+                grown_capacity = GIT_INSPECTION_MAX_BYTES;
+            }
+            grown = realloc(list, grown_capacity);
+            if (!grown) {
+                free(list);
+                set_error(ERR_MEMORY_ALLOCATION,
+                          "Out of memory growing effective Git configuration capture");
+                return -1;
+            }
+            list = grown;
+            capacity = grown_capacity;
         }
-        list = grown;
     }
 }
 
