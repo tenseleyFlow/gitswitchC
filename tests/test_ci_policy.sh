@@ -542,7 +542,9 @@ check_policy()
                        (direct_release_test &&
                         (step_env_map_count != 1 || step_env_count != 1 ||
                          step_caps_count != 1 ||
-                         step_caps_value != "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets")) ||
+                         step_caps_value != (current_job == "linux" ? \
+                             "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace" : \
+                             "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets"))) ||
                        (!direct_release_test &&
                         (step_env_map_count != 0 || step_env_count != 0))) {
                 reject("required release gate environment is missing or unsafe")
@@ -2270,7 +2272,7 @@ awk '
     }
     target && !changed &&
         $0 ~ /^          GITSWITCH_TEST_REQUIRED_CAPS:/ {
-        print "          GITSWITCH_TEST_REQUIRED_CAPS: '\''pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets'\''"
+        print "          GITSWITCH_TEST_REQUIRED_CAPS: '\''pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace'\''"
         changed = 1
         next
     }
