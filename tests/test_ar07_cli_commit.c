@@ -408,6 +408,55 @@ TEST(help_names_every_yes_confirmation_bypass) {
     unlink(output_path);
 }
 
+TEST(config_command_reports_exact_owner_only_mode) {
+    static const struct {
+        mode_t mode;
+        const char *label;
+    } cases[] = {
+        {0400, "0400"},
+        {0500, "0500"},
+        {0600, "0600"},
+        {0700, "0700"},
+    };
+    const char *argv[] = {"gitswitch", "--no-color", "config", NULL};
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char home[128], runtime[128], config_dir[4096], config_path[4096];
+        char output_path[128], output[8192], expected[8192];
+        const char *report;
+        int rc;
+
+        CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                      "gitswitch-ar09-home"), 0);
+        CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                      "gitswitch-ar09-run"), 0);
+        CHECK_EQ_INT(write_account_config(home, false, config_dir,
+                                          sizeof(config_dir)), 0);
+        CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                               "%s/accounts.toml", config_dir) <
+              sizeof(config_path));
+        CHECK_EQ_INT(chmod(config_path, cases[i].mode), 0);
+
+        rc = run_cli(home, runtime, argv, output_path, sizeof(output_path));
+        slurp(output_path, output, sizeof(output));
+        report = strstr(output, "\xF0\x9F\x93\x81 Configuration file:");
+        CHECK((size_t)snprintf(
+                  expected, sizeof(expected),
+                  "\xF0\x9F\x93\x81 Configuration file: %s\n"
+                  "Accounts: 1 configured\n"
+                  "Default scope: global\n"
+                  "[OK] Configuration file permissions are secure (%s)\n",
+                  config_path, cases[i].label) < sizeof(expected));
+        if (rc != 0 || !report || strcmp(report, expected) != 0) {
+            fprintf(stderr, "  owner-only mode %s returned %d:\n%s\n",
+                    cases[i].label, rc, output);
+        }
+        CHECK_EQ_INT(rc, 0);
+        CHECK_STR_EQ(report, expected);
+        unlink(output_path);
+    }
+}
+
 TEST(informational_output_bytes_are_stable) {
     static const char expected_help[] =
         "Usage: gitswitch [OPTIONS] [COMMAND] [ARGS]\n"
@@ -829,6 +878,7 @@ TEST_MAIN_BEGIN()
     }
     RUN_TEST(option_order_is_independent_of_posixly_correct);
     RUN_TEST(help_names_every_yes_confirmation_bypass);
+    RUN_TEST(config_command_reports_exact_owner_only_mode);
     RUN_TEST(informational_output_bytes_are_stable);
     RUN_TEST(informational_output_failures_return_nonzero);
     RUN_TEST(exact_arity_rejects_invalid_forms_before_state_creation);

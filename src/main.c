@@ -1412,7 +1412,8 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
     mode_t file_mode;
     if (get_file_permissions(ctx->config.config_path, &file_mode) == 0) {
         if ((file_mode & 077) == 0) {
-            display_success("Configuration file permissions are secure (600)");
+            display_success("Configuration file permissions are secure (%04o)",
+                            (unsigned int)(file_mode & 0777));
         } else {
             display_warning("Configuration file has unsafe permissions (%o)", file_mode & 0777);
         }
