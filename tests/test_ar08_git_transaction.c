@@ -29,11 +29,18 @@ git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
 
 static git_metadata_test_stage_t g_metadata_mismatch_stage;
 static int g_metadata_mismatch_calls;
+static git_metadata_test_stage_t g_metadata_trace[2];
+static int g_metadata_trace_count;
 
 static bool force_git_metadata_mismatch(git_metadata_test_stage_t stage) {
+    if (g_metadata_trace_count <
+        (int)(sizeof(g_metadata_trace) / sizeof(g_metadata_trace[0]))) {
+        g_metadata_trace[g_metadata_trace_count] = stage;
+    }
+    g_metadata_trace_count++;
+    errno = E2BIG;
     if (stage != g_metadata_mismatch_stage) return false;
     g_metadata_mismatch_calls++;
-    errno = E2BIG;
     return true;
 }
 
@@ -1977,6 +1984,8 @@ static void check_metadata_mismatch_errno(
     git_metadata_test_stage_t stage) {
     git_fixture_t fixture;
     git_metadata_test_hook_fn previous;
+    bool hook_installed = false;
+    int setup_rc;
     int restore_rc;
     int restore_errno;
 
@@ -1985,23 +1994,54 @@ static void check_metadata_mismatch_errno(
         fixture_cleanup(&fixture);
         return;
     }
-    CHECK_EQ_INT(git_set("--local", "user.name", "before-mismatch"), 0);
-    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
-    CHECK_EQ_INT(git_set_config_value("user.name", "owned-postimage",
-                                      GIT_SCOPE_LOCAL), 0);
-    CHECK_EQ_INT(git_config_seal(), 0);
+    setup_rc = git_set("--local", "user.name", "before-mismatch");
+    CHECK_EQ_INT(setup_rc, 0);
+    if (setup_rc != 0) goto cleanup;
+    setup_rc = git_config_snapshot(GIT_SCOPE_LOCAL);
+    CHECK_EQ_INT(setup_rc, 0);
+    if (setup_rc != 0) goto cleanup;
+    setup_rc = git_set_config_value("user.name", "owned-postimage",
+                                    GIT_SCOPE_LOCAL);
+    CHECK_EQ_INT(setup_rc, 0);
+    if (setup_rc != 0) goto cleanup;
+
+    /* These seams are restore-time metadata checks. Rollback before sealing is
+     * a supported partial-write failure path and isolates the exact branches
+     * from an unrelated real-Git post-image read. */
 
     g_metadata_mismatch_stage = stage;
     g_metadata_mismatch_calls = 0;
+    memset(g_metadata_trace, 0, sizeof(g_metadata_trace));
+    g_metadata_trace_count = 0;
     previous = git_ops_test_set_metadata_hook(force_git_metadata_mismatch);
+    hook_installed = true;
     clear_error();
     restore_rc = git_config_restore();
     restore_errno = errno;
     git_ops_test_set_metadata_hook(previous);
+    hook_installed = false;
 
     CHECK_EQ_INT(restore_rc, -1);
     CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
     CHECK_EQ_INT(restore_errno, EAGAIN);
+    if (stage == GIT_METADATA_TEST_SOURCE_PIN) {
+        CHECK_EQ_INT(g_metadata_trace_count, 1);
+        if (g_metadata_trace_count >= 1) {
+            CHECK_EQ_INT(g_metadata_trace[0], GIT_METADATA_TEST_SOURCE_PIN);
+        }
+    } else {
+        CHECK_EQ_INT(g_metadata_trace_count, 2);
+        if (g_metadata_trace_count >= 1) {
+            CHECK_EQ_INT(g_metadata_trace[0], GIT_METADATA_TEST_SOURCE_PIN);
+        }
+        if (g_metadata_trace_count >= 2) {
+            CHECK_EQ_INT(g_metadata_trace[1],
+                         GIT_METADATA_TEST_STAGE_REVALIDATE);
+        }
+    }
+
+cleanup:
+    if (hook_installed) git_ops_test_set_metadata_hook(previous);
     git_config_commit();
     fixture_cleanup(&fixture);
     ts_rm_rf(fixture.base);
