@@ -85,6 +85,21 @@ typedef void (*signals_test_guard_end_hook_fn)(void);
 signals_test_guard_end_hook_fn signals_test_set_guard_end_hook(
     signals_test_guard_end_hook_fn hook);
 
+#ifdef GITSWITCH_TESTING
+/* Deterministic, independent one-shot failures for normal-context dispatch
+ * boundaries. The production signals object exports none of this surface. */
+typedef enum {
+    SIGNALS_TEST_DISPATCH_NONE = 0,
+    SIGNALS_TEST_DISPATCH_MASK_QUERY,
+    SIGNALS_TEST_DISPATCH_UNBLOCK,
+    SIGNALS_TEST_DISPATCH_RAISE,
+    SIGNALS_TEST_DISPATCH_MASK_RESTORE
+} signals_test_dispatch_stage_t;
+
+void signals_test_fail_dispatch(signals_test_dispatch_stage_t stage,
+                                int system_errno);
+#endif
+
 /**
  * Restore the dispositions saved by signals_guard_begin(). Idempotent. Does
  * NOT clear a pending signal — callers finish their teardown first and then
@@ -147,12 +162,21 @@ bool signals_pending(void);
 int signals_pending_signal(void);
 
 /**
- * If a signal is pending: end the guard (restoring the caller's exact saved
- * dispositions) and re-raise it, terminating the process with the correct
- * signal exit status. If exact restoration fails, return -1 without clearing
- * or raising the pending signal; the failed guard entries and signal remain
- * owned for an explicit checked retry. Returns 0 when nothing is pending or
- * when a non-terminating inherited handler accepted the re-raised signal.
+ * If a signal is pending: capture the caller's exact signal mask, end the
+ * guard (restoring the caller's saved dispositions), temporarily unblock only
+ * the selected signal, and re-raise it. The library-pending signal remains
+ * published throughout delivery, then is cleared only if raise() returns
+ * successfully; a returning inherited handler therefore observes the pending
+ * signal during its call. The caller's exact mask is restored before return.
+ *
+ * A disposition-restoration, mask-query, unblock, or raise failure returns -1
+ * with the library-pending signal retained for an explicit checked retry. A
+ * raise failure remains the primary error even if restoring the caller mask
+ * also fails. If delivery succeeds but exact mask restoration fails, return
+ * -1 with the delivered signal cleared and retain only the mask-restoration
+ * obligation: a retry restores the mask without re-raising the signal.
+ * Returns 0 when nothing remains pending or when a non-terminating inherited
+ * handler accepted the re-raised signal and exact mask restoration succeeded.
  * Call only after rollback/teardown is done.
  */
 int signals_dispatch_pending(void);

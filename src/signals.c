@@ -32,6 +32,16 @@ static const int g_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
  * guaranteed readable/writable atomically with respect to a signal handler. */
 static volatile sig_atomic_t g_pending_signal = 0;
 
+/* signals_dispatch_pending() temporarily removes only the selected signal
+ * from the caller's mask. If restoring that exact mask fails after delivery,
+ * the signal must not be raised again on retry; if raise itself failed, the
+ * retained library-pending signal must not be retried against the temporary
+ * mask. Preserve the original mask until an explicit dispatch retry restores
+ * it in either case. This state is normal-context-only: the handler never
+ * reads or writes it. */
+static sigset_t g_dispatch_saved_mask;
+static bool g_dispatch_mask_restore_pending = false;
+
 /* Nonzero while the mainline owns a transaction-critical mutation/rollback
  * window. The handler's second-signal emergency exit must not fire between
  * forward publication and prepared commit/abort, nor mid-git_config_restore:
@@ -77,6 +87,73 @@ typedef struct {
 static sigaction_test_fault_t
     g_test_sigaction_faults[SIGNALS_TEST_SIGACTION_RESTORE + 1];
 static signals_test_guard_end_hook_fn g_test_guard_end_hook;
+
+enum {
+    DISPATCH_STAGE_NONE = 0,
+    DISPATCH_STAGE_MASK_QUERY,
+    DISPATCH_STAGE_UNBLOCK,
+    DISPATCH_STAGE_RAISE,
+    DISPATCH_STAGE_MASK_RESTORE
+};
+
+#ifdef GITSWITCH_TESTING
+static int g_test_dispatch_errno[DISPATCH_STAGE_MASK_RESTORE + 1];
+
+_Static_assert((int)SIGNALS_TEST_DISPATCH_NONE == DISPATCH_STAGE_NONE,
+               "dispatch test stages must remain aligned");
+_Static_assert((int)SIGNALS_TEST_DISPATCH_MASK_QUERY ==
+                   DISPATCH_STAGE_MASK_QUERY,
+               "dispatch test stages must remain aligned");
+_Static_assert((int)SIGNALS_TEST_DISPATCH_UNBLOCK == DISPATCH_STAGE_UNBLOCK,
+               "dispatch test stages must remain aligned");
+_Static_assert((int)SIGNALS_TEST_DISPATCH_RAISE == DISPATCH_STAGE_RAISE,
+               "dispatch test stages must remain aligned");
+_Static_assert((int)SIGNALS_TEST_DISPATCH_MASK_RESTORE ==
+                   DISPATCH_STAGE_MASK_RESTORE,
+               "dispatch test stages must remain aligned");
+
+void signals_test_fail_dispatch(signals_test_dispatch_stage_t stage,
+                                int system_errno) {
+    if (stage <= SIGNALS_TEST_DISPATCH_NONE ||
+        stage > SIGNALS_TEST_DISPATCH_MASK_RESTORE || system_errno <= 0) {
+        memset(g_test_dispatch_errno, 0, sizeof(g_test_dispatch_errno));
+        return;
+    }
+    g_test_dispatch_errno[stage] = system_errno;
+}
+#endif
+
+static int dispatch_sigprocmask(int how, const sigset_t *set,
+                                sigset_t *old_set, int stage) {
+#ifdef GITSWITCH_TESTING
+    if (stage > DISPATCH_STAGE_NONE &&
+        stage <= DISPATCH_STAGE_MASK_RESTORE &&
+        g_test_dispatch_errno[stage] != 0) {
+        int injected_errno = g_test_dispatch_errno[stage];
+
+        g_test_dispatch_errno[stage] = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#else
+    (void)stage;
+#endif
+    return sigprocmask(how, set, old_set);
+}
+
+static int dispatch_raise(int signal_number) {
+#ifdef GITSWITCH_TESTING
+    if (g_test_dispatch_errno[DISPATCH_STAGE_RAISE] != 0) {
+        int injected_errno =
+            g_test_dispatch_errno[DISPATCH_STAGE_RAISE];
+
+        g_test_dispatch_errno[DISPATCH_STAGE_RAISE] = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
+    return raise(signal_number);
+}
 
 void signals_test_fail_sigaction(int signal_number,
                                  signals_test_sigaction_stage_t stage,
@@ -448,9 +525,49 @@ int signals_pending_signal(void) {
 }
 
 int signals_dispatch_pending(void) {
-    int sig = (int)g_pending_signal;
+    sigset_t caller_mask;
+    sigset_t target_set;
+    int raise_errno;
+    int raise_rc;
+    int restore_errno;
+    int sig;
+
+    /* A previous delivery may have returned successfully before exact mask
+     * restoration failed. Repair that state first and do not re-raise when
+     * the library-pending signal was already consumed. A failed raise keeps
+     * g_pending_signal set, but likewise cannot be retried until the original
+     * mask has been recovered. */
+    if (g_dispatch_mask_restore_pending) {
+        if (dispatch_sigprocmask(SIG_SETMASK, &g_dispatch_saved_mask, NULL,
+                                 DISPATCH_STAGE_MASK_RESTORE) != 0) {
+            int retry_errno = errno;
+
+            errno = retry_errno;
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Failed to restore caller signal mask before resuming "
+                "deferred signal dispatch");
+            errno = retry_errno;
+            return -1;
+        }
+        g_dispatch_mask_restore_pending = false;
+    }
+
+    sig = (int)g_pending_signal;
     if (sig == 0) {
         return 0;
+    }
+    if (dispatch_sigprocmask(SIG_SETMASK, NULL, &caller_mask,
+                             DISPATCH_STAGE_MASK_QUERY) != 0) {
+        int mask_errno = errno;
+
+        errno = mask_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Failed to capture caller signal mask before "
+                         "dispatching deferred signal %d",
+                         sig);
+        errno = mask_errno;
+        return -1;
     }
     /* Restoration is part of dispatch, not a best-effort prelude. Clearing
      * and raising while even one saved disposition remains unrestored can
@@ -459,14 +576,65 @@ int signals_dispatch_pending(void) {
     if (signals_guard_end() != 0) {
         return -1;
     }
-    g_pending_signal = 0;
-    /* Re-raise under the restored (normally default) disposition so the
-     * process reports death-by-signal — scripts and shells relying on the
-     * 128+N convention see the truth, not a made-up exit code. */
-    if (raise(sig) != 0) {
-        int raise_errno = errno;
+    if (sigemptyset(&target_set) != 0 || sigaddset(&target_set, sig) != 0) {
+        int mask_errno = errno;
 
-        g_pending_signal = (sig_atomic_t)sig;
+        errno = mask_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Failed to prepare deferred signal %d for dispatch",
+                         sig);
+        errno = mask_errno;
+        return -1;
+    }
+    if (dispatch_sigprocmask(SIG_UNBLOCK, &target_set, NULL,
+                             DISPATCH_STAGE_UNBLOCK) != 0) {
+        int mask_errno = errno;
+
+        errno = mask_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Failed to unblock deferred signal %d for dispatch",
+                         sig);
+        errno = mask_errno;
+        return -1;
+    }
+
+    /* Keep the library state published throughout synchronous delivery so a
+     * returning inherited handler can observe which deferred signal it is
+     * handling. With the selected signal unblocked, raise() cannot report
+     * successful dispatch merely because the kernel left it pending. */
+    raise_rc = dispatch_raise(sig);
+    raise_errno = errno;
+    if (raise_rc == 0) {
+        g_pending_signal = 0;
+    }
+
+    if (dispatch_sigprocmask(SIG_SETMASK, &caller_mask, NULL,
+                             DISPATCH_STAGE_MASK_RESTORE) != 0) {
+        restore_errno = errno;
+        g_dispatch_saved_mask = caller_mask;
+        g_dispatch_mask_restore_pending = true;
+        if (raise_rc != 0) {
+            errno = raise_errno;
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Failed to dispatch deferred signal %d; also failed to "
+                "restore the caller signal mask (restore errno=%d)",
+                sig, restore_errno);
+            errno = raise_errno;
+            return -1;
+        }
+
+        errno = restore_errno;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "Deferred signal %d was delivered, but the caller signal mask "
+            "could not be restored",
+            sig);
+        errno = restore_errno;
+        return -1;
+    }
+
+    if (raise_rc != 0) {
         errno = raise_errno;
         set_system_error(ERR_SYSTEM_CALL,
                          "Failed to dispatch deferred signal %d", sig);

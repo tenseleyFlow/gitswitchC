@@ -377,12 +377,16 @@ AR08_REMOVE_ACCOUNTS_OBJECT = $(OBJDIR)/accounts_ar08_remove.o
 AR08_HINT_CONFIG_OBJECT = $(OBJDIR)/config_ar08_hint.o
 AR08_COPY_UTILS_OBJECT = $(OBJDIR)/utils_ar08_copy.o
 AR09_SECURITY_UTILS_OBJECT = $(OBJDIR)/utils_ar09_security.o
+AR09_DISPATCH_SIGNALS_OBJECT = $(OBJDIR)/signals_ar09_dispatch.o
+AR09_DISPATCH_TEST_OBJECT = $(OBJDIR)/test_signals_ar09_dispatch.o
 DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR07_RESET_MAIN_OBJECT:.o=.d) \
            $(AR08_REMOVE_ACCOUNTS_OBJECT:.o=.d) \
            $(AR08_HINT_CONFIG_OBJECT:.o=.d) \
            $(AR08_COPY_UTILS_OBJECT:.o=.d) \
-           $(AR09_SECURITY_UTILS_OBJECT:.o=.d)
+           $(AR09_SECURITY_UTILS_OBJECT:.o=.d) \
+           $(AR09_DISPATCH_SIGNALS_OBJECT:.o=.d) \
+           $(AR09_DISPATCH_TEST_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -723,6 +727,21 @@ $(AR09_SECURITY_UTILS_OBJECT): $(SRCDIR)/utils.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
+# Deferred-dispatch failure injection is test-build-only. Compile both sides
+# of that private API into dedicated objects so the production binary and
+# installed signals header surface contain no active fault state.
+$(AR09_DISPATCH_SIGNALS_OBJECT): $(SRCDIR)/signals.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-09 signal dispatch test object..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(FRAME_SIZE_WARNING) $(INCLUDES) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
+$(AR09_DISPATCH_TEST_OBJECT): $(TESTDIR)/test_signals.c $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling AR-09 signal dispatch test suite..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING $(RELEASE_ENFORCED_CFLAGS) \
+		$(TU_HARDENING_FLAGS) -c $< -o $@
+
 # Test executables (exclude main.o to avoid multiple main functions)
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
@@ -766,6 +785,13 @@ $(BINDIR)/test_security: \
 		$(OBJDIR)/test_security.o \
 		$(AR09_SECURITY_UTILS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_signals: \
+		$(AR09_DISPATCH_TEST_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
