@@ -3122,7 +3122,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * it, a signal delivered to this child would run guard_handler (which
          * only records and returns), swallowing it and leaving the helper
          * "pre-interrupted" instead of terminating normally. */
-        signals_reset_for_child();
+        signals_reset_for_child(&pre_spawn_mask);
 
         int child_status_fd = status_pipe[1];
         close(status_pipe[0]);

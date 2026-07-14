@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -23,8 +24,11 @@
 
 /* The signals we guard. SIGINT covers Ctrl-C at a passphrase/pinentry prompt,
  * SIGTERM a polite kill, SIGHUP a closed terminal — all three default to
- * terminating the process, which is what bypassed the rollback machinery. */
-static const int g_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
+ * terminating the process, which is what bypassed the rollback machinery.
+ * AR-10 L16: SIGQUIT (Ctrl-\) terminates too and bypassed the deferral
+ * exactly as unguarded SIGINT once did; deferral preserves its core-dump
+ * semantics because dispatch re-raises with the default disposition. */
+static const int g_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
 #define GUARDED_SIGNAL_COUNT \
     (sizeof(g_guarded_signals) / sizeof(g_guarded_signals[0]))
 
@@ -77,6 +81,11 @@ typedef enum {
 } guard_state_t;
 static guard_state_t g_guard_state = GUARD_INACTIVE;
 
+/* AR-10 L15: like the dispatch injection below, the sigaction fault and
+ * guard-end sabotage seams exist ONLY in GITSWITCH_TESTING objects. They
+ * used to compile into the production object as callable guard-sabotage
+ * entry points. */
+#ifdef GITSWITCH_TESTING
 /* Independent one-shot faults let a single begin attempt fail installation
  * and then fail the rollback restoration of an earlier disposition. */
 typedef struct {
@@ -87,6 +96,7 @@ typedef struct {
 static sigaction_test_fault_t
     g_test_sigaction_faults[SIGNALS_TEST_SIGACTION_RESTORE + 1];
 static signals_test_guard_end_hook_fn g_test_guard_end_hook;
+#endif
 
 enum {
     DISPATCH_STAGE_NONE = 0,
@@ -155,6 +165,7 @@ static int dispatch_raise(int signal_number) {
     return raise(signal_number);
 }
 
+#ifdef GITSWITCH_TESTING
 void signals_test_fail_sigaction(int signal_number,
                                  signals_test_sigaction_stage_t stage,
                                  int system_errno) {
@@ -175,10 +186,12 @@ signals_test_guard_end_hook_fn signals_test_set_guard_end_hook(
     g_test_guard_end_hook = hook;
     return previous;
 }
+#endif
 
 static int guard_sigaction(int signal_number, const struct sigaction *action,
                            struct sigaction *old_action,
                            signals_test_sigaction_stage_t stage) {
+#ifdef GITSWITCH_TESTING
     sigaction_test_fault_t *fault = &g_test_sigaction_faults[stage];
 
     if (fault->signal_number == signal_number) {
@@ -188,6 +201,9 @@ static int guard_sigaction(int signal_number, const struct sigaction *action,
         errno = injected_errno;
         return -1;
     }
+#else
+    (void)stage;
+#endif
     return sigaction(signal_number, action, old_action);
 }
 
@@ -328,7 +344,7 @@ int signals_restore_after_child_spawn(const sigset_t *previous_mask) {
     return sigprocmask(SIG_SETMASK, previous_mask, NULL);
 }
 
-void signals_reset_for_child(void) {
+void signals_reset_for_child(const sigset_t *inherited_mask) {
     /* AR-06 F76 / AR-07 M32: reset only dispositions this guard actually
      * replaced.  An inherited SIG_IGN is deliberately left untouched by
      * signals_guard_begin(); resetting every nominally guarded signal here
@@ -348,10 +364,20 @@ void signals_reset_for_child(void) {
         (void)sigaction(g_guarded_signals[i], &dfl, NULL);
         sigaddset(&installed, g_guarded_signals[i]);
     }
-    /* Only handlers installed by the guard are unblocked.  Preserving both
-     * the disposition and mask of a skipped inherited signal keeps the
-     * supervisor/nohup contract byte-for-byte until exec. */
-    (void)sigprocmask(SIG_UNBLOCK, &installed, NULL);
+    /* AR-10 L17: the caller's pre-spawn mask is the inherited-mask contract.
+     * The old unconditional SIG_UNBLOCK also unblocked a guarded signal the
+     * SUPERVISOR had blocked before gitswitch even started, so exec'd
+     * children diverged from what they would have inherited. Restore the
+     * exact snapshot when the caller provides one; the unblock of
+     * guard-installed signals remains the fallback for legacy callers. */
+    if (inherited_mask) {
+        (void)sigprocmask(SIG_SETMASK, inherited_mask, NULL);
+    } else {
+        /* Only handlers installed by the guard are unblocked.  Preserving
+         * both the disposition and mask of a skipped inherited signal keeps
+         * the supervisor/nohup contract byte-for-byte until exec. */
+        (void)sigprocmask(SIG_UNBLOCK, &installed, NULL);
+    }
 }
 
 void signals_rollback_begin(void) {
@@ -492,16 +518,20 @@ begin_failed:
 int signals_guard_end(void) {
     int restore_signal;
     int restore_errno;
+#ifdef GITSWITCH_TESTING
     signals_test_guard_end_hook_fn checkpoint;
+#endif
 
     if (g_guard_state == GUARD_INACTIVE) {
         return 0;
     }
+#ifdef GITSWITCH_TESTING
     checkpoint = g_test_guard_end_hook;
     g_test_guard_end_hook = NULL;
     if (checkpoint) {
         checkpoint();
     }
+#endif
     if (!restore_partial_guard(&restore_signal, &restore_errno)) {
         g_guard_state = GUARD_RESTORE_PENDING;
         errno = restore_errno;
@@ -658,8 +688,12 @@ int signals_scratch_register(const char *path) {
         if (!g_scratch[i].used) {
             /* Copy the path fully BEFORE publishing the slot via `used` so a
              * handler interrupting mid-copy sees an unused slot, never a
-             * truncated path it might unlink. */
+             * truncated path it might unlink. AR-10 L18: the fence makes the
+             * copy/publish order a language guarantee instead of an artifact
+             * of current codegen — nothing else stops the compiler from
+             * sinking the copy past the volatile store. */
             safe_strncpy(g_scratch[i].path, path, sizeof(g_scratch[i].path));
+            atomic_signal_fence(memory_order_release);
             g_scratch[i].used = 1;
             return 0;
         }

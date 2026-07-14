@@ -698,9 +698,12 @@ uninstall:
 	@echo "Uninstall complete"
 
 # Test compilation
+# AR-10 L15: test objects see the GITSWITCH_TESTING declarations (the suites
+# link the testing signals object below); production objects never do.
 $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING \
 		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The reset suite calls the real CLI entry point in isolated child processes
@@ -761,13 +764,17 @@ $(AR09_DISPATCH_TEST_OBJECT): $(TESTDIR)/test_signals.c $(BUILDTYPE_STAMP) | $(O
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
 # Test executables (exclude main.o to avoid multiple main functions)
-$(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+# AR-10 L15: suites link the GITSWITCH_TESTING signals object — the sigaction
+# fault / guard-end sabotage seams no longer exist in the production object.
+$(BINDIR)/test_%: $(OBJDIR)/test_%.o $(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 		$(AR07_RESET_MAIN_OBJECT) \
-		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 

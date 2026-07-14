@@ -67,7 +67,9 @@ int signals_guard_begin(void);
 /* Deterministic, one-shot fault injection for each sigaction(2) stage used by
  * the guard. Failures are stored independently by stage, so a test can arm an
  * installation failure and the rollback restoration failure it triggers at
- * the same time. Passing SIGNALS_TEST_SIGACTION_NONE clears every stage. */
+ * the same time. Passing SIGNALS_TEST_SIGACTION_NONE clears every stage.
+ * The types stay unconditional (internal plumbing references them); the
+ * entry points exist only in GITSWITCH_TESTING objects (AR-10 L15). */
 typedef enum {
     SIGNALS_TEST_SIGACTION_NONE = 0,
     SIGNALS_TEST_SIGACTION_QUERY,
@@ -75,15 +77,18 @@ typedef enum {
     SIGNALS_TEST_SIGACTION_RESTORE
 } signals_test_sigaction_stage_t;
 
+/* One-shot checkpoint immediately before guard_end starts restoration. It is
+ * used to reproduce the pending-check/restoration race deterministically. */
+typedef void (*signals_test_guard_end_hook_fn)(void);
+
+#ifdef GITSWITCH_TESTING
 void signals_test_fail_sigaction(int signal_number,
                                  signals_test_sigaction_stage_t stage,
                                  int system_errno);
 
-/* One-shot checkpoint immediately before guard_end starts restoration. It is
- * used to reproduce the pending-check/restoration race deterministically. */
-typedef void (*signals_test_guard_end_hook_fn)(void);
 signals_test_guard_end_hook_fn signals_test_set_guard_end_hook(
     signals_test_guard_end_hook_fn hook);
+#endif
 
 #ifdef GITSWITCH_TESTING
 /* Deterministic, independent one-shot failures for normal-context dispatch
@@ -123,13 +128,16 @@ void signals_rollback_end(void);
 
 /**
  * Reset only signals whose dispositions signals_guard_begin() actually
- * replaced, and unblock only that same set, in a freshly-forked child before
- * it execs (AR-06 F76 / AR-07 M32). This closes the window where the child
- * still runs guard_handler without changing an inherited SIG_IGN or its mask.
- * Async-signal-safe enough for our single-threaded fork; call it first thing
- * in the child branch.
+ * replaced, in a freshly-forked child before it execs (AR-06 F76 / AR-07
+ * M32). This closes the window where the child still runs guard_handler
+ * without changing an inherited SIG_IGN or its mask. AR-10 L17: pass the
+ * mask captured by signals_block_for_child_spawn() so the child's mask is
+ * restored to exactly what it would have inherited — a supervisor-blocked
+ * guarded signal stays blocked. NULL falls back to unblocking only the
+ * guard-installed set. Async-signal-safe enough for our single-threaded
+ * fork; call it first thing in the child branch.
  */
-void signals_reset_for_child(void);
+void signals_reset_for_child(const sigset_t *inherited_mask);
 
 /**
  * Close the post-fork/pre-publication race for a guarded child launch.
