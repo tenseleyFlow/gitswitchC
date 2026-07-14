@@ -60,8 +60,9 @@ static int store_error_message(error_context_t *error, const char *fmt,
                                va_list args) {
     int formatted_length;
 
-    formatted_length = vsnprintf(error->message, sizeof(error->message), fmt,
-                                 args); /* Flawfinder: ignore — checked below */
+    formatted_length = vsnprintf( /* Flawfinder: ignore — bounded destination;
+                                   * error and truncation checked below */
+        error->message, sizeof(error->message), fmt, args);
     if (formatted_length < 0) {
         copy_bounded_text(error->message, sizeof(error->message),
                           "[error message formatting failed]");
