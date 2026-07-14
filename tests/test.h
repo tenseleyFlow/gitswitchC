@@ -473,6 +473,10 @@ static inline const char *ts_capability_name(int index) {
         "high-fd",
         "freebsd-acl",
         "mount-namespace",
+        /* AR-10 L37: test_ar09_runner_stdin skipped with this token while it
+         * was unregistered, so a cat-less host FAILED the suite instead of
+         * skipping (TS_SKIP rejects unknown capabilities). */
+        "coreutils",
         "persistent-fs",
         "dev-full",
         "unix-sockets"
