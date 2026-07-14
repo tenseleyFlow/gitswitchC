@@ -272,6 +272,7 @@ int config_init_names(gitswitch_ctx_t *ctx) {
 
 static config_document_malloc_fn g_config_document_malloc = malloc;
 static config_io_fault_fn g_config_io_fault;
+static config_metadata_test_hook_fn g_config_metadata_test_hook;
 static config_backup_clock_fn g_config_backup_clock;
 
 config_document_malloc_fn config_set_document_malloc_fn(
@@ -284,6 +285,13 @@ config_document_malloc_fn config_set_document_malloc_fn(
 config_io_fault_fn config_set_io_fault_fn(config_io_fault_fn fn) {
     config_io_fault_fn previous = g_config_io_fault;
     g_config_io_fault = fn;
+    return previous;
+}
+
+config_metadata_test_hook_fn config_set_metadata_test_hook_fn(
+    config_metadata_test_hook_fn fn) {
+    config_metadata_test_hook_fn previous = g_config_metadata_test_hook;
+    g_config_metadata_test_hook = fn;
     return previous;
 }
 
@@ -1186,19 +1194,29 @@ static bool config_refresh_publication_identity(
     }
 
     source_fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (source_fd < 0) goto refresh_done;
     backup_fd = open(backup_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
-    if (source_fd < 0 || backup_fd < 0 ||
-        fstat(source_fd, &source_after) != 0 ||
-        fstat(backup_fd, &backup_before) != 0 ||
-        !config_metadata_file_is_safe(&source_after, true) ||
-        !config_metadata_file_is_safe(&backup_before, true) ||
-        !config_metadata_snapshot_same(&source_before, &source_after) ||
-        !config_metadata_snapshot_same(backup_identity, &backup_before) ||
-        source_after.st_size < 0 ||
-        source_after.st_size > (off_t)TOML_MAX_FILE_SIZE ||
-        source_after.st_size != backup_before.st_size) {
-        errno = errno ? errno : ESTALE;
+    if (backup_fd < 0 || fstat(source_fd, &source_after) != 0 ||
+        fstat(backup_fd, &backup_before) != 0) {
         goto refresh_done;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(
+                CONFIG_METADATA_TEST_REFRESH_INITIAL);
+        errno = 0;
+        if (forced_mismatch ||
+            !config_metadata_file_is_safe(&source_after, true) ||
+            !config_metadata_file_is_safe(&backup_before, true) ||
+            !config_metadata_snapshot_same(&source_before, &source_after) ||
+            !config_metadata_snapshot_same(backup_identity, &backup_before) ||
+            source_after.st_size < 0 ||
+            source_after.st_size > (off_t)TOML_MAX_FILE_SIZE ||
+            source_after.st_size != backup_before.st_size) {
+            errno = ESTALE;
+            goto refresh_done;
+        }
     }
 
     while (offset < source_after.st_size) {
@@ -1217,21 +1235,34 @@ static bool config_refresh_publication_identity(
     if (fstat(source_fd, &source_after) != 0 ||
         lstat(config_path, &source_named) != 0 ||
         fstat(backup_fd, &backup_after) != 0 ||
-        lstat(backup_path, &backup_named) != 0 ||
-        !config_metadata_snapshot_same(&source_before, &source_after) ||
-        !config_metadata_snapshot_same(&source_before, &source_named) ||
-        !config_metadata_snapshot_same(backup_identity, &backup_after) ||
-        !config_metadata_snapshot_same(backup_identity, &backup_named)) {
-        errno = errno ? errno : ESTALE;
+        lstat(backup_path, &backup_named) != 0) {
         goto refresh_done;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(CONFIG_METADATA_TEST_REFRESH_FINAL);
+        errno = 0;
+        if (forced_mismatch ||
+            !config_metadata_snapshot_same(&source_before, &source_after) ||
+            !config_metadata_snapshot_same(&source_before, &source_named) ||
+            !config_metadata_snapshot_same(backup_identity, &backup_after) ||
+            !config_metadata_snapshot_same(backup_identity, &backup_named)) {
+            errno = ESTALE;
+            goto refresh_done;
+        }
     }
 
     *publication_identity = source_after;
     matches = true;
 
 refresh_done:
-    if (source_fd >= 0) close(source_fd);
-    if (backup_fd >= 0) close(backup_fd);
+    {
+        int saved_errno = matches ? 0 : (errno ? errno : ESTALE);
+        if (source_fd >= 0) close(source_fd);
+        if (backup_fd >= 0) close(backup_fd);
+        if (!matches) errno = saved_errno;
+    }
     secure_zero_memory(source_buffer, sizeof(source_buffer));
     secure_zero_memory(backup_buffer, sizeof(backup_buffer));
     return matches;
@@ -2299,16 +2330,30 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         dir_path[dir_length] = '\0';
     }
     dir_fd = open(dir_path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (dir_fd < 0 || fstat(dir_fd, &pinned_dir) != 0 ||
-        !config_metadata_dir_is_safe(&pinned_dir) ||
-        !config_named_directory_matches(dir_path, &pinned_dir)) {
-        int saved_errno = errno ? errno : ESTALE;
+    if (dir_fd < 0 || fstat(dir_fd, &pinned_dir) != 0) {
+        int saved_errno = errno;
         if (dir_fd >= 0) close(dir_fd);
         errno = saved_errno;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Cannot pin config destination directory: %s",
                          dir_path);
         return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(CONFIG_METADATA_TEST_DOCUMENT_DIR);
+        errno = 0;
+        if (forced_mismatch || !config_metadata_dir_is_safe(&pinned_dir) ||
+            !config_named_directory_matches(dir_path, &pinned_dir)) {
+            int saved_errno = errno ? errno : ESTALE;
+            close(dir_fd);
+            errno = saved_errno;
+            set_system_error(ERR_CONFIG_WRITE_FAILED,
+                             "Cannot pin config destination directory: %s",
+                             dir_path);
+            return -1;
+        }
     }
     errno = 0;
     if (fstatat(dir_fd, target_name, &destination_before,
@@ -2927,15 +2972,28 @@ int config_create_default(const char *config_path) {
     }
     dir_fd = open(config_dir,
                   O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (dir_fd < 0 || fstat(dir_fd, &installed) != 0 ||
-        !config_metadata_dir_is_safe(&installed) ||
-        !config_metadata_same_file(&dir_identity, &installed)) {
-        int saved_errno = errno ? errno : ESTALE;
+    if (dir_fd < 0 || fstat(dir_fd, &installed) != 0) {
+        int saved_errno = errno;
         if (dir_fd >= 0) close(dir_fd);
         errno = saved_errno;
         set_system_error(ERR_PERMISSION_DENIED,
                          "Cannot pin default config parent: %s", config_dir);
         return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_config_metadata_test_hook &&
+            g_config_metadata_test_hook(CONFIG_METADATA_TEST_DEFAULT_DIR);
+        errno = 0;
+        if (forced_mismatch || !config_metadata_dir_is_safe(&installed) ||
+            !config_metadata_same_file(&dir_identity, &installed)) {
+            close(dir_fd);
+            errno = ESTALE;
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Cannot pin default config parent: %s",
+                             config_dir);
+            return -1;
+        }
     }
     fd = config_create_private_temp_at(dir_fd, target_name, temp_name,
                                        sizeof(temp_name));

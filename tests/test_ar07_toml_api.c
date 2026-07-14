@@ -24,6 +24,15 @@ static int make_fixture(char *dir, size_t dir_size,
     return 0;
 }
 
+static int g_metadata_mismatch_calls;
+
+static bool force_fd_metadata_mismatch(toml_metadata_test_stage_t stage) {
+    if (stage != TOML_METADATA_TEST_FD_REVALIDATE) return false;
+    g_metadata_mismatch_calls++;
+    errno = E2BIG;
+    return true;
+}
+
 static int write_exact_file(const char *path, const char *contents) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return -1;
@@ -811,6 +820,44 @@ TEST(temp_namespace_replacement_is_never_published_or_unlinked) {
     toml_cleanup_document(&doc);
 }
 
+TEST(descriptor_metadata_mismatch_uses_stable_estale_diagnostic) {
+    static toml_document_t doc;
+    char dir[128];
+    char path[192];
+    toml_metadata_test_hook_fn previous;
+    int fd = -1;
+
+    if (make_fixture(dir, sizeof(dir), path, sizeof(path)) != 0) {
+        CHECK(0);
+        return;
+    }
+    toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "active_account",
+                                 "audit"), 0);
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    CHECK(fd >= 0);
+    if (fd < 0) {
+        toml_cleanup_document(&doc);
+        ts_rm_rf(dir);
+        return;
+    }
+
+    g_metadata_mismatch_calls = 0;
+    previous = toml_set_metadata_test_hook_fn(force_fd_metadata_mismatch);
+    clear_error();
+    CHECK_EQ_INT(toml_write_fd(&doc, fd), -1);
+    toml_set_metadata_test_hook_fn(previous);
+
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(fcntl(fd, F_GETFD) >= 0);
+
+    CHECK_EQ_INT(close(fd), 0);
+    CHECK_EQ_INT(unlink(path), 0);
+    toml_cleanup_document(&doc);
+    ts_rm_rf(dir);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(setters_reject_invalid_sections_without_mutating_document);
     RUN_TEST(dotted_section_names_round_trip_across_parser_and_setters);
@@ -823,4 +870,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(normal_atomic_replacement_reloads_and_does_not_follow_symlink);
     RUN_TEST(parent_namespace_replacement_fails_and_cleans_pinned_temp);
     RUN_TEST(temp_namespace_replacement_is_never_published_or_unlinked);
+    RUN_TEST(descriptor_metadata_mismatch_uses_stable_estale_diagnostic);
 TEST_MAIN_END()

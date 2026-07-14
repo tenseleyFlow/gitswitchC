@@ -60,6 +60,16 @@ typedef enum {
 
 static source_after_copy_action_t g_source_after_copy_action;
 static int g_source_after_copy_calls;
+static config_metadata_test_stage_t g_metadata_mismatch_stage;
+static int g_metadata_mismatch_calls;
+
+static bool force_config_metadata_mismatch(
+    config_metadata_test_stage_t stage) {
+    if (stage != g_metadata_mismatch_stage) return false;
+    g_metadata_mismatch_calls++;
+    errno = E2BIG;
+    return true;
+}
 
 static int private_dir(char *path, size_t size) {
     if ((size_t)snprintf(path, size,
@@ -1059,6 +1069,98 @@ TEST(concurrent_public_save_cannot_commit_inside_state_replace_gap) {
     exercise_concurrent_public_save(CONFIG_IO_STATE_BEFORE_RENAME, true);
 }
 
+TEST(directory_metadata_mismatches_use_stable_estale_diagnostics) {
+    char dir[256];
+    char path[512];
+    gitswitch_ctx_t ctx;
+    config_metadata_test_hook_fn previous;
+    struct stat missing;
+    bool installed = false;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/default.toml", dir);
+    g_metadata_mismatch_stage = CONFIG_METADATA_TEST_DEFAULT_DIR;
+    g_metadata_mismatch_calls = 0;
+    previous = config_set_metadata_test_hook_fn(
+        force_config_metadata_mismatch);
+    clear_error();
+    CHECK_EQ_INT(config_create_default(path), -1);
+    config_set_metadata_test_hook_fn(previous);
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK_EQ_INT(lstat(path, &missing), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    ts_rm_rf(dir);
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    CHECK(installed);
+
+    installed = false;
+    g_metadata_mismatch_stage = CONFIG_METADATA_TEST_DOCUMENT_DIR;
+    g_metadata_mismatch_calls = 0;
+    previous = config_set_metadata_test_hook_fn(
+        force_config_metadata_mismatch);
+    clear_error();
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), -1);
+    config_set_metadata_test_hook_fn(previous);
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(!installed);
+    ts_rm_rf(dir);
+}
+
+static void check_refresh_metadata_mismatch_errno(
+    config_metadata_test_stage_t stage) {
+    char dir[256];
+    char path[512];
+    gitswitch_ctx_t ctx;
+    config_metadata_test_hook_fn previous;
+    bool installed = false;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(g_target, sizeof(g_target), "%s", path);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    CHECK(installed);
+
+    ctx.config.default_scope = GIT_SCOPE_GLOBAL;
+    installed = false;
+    g_hook_error = 0;
+    g_source_after_copy_calls = 0;
+    g_source_after_copy_action = SOURCE_AFTER_COPY_CTIME_ONLY;
+    g_replace_source_name = false;
+    g_replace_backup_destination = false;
+    g_metadata_mismatch_stage = stage;
+    g_metadata_mismatch_calls = 0;
+    config_set_io_fault_fn(publication_observer);
+    previous = config_set_metadata_test_hook_fn(
+        force_config_metadata_mismatch);
+    clear_error();
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), -1);
+    config_set_metadata_test_hook_fn(previous);
+    config_set_io_fault_fn(NULL);
+    g_source_after_copy_action = SOURCE_AFTER_COPY_NONE;
+
+    CHECK_EQ_INT(g_hook_error, 0);
+    CHECK_EQ_INT(g_source_after_copy_calls, 1);
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(!installed);
+    ts_rm_rf(dir);
+}
+
+TEST(refresh_metadata_mismatches_use_stable_estale_diagnostics) {
+    check_refresh_metadata_mismatch_errno(
+        CONFIG_METADATA_TEST_REFRESH_INITIAL);
+    check_refresh_metadata_mismatch_errno(CONFIG_METADATA_TEST_REFRESH_FINAL);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(default_creation_never_replaces_a_concurrent_winner);
     RUN_TEST(backup_rejects_an_in_place_mixed_generation);
@@ -1076,4 +1178,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_save_has_one_document_publisher_and_ignores_fault_environment);
     RUN_TEST(concurrent_public_save_cannot_commit_inside_document_replace_gap);
     RUN_TEST(concurrent_public_save_cannot_commit_inside_state_replace_gap);
+    RUN_TEST(directory_metadata_mismatches_use_stable_estale_diagnostics);
+    RUN_TEST(refresh_metadata_mismatches_use_stable_estale_diagnostics);
 TEST_MAIN_END()

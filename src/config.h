@@ -54,6 +54,20 @@ typedef enum {
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);
 config_io_fault_fn config_set_io_fault_fn(config_io_fault_fn fn);
 
+/* Focused metadata-mismatch observer for deterministic errno regressions.
+ * A callback returns true to model a pure identity mismatch after every
+ * required filesystem observation has succeeded. Production leaves it NULL. */
+typedef enum {
+    CONFIG_METADATA_TEST_REFRESH_INITIAL = 1,
+    CONFIG_METADATA_TEST_REFRESH_FINAL,
+    CONFIG_METADATA_TEST_DOCUMENT_DIR,
+    CONFIG_METADATA_TEST_DEFAULT_DIR
+} config_metadata_test_stage_t;
+typedef bool (*config_metadata_test_hook_fn)(
+    config_metadata_test_stage_t stage);
+config_metadata_test_hook_fn config_set_metadata_test_hook_fn(
+    config_metadata_test_hook_fn fn);
+
 /* Supplies the (seconds,nanoseconds) generation base for backup names. The
  * default reads CLOCK_REALTIME. Tests can pin both values to force collisions;
  * the writer still creates distinct monotonic generations with O_EXCL. */

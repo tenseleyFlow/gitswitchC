@@ -58,6 +58,7 @@ static bool toml_same_file(const struct stat *left, const struct stat *right);
 static bool toml_temp_identity_is_private(const struct stat *identity);
 static toml_document_init_hook_fn g_document_init_hook;
 static toml_writer_test_hook_fn g_writer_test_hook;
+static toml_metadata_test_hook_fn g_metadata_test_hook;
 
 static bool ascii_key_initial_is_valid(unsigned char c) {
     return c == '_' || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
@@ -99,6 +100,13 @@ toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
     toml_writer_test_hook_fn fn) {
     toml_writer_test_hook_fn previous = g_writer_test_hook;
     g_writer_test_hook = fn;
+    return previous;
+}
+
+toml_metadata_test_hook_fn toml_set_metadata_test_hook_fn(
+    toml_metadata_test_hook_fn fn) {
+    toml_metadata_test_hook_fn previous = g_metadata_test_hook;
+    g_metadata_test_hook = fn;
     return previous;
 }
 
@@ -2002,12 +2010,24 @@ int toml_write_fd(const toml_document_t *doc, int fd) {
     }
     file = NULL;
 
-    if (fstat(fd, &after) != 0 || !toml_same_file(&before, &after) ||
-        !toml_temp_identity_is_private(&after) || after.st_size < 0 ||
-        after.st_size > (off_t)TOML_MAX_FILE_SIZE) {
-        saved_errno = errno ? errno : ESTALE;
-        failure_context = "TOML output descriptor changed during serialization";
+    if (fstat(fd, &after) != 0) {
+        saved_errno = errno;
+        failure_context = "Cannot revalidate TOML output descriptor";
         goto cleanup;
+    }
+    {
+        bool forced_mismatch =
+            g_metadata_test_hook &&
+            g_metadata_test_hook(TOML_METADATA_TEST_FD_REVALIDATE);
+        errno = 0;
+        if (forced_mismatch || !toml_same_file(&before, &after) ||
+            !toml_temp_identity_is_private(&after) || after.st_size < 0 ||
+            after.st_size > (off_t)TOML_MAX_FILE_SIZE) {
+            saved_errno = ESTALE;
+            failure_context =
+                "TOML output descriptor changed during serialization";
+            goto cleanup;
+        }
     }
     result = 0;
 

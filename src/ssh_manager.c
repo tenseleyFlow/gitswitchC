@@ -185,6 +185,7 @@ static ssh_quarantine_hook_fn g_quarantine_capture_hook;
 static ssh_quarantine_hook_fn g_reset_retire_hook;
 static ssh_quarantine_hook_fn g_unrecorded_cleanup_hook;
 static bool g_force_portable_quarantine;
+static ssh_metadata_test_hook_fn g_metadata_test_hook;
 static unsigned int g_agent_lock_depth;
 static int ssh_key_open_real(const char *path, int flags) {
     return open(path, flags);
@@ -335,6 +336,13 @@ ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
 bool ssh_manager_set_force_portable_quarantine(bool force) {
     bool previous = g_force_portable_quarantine;
     g_force_portable_quarantine = force;
+    return previous;
+}
+
+ssh_metadata_test_hook_fn ssh_manager_set_metadata_test_hook_fn(
+    ssh_metadata_test_hook_fn fn) {
+    ssh_metadata_test_hook_fn previous = g_metadata_test_hook;
+    g_metadata_test_hook = fn;
     return previous;
 }
 
@@ -5535,20 +5543,39 @@ static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
                          pin->anchor);
         return -1; /* uncertain reserved state is reconciled on next mutation */
     }
-    if (fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_identity(&before, &opened) ||
-        !same_runtime_identity(&opened, &named)) {
-        int saved_errno = errno ? errno : ESTALE;
+    if (fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved_errno = errno;
         int retire_rc = unlink_ssh_runtime_identity_at(
             dir_fd, pin->anchor, &opened, false,
             "failed SSH runtime pin anchor rollback", NULL, NULL);
         if (retire_rc == 0) pin->anchor[0] = '\0';
         errno = saved_errno;
-        set_error(ERR_FILE_IO,
-                  "SSH runtime artifact changed while being anchored; pin %s: %s",
-                  retire_rc == 0 ? "retired" : "retained for retry",
-                  display_path ? display_path : name);
+        set_system_error(
+            ERR_FILE_IO,
+            "SSH runtime artifact changed while being anchored; pin %s: %s",
+            retire_rc == 0 ? "retired" : "retained for retry",
+            display_path ? display_path : name);
         return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_metadata_test_hook &&
+            g_metadata_test_hook(SSH_METADATA_TEST_RUNTIME_PIN);
+        errno = 0;
+        if (forced_mismatch || !same_runtime_identity(&before, &opened) ||
+            !same_runtime_identity(&opened, &named)) {
+            int retire_rc = unlink_ssh_runtime_identity_at(
+                dir_fd, pin->anchor, &opened, false,
+                "failed SSH runtime pin anchor rollback", NULL, NULL);
+            if (retire_rc == 0) pin->anchor[0] = '\0';
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH runtime artifact changed while being anchored; pin %s: %s",
+                retire_rc == 0 ? "retired" : "retained for retry",
+                display_path ? display_path : name);
+            return -1;
+        }
     }
     pin->identity = opened;
     return 0;
@@ -5562,15 +5589,29 @@ static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
         return -1;
     }
     if (fstat(fd, &opened) != 0 ||
-        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_identity(&opened, &named)) {
-        int saved_errno = errno ? errno : ESTALE;
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved_errno = errno;
         close(fd);
         errno = saved_errno;
-        set_error(ERR_FILE_IO,
-                  "SSH runtime artifact changed while being pinned: %s",
-                  display_path ? display_path : name);
+        set_system_error(ERR_FILE_IO,
+                         "SSH runtime artifact changed while being pinned: %s",
+                         display_path ? display_path : name);
         return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_metadata_test_hook &&
+            g_metadata_test_hook(SSH_METADATA_TEST_RUNTIME_PIN);
+        errno = 0;
+        if (forced_mismatch || !same_runtime_identity(&opened, &named)) {
+            close(fd);
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH runtime artifact changed while being pinned: %s",
+                display_path ? display_path : name);
+            return -1;
+        }
     }
     pin->identity = opened;
     pin->fd = fd;
@@ -6422,16 +6463,28 @@ static int quarantine_ssh_reset_entry(
 
     if (linkat(dir_fd, name, dir_fd, quarantine, 0) != 0) return -1;
     if (fstatat(dir_fd, name, &source, AT_SYMLINK_NOFOLLOW) != 0 ||
-        fstatat(dir_fd, quarantine, &captured, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !same_runtime_identity(expected, &source) ||
-        !same_runtime_identity(expected, &captured) ||
-        !same_runtime_identity(&source, &captured)) {
-        int saved_errno = errno == 0 ? ESTALE : errno;
+        fstatat(dir_fd, quarantine, &captured, AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved_errno = errno;
         (void)unlink_ssh_runtime_identity_at(
             dir_fd, quarantine, expected, true,
             "failed portable reset quarantine rollback", NULL, NULL);
         errno = saved_errno;
         return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_metadata_test_hook &&
+            g_metadata_test_hook(SSH_METADATA_TEST_RESET_QUARANTINE);
+        errno = 0;
+        if (forced_mismatch || !same_runtime_identity(expected, &source) ||
+            !same_runtime_identity(expected, &captured) ||
+            !same_runtime_identity(&source, &captured)) {
+            (void)unlink_ssh_runtime_identity_at(
+                dir_fd, quarantine, expected, true,
+                "failed portable reset quarantine rollback", NULL, NULL);
+            errno = ESTALE;
+            return -1;
+        }
     }
     if (sync_ssh_runtime_dir(
             dir_fd, "portable reset quarantine publication") != 0) {
@@ -6639,10 +6692,34 @@ static int ssh_current_matches_socket_at(int dir_fd, const char *current,
 
 static int ssh_reset_incomplete(void) {
     char detail[sizeof(g_last_error.message)];
+    int saved_system_errno = get_last_error()->system_errno;
     safe_strncpy(detail, get_last_error()->message, sizeof(detail));
     if (detail[0]) {
-        set_error(ERR_FILE_IO,
-                  "SSH reset incomplete; retained state for retry: %s", detail);
+        if (saved_system_errno != 0) {
+            char suffix[sizeof(detail)];
+            int suffix_length = snprintf(suffix, sizeof(suffix), " (%s)",
+                                         strerror(saved_system_errno));
+            size_t detail_length = strlen(detail);
+
+            /* set_system_error() appends this diagnostic itself. Remove the
+             * one already carried by the nested failure so retry wrapping
+             * preserves errno without duplicating its human-readable text. */
+            if (suffix_length > 0 &&
+                (size_t)suffix_length < sizeof(suffix) &&
+                detail_length >= (size_t)suffix_length &&
+                memcmp(detail + detail_length - (size_t)suffix_length,
+                       suffix, (size_t)suffix_length) == 0) {
+                detail[detail_length - (size_t)suffix_length] = '\0';
+            }
+            errno = saved_system_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "SSH reset incomplete; retained state for retry: %s", detail);
+        } else {
+            set_error(ERR_FILE_IO,
+                      "SSH reset incomplete; retained state for retry: %s",
+                      detail);
+        }
     } else {
         set_error(ERR_FILE_IO,
                   "SSH reset incomplete; retained remaining state for retry");

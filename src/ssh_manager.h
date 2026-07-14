@@ -74,6 +74,11 @@ typedef int (*ssh_current_cleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_precleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
 typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
+typedef enum {
+    SSH_METADATA_TEST_RUNTIME_PIN = 1,
+    SSH_METADATA_TEST_RESET_QUARANTINE
+} ssh_metadata_test_stage_t;
+typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
 typedef void (*ssh_key_snapshot_clear_hook_fn)(const void *data, size_t length,
                                                int retained_fd);
@@ -180,6 +185,8 @@ ssh_quarantine_hook_fn ssh_manager_set_reset_retire_hook_fn(
 ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
     ssh_quarantine_hook_fn fn);
 bool ssh_manager_set_force_portable_quarantine(bool force);
+ssh_metadata_test_hook_fn ssh_manager_set_metadata_test_hook_fn(
+    ssh_metadata_test_hook_fn fn);
 ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
 /* Observe the already-zeroed snapshot immediately before free/close. This is
  * a deterministic test seam; NULL restores the production no-op. */

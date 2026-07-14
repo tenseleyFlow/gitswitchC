@@ -182,11 +182,20 @@ static git_restore_test_hook_fn g_restore_prelock_hook;
 static git_restore_test_hook_fn g_restore_locked_hook;
 static git_restore_test_hook_fn g_restore_postpublish_hook;
 
+typedef enum {
+    GIT_METADATA_TEST_SOURCE_PIN = 1,
+    GIT_METADATA_TEST_STAGE_REVALIDATE
+} git_metadata_test_stage_t;
+typedef bool (*git_metadata_test_hook_fn)(git_metadata_test_stage_t stage);
+static git_metadata_test_hook_fn g_metadata_test_hook;
+
 /* Test seams for deterministic real-Git race coverage. They are deliberately
  * absent from the installed API; tests declare the prototypes locally. */
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn);
 void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn);
 void git_ops_test_set_restore_postpublish_hook(git_restore_test_hook_fn fn);
+git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
+    git_metadata_test_hook_fn fn);
 git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     git_snapshot_value_malloc_fn fn);
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
@@ -197,6 +206,12 @@ void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn) {
 }
 void git_ops_test_set_restore_postpublish_hook(git_restore_test_hook_fn fn) {
     g_restore_postpublish_hook = fn;
+}
+git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
+    git_metadata_test_hook_fn fn) {
+    git_metadata_test_hook_fn previous = g_metadata_test_hook;
+    g_metadata_test_hook = fn;
+    return previous;
 }
 git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     git_snapshot_value_malloc_fn fn) {
@@ -305,6 +320,7 @@ void git_ops_test_reset_caches(void) {
     g_restore_prelock_hook = NULL;
     g_restore_locked_hook = NULL;
     g_restore_postpublish_hook = NULL;
+    g_metadata_test_hook = NULL;
     g_git_snapshot_value_malloc = malloc;
 }
 
@@ -1910,13 +1926,26 @@ static int git_scope_lock_acquire(git_scope_t scope,
         }
         source_fd = openat(lock->dir_fd, lock->leaf,
                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-        if (source_fd < 0 || fstat(source_fd, &opened) != 0 ||
-            !git_same_file_version(&named, &opened)) {
-            if (errno == 0) errno = EAGAIN;
+        if (source_fd < 0 || fstat(source_fd, &opened) != 0) {
             set_system_error(ERR_GIT_CONFIG_FAILED,
-                             "Git configuration changed while pinning: %s",
+                             "Cannot pin Git configuration for rollback: %s",
                              lock->path);
             goto fail;
+        }
+        {
+            bool forced_mismatch =
+                g_metadata_test_hook &&
+                g_metadata_test_hook(GIT_METADATA_TEST_SOURCE_PIN);
+            errno = 0;
+            if (forced_mismatch ||
+                !git_same_file_version(&named, &opened)) {
+                errno = EAGAIN;
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Git configuration changed while pinning: %s",
+                    lock->path);
+                goto fail;
+            }
         }
         lock->original_stat = opened;
         lock->target_mode = opened.st_mode & 07777;
@@ -2098,18 +2127,41 @@ static int git_scope_lock_publish(git_scope_lock_t *lock) {
                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (verify_fd < 0 || fstat(verify_fd, &opened_stage) != 0 ||
         fstatat(lock->dir_fd, lock->stage_leaf, &named_stage,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !S_ISREG(opened_stage.st_mode) ||
-        opened_stage.st_dev != named_stage.st_dev ||
-        opened_stage.st_ino != named_stage.st_ino ||
-        (opened_stage.st_mode & 07777) != lock->target_mode ||
-        opened_stage.st_uid != lock->target_uid ||
-        opened_stage.st_gid != lock->target_gid || fsync(verify_fd) != 0) {
-        int saved_errno = errno ? errno : EAGAIN;
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        int saved_errno = errno;
         if (verify_fd >= 0) close(verify_fd);
         errno = saved_errno;
         set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Prepared Git rollback staging file changed unexpectedly: %s",
+                         "Cannot inspect prepared Git rollback staging file: %s",
+                         lock->stage_path);
+        return -1;
+    }
+    {
+        bool forced_mismatch =
+            g_metadata_test_hook &&
+            g_metadata_test_hook(GIT_METADATA_TEST_STAGE_REVALIDATE);
+        errno = 0;
+        if (forced_mismatch || !S_ISREG(opened_stage.st_mode) ||
+            opened_stage.st_dev != named_stage.st_dev ||
+            opened_stage.st_ino != named_stage.st_ino ||
+            (opened_stage.st_mode & 07777) != lock->target_mode ||
+            opened_stage.st_uid != lock->target_uid ||
+            opened_stage.st_gid != lock->target_gid) {
+            if (verify_fd >= 0) close(verify_fd);
+            errno = EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Prepared Git rollback staging file changed unexpectedly: %s",
+                lock->stage_path);
+            return -1;
+        }
+    }
+    if (fsync(verify_fd) != 0) {
+        int saved_errno = errno;
+        close(verify_fd);
+        errno = saved_errno;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot flush prepared Git rollback staging file: %s",
                          lock->stage_path);
         return -1;
     }

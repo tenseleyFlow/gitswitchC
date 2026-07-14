@@ -19,6 +19,23 @@ void git_ops_test_reset_caches(void);
 void git_ops_test_set_restore_prelock_hook(void (*fn)(git_scope_t scope));
 void git_ops_test_set_restore_locked_hook(void (*fn)(git_scope_t scope));
 void git_ops_test_set_restore_postpublish_hook(void (*fn)(git_scope_t scope));
+typedef enum {
+    GIT_METADATA_TEST_SOURCE_PIN = 1,
+    GIT_METADATA_TEST_STAGE_REVALIDATE
+} git_metadata_test_stage_t;
+typedef bool (*git_metadata_test_hook_fn)(git_metadata_test_stage_t stage);
+git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
+    git_metadata_test_hook_fn fn);
+
+static git_metadata_test_stage_t g_metadata_mismatch_stage;
+static int g_metadata_mismatch_calls;
+
+static bool force_git_metadata_mismatch(git_metadata_test_stage_t stage) {
+    if (stage != g_metadata_mismatch_stage) return false;
+    g_metadata_mismatch_calls++;
+    errno = E2BIG;
+    return true;
+}
 
 typedef struct {
     char *value;
@@ -1726,6 +1743,45 @@ TEST(snapshot_commit_releases_all_generation_descriptors) {
     fixture_cleanup(&fixture);
 }
 
+static void check_metadata_mismatch_errno(
+    git_metadata_test_stage_t stage) {
+    git_fixture_t fixture;
+    git_metadata_test_hook_fn previous;
+    int restore_rc;
+    int restore_errno;
+
+    if (!fixture_init(&fixture)) {
+        CHECK(false);
+        fixture_cleanup(&fixture);
+        return;
+    }
+    CHECK_EQ_INT(git_set("--local", "user.name", "before-mismatch"), 0);
+    CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_set_config_value("user.name", "owned-postimage",
+                                      GIT_SCOPE_LOCAL), 0);
+    CHECK_EQ_INT(git_config_seal(), 0);
+
+    g_metadata_mismatch_stage = stage;
+    g_metadata_mismatch_calls = 0;
+    previous = git_ops_test_set_metadata_hook(force_git_metadata_mismatch);
+    clear_error();
+    restore_rc = git_config_restore();
+    restore_errno = errno;
+    git_ops_test_set_metadata_hook(previous);
+
+    CHECK_EQ_INT(restore_rc, -1);
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(restore_errno, EAGAIN);
+    git_config_commit();
+    fixture_cleanup(&fixture);
+    ts_rm_rf(fixture.base);
+}
+
+TEST(metadata_mismatches_use_stable_eagain_diagnostics) {
+    check_metadata_mismatch_errno(GIT_METADATA_TEST_SOURCE_PIN);
+    check_metadata_mismatch_errno(GIT_METADATA_TEST_STAGE_REVALIDATE);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it);
@@ -1753,4 +1809,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(conflict_retry_never_rebases_onto_unrelated_same_path_generation);
     RUN_TEST(postpublish_path_race_retains_the_installed_generation_for_retry);
     RUN_TEST(snapshot_commit_releases_all_generation_descriptors);
+    RUN_TEST(metadata_mismatches_use_stable_eagain_diagnostics);
 TEST_MAIN_END()

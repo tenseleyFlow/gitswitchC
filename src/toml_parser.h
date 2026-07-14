@@ -79,6 +79,15 @@ typedef void (*toml_writer_test_hook_fn)(toml_writer_test_stage_t stage,
 toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
     toml_writer_test_hook_fn fn);
 
+/* Deterministic pure-metadata mismatch seam for descriptor revalidation.
+ * Production leaves it NULL; tests restore the returned prior callback. */
+typedef enum {
+    TOML_METADATA_TEST_FD_REVALIDATE = 1
+} toml_metadata_test_stage_t;
+typedef bool (*toml_metadata_test_hook_fn)(toml_metadata_test_stage_t stage);
+toml_metadata_test_hook_fn toml_set_metadata_test_hook_fn(
+    toml_metadata_test_hook_fn fn);
+
 /* Parser state for security tracking */
 typedef struct {
     const char *input;

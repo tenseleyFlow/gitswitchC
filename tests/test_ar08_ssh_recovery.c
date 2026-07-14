@@ -114,6 +114,15 @@ static int g_retire_hook_calls;
 static int g_retire_mutations;
 static int g_retire_replace_on_call;
 static int g_reset_dirsync_calls;
+static ssh_metadata_test_stage_t g_metadata_mismatch_stage;
+static int g_metadata_mismatch_calls;
+
+static bool force_ssh_metadata_mismatch(ssh_metadata_test_stage_t stage) {
+    if (stage != g_metadata_mismatch_stage) return false;
+    g_metadata_mismatch_calls++;
+    errno = E2BIG;
+    return true;
+}
 
 static int bind_stale_socket(const char *path) {
     struct sockaddr_un address;
@@ -1071,6 +1080,74 @@ TEST(pre_sidecar_probe_cleanup_preserves_socket_replacement) {
     close(fixture.dir_fd);
 }
 
+TEST(runtime_metadata_mismatches_use_stable_estale_diagnostics) {
+    ssh_fixture_t fixture;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_reap_fn previous_reap;
+    bool previous_portable;
+    char diagnostic_suffix[128];
+    const char *first_suffix;
+    int reset_rc;
+    int diagnostic_errno;
+
+    CHECK(snprintf(diagnostic_suffix, sizeof(diagnostic_suffix), " (%s)",
+                   strerror(ESTALE)) > 0);
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar08pinerrno"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(bind_stale_socket(fixture.socket), 0);
+    g_metadata_mismatch_stage = SSH_METADATA_TEST_RUNTIME_PIN;
+    g_metadata_mismatch_calls = 0;
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        force_ssh_metadata_mismatch);
+    clear_error();
+    reset_rc = ssh_manager_reset("work");
+    diagnostic_errno = get_last_error()->system_errno;
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+
+    CHECK_EQ_INT(reset_rc, -1);
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(diagnostic_errno, ESTALE);
+    first_suffix = strstr(get_last_error()->message, diagnostic_suffix);
+    CHECK(first_suffix != NULL);
+    CHECK(first_suffix == NULL ||
+          strstr(first_suffix + strlen(diagnostic_suffix),
+                 diagnostic_suffix) == NULL);
+    CHECK(path_exists(fixture.socket));
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar08quarerrno"), 0);
+    if (fixture.dir_fd < 0) return;
+    CHECK_EQ_INT(publish_sidecar(&fixture, TEST_PID), 0);
+    g_metadata_mismatch_stage = SSH_METADATA_TEST_RESET_QUARANTINE;
+    g_metadata_mismatch_calls = 0;
+    previous_portable = ssh_manager_set_force_portable_quarantine(true);
+    previous_reap = ssh_manager_set_reap_fn(reap_gone);
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        force_ssh_metadata_mismatch);
+    clear_error();
+    reset_rc = ssh_manager_reset("work");
+    diagnostic_errno = get_last_error()->system_errno;
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+    ssh_manager_set_reap_fn(previous_reap);
+    ssh_manager_set_force_portable_quarantine(previous_portable);
+
+    CHECK_EQ_INT(reset_rc, -1);
+    CHECK_EQ_INT(g_metadata_mismatch_calls, 1);
+    CHECK_EQ_INT(diagnostic_errno, ESTALE);
+    first_suffix = strstr(get_last_error()->message, diagnostic_suffix);
+    CHECK(first_suffix != NULL);
+    CHECK(first_suffix == NULL ||
+          strstr(first_suffix + strlen(diagnostic_suffix),
+                 diagnostic_suffix) == NULL);
+    CHECK(path_exists(fixture.sidecar));
+    cleanup_retained_fixture(&fixture);
+    close(fixture.dir_fd);
+    ts_rm_rf(fixture.xdg);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(indeterminate_identity_retains_retry_sidecar);
@@ -1091,4 +1168,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(pre_sidecar_failed_reap_publishes_retry_tuple);
     RUN_TEST(pre_sidecar_cleanup_preserves_reaped_socket_replacement);
     RUN_TEST(pre_sidecar_probe_cleanup_preserves_socket_replacement);
+    RUN_TEST(runtime_metadata_mismatches_use_stable_estale_diagnostics);
 TEST_MAIN_END()
