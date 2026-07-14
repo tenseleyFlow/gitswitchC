@@ -1,4 +1,5 @@
 build/*
+build-*/
 CLAUDE.md
 .fackr/
 .docs/
