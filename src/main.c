@@ -303,6 +303,53 @@ static int validate_command_arity(const char *command, int operand_count,
     return -1;
 }
 
+/* getopt_long's permutation mode is an implementation extension, and some
+ * implementations disable it when POSIXLY_CORRECT is present.  Build the
+ * option/operand ordering the CLI documents before calling getopt_long so its
+ * option recognition remains portable and environment-independent.  Both
+ * partitions are stable, and the first explicit `--` remains between them so
+ * option-looking operands after it are never reclassified. */
+static char **option_first_argv_copy(int argc, char *const argv[]) {
+    size_t delimiter = (size_t)argc;
+    size_t used = 0;
+    char **copy;
+
+    if (argc <= 0 || !argv) {
+        errno = EINVAL;
+        return NULL;
+    }
+    copy = calloc((size_t)argc + 1, sizeof(*copy));
+    if (!copy) {
+        return NULL;
+    }
+
+    copy[used++] = argv[0];
+    for (size_t i = 1; i < (size_t)argc; i++) {
+        if (strcmp(argv[i], "--") == 0) {
+            delimiter = i;
+            break;
+        }
+        if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            copy[used++] = argv[i];
+        }
+    }
+    if (delimiter < (size_t)argc) {
+        copy[used++] = argv[delimiter];
+    }
+    for (size_t i = 1; i < delimiter; i++) {
+        if (argv[i][0] != '-' || argv[i][1] == '\0') {
+            copy[used++] = argv[i];
+        }
+    }
+    if (delimiter < (size_t)argc) {
+        for (size_t i = delimiter + 1; i < (size_t)argc; i++) {
+            copy[used++] = argv[i];
+        }
+    }
+    copy[used] = NULL;
+    return copy;
+}
+
 static command_result_t command_result(int status) {
     command_result_t result;
 
@@ -367,6 +414,7 @@ int main(int argc, char *argv[]) {
     bool resume_hint_probe = false;
     const char *command = NULL;
     const char *arg1 = NULL;
+    int operand_count = 0;
     int exit_code = EXIT_SUCCESS;
     
     static struct option long_options[] = {
@@ -406,8 +454,17 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     
-    /* Parse command line options */
-    while ((opt = getopt_long(argc, argv, "hvcCVdngly", long_options, NULL)) != -1) {
+    /* Parse command line options.  The private pointer copy is intentionally
+     * reordered rather than the process environment: changing
+     * POSIXLY_CORRECT would be observable to libraries and is not thread-safe. */
+    char **option_argv = option_first_argv_copy(argc, argv);
+    if (!option_argv) {
+        fprintf(stderr, "gitswitch: could not allocate option parser state\n");
+        error_cleanup();
+        return EXIT_FAILURE;
+    }
+    while ((opt = getopt_long(argc, option_argv, "hvcCVdngly",
+                              long_options, NULL)) != -1) {
         switch (opt) {
             case 'h':
                 show_help = true;
@@ -451,11 +508,23 @@ int main(int argc, char *argv[]) {
                 break;
             default:
                 print_usage(argv[0]);
+                free(option_argv);
                 error_cleanup();
                 return EXIT_FAILURE;
         }
     }
     
+    /* option_argv already has every pre-`--` option ahead of the stable
+     * positional tail, regardless of the host getopt implementation. */
+    if (optind < argc) {
+        command = option_argv[optind];
+        if (optind + 1 < argc) {
+            arg1 = option_argv[optind + 1];
+        }
+        operand_count = argc - optind - 1;
+    }
+    free(option_argv);
+
     /* AR-06 F62: --global and --local are contradictory. Silently letting
      * --global win hid a user's mistake and could write the wrong scope; fail
      * with a clear message instead. */
@@ -463,15 +532,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "gitswitch: --global and --local are mutually exclusive\n");
         error_cleanup();
         return EXIT_FAILURE;
-    }
-
-    /* getopt_long has already permuted recognized options out of the
-     * positional tail, including options written after a command operand. */
-    if (optind < argc) {
-        command = argv[optind];
-        if (optind + 1 < argc) {
-            arg1 = argv[optind + 1];
-        }
     }
 
     /* Help/version remain unconditional informational exits. Every executable
@@ -498,9 +558,7 @@ int main(int argc, char *argv[]) {
             return EXIT_FAILURE;
         }
         if (internal_modes == 0 &&
-            validate_command_arity(command,
-                                   command ? argc - optind - 1 : 0,
-                                   arg1) != 0) {
+            validate_command_arity(command, operand_count, arg1) != 0) {
             error_cleanup();
             return EXIT_FAILURE;
         }
@@ -549,8 +607,8 @@ int main(int argc, char *argv[]) {
      * from env-based paths — and it runs on every interactive shell startup.
      * Dispatch it before config_init so it stays cheap and a broken config
      * (e.g. accounts.toml chmod'd wrong) can't blank the shell integration. */
-    if (optind < argc && strcmp(argv[optind], "init") == 0) {
-        const char *shell = (optind + 1 < argc) ? argv[optind + 1] : detect_shell_from_env();
+    if (command && strcmp(command, "init") == 0) {
+        const char *shell = arg1 ? arg1 : detect_shell_from_env();
         int rc = handle_init_command(shell);
         error_cleanup();
         return rc;
@@ -587,7 +645,7 @@ int main(int argc, char *argv[]) {
      * silently proceeding unlocked would reopen the exact lost-update and
      * split-identity races the lock exists to prevent (AR-02 #17). */
     {
-        const char *c = (optind < argc) ? argv[optind] : NULL;
+        const char *c = command;
         bool read_only = resume_check || (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||

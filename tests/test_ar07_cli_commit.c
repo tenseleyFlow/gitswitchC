@@ -17,6 +17,13 @@
 
 static char g_bin[4096];
 
+typedef enum {
+    POSIXLY_INHERIT = 0,
+    POSIXLY_ABSENT,
+    POSIXLY_EMPTY,
+    POSIXLY_SET
+} posixly_mode_t;
+
 static int resolve_binary(void) {
     const char *bin = getenv("GITSWITCH_BIN");
 
@@ -157,10 +164,11 @@ static const char *slurp(const char *path, char *buf, size_t size) {
 
 /* argv must include argv[0] and its terminating NULL. execv's historical API
  * is mutable even though it does not modify argument strings. */
-static int run_cli_input(const char *home, const char *runtime,
-                         const char *input_path,
-                         const char *const argv[],
-                         char *output_path, size_t output_size) {
+static int run_cli_input_posixly(const char *home, const char *runtime,
+                                 const char *input_path,
+                                 const char *const argv[],
+                                 posixly_mode_t posixly_mode,
+                                 char *output_path, size_t output_size) {
     char template_path[] = "/tmp/gitswitch-ar07-cli-output.XXXXXX";
     int output_fd;
     int status;
@@ -187,6 +195,15 @@ static int run_cli_input(const char *home, const char *runtime,
     if (child == 0) {
         char git_config[4096];
         int input_fd = open(input_path ? input_path : "/dev/null", O_RDONLY);
+        int posixly_rc = 0;
+
+        if (posixly_mode == POSIXLY_ABSENT) {
+            posixly_rc = unsetenv("POSIXLY_CORRECT");
+        } else if (posixly_mode == POSIXLY_EMPTY) {
+            posixly_rc = setenv("POSIXLY_CORRECT", "", 1);
+        } else if (posixly_mode == POSIXLY_SET) {
+            posixly_rc = setenv("POSIXLY_CORRECT", "1", 1);
+        }
 
         if ((size_t)snprintf(git_config, sizeof(git_config), "%s/.gitconfig",
                              home) >= sizeof(git_config)) {
@@ -200,7 +217,8 @@ static int run_cli_input(const char *home, const char *runtime,
             setenv("HOME", home, 1) != 0 ||
             setenv("XDG_RUNTIME_DIR", runtime, 1) != 0 ||
             setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
-            setenv("GIT_CONFIG_GLOBAL", git_config, 1) != 0) {
+            setenv("GIT_CONFIG_GLOBAL", git_config, 1) != 0 ||
+            posixly_rc != 0) {
             _exit(125);
         }
         if (input_fd > STDERR_FILENO) {
@@ -224,6 +242,14 @@ static int run_cli_input(const char *home, const char *runtime,
     return WEXITSTATUS(status);
 }
 
+static int run_cli_input(const char *home, const char *runtime,
+                         const char *input_path,
+                         const char *const argv[],
+                         char *output_path, size_t output_size) {
+    return run_cli_input_posixly(home, runtime, input_path, argv,
+                                 POSIXLY_INHERIT, output_path, output_size);
+}
+
 static int run_cli(const char *home, const char *runtime,
                    const char *const argv[],
                    char *output_path, size_t output_size) {
@@ -234,6 +260,73 @@ typedef struct {
     const char *label;
     const char *argv[8];
 } cli_case_t;
+
+TEST(option_order_is_independent_of_posixly_correct) {
+    struct {
+        const char *label;
+        posixly_mode_t mode;
+    } environments[] = {
+        {"absent", POSIXLY_ABSENT},
+        {"empty", POSIXLY_EMPTY},
+        {"set", POSIXLY_SET},
+    };
+    struct {
+        const char *label;
+        const char *argv[8];
+        bool valid;
+    } cases[] = {
+        {"documented names and dry-run options after command",
+         {"gitswitch", "list", "--names", "--dry-run", NULL}, true},
+        {"long option after command",
+         {"gitswitch", "list", "--help", NULL}, true},
+        {"short cluster after command operand",
+         {"gitswitch", "init", "bash", "-ng", NULL}, true},
+        {"long option after command operand",
+         {"gitswitch", "init", "bash", "--dry-run", NULL}, true},
+        {"double dash preserves option-looking operand",
+         {"gitswitch", "init", "bash", "--", "--dry-run", NULL}, false},
+        {"lone dash remains an operand",
+         {"gitswitch", "init", "bash", "-", "--dry-run", NULL}, false},
+        {"invalid extra operand control",
+         {"gitswitch", "init", "bash", "extra", "--dry-run", NULL}, false},
+    };
+
+    for (size_t e = 0; e < sizeof(environments) / sizeof(environments[0]); e++) {
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            char home[128], runtime[128], output_path[128], output[8192];
+            int rc;
+
+            CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                          "gitswitch-ar09-home"), 0);
+            CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                          "gitswitch-ar09-run"), 0);
+            rc = run_cli_input_posixly(home, runtime, NULL, cases[i].argv,
+                                       environments[e].mode, output_path,
+                                       sizeof(output_path));
+            slurp(output_path, output, sizeof(output));
+            if (cases[i].valid) {
+                if (rc != 0 || strstr(output, "invalid number of operands")) {
+                    fprintf(stderr, "  %s / %s returned %d:\n%s\n",
+                            environments[e].label, cases[i].label, rc, output);
+                }
+                CHECK_EQ_INT(rc, 0);
+                CHECK(strstr(output, "invalid number of operands") == NULL);
+            } else {
+                if (!(rc > 0 && rc < 126)) {
+                    fprintf(stderr, "  %s / %s returned %d:\n%s\n",
+                            environments[e].label, cases[i].label, rc, output);
+                }
+                CHECK(rc > 0 && rc < 126);
+                CHECK(strstr(output,
+                             "invalid number of operands for 'init'") != NULL);
+                CHECK(strstr(output, "Usage: gitswitch init [shell]") != NULL);
+            }
+            CHECK(directory_empty(home));
+            CHECK(directory_empty(runtime));
+            unlink(output_path);
+        }
+    }
+}
 
 TEST(exact_arity_rejects_invalid_forms_before_state_creation) {
     cli_case_t cases[] = {
@@ -526,6 +619,7 @@ TEST_MAIN_BEGIN()
         fprintf(stderr, "RESULT FAIL: cannot locate gitswitch binary\n");
         return 1;
     }
+    RUN_TEST(option_order_is_independent_of_posixly_correct);
     RUN_TEST(exact_arity_rejects_invalid_forms_before_state_creation);
     RUN_TEST(unsafe_shorthand_selector_with_extra_operand_is_not_reflected);
     RUN_TEST(legacy_init_alias_rejects_operands_without_creating_state);
