@@ -72,6 +72,8 @@ typedef int (*ssh_current_precleanup_hook_fn)(int dir_fd);
 typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
 typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
+typedef void (*ssh_key_snapshot_clear_hook_fn)(const void *data, size_t length,
+                                               int retained_fd);
 typedef int64_t (*ssh_probe_clock_fn)(void);
 typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
 
@@ -124,6 +126,8 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account);
 /**
  * Start isolated SSH agent for account
  * Returns socket path and PID for cleanup
+ * This low-level legacy entry point does not validate the key pathname. Use
+ * ssh_switch_account() for the descriptor-admitted validation/use contract.
  */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account);
 
@@ -172,6 +176,10 @@ ssh_quarantine_hook_fn ssh_manager_set_unrecorded_cleanup_hook_fn(
     ssh_quarantine_hook_fn fn);
 bool ssh_manager_set_force_portable_quarantine(bool force);
 ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
+/* Observe the already-zeroed snapshot immediately before free/close. This is
+ * a deterministic test seam; NULL restores the production no-op. */
+ssh_key_snapshot_clear_hook_fn ssh_manager_set_key_snapshot_clear_hook_fn(
+    ssh_key_snapshot_clear_hook_fn fn);
 ssh_probe_clock_fn ssh_manager_set_probe_clock_fn(ssh_probe_clock_fn fn);
 ssh_probe_poll_fn ssh_manager_set_probe_poll_fn(ssh_probe_poll_fn fn);
 

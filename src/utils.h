@@ -167,6 +167,8 @@ typedef struct {
     size_t      out_size;           /* size of out; output is NUL-terminated, truncated to fit */
     const char *input;              /* bytes written to child stdin; NULL => stdin is /dev/null */
     size_t      input_len;          /* length of input (not strlen; binary-safe) */
+    int         stdin_fd;           /* readable self-owned regular fd; caller retains ownership */
+    bool        use_stdin_fd;       /* duplicate current offset to child fd 0; mutually exclusive with input */
     bool        merge_stderr;       /* true => child stderr merged into captured stdout (2>&1) */
     bool        stderr_to_devnull;  /* when !merge_stderr: silence child stderr */
     const char *const *extra_env;   /* NULL-terminated "KEY=VALUE" entries set in the child (e.g. GNUPGHOME) */

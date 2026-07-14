@@ -2867,6 +2867,33 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         return -1;
     }
 
+    if (opts->input && opts->use_stdin_fd) {
+        set_error(ERR_INVALID_ARGS,
+                  "run_argv: byte input and stdin_fd are mutually exclusive");
+        return -1;
+    }
+    if (opts->use_stdin_fd) {
+        struct stat stdin_st;
+        int stdin_flags;
+
+        if (opts->stdin_fd < 0 || fstat(opts->stdin_fd, &stdin_st) != 0 ||
+            !S_ISREG(stdin_st.st_mode) || stdin_st.st_uid != getuid()) {
+            set_error(ERR_INVALID_ARGS,
+                      "run_argv: stdin_fd is not a readable self-owned regular file");
+            return -1;
+        }
+        stdin_flags = fcntl(opts->stdin_fd, F_GETFL, 0);
+        if (stdin_flags < 0 || (stdin_flags & O_ACCMODE) == O_WRONLY
+#ifdef O_PATH
+            || (stdin_flags & O_PATH) == O_PATH
+#endif
+        ) {
+            set_error(ERR_INVALID_ARGS,
+                      "run_argv: stdin_fd is not a readable self-owned regular file");
+            return -1;
+        }
+    }
+
     /* Some helpers can consume sensitive state only through a pathname (for
      * example GNUPGHOME). Let callers pin that directory before fork and make
      * the child enter the descriptor-backed directory, so a same-uid namespace
@@ -2935,7 +2962,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     }
     if (g_test_exec_resolved_hook) g_test_exec_resolved_hook(exec_path);
 
-    bool want_in = (opts->input != NULL);
+    bool pipe_input = opts->input != NULL;
+    bool fd_input = opts->use_stdin_fd;
+    bool want_in = pipe_input || fd_input;
     bool want_out = (opts->out && opts->out_size > 0);
     bool need_devnull = !want_in || !want_out ||
                         (!opts->merge_stderr && opts->stderr_to_devnull);
@@ -3002,7 +3031,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         trusted_script_launch_cleanup(&script_launch);
         return -1;
     }
-    if (want_in && make_internal_pipe(in_pipe) != 0) {
+    if (pipe_input && make_internal_pipe(in_pipe) != 0) {
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot create child stdin pipe");
         if (devnull >= 0) close(devnull);
@@ -3015,7 +3044,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot create child stdout pipe");
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         free(fd_snapshot.fds);
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
@@ -3025,7 +3054,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: cannot create child setup-status pipe");
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         free(fd_snapshot.fds);
         close(exec_fd);
@@ -3037,7 +3066,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     if (signals_block_for_child_spawn(&pre_spawn_mask) != 0) {
         int block_errno = errno;
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
@@ -3067,7 +3096,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             mask_restore_errno = errno;
         }
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
@@ -3120,7 +3149,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
             }
         }
 
-        int stdin_source = want_in ? in_pipe[0] : devnull;
+        int stdin_source = fd_input
+                               ? opts->stdin_fd
+                               : (pipe_input ? in_pipe[0] : devnull);
         int stdout_source = want_out ? out_pipe[1] : devnull;
         if (dup2(stdin_source, STDIN_FILENO) < 0) {
             child_report_failure(child_status_fd, CHILD_STAGE_STDIO,
@@ -3375,7 +3406,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         } while (waited < 0 && errno == EINTR);
         signals_child_reaped();
         if (devnull >= 0) close(devnull);
-        if (want_in) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
         close(status_pipe[0]);
         close(status_pipe[1]);
@@ -3392,7 +3423,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     close(exec_fd);
     trusted_script_launch_cleanup(&script_launch);
     if (devnull >= 0) close(devnull);
-    if (want_in) close(in_pipe[0]);
+    if (pipe_input) close(in_pipe[0]);
     if (want_out) close(out_pipe[1]);
     close(status_pipe[1]);
 
@@ -3425,7 +3456,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         int install_status = 0;
         pid_t waited;
 
-        if (want_in) close(in_pipe[1]);
+        if (pipe_input) close(in_pipe[1]);
         if (want_out) close(out_pipe[0]);
         (void)kill(pid, SIGKILL);
         do {
@@ -3445,7 +3476,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         return -1;
     }
 
-    int infd = want_in ? in_pipe[1] : -1;
+    int infd = pipe_input ? in_pipe[1] : -1;
     int outfd = want_out ? out_pipe[0] : -1;
     size_t in_off = 0, out_off = 0;
     bool input_failed = false;
