@@ -142,6 +142,23 @@ TEST(success_clears_stale_error_state) {
     fclose(stream);
 }
 
+TEST(empty_line_is_accepted_as_an_empty_answer) {
+    char buffer[8] = "dirty";
+    FILE *stream = input_stream("\n");
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_OK);
+        CHECK_STR_EQ(buffer, "");
+        end_input(&redirected);
+    }
+    fclose(stream);
+}
+
 TEST(input_error_is_distinct_from_eof) {
     char buffer[8] = "secret";
     FILE *stream = input_stream("");
@@ -167,7 +184,7 @@ TEST(input_error_is_distinct_from_eof) {
     fclose(stream);
 }
 
-#if defined(__GLIBC__) && !defined(HAVE_READLINE)
+#if defined(__GLIBC__)
 typedef struct {
     const char *bytes;
     size_t length;
@@ -184,6 +201,71 @@ static ssize_t failing_cookie_read(void *opaque, char *buffer, size_t size) {
     return -1;
 }
 
+static int begin_cookie_input(FILE *cookie_stream, FILE **saved_stdin,
+                              FILE **non_tty_stream,
+                              redirected_stream_t *redirected) {
+    *non_tty_stream = input_stream("");
+    if (!*non_tty_stream ||
+        begin_input(*non_tty_stream, redirected) != 0) {
+        if (*non_tty_stream) fclose(*non_tty_stream);
+        *non_tty_stream = NULL;
+        return -1;
+    }
+    *saved_stdin = stdin;
+    stdin = cookie_stream;
+    clearerr(stdin);
+    return 0;
+}
+
+static void end_cookie_input(FILE *saved_stdin, FILE *non_tty_stream,
+                             redirected_stream_t *redirected) {
+    stdin = saved_stdin;
+    end_input(redirected);
+    fclose(non_tty_stream);
+}
+
+TEST(partial_initial_read_error_clears_the_caller_buffer) {
+    char buffer[8] = "secret";
+    failing_cookie_t cookie = {
+        .bytes = "abc",
+        .length = sizeof("abc") - 1,
+        .offset = 0
+    };
+    cookie_io_functions_t functions = {
+        .read = failing_cookie_read,
+        .write = NULL,
+        .seek = NULL,
+        .close = NULL
+    };
+    FILE *stream = fopencookie(&cookie, "r", functions);
+    FILE *saved_stdin = NULL;
+    FILE *non_tty_stream = NULL;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(setvbuf(stream, NULL, _IONBF, 0), 0);
+    CHECK_EQ_INT(begin_cookie_input(stream, &saved_stdin, &non_tty_stream,
+                                    &redirected), 0);
+    if (saved_stdin) {
+        set_error(ERR_UNKNOWN, "preserve context across partial read error");
+        errno = 0;
+        int result = prompt_line("", buffer, sizeof(buffer), false);
+        int saved_errno = errno;
+
+        CHECK_EQ_INT(result, PROMPT_LINE_ERROR);
+        CHECK_STR_EQ(buffer, "");
+        CHECK(ferror(stdin));
+        CHECK_EQ_INT(saved_errno, EIO);
+        CHECK_EQ_INT(get_last_error()->code, ERR_UNKNOWN);
+        CHECK_STR_EQ(get_last_error()->message,
+                     "preserve context across partial read error");
+        end_cookie_input(saved_stdin, non_tty_stream, &redirected);
+    }
+    fclose(stream);
+    clearerr(stdin);
+}
+
 TEST(drain_error_is_not_reported_as_truncation) {
     char buffer[8] = "secret";
     failing_cookie_t cookie = {
@@ -198,20 +280,24 @@ TEST(drain_error_is_not_reported_as_truncation) {
         .close = NULL
     };
     FILE *stream = fopencookie(&cookie, "r", functions);
-    FILE *saved_stdin = stdin;
+    FILE *saved_stdin = NULL;
+    FILE *non_tty_stream = NULL;
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
 
     CHECK(stream != NULL);
     if (!stream) return;
     CHECK_EQ_INT(setvbuf(stream, NULL, _IONBF, 0), 0);
-    stdin = stream;
-    clearerr(stdin);
-    set_error(ERR_UNKNOWN, "preserve error across failed drain");
-    CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
-                 PROMPT_LINE_ERROR);
-    CHECK_STR_EQ(buffer, "");
-    CHECK(ferror(stdin));
-    CHECK_EQ_INT(get_last_error()->code, ERR_UNKNOWN);
-    stdin = saved_stdin;
+    CHECK_EQ_INT(begin_cookie_input(stream, &saved_stdin, &non_tty_stream,
+                                    &redirected), 0);
+    if (saved_stdin) {
+        set_error(ERR_UNKNOWN, "preserve error across failed drain");
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_ERROR);
+        CHECK_STR_EQ(buffer, "");
+        CHECK(ferror(stdin));
+        CHECK_EQ_INT(get_last_error()->code, ERR_UNKNOWN);
+        end_cookie_input(saved_stdin, non_tty_stream, &redirected);
+    }
     fclose(stream);
     clearerr(stdin);
 }
@@ -339,8 +425,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(oversized_line_is_rejected_and_next_line_recovers);
     RUN_TEST(unterminated_exact_boundary_and_eof_keep_their_semantics);
     RUN_TEST(success_clears_stale_error_state);
+    RUN_TEST(empty_line_is_accepted_as_an_empty_answer);
     RUN_TEST(input_error_is_distinct_from_eof);
-#if defined(__GLIBC__) && !defined(HAVE_READLINE)
+#if defined(__GLIBC__)
+    RUN_TEST(partial_initial_read_error_clears_the_caller_buffer);
     RUN_TEST(drain_error_is_not_reported_as_truncation);
 #endif
     RUN_TEST(account_flow_reprompts_without_accepting_any_prefix);
