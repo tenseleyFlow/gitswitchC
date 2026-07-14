@@ -141,11 +141,20 @@ static int run_shell_bounded(const char *command, long timeout_ms) {
 
     if (child < 0) return -1;
     if (child == 0) {
-        (void)setpgid(0, 0);
+        int null_fd;
+
+        /* These probes never consume input.  Detach them from a caller's
+         * controlling terminal before starting an interactive shell.  A
+         * mere background process group is insufficient because POSIX sh
+         * may still perform job-control terminal operations and stop itself
+         * instead of letting the bounded command finish. */
+        if (setsid() < 0) _exit(127);
+        null_fd = open("/dev/null", O_RDONLY);
+        if (null_fd < 0 || dup2(null_fd, STDIN_FILENO) < 0) _exit(127);
+        if (null_fd != STDIN_FILENO) close(null_fd);
         execl("/bin/sh", "sh", "-c", command, (char *)NULL);
         _exit(127);
     }
-    (void)setpgid(child, child);
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) goto timeout;
     for (;;) {
         pid_t waited = waitpid(child, &status, WNOHANG);
