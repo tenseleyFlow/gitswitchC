@@ -152,6 +152,29 @@ static ssh_process_outcome_t refuse_agent_reap(pid_t pid,
     return SSH_PROCESS_OWNED;
 }
 
+static ssh_process_outcome_t classify_agent_gone(pid_t pid,
+                                                  const char *socket_arg,
+                                                  int runtime_dir_fd) {
+    (void)pid;
+    (void)socket_arg;
+    (void)runtime_dir_fd;
+    return SSH_PROCESS_GONE;
+}
+
+static int g_stop_dirsync_calls;
+static int g_stop_dirsync_fail_call;
+
+static int stop_counting_dirsync(int dir_fd) {
+    (void)dir_fd;
+    g_stop_dirsync_calls++;
+    if (g_stop_dirsync_fail_call > 0 &&
+        g_stop_dirsync_calls == g_stop_dirsync_fail_call) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static int swap_pid_temp_path(int dir_fd, const char *temp_name) {
     static const char replacement[] = "replacement\n";
     int fd;
@@ -783,10 +806,15 @@ TEST(pid_sidecar_rejects_temp_path_inode_swap) {
  * ownership, socket, and exported environment intact for a later retry. */
 TEST(stop_agent_reap_failure_preserves_retry_handle) {
     char sock[256];
+    char pid_path[256];
     ssh_config_t cfg;
     ssh_reap_fn prev_reap;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    CHECK_EQ_INT(safe_snprintf(pid_path, sizeof(pid_path),
+                               "%s/gitswitch-ssh/ssh-agent.work.pid", g_xdg),
+                 0);
+    CHECK_EQ_INT(write_string_to_file(pid_path, "12345\n", 0600), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     safe_strncpy(cfg.agent_socket_path, sock, sizeof(cfg.agent_socket_path));
@@ -806,10 +834,133 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK_STR_EQ(cfg.agent_socket_arg, "ssh-agent.work.sock");
     CHECK(path_exists(sock));
+    CHECK(path_exists(pid_path));
     CHECK_STR_EQ(getenv("SSH_AUTH_SOCK"), sock);
     CHECK_STR_EQ(getenv("SSH_AGENT_PID"), "12345");
 
+    prev_reap = ssh_manager_set_reap_fn(classify_agent_gone);
     CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+    ssh_manager_set_reap_fn(prev_reap);
+    CHECK(!path_exists(sock));
+    CHECK(!path_exists(pid_path));
+}
+
+TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
+    char sock[256];
+    char pid_path[256];
+    ssh_config_t cfg;
+    ssh_reap_fn previous_reap;
+    ssh_dirsync_fn previous_dirsync;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    CHECK_EQ_INT(safe_snprintf(pid_path, sizeof(pid_path),
+                               "%s/gitswitch-ssh/ssh-agent.work.pid", g_xdg),
+                 0);
+    CHECK_EQ_INT(write_string_to_file(pid_path, "12345\n", 0600), 0);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_path, sock,
+                              sizeof(cfg.agent_socket_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_arg,
+                              "ssh-agent.work.sock",
+                              sizeof(cfg.agent_socket_arg)), 0);
+    cfg.agent_pid = 12345;
+    cfg.agent_owned = true;
+
+    g_stop_dirsync_calls = 0;
+    g_stop_dirsync_fail_call = 1;
+    previous_reap = ssh_manager_set_reap_fn(classify_agent_gone);
+    previous_dirsync = ssh_manager_set_dirsync_fn(stop_counting_dirsync);
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), -1);
+    CHECK_EQ_INT(g_stop_dirsync_calls, 1);
+    CHECK(cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, 12345);
+    CHECK_STR_EQ(cfg.agent_socket_path, sock);
+    CHECK(!path_exists(sock));
+    CHECK(path_exists(pid_path));
+
+    g_stop_dirsync_calls = 0;
+    g_stop_dirsync_fail_call = 0;
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+    CHECK(g_stop_dirsync_calls >= 1);
+    CHECK(!cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, -1);
+    CHECK(cfg.agent_socket_path[0] == '\0');
+    CHECK(!path_exists(sock));
+    CHECK(!path_exists(pid_path));
+
+    ssh_manager_set_dirsync_fn(previous_dirsync);
+    ssh_manager_set_reap_fn(previous_reap);
+}
+
+TEST(stop_agent_already_gone_artifacts_are_durably_confirmed) {
+    char sock[256];
+    char pid_path[256];
+    ssh_config_t cfg;
+    ssh_reap_fn previous_reap;
+    ssh_dirsync_fn previous_dirsync;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    CHECK_EQ_INT(safe_snprintf(pid_path, sizeof(pid_path),
+                               "%s/gitswitch-ssh/ssh-agent.work.pid", g_xdg),
+                 0);
+    CHECK_EQ_INT(write_string_to_file(pid_path, "12345\n", 0600), 0);
+    CHECK_EQ_INT(unlink(sock), 0);
+    CHECK_EQ_INT(unlink(pid_path), 0);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_path, sock,
+                              sizeof(cfg.agent_socket_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_arg,
+                              "ssh-agent.work.sock",
+                              sizeof(cfg.agent_socket_arg)), 0);
+    cfg.agent_pid = 12345;
+    cfg.agent_owned = true;
+
+    g_stop_dirsync_calls = 0;
+    g_stop_dirsync_fail_call = 0;
+    previous_reap = ssh_manager_set_reap_fn(classify_agent_gone);
+    previous_dirsync = ssh_manager_set_dirsync_fn(stop_counting_dirsync);
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+    CHECK_EQ_INT(g_stop_dirsync_calls, 1);
+    CHECK(!cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, -1);
+    CHECK(!path_exists(sock));
+    CHECK(!path_exists(pid_path));
+
+    ssh_manager_set_dirsync_fn(previous_dirsync);
+    ssh_manager_set_reap_fn(previous_reap);
+}
+
+TEST(stop_agent_preserves_a_replacement_pid_sidecar) {
+    char sock[256];
+    char pid_path[256];
+    ssh_config_t cfg;
+    ssh_reap_fn previous_reap;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    CHECK_EQ_INT(safe_snprintf(pid_path, sizeof(pid_path),
+                               "%s/gitswitch-ssh/ssh-agent.work.pid", g_xdg),
+                 0);
+    CHECK_EQ_INT(write_string_to_file(pid_path, "54321\n", 0600), 0);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_path, sock,
+                              sizeof(cfg.agent_socket_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_arg,
+                              "ssh-agent.work.sock",
+                              sizeof(cfg.agent_socket_arg)), 0);
+    cfg.agent_pid = 12345;
+    cfg.agent_owned = true;
+
+    previous_reap = ssh_manager_set_reap_fn(classify_agent_gone);
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), -1);
+    CHECK(cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, 12345);
+    CHECK(path_exists(sock));
+    CHECK(path_exists(pid_path));
+    CHECK(strstr(get_last_error()->message, "replacement retained") != NULL);
+    ssh_manager_set_reap_fn(previous_reap);
 }
 
 /* AR-02 #10: ssh_configure_host_alias writes "IdentityFile <path>" into
@@ -1070,6 +1221,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(fresh_start_aborts_and_cleans_on_namespace_replacement);
     RUN_TEST(pid_sidecar_rejects_temp_path_inode_swap);
     RUN_TEST(stop_agent_reap_failure_preserves_retry_handle);
+    RUN_TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry);
+    RUN_TEST(stop_agent_already_gone_artifacts_are_durably_confirmed);
+    RUN_TEST(stop_agent_preserves_a_replacement_pid_sidecar);
     RUN_TEST(host_alias_write_rejects_newline_key_path);
     RUN_TEST(host_alias_removal_excises_only_named_block);
     RUN_TEST(host_alias_handles_config_larger_than_64k);

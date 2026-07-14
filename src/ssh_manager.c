@@ -123,6 +123,10 @@ static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
                                      const ssh_runtime_pin_t *pin);
 static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin);
 static int reconcile_ssh_runtime_pins(int dir_fd, const char *socket_dir);
+static bool target_is_exact_managed_socket(const char *socket_dir,
+                                           const char *target,
+                                           char *component,
+                                           size_t component_size);
 static int read_ssh_agent_pid_at(int dir_fd, const char *name,
                                  const char *display_path, pid_t *pid_out,
                                  ssh_runtime_pin_t *pin);
@@ -2251,8 +2255,191 @@ done:
     return rc;
 }
 
+/* After a conclusive reap, consume both recovery names through one pinned,
+ * locked runtime namespace. Validate and pin both entries before deleting
+ * either, so a mismatched PID record or replacement socket is preserved rather
+ * than partially treated as ours. Each removal is directory-durable; a retry
+ * after an unlink/fsync split re-proves the remaining name or synchronizes the
+ * observed all-absent state before ownership is cleared. */
+static int cleanup_stopped_agent_runtime(const ssh_config_t *ssh_config) {
+    static const char socket_suffix[] = ".sock";
+    char expected_dir[MAX_PATH_LEN];
+    char runtime_dir[MAX_PATH_LEN];
+    char socket_name[MAX_NAME_LEN + 32];
+    char pid_name[MAX_NAME_LEN + 32];
+    char pid_path[MAX_PATH_LEN];
+    const char *slash;
+    size_t dir_len;
+    size_t socket_len;
+    size_t pid_base_len;
+    ssh_runtime_pin_t socket_pin;
+    ssh_runtime_pin_t pid_pin;
+    pid_t recorded_pid = -1;
+    bool dir_absent = false;
+    bool socket_present = false;
+    bool pid_present = false;
+    bool primary_failure = false;
+    error_context_t primary_error;
+    int primary_errno = 0;
+    int dir_fd = -1;
+    int lock_fd = -1;
+    int rc = -1;
+    int socket_rc;
+    int pid_rc;
+
+    ssh_runtime_pin_init(&socket_pin);
+    ssh_runtime_pin_init(&pid_pin);
+    if (!ssh_config || ssh_config->agent_socket_path[0] == '\0') {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot identify stopped SSH agent runtime for cleanup");
+        return -1;
+    }
+    slash = strrchr(ssh_config->agent_socket_path, '/');
+    if (!slash || slash == ssh_config->agent_socket_path ||
+        slash[1] == '\0') {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot identify SSH agent socket entry for durable cleanup");
+        return -1;
+    }
+    dir_len = (size_t)(slash - ssh_config->agent_socket_path);
+    if (dir_len >= sizeof(expected_dir)) {
+        set_error(ERR_INVALID_PATH, "SSH agent runtime directory is too long");
+        return -1;
+    }
+    memcpy(expected_dir, ssh_config->agent_socket_path, dir_len);
+    expected_dir[dir_len] = '\0';
+    if (!target_is_exact_managed_socket(
+            expected_dir, ssh_config->agent_socket_path, socket_name,
+            sizeof(socket_name))) {
+        set_error(ERR_INVALID_PATH,
+                  "Stopped SSH agent socket is not an exact managed entry");
+        return -1;
+    }
+    socket_len = strlen(socket_name);
+    if (socket_len <= sizeof(socket_suffix) - 1U ||
+        strcmp(socket_name + socket_len - (sizeof(socket_suffix) - 1U),
+               socket_suffix) != 0) {
+        set_error(ERR_INVALID_PATH, "Invalid managed SSH socket suffix");
+        return -1;
+    }
+    pid_base_len = socket_len - (sizeof(socket_suffix) - 1U);
+    if ((size_t)snprintf(pid_name, sizeof(pid_name), "%.*s.pid",
+                         (int)pid_base_len, socket_name) >= sizeof(pid_name) ||
+        (size_t)snprintf(pid_path, sizeof(pid_path), "%s/%s", expected_dir,
+                         pid_name) >= sizeof(pid_path)) {
+        set_error(ERR_INVALID_PATH, "SSH agent PID sidecar path is too long");
+        return -1;
+    }
+
+    runtime_dir[0] = '\0';
+    dir_fd = open_isolated_agent_socket_dir(runtime_dir, sizeof(runtime_dir),
+                                            false, &dir_absent);
+    if (runtime_dir[0] != '\0' && strcmp(runtime_dir, expected_dir) != 0) {
+        if (dir_fd >= 0) close(dir_fd);
+        set_error(ERR_FILE_IO,
+                  "SSH runtime root changed before stopped-agent cleanup");
+        return -1;
+    }
+    if (dir_fd < 0) {
+        return dir_absent ? 0 : -1;
+    }
+    lock_fd = lock_agent_dir(dir_fd);
+    if (lock_fd < 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to lock SSH agent directory during stop");
+        goto done;
+    }
+    if (verify_socket_dir_namespace(dir_fd, runtime_dir) != 0) goto done;
+    if (reconcile_ssh_runtime_pins(dir_fd, runtime_dir) != 0) goto done;
+
+    socket_rc = pin_ssh_runtime_entry_at(
+        dir_fd, socket_name, ssh_config->agent_socket_path, &socket_pin);
+    if (socket_rc < 0) goto done;
+    socket_present = socket_rc == 0;
+    if (socket_present &&
+        (!S_ISSOCK(socket_pin.identity.st_mode) ||
+         socket_pin.identity.st_uid != getuid() ||
+         (socket_pin.identity.st_mode & 0777) != 0600 ||
+         verify_ssh_runtime_pin_at(dir_fd, socket_name,
+                                   ssh_config->agent_socket_path,
+                                   &socket_pin) != 0)) {
+        set_error(ERR_SSH_AGENT_SOCKET_INVALID,
+                  "Stopped SSH agent socket changed or is unsafe: %s",
+                  ssh_config->agent_socket_path);
+        goto done;
+    }
+
+    pid_rc = read_ssh_agent_pid_at(dir_fd, pid_name, pid_path, &recorded_pid,
+                                   &pid_pin);
+    if (pid_rc < 0) goto done;
+    pid_present = pid_rc == 0;
+    if (pid_present && recorded_pid != ssh_config->agent_pid) {
+        set_error(ERR_FILE_IO,
+                  "SSH agent PID sidecar changed; replacement retained: %s",
+                  pid_path);
+        goto done;
+    }
+    if (socket_present &&
+        verify_ssh_runtime_pin_at(dir_fd, socket_name,
+                                  ssh_config->agent_socket_path,
+                                  &socket_pin) != 0) {
+        goto done;
+    }
+
+    if (socket_present &&
+        unlink_ssh_runtime_identity_at(
+            dir_fd, socket_name, &socket_pin.identity, false,
+            "stopped agent socket cleanup", NULL, NULL) != 0) {
+        goto done;
+    }
+    if (pid_present &&
+        unlink_ssh_runtime_identity_at(
+            dir_fd, pid_name, &pid_pin.identity, false,
+            "stopped agent PID sidecar cleanup", NULL, NULL) != 0) {
+        goto done;
+    }
+    if (!socket_present && !pid_present &&
+        sync_ssh_runtime_dir(dir_fd,
+                             "stopped agent artifact absence verification") !=
+            0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    if (rc != 0) {
+        primary_error = g_last_error;
+        primary_errno = errno;
+        primary_failure = true;
+    }
+    if (release_ssh_runtime_pin(dir_fd, &pid_pin) != 0) {
+        if (primary_failure) {
+            log_warning("Secondary failure releasing stopped-agent PID pin: %s",
+                        get_last_error()->message);
+        }
+        rc = -1;
+    }
+    if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) {
+        if (primary_failure) {
+            log_warning(
+                "Secondary failure releasing stopped-agent socket pin: %s",
+                get_last_error()->message);
+        }
+        rc = -1;
+    }
+    if (primary_failure) {
+        g_last_error = primary_error;
+        errno = primary_errno;
+    }
+    if (lock_fd >= 0) unlock_agent_dir(lock_fd);
+    if (dir_fd >= 0) close(dir_fd);
+    return rc;
+}
+
 /* Stop SSH agent */
 int ssh_stop_agent(ssh_config_t *ssh_config) {
+    ssh_process_outcome_t reap_outcome;
+
     if (!ssh_config) {
         set_error(ERR_INVALID_ARGS, "NULL SSH configuration to stop");
         return -1;
@@ -2266,7 +2453,7 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
                   "Owned SSH agent has no verified PID; retained for retry");
         return -1;
     }
-    
+
     log_info("Stopping SSH agent (PID: %d)", ssh_config->agent_pid);
 
     /* Route through the same hardened reaper as every other kill path
@@ -2274,7 +2461,7 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
      * pidfd-pin it before signaling, so a recorded PID that was recycled to
      * an unrelated same-uid process — or to the user's own login ssh-agent —
      * is never signaled. The old path gated only on kill(pid, 0) liveness. */
-    ssh_process_outcome_t reap_outcome = g_ssh_reap(
+    reap_outcome = g_ssh_reap(
         ssh_config->agent_pid,
         ssh_config->agent_socket_arg[0]
             ? ssh_config->agent_socket_arg
@@ -2289,73 +2476,22 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
         return -1;
     }
     log_debug("SSH agent stopped");
-    
-    /* Clean up socket file. AR-05 L15: this was the file's lone
-     * absolute-path, symlink-following unlink() — reachable from
-     * ssh_manager_cleanup's rollback paths with no agent-dir lock held and
-     * no namespace re-validation, while every other socket mutation goes
-     * through the pinned descriptor precisely because the runtime dir can
-     * live in world-writable sticky /tmp. Route it through the same
-     * validated, locked dir fd and unlinkat() the leaf component. The lock
-     * helpers re-enter cleanly when a caller already holds the agent-dir
-     * lock (per-process refcount), so the locked in-file caller is safe. The
-     * unlink and directory sync are now part of the teardown contract: an
-     * uncertain namespace commit retains this structure as a retry handle. */
-    if (strlen(ssh_config->agent_socket_path) > 0) {
-        char socket_dir[MAX_PATH_LEN];
-        const char *slash = strrchr(ssh_config->agent_socket_path, '/');
-        bool cleanup_complete = false;
-        if (slash && slash != ssh_config->agent_socket_path &&
-            *(slash + 1) != '\0' &&
-            (size_t)(slash - ssh_config->agent_socket_path) < sizeof(socket_dir)) {
-            const char *socket_name = slash + 1;
-            size_t dir_len = (size_t)(slash - ssh_config->agent_socket_path);
-            bool absent = false;
-            memcpy(socket_dir, ssh_config->agent_socket_path, dir_len);
-            socket_dir[dir_len] = '\0';
-            int dir_fd = open_isolated_agent_socket_dir(socket_dir,
-                                                        sizeof(socket_dir),
-                                                        false, &absent);
-            if (dir_fd >= 0) {
-                int lock_fd = lock_agent_dir(dir_fd);
-                if (lock_fd >= 0) {
-                    if (verify_socket_dir_namespace(dir_fd, socket_dir) == 0 &&
-                        unlink_ssh_runtime_entry(
-                            dir_fd, socket_name, true,
-                            "stopped agent socket cleanup") == 0) {
-                        cleanup_complete = true;
-                    }
-                    unlock_agent_dir(lock_fd);
-                } else {
-                    set_system_error(ERR_FILE_IO,
-                                     "Failed to lock SSH agent directory during stop");
-                }
-                close(dir_fd);
-            } else if (absent) {
-                cleanup_complete = true;
-            }
-        } else {
-            set_error(ERR_INVALID_PATH,
-                      "Cannot identify SSH agent socket entry for durable cleanup");
-        }
-        if (cleanup_complete) {
-            log_debug("Removed SSH agent socket: %s", ssh_config->agent_socket_path);
-        } else {
-            log_warning("SSH agent stopped but socket cleanup is not durable; retaining retry state");
-            return -1;
-        }
+
+    if (cleanup_stopped_agent_runtime(ssh_config) != 0) {
+        log_warning("SSH agent stopped but runtime cleanup is not durable; retaining retry state");
+        return -1;
     }
-    
-    /* Reset state */
+
+    /* Reset state only after both recovery names are durably absent. */
     ssh_config->agent_pid = -1;
     ssh_config->agent_owned = false;
     ssh_config->agent_socket_path[0] = '\0';
     ssh_config->agent_socket_arg[0] = '\0';
-    
+
     /* Clear environment */
     unsetenv("SSH_AUTH_SOCK");
     unsetenv("SSH_AGENT_PID");
-    
+
     return 0;
 }
 
