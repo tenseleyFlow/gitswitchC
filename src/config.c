@@ -806,8 +806,6 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
     config_active_state_t active_state;
     char legacy_active[MAX_NAME_LEN] = "";
     char scope_str[32];
-    uint32_t current_id = 0;
-    bool had_current;
 
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_load");
@@ -869,13 +867,13 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
         return -1;
     }
 
-    /* load_accounts_from_toml rebuilds the fixed array from index zero. Never
-     * let an interior pointer survive that rebuild by address: section order
-     * can move the same account to a different slot, or put a different
-     * account at the old address. Capture only a pointer proven to name a
-     * current array element, clear it before mutation, then rebind by the
-     * unique stable ID. */
-    had_current = config_capture_current_id(ctx, &current_id);
+    /* The pre-reload current pointer is not runtime evidence. Clear it before
+     * rebuilding the fixed array and leave it clear until live current.sock or
+     * validated persisted active state selects an account below. Rebinding by
+     * the old stable ID here would make accounts_detect_current() take its
+     * already-set fast path and silently ignore a different live account, a
+     * renamed identity, or complete runtime absence. The outer transaction
+     * still preserves the old pointer exactly if any reload phase fails. */
     ctx->current_account = NULL;
 
     /* Load accounts */
@@ -883,7 +881,6 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
         config_document_free(toml_doc);
         return -1;
     }
-    config_rebind_current_id(ctx, had_current, current_id);
 
     /* AR-06 F02: also detect unmodeled KEYS inside recognized sections, so a
      * full rewrite is refused before it silently erases them. */

@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <dirent.h>
@@ -172,6 +174,46 @@ static bool current_pointer_is_valid(const gitswitch_ctx_t *ctx) {
         if (ctx->current_account == &ctx->accounts[i]) return true;
     }
     return false;
+}
+
+static int install_live_current_socket(const char *runtime,
+                                       const char *account_name) {
+    char dir[256];
+    char current[320];
+    char socket_path[320];
+    struct sockaddr_un address;
+    int listener;
+
+    if (snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", runtime) >=
+        (int)sizeof(dir) ||
+        (mkdir(dir, 0700) != 0 && errno != EEXIST) || chmod(dir, 0700) != 0 ||
+        snprintf(socket_path, sizeof(socket_path), "%s/ssh-agent.%s.sock",
+                 dir, account_name) >= (int)sizeof(socket_path) ||
+        strlen(socket_path) >= sizeof(address.sun_path)) {
+        return -1;
+    }
+
+    listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listener < 0) return -1;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    memcpy(address.sun_path, socket_path, strlen(socket_path) + 1U);
+    unlink(socket_path);
+    if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0 ||
+        chmod(socket_path, 0600) != 0 || listen(listener, 4) != 0 ||
+        snprintf(current, sizeof(current), "%s/current.sock", dir) >=
+            (int)sizeof(current)) {
+        close(listener);
+        unlink(socket_path);
+        return -1;
+    }
+    unlink(current);
+    if (symlink(socket_path, current) != 0) {
+        close(listener);
+        unlink(socket_path);
+        return -1;
+    }
+    return listener;
 }
 
 static size_t count_occurrences(const char *haystack, const char *needle) {
@@ -421,13 +463,13 @@ TEST(failed_reload_preserves_complete_context) {
     free(before);
 }
 
-TEST(current_pointer_rebinds_by_id_across_reloads) {
-    static const char reordered_and_replaced[] =
+TEST(reload_reconciles_current_account_from_runtime_or_saved_state) {
+    static const char unchanged[] =
         "[settings]\ndefault_scope = \"local\"\n"
-        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n"
+        "[accounts.2]\nname = \"current-old\"\nemail = \"current@x.com\"\n"
         "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n"
         "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n";
-    static const char removed_before[] =
+    static const char renamed[] =
         "[settings]\ndefault_scope = \"local\"\n"
         "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n"
         "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n";
@@ -435,49 +477,84 @@ TEST(current_pointer_rebinds_by_id_across_reloads) {
         "[settings]\ndefault_scope = \"local\"\n"
         "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n"
         "[accounts.3]\nname = \"after\"\nemail = \"after@x.com\"\n";
-    static const char removed_after[] =
-        "[settings]\ndefault_scope = \"local\"\n"
-        "[accounts.1]\nname = \"before\"\nemail = \"before@x.com\"\n"
-        "[accounts.2]\nname = \"current-new\"\nemail = \"current@x.com\"\n";
+    static const char saved_state[] = "none\nactive=current-old\n";
     const char *old_runtime = getenv("XDG_RUNTIME_DIR");
     bool had_runtime = old_runtime != NULL;
     char saved_runtime[MAX_PATH_LEN] = "";
-    char dir[128], path[256];
+    char dir[128], path[256], hint[256];
     gitswitch_ctx_t ctx;
+    int listener;
 
     if (had_runtime) snprintf(saved_runtime, sizeof(saved_runtime), "%s", old_runtime);
+
+    /* A different live account must override the pointer inherited from the
+     * pre-reload model. This is the causal M7 case: before the fix the early
+     * ID rebind made accounts_detect_current() return without inspection. */
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", dir, 1), 0);
     snprintf(path, sizeof(path), "%s/accounts.toml", dir);
-
     seed_three_accounts(&ctx);
-    CHECK_EQ_INT(write_config(path, reordered_and_replaced,
-                              sizeof(reordered_and_replaced) - 1U), 0);
+    CHECK_EQ_INT(write_config(path, unchanged, sizeof(unchanged) - 1U), 0);
+    listener = install_live_current_socket(dir, "after");
+    CHECK(listener >= 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 3);
+    if (ctx.current_account) CHECK_STR_EQ(ctx.current_account->name, "after");
+    if (listener >= 0) close(listener);
+
+    /* An unchanged account is rebound only when validated persisted state says
+     * it remains active; the stale pointer itself is not evidence. */
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, unchanged, sizeof(unchanged) - 1U), 0);
+    CHECK_EQ_INT(write_config(hint, saved_state, sizeof(saved_state) - 1U), 0);
     CHECK_EQ_INT(config_load(&ctx, path), 0);
     CHECK(current_pointer_is_valid(&ctx));
     CHECK(ctx.current_account == &ctx.accounts[0]);
     CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
-    if (ctx.current_account) CHECK_STR_EQ(ctx.current_account->name, "current-new");
 
+    /* A stable ID whose name changed cannot inherit the old current status
+     * when the only live evidence still names the removed identity. */
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
     seed_three_accounts(&ctx);
-    CHECK_EQ_INT(write_config(path, removed_before, sizeof(removed_before) - 1U), 0);
-    CHECK_EQ_INT(config_load(&ctx, path), 0);
-    CHECK(current_pointer_is_valid(&ctx));
-    CHECK(ctx.current_account == &ctx.accounts[0]);
-    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
-
-    seed_three_accounts(&ctx);
-    CHECK_EQ_INT(write_config(path, removed_current, sizeof(removed_current) - 1U), 0);
+    CHECK_EQ_INT(write_config(path, renamed, sizeof(renamed) - 1U), 0);
+    listener = install_live_current_socket(dir, "current-old");
+    CHECK(listener >= 0);
     CHECK_EQ_INT(config_load(&ctx, path), 0);
     CHECK(current_pointer_is_valid(&ctx));
     CHECK(ctx.current_account == NULL);
+    if (listener >= 0) close(listener);
 
+    /* Removing the old current account likewise leaves no validated binding. */
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
     seed_three_accounts(&ctx);
-    CHECK_EQ_INT(write_config(path, removed_after, sizeof(removed_after) - 1U), 0);
+    CHECK_EQ_INT(write_config(path, removed_current,
+                              sizeof(removed_current) - 1U), 0);
+    listener = install_live_current_socket(dir, "current-old");
+    CHECK(listener >= 0);
     CHECK_EQ_INT(config_load(&ctx, path), 0);
     CHECK(current_pointer_is_valid(&ctx));
-    CHECK(ctx.current_account == &ctx.accounts[1]);
-    CHECK_EQ_INT(ctx.current_account ? (int)ctx.current_account->id : -1, 2);
+    CHECK(ctx.current_account == NULL);
+    if (listener >= 0) close(listener);
+
+    /* With neither live nor saved evidence, even an unchanged account is not
+     * reported as current merely because the caller once pointed at it. */
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    seed_three_accounts(&ctx);
+    CHECK_EQ_INT(write_config(path, unchanged, sizeof(unchanged) - 1U), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(current_pointer_is_valid(&ctx));
+    CHECK(ctx.current_account == NULL);
 
     if (had_runtime) setenv("XDG_RUNTIME_DIR", saved_runtime, 1);
     else unsetenv("XDG_RUNTIME_DIR");
@@ -2175,7 +2252,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(zero_account_id_is_rejected_before_mutation_or_persistence);
     RUN_TEST(current_pointer_rebinds_after_direct_array_compaction);
     RUN_TEST(failed_reload_preserves_complete_context);
-    RUN_TEST(current_pointer_rebinds_by_id_across_reloads);
+    RUN_TEST(reload_reconciles_current_account_from_runtime_or_saved_state);
     RUN_TEST(load_rejects_symlinked_config);
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
     RUN_TEST(config_init_rejects_nondirectory_final_components);
