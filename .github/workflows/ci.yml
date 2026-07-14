@@ -124,43 +124,44 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Build + test on FreeBSD
+      - name: Start FreeBSD 14.4 VM
         uses: cross-platform-actions/action@5ea7e8e4677bd726033a10b094ba1c5762b15dee # v1.3.0
         with:
           operating_system: freebsd
           version: '14.4'
-          shell: bash
-          # Tests run in release mode here: FreeBSD enables ASLR, which is
-          # incompatible with ASan/PIE binaries (they abort on init). The
-          # Linux/macOS jobs provide the ASan/UBSan coverage.
-          run: |
-            # Keep every standalone release gate fatal within this shared VM
-            # script; the policy checker verifies this precedes all three.
-            set -eu
-            # git: the git_ops perf tests prove availability via a PATH walk
-            # and assert no subprocess spawn — they need a real git binary,
-            # which the Linux/macOS runners ship but this VM does not.
-            sudo pkg install -y gmake gcc git binutils
-            # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
-            # run_argv passes the verified script as /dev/fd/4 and never falls
-            # back to its mutable pathname. The minimal CI image does not mount
-            # fdescfs, although normal installations commonly do.
-            if ! mount | grep -q ' on /dev/fd '; then
-              sudo mount -t fdescfs none /dev/fd
-            fi
-            exec 9</bin/sh
-            cmp -s /bin/sh /dev/fd/9
-            exec 9<&-
-            readelf_tool=$(command -v readelf || command -v llvm-readelf || command -v greadelf)
-            test -n "$readelf_tool"
-            "$readelf_tool" -h /bin/sh >/dev/null
-            export READELF="$readelf_tool"
-            gmake BUILD_TYPE=release WERROR=1
-            gmake BUILD_TYPE=release WERROR=1 test
-            gmake BUILD_TYPE=release WERROR=1 release-artifact-test
-            # Compiles and exercises FreeBSD's descriptor-conditioned
-            # funlinkat staging retirement instead of merely parsing it.
-            gmake release-contract-test
+      - name: Build + test on FreeBSD
+        # Tests run in release mode here: FreeBSD enables ASLR, which is
+        # incompatible with ASan/PIE binaries (they abort on init). The
+        # Linux/macOS jobs provide the ASan/UBSan coverage.
+        run: |
+          # Keep every standalone release gate fatal within this shared VM
+          # script; the policy checker verifies this precedes all three.
+          set -eu
+          # git: the git_ops perf tests prove availability via a PATH walk
+          # and assert no subprocess spawn — they need a real git binary,
+          # which the Linux/macOS runners ship but this VM does not.
+          sudo pkg install -y gmake gcc git binutils
+          # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
+          # run_argv passes the verified script as /dev/fd/4 and never falls
+          # back to its mutable pathname. The minimal CI image does not mount
+          # fdescfs, although normal installations commonly do.
+          if ! mount | grep -q ' on /dev/fd '; then
+            sudo mount -t fdescfs none /dev/fd
+          fi
+          exec 9</bin/sh
+          cmp -s /bin/sh /dev/fd/9
+          exec 9<&-
+          readelf_tool=$(command -v readelf || command -v llvm-readelf || command -v greadelf)
+          test -n "$readelf_tool"
+          "$readelf_tool" -h /bin/sh >/dev/null
+          export READELF="$readelf_tool"
+          gmake BUILD_TYPE=release WERROR=1
+          gmake BUILD_TYPE=release WERROR=1 test
+          gmake BUILD_TYPE=release WERROR=1 release-artifact-test
+          # Compiles and exercises FreeBSD's descriptor-conditioned
+          # funlinkat staging retirement instead of merely parsing it.
+          gmake release-contract-test
+        shell: cpa.sh {0}
 
   macos:
     runs-on: macos-latest

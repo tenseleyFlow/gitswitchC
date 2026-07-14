@@ -388,7 +388,7 @@ check_policy()
                 step_unsafe_script = 1
             if (shell_code ~ /[({][[:space:]]*$/)
                 step_unsafe_script = 1
-            if (source == "action" && current_job == "freebsd" &&
+            if (source == "direct" && current_job == "freebsd" &&
                 (shell_code ~ /^(alias|eval|source|trap)[[:space:]]/ ||
                  shell_code ~ /^\.[[:space:]]/ ||
                  shell_code ~ /^(export[[:space:]]+)?(PATH|MAKEFLAGS|MFLAGS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=/ ||
@@ -424,8 +424,12 @@ check_policy()
             shell_continued = shell_trailing_continuation(shell_code)
         }
         function start_run_block(source, style) {
-            if (source == "direct") step_direct_run_count++
-            else step_action_run_count++
+            if (source == "direct") {
+                step_direct_run_count++
+                step_direct_run_style = style
+            } else {
+                step_action_run_count++
+            }
             block_scalar_purpose = source
             shell_quote = 0
             shell_continued = 0
@@ -435,8 +439,12 @@ check_policy()
         function record_scalar_run(source, value) {
             decode_scalar(value)
             if (!scalar_ok || scalar_value == "") reject()
-            if (source == "direct") step_direct_run_count++
-            else step_action_run_count++
+            if (source == "direct") {
+                step_direct_run_count++
+                step_direct_run_style = "scalar"
+            } else {
+                step_action_run_count++
+            }
             if (required_release_job(current_job) &&
                 scalar_value ~ /GITHUB_(ENV|PATH)/)
                 release_job_dynamic_env[current_job] = 1
@@ -446,13 +454,12 @@ check_policy()
             release_gate_count[key]++
             if (release_gate_count[key] == 1) release_gate_serial[key] = serial
         }
-        function classify_release_step(normalized_action, i, command, source,
+        function classify_release_step(i, command, source,
                                        gate, step_gate_count,
                                        freebsd_errexit_count,
                                        freebsd_errexit_serial,
                                        first_gate_serial,
                                        direct_release_test) {
-            normalized_action = tolower(step_action)
             step_gate_count = 0
             first_gate_serial = 0
             for (i = 1; i <= step_command_count; i++) {
@@ -460,7 +467,7 @@ check_policy()
                 command = step_command_text[i]
                 source = step_command_source[i]
                 gate = ""
-                if (current_job == "freebsd" && source == "action" &&
+                if (current_job == "freebsd" && source == "direct" &&
                     command == "set -eu") {
                     freebsd_errexit_count++
                     freebsd_errexit_serial = step_command_serial[i]
@@ -483,8 +490,7 @@ check_policy()
                         gate = "macos-artifact"
                     else if (command == "make release-contract-test")
                         gate = "macos-contract"
-                } else if (current_job == "freebsd" && source == "action" &&
-                           normalized_action ~ /^cross-platform-actions\/action@/) {
+                } else if (current_job == "freebsd" && source == "direct") {
                     if (command == "gmake BUILD_TYPE=release WERROR=1 test")
                         gate = "freebsd-test"
                     else if (command == "gmake BUILD_TYPE=release WERROR=1 release-artifact-test")
@@ -508,14 +514,21 @@ check_policy()
             if (step_continue_count > 1 ||
                 (step_continue_count == 1 && step_continue_value != "false"))
                 reject("required release gate step cannot continue on error")
-            if (step_shell_count != 0)
+            if (current_job != "freebsd" && step_shell_count != 0)
                 reject("required release gate step cannot override its shell")
             if (step_unsafe_script || step_terminates_early)
                 reject("required release gate command is not provably reachable")
             if (current_job == "freebsd") {
                 freebsd_release_step_count++
-                if (step_direct_run_count != 0 || step_action_run_count != 1)
-                    reject("FreeBSD release gates must run inside the reviewed VM action")
+                if (step_use_count != 0 || step_direct_run_count != 1 ||
+                    step_direct_run_style != "|" ||
+                    step_action_run_count != 0)
+                    reject("FreeBSD release gates must share one literal cpa shell step")
+                if (step_shell_count != 1 ||
+                    step_shell_value != "cpa.sh {0}")
+                    reject("FreeBSD release gate step must use exact shell: cpa.sh {0}")
+                if (step_serial != freebsd_action_step_serial + 1)
+                    reject("FreeBSD cpa shell step must immediately follow the VM action")
                 if (step_env_unsafe || step_env_map_count != 0 ||
                     step_env_count != 0)
                     reject("required release gate environment is missing or unsafe")
@@ -586,6 +599,7 @@ check_policy()
             external_use_count++
         }
         function reset_step() {
+            step_serial++
             step_active = 1
             step_use_count = 0
             step_action = ""
@@ -593,6 +607,7 @@ check_policy()
             step_with_seen = 0
             step_in_with = 0
             step_with_indent = -1
+            step_with_input_count = 0
             step_persist_count = 0
             step_persist_value = ""
             step_persist_in_with = 0
@@ -607,10 +622,12 @@ check_policy()
             step_action_shell_in_with = 0
             step_direct_run_count = 0
             step_action_run_count = 0
+            step_direct_run_style = ""
             step_if_count = 0
             step_continue_count = 0
             step_continue_value = ""
             step_shell_count = 0
+            step_shell_value = ""
             step_unsafe_script = 0
             step_terminates_early = 0
             step_in_env = 0
@@ -630,7 +647,8 @@ check_policy()
             if (normalized_action ~ /^actions\/checkout@/) {
                 checkout_count++
                 checkout_job_count[current_job]++
-                if (step_persist_count != 1 ||
+                if (step_with_input_count != 1 ||
+                    step_persist_count != 1 ||
                     step_persist_value != "false" ||
                     !step_persist_in_with)
                     reject("checkout action must set persist-credentials: false")
@@ -639,16 +657,30 @@ check_policy()
                     reject("checkout action/ref/comment must match canonical v7.0.0 pin")
             }
             if (normalized_action ~ /^cross-platform-actions\/action@/) {
-                if (step_os_count != 1 || !step_os_in_with ||
+                if (current_job != "freebsd" ||
+                    step_with_input_count != 2 ||
+                    step_os_count != 1 || !step_os_in_with ||
                     step_os_value != "freebsd" ||
                     step_version_count != 1 || !step_version_in_with ||
-                    step_version_value !~ /^[0-9]+\.[0-9]+$/ ||
-                    step_action_shell_count != 1 ||
-                    !step_action_shell_in_with ||
-                    step_action_shell_value != "bash") reject()
+                    step_version_value !~ /^[0-9]+\.[0-9]+$/)
+                    reject("FreeBSD VM action configuration is missing or unsafe")
+                if (step_action_run_count != 0 ||
+                    step_direct_run_count != 0 ||
+                    step_action_shell_count != 0 || step_shell_count != 0)
+                    reject("FreeBSD VM action cannot carry run or shell inputs")
+                if (step_if_count != 0)
+                    reject("FreeBSD VM action must be unconditional")
+                if (step_continue_count > 1 ||
+                    (step_continue_count == 1 &&
+                     step_continue_value != "false"))
+                    reject("FreeBSD VM action cannot continue on error")
                 freebsd_action_count++
                 freebsd_version = step_version_value
+                freebsd_action_step_serial = step_serial
             }
+            if (current_job == "freebsd" && step_shell_count == 1 &&
+                step_shell_value == "cpa.sh {0}")
+                freebsd_cpa_shell_step_count++
             classify_release_step()
             step_active = 0
             step_in_with = 0
@@ -665,6 +697,7 @@ check_policy()
             job_has_steps = 0
         }
         function record_step_input(key, value, inside) {
+            if (inside) step_with_input_count++
             if (key == "persist-credentials") {
                 step_persist_count++
                 decode_scalar(value)
@@ -1070,6 +1103,7 @@ check_policy()
                 step_shell_count++
                 decode_scalar(entry_value)
                 if (!scalar_ok || scalar_value == "") reject()
+                step_shell_value = scalar_value
                 next
             }
             if ((step_direct_field || step_action_input) &&
@@ -1112,12 +1146,15 @@ check_policy()
                 } else reject()
                 next
             }
+            if (step_active && step_action_input) {
+                record_step_input(entry_key, entry_value, 1)
+                next
+            }
             if (step_active &&
                 (entry_key == "persist-credentials" ||
                  entry_key == "operating_system" || entry_key == "version" ||
                  entry_key == "shell")) {
-                record_step_input(entry_key, entry_value,
-                    step_in_with && current_indent == step_with_indent + 2)
+                record_step_input(entry_key, entry_value, 0)
                 next
             }
 
@@ -1154,8 +1191,11 @@ check_policy()
                 release_job_dynamic_env["macos"] ||
                 release_job_dynamic_env["freebsd"])
                 reject("required release jobs cannot persist environment overrides")
-            if (freebsd_release_step_count != 1)
-                reject("FreeBSD release gates must share one reviewed VM action step")
+            if (freebsd_action_count != 1)
+                reject("FreeBSD release job needs exactly one reviewed VM action")
+            if (freebsd_release_step_count != 1 ||
+                freebsd_cpa_shell_step_count != 1)
+                reject("FreeBSD release gates need exactly one cpa shell step")
             require_release_order("linux-gcc-test", "linux-gcc-artifact")
             require_release_order("linux-gcc-artifact", "linux-contract")
             require_release_order("linux-clang-test", "linux-clang-artifact")
@@ -1170,7 +1210,7 @@ check_policy()
                 reject("each required release job needs exactly one canonical checkout step")
             if (!top_permissions_seen || !jobs_seen || job_count == 0 ||
                 use_count == 0 || external_use_count == 0 ||
-                checkout_count == 0 || freebsd_action_count != 1) exit 1
+                checkout_count == 0) exit 1
             print "freebsd-version=" freebsd_version
         }
     ' "$workflow" >"$work_actions" || {
@@ -1343,8 +1383,9 @@ add_release_step_field()
             if (job != wanted_job || changed) next
             body = ltrim($0)
             if (wanted_job == "freebsd" &&
-                body ~ /^uses:[[:space:]]+cross-platform-actions\/action@/) {
-                print "        " field
+                body == "shell: cpa.sh {0}") {
+                match($0, /^[ ]*/)
+                print substr($0, 1, RLENGTH) field
                 changed = 1
             } else if (body == "run: " command) {
                 match($0, /^[ ]*/)
@@ -2108,9 +2149,15 @@ while IFS='|' read -r matrix_job matrix_command; do
         "required release gate step cannot continue on error"
     add_release_step_field "$matrix_job" "$matrix_command" "shell: bash" \
         "$tmp/shell-$matrix_job-release-step.yml"
+    case $matrix_job in
+        freebsd)
+            shell_reason="FreeBSD release gate step must use exact shell: cpa.sh {0}"
+            ;;
+        *) shell_reason="required release gate step cannot override its shell" ;;
+    esac
     expect_structural_rejected_for "$matrix_job release shell override" \
         "$tmp/shell-$matrix_job-release-step.yml" "$today" \
-        "required release gate step cannot override its shell"
+        "$shell_reason"
 done <<'EOF'
 linux|make BUILD_TYPE=release READLINE=1 WERROR=1 test
 macos|make BUILD_TYPE=release READLINE=1 WERROR=1 test
@@ -2125,8 +2172,8 @@ expect_accepted "explicit release continue-on-error false" \
 
 # Environment and shell defaults can change what an otherwise exact command
 # means. The canonical release subset forbids workflow/job overrides, allows
-# only the exact runtime-capability env on release test steps, and pins the VM
-# action input shell to bash.
+# only the exact runtime-capability env on release test steps, and pins FreeBSD
+# execution to the reviewed cpa shell.
 awk '
     $0 == "jobs:" && !changed {
         print "env:"
@@ -2246,16 +2293,99 @@ freebsd|gmake BUILD_TYPE=release WERROR=1 release-artifact-test
 EOF
 
 awk '
-    !changed && $0 == "          shell: bash" {
-        print "          shell: sh"
+    !changed && $0 == "        shell: cpa.sh {0}" {
+        print "        shell: bash"
         changed = 1
         next
     }
     { print }
     END { if (!changed) exit 1 }
 ' "$workflow" >"$tmp/freebsd-wrong-shell.yml"
-expect_structural_rejected "FreeBSD action shell downgrade" \
-    "$tmp/freebsd-wrong-shell.yml" "$today"
+expect_structural_rejected_for "wrong FreeBSD cpa shell" \
+    "$tmp/freebsd-wrong-shell.yml" "$today" \
+    "FreeBSD release gate step must use exact shell: cpa.sh {0}"
+
+awk '
+    !changed && $0 == "        shell: cpa.sh {0}" {
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-missing-shell.yml"
+expect_structural_rejected_for "missing FreeBSD cpa shell" \
+    "$tmp/freebsd-missing-shell.yml" "$today" \
+    "FreeBSD release gate step must use exact shell: cpa.sh {0}"
+
+# v1.3.0 starts the VM in the action step; commands belong only in the
+# immediately following cpa.sh step. Both the deprecated scalar input and a
+# legacy command-bearing block must fail before their text can count as gates.
+awk '
+    { print }
+    !changed && $0 == "          version: '\''14.4'\''" {
+        print "          run: true"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-deprecated-action-run.yml"
+expect_structural_rejected_for "deprecated FreeBSD action run input" \
+    "$tmp/freebsd-deprecated-action-run.yml" "$today" \
+    "FreeBSD VM action cannot carry run or shell inputs"
+
+# Inputs beyond the reviewed operating-system/version pair can change VM
+# publication and synchronization behavior, so the policy rejects them rather
+# than silently treating an unfamiliar action configuration as canonical.
+awk '
+    { print }
+    !changed && $0 == "          version: '\''14.4'\''" {
+        print "          sync_files: false"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-extra-action-input.yml"
+expect_structural_rejected_for "extra FreeBSD action input" \
+    "$tmp/freebsd-extra-action-input.yml" "$today" \
+    "FreeBSD VM action configuration is missing or unsafe"
+
+awk '
+    { print }
+    !changed && $0 == "          version: '\''14.4'\''" {
+        print "          run: |"
+        print "            gmake release-contract-test"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-command-in-action.yml"
+expect_structural_rejected_for "FreeBSD command left in action text" \
+    "$tmp/freebsd-command-in-action.yml" "$today" \
+    "FreeBSD VM action cannot carry run or shell inputs"
+
+awk '
+    { print }
+    !changed && $0 == "          version: '\''14.4'\''" {
+        print "      - name: Intervening host step"
+        print "        run: true"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-nonadjacent-cpa.yml"
+expect_structural_rejected_for "nonadjacent FreeBSD cpa shell step" \
+    "$tmp/freebsd-nonadjacent-cpa.yml" "$today" \
+    "FreeBSD cpa shell step must immediately follow the VM action"
+
+awk '
+    { print }
+    !changed && $0 == "        shell: cpa.sh {0}" {
+        print "      - name: Duplicate FreeBSD cpa shell"
+        print "        run: true"
+        print "        shell: cpa.sh {0}"
+        changed = 1
+    }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-duplicate-cpa.yml"
+expect_structural_rejected_for "duplicate FreeBSD cpa shell step" \
+    "$tmp/freebsd-duplicate-cpa.yml" "$today" \
+    "FreeBSD release gates need exactly one cpa shell step"
 
 # A prior step cannot persist MAKEFLAGS/PATH through the runner environment and
 # silently reinterpret later exact commands.
@@ -2272,7 +2402,7 @@ expect_structural_rejected_for "persisted release environment override" \
     "$tmp/persisted-release-env.yml" "$today" \
     "required release jobs cannot persist environment overrides"
 
-# The shared FreeBSD action script must establish fatal simple-command failures
+# The shared FreeBSD cpa shell script must establish fatal command failures
 # before every gate and cannot redefine gmake or its controlling environment.
 mutate_release_command freebsd "set -eu" true "$tmp/freebsd-no-errexit.yml"
 expect_structural_rejected_for "FreeBSD release gates without errexit" \
@@ -2284,8 +2414,8 @@ for unsafe_line in "alias gmake=true" "gmake() { true; }" \
     unsafe_id=$(printf '%s\n' "$unsafe_line" | cksum | awk '{print $1}')
     awk -v injected="$unsafe_line" '
         { print }
-        !changed && $0 == "            set -eu" {
-            print "            " injected
+        !changed && $0 == "          set -eu" {
+            print "          " injected
             changed = 1
         }
         END { if (!changed) exit 1 }
@@ -2296,10 +2426,10 @@ done
 
 awk '
     !changed &&
-        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
-        print "            cat <<'\''POLICY'\''"
-        print "            gmake BUILD_TYPE=release WERROR=1 test"
-        print "            POLICY"
+        $0 == "          gmake BUILD_TYPE=release WERROR=1 test" {
+        print "          cat <<'\''POLICY'\''"
+        print "          gmake BUILD_TYPE=release WERROR=1 test"
+        print "          POLICY"
         changed = 1
         next
     }
@@ -2409,8 +2539,8 @@ expect_structural_rejected_for "Linux multi-command release step" \
 
 awk '
     /^  freebsd:[[:space:]]*$/ { in_freebsd = 1 }
-    in_freebsd && !changed && $0 == "          run: |" {
-        print "          run: >"
+    in_freebsd && !changed && $0 == "        run: |" {
+        print "        run: >"
         changed = 1
         next
     }
@@ -2423,9 +2553,9 @@ expect_structural_rejected_for "folded FreeBSD release script" \
 
 awk '
     !changed &&
-        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
-        print "            false && \\"
-        print "              gmake BUILD_TYPE=release WERROR=1 test"
+        $0 == "          gmake BUILD_TYPE=release WERROR=1 test" {
+        print "          false && \\"
+        print "            gmake BUILD_TYPE=release WERROR=1 test"
         changed = 1
         next
     }
@@ -2438,10 +2568,10 @@ expect_structural_rejected_for "FreeBSD continuation release bypass" \
 
 awk '
     !changed &&
-        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
-        print "            if false; then"
-        print "              gmake BUILD_TYPE=release WERROR=1 test"
-        print "            fi"
+        $0 == "          gmake BUILD_TYPE=release WERROR=1 test" {
+        print "          if false; then"
+        print "            gmake BUILD_TYPE=release WERROR=1 test"
+        print "          fi"
         changed = 1
         next
     }
@@ -2454,8 +2584,8 @@ expect_structural_rejected_for "FreeBSD conditional release bypass" \
 
 awk '
     !changed &&
-        $0 == "            gmake BUILD_TYPE=release WERROR=1 test" {
-        print "            exit 0"
+        $0 == "          gmake BUILD_TYPE=release WERROR=1 test" {
+        print "          exit 0"
         print
         changed = 1
     }
