@@ -73,6 +73,20 @@ static int join_path(char *dest, size_t size, const char *base,
     return 0;
 }
 
+static int canonical_existing_path(const char *path, char *dest,
+                                   size_t dest_size) {
+    char resolved[PATH_MAX];
+    size_t length;
+
+    if (!path || !dest || dest_size == 0 || !realpath(path, resolved)) {
+        return -1;
+    }
+    length = strlen(resolved);
+    if (length >= dest_size) return -1;
+    memcpy(dest, resolved, length + 1U);
+    return 0;
+}
+
 static int create_live_ssh_socket(const char *runtime, char *socket_path,
                                   size_t socket_size, char *current_path,
                                   size_t current_size) {
@@ -648,6 +662,7 @@ TEST(fish_combined_resume_hint_checks_both_resources_once) {
 
 TEST(init_posix_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
     char home[PATH_MAX], runtime[PATH_MAX], snippet[PATH_MAX], shims[PATH_MAX];
+    char canonical_runtime[PATH_MAX];
     char hint[PATH_MAX], log_path[PATH_MAX];
     char ssh_socket[PATH_MAX], ssh_current[PATH_MAX], gpg_base[PATH_MAX];
     char gpg_target[PATH_MAX], gpg_current[PATH_MAX], cmd[PATH_MAX * 9];
@@ -655,6 +670,8 @@ TEST(init_posix_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
+    CHECK_EQ_INT(canonical_existing_path(runtime, canonical_runtime,
+                                         sizeof(canonical_runtime)), 0);
     CHECK_EQ_INT(prepare_init_fixture(home, runtime, snippet, sizeof(snippet),
                                       shims, sizeof(shims), hint, sizeof(hint),
                                       log_path, sizeof(log_path)), 0);
@@ -672,7 +689,11 @@ TEST(init_posix_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
 
     /* SSH-only live state exports exactly SSH_AUTH_SOCK, without triggering
      * resume in a noninteractive shell. */
-    socket_fd = create_live_ssh_socket(runtime, ssh_socket, sizeof(ssh_socket),
+    /* Darwin spells the system /tmp alias as /private/tmp after the runtime
+     * safety walk. Create and compare the live endpoints through that same
+     * physical parent while still passing the caller's lexical XDG spelling. */
+    socket_fd = create_live_ssh_socket(canonical_runtime, ssh_socket,
+                                       sizeof(ssh_socket),
                                        ssh_current, sizeof(ssh_current));
     CHECK(socket_fd >= 0);
     if (socket_fd >= 0) {
@@ -692,11 +713,11 @@ TEST(init_posix_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
     }
 
     /* GPG-only live state exports exactly GNUPGHOME. */
-    CHECK_EQ_INT(join_path(gpg_base, sizeof(gpg_base), runtime,
+    CHECK_EQ_INT(join_path(gpg_base, sizeof(gpg_base), canonical_runtime,
                            "/gitswitch-gpg"), 0);
-    CHECK_EQ_INT(join_path(gpg_target, sizeof(gpg_target), runtime,
+    CHECK_EQ_INT(join_path(gpg_target, sizeof(gpg_target), canonical_runtime,
                            "/gitswitch-gpg/work"), 0);
-    CHECK_EQ_INT(join_path(gpg_current, sizeof(gpg_current), runtime,
+    CHECK_EQ_INT(join_path(gpg_current, sizeof(gpg_current), canonical_runtime,
                            "/gitswitch-gpg/current"), 0);
     CHECK_EQ_INT(mkdir_private(gpg_base), 0);
     CHECK_EQ_INT(mkdir_private(gpg_target), 0);
@@ -719,6 +740,7 @@ TEST(init_posix_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
 
 TEST(init_fish_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
     char home[PATH_MAX], runtime[PATH_MAX], posix_snippet[PATH_MAX];
+    char canonical_runtime[PATH_MAX];
     char fish_snippet[PATH_MAX], shims[PATH_MAX], hint[PATH_MAX], log_path[PATH_MAX];
     char ssh_socket[PATH_MAX], ssh_current[PATH_MAX], gpg_base[PATH_MAX];
     char gpg_target[PATH_MAX], gpg_current[PATH_MAX], cmd[PATH_MAX * 9];
@@ -730,6 +752,8 @@ TEST(init_fish_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
     }
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
+    CHECK_EQ_INT(canonical_existing_path(runtime, canonical_runtime,
+                                         sizeof(canonical_runtime)), 0);
     CHECK_EQ_INT(prepare_init_fixture(home, runtime, posix_snippet,
                                       sizeof(posix_snippet), shims, sizeof(shims),
                                       hint, sizeof(hint), log_path,
@@ -751,7 +775,8 @@ TEST(init_fish_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
     CHECK_EQ_INT(run_shell(cmd), 0);
     CHECK(access(log_path, F_OK) != 0);
 
-    socket_fd = create_live_ssh_socket(runtime, ssh_socket, sizeof(ssh_socket),
+    socket_fd = create_live_ssh_socket(canonical_runtime, ssh_socket,
+                                       sizeof(ssh_socket),
                                        ssh_current, sizeof(ssh_current));
     CHECK(socket_fd >= 0);
     if (socket_fd >= 0) {
@@ -772,11 +797,11 @@ TEST(init_fish_snippet_is_quiet_noninteractive_and_exports_only_live_paths) {
         CHECK_EQ_INT(unlink(ssh_socket), 0);
     }
 
-    CHECK_EQ_INT(join_path(gpg_base, sizeof(gpg_base), runtime,
+    CHECK_EQ_INT(join_path(gpg_base, sizeof(gpg_base), canonical_runtime,
                            "/gitswitch-gpg"), 0);
-    CHECK_EQ_INT(join_path(gpg_target, sizeof(gpg_target), runtime,
+    CHECK_EQ_INT(join_path(gpg_target, sizeof(gpg_target), canonical_runtime,
                            "/gitswitch-gpg/work"), 0);
-    CHECK_EQ_INT(join_path(gpg_current, sizeof(gpg_current), runtime,
+    CHECK_EQ_INT(join_path(gpg_current, sizeof(gpg_current), canonical_runtime,
                            "/gitswitch-gpg/current"), 0);
     CHECK_EQ_INT(mkdir_private(gpg_base), 0);
     CHECK_EQ_INT(mkdir_private(gpg_target), 0);
