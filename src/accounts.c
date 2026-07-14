@@ -2198,15 +2198,20 @@ prepare_fail:
  * the account being edited (in which case every prompt shows the current value
  * as the default and an empty answer keeps it). Routes all input through
  * prompt_line so readline builds get line editing and TAB path completion. */
-static int account_prompt_line(char *input, size_t input_size,
-                               bool path_completion) {
+/* AR-10 L19: the label is passed to prompt_line (and thus readline) as the
+ * actual prompt instead of being printf'ed separately with an empty readline
+ * prompt — the old split broke readline's column accounting, so a TAB
+ * completion list, Ctrl-L, or line wrap redisplayed the input without its
+ * label. Each retry re-issues the full label for the same reason. */
+static int account_prompt_line(const char *prompt_text, char *input,
+                               size_t input_size, bool path_completion) {
     int result;
 
     do {
-        result = prompt_line("", input, input_size, path_completion);
+        result = prompt_line(prompt_text, input, input_size, path_completion);
         if (result == PROMPT_LINE_TRUNCATED) {
             printf("[ERROR]: Input is too long (maximum %zu bytes). "
-                   "Please try again: ", input_size - 1);
+                   "Please try again.\n", input_size - 1);
         }
     } while (result == PROMPT_LINE_TRUNCATED);
 
@@ -2217,9 +2222,10 @@ static int account_prompt_line(char *input, size_t input_size,
  * EOF and read failures are not answers. Keep that distinction at this shared
  * boundary so no add/edit prompt can accidentally publish a partially filled
  * local candidate after input disappeared. */
-static int account_read_prompt(char *input, size_t input_size,
-                               bool path_completion, const char *field) {
-    if (account_prompt_line(input, input_size, path_completion) !=
+static int account_read_prompt(const char *prompt_text, char *input,
+                               size_t input_size, bool path_completion,
+                               const char *field) {
+    if (account_prompt_line(prompt_text, input, input_size, path_completion) !=
         PROMPT_LINE_OK) {
         set_error(ERR_FILE_IO, "Failed to read %s", field);
         return -1;
@@ -2231,6 +2237,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     account_t acct;
     char input[512];
     char expanded_path[MAX_PATH_LEN];
+    char prompt_text[MAX_PATH_LEN + 64];
     bool edit = (existing != NULL);
 
     if (edit) {
@@ -2247,9 +2254,11 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
 
     /* Name */
     while (1) {
-        if (edit) printf("Account Name [%s]: ", acct.name);
-        else      printf("Account Name: ");
-        if (account_read_prompt(input, sizeof(input), false,
+        if (edit) snprintf(prompt_text, sizeof(prompt_text),
+                           "Account Name [%s]: ", acct.name);
+        else      snprintf(prompt_text, sizeof(prompt_text),
+                           "Account Name: ");
+        if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                 "account name") != 0) {
             return -1;
         }
@@ -2268,9 +2277,11 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
 
     /* Email */
     while (1) {
-        if (edit) printf("Email Address [%s]: ", acct.email);
-        else      printf("Email Address: ");
-        if (account_read_prompt(input, sizeof(input), false,
+        if (edit) snprintf(prompt_text, sizeof(prompt_text),
+                           "Email Address [%s]: ", acct.email);
+        else      snprintf(prompt_text, sizeof(prompt_text),
+                           "Email Address: ");
+        if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                 "email address") != 0) {
             return -1;
         }
@@ -2298,9 +2309,11 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
      * enforce the same strict UTF-8/terminal policy here and never echo a
      * rejected value in diagnostics. */
     while (1) {
-        if (edit) printf("Description [%s]: ", acct.description);
-        else      printf("Description (optional): ");
-        if (account_read_prompt(input, sizeof(input), false,
+        if (edit) snprintf(prompt_text, sizeof(prompt_text),
+                           "Description [%s]: ", acct.description);
+        else      snprintf(prompt_text, sizeof(prompt_text),
+                           "Description (optional): ");
+        if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                 "account description") != 0) {
             return -1;
         }
@@ -2330,10 +2343,13 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
      * Re-prompt on a bad path rather than silently dropping SSH. */
     while (1) {
         if (edit && acct.ssh_enabled)
-            printf("SSH Key Path [%s] (Enter to keep, 'none' to disable): ", acct.ssh_key_path);
+            snprintf(prompt_text, sizeof(prompt_text),
+                     "SSH Key Path [%s] (Enter to keep, 'none' to disable): ",
+                     acct.ssh_key_path);
         else
-            printf("SSH Key Path (optional, Enter to skip): ");
-        if (account_read_prompt(input, sizeof(input), true,
+            snprintf(prompt_text, sizeof(prompt_text),
+                     "SSH Key Path (optional, Enter to skip): ");
+        if (account_read_prompt(prompt_text, input, sizeof(input), true,
                                 "SSH key path") != 0) {
             return -1;
         }
@@ -2380,10 +2396,13 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
          * reported success with the alias dropped. Re-prompt on rejection. */
         while (1) {
             if (edit && acct.ssh_host_alias[0])
-                printf("SSH Host Alias [%s] (Enter to keep): ", acct.ssh_host_alias);
+                snprintf(prompt_text, sizeof(prompt_text),
+                         "SSH Host Alias [%s] (Enter to keep): ",
+                         acct.ssh_host_alias);
             else
-                printf("SSH Host Alias (optional, e.g., github.com-work): ");
-            if (account_read_prompt(input, sizeof(input), false,
+                snprintf(prompt_text, sizeof(prompt_text),
+                         "SSH Host Alias (optional, e.g., github.com-work): ");
+            if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                     "SSH host alias") != 0) {
                 return -1;
             }
@@ -2406,10 +2425,13 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     /* GPG key. Same empty/'none' semantics as SSH. */
     while (1) {
         if (edit && acct.gpg_enabled)
-            printf("GPG Key ID [%s] (Enter to keep, 'none' to disable): ", acct.gpg_key_id);
+            snprintf(prompt_text, sizeof(prompt_text),
+                     "GPG Key ID [%s] (Enter to keep, 'none' to disable): ",
+                     acct.gpg_key_id);
         else
-            printf("GPG Key ID (optional, Enter to skip): ");
-        if (account_read_prompt(input, sizeof(input), false,
+            snprintf(prompt_text, sizeof(prompt_text),
+                     "GPG Key ID (optional, Enter to skip): ");
+        if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                 "GPG key ID") != 0) {
             return -1;
         }
@@ -2433,9 +2455,10 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
         acct.gpg_enabled = true;
         printf("[OK]: GPG key validated: %s\n", input);
 
-        printf("Enable GPG signing for commits? (y/N)%s: ",
-               (edit && acct.gpg_signing_enabled) ? " [Y]" : "");
-        if (account_read_prompt(input, sizeof(input), false,
+        snprintf(prompt_text, sizeof(prompt_text),
+                 "Enable GPG signing for commits? (y/N)%s: ",
+                 (edit && acct.gpg_signing_enabled) ? " [Y]" : "");
+        if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                 "GPG signing preference") != 0) {
             return -1;
         }
@@ -2447,9 +2470,10 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
 
     /* Preferred scope. Validate; empty keeps the shown default. */
     while (1) {
-        printf("Preferred Git Scope (local/global) [%s]: ",
-               config_scope_to_string(acct.preferred_scope));
-        if (account_read_prompt(input, sizeof(input), false,
+        snprintf(prompt_text, sizeof(prompt_text),
+                 "Preferred Git Scope (local/global) [%s]: ",
+                 config_scope_to_string(acct.preferred_scope));
+        if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                 "preferred Git scope") != 0) {
             return -1;
         }
@@ -2487,8 +2511,10 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     printf("   GPG: %s\n", acct.gpg_enabled ? "[ENABLED]" : "[DISABLED]");
 
     if (!ctx->config.assume_yes) {
-        printf("\n%s this account? (y/N): ", edit ? "Save changes to" : "Add");
-        if (account_read_prompt(input, sizeof(input), false,
+        printf("\n");
+        snprintf(prompt_text, sizeof(prompt_text), "%s this account? (y/N): ",
+                 edit ? "Save changes to" : "Add");
+        if (account_read_prompt(prompt_text, input, sizeof(input), false,
                                 "account confirmation") != 0) {
             return -1;
         }
@@ -2604,7 +2630,6 @@ int accounts_remove_abort(gitswitch_ctx_t *ctx) {
  * classified config_save_transactional() as pre- or post-install. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *account;
-    char input[64];
     char account_name[MAX_NAME_LEN];
     char ssh_error[sizeof(g_last_error.message)] = "";
     char gpg_error[sizeof(g_last_error.message)] = "";
@@ -2644,21 +2669,23 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     printf("Email: %s\n", account->email);
     printf("Description: %s\n", account->description);
     
-    /* Confirmation (--yes skips it for scripting). */
+    /* Confirmation (--yes skips it for scripting). AR-10 L20: one shared
+     * exact-'yes' rule for every destructive confirmation — this site used
+     * to discard trim_whitespace's return, so leading-space handling
+     * diverged from the sibling prompts. */
     if (!ctx->config.assume_yes) {
+        int confirmed;
+
         printf("\n[WARN]: This will permanently remove the account from configuration.\n");
         printf("Are you sure? (type 'yes' to confirm): ");
         fflush(stdout);
 
-        if (!fgets(input, sizeof(input), stdin)) {
+        confirmed = prompt_confirm_exact_yes();
+        if (confirmed < 0) {
             set_error(ERR_FILE_IO, "Failed to read confirmation");
             return -1;
         }
-
-        input[strcspn(input, "\n")] = '\0';
-        trim_whitespace(input);
-
-        if (strcmp(input, "yes") != 0) {
+        if (confirmed == 0) {
             printf("Account removal cancelled.\n");
             return 0;
         }
@@ -2736,6 +2763,30 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         goto remove_done;
     }
     
+    /* AR-10 M1: a prior switch to this account published durable credential
+     * legs (core.sshCommand with IdentitiesOnly=yes, user.signingkey /
+     * commit.gpgsign / gpg.format) that git_ops documents as authoritative
+     * for every fetch/push and commit. Runtime teardown alone leaves them
+     * selecting the retired identity: pushes keep authenticating with the
+     * removed account's key and signing config outlives it. Scrub exactly
+     * the legs still attributable to this account. Best-effort: the durable
+     * removal must stay committable, so a failed unset warns loudly instead
+     * of aborting — the residue stays visible in `status`. */
+    {
+        size_t identity_cleared = 0;
+        if (git_retire_account_identity(account, &identity_cleared) != 0) {
+            fprintf(stderr,
+                    "gitswitch: WARNING: durable Git configuration may still "
+                    "select removed account '%s': %s\n",
+                    account_name, get_last_error()->message);
+        }
+        if (identity_cleared > 0) {
+            printf("Cleared %zu durable Git identity setting(s) that "
+                   "selected '%s'.\n",
+                   identity_cleared, account_name);
+        }
+    }
+
     /* Only a complete teardown permits deleting the configuration handle. */
     if (config_remove_account(ctx, account_id) != 0) {
         goto remove_done;
@@ -2914,35 +2965,11 @@ static int print_git_status_read_failure(void) {
  * selected key. */
 static bool status_signing_key_matches(const account_t *account,
                                        const git_current_config_t *git_config) {
-    const char *selector;
-    const char *configured;
-    size_t selector_len;
-    size_t configured_len;
-    size_t i;
-    bool expected;
-
     if (!account || !git_config) return false;
-    expected = account->gpg_enabled && account->gpg_key_id[0] != '\0';
-    configured = git_config->signing_key;
-    if (!expected) return configured[0] == '\0';
-
-    selector = account->gpg_key_id;
-    if (selector[0] == '0' &&
-        (selector[1] == 'x' || selector[1] == 'X')) {
-        selector += 2;
+    if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') {
+        return git_config->signing_key[0] == '\0';
     }
-    selector_len = strlen(selector);
-    configured_len = strlen(configured);
-    if (selector_len == 0 ||
-        (configured_len != 40 && configured_len != 64) ||
-        selector_len > configured_len) {
-        return false;
-    }
-    for (i = 0; i < configured_len; i++) {
-        if (!isxdigit((unsigned char)configured[i])) return false;
-    }
-    return strncasecmp(configured + configured_len - selector_len,
-                       selector, selector_len) == 0;
+    return git_signing_key_selects_account(account, git_config->signing_key);
 }
 
 /* Show current account status */
@@ -3198,6 +3225,33 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             printf("  Scope: %s\n",
                    git_config_origin_scope_to_string(
                        git_config->effective_name_scope));
+            /* AR-10 M1: the credential legs stay authoritative for fetch/push
+             * and signing even with no active account. Render them here so
+             * residue from a removed/reset account cannot hide in exactly the
+             * state that retirement produces. */
+            printf("  Effective SSH Command: %s",
+                   git_config->ssh_command.present ? "[SET]" : "[ABSENT]");
+            print_git_value_origin(&git_config->ssh_command);
+            printf("\n");
+            printf("  GPG Signing Key: ");
+            if (git_config->signing_key[0] != '\0') {
+                print_terminal_safe(git_config->signing_key);
+            } else {
+                printf("[ABSENT]");
+            }
+            printf("\n");
+            printf("  GPG Signing Enabled: %s\n",
+                   git_config->gpg_signing_enabled ? "[YES]" : "[NO]");
+            printf("  Effective GPG Program: %s",
+                   git_config->gpg_program.present ? "[SET]" : "[ABSENT]");
+            print_git_value_origin(&git_config->gpg_program);
+            printf("\n");
+            if (git_config->ssh_command.present ||
+                git_config->signing_key[0] != '\0' ||
+                git_config->gpg_signing_enabled) {
+                printf("  [WARN] Durable Git credential configuration is set "
+                       "while no account is active.\n");
+            }
         } else {
             if (print_git_status_read_failure() != 0) status_result = -1;
         }

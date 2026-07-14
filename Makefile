@@ -698,9 +698,12 @@ uninstall:
 	@echo "Uninstall complete"
 
 # Test compilation
+# AR-10 L15: test objects see the GITSWITCH_TESTING declarations (the suites
+# link the testing signals object below); production objects never do.
 $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
+		-DGITSWITCH_TESTING \
 		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The reset suite calls the real CLI entry point in isolated child processes
@@ -761,13 +764,17 @@ $(AR09_DISPATCH_TEST_OBJECT): $(TESTDIR)/test_signals.c $(BUILDTYPE_STAMP) | $(O
 		$(TU_HARDENING_FLAGS) -c $< -o $@
 
 # Test executables (exclude main.o to avoid multiple main functions)
-$(BINDIR)/test_%: $(OBJDIR)/test_%.o $(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+# AR-10 L15: suites link the GITSWITCH_TESTING signals object — the sigaction
+# fault / guard-end sabotage seams no longer exist in the production object.
+$(BINDIR)/test_%: $(OBJDIR)/test_%.o $(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 		$(AR07_RESET_MAIN_OBJECT) \
-		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
@@ -900,7 +907,7 @@ analyze:
 	@if command -v cppcheck >/dev/null 2>&1; then \
 		cppcheck --enable=warning,performance,portability \
 			--error-exitcode=1 --std=c11 \
-			--suppress=missingIncludeSystem $(SRCDIR); \
+			--suppress=missingIncludeSystem $(SRCDIR) tools; \
 	else \
 		echo "cppcheck not installed - skipping static analysis"; \
 	fi
@@ -920,12 +927,13 @@ format:
 # (AR-05 L1). Every pre-existing level-4 hit was triaged and carries an
 # inline "Flawfinder: ignore" with its rationale, so a NEW level-4 use of a
 # strcpy/format/exec-class function now fails this target until it is either
-# fixed or explicitly annotated.
+# fixed or explicitly annotated. AR-10 L27: tools/ (the release publisher)
+# ships in the pipeline's trust boundary and is scanned under the same gate.
 .PHONY: security-scan
 security-scan:
 	@echo "Running security scan..."
 	@if command -v flawfinder >/dev/null 2>&1; then \
-		flawfinder --error-level=4 $(SRCDIR); \
+		flawfinder --error-level=4 $(SRCDIR) tools; \
 	else \
 		echo "flawfinder not installed - skipping security scan"; \
 	fi

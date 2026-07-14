@@ -452,13 +452,15 @@ static void emit_status_matrix(void *opaque) {
 }
 
 TEST(status_levels_and_variadic_formatting_are_exact) {
+    /* AR-10 L4: error-level status lines follow the Unix convention and go
+     * to stderr; every other level stays on stdout. */
     static const char expected[] =
         "[OK] success-value-1\n"
-        "[ERROR] error-value-2\n"
         "[WARN] warning-value-3\n"
         "[INFO] info-value-4\n"
         "- other-value-5\n"
         "[INFO]\n";
+    static const char expected_error[] = "[ERROR] error-value-2\n";
     color_output_context_t context;
     captured_output_t plain;
     captured_output_t colored;
@@ -469,7 +471,10 @@ TEST(status_levels_and_variadic_formatting_are_exact) {
     CHECK_EQ_INT(capture_output(emit_status_matrix, &context, &plain), 0);
     if (!plain.standard_output) return;
     CHECK_STR_EQ(plain.standard_output, expected);
-    CHECK_EQ_INT(plain.standard_error_length, 0);
+    CHECK(plain.standard_error != NULL);
+    if (plain.standard_error) {
+        CHECK_STR_EQ(plain.standard_error, expected_error);
+    }
 
     context.color = true;
     CHECK_EQ_INT(capture_output(emit_status_matrix, &context, &colored), 0);
@@ -488,13 +493,21 @@ TEST(status_levels_and_variadic_formatting_are_exact) {
     }
     CHECK(strstr(colored.standard_output, COLOR_GREEN STATUS_SUCCESS
                  COLOR_RESET) != NULL);
-    CHECK(strstr(colored.standard_output, COLOR_RED STATUS_ERROR
+    CHECK(colored.standard_error != NULL &&
+          strstr(colored.standard_error, COLOR_RED STATUS_ERROR
                  COLOR_RESET) != NULL);
     CHECK(strstr(colored.standard_output, COLOR_YELLOW STATUS_WARNING
                  COLOR_RESET) != NULL);
     CHECK(strstr(colored.standard_output, COLOR_BLUE STATUS_INFO
                  COLOR_RESET) != NULL);
-    CHECK_EQ_INT(colored.standard_error_length, 0);
+    stripped = strip_sgr_sequences(colored.standard_error,
+                                   colored.standard_error_length,
+                                   &stripped_length);
+    CHECK(stripped != NULL);
+    if (stripped) {
+        CHECK_STR_EQ(stripped, expected_error);
+        free(stripped);
+    }
 
     captured_output_free(&colored);
     captured_output_free(&plain);
@@ -524,17 +537,19 @@ static void emit_wrapper_matrix(void *opaque) {
     info_fn(NULL);
 }
 
-TEST(message_wrappers_obey_stdout_and_null_empty_context_contracts) {
+TEST(message_wrappers_obey_streams_and_null_empty_context_contracts) {
+    /* AR-10 L4: display_error emits on stderr; the other wrappers on stdout. */
     static const char expected[] =
-        "[ERROR] context: problem-value-1\n"
-        "[ERROR] plain-2\n"
-        "[ERROR] empty-context\n"
         "[WARN] warning-3\n"
         "[WARN]\n"
         "[OK] success-four\n"
         "[OK]\n"
         "[INFO] info-5\n"
         "[INFO]\n";
+    static const char expected_error[] =
+        "[ERROR] context: problem-value-1\n"
+        "[ERROR] plain-2\n"
+        "[ERROR] empty-context\n";
     color_output_context_t context;
     captured_output_t plain;
     captured_output_t colored;
@@ -545,7 +560,10 @@ TEST(message_wrappers_obey_stdout_and_null_empty_context_contracts) {
     CHECK_EQ_INT(capture_output(emit_wrapper_matrix, &context, &plain), 0);
     if (!plain.standard_output) return;
     CHECK_STR_EQ(plain.standard_output, expected);
-    CHECK_EQ_INT(plain.standard_error_length, 0);
+    CHECK(plain.standard_error != NULL);
+    if (plain.standard_error) {
+        CHECK_STR_EQ(plain.standard_error, expected_error);
+    }
 
     context.color = true;
     CHECK_EQ_INT(capture_output(emit_wrapper_matrix, &context, &colored), 0);
@@ -562,7 +580,14 @@ TEST(message_wrappers_obey_stdout_and_null_empty_context_contracts) {
         CHECK_STR_EQ(stripped, plain.standard_output);
         free(stripped);
     }
-    CHECK_EQ_INT(colored.standard_error_length, 0);
+    stripped = strip_sgr_sequences(colored.standard_error,
+                                   colored.standard_error_length,
+                                   &stripped_length);
+    CHECK(stripped != NULL);
+    if (stripped) {
+        CHECK_STR_EQ(stripped, expected_error);
+        free(stripped);
+    }
 
     captured_output_free(&colored);
     captured_output_free(&plain);
@@ -824,19 +849,20 @@ TEST(long_colored_status_preserves_every_payload_byte) {
         return;
     }
 
+    /* AR-10 L4: the error-level line now lands on stderr. */
     context.payload = payload;
     context.color = false;
     CHECK_EQ_INT(capture_output(emit_long_error, &context, &plain), 0);
-    if (!plain.standard_output) return;
+    if (!plain.standard_error) return;
 
     context.color = true;
     CHECK_EQ_INT(capture_output(emit_long_error, &context, &colored), 0);
-    if (!colored.standard_output) {
+    if (!colored.standard_error) {
         captured_output_free(&plain);
         return;
     }
-    stripped_output = strip_sgr_sequences(colored.standard_output,
-                                          colored.standard_output_length,
+    stripped_output = strip_sgr_sequences(colored.standard_error,
+                                          colored.standard_error_length,
                                           &stripped_length);
     CHECK(stripped_output != NULL);
     if (!stripped_output) {
@@ -845,22 +871,22 @@ TEST(long_colored_status_preserves_every_payload_byte) {
         return;
     }
 
-    CHECK_EQ_INT(plain.standard_output_length, (size_t)expected_length);
-    CHECK(memcmp(plain.standard_output, expected,
+    CHECK_EQ_INT(plain.standard_error_length, (size_t)expected_length);
+    CHECK(memcmp(plain.standard_error, expected,
                  (size_t)expected_length + 1U) == 0);
-    CHECK(strstr(plain.standard_output, suffix) != NULL);
-    CHECK(strstr(colored.standard_output, COLOR_RED) != NULL);
-    CHECK(strstr(colored.standard_output, COLOR_RESET) != NULL);
-    CHECK(colored.standard_output_length >= sizeof(colored_ending) - 1U &&
-          memcmp(colored.standard_output + colored.standard_output_length -
+    CHECK(strstr(plain.standard_error, suffix) != NULL);
+    CHECK(strstr(colored.standard_error, COLOR_RED) != NULL);
+    CHECK(strstr(colored.standard_error, COLOR_RESET) != NULL);
+    CHECK(colored.standard_error_length >= sizeof(colored_ending) - 1U &&
+          memcmp(colored.standard_error + colored.standard_error_length -
                      (sizeof(colored_ending) - 1U),
                  colored_ending, sizeof(colored_ending) - 1U) == 0);
-    CHECK_EQ_INT(stripped_length, plain.standard_output_length);
-    CHECK(memcmp(stripped_output, plain.standard_output,
-                 plain.standard_output_length + 1U) == 0);
+    CHECK_EQ_INT(stripped_length, plain.standard_error_length);
+    CHECK(memcmp(stripped_output, plain.standard_error,
+                 plain.standard_error_length + 1U) == 0);
     CHECK(strstr(stripped_output, suffix) != NULL);
-    CHECK_EQ_INT(plain.standard_error_length, 0);
-    CHECK_EQ_INT(colored.standard_error_length, 0);
+    CHECK_EQ_INT(plain.standard_output_length, 0);
+    CHECK_EQ_INT(colored.standard_output_length, 0);
 
     free(stripped_output);
     captured_output_free(&colored);
@@ -881,6 +907,112 @@ static void emit_unrepresentable_diagnostics(void *unused) {
     display_success("success-prefix-%lc-success-suffix",
                     invalid_wide_character);
     display_info("info-prefix-%lc-info-suffix", invalid_wide_character);
+}
+
+/* AR-10 L2/L8: the width-clamp branch was structurally unreachable from the
+ * pipe-backed harness (always 80x24), hiding the negative-%*s widening bug.
+ * Drive display_init against a real pty whose winsize we control. */
+static void emit_overlong_header(void *unused) {
+    (void)unused;
+    display_header("This title is much longer than the narrow terminal");
+}
+
+/* No display_init here: these emitters run under pipe-backed capture, where
+ * a re-init would clobber the pty-derived dimensions under test. */
+static void emit_plain_header(void *unused) {
+    (void)unused;
+    display_header("Title");
+}
+
+static int build_boxed_expected(char *buffer, size_t capacity,
+                                const char *shown_title, int inner_width,
+                                int padding) {
+    size_t length = 0;
+    int index;
+    int right = inner_width - (int)strlen(shown_title) - padding;
+
+    if (!buffer || capacity == 0 || right < 0) return -1;
+    buffer[0] = '\0';
+    if (append_text(buffer, capacity, &length, "┌") != 0) return -1;
+    for (index = 0; index < inner_width; index++) {
+        if (append_text(buffer, capacity, &length, "─") != 0) return -1;
+    }
+    if (append_text(buffer, capacity, &length, "┐\n│") != 0) return -1;
+    for (index = 0; index < padding; index++) {
+        if (append_text(buffer, capacity, &length, " ") != 0) return -1;
+    }
+    if (append_text(buffer, capacity, &length, shown_title) != 0) return -1;
+    for (index = 0; index < right; index++) {
+        if (append_text(buffer, capacity, &length, " ") != 0) return -1;
+    }
+    if (append_text(buffer, capacity, &length, "│\n└") != 0) return -1;
+    for (index = 0; index < inner_width; index++) {
+        if (append_text(buffer, capacity, &length, "─") != 0) return -1;
+    }
+    return append_text(buffer, capacity, &length, "┘\n");
+}
+
+static int init_display_on_pty(unsigned short columns, unsigned short rows) {
+    struct winsize window_size;
+    bool supports_color;
+    int master;
+    int slave;
+    int pty_rc = open_test_pty(&master, &slave);
+    int result = -1;
+
+    if (pty_rc != 0) return pty_rc;
+    memset(&window_size, 0, sizeof(window_size));
+    window_size.ws_col = columns;
+    window_size.ws_row = rows;
+    if (ioctl(slave, TIOCSWINSZ, &window_size) == 0 &&
+        initialize_with_stdout(slave, false, true, &supports_color) == 0) {
+        result = 0;
+    }
+    close(slave);
+    close(master);
+    return result;
+}
+
+TEST(narrow_terminal_truncates_header_instead_of_widening) {
+    char expected[512];
+    captured_output_t captured;
+    int pty_rc = init_display_on_pty(20, 24);
+
+    if (pty_rc == 1) TS_SKIP("pty", "no usable pseudo-terminal");
+    CHECK_EQ_INT(pty_rc, 0);
+
+    /* total_width = 20-2 = 18, inner = 16: the 51-byte title must come back
+     * truncated to exactly 16 bytes with zero padding — the pre-fix code
+     * emitted a 55-column line here. */
+    CHECK_EQ_INT(build_boxed_expected(expected, sizeof(expected),
+                                      "This title is mu", 16, 0), 0);
+    CHECK_EQ_INT(capture_output(emit_overlong_header, NULL, &captured), 0);
+    if (!captured.standard_output) return;
+    CHECK_STR_EQ(captured.standard_output, expected);
+    CHECK_EQ_INT(captured.standard_error_length, 0);
+    captured_output_free(&captured);
+
+    /* Restore the default 80x24 layout state for later tests. */
+    (void)init_display_on_pty(80, 24);
+}
+
+TEST(zero_size_pty_falls_back_to_default_dimensions) {
+    char expected[512];
+    captured_output_t captured;
+    /* AR-10 L33: a fresh pty legitimately reports 0x0 from a SUCCEEDING
+     * TIOCGWINSZ; get_terminal_size must reject it so display_init falls
+     * back to 80x24 instead of collapsing the layout. */
+    int pty_rc = init_display_on_pty(0, 0);
+
+    if (pty_rc == 1) TS_SKIP("pty", "no usable pseudo-terminal");
+    CHECK_EQ_INT(pty_rc, 0);
+
+    CHECK_EQ_INT(build_boxed_expected(expected, sizeof(expected),
+                                      "Title", 38, 16), 0);
+    CHECK_EQ_INT(capture_output(emit_plain_header, NULL, &captured), 0);
+    if (!captured.standard_output) return;
+    CHECK_STR_EQ(captured.standard_output, expected);
+    captured_output_free(&captured);
 }
 
 TEST(formatting_failure_emits_no_partial_or_uninitialized_output) {
@@ -906,9 +1038,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(colorize_maps_exact_styles_resets_and_passthroughs);
     RUN_TEST(colorize_results_remain_valid_across_later_growth);
     RUN_TEST(status_levels_and_variadic_formatting_are_exact);
-    RUN_TEST(message_wrappers_obey_stdout_and_null_empty_context_contracts);
+    RUN_TEST(message_wrappers_obey_streams_and_null_empty_context_contracts);
     RUN_TEST(header_bytes_and_ansi_stripped_parity_are_exact);
     RUN_TEST(config_info_reports_existing_missing_null_and_color_parity);
     RUN_TEST(long_colored_status_preserves_every_payload_byte);
+    RUN_TEST(narrow_terminal_truncates_header_instead_of_widening);
+    RUN_TEST(zero_size_pty_falls_back_to_default_dimensions);
     RUN_TEST(formatting_failure_emits_no_partial_or_uninitialized_output);
 TEST_MAIN_END()

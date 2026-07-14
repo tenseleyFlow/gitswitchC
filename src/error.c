@@ -45,6 +45,10 @@ static void mark_text_truncated(char *destination, size_t destination_size) {
 
     if (!destination || destination_size == 0) return;
     if (destination_size <= marker_length) {
+        /* AR-10 L12: a buffer smaller than the marker still gets marked with
+         * as much of the marker as fits — print_error's contract is that a
+         * truncated field is never mistakable for a complete one. */
+        memcpy(destination, marker, destination_size - 1U);
         destination[destination_size - 1U] = '\0';
         return;
     }
@@ -219,29 +223,33 @@ static const char *log_level_to_string(log_level_t level) {
 
 /* Initialize error handling and logging system */
 int error_init(log_level_t level, const char *log_file_path) {
-    g_log_level = level;
-    
-    /* Close existing log file if open */
-    if (g_log_file && g_log_file != stderr) {
-        fclose(g_log_file);
-        g_log_file = NULL;
-    }
-    
-    /* Open new log file if specified */
+    FILE *replacement;
+
+    /* AR-10 L9: acquire the replacement sink BEFORE closing the old stream
+     * or committing the new level, mirroring error_set_log_file's
+     * transactional semantics. The old order closed the live stream and made
+     * the level effective first, so a failed fopen left the system in a
+     * half-reinitialized state. */
     if (log_file_path) {
-        g_log_file = fopen(log_file_path, "a");
-        if (!g_log_file) {
-            /* Fall back to stderr if file can't be opened */
-            g_log_file = stderr;
+        replacement = fopen(log_file_path, "a");
+        if (!replacement) {
+            /* First-ever init still needs a usable sink for the diagnostic. */
+            if (!g_log_file) g_log_file = stderr;
             set_error(ERR_FILE_IO, "Failed to open log file: %s", log_file_path);
             return -1;
         }
         /* Set log file to line buffered for immediate output */
-        setvbuf(g_log_file, NULL, _IOLBF, 0);
+        setvbuf(replacement, NULL, _IOLBF, 0);
     } else {
-        g_log_file = stderr;
+        replacement = stderr;
     }
-    
+
+    if (g_log_file && g_log_file != stderr) {
+        fclose(g_log_file);
+    }
+    g_log_file = replacement;
+    g_log_level = level;
+
     /* Clear any existing error */
     clear_error();
     
@@ -288,10 +296,14 @@ int set_error_context(error_code_t code, const char *file, int line,
 
     g_last_error = next;
 
-    /* Log the error */
-    log_error("Error set: %s (%s:%d in %s)", 
-              g_last_error.message, g_last_error.file, line,
-              g_last_error.function);
+    /* AR-10 L10: recorded at INFO, not ERROR. Many set_error sites are
+     * expected misses their callers recover from (absent config, first-run
+     * probes), so the automatic line spammed stderr with ERROR-level noise
+     * on exit-0 release commands. A genuine failure is reported at the
+     * command boundary; this line is developer telemetry. */
+    log_info("Error set: %s (%s:%d in %s)",
+             g_last_error.message, g_last_error.file, line,
+             g_last_error.function);
     return result;
 }
 
@@ -326,10 +338,10 @@ int set_system_error_context(error_code_t code, const char *file, int line,
 
     g_last_error = next;
 
-    /* Log the error with system details */
-    log_error("System error: %s [errno=%d: %s] (%s:%d in %s)", 
-              g_last_error.message, saved_errno, strerror(saved_errno),
-              g_last_error.file, line, g_last_error.function);
+    /* AR-10 L10: INFO, not ERROR — see set_error_context. */
+    log_info("System error: %s [errno=%d: %s] (%s:%d in %s)",
+             g_last_error.message, saved_errno, strerror(saved_errno),
+             g_last_error.file, line, g_last_error.function);
     return result;
 }
 
@@ -365,9 +377,13 @@ void log_message(log_level_t level, const char *file, int line,
         return;
     }
     
-    /* Format the message */
+    /* Format the message. AR-10 L11: a vsnprintf encoding failure leaves the
+     * buffer indeterminate; never hand that to fprintf. */
     va_start(args, fmt);
-    vsnprintf(message, sizeof(message), fmt, args); /* Flawfinder: ignore — bounded; fmt from internal callers */
+    if (vsnprintf(message, sizeof(message), fmt, args) < 0) { /* Flawfinder: ignore — bounded; fmt from internal callers */
+        static const char unformattable[] = "(unformattable log message)";
+        memcpy(message, unformattable, sizeof(unformattable));
+    }
     va_end(args);
     
     /* Get timestamp */
@@ -522,11 +538,11 @@ void get_timestamp(char *buffer, size_t buffer_size) {
     time(&now);
     tm_info = localtime(&now);
     
-    if (tm_info) {
-        strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", tm_info);
-    } else {
-        strncpy(buffer, "UNKNOWN-TIME", buffer_size - 1);
-        buffer[buffer_size - 1] = '\0';
+    /* AR-10 L13: strftime returning 0 leaves the buffer indeterminate and
+     * possibly unterminated; treat it exactly like a failed localtime. */
+    if (!tm_info ||
+        strftime(buffer, buffer_size, "%Y-%m-%d %H:%M:%S", tm_info) == 0) {
+        copy_bounded_text(buffer, buffer_size, "UNKNOWN-TIME");
     }
 }
 
@@ -542,9 +558,11 @@ int safe_strncpy(char *dest, const char *src, size_t dest_size) {
         set_error(ERR_INVALID_ARGS, "String too long for destination buffer");
         return -1;
     }
-    
-    strncpy(dest, src, dest_size - 1);
-    dest[dest_size - 1] = '\0';
+
+    /* AR-10 L14: the exact length is already proven above, so copy exactly
+     * src_len+1 bytes. strncpy zero-padded the entire destination — O(dest)
+     * writes for every one of the ~176 call sites. */
+    memcpy(dest, src, src_len + 1U);
     return 0;
 }
 

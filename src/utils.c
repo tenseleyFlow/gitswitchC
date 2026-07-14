@@ -3122,7 +3122,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * it, a signal delivered to this child would run guard_handler (which
          * only records and returns), swallowing it and leaving the helper
          * "pre-interrupted" instead of terminating normally. */
-        signals_reset_for_child();
+        signals_reset_for_child(&pre_spawn_mask);
 
         int child_status_fd = status_pipe[1];
         close(status_pipe[0]);
@@ -4905,6 +4905,17 @@ int get_terminal_size(int *width, int *height) {
 
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) {
         set_system_error(ERR_SYSTEM_CALL, "Failed to get terminal size");
+        return -1;
+    }
+
+    /* AR-10 L33: a fresh pty reports 0x0 with a SUCCEEDING ioctl. Accepting
+     * that as a valid size collapsed display layout (display_init only falls
+     * back to 80x24 on nonzero return); report failure so callers use their
+     * defaults. */
+    if (ws.ws_col == 0 || ws.ws_row == 0) {
+        set_error(ERR_SYSTEM_CALL,
+                  "Terminal reported a zero dimension (%ux%u)",
+                  (unsigned)ws.ws_col, (unsigned)ws.ws_row);
         return -1;
     }
 

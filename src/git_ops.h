@@ -109,6 +109,36 @@ int git_expected_ssh_command(const account_t *account, char *command,
 int git_clear_config(git_scope_t scope);
 
 /**
+ * True when `configured` is a canonical 40- or 64-hex-digit fingerprint whose
+ * suffix case-insensitively equals the account's saved signing-key selector
+ * (with any 0x prefix stripped). A successful isolated switch always publishes
+ * the canonical primary fingerprint to Git, while the saved account may retain
+ * the shorter selector the user entered; this is the one comparison rule for
+ * both status reporting and identity retirement. Never accepts a noncanonical
+ * Git value as proof of the selected key.
+ */
+bool git_signing_key_selects_account(const account_t *account,
+                                     const char *configured);
+
+/**
+ * AR-10 M1: scrub the durable Git credential legs that still select a retired
+ * account after its runtime state was torn down (remove/reset). A switch
+ * publishes core.sshCommand (authoritative for every fetch/push via
+ * IdentitiesOnly=yes) and user.signingkey/commit.gpgsign/gpg.format; neither
+ * remove nor reset previously touched them, so pushes kept authenticating as
+ * the retired identity and commit.gpgsign=true outlived the deleted isolated
+ * GNUPGHOME. Checks the global scope plus, inside a repository, the local and
+ * distinct managed-worktree scopes, and unsets only values attributable to
+ * `account`: an exactly matching rebuilt core.sshCommand, and a signing key
+ * accepted by git_signing_key_selects_account() (with its commit.gpgsign and
+ * gpg.format companions at the same scope). user.name/user.email are plain
+ * identity, not credentials, and are left untouched. Every scope and key is
+ * attempted; *cleared (optional) reports how many present keys were removed
+ * even on failure. Returns 0 when every attempted unset succeeded.
+ */
+int git_retire_account_identity(const account_t *account, size_t *cleared);
+
+/**
  * Snapshot the gitswitch-managed config keys (identity/signing keys,
  * gpg.format, every Git-supported GPG program selector, and core.sshCommand)
  * at `scope` before a switch mutates them, plus the LOCAL scope when a global

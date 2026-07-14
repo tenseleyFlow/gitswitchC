@@ -57,6 +57,38 @@
     "[GNUPG:] ERROR keylist.getkey 14\n" \
     "[GNUPG:] FAILURE gpg-exit 33554433\n"
 
+#ifdef __linux__
+/* AR-10 L31: see the twin helper in test_ar07_gpg_cleanup.c — user-namespace
+ * fallback so the bind-mount security regression runs unprivileged instead
+ * of green-skipping on every non-root host. */
+static int write_exact(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY);
+    ssize_t length = (ssize_t)strlen(text);
+
+    if (fd < 0) return -1;
+    if (write(fd, text, (size_t)length) != length) {
+        (void)close(fd);
+        return -1;
+    }
+    return close(fd);
+}
+
+static int enter_private_mount_namespace(void) {
+    char map[64];
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+
+    if (unshare(CLONE_NEWNS) == 0) return 0;
+    if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) return -1;
+    if (write_exact("/proc/self/setgroups", "deny") != 0) return -1;
+    snprintf(map, sizeof(map), "%u %u 1", (unsigned)uid, (unsigned)uid);
+    if (write_exact("/proc/self/uid_map", map) != 0) return -1;
+    snprintf(map, sizeof(map), "%u %u 1", (unsigned)gid, (unsigned)gid);
+    if (write_exact("/proc/self/gid_map", map) != 0) return -1;
+    return 0;
+}
+#endif
+
 static int make_runtime(char *xdg, size_t size) {
     char canonical[MAX_PATH_LEN];
     size_t length;
@@ -628,7 +660,7 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
         command_runner_fn previous;
         int rc;
 
-        if (unshare(CLONE_NEWNS) != 0 ||
+        if (enter_private_mount_namespace() != 0 ||
             mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
             mount(managed, alias, NULL, MS_BIND, NULL) != 0) {
             _exit(77);

@@ -19,6 +19,7 @@
 #include "error.h"
 #include "utils.h"
 #include "git_ops.h"
+#include "prompt.h"
 #include "ssh_manager.h"
 #include "gpg_manager.h"
 #include "signals.h"
@@ -1380,12 +1381,16 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
         
         char input[64];
         if (fgets(input, sizeof(input), stdin)) {
+            char *answer;
+
             input[strcspn(input, "\n")] = '\0';
-            trim_whitespace(input);
-            
+            /* AR-10 L20: use the trimmed pointer — the discarded return left
+             * a leading-space " y" rejected here while other prompts trimmed. */
+            answer = trim_whitespace(input);
+
             /* Cast to unsigned char first: passing a plain (possibly signed)
              * char to a ctype function is UB for negative values (mem-2). */
-            if (tolower((unsigned char)input[0]) == 'y') {
+            if (tolower((unsigned char)answer[0]) == 'y') {
                 if (config_create_default(ctx->config.config_path) == 0) {
                     display_success("Default configuration created");
                     printf("Please edit the file to add your accounts.\n");
@@ -2020,7 +2025,6 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     command_result_t result = command_result(EXIT_FAILURE);
     account_t *target_account = NULL;
     account_t *active_account = NULL;
-    char resp[16];
     const char *target = NULL;
     char ssh_error[sizeof(g_last_error.message)] = "";
     char gpg_error[sizeof(g_last_error.message)] = "";
@@ -2092,13 +2096,10 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     if (!ctx->config.assume_yes) {
         printf("Type 'yes' to continue: ");
         fflush(stdout);
-        if (!fgets(resp, sizeof(resp), stdin)) {
-            printf("Reset cancelled.\n");
-            result.status = EXIT_SUCCESS;
-            return result;
-        }
-        resp[strcspn(resp, "\n")] = '\0';
-        if (strcmp(resp, "yes") != 0) {
+        /* AR-10 L20: shared exact-'yes' rule; this site previously applied
+         * no whitespace trimming at all. EOF/read failure stays a polite
+         * cancel — nothing has been destroyed yet. */
+        if (prompt_confirm_exact_yes() != 1) {
             printf("Reset cancelled.\n");
             result.status = EXIT_SUCCESS;
             return result;
@@ -2167,6 +2168,48 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                 "gitswitch: reset failed; retry metadata was preserved\n");
         set_error(ERR_SYSTEM_CALL, "SSH/GPG reset did not complete");
         return result;
+    }
+
+    /* AR-10 M1: reset tears down the runtime state but previously left the
+     * durable Git credential legs a switch published (core.sshCommand,
+     * user.signingkey, commit.gpgsign, gpg.format). That is worse than
+     * remove: gpg_manager_reset just deleted the isolated GNUPGHOME while a
+     * persisted commit.gpgsign=true keeps instructing Git to sign, so later
+     * commits fail or silently fall back to the system keyring — and pushes
+     * keep authenticating with the reset account's key. Scrub the legs still
+     * attributable to the reset account(s); best-effort, the reset itself
+     * already succeeded. */
+    {
+        size_t identity_cleared = 0;
+        if (target_account) {
+            if (git_retire_account_identity(target_account,
+                                            &identity_cleared) != 0) {
+                fprintf(stderr,
+                        "gitswitch: WARNING: durable Git configuration may "
+                        "still select reset account '%s': %s\n",
+                        target, get_last_error()->message);
+            }
+            if (identity_cleared > 0) {
+                printf("Cleared %zu durable Git identity setting(s) that "
+                       "selected '%s'.\n", identity_cleared, target);
+            }
+        } else {
+            for (size_t i = 0; i < ctx->account_count; i++) {
+                size_t account_cleared = 0;
+                if (git_retire_account_identity(&ctx->accounts[i],
+                                                &account_cleared) != 0) {
+                    fprintf(stderr,
+                            "gitswitch: WARNING: durable Git configuration "
+                            "may still select reset account '%s': %s\n",
+                            ctx->accounts[i].name, get_last_error()->message);
+                }
+                if (account_cleared > 0) {
+                    printf("Cleared %zu durable Git identity setting(s) that "
+                           "selected '%s'.\n",
+                           account_cleared, ctx->accounts[i].name);
+                }
+            }
+        }
     }
 
     /* When the reset covered the saved active account (or everything), clear

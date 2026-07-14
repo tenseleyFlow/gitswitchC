@@ -18,16 +18,32 @@ qa_version=$(sed -n '1p' "$root/VERSION")
 [ -n "$qa_version" ] || fail "VERSION is empty"
 qa_root=gitswitcher-$qa_version
 qa_archive=$root/build/dist/$qa_root.tar.gz
+qa_preserved=
 cleanup()
 {
     status=$?
     trap - 0 1 2 3 15
-    rm -rf "$tmp"
     rm -f "$qa_archive"
+    if [ -n "$qa_preserved" ]; then
+        mkdir -p "$(dirname "$qa_archive")"
+        mv "$qa_preserved" "$qa_archive" || status=1
+    fi
+    rm -rf "$tmp"
     exit "$status"
 }
 trap cleanup 0
 trap 'exit 1' 1 2 3 15
+
+# AR-10 L29: this contract test exercises clean/dist/distcheck against the
+# real project tree, so it used to destroy exactly the artifact `make dist`
+# had just produced (its own rm -f, plus the interior `make clean`). Park any
+# pre-existing operator artifact outside the build tree and restore it on
+# every exit path above.
+if [ -e "$qa_archive" ] || [ -L "$qa_archive" ]; then
+    mv "$qa_archive" "$tmp/parked-dist-artifact" ||
+        fail "cannot park pre-existing distribution artifact"
+    qa_preserved=$tmp/parked-dist-artifact
+fi
 
 shim_dir=$tmp/shims
 mkdir "$shim_dir"

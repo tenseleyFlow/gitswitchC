@@ -24,6 +24,11 @@ jobs:
         # dash also provides the Ubuntu /bin/sh implementation;
         # openssh-client provides ssh, ssh-agent, ssh-add, and ssh-keygen.
         run: |
+          # AR-10 L31: Ubuntu 24.04 restricts unprivileged user namespaces
+          # via AppArmor. The mount-namespace security regressions run
+          # unprivileged through a user-namespace fallback and are REQUIRED
+          # capabilities on this job's test steps, so permit userns here.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo apt-get update
           sudo apt-get install -y \
             bash dash fish gnupg ksh libreadline-dev openssh-client zsh \
@@ -35,9 +40,11 @@ jobs:
       # authoritative gate is the symbol check on the built binary below
       # (AR-05 L8).
       - name: No-shell gate (source tripwire)
+        # AR-10 L27: tools/ (the release publisher) is inside the release
+        # pipeline's trust boundary and is held to the same no-shell rule.
         run: |
-          if grep -rn -e 'popen(' -e 'system(' src/*.c src/*.h; then
-            echo "ERROR: shell-based process execution reintroduced in src/" >&2
+          if grep -rn -e 'popen(' -e 'system(' src/*.c src/*.h tools/*.c; then
+            echo "ERROR: shell-based process execution reintroduced in src/ or tools/" >&2
             exit 1
           fi
       - name: Build + test (ASan/UBSan, warnings-as-errors, runtimes required)
@@ -46,13 +53,13 @@ jobs:
         # disabled readline build fails instead of becoming a green skip.
         run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       - name: Source coverage (GCC/gcovr, measured line + branch ratchet)
         run: make coverage
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Upload source coverage reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -65,7 +72,7 @@ jobs:
       - name: Release build + full NDEBUG suite (FORTIFY/RELRO, warnings-as-errors)
         run: make BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Release artifact hardening (built + staged)
         run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
       # AR-05 L8: symbol-level no-shell gate. An undefined-symbol reference to
@@ -84,12 +91,24 @@ jobs:
             echo "ERROR: release binary references system()/popen()" >&2
             exit 1
           fi
+          # AR-10 L27: the release publisher executes inside the pipeline's
+          # trust boundary; hold its linked binary to the same symbol gate.
+          make build/tools/release-publish
+          test -x build/tools/release-publish || { echo "ERROR: release publisher build/tools/release-publish missing or not executable" >&2; exit 1; }
+          syms=$(nm -D --undefined-only build/tools/release-publish) || { echo "ERROR: nm failed on release publisher" >&2; exit 1; }
+          if printf '%s\n' "$syms" | grep -E '(^| )(system|popen)(@|$)'; then
+            echo "ERROR: release publisher references system()/popen()" >&2
+            exit 1
+          fi
       # AR-05 L3: run REAL Valgrind against the release binaries. The
       # qa-contract-test below only proves the recipe's failure plumbing via
       # a shim; without this step no actual memory checking ever executed in
       # the pipeline.
+      # AR-10 L36: WERROR=1 matches the release gates above, so the
+      # build-config stamp is identical and Valgrind checks the exact objects
+      # those gates validated instead of forcing a divergent rebuild.
       - name: Memory check (Valgrind, release)
-        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release READLINE=1 memcheck
+        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release READLINE=1 WERROR=1 memcheck
       - name: Source distribution self-check
         run: make distcheck
       - name: Release input consistency and dirty-tree refusal
@@ -105,8 +124,9 @@ jobs:
       # the identity write. It was tracked but executed by nothing; run it here
       # (Linux, which ships ssh-agent) so a regression in the mid-switch signal
       # window is caught in CI.
+      # AR-10 L36: same flag set as the release gates for stamp identity.
       - name: Signal-interruption repro (SIG-01/SIG-02/F4)
-        run: make BUILD_TYPE=release sig-repro-test
+        run: make BUILD_TYPE=release READLINE=1 WERROR=1 sig-repro-test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: openssh
       - name: Clean before the clang release build
@@ -114,7 +134,7 @@ jobs:
       - name: Linux clang release build + full NDEBUG suite
         run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
-          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
+          GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Linux clang release artifact hardening
         run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
 
@@ -140,7 +160,15 @@ jobs:
           # git: the git_ops perf tests prove availability via a PATH walk
           # and assert no subprocess spawn — they need a real git binary,
           # which the Linux/macOS runners ship but this VM does not.
-          sudo pkg install -y gmake gcc git binutils
+          # AR-10 L35: the shells, gnupg, and readline used to be absent, so
+          # every gpg/shell-integration suite green-skipped on the sole
+          # FreeBSD gate. Provision them and require the capabilities below
+          # (inline export: step-level env maps are forbidden on this job).
+          # ksh stays best-effort: FreeBSD's ksh93 packaging does not reliably
+          # install a binary literally named `ksh`, which is what the suites
+          # resolve.
+          sudo pkg install -y gmake gcc git binutils \
+            bash dash fish gnupg readline zsh
           # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
           # run_argv passes the verified script as /dev/fd/4 and never falls
           # back to its mutable pathname. The minimal CI image does not mount
@@ -156,6 +184,10 @@ jobs:
           "$readelf_tool" -h /bin/sh >/dev/null
           export READELF="$readelf_tool"
           gmake BUILD_TYPE=release WERROR=1
+          # AR-10 L35: provisioned runtimes are mandatory, matching the
+          # Linux/macOS lanes (minus ksh per above; mount-namespace is
+          # Linux-only).
+          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets
           gmake BUILD_TYPE=release WERROR=1 test
           gmake BUILD_TYPE=release WERROR=1 release-artifact-test
           # Compiles and exercises FreeBSD's descriptor-conditioned
@@ -177,8 +209,10 @@ jobs:
       - name: Build + test (ASan/UBSan, warnings-as-errors)
         run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
-          # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin
-          # and remain covered by Linux; every portable runtime is mandatory.
+          # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin.
+          # AR-10 L31: the Linux lanes list mount-namespace as a REQUIRED
+          # capability (with a userns fallback), so "covered by Linux" is now
+          # enforced rather than assumed; every portable runtime is mandatory.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Clean before the release build
         run: make clean

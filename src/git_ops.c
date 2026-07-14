@@ -11,6 +11,7 @@
 #endif
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3944,6 +3945,151 @@ int git_clear_config(git_scope_t scope) {
     }
     
     log_info("Git configuration cleared");
+    return 0;
+}
+
+/* See git_ops.h. The suffix rule mirrors GnuPG's own selector semantics: any
+ * hex selector the user saved (short id, long id, or full fingerprint)
+ * selects exactly the keys whose fingerprint it is a suffix of. */
+bool git_signing_key_selects_account(const account_t *account,
+                                     const char *configured) {
+    const char *selector;
+    size_t selector_len;
+    size_t configured_len;
+    size_t i;
+
+    if (!account || !configured) return false;
+    if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') return false;
+
+    selector = account->gpg_key_id;
+    if (selector[0] == '0' && (selector[1] == 'x' || selector[1] == 'X')) {
+        selector += 2;
+    }
+    selector_len = strlen(selector);
+    configured_len = strlen(configured);
+    if (selector_len == 0 ||
+        (configured_len != 40 && configured_len != 64) ||
+        selector_len > configured_len) {
+        return false;
+    }
+    for (i = 0; i < configured_len; i++) {
+        if (!isxdigit((unsigned char)configured[i])) return false;
+    }
+    return strncasecmp(configured + configured_len - selector_len,
+                       selector, selector_len) == 0;
+}
+
+/* Unset one attributed credential key for git_retire_account_identity,
+ * preserving the first diagnostic and counting only keys that were present.
+ * first_error must be larger than an error message plus the "scope key: "
+ * prefix (see the caller) so the diagnostic never truncates. */
+static void git_retire_unset(const char *key, git_scope_t scope,
+                             size_t *removed, int *failures,
+                             char *first_error, size_t first_error_size) {
+    if (git_unset_config_value(key, scope) != 0) {
+        if (*failures == 0) {
+            snprintf(first_error, first_error_size, "%s %s: %s",
+                     git_scope_diagnostic_label(scope), key,
+                     get_last_error()->message);
+        }
+        (*failures)++;
+        return;
+    }
+    (*removed)++;
+}
+
+/* See git_ops.h (AR-10 M1). */
+int git_retire_account_identity(const account_t *account, size_t *cleared) {
+    git_scope_t scopes[3];
+    size_t scope_count = 0;
+    char expected_ssh[GIT_CFG_VALUE_MAX] = "";
+    bool expected_ssh_known = false;
+    char value[GIT_CFG_VALUE_MAX];
+    /* Wide enough for a full error message plus the "scope key: " prefix
+     * git_retire_unset prepends (gcc's -Wformat-truncation checks this). */
+    char first_error[sizeof(g_last_error.message) + 64] = "";
+    int failures = 0;
+    size_t removed = 0;
+
+    if (cleared) *cleared = 0;
+    if (!account) {
+        set_error(ERR_INVALID_ARGS,
+                  "NULL account to git_retire_account_identity");
+        return -1;
+    }
+
+    /* Rebuild the exact core.sshCommand a switch to this account would have
+     * published. When the trusted rebuild is impossible (e.g. the ssh binary
+     * disappeared), an existing value cannot be attributed to this account,
+     * so it is left in place; the no-active-account status view renders the
+     * residue instead of hiding it. */
+    if (account->ssh_enabled && account->ssh_key_path[0] != '\0') {
+        if (git_expected_ssh_command(account, expected_ssh,
+                                     sizeof(expected_ssh)) == 0) {
+            expected_ssh_known = true;
+        } else {
+            log_warning("Cannot rebuild expected core.sshCommand for '%s'; "
+                        "leaving any persisted value in place: %s",
+                        account->name, get_last_error()->message);
+        }
+    }
+
+    scopes[scope_count++] = GIT_SCOPE_GLOBAL;
+    if (git_is_repository()) {
+        bool worktree_present = false;
+        scopes[scope_count++] = GIT_SCOPE_LOCAL;
+        if (git_detect_managed_worktree_scope(&worktree_present) == 0 &&
+            worktree_present) {
+            scopes[scope_count++] = GIT_SCOPE_WORKTREE_INTERNAL;
+        }
+    }
+
+    for (size_t s = 0; s < scope_count; s++) {
+        git_scope_t scope = scopes[s];
+
+        if (expected_ssh_known &&
+            git_get_config_value(GIT_CONFIG_CORE_SSHCOMMAND, value,
+                                 sizeof(value), scope) == 0 &&
+            strcmp(value, expected_ssh) == 0) {
+            git_retire_unset(GIT_CONFIG_CORE_SSHCOMMAND, scope, &removed,
+                             &failures, first_error, sizeof(first_error));
+        }
+
+        /* The signing key attributes the whole signing leg: its enable flag
+         * and the format normalization a switch wrote alongside it belong to
+         * the same retired identity, so retire them at the same scope. A
+         * foreign or noncanonical value attributes nothing. */
+        if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, value,
+                                 sizeof(value), scope) == 0 &&
+            git_signing_key_selects_account(account, value)) {
+            git_retire_unset(GIT_CONFIG_USER_SIGNINGKEY, scope, &removed,
+                             &failures, first_error, sizeof(first_error));
+            if (git_get_config_value(GIT_CONFIG_COMMIT_GPGSIGN, value,
+                                     sizeof(value), scope) == 0) {
+                git_retire_unset(GIT_CONFIG_COMMIT_GPGSIGN, scope, &removed,
+                                 &failures, first_error, sizeof(first_error));
+            }
+            if (git_get_config_value(GIT_CONFIG_GPG_FORMAT, value,
+                                     sizeof(value), scope) == 0) {
+                git_retire_unset(GIT_CONFIG_GPG_FORMAT, scope, &removed,
+                                 &failures, first_error, sizeof(first_error));
+            }
+        }
+    }
+
+    if (cleared) *cleared = removed;
+    if (removed > 0) {
+        log_info("Retired %zu durable Git identity key(s) selecting '%s'",
+                 removed, account->name);
+    }
+    if (failures != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to retire %d durable Git identity key(s) for "
+                  "'%s': %s",
+                  failures, account->name,
+                  first_error[0] ? first_error : "unknown Git error");
+        return -1;
+    }
     return 0;
 }
 

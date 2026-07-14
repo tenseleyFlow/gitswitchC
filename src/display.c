@@ -8,17 +8,14 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <unistd.h>
-#include <ctype.h>
-#include <termios.h>
 
 #include "display.h"
 #include "utils.h"
 #include "error.h"
-#include "git_ops.h"
 
-/* Global display state */
+/* Global display state. (AR-10 L3: the old g_color_forced flag recorded the
+ * forced-vs-auto distinction but nothing ever read it — removed.) */
 static bool g_color_enabled = false;
-static bool g_color_forced = false;
 static int g_terminal_width = 80;
 static int g_terminal_height = 24;
 
@@ -39,7 +36,9 @@ static char *display_vformat(const char *format, va_list arguments) {
     va_copy(measured_arguments, arguments);
     required = vsnprintf(NULL, 0, format, measured_arguments); /* Flawfinder: ignore -- sizing pass; fmt from internal callers */
     va_end(measured_arguments);
-    if (required < 0 || (size_t)required == SIZE_MAX) return NULL;
+    /* AR-10 L5: a non-negative int always fits in size_t with room for the
+     * terminator (INT_MAX < SIZE_MAX), so only the failure sign needs a guard. */
+    if (required < 0) return NULL;
 
     buffer_size = (size_t)required + 1U;
     buffer = malloc(buffer_size);
@@ -85,14 +84,24 @@ static bool detect_color_support(void) {
 int display_init(bool force_color, bool no_color) {
     if (no_color) {
         g_color_enabled = false;
-        g_color_forced = true;
     } else if (force_color) {
         g_color_enabled = true;
-        g_color_forced = true;
     } else {
-        /* Auto-detect color support */
-        g_color_enabled = is_terminal(STDOUT_FILENO) && detect_color_support();
-        g_color_forced = false;
+        /* AR-10 L6: honor the ecosystem conventions between the explicit CLI
+         * flags and auto-detection. NO_COLOR (any non-empty value) disables;
+         * CLICOLOR_FORCE (non-empty, not "0") forces color even when stdout
+         * is not a terminal. https://no-color.org / https://bixense.com/clicolors */
+        const char *no_color_env = getenv("NO_COLOR");
+        const char *force_env = getenv("CLICOLOR_FORCE");
+
+        if (no_color_env && *no_color_env) {
+            g_color_enabled = false;
+        } else if (force_env && *force_env && strcmp(force_env, "0") != 0) {
+            g_color_enabled = true;
+        } else {
+            g_color_enabled = is_terminal(STDOUT_FILENO) &&
+                              detect_color_support();
+        }
     }
     
     /* Get terminal size */
@@ -172,46 +181,75 @@ char *display_colorize(const char *text, const char *type) {
     return result;
 }
 
-/* Print formatted header with decorative border */
+/* Print formatted header with decorative border. Widths are counted in BYTES,
+ * which equals display columns only for single-width ASCII titles — every
+ * in-tree caller. A multibyte/wide title would misalign the box (AR-10 L1);
+ * widen this to wcswidth() accounting before introducing such a caller. */
 void display_header(const char *title) {
-    int title_len, padding, total_width;
+    int title_len, padding, inner_width, total_width;
     int i;
+    char *truncated = NULL;
     char *colored_title;
-    
+    const char *shown;
+
     if (!title) return;
-    
-    title_len = strlen(title);
+
+    title_len = (int)strlen(title);
     total_width = (title_len + 4 > 40) ? title_len + 4 : 40;
     if (total_width > g_terminal_width - 2) {
         total_width = g_terminal_width - 2;
     }
-    
-    padding = (total_width - title_len - 2) / 2;
-    
+    /* Keep the box drawable even on absurdly narrow terminals. */
+    if (total_width < 4) {
+        total_width = 4;
+    }
+    inner_width = total_width - 2;
+
+    /* AR-10 L2: the clamp above can leave the title wider than the box, and
+     * the old code fed the resulting NEGATIVE field widths to %*s —
+     * left-justifying with a positive width and WIDENING exactly the line it
+     * meant to shrink. Truncate the plain title to the inner width (before
+     * colorizing, so an escape sequence is never split) and keep both pads
+     * non-negative. */
+    if (title_len > inner_width) {
+        truncated = malloc((size_t)inner_width + 1U);
+        if (!truncated) return;
+        memcpy(truncated, title, (size_t)inner_width);
+        truncated[inner_width] = '\0';
+        title_len = inner_width;
+    }
+    shown = truncated ? truncated : title;
+
+    padding = (inner_width - title_len) / 2;
+
     /* Top border */
     printf("┌");
     for (i = 0; i < total_width - 2; i++) {
         printf("─");
     }
     printf("┐\n");
-    
+
     /* Title line. No bare COLOR_RESET here: display_colorize already appends
      * the reset when color is on, and with color off it returns the plain
      * text — an unconditional reset would inject a raw ESC[0m into
      * --no-color/piped output (AR-03 L15). */
-    colored_title = display_colorize(title, "header");
+    colored_title = display_colorize(shown, "header");
     printf("│%*s%s%*s│\n",
            padding, "",
-           colored_title ? colored_title : title,
-           total_width - title_len - padding - 2, "");
+           colored_title ? colored_title : shown,
+           inner_width - title_len - padding, "");
     free(colored_title);
-    
+    free(truncated);
+
     /* Bottom border */
     printf("└");
     for (i = 0; i < total_width - 2; i++) {
         printf("─");
     }
     printf("┘\n");
+    /* AR-10 L7: match display_status's flush discipline so a header is never
+     * stranded in the stdio buffer ahead of an interleaved stderr line. */
+    fflush(stdout);
 }
 
 /* Print status message with appropriate color and icon */
@@ -249,16 +287,24 @@ void display_status(const char *level, const char *message, ...) {
         color_type = "info";
     }
     
-    colored_icon = display_colorize(icon, color_type);
-    if (formatted_message[0] != '\0') {
-        colored_message = display_colorize(formatted_message, color_type);
-        printf("%s %s\n",
-               colored_icon ? colored_icon : icon,
-               colored_message ? colored_message : formatted_message);
-    } else {
-        printf("%s\n", colored_icon ? colored_icon : icon);
+    /* AR-10 L4: user-facing errors follow the Unix convention — diagnostics
+     * on stderr, results on stdout. Routing them to stdout interleaved error
+     * text into pipelines and shell-eval'd output (`gitswitch init`) while
+     * the internal log already went to stderr. */
+    {
+        FILE *out = strcmp(level, "error") == 0 ? stderr : stdout;
+
+        colored_icon = display_colorize(icon, color_type);
+        if (formatted_message[0] != '\0') {
+            colored_message = display_colorize(formatted_message, color_type);
+            fprintf(out, "%s %s\n",
+                    colored_icon ? colored_icon : icon,
+                    colored_message ? colored_message : formatted_message);
+        } else {
+            fprintf(out, "%s\n", colored_icon ? colored_icon : icon);
+        }
+        fflush(out);
     }
-    fflush(stdout);
     free(colored_message);
     free(colored_icon);
     free(formatted_message);
@@ -361,4 +407,5 @@ void display_config_info(const gitswitch_ctx_t *ctx) {
     printf("Status:        %s\n",
            colored_status ? colored_status : status_text);
     free(colored_status);
+    fflush(stdout);
 }

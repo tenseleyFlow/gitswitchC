@@ -55,7 +55,7 @@ _gitswitch_unquote_candidate() {
 
 # Populate COMPREPLY with the live account names that prefix-match "$cur".
 _gitswitch_complete_accounts() {
-    local cur=$1 n
+    local original_cur=$1 cur=$1 n quote="" prefix
     local _gitswitch_quote_result _gitswitch_unquote_result
     local -a names=()
     # Read one name per line WITHOUT mapfile: mapfile is bash >= 4, but stock
@@ -63,17 +63,41 @@ _gitswitch_complete_accounts() {
     while IFS= read -r n; do
         names+=("$n")
     done < <(command gitswitch --names list 2>/dev/null)
-    # A previous TAB can feed our backslash-quoted common prefix back as $cur.
-    # Decode pairs rather than deleting every backslash: `\\` represents one
-    # literal backslash while `\ `, `\'`, etc. represent shell metacharacters.
-    _gitswitch_unquote_candidate "$cur"
+    # AR-10 L24: a user-opened quote ('Jane, "Jane) arrives as part of $cur;
+    # the backslash decoder alone left it in the match prefix, so quoted
+    # partial names never matched. Strip it for matching and emit RAW names —
+    # the still-open quote already protects metacharacters on the line.
+    if [[ $cur == \'* || $cur == \"* ]]; then
+        quote=${cur:0:1}
+        cur=${cur:1}
+    fi
+    if [[ $quote == "'" ]]; then
+        # Inside single quotes every byte is literal; do not decode pairs.
+        prefix=$cur
+    else
+        # A previous TAB can feed our backslash-quoted common prefix back as
+        # $cur. Decode pairs rather than deleting every backslash: `\\`
+        # represents one literal backslash while `\ `, `\'`, etc. represent
+        # shell metacharacters.
+        _gitswitch_unquote_candidate "$cur"
+        prefix=$_gitswitch_unquote_result
+    fi
     for n in "${names[@]}"; do
-        if [[ -z $_gitswitch_unquote_result ||
-            $n == "$_gitswitch_unquote_result"* ]]; then
-            _gitswitch_quote_candidate "$n"
-            COMPREPLY+=("$_gitswitch_quote_result")
+        if [[ -z $prefix || $n == "$prefix"* ]]; then
+            if [[ -n $quote ]]; then
+                COMPREPLY+=("$n")
+            else
+                _gitswitch_quote_candidate "$n"
+                COMPREPLY+=("$_gitswitch_quote_result")
+            fi
         fi
     done
+    # AR-10 L23: with COMP_WORDBREAKS splitting suppressed for `:`/`=` below,
+    # readline still treats the text before a colon as a fixed prefix; trim it
+    # from the candidates so the inserted text is not duplicated.
+    if declare -F __ltrim_colon_completions >/dev/null 2>&1; then
+        __ltrim_colon_completions "$original_cur"
+    fi
 }
 
 _gitswitch_complete_words() {
@@ -90,11 +114,19 @@ _gitswitch() {
     # contract even though this completion does not need to inspect it.
     # shellcheck disable=SC2034
     local cur prev words cword
-    _init_completion 2>/dev/null || {
+    if declare -F _init_completion >/dev/null 2>&1; then
+        # AR-10 L22: a nonzero return from an EXISTING _init_completion means
+        # it already handled this completion (redirect target, $variable, …);
+        # the old `|| fallback` misread that as "bash-completion absent" and
+        # wiped the stock behavior with an empty COMPREPLY. AR-10 L23:
+        # -n := keeps account names containing colons/equals as one word so
+        # the operand scanner and prefix match see the real name.
+        _init_completion -n := || return
+    else
         cur="${COMP_WORDS[COMP_CWORD]}"
         words=("${COMP_WORDS[@]}")
         cword=$COMP_CWORD
-    }
+    fi
 
     local subcommands="add edit list ls remove rm delete status doctor health config init resume reset switch"
     local options="--global --local --dry-run --yes --names --verbose --debug --color --no-color --help --version -g -l -n -y -V -d -c -C -h -v"

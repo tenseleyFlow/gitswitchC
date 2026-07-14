@@ -13,11 +13,12 @@ Commands:
   list, ls             List all configured accounts
   remove, rm, delete <account>  Remove specified account
   status               Show current account status
-  doctor, health       Run comprehensive health check
+  doctor, health       Run local configuration/key readiness checks
   config               Show configuration file information
-  init <shell>         Emit shell integration (fish|bash|zsh|sh)
-  resume               Re-activate the last-used account (used on login)
+  init <shell>         Emit shell integration (bash|zsh|fish|sh|dash|ksh)
+  resume               Restore saved boot-volatile SSH/GPG state (never rewrites Git config)
   reset [account]      Kill agents and delete isolated GPG/SSH state (all, or one)
+  switch <account>     Switch to specified account
   <account>            Switch to specified account
 
 Options:
@@ -39,9 +40,10 @@ Examples:
   gitswitch list                   # List all accounts
   gitswitch list --names           # Print just account names (scripts/completion)
   gitswitch 1                      # Switch to account ID 1
+  gitswitch switch work            # Explicitly switch to the 'work' account
   gitswitch work                   # Switch to account matching 'work'
   gitswitch remove 2 --yes         # Remove account ID 2 without confirmation
-  gitswitch doctor                 # Run health check
+  gitswitch doctor                 # Check local configuration/key readiness
 ```
 
 When built against GNU readline (auto-detected by the Makefile), the interactive
@@ -62,6 +64,11 @@ for accounts with GPG signing, a per-account `GNUPGHOME` — so your shell can
 point `SSH_AUTH_SOCK` and `GNUPGHOME` at them once and have every `gitswitch
 <account>` switch transparently. Add the matching line to your shell rc:
 
+The supported init targets are exactly `bash`, `zsh`, `fish`, `sh`, `dash`,
+and `ksh`. Fish uses `gitswitch init fish | source`; the other five use
+`eval "$(gitswitch init <shell>)"`. Completion scripts remain available for
+bash, zsh, and fish only.
+
 ```fish
 # ~/.config/fish/config.fish
 gitswitch init fish | source
@@ -77,16 +84,20 @@ eval "$(gitswitch init bash)"
 eval "$(gitswitch init zsh)"
 ```
 
-The snippet guards on each path's existence, so sourcing it before the first
-switch (or after `/tmp` has been wiped) is a silent no-op rather than an error.
+The snippet guards optional paths, so an SSH or GPG runtime that is not
+configured—or has never been created—is omitted without an error. A saved
+account whose boot-volatile runtime disappeared after a reboot or runtime wipe
+is different: the integration consults its bounded resume hint, runs
+`gitswitch resume`, and then exports the restored paths.
 
 ### Persistence across reboots
 
 gitswitch's live state (SSH agent, isolated GPG home) lives under
 `$XDG_RUNTIME_DIR`, which is wiped on reboot. So on the **first login after a
 boot** the integration auto-runs `gitswitch resume` to re-activate the account
-you last switched to — reloading its SSH key, reasserting your git identity, and
-rebuilding its isolated GPG home.
+you last switched to—reloading its SSH key and, when configured, rebuilding its
+isolated GPG home. Resume restores only boot-volatile SSH/GPG state; it never
+rewrites Git configuration.
 
 > **That GPG PIN prompt at first login is gitswitch, not an error.** Rebuilding
 > the isolated GPG keyring re-imports your secret key, which prompts your PIN
@@ -115,4 +126,3 @@ rebuilding its isolated GPG home.
 > **Migrating from the Python gitswitch?** The old `gitswitch --ssh-agent-info`
 > invocation still works as a compat alias that auto-detects your shell from
 > `$SHELL`, but prefer the explicit `init <shell>` form in new rc files.
-

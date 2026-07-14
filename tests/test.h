@@ -473,6 +473,10 @@ static inline const char *ts_capability_name(int index) {
         "high-fd",
         "freebsd-acl",
         "mount-namespace",
+        /* AR-10 L37: test_ar09_runner_stdin skipped with this token while it
+         * was unregistered, so a cat-less host FAILED the suite instead of
+         * skipping (TS_SKIP rejects unknown capabilities). */
+        "coreutils",
         "persistent-fs",
         "dev-full",
         "unix-sockets"
@@ -629,7 +633,13 @@ static inline int ts_test_finish(void) {
     }                                                                       \
 } while (0)
 
-#define TEST_MAIN_BEGIN() int main(void) {
+/* AR-10: suites sandbox HOME themselves but inherited GNUPGHOME leaked
+ * through, so any operator shell pointing at a gitswitch-managed (possibly
+ * dangling, e.g. post-reboot) GPG home turned source-keyring probes into
+ * false suite failures that CI's bare environment never sees. Tests that
+ * need GNUPGHOME set it explicitly. */
+#define TEST_MAIN_BEGIN() int main(void) {                                   \
+    (void)unsetenv("GNUPGHOME");
 #define TEST_MAIN_END()                                                      \
     return ts_test_finish();                                                 \
 }

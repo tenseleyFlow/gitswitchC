@@ -92,7 +92,7 @@ TEST(child_reset_preserves_every_inherited_ignore_and_mask) {
         /* Pre-fix this reset all three to SIG_DFL and unblocked them even
          * though guard_begin deliberately skipped every inherited ignore and
          * guard_end retired the installed-disposition bitmap. */
-        signals_reset_for_child();
+        signals_reset_for_child(NULL);
         _exit(child_dispositions_are(1, true) == 0 ? 0 : 13);
     }
     if (child > 0) {
@@ -117,7 +117,7 @@ TEST(child_reset_defaults_and_unblocks_only_installed_handlers) {
         }
         if (sigprocmask(SIG_BLOCK, &blocked, NULL) != 0) _exit(21);
         if (signals_guard_begin() != 0) _exit(22);
-        signals_reset_for_child();
+        signals_reset_for_child(NULL);
         _exit(child_dispositions_are(0, false) == 0 ? 0 : 23);
     }
     if (child > 0) {
@@ -144,7 +144,7 @@ TEST(child_reset_handles_mixed_ignored_caught_and_default_dispositions) {
         if (set_signal_state(SIGTERM, SIG_DFL, true) != 0) _exit(32);
         if (signals_guard_begin() != 0) _exit(33);
 
-        signals_reset_for_child();
+        signals_reset_for_child(NULL);
         if (signal_state_is(SIGHUP, SIG_IGN, true) != 0) _exit(34);
         if (signal_state_is(SIGINT, SIG_DFL, false) != 0) _exit(35);
         if (signal_state_is(SIGTERM, SIG_DFL, false) != 0) _exit(36);
@@ -174,13 +174,46 @@ TEST(child_reset_after_guard_end_preserves_original_dispositions_and_masks) {
         if (set_signal_state(SIGTERM, SIG_DFL, true) != 0) _exit(42);
         if (signals_guard_begin() != 0) _exit(43);
         signals_guard_end();
-        signals_reset_for_child();
+        signals_reset_for_child(NULL);
 
         if (signal_state_is(SIGHUP, SIG_IGN, true) != 0) _exit(44);
         if (signal_state_is(SIGINT, inherited_caught_handler, false) != 0) {
             _exit(45);
         }
         if (signal_state_is(SIGTERM, SIG_DFL, true) != 0) _exit(46);
+        _exit(0);
+    }
+    if (child > 0) {
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
+/* AR-10 L17: a guarded signal the SUPERVISOR blocked before gitswitch ran
+ * must stay blocked in the exec'd child. Passing the pre-spawn mask restores
+ * the exact inherited mask; the old unconditional unblock stripped it. */
+TEST(child_reset_restores_supervisor_blocked_mask_exactly) {
+    int status = 0;
+    pid_t child = fork();
+
+    CHECK(child >= 0);
+    if (child == 0) {
+        sigset_t supervisor;
+        sigset_t pre_spawn;
+        sigset_t current;
+
+        sigemptyset(&supervisor);
+        sigaddset(&supervisor, SIGTERM);
+        if (sigprocmask(SIG_BLOCK, &supervisor, NULL) != 0) _exit(50);
+        if (signals_guard_begin() != 0) _exit(51);
+        if (signals_block_for_child_spawn(&pre_spawn) != 0) _exit(52);
+        /* (fork of the helper would happen here) */
+        signals_reset_for_child(&pre_spawn);
+        if (sigprocmask(SIG_SETMASK, NULL, &current) != 0) _exit(53);
+        if (!sigismember(&current, SIGTERM)) _exit(54);
+        if (sigismember(&current, SIGINT)) _exit(55);
+        if (sigismember(&current, SIGHUP)) _exit(56);
         _exit(0);
     }
     if (child > 0) {
@@ -580,6 +613,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(child_reset_defaults_and_unblocks_only_installed_handlers);
     RUN_TEST(child_reset_handles_mixed_ignored_caught_and_default_dispositions);
     RUN_TEST(child_reset_after_guard_end_preserves_original_dispositions_and_masks);
+    RUN_TEST(child_reset_restores_supervisor_blocked_mask_exactly);
     RUN_TEST(every_release_stat_failure_is_distinct_and_release_still_works);
     RUN_TEST(renamed_runtime_parent_reports_disappearance_and_releases);
     RUN_TEST(renamed_runtime_directory_reports_disappearance_and_releases);
