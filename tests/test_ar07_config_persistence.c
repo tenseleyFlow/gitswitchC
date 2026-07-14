@@ -2,6 +2,7 @@
 #include "test.h"
 #include "config.h"
 #include "error.h"
+#include "scratch_registry_test.h"
 #include "signals.h"
 
 #include <errno.h>
@@ -718,6 +719,45 @@ TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds) {
     CHECK_STR_EQ(text, "none\nactive=Bob\n");
 }
 
+TEST(active_state_registration_failure_is_atomic_and_retryable) {
+    char scratch[TEST_SCRATCH_PROBE_MAX][TEST_SCRATCH_PATH_SIZE];
+    char dir[128], path[256], hint[256], text[1024];
+    gitswitch_ctx_t ctx;
+    size_t registered;
+    bool installed = true;
+    int before;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+
+    before = test_open_fd_count();
+    registered = test_scratch_fill(scratch, "state-full");
+    CHECK(registered > 0 && registered < TEST_SCRATCH_PROBE_MAX);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1);
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message, "register") != NULL);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+
+    test_scratch_release(scratch, registered);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(schema_rejects_lossy_types_and_dependent_keys);
     RUN_TEST(default_create_fault_matrix_is_atomic_and_closes_fds);
@@ -730,4 +770,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
     RUN_TEST(active_state_rejects_corruption_and_crash_mismatches);
     RUN_TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds);
+    RUN_TEST(active_state_registration_failure_is_atomic_and_retryable);
 TEST_MAIN_END()

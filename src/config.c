@@ -151,6 +151,9 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      config_resume_hint_snapshot_t *rollback_snapshot);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
+static void config_unlink_created_temp(const char *path,
+                                       const struct stat *created,
+                                       bool have_created_identity);
 static bool config_metadata_snapshot_same(const struct stat *a,
                                           const struct stat *b);
 static int config_require_loaded_source_generation(
@@ -1005,6 +1008,23 @@ static bool config_metadata_same_file(const struct stat *a, const struct stat *b
     return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
+/* Error cleanup must not remove a same-UID process's replacement merely
+ * because it reused our private temporary pathname.  Every caller captures
+ * the created descriptor's identity before registration and reaches this
+ * helper while the surrounding publication lock is still held. */
+static void config_unlink_created_temp(const char *path,
+                                       const struct stat *created,
+                                       bool have_created_identity) {
+    struct stat named;
+
+    if (!path || !created || !have_created_identity) return;
+    if (lstat(path, &named) == 0 &&
+        config_metadata_file_is_safe(&named, false) &&
+        config_metadata_same_file(created, &named)) {
+        (void)unlink(path);
+    }
+}
+
 /* A stable descriptor generation requires more than an unchanged inode: an
  * in-place writer preserves dev/ino while changing the bytes. Size plus mtime
  * and ctime catches both ordinary rewrites and same-size restoration attempts;
@@ -1663,9 +1683,12 @@ static int config_resume_hint_snapshot_restore_at(
     struct stat dir_identity;
     struct stat current;
     struct stat installed;
+    struct stat temp_identity;
     size_t total = 0;
     int dir_fd = -1;
     int fd = -1;
+    bool have_temp_identity = false;
+    bool temp_registered = false;
 
     if (!config_path || !snapshot || !snapshot->valid ||
         !snapshot->post_image_bound ||
@@ -1764,7 +1787,19 @@ static int config_resume_hint_snapshot_restore_at(
                          "Cannot create resume-hint rollback file: %s", temp);
         return -1;
     }
-    (void)signals_scratch_register(temp);
+    if (fstat(fd, &temp_identity) != 0 ||
+        !config_metadata_file_is_safe(&temp_identity, true)) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot identify resume-hint rollback file: %s", temp);
+        goto restore_fail;
+    }
+    have_temp_identity = true;
+    if (signals_scratch_register(temp) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot register resume-hint rollback file for cleanup");
+        goto restore_fail;
+    }
+    temp_registered = true;
     if (fchmod(fd, (mode_t)snapshot->mode) != 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot restore resume-hint permissions: %s", temp);
@@ -1808,6 +1843,7 @@ static int config_resume_hint_snapshot_restore_at(
         goto restore_fail;
     }
     signals_scratch_unregister(temp);
+    temp_registered = false;
     if (fsync(dir_fd) != 0 || lstat(hint, &installed) != 0 ||
         !config_metadata_file_is_safe(&installed, false) ||
         (installed.st_mode & 0777) != (mode_t)snapshot->mode ||
@@ -1866,8 +1902,8 @@ static int config_resume_hint_snapshot_restore_at(
 
 restore_fail:
     if (fd >= 0) close(fd);
-    unlink(temp);
-    signals_scratch_unregister(temp);
+    config_unlink_created_temp(temp, &temp_identity, have_temp_identity);
+    if (temp_registered) signals_scratch_unregister(temp);
     close(dir_fd);
     return -1;
 }
@@ -1911,6 +1947,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     struct stat temp_identity;
     struct stat after;
     bool existed = false;
+    bool have_temp_identity = false;
+    bool temp_registered = false;
     int fd = -1;
 
     if (state_installed) {
@@ -2047,16 +2085,22 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                          "Cannot create temporary resume hint: %s", hint);
         return -1;
     }
-    (void)signals_scratch_register(temp);
-    if (config_io_fault(CONFIG_IO_STATE_AFTER_TEMP,
-                        "active-state temp creation")) {
-        goto hint_fail;
-    }
     if (fchmod(fd, PERM_USER_RW) != 0 ||
         fstat(fd, &temp_identity) != 0 ||
         !config_metadata_file_is_safe(&temp_identity, true)) {
         set_system_error(ERR_FILE_IO,
                          "Cannot secure temporary resume hint: %s", temp);
+        goto hint_fail;
+    }
+    have_temp_identity = true;
+    if (signals_scratch_register(temp) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot register active-state temporary file for cleanup");
+        goto hint_fail;
+    }
+    temp_registered = true;
+    if (config_io_fault(CONFIG_IO_STATE_AFTER_TEMP,
+                        "active-state temp creation")) {
         goto hint_fail;
     }
 
@@ -2142,6 +2186,7 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         goto hint_fail;
     }
     signals_scratch_unregister(temp);
+    temp_registered = false;
     if (state_installed) {
         *state_installed = true;
     }
@@ -2191,8 +2236,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
 
 hint_fail:
     if (fd >= 0) close(fd);
-    unlink(temp);
-    signals_scratch_unregister(temp);
+    config_unlink_created_temp(temp, &temp_identity, have_temp_identity);
+    if (temp_registered) signals_scratch_unregister(temp);
     return -1;
 }
 

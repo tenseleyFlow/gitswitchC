@@ -3677,6 +3677,7 @@ static int ssh_write_config_atomic_at(
     struct stat installed;
     size_t written = 0;
     int fd = -1;
+    bool have_temp_identity = false;
     bool temp_registered = false;
     bool renamed = false;
 
@@ -3707,8 +3708,6 @@ static int ssh_write_config_atomic_at(
                   "Failed to allocate a unique temporary SSH config");
         return -1;
     }
-    temp_registered = signals_scratch_register(temp_path) == 0;
-
     if (fchmod(fd, 0600) != 0 || fstat(fd, &temp_identity) != 0 ||
         !S_ISREG(temp_identity.st_mode) || temp_identity.st_uid != getuid() ||
         temp_identity.st_nlink != 1 ||
@@ -3716,6 +3715,13 @@ static int ssh_write_config_atomic_at(
         set_system_error(ERR_FILE_IO, "Failed to secure temporary SSH config");
         goto fail;
     }
+    have_temp_identity = true;
+    if (signals_scratch_register(temp_path) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Failed to register temporary SSH config for cleanup");
+        goto fail;
+    }
+    temp_registered = true;
     while (written < content_len) {
         ssize_t n = write(fd, content + written, content_len - written);
         if (n > 0) {
@@ -3814,7 +3820,14 @@ static int ssh_write_config_atomic_at(
 
 fail:
     if (fd >= 0) close(fd);
-    if (!renamed) (void)unlinkat(dir_fd, temp_name, 0);
+    if (!renamed && have_temp_identity &&
+        fstatat(dir_fd, temp_name, &current_temp, AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISREG(current_temp.st_mode) && current_temp.st_uid == getuid() &&
+        current_temp.st_nlink == 1 &&
+        current_temp.st_dev == temp_identity.st_dev &&
+        current_temp.st_ino == temp_identity.st_ino) {
+        (void)unlinkat(dir_fd, temp_name, 0);
+    }
     if (temp_registered) signals_scratch_unregister(temp_path);
     return -1;
 }

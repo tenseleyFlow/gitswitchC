@@ -4,7 +4,9 @@
 
 #include "config.h"
 #include "error.h"
+#include "scratch_registry_test.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -96,6 +98,26 @@ static size_t read_private(const char *path, char *text, size_t size) {
     close(fd);
     text[total] = '\0';
     return total;
+}
+
+static size_t count_hint_temps(const char *prefix) {
+    char directory[PATH_MAX];
+    DIR *stream;
+    struct dirent *entry;
+    size_t count = 0;
+
+    if ((size_t)snprintf(directory, sizeof(directory),
+                         "%s/.config/gitswitch", g_home) >=
+        sizeof(directory)) {
+        return SIZE_MAX;
+    }
+    stream = opendir(directory);
+    if (!stream) return SIZE_MAX;
+    while ((entry = readdir(stream)) != NULL) {
+        if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) count++;
+    }
+    closedir(stream);
+    return count;
 }
 
 static int rewrite_same_inode_and_size(const char *path,
@@ -387,6 +409,60 @@ TEST(guarded_snapshot_restores_unchanged_post_image_exactly) {
     config_resume_hint_snapshot_clear(&saved);
 }
 
+TEST(snapshot_restore_registration_failure_preserves_post_image_and_retries) {
+    static const char config_body[] =
+        "[settings]\n"
+        "default_scope=\"local\"\n"
+        "[accounts.1]\n"
+        "name=\"alice\"\n"
+        "email=\"alice@example.com\"\n";
+    char scratch[TEST_SCRATCH_PROBE_MAX][TEST_SCRATCH_PATH_SIZE];
+    config_resume_hint_snapshot_t saved = {0};
+    char config_path[PATH_MAX];
+    char text[64];
+    struct stat restored;
+    gitswitch_ctx_t ctx;
+    size_t registered;
+    bool installed = false;
+    int before;
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/.config/gitswitch/accounts.toml", g_home) <
+          sizeof(config_path));
+    CHECK_EQ_INT(write_private(config_path, config_body), 0);
+    CHECK_EQ_INT(write_private(g_hint, "none\ninactive=v1\n"), 0);
+    CHECK_EQ_INT(chmod(g_hint, 0640), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, config_path), 0);
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&saved), 0);
+    CHECK_EQ_INT(config_save_active_account_transactional_guarded(
+                     &ctx, config_path, &installed, &saved), 0);
+    CHECK(installed);
+
+    before = test_open_fd_count();
+    registered = test_scratch_fill(scratch, "restore-full");
+    CHECK(registered > 0 && registered < TEST_SCRATCH_PROBE_MAX);
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), -1);
+    CHECK(strstr(get_last_error()->message, "register") != NULL);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+
+    test_scratch_release(scratch, registered);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+    clear_error();
+    CHECK_EQ_INT(config_resume_hint_snapshot_restore(&saved), 0);
+    CHECK(read_private(g_hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(lstat(g_hint, &restored), 0);
+    CHECK_EQ_INT(restored.st_mode & 0777, 0640);
+    CHECK_EQ_INT(count_hint_temps(".resume-hint.restore."), 0);
+    config_resume_hint_snapshot_clear(&saved);
+}
+
 TEST(guarded_save_does_not_adopt_an_in_place_rewrite) {
     static const char config_body[] =
         "[settings]\n"
@@ -579,6 +655,7 @@ int main(void) {
     RUN_TEST(testing_object_retains_legacy_fault_seam_before_installation);
     RUN_TEST(unbound_snapshot_cannot_overwrite_a_later_state);
     RUN_TEST(guarded_snapshot_restores_unchanged_post_image_exactly);
+    RUN_TEST(snapshot_restore_registration_failure_preserves_post_image_and_retries);
     RUN_TEST(guarded_save_does_not_adopt_an_in_place_rewrite);
     RUN_TEST(public_restore_serializes_its_final_compare_and_rename);
     RUN_TEST(guarded_noop_save_does_not_claim_a_state_generation);

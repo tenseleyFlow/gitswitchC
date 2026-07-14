@@ -5138,6 +5138,7 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     struct stat fd_now;
     struct stat entry;
     bool have_created_identity = false;
+    bool temp_registered = false;
     bool installed = false;
     int source_fd = -1;
     int fd = -1;
@@ -5356,7 +5357,12 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
         set_error(ERR_INVALID_PATH, "GPG agent config path too long");
         goto fail;
     }
-    (void)signals_scratch_register(temp_path);
+    if (signals_scratch_register(temp_path) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Failed to register temporary gpg-agent.conf for cleanup");
+        goto fail;
+    }
+    temp_registered = true;
     if (gpg_write_all(fd, desired, desired_len) != 0 ||
         g_agent_conf_sync(fd, false) != 0) {
         set_system_error(ERR_FILE_IO, "Failed to flush temporary gpg-agent.conf");
@@ -5389,6 +5395,7 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     }
     installed = true;
     signals_scratch_unregister(temp_path);
+    temp_registered = false;
     if (fstatat(home_fd, "gpg-agent.conf", &entry,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         entry.st_dev != created.st_dev || entry.st_ino != created.st_ino ||
@@ -5427,7 +5434,7 @@ fail:
         entry.st_dev == created.st_dev && entry.st_ino == created.st_ino) {
         (void)unlinkat(home_fd, temp_name, 0);
     }
-    if (temp_path[0]) signals_scratch_unregister(temp_path);
+    if (temp_registered) signals_scratch_unregister(temp_path);
     free(desired);
     return -1;
 }
