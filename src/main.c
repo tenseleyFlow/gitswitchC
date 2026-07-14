@@ -55,7 +55,16 @@ static bool shell_is_supported(const char *shell) {
     return false;
 }
 
-static void print_usage(const char *prog_name) {
+/* A successful printf can mean only that bytes reached stdio's user-space
+ * buffer.  Finish each informational response while main can still turn a
+ * write or final-flush failure into the process status. */
+static int finish_stdout_output(void) {
+    int flush_result = fflush(stdout);
+
+    return flush_result == 0 && !ferror(stdout) ? 0 : -1;
+}
+
+static int print_usage(const char *prog_name) {
     printf("Usage: %s [OPTIONS] [COMMAND] [ARGS]\n", prog_name);
     printf("\nComplete Git Identity Management\n");
     printf("Safe git identity switching with actual git configuration management\n");
@@ -106,9 +115,11 @@ static void print_usage(const char *prog_name) {
     printf("- Actual git configuration switching\n");
     printf("- Repository detection and scope management\n");
     printf("- Git configuration validation and testing\n");
+    return finish_stdout_output();
 }
-static void print_version(void) {
+static int print_version(void) {
     printf("%s %s (%s)\n", GITSWITCH_NAME, GITSWITCH_VERSION, GITSWITCH_COMMIT);
+    return finish_stdout_output();
 }
 typedef enum {
     COMMAND_SAVE_NONE = 0,
@@ -508,7 +519,7 @@ int main(int argc, char *argv[]) {
                 resume_hint_probe = true;
                 break;
             default:
-                print_usage(argv[0]);
+                (void)print_usage(argv[0]);
                 free(option_argv);
                 error_cleanup();
                 return EXIT_FAILURE;
@@ -568,9 +579,9 @@ int main(int argc, char *argv[]) {
     /* Handle informational commands before display/config initialization and,
      * critically, before allocating the large application context. */
     if (show_version) {
-        print_version();
+        int rc = print_version();
         error_cleanup();
-        return EXIT_SUCCESS;
+        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (resume_hint_probe && !show_help) {
@@ -593,9 +604,9 @@ int main(int argc, char *argv[]) {
     }
     
     if (show_help) {
-        print_usage(argv[0]);
+        int rc = print_usage(argv[0]);
         error_cleanup();
-        return EXIT_SUCCESS;
+        return rc == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
     if (legacy_agent_info) {
