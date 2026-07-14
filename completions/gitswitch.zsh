@@ -37,9 +37,17 @@ _gitswitch_scan() {
 # launches for options and fixed-value operands, keeping the escape adjacent to
 # the query preserves literal colons for _describe's value:description grammar.
 _gitswitch_describe_accounts() {
+    local names_output
     local -a accounts
 
-    accounts=("${(@)${(f)$(command gitswitch --names list 2>/dev/null)}//:/\\:}")
+    # AR-10 L25: ${(f)} over an empty capture yields ONE empty element, so a
+    # fresh install (or missing binary) registered a blank candidate that TAB
+    # happily inserted. Bail out before _describe when there are no names.
+    names_output=$(command gitswitch --names list 2>/dev/null)
+    [[ -n $names_output ]] || return 0
+    accounts=("${(@)${(f)names_output}//:/\\:}")
+    accounts=("${(@)accounts:#}")
+    (( ${#accounts} )) || return 0
     _describe -t accounts 'account' accounts
 }
 

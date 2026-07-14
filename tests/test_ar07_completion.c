@@ -741,8 +741,9 @@ TEST(completion_source_reader_covers_the_legacy_boundary) {
 TEST(bash_completion_executes_getopt_style_operand_state) {
     const char *bash = find_shell("bash");
     char output[16384];
+    /* AR-10 L26: no _init_completion stub — its absence exercises the real
+     * fallback branch; a `return 1` stub now means "already handled". */
     const char *script =
-        "_init_completion(){ return 1; }; "
         "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
         "_gitswitch_complete_accounts(){ COMPREPLY+=(ACCOUNT); }; "
         "probe(){ COMP_WORDS=(\"$@\"); COMP_CWORD=$((${#COMP_WORDS[@]}-1)); "
@@ -780,6 +781,8 @@ TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
         "Double\"Name\n"
         "Back\\Slash\n"
         "Paren (Work)\n"
+        "Colon:Name\n"
+        "Equal=Name\n"
         "NAMES\n";
     int written;
 
@@ -793,7 +796,6 @@ TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
     written = snprintf(
         script, sizeof(script),
         "export LC_ALL=C; PATH='%s':$PATH; "
-        "_init_completion(){ return 1; }; "
         "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
         "dump(){ printf '<%%s>\\n' \"${COMPREPLY[@]}\"; }; "
         "probe(){ COMPREPLY=(); _gitswitch_complete_accounts \"$1\"; dump; }; "
@@ -802,7 +804,13 @@ TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
         "probe \"Quote\\'N\"; printf '%%s\\n' QUOTE-END; "
         "probe 'Double\\\"N'; printf '%%s\\n' DOUBLE-END; "
         "probe 'Back\\\\S'; printf '%%s\\n' BACKSLASH-END; "
-        "probe 'Paren\\ \\(W'; printf '%%s\\n' PAREN-END",
+        "probe 'Paren\\ \\(W'; printf '%%s\\n' PAREN-END; "
+        /* AR-10 L24: user-opened quotes must match and yield RAW names. */
+        "probe \"'Café\"; printf '%%s\\n' SQUOTE-END; "
+        "probe '\"Café'; printf '%%s\\n' DQUOTE-END; "
+        /* AR-10 L23: colon/equals names must prefix-match at this layer. */
+        "probe 'Colon:'; printf '%%s\\n' COLON-END; "
+        "probe 'Equal='; printf '%%s\\n' EQUAL-END",
         root);
     CHECK(written >= 0 && (size_t)written < sizeof(script));
     if (written < 0 || (size_t)written >= sizeof(script)) return;
@@ -816,12 +824,46 @@ TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
         "<Double\\\"Name>\n"
         "<Back\\\\Slash>\n"
         "<Paren\\ \\(Work\\)>\n"
+        "<Colon:Name>\n"
+        "<Equal=Name>\n"
         "ALL-END\n"
         "<Café\\ One>\n<Café\\ Two>\nUTF8-END\n"
         "<Quote\\'Name>\nQUOTE-END\n"
         "<Double\\\"Name>\nDOUBLE-END\n"
         "<Back\\\\Slash>\nBACKSLASH-END\n"
-        "<Paren\\ \\(Work\\)>\nPAREN-END\n");
+        "<Paren\\ \\(Work\\)>\nPAREN-END\n"
+        "<Café One>\n<Café Two>\nSQUOTE-END\n"
+        "<Café One>\n<Café Two>\nDQUOTE-END\n"
+        "<Colon:Name>\nCOLON-END\n"
+        "<Equal=Name>\nEQUAL-END\n");
+}
+
+/* AR-10 L22/L26: a nonzero return from an EXISTING _init_completion means
+ * "this completion was already handled" (redirect target, $variable, …).
+ * The completer must leave COMPREPLY exactly as it found it — the old
+ * fallback misread the return as "bash-completion absent" and wiped the
+ * stock candidates. The second probe proves the handled=false path still
+ * completes and that the wordbreak exclusions are requested (AR-10 L23). */
+TEST(bash_handled_init_completion_preserves_stock_candidates) {
+    const char *bash = find_shell("bash");
+    char output[4096];
+    const char *script =
+        "_init_completion(){ return 1; }; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
+        "COMP_WORDS=(gitswitch ''); COMP_CWORD=1; COMPREPLY=(SENTINEL); "
+        "_gitswitch; printf '<%s>\\n' \"${COMPREPLY[*]}\"; "
+        "_init_completion(){ printf 'ARGS:%s\\n' \"$*\"; cur=''; "
+        "prev=gitswitch; words=(gitswitch ''); cword=1; return 0; }; "
+        "_gitswitch_complete_accounts(){ :; }; "
+        "COMPREPLY=(); _gitswitch; printf '<%s>\\n' \"${COMPREPLY[0]}\"";
+
+    CHECK(bash != NULL);
+    if (!bash) return;
+    CHECK_EQ_INT(run_script(bash, false, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(output,
+                 "<SENTINEL>\n"
+                 "ARGS:-n :=\n"
+                 "<add>\n");
 }
 
 TEST(zsh_completion_executes_runtime_expansion_and_state_scanner) {
@@ -933,6 +975,49 @@ TEST(zsh_completion_queries_accounts_only_for_account_operands) {
         "A:Alpha|Colon\\:Name|Space Name\nC:account-reset:1\n"
         "A:Alpha|Colon\\:Name|Space Name\nC:account-switch:1\n"
         "A:Alpha|Colon\\:Name|Space Name\nC:delimited-account:1\n");
+}
+
+/* AR-10 L25/L26: ${(f)} over an empty capture yields one EMPTY element, so a
+ * fresh install (no accounts / missing binary) used to register a single
+ * blank candidate that TAB happily inserted. With no names, _describe must
+ * not be reached at all. */
+TEST(zsh_empty_names_produce_no_blank_candidate) {
+    const char *zsh = find_shell("zsh");
+    char root[PATH_MAX], stub[PATH_MAX], script[8192], output[4096];
+    const char *stub_source =
+        "#!/bin/sh\n"
+        "[ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
+        "[ \"$2\" = list ] || exit 64\n"
+        "exit 0\n";
+    int written;
+
+    if (!zsh) {
+        TS_SKIP("zsh", "zsh shell is unavailable");
+    }
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar10-zsh-empty.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(stub, sizeof(stub), root, "gitswitch"), 0);
+    CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
+
+    written = snprintf(
+        script, sizeof(script),
+        "_describe(){ if [[ $2 == accounts ]]; then "
+        "local array_name=$4; local -a described; "
+        "described=(\"${(@P)array_name}\"); "
+        "print -r -- \"A:${#described}:${(j:|:)described}\"; fi; }; "
+        "_values(){ :; }; commands[gitswitch]='%s'; "
+        "words=(gitswitch --version); CURRENT=2; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.zsh\"; "
+        "words=(gitswitch ''); CURRENT=2; _gitswitch; "
+        "words=(gitswitch edit ''); CURRENT=3; _gitswitch; "
+        "print -r -- DONE",
+        stub);
+    CHECK(written >= 0 && (size_t)written < sizeof(script));
+    if (written < 0 || (size_t)written >= sizeof(script)) return;
+
+    CHECK_EQ_INT(run_script(zsh, false, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(output, "DONE\n");
 }
 
 TEST(fish_completion_executes_getopt_style_operand_state) {
@@ -1178,7 +1263,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden);
     RUN_TEST(bash_completion_executes_getopt_style_operand_state);
     RUN_TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale);
+    RUN_TEST(bash_handled_init_completion_preserves_stock_candidates);
     RUN_TEST(zsh_completion_executes_runtime_expansion_and_state_scanner);
+    RUN_TEST(zsh_empty_names_produce_no_blank_candidate);
     RUN_TEST(zsh_completion_queries_accounts_only_for_account_operands);
     RUN_TEST(fish_completion_executes_getopt_style_operand_state);
     RUN_TEST(names_loader_preserves_account_admission_without_runtime_work);
