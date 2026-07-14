@@ -74,6 +74,7 @@ static int ssh_start_isolated_agent_with_key(
 static int ssh_key_snapshot_capture(const char *key_path,
                                     ssh_key_snapshot_t *snapshot);
 static void ssh_key_snapshot_clear(ssh_key_snapshot_t *snapshot);
+static int write_all_fd(int fd, const char *buf, size_t size);
 static int setup_ssh_environment(ssh_config_t *ssh_config);
 static int open_isolated_agent_socket_dir(char *socket_dir,
                                           size_t socket_dir_size,
@@ -1313,25 +1314,250 @@ static bool ssh_key_snapshot_fd_matches(
     return true;
 }
 
-/* Copy the SHA256:... fingerprint token of the key at `key_path` into `buf`.
- * Uses `ssh-keygen -lf`, which reads the fingerprint from the key's public
- * portion without needing the passphrase. Returns 0 on success. */
+#if !defined(__linux__)
+typedef struct {
+    int fd;
+    size_t length;
+    bool created;
+    bool have_identity;
+    bool registered;
+    char name[64];
+    char path[MAX_PATH_LEN];
+    struct stat identity;
+} ssh_fingerprint_scratch_t;
+
+static bool ssh_fingerprint_scratch_matches(
+    int dir_fd, const ssh_fingerprint_scratch_t *scratch,
+    const ssh_key_snapshot_t *snapshot) {
+    struct stat opened;
+    struct stat named;
+    size_t offset = 0;
+
+    if (dir_fd < 0 || !scratch || scratch->fd < 0 ||
+        !scratch->have_identity || !snapshot ||
+        !ssh_key_snapshot_fd_matches(snapshot) ||
+        fstat(scratch->fd, &opened) != 0 ||
+        fstatat(dir_fd, scratch->name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_revision(&scratch->identity, &opened) ||
+        !same_runtime_revision(&scratch->identity, &named) ||
+        !S_ISREG(opened.st_mode) || !S_ISREG(named.st_mode) ||
+        opened.st_uid != getuid() || named.st_uid != getuid() ||
+        opened.st_nlink != 1 || named.st_nlink != 1 ||
+        (opened.st_mode & 0777) != 0600 ||
+        (named.st_mode & 0777) != 0600 ||
+        opened.st_size < 0 || named.st_size != opened.st_size ||
+        (uintmax_t)opened.st_size != snapshot->length) {
+        return false;
+    }
+
+    while (offset < snapshot->length) {
+        char bytes[4096];
+        size_t wanted = snapshot->length - offset;
+        if (wanted > sizeof(bytes)) wanted = sizeof(bytes);
+        ssize_t n = pread(scratch->fd, bytes, wanted, (off_t)offset);
+        if (n > 0) {
+            bool matches =
+                memcmp(bytes, snapshot->data + offset, (size_t)n) == 0;
+            secure_zero_memory(bytes, sizeof(bytes));
+            if (!matches) return false;
+            offset += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            secure_zero_memory(bytes, sizeof(bytes));
+            return false;
+        }
+    }
+    return true;
+}
+
+static int ssh_fingerprint_scratch_cleanup(
+    int dir_fd, ssh_fingerprint_scratch_t *scratch) {
+    static const char zeros[4096];
+    struct stat named;
+    size_t offset = 0;
+    int rc = 0;
+    bool scrubbed = false;
+
+    if (!scratch) return 0;
+    if (scratch->fd >= 0 && scratch->created) {
+        while (offset < scratch->length) {
+            size_t wanted = scratch->length - offset;
+            if (wanted > sizeof(zeros)) wanted = sizeof(zeros);
+            ssize_t n = pwrite(scratch->fd, zeros, wanted, (off_t)offset);
+            if (n > 0) {
+                offset += (size_t)n;
+            } else if (n < 0 && errno == EINTR) {
+                continue;
+            } else {
+                rc = -1;
+                break;
+            }
+        }
+        if (ftruncate(scratch->fd, 0) != 0) {
+            rc = -1;
+        } else {
+            scrubbed = true;
+        }
+    }
+
+    /* Once the retained inode contains no key bytes, a path-only signal slot
+     * is more dangerous than useful: an uncooperative same-UID process could
+     * replace the random name and turn later emergency cleanup into deletion
+     * of that replacement. Normal gitswitch writers are serialized by the
+     * manager lock; unregister before the best-effort namespace retirement so
+     * any uncertain name is left untouched rather than armed for later. */
+    if (scratch->registered && scrubbed) {
+        signals_scratch_unregister(scratch->path);
+        scratch->registered = false;
+    }
+
+    if (dir_fd >= 0 && scratch->name[0] != '\0' &&
+        scratch->created && scratch->have_identity) {
+        if (fstatat(dir_fd, scratch->name, &named,
+                    AT_SYMLINK_NOFOLLOW) == 0) {
+            if (same_runtime_identity(&scratch->identity, &named) &&
+                S_ISREG(named.st_mode) && named.st_uid == getuid()) {
+#if defined(__FreeBSD__)
+                if (funlinkat(dir_fd, scratch->name, scratch->fd, 0) == 0) {
+#else
+                /* Darwin has no unlink-by-descriptor primitive. The private
+                 * runtime manager lock is the supported writer boundary; the
+                 * identity check immediately before unlink also ensures an
+                 * observed replacement is preserved. */
+                if (unlinkat(dir_fd, scratch->name, 0) == 0) {
+#endif
+                } else {
+                    rc = -1;
+                }
+            } else {
+                /* Preserve a raced replacement rather than unlinking data we
+                 * no longer own. The original inode is still scrubbed through
+                 * the retained descriptor above. */
+                rc = -1;
+            }
+        } else if (errno == ENOENT) {
+            rc = -1;
+        } else {
+            rc = -1;
+        }
+    } else if (dir_fd >= 0 && scratch->name[0] != '\0' &&
+               scratch->created) {
+        /* Creation succeeded but identity capture did not, so pathname
+         * deletion has no ownership proof. The file is still empty at this
+         * stage; preserve the uncertain name and drop any path-only slot. */
+        rc = -1;
+    }
+
+    /* Never discard the captured identity while a path-only slot remains.
+     * Even if both truncation and namespace retirement fail, a later signal
+     * must not unlink an unrelated replacement installed at this name. The
+     * operation reports failure and preserves any uncertain entry for
+     * explicit recovery. */
+    if (scratch->registered) {
+        signals_scratch_unregister(scratch->path);
+        scratch->registered = false;
+    }
+    if (scratch->fd >= 0 && close(scratch->fd) != 0) rc = -1;
+    secure_zero_memory(scratch, sizeof(*scratch));
+    scratch->fd = -1;
+    return rc;
+}
+
+static int ssh_fingerprint_scratch_create(
+    int dir_fd, const char *dir_path, const ssh_key_snapshot_t *snapshot,
+    ssh_fingerprint_scratch_t *scratch) {
+    static const char random_chars[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    char suffix[17];
+    struct stat created;
+    struct stat named;
+
+    if (dir_fd < 0 || !dir_path || !*dir_path || !snapshot || !scratch ||
+        !ssh_key_snapshot_fd_matches(snapshot)) {
+        return -1;
+    }
+    memset(scratch, 0, sizeof(*scratch));
+    scratch->fd = -1;
+
+    for (unsigned int attempt = 0; attempt < 16; attempt++) {
+        if (generate_random_string(suffix, sizeof(suffix), random_chars) != 0 ||
+            (size_t)snprintf(scratch->name, sizeof(scratch->name),
+                             ".key-fingerprint.%s", suffix) >=
+                sizeof(scratch->name) ||
+            (size_t)snprintf(scratch->path, sizeof(scratch->path), "%s/%s",
+                             dir_path, scratch->name) >= sizeof(scratch->path)) {
+            return -1;
+        }
+        scratch->fd = openat(
+            dir_fd, scratch->name,
+            O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (scratch->fd >= 0 || errno != EEXIST) break;
+    }
+    if (scratch->fd < 0) return -1;
+    scratch->created = true;
+    scratch->length = snapshot->length;
+    if (fchmod(scratch->fd, 0600) != 0 ||
+        fstat(scratch->fd, &scratch->identity) != 0 ||
+        !S_ISREG(scratch->identity.st_mode) ||
+        scratch->identity.st_uid != getuid() ||
+        scratch->identity.st_nlink != 1 ||
+        (scratch->identity.st_mode & 0777) != 0600) {
+        (void)ssh_fingerprint_scratch_cleanup(dir_fd, scratch);
+        return -1;
+    }
+    scratch->have_identity = true;
+    if (signals_scratch_register(scratch->path) != 0) {
+        (void)ssh_fingerprint_scratch_cleanup(dir_fd, scratch);
+        return -1;
+    }
+    scratch->registered = true;
+    if (write_all_fd(scratch->fd, snapshot->data, snapshot->length) != 0 ||
+        fstat(scratch->fd, &created) != 0 ||
+        fstatat(dir_fd, scratch->name, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !same_runtime_identity(&scratch->identity, &created) ||
+        !same_runtime_identity(&created, &named) ||
+        !same_runtime_revision(&created, &named)) {
+        (void)ssh_fingerprint_scratch_cleanup(dir_fd, scratch);
+        return -1;
+    }
+    /* Seal the fully populated revision, not the empty O_EXCL creation
+     * revision. A rewrite-and-restore during ssh-keygen now changes ctime or
+     * generation and is rejected even if the bytes are restored afterward. */
+    scratch->identity = created;
+    if (!ssh_fingerprint_scratch_matches(dir_fd, scratch, snapshot)) {
+        (void)ssh_fingerprint_scratch_cleanup(dir_fd, scratch);
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+/* Copy the SHA256:... fingerprint token of the admitted key generation into
+ * `buf`. Linux can name the retained regular descriptor through procfs: each
+ * ssh-keygen reopen gets an independent file offset. Darwin and FreeBSD
+ * /dev/fd entries use dup-style shared offsets; OpenSSH reads the private-key header,
+ * reopens the path, and otherwise starts the second read at EOF. On those
+ * platforms, expose the already-captured bytes briefly through a random 0600
+ * file in the pinned, locked manager directory. Its exact inode and contents
+ * are checked before and after ssh-keygen, then scrubbed and unlinked. */
 static int ssh_key_fingerprint_generation(
+    int dir_fd, bool use_cwd_fd, const char *dir_path,
     const char *key_path, const ssh_key_snapshot_t *snapshot,
     char *buf, size_t size) {
     char out[1024];
 #if defined(__linux__)
     const char *stdin_path = "/proc/self/fd/0";
-#elif defined(__APPLE__) || defined(__FreeBSD__)
-    const char *stdin_path = "/dev/fd/0";
-#else
-    const char *stdin_path = "/dev/stdin";
 #endif
-    const char *argv[] = {
-        "ssh-keygen", "-lf", snapshot ? stdin_path : key_path, NULL
-    };
+    const char *argv[] = {"ssh-keygen", "-lf", key_path, NULL};
     run_opts_t opts;
     run_result_t res;
+#if !defined(__linux__)
+    ssh_fingerprint_scratch_t scratch;
+    memset(&scratch, 0, sizeof(scratch));
+    scratch.fd = -1;
+#endif
 
     if ((!snapshot && (!key_path || !*key_path)) ||
         (snapshot && (!snapshot->data || snapshot->length == 0 ||
@@ -1340,33 +1566,63 @@ static int ssh_key_fingerprint_generation(
         return -1;
     }
     memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
     opts.out = out;
     opts.out_size = sizeof(out);
     opts.stderr_to_devnull = true;
     if (snapshot) {
-        /* `ssh-keygen -lf -` expects a public-key stream and rejects private
-         * keys. Preserve the admitted regular descriptor as seekable fd 0 and
-         * name only that fd through the supported platform descriptor fs. */
-        if (!ssh_key_snapshot_fd_matches(snapshot) ||
-            lseek(snapshot->fd, 0, SEEK_SET) != 0) {
+        if (!ssh_key_snapshot_fd_matches(snapshot)) {
             set_error(ERR_SSH_KEY_INVALID,
                       "Validated SSH key changed before fingerprinting");
             return -1;
         }
-        opts.stdin_fd = snapshot->fd;
-        opts.use_stdin_fd = true;
-    }
-    int run_rc = run_argv(argv, &opts, &res);
-    if (snapshot) {
-        if (!ssh_key_snapshot_fd_matches(snapshot)) {
+#if defined(__linux__)
+        if (lseek(snapshot->fd, 0, SEEK_SET) != 0) {
             set_error(ERR_SSH_KEY_INVALID,
-                      "Validated SSH key changed while fingerprinting");
+                      "Validated SSH key could not be rewound for fingerprinting");
             return -1;
         }
+        argv[2] = stdin_path;
+        opts.stdin_fd = snapshot->fd;
+        opts.use_stdin_fd = true;
+#else
+        if (!use_cwd_fd || ssh_fingerprint_scratch_create(
+                dir_fd, dir_path, snapshot, &scratch) != 0) {
+            set_error(ERR_SSH_KEY_INVALID,
+                      "Cannot stage the validated SSH key for portable fingerprinting");
+            return -1;
+        }
+        argv[2] = scratch.name;
+        opts.cwd_fd = dir_fd;
+        opts.use_cwd_fd = true;
+#endif
     }
-    if (run_rc != 0) {
+    int run_rc = run_argv(argv, &opts, &res);
+    bool generation_matches = !snapshot || ssh_key_snapshot_fd_matches(snapshot);
+#if !defined(__linux__)
+    if (snapshot &&
+        !ssh_fingerprint_scratch_matches(dir_fd, &scratch, snapshot)) {
+        generation_matches = false;
+    }
+    int cleanup_rc = snapshot
+                         ? ssh_fingerprint_scratch_cleanup(dir_fd, &scratch)
+                         : 0;
+    if (cleanup_rc != 0) {
+        set_error(ERR_SSH_KEY_INVALID,
+                  "Portable SSH fingerprint scratch could not be retired safely");
         return -1;
     }
+#else
+    (void)dir_fd;
+    (void)use_cwd_fd;
+    (void)dir_path;
+#endif
+    if (!generation_matches) {
+        set_error(ERR_SSH_KEY_INVALID,
+                  "Validated SSH key changed while fingerprinting");
+        return -1;
+    }
+    if (run_rc != 0 || res.out_truncated) return -1;
 
     /* Output: "<bits> SHA256:<hash> <comment> (<type>)". Extract the token
      * that starts with "SHA256:" (or "MD5:" on legacy setups). */
@@ -1375,7 +1631,8 @@ static int ssh_key_fingerprint_generation(
     if (!fp) return -1;
 
     size_t i = 0;
-    while (fp[i] && fp[i] != ' ' && fp[i] != '\t' && fp[i] != '\n' && i + 1 < size) {
+    while (fp[i] && fp[i] != ' ' && fp[i] != '\t' && fp[i] != '\n' &&
+           i + 1 < size) {
         buf[i] = fp[i];
         i++;
     }
@@ -1399,7 +1656,8 @@ static int ssh_key_fingerprint_generation(
  * indeterminate falls back to false (restart + load) rather than risk
  * adopting the wrong agent. */
 static bool ssh_agent_has_exact_key_generation(
-    int dir_fd, bool use_cwd_fd, const char *socket_arg,
+    int dir_fd, bool use_cwd_fd, const char *dir_path,
+    const char *socket_arg,
     const char *key_path, const ssh_key_snapshot_t *snapshot) {
     char want_fp[256];
     char envbuf[MAX_PATH_LEN + 20];
@@ -1432,8 +1690,9 @@ static bool ssh_agent_has_exact_key_generation(
     if (res.out_truncated) {
         return false;
     }
-    if (ssh_key_fingerprint_generation(key_path, snapshot, want_fp,
-                                       sizeof(want_fp)) != 0) {
+    if (ssh_key_fingerprint_generation(
+            dir_fd, use_cwd_fd, dir_path, key_path, snapshot, want_fp,
+            sizeof(want_fp)) != 0) {
         return false;
     }
 
@@ -1462,15 +1721,17 @@ static bool ssh_agent_has_exact_key_generation(
 }
 
 static bool ssh_socket_has_key_generation(
-    int dir_fd, const char *socket_arg, const char *key_path,
+    int dir_fd, const char *dir_path, const char *socket_arg,
+    const char *key_path,
     const ssh_key_snapshot_t *snapshot) {
     return ssh_agent_has_exact_key_generation(
-        dir_fd, true, socket_arg, key_path, snapshot);
+        dir_fd, true, dir_path, socket_arg, key_path, snapshot);
 }
 
 static bool ssh_socket_has_key(int dir_fd, const char *socket_arg,
                                const char *key_path) {
-    return ssh_socket_has_key_generation(dir_fd, socket_arg, key_path, NULL);
+    return ssh_socket_has_key_generation(
+        dir_fd, NULL, socket_arg, key_path, NULL);
 }
 
 bool ssh_manager_test_socket_has_key(int dir_fd, const char *socket_arg,
@@ -1793,7 +2054,8 @@ static int ssh_start_isolated_agent_with_key(
                 reuse_pin.identity.st_uid == getuid() &&
                 (reuse_pin.identity.st_mode & 0777) == 0600) {
                 can_reuse = ssh_socket_has_key_generation(
-                    dir_fd, socket_name, reuse_key_path, snapshot);
+                    dir_fd, socket_dir, socket_name, reuse_key_path,
+                    snapshot);
                 if (verify_ssh_runtime_pin_at(
                         dir_fd, socket_name, socket_path, &reuse_pin) != 0) {
                     goto done;
@@ -2134,8 +2396,8 @@ static int ssh_start_isolated_agent_with_key(
                            snapshot) != 0) {
         goto fresh_commit_failed;
     }
-    if (!ssh_socket_has_key_generation(dir_fd, socket_name, reuse_key_path,
-                                       snapshot)) {
+    if (!ssh_socket_has_key_generation(
+            dir_fd, socket_dir, socket_name, reuse_key_path, snapshot)) {
         set_error(ERR_SSH_KEY_LOAD_FAILED,
                   "Fresh isolated SSH agent does not contain exactly the "
                   "requested key");

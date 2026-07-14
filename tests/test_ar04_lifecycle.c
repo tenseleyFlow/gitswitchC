@@ -6,6 +6,7 @@
 #include "error.h"
 #include "gitswitch.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -87,6 +88,32 @@ static int join_path(char *dest, size_t size, const char *base,
     memcpy(dest, base, base_len);
     memcpy(dest + base_len, suffix, suffix_len + 1);
     return 0;
+}
+
+static int directory_has_entry_prefix(const char *path, const char *prefix) {
+    DIR *directory;
+    struct dirent *entry;
+    size_t prefix_length;
+    int result = 0;
+
+    if (!path || !prefix) return -1;
+    directory = opendir(path);
+    if (!directory) return -1;
+    prefix_length = strlen(prefix);
+    for (;;) {
+        errno = 0;
+        entry = readdir(directory);
+        if (!entry) {
+            if (errno != 0) result = -1;
+            break;
+        }
+        if (strncmp(entry->d_name, prefix, prefix_length) == 0) {
+            result = 1;
+            break;
+        }
+    }
+    if (closedir(directory) != 0) result = -1;
+    return result;
 }
 
 static int write_text(const char *path, const char *text, mode_t mode) {
@@ -687,6 +714,8 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     }
     CHECK_EQ_INT(stat(current_path, &st), 0);
     CHECK(S_ISSOCK(st.st_mode));
+    CHECK_EQ_INT(join_path(path, sizeof(path), runtime, "/gitswitch-ssh"), 0);
+    CHECK_EQ_INT(directory_has_entry_prefix(path, ".key-fingerprint."), 0);
     slurp(pid_path, contents, sizeof(contents));
     retry_pid = (pid_t)strtol(contents, NULL, 10);
     CHECK(retry_pid > 1);
