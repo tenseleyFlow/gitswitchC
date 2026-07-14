@@ -27,7 +27,16 @@ static int prompt_drain_line(void) {
                                         : PROMPT_LINE_OK;
 }
 
+/* Byte-wise reader instead of fgets (AR-10 L32): fgets gives no length back,
+ * so an embedded NUL hid the newline fgets HAD consumed from the strchr scan
+ * — the "is the next byte a newline?" probe then ate the first byte of the
+ * FOLLOWING line and the drain destroyed the rest of it. Reading bytes
+ * directly keeps consumption exactly one line regardless of content. */
 static int prompt_line_stdio(const char *prompt, char *buf, size_t size) {
+    size_t used = 0;
+    bool saw_nul = false;
+    bool saw_any = false;
+
     if (!buf || size == 0) return PROMPT_LINE_ERROR;
     buf[0] = '\0';
 
@@ -35,51 +44,43 @@ static int prompt_line_stdio(const char *prompt, char *buf, size_t size) {
         fputs(prompt, stdout);
         fflush(stdout);
     }
-    /* fgets cannot consume even an empty line with a one-byte destination. */
-    if (size == 1) {
+
+    for (;;) {
         int byte = prompt_getchar_retry();
         if (byte == EOF) {
-            return ferror(stdin) ? PROMPT_LINE_ERROR : PROMPT_LINE_EOF;
+            if (ferror(stdin)) {
+                buf[0] = '\0';
+                return PROMPT_LINE_ERROR;
+            }
+            if (!saw_any) return PROMPT_LINE_EOF;
+            break; /* final line without a trailing newline */
         }
-        if (byte != '\n') {
+        saw_any = true;
+        if (byte == '\n') break;
+        if (byte == '\0') {
+            /* A NUL can never survive into a C-string answer; keep consuming
+             * this line only and reject it below so the caller re-asks. */
+            saw_nul = true;
+            continue;
+        }
+        if (used + 1U >= size) {
+            /* Overflow: drain the remainder of THIS line so the retry starts
+             * at the next answer. A prefix is never a valid answer. */
             int drain_result = prompt_drain_line();
+            buf[0] = '\0';
             if (drain_result != PROMPT_LINE_OK) return drain_result;
             clear_error();
             return PROMPT_LINE_TRUNCATED;
         }
-        clear_error();
-        return PROMPT_LINE_OK;
+        buf[used++] = (char)byte;
     }
+    buf[used] = '\0';
 
-    if (!fgets(buf, (int)size, stdin)) {
-        int saved_errno = errno;
-        int result = ferror(stdin) ? PROMPT_LINE_ERROR : PROMPT_LINE_EOF;
-        /* A failed fgets may already have copied a prefix. Never expose that
-         * indeterminate partial answer to callers, and do not let cleanup
-         * obscure the underlying input error. */
+    if (saw_nul) {
         buf[0] = '\0';
-        errno = saved_errno;
-        return result;
+        clear_error();
+        return PROMPT_LINE_TRUNCATED;
     }
-
-    /* No newline is ambiguous: size - 1 bytes are a valid exact-boundary line
-     * if the following byte is newline/EOF; any other byte proves overflow.
-     * Drain that complete line so the retry starts at the next answer. */
-    if (strchr(buf, '\n') == NULL) {
-        int byte = prompt_getchar_retry();
-        if (byte != '\n' && byte != EOF) {
-            int drain_result = prompt_drain_line();
-            buf[0] = '\0';
-            if (drain_result != PROMPT_LINE_OK) return drain_result;
-            clear_error();
-            return PROMPT_LINE_TRUNCATED;
-        }
-        if (byte == EOF && ferror(stdin)) {
-            buf[0] = '\0';
-            return PROMPT_LINE_ERROR;
-        }
-    }
-    buf[strcspn(buf, "\n")] = '\0';
 
     char *trimmed = trim_whitespace(buf);
     if (trimmed != buf) {
@@ -111,10 +112,20 @@ int prompt_line(const char *prompt, char *buf, size_t size, bool path_completion
      * elsewhere a stray TAB should not spew the working directory. */
     rl_inhibit_completion = path_completion ? 0 : 1;
 
+    errno = 0;
     char *line = readline(prompt ? prompt : "");
     if (!line) {
-        return ferror(stdin) ? PROMPT_LINE_ERROR
-                             : PROMPT_LINE_EOF; /* EOF (Ctrl-D) */
+        /* AR-10 L34: readline reads through its own read(2) and never sets
+         * stdio's error flag, so ferror(stdin) was structurally false here
+         * and a hard tty error was misclassified as a polite EOF. readline
+         * leaves the failing read's errno in place; classify the specific
+         * hard-error values and keep everything else as EOF (Ctrl-D). */
+        int saved_errno = errno;
+        if (ferror(stdin) || saved_errno == EIO || saved_errno == EBADF ||
+            saved_errno == ENXIO) {
+            return PROMPT_LINE_ERROR;
+        }
+        return PROMPT_LINE_EOF;
     }
 
     /* Apply the limit to the physical input, before trimming, so readline and

@@ -103,6 +103,35 @@ TEST(oversized_line_is_rejected_and_next_line_recovers) {
     fclose(stream);
 }
 
+/* AR-10 L32: an embedded NUL used to hide the newline fgets had consumed, so
+ * the boundary probe ate the first byte of the NEXT line and the drain
+ * destroyed the rest of it — reproduced as "second" vanishing. Exactly one
+ * line may be consumed per call, whatever its bytes. */
+TEST(embedded_nul_rejects_one_line_and_preserves_the_next) {
+    static const char fixture[] = "fir\0st\nsecond\n";
+    char buffer[16] = "dirty";
+    FILE *stream = tmpfile();
+    redirected_stream_t redirected = { .stream = NULL, .saved_fd = -1 };
+
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT((int)fwrite(fixture, 1, sizeof(fixture) - 1U, stream),
+                 (int)(sizeof(fixture) - 1U));
+    CHECK_EQ_INT(fflush(stream), 0);
+    CHECK_EQ_INT(fseek(stream, 0, SEEK_SET), 0);
+    CHECK_EQ_INT(begin_input(stream, &redirected), 0);
+    if (redirected.saved_fd >= 0) {
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_TRUNCATED);
+        CHECK_STR_EQ(buffer, "");
+        CHECK_EQ_INT(prompt_line("", buffer, sizeof(buffer), false),
+                     PROMPT_LINE_OK);
+        CHECK_STR_EQ(buffer, "second");
+        end_input(&redirected);
+    }
+    fclose(stream);
+}
+
 TEST(unterminated_exact_boundary_and_eof_keep_their_semantics) {
     char buffer[8] = "dirty";
     FILE *stream = input_stream("1234567");
@@ -731,6 +760,7 @@ TEST_MAIN_BEGIN()
     (void)setvbuf(stdin, NULL, _IONBF, 0);
     RUN_TEST(exact_boundary_is_accepted);
     RUN_TEST(oversized_line_is_rejected_and_next_line_recovers);
+    RUN_TEST(embedded_nul_rejects_one_line_and_preserves_the_next);
     RUN_TEST(unterminated_exact_boundary_and_eof_keep_their_semantics);
     RUN_TEST(success_clears_stale_error_state);
     RUN_TEST(empty_line_is_accepted_as_an_empty_answer);
