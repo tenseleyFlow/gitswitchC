@@ -335,6 +335,182 @@ TEST(failed_error_init_retains_previous_log_sink) {
     CHECK_EQ_INT(error_init(LOG_LEVEL_CRITICAL, NULL), 0);
 }
 
+TEST(error_accumulator_retains_first_context_without_global_side_effects) {
+    error_accumulator_t accumulator;
+    error_context_t first;
+    error_context_t first_bytes;
+    error_context_t global_before = {0};
+
+    memset(&first, 0xA5, sizeof(first));
+    first.code = ERR_CONFIG_WRITE_FAILED;
+    snprintf(first.message, sizeof(first.message), "%s", "first failure");
+    first.message_truncated = false;
+    snprintf(first.details, sizeof(first.details), "%s", "first details");
+    first.details_truncated = false;
+    snprintf(first.file, sizeof(first.file), "%s", "first-source.c");
+    first.line = 271;
+    snprintf(first.function, sizeof(first.function), "%s", "first_function");
+    first.system_errno = EIO;
+    memcpy(&first_bytes, &first, sizeof(first_bytes));
+
+    global_before.code = ERR_UNKNOWN;
+    snprintf(global_before.message, sizeof(global_before.message), "%s",
+             "unrelated global error");
+    memcpy(&g_last_error, &global_before, sizeof(g_last_error));
+
+    errno = EDOM;
+    error_accumulator_init(&accumulator);
+    CHECK_EQ_INT(errno, EDOM);
+    CHECK(!accumulator.active);
+
+    errno = EINTR;
+    CHECK(error_accumulator_add(&accumulator, "initial", &first));
+    CHECK_EQ_INT(errno, EINTR);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+    CHECK(accumulator.active);
+    CHECK_EQ_INT(accumulator.first_errno, EINTR);
+    CHECK_EQ_INT(accumulator.failure_count, 1);
+    CHECK_EQ_INT(accumulator.rendered_count, 1);
+    CHECK(!accumulator.chain_truncated);
+    CHECK_STR_EQ(accumulator.accumulated_details, "first details");
+}
+
+TEST(error_accumulator_appends_in_order_and_publishes_first_cause) {
+    error_accumulator_t accumulator;
+    error_context_t first = {0};
+    error_context_t first_bytes;
+    error_context_t later = {0};
+    error_context_t global_before;
+
+    first.code = ERR_FILE_IO;
+    snprintf(first.message, sizeof(first.message), "%s", "save failed");
+    snprintf(first.details, sizeof(first.details), "%s", "save errno detail");
+    snprintf(first.file, sizeof(first.file), "%s", "resume.c");
+    first.line = 41;
+    snprintf(first.function, sizeof(first.function), "%s", "restore_resume");
+    first.system_errno = ENOSPC;
+    memcpy(&first_bytes, &first, sizeof(first_bytes));
+
+    error_accumulator_init(&accumulator);
+    errno = EBUSY;
+    CHECK(error_accumulator_add(&accumulator, "save", &first));
+
+    set_error_context(ERR_CONFIG_WRITE_FAILED, "metadata.c", 52,
+                      "restore_metadata", "metadata restore failed");
+    memcpy(&global_before, &g_last_error, sizeof(global_before));
+    errno = EAGAIN;
+    CHECK(error_accumulator_add_last(&accumulator, "resume restore"));
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+
+    later.code = ERR_SYSTEM_CALL;
+    snprintf(later.message, sizeof(later.message), "%s", "abort failed");
+    snprintf(later.details, sizeof(later.details), "%s", "later detail");
+    snprintf(later.file, sizeof(later.file), "%s", "accounts.c");
+    later.line = 63;
+    snprintf(later.function, sizeof(later.function), "%s", "abort_switch");
+    later.system_errno = EPERM;
+    errno = ENOTTY;
+    CHECK(error_accumulator_add(&accumulator, "account abort", &later));
+    CHECK_EQ_INT(errno, ENOTTY);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+
+    CHECK_EQ_INT(accumulator.failure_count, 3);
+    CHECK_EQ_INT(accumulator.rendered_count, 3);
+    CHECK(!accumulator.chain_truncated);
+    CHECK_STR_EQ(accumulator.accumulated_details,
+                 "save errno detail; [resume restore] metadata restore failed; "
+                 "[account abort] abort failed");
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+
+    set_error_context(ERR_UNKNOWN, "sentinel.c", 99, "sentinel",
+                      "publish replaces this once");
+    errno = ERANGE;
+    CHECK(error_accumulator_publish(&accumulator));
+    CHECK_EQ_INT(errno, EBUSY);
+    CHECK_EQ_INT(g_last_error.code, ERR_FILE_IO);
+    CHECK_EQ_INT(g_last_error.system_errno, ENOSPC);
+    CHECK_STR_EQ(g_last_error.message, "save failed");
+    CHECK_STR_EQ(g_last_error.details,
+                 "save errno detail; [resume restore] metadata restore failed; "
+                 "[account abort] abort failed");
+    CHECK_STR_EQ(g_last_error.file, "resume.c");
+    CHECK_EQ_INT(g_last_error.line, 41);
+    CHECK_STR_EQ(g_last_error.function, "restore_resume");
+    CHECK(!g_last_error.details_truncated);
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+}
+
+TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures) {
+    error_accumulator_t accumulator;
+    error_context_t first = {0};
+    error_context_t first_bytes;
+    error_context_t later = {0};
+    error_context_t global_before = {0};
+    char truncated_details[sizeof(accumulator.accumulated_details)];
+    size_t initial_length = sizeof(first.details) - 24U;
+
+    first.code = ERR_CONFIG_WRITE_FAILED;
+    snprintf(first.message, sizeof(first.message), "%s", "primary failure");
+    memset(first.details, 'd', initial_length);
+    first.details[initial_length] = '\0';
+    snprintf(first.file, sizeof(first.file), "%s", "primary.c");
+    first.line = 72;
+    snprintf(first.function, sizeof(first.function), "%s", "primary_stage");
+    first.system_errno = EROFS;
+    memcpy(&first_bytes, &first, sizeof(first_bytes));
+
+    memset(later.message, 'x', sizeof(later.message) - 1U);
+    later.message[sizeof(later.message) - 1U] = '\0';
+    later.code = ERR_SYSTEM_CALL;
+
+    global_before.code = ERR_ACCOUNT_INVALID;
+    snprintf(global_before.message, sizeof(global_before.message), "%s",
+             "global sentinel");
+    memcpy(&g_last_error, &global_before, sizeof(g_last_error));
+
+    error_accumulator_init(&accumulator);
+    errno = ECHILD;
+    CHECK(error_accumulator_add(&accumulator, "primary", &first));
+    errno = EPIPE;
+    CHECK(!error_accumulator_add(&accumulator, "secondary", &later));
+    CHECK_EQ_INT(errno, EPIPE);
+    CHECK(accumulator.chain_truncated);
+    CHECK_EQ_INT(accumulator.failure_count, 2);
+    CHECK_EQ_INT(accumulator.rendered_count, 1);
+    CHECK(strstr(accumulator.accumulated_details,
+                 ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
+    memcpy(truncated_details, accumulator.accumulated_details,
+           sizeof(truncated_details));
+
+    errno = ENFILE;
+    CHECK(!error_accumulator_add(&accumulator, "tertiary", &later));
+    CHECK_EQ_INT(errno, ENFILE);
+    CHECK_EQ_INT(accumulator.failure_count, 3);
+    CHECK_EQ_INT(accumulator.rendered_count, 1);
+    CHECK(memcmp(truncated_details, accumulator.accumulated_details,
+                 sizeof(truncated_details)) == 0);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+
+    errno = ENOMSG;
+    CHECK(error_accumulator_publish(&accumulator));
+    CHECK_EQ_INT(errno, ECHILD);
+    CHECK_EQ_INT(g_last_error.code, ERR_CONFIG_WRITE_FAILED);
+    CHECK_EQ_INT(g_last_error.system_errno, EROFS);
+    CHECK_STR_EQ(g_last_error.message, "primary failure");
+    CHECK_STR_EQ(g_last_error.file, "primary.c");
+    CHECK_EQ_INT(g_last_error.line, 72);
+    CHECK_STR_EQ(g_last_error.function, "primary_stage");
+    CHECK(g_last_error.details_truncated);
+    CHECK(strstr(g_last_error.details, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
@@ -353,4 +529,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(display_format_marks_its_own_bounded_truncation);
     RUN_TEST(display_format_rejects_unterminated_context_fields_truthfully);
     RUN_TEST(failed_error_init_retains_previous_log_sink);
+    RUN_TEST(error_accumulator_retains_first_context_without_global_side_effects);
+    RUN_TEST(error_accumulator_appends_in_order_and_publishes_first_cause);
+    RUN_TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures);
 TEST_MAIN_END()

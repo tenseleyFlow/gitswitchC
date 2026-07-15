@@ -80,6 +80,19 @@ typedef struct {
     int system_errno;
 } error_context_t;
 
+/* Bounded first-error aggregation for multi-stage cleanup paths. The first
+ * context remains byte-identical in first_error; accumulated_details is the
+ * publication copy that may gain later causal entries. */
+typedef struct {
+    bool active;
+    error_context_t first_error;
+    int first_errno;
+    size_t failure_count;
+    size_t rendered_count;
+    bool chain_truncated;
+    char accumulated_details[sizeof(((error_context_t *)0)->details)];
+} error_accumulator_t;
+
 /* Global error context */
 extern error_context_t g_last_error;
 
@@ -150,6 +163,34 @@ const error_context_t *get_last_error(void);
  * Clear last error
  */
 void clear_error(void);
+
+/**
+ * Initialize a bounded first-error accumulator.
+ */
+void error_accumulator_init(error_accumulator_t *accumulator);
+
+/**
+ * Retain an error without changing the global error context or errno. The
+ * first context and ambient errno are captured exactly. Later failures are
+ * appended as "; [label] message" while space permits. Returns false for an
+ * invalid call or when the new entry cannot be rendered completely.
+ */
+bool error_accumulator_add(error_accumulator_t *accumulator,
+                           const char *label,
+                           const error_context_t *error);
+
+/**
+ * Add the current global error context under label without changing it.
+ */
+bool error_accumulator_add_last(error_accumulator_t *accumulator,
+                                const char *label);
+
+/**
+ * Publish the accumulated context with one global assignment and restore the
+ * ambient errno captured with the first failure. Returns false when no first
+ * failure has been captured.
+ */
+bool error_accumulator_publish(const error_accumulator_t *accumulator);
 
 /**
  * Convert error code to human-readable string

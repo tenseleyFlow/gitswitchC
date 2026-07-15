@@ -134,6 +134,10 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(enable_echo);
     REQUIRE_PUBLIC_API(ensure_config_directory_exists);
     REQUIRE_PUBLIC_API(ensure_private_dir);
+    REQUIRE_PUBLIC_API(error_accumulator_add);
+    REQUIRE_PUBLIC_API(error_accumulator_add_last);
+    REQUIRE_PUBLIC_API(error_accumulator_init);
+    REQUIRE_PUBLIC_API(error_accumulator_publish);
     REQUIRE_PUBLIC_API(error_cleanup);
     REQUIRE_PUBLIC_API(error_code_to_string);
     REQUIRE_PUBLIC_API(error_init);
