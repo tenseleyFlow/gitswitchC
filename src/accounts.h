@@ -74,6 +74,15 @@ int accounts_transaction_finish(gitswitch_ctx_t *ctx,
                                 accounts_transaction_kind_t kind,
                                 accounts_transaction_token_t token);
 
+/* Capability check for config.c's account-model mutation boundary. Public
+ * config mutation passes NONE/0 and is admitted only while no account
+ * transaction exists. Operation-owned mutation must present the exact
+ * context/kind/token while that owner is still entering; there is no API for
+ * discovering a live owner's token. */
+int accounts_transaction_authorize_model_mutation(
+    gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
+    accounts_transaction_token_t token);
+
 /**
  * Switch to specified account
  * - Validates account exists and is properly configured

@@ -8,6 +8,7 @@
 
 #include "test.h"
 #include "accounts.h"
+#include "config.h"
 #include "error.h"
 #include "signals.h"
 #include "utils.h"
@@ -43,6 +44,22 @@ static void make_base_context(gitswitch_ctx_t *ctx) {
     account->preferred_scope = GIT_SCOPE_GLOBAL;
     ctx->account_count = 1;
     ctx->current_account = account;
+}
+
+static account_t make_model_candidate(uint32_t id, const char *name,
+                                      const char *description) {
+    account_t candidate;
+
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.id = id;
+    CHECK_EQ_INT(safe_strncpy(candidate.name, name,
+                              sizeof(candidate.name)), 0);
+    CHECK_EQ_INT(safe_snprintf(candidate.email, sizeof(candidate.email),
+                               "%s@example.test", name), 0);
+    CHECK_EQ_INT(safe_strncpy(candidate.description, description,
+                              sizeof(candidate.description)), 0);
+    candidate.preferred_scope = GIT_SCOPE_GLOBAL;
+    return candidate;
 }
 
 /* Feed the non-TTY add flow exactly six answers (name, email, description,
@@ -414,6 +431,107 @@ TEST(prepared_edit_retains_guard_rollback_and_exact_abort_owner) {
     CHECK(!signals_rollback_active());
 }
 
+TEST(model_mutation_requires_idle_public_state_or_exact_owner_capability) {
+    const accounts_transaction_kind_t mutation_kinds[] = {
+        ACCOUNTS_TRANSACTION_ADD,
+        ACCOUNTS_TRANSACTION_EDIT,
+        ACCOUNTS_TRANSACTION_REMOVE,
+    };
+
+    for (size_t index = 0;
+         index < sizeof(mutation_kinds) / sizeof(mutation_kinds[0]); index++) {
+        gitswitch_ctx_t owner;
+        gitswitch_ctx_t contender;
+        gitswitch_ctx_t owner_before;
+        gitswitch_ctx_t contender_before;
+        account_t added = make_model_candidate(12, "newmodel", "new model");
+        account_t edited;
+        accounts_transaction_kind_t kind = mutation_kinds[index];
+        accounts_transaction_token_t token = 0;
+        accounts_transaction_token_t foreign;
+
+        make_base_context(&owner);
+        make_base_context(&contender);
+        edited = owner.accounts[0];
+        CHECK_EQ_INT(safe_strncpy(edited.description, "edited model",
+                                  sizeof(edited.description)), 0);
+        owner_before = owner;
+        contender_before = contender;
+        CHECK_EQ_INT(accounts_transaction_begin(&owner, kind, &token), 0);
+        if (token == 0) return;
+        foreign = token ^ UINT64_C(0x4000000000000000);
+        if (foreign == 0 || foreign == token) foreign = token + 1U;
+
+        /* Public mutation loses to the live owner before argument validation,
+         * regardless of whether it targets the owner, another context, or a
+         * malformed request. */
+        CHECK_EQ_INT(config_add_account(&owner, &added), -1);
+        CHECK_EQ_INT(config_remove_account(&owner, 11), -1);
+        CHECK_EQ_INT(config_update_account(&owner, &edited), -1);
+        CHECK_EQ_INT(config_add_account(&contender, &added), -1);
+        CHECK_EQ_INT(config_remove_account(&contender, 11), -1);
+        CHECK_EQ_INT(config_update_account(&contender, &edited), -1);
+        CHECK_EQ_INT(config_add_account(NULL, NULL), -1);
+        CHECK_EQ_INT(config_remove_account(NULL, 0), -1);
+        CHECK_EQ_INT(config_update_account(NULL, NULL), -1);
+
+        /* Owned variants accept neither a copied context, a guessed token,
+         * nor a capability for another mutation family. */
+        CHECK_EQ_INT(config_add_account_owned(&contender, &added, token), -1);
+        CHECK_EQ_INT(config_update_account_owned(&contender, &edited, token),
+                     -1);
+        CHECK_EQ_INT(config_remove_account_owned(&contender, 11, token), -1);
+        CHECK_EQ_INT(config_add_account_owned(&owner, &added, foreign), -1);
+        CHECK_EQ_INT(config_update_account_owned(&owner, &edited, foreign),
+                     -1);
+        CHECK_EQ_INT(config_remove_account_owned(&owner, 11, foreign), -1);
+        CHECK_EQ_INT(accounts_transaction_authorize_model_mutation(
+                         &owner, ACCOUNTS_TRANSACTION_NONE, 0), -1);
+        CHECK_EQ_INT(accounts_transaction_authorize_model_mutation(
+                         &owner, kind, foreign), -1);
+
+        if (kind != ACCOUNTS_TRANSACTION_ADD) {
+            CHECK_EQ_INT(config_add_account_owned(&owner, &added, token), -1);
+        }
+        if (kind != ACCOUNTS_TRANSACTION_EDIT) {
+            CHECK_EQ_INT(config_update_account_owned(&owner, &edited, token),
+                         -1);
+        }
+        if (kind != ACCOUNTS_TRANSACTION_REMOVE) {
+            CHECK_EQ_INT(config_remove_account_owned(&owner, 11, token), -1);
+        }
+        CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
+        CHECK(memcmp(&contender, &contender_before, sizeof(contender)) == 0);
+
+        CHECK_EQ_INT(accounts_transaction_authorize_model_mutation(
+                         &owner, kind, token), 0);
+        if (kind == ACCOUNTS_TRANSACTION_ADD) {
+            CHECK_EQ_INT(config_add_account_owned(&owner, &added, token), 0);
+            CHECK_EQ_INT(owner.account_count, 2);
+            CHECK_STR_EQ(owner.accounts[1].name, "newmodel");
+        } else if (kind == ACCOUNTS_TRANSACTION_EDIT) {
+            CHECK_EQ_INT(config_update_account_owned(&owner, &edited, token),
+                         0);
+            CHECK_STR_EQ(owner.accounts[0].description, "edited model");
+        } else {
+            CHECK_EQ_INT(config_remove_account_owned(&owner, 11, token), 0);
+            CHECK_EQ_INT(owner.account_count, 0);
+            CHECK(owner.current_account == NULL);
+        }
+        CHECK_EQ_INT(accounts_transaction_finish(&owner, kind, token), 0);
+    }
+
+    /* Once the exact owner is consumed, ordinary model APIs are admitted. */
+    {
+        gitswitch_ctx_t ctx;
+        account_t added = make_model_candidate(12, "idlemodel", "idle model");
+
+        make_base_context(&ctx);
+        CHECK_EQ_INT(config_add_account(&ctx, &added), 0);
+        CHECK_EQ_INT(config_remove_account(&ctx, 12), 0);
+    }
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(every_kind_pair_requires_exact_context_token_and_depth);
@@ -422,4 +540,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_prepare_settles_only_through_exact_commit_or_abort);
     RUN_TEST(abort_only_add_owner_blocks_init_and_commit_until_abort_retry);
     RUN_TEST(prepared_edit_retains_guard_rollback_and_exact_abort_owner);
+    RUN_TEST(model_mutation_requires_idle_public_state_or_exact_owner_capability);
 TEST_MAIN_END()

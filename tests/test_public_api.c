@@ -63,6 +63,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_switch_prepare);
     REQUIRE_PUBLIC_API(accounts_transaction_begin);
     REQUIRE_PUBLIC_API(accounts_transaction_finish);
+    REQUIRE_PUBLIC_API(accounts_transaction_authorize_model_mutation);
     REQUIRE_PUBLIC_API(accounts_transaction_rollback_begin);
     REQUIRE_PUBLIC_API(accounts_transaction_rollback_end);
     REQUIRE_PUBLIC_API(accounts_validate);
@@ -76,6 +77,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(compare_accounts_by_name);
     REQUIRE_PUBLIC_API(compare_strings);
     REQUIRE_PUBLIC_API(config_add_account);
+    REQUIRE_PUBLIC_API(config_add_account_owned);
     REQUIRE_PUBLIC_API(config_backup);
     REQUIRE_PUBLIC_API(config_check_rewritable);
     REQUIRE_PUBLIC_API(config_create_default);
@@ -89,6 +91,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_load);
     REQUIRE_PUBLIC_API(config_parse_scope);
     REQUIRE_PUBLIC_API(config_remove_account);
+    REQUIRE_PUBLIC_API(config_remove_account_owned);
     REQUIRE_PUBLIC_API(config_restore_active_account);
     REQUIRE_PUBLIC_API(config_resume_hint_path);
     REQUIRE_PUBLIC_API(config_resume_hint_probe);
@@ -107,6 +110,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_set_io_fault_fn);
     REQUIRE_PUBLIC_API(config_set_metadata_test_hook_fn);
     REQUIRE_PUBLIC_API(config_update_account);
+    REQUIRE_PUBLIC_API(config_update_account_owned);
     REQUIRE_PUBLIC_API(config_validate);
     REQUIRE_PUBLIC_API(config_validate_account_model);
     REQUIRE_PUBLIC_API(config_write_lock);

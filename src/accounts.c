@@ -89,6 +89,7 @@ typedef struct {
     bool gpg_dirty;
     int runtime_lock_fd;
     uint32_t target_id;
+    account_t frozen_target;
     account_t switch_target;
     git_scope_t scope;
     bool ssh_ok;
@@ -307,6 +308,44 @@ int accounts_transaction_finish(gitswitch_ctx_t *ctx,
         return -1;
     }
     memset(&g_transaction_owner, 0, sizeof(g_transaction_owner));
+    return 0;
+}
+
+int accounts_transaction_authorize_model_mutation(
+    gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
+    accounts_transaction_token_t token) {
+    if (kind == ACCOUNTS_TRANSACTION_NONE && token == 0) {
+        if (g_transaction_owner.kind == ACCOUNTS_TRANSACTION_NONE &&
+            !pending_account_record_live()) {
+            return 0;
+        }
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot mutate the public account model while %s transaction token %llu is active",
+                  transaction_kind_name(g_transaction_owner.kind),
+                  (unsigned long long)g_transaction_owner.token);
+        return -1;
+    }
+    if (kind != ACCOUNTS_TRANSACTION_ADD &&
+        kind != ACCOUNTS_TRANSACTION_EDIT &&
+        kind != ACCOUNTS_TRANSACTION_REMOVE) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account-model transaction authorization");
+        return -1;
+    }
+    if (transaction_require(ctx, kind, token, "authorize model mutation for") !=
+        0) {
+        return -1;
+    }
+    if (g_transaction_owner.phase != ACCOUNTS_TRANSACTION_ENTERING) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot mutate the %s account model from transaction phase %d",
+                  transaction_kind_name(kind),
+                  (int)g_transaction_owner.phase);
+        return -1;
+    }
     return 0;
 }
 
@@ -1245,6 +1284,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                          sizeof(prepared_owner.previous_gpg_home));
             prepared_owner.previous_gpg_present = prev_gpg_present;
             prepared_owner.target_id = account->id;
+            prepared_owner.frozen_target = *account;
             prepared_owner.switch_target = switch_target;
             prepared_owner.scope = scope;
         }
@@ -1774,6 +1814,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                         g_pending_switch.gpg_dirty = gpg_remaining;
                         g_pending_switch.runtime_lock_fd = -1;
                         g_pending_switch.target_id = account->id;
+                        g_pending_switch.frozen_target = *account;
                         g_pending_switch.switch_target = switch_target;
                         g_pending_switch.scope = scope;
                         g_pending_switch.ssh_ok = ssh_ok;
@@ -1957,6 +1998,25 @@ int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
     return rc;
 }
 
+/* Compare semantic account fields one by one. Avoiding a struct memcmp keeps
+ * padding out of the generation contract while still binding every persisted
+ * field, including metadata and currently-disabled routing selectors. */
+static bool account_fields_equal_exact(const account_t *left,
+                                       const account_t *right) {
+    return left && right && left->id == right->id &&
+           strcmp(left->name, right->name) == 0 &&
+           strcmp(left->email, right->email) == 0 &&
+           strcmp(left->description, right->description) == 0 &&
+           left->preferred_scope == right->preferred_scope &&
+           left->ssh_enabled == right->ssh_enabled &&
+           strcmp(left->ssh_key_path, right->ssh_key_path) == 0 &&
+           strcmp(left->ssh_host_alias, right->ssh_host_alias) == 0 &&
+           strcmp(left->ssh_hostname, right->ssh_hostname) == 0 &&
+           left->gpg_enabled == right->gpg_enabled &&
+           left->gpg_signing_enabled == right->gpg_signing_enabled &&
+           strcmp(left->gpg_key_id, right->gpg_key_id) == 0;
+}
+
 int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                                   accounts_switch_commit_state_t *state) {
     account_t *target = NULL;
@@ -1996,8 +2056,16 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         }
     }
     if (!target) {
+        errno = ESTALE;
         set_error(ERR_ACCOUNT_NOT_FOUND,
-                  "Prepared switch target disappeared before commit");
+                  "Prepared switch target changed or disappeared before commit");
+        return -1;
+    }
+    if (!account_fields_equal_exact(target,
+                                    &g_pending_switch.frozen_target)) {
+        errno = ESTALE;
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Prepared switch target changed before commit; abort the retained transaction and retry");
         return -1;
     }
     if (transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_SWITCH,
@@ -2466,7 +2534,7 @@ static int accounts_edit_candidate_prepare_owned(
     /* config_update_account is the single add/edit admission gate. Nothing
      * externally visible has changed yet, so a validation failure needs no
      * rollback window. */
-    if (config_update_account(ctx, &edited) != 0) {
+    if (config_update_account_owned(ctx, &edited, token) != 0) {
         memset(&g_pending_edit, 0, sizeof(g_pending_edit));
         return -1;
     }
@@ -2976,7 +3044,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
         return accounts_edit_candidate_prepare_owned(ctx, &acct, token);
     }
 
-    if (config_add_account(ctx, &acct) != 0) {
+    if (config_add_account_owned(ctx, &acct, token) != 0) {
         return -1;
     }
     return 0;
@@ -3423,7 +3491,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     }
 
     /* Only a complete teardown permits deleting the configuration handle. */
-    if (config_remove_account(ctx, account_id) != 0) {
+    if (config_remove_account_owned(ctx, account_id, token) != 0) {
         goto remove_done;
     }
 

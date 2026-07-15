@@ -3815,12 +3815,23 @@ int config_get_path(char *path_buffer, size_t buffer_size) {
     return join_path(path_buffer, buffer_size, config_dir, DEFAULT_CONFIG_FILE);
 }
 
-/* Add new account to configuration */
-int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
+/* Add new account to configuration. The shared implementation admits either
+ * a globally idle public call or the exact ADD owner capability. */
+static int config_add_account_impl(gitswitch_ctx_t *ctx,
+                                   const account_t *account,
+                                   bool operation_owned,
+                                   uint64_t transaction_token) {
     account_t candidate;
     uint32_t current_id = 0;
     bool had_current;
 
+    if (accounts_transaction_authorize_model_mutation(
+            ctx,
+            operation_owned ? ACCOUNTS_TRANSACTION_ADD
+                            : ACCOUNTS_TRANSACTION_NONE,
+            operation_owned ? transaction_token : 0) != 0) {
+        return -1;
+    }
     if (!ctx || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_add_account");
         return -1;
@@ -3852,12 +3863,31 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
     return 0;
 }
 
+int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
+    return config_add_account_impl(ctx, account, false, 0);
+}
+
+int config_add_account_owned(gitswitch_ctx_t *ctx, const account_t *account,
+                             uint64_t transaction_token) {
+    return config_add_account_impl(ctx, account, true, transaction_token);
+}
+
 /* Remove account from configuration */
-int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
+static int config_remove_account_impl(gitswitch_ctx_t *ctx,
+                                      uint32_t account_id,
+                                      bool operation_owned,
+                                      uint64_t transaction_token) {
     size_t found_index = SIZE_MAX;
     uint32_t current_id = 0;
     bool had_current;
     
+    if (accounts_transaction_authorize_model_mutation(
+            ctx,
+            operation_owned ? ACCOUNTS_TRANSACTION_REMOVE
+                            : ACCOUNTS_TRANSACTION_NONE,
+            operation_owned ? transaction_token : 0) != 0) {
+        return -1;
+    }
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_remove_account");
         return -1;
@@ -3896,14 +3926,34 @@ int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
     return 0;
 }
 
+int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
+    return config_remove_account_impl(ctx, account_id, false, 0);
+}
+
+int config_remove_account_owned(gitswitch_ctx_t *ctx, uint32_t account_id,
+                                uint64_t transaction_token) {
+    return config_remove_account_impl(ctx, account_id, true,
+                                      transaction_token);
+}
+
 /* Update existing account */
-int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
+static int config_update_account_impl(gitswitch_ctx_t *ctx,
+                                      const account_t *account,
+                                      bool operation_owned,
+                                      uint64_t transaction_token) {
     account_t *existing_account = NULL;
     account_t replacement;
     size_t existing_index = SIZE_MAX;
     uint32_t current_id = 0;
     bool had_current;
     
+    if (accounts_transaction_authorize_model_mutation(
+            ctx,
+            operation_owned ? ACCOUNTS_TRANSACTION_EDIT
+                            : ACCOUNTS_TRANSACTION_NONE,
+            operation_owned ? transaction_token : 0) != 0) {
+        return -1;
+    }
     if (!ctx || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_update_account");
         return -1;
@@ -3950,6 +4000,16 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     log_info("Updated account: %s (%s)", replacement.name,
              replacement.description);
     return 0;
+}
+
+int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
+    return config_update_account_impl(ctx, account, false, 0);
+}
+
+int config_update_account_owned(gitswitch_ctx_t *ctx,
+                                const account_t *account,
+                                uint64_t transaction_token) {
+    return config_update_account_impl(ctx, account, true, transaction_token);
 }
 
 /* Find account by identifier, exact matches first to avoid selecting the wrong

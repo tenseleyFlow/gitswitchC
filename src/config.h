@@ -277,15 +277,26 @@ int config_get_path(char *path_buffer, size_t buffer_size);
  */
 int config_add_account(gitswitch_ctx_t *ctx, const account_t *account);
 
+/* Account-operation capability variants. The token is accepted only for the
+ * exact ADD/EDIT/REMOVE owner and context while that transaction is entering;
+ * callers cannot query a live token. */
+int config_add_account_owned(gitswitch_ctx_t *ctx, const account_t *account,
+                             uint64_t transaction_token);
+
 /**
  * Remove account from configuration
  */
 int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id);
+int config_remove_account_owned(gitswitch_ctx_t *ctx, uint32_t account_id,
+                                uint64_t transaction_token);
 
 /**
  * Update existing account in configuration
  */
 int config_update_account(gitswitch_ctx_t *ctx, const account_t *account);
+int config_update_account_owned(gitswitch_ctx_t *ctx,
+                                const account_t *account,
+                                uint64_t transaction_token);
 
 /**
  * Find account by ID or name/description
