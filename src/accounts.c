@@ -94,6 +94,8 @@ typedef struct {
     git_scope_t scope;
     bool ssh_ok;
     bool gpg_ok;
+    bool publication_valid;
+    publication_record_t publication;
 } pending_switch_t;
 
 static pending_switch_t g_pending_switch = {0};
@@ -408,12 +410,41 @@ static int transaction_finish_after_call(
 }
 
 /* Internal helper functions */
-static uint32_t get_next_available_id(const gitswitch_ctx_t *ctx);
+static int get_next_available_id(const gitswitch_ctx_t *ctx,
+                                 uint32_t *account_id);
+static int account_incarnation_admits_publication(
+    const gitswitch_ctx_t *ctx, const account_t *account);
 static bool prompt_host_alias_valid(const char *alias);
 static int validate_gpg_key_availability(const char *gpg_key_id);
 static int validate_gpg_key_availability_fresh(const char *gpg_key_id);
 static int check_ssh_key_local_file(const account_t *account);
 static int check_gpg_key_local_state(const account_t *account);
+
+/* current_account is public context state but, when present, must be an exact
+ * interior pointer to one of the currently live fixed-array slots. Compare
+ * addresses only until that provenance is proven; dereferencing an arbitrary
+ * non-NULL pointer here would recreate the stale/UAF hazard this guard owns. */
+static bool accounts_current_pointer_is_live(const gitswitch_ctx_t *ctx) {
+    size_t count;
+
+    if (!ctx || !ctx->current_account) return true;
+    if (ctx->account_count > MAX_ACCOUNTS) return false;
+    count = ctx->account_count;
+    for (size_t i = 0; i < count; i++) {
+        if (ctx->current_account == &ctx->accounts[i]) return true;
+    }
+    return false;
+}
+
+static int accounts_require_current_pointer_live(
+    const gitswitch_ctx_t *ctx, const char *operation) {
+    if (accounts_current_pointer_is_live(ctx)) return 0;
+    errno = ESTALE;
+    set_error(ERR_ACCOUNT_INVALID,
+              "Cannot %s with a stale current-account reference",
+              operation ? operation : "continue");
+    return -1;
+}
 
 static bool gpg_session_cleanup_needed(void) {
     return g_session.gpg_active ||
@@ -1159,6 +1190,9 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_switch");
         return -1;
     }
+    if (accounts_require_current_pointer_live(ctx, "switch accounts") != 0) {
+        return -1;
+    }
     if (!text_is_tty_safe(identifier)) {
         set_error(ERR_ACCOUNT_NOT_FOUND,
                   "Account selector contains terminal control bytes or malformed UTF-8");
@@ -1197,6 +1231,11 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
      * the original repo, leaving no agent restored and re-spawning a failing
      * resume before every prompt (AR-02 #8). */
     bool write_git = !ctx->config.resuming;
+
+    if (write_git && !ctx->config.dry_run &&
+        account_incarnation_admits_publication(ctx, account) != 0) {
+        return -1;
+    }
 
     /* Determine git scope. Explicit --global/--local override the account
      * preference. Writing an identity GLOBALLY affects every repository on the
@@ -1391,6 +1430,24 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             set_error(ERR_GIT_CONFIG_FAILED,
                       "Cannot snapshot Git configuration before switching: %s",
                       detail[0] ? detail : "unknown snapshot error");
+            return -1;
+        }
+
+        /* The CLI must know that the durable publication bundle can accept a
+         * new worst-case record before runtime or Git state starts changing.
+         * Direct prepared-library callers retain their explicit two-phase
+         * contract and can invoke config_publication_preflight() themselves
+         * for the persistence destination they own. */
+        if (write_git && defer_commit &&
+            ctx->config.defer_signal_cleanup &&
+            config_publication_preflight(ctx->config.config_path) != 0) {
+            error_context_t preflight_error = *get_last_error();
+            int preflight_errno = errno;
+
+            git_config_commit();
+            runtime_state_lock_release(runtime_lock_fd);
+            g_last_error = preflight_error;
+            errno = preflight_errno;
             return -1;
         }
 
@@ -1736,6 +1793,43 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             return -1;
         }
 
+        /* The sealed Git transaction is the only authority for what was
+         * actually published. Capture its canonical destination and vectors
+         * before any later commit can discard that evidence. Prepared CLI
+         * switches carry the record into the atomic active-state bundle; no
+         * selector, PATH lookup, or current-directory reconstruction is
+         * allowed to substitute for it. Only the CLI-owned prepared cycle
+         * persists the active-state bundle; direct prepared API cycles remain
+         * commit/abort capable without inventing a publication generation. */
+        if (write_git && defer_commit &&
+            ctx->config.defer_signal_cleanup) {
+            if (git_config_export_sealed_publication(
+                    &prepared_owner.publication,
+                    prepared_owner.frozen_target.gpg_enabled
+                        ? prepared_owner.frozen_target.gpg_key_id
+                        : NULL) != 0) {
+                char publication_detail[sizeof(g_last_error.message)];
+
+                safe_strncpy(publication_detail,
+                             get_last_error()->message,
+                             sizeof(publication_detail));
+                if (abort_switch_failure(
+                        &prepared_owner, prev_account, prev_gpg_home,
+                        prev_gpg_present, true, ssh_dirty, gpg_dirty,
+                        runtime_lock_fd, defer_signal_dispatch)) {
+                    return -1;
+                }
+                set_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Cannot retain sealed Git publication provenance; switch was rolled back: %s",
+                    publication_detail[0]
+                        ? publication_detail
+                        : "unknown publication export error");
+                return -1;
+            }
+            prepared_owner.publication_valid = true;
+        }
+
         /* Last all-or-nothing checkpoint: a signal up to here rolls the whole
          * switch back (git config, when written, was just written — restore it
          * too; on resume nothing was written, so nothing to restore). */
@@ -2069,6 +2163,8 @@ int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
 static bool account_fields_equal_exact(const account_t *left,
                                        const account_t *right) {
     return left && right && left->id == right->id &&
+           strcmp(left->incarnation, right->incarnation) == 0 &&
+           left->incarnation_persisted == right->incarnation_persisted &&
            strcmp(left->name, right->name) == 0 &&
            strcmp(left->email, right->email) == 0 &&
            strcmp(left->description, right->description) == 0 &&
@@ -2192,6 +2288,25 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                                              alias_publication_detail);
         return -1;
     }
+    return 0;
+}
+
+int accounts_switch_publication(
+    const gitswitch_ctx_t *ctx, const publication_record_t **publication) {
+    if (publication) *publication = NULL;
+    if (!ctx || !publication || !g_pending_switch.active ||
+        g_pending_switch.ctx != ctx || g_pending_switch.abort_only ||
+        !g_pending_switch.publication_valid ||
+        g_transaction_owner.kind != ACCOUNTS_TRANSACTION_SWITCH ||
+        g_transaction_owner.ctx != ctx ||
+        g_transaction_owner.token != g_pending_switch.token ||
+        g_transaction_owner.phase != ACCOUNTS_TRANSACTION_PREPARED) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Prepared switch has no exact sealed publication provenance");
+        return -1;
+    }
+    *publication = &g_pending_switch.publication;
     return 0;
 }
 
@@ -2584,6 +2699,9 @@ static int accounts_edit_candidate_prepare_owned(
         set_error(ERR_INVALID_ARGS, "Invalid arguments to account edit prepare");
         return -1;
     }
+    if (accounts_require_current_pointer_live(ctx, "edit an account") != 0) {
+        return -1;
+    }
     existing = account_by_id(ctx, candidate->id);
     if (!existing) {
         set_error(ERR_ACCOUNT_NOT_FOUND, "Account with ID %u not found",
@@ -2861,7 +2979,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
         acct = *existing;
     } else {
         memset(&acct, 0, sizeof(acct));
-        acct.id = get_next_available_id(ctx);
+        if (get_next_available_id(ctx, &acct.id) != 0) return -1;
         acct.preferred_scope = ctx->config.default_scope;
     }
 
@@ -3174,6 +3292,11 @@ int accounts_add_interactive_prepare(gitswitch_ctx_t *ctx) {
                                           token);
         return -1;
     }
+    if (accounts_require_current_pointer_live(ctx, "add an account") != 0) {
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_ADD,
+                                          token);
+        return -1;
+    }
     count_before = ctx->account_count;
     had_current = ctx->current_account != NULL;
     if (had_current) current_id = ctx->current_account->id;
@@ -3277,6 +3400,11 @@ int accounts_edit_interactive_prepare(gitswitch_ctx_t *ctx,
     if (!ctx || !identifier) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid arguments to accounts_edit_interactive_prepare");
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_EDIT,
+                                          token);
+        return -1;
+    }
+    if (accounts_require_current_pointer_live(ctx, "edit an account") != 0) {
         (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_EDIT,
                                           token);
         return -1;
@@ -3442,6 +3570,11 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
                                           token);
         return -1;
     }
+    if (accounts_require_current_pointer_live(ctx, "remove an account") != 0) {
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                          token);
+        return -1;
+    }
     
     /* Find the account. AR-06 F50: destructive resolution (exact id/name/email
      * only) — never a substring, so `remove work` can't delete "work-old". */
@@ -3578,7 +3711,8 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
      * of aborting — the residue stays visible in `status`. */
     {
         size_t identity_cleared = 0;
-        if (git_retire_account_identity(account, &identity_cleared) != 0) {
+        if (accounts_retire_git_identity(ctx, account,
+                                         &identity_cleared) != 0) {
             fprintf(stderr,
                     "gitswitch: WARNING: durable Git configuration may still "
                     "select removed account '%s': %s\n",
@@ -3674,6 +3808,9 @@ remove_done:
 int accounts_list(const gitswitch_ctx_t *ctx) {
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to accounts_list");
+        return -1;
+    }
+    if (accounts_require_current_pointer_live(ctx, "list accounts") != 0) {
         return -1;
     }
     
@@ -3785,27 +3922,183 @@ static int print_git_status_read_failure(void) {
     return -1;
 }
 
-/* A saved account may retain the shorter hexadecimal selector that the user
- * entered, while a successful isolated switch always publishes GnuPG's
- * canonical 40- or 64-digit primary fingerprint to Git. Compare those two
- * representations without accepting a noncanonical Git value as proof of the
- * selected key. */
-static bool status_signing_key_matches(const account_t *account,
-                                       const git_current_config_t *git_config) {
-    if (!account || !git_config) return false;
-    if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') {
-        return git_config->signing_key[0] == '\0';
+static int account_incarnation_admits_publication(
+    const gitswitch_ctx_t *ctx, const account_t *account) {
+    publication_ledger_t ledger;
+    int result = 0;
+
+    if (!ctx || !account || !account->incarnation_persisted ||
+        !account_incarnation_is_valid(account->incarnation)) {
+        errno = ESTALE;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Account '%s' has no persisted immutable incarnation; migrate the account document before switching",
+            account && account->name[0] ? account->name : "?");
+        return -1;
     }
-    return git_signing_key_selects_account(account, git_config->signing_key);
+    publication_ledger_init(&ledger);
+    if (config_load_publication_ledger(ctx->config.config_path, &ledger) != 0) {
+        publication_ledger_clear(&ledger);
+        return -1;
+    }
+    for (size_t i = 0; i < ledger.count; i++) {
+        const publication_record_t *record = &ledger.records[i];
+        if (record->account_id == account->id &&
+            strcmp(record->account_incarnation,
+                   account->incarnation) != 0) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Account ID %u is already bound to a different durable incarnation",
+                account->id);
+            result = -1;
+            break;
+        }
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
+typedef enum {
+    ACCOUNT_PUBLICATION_LOOKUP_ERROR = -1,
+    ACCOUNT_PUBLICATION_LOOKUP_ABSENT = 0,
+    ACCOUNT_PUBLICATION_LOOKUP_FOUND = 1
+} account_publication_lookup_result_t;
+
+static account_publication_lookup_result_t load_unique_account_publication(
+    const gitswitch_ctx_t *ctx, const account_t *account,
+    uint32_t required_capabilities, publication_ledger_t *ledger,
+    const publication_record_t **publication) {
+    const publication_record_t *match = NULL;
+
+    if (publication) *publication = NULL;
+    if (!ctx || !account || !ledger || !publication) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid durable-publication lookup arguments");
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    if (!account->incarnation_persisted ||
+        !account_incarnation_is_valid(account->incarnation)) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Account '%s' has no persisted immutable incarnation",
+                  account->name);
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    publication_ledger_clear(ledger);
+    publication_ledger_init(ledger);
+    if (config_load_publication_ledger(ctx->config.config_path, ledger) != 0) {
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    for (size_t i = 0; i < ledger->count; i++) {
+        const publication_record_t *candidate = &ledger->records[i];
+
+        if (candidate->account_id != account->id) continue;
+        if (strcmp(candidate->account_incarnation,
+                   account->incarnation) != 0) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Durable publication provenance for account '%s' belongs to a different incarnation",
+                account->name);
+            return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+        }
+        if (candidate->state != PUBLICATION_STATE_PUBLISHED ||
+            (candidate->capabilities & required_capabilities) !=
+                required_capabilities) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Durable publication provenance for account '%s' is incomplete",
+                account->name);
+            return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+        }
+        if (match) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Durable publication provenance for account '%s' names multiple destinations",
+                account->name);
+            return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+        }
+        match = candidate;
+    }
+    if (!match) {
+        errno = ENOENT;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "No canonical publication provenance exists for account '%s'; switch it again before attributing durable Git credentials",
+            account->name);
+        return ACCOUNT_PUBLICATION_LOOKUP_ABSENT;
+    }
+    *publication = match;
+    return ACCOUNT_PUBLICATION_LOOKUP_FOUND;
+}
+
+int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
+                                 const account_t *account,
+                                 size_t *cleared) {
+    publication_ledger_t ledger;
+    const publication_record_t *publication = NULL;
+    account_publication_lookup_result_t lookup_result;
+    int result = -1;
+
+    if (cleared) *cleared = 0;
+    if (!ctx || !account) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid durable Git retirement arguments");
+        return -1;
+    }
+    publication_ledger_init(&ledger);
+    lookup_result = load_unique_account_publication(
+        ctx, account,
+        PUBLICATION_CAP_DESTINATION | PUBLICATION_CAP_POST_GENERATION,
+        &ledger, &publication);
+    if (lookup_result == ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
+        result = git_retire_account_identity_published(
+            account, publication, cleared);
+    } else if (lookup_result == ACCOUNT_PUBLICATION_LOOKUP_ABSENT &&
+               (!account->gpg_enabled || account->gpg_key_id[0] == '\0')) {
+        /* No record ever existed for this legacy SSH-only account. M9 removes
+         * this compatibility reconstruction once all SSH retirement is
+         * record-backed. A present exact record always wins, even after edit
+         * disabled the feature that originally published its credential leg. */
+        clear_error();
+        result = git_retire_account_identity(account, cleared);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
+static git_signing_publication_result_t status_signing_key_matches(
+    const account_t *account, const publication_record_t *publication,
+    const git_current_config_t *git_config) {
+    if (!account || !git_config) return GIT_SIGNING_PUBLICATION_MISMATCH;
+    if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') {
+        return git_config->signing_key[0] == '\0'
+                   ? GIT_SIGNING_PUBLICATION_MATCH
+                   : GIT_SIGNING_PUBLICATION_MISMATCH;
+    }
+    return git_signing_key_matches_publication(account, publication,
+                                               git_config);
 }
 
 /* Show current account status */
 int accounts_show_status(const gitswitch_ctx_t *ctx) {
     int status_result = 0;
     git_current_config_t *git_config = NULL;
+    publication_ledger_t publication_ledger;
+
+    publication_ledger_init(&publication_ledger);
 
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to accounts_show_status");
+        return -1;
+    }
+    if (accounts_require_current_pointer_live(ctx,
+                                              "show account status") != 0) {
         return -1;
     }
     
@@ -3885,14 +4178,20 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             char expected_gpg_program[MAX_PATH_LEN] = "";
             char ssh_status_error[512] = "";
             char gpg_program_status_error[512] = "";
+            char signing_status_error[512] = "";
+            char current_gpg_selector[MAX_GPG_SELECTOR_LEN] = "";
+            const publication_record_t *publication = NULL;
             bool identity_matches;
             bool ssh_matches;
             bool ssh_status_determined = true;
             bool gpg_openpgp_matches;
             bool gpg_programs_match;
             bool gpg_program_status_determined = true;
+            bool signing_status_determined = true;
             bool foreign_gpg_program_present;
             bool signing_key_matches;
+            bool signing_fingerprint_matches = false;
+            bool signing_selector_mismatch = false;
             bool signing_enabled_matches;
             bool signing_expected;
 
@@ -3942,9 +4241,22 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 git_config->gpg_x509_program.present ||
                 git_config->gpg_ssh_program.present;
             if (signing_expected) {
-                if (gpg_manager_resolve_executable(
-                        expected_gpg_program,
-                        sizeof(expected_gpg_program)) != 0) {
+                if (load_unique_account_publication(
+                        ctx, account,
+                        PUBLICATION_CAP_DESTINATION |
+                            PUBLICATION_CAP_POST_GENERATION |
+                            PUBLICATION_CAP_GPG_FINGERPRINT |
+                            PUBLICATION_CAP_GPG_PROGRAM |
+                            PUBLICATION_CAP_GPG_SELECTOR,
+                        &publication_ledger, &publication) !=
+                        ACCOUNT_PUBLICATION_LOOKUP_FOUND ||
+                    safe_strncpy(expected_gpg_program,
+                                 publication->gpg_program,
+                                 sizeof(expected_gpg_program)) != 0 ||
+                    git_publication_verify_program_identity(
+                        publication->gpg_program,
+                        &publication->gpg_program_identity,
+                        "OpenPGP") != 0) {
                     const error_context_t *error = get_last_error();
 
                     gpg_program_status_determined = false;
@@ -3971,14 +4283,58 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 gpg_programs_match = gpg_openpgp_matches &&
                                      !foreign_gpg_program_present;
             }
-            signing_key_matches =
-                status_signing_key_matches(account, git_config);
+            {
+                git_signing_publication_result_t signing_result =
+                    status_signing_key_matches(account, publication,
+                                               git_config);
+                signing_key_matches =
+                    signing_result == GIT_SIGNING_PUBLICATION_MATCH;
+                if (signing_result == GIT_SIGNING_PUBLICATION_ERROR) {
+                    const error_context_t *error = get_last_error();
+
+                    signing_status_determined = false;
+                    status_result = -1;
+                    if (error && error->message[0] != '\0') {
+                        (void)snprintf(signing_status_error,
+                                       sizeof(signing_status_error), "%s",
+                                       error->message);
+                    }
+                } else if (signing_result ==
+                               GIT_SIGNING_PUBLICATION_MISMATCH &&
+                           signing_expected && publication &&
+                           (publication->capabilities &
+                            PUBLICATION_CAP_GPG_SELECTOR) != 0U) {
+                    if (publication_normalize_gpg_selector(
+                            account->gpg_key_id,
+                            current_gpg_selector) != 0) {
+                        const error_context_t *error = get_last_error();
+
+                        signing_status_determined = false;
+                        status_result = -1;
+                        if (error && error->message[0] != '\0') {
+                            (void)snprintf(signing_status_error,
+                                           sizeof(signing_status_error),
+                                           "%s", error->message);
+                        }
+                    } else {
+                        signing_selector_mismatch =
+                            strcmp(publication->gpg_selector,
+                                   current_gpg_selector) != 0;
+                    }
+                }
+                signing_fingerprint_matches =
+                    signing_expected && publication &&
+                    git_signing_key_matches_fingerprint(
+                        publication->gpg_fingerprint,
+                        git_config->signing_key);
+            }
             signing_enabled_matches =
                 git_config->gpg_signing_enabled ==
                 (signing_expected && account->gpg_signing_enabled);
             
             /* Check if git config matches account */
-            if (!ssh_status_determined || !gpg_program_status_determined) {
+            if (!ssh_status_determined || !gpg_program_status_determined ||
+                !signing_status_determined) {
                 printf("  Match Status: [ERROR] Unable to determine trusted expected configuration\n");
                 if (!ssh_status_determined) {
                     printf("    SSH command: ");
@@ -3988,11 +4344,53 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                     printf("\n");
                 }
                 if (!gpg_program_status_determined) {
-                    printf("    OpenPGP program: ");
-                    print_terminal_safe(gpg_program_status_error[0] != '\0'
-                                            ? gpg_program_status_error
-                                            : "unknown resolution failure");
+                    printf("    OpenPGP provenance: [UNAVAILABLE] ");
+                    print_terminal_safe(
+                        gpg_program_status_error[0] != '\0'
+                            ? gpg_program_status_error
+                            : "unknown resolution failure");
                     printf("\n");
+                }
+                if (!signing_status_determined) {
+                    printf("    Signing attribution: [UNAVAILABLE] current account GPG selector is invalid\n");
+                    printf("    Selector diagnostic: ");
+                    print_terminal_safe(
+                        signing_status_error[0] != '\0'
+                            ? signing_status_error
+                            : "invalid current account GPG selector");
+                    printf("\n");
+                    printf("    Expected Switch-time GPG Selector: ");
+                    if (publication &&
+                        (publication->capabilities &
+                         PUBLICATION_CAP_GPG_SELECTOR) != 0U) {
+                        print_terminal_safe(publication->gpg_selector);
+                    } else {
+                        printf("[PROVENANCE UNAVAILABLE]");
+                    }
+                    printf("\n");
+                    printf("    Current Account GPG Selector:  ");
+                    print_terminal_safe(account->gpg_key_id);
+                    printf(" [INVALID]\n");
+                } else if (!gpg_program_status_determined &&
+                           signing_expected) {
+                    printf("    Signing attribution: [UNAVAILABLE] complete trusted publication provenance unavailable\n");
+                }
+                if (!gpg_program_status_determined ||
+                    !signing_status_determined) {
+                    printf("    Expected GPG Signing Key: ");
+                    if (publication) {
+                        print_terminal_safe(publication->gpg_fingerprint);
+                    } else {
+                        printf("[PROVENANCE UNAVAILABLE]");
+                    }
+                    printf("\n");
+                    printf("    Current GPG Signing Key:  ");
+                    if (git_config->signing_key[0] != '\0') {
+                        print_terminal_safe(git_config->signing_key);
+                        printf("\n");
+                    } else {
+                        printf("[ABSENT]\n");
+                    }
                 }
             } else if (identity_matches && ssh_matches &&
                        gpg_programs_match && signing_key_matches &&
@@ -4009,19 +4407,36 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                     printf(">\n");
                 }
                 if (!signing_key_matches) {
-                    if (signing_expected) {
-                        printf("    Expected GPG Signing Key: canonical fingerprint selected by ");
-                        print_terminal_safe(account->gpg_key_id);
+                    if (signing_selector_mismatch) {
+                        printf("    Expected Switch-time GPG Selector: ");
+                        print_terminal_safe(publication->gpg_selector);
                         printf("\n");
-                    } else {
-                        printf("    Expected GPG Signing Key: [ABSENT]\n");
+                        printf("    Current Account GPG Selector:  ");
+                        print_terminal_safe(current_gpg_selector);
+                        printf("\n");
                     }
-                    printf("    Current GPG Signing Key:  ");
-                    if (git_config->signing_key[0] != '\0') {
-                        print_terminal_safe(git_config->signing_key);
-                        printf("\n");
-                    } else {
-                        printf("[ABSENT]\n");
+                    if (!signing_fingerprint_matches) {
+                        if (signing_expected) {
+                            printf("    Expected GPG Signing Key: ");
+                            if (publication) {
+                                print_terminal_safe(
+                                    publication->gpg_fingerprint);
+                            } else {
+                                printf("[PROVENANCE UNAVAILABLE]");
+                            }
+                            printf("\n");
+                        } else {
+                            printf("    Expected GPG Signing Key: [ABSENT]\n");
+                        }
+                        printf("    Current GPG Signing Key:  ");
+                        if (git_config->signing_key[0] != '\0') {
+                            print_terminal_safe(git_config->signing_key);
+                            printf("\n");
+                        } else {
+                            printf("[ABSENT]\n");
+                        }
+                    } else if (!signing_selector_mismatch) {
+                        printf("    Signing attribution: [MISMATCH] configured key came from a different published destination\n");
                     }
                 }
                 if (!signing_enabled_matches) {
@@ -4190,6 +4605,7 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         secure_zero_memory(git_config, sizeof(*git_config));
         free(git_config);
     }
+    publication_ledger_clear(&publication_ledger);
     return status_result;
 }
 
@@ -4246,41 +4662,81 @@ int accounts_validate(const account_t *account) {
     return 0;
 }
 
-/* Get next available account ID */
-static uint32_t get_next_available_id(const gitswitch_ctx_t *ctx) {
+static bool account_id_is_live(const gitswitch_ctx_t *ctx,
+                               uint32_t account_id) {
+    for (size_t i = 0; ctx && i < ctx->account_count; i++) {
+        if (ctx->accounts[i].id == account_id) return true;
+    }
+    return false;
+}
+
+static bool account_id_has_publication(
+    const publication_ledger_t *ledger, uint32_t account_id) {
+    for (size_t i = 0; ledger && i < ledger->count; i++) {
+        if (ledger->records[i].account_id == account_id) return true;
+    }
+    return false;
+}
+
+/* Publication records are durable ownership tombstones as well as positive
+ * attribution. An account ID named by any record cannot be recycled: after a
+ * failed retirement, reusing that integer would otherwise let the new account
+ * inherit the old account's Git-mutation authority. Include both live and
+ * published IDs in the allocator, and fail closed when the persisted ledger
+ * cannot be read faithfully. */
+static int get_next_available_id(const gitswitch_ctx_t *ctx,
+                                 uint32_t *account_id) {
+    publication_ledger_t ledger;
     uint32_t max_id = 0;
+    uint32_t search_limit;
 
-    if (!ctx) return 1;
+    if (!ctx || !account_id) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account ID allocation request");
+        return -1;
+    }
+    *account_id = 0;
+    publication_ledger_init(&ledger);
+    if (ctx->config.config_path[0] != '\0' &&
+        config_load_publication_ledger(ctx->config.config_path, &ledger) != 0) {
+        publication_ledger_clear(&ledger);
+        return -1;
+    }
 
-    /* Find the highest existing ID */
     for (size_t i = 0; i < ctx->account_count; i++) {
         if (ctx->accounts[i].id > max_id) {
             max_id = ctx->accounts[i].id;
         }
     }
+    for (size_t i = 0; i < ledger.count; i++) {
+        if (ledger.records[i].account_id > max_id) {
+            max_id = ledger.records[i].account_id;
+        }
+    }
 
     if (max_id < UINT32_MAX) {
-        return max_id + 1;
+        *account_id = max_id + 1U;
+        publication_ledger_clear(&ledger);
+        return 0;
     }
 
-    /* L3: the loader accepts ids up to UINT32_MAX, so a hand-planted
-     * [accounts.4294967295] made max_id+1 wrap to 0 — an id the loader
-     * rejects, which wedged every future save behind the data-loss guard.
-     * Fall back to the lowest unused positive id; with at most MAX_ACCOUNTS
-     * entries one always exists in [1, MAX_ACCOUNTS+1]. */
-    for (uint32_t candidate = 1; candidate <= (uint32_t)MAX_ACCOUNTS + 1; candidate++) {
-        bool used = false;
-        for (size_t i = 0; i < ctx->account_count; i++) {
-            if (ctx->accounts[i].id == candidate) {
-                used = true;
-                break;
-            }
-        }
-        if (!used) {
-            return candidate;
+    /* A UINT32_MAX record forbids max+1. At most MAX_ACCOUNTS live IDs and
+     * PUBLICATION_LEDGER_MAX_RECORDS durable IDs exist, so one positive ID is
+     * guaranteed within this bounded prefix unless the model is corrupt. */
+    search_limit = (uint32_t)MAX_ACCOUNTS +
+                   (uint32_t)PUBLICATION_LEDGER_MAX_RECORDS + 1U;
+    for (uint32_t candidate = 1; candidate <= search_limit; candidate++) {
+        if (!account_id_is_live(ctx, candidate) &&
+            !account_id_has_publication(&ledger, candidate)) {
+            *account_id = candidate;
+            publication_ledger_clear(&ledger);
+            return 0;
         }
     }
-    return 1; /* unreachable: account_count <= MAX_ACCOUNTS */
+    publication_ledger_clear(&ledger);
+    set_error(ERR_ACCOUNT_EXISTS,
+              "No account ID is available outside durable publication provenance");
+    return -1;
 }
 
 /* L2: charset+length gate for the interactive host-alias prompt. Mirrors
@@ -4489,9 +4945,15 @@ int accounts_detect_current(gitswitch_ctx_t *ctx) {
         return -1;
     }
 
-    /* Already have a current account set */
-    if (ctx->current_account) {
+    /* Preserve a proven live selection. A stale public pointer is not a
+     * discovery result: clear it without dereferencing and continue through
+     * the same trusted runtime/saved-state resolution as an unset context. */
+    if (ctx->current_account && accounts_current_pointer_is_live(ctx)) {
         return 0;
+    }
+    if (ctx->current_account) {
+        log_debug("Discarding stale current-account reference before detection");
+        ctx->current_account = NULL;
     }
 
     /* Discovery is serialized with SSH runtime writers and accepts only a

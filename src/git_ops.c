@@ -46,6 +46,11 @@ static int git_detect_managed_worktree_scope(bool *present);
 static int git_verify_merged_account(const account_t *account,
                                      const char *expected_gpg_program);
 static int git_reject_ssh_command_override(void);
+static int git_set_config_impl(const account_t *account, git_scope_t scope);
+static int git_configure_ssh_impl(const account_t *account,
+                                  git_scope_t scope);
+static int git_configure_gpg_impl(const account_t *account,
+                                  git_scope_t scope);
 
 /* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
 
@@ -162,12 +167,18 @@ typedef struct {
     git_scope_generation_t primary_generation;
     git_scope_generation_t local_generation;
     git_scope_generation_t worktree_generation;
+    uint32_t publication_account_id;
+    char publication_account_incarnation[ACCOUNT_INCARNATION_LEN];
+    bool publication_owner_bound;
+    bool publication_owner_tainted;
+    bool publication_full_image_written;
     bool postimage_sealed;
     bool valid;
     bool restore_incomplete;
 } git_config_snapshot_t;
 
 static git_config_snapshot_t g_git_snapshot;
+static unsigned int g_git_account_write_depth;
 static void git_snapshot_clear(git_config_snapshot_t *snapshot);
 static int git_scope_generation_capture(git_scope_t scope,
                                         git_scope_generation_t *generation);
@@ -318,6 +329,7 @@ static void cfg_cache_store(int s, int k, cfg_state_t state, bool present,
 void git_ops_test_reset_caches(void);
 void git_ops_test_reset_caches(void) {
     git_snapshot_clear(&g_git_snapshot);
+    g_git_account_write_depth = 0U;
     memset(g_cfg_cache, 0, sizeof(g_cfg_cache));
     memset(&g_repo_cache, 0, sizeof(g_repo_cache));
     g_git_validated = false;
@@ -2891,7 +2903,13 @@ static git_scope_snapshot_t *git_transaction_post_scope(git_scope_t scope) {
 
 static int git_transaction_require_write_allowed(git_scope_t scope,
                                                  const char *key) {
-    if (cfg_key_index(key) < 0 || !git_transaction_post_scope(scope)) return 0;
+    if (cfg_key_index(key) < 0 || !g_git_snapshot.valid) return 0;
+    if (!git_transaction_post_scope(scope)) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot write a managed key outside the active Git transaction scopes");
+        return -1;
+    }
     if (g_git_snapshot.restore_incomplete) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Cannot modify a Git transaction with incomplete rollback");
@@ -2903,6 +2921,118 @@ static int git_transaction_require_write_allowed(git_scope_t scope,
         return -1;
     }
     return 0;
+}
+
+/* Bind durable publication ownership to the account that supplied the
+ * transaction's managed Git identity. The optional incarnation fields remain
+ * backward compatible for direct low-level git_set_config() callers, but a
+ * transaction without a canonical persisted owner can never be exported as
+ * durable account provenance. Once bound, another account cannot reuse the
+ * same snapshot slot to manufacture a post-image attributed to the first. */
+static int git_snapshot_bind_publication_owner(const account_t *account,
+                                               git_scope_t scope) {
+    if (!g_git_snapshot.valid) return 0;
+    if (!account) {
+        set_error(ERR_INVALID_ARGS,
+                  "Cannot bind a NULL Git publication owner");
+        return -1;
+    }
+    /* Account-owned boundaries are always primary-scope operations while a
+     * transaction is active. git_set_config_impl() normalizes tracked local
+     * and worktree overrides through raw managed-key operations under its
+     * authorization depth; it never needs a second account-owned boundary.
+     * Reject every other scope before considering whether that store was
+     * captured, because an untracked write is outside both rollback and the
+     * durable publication destination. */
+    if (scope != g_git_snapshot.scope) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot write an account outside the active Git transaction's primary scope");
+        return -1;
+    }
+    if (!git_transaction_post_scope(scope)) return 0;
+    if (g_git_snapshot.publication_owner_bound) {
+        if (account->id == 0U || !account->incarnation_persisted ||
+            !account_incarnation_is_valid(account->incarnation) ||
+            g_git_snapshot.publication_account_id != account->id ||
+            strcmp(g_git_snapshot.publication_account_incarnation,
+                   account->incarnation) != 0) {
+            errno = ESTALE;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git transaction is already bound to another account incarnation");
+            return -1;
+        }
+        return 0;
+    }
+    if (scope != g_git_snapshot.scope) return 0;
+    if (!account->incarnation_persisted && account->incarnation[0] == '\0') {
+        return 0;
+    }
+    if (account->id == 0U || !account->incarnation_persisted ||
+        !account_incarnation_is_valid(account->incarnation)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Git publication owner has no canonical persisted incarnation");
+        return -1;
+    }
+    g_git_snapshot.publication_account_id = account->id;
+    memcpy(g_git_snapshot.publication_account_incarnation,
+           account->incarnation, ACCOUNT_INCARNATION_LEN);
+    g_git_snapshot.publication_owner_bound = true;
+    return 0;
+}
+
+static bool git_snapshot_publication_owner_matches(
+    const account_t *account) {
+    return account && g_git_snapshot.publication_owner_bound &&
+           account->id != 0U && account->incarnation_persisted &&
+           account_incarnation_is_valid(account->incarnation) &&
+           g_git_snapshot.publication_account_id == account->id &&
+           strcmp(g_git_snapshot.publication_account_incarnation,
+                  account->incarnation) == 0;
+}
+
+static bool git_snapshot_publication_is_complete_for(
+    const account_t *account, git_scope_t scope) {
+    return g_git_snapshot.valid && scope == g_git_snapshot.scope &&
+           git_snapshot_publication_owner_matches(account) &&
+           !g_git_snapshot.publication_owner_tainted &&
+           g_git_snapshot.publication_full_image_written;
+}
+
+static int git_account_write_begin(const account_t *account,
+                                   git_scope_t scope) {
+    if (g_git_account_write_depth == UINT_MAX) {
+        errno = EOVERFLOW;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git account-write authorization depth overflow");
+        return -1;
+    }
+    if (git_snapshot_bind_publication_owner(account, scope) != 0) return -1;
+    /* Completeness describes the current post-image, not a historical success.
+     * Invalidate it before every standalone account-owned mutation. A failed
+     * repeated full write or partial writer may already have changed one key;
+     * only the successful full writer, or its exact canonical OpenPGP
+     * completion, is allowed to restore publication eligibility. */
+    if (g_git_account_write_depth == 0U && g_git_snapshot.valid &&
+        scope == g_git_snapshot.scope &&
+        g_git_snapshot.publication_owner_bound) {
+        g_git_snapshot.publication_full_image_written = false;
+    }
+    g_git_account_write_depth++;
+    return 0;
+}
+
+static void git_account_write_end(void) {
+    if (g_git_account_write_depth > 0U) g_git_account_write_depth--;
+}
+
+static void git_taint_publication_after_raw_write(git_scope_t scope,
+                                                  const char *key) {
+    if (g_git_account_write_depth != 0U || !key ||
+        cfg_key_index(key) < 0 || !git_transaction_post_scope(scope)) {
+        return;
+    }
+    g_git_snapshot.publication_owner_tainted = true;
 }
 
 typedef struct {
@@ -3037,6 +3167,20 @@ int git_config_seal(void) {
         set_error(ERR_INVALID_ARGS, "No Git snapshot to seal");
         return -1;
     }
+    if (g_git_snapshot.publication_owner_bound &&
+        g_git_snapshot.publication_owner_tainted) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git publication ownership was invalidated by an unowned managed-key write");
+        return -1;
+    }
+    if (g_git_snapshot.publication_owner_bound &&
+        !g_git_snapshot.publication_full_image_written) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git publication owner has no complete account post-image");
+        return -1;
+    }
     if (g_git_snapshot.postimage_sealed) return 0;
     if (git_snapshot_verify_generations(&g_git_snapshot, false) != 0 ||
         git_snapshot_pin_post_configs(&g_git_snapshot) != 0 ||
@@ -3070,6 +3214,337 @@ int git_config_seal(void) {
         return -1;
     }
     g_git_snapshot.postimage_sealed = true;
+    return 0;
+}
+
+static int git_publication_scope_from_git(git_scope_t scope,
+                                          publication_scope_t *publication) {
+    if (!publication) return -1;
+    if (scope == GIT_SCOPE_WORKTREE_INTERNAL) {
+        *publication = PUBLICATION_SCOPE_WORKTREE;
+        return 0;
+    }
+    switch (scope) {
+        case GIT_SCOPE_LOCAL:
+            *publication = PUBLICATION_SCOPE_LOCAL;
+            return 0;
+        case GIT_SCOPE_GLOBAL:
+            *publication = PUBLICATION_SCOPE_GLOBAL;
+            return 0;
+        case GIT_SCOPE_SYSTEM:
+        default:
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Cannot persist provenance for an unsupported Git publication scope");
+            return -1;
+    }
+}
+
+/* Copy one exact scalar from the sealed primary post-image. Switch writes
+ * replace every credential vector, so repetition here is a provenance error,
+ * not a value from which the exporter may choose a convenient element. */
+static int git_publication_copy_post_value(const char *key, char *out,
+                                           size_t out_size, bool *present) {
+    const git_snapshot_key_t *post;
+    int key_index;
+
+    if (!key || !out || out_size == 0 || !present) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid sealed Git publication value request");
+        return -1;
+    }
+    out[0] = '\0';
+    *present = false;
+    key_index = cfg_key_index(key);
+    if (key_index < 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication requested an unmanaged key");
+        return -1;
+    }
+    post = &g_git_snapshot.post_primary.keys[key_index];
+    if (post->count == 0) return 0;
+    if (post->count != 1 || !post->values || !post->values[0]) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication contains a repeated %s vector",
+                  key);
+        return -1;
+    }
+    if (safe_strncpy(out, post->values[0], out_size) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication %s value exceeds durable storage",
+                  key);
+        return -1;
+    }
+    *present = true;
+    return 0;
+}
+
+/* Invert the first shell word emitted by ssh_command_append_quoted(). The
+ * command builder always publishes `'<absolute ssh>' -i ...`; accepting any
+ * other grammar would manufacture executable provenance from a foreign
+ * command string. */
+static int git_publication_extract_ssh_program(const char *command, char *out,
+                                               size_t out_size) {
+    const char *cursor;
+    size_t used = 0;
+
+    if (!command || !out || out_size == 0 || command[0] != '\'') {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed core.sshCommand has no canonical executable word");
+        return -1;
+    }
+    out[0] = '\0';
+    cursor = command + 1;
+    while (*cursor) {
+        if (*cursor == '\'') {
+            if (cursor[1] == '\\' && cursor[2] == '\'' &&
+                cursor[3] == '\'') {
+                if (used + 1U >= out_size) goto too_long;
+                out[used++] = '\'';
+                cursor += 4;
+                continue;
+            }
+            cursor++;
+            if (strncmp(cursor, " -i '", sizeof(" -i '") - 1U) != 0 ||
+                used == 0 || out[0] != '/') {
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Sealed core.sshCommand does not match the managed command grammar");
+                return -1;
+            }
+            out[used] = '\0';
+            return 0;
+        }
+        if ((unsigned char)*cursor < 0x20U ||
+            (unsigned char)*cursor == 0x7fU) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed core.sshCommand executable contains a control character");
+            return -1;
+        }
+        if (used + 1U >= out_size) goto too_long;
+        out[used++] = *cursor++;
+    }
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Sealed core.sshCommand has an unterminated executable word");
+    return -1;
+
+too_long:
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Sealed core.sshCommand executable exceeds durable storage");
+    return -1;
+}
+
+/* Re-run the complete executable trust walk against the absolute program
+ * stored in Git, and bind the durable identity only while the named object is
+ * unchanged across that proof. find_command_path() returns the canonical path
+ * but intentionally closes its launch descriptor; the before/after witness
+ * prevents a replacement in that gap from inheriting the proof. */
+static int git_publication_capture_program_identity(
+    const char *program, publication_identity_t *identity,
+    const char *diagnostic_name) {
+    char canonical[MAX_PATH_LEN];
+    struct stat before;
+    struct stat after;
+
+    if (!program || program[0] != '/' || !identity ||
+        lstat(program, &before) != 0 ||
+        find_command_path(program, canonical, sizeof(canonical)) != 0 ||
+        strcmp(canonical, program) != 0 || lstat(program, &after) != 0 ||
+        !git_same_file_version(&before, &after) ||
+        !S_ISREG(after.st_mode)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot bind the sealed %s executable identity",
+                  diagnostic_name ? diagnostic_name : "Git helper");
+        return -1;
+    }
+    publication_identity_from_stat(identity, &after);
+    return 0;
+}
+
+int git_publication_verify_program_identity(
+    const char *program, const publication_identity_t *expected,
+    const char *diagnostic_name) {
+    publication_identity_t observed;
+
+    if (!program || !expected || !expected->present) {
+        set_error(ERR_INVALID_ARGS,
+                  "Missing persisted %s executable identity",
+                  diagnostic_name ? diagnostic_name : "Git helper");
+        return -1;
+    }
+    memset(&observed, 0, sizeof(observed));
+    if (git_publication_capture_program_identity(
+            program, &observed, diagnostic_name) != 0) {
+        return -1;
+    }
+    if (!publication_identity_equal(expected, &observed)) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Recorded %s executable generation changed",
+                  diagnostic_name ? diagnostic_name : "Git helper");
+        return -1;
+    }
+    return 0;
+}
+
+int git_config_export_sealed_publication(publication_record_t *out,
+                                         const char *gpg_selector) {
+    publication_record_t record;
+    const git_scope_generation_t *generation;
+    char gpg_format[sizeof(GIT_GPG_FORMAT_OPENPGP)];
+    char legacy_program[MAX_PATH_LEN];
+    bool fingerprint_present = false;
+    bool gpg_program_present = false;
+    bool ssh_command_present = false;
+    bool gpg_format_present = false;
+    bool legacy_program_present = false;
+
+    if (!out) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid sealed Git publication export request");
+        return -1;
+    }
+    if (!g_git_snapshot.valid || !g_git_snapshot.postimage_sealed) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "No sealed Git publication is available to export");
+        return -1;
+    }
+    if (!g_git_snapshot.publication_owner_bound ||
+        g_git_snapshot.publication_owner_tainted ||
+        !g_git_snapshot.publication_full_image_written ||
+        g_git_snapshot.publication_account_id == 0U ||
+        !account_incarnation_is_valid(
+            g_git_snapshot.publication_account_incarnation)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication has no transaction-bound account owner");
+        return -1;
+    }
+    if (git_snapshot_verify_generations(&g_git_snapshot, true) != 0) {
+        return -1;
+    }
+    generation = &g_git_snapshot.primary_generation;
+    if (!generation->valid || !generation->post_config_identity_valid ||
+        !generation->post_config_present) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication has no durable post-config generation");
+        return -1;
+    }
+
+    publication_record_init(&record);
+    record.account_id = g_git_snapshot.publication_account_id;
+    memcpy(record.account_incarnation,
+           g_git_snapshot.publication_account_incarnation,
+           ACCOUNT_INCARNATION_LEN);
+    record.state = PUBLICATION_STATE_PUBLISHED;
+    if (git_publication_scope_from_git(g_git_snapshot.scope,
+                                       &record.scope) != 0 ||
+        safe_strncpy(record.config_path, generation->path,
+                     sizeof(record.config_path)) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication destination exceeds durable storage");
+        return -1;
+    }
+    publication_identity_from_stat(&record.config_parent,
+                                   &generation->parent_stat);
+    publication_identity_from_stat(&record.post_config,
+                                   &generation->post_config_stat);
+    record.capabilities = PUBLICATION_CAP_DESTINATION |
+                          PUBLICATION_CAP_POST_GENERATION;
+    if (generation->repository_present) {
+        if (safe_strncpy(record.repository_path,
+                         generation->repository_path,
+                         sizeof(record.repository_path)) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed Git repository path exceeds durable storage");
+            return -1;
+        }
+        publication_identity_from_stat(&record.repository,
+                                       &generation->repository_stat);
+    }
+
+    if (git_publication_copy_post_value(
+            GIT_CONFIG_USER_SIGNINGKEY, record.gpg_fingerprint,
+            sizeof(record.gpg_fingerprint), &fingerprint_present) != 0 ||
+        git_publication_copy_post_value(
+            GIT_CONFIG_GPG_OPENPGP_PROGRAM, record.gpg_program,
+            sizeof(record.gpg_program), &gpg_program_present) != 0 ||
+        git_publication_copy_post_value(
+            GIT_CONFIG_CORE_SSHCOMMAND, record.ssh_command,
+            sizeof(record.ssh_command), &ssh_command_present) != 0 ||
+        git_publication_copy_post_value(
+            GIT_CONFIG_GPG_FORMAT, gpg_format, sizeof(gpg_format),
+            &gpg_format_present) != 0) {
+        return -1;
+    }
+    if (!gpg_format_present || strcmp(gpg_format,
+                                      GIT_GPG_FORMAT_OPENPGP) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication is not in the managed OpenPGP format");
+        return -1;
+    }
+    for (size_t i = 0;
+         i < sizeof(g_gpg_program_keys) / sizeof(g_gpg_program_keys[0]); i++) {
+        if (strcmp(g_gpg_program_keys[i],
+                   GIT_CONFIG_GPG_OPENPGP_PROGRAM) == 0) {
+            continue;
+        }
+        if (git_publication_copy_post_value(
+                g_gpg_program_keys[i], legacy_program,
+                sizeof(legacy_program), &legacy_program_present) != 0) {
+            return -1;
+        }
+        if (legacy_program_present) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed Git publication retains a foreign %s selector",
+                      g_gpg_program_keys[i]);
+            return -1;
+        }
+    }
+    if (fingerprint_present != gpg_program_present ||
+        (fingerprint_present &&
+         !git_signing_key_matches_fingerprint(record.gpg_fingerprint,
+                                              record.gpg_fingerprint))) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication lacks a complete canonical OpenPGP identity");
+        return -1;
+    }
+    if (fingerprint_present) {
+        if (publication_normalize_gpg_selector(
+                gpg_selector, record.gpg_selector) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed Git publication lacks its original account GPG selector");
+            return -1;
+        }
+        for (char *digit = record.gpg_fingerprint; *digit; digit++) {
+            *digit = (char)toupper((unsigned char)*digit);
+        }
+        if (git_publication_capture_program_identity(
+                record.gpg_program, &record.gpg_program_identity,
+                "OpenPGP") != 0) {
+            return -1;
+        }
+        record.capabilities |= PUBLICATION_CAP_GPG_FINGERPRINT |
+                               PUBLICATION_CAP_GPG_PROGRAM |
+                               PUBLICATION_CAP_GPG_SELECTOR;
+    } else if (gpg_selector && gpg_selector[0] != '\0') {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication received a selector without a GPG post-image");
+        return -1;
+    }
+    if (ssh_command_present) {
+        if (git_publication_extract_ssh_program(
+                record.ssh_command, record.ssh_program,
+                sizeof(record.ssh_program)) != 0) {
+            return -1;
+        }
+        if (git_publication_capture_program_identity(
+                record.ssh_program, &record.ssh_program_identity,
+                "SSH") != 0) {
+            return -1;
+        }
+        record.capabilities |= PUBLICATION_CAP_SSH_COMMAND |
+                               PUBLICATION_CAP_SSH_PROGRAM;
+    }
+    if (publication_record_validate(&record) != 0) return -1;
+    *out = record;
     return 0;
 }
 
@@ -3316,7 +3791,7 @@ static int git_verify_effective_account(const account_t *account,
 }
 
 /* Set git configuration for account */
-int git_set_config(const account_t *account, git_scope_t scope) {
+static int git_set_config_impl(const account_t *account, git_scope_t scope) {
     const char *scope_flag;
     bool manage_worktree = false;
     
@@ -3349,7 +3824,6 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         set_error(ERR_GIT_NOT_REPOSITORY, "Not in a git repository, cannot set local config");
         return -1;
     }
-    
     /* The caller (accounts_switch) snapshots managed keys via
      * git_config_snapshot() before this point and restores them on failure, so
      * the whole switch is rolled back atomically rather than left half-applied. */
@@ -3472,6 +3946,24 @@ int git_set_config(const account_t *account, git_scope_t scope) {
     
     log_info("Git configuration set successfully for %s", account->name);
     return 0;
+}
+
+int git_set_config(const account_t *account, git_scope_t scope) {
+    int result;
+
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    result = git_set_config_impl(account, scope);
+    if (result == 0 && g_git_snapshot.valid &&
+        g_git_snapshot.scope == scope &&
+        git_snapshot_publication_owner_matches(account)) {
+        /* This full account writer normalizes every managed key in the
+         * primary and discovered override scopes, so it supersedes any raw
+         * pre-binding write observed earlier in the same snapshot. */
+        g_git_snapshot.publication_owner_tainted = false;
+        g_git_snapshot.publication_full_image_written = true;
+    }
+    git_account_write_end();
+    return result;
 }
 
 /* Preserve a useful Git diagnostic without ever feeding its arbitrary control
@@ -3892,6 +4384,10 @@ int git_get_current_config(git_current_config_t *config) {
     snprintf(config->effective_name_origin,
              sizeof(config->effective_name_origin), "%s",
              effective->origins[k_name]);
+    config->effective_signing_key_scope = effective->scopes[k_signkey];
+    snprintf(config->effective_signing_key_origin,
+             sizeof(config->effective_signing_key_origin), "%s",
+             effective->origins[k_signkey]);
     switch (config->effective_name_scope) {
         case GIT_CONFIG_ORIGIN_GLOBAL: config->scope = GIT_SCOPE_GLOBAL; break;
         case GIT_CONFIG_ORIGIN_SYSTEM: config->scope = GIT_SCOPE_SYSTEM; break;
@@ -3951,35 +4447,144 @@ int git_clear_config(git_scope_t scope) {
     return 0;
 }
 
-/* See git_ops.h. The suffix rule mirrors GnuPG's own selector semantics: any
- * hex selector the user saved (short id, long id, or full fingerprint)
- * selects exactly the keys whose fingerprint it is a suffix of. */
-bool git_signing_key_selects_account(const account_t *account,
-                                     const char *configured) {
-    const char *selector;
-    size_t selector_len;
+/* See git_ops.h. Selector resolution belongs to activation; ownership checks
+ * accept only complete canonical fingerprints. */
+bool git_signing_key_matches_fingerprint(const char *fingerprint,
+                                         const char *configured) {
+    size_t fingerprint_len;
     size_t configured_len;
     size_t i;
 
-    if (!account || !configured) return false;
-    if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') return false;
-
-    selector = account->gpg_key_id;
-    if (selector[0] == '0' && (selector[1] == 'x' || selector[1] == 'X')) {
-        selector += 2;
-    }
-    selector_len = strlen(selector);
+    if (!fingerprint || !configured) return false;
+    fingerprint_len = strlen(fingerprint);
     configured_len = strlen(configured);
-    if (selector_len == 0 ||
-        (configured_len != 40 && configured_len != 64) ||
-        selector_len > configured_len) {
+    if ((fingerprint_len != 40 && fingerprint_len != 64) ||
+        configured_len != fingerprint_len) {
         return false;
     }
-    for (i = 0; i < configured_len; i++) {
-        if (!isxdigit((unsigned char)configured[i])) return false;
+    for (i = 0; i < fingerprint_len; i++) {
+        if (!isxdigit((unsigned char)fingerprint[i]) ||
+            !isxdigit((unsigned char)configured[i])) {
+            return false;
+        }
     }
-    return strncasecmp(configured + configured_len - selector_len,
-                       selector, selector_len) == 0;
+    return strcasecmp(configured, fingerprint) == 0;
+}
+
+bool git_signing_key_selects_account(const account_t *account,
+                                     const char *configured) {
+    if (!account || !account->gpg_enabled) return false;
+    return git_signing_key_matches_fingerprint(account->gpg_key_id,
+                                               configured);
+}
+
+static bool git_publication_scope_matches_origin(
+    publication_scope_t publication_scope,
+    git_config_origin_scope_t origin_scope) {
+    switch (publication_scope) {
+        case PUBLICATION_SCOPE_LOCAL:
+            return origin_scope == GIT_CONFIG_ORIGIN_LOCAL;
+        case PUBLICATION_SCOPE_GLOBAL:
+            return origin_scope == GIT_CONFIG_ORIGIN_GLOBAL;
+        case PUBLICATION_SCOPE_WORKTREE:
+            return origin_scope == GIT_CONFIG_ORIGIN_WORKTREE;
+        default:
+            return false;
+    }
+}
+
+static bool git_publication_origin_matches_path(
+    const char *origin_path, const publication_record_t *publication) {
+    char canonical[MAX_PATH_LEN];
+    char repository_relative[MAX_PATH_LEN];
+    const char *candidate = origin_path;
+    int written;
+
+    if (!origin_path || !publication || publication->config_path[0] != '/') {
+        return false;
+    }
+    if (strcmp(origin_path, publication->config_path) == 0) return true;
+    /* Git may report a logical symlink spelling or a repository-relative
+     * local origin. Relative local/worktree origins are rooted at Git's
+     * canonical repository top level, not at the process's current
+     * subdirectory. Global relative origins and resolution failure are
+     * unknown provenance, never a match. */
+    if (origin_path[0] != '/') {
+        if ((publication->scope != PUBLICATION_SCOPE_LOCAL &&
+             publication->scope != PUBLICATION_SCOPE_WORKTREE) ||
+            publication->repository_path[0] != '/') {
+            return false;
+        }
+        written = snprintf(repository_relative,
+                           sizeof(repository_relative), "%s/%s",
+                           publication->repository_path, origin_path);
+        if (written < 0 || (size_t)written >= sizeof(repository_relative)) {
+            return false;
+        }
+        candidate = repository_relative;
+    }
+    return realpath(candidate, canonical) != NULL &&
+           strcmp(canonical, publication->config_path) == 0;
+}
+
+git_signing_publication_result_t git_signing_key_matches_publication(
+    const account_t *account, const publication_record_t *publication,
+    const git_current_config_t *current) {
+    static const char file_origin_prefix[] = "file:";
+    char normalized_selector[MAX_GPG_SELECTOR_LEN];
+    const char *origin_path;
+
+    if (!account || !publication || !current || !account->gpg_enabled ||
+        !account->incarnation_persisted ||
+        publication->account_id != account->id ||
+        strcmp(publication->account_incarnation,
+               account->incarnation) != 0 ||
+        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        (publication->capabilities &
+         (PUBLICATION_CAP_DESTINATION |
+          PUBLICATION_CAP_POST_GENERATION |
+          PUBLICATION_CAP_GPG_FINGERPRINT |
+          PUBLICATION_CAP_GPG_PROGRAM |
+          PUBLICATION_CAP_GPG_SELECTOR)) !=
+            (PUBLICATION_CAP_DESTINATION |
+             PUBLICATION_CAP_POST_GENERATION |
+             PUBLICATION_CAP_GPG_FINGERPRINT |
+             PUBLICATION_CAP_GPG_PROGRAM |
+             PUBLICATION_CAP_GPG_SELECTOR)) {
+        return GIT_SIGNING_PUBLICATION_MISMATCH;
+    }
+
+    /* Once a complete publication tuple is established for this account,
+     * malformed current account input is an operational ERROR regardless of
+     * any additional destination or fingerprint mismatch. Otherwise the same
+     * invalid selector could be reported as WARN or ERROR merely according to
+     * which unrelated comparison happened to run first. */
+    if (publication_normalize_gpg_selector(
+            account->gpg_key_id, normalized_selector) != 0) {
+        return GIT_SIGNING_PUBLICATION_ERROR;
+    }
+    if (
+        !git_publication_scope_matches_origin(
+            publication->scope, current->effective_signing_key_scope) ||
+        strncmp(current->effective_signing_key_origin, file_origin_prefix,
+                sizeof(file_origin_prefix) - 1U) != 0) {
+        return GIT_SIGNING_PUBLICATION_MISMATCH;
+    }
+    origin_path = current->effective_signing_key_origin +
+                  sizeof(file_origin_prefix) - 1U;
+    if (!git_publication_origin_matches_path(origin_path, publication) ||
+        !git_signing_key_matches_fingerprint(
+            publication->gpg_fingerprint, current->signing_key)) {
+        return GIT_SIGNING_PUBLICATION_MISMATCH;
+    }
+
+    /* The switch-time selector is part of the durable tuple precisely so
+     * status remains observational when a valid isolated key outlives its
+     * source keyring. Only representation-neutral case/0x normalization is
+     * allowed; selector length and every digit remain significant. */
+    return strcmp(publication->gpg_selector, normalized_selector) == 0
+               ? GIT_SIGNING_PUBLICATION_MATCH
+               : GIT_SIGNING_PUBLICATION_MISMATCH;
 }
 
 /* Unset one attributed credential key for git_retire_account_identity,
@@ -4001,8 +4606,10 @@ static void git_retire_unset(const char *key, git_scope_t scope,
     (*removed)++;
 }
 
-/* See git_ops.h (AR-10 M1). */
-int git_retire_account_identity(const account_t *account, size_t *cleared) {
+static int git_retire_account_identity_with_fingerprint(
+    const account_t *account, const char *canonical_fingerprint,
+    const char *published_ssh_command, bool restrict_scope,
+    git_scope_t published_scope, size_t *cleared) {
     git_scope_t scopes[3];
     size_t scope_count = 0;
     char expected_ssh[GIT_CFG_VALUE_MAX] = "";
@@ -4021,12 +4628,17 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
         return -1;
     }
 
-    /* Rebuild the exact core.sshCommand a switch to this account would have
-     * published. When the trusted rebuild is impossible (e.g. the ssh binary
-     * disappeared), an existing value cannot be attributed to this account,
-     * so it is left in place; the no-active-account status view renders the
-     * residue instead of hiding it. */
-    if (account->ssh_enabled && account->ssh_key_path[0] != '\0') {
+    /* A durable record carries the exact command actually published and never
+     * repeats PATH resolution. The compatibility entry point has no such
+     * record and retains its historical reconstruction only for the SSH leg;
+     * M8 deliberately gives it no signing-key attribution. */
+    if (published_ssh_command && published_ssh_command[0] != '\0') {
+        if (safe_strncpy(expected_ssh, published_ssh_command,
+                         sizeof(expected_ssh)) == 0) {
+            expected_ssh_known = true;
+        }
+    } else if (!restrict_scope && account->ssh_enabled &&
+               account->ssh_key_path[0] != '\0') {
         if (git_expected_ssh_command(account, expected_ssh,
                                      sizeof(expected_ssh)) == 0) {
             expected_ssh_known = true;
@@ -4037,13 +4649,24 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
         }
     }
 
-    scopes[scope_count++] = GIT_SCOPE_GLOBAL;
-    if (git_is_repository()) {
-        bool worktree_present = false;
-        scopes[scope_count++] = GIT_SCOPE_LOCAL;
-        if (git_detect_managed_worktree_scope(&worktree_present) == 0 &&
-            worktree_present) {
-            scopes[scope_count++] = GIT_SCOPE_WORKTREE_INTERNAL;
+    if (restrict_scope) {
+        if ((published_scope == GIT_SCOPE_LOCAL ||
+             published_scope == GIT_SCOPE_WORKTREE_INTERNAL) &&
+            !git_is_repository()) {
+            set_error(ERR_GIT_NOT_REPOSITORY,
+                      "Recorded Git publication destination is not the current repository");
+            return -1;
+        }
+        scopes[scope_count++] = published_scope;
+    } else {
+        scopes[scope_count++] = GIT_SCOPE_GLOBAL;
+        if (git_is_repository()) {
+            bool worktree_present = false;
+            scopes[scope_count++] = GIT_SCOPE_LOCAL;
+            if (git_detect_managed_worktree_scope(&worktree_present) == 0 &&
+                worktree_present) {
+                scopes[scope_count++] = GIT_SCOPE_WORKTREE_INTERNAL;
+            }
         }
     }
 
@@ -4064,7 +4687,8 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
          * foreign or noncanonical value attributes nothing. */
         if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, value,
                                  sizeof(value), scope) == 0 &&
-            git_signing_key_selects_account(account, value)) {
+            git_signing_key_matches_fingerprint(canonical_fingerprint,
+                                                value)) {
             git_retire_unset(GIT_CONFIG_USER_SIGNINGKEY, scope, &removed,
                              &failures, first_error, sizeof(first_error));
             if (git_get_config_value(GIT_CONFIG_COMMIT_GPGSIGN, value,
@@ -4103,6 +4727,167 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
         return -1;
     }
     return 0;
+}
+
+/* See git_ops.h (AR-10 M1). The compatibility entry point has no durable
+ * publication record, so it may retire the exactly reconstructed SSH leg but
+ * must never attribute a signing leg from an account selector alone. */
+int git_retire_account_identity(const account_t *account, size_t *cleared) {
+    return git_retire_account_identity_with_fingerprint(
+        account, NULL, NULL, false, GIT_SCOPE_GLOBAL, cleared);
+}
+
+static int git_scope_from_publication(publication_scope_t publication_scope,
+                                      git_scope_t *scope) {
+    if (!scope) return -1;
+    switch (publication_scope) {
+        case PUBLICATION_SCOPE_LOCAL:
+            *scope = GIT_SCOPE_LOCAL;
+            return 0;
+        case PUBLICATION_SCOPE_GLOBAL:
+            *scope = GIT_SCOPE_GLOBAL;
+            return 0;
+        case PUBLICATION_SCOPE_WORKTREE:
+            *scope = GIT_SCOPE_WORKTREE_INTERNAL;
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+static bool git_publication_identity_matches_stat(
+    const publication_identity_t *identity, const struct stat *st) {
+    return identity && identity->present && st &&
+           identity->device == (uintmax_t)st->st_dev &&
+           identity->inode == (uintmax_t)st->st_ino &&
+           (identity->mode & (uintmax_t)S_IFMT) ==
+               ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
+}
+
+/* Until M10 owns traversal of every recorded repository, a local/worktree
+ * retirement may operate only from the exact destination that produced the
+ * record. Scope equality alone is insufficient: `git config --local` in
+ * repository B would otherwise remove B's matching credential while holding
+ * provenance for repository A. This is a fail-before-mutation admission
+ * check; M14 later strengthens the read/delete interval itself. */
+static int git_retire_verify_current_publication_destination(
+    const publication_record_t *publication, git_scope_t scope) {
+    git_scope_lock_t resolved;
+    char repository_path[MAX_PATH_LEN];
+    publication_identity_t live_config_identity;
+    struct stat parent_stat;
+    struct stat config_stat;
+    struct stat repository_stat;
+    int parent_fd = -1;
+    int config_fd = -1;
+    int repository_fd = -1;
+    bool matches = false;
+
+    if (!publication ||
+        (scope != GIT_SCOPE_GLOBAL && scope != GIT_SCOPE_LOCAL &&
+         scope != GIT_SCOPE_WORKTREE_INTERNAL) ||
+        (publication->capabilities & PUBLICATION_CAP_POST_GENERATION) == 0U) {
+        goto mismatch;
+    }
+
+    memset(&resolved, 0, sizeof(resolved));
+    resolved.dir_fd = -1;
+    if (git_scope_lock_resolve_paths(scope, &resolved) != 0 ||
+        strcmp(resolved.path, publication->config_path) != 0) {
+        goto mismatch;
+    }
+    parent_fd = open(resolved.parent,
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent_fd < 0 || fstat(parent_fd, &parent_stat) != 0 ||
+        !git_publication_identity_matches_stat(&publication->config_parent,
+                                               &parent_stat)) {
+        goto mismatch;
+    }
+    config_fd = openat(parent_fd, resolved.leaf,
+                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (config_fd < 0 || fstat(config_fd, &config_stat) != 0 ||
+        !S_ISREG(config_stat.st_mode)) {
+        goto mismatch;
+    }
+    publication_identity_from_stat(&live_config_identity, &config_stat);
+    if (!publication_identity_equal(&publication->post_config,
+                                    &live_config_identity)) {
+        goto mismatch;
+    }
+    if (scope == GIT_SCOPE_GLOBAL) {
+        matches = true;
+        goto mismatch;
+    }
+    if (git_resolve_repository_generation_path(
+            repository_path, sizeof(repository_path)) != 0 ||
+        strcmp(repository_path, publication->repository_path) != 0) {
+        goto mismatch;
+    }
+    repository_fd = open(repository_path,
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (repository_fd < 0 ||
+        fstat(repository_fd, &repository_stat) != 0 ||
+        !git_publication_identity_matches_stat(&publication->repository,
+                                               &repository_stat)) {
+        goto mismatch;
+    }
+    matches = true;
+
+mismatch:
+    if (repository_fd >= 0) (void)close(repository_fd);
+    if (config_fd >= 0) (void)close(config_fd);
+    if (parent_fd >= 0) (void)close(parent_fd);
+    if (!matches) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Recorded Git publication destination does not match the current %s Git destination generation",
+            git_scope_diagnostic_label(scope));
+        return -1;
+    }
+    return 0;
+}
+
+int git_retire_account_identity_published(
+    const account_t *account, const publication_record_t *publication,
+    size_t *cleared) {
+    git_scope_t scope;
+    const char *fingerprint = NULL;
+    const char *ssh_command = NULL;
+
+    if (cleared) *cleared = 0;
+    if (!account || !publication || !account->incarnation_persisted ||
+        publication->account_id != account->id ||
+        strcmp(publication->account_incarnation,
+               account->incarnation) != 0 ||
+        (publication->capabilities & PUBLICATION_CAP_DESTINATION) == 0U ||
+        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        git_scope_from_publication(publication->scope, &scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Account has no exact durable Git publication provenance");
+        return -1;
+    }
+    if (publication_record_validate(publication) != 0) return -1;
+    if ((publication->capabilities &
+         PUBLICATION_CAP_GPG_FINGERPRINT) != 0U) {
+        if (!git_signing_key_matches_fingerprint(
+                publication->gpg_fingerprint,
+                publication->gpg_fingerprint)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Publication record has no canonical signing fingerprint");
+            return -1;
+        }
+        fingerprint = publication->gpg_fingerprint;
+    }
+    if ((publication->capabilities & PUBLICATION_CAP_SSH_COMMAND) != 0U) {
+        ssh_command = publication->ssh_command;
+    }
+    if (git_retire_verify_current_publication_destination(publication,
+                                                          scope) != 0) {
+        return -1;
+    }
+    return git_retire_account_identity_with_fingerprint(
+        account, fingerprint, ssh_command, true, scope, cleared);
 }
 
 /* AR-06 F59: git_validate_repository() and git_get_config_scope() were removed
@@ -4247,7 +5032,9 @@ static int git_set_config_value_impl(const char *key, const char *value,
 }
 
 int git_set_config_value(const char *key, const char *value, git_scope_t scope) {
-    return git_set_config_value_impl(key, value, scope, false);
+    int result = git_set_config_value_impl(key, value, scope, false);
+    if (result == 0) git_taint_publication_after_raw_write(scope, key);
+    return result;
 }
 
 /* Get single git configuration value.
@@ -4444,7 +5231,9 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
 }
 
 int git_unset_config_value(const char *key, git_scope_t scope) {
-    return git_unset_config_value_impl(key, scope, false);
+    int result = git_unset_config_value_impl(key, scope, false);
+    if (result == 0) git_taint_publication_after_raw_write(scope, key);
+    return result;
 }
 
 /* List all git configuration values */
@@ -4641,7 +5430,8 @@ int git_expected_ssh_command(const account_t *account, char *command,
 }
 
 /* Configure SSH command for git operations */
-int git_configure_ssh(const account_t *account, git_scope_t scope) {
+static int git_configure_ssh_impl(const account_t *account,
+                                  git_scope_t scope) {
     char ssh_command[GIT_CFG_VALUE_MAX];
     char expanded_key_path[MAX_PATH_LEN];
 
@@ -4685,8 +5475,18 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
     return 0;
 }
 
+int git_configure_ssh(const account_t *account, git_scope_t scope) {
+    int result;
+
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    result = git_configure_ssh_impl(account, scope);
+    git_account_write_end();
+    return result;
+}
+
 /* Configure GPG for git operations */
-int git_configure_gpg(const account_t *account, git_scope_t scope) {
+static int git_configure_gpg_impl(const account_t *account,
+                                  git_scope_t scope) {
     if (!account || !account->gpg_enabled || strlen(account->gpg_key_id) == 0) {
         return 0; /* Nothing to configure */
     }
@@ -4707,6 +5507,80 @@ int git_configure_gpg(const account_t *account, git_scope_t scope) {
     }
     
     return 0;
+}
+
+int git_configure_gpg(const account_t *account, git_scope_t scope) {
+    int result;
+
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    result = git_configure_gpg_impl(account, scope);
+    git_account_write_end();
+    return result;
+}
+
+int git_configure_openpgp_publication(const account_t *account,
+                                      const char *gpg_program,
+                                      git_scope_t scope) {
+    const char *signing_value;
+    bool may_restore_complete_image;
+    int result = -1;
+
+    if (!account || !account->gpg_enabled ||
+        !git_signing_key_matches_fingerprint(account->gpg_key_id,
+                                             account->gpg_key_id) ||
+        !gpg_program || gpg_program[0] != '/' ||
+        strnlen(gpg_program, MAX_PATH_LEN) >= MAX_PATH_LEN ||
+        !is_valid_git_config_value(gpg_program)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid canonical OpenPGP publication request");
+        return -1;
+    }
+    may_restore_complete_image =
+        git_snapshot_publication_is_complete_for(account, scope);
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    signing_value = account->gpg_signing_enabled ? "true" : "false";
+
+    if (git_set_config_value(GIT_CONFIG_USER_SIGNINGKEY,
+                             account->gpg_key_id, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git signing key");
+        goto cleanup;
+    }
+    if (git_set_config_value(GIT_CONFIG_COMMIT_GPGSIGN,
+                             signing_value, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set commit.gpgsign=%s",
+                  signing_value);
+        goto cleanup;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.program");
+        goto cleanup;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_X509_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to clear gpg.x509.program");
+        goto cleanup;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_SSH_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to clear gpg.ssh.program");
+        goto cleanup;
+    }
+    if (git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                             gpg_program, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to set gpg.openpgp.program");
+        goto cleanup;
+    }
+    result = 0;
+    if (may_restore_complete_image &&
+        git_snapshot_publication_owner_matches(account) &&
+        !g_git_snapshot.publication_owner_tainted) {
+        g_git_snapshot.publication_full_image_written = true;
+    }
+
+cleanup:
+    git_account_write_end();
+    return result;
 }
 
 /* Check if current directory is a git repository.

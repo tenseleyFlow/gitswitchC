@@ -922,15 +922,30 @@ static int install_live_current_socket(const char *runtime,
                                        const char *account_name) {
     char dir[1024];
     char current[1024];
+    char lock_path[1024];
     char socket_path[1024];
     struct sockaddr_un addr;
     int fd;
+    int lock_fd;
 
     if ((size_t)snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", runtime) >=
         sizeof(dir)) {
         return -1;
     }
     if (mkdir_private(dir) != 0) return -1;
+    if ((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock", dir) >=
+        sizeof(lock_path)) {
+        return -1;
+    }
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0) return -1;
+    if (fchmod(lock_fd, 0600) != 0) {
+        int saved_errno = errno;
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(lock_fd) != 0) return -1;
     if ((size_t)snprintf(socket_path, sizeof(socket_path),
                          "%s/ssh-agent.%s.sock", dir, account_name) >=
         sizeof(socket_path)) {

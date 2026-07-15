@@ -38,6 +38,7 @@
 #endif
 
 #include "test.h"
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -177,14 +178,53 @@ static int file_exists(const char *path) {
     return lstat(path, &st) == 0;
 }
 
+static bool directory_empty(const char *path) {
+    DIR *dir = opendir(path);
+    struct dirent *entry;
+
+    if (!dir) return false;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") != 0 &&
+            strcmp(entry->d_name, "..") != 0) {
+            closedir(dir);
+            return false;
+        }
+    }
+    return closedir(dir) == 0;
+}
+
+static bool same_file_identity_and_metadata(const struct stat *before,
+                                            const struct stat *after) {
+    return before && after &&
+           before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_mode == after->st_mode &&
+           before->st_nlink == after->st_nlink &&
+           before->st_size == after->st_size &&
+           before->st_mtime == after->st_mtime &&
+           before->st_ctime == after->st_ctime;
+}
+
 /* Create $XDG_RUNTIME_DIR/gitswitch-ssh (0700) and point current.sock at
  * an ssh-agent.<name>.sock target inside it (dangling is fine — the
  * detector only readlinks). */
 static int plant_runtime_link(const sandbox_t *sb, const char *account_name) {
-    char dir[256], link[320], target[448];
+    char dir[256], link[320], lock[320], target[448];
+    int lock_fd;
+
     snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", sb->rt);
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) return -1;
     if (chmod(dir, 0700) != 0) return -1;
+    snprintf(lock, sizeof(lock), "%s/.lock", dir);
+    lock_fd = open(lock, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0) return -1;
+    if (fchmod(lock_fd, 0600) != 0) {
+        int saved_errno = errno;
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(lock_fd) != 0) return -1;
     snprintf(link, sizeof(link), "%s/current.sock", dir);
     snprintf(target, sizeof(target), "%s/ssh-agent.%s.sock", dir, account_name);
     unlink(link);
@@ -880,30 +920,56 @@ TEST(init_refuses_quote_in_runtime_dir) {
     sandbox_teardown(&sb);
 }
 
-/* 11. Switching to an unknown account must fail with a nonzero exit, print
- *     the failure (no success banner), and leave the config untouched. */
-TEST(switch_unknown_account_exit_code) {
+static void assert_rejected_legacy_switch_is_nonmutating(
+    const char *selector, const char *expected_detail) {
     sandbox_t sb;
-    char before[16384], after[16384];
+    char before[16384], after[16384], path[512];
+    struct stat before_stat, after_stat;
     size_t before_len, after_len;
-    const char *argv[] = { "gitswitch", "zzz-not-here", NULL };
+    const char *argv[] = { "gitswitch", selector, NULL };
 
-    SKIP_IF_NO_PTY();
     if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
     CHECK_EQ_INT(write_cfg_work_other(&sb, NULL), 0);
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
+    CHECK_EQ_INT(lstat(sb.cfg, &before_stat), 0);
 
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
     CHECK_EQ_INT(pty_expect(&g_p, "Failed to switch account"), 0);
     CHECK(pty_wait_exit(&g_p) != 0);
     CHECK(strstr(g_p.out, "Switched to:") == NULL);
+    CHECK(strstr(g_p.out, expected_detail) != NULL);
 
     after_len = slurp(sb.cfg, after, sizeof(after));
     CHECK(after_len == before_len && memcmp(before, after, before_len) == 0);
+    CHECK_EQ_INT(lstat(sb.cfg, &after_stat), 0);
+    CHECK(same_file_identity_and_metadata(&before_stat, &after_stat));
+
+    CHECK(!resume_hint_exists(&sb));
+    snprintf(path, sizeof(path), "%s/.gitconfig", sb.home);
+    CHECK(!file_exists(path));
+    snprintf(path, sizeof(path), "%s/.config/git", sb.home);
+    CHECK(!file_exists(path));
+    CHECK(directory_empty(sb.rt));
 
     pty_close(&g_p);
     sandbox_teardown(&sb);
+}
+
+/* 11. Unknown and ambiguous selectors are rejected before a legacy account
+ *     document crosses the incarnation migration boundary. The rejection is
+ *     not a real switch: it must preserve the config inode, metadata, and
+ *     bytes and must not publish state to runtime, Git, or the resume ledger. */
+TEST(switch_unknown_account_exit_code) {
+    SKIP_IF_NO_PTY();
+    assert_rejected_legacy_switch_is_nonmutating("zzz-not-here",
+                                                 "Account not found");
+}
+
+TEST(switch_ambiguous_account_exit_code) {
+    SKIP_IF_NO_PTY();
+    assert_rejected_legacy_switch_is_nonmutating("o",
+                                                 "Ambiguous identifier");
 }
 
 TEST_MAIN_BEGIN()
@@ -930,4 +996,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(init_fish_snippet_round_trip);
     RUN_TEST(init_refuses_quote_in_runtime_dir);
     RUN_TEST(switch_unknown_account_exit_code);
+    RUN_TEST(switch_ambiguous_account_exit_code);
 TEST_MAIN_END()

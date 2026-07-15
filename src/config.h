@@ -4,6 +4,7 @@
 #define CONFIG_H
 
 #include "gitswitch.h"
+#include "publication.h"
 #include <dirent.h>
 
 /* Configuration file format version */
@@ -83,6 +84,14 @@ typedef struct dirent *(*config_backup_readdir_fn)(DIR *dir);
 config_backup_readdir_fn config_set_backup_readdir_fn(
     config_backup_readdir_fn fn);
 
+/* Focused single-threaded entropy seam for incarnation allocation tests.
+ * Production leaves NULL installed and uses generate_random_string(). A test
+ * generator must emit one exact ACCOUNT_INCARNATION_LEN token or fail. */
+typedef int (*config_incarnation_generate_fn)(
+    char incarnation[ACCOUNT_INCARNATION_LEN]);
+config_incarnation_generate_fn config_set_incarnation_generate_fn(
+    config_incarnation_generate_fn fn);
+
 /* Function prototypes */
 
 /**
@@ -100,6 +109,14 @@ int config_init(gitswitch_ctx_t *ctx);
  * config directory or lock metadata.
  */
 int config_init_readonly(gitswitch_ctx_t *ctx);
+
+/**
+ * Initialize configuration for a read-only command that reports live runtime
+ * state. Like config_init_readonly(), this never creates or chmods the config
+ * directory or lock metadata, but it may take the existing SSH runtime lock
+ * and probe current.sock to attribute the active account.
+ */
+int config_init_runtime_readonly(gitswitch_ctx_t *ctx);
 
 /**
  * Load the complete account document for `list --names` without creating or
@@ -145,6 +162,14 @@ int config_save(gitswitch_ctx_t *ctx, const char *config_path);
 int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed);
+
+/* Materialize and durably persist every legacy account incarnation in one
+ * full transaction. A no-op when every account came from a persisted token.
+ * The CLI invokes this under its outer config lock before switch prepare, so
+ * entropy or persistence failure precedes all runtime and Git mutation. */
+int config_migrate_account_incarnations(gitswitch_ctx_t *ctx,
+                                        const char *config_path,
+                                        bool *config_installed);
 
 /**
  * Fail-closed gate shared by config_save and the mutating-command handlers
@@ -197,12 +222,14 @@ typedef struct {
     unsigned char *data;
     size_t length;
     unsigned int mode;
+    bool before_image_valid;
+    struct stat before_image;
     char config_path[MAX_PATH_LEN];
     bool post_image_bound;
     bool post_image_installed;
     bool post_image_valid;
     struct stat post_image;
-    unsigned char post_image_data[MAX_NAME_LEN + 32U];
+    unsigned char *post_image_data;
     size_t post_image_length;
 } config_resume_hint_snapshot_t;
 
@@ -230,6 +257,27 @@ int config_save_active_account_transactional_guarded(
     gitswitch_ctx_t *ctx, const char *config_path,
     bool *config_installed,
     config_resume_hint_snapshot_t *rollback_snapshot);
+/* Merge one required, valid sealed Git publication into the same atomic
+ * active-state bundle. The exact destination replaces its prior owner; other
+ * repositories/scopes remain recorded. Use the ordinary guarded save above
+ * when no publication is being merged and the current ledger must be
+ * preserved. */
+int config_save_active_account_publication_transactional_guarded(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const publication_record_t *publication,
+    bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot);
+/* Read the optional publication ledger from a stable active-state bundle.
+ * Historical state returns a successful ledger-absent model. Before its first
+ * load, `ledger` must be initialized with publication_ledger_init(); the load
+ * clears its prior contents before reading, including on failure. Clear the
+ * final model with publication_ledger_clear(). */
+int config_load_publication_ledger(const char *config_path,
+                                   publication_ledger_t *ledger);
+/* Fail-before-mutation capacity gate for one worst-case new publication.
+ * This deliberately remains conservative when a later upsert may replace an
+ * existing record. */
+int config_publication_preflight(const char *config_path);
 int config_restore_active_account(gitswitch_ctx_t *ctx,
                                   const char *config_path);
 

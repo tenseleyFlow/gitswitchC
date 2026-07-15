@@ -2897,15 +2897,9 @@ static int gpg_verify_reset_all_final_locked(int base_fd, int lock_fd,
     int scan_fd;
     DIR *dir;
     struct dirent *entry;
-    struct stat held;
-    struct stat named;
     bool saw_lock = false;
 
-    if (fstat(lock_fd, &held) != 0 ||
-        fstatat(base_fd, ".lock", &named, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !S_ISREG(named.st_mode) || named.st_uid != getuid() ||
-        named.st_nlink != 1 || (named.st_mode & 0777) != 0600 ||
-        !gpg_same_reset_entry(&held, &named)) {
+    if (verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
         set_error(ERR_FILE_IO,
                   "GPG reset lock changed before final verification: %s", base);
         return -1;
@@ -2956,10 +2950,7 @@ static int gpg_verify_reset_all_final_locked(int base_fd, int lock_fd,
         }
     }
     if (closedir(dir) != 0 || !saw_lock ||
-        fstatat(base_fd, ".lock", &named, AT_SYMLINK_NOFOLLOW) != 0 ||
-        !S_ISREG(named.st_mode) || named.st_uid != getuid() ||
-        named.st_nlink != 1 || (named.st_mode & 0777) != 0600 ||
-        !gpg_same_reset_entry(&held, &named)) {
+        verify_private_lock_file_at(lock_fd, base_fd, ".lock") != 0) {
         set_error(ERR_FILE_IO,
                   "GPG reset final state lacks its exact lock: %s", base);
         return -1;
@@ -3647,7 +3638,6 @@ out:
 /* Configure git GPG signing */
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, git_scope_t scope) {
     account_t configured_account;
-    const char *signing_value;
 
     if (!gpg_config || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_configure_git_signing");
@@ -3672,46 +3662,11 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
     }
 
     log_info("Configuring git GPG identity for account: %s", account->name);
-    signing_value = account->gpg_signing_enabled ? "true" : "false";
-
-    /* The canonical primary fingerprint remains configured even when automatic
-     * commit signing is disabled. This keeps manual signing deterministic and
-     * prevents a short/prefixed selector from becoming Git's effective identity. */
-    if (git_set_config_value(GIT_CONFIG_USER_SIGNINGKEY,
-                             gpg_config->current_key_id,
-                             scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git signing key");
-        return -1;
-    }
-
-    if (git_set_config_value(GIT_CONFIG_COMMIT_GPGSIGN, signing_value,
-                             scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set commit.gpgsign=%s",
-                  signing_value);
-        return -1;
-    }
-
-    /* Git inherits the isolated GNUPGHOME, but executable selection is a
-     * separate trust decision. Publish the exact absolute program already
-     * retained by this manager transaction so Git signing and manager helpers
-     * cannot diverge after PATH changes. Keep unrelated format selectors out
-     * of the effective OpenPGP model. */
-    if (git_unset_config_value(GIT_CONFIG_GPG_PROGRAM, scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.program");
-        return -1;
-    }
-    if (git_unset_config_value(GIT_CONFIG_GPG_X509_PROGRAM, scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.x509.program");
-        return -1;
-    }
-    if (git_unset_config_value(GIT_CONFIG_GPG_SSH_PROGRAM, scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.ssh.program");
-        return -1;
-    }
-    if (git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
-                             gpg_config->executable_path, scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Failed to set gpg.openpgp.program");
+    /* Publish the canonical fingerprint, preference, and trusted executable
+     * through one owner-checked Git boundary. A second account incarnation
+     * cannot replace the post-image while it remains attributed to the first. */
+    if (git_configure_openpgp_publication(
+            &configured_account, gpg_config->executable_path, scope) != 0) {
         return -1;
     }
 

@@ -1066,6 +1066,7 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     char agent_sock[PATH_MAX];
     char other_sock[PATH_MAX];
     char current[PATH_MAX];
+    char agent_lock[PATH_MAX];
     char expected_key[PATH_MAX];
     char other_key[PATH_MAX];
     char output[4096];
@@ -1092,9 +1093,11 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         join_path(other_sock, sizeof(other_sock), agent_dir,
                   "/ssh-agent.other.sock") != 0 ||
         join_path(current, sizeof(current), agent_dir, "/current.sock") != 0 ||
+        join_path(agent_lock, sizeof(agent_lock), agent_dir, "/.lock") != 0 ||
         join_path(expected_key, sizeof(expected_key), root, "/expected") != 0 ||
         join_path(other_key, sizeof(other_key), root, "/other") != 0 ||
         mkdir_private(runtime) != 0 || mkdir_private(agent_dir) != 0 ||
+        write_bytes(agent_lock, "", 0, 0600) != 0 ||
         setenv("XDG_RUNTIME_DIR", runtime, 1) != 0) {
         CHECK(!"real SSH liveness fixture setup failed");
         free(saved_runtime);

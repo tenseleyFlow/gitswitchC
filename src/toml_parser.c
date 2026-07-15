@@ -673,6 +673,36 @@ bool toml_validate_ssh_hostname(const char *hostname) {
     return true;
 }
 
+static int toml_validate_account_incarnation_uniformity(
+    const toml_document_t *doc) {
+    bool found_bound_account = false;
+    bool found_legacy_account = false;
+
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const toml_section_t *section = &doc->sections[i];
+        bool has_incarnation = false;
+
+        if (!string_starts_with(section->name, "accounts.")) continue;
+        for (size_t j = 0; j < section->key_count; j++) {
+            const toml_keyvalue_t *kv = &section->keys[j];
+            if (kv->is_set && strcmp(kv->key, "incarnation") == 0) {
+                has_incarnation = true;
+                break;
+            }
+        }
+        found_bound_account |= has_incarnation;
+        found_legacy_account |= !has_incarnation;
+    }
+
+    if (found_bound_account && found_legacy_account) {
+        set_error(
+            ERR_CONFIG_INVALID,
+            "Account document mixes legacy accounts without incarnations and incarnation-bound accounts");
+        return -1;
+    }
+    return 0;
+}
+
 /* Validate TOML document structure for gitswitch schema.
  *
  * Failure granularity matters here (AR-03 M5): this runs inside
@@ -787,6 +817,17 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                     has_email = true;
                     if (kv->type != TOML_TYPE_STRING || !validate_email(kv->value)) {
                         set_error(ERR_CONFIG_INVALID, "Account email must be a valid email address");
+                        return -1;
+                    }
+                }
+
+                if (strcmp(kv->key, "incarnation") == 0) {
+                    if (kv->type != TOML_TYPE_STRING ||
+                        !account_incarnation_is_valid(kv->value)) {
+                        set_error(
+                            ERR_CONFIG_INVALID,
+                            "%s.incarnation must be exactly 64 uppercase hexadecimal digits",
+                            section->name);
                         return -1;
                     }
                 }
@@ -1486,6 +1527,16 @@ static int toml_validate_model_invariants(const toml_document_t *doc,
                     return -1;
             }
         }
+    }
+
+    /* Incarnation migration is document-atomic. Pass one proved the raw
+     * section/key bounds, so inspect every account now, before pass two can
+     * reject a missing required field and before schema semantics can hide a
+     * recoverably skipped section. Otherwise a mixed generation can evade
+     * the loader's later live-account count. */
+    if (require_schema_fields &&
+        toml_validate_account_incarnation_uniformity(doc) != 0) {
+        return -1;
     }
 
     /* Pass two may safely scan the complete model for namespace and required

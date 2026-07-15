@@ -292,6 +292,10 @@ int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size);
  * The private SSH runtime directory is inspected under the manager lock, and
  * current.sock must be a stable symlink to an exact same-directory
  * ssh-agent.<name>.sock entry backed by a live, user-owned 0600 socket.
+ * Discovery acquires only an already-existing self-owned 0600 manager lock;
+ * it never creates or repairs runtime state. A missing manager lock means no
+ * manager-owned generation can be proven and returns success with
+ * `*present == false` without inspecting current.sock.
  *
  * Returns 0 with `*present == false` when the managed directory or current.sock
  * is absent. Returns 0 with `*present == true` and a NUL-terminated name for a

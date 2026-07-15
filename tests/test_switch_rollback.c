@@ -1038,6 +1038,26 @@ static int concurrent_config_runner(const char *const argv[],
 
 /* ---- ctx factory ---------------------------------------------------------- */
 
+/* Hand-built contexts in this suite model accounts that already came from a
+ * fully migrated persisted document. Derive a stable, canonical 256-bit token
+ * from the fixture ID so multi-account contexts never accidentally share one
+ * incarnation. Tests that explicitly exercise legacy accounts clear it. */
+static void bind_rollback_test_incarnation(account_t *account) {
+    static const char hexadecimal[] = "0123456789ABCDEF";
+    uint32_t value;
+
+    if (!account) return;
+    memset(account->incarnation, '0', ACCOUNT_INCARNATION_HEX_LEN);
+    value = account->id;
+    for (size_t i = 0; i < sizeof(value) * 2U; i++) {
+        account->incarnation[ACCOUNT_INCARNATION_HEX_LEN - 1U - i] =
+            hexadecimal[value & 0x0FU];
+        value >>= 4U;
+    }
+    account->incarnation[ACCOUNT_INCARNATION_HEX_LEN] = '\0';
+    account->incarnation_persisted = true;
+}
+
 /* One SSH/GPG-disabled account with global preferred scope (avoids both real
  * agent startup and the not-in-a-repo consent prompt). */
 static gitswitch_ctx_t make_ctx(void) {
@@ -1045,6 +1065,7 @@ static gitswitch_ctx_t make_ctx(void) {
     memset(&ctx, 0, sizeof(ctx));
     account_t *a = &ctx.accounts[0];
     a->id = 1;
+    bind_rollback_test_incarnation(a);
     safe_strncpy(a->name, "testacct", sizeof(a->name));
     safe_strncpy(a->email, "test@example.com", sizeof(a->email));
     safe_strncpy(a->description, "test account", sizeof(a->description));
@@ -1061,6 +1082,7 @@ static account_t *add_previous_account(gitswitch_ctx_t *ctx) {
     account_t *prev = &ctx->accounts[1];
     memset(prev, 0, sizeof(*prev));
     prev->id = 2;
+    bind_rollback_test_incarnation(prev);
     safe_strncpy(prev->name, "prev", sizeof(prev->name));
     safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
     safe_strncpy(prev->description, "previous account", sizeof(prev->description));
@@ -1096,6 +1118,47 @@ static void seed_previous_git_identity(void) {
 static int write_fake_key(const char *path);
 
 /* ---- tests ---------------------------------------------------------------- */
+
+/* AR-11 M8: durable Git provenance may only be attributed to an account that
+ * has an immutable incarnation from a completed full-document save. A legacy
+ * in-memory target must fail before Git inspection, runtime teardown, or
+ * active-account publication rather than creating ownerless Git state. */
+TEST(unpersisted_target_fails_before_switch_mutation) {
+    error_context_t failure;
+    int returned_errno;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    gitswitch_ctx_t ctx = make_ctx();
+    memset(ctx.accounts[0].incarnation, 0,
+           sizeof(ctx.accounts[0].incarnation));
+    ctx.accounts[0].incarnation_persisted = false;
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    clear_error();
+    errno = 0;
+
+    command_runner_fn previous = run_set_runner(fake_runner);
+    int rc = accounts_switch(&ctx, "testacct");
+    returned_errno = errno;
+    failure = *get_last_error();
+    run_set_runner(previous);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(returned_errno, ESTALE);
+    CHECK_EQ_INT(failure.code, ERR_CONFIG_INVALID);
+    CHECK(strstr(failure.message, "no persisted immutable incarnation") !=
+          NULL);
+    CHECK_EQ_INT(g_fake_runner_calls, 0);
+    CHECK_EQ_INT(g_user_name_writes, 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(ctx.current_account == NULL);
+    CHECK(ctx.config.active_account[0] == '\0');
+    CHECK(symlink_present(g_ssh_sock));
+    CHECK(symlink_present(g_gpg_link));
+}
 
 /* AR-07 T1: snapshot acquisition is the Git transaction boundary. Fail only
  * the first worktree-scope probe: if accounts_switch ever ignores the
@@ -1490,6 +1553,7 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
     account_t *broken = &ctx.accounts[1];
     memset(broken, 0, sizeof(*broken));
     broken->id = 2;
+    bind_rollback_test_incarnation(broken);
     safe_strncpy(broken->name, "broken", sizeof(broken->name));
     safe_strncpy(broken->email, "broken@example.com", sizeof(broken->email));
     safe_strncpy(broken->description, "invalid second target",
@@ -1568,6 +1632,7 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     account_t *second = &ctx.accounts[1];
     memset(second, 0, sizeof(*second));
     second->id = 2;
+    bind_rollback_test_incarnation(second);
     safe_strncpy(second->name, "second", sizeof(second->name));
     safe_strncpy(second->email, "second@example.com", sizeof(second->email));
     safe_strncpy(second->description, "valid second target",
@@ -1644,6 +1709,7 @@ TEST(repeated_signals_during_previous_session_cleanup_wait_for_abort) {
 
     memset(&ctx.accounts[1], 0, sizeof(ctx.accounts[1]));
     ctx.accounts[1].id = 2;
+    bind_rollback_test_incarnation(&ctx.accounts[1]);
     safe_strncpy(ctx.accounts[1].name, "second",
                  sizeof(ctx.accounts[1].name));
     safe_strncpy(ctx.accounts[1].email, "second@example.com",
@@ -1795,6 +1861,7 @@ TEST(failed_switch_restarts_previous_accounts_agent) {
     account_t *prev = &ctx.accounts[1];
     memset(prev, 0, sizeof(*prev));
     prev->id = 2;
+    bind_rollback_test_incarnation(prev);
     safe_strncpy(prev->name, "prev", sizeof(prev->name));
     safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
     safe_strncpy(prev->description, "previous account", sizeof(prev->description));
@@ -1859,6 +1926,7 @@ static int setup_alias_ctx(gitswitch_ctx_t *ctx, const char *alias) {
 
     memset(prev, 0, sizeof(*prev));
     prev->id = 2;
+    bind_rollback_test_incarnation(prev);
     safe_strncpy(prev->name, "prev", sizeof(prev->name));
     safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
     safe_strncpy(prev->description, "previous account", sizeof(prev->description));
@@ -2741,6 +2809,7 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
     account_t *second = &ctx.accounts[1];
     memset(second, 0, sizeof(*second));
     second->id = 2;
+    bind_rollback_test_incarnation(second);
     safe_strncpy(second->name, "second", sizeof(second->name));
     safe_strncpy(second->email, "second@example.com", sizeof(second->email));
     second->preferred_scope = GIT_SCOPE_GLOBAL;
@@ -2969,6 +3038,7 @@ TEST(failed_switch_retargets_gpg_current_to_previous_home) {
     account_t *prev = &ctx.accounts[1];
     memset(prev, 0, sizeof(*prev));
     prev->id = 2;
+    bind_rollback_test_incarnation(prev);
     safe_strncpy(prev->name, "prev", sizeof(prev->name));
     safe_strncpy(prev->email, "prev@example.com", sizeof(prev->email));
     safe_strncpy(prev->description, "previous account", sizeof(prev->description));
@@ -4383,6 +4453,7 @@ TEST(sigint_mid_git_config_rolls_back_then_reraises) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
+    RUN_TEST(unpersisted_target_fails_before_switch_mutation);
     RUN_TEST(snapshot_failure_aborts_before_any_git_write);
     RUN_TEST(signal_guard_failure_aborts_before_switch_mutation);
     RUN_TEST(snapshot_listing_failure_aborts_before_ssh_activation);

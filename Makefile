@@ -352,7 +352,7 @@ endif
 # Source files (Phase 2 - Configuration Management)
 PHASE2_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/error.c $(SRCDIR)/utils.c \
                  $(SRCDIR)/display.c $(SRCDIR)/toml_parser.c $(SRCDIR)/config.c \
-                 $(SRCDIR)/accounts.c $(SRCDIR)/prompt.c
+                 $(SRCDIR)/publication.c $(SRCDIR)/accounts.c $(SRCDIR)/prompt.c
 
 # Source files (Phase 3 - Git Operations)
 PHASE3_SOURCES = $(PHASE2_SOURCES) $(SRCDIR)/git_ops.c

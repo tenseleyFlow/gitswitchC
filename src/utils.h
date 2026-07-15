@@ -101,6 +101,19 @@ int open_private_subdir_at(int parent_fd, const char *name, bool create,
  */
 int lock_private_file_at(int dir_fd, const char *name);
 int try_lock_private_file_at(int dir_fd, const char *name);
+/**
+ * Non-blockingly acquire an already-existing exact private lock file without
+ * creating it or repairing its metadata. The entry must be a self-owned 0600
+ * regular file with one link. An absent entry returns -1 with errno=ENOENT.
+ */
+int try_lock_existing_private_file_at(int dir_fd, const char *name);
+/**
+ * Prove that a live opaque token still owns the exact private lock file named
+ * in the pinned directory. Returns 0 only while both the token registration
+ * and the directory-entry identity still match the acquisition; otherwise
+ * returns -1 with errno set to ESTALE (or EINVAL for invalid arguments).
+ */
+int verify_private_lock_file_at(int token_fd, int dir_fd, const char *name);
 void unlock_private_file(int token_fd);
 
 /**
@@ -391,6 +404,9 @@ bool text_is_tty_safe(const char *text);
  */
 void secure_zero_memory(void *ptr, size_t size);
 int generate_random_string(char *buffer, size_t buffer_size, const char *charset);
+/* Exact immutable-account identity grammar shared by the TOML and durable
+ * publication trust boundaries: 64 uppercase hexadecimal digits plus NUL. */
+bool account_incarnation_is_valid(const char *incarnation);
 bool check_file_permissions_safe(const char *file_path, mode_t expected_mode);
 
 /**

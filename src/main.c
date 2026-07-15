@@ -662,6 +662,7 @@ int main(int argc, char *argv[]) {
     bool has_mutation_result = false;
     bool signal_guard_cleanup_failed = false;
     bool retained_account_context = false;
+    bool read_only_command = false;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
     int opt;
@@ -920,14 +921,14 @@ int main(int argc, char *argv[]) {
      * split-identity races the lock exists to prevent (AR-02 #17). */
     {
         const char *c = command;
-        bool read_only = resume_check || (c == NULL) ||
+        read_only_command = resume_check || (c == NULL) ||
             strcmp(c, "list") == 0 || strcmp(c, "ls") == 0 ||
             strcmp(c, "status") == 0 || strcmp(c, "doctor") == 0 ||
             strcmp(c, "health") == 0;
         /* Preview-only work must not create/chmod the config directory or its
          * lock. The read-only initializer below can still inspect an existing
          * config, while a fresh HOME remains byte-for-byte untouched. */
-        if (!read_only && !dry_run) {
+        if (!read_only_command && !dry_run) {
             config_lock_fd = config_write_lock();
             if (config_lock_fd < 0) {
                 int lock_errno = errno;
@@ -967,7 +968,8 @@ int main(int argc, char *argv[]) {
         (strcmp(command, "list") == 0 || strcmp(command, "ls") == 0);
     int config_rc = names_list ? config_init_names(ctx) :
         ((dry_run || resume_check) ? config_init_readonly(ctx) :
-                                     config_init(ctx));
+         (read_only_command ? config_init_runtime_readonly(ctx) :
+                              config_init(ctx)));
     if (config_rc != 0) {
         display_error("Configuration initialization failed", "%s", get_last_error()->message);
         exit_code = EXIT_CONFIG_ERROR;
@@ -1118,10 +1120,17 @@ int main(int argc, char *argv[]) {
                     }
                 } else if (mutation.switch_prepare_state ==
                            ACCOUNTS_SWITCH_PREPARE_PREPARED) {
-                    save_rc =
-                        config_save_active_account_transactional_guarded(
-                            ctx, ctx->config.config_path, &config_installed,
-                            &mutation.hint_snapshot);
+                    const publication_record_t *publication = NULL;
+
+                    if (accounts_switch_publication(ctx, &publication) != 0) {
+                        save_rc = -1;
+                    } else {
+                        save_rc =
+                            config_save_active_account_publication_transactional_guarded(
+                                ctx, ctx->config.config_path, publication,
+                                &config_installed,
+                                &mutation.hint_snapshot);
+                    }
                 } else if (mutation.reset_guarded) {
                     save_rc = config_save_active_account_transactional(
                         ctx, ctx->config.config_path, &config_installed);
@@ -1695,6 +1704,37 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
         display_success("DRY RUN complete - no changes were made");
         result.status = EXIT_SUCCESS;
         return result;
+    }
+
+    /* Resolve the selector before crossing the legacy-document migration
+     * boundary. Unknown, ambiguous, or otherwise inadmissible selectors are
+     * not real switches and must fail without rewriting the account file. The
+     * prepared switch resolves it again under the same outer config lock after
+     * migration, so no pointer from this admission check is retained. */
+    if (!config_find_account(ctx, identifier)) {
+        display_error("Failed to switch account", "%s",
+                      get_last_error()->message);
+        return result;
+    }
+
+    /* Legacy account documents remain entropy- and write-free while being
+     * listed, inspected, or previewed. A real switch is their explicit
+     * migration boundary: persist the complete incarnation-bound account
+     * model under the CLI's outer config lock before capturing switch
+     * rollback state or touching any runtime/Git destination. */
+    {
+        bool migration_installed = false;
+        if (config_migrate_account_incarnations(
+                ctx, ctx->config.config_path,
+                &migration_installed) != 0) {
+            display_error(
+                "Cannot bind legacy account identities",
+                "%s%s", get_last_error()->message,
+                migration_installed
+                    ? "; the account document may have installed; reload and retry"
+                    : "");
+            return result;
+        }
     }
 
     /* The hint before-image must be complete before Git or runtime mutation.
@@ -2637,8 +2677,8 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     {
         size_t identity_cleared = 0;
         if (target_account) {
-            if (git_retire_account_identity(target_account,
-                                            &identity_cleared) != 0) {
+            if (accounts_retire_git_identity(ctx, target_account,
+                                             &identity_cleared) != 0) {
                 fprintf(stderr,
                         "gitswitch: WARNING: durable Git configuration may "
                         "still select reset account '%s': %s\n",
@@ -2651,8 +2691,8 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         } else {
             for (size_t i = 0; i < ctx->account_count; i++) {
                 size_t account_cleared = 0;
-                if (git_retire_account_identity(&ctx->accounts[i],
-                                                &account_cleared) != 0) {
+                if (accounts_retire_git_identity(ctx, &ctx->accounts[i],
+                                                 &account_cleared) != 0) {
                     fprintf(stderr,
                             "gitswitch: WARNING: durable Git configuration "
                             "may still select reset account '%s': %s\n",

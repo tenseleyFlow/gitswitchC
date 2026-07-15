@@ -92,6 +92,7 @@ typedef struct {
 typedef struct {
     struct stat identity;
     int fd;
+    bool observational;
     char anchor[96];
 } ssh_runtime_pin_t;
 
@@ -116,6 +117,9 @@ static void ssh_runtime_pin_init(ssh_runtime_pin_t *pin);
 static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
                                     const char *display_path,
                                     ssh_runtime_pin_t *pin);
+static int observe_ssh_runtime_entry_at(int dir_fd, const char *name,
+                                        const char *display_path,
+                                        ssh_runtime_pin_t *pin);
 static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
                                      const char *display_path,
                                      const ssh_runtime_pin_t *pin);
@@ -1256,7 +1260,7 @@ static int lock_agent_dir(int dir_fd) {
  * exactly as main.c's config lock is non-blocking for the same reason
  * (AR-03 L10); only genuine writers (start/reap/reset) may block. */
 static int try_lock_agent_dir(int dir_fd) {
-    int fd = try_lock_private_file_at(dir_fd, ".lock");
+    int fd = try_lock_existing_private_file_at(dir_fd, ".lock");
     if (fd >= 0) g_agent_lock_depth++;
     return fd;
 }
@@ -5882,11 +5886,57 @@ static int pin_ssh_runtime_entry_at(int dir_fd, const char *name,
     return 0;
 }
 
+/* Runtime discovery is observational. On systems with O_PATH, reuse the
+ * descriptor pin without touching the namespace. Platforms that cannot open
+ * a filesystem socket use a revision snapshot under the already-held exact
+ * manager lock; every supported writer takes that lock, and the named entry
+ * is revalidated after each external scheduling point. Mutating teardown and
+ * publication paths retain the hard-link anchor fallback above. */
+static int observe_ssh_runtime_entry_at(int dir_fd, const char *name,
+                                        const char *display_path,
+                                        ssh_runtime_pin_t *pin) {
+#if defined(O_PATH)
+    return pin_ssh_runtime_entry_at(dir_fd, name, display_path, pin);
+#else
+    struct stat named;
+
+    if (dir_fd < 0 || !name || !*name || !pin) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid SSH runtime observation arguments");
+        errno = EINVAL;
+        return -1;
+    }
+    ssh_runtime_pin_init(pin);
+    if (fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return 1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect SSH runtime artifact: %s",
+                         display_path ? display_path : name);
+        return -1;
+    }
+    pin->identity = named;
+    pin->observational = true;
+    return 0;
+#endif
+}
+
 static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
                                      const char *display_path,
                                      const ssh_runtime_pin_t *pin) {
     struct stat held;
     struct stat named;
+
+    if (pin && pin->observational) {
+        if (fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !same_runtime_revision(&pin->identity, &named)) {
+            set_error(ERR_FILE_IO,
+                      "SSH runtime artifact changed while observed: %s",
+                      display_path ? display_path : name);
+            errno = ESTALE;
+            return -1;
+        }
+        return 0;
+    }
 
     if (stat_ssh_runtime_pin(pin, dir_fd, &held) != 0 ||
         fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
@@ -5903,6 +5953,10 @@ static int verify_ssh_runtime_pin_at(int dir_fd, const char *name,
 
 static int release_ssh_runtime_pin(int dir_fd, ssh_runtime_pin_t *pin) {
     if (!pin) return 0;
+    if (pin->observational) {
+        ssh_runtime_pin_init(pin);
+        return 0;
+    }
     if (pin->fd >= 0) {
         int fd = pin->fd;
         pin->fd = -1;
@@ -6107,15 +6161,20 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
         return -1;
     }
 
-    /* Discovery never waits on a writer that may be parked at an interactive
-     * prompt for minutes. On contention return an error so
+    /* Discovery never creates or repairs the writer lock and never waits on a
+     * writer that may be parked at an interactive prompt for minutes. A
+     * missing lock means no manager-owned runtime generation can be proven;
+     * return an ordinary absence without inspecting unlocked entries. On
+     * contention return an error so
      * accounts_detect_current serves the persisted saved-account fallback
-     * instead of hanging every read-only command (AR-05 H2). Linux/FreeBSD
-     * pins are descriptor-only; Darwin briefly creates a reserved hard-link
-     * anchor inside this locked private directory and retires it before
-     * returning, without changing either public runtime name. */
+     * instead of hanging every read-only command (AR-05 H2). Observation is
+     * namespace-preserving on every supported platform. */
     lock_fd = try_lock_agent_dir(dir_fd);
     if (lock_fd < 0) {
+        if (errno == ENOENT) {
+            close(dir_fd);
+            return 0;
+        }
         bool contended = errno == EWOULDBLOCK;
 #if EAGAIN != EWOULDBLOCK
         contended = contended || errno == EAGAIN;
@@ -6134,7 +6193,7 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     }
 
     {
-        int pin_rc = pin_ssh_runtime_entry_at(
+        int pin_rc = observe_ssh_runtime_entry_at(
             dir_fd, "current.sock", current, &current_pin);
         if (pin_rc > 0) {
             rc = 0;
@@ -6222,7 +6281,7 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     }
 
     {
-        int pin_rc = pin_ssh_runtime_entry_at(
+        int pin_rc = observe_ssh_runtime_entry_at(
             dir_fd, component, target, &socket_pin);
         if (pin_rc > 0 && expected) {
             rc = 0;

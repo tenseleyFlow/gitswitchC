@@ -190,6 +190,32 @@ static int directory_entry_count(const char *path) {
     return count;
 }
 
+static bool preserved_metadata_equal(const struct stat *before,
+                                     const struct stat *after) {
+    bool timestamps_equal;
+
+#ifdef __APPLE__
+    timestamps_equal =
+        before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+        before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec &&
+        before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+        before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+    timestamps_equal =
+        before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+        before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+        before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+        before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_mode == after->st_mode &&
+           before->st_nlink == after->st_nlink &&
+           before->st_uid == after->st_uid &&
+           before->st_gid == after->st_gid &&
+           before->st_size == after->st_size && timestamps_equal;
+}
+
 static size_t count_occurrences(const char *text, const char *needle) {
     size_t count = 0;
     size_t length = strlen(needle);
@@ -383,7 +409,7 @@ static int create_runtime_socket(const char *path, int *fd_out) {
     address.sun_family = AF_UNIX;
     memcpy(address.sun_path, path, strlen(path) + 1);
     if (bind(fd, (struct sockaddr *)(void *)&address, sizeof(address)) != 0 ||
-        chmod(path, 0600) != 0) {
+        chmod(path, 0600) != 0 || listen(fd, 4) != 0) {
         close(fd);
         return -1;
     }
@@ -1071,9 +1097,13 @@ TEST(names_loader_preserves_account_admission_without_runtime_work) {
     env_snapshot_t saved;
     command_runner_fn old_runner;
     ssh_probe_poll_fn old_probe;
-    struct stat socket_before;
-    struct stat socket_after;
+    struct stat runtime_before = {0}, runtime_after = {0};
+    struct stat manager_before = {0}, manager_after = {0};
+    struct stat socket_before = {0}, socket_after = {0};
+    struct stat current_before = {0}, current_after = {0};
+    struct stat lock_before = {0}, lock_after = {0};
     int socket_fd = -1;
+    int lock_fd = -1;
 
     CHECK_EQ_INT(make_home_fixture(root, sizeof(root), home, sizeof(home),
                                    runtime, sizeof(runtime), config_dir,
@@ -1093,7 +1123,10 @@ TEST(names_loader_preserves_account_admission_without_runtime_work) {
                            ".lock"), 0);
     CHECK_EQ_INT(path_join(shared_lock_dir, sizeof(shared_lock_dir), runtime,
                            "gitswitch-runtime"), 0);
+    CHECK_EQ_INT(lstat(runtime, &runtime_before), 0);
+    CHECK_EQ_INT(lstat(ssh_dir, &manager_before), 0);
     CHECK_EQ_INT(lstat(socket_path, &socket_before), 0);
+    CHECK_EQ_INT(lstat(current_path, &current_before), 0);
     save_environment(&saved);
     CHECK_EQ_INT(setenv("HOME", home, 1), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
@@ -1117,25 +1150,61 @@ TEST(names_loader_preserves_account_admission_without_runtime_work) {
     CHECK_EQ_INT(directory_entry_count(ssh_dir), 2);
     CHECK(access(agent_lock, F_OK) != 0);
     CHECK(access(shared_lock_dir, F_OK) != 0);
+    CHECK_EQ_INT(lstat(runtime, &runtime_after), 0);
+    CHECK_EQ_INT(lstat(ssh_dir, &manager_after), 0);
     CHECK_EQ_INT(lstat(socket_path, &socket_after), 0);
-    CHECK_EQ_INT(socket_before.st_dev, socket_after.st_dev);
-    CHECK_EQ_INT(socket_before.st_ino, socket_after.st_ino);
+    CHECK_EQ_INT(lstat(current_path, &current_after), 0);
+    CHECK(preserved_metadata_equal(&runtime_before, &runtime_after));
+    CHECK(preserved_metadata_equal(&manager_before, &manager_after));
+    CHECK(preserved_metadata_equal(&socket_before, &socket_after));
+    CHECK(preserved_metadata_equal(&current_before, &current_after));
     CHECK_EQ_INT(path_join(lock_path, sizeof(lock_path), config_dir,
                            ".config.lock"), 0);
     CHECK(access(lock_path, F_OK) != 0);
 
-    /* Positive control: the ordinary loader must traverse this planted live
-     * runtime namespace and therefore create its manager lock. If discovery
-     * is accidentally restored to config_init_names(), the assertions above
-     * fail even on platforms where connect(2) resolves without poll(2). */
+    /* Positive control: discovery observes only a manager-owned generation;
+     * seed its production-shaped lock explicitly, then prove the ordinary
+     * loader selects the live account without changing any runtime identity
+     * or metadata. The names-only assertions above remain responsible for
+     * proving that completion neither creates this lock nor probes the socket. */
+    lock_fd = open(agent_lock, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    CHECK(lock_fd >= 0);
+    if (lock_fd >= 0) {
+        CHECK_EQ_INT(fchmod(lock_fd, 0600), 0);
+        CHECK_EQ_INT(close(lock_fd), 0);
+        lock_fd = -1;
+    }
+    CHECK_EQ_INT(lstat(agent_lock, &lock_before), 0);
+    CHECK_EQ_INT(lock_before.st_mode & 0777, 0600);
+    CHECK_EQ_INT(lstat(runtime, &runtime_before), 0);
+    CHECK_EQ_INT(lstat(ssh_dir, &manager_before), 0);
+    CHECK_EQ_INT(lstat(socket_path, &socket_before), 0);
+    CHECK_EQ_INT(lstat(current_path, &current_before), 0);
     memset(&full_ctx, 0, sizeof(full_ctx));
     CHECK_EQ_INT(config_load(&full_ctx, config_path), 0);
-    CHECK(access(agent_lock, F_OK) == 0);
+    CHECK(full_ctx.current_account == &full_ctx.accounts[0]);
+    if (full_ctx.current_account) {
+        CHECK_STR_EQ(full_ctx.current_account->name, "Alpha");
+    }
     CHECK_EQ_INT(full_ctx.account_count, names_ctx.account_count);
     for (size_t i = 0; i < names_ctx.account_count; i++) {
         CHECK_STR_EQ(full_ctx.accounts[i].name, names_ctx.accounts[i].name);
     }
+    CHECK_EQ_INT(directory_entry_count(runtime), 1);
+    CHECK_EQ_INT(directory_entry_count(ssh_dir), 3);
+    CHECK(access(shared_lock_dir, F_OK) != 0);
+    CHECK_EQ_INT(lstat(agent_lock, &lock_after), 0);
+    CHECK_EQ_INT(lstat(runtime, &runtime_after), 0);
+    CHECK_EQ_INT(lstat(ssh_dir, &manager_after), 0);
+    CHECK_EQ_INT(lstat(socket_path, &socket_after), 0);
+    CHECK_EQ_INT(lstat(current_path, &current_after), 0);
+    CHECK(preserved_metadata_equal(&lock_before, &lock_after));
+    CHECK(preserved_metadata_equal(&runtime_before, &runtime_after));
+    CHECK(preserved_metadata_equal(&manager_before, &manager_after));
+    CHECK(preserved_metadata_equal(&socket_before, &socket_after));
+    CHECK(preserved_metadata_equal(&current_before, &current_after));
     if (socket_fd >= 0) close(socket_fd);
+    if (lock_fd >= 0) close(lock_fd);
     restore_environment(&saved);
 }
 

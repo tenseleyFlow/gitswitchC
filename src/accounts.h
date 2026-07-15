@@ -4,6 +4,7 @@
 #define ACCOUNTS_H
 
 #include "gitswitch.h"
+#include "publication.h"
 
 /* One process-global owner serializes every account mutation family. Tokens
  * are monotonically assigned and must match every rollback/finalizer call;
@@ -122,6 +123,12 @@ int accounts_switch_prepare_result(gitswitch_ctx_t *ctx,
 int accounts_switch_commit(gitswitch_ctx_t *ctx);
 int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                                   accounts_switch_commit_state_t *state);
+/* Borrow the exact sealed Git publication owned by a prepared switch. The
+ * pointer remains valid only until that switch is committed or aborted. CLI
+ * persistence uses it to install provenance in the same atomic active-state
+ * bundle before releasing transaction ownership. */
+int accounts_switch_publication(
+    const gitswitch_ctx_t *ctx, const publication_record_t **publication);
 /* continue_persistence_rollback keeps the signal rollback window active so
  * the caller can restore config/hint state without an interruptible gap. */
 int accounts_switch_abort(gitswitch_ctx_t *ctx,
@@ -182,6 +189,13 @@ int accounts_list(const gitswitch_ctx_t *ctx);
  * - Indicates scope (local/global)
  */
 int accounts_show_status(const gitswitch_ctx_t *ctx);
+
+/* Retire only durable Git credential state whose ownership is proven by the
+ * publication ledger belonging to `ctx`. GPG-enabled accounts fail before
+ * mutation when canonical provenance is absent, incomplete, or ambiguous. */
+int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
+                                 const account_t *account,
+                                 size_t *cleared);
 
 /**
  * Validate account configuration

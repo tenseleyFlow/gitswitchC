@@ -17,6 +17,7 @@
 #endif
 
 #include "test.h"
+#include "config.h"
 #include "gitswitch.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -113,6 +114,64 @@ static const char *slurp(const char *path, char *buf, size_t size) {
     buf[n] = '\0';
     fclose(f);
     return buf;
+}
+
+/* The active-state file's first two lines remain a byte-stable shell contract,
+ * while AR-11 appends a canonical publication ledger whose object identities
+ * necessarily vary per fixture. Verify the header bytes exactly, then parse
+ * and inspect the complete tail rather than ignoring it or freezing dynamic
+ * inode/timestamp text into the test. */
+static void check_identity_only_global_state_bundle(
+    const char *hint_path, const char *config_path, const char *home,
+    const char *expected_header) {
+    char contents[16384];
+    char expected_git_config[MAX_PATH_LEN];
+    publication_ledger_t ledger;
+    const publication_record_t *record;
+    size_t header_length = strlen(expected_header);
+    int rc;
+
+    publication_ledger_init(&ledger);
+    slurp(hint_path, contents, sizeof(contents));
+    CHECK(strncmp(contents, expected_header, header_length) == 0);
+    if (strncmp(contents, expected_header, header_length) != 0) {
+        goto cleanup;
+    }
+    CHECK(strncmp(contents + header_length, "publications=v1\n",
+                  sizeof("publications=v1\n") - 1U) == 0);
+
+    rc = config_load_publication_ledger(config_path, &ledger);
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
+    CHECK(ledger.present);
+    CHECK_EQ_INT(ledger.version, PUBLICATION_LEDGER_VERSION);
+    CHECK_EQ_INT(ledger.count, 1);
+    if (!ledger.present || ledger.count != 1U) goto cleanup;
+
+    record = &ledger.records[0];
+    CHECK_EQ_INT(publication_record_validate(record), 0);
+    CHECK_EQ_INT(record->account_id, 1);
+    CHECK_EQ_INT(record->scope, PUBLICATION_SCOPE_GLOBAL);
+    CHECK_EQ_INT(record->state, PUBLICATION_STATE_PUBLISHED);
+    CHECK_EQ_INT(record->capabilities,
+                 PUBLICATION_CAP_DESTINATION |
+                     PUBLICATION_CAP_POST_GENERATION);
+    rc = snprintf(expected_git_config, sizeof(expected_git_config),
+                  "%s/.gitconfig", home);
+    CHECK(rc > 0 && (size_t)rc < sizeof(expected_git_config));
+    if (rc > 0 && (size_t)rc < sizeof(expected_git_config)) {
+        CHECK_STR_EQ(record->config_path, expected_git_config);
+    }
+    CHECK(record->config_parent.present);
+    CHECK(record->post_config.present);
+    CHECK_STR_EQ(record->repository_path, "");
+    CHECK_STR_EQ(record->gpg_fingerprint, "");
+    CHECK_STR_EQ(record->gpg_program, "");
+    CHECK_STR_EQ(record->ssh_command, "");
+    CHECK_STR_EQ(record->ssh_program, "");
+
+cleanup:
+    publication_ledger_clear(&ledger);
 }
 
 /* ---------- SIPW-1: `init` must detect stdout write failure ---------- */
@@ -1031,9 +1090,10 @@ TEST(switch_writes_resume_hint_and_reset_clears_it) {
     rc = run_shell(cmd);
     CHECK_EQ_INT(rc, 0);
 
-    /* Exact content: the shell snippet string-matches on it. */
-    slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "none\nactive=solo\n");
+    /* The shell-consumed header is exact; the complete durable publication
+     * tail must parse and identify this global Git destination. */
+    check_identity_only_global_state_bundle(
+        hint, toml_path, home, "none\nactive=solo\n");
     slurp(toml_path, buf, sizeof(buf));
     CHECK(strstr(buf, "active_account") == NULL);
 
@@ -1044,8 +1104,8 @@ TEST(switch_writes_resume_hint_and_reset_clears_it) {
              home, rt, g_bin);
     rc = run_shell(cmd);
     CHECK_EQ_INT(rc, 0);
-    slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "none\ninactive=v1\n");
+    check_identity_only_global_state_bundle(
+        hint, toml_path, home, "none\ninactive=v1\n");
     slurp(toml_path, buf, sizeof(buf));
     CHECK(strstr(buf, "active_account") == NULL);
 
@@ -1078,11 +1138,13 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
              "default_scope = \"global\"\n"
              "\n"
              "[accounts.1]\n"
+             "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
              "name = \"good\"\n"
              "email = \"g@example.com\"\n"
              "preferred_scope = \"global\"\n"
              "\n"
              "[accounts.2]\n"
+             "incarnation = \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
              "name = \"%s\"\n"
              "email = \"long@example.com\"\n"
              "\n"
@@ -1125,8 +1187,8 @@ TEST(partial_load_blocks_add_but_switch_persists_active) {
     CHECK(strstr(buf, "active_account") == NULL);
     CHECK(strstr(buf, longname) != NULL);                    /* skipped intact */
     CHECK(strstr(buf, "[account.3]") != NULL);               /* unknown intact (M8) */
-    slurp(hint, buf, sizeof(buf));
-    CHECK_STR_EQ(buf, "none\nactive=good\n");
+    check_identity_only_global_state_bundle(
+        hint, toml_path, home, "none\nactive=good\n");
 
     remove_tree(home);
     remove_tree(rt);
@@ -1155,6 +1217,7 @@ TEST(switch_save_failure_exits_nonzero) {
         "default_scope = \"global\"\n"
         "\n"
         "[accounts.1]\n"
+        "incarnation = \"2222222222222222222222222222222222222222222222222222222222222222\"\n"
         "name = \"solo\"\n"
         "email = \"s@example.com\"\n"
         "preferred_scope = \"global\"\n"), 0);
@@ -1222,6 +1285,111 @@ TEST(configuration_and_command_failures_keep_distinct_exit_codes) {
     remove_tree(rt);
 }
 
+TEST(readonly_cli_forms_never_create_or_rewrite_configuration_state) {
+    static const char *const commands[] = {
+        "list", "status", "doctor", ""
+    };
+    static const char legacy_config[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"observer\"\n"
+        "email = \"observer@example.test\"\n"
+        "preferred_scope = \"global\"\n";
+    char home[256];
+    char rt[256];
+    char cmd[9000];
+    char config_parent[512];
+    char config_dir[512];
+    char config_path[640];
+    char state_path[640];
+    char lock_path[640];
+    char before[4096];
+    char after[4096];
+    struct stat config_before;
+    struct stat dir_before;
+    struct stat observed;
+
+    /* A fresh HOME remains fresh for every command form classified read-only,
+     * including no-command list mode. */
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        int rc;
+
+        if (!make_temp_dir(home, sizeof(home)) ||
+            !make_temp_dir(rt, sizeof(rt))) {
+            CHECK(!"mkdtemp failed");
+            return;
+        }
+        snprintf(config_parent, sizeof(config_parent), "%s/.config", home);
+        snprintf(cmd, sizeof(cmd),
+                 "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' %s "
+                 "</dev/null >/dev/null 2>&1",
+                 home, rt, g_bin, commands[i]);
+        rc = run_shell(cmd);
+        CHECK(rc >= 0 && rc < 126);
+        errno = 0;
+        CHECK_EQ_INT(access(config_parent, F_OK), -1);
+        CHECK_EQ_INT(errno, ENOENT);
+        remove_tree(home);
+        remove_tree(rt);
+    }
+
+    /* An existing legacy document stays byte- and identity-exact, and its
+     * deliberately restrictive private modes are not "repaired" by reads.
+     * No incarnation, state artifact, or config lock is materialized. */
+    if (!make_temp_dir(home, sizeof(home)) ||
+        !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home, legacy_config), 0);
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/gitswitch", home);
+    snprintf(config_path, sizeof(config_path), "%s/accounts.toml",
+             config_dir);
+    snprintf(state_path, sizeof(state_path), "%s/.resume-hint", config_dir);
+    snprintf(lock_path, sizeof(lock_path), "%s/.config.lock", config_dir);
+    CHECK_EQ_INT(chmod(config_path, 0400), 0);
+    CHECK_EQ_INT(chmod(config_dir, 0500), 0);
+    CHECK_EQ_INT(lstat(config_path, &config_before), 0);
+    CHECK_EQ_INT(lstat(config_dir, &dir_before), 0);
+    slurp(config_path, before, sizeof(before));
+
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        int rc;
+
+        snprintf(cmd, sizeof(cmd),
+                 "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' %s "
+                 "</dev/null >/dev/null 2>&1",
+                 home, rt, g_bin, commands[i]);
+        rc = run_shell(cmd);
+        CHECK(rc >= 0 && rc < 126);
+        CHECK_EQ_INT(lstat(config_path, &observed), 0);
+        CHECK_EQ_INT((long)observed.st_dev, (long)config_before.st_dev);
+        CHECK_EQ_INT((long)observed.st_ino, (long)config_before.st_ino);
+        CHECK_EQ_INT((long)(observed.st_mode & 07777), 0400);
+        CHECK_EQ_INT((long)observed.st_size, (long)config_before.st_size);
+        CHECK_EQ_INT(lstat(config_dir, &observed), 0);
+        CHECK_EQ_INT((long)observed.st_dev, (long)dir_before.st_dev);
+        CHECK_EQ_INT((long)observed.st_ino, (long)dir_before.st_ino);
+        CHECK_EQ_INT((long)(observed.st_mode & 07777), 0500);
+        slurp(config_path, after, sizeof(after));
+        CHECK_STR_EQ(after, before);
+        CHECK(strstr(after, "incarnation") == NULL);
+        errno = 0;
+        CHECK_EQ_INT(access(state_path, F_OK), -1);
+        CHECK_EQ_INT(errno, ENOENT);
+        errno = 0;
+        CHECK_EQ_INT(access(lock_path, F_OK), -1);
+        CHECK_EQ_INT(errno, ENOENT);
+    }
+
+    CHECK_EQ_INT(chmod(config_dir, 0700), 0);
+    CHECK_EQ_INT(chmod(config_path, 0600), 0);
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 TEST_MAIN_BEGIN()
     if (resolve_binary() != 0) {
         fprintf(stderr, "RESULT FAIL: cannot locate gitswitch binary\n");
@@ -1250,4 +1418,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(partial_load_blocks_add_but_switch_persists_active);
     RUN_TEST(switch_save_failure_exits_nonzero);
     RUN_TEST(configuration_and_command_failures_keep_distinct_exit_codes);
+    RUN_TEST(readonly_cli_forms_never_create_or_rewrite_configuration_state);
 TEST_MAIN_END()

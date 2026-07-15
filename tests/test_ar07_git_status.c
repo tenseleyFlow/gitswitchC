@@ -15,6 +15,19 @@
 
 void git_ops_test_reset_caches(void);
 
+#define STATUS_TEST_INCARNATION \
+    "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789"
+#define STATUS_TEST_INCARNATION_B \
+    "123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0"
+
+static void bind_status_test_incarnation(account_t *account) {
+    if (!account) return;
+    CHECK_EQ_INT(safe_strncpy(account->incarnation,
+                              STATUS_TEST_INCARNATION,
+                              sizeof(account->incarnation)), 0);
+    account->incarnation_persisted = true;
+}
+
 typedef struct {
     char *value;
     bool present;
@@ -47,6 +60,23 @@ static int write_text_file(const char *path, const char *contents,
     if (fclose(file) != 0) failed = 1;
     if (failed) return -1;
     return chmod(path, mode);
+}
+
+static int write_all_test_bytes(int fd, const void *data, size_t length) {
+    const unsigned char *bytes = data;
+    size_t written = 0;
+
+    while (written < length) {
+        ssize_t result = write(fd, bytes + written, length - written);
+        if (result > 0) {
+            written += (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int run_command(const char *const argv[], char *output,
@@ -84,6 +114,9 @@ static size_t fake_failure_diagnostic_len =
 static bool fake_repository;
 static const unsigned char *fake_repo_root;
 static size_t fake_repo_root_len;
+static int fake_non_git_calls;
+static const char *publication_selector_override;
+static bool publication_omit_selector_override;
 
 static bool fake_append(const void *bytes, size_t length) {
     if (length > sizeof(fake_listing) - fake_listing_len) return false;
@@ -142,8 +175,10 @@ static int status_fake_runner(const char *const argv[], const run_opts_t *opts,
     if (result) memset(result, 0, sizeof(*result));
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (!argv[0] || strcmp(argv[0], "git") != 0 || !argv[1])
+    if (!argv[0] || strcmp(argv[0], "git") != 0 || !argv[1]) {
+        fake_non_git_calls++;
         return fake_finish(result, 127);
+    }
     if (strcmp(argv[1], "rev-parse") == 0) {
         static const unsigned char git_dir[] = ".git\n";
 
@@ -758,58 +793,223 @@ TEST(active_status_propagates_required_key_inspection_failure) {
     CHECK_EQ_INT(unlink(key_path), 0);
 }
 
-static int capture_signing_status(const account_t *account,
-                                  const char *signing_key,
-                                  const char *gpg_signing,
-                                  const char *openpgp_program,
-                                  const char *foreign_program_key,
-                                  const char *foreign_program,
-                                  char *status, size_t status_size) {
+static int install_signing_publication(gitswitch_ctx_t *context,
+                                       const account_t *account,
+                                       const char *fingerprint,
+                                       const char *gpg_program,
+                                       publication_state_t state,
+                                       char *origin, size_t origin_size) {
+    static const unsigned char header_prefix[] = "gpg\nactive=";
+    char root[MAX_PATH_LEN] = "/tmp/gsw_ar11_status_XXXXXX";
+    char config_path[MAX_PATH_LEN];
+    char state_path[MAX_PATH_LEN];
+    publication_record_t publication;
+    publication_ledger_t ledger;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0;
+    struct stat st;
+    int origin_length;
+    int fd = -1;
+    int result = -1;
+
+    publication_ledger_init(&ledger);
+    publication_record_init(&publication);
+    if (!context || !account || !origin || origin_size == 0U ||
+        !ts_mkdtemp(root) || chmod(root, 0700) != 0 ||
+        ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        (size_t)snprintf(config_path, sizeof(config_path), "%s/gitconfig",
+                         root) >= sizeof(config_path) ||
+        (size_t)snprintf(state_path, sizeof(state_path), "%s/.resume-hint",
+                         root) >= sizeof(state_path) ||
+        write_text_file(config_path, "[fixture]\n", 0600) != 0 ||
+        stat(root, &st) != 0) {
+        goto cleanup;
+    }
+
+    origin_length = snprintf(origin, origin_size, "file:%s", config_path);
+    if (safe_strncpy(context->config.config_path, config_path,
+                     sizeof(context->config.config_path)) != 0 ||
+        origin_length < 0 || (size_t)origin_length >= origin_size) {
+        goto cleanup;
+    }
+    if (!fingerprint) {
+        result = 0;
+        goto cleanup;
+    }
+    if (!gpg_program) goto cleanup;
+
+    publication.account_id = account->id;
+    if (safe_strncpy(publication.account_incarnation,
+                     account->incarnation,
+                     sizeof(publication.account_incarnation)) != 0) {
+        goto cleanup;
+    }
+    publication.scope = PUBLICATION_SCOPE_GLOBAL;
+    if (safe_strncpy(publication.config_path, config_path,
+                     sizeof(publication.config_path)) != 0) {
+        goto cleanup;
+    }
+    publication_identity_from_stat(&publication.config_parent, &st);
+    if (stat(config_path, &st) != 0) goto cleanup;
+    publication_identity_from_stat(&publication.post_config, &st);
+    if (stat(gpg_program, &st) != 0 || !S_ISREG(st.st_mode) ||
+        safe_strncpy(publication.gpg_fingerprint, fingerprint,
+                     sizeof(publication.gpg_fingerprint)) != 0 ||
+        safe_strncpy(publication.gpg_program, gpg_program,
+                     sizeof(publication.gpg_program)) != 0) {
+        goto cleanup;
+    }
+    publication_identity_from_stat(&publication.gpg_program_identity, &st);
+    publication.capabilities = PUBLICATION_CAP_DESTINATION |
+                               PUBLICATION_CAP_POST_GENERATION |
+                               PUBLICATION_CAP_GPG_FINGERPRINT |
+                               PUBLICATION_CAP_GPG_PROGRAM;
+    if (!publication_omit_selector_override) {
+        if (publication_normalize_gpg_selector(
+                publication_selector_override
+                    ? publication_selector_override
+                    : account->gpg_key_id,
+                publication.gpg_selector) != 0) {
+            goto cleanup;
+        }
+        publication.capabilities |= PUBLICATION_CAP_GPG_SELECTOR;
+    }
+    publication.state = state;
+    if (publication_ledger_upsert(&ledger, &publication) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0 ||
+        publication_record_validate(&publication) != 0) {
+        goto cleanup;
+    }
+
+    fd = open(state_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write_all_test_bytes(fd, header_prefix,
+                             sizeof(header_prefix) - 1U) != 0 ||
+        write_all_test_bytes(fd, account->name,
+                             strlen(account->name)) != 0 ||
+        write_all_test_bytes(fd, "\n", 1U) != 0 ||
+        write_all_test_bytes(fd, tail, tail_length) != 0) {
+        goto cleanup;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    result = 0;
+
+cleanup:
+    if (fd >= 0) close(fd);
+    if (tail) {
+        memset(tail, 0, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
+static int capture_signing_status_incarnation_state(
+    const account_t *account, const char *publication_incarnation,
+    const char *published_fingerprint,
+    const char *published_gpg_program, publication_state_t state,
+    const char *signing_key, const char *gpg_signing,
+    const char *openpgp_program, const char *foreign_program_key,
+    const char *foreign_program, char *status, size_t status_size) {
     gitswitch_ctx_t context;
+    account_t publication_owner;
     command_runner_fn previous;
+    char origin[MAX_PATH_LEN] = "file:/ar09/global";
     int status_rc;
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1;
+    context.accounts[0] = *account;
+    if (!account_incarnation_is_valid(context.accounts[0].incarnation)) {
+        bind_status_test_incarnation(&context.accounts[0]);
+    }
+    context.current_account = &context.accounts[0];
+    publication_owner = context.accounts[0];
+    if (publication_incarnation &&
+        safe_strncpy(publication_owner.incarnation,
+                     publication_incarnation,
+                     sizeof(publication_owner.incarnation)) != 0) {
+        return -1;
+    }
+    publication_owner.incarnation_persisted = true;
+    if (install_signing_publication(&context, &publication_owner,
+                                    published_fingerprint,
+                                    published_gpg_program, state, origin,
+                                    sizeof(origin)) != 0) {
+        return -1;
+    }
 
     fake_listing_len = 0;
     fake_listing_calls = 0;
+    fake_non_git_calls = 0;
     fake_execution_failure = false;
     fake_repository = false;
-    CHECK(fake_append_record("global", "file:/ar09/global", "user.name",
+    CHECK(fake_append_record("global", origin, "user.name",
                              account->name, strlen(account->name)));
-    CHECK(fake_append_record("global", "file:/ar09/global", "user.email",
+    CHECK(fake_append_record("global", origin, "user.email",
                              account->email, strlen(account->email)));
     if (signing_key) {
-        CHECK(fake_append_record("global", "file:/ar09/global",
+        CHECK(fake_append_record("global", origin,
                                  "user.signingkey", signing_key,
                                  strlen(signing_key)));
     }
     if (gpg_signing) {
-        CHECK(fake_append_record("global", "file:/ar09/global",
+        CHECK(fake_append_record("global", origin,
                                  "commit.gpgsign", gpg_signing,
                                  strlen(gpg_signing)));
     }
     if (openpgp_program) {
-        CHECK(fake_append_record("global", "file:/ar09/global",
+        CHECK(fake_append_record("global", origin,
                                  GIT_CONFIG_GPG_OPENPGP_PROGRAM,
                                  openpgp_program,
                                  strlen(openpgp_program)));
     }
     if (foreign_program_key && foreign_program) {
-        CHECK(fake_append_record("global", "file:/ar09/global",
+        CHECK(fake_append_record("global", origin,
                                  foreign_program_key, foreign_program,
                                  strlen(foreign_program)));
     }
-
-    memset(&context, 0, sizeof(context));
-    context.account_count = 1;
-    context.accounts[0] = *account;
-    context.current_account = &context.accounts[0];
 
     git_ops_test_reset_caches();
     previous = run_set_runner(status_fake_runner);
     status_rc = capture_status_output_for(&context, status, status_size);
     run_set_runner(previous);
     git_ops_test_reset_caches();
+    publication_selector_override = NULL;
+    publication_omit_selector_override = false;
     return status_rc;
+}
+
+static int capture_signing_status_state(
+    const account_t *account, const char *published_fingerprint,
+    const char *published_gpg_program, publication_state_t state,
+    const char *signing_key, const char *gpg_signing,
+    const char *openpgp_program, const char *foreign_program_key,
+    const char *foreign_program, char *status, size_t status_size) {
+    return capture_signing_status_incarnation_state(
+        account, NULL, published_fingerprint, published_gpg_program, state,
+        signing_key, gpg_signing, openpgp_program, foreign_program_key,
+        foreign_program, status, status_size);
+}
+
+static int capture_signing_status(const account_t *account,
+                                  const char *published_fingerprint,
+                                  const char *published_gpg_program,
+                                  const char *signing_key,
+                                  const char *gpg_signing,
+                                  const char *openpgp_program,
+                                  const char *foreign_program_key,
+                                  const char *foreign_program,
+                                  char *status, size_t status_size) {
+    return capture_signing_status_state(
+        account, published_fingerprint, published_gpg_program,
+        PUBLICATION_STATE_PUBLISHED, signing_key, gpg_signing,
+        openpgp_program, foreign_program_key, foreign_program, status,
+        status_size);
 }
 
 TEST(active_status_includes_every_selected_signing_field) {
@@ -820,6 +1020,7 @@ TEST(active_status_includes_every_selected_signing_field) {
     account_t account;
     char status[8192];
     char expected_program[MAX_PATH_LEN];
+    saved_env_t gnupg_home;
 
     if (gpg_manager_resolve_executable(expected_program,
                                        sizeof(expected_program)) != 0) {
@@ -834,86 +1035,422 @@ TEST(active_status_includes_every_selected_signing_field) {
                               sizeof(account.email)), 0);
     account.gpg_enabled = true;
     account.gpg_signing_enabled = true;
+    bind_status_test_incarnation(&account);
     CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "0x89abcdef",
                               sizeof(account.gpg_key_id)), 0);
 
     /* A successful switch publishes the canonical primary fingerprint even
      * when the persisted account retains a shorter, 0x-prefixed selector. */
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
-                                        expected_program, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    gnupg_home = save_env("GNUPGHOME");
+    CHECK_EQ_INT(setenv("GNUPGHOME",
+                        "/definitely/not/present/ar11-status-source", 1), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
+    restore_env("GNUPGHOME", &gnupg_home);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
     CHECK(strstr(status, "Effective OpenPGP Program: [MATCH]") != NULL);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
 
     /* Missing/wrong OpenPGP bindings and foreign selector spellings are all
      * mismatches. In particular, the exact same path under legacy
      * gpg.program must not be accepted as equivalent to gpg.openpgp.program. */
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
-                                        NULL, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "true", NULL, NULL, NULL,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
-                                        "/wrong/ar11/gpg", NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "true", "/wrong/ar11/gpg", NULL,
+                     NULL, status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
-                                        NULL, GIT_CONFIG_GPG_PROGRAM,
-                                        expected_program,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "true", NULL, GIT_CONFIG_GPG_PROGRAM,
+                     expected_program, status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
-                                        expected_program,
-                                        GIT_CONFIG_GPG_X509_PROGRAM,
-                                        expected_program,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "true", expected_program,
+                     GIT_CONFIG_GPG_X509_PROGRAM, expected_program,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
-                                        expected_program,
-                                        GIT_CONFIG_GPG_SSH_PROGRAM,
-                                        expected_program,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "true", expected_program,
+                     GIT_CONFIG_GPG_SSH_PROGRAM, expected_program,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, NULL, "true",
-                                        expected_program, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program, NULL,
+                     "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, wrong_key, "true",
-                                        expected_program, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program, wrong_key,
+                     "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
-                                        expected_program, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "false", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
     account.gpg_signing_enabled = false;
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
-                                        expected_program, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, canonical_key, expected_program,
+                     canonical_key, "false", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
 
     account.gpg_enabled = false;
-    CHECK_EQ_INT(capture_signing_status(&account, NULL, "false",
-                                        NULL, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, NULL, NULL, NULL, "false", NULL, NULL, NULL,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
-                                        NULL, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, NULL, NULL, canonical_key, "false", NULL,
+                     NULL, NULL, status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
-    CHECK_EQ_INT(capture_signing_status(&account, NULL, "true",
-                                        NULL, NULL, NULL,
-                                        status, sizeof(status)), 0);
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, NULL, NULL, NULL, "true", NULL, NULL, NULL,
+                     status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+}
+
+TEST(edited_short_selector_cannot_reuse_historical_fingerprint) {
+    static const char published_key[] =
+        "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
+    account_t account;
+    char status[8192];
+    char expected_program[MAX_PATH_LEN];
+
+    if (gpg_manager_resolve_executable(expected_program,
+                                       sizeof(expected_program)) != 0) {
+        TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
+
+    memset(&account, 0, sizeof(account));
+    account.id = 12;
+    CHECK_EQ_INT(safe_strncpy(account.name, "Edited Selector",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "edited@example.test",
+                              sizeof(account.email)), 0);
+    account.gpg_enabled = true;
+    account.gpg_signing_enabled = true;
+    bind_status_test_incarnation(&account);
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "0xFEDCBA98",
+                              sizeof(account.gpg_key_id)), 0);
+
+    /* The immutable account incarnation did not change, but its saved short
+     * selector did. Git still carrying the old canonical publication can no
+     * longer be attributed to this edited account. No keyring observation is
+     * needed or allowed. */
+    publication_selector_override = "0x89abcdef";
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, published_key, expected_program,
+                     published_key, "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+    CHECK(strstr(status, "Match Status: [OK]") == NULL);
+    CHECK(strstr(status,
+                 "Expected Switch-time GPG Selector: 89ABCDEF") != NULL);
+    CHECK(strstr(status,
+                 "Current Account GPG Selector:  FEDCBA98") != NULL);
+    CHECK(strstr(status, "Expected GPG Signing Key:") == NULL);
+
+    /* Optional 0x and ASCII hex case are representation only. */
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "0x89abcdef",
+                              sizeof(account.gpg_key_id)), 0);
+    publication_selector_override = "89ABCDEF";
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, published_key, expected_program,
+                     published_key, "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+
+    /* Selector length is identity-significant even when the short spelling is
+     * a suffix of the historical full selector. */
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "89ABCDEF",
+                              sizeof(account.gpg_key_id)), 0);
+    publication_selector_override = published_key;
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, published_key, expected_program,
+                     published_key, "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), 0);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+    CHECK(strstr(status, "Match Status: [OK]") == NULL);
+    CHECK(strstr(status,
+                 "Expected Switch-time GPG Selector: 0123456789ABCDEF0123456789ABCDEF89ABCDEF") != NULL);
+    CHECK(strstr(status,
+                 "Current Account GPG Selector:  89ABCDEF") != NULL);
+
+    /* Malformed current account input is distinct from missing persisted
+     * switch-time provenance. The status path remains observational and
+     * reports the actual invalid field. */
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "not-hex",
+                              sizeof(account.gpg_key_id)), 0);
+    publication_selector_override = "89ABCDEF";
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, published_key, expected_program,
+                     published_key, "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), -1);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "OpenPGP provenance: [UNAVAILABLE]") == NULL);
+    CHECK(strstr(status,
+                 "Signing attribution: [UNAVAILABLE] current account GPG selector is invalid") != NULL);
+    CHECK(strstr(status,
+                 "Expected Switch-time GPG Selector: 89ABCDEF") != NULL);
+    CHECK(strstr(status,
+                 "Current Account GPG Selector:  not-hex [INVALID]") != NULL);
+    CHECK(strstr(status,
+                 "complete switch-time selector provenance unavailable") == NULL);
+
+    /* Invalid current input keeps ERROR precedence when the configured key is
+     * independently foreign; comparison order cannot downgrade it to WARN. */
+    publication_selector_override = "89ABCDEF";
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, published_key, expected_program,
+                     "0123456789ABCDEF0123456789ABCDEFFEDCBA98", "true",
+                     expected_program, NULL, NULL, status, sizeof(status)),
+                 -1);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status,
+                 "Signing attribution: [UNAVAILABLE] current account GPG selector is invalid") != NULL);
+    CHECK(strstr(status, "Match Status: [WARN]") == NULL);
+
+    /* A legacy fingerprint/program record remains parseable for retirement,
+     * but missing switch-time selector proof is status-unavailable. */
+    publication_omit_selector_override = true;
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, published_key, expected_program,
+                     published_key, "true", expected_program, NULL, NULL,
+                     status, sizeof(status)), -1);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "OpenPGP provenance: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "Signing attribution: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "Match Status: [OK]") == NULL);
+}
+
+TEST(historical_short_selector_without_publication_is_incomplete) {
+    static const char canonical_key[] =
+        "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
+    account_t account;
+    char status[8192];
+    char expected_program[MAX_PATH_LEN];
+
+    if (gpg_manager_resolve_executable(expected_program,
+                                       sizeof(expected_program)) != 0) {
+        TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
+
+    memset(&account, 0, sizeof(account));
+    account.id = 10;
+    CHECK_EQ_INT(safe_strncpy(account.name, "Historical Selector",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email,
+                              "historical@example.test",
+                              sizeof(account.email)), 0);
+    account.gpg_enabled = true;
+    account.gpg_signing_enabled = true;
+    bind_status_test_incarnation(&account);
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "0x89abcdef",
+                              sizeof(account.gpg_key_id)), 0);
+
+    CHECK_EQ_INT(capture_signing_status(
+                     &account, NULL, NULL, canonical_key, "true",
+                     expected_program, NULL, NULL, status,
+                     sizeof(status)), -1);
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "OpenPGP provenance: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "Signing attribution: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status,
+                 "Expected GPG Signing Key: [PROVENANCE UNAVAILABLE]") !=
+          NULL);
+    CHECK(strstr(status, canonical_key) != NULL);
+}
+
+TEST(retiring_publication_cannot_attribute_a_reused_account_id) {
+    static const char canonical_key[] =
+        "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
+    account_t replacement;
+    char status[8192];
+    char expected_program[MAX_PATH_LEN];
+
+    if (gpg_manager_resolve_executable(expected_program,
+                                       sizeof(expected_program)) != 0) {
+        TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
+
+    memset(&replacement, 0, sizeof(replacement));
+    replacement.id = 41;
+    CHECK_EQ_INT(safe_strncpy(replacement.name, "Replacement Account",
+                              sizeof(replacement.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(replacement.email,
+                              "replacement@example.test",
+                              sizeof(replacement.email)), 0);
+    replacement.gpg_enabled = true;
+    replacement.gpg_signing_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(replacement.gpg_key_id, "0x89abcdef",
+                              sizeof(replacement.gpg_key_id)), 0);
+
+    /* The same complete record and live Git values are an exact match while
+     * published. Once account deletion commits its RETIRING tombstone, the
+     * reusable integer alone must no longer confer status attribution. */
+    CHECK_EQ_INT(capture_signing_status_state(
+                     &replacement, canonical_key, expected_program,
+                     PUBLICATION_STATE_PUBLISHED, canonical_key, "true",
+                     expected_program, NULL, NULL, status, sizeof(status)),
+                 0);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status_state(
+                     &replacement, canonical_key, expected_program,
+                     PUBLICATION_STATE_RETIRING, canonical_key, "true",
+                     expected_program, NULL, NULL, status, sizeof(status)),
+                 -1);
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "Signing attribution: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "Match Status: [OK]") == NULL);
+}
+
+TEST(published_record_from_different_incarnation_cannot_attribute_status) {
+    static const char canonical_key[] =
+        "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
+    account_t replacement;
+    char status[8192];
+    char program[MAX_PATH_LEN] = "";
+
+    CHECK_EQ_INT(safe_strncpy(program, "/bin/sh", sizeof(program)), 0);
+    memset(&replacement, 0, sizeof(replacement));
+    replacement.id = 41;
+    CHECK_EQ_INT(safe_strncpy(replacement.incarnation,
+                              STATUS_TEST_INCARNATION_B,
+                              sizeof(replacement.incarnation)), 0);
+    replacement.incarnation_persisted = true;
+    CHECK_EQ_INT(safe_strncpy(replacement.name, "Replacement Account",
+                              sizeof(replacement.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(replacement.email,
+                              "replacement@example.test",
+                              sizeof(replacement.email)), 0);
+    replacement.gpg_enabled = true;
+    replacement.gpg_signing_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(replacement.gpg_key_id, "0x89abcdef",
+                              sizeof(replacement.gpg_key_id)), 0);
+
+    CHECK_EQ_INT(capture_signing_status_incarnation_state(
+                     &replacement, STATUS_TEST_INCARNATION,
+                     canonical_key, program, PUBLICATION_STATE_PUBLISHED,
+                     canonical_key, "true", program, NULL, NULL,
+                     status, sizeof(status)), -1);
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "Signing attribution: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "Match Status: [OK]") == NULL);
+}
+
+TEST(status_rejects_replaced_or_missing_published_gpg_program) {
+    static const char canonical_key[] =
+        "0123456789ABCDEF0123456789ABCDEF89ABCDEF";
+    char trusted_root[MAX_PATH_LEN];
+    char program[MAX_PATH_LEN];
+    char replacement[MAX_PATH_LEN];
+    char origin[MAX_PATH_LEN];
+    char status[8192];
+    account_t account;
+    gitswitch_ctx_t context;
+    command_runner_fn previous;
+
+    if (!ts_mkdtemp_trusted(trusted_root, sizeof(trusted_root),
+                            "ar11-status-program") ||
+        safe_snprintf(program, sizeof(program), "%s/gpg", trusted_root) !=
+            0 ||
+        safe_snprintf(replacement, sizeof(replacement), "%s/gpg.new",
+                      trusted_root) != 0 ||
+        write_text_file(program, "#!/bin/sh\nexit 0\n", 0700) != 0) {
+        CHECK(false);
+        return;
+    }
+
+    memset(&account, 0, sizeof(account));
+    account.id = 11;
+    bind_status_test_incarnation(&account);
+    CHECK_EQ_INT(safe_strncpy(account.name, "Program Generation",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "program@example.test",
+                              sizeof(account.email)), 0);
+    account.gpg_enabled = true;
+    account.gpg_signing_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account.gpg_key_id, "0x89abcdef",
+                              sizeof(account.gpg_key_id)), 0);
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1;
+    context.accounts[0] = account;
+    context.current_account = &context.accounts[0];
+    CHECK_EQ_INT(install_signing_publication(
+                     &context, &account, canonical_key, program,
+                     PUBLICATION_STATE_PUBLISHED, origin, sizeof(origin)), 0);
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", origin, "user.name", account.name,
+                             strlen(account.name)));
+    CHECK(fake_append_record("global", origin, "user.email", account.email,
+                             strlen(account.email)));
+    CHECK(fake_append_record("global", origin, "user.signingkey",
+                             canonical_key, strlen(canonical_key)));
+    CHECK(fake_append_record("global", origin, "commit.gpgsign", "true",
+                             strlen("true")));
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_GPG_OPENPGP_PROGRAM, program,
+                             strlen(program)));
+
+    /* Preserve the configured spelling while replacing the exact executable
+     * generation sealed in the publication record. */
+    CHECK_EQ_INT(write_text_file(replacement,
+                                 "#!/bin/sh\n# replacement\nexit 0\n",
+                                 0700), 0);
+    CHECK_EQ_INT(rename(replacement, program), 0);
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), -1);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "OpenPGP provenance: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "Effective OpenPGP Program: [ERROR]") != NULL);
+    CHECK(strstr(status, "Match Status: [OK]") == NULL);
+
+    CHECK_EQ_INT(unlink(program), 0);
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), -1);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+    CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "OpenPGP provenance: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "Effective OpenPGP Program: [ERROR]") != NULL);
 }
 
 TEST(no_active_account_warns_for_residual_openpgp_program) {
@@ -945,6 +1482,63 @@ TEST(no_active_account_warns_for_residual_openpgp_program) {
     CHECK(strstr(status,
                  "[WARN] Durable Git credential configuration is set") !=
           NULL);
+}
+
+TEST(stale_current_account_is_rejected_before_use_or_cleared_for_discovery) {
+    gitswitch_ctx_t context;
+    account_t detached;
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1U;
+    context.accounts[0].id = 77U;
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].name, "Pointer User",
+                              sizeof(context.accounts[0].name)), 0);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
+                              "pointer@example.test",
+                              sizeof(context.accounts[0].email)), 0);
+    detached = context.accounts[0];
+    context.current_account = &detached;
+    context.config.dry_run = true;
+    context.config.assume_yes = true;
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(accounts_list(&context), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(accounts_show_status(&context), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(accounts_switch(&context, "Pointer User"), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(accounts_edit_candidate_prepare(&context, &detached), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(accounts_add_interactive_prepare(&context), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(accounts_remove(&context, "Pointer User"), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+
+    /* Discovery treats a stale reference as no observation. With no saved
+     * active name it may not find a replacement, but it must clear the
+     * unproven pointer without ever dereferencing it. */
+    clear_error();
+    context.current_account = &detached;
+    context.config.active_account[0] = '\0';
+    CHECK_EQ_INT(accounts_detect_current(&context), -1);
+    CHECK(context.current_account == NULL);
 }
 
 static int setup_isolated_git(char *base, size_t base_size,
@@ -1502,7 +2096,13 @@ TEST_MAIN_BEGIN()
     RUN_TEST(active_status_reports_expected_ssh_resolution_failure);
     RUN_TEST(active_status_propagates_required_key_inspection_failure);
     RUN_TEST(active_status_includes_every_selected_signing_field);
+    RUN_TEST(edited_short_selector_cannot_reuse_historical_fingerprint);
+    RUN_TEST(historical_short_selector_without_publication_is_incomplete);
+    RUN_TEST(retiring_publication_cannot_attribute_a_reused_account_id);
+    RUN_TEST(published_record_from_different_incarnation_cannot_attribute_status);
+    RUN_TEST(status_rejects_replaced_or_missing_published_gpg_program);
     RUN_TEST(no_active_account_warns_for_residual_openpgp_program);
+    RUN_TEST(stale_current_account_is_rejected_before_use_or_cleared_for_discovery);
     RUN_TEST(real_malformed_config_retains_gits_diagnostic);
     RUN_TEST(git_boolean_grammar_matches_gits_canonical_oracle);
     RUN_TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow);

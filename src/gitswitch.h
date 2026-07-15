@@ -41,6 +41,8 @@
  * fingerprint contract: 64 hexadecimal digits plus NUL. */
 #define MAX_GPG_SELECTOR_LEN 67
 #define MAX_GPG_FINGERPRINT_LEN 65
+#define ACCOUNT_INCARNATION_HEX_LEN 64U
+#define ACCOUNT_INCARNATION_LEN (ACCOUNT_INCARNATION_HEX_LEN + 1U)
 #define MAX_ACCOUNTS 64
 
 /* Default configuration paths */
@@ -67,6 +69,14 @@ typedef enum {
 /* Account structure */
 typedef struct {
     uint32_t id;
+    /* Immutable account ownership identity. Numeric IDs remain human-facing
+     * selectors and can be hand-edited; durable publication authority is
+     * always bound to this independently generated 256-bit value as well.
+     * Legacy account documents remain empty during every read-only load; an
+     * explicit mutating migration generates a candidate and sets the runtime-
+     * only persisted bit only after a full transactional save. */
+    char incarnation[ACCOUNT_INCARNATION_LEN];
+    bool incarnation_persisted;
     char name[MAX_NAME_LEN];
     char email[MAX_EMAIL_LEN];
     char description[MAX_DESC_LEN];

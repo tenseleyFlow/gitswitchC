@@ -401,6 +401,9 @@ static int fail_agent_pid_setenv(const char *name, const char *value,
 }
 
 static int setup_runtime(char *agent_dir, size_t size) {
+    char lock_path[192];
+    int lock_fd;
+
     snprintf(g_xdg, sizeof(g_xdg), "/tmp/gswssh4XXXXXX");
     if (!ts_mkdtemp(g_xdg) ||
         ts_canonicalize_dir_path(g_xdg, sizeof(g_xdg)) != 0 ||
@@ -409,7 +412,14 @@ static int setup_runtime(char *agent_dir, size_t size) {
     if ((size_t)snprintf(agent_dir, size, "%s/gitswitch-ssh", g_xdg) >= size) {
         return -1;
     }
-    return mkdir(agent_dir, 0700);
+    if (mkdir(agent_dir, 0700) != 0 ||
+        (size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock",
+                         agent_dir) >= sizeof(lock_path)) {
+        return -1;
+    }
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0) return -1;
+    return close(lock_fd);
 }
 
 static int make_live_current(const char *agent_dir, const char *account,
@@ -562,6 +572,61 @@ TEST(current_account_reports_absent_and_valid_live_socket) {
     close(listener);
     (void)unlink(current);
     (void)unlink(sock);
+}
+
+TEST(current_account_discovery_never_creates_or_repairs_manager_lock) {
+    char agent_dir[128], sock[192], current[192], lock_path[192];
+    char name[MAX_NAME_LEN];
+    struct stat before;
+    struct stat after;
+    bool present = true;
+    int listener;
+    int lock_fd;
+
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    listener = make_live_current(agent_dir, "observed", sock, sizeof(sock),
+                                 current, sizeof(current));
+    CHECK(listener >= 0);
+    if (listener < 0) return;
+    snprintf(lock_path, sizeof(lock_path), "%s/.lock", agent_dir);
+
+    CHECK_EQ_INT(unlink(lock_path), 0);
+    CHECK_EQ_INT(ssh_manager_get_current_account(name, sizeof(name),
+                                                 &present), 0);
+    CHECK(!present);
+    CHECK(name[0] == '\0');
+    errno = 0;
+    CHECK(lstat(lock_path, &after) != 0 && errno == ENOENT);
+    CHECK(entry_exists(current));
+    CHECK(entry_exists(sock));
+
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    CHECK(lock_fd >= 0);
+    if (lock_fd >= 0) CHECK_EQ_INT(close(lock_fd), 0);
+    CHECK_EQ_INT(chmod(lock_path, 0644), 0);
+    CHECK_EQ_INT(stat(lock_path, &before), 0);
+    present = true;
+    name[0] = 'x';
+    CHECK_EQ_INT(ssh_manager_get_current_account(name, sizeof(name),
+                                                 &present), -1);
+    CHECK(!present);
+    CHECK(name[0] == '\0');
+    CHECK_EQ_INT(stat(lock_path, &after), 0);
+    CHECK(before.st_dev == after.st_dev && before.st_ino == after.st_ino);
+    CHECK_EQ_INT(before.st_mode & 0777, after.st_mode & 0777);
+    CHECK(before.st_mtime == after.st_mtime);
+    CHECK(before.st_ctime == after.st_ctime);
+
+    CHECK_EQ_INT(chmod(lock_path, 0600), 0);
+    CHECK_EQ_INT(ssh_manager_get_current_account(name, sizeof(name),
+                                                 &present), 0);
+    CHECK(present);
+    CHECK_STR_EQ(name, "observed");
+
+    close(listener);
+    (void)unlink(current);
+    (void)unlink(sock);
+    (void)unlink(lock_path);
 }
 
 TEST(current_account_rejects_unsafe_malformed_and_stale_state) {
@@ -1099,6 +1164,7 @@ TEST(reset_fails_closed_when_lock_is_unavailable) {
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
+    CHECK_EQ_INT(unlink(lock), 0);
     CHECK_EQ_INT(mkdir(lock, 0700), 0); /* open(O_RDWR) must fail */
     CHECK_EQ_INT(write_text_file(pidfile, "424242\n"), 0);
     CHECK_EQ_INT(write_text_file(sock, "socket marker\n"), 0);
@@ -1424,6 +1490,7 @@ int main(int argc, char **argv) {
 #endif
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(current_account_reports_absent_and_valid_live_socket);
+    RUN_TEST(current_account_discovery_never_creates_or_repairs_manager_lock);
     RUN_TEST(current_account_rejects_unsafe_malformed_and_stale_state);
     RUN_TEST(current_account_accepts_longest_bindable_name_without_truncation);
     RUN_TEST(current_account_fails_fast_when_manager_lock_held);

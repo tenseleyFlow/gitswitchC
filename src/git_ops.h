@@ -4,6 +4,7 @@
 #define GIT_OPS_H
 
 #include "gitswitch.h"
+#include "publication.h"
 
 /* Git configuration keys */
 #define GIT_CONFIG_USER_NAME "user.name"
@@ -55,6 +56,8 @@ typedef struct {
     git_scope_t scope;
     git_config_origin_scope_t effective_name_scope;
     char effective_name_origin[MAX_PATH_LEN];
+    git_config_origin_scope_t effective_signing_key_scope;
+    char effective_signing_key_origin[MAX_PATH_LEN];
     git_config_effective_value_t ssh_command;
     /* Keep every Git-supported program selector distinct. Folding them into
      * one value loses both selector semantics and origin attribution when a
@@ -116,36 +119,86 @@ int git_expected_ssh_command(const account_t *account, char *command,
 int git_clear_config(git_scope_t scope);
 
 /**
- * True when `configured` is a canonical 40- or 64-hex-digit fingerprint whose
- * suffix case-insensitively equals the account's saved signing-key selector
- * (with any 0x prefix stripped). A successful isolated switch always publishes
- * the canonical primary fingerprint to Git, while the saved account may retain
- * the shorter selector the user entered; this is the one comparison rule for
- * both status reporting and identity retirement. Never accepts a noncanonical
- * Git value as proof of the selected key.
+ * Compare two canonical OpenPGP fingerprints. Both values must contain
+ * exactly 40 or 64 hexadecimal digits of equal length; comparison is over the
+ * complete value and is case-insensitive. Selectors and 0x prefixes never
+ * match. The fingerprint must come from proven publication provenance before
+ * this result is used for status or mutation ownership.
+ */
+bool git_signing_key_matches_fingerprint(const char *canonical_fingerprint,
+                                         const char *configured);
+
+/**
+ * True only when both the account value and `configured` are canonical 40- or
+ * 64-hex-digit fingerprints of equal length whose complete values compare
+ * case-insensitively equal. Short selectors and 0x-prefixed selectors are
+ * resolution inputs, not durable ownership evidence, and never match here.
+ * Internal status and retirement additionally require persisted publication
+ * provenance before treating a configured value as account-owned.
  */
 bool git_signing_key_selects_account(const account_t *account,
                                      const char *configured);
 
+typedef enum {
+    GIT_SIGNING_PUBLICATION_ERROR = -1,
+    GIT_SIGNING_PUBLICATION_MISMATCH = 0,
+    GIT_SIGNING_PUBLICATION_MATCH = 1
+} git_signing_publication_result_t;
+
+/**
+ * Match only when a published provenance record belongs to `account`, names
+ * the exact effective signing-key destination reported by `current`, and its
+ * canonical fingerprint equals both the complete configured value and the
+ * account's normalized current selector. Selector comparison is purely
+ * observational against the switch-time persisted selector; it never reads a
+ * keyring or re-resolves through a helper. Missing selector provenance is not
+ * a match. Invalid current selector input is ERROR; a different valid
+ * selector is a semantic mismatch.
+ */
+git_signing_publication_result_t git_signing_key_matches_publication(
+    const account_t *account, const publication_record_t *publication,
+    const git_current_config_t *current);
+
+/**
+ * Re-run the hardened absolute-executable trust walk and require the complete
+ * live file generation to equal a persisted publication identity. Removal,
+ * replacement, in-place rewrite, permission/ownership change, and an unsafe
+ * path all fail closed with a diagnostic. `diagnostic_name` is an internal
+ * human-readable label only.
+ */
+int git_publication_verify_program_identity(
+    const char *program, const publication_identity_t *expected,
+    const char *diagnostic_name);
+
 /**
  * AR-10 M1: scrub the durable Git credential legs that still select a retired
- * account after its runtime state was torn down (remove/reset). A switch
- * publishes core.sshCommand (authoritative for every fetch/push via
- * IdentitiesOnly=yes) and user.signingkey/commit.gpgsign/gpg.format; neither
- * remove nor reset previously touched them, so pushes kept authenticating as
- * the retired identity and commit.gpgsign=true outlived the deleted isolated
- * GNUPGHOME. Checks the global scope plus, inside a repository, the local and
- * distinct managed-worktree scopes, and unsets only values attributable to
- * `account`: an exactly matching rebuilt core.sshCommand, and a signing key
- * accepted by git_signing_key_selects_account() (with its commit.gpgsign,
- * gpg.format, and gpg.openpgp.program companions at the same scope). Legacy,
- * X.509, and SSH program selectors are foreign to an account-owned OpenPGP
- * leg and are preserved. user.name/user.email are plain identity, not
- * credentials, and are left untouched. Every scope and key is attempted;
- * *cleared (optional) reports how many present keys were removed even on
- * failure. Returns 0 when every attempted unset succeeded.
+ * account after its runtime state was torn down (remove/reset). This legacy
+ * compatibility entry point has no sealed publication record, so it may
+ * reconstruct and remove an exactly matching core.sshCommand across the
+ * historical global/current-repository scopes, but it never attributes or
+ * removes a signing leg from the account's selector alone. user.name,
+ * user.email, user.signingkey, and every signing companion remain untouched.
+ * New callers that own durable provenance use the record-backed entry point
+ * below. *cleared (optional) reports how many present SSH keys were removed
+ * even on failure. Returns 0 when every attempted unset succeeded.
  */
 int git_retire_account_identity(const account_t *account, size_t *cleared);
+
+/**
+ * Retire an account identity using a validated durable publication record.
+ * Signing attribution is restricted to the record's exact canonical
+ * fingerprint and destination. Local/worktree retirement additionally
+ * requires the caller's current canonical config and repository paths plus
+ * their object identities to match the record; scope equality alone never
+ * authorizes mutation in another repository. Only PUBLISHED records authorize
+ * mutation; RETIRING records are durable deletion tombstones and fail before
+ * Git execution. NULL, incomplete, mismatched, or selector-derived records
+ * likewise fail before mutation. The compatibility entry point above has no
+ * provenance argument and therefore never removes a signing leg.
+ */
+int git_retire_account_identity_published(
+    const account_t *account, const publication_record_t *publication,
+    size_t *cleared);
 
 /**
  * Snapshot the gitswitch-managed config keys (identity/signing keys,
@@ -167,11 +220,29 @@ int git_config_snapshot(git_scope_t scope);
  * fresh Git read. The intended image is updated only by this process's
  * successful managed writes, so a concurrent value arriving before this call
  * is rejected rather than adopted. For real Git, sealing also pins the exact
- * installed config-file generation that rollback may replace. Call after all
- * forward Git writes and before later transaction steps can fail. Idempotent
- * after successful seal.
+ * installed config-file generation that rollback may replace. A durable
+ * publication is eligible only when a complete primary-scope account writer
+ * bound the snapshot's immutable account incarnation; standalone account
+ * writes into tracked override scopes and partial/failed follow-up writers
+ * invalidate that eligibility. Call after all forward Git writes and before
+ * later transaction steps can fail. Idempotent after successful seal.
  */
 int git_config_seal(void);
+
+/**
+ * Copy the active sealed transaction's primary publication destination and
+ * exact credential post-image into a durable-record POD. The export
+ * revalidates the pinned namespace and post-config generation, accepts only a
+ * canonical signing fingerprint/program pair, and uses only the immutable
+ * account owner bound by the complete transaction writer. `gpg_selector` is
+ * the original persisted account selector captured before the switch target
+ * is canonicalized; it is normalized and bound to the fingerprint/program
+ * tuple without any keyring lookup. The exporter never consults PATH or the
+ * caller's current directory to reconstruct values. `out` is initialized
+ * only on success and remains caller-owned.
+ */
+int git_config_export_sealed_publication(publication_record_t *out,
+                                         const char *gpg_selector);
 
 /**
  * Restore the most recent git_config_snapshot(), rebuilding every key with its
@@ -246,6 +317,15 @@ int git_configure_ssh(const account_t *account, git_scope_t scope);
  *   canonical key resolution
  */
 int git_configure_gpg(const account_t *account, git_scope_t scope);
+
+/**
+ * Publish the canonical OpenPGP fingerprint, signing preference, and exact
+ * trusted executable as one account-owned transaction step. When a snapshot
+ * is active, the account must match its immutable publication owner.
+ */
+int git_configure_openpgp_publication(const account_t *account,
+                                      const char *gpg_program,
+                                      git_scope_t scope);
 
 /**
  * Check if current directory is a git repository

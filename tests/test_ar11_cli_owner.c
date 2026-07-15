@@ -74,6 +74,7 @@ static const char expected_accounts_config[] =
     "default_scope = \"global\"\n"
     "\n"
     "[accounts.1]\n"
+    "incarnation = \"1111111111111111111111111111111111111111111111111111111111111111\"\n"
     "name = \"work\"\n"
     "email = \"work@example.test\"\n"
     "description = \"retained owner fixture\"\n"

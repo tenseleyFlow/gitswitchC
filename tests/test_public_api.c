@@ -15,6 +15,7 @@
 #include "gitswitch.h"
 #include "gpg_manager.h"
 #include "prompt.h"
+#include "publication.h"
 #include "signals.h"
 #include "ssh_manager.h"
 #include "toml_parser.h"
@@ -54,6 +55,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_remove);
     REQUIRE_PUBLIC_API(accounts_remove_abort);
     REQUIRE_PUBLIC_API(accounts_remove_commit);
+    REQUIRE_PUBLIC_API(accounts_retire_git_identity);
     REQUIRE_PUBLIC_API(accounts_session_cleanup);
     REQUIRE_PUBLIC_API(accounts_show_status);
     REQUIRE_PUBLIC_API(accounts_switch);
@@ -62,6 +64,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_switch_commit_result);
     REQUIRE_PUBLIC_API(accounts_switch_prepare);
     REQUIRE_PUBLIC_API(accounts_switch_prepare_result);
+    REQUIRE_PUBLIC_API(accounts_switch_publication);
     REQUIRE_PUBLIC_API(accounts_transaction_begin);
     REQUIRE_PUBLIC_API(accounts_transaction_context_release_safe);
     REQUIRE_PUBLIC_API(accounts_transaction_finish);
@@ -78,6 +81,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(compare_accounts_by_id);
     REQUIRE_PUBLIC_API(compare_accounts_by_name);
     REQUIRE_PUBLIC_API(compare_strings);
+    REQUIRE_PUBLIC_API(account_incarnation_is_valid);
     REQUIRE_PUBLIC_API(config_add_account);
     REQUIRE_PUBLIC_API(config_add_account_owned);
     REQUIRE_PUBLIC_API(config_backup);
@@ -90,8 +94,12 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_init);
     REQUIRE_PUBLIC_API(config_init_names);
     REQUIRE_PUBLIC_API(config_init_readonly);
+    REQUIRE_PUBLIC_API(config_init_runtime_readonly);
     REQUIRE_PUBLIC_API(config_load);
+    REQUIRE_PUBLIC_API(config_load_publication_ledger);
+    REQUIRE_PUBLIC_API(config_migrate_account_incarnations);
     REQUIRE_PUBLIC_API(config_parse_scope);
+    REQUIRE_PUBLIC_API(config_publication_preflight);
     REQUIRE_PUBLIC_API(config_remove_account);
     REQUIRE_PUBLIC_API(config_remove_account_owned);
     REQUIRE_PUBLIC_API(config_restore_active_account);
@@ -102,10 +110,12 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_restore);
     REQUIRE_PUBLIC_API(config_save);
     REQUIRE_PUBLIC_API(config_save_active_account);
+    REQUIRE_PUBLIC_API(config_save_active_account_publication_transactional_guarded);
     REQUIRE_PUBLIC_API(config_save_active_account_transactional);
     REQUIRE_PUBLIC_API(config_save_active_account_transactional_guarded);
     REQUIRE_PUBLIC_API(config_save_transactional);
     REQUIRE_PUBLIC_API(config_scope_to_string);
+    REQUIRE_PUBLIC_API(config_set_incarnation_generate_fn);
     REQUIRE_PUBLIC_API(config_set_backup_clock_fn);
     REQUIRE_PUBLIC_API(config_set_backup_readdir_fn);
     REQUIRE_PUBLIC_API(config_set_document_malloc_fn);
@@ -163,11 +173,13 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(get_timestamp_string);
     REQUIRE_PUBLIC_API(git_clear_config);
     REQUIRE_PUBLIC_API(git_config_commit);
+    REQUIRE_PUBLIC_API(git_config_export_sealed_publication);
     REQUIRE_PUBLIC_API(git_config_origin_scope_to_string);
     REQUIRE_PUBLIC_API(git_config_restore);
     REQUIRE_PUBLIC_API(git_config_seal);
     REQUIRE_PUBLIC_API(git_config_snapshot);
     REQUIRE_PUBLIC_API(git_configure_gpg);
+    REQUIRE_PUBLIC_API(git_configure_openpgp_publication);
     REQUIRE_PUBLIC_API(git_configure_ssh);
     REQUIRE_PUBLIC_API(git_expected_ssh_command);
     REQUIRE_PUBLIC_API(git_get_config_value);
@@ -177,9 +189,13 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_list_config);
     REQUIRE_PUBLIC_API(git_ops_init);
     REQUIRE_PUBLIC_API(git_retire_account_identity);
+    REQUIRE_PUBLIC_API(git_retire_account_identity_published);
     REQUIRE_PUBLIC_API(git_scope_to_flag);
     REQUIRE_PUBLIC_API(git_set_config);
     REQUIRE_PUBLIC_API(git_set_config_value);
+    REQUIRE_PUBLIC_API(git_signing_key_matches_fingerprint);
+    REQUIRE_PUBLIC_API(git_signing_key_matches_publication);
+    REQUIRE_PUBLIC_API(git_publication_verify_program_identity);
     REQUIRE_PUBLIC_API(git_signing_key_selects_account);
     REQUIRE_PUBLIC_API(git_test_config);
     REQUIRE_PUBLIC_API(git_unset_config_value);
@@ -234,6 +250,18 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(path_exists);
     REQUIRE_PUBLIC_API(print_error);
     REQUIRE_PUBLIC_API(process_is_running);
+    REQUIRE_PUBLIC_API(publication_identity_equal);
+    REQUIRE_PUBLIC_API(publication_identity_from_stat);
+    REQUIRE_PUBLIC_API(publication_normalize_gpg_selector);
+    REQUIRE_PUBLIC_API(publication_ledger_clear);
+    REQUIRE_PUBLIC_API(publication_ledger_find);
+    REQUIRE_PUBLIC_API(publication_ledger_init);
+    REQUIRE_PUBLIC_API(publication_ledger_parse);
+    REQUIRE_PUBLIC_API(publication_ledger_serialize);
+    REQUIRE_PUBLIC_API(publication_ledger_upsert);
+    REQUIRE_PUBLIC_API(publication_record_init);
+    REQUIRE_PUBLIC_API(publication_record_same_destination);
+    REQUIRE_PUBLIC_API(publication_record_validate);
     REQUIRE_PUBLIC_API(prompt_confirm_exact_yes);
     REQUIRE_PUBLIC_API(prompt_line);
     REQUIRE_PUBLIC_API(read_file_to_string);
@@ -383,6 +411,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(text_is_tty_safe);
     REQUIRE_PUBLIC_API(trim_whitespace);
     REQUIRE_PUBLIC_API(try_lock_private_file_at);
+    REQUIRE_PUBLIC_API(try_lock_existing_private_file_at);
     REQUIRE_PUBLIC_API(tty_safe_codepoint);
     REQUIRE_PUBLIC_API(unlock_private_file);
     REQUIRE_PUBLIC_API(unset_env_var);
@@ -391,6 +420,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(validate_file_path);
     REQUIRE_PUBLIC_API(validate_key_id);
     REQUIRE_PUBLIC_API(validate_name);
+    REQUIRE_PUBLIC_API(verify_private_lock_file_at);
     REQUIRE_PUBLIC_API(write_string_to_file);
 
     REQUIRE_PUBLIC_OBJECT(default_config_template);

@@ -184,18 +184,35 @@ static int install_live_current_socket(const char *runtime,
                                        const char *account_name) {
     char dir[256];
     char current[320];
+    char lock_path[320];
     char socket_path[320];
     struct sockaddr_un address;
     int listener;
+    int lock_fd;
 
     if (snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", runtime) >=
         (int)sizeof(dir) ||
         (mkdir(dir, 0700) != 0 && errno != EEXIST) || chmod(dir, 0700) != 0 ||
+        snprintf(lock_path, sizeof(lock_path), "%s/.lock", dir) >=
+            (int)sizeof(lock_path) ||
         snprintf(socket_path, sizeof(socket_path), "%s/ssh-agent.%s.sock",
                  dir, account_name) >= (int)sizeof(socket_path) ||
         strlen(socket_path) >= sizeof(address.sun_path)) {
         return -1;
     }
+
+    /* Read-only current-account discovery intentionally refuses to create or
+     * repair the manager lock.  A live-runtime fixture must therefore model
+     * the writer-established private lock that protects current.sock. */
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0) return -1;
+    if (fchmod(lock_fd, 0600) != 0) {
+        int saved_errno = errno;
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(lock_fd) != 0) return -1;
 
     listener = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listener < 0) return -1;

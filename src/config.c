@@ -131,6 +131,15 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
+static int config_materialize_missing_incarnations(
+    gitswitch_ctx_t *ctx, const publication_ledger_t *publications);
+static int config_validate_live_publication_bindings(
+    const gitswitch_ctx_t *ctx,
+    const publication_ledger_t *publications);
+static int config_generate_incarnation(
+    const gitswitch_ctx_t *ctx, const publication_ledger_t *publications,
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN],
+    size_t generated_count, char out[ACCOUNT_INCARNATION_LEN]);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
 static int normalize_account_model_for_admission(account_t *account);
@@ -155,7 +164,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      bool *state_installed,
                                      config_source_generation_requirement_t
                                          generation_requirement,
-                                     config_resume_hint_snapshot_t *rollback_snapshot);
+                                     config_resume_hint_snapshot_t *rollback_snapshot,
+                                     const publication_record_t *publication);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
 static void config_unlink_created_temp(const char *path,
@@ -196,23 +206,35 @@ typedef struct {
     char active_account[MAX_NAME_LEN];
 } config_active_state_t;
 
-#define CONFIG_ACTIVE_STATE_MAX 1024U
+#define CONFIG_ACTIVE_STATE_HEADER_MAX (MAX_NAME_LEN + 64U)
+#define CONFIG_ACTIVE_STATE_MAX \
+    (PUBLICATION_LEDGER_MAX_BYTES + CONFIG_ACTIVE_STATE_HEADER_MAX)
+/* Hex encoding can double every bounded string. Two complete record structs
+ * plus fixed grammar/identity overhead is therefore a conservative upper
+ * bound for one additional canonical record. */
+#define CONFIG_PUBLICATION_RECORD_RESERVE \
+    (sizeof(publication_record_t) * 2U + 8192U)
 
 typedef struct {
     bool existed;
     struct stat metadata;
-    unsigned char data[CONFIG_ACTIVE_STATE_MAX];
+    unsigned char *data;
     size_t length;
 } config_active_state_generation_t;
+
+static void config_active_state_generation_clear(
+    config_active_state_generation_t *generation);
 
 static int config_read_active_state(const char *config_path,
                                     config_active_state_t *state,
                                     bool require_private_mode,
-                                    config_active_state_generation_t *generation);
+                                    config_active_state_generation_t *generation,
+                                    publication_ledger_t *publications);
 
 typedef enum {
     CONFIG_INIT_NORMAL = 0,
     CONFIG_INIT_READONLY,
+    CONFIG_INIT_RUNTIME_READONLY,
     CONFIG_INIT_NAMES
 } config_init_kind_t;
 
@@ -263,7 +285,8 @@ static int config_init_mode(gitswitch_ctx_t *ctx, config_init_kind_t kind) {
         log_info("Loading configuration from: %s", config_path);
         return config_load_mode(ctx, config_path,
                                 kind != CONFIG_INIT_NAMES,
-                                kind == CONFIG_INIT_NORMAL);
+                                kind == CONFIG_INIT_NORMAL ||
+                                    kind == CONFIG_INIT_RUNTIME_READONLY);
     } else {
         log_info("Configuration file not found: %s", config_path);
         /* File creation remains deferred to a command that actually needs it. */
@@ -284,6 +307,14 @@ int config_init_readonly(gitswitch_ctx_t *ctx) {
     return config_init_mode(ctx, CONFIG_INIT_READONLY);
 }
 
+/* Read-only commands still need truthful live-account attribution. Inspect the
+ * existing runtime namespace without creating or repairing the configuration
+ * directory; unlike preview mode, this deliberately takes the SSH manager's
+ * read-side lock and probes an existing current.sock target. */
+int config_init_runtime_readonly(gitswitch_ctx_t *ctx) {
+    return config_init_mode(ctx, CONFIG_INIT_RUNTIME_READONLY);
+}
+
 /* Load only the account document needed by `list --names`. It still validates
  * the legacy field in that document for schema compatibility, but deliberately
  * does not apply legacy/versioned active-account state and never reaches
@@ -298,6 +329,7 @@ static config_io_fault_fn g_config_io_fault;
 static config_metadata_test_hook_fn g_config_metadata_test_hook;
 static config_backup_clock_fn g_config_backup_clock;
 static config_backup_readdir_fn g_config_backup_readdir = readdir;
+static config_incarnation_generate_fn g_config_incarnation_generate;
 
 config_document_malloc_fn config_set_document_malloc_fn(
     config_document_malloc_fn fn) {
@@ -330,6 +362,14 @@ config_backup_readdir_fn config_set_backup_readdir_fn(
     config_backup_readdir_fn fn) {
     config_backup_readdir_fn previous = g_config_backup_readdir;
     g_config_backup_readdir = fn ? fn : readdir;
+    return previous;
+}
+
+config_incarnation_generate_fn config_set_incarnation_generate_fn(
+    config_incarnation_generate_fn fn) {
+    config_incarnation_generate_fn previous =
+        g_config_incarnation_generate;
+    g_config_incarnation_generate = fn;
     return previous;
 }
 
@@ -606,21 +646,38 @@ static int config_state_path_for_config(const char *config_path,
     return 0;
 }
 
+static void config_active_state_generation_clear(
+    config_active_state_generation_t *generation) {
+    if (!generation) return;
+    if (generation->data) {
+        secure_zero_memory(generation->data, generation->length);
+        free(generation->data);
+    }
+    memset(generation, 0, sizeof(*generation));
+}
+
 static int config_read_active_state(const char *config_path,
                                     config_active_state_t *state,
                                     bool require_private_mode,
-                                    config_active_state_generation_t *generation) {
+                                    config_active_state_generation_t *generation,
+                                    publication_ledger_t *publications) {
     char hint[MAX_PATH_LEN];
     char dir[MAX_PATH_LEN];
-    char buffer[CONFIG_ACTIVE_STATE_MAX + 1];
+    unsigned char *buffer = NULL;
     struct stat before;
     struct stat opened;
     struct stat after;
-    const char *first_newline;
-    const char *active;
+    const unsigned char *first_newline;
+    const unsigned char *second_newline;
+    const unsigned char *second;
+    const unsigned char *active;
+    publication_ledger_t parsed_publications;
     size_t first_length;
+    size_t second_length;
     size_t active_length;
+    size_t tail_offset;
     size_t total = 0;
+    int result = -1;
     int fd = -1;
 
     if (!state) {
@@ -628,27 +685,30 @@ static int config_read_active_state(const char *config_path,
         return -1;
     }
     memset(state, 0, sizeof(*state));
+    publication_ledger_init(&parsed_publications);
+    if (publications) publication_ledger_clear(publications);
     if (generation) {
-        memset(generation, 0, sizeof(*generation));
+        config_active_state_generation_clear(generation);
     }
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0) {
-        return -1;
+        goto cleanup;
     }
     if (lstat(hint, &before) != 0) {
         if (errno == ENOENT) {
-            return 0;
+            result = 0;
+            goto cleanup;
         }
         set_system_error(ERR_FILE_IO,
                          "Cannot inspect active-state artifact: %s", hint);
-        return -1;
+        goto cleanup;
     }
 
     if (safe_strncpy(dir, hint, sizeof(dir)) != 0) {
-        return -1;
+        goto cleanup;
     }
     char *slash = strrchr(dir, '/');
     if (!slash) {
-        if (safe_strncpy(dir, ".", sizeof(dir)) != 0) return -1;
+        if (safe_strncpy(dir, ".", sizeof(dir)) != 0) goto cleanup;
     } else if (slash == dir) {
         slash[1] = '\0';
     } else {
@@ -658,7 +718,7 @@ static int config_read_active_state(const char *config_path,
         set_error(ERR_PERMISSION_DENIED,
                   "Active-state parent is not a private owned directory: %s",
                   dir);
-        return -1;
+        goto cleanup;
     }
     if (!config_metadata_file_is_safe(&before, require_private_mode) ||
         before.st_size < 0 ||
@@ -666,7 +726,14 @@ static int config_read_active_state(const char *config_path,
         set_error(ERR_PERMISSION_DENIED,
                   "Active-state artifact is not a small stable owned file: %s",
                   hint);
-        return -1;
+        goto cleanup;
+    }
+
+    buffer = malloc((size_t)before.st_size + 1U);
+    if (!buffer) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate active-state bundle");
+        goto cleanup;
     }
 
     RESUME_HINT_TEST_CHECKPOINT(1);
@@ -681,7 +748,8 @@ static int config_read_active_state(const char *config_path,
         errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Cannot open stable active-state artifact: %s", hint);
-        return -1;
+        fd = -1;
+        goto cleanup;
     }
     while (total < (size_t)opened.st_size) {
         ssize_t n = read(fd, buffer + total, (size_t)opened.st_size - total);
@@ -692,8 +760,7 @@ static int config_read_active_state(const char *config_path,
         } else {
             set_error(ERR_FILE_IO,
                       "Cannot read complete active-state artifact: %s", hint);
-            close(fd);
-            return -1;
+            goto cleanup;
         }
     }
     RESUME_HINT_TEST_CHECKPOINT(2);
@@ -703,15 +770,21 @@ static int config_read_active_state(const char *config_path,
         lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, require_private_mode) ||
         !config_metadata_snapshot_same(&opened, &after)) {
-        close(fd);
         set_error(ERR_FILE_IO,
                   "Active-state artifact changed while being read: %s", hint);
-        return -1;
+        goto cleanup;
     }
     close(fd);
+    fd = -1;
     buffer[total] = '\0';
 
     if (generation) {
+        generation->data = malloc(total == 0U ? 1U : total);
+        if (!generation->data) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot allocate active-state generation witness");
+            goto cleanup;
+        }
         generation->existed = true;
         generation->metadata = opened;
         memcpy(generation->data, buffer, total);
@@ -722,7 +795,7 @@ static int config_read_active_state(const char *config_path,
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: embedded NUL byte",
                   hint);
-        return -1;
+        goto cleanup;
     }
 
     /* The first resume-hint implementation wrote a zero-byte marker. It still
@@ -732,7 +805,8 @@ static int config_read_active_state(const char *config_path,
     if (total == 0) {
         state->exists = true;
         state->legacy_needs_only = true;
-        return 0;
+        result = 0;
+        goto publish;
     }
 
     first_newline = memchr(buffer, '\n', total);
@@ -740,65 +814,96 @@ static int config_read_active_state(const char *config_path,
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: missing first newline",
                   hint);
-        return -1;
+        goto cleanup;
     }
     first_length = (size_t)(first_newline - buffer);
-    if (!config_state_needs_valid(buffer, first_length)) {
+    if (!config_state_needs_valid((const char *)buffer, first_length)) {
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: invalid runtime-needs token",
                   hint);
-        return -1;
+        goto cleanup;
     }
     memcpy(state->needs, buffer, first_length);
     state->needs[first_length] = '\0';
     state->exists = true;
     if ((size_t)(first_newline - buffer) + 1 == total) {
         state->legacy_needs_only = true;
-        return 0;
+        result = 0;
+        goto publish;
     }
+
+    second = first_newline + 1;
+    second_newline = memchr(second, '\n', total - (size_t)(second - buffer));
+    if (!second_newline) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: missing second newline",
+                  hint);
+        goto cleanup;
+    }
+    second_length = (size_t)(second_newline - second);
+    tail_offset = (size_t)(second_newline - buffer) + 1U;
 
     /* Versioned inactive tombstone. Keeping the first line as "none" makes
      * every already-generated shell snippet take its no-op arm, while the
      * second line disambiguates a deliberate reset from a pre-state-artifact
      * configuration whose legacy active_account must still migrate. */
-    if (first_length == 4 && memcmp(buffer, "none", 4) == 0 &&
-        total - ((size_t)(first_newline - buffer) + 1) ==
-            sizeof("inactive=v1\n") - 1 &&
-        memcmp(first_newline + 1, "inactive=v1\n",
-               sizeof("inactive=v1\n") - 1) == 0) {
+    if (first_length == 4U && memcmp(buffer, "none", 4U) == 0 &&
+        second_length == sizeof("inactive=v1") - 1U &&
+        memcmp(second, "inactive=v1", second_length) == 0) {
         state->inactive_tombstone = true;
-        return 0;
-    }
-
-    active = first_newline + 1;
-    if ((size_t)(active - buffer) + 7 > total ||
-        memcmp(active, "active=", 7) != 0 || buffer[total - 1] != '\n') {
+    } else if (second_length < sizeof("active=") - 1U ||
+               memcmp(second, "active=", sizeof("active=") - 1U) != 0) {
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: expected active=<name>",
                   hint);
-        return -1;
+        goto cleanup;
+    } else {
+        active = second + sizeof("active=") - 1U;
+        active_length = second_length - (sizeof("active=") - 1U);
+        if (active_length == 0U ||
+            active_length >= sizeof(state->active_account) ||
+            memchr(active, '\r', active_length) != NULL) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Malformed active-state artifact %s: invalid active name length",
+                      hint);
+            goto cleanup;
+        }
+        memcpy(state->active_account, active, active_length);
+        state->active_account[active_length] = '\0';
+        if (!validate_name(state->active_account) ||
+            !text_is_tty_safe(state->active_account)) {
+            memset(state->active_account, 0,
+                   sizeof(state->active_account));
+            set_error(ERR_CONFIG_INVALID,
+                      "Malformed active-state artifact %s: unsafe active account name",
+                      hint);
+            goto cleanup;
+        }
     }
-    active += 7;
-    active_length = total - (size_t)(active - buffer) - 1;
-    if (active_length == 0 || active_length >= sizeof(state->active_account) ||
-        memchr(active, '\n', active_length) != NULL ||
-        memchr(active, '\r', active_length) != NULL) {
-        set_error(ERR_CONFIG_INVALID,
-                  "Malformed active-state artifact %s: invalid active name length",
-                  hint);
-        return -1;
+    if (publication_ledger_parse(buffer + tail_offset,
+                                 total - tail_offset,
+                                 &parsed_publications) != 0) {
+        goto cleanup;
     }
-    memcpy(state->active_account, active, active_length);
-    state->active_account[active_length] = '\0';
-    if (!validate_name(state->active_account) ||
-        !text_is_tty_safe(state->active_account)) {
-        memset(state->active_account, 0, sizeof(state->active_account));
-        set_error(ERR_CONFIG_INVALID,
-                  "Malformed active-state artifact %s: unsafe active account name",
-                  hint);
-        return -1;
+    result = 0;
+
+publish:
+    if (result == 0 && publications) {
+        *publications = parsed_publications;
+        publication_ledger_init(&parsed_publications);
     }
-    return 0;
+
+cleanup:
+    if (fd >= 0) close(fd);
+    if (buffer) {
+        secure_zero_memory(buffer, (size_t)before.st_size + 1U);
+        free(buffer);
+    }
+    publication_ledger_clear(&parsed_publications);
+    if (result != 0 && generation) {
+        config_active_state_generation_clear(generation);
+    }
+    return result;
 }
 
 static const char *config_account_runtime_needs(const account_t *account) {
@@ -968,7 +1073,8 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
      * runtime-needs marker) migrates from settings.active_account. Reset writes
      * the tombstone atomically, so absence can safely retain its pre-T12 meaning
      * without resurrecting a post-T12 reset. */
-    if (config_read_active_state(config_path, &active_state, false, NULL) != 0) {
+    if (config_read_active_state(config_path, &active_state, false, NULL,
+                                 NULL) != 0) {
         return -1;
     }
     if (active_state.exists && active_state.inactive_tombstone) {
@@ -1427,7 +1533,7 @@ proof_fail:
  * unavailable or has been restored. */
 static int config_require_active_state_generation(
     const char *hint, const config_active_state_generation_t *expected) {
-    unsigned char observed[CONFIG_ACTIVE_STATE_MAX];
+    unsigned char observed[4096];
     struct stat named_before;
     struct stat opened;
     struct stat descriptor_after;
@@ -1436,8 +1542,10 @@ static int config_require_active_state_generation(
     ssize_t trailing_count;
     int fd = -1;
     int failure_errno = ESTALE;
+    size_t offset = 0;
 
-    if (!hint || !expected || expected->length > sizeof(expected->data)) {
+    if (!hint || !expected || expected->length > CONFIG_ACTIVE_STATE_MAX ||
+        (expected->length != 0U && !expected->data)) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid active-state generation proof arguments");
         return -1;
@@ -1491,14 +1599,19 @@ static int config_require_active_state_generation(
         failure_errno = ESTALE;
         goto generation_mismatch;
     }
-    errno = 0;
-    if (!config_pread_full(fd, observed, expected->length, 0)) {
-        failure_errno = errno ? errno : EIO;
-        goto generation_mismatch;
-    }
-    if (memcmp(observed, expected->data, expected->length) != 0) {
-        failure_errno = ESTALE;
-        goto generation_mismatch;
+    while (offset < expected->length) {
+        size_t wanted = expected->length - offset;
+        if (wanted > sizeof(observed)) wanted = sizeof(observed);
+        errno = 0;
+        if (!config_pread_full(fd, observed, wanted, (off_t)offset)) {
+            failure_errno = errno ? errno : EIO;
+            goto generation_mismatch;
+        }
+        if (memcmp(observed, expected->data + offset, wanted) != 0) {
+            failure_errno = ESTALE;
+            goto generation_mismatch;
+        }
+        offset += wanted;
     }
     errno = 0;
     do {
@@ -1908,7 +2021,7 @@ int config_resume_hint_probe(char *needs, size_t size) {
     }
     needs[0] = '\0';
     if (config_get_path(config_path, sizeof(config_path)) != 0 ||
-        config_read_active_state(config_path, &state, true, NULL) != 0) {
+        config_read_active_state(config_path, &state, true, NULL, NULL) != 0) {
         return -1;
     }
     if (!state.exists) {
@@ -1924,7 +2037,7 @@ int config_resume_hint_probe(char *needs, size_t size) {
     return safe_strncpy(needs, normalized, size);
 }
 
-#define CONFIG_RESUME_HINT_SNAPSHOT_MAX 4096U
+#define CONFIG_RESUME_HINT_SNAPSHOT_MAX CONFIG_ACTIVE_STATE_MAX
 
 void config_resume_hint_snapshot_clear(
     config_resume_hint_snapshot_t *snapshot) {
@@ -1934,6 +2047,11 @@ void config_resume_hint_snapshot_clear(
     if (snapshot->data) {
         secure_zero_memory(snapshot->data, snapshot->length);
         free(snapshot->data);
+    }
+    if (snapshot->post_image_data) {
+        secure_zero_memory(snapshot->post_image_data,
+                           snapshot->post_image_length);
+        free(snapshot->post_image_data);
     }
     memset(snapshot, 0, sizeof(*snapshot));
 }
@@ -2037,6 +2155,8 @@ static int config_resume_hint_snapshot_capture_at(
 
     snapshot->data = data;
     snapshot->mode = (unsigned int)(opened.st_mode & 0777);
+    snapshot->before_image = opened;
+    snapshot->before_image_valid = true;
     snapshot->existed = true;
     snapshot->valid = true;
     return 0;
@@ -2065,10 +2185,65 @@ static int config_resume_hint_snapshot_bind_post_image(
     snapshot->post_image_installed = false;
     snapshot->post_image_valid = false;
     memset(&snapshot->post_image, 0, sizeof(snapshot->post_image));
-    secure_zero_memory(snapshot->post_image_data,
-                       sizeof(snapshot->post_image_data));
+    if (snapshot->post_image_data) {
+        secure_zero_memory(snapshot->post_image_data,
+                           snapshot->post_image_length);
+        free(snapshot->post_image_data);
+        snapshot->post_image_data = NULL;
+    }
     snapshot->post_image_length = 0;
     return 0;
+}
+
+/* A guarded transaction starts from a before-image captured before its
+ * surrounding mutation. Re-read the state only after entering the
+ * destination's write lock, then prove that no cooperating state writer
+ * committed in the gap.
+ * The complete bytes distinguish same-inode rewrites; the captured metadata
+ * distinguishes atomic replacement even when a later writer restored the
+ * same bytes. FreeBSD may materialize ctime during a directory sync, so admit
+ * only that narrow metadata drift when the independent byte witness matches. */
+static int config_resume_hint_snapshot_require_before_image(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot,
+    const config_active_state_generation_t *current) {
+    bool content_same;
+    bool metadata_same;
+
+    if (!hint || !snapshot || !snapshot->valid || !current ||
+        snapshot->length > CONFIG_ACTIVE_STATE_MAX ||
+        (snapshot->length != 0U && !snapshot->data)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid active-state rollback before-image proof");
+        return -1;
+    }
+    if (snapshot->existed != current->existed) {
+        goto conflict;
+    }
+    if (!snapshot->existed) {
+        return 0;
+    }
+    if (!snapshot->before_image_valid || !current->data ||
+        snapshot->length != current->length) {
+        goto conflict;
+    }
+    content_same = snapshot->length == 0U ||
+                   memcmp(snapshot->data, current->data,
+                          snapshot->length) == 0;
+    metadata_same =
+        config_metadata_snapshot_same(&snapshot->before_image,
+                                      &current->metadata) ||
+        config_metadata_ctime_only_change(&snapshot->before_image,
+                                          &current->metadata);
+    if (!content_same || !metadata_same) {
+        goto conflict;
+    }
+    return 0;
+
+conflict:
+    set_error(ERR_FILE_IO,
+              "Active-state before-image changed after rollback snapshot capture; refusing publication: %s",
+              hint);
+    return -1;
 }
 
 static bool config_resume_hint_post_image_content_same(
@@ -2077,32 +2252,42 @@ static bool config_resume_hint_post_image_content_same(
     struct stat opened;
     struct stat after;
     struct stat named;
-    unsigned char data[MAX_NAME_LEN + 32U];
+    unsigned char data[4096];
     unsigned char extra;
     ssize_t extra_count;
+    size_t offset = 0;
     int fd = -1;
     bool matches = false;
 
     if (!hint || !snapshot || !current || !snapshot->post_image_valid ||
-        snapshot->post_image_length > sizeof(data) || current->st_size < 0 ||
+        (snapshot->post_image_length != 0U &&
+         !snapshot->post_image_data) ||
+        snapshot->post_image_length > CONFIG_ACTIVE_STATE_MAX ||
+        current->st_size < 0 ||
         (uintmax_t)current->st_size != snapshot->post_image_length) {
         return false;
     }
     fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, true) ||
-        !config_metadata_snapshot_same(current, &opened) ||
-        !config_pread_full(fd, data, snapshot->post_image_length, 0)) {
+        !config_metadata_snapshot_same(current, &opened)) {
         goto cleanup;
+    }
+    while (offset < snapshot->post_image_length) {
+        size_t wanted = snapshot->post_image_length - offset;
+        if (wanted > sizeof(data)) wanted = sizeof(data);
+        if (!config_pread_full(fd, data, wanted, (off_t)offset) ||
+            memcmp(data, snapshot->post_image_data + offset, wanted) != 0) {
+            goto cleanup;
+        }
+        offset += wanted;
     }
     do {
         extra_count = pread(fd, &extra, 1,
                             (off_t)snapshot->post_image_length);
     } while (extra_count < 0 && errno == EINTR);
-    if (extra_count == 0 &&
-        memcmp(data, snapshot->post_image_data,
-               snapshot->post_image_length) == 0 &&
-        fstat(fd, &after) == 0 && lstat(hint, &named) == 0 &&
+    if (extra_count == 0 && fstat(fd, &after) == 0 &&
+        lstat(hint, &named) == 0 &&
         config_metadata_file_is_safe(&after, true) &&
         config_metadata_file_is_safe(&named, true) &&
         config_metadata_snapshot_same(&opened, &after) &&
@@ -2425,12 +2610,18 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      bool *state_installed,
                                      config_source_generation_requirement_t
                                          generation_requirement,
-                                     config_resume_hint_snapshot_t *rollback_snapshot) {
+                                     config_resume_hint_snapshot_t *rollback_snapshot,
+                                     const publication_record_t *publication) {
     config_active_state_t existing_state;
-    config_active_state_generation_t state_before;
+    config_active_state_generation_t state_before = {0};
+    publication_ledger_t publications;
     const account_t *active_account = NULL;
     const char *needs;
-    char content[MAX_NAME_LEN + 32];
+    char header[MAX_NAME_LEN + 32U];
+    unsigned char *ledger_bytes = NULL;
+    size_t ledger_length = 0U;
+    unsigned char *content = NULL;
+    size_t length = 0U;
     char dir[MAX_PATH_LEN];
     char hint[MAX_PATH_LEN];
     char temp[MAX_PATH_LEN];
@@ -2439,7 +2630,10 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     struct stat after;
     bool have_temp_identity = false;
     bool temp_registered = false;
+    int result = -1;
     int fd = -1;
+
+    publication_ledger_init(&publications);
 
     if (state_installed) {
         *state_installed = false;
@@ -2501,16 +2695,46 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         return -1;
     }
     if (config_read_active_state(config_path, &existing_state, false,
-                                 &state_before) != 0) {
-        return -1;
+                                 &state_before, &publications) != 0) {
+        goto state_cleanup;
+    }
+    if (rollback_snapshot &&
+        config_resume_hint_snapshot_require_before_image(
+            hint, rollback_snapshot, &state_before) != 0) {
+        goto state_cleanup;
+    }
+
+    /* A full account-model save is the causal boundary that makes deletion
+     * durable. Preserve every deleted account's record as a non-authorizing
+     * tombstone instead of leaving it published under a reusable integer. The
+     * state file is installed first and restored from its exact before-image
+     * when accounts.toml does not install, so this transition commits or rolls
+     * back with the deletion. A load that skipped account sections is not a
+     * complete ownership view and therefore cannot classify any record as
+     * orphaned. */
+    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE &&
+        ctx->accounts_skipped_on_load == 0U) {
+        for (size_t i = 0; i < publications.count; i++) {
+            bool account_present = false;
+            for (size_t j = 0; j < ctx->account_count; j++) {
+                if (ctx->accounts[j].incarnation_persisted &&
+                    ctx->accounts[j].id ==
+                        publications.records[i].account_id &&
+                    strcmp(ctx->accounts[j].incarnation,
+                           publications.records[i].account_incarnation) == 0) {
+                    account_present = true;
+                    break;
+                }
+            }
+            if (!account_present) {
+                publications.records[i].state = PUBLICATION_STATE_RETIRING;
+            }
+        }
     }
     if (ctx->config.active_account[0] == '\0') {
-        if (safe_strncpy(content, "none\ninactive=v1\n",
-                         sizeof(content)) != 0) {
-            return -1;
-        }
-        if (existing_state.exists && existing_state.inactive_tombstone) {
-            return 0;
+        if (safe_strncpy(header, "none\ninactive=v1\n",
+                         sizeof(header)) != 0) {
+            goto state_cleanup;
         }
     } else {
 
@@ -2530,13 +2754,13 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             !text_is_tty_safe(ctx->config.active_account)) {
             set_error(ERR_CONFIG_INVALID,
                       "Refusing to persist unsafe active account name");
-            return -1;
+            goto state_cleanup;
         }
         if (!active_account) {
             set_error(ERR_CONFIG_INVALID,
                       "Refusing to persist missing active account '%s'",
                       ctx->config.active_account);
-            return -1;
+            goto state_cleanup;
         }
         bool wants_ssh = active_account->ssh_enabled &&
                          active_account->ssh_key_path[0] != '\0';
@@ -2546,18 +2770,55 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         else if (wants_ssh)              needs = "ssh";
         else if (wants_gpg)              needs = "gpg";
         else                             needs = "none";
-        if ((size_t)snprintf(content, sizeof(content), "%s\nactive=%s\n",
-                             needs, active_account->name) >= sizeof(content)) {
+        if ((size_t)snprintf(header, sizeof(header), "%s\nactive=%s\n",
+                             needs, active_account->name) >= sizeof(header)) {
             set_error(ERR_CONFIG_INVALID, "Active-state content is too long");
-            return -1;
+            goto state_cleanup;
         }
-        if (existing_state.exists && !existing_state.legacy_needs_only &&
-            !existing_state.inactive_tombstone &&
-            strcmp(existing_state.needs, needs) == 0 &&
-            strcmp(existing_state.active_account,
-                   active_account->name) == 0) {
-            return 0;
+    }
+
+    if (publication &&
+        publication_ledger_upsert(&publications, publication) != 0) {
+        goto state_cleanup;
+    }
+    if (publication_ledger_serialize(&publications, &ledger_bytes,
+                                     &ledger_length) != 0) {
+        goto state_cleanup;
+    }
+    if (strlen(header) > CONFIG_ACTIVE_STATE_MAX ||
+        ledger_length > CONFIG_ACTIVE_STATE_MAX - strlen(header)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Active-state publication bundle exceeds byte limit");
+        goto state_cleanup;
+    }
+    length = strlen(header) + ledger_length;
+    content = malloc(length == 0U ? 1U : length);
+    if (!content) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate active-state publication bundle");
+        goto state_cleanup;
+    }
+    memcpy(content, header, strlen(header));
+    if (ledger_length != 0U) {
+        memcpy(content + strlen(header), ledger_bytes, ledger_length);
+    }
+    if (state_before.existed && state_before.length == length &&
+        memcmp(state_before.data, content, length) == 0) {
+        result = 0;
+        goto state_cleanup;
+    }
+    /* Reserve the exact post-image before entering the mutation phase. A
+     * post-rename allocation failure would otherwise leave an installed state
+     * that the guarded rollback snapshot could not identify safely. */
+    if (rollback_snapshot) {
+        rollback_snapshot->post_image_data = malloc(length == 0U ? 1U : length);
+        if (!rollback_snapshot->post_image_data) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot allocate active-state post-image witness");
+            goto state_cleanup;
         }
+        memcpy(rollback_snapshot->post_image_data, content, length);
+        rollback_snapshot->post_image_length = length;
     }
 
     /* Never open the destination for writing. The validated reader above
@@ -2566,14 +2827,14 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
      * public pre-rename checkpoint. */
     if ((size_t)snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", hint) >= sizeof(temp)) {
         set_error(ERR_INVALID_PATH, "Resume hint temporary path is too long");
-        return -1;
+        goto state_cleanup;
     }
 
     fd = mkstemp(temp);
     if (fd < 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot create temporary resume hint: %s", hint);
-        return -1;
+        goto state_cleanup;
     }
     if (fchmod(fd, PERM_USER_RW) != 0 ||
         fstat(fd, &temp_identity) != 0 ||
@@ -2595,7 +2856,6 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     }
 
     size_t total = 0;
-    size_t length = strlen(content);
     while (total < length) {
         ssize_t n = write(fd, content + total, length - total);
         if (n > 0) {
@@ -2682,17 +2942,10 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         !config_metadata_same_file(&temp_identity, &after)) {
         set_error(ERR_FILE_IO,
                   "Cannot verify installed resume hint: %s", hint);
-        return -1;
+        goto state_cleanup;
     }
     if (rollback_snapshot) {
-        if (length > sizeof(rollback_snapshot->post_image_data)) {
-            set_error(ERR_CONFIG_INVALID,
-                      "Installed resume-hint post-image is too long");
-            return -1;
-        }
         rollback_snapshot->post_image = after;
-        memcpy(rollback_snapshot->post_image_data, content, length);
-        rollback_snapshot->post_image_length = length;
         rollback_snapshot->post_image_valid = true;
     }
     {
@@ -2707,7 +2960,7 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             errno = saved_errno;
             set_system_error(ERR_FILE_IO,
                              "Cannot durably commit resume hint: %s", hint);
-            return -1;
+            goto state_cleanup;
         }
         close(dir_fd);
     }
@@ -2717,16 +2970,29 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             set_error(ERR_FILE_IO,
                       "Installed resume-hint generation changed during durability commit: %s",
                       hint);
-            return -1;
+            goto state_cleanup;
         }
     }
-    return 0;
+    result = 0;
+    goto state_cleanup;
 
 hint_fail:
     if (fd >= 0) close(fd);
     config_unlink_created_temp(temp, &temp_identity, have_temp_identity);
     if (temp_registered) signals_scratch_unregister(temp);
-    return -1;
+
+state_cleanup:
+    if (content) {
+        secure_zero_memory(content, length);
+        free(content);
+    }
+    if (ledger_bytes) {
+        secure_zero_memory(ledger_bytes, ledger_length);
+        free(ledger_bytes);
+    }
+    publication_ledger_clear(&publications);
+    config_active_state_generation_clear(&state_before);
+    return result;
 }
 
 /* Shared atomic-write tail for config_save and config_save_active_account:
@@ -3094,7 +3360,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     if (update_hint &&
         config_update_resume_hint(ctx, config_path, NULL,
                                   CONFIG_SOURCE_GENERATION_UNBOUND,
-                                  NULL) != 0) {
+                                  NULL, NULL) != 0) {
         goto document_fail;
     }
     if (committed_generation) {
@@ -3204,21 +3470,42 @@ static int config_save_mode(gitswitch_ctx_t *ctx,
                             const char *config_path,
                             bool update_hint,
                             bool *config_installed,
-                            config_resume_hint_snapshot_t *rollback_snapshot) {
+                            config_resume_hint_snapshot_t *rollback_snapshot,
+                            const publication_record_t *publication) {
     config_resume_hint_snapshot_t local_state_before = {0};
     config_resume_hint_snapshot_t *state_before = rollback_snapshot
         ? rollback_snapshot : &local_state_before;
     toml_document_t *toml_doc = NULL;
+    publication_ledger_t incarnation_reservations;
+    char incarnation_before[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN] = {{0}};
+    bool incarnation_persisted_before[MAX_ACCOUNTS] = {false};
+    size_t incarnation_before_count = 0U;
+    bool incarnation_before_valid = false;
     bool document_installed = false;
     bool state_installed = false;
     struct stat committed_generation;
     int write_lock_fd = -1;
     int result = -1;
 
+    publication_ledger_init(&incarnation_reservations);
+
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save");
         return -1;
     }
+    if (ctx->account_count > MAX_ACCOUNTS) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Account model exceeds the supported account limit");
+        return -1;
+    }
+    incarnation_before_count = ctx->account_count;
+    for (size_t i = 0; i < incarnation_before_count; i++) {
+        memcpy(incarnation_before[i], ctx->accounts[i].incarnation,
+               ACCOUNT_INCARNATION_LEN);
+        incarnation_persisted_before[i] =
+            ctx->accounts[i].incarnation_persisted;
+    }
+    incarnation_before_valid = true;
     if (config_installed) {
         *config_installed = false;
     }
@@ -3270,6 +3557,21 @@ static int config_save_mode(gitswitch_ctx_t *ctx,
         goto cleanup;
     }
 
+    /* Full account-model publication is the only point that materializes a
+     * legacy token. Run every model/rewrite admission first, reserve every
+     * incarnation already named by durable Git provenance, and generate all
+     * missing candidates off-model before installing the complete set. The
+     * cleanup path restores this function's exact in-memory before-image when
+     * the account document never installs. */
+    if (config_load_publication_ledger(
+            config_path, &incarnation_reservations) != 0 ||
+        config_validate_live_publication_bindings(
+            ctx, &incarnation_reservations) != 0 ||
+        config_materialize_missing_incarnations(
+            ctx, &incarnation_reservations) != 0) {
+        goto cleanup;
+    }
+
     /* Initialize the heap-allocated TOML document exactly once. */
     toml_doc = config_document_alloc();
     if (!toml_doc) {
@@ -3311,7 +3613,7 @@ static int config_save_mode(gitswitch_ctx_t *ctx,
         if (config_update_resume_hint(ctx, config_path,
                                       &state_installed,
                                       CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE,
-                                      state_before) != 0) {
+                                      state_before, publication) != 0) {
             if (state_installed) {
                 error_context_t state_error = *get_last_error();
                 if (config_resume_hint_snapshot_restore_at(config_path,
@@ -3355,13 +3657,26 @@ static int config_save_mode(gitswitch_ctx_t *ctx,
                 strlen(config_path) + 1U);
         ctx->config.source_generation = committed_generation;
         ctx->config.source_generation_valid = true;
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            ctx->accounts[i].incarnation_persisted = true;
+        }
     }
 
 cleanup:
+    if (result != 0 && !document_installed && incarnation_before_valid) {
+        for (size_t i = 0; i < incarnation_before_count; i++) {
+            memcpy(ctx->accounts[i].incarnation, incarnation_before[i],
+                   ACCOUNT_INCARNATION_LEN);
+            ctx->accounts[i].incarnation_persisted =
+                incarnation_persisted_before[i];
+        }
+    }
+    secure_zero_memory(incarnation_before, sizeof(incarnation_before));
     if (!rollback_snapshot) {
         config_resume_hint_snapshot_clear(&local_state_before);
     }
     config_document_free(toml_doc);
+    publication_ledger_clear(&incarnation_reservations);
     if (write_lock_fd >= 0) {
         config_write_unlock(write_lock_fd);
     }
@@ -3369,7 +3684,7 @@ cleanup:
 }
 
 int config_save(gitswitch_ctx_t *ctx, const char *config_path) {
-    return config_save_mode(ctx, config_path, true, NULL, NULL);
+    return config_save_mode(ctx, config_path, true, NULL, NULL, NULL);
 }
 
 int config_save_transactional(gitswitch_ctx_t *ctx,
@@ -3381,7 +3696,35 @@ int config_save_transactional(gitswitch_ctx_t *ctx,
         return -1;
     }
     *config_installed = false;
-    return config_save_mode(ctx, config_path, true, config_installed, NULL);
+    return config_save_mode(ctx, config_path, true, config_installed, NULL,
+                            NULL);
+}
+
+int config_migrate_account_incarnations(gitswitch_ctx_t *ctx,
+                                        const char *config_path,
+                                        bool *config_installed) {
+    bool migration_required = false;
+
+    if (config_installed) *config_installed = false;
+    if (!ctx || !config_path || !config_installed) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account incarnation migration request");
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (!ctx->accounts[i].incarnation_persisted) {
+            migration_required = true;
+            continue;
+        }
+        if (!account_incarnation_is_valid(ctx->accounts[i].incarnation)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account %u has invalid persisted incarnation state",
+                      ctx->accounts[i].id);
+            return -1;
+        }
+    }
+    if (!migration_required) return 0;
+    return config_save_transactional(ctx, config_path, config_installed);
 }
 
 /* Persist only the consolidated state artifact. This intentionally does not
@@ -3391,7 +3734,8 @@ int config_save_transactional(gitswitch_ctx_t *ctx,
 static int config_save_active_account_mode(gitswitch_ctx_t *ctx,
                                            const char *config_path,
                                            bool *config_installed,
-                                           config_resume_hint_snapshot_t *rollback_snapshot) {
+                                           config_resume_hint_snapshot_t *rollback_snapshot,
+                                           const publication_record_t *publication) {
     int write_lock_fd;
     int result;
 
@@ -3411,11 +3755,12 @@ static int config_save_active_account_mode(gitswitch_ctx_t *ctx,
      * to edit — the full rebuild is both safe and required to create one. */
     if (!path_exists(config_path)) {
         result = config_save_mode(ctx, config_path, true,
-                                  config_installed, rollback_snapshot);
+                                  config_installed, rollback_snapshot,
+                                  publication);
     } else {
         result = config_update_resume_hint(ctx, config_path, config_installed,
                                            CONFIG_SOURCE_GENERATION_REQUIRE_LOADED,
-                                           rollback_snapshot);
+                                           rollback_snapshot, publication);
     }
     config_write_unlock(write_lock_fd);
     return result;
@@ -3423,7 +3768,8 @@ static int config_save_active_account_mode(gitswitch_ctx_t *ctx,
 
 int config_save_active_account(gitswitch_ctx_t *ctx,
                                const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL,
+                                           NULL);
 }
 
 int config_save_active_account_transactional(gitswitch_ctx_t *ctx,
@@ -3436,7 +3782,7 @@ int config_save_active_account_transactional(gitswitch_ctx_t *ctx,
     }
     *config_installed = false;
     return config_save_active_account_mode(ctx, config_path,
-                                           config_installed, NULL);
+                                           config_installed, NULL, NULL);
 }
 
 int config_save_active_account_transactional_guarded(
@@ -3452,12 +3798,134 @@ int config_save_active_account_transactional_guarded(
     *config_installed = false;
     return config_save_active_account_mode(ctx, config_path,
                                            config_installed,
-                                           rollback_snapshot);
+                                           rollback_snapshot, NULL);
+}
+
+/* A durable publication record may be installed only for the exact live
+ * account selected by the prepared switch. Validate pointer provenance before
+ * dereferencing current_account, then bind both the numeric ID and immutable
+ * incarnation. This prevents a caller from relabelling a sealed Git post-image
+ * as another account or as a later account that reused the same numeric ID. */
+static int config_validate_publication_owner(
+    const gitswitch_ctx_t *ctx, const publication_record_t *publication) {
+    const account_t *owner = NULL;
+    size_t pair_matches = 0U;
+
+    if (!ctx || !publication || !ctx->current_account ||
+        ctx->account_count > MAX_ACCOUNTS) {
+        errno = ESTALE;
+        set_error(ERR_CONFIG_INVALID,
+                  "Publication save has no live current account owner");
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        const account_t *candidate = &ctx->accounts[i];
+
+        if (ctx->current_account == candidate) owner = candidate;
+        if (candidate->id == publication->account_id &&
+            account_incarnation_is_valid(candidate->incarnation) &&
+            strcmp(candidate->incarnation,
+                   publication->account_incarnation) == 0) {
+            pair_matches++;
+        }
+    }
+    if (!owner || pair_matches != 1U || !owner->incarnation_persisted ||
+        !account_incarnation_is_valid(owner->incarnation) ||
+        owner->id != publication->account_id ||
+        strcmp(owner->incarnation,
+               publication->account_incarnation) != 0 ||
+        ctx->config.active_account[0] == '\0' ||
+        strcmp(ctx->config.active_account, owner->name) != 0 ||
+        publication->state != PUBLICATION_STATE_PUBLISHED) {
+        errno = ESTALE;
+        set_error(ERR_CONFIG_INVALID,
+                  "Publication record does not belong to the exact live active account incarnation");
+        return -1;
+    }
+    return 0;
+}
+
+int config_save_active_account_publication_transactional_guarded(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const publication_record_t *publication, bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot) {
+    if (config_installed) {
+        *config_installed = false;
+    }
+    if (!publication || !config_installed || !rollback_snapshot ||
+        !rollback_snapshot->valid) {
+        set_error(
+            ERR_INVALID_ARGS,
+            "Guarded publication save requires a record, install state, and valid rollback snapshot");
+        return -1;
+    }
+    if (publication_record_validate(publication) != 0) {
+        return -1;
+    }
+    if (config_validate_publication_owner(ctx, publication) != 0) {
+        return -1;
+    }
+    return config_save_active_account_mode(ctx, config_path,
+                                           config_installed,
+                                           rollback_snapshot, publication);
+}
+
+int config_load_publication_ledger(const char *config_path,
+                                   publication_ledger_t *ledger) {
+    config_active_state_t state;
+
+    if (!config_path || !ledger) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid publication-ledger load arguments");
+        return -1;
+    }
+    return config_read_active_state(config_path, &state, false, NULL,
+                                    ledger);
+}
+
+int config_publication_preflight(const char *config_path) {
+    config_active_state_t state;
+    publication_ledger_t ledger;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+    int result = -1;
+
+    if (!config_path) {
+        set_error(ERR_INVALID_ARGS,
+                  "NULL config path for publication capacity preflight");
+        return -1;
+    }
+    publication_ledger_init(&ledger);
+    if (config_read_active_state(config_path, &state, false, NULL,
+                                 &ledger) != 0 ||
+        publication_ledger_serialize(&ledger, &serialized,
+                                     &serialized_length) != 0) {
+        goto cleanup;
+    }
+    if (ledger.count >= PUBLICATION_LEDGER_MAX_RECORDS ||
+        CONFIG_PUBLICATION_RECORD_RESERVE > PUBLICATION_LEDGER_MAX_BYTES ||
+        serialized_length >
+            PUBLICATION_LEDGER_MAX_BYTES - CONFIG_PUBLICATION_RECORD_RESERVE) {
+        errno = ENOSPC;
+        set_error(ERR_CONFIG_INVALID,
+                  "Publication ledger has no capacity for another worst-case record");
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (serialized) {
+        secure_zero_memory(serialized, serialized_length);
+        free(serialized);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
 }
 
 int config_restore_active_account(gitswitch_ctx_t *ctx,
                                   const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL,
+                                           NULL);
 }
 
 /* Create default configuration file */
@@ -3822,8 +4290,10 @@ static int config_add_account_impl(gitswitch_ctx_t *ctx,
                                    bool operation_owned,
                                    uint64_t transaction_token) {
     account_t candidate;
+    publication_ledger_t publications;
     uint32_t current_id = 0;
     bool had_current;
+    bool publication_reserved = false;
 
     if (accounts_transaction_authorize_model_mutation(
             ctx,
@@ -3842,6 +4312,9 @@ static int config_add_account_impl(gitswitch_ctx_t *ctx,
         return -1;
     }
     candidate = *account;
+    secure_zero_memory(candidate.incarnation,
+                       sizeof(candidate.incarnation));
+    candidate.incarnation_persisted = false;
     if (normalize_account_model_for_admission(&candidate) != 0) return -1;
     
     /* Validate account security */
@@ -3850,6 +4323,40 @@ static int config_add_account_impl(gitswitch_ctx_t *ctx,
     }
     
     if (validate_account_uniqueness(ctx, &candidate, SIZE_MAX) != 0) return -1;
+
+    /* Account IDs are publication ownership identities, not merely current
+     * array keys. A record survives failed retirement so a later retry can
+     * still describe the residue; recycling its integer would let an unrelated
+     * account inherit that authority. Empty/unbound contexts have no durable
+     * namespace, while a bound context must read the ledger exactly or fail
+     * before model mutation. */
+    publication_ledger_init(&publications);
+    if (ctx->config.config_path[0] != '\0' &&
+        config_load_publication_ledger(ctx->config.config_path,
+                                       &publications) != 0) {
+        publication_ledger_clear(&publications);
+        return -1;
+    }
+    for (size_t i = 0; i < publications.count; i++) {
+        if (publications.records[i].account_id == candidate.id) {
+            publication_reserved = true;
+            break;
+        }
+    }
+    if (publication_reserved) {
+        publication_ledger_clear(&publications);
+        set_error(
+            ERR_ACCOUNT_EXISTS,
+            "Account ID %u is reserved by durable Git publication provenance",
+            candidate.id);
+        return -1;
+    }
+    if (config_generate_incarnation(ctx, &publications, NULL, 0U,
+                                    candidate.incarnation) != 0) {
+        publication_ledger_clear(&publications);
+        return -1;
+    }
+    publication_ledger_clear(&publications);
 
     had_current = config_capture_current_id(ctx, &current_id);
 
@@ -3979,6 +4486,36 @@ static int config_update_account_impl(gitswitch_ctx_t *ctx,
         set_error(ERR_ACCOUNT_NOT_FOUND, "Account with ID %u not found", account->id);
         return -1;
     }
+
+    /* Incarnation is immutable account authority, not an editable field.
+     * Empty means an older/source-compatible caller omitted the field and
+     * inherits it. A nonempty value must name the exact current incarnation;
+     * silently accepting a different token would mask a stale or misbound
+     * edit request. Durability state always comes from the live model. */
+    if (existing_account->incarnation[0] != '\0' &&
+        !account_incarnation_is_valid(existing_account->incarnation)) {
+        errno = ESTALE;
+        set_error(
+            ERR_ACCOUNT_INVALID,
+            "Account %u has a corrupted immutable incarnation",
+            account->id);
+        return -1;
+    }
+    if (replacement.incarnation[0] != '\0' &&
+        (!account_incarnation_is_valid(replacement.incarnation) ||
+         strcmp(replacement.incarnation,
+                existing_account->incarnation) != 0)) {
+        errno = ESTALE;
+        set_error(
+            ERR_ACCOUNT_INVALID,
+            "Account %u edit attempted to replace its immutable incarnation",
+            account->id);
+        return -1;
+    }
+    memcpy(replacement.incarnation, existing_account->incarnation,
+           sizeof(replacement.incarnation));
+    replacement.incarnation_persisted =
+        existing_account->incarnation_persisted;
     
     /* Validate new account data */
     if (validate_account_security(&replacement) != 0) {
@@ -4256,6 +4793,171 @@ static bool config_scope_is_persistable(git_scope_t scope) {
 
 static bool config_account_id_is_valid(uint32_t account_id) {
     return account_id != 0;
+}
+
+static bool config_incarnation_reserved(
+    const gitswitch_ctx_t *ctx, const publication_ledger_t *publications,
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN],
+    size_t generated_count, const char *candidate) {
+    for (size_t i = 0; ctx && i < ctx->account_count; i++) {
+        if (account_incarnation_is_valid(ctx->accounts[i].incarnation) &&
+            strcmp(ctx->accounts[i].incarnation, candidate) == 0) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < generated_count; i++) {
+        if (generated[i][0] != '\0' &&
+            strcmp(generated[i], candidate) == 0) {
+            return true;
+        }
+    }
+    for (size_t i = 0; publications && i < publications->count; i++) {
+        if (strcmp(publications->records[i].account_incarnation,
+                   candidate) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An integer mentioned by durable Git provenance is already an ownership
+ * namespace. A full save may remove its exact account (the state phase then
+ * tombstones the record), but it may not install a different live account at
+ * the same integer. Reject before entropy generation or any state write so a
+ * hand-edited legacy/mismatched document cannot be normalized into a binding
+ * that every later switch must reject. */
+static int config_validate_live_publication_bindings(
+    const gitswitch_ctx_t *ctx,
+    const publication_ledger_t *publications) {
+    if (!ctx || !publications) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account publication binding model");
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        const account_t *account = &ctx->accounts[i];
+
+        for (size_t j = 0; j < publications->count; j++) {
+            const publication_record_t *record = &publications->records[j];
+
+            if (record->account_id != account->id) continue;
+            if (account->incarnation_persisted &&
+                account_incarnation_is_valid(account->incarnation) &&
+                strcmp(account->incarnation,
+                       record->account_incarnation) == 0) {
+                continue;
+            }
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Account ID %u is bound to a different durable incarnation",
+                account->id);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int config_generate_incarnation(
+    const gitswitch_ctx_t *ctx, const publication_ledger_t *publications,
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN],
+    size_t generated_count, char out[ACCOUNT_INCARNATION_LEN]) {
+    static const char hexadecimal[] = "0123456789ABCDEF";
+
+    if (!out) {
+        set_error(ERR_INVALID_ARGS, "NULL account incarnation output");
+        return -1;
+    }
+    out[0] = '\0';
+    for (size_t attempt = 0; attempt < 128U; attempt++) {
+        int result = g_config_incarnation_generate
+            ? g_config_incarnation_generate(out)
+            : generate_random_string(out, ACCOUNT_INCARNATION_LEN,
+                                     hexadecimal);
+        if (result != 0) {
+            secure_zero_memory(out, ACCOUNT_INCARNATION_LEN);
+            return -1;
+        }
+        if (!account_incarnation_is_valid(out)) {
+            secure_zero_memory(out, ACCOUNT_INCARNATION_LEN);
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Account incarnation generator returned a noncanonical token");
+            return -1;
+        }
+        if (!config_incarnation_reserved(ctx, publications, generated,
+                                         generated_count, out)) {
+            return 0;
+        }
+        secure_zero_memory(out, ACCOUNT_INCARNATION_LEN);
+    }
+    set_error(ERR_CONFIG_INVALID,
+              "Cannot allocate a unique account incarnation");
+    return -1;
+}
+
+/* Generate every missing token off-model first. Entropy failure at any point
+ * therefore leaves the complete in-memory account array unchanged; only once
+ * the full candidate set is valid and collision-free are values installed. */
+static int config_materialize_missing_incarnations(
+    gitswitch_ctx_t *ctx, const publication_ledger_t *publications) {
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN] = {{0}};
+    size_t count;
+
+    if (!ctx || ctx->account_count > MAX_ACCOUNTS) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account incarnation migration model");
+        return -1;
+    }
+    count = ctx->account_count;
+    for (size_t i = 0; i < count; i++) {
+        const char *incarnation = ctx->accounts[i].incarnation;
+
+        if (incarnation[0] != '\0') {
+            if (!account_incarnation_is_valid(incarnation)) {
+                set_error(
+                    ERR_ACCOUNT_INVALID,
+                    "Account %u has a noncanonical incarnation",
+                    ctx->accounts[i].id);
+                goto fail;
+            }
+            for (size_t j = 0; j < i; j++) {
+                const char *prior = generated[j][0] != '\0'
+                    ? generated[j] : ctx->accounts[j].incarnation;
+                if (strcmp(prior, incarnation) == 0) {
+                    set_error(
+                        ERR_ACCOUNT_INVALID,
+                        "Accounts %u and %u share one incarnation",
+                        ctx->accounts[j].id, ctx->accounts[i].id);
+                    goto fail;
+                }
+            }
+            continue;
+        }
+        if (ctx->accounts[i].incarnation_persisted ||
+            config_generate_incarnation(ctx, publications, generated, i,
+                                        generated[i]) != 0) {
+            if (ctx->accounts[i].incarnation_persisted) {
+                set_error(ERR_ACCOUNT_INVALID,
+                          "Account %u has no persisted incarnation",
+                          ctx->accounts[i].id);
+            }
+            goto fail;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (generated[i][0] != '\0') {
+            memcpy(ctx->accounts[i].incarnation, generated[i],
+                   ACCOUNT_INCARNATION_LEN);
+            ctx->accounts[i].incarnation_persisted = false;
+        }
+    }
+    secure_zero_memory(generated, sizeof(generated));
+    return 0;
+
+fail:
+    secure_zero_memory(generated, sizeof(generated));
+    return -1;
 }
 
 typedef struct {
@@ -5334,7 +6036,7 @@ static bool config_key_is_modeled(const char *section, const char *key) {
     }
     /* An [accounts.<id>] section. */
     static const char *const account_keys[] = {
-        "name", "email", "description", "preferred_scope",
+        "incarnation", "name", "email", "description", "preferred_scope",
         "ssh_key", "ssh_host", "ssh_hostname", "gpg_key",
         "gpg_signing_enabled", NULL
     };
@@ -5411,6 +6113,21 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             memset(&account, 0, sizeof(account));
             account.id = account_id;
             account.preferred_scope = GIT_SCOPE_LOCAL; /* Default */
+
+            /* Optional only for pre-incarnation account documents. Never
+             * generate entropy during load: readonly/names/status must remain
+             * observational. A real mutation materializes every missing token
+             * together before its full transactional save. */
+            fs = get_account_field(
+                doc, sections[i], "incarnation", account.incarnation,
+                sizeof(account.incarnation));
+            if (fs == FIELD_UNLOADABLE) {
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account section [%s] was skipped: %s",
+                                sections[i], get_last_error()->message);
+                continue;
+            }
+            account.incarnation_persisted = fs == FIELD_LOADED;
 
             /* Load required fields. Skipped, not dropped: whether the field
              * is MISSING or present-but-refused by the getter (a name over
@@ -5609,6 +6326,9 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             bool dup = false;
             for (size_t j = 0; j < ctx->account_count; j++) {
                 if (ctx->accounts[j].id == account.id ||
+                    (account.incarnation[0] != '\0' &&
+                     strcmp(ctx->accounts[j].incarnation,
+                            account.incarnation) == 0) ||
                     strcasecmp(ctx->accounts[j].name, account.name) == 0 ||
                     (ctx->accounts[j].ssh_host_alias[0] != '\0' &&
                      account.ssh_host_alias[0] != '\0' &&
@@ -5661,6 +6381,23 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                             "understands [settings] and [accounts.<id>]). It is preserved, "
                             "but account changes are blocked until you fix or remove it.",
                             sections[i]);
+        }
+    }
+
+    /* The writer emits incarnations for every account in one generation.
+     * A mixture of present and absent tokens cannot be its output: treat that
+     * shape as a manual same-ID replacement/partial rewrite, not as legacy.
+     * Pure legacy documents (all absent) remain readable and unmaterialized. */
+    {
+        size_t persisted = 0U;
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            if (ctx->accounts[i].incarnation_persisted) persisted++;
+        }
+        if (persisted != 0U && persisted != ctx->account_count) {
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Account document mixes legacy accounts without incarnations and incarnation-bound accounts");
+            return -1;
         }
     }
 
@@ -6008,6 +6745,12 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
                       "Account ID must be in 1..%u", UINT32_MAX);
             return -1;
         }
+        if (!account_incarnation_is_valid(account->incarnation)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account %u has no canonical incarnation",
+                      account->id);
+            return -1;
+        }
         if (!config_scope_is_persistable(account->preferred_scope)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account %u preferred scope must be local or global",
@@ -6027,6 +6770,13 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         log_debug("Creating/updating section: %s", section_name);
         
         /* Save required fields */
+        if (toml_set_string(doc, section_name, "incarnation",
+                            account->incarnation) != 0) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Failed to save account incarnation");
+            return -1;
+        }
+
         if (toml_set_string(doc, section_name, "name", account->name) != 0) {
             set_error(ERR_CONFIG_INVALID, "Failed to save account name");
             return -1;

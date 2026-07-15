@@ -1360,11 +1360,12 @@ static void private_lock_inode_release(size_t slot) {
 }
 
 static int lock_private_file_at_mode(int dir_fd, const char *name,
-                                     bool nonblocking) {
+                                     bool nonblocking,
+                                     bool create_and_repair) {
     struct stat opened;
     struct stat entry;
     struct stat leaf;
-    int flags = O_RDWR | O_CREAT;
+    int flags = O_RDWR;
     int dir_flags = O_RDONLY;
     int parent_fd = -1;
     int leaf_fd = -1;
@@ -1438,6 +1439,7 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
 #ifdef O_NOFOLLOW
     flags |= O_NOFOLLOW;
 #endif
+    if (create_and_repair) flags |= O_CREAT;
     file_fd = openat(dir_fd, name, flags, 0600);
     if (file_fd < 0) {
         goto fail;
@@ -1450,7 +1452,12 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
         errno = EACCES;
         goto fail;
     }
-    if (fchmod(file_fd, 0600) != 0) {
+    if (create_and_repair) {
+        if (fchmod(file_fd, 0600) != 0) {
+            goto fail;
+        }
+    } else if ((opened.st_mode & 0777) != 0600) {
+        errno = EACCES;
         goto fail;
     }
     if (private_lock_inode_acquire(file_fd, nonblocking, &file_slot) != 0) {
@@ -1494,11 +1501,66 @@ fail: {
 }
 
 int lock_private_file_at(int dir_fd, const char *name) {
-    return lock_private_file_at_mode(dir_fd, name, false);
+    return lock_private_file_at_mode(dir_fd, name, false, true);
 }
 
 int try_lock_private_file_at(int dir_fd, const char *name) {
-    return lock_private_file_at_mode(dir_fd, name, true);
+    return lock_private_file_at_mode(dir_fd, name, true, true);
+}
+
+int try_lock_existing_private_file_at(int dir_fd, const char *name) {
+    return lock_private_file_at_mode(dir_fd, name, true, false);
+}
+
+int verify_private_lock_file_at(int token_fd, int dir_fd, const char *name) {
+    const private_lock_context_t *matched = NULL;
+    const private_lock_inode_t *leaf_inode;
+    const private_lock_inode_t *file_inode;
+    struct stat token;
+    struct stat leaf;
+    struct stat named;
+
+    if (token_fd < 0 || dir_fd < 0 || !name || !*name || strchr(name, '/')) {
+        errno = EINVAL;
+        return -1;
+    }
+    private_lock_prepare_process();
+    if (fstat(token_fd, &token) != 0) {
+        errno = ESTALE;
+        return -1;
+    }
+    for (size_t i = 0; i < PRIVATE_LOCK_CONTEXTS; i++) {
+        const private_lock_context_t *ctx = &g_private_lock_contexts[i];
+
+        if (ctx->active && ctx->token_fd == token_fd &&
+            ctx->token_dev == token.st_dev && ctx->token_ino == token.st_ino) {
+            matched = ctx;
+            break;
+        }
+    }
+    if (!matched || matched->leaf_slot >= PRIVATE_LOCK_INODES ||
+        matched->file_slot >= PRIVATE_LOCK_INODES) {
+        errno = ESTALE;
+        return -1;
+    }
+    leaf_inode = &g_private_lock_inodes[matched->leaf_slot];
+    file_inode = &g_private_lock_inodes[matched->file_slot];
+    if (!leaf_inode->active || leaf_inode->refs == 0 ||
+        !file_inode->active || file_inode->refs == 0 ||
+        !private_lock_fd_has_identity(leaf_inode->fd, leaf_inode->dev,
+                                      leaf_inode->ino) ||
+        !private_lock_fd_has_identity(file_inode->fd, file_inode->dev,
+                                      file_inode->ino) ||
+        fstat(dir_fd, &leaf) != 0 || !S_ISDIR(leaf.st_mode) ||
+        leaf.st_dev != leaf_inode->dev || leaf.st_ino != leaf_inode->ino ||
+        fstatat(dir_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !S_ISREG(named.st_mode) || named.st_uid != getuid() ||
+        named.st_nlink != 1 || (named.st_mode & 0777) != 0600 ||
+        named.st_dev != file_inode->dev || named.st_ino != file_inode->ino) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
 }
 
 static uint64_t private_lock_latest_generation_for_fd(int token_fd) {
@@ -5622,6 +5684,22 @@ int generate_random_string(char *buffer, size_t buffer_size, const char *charset
     fclose(urandom);
     
     return 0;
+}
+
+bool account_incarnation_is_valid(const char *incarnation) {
+    if (!incarnation ||
+        strnlen(incarnation, ACCOUNT_INCARNATION_LEN) !=
+            ACCOUNT_INCARNATION_HEX_LEN) {
+        return false;
+    }
+    for (size_t i = 0; i < ACCOUNT_INCARNATION_HEX_LEN; i++) {
+        unsigned char byte = (unsigned char)incarnation[i];
+        if (!((byte >= (unsigned char)'0' && byte <= (unsigned char)'9') ||
+              (byte >= (unsigned char)'A' && byte <= (unsigned char)'F'))) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool check_file_permissions_safe(const char *file_path, mode_t expected_mode) {

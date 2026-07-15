@@ -997,6 +997,102 @@ cleanup:
     (void)rmdir(root);
 }
 
+TEST(private_lock_verifier_rejects_named_lock_replacement) {
+    char root[] = "/tmp/gs_private_lock_verify_XXXXXX";
+    char lock_path[512];
+    int dir_fd = -1;
+    int token = -1;
+    int replacement_fd = -1;
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+    token = lock_private_file_at(dir_fd, ".test-lock");
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+    CHECK_EQ_INT(verify_private_lock_file_at(token, dir_fd, ".test-lock"), 0);
+
+    CHECK_EQ_INT(unlink(lock_path), 0);
+    replacement_fd = open(lock_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC,
+                          0600);
+    CHECK(replacement_fd >= 0);
+    errno = 0;
+    CHECK_EQ_INT(verify_private_lock_file_at(token, dir_fd, ".test-lock"), -1);
+    CHECK_EQ_INT(errno, ESTALE);
+
+cleanup:
+    if (replacement_fd >= 0) close(replacement_fd);
+    if (token >= 0) unlock_private_file(token);
+    if (dir_fd >= 0) close(dir_fd);
+    (void)unlink(lock_path);
+    (void)rmdir(root);
+}
+
+TEST(existing_private_lock_acquisition_never_creates_or_repairs) {
+    char root[] = "/tmp/gs_private_lock_existing_XXXXXX";
+    char lock_path[512];
+    struct stat before;
+    struct stat after;
+    int dir_fd = -1;
+    int lock_fd = -1;
+    int token = -1;
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(lock_path, sizeof(lock_path), "%s/.observe-lock", root);
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+
+    errno = 0;
+    token = try_lock_existing_private_file_at(dir_fd, ".observe-lock");
+    CHECK_EQ_INT(token, -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    errno = 0;
+    CHECK(lstat(lock_path, &after) != 0 && errno == ENOENT);
+
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    CHECK(lock_fd >= 0);
+    if (lock_fd < 0) goto cleanup;
+    CHECK_EQ_INT(close(lock_fd), 0);
+    lock_fd = -1;
+    CHECK_EQ_INT(stat(lock_path, &before), 0);
+    token = try_lock_existing_private_file_at(dir_fd, ".observe-lock");
+    CHECK(token >= 0);
+    if (token >= 0) {
+        CHECK_EQ_INT(verify_private_lock_file_at(
+                         token, dir_fd, ".observe-lock"), 0);
+        unlock_private_file(token);
+        token = -1;
+    }
+    CHECK_EQ_INT(stat(lock_path, &after), 0);
+    CHECK(before.st_dev == after.st_dev && before.st_ino == after.st_ino);
+    CHECK_EQ_INT(before.st_mode & 0777, after.st_mode & 0777);
+    CHECK(before.st_mtime == after.st_mtime);
+    CHECK(before.st_ctime == after.st_ctime);
+
+    CHECK_EQ_INT(chmod(lock_path, 0644), 0);
+    CHECK_EQ_INT(stat(lock_path, &before), 0);
+    errno = 0;
+    token = try_lock_existing_private_file_at(dir_fd, ".observe-lock");
+    CHECK_EQ_INT(token, -1);
+    CHECK_EQ_INT(errno, EACCES);
+    token = -1;
+    CHECK_EQ_INT(stat(lock_path, &after), 0);
+    CHECK(before.st_dev == after.st_dev && before.st_ino == after.st_ino);
+    CHECK_EQ_INT(before.st_mode & 0777, after.st_mode & 0777);
+    CHECK(before.st_mtime == after.st_mtime);
+    CHECK(before.st_ctime == after.st_ctime);
+
+cleanup:
+    if (token >= 0) unlock_private_file(token);
+    if (lock_fd >= 0) close(lock_fd);
+    if (dir_fd >= 0) close(dir_fd);
+    (void)unlink(lock_path);
+    (void)rmdir(root);
+}
+
 /* AR-08 L7: an exposed token is only an opaque handle. Closing it and reusing
  * the integer must not let release close the replacement, but the stale
  * context still has to retire its registry references so nested locks remain
@@ -1025,6 +1121,9 @@ TEST(private_lock_release_identity_checks_reused_and_nested_tokens) {
     replacement = replace_fd_with_devnull(first);
     CHECK_EQ_INT(replacement, first);
     if (replacement < 0) goto cleanup;
+    errno = 0;
+    CHECK_EQ_INT(verify_private_lock_file_at(first, dir_fd, ".test-lock"), -1);
+    CHECK_EQ_INT(errno, ESTALE);
     errno = ERANGE;
     unlock_private_file(first);
     CHECK_EQ_INT(errno, ERANGE);
@@ -1851,6 +1950,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting);
     RUN_TEST(runtime_state_lock_excludes_contender_after_leaf_replacement);
     RUN_TEST(private_lock_token_is_anonymous_and_lock_path_rebind_survives_release);
+    RUN_TEST(private_lock_verifier_rejects_named_lock_replacement);
+    RUN_TEST(existing_private_lock_acquisition_never_creates_or_repairs);
     RUN_TEST(private_lock_release_identity_checks_reused_and_nested_tokens);
     RUN_TEST(private_lock_release_preserves_newer_registered_token_on_aba);
     RUN_TEST(runtime_lock_release_ignores_foreign_private_token);
