@@ -27,6 +27,11 @@ typedef struct {
     bool was_set;
 } saved_environment_t;
 
+typedef struct {
+    saved_environment_t variables[4];
+    size_t count;
+} saved_color_environment_t;
+
 static void captured_output_free(captured_output_t *captured) {
     if (!captured) return;
     free(captured->standard_output);
@@ -176,6 +181,47 @@ static int restore_environment(saved_environment_t *saved) {
     return result;
 }
 
+/* Automatic-color cases must be hermetic with respect to all policy inputs,
+ * including overrides inherited from a developer shell or hosted runner. */
+static int isolate_color_environment(saved_color_environment_t *saved) {
+    static const char *const names[] = {
+        "TERM", "COLORTERM", "NO_COLOR", "CLICOLOR_FORCE"
+    };
+
+    if (!saved) return -1;
+    memset(saved, 0, sizeof(*saved));
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (save_environment(&saved->variables[i], names[i]) != 0) {
+            goto fail;
+        }
+        saved->count++;
+    }
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (unsetenv(names[i]) != 0) goto fail;
+    }
+    return 0;
+
+fail:
+    while (saved->count > 0) {
+        saved->count--;
+        (void)restore_environment(&saved->variables[saved->count]);
+    }
+    return -1;
+}
+
+static int restore_color_environment(saved_color_environment_t *saved) {
+    int result = 0;
+
+    if (!saved) return -1;
+    while (saved->count > 0) {
+        saved->count--;
+        if (restore_environment(&saved->variables[saved->count]) != 0) {
+            result = -1;
+        }
+    }
+    return result;
+}
+
 static int set_color_environment(const char *term, const char *colorterm) {
     if ((term ? setenv("TERM", term, 1) : unsetenv("TERM")) != 0) return -1;
     if ((colorterm ? setenv("COLORTERM", colorterm, 1)
@@ -266,12 +312,59 @@ TEST(retained_public_display_api_links) {
 }
 
 TEST(explicit_color_flags_have_deterministic_precedence) {
+    saved_color_environment_t saved;
+
+    if (isolate_color_environment(&saved) != 0) {
+        CHECK(false);
+        return;
+    }
+    CHECK_EQ_INT(setenv("NO_COLOR", "inherited-disable", 1), 0);
     CHECK_EQ_INT(display_init(false, true), 0);
     CHECK(!display_supports_color());
     CHECK_EQ_INT(display_init(true, false), 0);
     CHECK(display_supports_color());
+    CHECK_EQ_INT(setenv("CLICOLOR_FORCE", "1", 1), 0);
     CHECK_EQ_INT(display_init(true, true), 0);
     CHECK(!display_supports_color());
+    CHECK_EQ_INT(restore_color_environment(&saved), 0);
+}
+
+TEST(environment_color_policy_precedence_and_values_are_exact) {
+    saved_color_environment_t saved;
+
+    if (isolate_color_environment(&saved) != 0) {
+        CHECK(false);
+        return;
+    }
+
+    /* NO_COLOR wins over CLICOLOR_FORCE, and every non-empty NO_COLOR value
+     * (including the commonly misunderstood string "0") disables color. */
+    CHECK_EQ_INT(setenv("NO_COLOR", "1", 1), 0);
+    CHECK_EQ_INT(setenv("CLICOLOR_FORCE", "1", 1), 0);
+    CHECK_EQ_INT(display_init(false, false), 0);
+    CHECK(!display_supports_color());
+    CHECK_EQ_INT(setenv("NO_COLOR", "0", 1), 0);
+    CHECK_EQ_INT(display_init(false, false), 0);
+    CHECK(!display_supports_color());
+
+    /* Empty NO_COLOR is inactive. A nonzero force value then enables color
+     * even when automatic terminal detection would reject this stream. */
+    CHECK_EQ_INT(setenv("NO_COLOR", "", 1), 0);
+    CHECK_EQ_INT(setenv("TERM", "dumb", 1), 0);
+    CHECK_EQ_INT(unsetenv("COLORTERM"), 0);
+    CHECK_EQ_INT(display_init(false, false), 0);
+    CHECK(display_supports_color());
+
+    /* Empty and literal-zero CLICOLOR_FORCE values both fall through to
+     * automatic detection; TERM=dumb keeps that result deterministic. */
+    CHECK_EQ_INT(setenv("CLICOLOR_FORCE", "", 1), 0);
+    CHECK_EQ_INT(display_init(false, false), 0);
+    CHECK(!display_supports_color());
+    CHECK_EQ_INT(setenv("CLICOLOR_FORCE", "0", 1), 0);
+    CHECK_EQ_INT(display_init(false, false), 0);
+    CHECK(!display_supports_color());
+
+    CHECK_EQ_INT(restore_color_environment(&saved), 0);
 }
 
 typedef struct {
@@ -286,8 +379,7 @@ static void emit_automatic_color_probe(void *opaque) {
 }
 
 TEST(automatic_color_requires_tty_and_color_environment) {
-    saved_environment_t saved_term;
-    saved_environment_t saved_colorterm;
+    saved_color_environment_t saved;
     captured_output_t captured;
     automatic_color_context_t context;
     bool supports_color = false;
@@ -295,13 +387,8 @@ TEST(automatic_color_requires_tty_and_color_environment) {
     int slave = -1;
     int pty_result;
 
-    if (save_environment(&saved_term, "TERM") != 0) {
+    if (isolate_color_environment(&saved) != 0) {
         CHECK(false);
-        return;
-    }
-    if (save_environment(&saved_colorterm, "COLORTERM") != 0) {
-        CHECK(false);
-        (void)restore_environment(&saved_term);
         return;
     }
 
@@ -318,8 +405,7 @@ TEST(automatic_color_requires_tty_and_color_environment) {
 
     pty_result = open_test_pty(&master, &slave);
     if (pty_result == 1) {
-        CHECK_EQ_INT(restore_environment(&saved_colorterm), 0);
-        CHECK_EQ_INT(restore_environment(&saved_term), 0);
+        CHECK_EQ_INT(restore_color_environment(&saved), 0);
         TS_SKIP("pty", "host cannot provide a usable pseudo-terminal");
     }
     CHECK_EQ_INT(pty_result, 0);
@@ -351,8 +437,7 @@ TEST(automatic_color_requires_tty_and_color_environment) {
 cleanup:
     if (slave >= 0) close(slave);
     if (master >= 0) close(master);
-    CHECK_EQ_INT(restore_environment(&saved_colorterm), 0);
-    CHECK_EQ_INT(restore_environment(&saved_term), 0);
+    CHECK_EQ_INT(restore_color_environment(&saved), 0);
 }
 
 static void check_owned_colorized_result(const char *text, const char *type,
@@ -1034,6 +1119,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
     RUN_TEST(retained_public_display_api_links);
     RUN_TEST(explicit_color_flags_have_deterministic_precedence);
+    RUN_TEST(environment_color_policy_precedence_and_values_are_exact);
     RUN_TEST(automatic_color_requires_tty_and_color_environment);
     RUN_TEST(colorize_maps_exact_styles_resets_and_passthroughs);
     RUN_TEST(colorize_results_remain_valid_across_later_growth);
