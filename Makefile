@@ -375,6 +375,10 @@ HEADERS = $(wildcard $(SRCDIR)/*.h)
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
+PUBLIC_API_PRODUCTION_OBJECT = $(OBJDIR)/test_public_api_production.o
+PUBLIC_API_PRODUCTION_TARGET = $(BINDIR)/test_public_api_production
+PUBLIC_API_COVERAGE_STAMP = $(OBJDIR)/.public-api-coverage
+TEST_TARGETS += $(PUBLIC_API_PRODUCTION_TARGET)
 CLI_E2E_TEST_TARGETS = \
 	$(BINDIR)/test_ar04_cli \
 	$(BINDIR)/test_ar04_lifecycle \
@@ -398,7 +402,8 @@ DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR08_COPY_UTILS_OBJECT:.o=.d) \
            $(AR09_SECURITY_UTILS_OBJECT:.o=.d) \
            $(AR09_DISPATCH_SIGNALS_OBJECT:.o=.d) \
-           $(AR09_DISPATCH_TEST_OBJECT:.o=.d)
+           $(AR09_DISPATCH_TEST_OBJECT:.o=.d) \
+           $(PUBLIC_API_PRODUCTION_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -700,10 +705,27 @@ uninstall:
 # Test compilation
 # AR-10 L15: test objects see the GITSWITCH_TESTING declarations (the suites
 # link the testing signals object below); production objects never do.
+$(PUBLIC_API_COVERAGE_STAMP): $(TESTDIR)/test_public_api.c \
+		$(TESTDIR)/test_public_api_coverage.sh $(HEADERS) \
+		$(BUILDTYPE_STAMP) | $(OBJDIR)
+	@PUBLIC_API_CC="$(CC)" sh $(TESTDIR)/test_public_api_coverage.sh "$(CURDIR)"
+	@touch $@
+
+$(OBJDIR)/test_public_api.o: $(PUBLIC_API_COVERAGE_STAMP)
+
 $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
 		-DGITSWITCH_TESTING \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
+
+# Compile the same exhaustive registry without GITSWITCH_TESTING so an API
+# accidentally available only to test objects cannot satisfy the production
+# link contract (AR-11 L4).
+$(PUBLIC_API_PRODUCTION_OBJECT): $(TESTDIR)/test_public_api.c \
+		$(PUBLIC_API_COVERAGE_STAMP) $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling production public API profile..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
 		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The reset suite calls the real CLI entry point in isolated child processes
@@ -769,6 +791,11 @@ $(AR09_DISPATCH_TEST_OBJECT): $(TESTDIR)/test_signals.c $(BUILDTYPE_STAMP) | $(O
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(AR09_DISPATCH_SIGNALS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(PUBLIC_API_PRODUCTION_TARGET): $(PUBLIC_API_PRODUCTION_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking production public API profile..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
@@ -863,12 +890,15 @@ endif
 # ShellCheck is intentionally a separate, fail-closed QA gate instead of an
 # ordinary `make test` prerequisite: builds remain package-independent while
 # CI and release reviewers can require every dialect parser explicitly.
-.PHONY: shell-static-test ci-policy-test
+.PHONY: shell-static-test ci-policy-test public-api-coverage-test
 shell-static-test:
 	@sh tests/test_shell_assets.sh "$(CURDIR)"
 
 ci-policy-test:
 	@sh tests/test_ci_policy.sh "$(CURDIR)"
+
+public-api-coverage-test:
+	@PUBLIC_API_CC="$(CC)" sh $(TESTDIR)/test_public_api_coverage.sh "$(CURDIR)"
 
 # The small contract fixture proves both threshold metrics are wired to gcovr's
 # documented nonzero exit bits; a no-op or report-only replacement cannot make
@@ -1307,5 +1337,6 @@ rpm: dist
 	@echo "RPM packages created in ~/rpmbuild/RPMS/"
 
 # Prevent make from removing intermediate files
-.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT) \
+.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(PUBLIC_API_PRODUCTION_OBJECT) \
+	$(AR07_RESET_MAIN_OBJECT) \
 	$(AR08_REMOVE_ACCOUNTS_OBJECT) $(AR08_HINT_CONFIG_OBJECT)

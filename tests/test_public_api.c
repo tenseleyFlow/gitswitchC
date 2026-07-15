@@ -1,4 +1,6 @@
-/* AR-08 L27: compile and link every function exported by a project header.
+/* AR-08 L27 / AR-11 L4: compile and link every function exported by a
+ * project header.  tests/test_public_api_coverage.sh mechanically compares
+ * these references with the declarations visible in both header profiles.
  *
  * __typeof__ binds each reference to the declaration's exact function-pointer
  * type.  The volatile local keeps a real relocation in optimized builds, so a
@@ -18,6 +20,10 @@
 #include "toml_parser.h"
 #include "utils.h"
 
+#ifdef GITSWITCH_PUBLIC_API_REGISTRY_ONLY
+#define REQUIRE_PUBLIC_API(name) GITSWITCH_PUBLIC_API_REGISTRY(name)
+#define REQUIRE_PUBLIC_OBJECT(name) ((void)0)
+#else
 #define REQUIRE_PUBLIC_API(name)                 \
     do {                                         \
         __typeof__(&(name)) volatile typed_api = &(name); \
@@ -29,6 +35,7 @@
         __typeof__(&(name)) volatile typed_object = &(name); \
         CHECK(typed_object != NULL);             \
     } while (0)
+#endif
 
 TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_add_interactive);
@@ -49,6 +56,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_switch);
     REQUIRE_PUBLIC_API(accounts_switch_abort);
     REQUIRE_PUBLIC_API(accounts_switch_commit);
+    REQUIRE_PUBLIC_API(accounts_switch_commit_result);
     REQUIRE_PUBLIC_API(accounts_switch_prepare);
     REQUIRE_PUBLIC_API(accounts_validate);
     REQUIRE_PUBLIC_API(atomic_symlink);
@@ -87,8 +95,10 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_save_transactional);
     REQUIRE_PUBLIC_API(config_scope_to_string);
     REQUIRE_PUBLIC_API(config_set_backup_clock_fn);
+    REQUIRE_PUBLIC_API(config_set_backup_readdir_fn);
     REQUIRE_PUBLIC_API(config_set_document_malloc_fn);
     REQUIRE_PUBLIC_API(config_set_io_fault_fn);
+    REQUIRE_PUBLIC_API(config_set_metadata_test_hook_fn);
     REQUIRE_PUBLIC_API(config_update_account);
     REQUIRE_PUBLIC_API(config_validate);
     REQUIRE_PUBLIC_API(config_validate_account_model);
@@ -149,9 +159,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_is_repository);
     REQUIRE_PUBLIC_API(git_list_config);
     REQUIRE_PUBLIC_API(git_ops_init);
+    REQUIRE_PUBLIC_API(git_retire_account_identity);
     REQUIRE_PUBLIC_API(git_scope_to_flag);
     REQUIRE_PUBLIC_API(git_set_config);
     REQUIRE_PUBLIC_API(git_set_config_value);
+    REQUIRE_PUBLIC_API(git_signing_key_selects_account);
     REQUIRE_PUBLIC_API(git_test_config);
     REQUIRE_PUBLIC_API(git_unset_config_value);
     REQUIRE_PUBLIC_API(gpg_configure_git_signing);
@@ -178,6 +190,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_set_mount_identity_probe_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_readdir_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_rename_noreplace_fn);
+    REQUIRE_PUBLIC_API(gpg_manager_set_reset_current_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_reset_final_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_retarget_commit_hook_fn);
     REQUIRE_PUBLIC_API(gpg_manager_set_retarget_restore_hook_fn);
@@ -203,6 +216,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(path_exists);
     REQUIRE_PUBLIC_API(print_error);
     REQUIRE_PUBLIC_API(process_is_running);
+    REQUIRE_PUBLIC_API(prompt_confirm_exact_yes);
     REQUIRE_PUBLIC_API(prompt_line);
     REQUIRE_PUBLIC_API(read_file_to_string);
     REQUIRE_PUBLIC_API(run_argv);
@@ -217,6 +231,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_test_set_fd_close_strategy);
     REQUIRE_PUBLIC_API(run_test_set_fork_failure);
     REQUIRE_PUBLIC_API(run_test_set_post_fork_pre_publish_hook);
+    REQUIRE_PUBLIC_API(run_uses_default_runner);
     REQUIRE_PUBLIC_API(runtime_lock_test_fail_release_stat);
     REQUIRE_PUBLIC_API(runtime_state_lock_acquire);
     REQUIRE_PUBLIC_API(runtime_state_lock_release);
@@ -253,11 +268,16 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_scratch_cleanup);
     REQUIRE_PUBLIC_API(signals_scratch_register);
     REQUIRE_PUBLIC_API(signals_scratch_unregister);
+#ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(signals_test_fail_dispatch);
     REQUIRE_PUBLIC_API(signals_test_fail_sigaction);
+    REQUIRE_PUBLIC_API(signals_test_set_guard_end_hook);
+#endif
     REQUIRE_PUBLIC_API(sort_accounts);
     REQUIRE_PUBLIC_API(ssh_add_key);
     REQUIRE_PUBLIC_API(ssh_clear_agent_keys);
     REQUIRE_PUBLIC_API(ssh_configure_host_alias);
+    REQUIRE_PUBLIC_API(ssh_configure_host_alias_result);
     REQUIRE_PUBLIC_API(ssh_inspect_key_file);
     REQUIRE_PUBLIC_API(ssh_list_keys);
     REQUIRE_PUBLIC_API(ssh_manager_cleanup);
@@ -267,6 +287,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_manager_init);
     REQUIRE_PUBLIC_API(ssh_manager_reset);
     REQUIRE_PUBLIC_API(ssh_manager_set_config_commit_hook_fn);
+    REQUIRE_PUBLIC_API(ssh_manager_set_config_postrename_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_current_cleanup_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_current_precleanup_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_current_publish_hook_fn);
@@ -282,7 +303,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_manager_set_quarantine_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_reap_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_reap_test_ops);
+    REQUIRE_PUBLIC_API(ssh_manager_set_reset_retire_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_setenv_fn);
+    REQUIRE_PUBLIC_API(ssh_manager_set_unrecorded_cleanup_hook_fn);
+    REQUIRE_PUBLIC_API(ssh_manager_set_metadata_test_hook_fn);
+    REQUIRE_PUBLIC_API(ssh_manager_set_key_snapshot_clear_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_test_cleanup_current_link);
     REQUIRE_PUBLIC_API(ssh_manager_test_probe_deadline);
     REQUIRE_PUBLIC_API(ssh_manager_test_probe_socket);
@@ -313,6 +338,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(toml_sanitize_string);
     REQUIRE_PUBLIC_API(toml_set_boolean);
     REQUIRE_PUBLIC_API(toml_set_document_init_hook_fn);
+    REQUIRE_PUBLIC_API(toml_set_metadata_test_hook_fn);
     REQUIRE_PUBLIC_API(toml_set_string);
     REQUIRE_PUBLIC_API(toml_set_writer_test_hook_fn);
     REQUIRE_PUBLIC_API(toml_validate_file_path);
