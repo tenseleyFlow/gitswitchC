@@ -34,13 +34,134 @@ static bool signal_masks_equal(const sigset_t *left, const sigset_t *right) {
     return true;
 }
 
+static bool signal_actions_equal(const struct sigaction *left,
+                                 const struct sigaction *right) {
+    if (left->sa_handler != right->sa_handler ||
+        left->sa_flags != right->sa_flags) {
+        return false;
+    }
+    return signal_masks_equal(&left->sa_mask, &right->sa_mask);
+}
+
+static void sigchld_reaping_handler(int signal_number) {
+    int saved_errno = errno;
+    int status;
+    (void)signal_number;
+    while (waitpid(-1, &status, WNOHANG) > 0) {}
+    errno = saved_errno;
+}
+
+typedef enum {
+    SIGCHLD_POLICY_IGNORE = 0,
+    SIGCHLD_POLICY_NOCLDWAIT,
+    SIGCHLD_POLICY_REAPER
+} sigchld_policy_t;
+
+static int exercise_rejected_sigchld_policy(sigchld_policy_t policy) {
+    char marker[] = "/tmp/gitswitch-ar11-sigchld.XXXXXX";
+    char command[MAX_PATH_LEN + 32];
+    const char *argv[] = {"sh", "-c", command, NULL};
+    struct sigaction original_action;
+    struct sigaction installed;
+    struct sigaction after_action;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    run_result_t result;
+    int marker_fd = mkstemp(marker);
+
+    if (marker_fd < 0) return 20;
+    close(marker_fd);
+    if (unlink(marker) != 0) return 21;
+    if ((size_t)snprintf(command, sizeof(command), ": > '%s'", marker) >=
+        sizeof(command)) {
+        return 22;
+    }
+    if (sigaction(SIGCHLD, NULL, &original_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) {
+        return 23;
+    }
+    configured_mask = original_mask;
+    if (sigaddset(&configured_mask, SIGUSR1) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
+        return 24;
+    }
+
+    memset(&installed, 0, sizeof(installed));
+    if (sigemptyset(&installed.sa_mask) != 0 ||
+        sigaddset(&installed.sa_mask, SIGUSR2) != 0) {
+        return 25;
+    }
+    switch (policy) {
+        case SIGCHLD_POLICY_IGNORE:
+            installed.sa_handler = SIG_IGN;
+            break;
+        case SIGCHLD_POLICY_NOCLDWAIT:
+            installed.sa_handler = SIG_DFL;
+            installed.sa_flags = SA_NOCLDWAIT;
+            break;
+        case SIGCHLD_POLICY_REAPER:
+            installed.sa_handler = sigchld_reaping_handler;
+            installed.sa_flags = SA_RESTART;
+            break;
+        default:
+            return 26;
+    }
+    if (sigaction(SIGCHLD, &installed, NULL) != 0 ||
+        sigaction(SIGCHLD, NULL, &installed) != 0) {
+        return 27;
+    }
+
+    clear_error();
+    errno = 0;
+    int rc = run_argv(argv, NULL, &result);
+    int returned_errno = errno;
+    bool marker_absent = access(marker, F_OK) != 0 && errno == ENOENT;
+    if (sigaction(SIGCHLD, NULL, &after_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) {
+        return 28;
+    }
+    int action_restore = sigaction(SIGCHLD, &original_action, NULL);
+    int mask_restore = sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    (void)unlink(marker);
+
+    if (action_restore != 0 || mask_restore != 0) return 29;
+    if (rc != -1 || result.spawned || returned_errno != EBUSY) return 30;
+    if (!marker_absent) return 31;
+    if (!signal_actions_equal(&installed, &after_action)) return 32;
+    if (!signal_masks_equal(&configured_mask, &after_mask)) return 33;
+    return 0;
+}
+
+static bool sigchld_policy_is_rejected(sigchld_policy_t policy) {
+    int status = 0;
+    pid_t worker = fork();
+    if (worker < 0) return false;
+    if (worker == 0) _exit(exercise_rejected_sigchld_policy(policy));
+    return waitpid(worker, &status, 0) == worker && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
+TEST(run_rejects_ignored_sigchld_before_spawn) {
+    CHECK(sigchld_policy_is_rejected(SIGCHLD_POLICY_IGNORE));
+}
+
+TEST(run_rejects_nocldwait_sigchld_before_spawn) {
+    CHECK(sigchld_policy_is_rejected(SIGCHLD_POLICY_NOCLDWAIT));
+}
+
+TEST(run_rejects_foreign_sigchld_reaper_before_spawn) {
+    CHECK(sigchld_policy_is_rejected(SIGCHLD_POLICY_REAPER));
+}
+
 static void raise_second_rollback_signal_before_pid_publication(void) {
     sigset_t current;
     sigset_t expected = g_expected_parent_mask;
 
-    /* The spawn window blocks every guard-INSTALLED signal: SIGINT, SIGTERM,
-     * and (AR-10 L16) SIGQUIT; SIGHUP is SIG_IGN in this fixture, so the
-     * guard deliberately skipped it. */
+    /* The ownership window keeps SIGCHLD blocked, and the spawn window adds
+     * every guard-INSTALLED signal: SIGINT, SIGTERM, and (AR-10 L16)
+     * SIGQUIT. SIGHUP is SIG_IGN here, so the guard deliberately skipped it. */
+    sigaddset(&expected, SIGCHLD);
     sigaddset(&expected, SIGINT);
     sigaddset(&expected, SIGTERM);
     sigaddset(&expected, SIGQUIT);
@@ -468,6 +589,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_empty_argv_fails);
     RUN_TEST(run_reports_output_truncation);
     RUN_TEST(run_reports_death_by_signal);
+    RUN_TEST(run_rejects_ignored_sigchld_before_spawn);
+    RUN_TEST(run_rejects_nocldwait_sigchld_before_spawn);
+    RUN_TEST(run_rejects_foreign_sigchld_reaper_before_spawn);
     RUN_TEST(run_publishes_child_before_releasing_blocked_rollback_signal);
     RUN_TEST(run_restores_exact_mask_and_errno_when_fork_fails);
 TEST_MAIN_END()

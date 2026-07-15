@@ -2578,6 +2578,12 @@ static int exec_fd_at_least(int fd, int minimum) {
 
 #define EXEC_SHEBANG_LIMIT 256
 
+#ifdef GITSWITCH_TESTING
+static unsigned int g_test_exec_parse_failure_ordinal;
+static unsigned int g_test_exec_parse_call_count;
+static int g_test_exec_parse_failure_errno;
+#endif
+
 typedef enum {
     EXEC_FORMAT_UNKNOWN = 0,
     EXEC_FORMAT_BINARY,
@@ -2617,6 +2623,17 @@ static int exec_parse_format(int fd, exec_format_t *format,
                              bool *has_argument) {
     unsigned char prefix[EXEC_SHEBANG_LIMIT + 1];
     ssize_t got;
+#ifdef GITSWITCH_TESTING
+    g_test_exec_parse_call_count++;
+    if (g_test_exec_parse_failure_errno != 0 &&
+        g_test_exec_parse_call_count == g_test_exec_parse_failure_ordinal) {
+        int injected_errno = g_test_exec_parse_failure_errno;
+        g_test_exec_parse_failure_errno = 0;
+        g_test_exec_parse_failure_ordinal = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
     do {
         got = pread(fd, prefix, sizeof(prefix), 0);
     } while (got < 0 && errno == EINTR);
@@ -2753,8 +2770,13 @@ static int prepare_trusted_script_launch(
     if (exec_parse_format(launch->interpreter_fd, &interpreter_format,
                           unused_interpreter, sizeof(unused_interpreter),
                           unused_argument, sizeof(unused_argument),
-                          &unused_has_argument) != 0 ||
-        interpreter_format != EXEC_FORMAT_BINARY) {
+                          &unused_has_argument) != 0) {
+        int parse_errno = errno;
+        trusted_script_launch_cleanup(launch);
+        errno = parse_errno;
+        return -1;
+    }
+    if (interpreter_format != EXEC_FORMAT_BINARY) {
         trusted_script_launch_cleanup(launch);
         errno = ENOEXEC;
         return -1;
@@ -2986,59 +3008,99 @@ static run_test_exec_resolved_hook_fn g_test_exec_resolved_hook;
 static run_test_post_fork_pre_publish_hook_fn
     g_test_post_fork_pre_publish_hook;
 static int g_test_fork_failure_errno;
-
-/* AR-09 M27: sigaction preserves the caller's complete SIGPIPE contract;
- * these stages also provide one-shot failure boundaries to the test build. */
-enum {
-    RUN_SIGPIPE_ACTION_INSTALL = 1,
-    RUN_SIGPIPE_ACTION_RESTORE,
-    RUN_SIGPIPE_ACTION_STAGE_COUNT
-};
-
 #ifdef GITSWITCH_TESTING
-static int
-    g_test_run_sigpipe_action_errno[RUN_SIGPIPE_ACTION_STAGE_COUNT];
-
-void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno);
-
-void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno) {
-    if (stage <= 0 || stage >= RUN_SIGPIPE_ACTION_STAGE_COUNT ||
-        system_errno <= 0) {
-        memset(g_test_run_sigpipe_action_errno, 0,
-               sizeof(g_test_run_sigpipe_action_errno));
-        return;
-    }
-    g_test_run_sigpipe_action_errno[stage] = system_errno;
-}
+static unsigned int g_test_path_candidate_failure_ordinal;
+static int g_test_path_candidate_failure_errno;
+static unsigned int g_test_directory_open_failure_ordinal;
+static unsigned int g_test_directory_open_call_count;
+static int g_test_directory_open_failure_errno;
+static int g_test_exec_acl_failure_target;
+static int g_test_exec_acl_failure_errno;
 #endif
 
-static int run_sigpipe_action(const struct sigaction *action,
-                              struct sigaction *old_action, int stage) {
-#ifdef GITSWITCH_TESTING
-    if (stage > 0 && stage < RUN_SIGPIPE_ACTION_STAGE_COUNT &&
-        g_test_run_sigpipe_action_errno[stage] != 0) {
-        int injected_errno = g_test_run_sigpipe_action_errno[stage];
-        g_test_run_sigpipe_action_errno[stage] = 0;
-        errno = injected_errno;
+/* A pipe write has no portable per-call "do not generate SIGPIPE" flag.
+ * Follow the POSIX thread-mask pattern instead: block only for actual stdin
+ * writes, remember whether the caller already owned a pending instance, and
+ * synchronously consume the generated instance only after write reports
+ * EPIPE. The process-wide disposition is never changed. */
+typedef struct {
+    bool active;
+    bool initially_pending;
+    bool saw_epipe;
+    sigset_t set;
+    sigset_t saved_mask;
+} run_sigpipe_state_t;
+
+static int run_sigpipe_begin(run_sigpipe_state_t *state) {
+    sigset_t pending;
+
+    memset(state, 0, sizeof(*state));
+    if (sigemptyset(&state->set) != 0 ||
+        sigaddset(&state->set, SIGPIPE) != 0) {
         return -1;
     }
-#else
-    (void)stage;
-#endif
-    return sigaction(SIGPIPE, action, old_action);
+    if (sigprocmask(SIG_BLOCK, &state->set, &state->saved_mask) != 0) {
+        return -1;
+    }
+    state->active = true;
+    if (sigpending(&pending) != 0) {
+        int pending_errno = errno;
+        (void)sigprocmask(SIG_SETMASK, &state->saved_mask, NULL);
+        state->active = false;
+        errno = pending_errno;
+        return -1;
+    }
+    state->initially_pending = sigismember(&pending, SIGPIPE) == 1;
+    return 0;
 }
 
-static void report_secondary_sigpipe_restore_failure(int restore_errno) {
-    if (restore_errno <= 0) return;
+static int run_sigpipe_end(run_sigpipe_state_t *state) {
+    int entry_errno = errno;
+    int consume_errno = 0;
+
+    if (!state->active) return 0;
+    if (state->saw_epipe && !state->initially_pending) {
+        struct timespec zero = {0, 0};
+        int consumed;
+        do {
+            consumed = sigtimedwait(&state->set, NULL, &zero);
+        } while (consumed < 0 && errno == EINTR);
+        if (consumed < 0 && errno != EAGAIN) consume_errno = errno;
+    }
+    if (sigprocmask(SIG_SETMASK, &state->saved_mask, NULL) != 0) {
+        int restore_errno = errno;
+        state->active = false;
+        errno = restore_errno;
+        return -1;
+    }
+    state->active = false;
+    if (consume_errno != 0) {
+        errno = consume_errno;
+        return -1;
+    }
+    errno = entry_errno;
+    return 0;
+}
+
+static void report_secondary_runner_cleanup_failure(
+    const char *operation, int cleanup_errno) {
+    if (!operation || cleanup_errno <= 0) return;
 
     int primary_errno = errno;
     error_context_t primary_error = g_last_error;
-    log_warning(
-        "run_argv: secondary failure restoring previous SIGPIPE disposition "
-        "(restore errno=%d: %s)",
-        restore_errno, strerror(restore_errno));
+    log_warning("run_argv: secondary cleanup failure %s "
+                "(errno=%d: %s)",
+                operation, cleanup_errno, strerror(cleanup_errno));
     g_last_error = primary_error;
     errno = primary_errno;
+}
+
+static void report_secondary_signal_cleanup_failures(
+    int sigpipe_errno, int wait_ownership_errno) {
+    report_secondary_runner_cleanup_failure(
+        "while restoring the subprocess SIGPIPE state", sigpipe_errno);
+    report_secondary_runner_cleanup_failure(
+        "while restoring SIGCHLD wait ownership", wait_ownership_errno);
 }
 
 int run_test_set_fd_close_strategy(run_test_fd_close_strategy_t strategy) {
@@ -3097,6 +3159,43 @@ void run_test_set_post_fork_pre_publish_hook(
 void run_test_set_fork_failure(int system_errno) {
     g_test_fork_failure_errno = system_errno > 0 ? system_errno : 0;
 }
+
+#ifdef GITSWITCH_TESTING
+void run_test_set_exec_parse_failure(unsigned int parse_ordinal,
+                                     int system_errno) {
+    g_test_exec_parse_failure_ordinal =
+        system_errno > 0 ? parse_ordinal : 0;
+    g_test_exec_parse_call_count = 0;
+    g_test_exec_parse_failure_errno = system_errno > 0 ? system_errno : 0;
+}
+
+void run_test_set_path_candidate_failure(unsigned int candidate_ordinal,
+                                         int system_errno) {
+    g_test_path_candidate_failure_ordinal =
+        system_errno > 0 ? candidate_ordinal : 0;
+    g_test_path_candidate_failure_errno =
+        system_errno > 0 ? system_errno : 0;
+}
+
+void run_test_set_directory_open_failure(unsigned int open_ordinal,
+                                         int system_errno) {
+    g_test_directory_open_failure_ordinal =
+        system_errno > 0 ? open_ordinal : 0;
+    g_test_directory_open_call_count = 0;
+    g_test_directory_open_failure_errno =
+        system_errno > 0 ? system_errno : 0;
+}
+
+void run_test_set_exec_acl_failure(run_test_exec_acl_target_t target,
+                                   int system_errno) {
+    bool enabled =
+        system_errno > 0 &&
+        (target == RUN_TEST_EXEC_ACL_DIRECTORY ||
+         target == RUN_TEST_EXEC_ACL_LEAF);
+    g_test_exec_acl_failure_target = enabled ? (int)target : 0;
+    g_test_exec_acl_failure_errno = enabled ? system_errno : 0;
+}
+#endif
 
 /* Close every descriptor >= lowfd in the forked child before exec (fd-CLOEXEC).
  * Without this, any fd the parent left open without O_CLOEXEC — a config or
@@ -3349,8 +3448,20 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     int exec_fd = open_trusted_command(argv[0], exec_path,
                                        sizeof(exec_path), &exec_identity);
     if (exec_fd < 0) {
-        set_error(ERR_SYSTEM_CALL,
-                  "run_argv: '%s' not found in any trusted PATH directory", argv[0]);
+        int resolve_errno = errno;
+        if (resolve_errno == ENOENT) {
+            set_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: '%s' not found in any trusted PATH directory",
+                argv[0]);
+        } else {
+            errno = resolve_errno;
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: trusted PATH resolution failed for '%s'",
+                argv[0]);
+        }
+        errno = resolve_errno;
         return -1;
     }
     if (prepare_trusted_script_launch(exec_fd, argv, &script_launch) != 0) {
@@ -3358,9 +3469,19 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
         errno = saved_errno;
-        set_system_error(ERR_PERMISSION_DENIED,
-                         "run_argv: rejected unsafe or unsupported executable format/shebang for '%s'",
-                         exec_path);
+        if (saved_errno == ENOEXEC || saved_errno == EINVAL ||
+            saved_errno == E2BIG || saved_errno == EPERM) {
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "run_argv: rejected unsafe or unsupported executable format/shebang for '%s'",
+                exec_path);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot inspect executable format for '%s'",
+                exec_path);
+        }
+        errno = saved_errno;
         return -1;
     }
 
@@ -3491,9 +3612,31 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         return -1;
     }
 
+    /* Own SIGCHLD before fork so an inherited auto-reap policy or foreign
+     * signal handler can never consume a helper after it has side effects.
+     * The exact caller mask is restored only after final reap/retirement. */
+    sigset_t pre_wait_mask;
+    if (signals_child_wait_begin(&pre_wait_mask) != 0) {
+        int ownership_errno = errno;
+        if (devnull >= 0) close(devnull);
+        if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
+        if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
+        close(status_pipe[0]);
+        close(status_pipe[1]);
+        free(fd_snapshot.fds);
+        close(exec_fd);
+        trusted_script_launch_cleanup(&script_launch);
+        errno = ownership_errno;
+        return -1;
+    }
+
     sigset_t pre_spawn_mask;
     if (signals_block_for_child_spawn(&pre_spawn_mask) != 0) {
         int block_errno = errno;
+        int ownership_restore_errno = 0;
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            ownership_restore_errno = errno;
+        }
         if (devnull >= 0) close(devnull);
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
@@ -3503,8 +3646,15 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
         errno = block_errno;
-        set_system_error(ERR_SYSTEM_CALL,
-                         "run_argv: cannot block guarded signals before fork");
+        if (ownership_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot block guarded signals before fork; also failed to restore SIGCHLD ownership mask (restore errno=%d)",
+                ownership_restore_errno);
+        } else {
+            set_system_error(ERR_SYSTEM_CALL,
+                             "run_argv: cannot block guarded signals before fork");
+        }
         errno = block_errno;
         return -1;
     }
@@ -3521,8 +3671,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     if (pid < 0) {
         int fork_errno = errno;
         int mask_restore_errno = 0;
+        int wait_mask_restore_errno = 0;
         if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
             mask_restore_errno = errno;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
         }
         if (devnull >= 0) close(devnull);
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
@@ -3533,11 +3687,11 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
         errno = fork_errno;
-        if (mask_restore_errno != 0) {
+        if (mask_restore_errno != 0 || wait_mask_restore_errno != 0) {
             set_system_error(
                 ERR_SYSTEM_CALL,
-                "fork() failed; also failed to restore parent signal mask (restore errno=%d)",
-                mask_restore_errno);
+                "fork() failed; also failed to restore parent signal mask (spawn restore errno=%d, wait restore errno=%d)",
+                mask_restore_errno, wait_mask_restore_errno);
         } else {
             set_system_error(ERR_SYSTEM_CALL, "fork() failed");
         }
@@ -3551,7 +3705,7 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * it, a signal delivered to this child would run guard_handler (which
          * only records and returns), swallowing it and leaving the helper
          * "pre-interrupted" instead of terminating normally. */
-        signals_reset_for_child(&pre_spawn_mask);
+        signals_reset_for_child(&pre_wait_mask);
 
         int child_status_fd = status_pipe[1];
         close(status_pipe[0]);
@@ -3827,13 +3981,24 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     signals_child_spawned(pid);
     if (signals_restore_after_child_spawn(&pre_spawn_mask) != 0) {
         int restore_errno = errno;
-        pid_t waited;
+        int cleanup_wait_errno = 0;
+        int wait_mask_restore_errno = 0;
+        signals_child_wait_result_t wait_result;
 
         (void)kill(pid, SIGKILL);
         do {
-            waited = waitpid(pid, NULL, 0);
-        } while (waited < 0 && errno == EINTR);
-        signals_child_reaped();
+            wait_result = signals_wait_child(pid, NULL, 0);
+        } while (wait_result.waited < 0 &&
+                 wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.waited != pid) {
+            cleanup_wait_errno = wait_result.wait_errno != 0
+                                     ? wait_result.wait_errno
+                                     : ECHILD;
+        }
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            wait_mask_restore_errno = errno;
+        }
         if (devnull >= 0) close(devnull);
         if (pipe_input) { close(in_pipe[0]); close(in_pipe[1]); }
         if (want_out) { close(out_pipe[0]); close(out_pipe[1]); }
@@ -3843,8 +4008,17 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         close(exec_fd);
         trusted_script_launch_cleanup(&script_launch);
         errno = restore_errno;
-        set_system_error(ERR_SYSTEM_CALL,
-                         "run_argv: cannot restore parent signal mask after fork");
+        if (cleanup_wait_errno != 0 || wait_result.mask_errno != 0 ||
+            wait_mask_restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "run_argv: cannot restore parent signal mask after fork; child cleanup also failed (reap errno=%d, wait-mask errno=%d, final-mask errno=%d)",
+                cleanup_wait_errno, wait_result.mask_errno,
+                wait_mask_restore_errno);
+        } else {
+            set_system_error(ERR_SYSTEM_CALL,
+                             "run_argv: cannot restore parent signal mask after fork");
+        }
         errno = restore_errno;
         return -1;
     }
@@ -3870,38 +4044,45 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         g_test_fd_close_observation_valid = true;
     }
 
-    /* Parent pipe writes need SIGPIPE suppressed, but only for this bounded
-     * I/O window. Save and later restore the full action, including metadata
-     * that signal(3) silently discards. */
-    struct sigaction ignored_sigpipe;
-    struct sigaction saved_sigpipe;
-    memset(&ignored_sigpipe, 0, sizeof(ignored_sigpipe));
-    memset(&saved_sigpipe, 0, sizeof(saved_sigpipe));
-    ignored_sigpipe.sa_handler = SIG_IGN;
-    (void)sigemptyset(&ignored_sigpipe.sa_mask);
-    if (run_sigpipe_action(&ignored_sigpipe, &saved_sigpipe,
-                           RUN_SIGPIPE_ACTION_INSTALL) != 0) {
-        int install_errno = errno;
-        int install_status = 0;
-        pid_t waited;
+    run_sigpipe_state_t sigpipe_state;
+    memset(&sigpipe_state, 0, sizeof(sigpipe_state));
+    if (pipe_input && run_sigpipe_begin(&sigpipe_state) != 0) {
+        int block_errno = errno;
+        int cleanup_wait_errno = 0;
+        int cleanup_wait_mask_errno = 0;
+        int cleanup_final_mask_errno = 0;
+        signals_child_wait_result_t wait_result;
 
-        if (pipe_input) close(in_pipe[1]);
+        close(in_pipe[1]);
         if (want_out) close(out_pipe[0]);
         (void)kill(pid, SIGKILL);
         do {
-            waited = waitpid(pid, &install_status, 0);
-        } while (waited < 0 && errno == EINTR);
-        signals_child_reaped();
-        if (waited == pid && WIFEXITED(install_status)) {
-            result->exit_code = WEXITSTATUS(install_status);
-        } else if (waited == pid && WIFSIGNALED(install_status)) {
-            result->term_signal = WTERMSIG(install_status);
+            wait_result = signals_wait_child(pid, NULL, 0);
+        } while (wait_result.waited < 0 &&
+                 wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.waited != pid) {
+            cleanup_wait_errno = wait_result.wait_errno != 0
+                                     ? wait_result.wait_errno
+                                     : ECHILD;
         }
-        errno = install_errno;
-        set_system_error(
-            ERR_SYSTEM_CALL,
-            "run_argv: cannot install temporary SIGPIPE disposition");
-        errno = install_errno;
+        cleanup_wait_mask_errno = wait_result.mask_errno;
+        if (signals_child_wait_end(&pre_wait_mask) != 0) {
+            cleanup_final_mask_errno = errno;
+        }
+        errno = block_errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "run_argv: cannot block SIGPIPE for child stdin writes");
+        errno = block_errno;
+        report_secondary_runner_cleanup_failure(
+            "while reaping after SIGPIPE-mask setup failure",
+            cleanup_wait_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring the guarded wait mask after SIGPIPE-mask setup failure",
+            cleanup_wait_mask_errno);
+        report_secondary_runner_cleanup_failure(
+            "while restoring SIGCHLD ownership after SIGPIPE-mask setup failure",
+            cleanup_final_mask_errno);
         return -1;
     }
 
@@ -3991,16 +4172,19 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
 
         int poll_rc = poll(pfds, (nfds_t)n, timeout_ms);
         if (poll_rc < 0) {
-            if (errno == EINTR) continue;
-            /* Close both pipe ends before bailing: leaving infd open means a
-             * child reading stdin (e.g. `gpg --import`) never sees EOF, and
-             * the waitpid() below would then block forever. Closing also lets
-             * a child blocked writing a full pipe get SIGPIPE and exit. */
-            if (infd >= 0) { close(infd); infd = -1; }
-            if (outfd >= 0) { close(outfd); outfd = -1; }
-            io_failed = true;
-            io_errno = errno;
-            break;
+            if (errno == EINTR) {
+                /* Still execute the child-state/deadline maintenance below. */
+                poll_rc = 0;
+            } else {
+                /* Close both pipe ends before bailing: leaving infd open means
+                 * a child reading stdin never sees EOF, and the wait below
+                 * would then block forever. */
+                if (infd >= 0) { close(infd); infd = -1; }
+                if (outfd >= 0) { close(outfd); outfd = -1; }
+                io_failed = true;
+                io_errno = errno;
+                break;
+            }
         }
 
         if (poll_rc > 0 && in_idx >= 0 &&
@@ -4013,6 +4197,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                     if (in_off >= opts->input_len) { close(infd); infd = -1; }
                 } else if (w == 0 ||
                            (w < 0 && errno != EAGAIN && errno != EINTR)) {
+                    if (w < 0 && errno == EPIPE) {
+                        sigpipe_state.saw_epipe = true;
+                    }
                     if (in_off < opts->input_len) input_failed = true;
                     close(infd); infd = -1;
                 }
@@ -4070,14 +4257,21 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
          * capture EOF.  A background descendant may retain stdout forever;
          * once the direct child is reaped, only a short drain grace remains. */
         if (!child_reaped) {
-            pid_t waited;
+            signals_child_wait_result_t wait_result;
             do {
-                waited = waitpid(pid, &status, WNOHANG);
-            } while (waited < 0 && errno == EINTR);
+                wait_result = signals_wait_child(pid, &status, WNOHANG);
+            } while (wait_result.waited < 0 &&
+                     wait_result.wait_errno == EINTR &&
+                     wait_result.mask_errno == 0);
 
-            if (waited == pid) {
+            if (wait_result.mask_errno != 0) {
+                wait_failed = true;
+                wait_errno = wait_result.mask_errno;
+                if (infd >= 0) { close(infd); infd = -1; }
+                if (outfd >= 0) { close(outfd); outfd = -1; }
+                break;
+            } else if (wait_result.waited == pid) {
                 child_reaped = true;
-                signals_child_reaped();
                 if (infd >= 0) {
                     if (in_off < opts->input_len) input_failed = true;
                     close(infd);
@@ -4094,10 +4288,9 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                         capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
                     }
                 }
-            } else if (waited < 0) {
+            } else if (wait_result.waited < 0) {
                 wait_failed = true;
-                wait_errno = errno;
-                signals_child_reaped();
+                wait_errno = wait_result.wait_errno;
                 if (infd >= 0) { close(infd); infd = -1; }
                 if (outfd >= 0) { close(outfd); outfd = -1; }
                 break;
@@ -4112,25 +4305,30 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->out_len = out_off;
 
     if (!child_reaped && !wait_failed) {
-        pid_t waited;
-        do { waited = waitpid(pid, &status, 0); } while (waited < 0 && errno == EINTR);
-        if (waited == pid) {
+        signals_child_wait_result_t wait_result;
+        do {
+            wait_result = signals_wait_child(pid, &status, 0);
+        } while (wait_result.waited < 0 &&
+                 wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.mask_errno != 0) {
+            wait_failed = true;
+            wait_errno = wait_result.mask_errno;
+        } else if (wait_result.waited == pid) {
             child_reaped = true;
         } else {
             wait_failed = true;
-            wait_errno = errno;
+            wait_errno = wait_result.wait_errno;
         }
-        /* Retract immediately after the reap: past this point the pid is free
-         * for kernel reuse, and the handler must not signal a stranger. */
-        signals_child_reaped();
     }
-    int errno_before_sigpipe_restore = errno;
-    int sigpipe_restore_errno = 0;
-    if (run_sigpipe_action(&saved_sigpipe, NULL,
-                           RUN_SIGPIPE_ACTION_RESTORE) != 0) {
-        sigpipe_restore_errno = errno;
+    int sigpipe_cleanup_errno = 0;
+    int wait_ownership_cleanup_errno = 0;
+    if (run_sigpipe_end(&sigpipe_state) != 0) {
+        sigpipe_cleanup_errno = errno;
     }
-    errno = errno_before_sigpipe_restore;
+    if (signals_child_wait_end(&pre_wait_mask) != 0) {
+        wait_ownership_cleanup_errno = errno;
+    }
 
     if (child_reaped && WIFEXITED(status)) {
         result->exit_code = WEXITSTATUS(status);
@@ -4170,7 +4368,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                 break;
         }
         errno = primary_errno;
-        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
         return -1;
     }
     if (child_status_rc < 0) {
@@ -4179,7 +4378,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         set_system_error(ERR_SYSTEM_CALL,
                          "run_argv: child setup-status channel failed");
         errno = primary_errno;
-        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
         return -1;
     }
     if (wait_failed) {
@@ -4187,7 +4387,8 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         errno = primary_errno;
         set_system_error(ERR_SYSTEM_CALL, "waitpid() failed");
         errno = primary_errno;
-        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
         return -1;
     }
     if (io_failed) {
@@ -4202,33 +4403,46 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                              "run_argv: subprocess pipe I/O failed");
         }
         errno = primary_errno;
-        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
         return -1;
     }
     if (input_failed) {
         set_error(ERR_SYSTEM_COMMAND_FAILED,
                   "run_argv: child stdin closed before all input was delivered "
                   "(%zu/%zu bytes)", in_off, opts->input_len);
-        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
         return -1;
     }
     if (output_stalled) {
         set_error(ERR_SYSTEM_COMMAND_FAILED,
                   "run_argv: captured stdout remained open after the direct "
                   "child exited");
-        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
         return -1;
     }
     if (!result->spawned || result->exit_code != 0) {
-        report_secondary_sigpipe_restore_failure(sigpipe_restore_errno);
+        report_secondary_signal_cleanup_failures(
+            sigpipe_cleanup_errno, wait_ownership_cleanup_errno);
         return -1;
     }
-    if (sigpipe_restore_errno != 0) {
-        errno = sigpipe_restore_errno;
+    if (sigpipe_cleanup_errno != 0 || wait_ownership_cleanup_errno != 0) {
+        int primary_cleanup_errno = sigpipe_cleanup_errno != 0
+                                        ? sigpipe_cleanup_errno
+                                        : wait_ownership_cleanup_errno;
+        errno = primary_cleanup_errno;
         set_system_error(
             ERR_SYSTEM_CALL,
-            "run_argv: cannot restore previous SIGPIPE disposition");
-        errno = sigpipe_restore_errno;
+            "run_argv: cannot restore subprocess signal mask state");
+        errno = primary_cleanup_errno;
+        if (sigpipe_cleanup_errno != 0 &&
+            wait_ownership_cleanup_errno != 0) {
+            report_secondary_runner_cleanup_failure(
+                "while restoring SIGCHLD wait ownership",
+                wait_ownership_cleanup_errno);
+        }
         return -1;
     }
     return 0;
@@ -4295,9 +4509,15 @@ static bool exec_freebsd_acl_is_trivial(acl_t acl) {
     errno = 0;
     int check_rc = acl_is_trivial_np(acl, &trivial);
     int check_errno = errno;
+    errno = 0;
     int free_rc = acl_free(acl);
-    if (check_rc != 0 || free_rc != 0) {
+    int free_errno = errno;
+    if (check_rc != 0) {
         errno = check_errno ? check_errno : EIO;
+        return false;
+    }
+    if (free_rc != 0) {
+        errno = free_errno ? free_errno : EIO;
         return false;
     }
     if (trivial != 1) {
@@ -4321,7 +4541,7 @@ static bool exec_fd_acl_is_trusted(int fd) {
          * ambiguous and fails closed. */
         if (query_errno == ENOENT ||
             exec_acl_query_is_unsupported(query_errno)) return true;
-        errno = query_errno;
+        errno = query_errno ? query_errno : EIO;
         return false;
     }
 
@@ -4334,6 +4554,7 @@ static bool exec_fd_acl_is_trusted(int fd) {
         (acl_permset_mask_t)ACL_SYNCHRONIZE;
     int entry_id = ACL_FIRST_ENTRY;
     bool trusted = true;
+    int operation_errno = 0;
     for (;;) {
         acl_entry_t entry;
         errno = 0;
@@ -4341,19 +4562,24 @@ static bool exec_fd_acl_is_trusted(int fd) {
         if (entry_rc != 0) {
             /* A valid ACL reports EINVAL after its last entry (and for an
              * empty ACL). Other errors are ambiguous and fail closed. */
-            if (errno != EINVAL) trusted = false;
+            if (errno != EINVAL) operation_errno = errno ? errno : EIO;
             break;
         }
 
         acl_tag_t tag;
+        errno = 0;
         if (acl_get_tag_type(entry, &tag) != 0) {
-            trusted = false;
+            operation_errno = errno ? errno : EIO;
             break;
         }
         if (tag == ACL_EXTENDED_ALLOW) {
             acl_permset_mask_t permissions = 0;
-            if (acl_get_permset_mask_np(entry, &permissions) != 0 ||
-                (permissions & ~harmless_allow) != 0) {
+            errno = 0;
+            if (acl_get_permset_mask_np(entry, &permissions) != 0) {
+                operation_errno = errno ? errno : EIO;
+                break;
+            }
+            if ((permissions & ~harmless_allow) != 0) {
                 trusted = false;
                 break;
             }
@@ -4364,8 +4590,18 @@ static bool exec_fd_acl_is_trusted(int fd) {
         entry_id = ACL_NEXT_ENTRY;
     }
 
+    errno = 0;
     int free_rc = acl_free(acl);
-    if (!trusted || free_rc != 0) {
+    int free_errno = errno;
+    if (operation_errno != 0) {
+        errno = operation_errno;
+        return false;
+    }
+    if (free_rc != 0) {
+        errno = free_errno ? free_errno : EIO;
+        return false;
+    }
+    if (!trusted) {
         errno = EACCES;
         return false;
     }
@@ -4379,7 +4615,7 @@ static bool exec_fd_acl_is_trusted(int fd) {
     int nfs4_errno = errno;
     if (nfs4_errno != EINVAL &&
         !exec_acl_query_is_unsupported(nfs4_errno)) {
-        errno = nfs4_errno;
+        errno = nfs4_errno ? nfs4_errno : EIO;
         return false;
     }
 #endif
@@ -4389,7 +4625,7 @@ static bool exec_fd_acl_is_trusted(int fd) {
     if (!acl) {
         int access_errno = errno;
         if (exec_acl_query_is_unsupported(access_errno)) return true;
-        errno = access_errno;
+        errno = access_errno ? access_errno : EIO;
         return false;
     }
     return exec_freebsd_acl_is_trivial(acl);
@@ -4401,6 +4637,27 @@ static bool exec_fd_acl_is_trusted(int fd) {
     return true;
 }
 #endif
+
+typedef enum {
+    EXEC_ACL_TARGET_DIRECTORY = 1,
+    EXEC_ACL_TARGET_LEAF
+} exec_acl_target_t;
+
+static bool exec_command_acl_is_trusted(int fd, exec_acl_target_t target) {
+#ifdef GITSWITCH_TESTING
+    if (g_test_exec_acl_failure_errno != 0 &&
+        g_test_exec_acl_failure_target == (int)target) {
+        int injected_errno = g_test_exec_acl_failure_errno;
+        g_test_exec_acl_failure_target = 0;
+        g_test_exec_acl_failure_errno = 0;
+        errno = injected_errno;
+        return false;
+    }
+#else
+    (void)target;
+#endif
+    return exec_fd_acl_is_trusted(fd);
+}
 
 static bool exec_current_user_in_group(gid_t group) {
     if (group == getgid()) return true;
@@ -4488,6 +4745,18 @@ static int exec_open_directory_at(int parent_fd, const char *component,
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
+#ifdef GITSWITCH_TESTING
+    g_test_directory_open_call_count++;
+    if (g_test_directory_open_failure_errno != 0 &&
+        g_test_directory_open_call_count ==
+            g_test_directory_open_failure_ordinal) {
+        int injected_errno = g_test_directory_open_failure_errno;
+        g_test_directory_open_failure_errno = 0;
+        g_test_directory_open_failure_ordinal = 0;
+        errno = injected_errno;
+        return -1;
+    }
+#endif
     int fd = openat(parent_fd, component, flags);
     if (fd < 0) return -1;
     if (fstat(fd, opened) != 0) {
@@ -4496,10 +4765,15 @@ static int exec_open_directory_at(int parent_fd, const char *component,
         errno = saved_errno;
         return -1;
     }
-    if (!exec_directory_stat_is_trusted(opened) ||
-        !exec_fd_acl_is_trusted(fd)) {
+    if (!exec_directory_stat_is_trusted(opened)) {
         close(fd);
         errno = EACCES;
+        return -1;
+    }
+    if (!exec_command_acl_is_trusted(fd, EXEC_ACL_TARGET_DIRECTORY)) {
+        int saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
         return -1;
     }
     struct stat sealed;
@@ -4533,20 +4807,37 @@ static int exec_open_directory_at(int parent_fd, const char *component,
 #endif
 }
 
+static bool exec_path_candidate_errno_is_fatal(int candidate_errno) {
+    switch (candidate_errno) {
+        case ENOENT:
+        case ENOTDIR:
+        case EACCES:
+        case EPERM:
+        case ELOOP:
+        case EINVAL:
+        case ENAMETOOLONG:
+            return false;
+        default:
+            return true;
+    }
+}
+
 /* Validate the spelling supplied by PATH as well as its canonical target.
  * This prevents `/tmp/safe-looking-link -> /usr/bin` from erasing the hostile
  * 01777 lexical ancestor during realpath().  A symlink is accepted only when
  * it is itself held in an already-pinned trusted directory and owned by root
  * or this uid; the separately pinned canonical walk validates its target. */
 static bool exec_lexical_path_is_trusted(const char *path) {
-    if (!path || path[0] != '/' || strlen(path) >= MAX_PATH_LEN) return false;
+    if (!path || path[0] != '/' || strlen(path) >= MAX_PATH_LEN) {
+        errno = EINVAL;
+        return false;
+    }
 
     struct stat root_st;
     int root_fd = exec_open_directory_at(AT_FDCWD, "/", &root_st);
     if (root_fd < 0) return false;
 
     const char *cursor = path + 1;
-    bool trusted = false;
     while (*cursor) {
         const char *slash = strchr(cursor, '/');
         size_t length = slash ? (size_t)(slash - cursor) : strlen(cursor);
@@ -4554,23 +4845,36 @@ static bool exec_lexical_path_is_trusted(const char *path) {
             cursor++;
             continue;
         }
-        if (length >= MAX_PATH_LEN) break;
+        if (length >= MAX_PATH_LEN) {
+            close(root_fd);
+            errno = EINVAL;
+            return false;
+        }
 
         char component[MAX_PATH_LEN];
         memcpy(component, cursor, length);
         component[length] = '\0';
         if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
-            break;
+            close(root_fd);
+            errno = EINVAL;
+            return false;
         }
 
         if (!slash) {
             struct stat leaf;
             if (fstatat(root_fd, component, &leaf,
-                        AT_SYMLINK_NOFOLLOW) == 0 &&
-                exec_owner_is_allowed(leaf.st_uid)) {
-                trusted = true;
+                        AT_SYMLINK_NOFOLLOW) != 0) {
+                int stat_errno = errno;
+                close(root_fd);
+                errno = stat_errno;
+                return false;
             }
-            break;
+            close(root_fd);
+            if (!exec_owner_is_allowed(leaf.st_uid)) {
+                errno = EACCES;
+                return false;
+            }
+            return true;
         }
 
         struct stat next_st;
@@ -4581,18 +4885,37 @@ static bool exec_lexical_path_is_trusted(const char *path) {
             cursor = slash + 1;
             continue;
         }
+        int open_errno = errno;
+
+        /* A no-follow open can fail for a policy reason that merits a symlink
+         * probe, or for an operational reason that must stop PATH selection.
+         * Preserve the primary operational error even when fstatat would
+         * successfully describe the same component. */
+        if (exec_path_candidate_errno_is_fatal(open_errno)) {
+            close(root_fd);
+            errno = open_errno;
+            return false;
+        }
 
         struct stat link_st;
         if (fstatat(root_fd, component, &link_st,
-                    AT_SYMLINK_NOFOLLOW) == 0 &&
-            S_ISLNK(link_st.st_mode) &&
-            exec_owner_is_allowed(link_st.st_uid)) {
-            trusted = true;
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            int stat_errno = errno;
+            close(root_fd);
+            errno = stat_errno;
+            return false;
         }
-        break;
+        close(root_fd);
+        if (!S_ISLNK(link_st.st_mode) ||
+            !exec_owner_is_allowed(link_st.st_uid)) {
+            errno = EACCES;
+            return false;
+        }
+        return true;
     }
     close(root_fd);
-    return trusted;
+    errno = EINVAL;
+    return false;
 }
 
 static int exec_open_canonical(const char *canonical,
@@ -4703,11 +5026,12 @@ static int exec_open_canonical(const char *canonical,
             errno = EACCES;
             return -1;
         }
-        if (!exec_fd_acl_is_trusted(fd)) {
+        if (!exec_command_acl_is_trusted(fd, EXEC_ACL_TARGET_LEAF)) {
+            int saved_errno = errno ? errno : EIO;
             close(fd);
             close(metadata_fd);
             close(dir_fd);
-            errno = EACCES;
+            errno = saved_errno;
             return -1;
         }
 
@@ -4784,6 +5108,22 @@ static int exec_open_candidate(const char *candidate, char *resolved,
     return fd;
 }
 
+typedef enum {
+    EXEC_CANDIDATE_FOUND = 0,
+    EXEC_CANDIDATE_SKIP,
+    EXEC_CANDIDATE_FATAL
+} exec_candidate_outcome_t;
+
+static exec_candidate_outcome_t exec_candidate_classify_errno(
+    int candidate_errno) {
+    /* Resource exhaustion, storage failure, stale handles, and every unknown
+     * operational error are fatal. Only ordinary absence and explicit
+     * trust/policy rejection permit selection of a later PATH entry. */
+    return exec_path_candidate_errno_is_fatal(candidate_errno)
+               ? EXEC_CANDIDATE_FATAL
+               : EXEC_CANDIDATE_SKIP;
+}
+
 static int open_trusted_command(const char *name, char *resolved,
                                 size_t resolved_size,
                                 struct stat *file_stat) {
@@ -4806,6 +5146,9 @@ static int open_trusted_command(const char *name, char *resolved,
     }
 
     const char *cursor = path_env;
+#ifdef GITSWITCH_TESTING
+    unsigned int candidate_ordinal = 0;
+#endif
     while (*cursor) {
         const char *colon = strchr(cursor, ':');
         size_t dir_length = colon ? (size_t)(colon - cursor) : strlen(cursor);
@@ -4814,12 +5157,34 @@ static int open_trusted_command(const char *name, char *resolved,
 
         if (dir_length > 0 && cursor[0] == '/' &&
             dir_length + 1 + name_length + 1 <= sizeof(candidate)) {
+#ifdef GITSWITCH_TESTING
+            candidate_ordinal++;
+#endif
             memcpy(candidate, cursor, dir_length);
             candidate[dir_length] = '/';
             memcpy(candidate + dir_length + 1, name, name_length + 1);
-            int fd = exec_open_candidate(candidate, resolved, resolved_size,
+            int fd;
+#ifdef GITSWITCH_TESTING
+            if (g_test_path_candidate_failure_errno != 0 &&
+                candidate_ordinal ==
+                    g_test_path_candidate_failure_ordinal) {
+                errno = g_test_path_candidate_failure_errno;
+                g_test_path_candidate_failure_errno = 0;
+                g_test_path_candidate_failure_ordinal = 0;
+                fd = -1;
+            } else
+#endif
+            {
+                fd = exec_open_candidate(candidate, resolved, resolved_size,
                                          file_stat);
+            }
             if (fd >= 0) return fd;
+            int candidate_errno = errno;
+            if (exec_candidate_classify_errno(candidate_errno) ==
+                EXEC_CANDIDATE_FATAL) {
+                errno = candidate_errno;
+                return -1;
+            }
         }
 
         if (!colon) break;

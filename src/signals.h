@@ -130,11 +130,11 @@ void signals_rollback_end(void);
  * Reset only signals whose dispositions signals_guard_begin() actually
  * replaced, in a freshly-forked child before it execs (AR-06 F76 / AR-07
  * M32). This closes the window where the child still runs guard_handler
- * without changing an inherited SIG_IGN or its mask. AR-10 L17: pass the
- * mask captured by signals_block_for_child_spawn() so the child's mask is
- * restored to exactly what it would have inherited — a supervisor-blocked
- * guarded signal stays blocked. NULL falls back to unblocking only the
- * guard-installed set. Async-signal-safe enough for our single-threaded
+ * without changing an inherited SIG_IGN or its mask. Pass the mask captured
+ * before any runner-owned SIGCHLD or guarded-signal blocking so the child's
+ * mask is restored to exactly what it would otherwise have inherited — a
+ * supervisor-blocked signal stays blocked. NULL falls back to unblocking only
+ * the guard-installed set. Async-signal-safe enough for our single-threaded
  * fork; call it first thing in the child branch.
  */
 void signals_reset_for_child(const sigset_t *inherited_mask);
@@ -144,24 +144,57 @@ void signals_reset_for_child(const sigset_t *inherited_mask);
  * signals_block_for_child_spawn() adds exactly the dispositions installed by
  * the active guard to the caller's mask and captures the complete prior mask.
  * In the parent, publish the PID and then restore that exact mask with
- * signals_restore_after_child_spawn(). In the child, signals_reset_for_child()
- * resets the inherited guard dispositions and unblocks that installed set.
+ * signals_restore_after_child_spawn(). The child instead passes its earlier
+ * pre-ownership snapshot to signals_reset_for_child(), which resets inherited
+ * guard dispositions and restores the mask it should have inherited.
  */
 int signals_block_for_child_spawn(sigset_t *previous_mask);
 int signals_restore_after_child_spawn(const sigset_t *previous_mask);
 
 /**
- * Publish / retract the in-flight subprocess (AR-03 L8). run_argv's spawn
- * path calls signals_child_spawned(pid) right after fork() returns in the
- * parent and signals_child_reaped() right after waitpid() reaps, so the
- * handler can kill() the child that a blocked rollback is waiting on (see the
- * bounded-deferral bullet above). Both are single sig_atomic_t stores —
- * cheap, lock-free, and safe against the handler observing a torn value.
- * Publishing outside the rollback window is harmless: the handler only
- * consults the pid when a second guarded signal lands during rollback.
+ * Establish exclusive wait ownership before a helper is forked. SIGCHLD is
+ * blocked before its disposition is inspected. An inherited SIG_IGN,
+ * SA_NOCLDWAIT, or non-default handler is rejected with EBUSY before spawn;
+ * the exact caller mask is restored on rejection. A successful caller keeps
+ * SIGCHLD blocked until signals_child_wait_end() after the child is retired.
+ */
+int signals_child_wait_begin(sigset_t *previous_mask);
+int signals_child_wait_end(const sigset_t *previous_mask);
+
+typedef struct {
+    pid_t waited;       /* waitpid result; -1 when wait was not attempted */
+    int wait_errno;     /* errno from waitid/waitpid when waited < 0 */
+    int mask_errno;     /* guarded-mask block/restore failure, independently */
+} signals_child_wait_result_t;
+
+/**
+ * Observe the requested child state without reaping, then execute waitpid
+ * while every installed guarded signal is blocked and retire the
+ * handler-visible PID before restoring the exact entry mask. The observed
+ * transition keeps blocking waits interruptible while WNOWAIT prevents PID
+ * reuse before the guarded reap. Wait and mask outcomes are independent so a
+ * caller never retries a reaped child merely because mask restoration failed.
+ */
+signals_child_wait_result_t signals_wait_child(pid_t pid, int *status,
+                                                int options);
+
+/**
+ * Publish the in-flight subprocess (AR-03 L8). run_argv calls this while
+ * guarded signals are blocked immediately after fork. Retirement is owned
+ * exclusively by signals_wait_child(), which closes the reap-to-clear PID
+ * reuse window. Publishing outside the rollback window is harmless: the
+ * handler consults the PID only for a repeated signal during rollback.
  */
 void signals_child_spawned(pid_t pid);
-void signals_child_reaped(void);
+
+#ifdef GITSWITCH_TESTING
+/* One-shot checkpoint after waitpid returns but before child publication is
+ * retired. Guarded signals are blocked at this checkpoint. */
+typedef void (*signals_test_post_wait_hook_fn)(void);
+signals_test_post_wait_hook_fn signals_test_set_post_wait_hook(
+    signals_test_post_wait_hook_fn hook);
+pid_t signals_test_published_child(void);
+#endif
 
 /** True if a guarded signal arrived since signals_guard_begin(). */
 bool signals_pending(void);

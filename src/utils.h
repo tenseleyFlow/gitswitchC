@@ -277,6 +277,27 @@ void run_test_set_post_fork_pre_publish_hook(
  * restored without replacing the primary system errno. Zero disables it. */
 void run_test_set_fork_failure(int system_errno);
 
+#ifdef GITSWITCH_TESTING
+typedef enum {
+    RUN_TEST_EXEC_ACL_NONE = 0,
+    RUN_TEST_EXEC_ACL_DIRECTORY,
+    RUN_TEST_EXEC_ACL_LEAF
+} run_test_exec_acl_target_t;
+
+/* One-shot parser fault on the Nth executable-format read (1-based). */
+void run_test_set_exec_parse_failure(unsigned int parse_ordinal,
+                                     int system_errno);
+/* One-shot PATH candidate fault on the Nth absolute nonempty entry (1-based). */
+void run_test_set_path_candidate_failure(unsigned int candidate_ordinal,
+                                         int system_errno);
+/* One-shot directory-open fault on the Nth lexical/canonical walk open. */
+void run_test_set_directory_open_failure(unsigned int open_ordinal,
+                                         int system_errno);
+/* One-shot ACL inspection result for an executable directory or leaf. */
+void run_test_set_exec_acl_failure(run_test_exec_acl_target_t target,
+                                   int system_errno);
+#endif
+
 /* True if `command` is currently eligible for the default runner; does not
  * execute it. */
 bool command_exists(const char *command);

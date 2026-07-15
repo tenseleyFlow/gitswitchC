@@ -135,12 +135,27 @@ static void inherited_test_handler(int signal_number) {
 
 static volatile sig_atomic_t dispatch_handler_calls;
 static volatile sig_atomic_t dispatch_handler_pending;
+static volatile sig_atomic_t post_wait_hook_called;
+static volatile sig_atomic_t post_wait_hook_guarded_masked;
 static volatile sig_atomic_t unrelated_handler_calls;
 
 static void dispatch_observing_handler(int signal_number) {
     (void)signal_number;
     dispatch_handler_calls++;
     dispatch_handler_pending = (sig_atomic_t)signals_pending_signal();
+}
+
+static void raise_repeat_signal_at_reap_transition(void) {
+    sigset_t current;
+
+    post_wait_hook_called = 1;
+    post_wait_hook_guarded_masked =
+        sigprocmask(SIG_SETMASK, NULL, &current) == 0 &&
+        sigismember(&current, SIGINT) == 1 &&
+        sigismember(&current, SIGTERM) == 1 &&
+        sigismember(&current, SIGHUP) == 1 &&
+        sigismember(&current, SIGQUIT) == 1;
+    (void)raise(SIGTERM);
 }
 
 static void unrelated_observing_handler(int signal_number) {
@@ -961,6 +976,125 @@ TEST(dispatch_raise_and_restore_failure_preserves_primary_error) {
     dispatch_test_restore(SIGTERM, &original_action, &original_mask);
 }
 
+/* AR-11 L11: a delivered signal whose exact mask restoration failed leaves a
+ * single dispatch-owned obligation. Starting another guard must not adopt or
+ * overwrite that saved mask; only an explicit dispatch retry may discharge it. */
+TEST(dispatch_mask_debt_rejects_new_guard_until_explicit_retry) {
+    struct sigaction original_action;
+    sigset_t original_mask;
+    sigset_t first_mask;
+    sigset_t changed_mask;
+    sigset_t observed_mask;
+
+    CHECK_EQ_INT(dispatch_test_install_handler(
+                     SIGTERM, dispatch_observing_handler, &original_action),
+                 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &original_mask), 0);
+    first_mask = original_mask;
+    sigdelset(&first_mask, SIGTERM);
+    sigaddset(&first_mask, SIGUSR1);
+    sigdelset(&first_mask, SIGUSR2);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &first_mask, NULL), 0);
+
+    dispatch_handler_calls = 0;
+    CHECK_EQ_INT(dispatch_test_defer(SIGTERM), 0);
+    signals_test_fail_dispatch(SIGNALS_TEST_DISPATCH_MASK_RESTORE, EIO);
+    errno = 0;
+    CHECK_EQ_INT(signals_dispatch_pending(), -1);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK_EQ_INT(dispatch_handler_calls, 1);
+
+    changed_mask = original_mask;
+    sigdelset(&changed_mask, SIGTERM);
+    sigdelset(&changed_mask, SIGUSR1);
+    sigaddset(&changed_mask, SIGUSR2);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &changed_mask, NULL), 0);
+    errno = 0;
+    CHECK_EQ_INT(signals_guard_begin(), -1);
+    CHECK_EQ_INT(errno, EBUSY);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK(dispatch_test_masks_equal(&observed_mask, &changed_mask));
+
+    CHECK_EQ_INT(signals_dispatch_pending(), 0);
+    CHECK_EQ_INT(sigprocmask(SIG_SETMASK, NULL, &observed_mask), 0);
+    CHECK(dispatch_test_masks_equal(&observed_mask, &first_mask));
+    dispatch_test_restore(SIGTERM, &original_action, &original_mask);
+}
+
+static int exercise_atomic_reap_retirement(void) {
+    const char *argv[] = {"true", NULL};
+    run_result_t result;
+
+    if (signals_guard_begin() != 0) return 40;
+    if (raise(SIGTERM) != 0 || !signals_pending()) return 41;
+    signals_rollback_begin();
+    post_wait_hook_called = 0;
+    post_wait_hook_guarded_masked = 0;
+    signals_test_set_post_wait_hook(raise_repeat_signal_at_reap_transition);
+    int run_rc = run_argv(argv, NULL, &result);
+    signals_test_set_post_wait_hook(NULL);
+    if (run_rc != 0 || !result.spawned || result.exit_code != 0) return 42;
+    if (!post_wait_hook_called || !post_wait_hook_guarded_masked) return 43;
+    if (!signals_pending()) return 44;
+    signals_rollback_end();
+    if (signals_guard_end() != 0) return 45;
+    return 0;
+}
+
+/* AR-11 M31: the deterministic post-wait checkpoint runs with every installed
+ * guarded signal blocked. The repeated rollback signal is delivered only
+ * after the reaped PID publication has been retired, while the real child
+ * status remains intact. */
+TEST(reap_and_child_pid_retirement_are_one_guarded_transition) {
+    int status = 0;
+    pid_t worker = fork();
+
+    CHECK(worker >= 0);
+    if (worker == 0) _exit(exercise_atomic_reap_retirement());
+    if (worker > 0) {
+        CHECK_EQ_INT(waitpid(worker, &status, 0), worker);
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
+static int exercise_initial_echild_retirement(bool matching_publication) {
+    int status = 0;
+    pid_t child = fork();
+    if (child < 0) return 50;
+    if (child == 0) _exit(0);
+    if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 51;
+
+    pid_t published = matching_publication ? child : child + 1000000;
+    signals_child_spawned(published);
+    if (signals_test_published_child() != published) return 52;
+    signals_child_wait_result_t result = signals_wait_child(child, NULL, 0);
+    if (result.waited != -1 || result.wait_errno != ECHILD ||
+        result.mask_errno != 0) {
+        return 53;
+    }
+    if (matching_publication) {
+        return signals_test_published_child() == 0 ? 0 : 54;
+    }
+    return signals_test_published_child() == published ? 0 : 55;
+}
+
+TEST(initial_echild_retires_only_the_matching_publication) {
+    for (int matching = 0; matching <= 1; matching++) {
+        int status = 0;
+        pid_t worker = fork();
+        CHECK(worker >= 0);
+        if (worker == 0) {
+            _exit(exercise_initial_echild_retirement(matching != 0));
+        }
+        if (worker > 0) {
+            CHECK_EQ_INT(waitpid(worker, &status, 0), worker);
+            CHECK(WIFEXITED(status));
+            if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        }
+    }
+}
+
 /* A second signal while one is pending is the emergency exit: the handler
  * unlinks registered scratch files (SIG-02) and dies immediately with the
  * signal's default action. */
@@ -1110,8 +1244,13 @@ TEST(second_signal_during_rollback_kills_blocking_child) {
         close(sync[1]); /* grandchild's CLOEXEC copy is now the last writer */
 
         /* run_argv's blocking reap — pre-fix, stuck here for 30 s. */
-        do { w = waitpid(child, &cst, 0); } while (w < 0 && errno == EINTR);
-        signals_child_reaped();
+        signals_child_wait_result_t wait_result;
+        do {
+            wait_result = signals_wait_child(child, &cst, 0);
+            w = wait_result.waited;
+        } while (w < 0 && wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.mask_errno != 0) _exit(17);
         if (w != child) _exit(14);
         /* The handler must have forwarded OUR signal, not something else. */
         if (!WIFSIGNALED(cst) || WTERMSIG(cst) != SIGTERM) _exit(15);
@@ -1179,8 +1318,13 @@ TEST(rollback_child_kill_escalates_to_sigkill) {
         (void)!write(sync[1], "r", 1);
         close(sync[1]);
 
-        do { w = waitpid(child, &cst, 0); } while (w < 0 && errno == EINTR);
-        signals_child_reaped();
+        signals_child_wait_result_t wait_result;
+        do {
+            wait_result = signals_wait_child(child, &cst, 0);
+            w = wait_result.waited;
+        } while (w < 0 && wait_result.wait_errno == EINTR &&
+                 wait_result.mask_errno == 0);
+        if (wait_result.mask_errno != 0) _exit(16);
         if (w != child) _exit(14);
         if (!WIFSIGNALED(cst) || WTERMSIG(cst) != SIGKILL) _exit(15);
 
@@ -1231,6 +1375,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(dispatch_raise_failure_retains_pending_for_retry);
     RUN_TEST(dispatch_restore_failure_after_delivery_does_not_reraise);
     RUN_TEST(dispatch_raise_and_restore_failure_preserves_primary_error);
+    RUN_TEST(dispatch_mask_debt_rejects_new_guard_until_explicit_retry);
+    RUN_TEST(reap_and_child_pid_retirement_are_one_guarded_transition);
+    RUN_TEST(initial_echild_retires_only_the_matching_publication);
     RUN_TEST(second_signal_is_emergency_exit_and_drops_scratch);
     RUN_TEST(second_signal_during_rollback_is_deferred);
     RUN_TEST(second_signal_during_rollback_kills_blocking_child);

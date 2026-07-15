@@ -16,6 +16,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "signals.h"
@@ -54,12 +55,11 @@ static bool g_dispatch_mask_restore_pending = false;
 static volatile sig_atomic_t g_rollback_in_progress = 0;
 
 /* AR-03 L8: the pid of the subprocess run_argv is currently blocked on, or 0.
- * Published right after fork() and cleared right after waitpid() so the
- * handler can kill() a child the rollback is wedged behind (a re-prompting
- * ssh-add reading a passphrase that will never come). sig_atomic_t is the
- * only type the handler may read while the mainline writes it; pid_t is int
- * on every platform we build for — the static assert makes that assumption
- * fail loudly rather than truncate a pid. */
+ * Published right after fork() and retired with its matching guarded reap;
+ * WNOWAIT keeps the PID unreusable until that transition. The handler can
+ * kill() a child the rollback is wedged behind (for example ssh-add awaiting
+ * input). sig_atomic_t is the only type the handler may read while mainline
+ * writes it; the static assert prevents pid_t truncation. */
 static volatile sig_atomic_t g_child_pid = 0;
 _Static_assert(sizeof(sig_atomic_t) >= sizeof(pid_t),
                "pid_t must fit in sig_atomic_t for the L8 child-pid publication");
@@ -96,6 +96,7 @@ typedef struct {
 static sigaction_test_fault_t
     g_test_sigaction_faults[SIGNALS_TEST_SIGACTION_RESTORE + 1];
 static signals_test_guard_end_hook_fn g_test_guard_end_hook;
+static signals_test_post_wait_hook_fn g_test_post_wait_hook;
 #endif
 
 enum {
@@ -185,6 +186,18 @@ signals_test_guard_end_hook_fn signals_test_set_guard_end_hook(
 
     g_test_guard_end_hook = hook;
     return previous;
+}
+
+signals_test_post_wait_hook_fn signals_test_set_post_wait_hook(
+    signals_test_post_wait_hook_fn hook) {
+    signals_test_post_wait_hook_fn previous = g_test_post_wait_hook;
+
+    g_test_post_wait_hook = hook;
+    return previous;
+}
+
+pid_t signals_test_published_child(void) {
+    return (pid_t)g_child_pid;
 }
 #endif
 
@@ -394,21 +407,192 @@ void signals_child_spawned(pid_t pid) {
     }
 }
 
-void signals_child_reaped(void) {
-    /* Clear the pid FIRST: once waitpid() has reaped, the kernel may reuse
-     * the pid, and a handler firing between reap and this store must not
-     * kill() a stranger. The window is the few instructions between waitpid
-     * returning and this call — and the handler only consults the pid when a
-     * repeat signal lands mid-rollback — so the residual race is accepted.
-     * Then retire the escalation latch so the next child (which could
-     * legitimately be handed the same pid) starts back at the polite step. */
-    g_child_pid = 0;
-    g_child_signaled = 0;
+static void signals_child_retire(pid_t pid) {
+    if ((pid_t)g_child_pid == pid) {
+        g_child_pid = 0;
+        g_child_signaled = 0;
+    }
+}
+
+int signals_child_wait_begin(sigset_t *previous_mask) {
+    sigset_t block;
+    struct sigaction action;
+    int failure_errno;
+
+    memset(&action, 0, sizeof(action));
+
+    if (!previous_mask) {
+        errno = EINVAL;
+        set_system_error(ERR_INVALID_ARGS,
+                         "Cannot establish child wait ownership without a mask output");
+        errno = EINVAL;
+        return -1;
+    }
+    if (sigemptyset(&block) != 0 || sigaddset(&block, SIGCHLD) != 0) {
+        failure_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot prepare SIGCHLD wait-ownership mask");
+        errno = failure_errno;
+        return -1;
+    }
+    if (sigprocmask(SIG_BLOCK, &block, previous_mask) != 0) {
+        failure_errno = errno;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "Cannot block SIGCHLD before checking wait ownership");
+        errno = failure_errno;
+        return -1;
+    }
+    if (sigaction(SIGCHLD, NULL, &action) != 0) {
+        failure_errno = errno;
+        int restore_errno = 0;
+        if (sigprocmask(SIG_SETMASK, previous_mask, NULL) != 0) {
+            restore_errno = errno;
+        }
+        errno = failure_errno;
+        if (restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Cannot query SIGCHLD wait ownership; also failed to restore the caller mask (restore errno=%d)",
+                restore_errno);
+        } else {
+            set_system_error(ERR_SYSTEM_CALL,
+                             "Cannot query SIGCHLD wait ownership");
+        }
+        errno = failure_errno;
+        return -1;
+    }
+    if (action.sa_handler == SIG_IGN || action.sa_handler != SIG_DFL ||
+        (action.sa_flags & SA_NOCLDWAIT) != 0) {
+        failure_errno = EBUSY;
+        int restore_errno = 0;
+        if (sigprocmask(SIG_SETMASK, previous_mask, NULL) != 0) {
+            restore_errno = errno;
+        }
+        errno = failure_errno;
+        if (restore_errno != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Cannot spawn helper while SIGCHLD is ignored, auto-reaped, or owned by another reaper; also failed to restore the caller mask (restore errno=%d)",
+                restore_errno);
+        } else {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Cannot spawn helper while SIGCHLD is ignored, auto-reaped, or owned by another reaper");
+        }
+        errno = failure_errno;
+        return -1;
+    }
+    return 0;
+}
+
+int signals_child_wait_end(const sigset_t *previous_mask) {
+    if (!previous_mask) {
+        errno = EINVAL;
+        return -1;
+    }
+    return sigprocmask(SIG_SETMASK, previous_mask, NULL);
+}
+
+signals_child_wait_result_t signals_wait_child(pid_t pid, int *status,
+                                                int options) {
+    signals_child_wait_result_t result = {
+        .waited = -1,
+        .wait_errno = 0,
+        .mask_errno = 0
+    };
+    siginfo_t observed;
+    sigset_t guarded;
+    sigset_t saved_mask;
+    int observe_options = WEXITED | WNOWAIT;
+    bool observed_echild = false;
+    bool terminal_status = false;
+
+    /* First observe the child without releasing its PID.  A blocking waitid
+     * remains interruptible by the guard handler, so a repeated rollback
+     * signal can still reach and terminate a wedged helper.  WNOWAIT keeps a
+     * completed child waitable (and therefore its PID unreusable) until the
+     * guarded waitpid+retire transition below. */
+    if ((options & WNOHANG) != 0) observe_options |= WNOHANG;
+#ifdef WUNTRACED
+    if ((options & WUNTRACED) != 0) observe_options |= WSTOPPED;
+#endif
+#ifdef WCONTINUED
+    if ((options & WCONTINUED) != 0) observe_options |= WCONTINUED;
+#endif
+    memset(&observed, 0, sizeof(observed));
+    if (waitid(P_PID, (id_t)pid, &observed, observe_options) != 0) {
+        result.wait_errno = errno;
+        if (result.wait_errno != ECHILD) return result;
+        /* An initial ECHILD proves this process no longer owns the published
+         * PID. Still enter the guarded retirement transition so the handler
+         * cannot retain or act on that stale publication. */
+        observed_echild = true;
+    }
+    if (!observed_echild && observed.si_pid == 0) {
+        result.waited = 0;
+        return result;
+    }
+    if (!observed_echild) {
+        terminal_status = observed.si_code == CLD_EXITED ||
+                          observed.si_code == CLD_KILLED ||
+                          observed.si_code == CLD_DUMPED;
+    }
+
+    if (sigemptyset(&guarded) != 0) {
+        result.mask_errno = errno;
+        return result;
+    }
+    for (size_t i = 0; i < GUARDED_SIGNAL_COUNT; i++) {
+        if (g_action_installed[i] &&
+            sigaddset(&guarded, g_guarded_signals[i]) != 0) {
+            result.mask_errno = errno;
+            return result;
+        }
+    }
+    if (sigprocmask(SIG_BLOCK, &guarded, &saved_mask) != 0) {
+        result.mask_errno = errno;
+        return result;
+    }
+
+    if (!observed_echild) {
+        result.waited = waitpid(pid, status, options);
+        if (result.waited < 0) result.wait_errno = errno;
+    }
+
+#ifdef GITSWITCH_TESTING
+    if (g_test_post_wait_hook &&
+        (result.waited == pid ||
+         (result.waited < 0 && result.wait_errno == ECHILD))) {
+        signals_test_post_wait_hook_fn checkpoint = g_test_post_wait_hook;
+        g_test_post_wait_hook = NULL;
+        checkpoint();
+    }
+#endif
+
+    if ((result.waited == pid && terminal_status) ||
+        (result.waited < 0 && result.wait_errno == ECHILD)) {
+        /* waitpid has either released the PID or proved that this process no
+         * longer owns it. Retire while every handler that could consult the
+         * publication is still blocked. */
+        signals_child_retire(pid);
+    }
+    if (sigprocmask(SIG_SETMASK, &saved_mask, NULL) != 0) {
+        result.mask_errno = errno;
+    }
+    return result;
 }
 
 int signals_guard_begin(void) {
     sig_atomic_t previous_pending;
 
+    if (g_dispatch_mask_restore_pending) {
+        errno = EBUSY;
+        set_system_error(
+            ERR_SYSTEM_CALL,
+            "Cannot begin signal guard while deferred-dispatch mask restoration remains pending");
+        errno = EBUSY;
+        return -1;
+    }
     if (g_guard_state == GUARD_ACTIVE) {
         return 0;
     }
@@ -471,10 +655,9 @@ int signals_guard_begin(void) {
         for (size_t j = 0; j < GUARDED_SIGNAL_COUNT; j++) {
             sigaddset(&ours.sa_mask, g_guarded_signals[j]);
         }
-        /* SA_RESTART: the guarded window spends its time blocked in
-         * poll()/waitpid() on children (git, ssh-add, gpg); run_argv retries
-         * EINTR anyway, but restarting keeps every other syscall in the
-         * window from failing spuriously. */
+        /* SA_RESTART: guarded work often blocks in poll()/waitid()/waitpid()
+         * on children. The runner handles EINTR, while restart semantics keep
+         * unrelated syscalls from failing spuriously. */
         ours.sa_flags = SA_RESTART;
 
         if (guard_sigaction(g_guarded_signals[i], &ours,

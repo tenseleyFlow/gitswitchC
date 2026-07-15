@@ -231,6 +231,12 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(run_test_set_fd_close_strategy);
     REQUIRE_PUBLIC_API(run_test_set_fork_failure);
     REQUIRE_PUBLIC_API(run_test_set_post_fork_pre_publish_hook);
+#ifdef GITSWITCH_TESTING
+    REQUIRE_PUBLIC_API(run_test_set_exec_parse_failure);
+    REQUIRE_PUBLIC_API(run_test_set_path_candidate_failure);
+    REQUIRE_PUBLIC_API(run_test_set_directory_open_failure);
+    REQUIRE_PUBLIC_API(run_test_set_exec_acl_failure);
+#endif
     REQUIRE_PUBLIC_API(run_uses_default_runner);
     REQUIRE_PUBLIC_API(runtime_lock_test_fail_release_stat);
     REQUIRE_PUBLIC_API(runtime_state_lock_acquire);
@@ -254,8 +260,10 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(set_system_error_context);
     REQUIRE_PUBLIC_API(should_log);
     REQUIRE_PUBLIC_API(signals_block_for_child_spawn);
-    REQUIRE_PUBLIC_API(signals_child_reaped);
+    REQUIRE_PUBLIC_API(signals_child_wait_begin);
+    REQUIRE_PUBLIC_API(signals_child_wait_end);
     REQUIRE_PUBLIC_API(signals_child_spawned);
+    REQUIRE_PUBLIC_API(signals_wait_child);
     REQUIRE_PUBLIC_API(signals_dispatch_pending);
     REQUIRE_PUBLIC_API(signals_guard_begin);
     REQUIRE_PUBLIC_API(signals_guard_end);
@@ -272,6 +280,8 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_test_fail_dispatch);
     REQUIRE_PUBLIC_API(signals_test_fail_sigaction);
     REQUIRE_PUBLIC_API(signals_test_set_guard_end_hook);
+    REQUIRE_PUBLIC_API(signals_test_set_post_wait_hook);
+    REQUIRE_PUBLIC_API(signals_test_published_child);
 #endif
     REQUIRE_PUBLIC_API(sort_accounts);
     REQUIRE_PUBLIC_API(ssh_add_key);

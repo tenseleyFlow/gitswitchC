@@ -11,19 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 static char g_self_path[MAX_PATH_LEN];
-
-/* AR-09 M27: exact SIGPIPE disposition restoration and failure precedence. */
-enum {
-    RUN_SIGPIPE_ACTION_INSTALL = 1,
-    RUN_SIGPIPE_ACTION_RESTORE
-};
-
-void gitswitch_test_fail_run_sigpipe_action(int stage, int system_errno);
 
 typedef enum {
     SIGPIPE_DISPOSITION_DEFAULT = 0,
@@ -122,12 +115,6 @@ static bool sigpipe_round_trip_passes(sigpipe_disposition_t disposition) {
            WEXITSTATUS(status) == 0;
 }
 
-static bool no_children_remain(void) {
-    int status = 0;
-    errno = 0;
-    return waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD;
-}
-
 static bool isolated_runner_check_passes(int (*check)(void)) {
     int status = 0;
 
@@ -135,146 +122,106 @@ static bool isolated_runner_check_passes(int (*check)(void)) {
     pid_t worker = fork();
     if (worker < 0) return false;
     if (worker == 0) _exit(check());
-    return waitpid(worker, &status, 0) == worker && WIFEXITED(status) &&
-           WEXITSTATUS(status) == 0;
+    if (waitpid(worker, &status, 0) != worker) return false;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "  isolated runner worker status=%d\n", status);
+        return false;
+    }
+    return true;
 }
 
-static bool file_contains_text(const char *path, const char *needle) {
-    char content[8192];
-    FILE *file = fopen(path, "r");
-
-    if (!file) return false;
-    size_t length = fread(content, 1, sizeof(content) - 1, file);
-    bool read_ok = !ferror(file);
-    int close_rc = fclose(file);
-    content[length] = '\0';
-    return read_ok && close_rc == 0 && strstr(content, needle) != NULL;
+static bool sigsets_semantically_equal(const sigset_t *left,
+                                       const sigset_t *right) {
+#ifdef NSIG
+    const int signal_limit = NSIG;
+#else
+    const int signal_limit = 128;
+#endif
+    for (int signal_number = 1; signal_number < signal_limit;
+         signal_number++) {
+        int left_member = sigismember(left, signal_number);
+        int right_member = sigismember(right, signal_number);
+        if (left_member < 0 && right_member < 0) continue;
+        if (left_member != right_member) return false;
+    }
+    return true;
 }
 
-static int sigpipe_install_failure_worker(void) {
-    const char *argv[] = {"true", NULL};
-    struct sigaction original;
-    struct sigaction installed;
-    struct sigaction after;
-    run_result_t result;
+typedef enum {
+    SIGPIPE_PENDING_NO_INPUT = 0,
+    SIGPIPE_PENDING_WITH_EPIPE,
+    SIGPIPE_NEW_EPIPE
+} sigpipe_pending_case_t;
 
-    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM, &original,
-                                    &installed) != 0) {
-        return 20;
-    }
-    gitswitch_test_fail_run_sigpipe_action(RUN_SIGPIPE_ACTION_INSTALL, EIO);
-    clear_error();
-    errno = 0;
-    int run_rc = run_argv(argv, NULL, &result);
-    int returned_errno = errno;
-    error_context_t failure = *get_last_error();
-    int query_rc = sigaction(SIGPIPE, NULL, &after);
-    bool exact_state = query_rc == 0 &&
-                       sigactions_semantically_equal(&installed, &after);
-    bool child_reaped = no_children_remain();
-    int cleanup_rc = sigaction(SIGPIPE, &original, NULL);
-
-    if (cleanup_rc != 0) return 21;
-    if (run_rc != -1 || !result.spawned) return 22;
-    if (returned_errno != EIO || failure.system_errno != EIO ||
-        failure.code != ERR_SYSTEM_CALL) {
-        return 23;
-    }
-    if (!strstr(failure.message, "install temporary SIGPIPE disposition")) {
-        return 24;
-    }
-    if (!exact_state) return 25;
-    if (!child_reaped) return 26;
-    return 0;
-}
-
-static int sigpipe_restore_failure_worker(void) {
-    const char *argv[] = {"true", NULL};
-    struct sigaction original;
-    struct sigaction installed;
-    struct sigaction after;
-    run_result_t result;
-
-    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM, &original,
-                                    &installed) != 0) {
-        return 30;
-    }
-    gitswitch_test_fail_run_sigpipe_action(RUN_SIGPIPE_ACTION_RESTORE, EIO);
-    clear_error();
-    errno = 0;
-    int run_rc = run_argv(argv, NULL, &result);
-    int returned_errno = errno;
-    error_context_t failure = *get_last_error();
-    int query_rc = sigaction(SIGPIPE, NULL, &after);
-    bool restore_was_skipped = query_rc == 0 && after.sa_handler == SIG_IGN;
-    bool child_reaped = no_children_remain();
-    int cleanup_rc = sigaction(SIGPIPE, &original, NULL);
-
-    if (cleanup_rc != 0) return 31;
-    if (run_rc != -1 || !result.spawned || result.exit_code != 0) return 32;
-    if (returned_errno != EIO || failure.system_errno != EIO ||
-        failure.code != ERR_SYSTEM_CALL) {
-        return 33;
-    }
-    if (!strstr(failure.message, "restore previous SIGPIPE disposition")) {
-        return 34;
-    }
-    if (!restore_was_skipped) return 35;
-    if (!child_reaped) return 36;
-    return 0;
-}
-
-static int sigpipe_restore_secondary_to_child_failure_worker(void) {
-    char log_path[] = "/tmp/gs_sigpipe_secondary_XXXXXX";
-    char invalid_env[300];
-    const char *env[] = {invalid_env, NULL};
-    const char *argv[] = {"true", NULL};
-    struct sigaction original;
-    struct sigaction installed;
+static int sigpipe_pending_worker(sigpipe_pending_case_t test_case) {
+    /* Exceed supported platforms' pipe capacities so the parent cannot queue
+     * every byte before the helper closes fd 0; an actual EPIPE is required
+     * to exercise selective pending-SIGPIPE consumption deterministically. */
+    static char input[8U * 1024U * 1024U];
+    const char *argv_no_input[] = {g_self_path, "--ar07-fd-probe", NULL};
+    const char *argv_epipe[] = {g_self_path, "--ar11-close-stdin", NULL};
+    struct sigaction original_action;
+    struct sigaction installed_action;
+    struct sigaction after_action;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    sigset_t pending;
+    sigset_t pipe_set;
     run_opts_t opts;
     run_result_t result;
+    bool initially_pending = test_case != SIGPIPE_NEW_EPIPE;
+    bool with_input = test_case != SIGPIPE_PENDING_NO_INPUT;
 
-    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM, &original,
-                                    &installed) != 0) {
-        return 40;
+    if (install_sigpipe_disposition(SIGPIPE_DISPOSITION_CUSTOM,
+                                    &original_action,
+                                    &installed_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) {
+        return 20;
     }
-    int log_fd = mkstemp(log_path);
-    if (log_fd < 0 || close(log_fd) != 0) return 41;
-    if (set_log_file(log_path) != 0) {
-        (void)unlink(log_path);
-        return 42;
-    }
-    memset(invalid_env, 'K', sizeof(invalid_env));
-    invalid_env[270] = '=';
-    invalid_env[271] = 'x';
-    invalid_env[272] = '\0';
+    configured_mask = original_mask;
+    if (initially_pending) sigaddset(&configured_mask, SIGPIPE);
+    else sigdelset(&configured_mask, SIGPIPE);
+    sigaddset(&configured_mask, SIGUSR2);
+    if (sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) return 21;
+    if (initially_pending && raise(SIGPIPE) != 0) return 22;
+
     memset(&opts, 0, sizeof(opts));
-    opts.extra_env = env;
-
-    gitswitch_test_fail_run_sigpipe_action(RUN_SIGPIPE_ACTION_RESTORE, EIO);
-    clear_error();
-    errno = 0;
-    int run_rc = run_argv(argv, &opts, &result);
-    int returned_errno = errno;
-    error_context_t failure = *get_last_error();
-    bool child_reaped = no_children_remain();
-    int reset_log_rc = set_log_file(NULL);
-    bool secondary_visible = file_contains_text(
-        log_path,
-        "secondary failure restoring previous SIGPIPE disposition");
-    (void)unlink(log_path);
-    int cleanup_rc = sigaction(SIGPIPE, &original, NULL);
-
-    if (reset_log_rc != 0 || cleanup_rc != 0) return 43;
-    if (run_rc != -1 || !result.spawned || result.exit_code != 126) return 44;
-    if (returned_errno != EINVAL || failure.system_errno != EINVAL ||
-        failure.code != ERR_SYSTEM_CALL) {
-        return 45;
+    if (with_input) {
+        opts.input = input;
+        opts.input_len = sizeof(input);
     }
-    if (!strstr(failure.message, "child environment setup failed")) return 46;
-    if (strstr(failure.message, "SIGPIPE")) return 47;
-    if (!secondary_visible) return 48;
-    if (!child_reaped) return 49;
+    g_sigpipe_witness_calls = 0;
+    int run_rc = run_argv(with_input ? argv_epipe : argv_no_input,
+                          with_input ? &opts : NULL, &result);
+    int returned_errno = errno;
+    if (sigaction(SIGPIPE, NULL, &after_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0 ||
+        sigpending(&pending) != 0) {
+        return 23;
+    }
+    bool remains_pending = sigismember(&pending, SIGPIPE) == 1;
+    bool exact_action =
+        sigactions_semantically_equal(&installed_action, &after_action);
+    bool exact_mask = sigsets_semantically_equal(&configured_mask, &after_mask);
+
+    sigemptyset(&pipe_set);
+    sigaddset(&pipe_set, SIGPIPE);
+    if (remains_pending) {
+        struct timespec zero = {0, 0};
+        (void)sigtimedwait(&pipe_set, NULL, &zero);
+    }
+    int action_restore = sigaction(SIGPIPE, &original_action, NULL);
+    int mask_restore = sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    if (action_restore != 0 || mask_restore != 0) return 24;
+    if (!result.spawned || !exact_action || !exact_mask) return 25;
+    if (initially_pending != remains_pending) return 26;
+    if (g_sigpipe_witness_calls != 0) return 27;
+    if (with_input && run_rc != -1) return 28;
+    if (!with_input && (run_rc != 0 || result.exit_code != 0)) return 29;
+    /* A successful zero-time drain reports EAGAIN internally when no new
+     * instance remains; that bookkeeping errno must never escape the runner. */
+    if (with_input && returned_errno == EAGAIN) return 30;
     return 0;
 }
 
@@ -290,17 +237,28 @@ TEST(sigpipe_custom_handler_mask_and_flags_round_trip_exactly) {
     CHECK(sigpipe_round_trip_passes(SIGPIPE_DISPOSITION_CUSTOM));
 }
 
-TEST(sigpipe_install_failure_preserves_state_and_reaps_child) {
-    CHECK(isolated_runner_check_passes(sigpipe_install_failure_worker));
+static int sigpipe_pending_no_input_worker(void) {
+    return sigpipe_pending_worker(SIGPIPE_PENDING_NO_INPUT);
 }
 
-TEST(sigpipe_restore_failure_is_reported_after_successful_child) {
-    CHECK(isolated_runner_check_passes(sigpipe_restore_failure_worker));
+static int sigpipe_pending_epipe_worker(void) {
+    return sigpipe_pending_worker(SIGPIPE_PENDING_WITH_EPIPE);
 }
 
-TEST(sigpipe_restore_failure_does_not_replace_primary_child_error) {
-    CHECK(isolated_runner_check_passes(
-        sigpipe_restore_secondary_to_child_failure_worker));
+static int sigpipe_new_epipe_worker(void) {
+    return sigpipe_pending_worker(SIGPIPE_NEW_EPIPE);
+}
+
+TEST(sigpipe_initial_pending_instance_survives_no_input_execution) {
+    CHECK(isolated_runner_check_passes(sigpipe_pending_no_input_worker));
+}
+
+TEST(sigpipe_initial_pending_instance_survives_epipe) {
+    CHECK(isolated_runner_check_passes(sigpipe_pending_epipe_worker));
+}
+
+TEST(sigpipe_runner_generated_epipe_leaves_no_pending_instance) {
+    CHECK(isolated_runner_check_passes(sigpipe_new_epipe_worker));
 }
 
 static int fd_probe_main(void) {
@@ -359,6 +317,25 @@ static int stdin_eof_probe_main(void) {
 static int stdout_probe_main(void) {
     static const char witness[] = "AR07-DISCARD-WITNESS";
     return write_full(STDOUT_FILENO, witness, sizeof(witness) - 1) ? 0 : 1;
+}
+
+static int close_stdin_pause_main(void) {
+    struct timespec pause = {.tv_sec = 0, .tv_nsec = 300000000L};
+
+    if (close(STDIN_FILENO) != 0) return 1;
+    while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {}
+    return 0;
+}
+
+static int quiet_capture_holder_main(void) {
+    pid_t holder = fork();
+    if (holder < 0) return 1;
+    if (holder == 0) {
+        struct timespec lifetime = {.tv_sec = 2, .tv_nsec = 0};
+        while (nanosleep(&lifetime, &lifetime) != 0 && errno == EINTR) {}
+        _exit(0);
+    }
+    return 0;
 }
 
 static int64_t test_monotonic_ms(void) {
@@ -635,6 +612,63 @@ TEST(descendant_held_capture_pipe_returns_within_grace) {
     }
     CHECK(reap_within(worker, 2000, &status));
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static volatile sig_atomic_t g_periodic_alarm_calls;
+
+static void periodic_alarm_handler(int signal_number) {
+    (void)signal_number;
+    g_periodic_alarm_calls++;
+}
+
+static int interrupted_poll_deadline_worker(void) {
+    const char *argv[] = {g_self_path, "--ar11-quiet-holder", NULL};
+    struct sigaction original_action;
+    struct sigaction action;
+    struct itimerval timer;
+    struct itimerval stopped = {{0, 0}, {0, 0}};
+    char output[16];
+    run_opts_t opts;
+    run_result_t result;
+
+    if (sigaction(SIGALRM, NULL, &original_action) != 0) return 50;
+    memset(&action, 0, sizeof(action));
+    action.sa_handler = periodic_alarm_handler;
+    if (sigemptyset(&action.sa_mask) != 0 ||
+        sigaction(SIGALRM, &action, NULL) != 0) {
+        return 51;
+    }
+    memset(&timer, 0, sizeof(timer));
+    timer.it_value.tv_usec = 10000;
+    timer.it_interval.tv_usec = 10000;
+    g_periodic_alarm_calls = 0;
+    if (setitimer(ITIMER_REAL, &timer, NULL) != 0) return 52;
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    int64_t started = test_monotonic_ms();
+    clear_error();
+    int rc = run_argv(argv, &opts, &result);
+    int64_t elapsed = test_monotonic_ms() - started;
+    int timer_rc = setitimer(ITIMER_REAL, &stopped, NULL);
+    int action_rc = sigaction(SIGALRM, &original_action, NULL);
+
+    if (timer_rc != 0 || action_rc != 0) return 53;
+    if (rc != -1 || !result.spawned || result.exit_code != 0) return 54;
+    if (elapsed < 180 || elapsed > 1000) return 55;
+    if (g_periodic_alarm_calls < 5) return 56;
+    if (!strstr(get_last_error()->message,
+                "remained open after the direct child")) {
+        return 57;
+    }
+    return 0;
+}
+
+/* AR-11 M29: handled signals may interrupt every poll cycle, but the direct
+ * child still starts the retained-stream grace deadline immediately. */
+TEST(interrupted_poll_still_advances_child_capture_deadline) {
+    CHECK(isolated_runner_check_passes(interrupted_poll_deadline_worker));
 }
 
 /* A finite drain-to-EAGAIN loop is not sufficient when a descendant writes
@@ -1073,6 +1107,12 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--ar07-stdout-probe") == 0) {
         return stdout_probe_main();
     }
+    if (argc == 2 && strcmp(argv[1], "--ar11-close-stdin") == 0) {
+        return close_stdin_pause_main();
+    }
+    if (argc == 2 && strcmp(argv[1], "--ar11-quiet-holder") == 0) {
+        return quiet_capture_holder_main();
+    }
 
     error_init(LOG_LEVEL_WARNING, NULL);
     if (argc != 1 || !realpath(argv[0], g_self_path)) {
@@ -1082,9 +1122,9 @@ int main(int argc, char **argv) {
     RUN_TEST(sigpipe_default_disposition_round_trips_exactly);
     RUN_TEST(sigpipe_ignore_disposition_round_trips_exactly);
     RUN_TEST(sigpipe_custom_handler_mask_and_flags_round_trip_exactly);
-    RUN_TEST(sigpipe_install_failure_preserves_state_and_reaps_child);
-    RUN_TEST(sigpipe_restore_failure_is_reported_after_successful_child);
-    RUN_TEST(sigpipe_restore_failure_does_not_replace_primary_child_error);
+    RUN_TEST(sigpipe_initial_pending_instance_survives_no_input_execution);
+    RUN_TEST(sigpipe_initial_pending_instance_survives_epipe);
+    RUN_TEST(sigpipe_runner_generated_epipe_leaves_no_pending_instance);
     RUN_TEST(runner_fails_before_spawn_under_fd_exhaustion);
     RUN_TEST(child_setup_status_is_reported_explicitly);
     RUN_TEST(early_stdin_close_is_a_runner_failure);
@@ -1093,6 +1133,7 @@ int main(int argc, char **argv) {
     RUN_TEST(default_stdin_is_devnull_and_parent_input_is_preserved);
     RUN_TEST(default_stdout_is_devnull_not_parent_stdout);
     RUN_TEST(descendant_held_capture_pipe_returns_within_grace);
+    RUN_TEST(interrupted_poll_still_advances_child_capture_deadline);
     RUN_TEST(continuous_descendant_output_cannot_starve_capture_deadline);
     RUN_TEST(ordinary_buffered_capture_is_fully_drained);
     RUN_TEST(sparse_parent_descriptors_close_in_auto_branch);

@@ -840,6 +840,25 @@ $(BINDIR)/test_ar07_runner: \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+# AR-11 trusted-exec fault seams are compiled only into these causal test
+# profiles; the production utils object and installed binary retain no fault
+# state or injection symbols.
+$(BINDIR)/test_ar07_exec_trust: \
+		$(OBJDIR)/test_ar07_exec_trust.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_public_api: \
+		$(OBJDIR)/test_public_api.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 $(BINDIR)/test_security: \
 		$(OBJDIR)/test_security.o \
 		$(AR09_SECURITY_UTILS_OBJECT) \
