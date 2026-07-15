@@ -17,6 +17,10 @@
 
 /* Global error context */
 error_context_t g_last_error = {0};
+/* New causal reports advance independently of the context bytes. This lets a
+ * caller distinguish an identical consecutive diagnostic from stale global
+ * state without clearing or rewriting a previously retained failure. */
+static uint64_t g_error_report_generation = 0U;
 
 /* Logging configuration */
 log_level_t g_log_level = LOG_LEVEL_INFO;
@@ -36,6 +40,14 @@ static void copy_bounded_text(char *destination, size_t destination_size,
     if (length >= destination_size) length = destination_size - 1U;
     memcpy(destination, text, length);
     destination[length] = '\0';
+}
+
+static void error_advance_report_generation(void) {
+    g_error_report_generation++;
+    if (g_error_report_generation == 0U) {
+        /* Reserve zero for the process-start state after unsigned wrap. */
+        g_error_report_generation = 1U;
+    }
 }
 
 static void mark_text_truncated(char *destination, size_t destination_size) {
@@ -295,6 +307,7 @@ int set_error_context(error_code_t code, const char *file, int line,
     }
 
     g_last_error = next;
+    error_advance_report_generation();
 
     /* AR-10 L10: recorded at INFO, not ERROR. Many set_error sites are
      * expected misses their callers recover from (absent config, first-run
@@ -337,6 +350,7 @@ int set_system_error_context(error_code_t code, const char *file, int line,
     }
 
     g_last_error = next;
+    error_advance_report_generation();
 
     /* AR-10 L10: INFO, not ERROR — see set_error_context. */
     log_info("System error: %s [errno=%d: %s] (%s:%d in %s)",
@@ -348,6 +362,10 @@ int set_system_error_context(error_code_t code, const char *file, int line,
 /* Get last error information */
 const error_context_t *get_last_error(void) {
     return &g_last_error;
+}
+
+uint64_t error_report_generation(void) {
+    return g_error_report_generation;
 }
 
 /* Clear last error */

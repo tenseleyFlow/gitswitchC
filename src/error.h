@@ -160,6 +160,13 @@ int set_system_error_context(error_code_t code, const char *file, int line,
 const error_context_t *get_last_error(void);
 
 /**
+ * Return the monotonic generation of causal reports published through
+ * set_error_context() or set_system_error_context(). Clearing or restoring a
+ * retained context does not manufacture a new report and does not advance it.
+ */
+uint64_t error_report_generation(void);
+
+/**
  * Clear last error
  */
 void clear_error(void);

@@ -585,6 +585,38 @@ static int m10_key_slot(const char *key) {
     return -1;
 }
 
+static int m10_snapshot_output(const m10_destination_t *destination,
+                               const run_opts_t *opts,
+                               run_result_t *result) {
+    unsigned char listing[4096];
+    size_t length = 0U;
+
+    if (!destination) return m10_finish(result, 2);
+    for (size_t slot = 0U; slot < M10_KEY_COUNT; slot++) {
+        const char *value;
+        size_t key_length;
+        size_t value_length;
+
+        if (!destination->present[slot]) continue;
+        if (slot == M10_SIGNING_KEY) value = destination->fingerprint;
+        else if (slot == M10_SIGNING_ENABLED) value = "true";
+        else if (slot == M10_GPG_FORMAT) value = "openpgp";
+        else value = destination->program;
+        key_length = strlen(m10_keys[slot]);
+        value_length = strlen(value);
+        if (key_length + value_length + 2U > sizeof(listing) - length) {
+            return m10_finish(result, 2);
+        }
+        memcpy(listing + length, m10_keys[slot], key_length);
+        length += key_length;
+        listing[length++] = '\n';
+        memcpy(listing + length, value, value_length);
+        length += value_length;
+        listing[length++] = '\0';
+    }
+    return m10_binary_output(opts, result, listing, length);
+}
+
 static int m10_retirement_runner(const char *const argv[],
                                  const run_opts_t *opts,
                                  run_result_t *result) {
@@ -631,6 +663,14 @@ static int m10_retirement_runner(const char *const argv[],
     if (!destination) {
         m10_saw_unknown_path = true;
         return m10_finish(result, 2);
+    }
+    if (strcmp(argv[4], "--list") == 0) {
+        if (!argv[5] || strcmp(argv[5], "-z") != 0 || !argv[6] ||
+            strcmp(argv[6], "--no-includes") != 0 || argv[7]) {
+            return m10_finish(result, 2);
+        }
+        destination->gets++;
+        return m10_snapshot_output(destination, opts, result);
     }
     operation_index = strcmp(argv[4], "--no-includes") == 0 ? 5U : 4U;
     if (!argv[operation_index] || !argv[operation_index + 1U]) {

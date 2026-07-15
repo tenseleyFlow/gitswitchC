@@ -214,12 +214,15 @@ int git_retire_account_identity_published(
 
 /**
  * Retire every recorded publication for one account incarnation. All records
- * and live destinations are validated before the first mutation. Records for
- * linked worktrees may share one stable config destination; their repository
- * witnesses are checked independently and the physical config is processed
- * as one group using every persisted credential witness. Unchanged groups are
- * retired even when another record is stale, while the first causal failure
- * and an aggregate summary are returned with the total cleared-key count.
+ * and live destinations are validated before the first mutation, then every
+ * live physical destination is captured as one immutable exact-file vector.
+ * A read, parse, allocation, or truncation failure authorizes no mutation in
+ * any group; clean absence is idempotent. Records for linked worktrees may
+ * share one stable config destination; their repository witnesses are checked
+ * independently and the physical config is processed as one group using every
+ * persisted credential witness. Healthy groups still retire when another
+ * record is stale or indeterminate, while the first causal failure and an
+ * aggregate summary are returned with the total cleared-key count.
  */
 int git_retire_account_identity_publications(
     const account_t *account,

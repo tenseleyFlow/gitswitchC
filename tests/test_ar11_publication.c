@@ -467,6 +467,8 @@ static bool fail_publication_boundary(config_io_boundary_t boundary) {
 
 static int count_unexpected_retirement_runner(
     const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    static const char signing_snapshot[] =
+        "user.signingkey\n" FINGERPRINT_A;
     const char *operation;
     const char *key;
 
@@ -479,8 +481,33 @@ static int count_unexpected_retirement_runner(
         strcmp(argv[1], "config") != 0 || !argv[2] ||
         strcmp(argv[2], "--file") != 0 || !argv[3] ||
         retirement_expected_config_path[0] == '\0' ||
-        strcmp(argv[3], retirement_expected_config_path) != 0 || !argv[4] ||
-        strcmp(argv[4], "--no-includes") != 0 || !argv[5] || !argv[6]) {
+        strcmp(argv[3], retirement_expected_config_path) != 0 || !argv[4]) {
+        if (result) result->exit_code = 2;
+        return -1;
+    }
+    if (strcmp(argv[4], "--list") == 0) {
+        if (!argv[5] || strcmp(argv[5], "-z") != 0 || !argv[6] ||
+            strcmp(argv[6], "--no-includes") != 0 || argv[7] ||
+            !opts || !opts->out ||
+            opts->out_size <= sizeof(signing_snapshot)) {
+            if (result) result->exit_code = 2;
+            return -1;
+        }
+        if (retirement_signing_key_present) {
+            /* `git config --list -z` emits key, newline, value, then NUL;
+             * out_len includes that record terminator. The extra byte keeps
+             * the runner's ordinary capture-buffer contract as well. */
+            memcpy(opts->out, signing_snapshot, sizeof(signing_snapshot));
+            opts->out[sizeof(signing_snapshot)] = '\0';
+            if (result) result->out_len = sizeof(signing_snapshot);
+        } else {
+            opts->out[0] = '\0';
+        }
+        if (result) result->exit_code = 0;
+        return 0;
+    }
+    if (strcmp(argv[4], "--no-includes") != 0 ||
+        !argv[5] || !argv[6] || argv[7]) {
         if (result) result->exit_code = 2;
         return -1;
     }

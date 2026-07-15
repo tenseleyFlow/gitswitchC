@@ -75,6 +75,19 @@ static int fk_find(const char *scope, const char *key) {
     return -1;
 }
 
+static bool fk_unset_all(const char *scope, const char *key) {
+    bool found = false;
+
+    for (int i = 0; i < FK_MAX; i++) {
+        if (fk_store[i].used && strcmp(fk_store[i].scope, scope) == 0 &&
+            strcmp(fk_store[i].key, key) == 0) {
+            fk_store[i].used = false;
+            found = true;
+        }
+    }
+    return found;
+}
+
 /* A custom runner fully replaces run_argv, so — like the real run_argv_real —
  * it must publish result->exit_code (WEXITSTATUS), not just a return value:
  * git_unset_config_value now inspects res.exit_code to tell "removed"/"absent"
@@ -197,6 +210,16 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
         if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] &&
             argv[6] && strcmp(argv[3], fk_exact_global_path) == 0 &&
+            strcmp(argv[4], "--list") == 0 &&
+            strcmp(argv[5], "-z") == 0 &&
+            strcmp(argv[6], "--no-includes") == 0) {
+            /* Retirement preflights the complete exact file once. Reuse the
+             * ordered store emitter so repeated modeled values remain
+             * distinct NUL records just as they are in real Git output. */
+            return fk_emit_scope_listing("--global", opts, result);
+        }
+        if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] &&
+            argv[6] && strcmp(argv[3], fk_exact_global_path) == 0 &&
             strcmp(argv[4], "--no-includes") == 0) {
             const char *scope = "--global";
             const char *operation = argv[5];
@@ -213,10 +236,7 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
                 return fk_ret(result, 0);
             }
             if (strcmp(operation, "--unset-all") == 0) {
-                int i = fk_find(scope, key);
-                if (i < 0) return fk_ret(result, 5);
-                fk_store[i].used = false;
-                return fk_ret(result, 0);
+                return fk_ret(result, fk_unset_all(scope, key) ? 0 : 5);
             }
             return fk_ret(result, 1);
         }
@@ -235,12 +255,10 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
          * too so the fake stays robust. Removes ALL values of a (possibly
          * multi-valued) key; exit 5 when the key does not exist. */
         if ((strcmp(argv[3], "--unset-all") == 0 || strcmp(argv[3], "--unset") == 0) && argv[4]) {
-            int i = fk_find(scope, argv[4]);
-            if (i < 0) {
-                return fk_ret(result, 5); /* git: option does not exist */
-            }
-            fk_store[i].used = false;
-            return fk_ret(result, 0);
+            return fk_ret(result,
+                          fk_unset_all(scope, argv[4])
+                              ? 0
+                              : 5); /* git: option does not exist */
         }
 
         if (argv[4]) { /* set */
@@ -1607,6 +1625,42 @@ static int retire_destination_emit(const run_opts_t *opts,
     return fk_ret(result, 0);
 }
 
+static int retire_destination_emit_listing(int repository,
+                                           const run_opts_t *opts,
+                                           run_result_t *result) {
+    size_t used = 0U;
+
+    if (repository < 0 || repository >= RETIRE_DESTINATION_REPOSITORIES ||
+        !opts || !opts->out || opts->out_size == 0U) {
+        return fk_ret(result, 1);
+    }
+    for (int key = 0; key < RETIRE_DESTINATION_KEYS; key++) {
+        size_t key_length;
+        size_t value_length;
+
+        if (!retire_destination_values[repository][key]) continue;
+        key_length = strlen(retire_destination_keys[key]);
+        value_length = strlen(retire_destination_expected[key]);
+        if (used + key_length + 1U + value_length + 1U >
+            opts->out_size) {
+            if (result) {
+                result->out_len = opts->out_size - 1U;
+                result->out_truncated = true;
+            }
+            return fk_ret(result, 0);
+        }
+        memcpy(opts->out + used, retire_destination_keys[key], key_length);
+        used += key_length;
+        opts->out[used++] = '\n';
+        memcpy(opts->out + used, retire_destination_expected[key],
+               value_length);
+        used += value_length;
+        opts->out[used++] = '\0';
+    }
+    if (result) result->out_len = used;
+    return fk_ret(result, 0);
+}
+
 /* Model both ordinary cwd-sensitive --local reads used by assertions and the
  * exact-file retirement grammar. Exact retirement must derive its destination
  * only from argv[3], never from cwd or repository discovery. */
@@ -1630,8 +1684,7 @@ static int retire_destination_runner(const char *const argv[],
     if (strcmp(argv[1], "config") != 0 || !argv[2] || !argv[3]) {
         return fk_ret(result, 1);
     }
-    if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] && argv[6] &&
-        strcmp(argv[4], "--no-includes") == 0) {
+    if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] && argv[6]) {
         repository = -1;
         for (int i = 0; i < RETIRE_DESTINATION_REPOSITORIES; i++) {
             if ((size_t)snprintf(path, sizeof(path), "%s/.git/config",
@@ -1645,6 +1698,14 @@ static int retire_destination_runner(const char *const argv[],
             }
         }
         if (repository < 0) return fk_ret(result, 1);
+        if (strcmp(argv[4], "--list") == 0 &&
+            strcmp(argv[5], "-z") == 0 &&
+            strcmp(argv[6], "--no-includes") == 0) {
+            return retire_destination_emit_listing(repository, opts, result);
+        }
+        if (strcmp(argv[4], "--no-includes") != 0) {
+            return fk_ret(result, 1);
+        }
         key = retire_destination_key_index(argv[6]);
         if (key < 0) return fk_ret(result, 1);
         if (strcmp(argv[5], "--unset-all") == 0) {
@@ -2295,7 +2356,8 @@ TEST(published_ssh_retirement_ignores_current_global_override) {
                      &acct, &publication, &cleared), 0);
     run_set_runner(previous);
     CHECK_EQ_INT((int)cleared, 1);
-    CHECK_EQ_INT(fk_execs, 3);
+    /* One exact full-vector preflight plus the attributed unset. */
+    CHECK_EQ_INT(fk_execs, 2);
     CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) < 0);
 
 cleanup:

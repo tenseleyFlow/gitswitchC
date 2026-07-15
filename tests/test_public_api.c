@@ -153,6 +153,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(error_cleanup);
     REQUIRE_PUBLIC_API(error_code_to_string);
     REQUIRE_PUBLIC_API(error_init);
+    REQUIRE_PUBLIC_API(error_report_generation);
     REQUIRE_PUBLIC_API(expand_path);
     REQUIRE_PUBLIC_API(file_is_readable);
     REQUIRE_PUBLIC_API(file_is_writable);
