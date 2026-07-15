@@ -459,6 +459,7 @@ static config_io_boundary_t publication_fault_target;
 static int retirement_runner_calls;
 static int retirement_unset_attempts;
 static bool retirement_signing_key_present;
+static char retirement_expected_config_path[MAX_PATH_LEN];
 
 static bool fail_publication_boundary(config_io_boundary_t boundary) {
     return boundary == publication_fault_target;
@@ -466,6 +467,7 @@ static bool fail_publication_boundary(config_io_boundary_t boundary) {
 
 static int count_unexpected_retirement_runner(
     const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    const char *operation;
     const char *key;
 
     retirement_runner_calls++;
@@ -475,18 +477,23 @@ static int count_unexpected_retirement_runner(
     }
     if (!argv || !argv[0] || strcmp(argv[0], "git") != 0 || !argv[1] ||
         strcmp(argv[1], "config") != 0 || !argv[2] ||
-        strcmp(argv[2], "--global") != 0 || !argv[3]) {
+        strcmp(argv[2], "--file") != 0 || !argv[3] ||
+        retirement_expected_config_path[0] == '\0' ||
+        strcmp(argv[3], retirement_expected_config_path) != 0 || !argv[4] ||
+        strcmp(argv[4], "--no-includes") != 0 || !argv[5] || !argv[6]) {
         if (result) result->exit_code = 2;
         return -1;
     }
-    if (strcmp(argv[3], "--unset-all") == 0) {
+    operation = argv[5];
+    key = argv[6];
+    if (strcmp(operation, "--unset-all") == 0) {
         retirement_unset_attempts++;
         /* Inject a pre-mutation Git failure: the modeled key remains present. */
         if (result) result->exit_code = 2;
         return -1;
     }
-    key = argv[3];
-    if (strcmp(key, "user.signingkey") == 0 &&
+    if (strcmp(operation, "--get-all") == 0 &&
+        strcmp(key, "user.signingkey") == 0 &&
         retirement_signing_key_present && opts && opts->out &&
         opts->out_size > sizeof(FINGERPRINT_A)) {
         int written = snprintf(opts->out, opts->out_size, "%s\n",
@@ -2338,6 +2345,9 @@ TEST(removed_account_publication_reserves_recycled_id_without_git_mutation) {
     retirement_runner_calls = 0;
     retirement_unset_attempts = 0;
     retirement_signing_key_present = true;
+    CHECK_EQ_INT(safe_strncpy(retirement_expected_config_path,
+                              record.config_path,
+                              sizeof(retirement_expected_config_path)), 0);
     previous_runner = run_set_runner(count_unexpected_retirement_runner);
     cleared = 123U;
     CHECK_EQ_INT(accounts_retire_git_identity(&ctx, &removed, &cleared), -1);

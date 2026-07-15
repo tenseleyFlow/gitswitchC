@@ -190,6 +190,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_ops_init);
     REQUIRE_PUBLIC_API(git_retire_account_identity);
     REQUIRE_PUBLIC_API(git_retire_account_identity_published);
+    REQUIRE_PUBLIC_API(git_retire_account_identity_publications);
     REQUIRE_PUBLIC_API(git_scope_to_flag);
     REQUIRE_PUBLIC_API(git_set_config);
     REQUIRE_PUBLIC_API(git_set_config_value);
@@ -262,8 +263,10 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(publication_ledger_serialize);
     REQUIRE_PUBLIC_API(publication_ledger_upsert);
     REQUIRE_PUBLIC_API(publication_record_init);
+    REQUIRE_PUBLIC_API(publication_record_same_config_destination);
     REQUIRE_PUBLIC_API(publication_record_same_destination);
     REQUIRE_PUBLIC_API(publication_record_validate);
+    REQUIRE_PUBLIC_API(publication_record_verify_live_destination);
     REQUIRE_PUBLIC_API(prompt_confirm_exact_yes);
     REQUIRE_PUBLIC_API(prompt_line);
     REQUIRE_PUBLIC_API(read_file_to_string);

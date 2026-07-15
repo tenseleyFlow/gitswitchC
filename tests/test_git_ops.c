@@ -43,6 +43,11 @@ static const char *fk_repo_root_output;
 static int fk_repo_root_exit;
 static unsigned int fk_write_attempts;
 static unsigned int fk_fail_write_ordinal;
+/* Exact-file retirement deliberately ignores the caller's current Git
+ * environment. Tests that seed the simple global in-memory store bind its
+ * persisted publication path here so the fake can model `git config --file`
+ * without weakening the argv assertion. */
+static char fk_exact_global_path[MAX_PATH_LEN];
 
 static void fk_reset(void) {
     memset(fk_store, 0, sizeof(fk_store));
@@ -57,6 +62,7 @@ static void fk_reset(void) {
     fk_repo_root_exit = 1;
     fk_write_attempts = 0U;
     fk_fail_write_ordinal = 0U;
+    fk_exact_global_path[0] = '\0';
 }
 
 static int fk_find(const char *scope, const char *key) {
@@ -189,6 +195,31 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
     }
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
+        if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] &&
+            argv[6] && strcmp(argv[3], fk_exact_global_path) == 0 &&
+            strcmp(argv[4], "--no-includes") == 0) {
+            const char *scope = "--global";
+            const char *operation = argv[5];
+            const char *key = argv[6];
+
+            if (strcmp(operation, "--get-all") == 0) {
+                int i = fk_find(scope, key);
+                if (i < 0) return fk_ret(result, 1);
+                if (opts && opts->out && opts->out_size > 0) {
+                    (void)snprintf(opts->out, opts->out_size, "%s\n",
+                                   fk_store[i].value);
+                    if (result) result->out_len = strlen(opts->out);
+                }
+                return fk_ret(result, 0);
+            }
+            if (strcmp(operation, "--unset-all") == 0) {
+                int i = fk_find(scope, key);
+                if (i < 0) return fk_ret(result, 5);
+                fk_store[i].used = false;
+                return fk_ret(result, 0);
+            }
+            return fk_ret(result, 1);
+        }
         if (strcmp(argv[2], "--show-origin") == 0) {
             fk_effective_reads++;
             return fk_emit_effective_listing(opts, result);
@@ -1469,6 +1500,9 @@ static void retire_fill_publication(publication_record_t *publication,
         CHECK(false);
         return;
     }
+    CHECK_EQ_INT(safe_strncpy(fk_exact_global_path,
+                              publication->config_path,
+                              sizeof(fk_exact_global_path)), 0);
     publication->account_id = acct->id;
     safe_strncpy(publication->account_incarnation, acct->incarnation,
                  sizeof(publication->account_incarnation));
@@ -1573,9 +1607,9 @@ static int retire_destination_emit(const run_opts_t *opts,
     return fk_ret(result, 0);
 }
 
-/* Model Git's cwd-sensitive path and --local config behavior while retaining
- * real filesystem objects for the production destination verifier to open and
- * compare. This keeps the regression independent of host PATH trust policy. */
+/* Model both ordinary cwd-sensitive --local reads used by assertions and the
+ * exact-file retirement grammar. Exact retirement must derive its destination
+ * only from argv[3], never from cwd or repository discovery. */
 static int retire_destination_runner(const char *const argv[],
                                      const run_opts_t *opts,
                                      run_result_t *result) {
@@ -1590,31 +1624,46 @@ static int retire_destination_runner(const char *const argv[],
     if (!argv || !argv[0] || strcmp(argv[0], "git") != 0 || !argv[1]) {
         return fk_ret(result, 1);
     }
-    repository = retire_destination_current_repository();
-    if (repository < 0) return fk_ret(result, 1);
-
-    if (strcmp(argv[1], "rev-parse") == 0 && argv[2] &&
-        strcmp(argv[2], "--git-dir") == 0) {
-        return retire_destination_emit(opts, result, ".git");
-    }
-    if (strcmp(argv[1], "rev-parse") == 0 && argv[2] && argv[3] &&
-        strcmp(argv[2], "--path-format=absolute") == 0) {
-        if (strcmp(argv[3], "--show-toplevel") == 0) {
-            return retire_destination_emit(
-                opts, result, retire_destination_repositories[repository]);
-        }
-        if (strcmp(argv[3], "--git-path") == 0 && argv[4] &&
-            (size_t)snprintf(
-                path, sizeof(path), "%s/.git/%s",
-                retire_destination_repositories[repository], argv[4]) <
-                    sizeof(path)) {
-            return retire_destination_emit(opts, result, path);
-        }
+    if (strcmp(argv[1], "rev-parse") == 0) {
         return fk_ret(result, 1);
     }
+    if (strcmp(argv[1], "config") != 0 || !argv[2] || !argv[3]) {
+        return fk_ret(result, 1);
+    }
+    if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] && argv[6] &&
+        strcmp(argv[4], "--no-includes") == 0) {
+        repository = -1;
+        for (int i = 0; i < RETIRE_DESTINATION_REPOSITORIES; i++) {
+            if ((size_t)snprintf(path, sizeof(path), "%s/.git/config",
+                                 retire_destination_repositories[i]) >=
+                sizeof(path)) {
+                return fk_ret(result, 1);
+            }
+            if (strcmp(argv[3], path) == 0) {
+                repository = i;
+                break;
+            }
+        }
+        if (repository < 0) return fk_ret(result, 1);
+        key = retire_destination_key_index(argv[6]);
+        if (key < 0) return fk_ret(result, 1);
+        if (strcmp(argv[5], "--unset-all") == 0) {
+            if (!retire_destination_values[repository][key]) {
+                return fk_ret(result, 5);
+            }
+            retire_destination_values[repository][key] = false;
+            return fk_ret(result, 0);
+        }
+        if (strcmp(argv[5], "--get-all") != 0 ||
+            !retire_destination_values[repository][key]) {
+            return fk_ret(result, 1);
+        }
+        return retire_destination_emit(opts, result,
+                                       retire_destination_expected[key]);
+    }
 
-    if (strcmp(argv[1], "config") != 0 || !argv[2] ||
-        strcmp(argv[2], "--local") != 0 || !argv[3]) {
+    repository = retire_destination_current_repository();
+    if (repository < 0 || strcmp(argv[2], "--local") != 0) {
         return fk_ret(result, 1);
     }
     if (strcmp(argv[3], "--unset-all") == 0 && argv[4]) {
@@ -1650,11 +1699,10 @@ static bool retire_local_signing_leg_equals(const char *fingerprint) {
            strcmp(value, "/trusted/ar11/gpg") == 0;
 }
 
-/* M8/M10 boundary: a local publication for repository A must not authorize
- * `git config --local` mutation merely because the caller is now in B and B
- * happens to contain the same fingerprint. The exact canonical config and
- * repository object identities are admission evidence, not the scope name. */
-TEST(retire_local_publication_refuses_matching_other_repository) {
+/* M10: a local publication for repository A remains exactly addressable from
+ * B. B's identical-looking credential is not owned by A's provenance and
+ * survives; no cwd-sensitive --local operation is allowed to substitute B. */
+TEST(retire_local_publication_targets_recorded_repository_from_other_repository) {
     char base[128] = "/tmp/gsw-retire-destination-XXXXXX";
     char config_a[MAX_PATH_LEN] = "";
     char config_parent[MAX_PATH_LEN] = "";
@@ -1776,19 +1824,18 @@ TEST(retire_local_publication_refuses_matching_other_repository) {
     clear_error();
     rc = git_retire_account_identity_published(
         &acct, &publication, &cleared);
-    CHECK_EQ_INT(rc, -1);
-    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
-    CHECK_EQ_INT((int)cleared, 0);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT((int)cleared, 4);
     CHECK(retire_local_signing_leg_equals(RETIRE_FPR));
 
-    /* The matching destination remains usable: the same record authorizes A
-     * and removes exactly its four account-owned signing values. */
+    /* Repeating from A is idempotent and proves the first call already
+     * consumed A rather than accidentally operating on caller repository B. */
     CHECK_EQ_INT(chdir(retire_destination_repositories[0]), 0);
     git_ops_test_reset_caches();
     cleared = 0;
     CHECK_EQ_INT(git_retire_account_identity_published(
                      &acct, &publication, &cleared), 0);
-    CHECK_EQ_INT((int)cleared, 4);
+    CHECK_EQ_INT((int)cleared, 0);
     CHECK(git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, config_a,
                                sizeof(config_a), GIT_SCOPE_LOCAL) != 0);
 
@@ -1809,7 +1856,7 @@ static void fk_seed(const char *scope, const char *key, const char *value) {
     fk_store[i].used = true;
 }
 
-TEST(retire_global_publication_refuses_changed_config_destination) {
+TEST(retire_global_publication_ignores_environment_but_checks_generation) {
     char config_b[MAX_PATH_LEN] = "";
     char config_link[MAX_PATH_LEN] = "";
     FILE *file = NULL;
@@ -1851,13 +1898,17 @@ TEST(retire_global_publication_refuses_changed_config_destination) {
     clear_error();
     rc = git_retire_account_identity_published(
         &acct, &publication, &cleared);
-    CHECK_EQ_INT(rc, -1);
-    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
-    CHECK_EQ_INT((int)cleared, 0);
-    CHECK(fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY) >= 0);
-    CHECK(fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN) >= 0);
-    CHECK(fk_find("--global", GIT_CONFIG_GPG_FORMAT) >= 0);
-    CHECK(fk_find("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM) >= 0);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT((int)cleared, 4);
+    CHECK(fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY) < 0);
+
+    /* Restore the modeled record-owned values before exercising an actual
+     * generation change at the persisted path. */
+    fk_seed("--global", GIT_CONFIG_USER_SIGNINGKEY, RETIRE_FPR);
+    fk_seed("--global", GIT_CONFIG_COMMIT_GPGSIGN, "true");
+    fk_seed("--global", GIT_CONFIG_GPG_FORMAT, "openpgp");
+    fk_seed("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+            "/trusted/ar11/gpg");
 
     /* Exact path and inode are still insufficient: changing the sealed file's
      * hard-link count keeps its inode, size, and mtime but invalidates the
@@ -2199,7 +2250,7 @@ TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
     ts_rm_rf(root);
 }
 
-TEST(published_ssh_retirement_rejects_wrong_destination_before_git) {
+TEST(published_ssh_retirement_ignores_current_global_override) {
     char program_root[MAX_PATH_LEN] = "/tmp/gsw-retire-ssh-program-XXXXXX";
     char program[MAX_PATH_LEN];
     char command[GIT_CONFIG_VALUE_MAX];
@@ -2241,13 +2292,11 @@ TEST(published_ssh_retirement_rejects_wrong_destination_before_git) {
     previous = run_set_runner(fake_git_runner);
     clear_error();
     CHECK_EQ_INT(git_retire_account_identity_published(
-                     &acct, &publication, &cleared), -1);
+                     &acct, &publication, &cleared), 0);
     run_set_runner(previous);
-    CHECK_EQ_INT((int)cleared, 0);
-    CHECK_EQ_INT(fk_execs, 0);
-    CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) >= 0);
-    CHECK(strstr(get_last_error()->message,
-                 "destination does not match") != NULL);
+    CHECK_EQ_INT((int)cleared, 1);
+    CHECK_EQ_INT(fk_execs, 3);
+    CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) < 0);
 
 cleanup:
     if (fd >= 0) CHECK_EQ_INT(close(fd), 0);
@@ -2487,9 +2536,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
     RUN_TEST(git_test_config_probes_with_exact_absolute_program);
     RUN_TEST(git_test_config_rejects_invalid_program_contract_before_exec);
-    RUN_TEST(retire_global_publication_refuses_changed_config_destination);
+    RUN_TEST(retire_global_publication_ignores_environment_but_checks_generation);
     RUN_TEST(retire_without_publication_record_preserves_signing_leg);
-    RUN_TEST(retire_local_publication_refuses_matching_other_repository);
+    RUN_TEST(retire_local_publication_targets_recorded_repository_from_other_repository);
     RUN_TEST(retire_exact_published_fingerprint_clears_signing_leg);
     RUN_TEST(retire_legacy_publication_without_selector_uses_exact_fingerprint);
     RUN_TEST(retire_leaves_foreign_signing_key_in_place);
@@ -2498,7 +2547,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(retire_without_publication_refuses_matching_ssh_command);
     RUN_TEST(retire_leaves_foreign_ssh_command_in_place);
     RUN_TEST(published_ssh_retirement_uses_saved_command_after_program_removal);
-    RUN_TEST(published_ssh_retirement_rejects_wrong_destination_before_git);
+    RUN_TEST(published_ssh_retirement_ignores_current_global_override);
     RUN_TEST(signing_key_identity_requires_exact_canonical_fingerprint);
     RUN_TEST(signing_status_requires_exact_published_destination_and_fingerprint);
     RUN_TEST(signing_status_roots_relative_local_origin_at_repository);

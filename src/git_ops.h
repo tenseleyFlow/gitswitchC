@@ -200,18 +200,31 @@ int git_retire_account_identity(const account_t *account, size_t *cleared);
 /**
  * Retire an account identity using a validated durable publication record.
  * Signing attribution is restricted to the record's exact canonical
- * fingerprint and destination. Local/worktree retirement additionally
- * requires the caller's current canonical config and repository paths plus
- * their object identities to match the record; scope equality alone never
- * authorizes mutation in another repository. Only PUBLISHED records authorize
- * mutation; RETIRING records are durable deletion tombstones and fail before
- * Git execution. NULL, incomplete, mismatched, or selector-derived records
+ * fingerprint and destination. Local/worktree retirement verifies the exact
+ * persisted config and repository identities without consulting cwd, HOME,
+ * or Git environment overrides. Only PUBLISHED records authorize mutation;
+ * RETIRING records are durable deletion tombstones and fail before Git
+ * execution. NULL, incomplete, mismatched, or selector-derived records
  * likewise fail before mutation. Retirement consumes the exact persisted SSH
  * command and does not require the recorded executable still to exist.
  */
 int git_retire_account_identity_published(
     const account_t *account, const publication_record_t *publication,
     size_t *cleared);
+
+/**
+ * Retire every recorded publication for one account incarnation. All records
+ * and live destinations are validated before the first mutation. Records for
+ * linked worktrees may share one stable config destination; their repository
+ * witnesses are checked independently and the physical config is processed
+ * as one group using every persisted credential witness. Unchanged groups are
+ * retired even when another record is stale, while the first causal failure
+ * and an aggregate summary are returned with the total cleared-key count.
+ */
+int git_retire_account_identity_publications(
+    const account_t *account,
+    const publication_record_t *const publications[],
+    size_t publication_count, size_t *cleared);
 
 /**
  * Snapshot the gitswitch-managed config keys (identity/signing keys,

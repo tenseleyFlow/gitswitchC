@@ -9,6 +9,7 @@
 #define _DARWIN_C_SOURCE 1
 #endif
 #define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -3965,14 +3966,15 @@ typedef enum {
     ACCOUNT_PUBLICATION_LOOKUP_FOUND = 1
 } account_publication_lookup_result_t;
 
-static account_publication_lookup_result_t load_unique_account_publication(
+static account_publication_lookup_result_t load_account_publications(
     const gitswitch_ctx_t *ctx, const account_t *account,
-    uint32_t required_capabilities, publication_ledger_t *ledger,
-    const publication_record_t **publication) {
-    const publication_record_t *match = NULL;
+    uint32_t required_capabilities, bool require_every_candidate,
+    publication_ledger_t *ledger,
+    size_t *publication_count) {
+    size_t matches = 0U;
 
-    if (publication) *publication = NULL;
-    if (!ctx || !account || !ledger || !publication) {
+    if (publication_count) *publication_count = 0U;
+    if (!ctx || !account || !ledger || !publication_count) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid durable-publication lookup arguments");
@@ -4004,9 +4006,8 @@ static account_publication_lookup_result_t load_unique_account_publication(
                 account->name);
             return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
         }
-        if (candidate->state != PUBLICATION_STATE_PUBLISHED ||
-            (candidate->capabilities & required_capabilities) !=
-                required_capabilities) {
+        if (publication_record_validate(candidate) != 0 ||
+            candidate->state != PUBLICATION_STATE_PUBLISHED) {
             errno = ESTALE;
             set_error(
                 ERR_GIT_CONFIG_FAILED,
@@ -4014,17 +4015,19 @@ static account_publication_lookup_result_t load_unique_account_publication(
                 account->name);
             return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
         }
-        if (match) {
+        if ((candidate->capabilities & required_capabilities) !=
+            required_capabilities) {
+            if (!require_every_candidate) continue;
             errno = ESTALE;
             set_error(
                 ERR_GIT_CONFIG_FAILED,
-                "Durable publication provenance for account '%s' names multiple destinations",
+                "Durable publication provenance for account '%s' is incomplete",
                 account->name);
             return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
         }
-        match = candidate;
+        matches++;
     }
-    if (!match) {
+    if (matches == 0U) {
         errno = ENOENT;
         set_error(
             ERR_GIT_CONFIG_FAILED,
@@ -4032,7 +4035,7 @@ static account_publication_lookup_result_t load_unique_account_publication(
             account->name);
         return ACCOUNT_PUBLICATION_LOOKUP_ABSENT;
     }
-    *publication = match;
+    *publication_count = matches;
     return ACCOUNT_PUBLICATION_LOOKUP_FOUND;
 }
 
@@ -4040,9 +4043,12 @@ int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
                                  const account_t *account,
                                  size_t *cleared) {
     publication_ledger_t ledger;
-    const publication_record_t *publication = NULL;
     account_publication_lookup_result_t lookup_result;
-    int result = -1;
+    const publication_record_t *publications[
+        PUBLICATION_LEDGER_MAX_RECORDS];
+    size_t publication_count = 0U;
+    size_t collected = 0U;
+    int result;
 
     if (cleared) *cleared = 0;
     if (!ctx || !account) {
@@ -4052,14 +4058,29 @@ int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
         return -1;
     }
     publication_ledger_init(&ledger);
-    lookup_result = load_unique_account_publication(
+    lookup_result = load_account_publications(
         ctx, account,
         PUBLICATION_CAP_DESTINATION | PUBLICATION_CAP_POST_GENERATION,
-        &ledger, &publication);
-    if (lookup_result == ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
-        result = git_retire_account_identity_published(
-            account, publication, cleared);
+        true, &ledger, &publication_count);
+    if (lookup_result != ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
+        publication_ledger_clear(&ledger);
+        return -1;
     }
+    for (size_t i = 0; i < ledger.count; i++) {
+        const publication_record_t *publication = &ledger.records[i];
+
+        if (publication->account_id != account->id) continue;
+        publications[collected++] = publication;
+    }
+    if (collected != publication_count) {
+        publication_ledger_clear(&ledger);
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Durable publication enumeration changed unexpectedly");
+        return -1;
+    }
+    result = git_retire_account_identity_publications(
+        account, publications, collected, cleared);
     publication_ledger_clear(&ledger);
     return result;
 }
@@ -4075,6 +4096,203 @@ static git_signing_publication_result_t status_signing_key_matches(
     }
     return git_signing_key_matches_publication(account, publication,
                                                git_config);
+}
+
+static bool account_publication_scope_matches_origin(
+    publication_scope_t publication_scope,
+    git_config_origin_scope_t origin_scope) {
+    return (publication_scope == PUBLICATION_SCOPE_GLOBAL &&
+            origin_scope == GIT_CONFIG_ORIGIN_GLOBAL) ||
+           (publication_scope == PUBLICATION_SCOPE_LOCAL &&
+            origin_scope == GIT_CONFIG_ORIGIN_LOCAL) ||
+           (publication_scope == PUBLICATION_SCOPE_WORKTREE &&
+            origin_scope == GIT_CONFIG_ORIGIN_WORKTREE);
+}
+
+static bool account_publication_origin_matches(
+    const publication_record_t *publication, const char *origin) {
+    static const char file_prefix[] = "file:";
+    char repository_relative[MAX_PATH_LEN];
+    char canonical[MAX_PATH_LEN];
+    const char *candidate;
+    int written;
+
+    if (!publication || !origin ||
+        strncmp(origin, file_prefix, sizeof(file_prefix) - 1U) != 0) {
+        return false;
+    }
+    candidate = origin + sizeof(file_prefix) - 1U;
+    if (strcmp(candidate, publication->config_path) == 0) return true;
+    if (candidate[0] != '/') {
+        if (publication->scope == PUBLICATION_SCOPE_GLOBAL ||
+            publication->repository_path[0] != '/') {
+            return false;
+        }
+        written = snprintf(repository_relative,
+                           sizeof(repository_relative), "%s/%s",
+                           publication->repository_path, candidate);
+        if (written < 0 || (size_t)written >= sizeof(repository_relative)) {
+            return false;
+        }
+        candidate = repository_relative;
+    }
+    return realpath(candidate, canonical) != NULL &&
+           strcmp(canonical, publication->config_path) == 0;
+}
+
+static account_publication_lookup_result_t
+select_current_account_publication(
+    const account_t *account, const publication_ledger_t *ledger,
+    const git_current_config_t *current,
+    uint32_t required_capabilities,
+    publication_record_t *publication) {
+    char reported_repository[MAX_PATH_LEN] = "";
+    char current_repository[MAX_PATH_LEN] = "";
+    const publication_record_t *generation_records[
+        PUBLICATION_LEDGER_MAX_RECORDS];
+    const publication_record_t *membership = NULL;
+    const publication_record_t *live_generation = NULL;
+    const publication_record_t *live_publication = NULL;
+    size_t generation_count = 0U;
+    size_t origin_matches = 0U;
+    bool ignored_probe_failure = false;
+    bool repository_required;
+
+    if (!account || !ledger || !current || !publication) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid current publication selection arguments");
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    for (size_t i = 0; i < ledger->count; i++) {
+        const publication_record_t *candidate = &ledger->records[i];
+
+        if (candidate->account_id == account->id &&
+            strcmp(candidate->account_incarnation,
+                   account->incarnation) == 0 &&
+            candidate->state == PUBLICATION_STATE_PUBLISHED) {
+            generation_records[generation_count++] = candidate;
+        }
+    }
+    if (generation_count == 0U) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "No live publication generation exists for account '%s'",
+                  account->name);
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    repository_required =
+        current->effective_name_scope == GIT_CONFIG_ORIGIN_LOCAL ||
+        current->effective_name_scope == GIT_CONFIG_ORIGIN_WORKTREE;
+    if (repository_required &&
+        (git_get_repo_root(reported_repository,
+                           sizeof(reported_repository)) != 0 ||
+         realpath(reported_repository, current_repository) == NULL)) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot prove the current Git repository destination for account '%s'",
+                  account->name);
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    for (size_t i = 0; i < ledger->count; i++) {
+        const publication_record_t *candidate = &ledger->records[i];
+        const publication_record_t *candidate_generation = NULL;
+
+        if (candidate->account_id != account->id ||
+            strcmp(candidate->account_incarnation,
+                   account->incarnation) != 0 ||
+            (candidate->capabilities &
+             (PUBLICATION_CAP_DESTINATION |
+              PUBLICATION_CAP_POST_GENERATION)) !=
+                (PUBLICATION_CAP_DESTINATION |
+                 PUBLICATION_CAP_POST_GENERATION) ||
+            (repository_required &&
+             strcmp(candidate->repository_path,
+                    current_repository) != 0) ||
+            !account_publication_scope_matches_origin(
+                candidate->scope, current->effective_name_scope) ||
+            !account_publication_origin_matches(
+                candidate, current->effective_name_origin)) {
+            continue;
+        }
+        origin_matches++;
+        if (publication_record_verify_live_destination(
+                candidate, generation_records, generation_count,
+                &candidate_generation) != 0) {
+            ignored_probe_failure = true;
+            continue;
+        }
+        if (membership) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Durable publication provenance for account '%s' is ambiguous at the current Git destination",
+                account->name);
+            return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+        }
+        membership = candidate;
+        live_generation = candidate_generation;
+    }
+    if (!membership || !live_generation) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            origin_matches > 0U
+                ? "Current Git publication destination for account '%s' is inaccessible or changed"
+                : "No durable publication provenance for account '%s' applies to the current Git destination",
+            account->name);
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+
+    /* Repository membership and credential generation are separate linked-
+     * worktree witnesses. Select the unique complete record that sealed the
+     * live shared-config generation, then retain the current repository's
+     * origin context for relative Git --show-origin paths. */
+    for (size_t i = 0; i < generation_count; i++) {
+        const publication_record_t *candidate = generation_records[i];
+
+        if (!publication_record_same_config_destination(
+                membership, candidate) ||
+            !publication_identity_equal(&candidate->post_config,
+                                        &live_generation->post_config) ||
+            (candidate->capabilities & required_capabilities) !=
+                required_capabilities ||
+            !account_publication_scope_matches_origin(
+                candidate->scope, current->effective_name_scope)) {
+            continue;
+        }
+        if (live_publication) {
+            errno = ESTALE;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Durable publication provenance for account '%s' is ambiguous at the live Git config generation",
+                account->name);
+            return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+        }
+        live_publication = candidate;
+    }
+    if (!live_publication) {
+        errno = ESTALE;
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Live Git config generation for account '%s' lacks complete publication provenance",
+            account->name);
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+
+    *publication = *live_publication;
+    publication->scope = membership->scope;
+    publication->config_parent = membership->config_parent;
+    publication->repository = membership->repository;
+    if (safe_strncpy(publication->config_path, membership->config_path,
+                     sizeof(publication->config_path)) != 0 ||
+        safe_strncpy(publication->repository_path,
+                     membership->repository_path,
+                     sizeof(publication->repository_path)) != 0 ||
+        publication_record_validate(publication) != 0) {
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    if (ignored_probe_failure) clear_error();
+    return ACCOUNT_PUBLICATION_LOOKUP_FOUND;
 }
 
 /* Show current account status */
@@ -4100,8 +4318,10 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
     
     if (ctx->current_account) {
         const account_t *account = ctx->current_account;
+        publication_record_t publication_storage;
         const publication_record_t *publication = NULL;
         char publication_status_error[512] = "";
+        size_t account_publication_count = 0U;
         uint32_t publication_capabilities =
             PUBLICATION_CAP_DESTINATION |
             PUBLICATION_CAP_POST_GENERATION;
@@ -4122,9 +4342,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                                         PUBLICATION_CAP_GPG_SELECTOR;
         }
         if (publication_required &&
-            load_unique_account_publication(
+            load_account_publications(
                 ctx, account, publication_capabilities,
-                &publication_ledger, &publication) !=
+                false, &publication_ledger, &account_publication_count) !=
                 ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
             const error_context_t *error = get_last_error();
 
@@ -4243,6 +4463,26 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             bool signing_selector_mismatch = false;
             bool signing_enabled_matches;
 
+            if (publication_required && publication_available &&
+                select_current_account_publication(
+                    account, &publication_ledger, git_config,
+                    publication_capabilities,
+                    &publication_storage) !=
+                    ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
+                const error_context_t *error = get_last_error();
+
+                publication_available = false;
+                status_result = -1;
+                if (ssh_expected) repository_probe_allowed = false;
+                if (error && error->message[0] != '\0') {
+                    (void)snprintf(publication_status_error,
+                                   sizeof(publication_status_error), "%s",
+                                   error->message);
+                }
+            } else if (publication_required && publication_available) {
+                publication = &publication_storage;
+            }
+
             printf("  Current Name: ");
             print_terminal_safe(git_config->name);
             printf("\n  Current Email: ");
@@ -4262,19 +4502,31 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 strcmp(git_config->name, account->name) == 0 &&
                 strcmp(git_config->email, account->email) == 0;
             if (ssh_expected) {
-                git_ssh_publication_result_t ssh_result =
-                    git_ssh_command_matches_publication(
-                        account, publication, git_config);
-
-                ssh_matches = ssh_result == GIT_SSH_PUBLICATION_MATCH;
-                if (ssh_result == GIT_SSH_PUBLICATION_ERROR) {
-                    const error_context_t *error = get_last_error();
+                if (!publication) {
+                    ssh_matches = false;
                     ssh_status_determined = false;
                     status_result = -1;
-                    if (error && error->message[0] != '\0') {
-                        (void)snprintf(ssh_status_error,
-                                       sizeof(ssh_status_error), "%s",
-                                       error->message);
+                    (void)snprintf(
+                        ssh_status_error, sizeof(ssh_status_error), "%s",
+                        publication_status_error[0] != '\0'
+                            ? publication_status_error
+                            : "complete switch-time SSH publication is required");
+                } else {
+                    git_ssh_publication_result_t ssh_result =
+                        git_ssh_command_matches_publication(
+                            account, publication, git_config);
+
+                    ssh_matches =
+                        ssh_result == GIT_SSH_PUBLICATION_MATCH;
+                    if (ssh_result == GIT_SSH_PUBLICATION_ERROR) {
+                        const error_context_t *error = get_last_error();
+                        ssh_status_determined = false;
+                        status_result = -1;
+                        if (error && error->message[0] != '\0') {
+                            (void)snprintf(ssh_status_error,
+                                           sizeof(ssh_status_error), "%s",
+                                           error->message);
+                        }
                     }
                 }
             } else {

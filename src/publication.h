@@ -99,6 +99,21 @@ int publication_extract_ssh_program(const char *command, char *out,
                                     size_t out_size);
 void publication_record_init(publication_record_t *record);
 int publication_record_validate(const publication_record_t *record);
+/* Compare the stable configuration namespace independently of repository
+ * witnesses. Linked Git worktrees have distinct repository roots while
+ * legitimately sharing one local config file. */
+bool publication_record_same_config_destination(
+    const publication_record_t *left,
+    const publication_record_t *right);
+/* Verify one record's live config/repository namespace. The config generation
+ * may be supplied by any PUBLISHED record for the same account incarnation
+ * and stable config destination, which models linked worktrees that share a
+ * config file but retain distinct repository witnesses. */
+int publication_record_verify_live_destination(
+    const publication_record_t *record,
+    const publication_record_t *const generation_records[],
+    size_t generation_count,
+    const publication_record_t **live_generation);
 bool publication_record_same_destination(const publication_record_t *left,
                                          const publication_record_t *right);
 

@@ -2309,11 +2309,60 @@ fail:
     return -1;
 }
 
-static int git_config_file_unset(const char *path, const char *key) {
-    char output[256] = "";
+static int git_config_file_get_all(const char *path, const char *key,
+                                   char *value, size_t value_size) {
+    char output[GIT_CFG_VALUE_MAX + 8U];
     const char *const argv[] = {
+        "git", "config", "--file", path, "--no-includes", "--get-all",
+        key, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+    size_t length;
+
+    if (!path || path[0] != '/' || !key || !value || value_size == 0U) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid exact-file Git configuration read");
+        return -1;
+    }
+    value[0] = '\0';
+    memset(output, 0, sizeof(output));
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    if (run_argv(argv, &opts, &result) != 0 || result.out_truncated ||
+        result.out_len >= sizeof(output)) {
+        /* M12 owns tri-state retirement reads. Preserve the established
+         * present-versus-nonmatching behavior here while M10 changes only the
+         * destination authority from caller scope/cwd to the exact ledger
+         * path. Unknown reads therefore authorize no mutation. */
+        return -1;
+    }
+    length = result.out_len;
+    if (length > 0U && output[length - 1U] == '\n') {
+        output[--length] = '\0';
+    }
+    if (length >= value_size || safe_strncpy(value, output, value_size) != 0) {
+        value[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
+
+static int git_config_file_unset(const char *path, const char *key,
+                                 bool no_includes,
+                                 const char *diagnostic_context) {
+    char output[256] = "";
+    const char *const ordinary_argv[] = {
         "git", "config", "--file", path, "--unset-all", key, NULL
     };
+    const char *const exact_argv[] = {
+        "git", "config", "--file", path, "--no-includes", "--unset-all",
+        key, NULL
+    };
+    const char *const *argv = no_includes ? exact_argv : ordinary_argv;
     run_opts_t opts;
     run_result_t result;
 
@@ -2328,7 +2377,8 @@ static int git_config_file_unset(const char *path, const char *key) {
         return 0;
     }
     set_error(ERR_GIT_CONFIG_FAILED,
-              "Failed to clear Git config %s in rollback lock: %s", key,
+              "Failed to clear Git config %s in %s: %s", key,
+              diagnostic_context ? diagnostic_context : "exact file",
               output[0] ? output : "unknown Git error");
     return -1;
 }
@@ -2701,7 +2751,8 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
 
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         if (!restore_key[i]) continue;
-        if (git_config_file_unset(lock.stage_path, g_managed_keys[i]) != 0) {
+        if (git_config_file_unset(lock.stage_path, g_managed_keys[i], false,
+                                  "rollback lock") != 0) {
             result.write_failures++;
             goto done;
         }
@@ -4600,10 +4651,12 @@ git_ssh_publication_result_t git_ssh_command_matches_publication(
  * preserving the first diagnostic and counting only keys that were present.
  * first_error must be larger than an error message plus the "scope key: "
  * prefix (see the caller) so the diagnostic never truncates. */
-static void git_retire_unset(const char *key, git_scope_t scope,
+static void git_retire_unset(const char *path, const char *key,
+                             git_scope_t scope,
                              size_t *removed, int *failures,
                              char *first_error, size_t first_error_size) {
-    if (git_unset_config_value(key, scope) != 0) {
+    if (git_config_file_unset(path, key, true,
+                              "recorded publication destination") != 0) {
         if (*failures == 0) {
             snprintf(first_error, first_error_size, "%s %s: %s",
                      git_scope_diagnostic_label(scope), key,
@@ -4618,6 +4671,7 @@ static void git_retire_unset(const char *key, git_scope_t scope,
 static int git_retire_account_identity_with_fingerprint(
     const account_t *account, const char *canonical_fingerprint,
     const char *published_ssh_command, git_scope_t published_scope,
+    const char *config_path,
     size_t *cleared) {
     char value[GIT_CFG_VALUE_MAX];
     /* Wide enough for a full error message plus the "scope key: " prefix
@@ -4641,39 +4695,48 @@ static int git_retire_account_identity_with_fingerprint(
          * recorded SSH program: relocation/removal cannot strand a matching
          * Git value, while an unequal foreign replacement remains untouched. */
         if (published_ssh_command && published_ssh_command[0] != '\0' &&
-            git_get_config_value(GIT_CONFIG_CORE_SSHCOMMAND, value,
-                                 sizeof(value), scope) == 0 &&
+            git_config_file_get_all(config_path,
+                                    GIT_CONFIG_CORE_SSHCOMMAND, value,
+                                    sizeof(value)) == 0 &&
             strcmp(value, published_ssh_command) == 0) {
-            git_retire_unset(GIT_CONFIG_CORE_SSHCOMMAND, scope, &removed,
-                             &failures, first_error, sizeof(first_error));
+            git_retire_unset(config_path, GIT_CONFIG_CORE_SSHCOMMAND, scope,
+                             &removed, &failures, first_error,
+                             sizeof(first_error));
         }
 
         /* The signing key attributes the whole signing leg: its enable flag
          * and the format normalization a switch wrote alongside it belong to
          * the same retired identity, so retire them at the same scope. A
          * foreign or noncanonical value attributes nothing. */
-        if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, value,
-                                 sizeof(value), scope) == 0 &&
+        if (git_config_file_get_all(config_path,
+                                    GIT_CONFIG_USER_SIGNINGKEY, value,
+                                    sizeof(value)) == 0 &&
             git_signing_key_matches_fingerprint(canonical_fingerprint,
                                                 value)) {
-            git_retire_unset(GIT_CONFIG_USER_SIGNINGKEY, scope, &removed,
-                             &failures, first_error, sizeof(first_error));
-            if (git_get_config_value(GIT_CONFIG_COMMIT_GPGSIGN, value,
-                                     sizeof(value), scope) == 0) {
-                git_retire_unset(GIT_CONFIG_COMMIT_GPGSIGN, scope, &removed,
-                                 &failures, first_error, sizeof(first_error));
+            git_retire_unset(config_path, GIT_CONFIG_USER_SIGNINGKEY, scope,
+                             &removed, &failures, first_error,
+                             sizeof(first_error));
+            if (git_config_file_get_all(config_path,
+                                        GIT_CONFIG_COMMIT_GPGSIGN, value,
+                                        sizeof(value)) == 0) {
+                git_retire_unset(config_path, GIT_CONFIG_COMMIT_GPGSIGN,
+                                 scope, &removed, &failures, first_error,
+                                 sizeof(first_error));
             }
-            if (git_get_config_value(GIT_CONFIG_GPG_FORMAT, value,
-                                     sizeof(value), scope) == 0) {
-                git_retire_unset(GIT_CONFIG_GPG_FORMAT, scope, &removed,
-                                 &failures, first_error, sizeof(first_error));
+            if (git_config_file_get_all(config_path, GIT_CONFIG_GPG_FORMAT,
+                                        value, sizeof(value)) == 0) {
+                git_retire_unset(config_path, GIT_CONFIG_GPG_FORMAT, scope,
+                                 &removed, &failures, first_error,
+                                 sizeof(first_error));
             }
             /* The account-owned signing key is the attribution anchor for
              * the OpenPGP executable published by the same switch. Other
              * format selectors are foreign configuration and must survive. */
-            if (git_get_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM, value,
-                                     sizeof(value), scope) == 0) {
-                git_retire_unset(GIT_CONFIG_GPG_OPENPGP_PROGRAM, scope,
+            if (git_config_file_get_all(
+                    config_path, GIT_CONFIG_GPG_OPENPGP_PROGRAM, value,
+                    sizeof(value)) == 0) {
+                git_retire_unset(config_path,
+                                 GIT_CONFIG_GPG_OPENPGP_PROGRAM, scope,
                                  &removed, &failures, first_error,
                                  sizeof(first_error));
             }
@@ -4730,139 +4793,192 @@ static int git_scope_from_publication(publication_scope_t publication_scope,
     }
 }
 
-static bool git_publication_identity_matches_stat(
-    const publication_identity_t *identity, const struct stat *st) {
-    return identity && identity->present && st &&
-           identity->device == (uintmax_t)st->st_dev &&
-           identity->inode == (uintmax_t)st->st_ino &&
-           (identity->mode & (uintmax_t)S_IFMT) ==
-               ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
-}
-
-/* Until M10 owns traversal of every recorded repository, a local/worktree
- * retirement may operate only from the exact destination that produced the
- * record. Scope equality alone is insufficient: `git config --local` in
- * repository B would otherwise remove B's matching credential while holding
- * provenance for repository A. This is a fail-before-mutation admission
- * check; M14 later strengthens the read/delete interval itself. */
-static int git_retire_verify_current_publication_destination(
-    const publication_record_t *publication, git_scope_t scope) {
-    git_scope_lock_t resolved;
-    char repository_path[MAX_PATH_LEN];
-    publication_identity_t live_config_identity;
-    struct stat parent_stat;
-    struct stat config_stat;
-    struct stat repository_stat;
-    int parent_fd = -1;
-    int config_fd = -1;
-    int repository_fd = -1;
-    bool matches = false;
-
-    if (!publication ||
-        (scope != GIT_SCOPE_GLOBAL && scope != GIT_SCOPE_LOCAL &&
-         scope != GIT_SCOPE_WORKTREE_INTERNAL) ||
-        (publication->capabilities & PUBLICATION_CAP_POST_GENERATION) == 0U) {
-        goto mismatch;
+static int git_retire_validate_publication(
+    const account_t *account, const publication_record_t *publication,
+    git_scope_t *scope) {
+    if (!account || !publication || !scope ||
+        !account->incarnation_persisted) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Account has no exact durable Git publication provenance");
+        return -1;
     }
-
-    memset(&resolved, 0, sizeof(resolved));
-    resolved.dir_fd = -1;
-    if (git_scope_lock_resolve_paths(scope, &resolved) != 0 ||
-        strcmp(resolved.path, publication->config_path) != 0) {
-        goto mismatch;
+    if (publication_record_validate(publication) != 0) return -1;
+    if (publication->account_id != account->id ||
+        strcmp(publication->account_incarnation,
+               account->incarnation) != 0 ||
+        (publication->capabilities &
+         (PUBLICATION_CAP_DESTINATION |
+          PUBLICATION_CAP_POST_GENERATION)) !=
+            (PUBLICATION_CAP_DESTINATION |
+             PUBLICATION_CAP_POST_GENERATION) ||
+        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        git_scope_from_publication(publication->scope, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Account has no exact durable Git publication provenance");
+        return -1;
     }
-    parent_fd = open(resolved.parent,
-                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (parent_fd < 0 || fstat(parent_fd, &parent_stat) != 0 ||
-        !git_publication_identity_matches_stat(&publication->config_parent,
-                                               &parent_stat)) {
-        goto mismatch;
-    }
-    config_fd = openat(parent_fd, resolved.leaf,
-                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (config_fd < 0 || fstat(config_fd, &config_stat) != 0 ||
-        !S_ISREG(config_stat.st_mode)) {
-        goto mismatch;
-    }
-    publication_identity_from_stat(&live_config_identity, &config_stat);
-    if (!publication_identity_equal(&publication->post_config,
-                                    &live_config_identity)) {
-        goto mismatch;
-    }
-    if (scope == GIT_SCOPE_GLOBAL) {
-        matches = true;
-        goto mismatch;
-    }
-    if (git_resolve_repository_generation_path(
-            repository_path, sizeof(repository_path)) != 0 ||
-        strcmp(repository_path, publication->repository_path) != 0) {
-        goto mismatch;
-    }
-    repository_fd = open(repository_path,
-                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (repository_fd < 0 ||
-        fstat(repository_fd, &repository_stat) != 0 ||
-        !git_publication_identity_matches_stat(&publication->repository,
-                                               &repository_stat)) {
-        goto mismatch;
-    }
-    matches = true;
-
-mismatch:
-    if (repository_fd >= 0) (void)close(repository_fd);
-    if (config_fd >= 0) (void)close(config_fd);
-    if (parent_fd >= 0) (void)close(parent_fd);
-    if (!matches) {
-        errno = ESTALE;
-        set_error(
-            ERR_GIT_CONFIG_FAILED,
-            "Recorded Git publication destination does not match the current %s Git destination generation",
-            git_scope_diagnostic_label(scope));
+    if ((publication->capabilities &
+         PUBLICATION_CAP_GPG_FINGERPRINT) != 0U &&
+        !git_signing_key_matches_fingerprint(
+            publication->gpg_fingerprint,
+            publication->gpg_fingerprint)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Publication record has no canonical signing fingerprint");
         return -1;
     }
     return 0;
 }
 
-int git_retire_account_identity_published(
+/* Attribution and destination generations have already been validated by the
+ * caller. Keeping this leg free of another generation probe lets linked
+ * worktree records sharing one config file contribute every sealed credential
+ * witness after the first successful unset rewrites that file. */
+static int git_retire_account_identity_publication_unchecked(
     const account_t *account, const publication_record_t *publication,
     size_t *cleared) {
     git_scope_t scope;
     const char *fingerprint = NULL;
     const char *ssh_command = NULL;
 
-    if (cleared) *cleared = 0;
-    if (!account || !publication || !account->incarnation_persisted ||
-        publication->account_id != account->id ||
-        strcmp(publication->account_incarnation,
-               account->incarnation) != 0 ||
-        (publication->capabilities & PUBLICATION_CAP_DESTINATION) == 0U ||
-        publication->state != PUBLICATION_STATE_PUBLISHED ||
-        git_scope_from_publication(publication->scope, &scope) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Account has no exact durable Git publication provenance");
+    if (git_retire_validate_publication(account, publication, &scope) != 0) {
+        if (cleared) *cleared = 0;
         return -1;
     }
-    if (publication_record_validate(publication) != 0) return -1;
     if ((publication->capabilities &
          PUBLICATION_CAP_GPG_FINGERPRINT) != 0U) {
-        if (!git_signing_key_matches_fingerprint(
-                publication->gpg_fingerprint,
-                publication->gpg_fingerprint)) {
-            set_error(ERR_GIT_CONFIG_FAILED,
-                      "Publication record has no canonical signing fingerprint");
-            return -1;
-        }
         fingerprint = publication->gpg_fingerprint;
     }
     if ((publication->capabilities & PUBLICATION_CAP_SSH_COMMAND) != 0U) {
         ssh_command = publication->ssh_command;
     }
-    if (git_retire_verify_current_publication_destination(publication,
-                                                          scope) != 0) {
+    return git_retire_account_identity_with_fingerprint(
+        account, fingerprint, ssh_command, scope, publication->config_path,
+        cleared);
+}
+
+int git_retire_account_identity_published(
+    const account_t *account, const publication_record_t *publication,
+    size_t *cleared) {
+    const publication_record_t *records[1];
+    git_scope_t scope;
+
+    if (cleared) *cleared = 0;
+    if (git_retire_validate_publication(account, publication, &scope) != 0) {
         return -1;
     }
-    return git_retire_account_identity_with_fingerprint(
-        account, fingerprint, ssh_command, scope, cleared);
+    records[0] = publication;
+    if (publication_record_verify_live_destination(
+            publication, records, 1U, NULL) != 0) {
+        return -1;
+    }
+    return git_retire_account_identity_publication_unchecked(
+        account, publication, cleared);
+}
+
+int git_retire_account_identity_publications(
+    const account_t *account,
+    const publication_record_t *const publications[],
+    size_t publication_count, size_t *cleared) {
+    error_accumulator_t destination_errors;
+    bool ready[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    bool processed[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    size_t total_cleared = 0U;
+    size_t failure_count = 0U;
+
+    if (cleared) *cleared = 0;
+    if (!account || !publications || publication_count == 0U ||
+        publication_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid durable Git publication retirement set");
+        return -1;
+    }
+
+    /* Reject every malformed, tombstoned, or differently owned record before
+     * any filesystem probe or Git subprocess can mutate a destination. */
+    for (size_t i = 0; i < publication_count; i++) {
+        git_scope_t ignored_scope;
+
+        if (git_retire_validate_publication(
+                account, publications[i], &ignored_scope) != 0) {
+            return -1;
+        }
+    }
+
+    error_accumulator_init(&destination_errors);
+    /* Preflight every repository witness before the first Git subprocess. A
+     * linked-worktree record may use the current generation sealed by another
+     * record for the same stable physical config namespace. */
+    for (size_t i = 0; i < publication_count; i++) {
+        git_scope_t scope = GIT_SCOPE_GLOBAL;
+        char label[64];
+
+        (void)git_scope_from_publication(publications[i]->scope, &scope);
+        if (publication_record_verify_live_destination(
+                publications[i], publications, publication_count,
+                NULL) == 0) {
+            ready[i] = true;
+            continue;
+        }
+        (void)snprintf(label, sizeof(label), "destination %zu (%s)",
+                       i + 1U, git_scope_diagnostic_label(scope));
+        (void)error_accumulator_add_last(&destination_errors, label);
+        failure_count++;
+    }
+
+    for (size_t i = 0; i < publication_count; i++) {
+        bool any_ready = false;
+
+        if (processed[i]) continue;
+        for (size_t j = i; j < publication_count; j++) {
+            if (publication_record_same_config_destination(
+                    publications[i], publications[j])) {
+                processed[j] = true;
+                if (ready[j]) any_ready = true;
+            }
+        }
+        if (!any_ready) continue;
+
+        /* The group has at least one live repository witness and an exact
+         * matching config generation. Try every persisted credential witness
+         * against that one file without re-preflighting after each rewrite. */
+        for (size_t j = i; j < publication_count; j++) {
+            git_scope_t scope = GIT_SCOPE_GLOBAL;
+            size_t record_cleared = 0U;
+            char label[80];
+
+            if (!publication_record_same_config_destination(
+                    publications[i], publications[j])) {
+                continue;
+            }
+            (void)git_scope_from_publication(publications[j]->scope, &scope);
+            if (git_retire_account_identity_publication_unchecked(
+                    account, publications[j], &record_cleared) != 0) {
+                (void)snprintf(label, sizeof(label),
+                               "destination %zu witness (%s)", j + 1U,
+                               git_scope_diagnostic_label(scope));
+                (void)error_accumulator_add_last(&destination_errors, label);
+                failure_count++;
+            }
+            total_cleared += record_cleared;
+        }
+    }
+
+    if (cleared) *cleared = total_cleared;
+    if (failure_count != 0U) {
+        error_context_t summary;
+
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Git retirement for '%s' cleared %zu key(s), but %zu operation(s) across %zu recorded destination(s) failed",
+            account->name, total_cleared, failure_count, publication_count);
+        summary = *get_last_error();
+        (void)error_accumulator_add(&destination_errors,
+                                    "retirement summary", &summary);
+        (void)error_accumulator_publish(&destination_errors);
+        return -1;
+    }
+    return 0;
 }
 
 /* AR-06 F59: git_validate_repository() and git_get_config_scope() were removed

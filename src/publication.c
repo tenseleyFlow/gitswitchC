@@ -1,5 +1,11 @@
 /* Strict, bounded durable Git-publication provenance. */
 
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
+#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
+
 #include "publication.h"
 
 #include "error.h"
@@ -7,10 +13,24 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+# if !defined(O_NOFOLLOW) || O_NOFOLLOW == 0
+#  error "O_NOFOLLOW is required on supported platforms"
+# endif
+#elif !defined(O_NOFOLLOW)
+#define O_NOFOLLOW 0
+#endif
 
 typedef struct {
     const unsigned char *cursor;
@@ -105,6 +125,15 @@ static bool publication_identity_same_object(
     const publication_identity_t *right) {
     return left && right && left->present && right->present &&
            left->device == right->device && left->inode == right->inode;
+}
+
+bool publication_record_same_config_destination(
+    const publication_record_t *left,
+    const publication_record_t *right) {
+    return left && right &&
+           strcmp(left->config_path, right->config_path) == 0 &&
+           publication_identity_same_object(&left->config_parent,
+                                            &right->config_parent);
 }
 
 void publication_record_init(publication_record_t *record) {
@@ -423,6 +452,144 @@ int publication_record_validate(const publication_record_t *record) {
         return publication_invalid("Publication identity has invalid nanoseconds");
     }
     return 0;
+}
+
+static const char *publication_destination_scope_name(
+    publication_scope_t scope) {
+    switch (scope) {
+        case PUBLICATION_SCOPE_GLOBAL: return "global";
+        case PUBLICATION_SCOPE_LOCAL: return "local";
+        case PUBLICATION_SCOPE_WORKTREE: return "worktree";
+        default: return "invalid";
+    }
+}
+
+static bool publication_directory_identity_matches_stat(
+    const publication_identity_t *identity, const struct stat *st) {
+    return identity && identity->present && st &&
+           identity->device == (uintmax_t)st->st_dev &&
+           identity->inode == (uintmax_t)st->st_ino &&
+           (identity->mode & (uintmax_t)S_IFMT) ==
+               ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
+}
+
+int publication_record_verify_live_destination(
+    const publication_record_t *record,
+    const publication_record_t *const generation_records[],
+    size_t generation_count,
+    const publication_record_t **live_generation) {
+    char canonical_config[MAX_PATH_LEN];
+    char canonical_repository[MAX_PATH_LEN];
+    char parent_path[MAX_PATH_LEN];
+    const char *slash;
+    const char *leaf;
+    publication_identity_t live_config;
+    struct stat parent_stat;
+    struct stat config_stat;
+    struct stat repository_stat;
+    int parent_fd = -1;
+    int config_fd = -1;
+    int repository_fd = -1;
+    bool generation_matches = false;
+    bool destination_matches = false;
+
+    if (live_generation) *live_generation = NULL;
+    if (!record || !generation_records || generation_count == 0U ||
+        generation_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid publication destination verification arguments");
+        return -1;
+    }
+    if (publication_record_validate(record) != 0) return -1;
+    if ((record->capabilities & PUBLICATION_CAP_POST_GENERATION) == 0U) {
+        goto mismatch;
+    }
+    for (size_t i = 0; i < generation_count; i++) {
+        if (!generation_records[i] ||
+            publication_record_validate(generation_records[i]) != 0) {
+            return -1;
+        }
+    }
+
+    slash = strrchr(record->config_path, '/');
+    if (!slash || !slash[1] ||
+        realpath(record->config_path, canonical_config) == NULL ||
+        strcmp(canonical_config, record->config_path) != 0) {
+        goto mismatch;
+    }
+    leaf = slash + 1U;
+    if (slash == record->config_path) {
+        if (safe_strncpy(parent_path, "/", sizeof(parent_path)) != 0) {
+            goto mismatch;
+        }
+    } else {
+        size_t parent_length = (size_t)(slash - record->config_path);
+
+        if (parent_length >= sizeof(parent_path)) goto mismatch;
+        memcpy(parent_path, record->config_path, parent_length);
+        parent_path[parent_length] = '\0';
+    }
+    parent_fd = open(parent_path,
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent_fd < 0 || fstat(parent_fd, &parent_stat) != 0 ||
+        !publication_directory_identity_matches_stat(
+            &record->config_parent, &parent_stat)) {
+        goto mismatch;
+    }
+    config_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (config_fd < 0 || fstat(config_fd, &config_stat) != 0 ||
+        !S_ISREG(config_stat.st_mode)) {
+        goto mismatch;
+    }
+    publication_identity_from_stat(&live_config, &config_stat);
+    for (size_t i = 0; i < generation_count; i++) {
+        const publication_record_t *candidate = generation_records[i];
+
+        if (candidate->account_id == record->account_id &&
+            strcmp(candidate->account_incarnation,
+                   record->account_incarnation) == 0 &&
+            candidate->state == PUBLICATION_STATE_PUBLISHED &&
+            (candidate->capabilities & PUBLICATION_CAP_POST_GENERATION) != 0U &&
+            publication_record_same_config_destination(record, candidate) &&
+            publication_identity_equal(&candidate->post_config,
+                                       &live_config)) {
+            generation_matches = true;
+            if (live_generation) *live_generation = candidate;
+            break;
+        }
+    }
+    if (!generation_matches) goto mismatch;
+
+    if (record->scope == PUBLICATION_SCOPE_GLOBAL) {
+        destination_matches = true;
+        goto cleanup;
+    }
+    if (realpath(record->repository_path, canonical_repository) == NULL ||
+        strcmp(canonical_repository, record->repository_path) != 0) {
+        goto mismatch;
+    }
+    repository_fd = open(record->repository_path,
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (repository_fd < 0 || fstat(repository_fd, &repository_stat) != 0 ||
+        !publication_directory_identity_matches_stat(
+            &record->repository, &repository_stat)) {
+        goto mismatch;
+    }
+    destination_matches = true;
+    goto cleanup;
+
+mismatch:
+    errno = ESTALE;
+    set_error(
+        ERR_GIT_CONFIG_FAILED,
+        "Recorded %s Git publication destination generation is inaccessible or changed",
+        publication_destination_scope_name(record->scope));
+cleanup:
+    if (repository_fd >= 0) (void)close(repository_fd);
+    if (config_fd >= 0) (void)close(config_fd);
+    if (parent_fd >= 0) (void)close(parent_fd);
+    return destination_matches ? 0 : -1;
 }
 
 bool publication_record_same_destination(const publication_record_t *left,
