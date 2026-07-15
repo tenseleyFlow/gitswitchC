@@ -860,6 +860,14 @@ $(BINDIR)/test_ar07_exec_trust: \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+$(BINDIR)/test_ar11_gpg_program: \
+		$(OBJDIR)/test_ar11_gpg_program.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 $(BINDIR)/test_public_api: \
 		$(OBJDIR)/test_public_api.o \
 		$(AR08_COPY_UTILS_OBJECT) \

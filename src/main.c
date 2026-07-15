@@ -1751,6 +1751,8 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
 }
 
 static int handle_doctor_command(gitswitch_ctx_t *ctx) {
+    char gpg_executable[MAX_PATH_LEN];
+
     if (!ctx) return EXIT_FAILURE;
     
     /* Check system requirements */
@@ -1769,11 +1771,18 @@ static int handle_doctor_command(gitswitch_ctx_t *ctx) {
         display_warning("SSH agent not found - SSH key management may not work");
     }
     
-    if (command_exists("gpg") || command_exists("gpg2")) {
-        display_success("GPG found");
+    int gpg_probe_ambient_errno = errno;
+    if (gpg_manager_resolve_executable(gpg_executable,
+                                       sizeof(gpg_executable)) == 0) {
+        display_success("GPG found: %s", gpg_executable);
     } else {
         display_warning("GPG not found - GPG signing will not work");
+        /* GPG is optional for accounts that do not use signing. The resolver
+         * reports a precise diagnostic for fatal callers; doctor has rendered
+         * its warning and must not leak that optional miss into later checks. */
+        clear_error();
     }
+    errno = gpg_probe_ambient_errno;
     
     /* Check configuration */
     printf("\n[INFO]: Checking configuration...\n");

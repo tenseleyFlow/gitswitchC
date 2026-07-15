@@ -90,6 +90,21 @@ static inline int ts_same_identity(const struct stat *a,
     return a && b && a->st_dev == b->st_dev && a->st_ino == b->st_ino;
 }
 
+/* Command fakes must model the caller's argument contract without assuming
+ * PATH lookup. Production increasingly passes canonical absolute argv[0]
+ * spellings, so compare the final component explicitly. */
+static inline const char *ts_command_basename(const char *path) {
+    const char *slash;
+
+    if (!path) return "";
+    slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static inline int ts_command_is(const char *path, const char *name) {
+    return name && strcmp(ts_command_basename(path), name) == 0;
+}
+
 static inline int ts_set_cloexec(int fd) {
 #ifdef O_CLOEXEC
     (void)fd;

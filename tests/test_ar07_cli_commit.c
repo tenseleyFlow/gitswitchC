@@ -4,6 +4,7 @@
  * tests execute the built CLI in isolated HOME/XDG_RUNTIME_DIR trees. */
 #include "test.h"
 #include "gitswitch.h"
+#include "utils.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 
 static char g_bin[4096];
+static const char *g_cli_path_override;
 
 typedef enum {
     POSIXLY_INHERIT = 0,
@@ -76,6 +78,16 @@ static int write_text_mode(const char *path, const char *text, mode_t mode) {
     }
     if (close(fd) != 0) return -1;
     return chmod(path, mode);
+}
+
+static int install_cli_probe_program(const char *source,
+                                     const char *directory, const char *name,
+                                     char *path, size_t path_size) {
+    int written;
+
+    written = snprintf(path, path_size, "%s/%s", directory, name);
+    if (written < 0 || (size_t)written >= path_size) return -1;
+    return copy_file(source, path) == 0 && chmod(path, 0700) == 0 ? 0 : -1;
 }
 
 static int write_account_config(const char *home, bool include_second,
@@ -259,6 +271,8 @@ static int run_cli_input_posixly(const char *home, const char *runtime,
             setenv("XDG_RUNTIME_DIR", runtime, 1) != 0 ||
             setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
             setenv("GIT_CONFIG_GLOBAL", git_config, 1) != 0 ||
+            (g_cli_path_override &&
+             setenv("PATH", g_cli_path_override, 1) != 0) ||
             posixly_rc != 0 || stdout_fault_rc != 0) {
             _exit(125);
         }
@@ -303,6 +317,19 @@ static int run_cli(const char *home, const char *runtime,
                    const char *const argv[],
                    char *output_path, size_t output_size) {
     return run_cli_input(home, runtime, NULL, argv, output_path, output_size);
+}
+
+static int run_cli_with_path(const char *home, const char *runtime,
+                             const char *path,
+                             const char *const argv[],
+                             char *output_path, size_t output_size) {
+    const char *previous_override = g_cli_path_override;
+    int rc;
+
+    g_cli_path_override = path;
+    rc = run_cli(home, runtime, argv, output_path, output_size);
+    g_cli_path_override = previous_override;
+    return rc;
 }
 
 static int run_cli_stdout_mode(const char *home, const char *runtime,
@@ -453,6 +480,79 @@ TEST(config_command_reports_exact_owner_only_mode) {
         }
         CHECK_EQ_INT(rc, 0);
         CHECK_STR_EQ(report, expected);
+        unlink(output_path);
+    }
+}
+
+TEST(doctor_reports_the_bound_gpg_path_and_keeps_absence_optional) {
+    const char *argv[] = {"gitswitch", "--no-color", "doctor", NULL};
+    char trusted_root[4096], with_gpg[4096], without_gpg[4096];
+    char probe_source[4096];
+    char git_path[4096], ssh_agent_path[4096], gpg_path[4096];
+
+    CHECK_EQ_INT(find_command_path("true", probe_source,
+                                   sizeof(probe_source)), 0);
+    CHECK(ts_mkdtemp_trusted(trusted_root, sizeof(trusted_root),
+                             "gitswitch-ar11-doctor") != NULL);
+    CHECK((size_t)snprintf(with_gpg, sizeof(with_gpg), "%s/with-gpg",
+                           trusted_root) < sizeof(with_gpg));
+    CHECK((size_t)snprintf(without_gpg, sizeof(without_gpg), "%s/no-gpg",
+                           trusted_root) < sizeof(without_gpg));
+    CHECK_EQ_INT(mkdir(with_gpg, 0700), 0);
+    CHECK_EQ_INT(mkdir(without_gpg, 0700), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, with_gpg, "git",
+                                           git_path,
+                                           sizeof(git_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, with_gpg,
+                                           "ssh-agent",
+                                           ssh_agent_path,
+                                           sizeof(ssh_agent_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, with_gpg, "gpg",
+                                           gpg_path,
+                                           sizeof(gpg_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, without_gpg, "git",
+                                           git_path,
+                                           sizeof(git_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, without_gpg,
+                                           "ssh-agent",
+                                           ssh_agent_path,
+                                           sizeof(ssh_agent_path)), 0);
+
+    for (int gpg_present = 1; gpg_present >= 0; gpg_present--) {
+        char home[128], runtime[128], config_dir[4096];
+        char output_path[128], output[16384], expected[8192];
+        const char *selected_path = gpg_present ? with_gpg : without_gpg;
+        int rc;
+
+        CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                      "gitswitch-ar11-home"), 0);
+        CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                      "gitswitch-ar11-run"), 0);
+        CHECK_EQ_INT(write_account_config(home, false, config_dir,
+                                          sizeof(config_dir)), 0);
+        rc = run_cli_with_path(home, runtime, selected_path, argv,
+                               output_path, sizeof(output_path));
+        slurp(output_path, output, sizeof(output));
+        if (rc != 0) {
+            fprintf(stderr, "  doctor GPG-present=%d returned %d:\n%s\n",
+                    gpg_present, rc, output);
+        }
+        CHECK_EQ_INT(rc, 0);
+        if (gpg_present) {
+            CHECK((size_t)snprintf(expected, sizeof(expected),
+                                   "[OK] GPG found: %s", gpg_path) <
+                  sizeof(expected));
+            CHECK(strstr(output, expected) != NULL);
+            CHECK(strstr(output, "GPG not found") == NULL);
+        } else {
+            CHECK(strstr(output,
+                         "[WARN] GPG not found - GPG signing will not work") !=
+                  NULL);
+            CHECK(strstr(output, "GPG found:") == NULL);
+        }
+        CHECK(strstr(output,
+                     "All configured accounts passed the reported local checks") !=
+              NULL);
         unlink(output_path);
     }
 }
@@ -879,6 +979,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(option_order_is_independent_of_posixly_correct);
     RUN_TEST(help_names_every_yes_confirmation_bypass);
     RUN_TEST(config_command_reports_exact_owner_only_mode);
+    RUN_TEST(doctor_reports_the_bound_gpg_path_and_keeps_absence_optional);
     RUN_TEST(informational_output_bytes_are_stable);
     RUN_TEST(informational_output_failures_return_nonzero);
     RUN_TEST(exact_arity_rejects_invalid_forms_before_state_creation);

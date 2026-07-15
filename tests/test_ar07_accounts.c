@@ -82,7 +82,8 @@ static int missing_system_gpg_key_runner(const char *const argv[],
                                          run_result_t *result) {
     bool list_secret = false;
 
-    if (argv && argv[0] && strcmp(argv[0], "gpg") == 0) {
+    if (argv && argv[0] &&
+        (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2"))) {
         for (size_t i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) {
                 list_secret = true;
@@ -118,7 +119,8 @@ static int present_system_gpg_key_runner(const char *const argv[],
                                          run_result_t *result) {
     bool list_secret = false;
 
-    if (argv && argv[0] && strcmp(argv[0], "gpg") == 0) {
+    if (argv && argv[0] &&
+        (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2"))) {
         for (size_t i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) {
                 list_secret = true;
@@ -146,7 +148,8 @@ static int failed_system_gpg_setup_runner(const char *const argv[],
                                           run_result_t *result) {
     bool list_secret = false;
 
-    if (argv && argv[0] && strcmp(argv[0], "gpg") == 0) {
+    if (argv && argv[0] &&
+        (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2"))) {
         for (size_t i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) {
                 list_secret = true;
@@ -176,7 +179,8 @@ static int health_local_probe_runner(const char *const argv[],
         g_health_ssh_calls++;
         return null_runner(argv, opts, result);
     }
-    if (argv && argv[0] && strcmp(argv[0], "gpg") == 0) {
+    if (argv && argv[0] &&
+        (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2"))) {
         for (size_t i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) {
                 list_secret = true;

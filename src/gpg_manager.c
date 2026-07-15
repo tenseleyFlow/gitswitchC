@@ -106,7 +106,8 @@ static int gpg_user_source_home(char *buf, size_t size);
 static int gpg_open_user_source_home(gpg_source_home_t *source);
 static int gpg_validate_source_home(const gpg_source_home_t *source);
 static void gpg_close_source_home(gpg_source_home_t *source);
-static int gpg_resolve_source_key(const char *selector, bool require_signing,
+static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
+                                  const char *selector, bool require_signing,
                                   char *fingerprint,
                                   size_t fingerprint_size);
 static int gpg_resolve_pinned_key(const gpg_config_t *gpg_config,
@@ -280,6 +281,86 @@ bool gpg_manager_key_available_cached(const char *key_id) {
     return false;
 }
 
+static bool gpg_executable_may_try_compat_name(int resolve_errno) {
+    switch (resolve_errno) {
+        case ENOENT:
+        case ENOTDIR:
+        case EACCES:
+        case EPERM:
+        case ELOOP:
+        case EINVAL:
+        case ENAMETOOLONG:
+        case ENOEXEC:
+        case E2BIG:
+        case ENOTSUP:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Resolve one OpenPGP program spelling for every GPG-facing subsystem. A
+ * missing or launch-policy-ineligible `gpg` permits the documented `gpg2`
+ * compatibility name; an operational failure does not get hidden by a
+ * successful fallback. */
+int gpg_manager_resolve_executable(char *path, size_t path_size) {
+    int resolve_errno;
+
+    if (!path || path_size == 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG executable path destination");
+        return -1;
+    }
+    path[0] = '\0';
+
+    if (find_command_path("gpg", path, path_size) == 0) {
+        return 0;
+    }
+    resolve_errno = errno;
+    if (!gpg_executable_may_try_compat_name(resolve_errno)) {
+        path[0] = '\0';
+        errno = resolve_errno;
+        set_system_error(ERR_GPG_NOT_FOUND,
+                         "Failed to validate trusted GPG executable 'gpg'");
+        errno = resolve_errno;
+        return -1;
+    }
+    path[0] = '\0';
+
+    if (find_command_path("gpg2", path, path_size) == 0) {
+        return 0;
+    }
+    resolve_errno = errno;
+    path[0] = '\0';
+    if (!gpg_executable_may_try_compat_name(resolve_errno)) {
+        errno = resolve_errno;
+        set_system_error(ERR_GPG_NOT_FOUND,
+                         "Failed to validate trusted GPG executable 'gpg2'");
+    } else {
+        set_error(ERR_GPG_NOT_FOUND,
+                  "No trusted GPG executable ('gpg' or 'gpg2') found in PATH");
+    }
+    errno = resolve_errno;
+    return -1;
+}
+
+static int gpg_bind_executable_if_needed(gpg_config_t *gpg_config) {
+    if (!gpg_config) {
+        set_error(ERR_INVALID_ARGS, "Missing GPG manager configuration");
+        return -1;
+    }
+    if (gpg_config->executable_path[0] != '\0') {
+        if (gpg_config->executable_path[0] != '/') {
+            set_error(ERR_GPG_NOT_FOUND,
+                      "GPG manager executable binding is not absolute");
+            return -1;
+        }
+        return 0;
+    }
+    return gpg_manager_resolve_executable(gpg_config->executable_path,
+                                          sizeof(gpg_config->executable_path));
+}
+
 /* Initialize GPG manager with specified mode */
 int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode) {
     if (!gpg_config) {
@@ -317,9 +398,10 @@ int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode) {
             return -1;
     }
     
-    /* Verify GPG is available */
-    if (!command_exists("gpg")) {
-        set_error(ERR_GPG_NOT_FOUND, "GPG command not found in PATH");
+    /* Bind the exact trusted executable spelling for this transaction. Every
+     * manager helper below receives this absolute path instead of consulting
+     * a possibly changed PATH again. */
+    if (gpg_bind_executable_if_needed(gpg_config) != 0) {
         return -1;
     }
     
@@ -453,6 +535,9 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
         log_debug("GPG not enabled for account: %s", account->name);
         return 0;
     }
+    if (gpg_bind_executable_if_needed(gpg_config) != 0) {
+        return -1;
+    }
 
     log_info("Switching to GPG configuration for account: %s", account->name);
     log_debug("Account GPG key ID: %s", account->gpg_key_id);
@@ -460,7 +545,7 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
     /* Handle different GPG modes */
     switch (gpg_config->mode) {
         case GPG_MODE_SYSTEM:
-            if (gpg_resolve_source_key(account->gpg_key_id,
+            if (gpg_resolve_source_key(gpg_config, account->gpg_key_id,
                                        account->gpg_signing_enabled,
                                        fingerprint, sizeof(fingerprint)) != 0) {
                 goto out;
@@ -522,7 +607,7 @@ int gpg_switch_account(gpg_config_t *gpg_config, const account_t *account) {
         }
 
         case GPG_MODE_SHARED:
-            if (gpg_resolve_source_key(account->gpg_key_id,
+            if (gpg_resolve_source_key(gpg_config, account->gpg_key_id,
                                        account->gpg_signing_enabled,
                                        fingerprint, sizeof(fingerprint)) != 0) {
                 goto out;
@@ -3658,13 +3743,23 @@ int gpg_manager_resolve_system_key(const char *selector,
                                    bool require_signing,
                                    char *fingerprint,
                                    size_t fingerprint_size) {
-    if (!fingerprint || fingerprint_size == 0) {
+    gpg_config_t resolver_config;
+
+    if (fingerprint && fingerprint_size > 0) {
+        fingerprint[0] = '\0';
+    }
+    if (!selector || !*selector || !fingerprint || fingerprint_size == 0) {
         set_error(ERR_INVALID_ARGS,
-                  "Invalid canonical GPG fingerprint destination");
+                  "Invalid GPG system-key resolution arguments");
         return -1;
     }
-    fingerprint[0] = '\0';
-    return gpg_resolve_source_key(selector, require_signing, fingerprint,
+    memset(&resolver_config, 0, sizeof(resolver_config));
+    resolver_config.mode = GPG_MODE_SYSTEM;
+    if (gpg_bind_executable_if_needed(&resolver_config) != 0) {
+        return -1;
+    }
+    return gpg_resolve_source_key(&resolver_config, selector,
+                                  require_signing, fingerprint,
                                   fingerprint_size);
 }
 
@@ -4133,7 +4228,7 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                                       size_t fingerprint_size) {
     const char *env[2] = {"GNUPGHOME=.", NULL};
     const char *argv[] = {
-        "gpg", "--batch", "--status-fd=1", "--with-colons",
+        NULL, "--batch", "--status-fd=1", "--with-colons",
         "--fixed-list-mode",
         "--list-secret-keys", "--fingerprint", "--fingerprint", selector,
         NULL
@@ -4144,7 +4239,8 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
     int run_rc;
     int status;
 
-    if ((!home && !source) || (home && source) || !selector || !*selector) {
+    if (!gpg_config || gpg_config->executable_path[0] != '/' ||
+        (!home && !source) || (home && source) || !selector || !*selector) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid GPG secret-key listing source");
         return -1;
@@ -4155,7 +4251,7 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
                   "Failed to allocate GPG key-listing buffer");
         return -1;
     }
-    (void)gpg_config;
+    argv[0] = gpg_config->executable_path;
     memset(&opts, 0, sizeof(opts));
     opts.out = listing;
     opts.out_size = GPG_KEY_LISTING_CAP;
@@ -4207,14 +4303,16 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
     }
 }
 
-static int gpg_resolve_source_key(const char *selector, bool require_signing,
+static int gpg_resolve_source_key(const gpg_config_t *gpg_config,
+                                  const char *selector, bool require_signing,
                                   char *fingerprint,
                                   size_t fingerprint_size) {
     gpg_source_home_t source;
     int open_rc;
     int rc;
 
-    if (!selector || !*selector) {
+    if (!gpg_config || gpg_config->executable_path[0] != '/' ||
+        !selector || !*selector) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG key selector");
         return -1;
     }
@@ -4226,7 +4324,7 @@ static int gpg_resolve_source_key(const char *selector, bool require_signing,
         }
         return -1;
     }
-    rc = gpg_capture_secret_listing(NULL, NULL, &source, selector,
+    rc = gpg_capture_secret_listing(gpg_config, NULL, &source, selector,
                                     require_signing, fingerprint,
                                     fingerprint_size);
     gpg_close_source_home(&source);
@@ -4315,7 +4413,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         return -1;
     }
     source_rc = gpg_capture_secret_listing(
-        NULL, NULL, &source, selector, require_signing, fingerprint,
+        gpg_config, NULL, &source, selector, require_signing, fingerprint,
         fingerprint_size);
     if (source_rc != 0) {
         gpg_close_source_home(&source);
@@ -4349,7 +4447,8 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
      * Export stderr stays discarded: stdout IS the key, so merging would
      * corrupt it. */
     {
-        const char *export_argv[] = {"gpg", "--armor", "--export-secret-keys",
+        const char *export_argv[] = {gpg_config->executable_path, "--armor",
+                                     "--export-secret-keys",
                                      fingerprint, NULL};
         const char *export_env[2] = {"GNUPGHOME=.", NULL};
         int export_rc;
@@ -4427,7 +4526,8 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
      * merged stdout+stderr so a failure surfaces gpg's real diagnostic
      * instead of a generic message with the cause thrown away (AR-02 #4). */
     {
-        const char *import_argv[] = {"gpg", "--batch", "--import", NULL};
+        const char *import_argv[] = {gpg_config->executable_path, "--batch",
+                                     "--import", NULL};
         int import_rc;
         memset(&opts, 0, sizeof(opts));
         opts.input = key_data;

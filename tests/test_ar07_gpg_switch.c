@@ -637,6 +637,17 @@ TEST(system_key_helper_stays_on_pinned_source_after_directory_replacement) {
 TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
     char xdg[128], base[MAX_PATH_LEN], managed[MAX_PATH_LEN];
     char alias[MAX_PATH_LEN];
+    char trusted_program_dir[MAX_PATH_LEN];
+    char trusted_gpg[MAX_PATH_LEN];
+    char self_executable[MAX_PATH_LEN];
+    const char *inherited_path;
+    char *saved_path = NULL;
+    bool saved_path_present;
+    ssize_t self_length;
+    int init_rc;
+    int restore_path_rc;
+    gpg_config_t config;
+    account_t account;
     pid_t child;
     int status = 0;
     bool mount_namespace_unavailable = false;
@@ -652,11 +663,57 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
     CHECK_EQ_INT(mkdir(managed, 0700), 0);
     CHECK_EQ_INT(mkdir(alias, 0700), 0);
 
+    /* A user-namespace fallback maps host root-owned executables to the
+     * overflow uid, which the hardened resolver correctly rejects. Give this
+     * source-home test a self-owned native GPG stand-in; the fake runner below
+     * prevents execution, while the resolver still proves real ELF shape and
+     * trusted ancestry inside either namespace form. */
+    self_length = readlink("/proc/self/exe", self_executable,
+                           sizeof(self_executable) - 1U);
+    if (self_length <= 0 || (size_t)self_length >= sizeof(self_executable) - 1U ||
+        !ts_mkdtemp_trusted(trusted_program_dir,
+                            sizeof(trusted_program_dir),
+                            "gitswitch-ar11-bind-gpg") ||
+        safe_snprintf(trusted_gpg, sizeof(trusted_gpg), "%s/gpg",
+                      trusted_program_dir) != 0) {
+        CHECK(!"failed to prepare trusted bind-alias GPG fixture");
+        return;
+    }
+    self_executable[self_length] = '\0';
+    if (copy_file(self_executable, trusted_gpg) != 0 ||
+        chmod(trusted_gpg, 0700) != 0) {
+        CHECK(!"failed to install trusted bind-alias GPG fixture");
+        return;
+    }
+    inherited_path = getenv("PATH");
+    saved_path_present = inherited_path != NULL;
+    if (inherited_path) {
+        saved_path = strdup(inherited_path);
+        if (!saved_path) {
+            CHECK(!"failed to retain PATH for bind-alias fixture");
+            return;
+        }
+    }
+    memset(&config, 0, sizeof(config));
+    if (setenv("PATH", trusted_program_dir, 1) != 0) {
+        free(saved_path);
+        CHECK(!"failed to select trusted bind-alias PATH");
+        return;
+    }
+    init_rc = gpg_manager_init(&config, GPG_MODE_SYSTEM);
+    restore_path_rc = saved_path_present ? setenv("PATH", saved_path, 1)
+                                         : unsetenv("PATH");
+    free(saved_path);
+    if (init_rc != 0 || restore_path_rc != 0) {
+        CHECK(!"failed to bind trusted GPG before namespace entry");
+        return;
+    }
+    fill_account(&account, "managed-alias", "01234567", true);
+
     fflush(NULL);
     child = fork();
     CHECK(child >= 0);
     if (child == 0) {
-        char fingerprint[GPG_FINGERPRINT_BUFSIZE];
         command_runner_fn previous;
         int rc;
 
@@ -665,20 +722,31 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
             mount(managed, alias, NULL, MS_BIND, NULL) != 0) {
             _exit(77);
         }
-        if (setenv("GNUPGHOME", alias, 1) != 0) _exit(9);
+        if (setenv("GNUPGHOME", alias, 1) != 0) {
+            fprintf(stderr, "bind-alias child: environment setup failed: %s\n",
+                    strerror(errno));
+            _exit(9);
+        }
         g_listing_result_calls = 0;
         g_listing_result_mode = LISTING_RESULT_MATCH;
         previous = run_set_runner(listing_result_runner);
-        rc = gpg_manager_resolve_system_key(
-            "01234567", true, fingerprint, sizeof(fingerprint));
+        rc = gpg_switch_account(&config, &account);
         run_set_runner(previous);
         if (rc != -1 || g_listing_result_calls != 0 ||
             strstr(get_last_error()->message,
                    "bind-mounted alias of a managed GPG home") == NULL) {
+            fprintf(stderr,
+                    "bind-alias child: rc=%d calls=%d error=%d message=%s\n",
+                    rc, g_listing_result_calls, get_last_error()->code,
+                    get_last_error()->message);
             (void)umount2(alias, MNT_DETACH);
             _exit(9);
         }
-        if (umount2(alias, MNT_DETACH) != 0) _exit(9);
+        if (umount2(alias, MNT_DETACH) != 0) {
+            fprintf(stderr, "bind-alias child: unmount failed: %s\n",
+                    strerror(errno));
+            _exit(9);
+        }
         _exit(0);
     }
     if (child > 0) {

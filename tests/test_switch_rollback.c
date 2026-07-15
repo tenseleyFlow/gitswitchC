@@ -2345,7 +2345,7 @@ static const char *g_gpg_secret_listing = SEC_SIGN;
 
 static int gpg_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
-    if (strncmp(argv[0], "gpg", 3) == 0) {
+    if (strncmp(ts_command_basename(argv[0]), "gpg", 3) == 0) {
         bool listing = false;
         if (result) {
             memset(result, 0, sizeof(*result));
@@ -2366,7 +2366,7 @@ static int gpg_git_runner(const char *const argv[], const run_opts_t *opts,
 
 static int ssh_gpg_git_runner(const char *const argv[], const run_opts_t *opts,
                               run_result_t *result) {
-    if (strncmp(argv[0], "gpg", 3) == 0) {
+    if (strncmp(ts_command_basename(argv[0]), "gpg", 3) == 0) {
         return gpg_git_runner(argv, opts, result);
     }
     return ssh_git_runner(argv, opts, result);

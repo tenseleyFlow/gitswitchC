@@ -48,6 +48,9 @@ typedef struct {
 /* GPG configuration structure */
 typedef struct {
     gpg_mode_t mode;
+    /* Canonical absolute OpenPGP executable selected by the hardened resolver.
+     * One manager transaction keeps this binding even if PATH changes. */
+    char executable_path[MAX_PATH_LEN];
     char gnupg_home[MAX_PATH_LEN];    /* GNUPGHOME path */
     char current_key_id[GPG_FINGERPRINT_BUFSIZE];
     bool signing_enabled;
@@ -140,6 +143,11 @@ int gpg_manager_setup_agent_config_for_test(int home_fd,
  * Initialize GPG manager with specified mode
  */
 int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode);
+
+/** Resolve the manager's supported OpenPGP executable names through the same
+ * hardened path policy used for launch. `gpg` has deterministic priority over
+ * `gpg2`. Returns one canonical absolute path or -1 with a GPG diagnostic. */
+int gpg_manager_resolve_executable(char *path, size_t path_size);
 
 /** Restore manager-owned environment/runtime retry state, then clear the
  * transaction configuration. Persistent per-account homes are deliberately

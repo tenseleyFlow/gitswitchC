@@ -96,7 +96,7 @@ static int counting_runner(const char *const argv[], const run_opts_t *opts,
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (strcmp(argv[0], "gpg") == 0) {
+    if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         g_gpg_execs++;
         bool listing = false;
         for (int i = 1; argv[i]; i++) {
@@ -142,7 +142,7 @@ static int swapping_listing_runner(const char *const argv[],
         result->spawned = true;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
-    if (strcmp(argv[0], "gpg") == 0) {
+    if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) listing = true;
             if (strcmp(argv[i], "--export-secret-keys") == 0) {
@@ -304,7 +304,7 @@ static int truncating_export_runner(const char *const argv[],
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (strcmp(argv[0], "gpg") == 0) {
+    if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--export-secret-keys") == 0) is_export = true;
             if (strcmp(argv[i], "--import") == 0) is_import = true;
@@ -426,7 +426,7 @@ static int import_flow_runner(const char *const argv[], const run_opts_t *opts,
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (strcmp(argv[0], "gpg") == 0) {
+    if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--export-secret-keys") == 0) is_export = true;
             if (strcmp(argv[i], "--import") == 0) is_import = true;
@@ -1254,7 +1254,7 @@ static int truncated_probe_runner(const char *const argv[],
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
-    if (strcmp(argv[0], "gpg") == 0) {
+    if (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2")) {
         for (int i = 1; argv[i]; i++) {
             if (strcmp(argv[i], "--list-secret-keys") == 0) is_listing = true;
         }
