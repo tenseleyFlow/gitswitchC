@@ -18,6 +18,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+      # Keep the checker adjacent to the canonical checkout. No preceding run
+      # step may replace this repository-owned script before it validates the
+      # remainder of the workflow.
+      - name: CI policy self-check
+        run: /bin/sh tests/test_ci_policy.sh .
       - name: Install native test runtimes and QA dependencies
         # rpm: gives distcheck a real rpmbuild so the archive-satisfies-its-
         # own-spec lane (AR-05 L17) actually runs instead of skipping.
@@ -31,10 +36,16 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           sudo apt-get update
           sudo apt-get install -y \
-            bash dash fish gnupg ksh libreadline-dev openssh-client zsh \
-            cppcheck flawfinder gcovr rpm shellcheck
+            bash binutils dash fish gnupg ksh libreadline-dev openssh-client zsh \
+            cppcheck flawfinder gcovr rpm shellcheck valgrind
+      # Every Linux make invocation below uses the package-owned absolute path.
+      # Verify its recorded package checksum before any build command executes,
+      # so a resolver or filesystem replacement cannot turn literal gates into
+      # no-op command text.
+      - name: Verify GNU Make package provenance
+        run: /usr/bin/dpkg --verify make
       - name: Shell assets (ShellCheck + native parsers)
-        run: make shell-static-test
+        run: /usr/bin/make shell-static-test
       # Fast textual tripwire only — headers included, but whitespace variants,
       # function-pointer indirection, and macro wrapping evade a grep. The
       # authoritative gate is the symbol check on the built binary below
@@ -51,55 +62,40 @@ jobs:
         # AR-08 M45/M46: this is the designated native-runtime lane. Every
         # provisioned capability is mandatory here, so a vanished runtime or
         # disabled readline build fails instead of becoming a green skip.
-        run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
+        run: /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
       - name: Source coverage (GCC/gcovr, measured line + branch ratchet)
-        run: make coverage
+        run: /usr/bin/make coverage
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
+      - name: Verify coverage build provenance
+        run: test "$(/usr/bin/sed -n '1s/|.*//p' build/obj/.buildconfig)" = coverage && test -s build/coverage/coverage.json
       - name: Upload source coverage reports
-        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-gcc-coverage
           path: build/coverage/
           if-no-files-found: error
       - name: Clean before the GCC release build
-        run: make clean
+        run: /usr/bin/make clean
       - name: Release build + full NDEBUG suite (FORTIFY/RELRO, warnings-as-errors)
-        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Release artifact hardening (built + staged)
-        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
-      # AR-05 L8: symbol-level no-shell gate. An undefined-symbol reference to
-      # system()/popen() in the linked binary catches ANY call path — headers,
-      # whitespace variants, function pointers — that the textual tripwire
-      # above cannot. This is the regression gate for the v1.7.0
-      # shell-injection fix.
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+      # The preceding required clean removes any pre-existing publisher. Keep
+      # its build as a separately recognized gate, before symbol inspection.
+      - name: Build release publisher from the reviewed source
+        run: /usr/bin/make -B build/tools/release-publish
+      # AR-05 L8: symbol-level no-shell gate. Keep the exact consumer adjacent
+      # to the separately rebuilt publisher so neither inspected file can be
+      # replaced between production and inspection.
       - name: No-shell gate (binary symbols)
-        run: |
-          # AR-06 F34: fail loudly if the binary is missing or nm errors, so a
-          # path/name change cannot silently disarm the gate (an empty pipe used
-          # to grep-miss and pass vacuously).
-          test -x build/bin/gitswitch || { echo "ERROR: release binary build/bin/gitswitch missing or not executable" >&2; exit 1; }
-          syms=$(nm -D --undefined-only build/bin/gitswitch) || { echo "ERROR: nm failed on release binary" >&2; exit 1; }
-          if printf '%s\n' "$syms" | grep -E '(^| )(system|popen)(@|$)'; then
-            echo "ERROR: release binary references system()/popen()" >&2
-            exit 1
-          fi
-          # AR-10 L27: the release publisher executes inside the pipeline's
-          # trust boundary; hold its linked binary to the same symbol gate.
-          make build/tools/release-publish
-          test -x build/tools/release-publish || { echo "ERROR: release publisher build/tools/release-publish missing or not executable" >&2; exit 1; }
-          syms=$(nm -D --undefined-only build/tools/release-publish) || { echo "ERROR: nm failed on release publisher" >&2; exit 1; }
-          if printf '%s\n' "$syms" | grep -E '(^| )(system|popen)(@|$)'; then
-            echo "ERROR: release publisher references system()/popen()" >&2
-            exit 1
-          fi
+        run: /bin/sh tests/test_ci_symbols.sh build/bin/gitswitch build/tools/release-publish
       # AR-05 L3: run REAL Valgrind against the release binaries. The
       # qa-contract-test below only proves the recipe's failure plumbing via
       # a shim; without this step no actual memory checking ever executed in
@@ -108,17 +104,17 @@ jobs:
       # build-config stamp is identical and Valgrind checks the exact objects
       # those gates validated instead of forcing a divergent rebuild.
       - name: Memory check (Valgrind, release)
-        run: sudo apt-get install -y valgrind && make BUILD_TYPE=release READLINE=1 WERROR=1 memcheck
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 memcheck
       - name: Source distribution self-check
-        run: make distcheck
+        run: /usr/bin/make distcheck
       - name: Release input consistency and dirty-tree refusal
-        run: make release-contract-test
+        run: /usr/bin/make release-contract-test
       - name: Static analysis (cppcheck)
-        run: make analyze
+        run: /usr/bin/make analyze
       - name: Security scan (flawfinder)
-        run: make security-scan
+        run: /usr/bin/make security-scan
       - name: QA negative-path contracts
-        run: make qa-contract-test
+        run: /usr/bin/make qa-contract-test
       # AR-06 F32: the SIG-01/SIG-02/F4 end-to-end signal-interruption repro
       # drives the REAL binary with a real ssh-agent and a git shim that races
       # the identity write. It was tracked but executed by nothing; run it here
@@ -126,17 +122,17 @@ jobs:
       # window is caught in CI.
       # AR-10 L36: same flag set as the release gates for stamp identity.
       - name: Signal-interruption repro (SIG-01/SIG-02/F4)
-        run: make BUILD_TYPE=release READLINE=1 WERROR=1 sig-repro-test
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 sig-repro-test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: openssh
       - name: Clean before the clang release build
-        run: make clean
+        run: /usr/bin/make clean
       - name: Linux clang release build + full NDEBUG suite
-        run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
+        run: /usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Linux clang release artifact hardening
-        run: make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+        run: /usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
 
   freebsd:
     runs-on: ubuntu-latest
