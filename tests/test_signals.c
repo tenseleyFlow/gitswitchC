@@ -123,7 +123,9 @@ static void test_fixture_unlink(const char *name) {
     }
 }
 
-static const int test_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
+static const int test_guarded_signals[] = {
+    SIGINT, SIGTERM, SIGHUP, SIGQUIT
+};
 #define TEST_GUARDED_SIGNAL_COUNT \
     (sizeof(test_guarded_signals) / sizeof(test_guarded_signals[0]))
 
@@ -149,7 +151,8 @@ static void unrelated_observing_handler(int signal_number) {
 static bool dispatch_test_masks_equal(const sigset_t *left,
                                       const sigset_t *right) {
     static const int observed_signals[] = {
-        SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM, SIGPIPE, SIGCHLD
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT,
+        SIGUSR1, SIGUSR2, SIGALRM, SIGPIPE, SIGCHLD
     };
 
     for (size_t i = 0;
@@ -201,7 +204,7 @@ static void dispatch_test_restore(int signal_number,
 static bool test_actions_equal(const struct sigaction *left,
                                const struct sigaction *right) {
     static const int mask_signals[] = {
-        SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2, SIGALRM
     };
 
     if (left->sa_handler != right->sa_handler ||
@@ -375,25 +378,33 @@ TEST(guard_end_retains_failed_restoration_for_retry) {
         CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &original[i]), 0);
     }
     install_distinct_test_actions(baseline);
-    CHECK_EQ_INT(signals_guard_begin(), 0);
 
-    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
-    errno = 0;
-    CHECK_EQ_INT(signals_guard_end(), -1);
-    CHECK_EQ_INT(errno, EIO);
-    CHECK_EQ_INT(sigaction(SIGTERM, NULL, &current), 0);
-    CHECK(!test_actions_equal(&current, &baseline[1]));
+    /* Run the retry contract at every production slot. In particular, the
+     * SIGQUIT iteration is a causal mutant check: leaving its guard handler
+     * installed after guard_end() differs from baseline and fails here. */
+    for (size_t target = 0; target < TEST_GUARDED_SIGNAL_COUNT; target++) {
+        int signal_number = test_guarded_signals[target];
 
-    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE,
-                                EAGAIN);
-    errno = 0;
-    CHECK_EQ_INT(signals_guard_end(), -1);
-    CHECK_EQ_INT(errno, EAGAIN);
-    CHECK_EQ_INT(sigaction(SIGTERM, NULL, &current), 0);
-    CHECK(!test_actions_equal(&current, &baseline[1]));
+        CHECK_EQ_INT(signals_guard_begin(), 0);
+        signals_test_fail_sigaction(signal_number,
+                                    SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        errno = 0;
+        CHECK_EQ_INT(signals_guard_end(), -1);
+        CHECK_EQ_INT(errno, EIO);
+        CHECK_EQ_INT(sigaction(signal_number, NULL, &current), 0);
+        CHECK(!test_actions_equal(&current, &baseline[target]));
 
-    CHECK_EQ_INT(signals_guard_end(), 0);
-    check_current_actions(baseline);
+        signals_test_fail_sigaction(signal_number,
+                                    SIGNALS_TEST_SIGACTION_RESTORE, EAGAIN);
+        errno = 0;
+        CHECK_EQ_INT(signals_guard_end(), -1);
+        CHECK_EQ_INT(errno, EAGAIN);
+        CHECK_EQ_INT(sigaction(signal_number, NULL, &current), 0);
+        CHECK(!test_actions_equal(&current, &baseline[target]));
+
+        CHECK_EQ_INT(signals_guard_end(), 0);
+        check_current_actions(baseline);
+    }
     restore_test_actions(original);
     signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
 }
@@ -441,26 +452,46 @@ TEST(guard_begin_skips_only_inherited_sig_ign) {
     restore_test_actions(original);
 }
 
-/* A raised SIGINT inside the guard must be recorded, not kill the process —
- * this is the entire SIG-01 mechanism (the mainline rolls back and re-raises). */
+/* Every guarded signal must be recorded rather than taking its default action
+ * inside the window. Starting the next guard clears the preceding pending
+ * value, so each production slot is exercised independently. */
 TEST(guard_defers_first_signal) {
-    signals_guard_begin();
-    raise(SIGINT); /* would terminate the process without the guard */
-    CHECK(signals_pending());
-    CHECK_EQ_INT(signals_pending_signal(), SIGINT);
-    signals_guard_end();
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(signals_guard_begin(), 0);
+        CHECK_EQ_INT(raise(test_guarded_signals[i]), 0);
+        CHECK(signals_pending());
+        CHECK_EQ_INT(signals_pending_signal(), test_guarded_signals[i]);
+        CHECK_EQ_INT(signals_guard_end(), 0);
+    }
 }
 
-/* guard_end must put the default disposition back so the rest of the program
- * (and a later dispatch) sees normal signal semantics. */
+/* guard_end must put every default disposition back so the rest of the
+ * program (and a later dispatch) sees normal signal semantics. */
 TEST(guard_end_restores_default_disposition) {
+    struct sigaction original[TEST_GUARDED_SIGNAL_COUNT];
+    struct sigaction default_action;
     struct sigaction sa;
-    signals_guard_begin();
-    CHECK_EQ_INT(sigaction(SIGTERM, NULL, &sa), 0);
-    CHECK(sa.sa_handler != SIG_DFL); /* guard handler installed */
-    signals_guard_end();
-    CHECK_EQ_INT(sigaction(SIGTERM, NULL, &sa), 0);
-    CHECK(sa.sa_handler == SIG_DFL);
+
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    sigemptyset(&default_action.sa_mask);
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &original[i]), 0);
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], &default_action, NULL),
+                     0);
+    }
+
+    CHECK_EQ_INT(signals_guard_begin(), 0);
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &sa), 0);
+        CHECK(sa.sa_handler != SIG_DFL); /* guard handler installed */
+    }
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], NULL, &sa), 0);
+        CHECK(sa.sa_handler == SIG_DFL);
+        CHECK_EQ_INT(sigaction(test_guarded_signals[i], &original[i], NULL), 0);
+    }
 }
 
 /* An inherited SIG_IGN (nohup ignores SIGHUP) must be preserved: the guard
@@ -497,6 +528,7 @@ TEST(child_spawn_barrier_blocks_only_installed_guard_signals) {
     sigdelset(&configured_mask, SIGINT);
     sigdelset(&configured_mask, SIGTERM);
     sigdelset(&configured_mask, SIGHUP);
+    sigdelset(&configured_mask, SIGQUIT);
     sigdelset(&configured_mask, SIGUSR2);
     sigaddset(&configured_mask, SIGUSR1);
     CHECK_EQ_INT(sigprocmask(SIG_SETMASK, &configured_mask, NULL), 0);
@@ -511,6 +543,7 @@ TEST(child_spawn_barrier_blocks_only_installed_guard_signals) {
     CHECK_EQ_INT(sigismember(&during_mask, SIGINT), 1);
     CHECK_EQ_INT(sigismember(&during_mask, SIGTERM), 1);
     CHECK_EQ_INT(sigismember(&during_mask, SIGHUP), 0);
+    CHECK_EQ_INT(sigismember(&during_mask, SIGQUIT), 1);
     CHECK_EQ_INT(sigismember(&during_mask, SIGUSR1), 1);
     CHECK_EQ_INT(sigismember(&during_mask, SIGUSR2), 0);
 
@@ -519,6 +552,7 @@ TEST(child_spawn_barrier_blocks_only_installed_guard_signals) {
     CHECK_EQ_INT(sigismember(&restored_mask, SIGINT), 0);
     CHECK_EQ_INT(sigismember(&restored_mask, SIGTERM), 0);
     CHECK_EQ_INT(sigismember(&restored_mask, SIGHUP), 0);
+    CHECK_EQ_INT(sigismember(&restored_mask, SIGQUIT), 0);
     CHECK_EQ_INT(sigismember(&restored_mask, SIGUSR1), 1);
     CHECK_EQ_INT(sigismember(&restored_mask, SIGUSR2), 0);
 
@@ -610,24 +644,31 @@ TEST(scratch_registry_rejects_invalid) {
 
 /* signals_dispatch_pending must terminate the process with the deferred
  * signal's default action so shells see the 128+N convention. Forked child:
- * exit code 10/11 mark the specific failure mode. */
+ * exit codes 10-12 mark the specific failure mode. */
 TEST(dispatch_terminates_with_deferred_signal) {
-    int status = 0;
-    pid_t pid;
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        int signal_number = test_guarded_signals[i];
+        int status = 0;
+        pid_t pid;
 
-    fflush(NULL);
-    pid = fork();
-    CHECK(pid >= 0);
-    if (pid == 0) {
-        signals_guard_begin();
-        raise(SIGTERM);
-        if (!signals_pending()) _exit(10); /* guard failed to defer */
-        signals_dispatch_pending();        /* must not return */
-        _exit(11);
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            if (signals_guard_begin() != 0) _exit(10);
+            if (raise(signal_number) != 0 || !signals_pending() ||
+                signals_pending_signal() != signal_number) {
+                _exit(11);
+            }
+            (void)signals_dispatch_pending(); /* must not return */
+            _exit(12);
+        }
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) {
+            CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        }
     }
-    CHECK(waitpid(pid, &status, 0) == pid);
-    CHECK(WIFSIGNALED(status));
-    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
 }
 
 /* Dispatch must never turn restoration into two unchecked attempts (one in
@@ -924,31 +965,39 @@ TEST(dispatch_raise_and_restore_failure_preserves_primary_error) {
  * unlinks registered scratch files (SIG-02) and dies immediately with the
  * signal's default action. */
 TEST(second_signal_is_emergency_exit_and_drops_scratch) {
-    char scratch[256];
-    int status = 0;
-    pid_t pid;
+    for (size_t i = 0; i < TEST_GUARDED_SIGNAL_COUNT; i++) {
+        char name[64];
+        char scratch[256];
+        int signal_number = test_guarded_signals[i];
+        int status = 0;
+        pid_t pid;
 
-    CHECK_EQ_INT(test_fixture_path(scratch, sizeof(scratch),
-                                   "scratch-emergency"), 0);
-    CHECK_EQ_INT(test_fixture_create("scratch-emergency"), 0);
+        CHECK(snprintf(name, sizeof(name), "scratch-emergency-%d",
+                       signal_number) > 0);
+        CHECK_EQ_INT(test_fixture_path(scratch, sizeof(scratch), name), 0);
+        CHECK_EQ_INT(test_fixture_create(name), 0);
 
-    fflush(NULL);
-    pid = fork();
-    CHECK(pid >= 0);
-    if (pid == 0) {
-        signals_scratch_register(scratch);
-        signals_guard_begin();
-        raise(SIGINT);
-        if (!signals_pending()) _exit(10); /* first signal must defer */
-        raise(SIGINT);                     /* second: must terminate NOW */
-        _exit(11);
+        fflush(NULL);
+        pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            if (signals_scratch_register(scratch) != 0 ||
+                signals_guard_begin() != 0 || raise(signal_number) != 0 ||
+                !signals_pending()) {
+                _exit(10);
+            }
+            (void)raise(signal_number); /* second: must terminate NOW */
+            _exit(11);
+        }
+        CHECK(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFSIGNALED(status));
+        if (WIFSIGNALED(status)) {
+            CHECK_EQ_INT(WTERMSIG(status), signal_number);
+        }
+        CHECK(!test_fixture_exists(name));
+
+        test_fixture_unlink(name); /* in case the child failed */
     }
-    CHECK(waitpid(pid, &status, 0) == pid);
-    CHECK(WIFSIGNALED(status));
-    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGINT);
-    CHECK(!test_fixture_exists("scratch-emergency"));
-
-    test_fixture_unlink("scratch-emergency"); /* in case the child failed */
 }
 
 /* AR-02 #2: a second signal arriving while the failed-switch ROLLBACK is

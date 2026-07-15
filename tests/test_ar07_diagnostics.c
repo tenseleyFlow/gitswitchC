@@ -20,7 +20,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static const int guarded_signals[] = {SIGINT, SIGTERM, SIGHUP};
+static const int guarded_signals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
 
 static void inherited_caught_handler(int sig) {
     (void)sig;
@@ -89,7 +89,7 @@ TEST(child_reset_preserves_every_inherited_ignore_and_mask) {
         if (signals_guard_begin() != 0) _exit(12);
         signals_guard_end();
 
-        /* Pre-fix this reset all three to SIG_DFL and unblocked them even
+        /* Pre-fix this reset every guarded signal to SIG_DFL and unblocked it
          * though guard_begin deliberately skipped every inherited ignore and
          * guard_end retired the installed-disposition bitmap. */
         signals_reset_for_child(NULL);
@@ -142,12 +142,16 @@ TEST(child_reset_handles_mixed_ignored_caught_and_default_dispositions) {
             _exit(31);
         }
         if (set_signal_state(SIGTERM, SIG_DFL, true) != 0) _exit(32);
-        if (signals_guard_begin() != 0) _exit(33);
+        if (set_signal_state(SIGQUIT, inherited_caught_handler, false) != 0) {
+            _exit(33);
+        }
+        if (signals_guard_begin() != 0) _exit(34);
 
         signals_reset_for_child(NULL);
-        if (signal_state_is(SIGHUP, SIG_IGN, true) != 0) _exit(34);
-        if (signal_state_is(SIGINT, SIG_DFL, false) != 0) _exit(35);
-        if (signal_state_is(SIGTERM, SIG_DFL, false) != 0) _exit(36);
+        if (signal_state_is(SIGHUP, SIG_IGN, true) != 0) _exit(35);
+        if (signal_state_is(SIGINT, SIG_DFL, false) != 0) _exit(36);
+        if (signal_state_is(SIGTERM, SIG_DFL, false) != 0) _exit(37);
+        if (signal_state_is(SIGQUIT, SIG_DFL, false) != 0) _exit(38);
         _exit(0);
     }
     if (child > 0) {
@@ -172,15 +176,21 @@ TEST(child_reset_after_guard_end_preserves_original_dispositions_and_masks) {
             _exit(41);
         }
         if (set_signal_state(SIGTERM, SIG_DFL, true) != 0) _exit(42);
-        if (signals_guard_begin() != 0) _exit(43);
+        if (set_signal_state(SIGQUIT, inherited_caught_handler, false) != 0) {
+            _exit(43);
+        }
+        if (signals_guard_begin() != 0) _exit(44);
         signals_guard_end();
         signals_reset_for_child(NULL);
 
-        if (signal_state_is(SIGHUP, SIG_IGN, true) != 0) _exit(44);
+        if (signal_state_is(SIGHUP, SIG_IGN, true) != 0) _exit(45);
         if (signal_state_is(SIGINT, inherited_caught_handler, false) != 0) {
-            _exit(45);
+            _exit(46);
         }
-        if (signal_state_is(SIGTERM, SIG_DFL, true) != 0) _exit(46);
+        if (signal_state_is(SIGTERM, SIG_DFL, true) != 0) _exit(47);
+        if (signal_state_is(SIGQUIT, inherited_caught_handler, false) != 0) {
+            _exit(48);
+        }
         _exit(0);
     }
     if (child > 0) {
@@ -214,6 +224,7 @@ TEST(child_reset_restores_supervisor_blocked_mask_exactly) {
         if (!sigismember(&current, SIGTERM)) _exit(54);
         if (sigismember(&current, SIGINT)) _exit(55);
         if (sigismember(&current, SIGHUP)) _exit(56);
+        if (sigismember(&current, SIGQUIT)) _exit(57);
         _exit(0);
     }
     if (child > 0) {

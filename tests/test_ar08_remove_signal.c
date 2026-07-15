@@ -316,7 +316,7 @@ TEST(repeated_signals_defer_through_complete_removal_transaction) {
         REMOVE_TEST_AFTER_ALIAS,
         REMOVE_TEST_AFTER_PERSIST
     };
-    const int signals[] = { SIGINT, SIGTERM, SIGHUP };
+    const int signals[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
 
     for (size_t signal_index = 0;
          signal_index < sizeof(signals) / sizeof(signals[0]); signal_index++) {
@@ -432,10 +432,10 @@ static void custom_handler(int signo) {
 
 TEST(direct_remove_restores_callers_signal_dispositions) {
     gitswitch_ctx_t ctx;
-    struct sigaction original[3];
+    struct sigaction original[4];
     struct sigaction installed;
     struct sigaction observed;
-    const int signals[] = { SIGINT, SIGTERM, SIGHUP };
+    const int signals[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
     char runtime[PATH_MAX];
 
     memset(&ctx, 0, sizeof(ctx));

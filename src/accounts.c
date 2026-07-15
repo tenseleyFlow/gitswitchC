@@ -945,8 +945,8 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
      * writer has not run yet, rollback never needs to replace a user file.
      *
      * SIG-01: the whole mutation window is guarded against SIGINT/SIGTERM/
-     * SIGHUP (Ctrl-C at the ssh-add passphrase or GPG pinentry prompt is a
-     * normal path). The handler only records the signal; we check between
+     * SIGHUP/SIGQUIT (Ctrl-C at the ssh-add passphrase or GPG pinentry prompt
+     * is a normal path). The handler only records the signal; we check between
      * durable steps and run the same rollback as an explicit failure, so a
      * signal can no longer leave user.name=new/user.email=old or repointed
      * SSH/GPG state without the matching git identity. */

@@ -2,19 +2,19 @@
  *
  * accounts_switch() applies SSH -> GPG -> git config as separate durable
  * steps, and Ctrl-C at an ssh-add passphrase or GPG pinentry prompt is a
- * NORMAL path through that window. Without a handler, SIGINT/SIGTERM/SIGHUP
- * killed the process between steps, bypassing the rollback machinery and
- * leaving a half-applied identity (e.g. current.sock repointed at the new
+ * NORMAL path through that window. Without a handler, SIGINT/SIGTERM/SIGHUP/
+ * SIGQUIT killed the process between steps, bypassing the rollback machinery
+ * and leaving a half-applied identity (e.g. current.sock repointed at the new
  * account while git user.email still names the old one) — exactly the
  * mixed-identity state the tool exists to prevent.
  *
  * Design (async-signal-safe by construction):
- *   - signals_guard_begin() installs a handler for SIGINT/SIGTERM/SIGHUP that
- *     only records the signal in a volatile sig_atomic_t. The mainline checks
- *     signals_pending() between durable steps and runs the ordinary rollback
- *     (git_config_restore + runtime-isolation teardown) in normal, non-handler
- *     context, then signals_dispatch_pending() re-raises so the exit status
- *     still reports death-by-signal to the shell.
+ *   - signals_guard_begin() installs a handler for SIGINT/SIGTERM/SIGHUP/
+ *     SIGQUIT that only records the signal in a volatile sig_atomic_t. The
+ *     mainline checks signals_pending() between durable steps and runs the
+ *     ordinary rollback (git_config_restore + runtime-isolation teardown) in
+ *     normal, non-handler context, then signals_dispatch_pending() re-raises
+ *     so the exit status still reports death-by-signal to the shell.
  *   - A SECOND signal while one is already pending is an emergency exit (e.g.
  *     a child pinentry that swallowed the first Ctrl-C): the handler unlinks
  *     the registered scratch files below (unlink(2) is async-signal-safe),
@@ -53,14 +53,14 @@
 #include <sys/types.h>
 
 /**
- * Install the deferring handler for SIGINT/SIGTERM/SIGHUP and clear any
- * previously pending signal. Idempotent while a guard is active. SA_RESTART
- * is used so a signal doesn't interrupt the parent blocked in poll/waitpid on
- * an in-flight child (run_argv already retries EINTR; restarting avoids
- * surprising every other syscall in the window). Returns 0 on success and -1
- * if any disposition query or installation fails. A failed begin restores
- * every disposition it already changed and preserves the originating errno;
- * only an inherited SIG_IGN is intentionally skipped.
+ * Install the deferring handler for SIGINT/SIGTERM/SIGHUP/SIGQUIT and clear
+ * any previously pending signal. Idempotent while a guard is active.
+ * SA_RESTART is used so a signal doesn't interrupt the parent blocked in
+ * poll/waitpid on an in-flight child (run_argv already retries EINTR;
+ * restarting avoids surprising every other syscall in the window). Returns
+ * 0 on success and -1 if any disposition query or installation fails. A
+ * failed begin restores every disposition it already changed and preserves
+ * the originating errno; only an inherited SIG_IGN is intentionally skipped.
  */
 int signals_guard_begin(void);
 

@@ -267,7 +267,9 @@ static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer *
 static FILE *g_log;                 /* when set, every argv is logged here */
 static char g_effective_signingkey_observed[MAX_GPG_FINGERPRINT_LEN];
 
-static const int switch_guarded_signals[] = { SIGINT, SIGTERM, SIGHUP };
+static const int switch_guarded_signals[] = {
+    SIGINT, SIGTERM, SIGHUP, SIGQUIT
+};
 #define SWITCH_GUARDED_SIGNAL_COUNT \
     (sizeof(switch_guarded_signals) / sizeof(switch_guarded_signals[0]))
 
@@ -2709,7 +2711,7 @@ static void raise_during_guard_end(void) {
 static bool switch_actions_equal(const struct sigaction *left,
                                  const struct sigaction *right) {
     static const int mask_signals[] = {
-        SIGINT, SIGTERM, SIGHUP, SIGUSR1, SIGUSR2, SIGALRM
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGUSR1, SIGUSR2, SIGALRM
     };
 
     if (left->sa_handler != right->sa_handler ||
