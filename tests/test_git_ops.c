@@ -1494,6 +1494,30 @@ static void retire_fill_publication(publication_record_t *publication,
     publication->state = PUBLICATION_STATE_PUBLISHED;
 }
 
+static void retire_fill_ssh_publication(
+    publication_record_t *publication, const account_t *acct,
+    const char *ssh_command, const char *ssh_program) {
+    struct stat st;
+
+    retire_fill_publication(publication, acct);
+    publication->capabilities = PUBLICATION_CAP_DESTINATION |
+                                PUBLICATION_CAP_POST_GENERATION |
+                                PUBLICATION_CAP_SSH_COMMAND |
+                                PUBLICATION_CAP_SSH_PROGRAM;
+    publication->gpg_fingerprint[0] = '\0';
+    publication->gpg_selector[0] = '\0';
+    publication->gpg_program[0] = '\0';
+    memset(&publication->gpg_program_identity, 0,
+           sizeof(publication->gpg_program_identity));
+    CHECK_EQ_INT(safe_strncpy(publication->ssh_command, ssh_command,
+                              sizeof(publication->ssh_command)), 0);
+    CHECK_EQ_INT(safe_strncpy(publication->ssh_program, ssh_program,
+                              sizeof(publication->ssh_program)), 0);
+    CHECK_EQ_INT(stat(ssh_program, &st), 0);
+    publication_identity_from_stat(&publication->ssh_program_identity, &st);
+    CHECK_EQ_INT(publication_record_validate(publication), 0);
+}
+
 #define RETIRE_DESTINATION_REPOSITORIES 2
 #define RETIRE_DESTINATION_KEYS 4
 
@@ -1896,11 +1920,14 @@ TEST(retire_without_publication_record_preserves_signing_leg) {
     fk_seed("--global", "core.sshcommand", "ssh -i /someone/elses/key");
 
     command_runner_fn prev = run_set_runner(fake_git_runner);
+    errno = 0;
     int rc = git_retire_account_identity(&acct, &cleared);
     run_set_runner(prev);
 
-    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(errno, ESTALE);
     CHECK_EQ_INT((int)cleared, 0);
+    CHECK_EQ_INT(fk_execs, 0);
     /* Even a full account selector is not durable proof that this process
      * published the signing leg. The compatibility API has no publication
      * record, so every signing key and companion remains untouched. */
@@ -2015,11 +2042,14 @@ TEST(retire_preserves_legacy_selector_without_canonical_record) {
             "/trusted/ar11/gpg");
 
     command_runner_fn prev = run_set_runner(fake_git_runner);
+    errno = 0;
     int rc = git_retire_account_identity(&acct, &cleared);
     run_set_runner(prev);
 
-    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(errno, ESTALE);
     CHECK_EQ_INT((int)cleared, 0);
+    CHECK_EQ_INT(fk_execs, 0);
     CHECK(fk_find("--global", "user.signingkey") >= 0);
     CHECK(fk_find("--global", "commit.gpgsign") >= 0);
     CHECK(fk_find("--global", "gpg.format") >= 0);
@@ -2054,65 +2084,176 @@ TEST(retire_preserves_shared_suffix_foreign_signing_leg) {
     CHECK(fk_find("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM) >= 0);
 }
 
-TEST(retire_clears_exactly_matching_ssh_command) {
-    char dir[64];
-    char key_path[512];
-    char expected[GIT_CONFIG_VALUE_MAX];
-    account_t acct;
-    size_t cleared = 0;
-
-    snprintf(dir, sizeof(dir), "/tmp/gsw_retire_XXXXXX");
-    CHECK(ts_mkdtemp(dir) != NULL);
-    snprintf(key_path, sizeof(key_path), "%s/id_ed25519", dir);
-    CHECK(fk_touch(key_path));
-
-    git_ops_test_reset_caches();
-    fk_reset();
-    retire_fill_account(&acct, key_path);
-    acct.gpg_enabled = false;
-    acct.gpg_key_id[0] = '\0';
-
-    if (git_expected_ssh_command(&acct, expected, sizeof(expected)) != 0) {
-        TS_SKIP("openssh", "no trusted ssh executable on this host");
-    }
-    fk_seed("--global", "core.sshcommand", expected);
-    fk_seed("--global", "user.name", "Retired User");
-
-    command_runner_fn prev = run_set_runner(fake_git_runner);
-    int rc = git_retire_account_identity(&acct, &cleared);
-    run_set_runner(prev);
-
-    CHECK_EQ_INT(rc, 0);
-    CHECK_EQ_INT((int)cleared, 1);
-    CHECK(fk_find("--global", "core.sshcommand") < 0);
-    CHECK(fk_find("--global", "user.name") >= 0);
-}
-
-TEST(retire_leaves_foreign_ssh_command_in_place) {
-    char dir[64];
-    char key_path[512];
+TEST(retire_without_publication_refuses_matching_ssh_command) {
+    static const char historical_command[] =
+        "'/historical/bin/ssh' -i '/historical/key' -F '/dev/null'";
     account_t acct;
     size_t cleared = 99;
 
-    snprintf(dir, sizeof(dir), "/tmp/gsw_retire_XXXXXX");
-    CHECK(ts_mkdtemp(dir) != NULL);
-    snprintf(key_path, sizeof(key_path), "%s/id_ed25519", dir);
-    CHECK(fk_touch(key_path));
+    git_ops_test_reset_caches();
+    fk_reset();
+    retire_fill_account(&acct, "/current/account/key");
+    acct.gpg_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+    fk_seed("--global", "core.sshcommand", historical_command);
+    fk_seed("--global", "user.name", "Retired User");
+
+    command_runner_fn prev = run_set_runner(fake_git_runner);
+    errno = 0;
+    int rc = git_retire_account_identity(&acct, &cleared);
+    run_set_runner(prev);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(errno, ESTALE);
+    CHECK_EQ_INT((int)cleared, 0);
+    CHECK_EQ_INT(fk_execs, 0);
+    CHECK(fk_find("--global", "core.sshcommand") >= 0);
+    CHECK(fk_find("--global", "user.name") >= 0);
+    CHECK(strstr(get_last_error()->message,
+                 "Durable Git publication provenance is required") != NULL);
+}
+
+TEST(retire_leaves_foreign_ssh_command_in_place) {
+    account_t acct;
+    size_t cleared = 99;
 
     git_ops_test_reset_caches();
     fk_reset();
-    retire_fill_account(&acct, key_path);
+    retire_fill_account(&acct, "/current/account/key");
     acct.gpg_enabled = false;
     acct.gpg_key_id[0] = '\0';
     fk_seed("--global", "core.sshcommand", "ssh -i /someone/elses/key");
 
     command_runner_fn prev = run_set_runner(fake_git_runner);
+    errno = 0;
     int rc = git_retire_account_identity(&acct, &cleared);
     run_set_runner(prev);
 
-    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(errno, ESTALE);
     CHECK_EQ_INT((int)cleared, 0);
+    CHECK_EQ_INT(fk_execs, 0);
     CHECK(fk_find("--global", "core.sshcommand") >= 0);
+}
+
+TEST(published_ssh_retirement_uses_saved_command_after_program_removal) {
+    char root[MAX_PATH_LEN] = "/tmp/gsw-retire-published-ssh-XXXXXX";
+    char program[MAX_PATH_LEN];
+    char command[GIT_CONFIG_VALUE_MAX];
+    char *saved_path = NULL;
+    const char *path_before = getenv("PATH");
+    account_t acct;
+    publication_record_t publication;
+    command_runner_fn previous;
+    size_t cleared = 99;
+
+    if (path_before) {
+        saved_path = strdup(path_before);
+        CHECK(saved_path != NULL);
+        if (!saved_path) return;
+    }
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(safe_snprintf(program, sizeof(program), "%s/ssh", root), 0);
+    CHECK(fk_touch(program));
+    CHECK_EQ_INT(chmod(program, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(
+                     command, sizeof(command),
+                     "'%s' -i '/historical/key' -F '/dev/null' "
+                     "-o IdentitiesOnly=yes",
+                     program), 0);
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    retire_fill_account(&acct, "/edited/account/key");
+    retire_fill_ssh_publication(&publication, &acct, command, program);
+    acct.gpg_enabled = false;
+    acct.gpg_signing_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+    CHECK_EQ_INT(unlink(program), 0);
+    CHECK_EQ_INT(setenv("PATH", "/definitely/not/present", 1), 0);
+    fk_seed("--global", GIT_CONFIG_CORE_SSHCOMMAND, command);
+
+    previous = run_set_runner(fake_git_runner);
+    CHECK_EQ_INT(git_retire_account_identity_published(
+                     &acct, &publication, &cleared), 0);
+    run_set_runner(previous);
+    CHECK_EQ_INT((int)cleared, 1);
+    CHECK_EQ_INT(fk_non_git_execs, 0);
+    CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) < 0);
+
+    /* A later foreign writer is not owned merely because the destination and
+     * historical program identity still match the record. */
+    fk_seed("--global", GIT_CONFIG_CORE_SSHCOMMAND,
+            "'/foreign/ssh' -i '/foreign/key'");
+    cleared = 99;
+    previous = run_set_runner(fake_git_runner);
+    CHECK_EQ_INT(git_retire_account_identity_published(
+                     &acct, &publication, &cleared), 0);
+    run_set_runner(previous);
+    CHECK_EQ_INT((int)cleared, 0);
+    CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) >= 0);
+
+    if (saved_path) CHECK_EQ_INT(setenv("PATH", saved_path, 1), 0);
+    else CHECK_EQ_INT(unsetenv("PATH"), 0);
+    free(saved_path);
+    ts_rm_rf(root);
+}
+
+TEST(published_ssh_retirement_rejects_wrong_destination_before_git) {
+    char program_root[MAX_PATH_LEN] = "/tmp/gsw-retire-ssh-program-XXXXXX";
+    char program[MAX_PATH_LEN];
+    char command[GIT_CONFIG_VALUE_MAX];
+    char foreign_config[MAX_PATH_LEN];
+    account_t acct;
+    publication_record_t publication;
+    command_runner_fn previous;
+    size_t cleared = 99;
+    int fd = -1;
+
+    CHECK(ts_mkdtemp(program_root) != NULL);
+    CHECK_EQ_INT(safe_snprintf(program, sizeof(program), "%s/ssh",
+                               program_root), 0);
+    CHECK(fk_touch(program));
+    CHECK_EQ_INT(chmod(program, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(command, sizeof(command),
+                               "'%s' -i '/historical/key'", program), 0);
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    retire_fill_account(&acct, "/current/key");
+    retire_fill_ssh_publication(&publication, &acct, command, program);
+    acct.gpg_enabled = false;
+    acct.gpg_signing_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+    CHECK_EQ_INT(safe_snprintf(foreign_config, sizeof(foreign_config),
+                               "%s/foreign-config-XXXXXX",
+                               retire_global_root), 0);
+    fd = mkstemp(foreign_config);
+    CHECK(fd >= 0);
+    if (fd < 0) goto cleanup;
+    CHECK_EQ_INT(close(fd), 0);
+    fd = -1;
+    CHECK_EQ_INT(chmod(foreign_config, 0600), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", foreign_config, 1), 0);
+    git_ops_test_reset_caches();
+    fk_seed("--global", GIT_CONFIG_CORE_SSHCOMMAND, command);
+
+    previous = run_set_runner(fake_git_runner);
+    clear_error();
+    CHECK_EQ_INT(git_retire_account_identity_published(
+                     &acct, &publication, &cleared), -1);
+    run_set_runner(previous);
+    CHECK_EQ_INT((int)cleared, 0);
+    CHECK_EQ_INT(fk_execs, 0);
+    CHECK(fk_find("--global", GIT_CONFIG_CORE_SSHCOMMAND) >= 0);
+    CHECK(strstr(get_last_error()->message,
+                 "destination does not match") != NULL);
+
+cleanup:
+    if (fd >= 0) CHECK_EQ_INT(close(fd), 0);
+    CHECK_EQ_INT(setenv("GIT_CONFIG_GLOBAL", retire_global_config, 1), 0);
+    git_ops_test_reset_caches();
+    ts_rm_rf(program_root);
 }
 
 TEST(signing_key_identity_requires_exact_canonical_fingerprint) {
@@ -2354,8 +2495,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(retire_leaves_foreign_signing_key_in_place);
     RUN_TEST(retire_preserves_legacy_selector_without_canonical_record);
     RUN_TEST(retire_preserves_shared_suffix_foreign_signing_leg);
-    RUN_TEST(retire_clears_exactly_matching_ssh_command);
+    RUN_TEST(retire_without_publication_refuses_matching_ssh_command);
     RUN_TEST(retire_leaves_foreign_ssh_command_in_place);
+    RUN_TEST(published_ssh_retirement_uses_saved_command_after_program_removal);
+    RUN_TEST(published_ssh_retirement_rejects_wrong_destination_before_git);
     RUN_TEST(signing_key_identity_requires_exact_canonical_fingerprint);
     RUN_TEST(signing_status_requires_exact_published_destination_and_fingerprint);
     RUN_TEST(signing_status_roots_relative_local_origin_at_repository);

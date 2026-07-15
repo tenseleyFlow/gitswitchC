@@ -114,6 +114,7 @@ static size_t fake_failure_diagnostic_len =
 static bool fake_repository;
 static const unsigned char *fake_repo_root;
 static size_t fake_repo_root_len;
+static int fake_git_calls;
 static int fake_non_git_calls;
 static const char *publication_selector_override;
 static bool publication_omit_selector_override;
@@ -179,6 +180,7 @@ static int status_fake_runner(const char *const argv[], const run_opts_t *opts,
         fake_non_git_calls++;
         return fake_finish(result, 127);
     }
+    fake_git_calls++;
     if (strcmp(argv[1], "rev-parse") == 0) {
         static const unsigned char git_dir[] = ".git\n";
 
@@ -654,21 +656,113 @@ TEST(absent_identity_with_oversized_managed_value_reports_error) {
     CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
 }
 
-TEST(active_status_reports_expected_ssh_resolution_failure) {
+static int install_ssh_publication(gitswitch_ctx_t *context,
+                                   const account_t *account,
+                                   const char *ssh_command,
+                                   const char *ssh_program,
+                                   char *origin, size_t origin_size) {
+    static const unsigned char header_prefix[] = "gpg\nactive=";
+    char root[MAX_PATH_LEN] = "/tmp/gsw_ar11_ssh_status_XXXXXX";
+    char config_path[MAX_PATH_LEN];
+    char state_path[MAX_PATH_LEN];
+    publication_record_t publication;
+    publication_ledger_t ledger;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0U;
+    struct stat st;
+    int fd = -1;
+    int result = -1;
+
+    publication_ledger_init(&ledger);
+    publication_record_init(&publication);
+    if (!context || !account || !ssh_command || !ssh_program ||
+        !origin || origin_size == 0U || !ts_mkdtemp(root) ||
+        chmod(root, 0700) != 0 ||
+        ts_canonicalize_dir_path(root, sizeof(root)) != 0 ||
+        safe_snprintf(config_path, sizeof(config_path), "%s/gitconfig",
+                      root) != 0 ||
+        safe_snprintf(state_path, sizeof(state_path), "%s/.resume-hint",
+                      root) != 0 ||
+        write_text_file(config_path, "[fixture]\n", 0600) != 0 ||
+        stat(root, &st) != 0 ||
+        safe_snprintf(origin, origin_size, "file:%s", config_path) != 0 ||
+        safe_strncpy(context->config.config_path, config_path,
+                     sizeof(context->config.config_path)) != 0) {
+        goto cleanup;
+    }
+
+    publication.account_id = account->id;
+    if (safe_strncpy(publication.account_incarnation,
+                     account->incarnation,
+                     sizeof(publication.account_incarnation)) != 0 ||
+        safe_strncpy(publication.config_path, config_path,
+                     sizeof(publication.config_path)) != 0) {
+        goto cleanup;
+    }
+    publication.scope = PUBLICATION_SCOPE_GLOBAL;
+    publication_identity_from_stat(&publication.config_parent, &st);
+    if (stat(config_path, &st) != 0 || stat(ssh_program, &st) != 0 ||
+        !S_ISREG(st.st_mode) ||
+        safe_strncpy(publication.ssh_command, ssh_command,
+                     sizeof(publication.ssh_command)) != 0 ||
+        safe_strncpy(publication.ssh_program, ssh_program,
+                     sizeof(publication.ssh_program)) != 0) {
+        goto cleanup;
+    }
+    /* Re-read the config generation after the independent program stat. */
+    if (stat(config_path, &st) != 0) goto cleanup;
+    publication_identity_from_stat(&publication.post_config, &st);
+    if (stat(ssh_program, &st) != 0) goto cleanup;
+    publication_identity_from_stat(&publication.ssh_program_identity, &st);
+    publication.capabilities = PUBLICATION_CAP_DESTINATION |
+                               PUBLICATION_CAP_POST_GENERATION |
+                               PUBLICATION_CAP_SSH_COMMAND |
+                               PUBLICATION_CAP_SSH_PROGRAM;
+    publication.state = PUBLICATION_STATE_PUBLISHED;
+    if (publication_record_validate(&publication) != 0 ||
+        publication_ledger_upsert(&ledger, &publication) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0) {
+        goto cleanup;
+    }
+
+    fd = open(state_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write_all_test_bytes(fd, header_prefix,
+                             sizeof(header_prefix) - 1U) != 0 ||
+        write_all_test_bytes(fd, account->name,
+                             strlen(account->name)) != 0 ||
+        write_all_test_bytes(fd, "\n", 1U) != 0 ||
+        write_all_test_bytes(fd, tail, tail_length) != 0) {
+        goto cleanup;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    result = 0;
+
+cleanup:
+    if (fd >= 0) (void)close(fd);
+    if (tail) {
+        memset(tail, 0, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
+TEST(active_ssh_without_publication_fails_before_any_git_probe) {
     gitswitch_ctx_t context;
     char status[8192];
     int status_rc;
     command_runner_fn previous;
-    saved_env_t path = save_env("PATH");
 
     fake_listing_len = 0;
     fake_listing_calls = 0;
+    fake_git_calls = 0;
+    fake_non_git_calls = 0;
     fake_execution_failure = false;
-    CHECK(fake_append_record("global", "file:/ar07/global", "user.name",
-                             "Active User", strlen("Active User")));
-    CHECK(fake_append_record("global", "file:/ar07/global", "user.email",
-                             "active@example.test",
-                             strlen("active@example.test")));
 
     memset(&context, 0, sizeof(context));
     context.account_count = 1;
@@ -678,25 +772,159 @@ TEST(active_status_reports_expected_ssh_resolution_failure) {
     CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
                               "active@example.test",
                               sizeof(context.accounts[0].email)), 0);
+    bind_status_test_incarnation(&context.accounts[0]);
     context.accounts[0].ssh_enabled = true;
     CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path,
                               "/definitely/not/present/ar07-status-key",
                               sizeof(context.accounts[0].ssh_key_path)), 0);
     context.current_account = &context.accounts[0];
 
-    /* The fake runner still supplies Git's read-only answers, while this PATH
-     * contains no trusted ssh executable for expected-command construction. */
-    CHECK_EQ_INT(setenv("PATH", "/tmp", 1), 0);
     git_ops_test_reset_caches();
     previous = run_set_runner(status_fake_runner);
     status_rc = capture_status_output_for(&context, status, sizeof(status));
     run_set_runner(previous);
-    restore_env("PATH", &path);
 
     CHECK_EQ_INT(status_rc, -1);
     CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "SSH provenance: [UNAVAILABLE]") != NULL);
     CHECK(strstr(status, "Effective SSH Command: [ERROR]") != NULL);
-    CHECK(strstr(status, "No trusted SSH executable") != NULL);
+    CHECK_EQ_INT(fake_git_calls, 0);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+}
+
+TEST(active_ssh_status_uses_saved_program_and_exact_destination) {
+    char key_a[] = "/tmp/gsw_ar11_status_key_a_XXXXXX";
+    char key_b[] = "/tmp/gsw_ar11_status_key_b_XXXXXX";
+    char ssh_program[MAX_PATH_LEN];
+    char published_command[GIT_CONFIG_VALUE_MAX];
+    char origin[MAX_PATH_LEN];
+    char status[8192];
+    gitswitch_ctx_t context;
+    command_runner_fn previous;
+    saved_env_t path = save_env("PATH");
+    int key_a_fd = -1;
+    int key_b_fd = -1;
+
+    if (find_command_path("ssh", ssh_program, sizeof(ssh_program)) != 0) {
+        TS_SKIP("openssh", "no trusted SSH executable on this host");
+    }
+    key_a_fd = mkstemp(key_a);
+    key_b_fd = mkstemp(key_b);
+    CHECK(key_a_fd >= 0);
+    CHECK(key_b_fd >= 0);
+    if (key_a_fd < 0 || key_b_fd < 0) goto cleanup;
+    CHECK_EQ_INT(fchmod(key_a_fd, 0600), 0);
+    CHECK_EQ_INT(fchmod(key_b_fd, 0600), 0);
+    CHECK_EQ_INT(close(key_a_fd), 0);
+    key_a_fd = -1;
+    CHECK_EQ_INT(close(key_b_fd), 0);
+    key_b_fd = -1;
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1U;
+    context.accounts[0].id = 17U;
+    bind_status_test_incarnation(&context.accounts[0]);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].name, "SSH Ledger User",
+                              sizeof(context.accounts[0].name)), 0);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
+                              "ssh-ledger@example.test",
+                              sizeof(context.accounts[0].email)), 0);
+    context.accounts[0].ssh_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path, key_a,
+                              sizeof(context.accounts[0].ssh_key_path)), 0);
+    context.current_account = &context.accounts[0];
+    CHECK_EQ_INT(git_expected_ssh_command(
+                     &context.accounts[0], published_command,
+                     sizeof(published_command)), 0);
+    CHECK_EQ_INT(install_ssh_publication(
+                     &context, &context.accounts[0], published_command,
+                     ssh_program, origin, sizeof(origin)), 0);
+
+    CHECK_EQ_INT(setenv("PATH", "/definitely/not/present", 1), 0);
+    fake_listing_len = 0U;
+    fake_listing_calls = 0;
+    fake_git_calls = 0;
+    fake_non_git_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", origin, "user.name",
+                             context.accounts[0].name,
+                             strlen(context.accounts[0].name)));
+    CHECK(fake_append_record("global", origin, "user.email",
+                             context.accounts[0].email,
+                             strlen(context.accounts[0].email)));
+    CHECK(fake_append_record("global", origin, GIT_CONFIG_CORE_SSHCOMMAND,
+                             published_command, strlen(published_command)));
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), 0);
+    run_set_runner(previous);
+    CHECK(strstr(status, "Match Status: [OK]") != NULL);
+    CHECK(strstr(status, "Effective SSH Command: [MATCH]") != NULL);
+    CHECK(fake_git_calls > 0);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+
+    /* The account model changed after publication. Rebuild it with the saved
+     * program, not PATH, and report the exact old Git value as drift. */
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path, key_b,
+                              sizeof(context.accounts[0].ssh_key_path)), 0);
+    fake_git_calls = 0;
+    fake_non_git_calls = 0;
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), 0);
+    run_set_runner(previous);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+    CHECK(strstr(status, "Effective SSH Command: [MISMATCH]") != NULL);
+    CHECK(fake_git_calls > 0);
+    CHECK_EQ_INT(fake_non_git_calls, 0);
+
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path, key_a,
+                              sizeof(context.accounts[0].ssh_key_path)), 0);
+    fake_listing_len = 0U;
+    CHECK(fake_append_record("global", origin, "user.name",
+                             context.accounts[0].name,
+                             strlen(context.accounts[0].name)));
+    CHECK(fake_append_record("global", origin, "user.email",
+                             context.accounts[0].email,
+                             strlen(context.accounts[0].email)));
+    CHECK(fake_append_record("local", origin, GIT_CONFIG_CORE_SSHCOMMAND,
+                             published_command, strlen(published_command)));
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), 0);
+    run_set_runner(previous);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+    CHECK(strstr(status, "Effective SSH Command: [MISMATCH]") != NULL);
+
+    fake_listing_len = 0U;
+    CHECK(fake_append_record("global", origin, "user.name",
+                             context.accounts[0].name,
+                             strlen(context.accounts[0].name)));
+    CHECK(fake_append_record("global", origin, "user.email",
+                             context.accounts[0].email,
+                             strlen(context.accounts[0].email)));
+    CHECK(fake_append_record("global", "file:/foreign/gitconfig",
+                             GIT_CONFIG_CORE_SSHCOMMAND,
+                             published_command, strlen(published_command)));
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), 0);
+    run_set_runner(previous);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+    CHECK(strstr(status, "Effective SSH Command: [MISMATCH]") != NULL);
+
+cleanup:
+    if (key_a_fd >= 0) CHECK_EQ_INT(close(key_a_fd), 0);
+    if (key_b_fd >= 0) CHECK_EQ_INT(close(key_b_fd), 0);
+    if (key_a[0] != '\0') (void)unlink(key_a);
+    if (key_b[0] != '\0') (void)unlink(key_b);
+    restore_env("PATH", &path);
+    git_ops_test_reset_caches();
 }
 
 static int denied_status_key_open(const char *path, int flags) {
@@ -710,21 +938,28 @@ TEST(active_status_propagates_required_key_inspection_failure) {
     gitswitch_ctx_t context;
     char key_path[] = "/tmp/gsw_ar09_status_key_XXXXXX";
     char expected_ssh[GIT_CONFIG_VALUE_MAX];
+    char ssh_program[MAX_PATH_LEN];
+    char origin[MAX_PATH_LEN];
     char status[8192];
     command_runner_fn previous_runner;
     ssh_key_open_fn previous_open;
-    int key_fd;
+    int key_fd = -1;
     int status_rc;
 
-    fake_listing_len = 0;
-    fake_listing_calls = 0;
-    fake_execution_failure = false;
-    fake_repository = false;
-    CHECK(fake_append_record("global", "file:/ar09/global", "user.name",
-                             "Inspection User", strlen("Inspection User")));
-    CHECK(fake_append_record("global", "file:/ar09/global", "user.email",
-                             "inspection@example.test",
-                             strlen("inspection@example.test")));
+    if (find_command_path("ssh", ssh_program, sizeof(ssh_program)) != 0) {
+        TS_SKIP("openssh", "no trusted SSH executable on this host");
+    }
+    key_fd = mkstemp(key_path);
+    CHECK(key_fd >= 0);
+    if (key_fd < 0) return;
+    CHECK_EQ_INT(fchmod(key_fd, 0600), 0);
+    CHECK_EQ_INT(write(key_fd,
+                       "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                       strlen("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n")),
+                 (ssize_t)strlen(
+                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n"));
+    CHECK_EQ_INT(close(key_fd), 0);
+    key_fd = -1;
 
     memset(&context, 0, sizeof(context));
     context.account_count = 1;
@@ -734,11 +969,30 @@ TEST(active_status_propagates_required_key_inspection_failure) {
     CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
                               "inspection@example.test",
                               sizeof(context.accounts[0].email)), 0);
+    bind_status_test_incarnation(&context.accounts[0]);
     context.accounts[0].ssh_enabled = true;
     CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path,
-                              "/private/ar09/status-key",
+                              key_path,
                               sizeof(context.accounts[0].ssh_key_path)), 0);
     context.current_account = &context.accounts[0];
+    CHECK_EQ_INT(git_expected_ssh_command(&context.accounts[0], expected_ssh,
+                                          sizeof(expected_ssh)), 0);
+    CHECK_EQ_INT(install_ssh_publication(
+                     &context, &context.accounts[0], expected_ssh,
+                     ssh_program, origin, sizeof(origin)), 0);
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", origin, "user.name",
+                             context.accounts[0].name,
+                             strlen(context.accounts[0].name)));
+    CHECK(fake_append_record("global", origin, "user.email",
+                             context.accounts[0].email,
+                             strlen(context.accounts[0].email)));
+    CHECK(fake_append_record("global", origin, GIT_CONFIG_CORE_SSHCOMMAND,
+                             expected_ssh, strlen(expected_ssh)));
 
     git_ops_test_reset_caches();
     previous_runner = run_set_runner(status_fake_runner);
@@ -751,35 +1005,9 @@ TEST(active_status_propagates_required_key_inspection_failure) {
     CHECK_EQ_INT(status_rc, -1);
     CHECK(strstr(status, "Key File: [ERROR] Unable to inspect safely") != NULL);
     CHECK(strstr(status, "Cannot safely open SSH key file") != NULL);
-    /* Prove the exit failure came from key inspection, not from expected SSH
-     * executable discovery or the independent Git status read. */
-    CHECK(strstr(status, "Effective SSH Command: [MISMATCH]") != NULL);
+    CHECK(strstr(status, "Effective SSH Command: [MATCH]") != NULL);
     CHECK(strstr(status, "Match Status: [ERROR]") == NULL);
 
-    key_fd = mkstemp(key_path);
-    CHECK(key_fd >= 0);
-    if (key_fd < 0) return;
-    CHECK_EQ_INT(fchmod(key_fd, 0600), 0);
-    CHECK_EQ_INT(write(key_fd,
-                       "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
-                       strlen("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n")),
-                 (ssize_t)strlen(
-                     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n"));
-    CHECK_EQ_INT(close(key_fd), 0);
-    CHECK_EQ_INT(safe_strncpy(context.accounts[0].ssh_key_path, key_path,
-                              sizeof(context.accounts[0].ssh_key_path)), 0);
-    CHECK_EQ_INT(git_expected_ssh_command(&context.accounts[0], expected_ssh,
-                                          sizeof(expected_ssh)), 0);
-
-    fake_listing_len = 0;
-    CHECK(fake_append_record("global", "file:/ar09/global", "user.name",
-                             "Inspection User", strlen("Inspection User")));
-    CHECK(fake_append_record("global", "file:/ar09/global", "user.email",
-                             "inspection@example.test",
-                             strlen("inspection@example.test")));
-    CHECK(fake_append_record("global", "file:/ar09/global",
-                             "core.sshcommand", expected_ssh,
-                             strlen(expected_ssh)));
     git_ops_test_reset_caches();
     previous_runner = run_set_runner(status_fake_runner);
     status_rc = capture_status_output_for(&context, status, sizeof(status));
@@ -790,6 +1018,7 @@ TEST(active_status_propagates_required_key_inspection_failure) {
     CHECK(strstr(status, "Key File: [FOUND]") != NULL);
     CHECK(strstr(status, "Permissions: [SECURE] (600)") != NULL);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
+    if (key_fd >= 0) CHECK_EQ_INT(close(key_fd), 0);
     CHECK_EQ_INT(unlink(key_path), 0);
 }
 
@@ -1362,7 +1591,7 @@ TEST(published_record_from_different_incarnation_cannot_attribute_status) {
                      canonical_key, "true", program, NULL, NULL,
                      status, sizeof(status)), -1);
     CHECK(strstr(status, "Match Status: [ERROR]") != NULL);
-    CHECK(strstr(status, "Signing attribution: [UNAVAILABLE]") != NULL);
+    CHECK(strstr(status, "OpenPGP provenance: [UNAVAILABLE]") != NULL);
     CHECK(strstr(status, "Match Status: [OK]") == NULL);
 }
 
@@ -2093,7 +2322,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(absent_identity_with_invalid_boolean_reports_error);
     RUN_TEST(int_min_boolean_follows_selected_gits_grammar);
     RUN_TEST(absent_identity_with_oversized_managed_value_reports_error);
-    RUN_TEST(active_status_reports_expected_ssh_resolution_failure);
+    RUN_TEST(active_ssh_without_publication_fails_before_any_git_probe);
+    RUN_TEST(active_ssh_status_uses_saved_program_and_exact_destination);
     RUN_TEST(active_status_propagates_required_key_inspection_failure);
     RUN_TEST(active_status_includes_every_selected_signing_field);
     RUN_TEST(edited_short_selector_cannot_reuse_historical_fingerprint);

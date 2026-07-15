@@ -106,9 +106,9 @@ const char *git_config_origin_scope_to_string(git_config_origin_scope_t scope);
  * This resolves `ssh` through the hardened executable trust walk, expands the
  * key path, isolates OpenSSH from shared configuration, and serializes both
  * absolute arguments safely. For a managed alias it also pins the validated
- * canonical hostname. It does not require the key file to exist, so read-only
- * status can compare persisted Git state without introducing a filesystem
- * mutation.
+ * canonical hostname. It does not require the key file to exist. Durable
+ * status uses the publication-backed matcher below so it never substitutes a
+ * newly PATH-resolved executable for the one used at switch time.
  */
 int git_expected_ssh_command(const account_t *account, char *command,
                              size_t command_size);
@@ -145,6 +145,12 @@ typedef enum {
     GIT_SIGNING_PUBLICATION_MATCH = 1
 } git_signing_publication_result_t;
 
+typedef enum {
+    GIT_SSH_PUBLICATION_ERROR = -1,
+    GIT_SSH_PUBLICATION_MISMATCH = 0,
+    GIT_SSH_PUBLICATION_MATCH = 1
+} git_ssh_publication_result_t;
+
 /**
  * Match only when a published provenance record belongs to `account`, names
  * the exact effective signing-key destination reported by `current`, and its
@@ -160,6 +166,18 @@ git_signing_publication_result_t git_signing_key_matches_publication(
     const git_current_config_t *current);
 
 /**
+ * Compare SSH status only against a complete publication tuple. The current
+ * account model is serialized with the persisted absolute SSH executable (no
+ * PATH lookup), then the exact saved command, effective scope/file origin,
+ * and persisted executable generation must all agree. Invalid/incomplete
+ * provenance or an unverifiable program returns ERROR; ordinary drift returns
+ * MISMATCH.
+ */
+git_ssh_publication_result_t git_ssh_command_matches_publication(
+    const account_t *account, const publication_record_t *publication,
+    const git_current_config_t *current);
+
+/**
  * Re-run the hardened absolute-executable trust walk and require the complete
  * live file generation to equal a persisted publication identity. Removal,
  * replacement, in-place rewrite, permission/ownership change, and an unsafe
@@ -171,16 +189,11 @@ int git_publication_verify_program_identity(
     const char *diagnostic_name);
 
 /**
- * AR-10 M1: scrub the durable Git credential legs that still select a retired
- * account after its runtime state was torn down (remove/reset). This legacy
- * compatibility entry point has no sealed publication record, so it may
- * reconstruct and remove an exactly matching core.sshCommand across the
- * historical global/current-repository scopes, but it never attributes or
- * removes a signing leg from the account's selector alone. user.name,
- * user.email, user.signingkey, and every signing companion remain untouched.
- * New callers that own durable provenance use the record-backed entry point
- * below. *cleared (optional) reports how many present SSH keys were removed
- * even on failure. Returns 0 when every attempted unset succeeded.
+ * Legacy compatibility entry point retained for source compatibility only.
+ * Without a sealed publication record it cannot attribute any Git credential
+ * leg, so it fails closed before Git/PATH work, leaves all values untouched,
+ * and stores zero in `cleared` when provided. Use the record-backed entry
+ * point below for retirement.
  */
 int git_retire_account_identity(const account_t *account, size_t *cleared);
 
@@ -193,8 +206,8 @@ int git_retire_account_identity(const account_t *account, size_t *cleared);
  * authorizes mutation in another repository. Only PUBLISHED records authorize
  * mutation; RETIRING records are durable deletion tombstones and fail before
  * Git execution. NULL, incomplete, mismatched, or selector-derived records
- * likewise fail before mutation. The compatibility entry point above has no
- * provenance argument and therefore never removes a signing leg.
+ * likewise fail before mutation. Retirement consumes the exact persisted SSH
+ * command and does not require the recorded executable still to exist.
  */
 int git_retire_account_identity_published(
     const account_t *account, const publication_record_t *publication,

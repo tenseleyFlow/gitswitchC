@@ -18,6 +18,11 @@
 #define SELECTOR_A "22223333"
 #define SELECTOR_64 \
     "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
+#define SSH_PROGRAM_A "/usr/bin/ssh"
+#define SSH_PROGRAM_B "/usr/bin/scp"
+#define SSH_COMMAND_A \
+    "'/usr/bin/ssh' -i '/tmp/ar11 publication key' -F '/dev/null' " \
+    "-o IdentitiesOnly=yes"
 #define INCARNATION_A \
     "1111111111111111111111111111111111111111111111111111111111111111"
 #define INCARNATION_B \
@@ -91,6 +96,17 @@ static void fill_complete_gpg_tuple(publication_record_t *record,
                   (uintmax_t)(S_IFREG | 0555), UINTMAX_C(267104));
 }
 
+static void fill_complete_ssh_tuple(publication_record_t *record) {
+    record->capabilities |= PUBLICATION_CAP_SSH_COMMAND |
+                            PUBLICATION_CAP_SSH_PROGRAM;
+    snprintf(record->ssh_command, sizeof(record->ssh_command), "%s",
+             SSH_COMMAND_A);
+    snprintf(record->ssh_program, sizeof(record->ssh_program), "%s",
+             SSH_PROGRAM_A);
+    fill_identity(&record->ssh_program_identity, UINTMAX_C(105),
+                  (uintmax_t)(S_IFREG | 0555), UINTMAX_C(112640));
+}
+
 static void fill_gpg_record(publication_record_t *record,
                             const char *repository_path,
                             const char *fingerprint) {
@@ -115,6 +131,20 @@ static void fill_gpg_record(publication_record_t *record,
              "%s", fingerprint);
     fill_complete_gpg_tuple(record, SELECTOR_A);
     record->state = PUBLICATION_STATE_PUBLISHED;
+}
+
+static void fill_ssh_record(publication_record_t *record) {
+    fill_gpg_record(record, "/tmp/ar11-publication/repository",
+                    FINGERPRINT_A);
+    record->capabilities &= ~(PUBLICATION_CAP_GPG_FINGERPRINT |
+                              PUBLICATION_CAP_GPG_PROGRAM |
+                              PUBLICATION_CAP_GPG_SELECTOR);
+    record->gpg_fingerprint[0] = '\0';
+    record->gpg_selector[0] = '\0';
+    record->gpg_program[0] = '\0';
+    memset(&record->gpg_program_identity, 0,
+           sizeof(record->gpg_program_identity));
+    fill_complete_ssh_tuple(record);
 }
 
 static void fill_global_gpg_record(publication_record_t *record,
@@ -712,6 +742,178 @@ TEST(gpg_selector_record_validation_requires_complete_canonical_tuple) {
     CHECK_EQ_INT(publication_record_validate(&candidate), -1);
     CHECK(strstr(get_last_error()->message,
                  "Unterminated publication record field") != NULL);
+}
+
+TEST(ssh_program_extraction_accepts_only_the_managed_first_word) {
+    static const char escaped_command[] =
+        "'/opt/ssh'\\''helper' -i '/tmp/key' -F '/dev/null'";
+    char program[MAX_PATH_LEN];
+    char tiny[4];
+
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     SSH_COMMAND_A, program, sizeof(program)), 0);
+    CHECK_STR_EQ(program, SSH_PROGRAM_A);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     escaped_command, program, sizeof(program)), 0);
+    CHECK_STR_EQ(program, "/opt/ssh'helper");
+
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     "/usr/bin/ssh -i '/tmp/key'", program,
+                     sizeof(program)), -1);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     "'ssh' -i '/tmp/key'", program,
+                     sizeof(program)), -1);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     "'/usr/bin/ssh' -F '/dev/null'", program,
+                     sizeof(program)), -1);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     "'/usr/bin/ssh -i '/tmp/key'", program,
+                     sizeof(program)), -1);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     "'/usr/bin/ssh\n' -i '/tmp/key'", program,
+                     sizeof(program)), -1);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     SSH_COMMAND_A, tiny, sizeof(tiny)), -1);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     NULL, program, sizeof(program)), -1);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     SSH_COMMAND_A, NULL, 0U), -1);
+}
+
+TEST(ssh_record_validation_requires_complete_matching_provenance) {
+    static const uint32_t incomplete_masks[] = {
+        PUBLICATION_CAP_SSH_COMMAND,
+        PUBLICATION_CAP_SSH_PROGRAM
+    };
+    publication_record_t record;
+    publication_record_t candidate;
+
+    fill_ssh_record(&record);
+    CHECK_EQ_INT(publication_record_validate(&record), 0);
+
+    for (size_t i = 0U;
+         i < sizeof(incomplete_masks) / sizeof(incomplete_masks[0]); i++) {
+        candidate = record;
+        candidate.capabilities = PUBLICATION_CAP_DESTINATION |
+                                 PUBLICATION_CAP_POST_GENERATION |
+                                 incomplete_masks[i];
+        clear_error();
+        CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+        CHECK(strstr(get_last_error()->message,
+                     "Incomplete publication SSH provenance tuple") != NULL);
+    }
+
+    candidate = record;
+    candidate.capabilities &= ~PUBLICATION_CAP_POST_GENERATION;
+    memset(&candidate.post_config, 0, sizeof(candidate.post_config));
+    clear_error();
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "SSH provenance requires a post-config generation") !=
+          NULL);
+
+    candidate = record;
+    CHECK_EQ_INT(safe_strncpy(candidate.ssh_program, SSH_PROGRAM_B,
+                              sizeof(candidate.ssh_program)), 0);
+    clear_error();
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "SSH command executable does not match its persisted program") !=
+          NULL);
+
+    candidate = record;
+    CHECK_EQ_INT(safe_strncpy(candidate.ssh_command,
+                              "/usr/bin/ssh -i '/tmp/key'",
+                              sizeof(candidate.ssh_command)), 0);
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+
+    candidate = record;
+    candidate.capabilities &= ~(PUBLICATION_CAP_SSH_COMMAND |
+                                PUBLICATION_CAP_SSH_PROGRAM);
+    clear_error();
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "SSH command lacks its capability bit") != NULL);
+
+    candidate = record;
+    candidate.ssh_command[0] = '\0';
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+
+    candidate = record;
+    candidate.ssh_program[0] = '\0';
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+
+    candidate = record;
+    candidate.ssh_program[0] = 's';
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+
+    candidate = record;
+    candidate.ssh_program_identity.mode = (uintmax_t)(S_IFDIR | 0755);
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+}
+
+TEST(complete_ssh_tuple_round_trip_preserves_exact_record) {
+    static const char capabilities_prefix[] = "p.0.capabilities=";
+    static const char command_prefix[] = "p.0.ssh_command=";
+    static const char program_prefix[] = "p.0.ssh_program=";
+    publication_record_t record;
+    publication_ledger_t source;
+    publication_ledger_t loaded;
+    const publication_record_t *found = NULL;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+
+    fill_ssh_record(&record);
+    publication_ledger_init(&source);
+    publication_ledger_init(&loaded);
+    CHECK_EQ_INT(publication_ledger_upsert(&source, &record), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK(serialized != NULL);
+    CHECK(find_serialized_bytes(serialized, serialized_length,
+                                command_prefix) != SIZE_MAX);
+    CHECK(find_serialized_bytes(serialized, serialized_length,
+                                program_prefix) != SIZE_MAX);
+    if (serialized) {
+        CHECK_EQ_INT(publication_ledger_parse(
+                         serialized, serialized_length, &loaded), 0);
+    }
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &loaded, UINT32_C(41), INCARNATION_A,
+                     PUBLICATION_SCOPE_LOCAL,
+                     "/tmp/ar11-publication/repository/.git/config",
+                     "/tmp/ar11-publication/repository", &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found != NULL);
+    if (found) {
+        CHECK_EQ_INT((int)(found->capabilities &
+                           (PUBLICATION_CAP_SSH_COMMAND |
+                            PUBLICATION_CAP_SSH_PROGRAM)),
+                     (int)(PUBLICATION_CAP_SSH_COMMAND |
+                           PUBLICATION_CAP_SSH_PROGRAM));
+        CHECK_STR_EQ(found->ssh_command, SSH_COMMAND_A);
+        CHECK_STR_EQ(found->ssh_program, SSH_PROGRAM_A);
+        CHECK(publication_identity_equal(&found->ssh_program_identity,
+                                         &record.ssh_program_identity));
+    }
+
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, capabilities_prefix, "00000013");
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, capabilities_prefix, "00000023");
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, capabilities_prefix, "00000031");
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, command_prefix, "");
+    /* /usr/bin/scp is well-formed hex and an absolute path, but it is not the
+     * executable sealed in SSH_COMMAND_A. */
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, program_prefix,
+        "2F7573722F62696E2F736370");
+
+    free(serialized);
+    publication_ledger_clear(&loaded);
+    publication_ledger_clear(&source);
 }
 
 TEST(complete_gpg_selector_tuple_round_trip_preserves_exact_record) {
@@ -2256,6 +2458,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(empty_tail_is_an_explicit_legacy_ledger_absence);
     RUN_TEST(gpg_selector_normalization_canonicalizes_case_prefix_and_v5_boundary);
     RUN_TEST(gpg_selector_record_validation_requires_complete_canonical_tuple);
+    RUN_TEST(ssh_program_extraction_accepts_only_the_managed_first_word);
+    RUN_TEST(ssh_record_validation_requires_complete_matching_provenance);
+    RUN_TEST(complete_ssh_tuple_round_trip_preserves_exact_record);
     RUN_TEST(complete_gpg_selector_tuple_round_trip_preserves_exact_record);
     RUN_TEST(legacy_gpg_pair_without_selector_field_remains_retirement_compatible);
     RUN_TEST(persisted_gpg_selector_schema_rejects_malformed_fields_and_tuples);

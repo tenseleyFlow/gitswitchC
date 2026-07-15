@@ -4059,14 +4059,6 @@ int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
     if (lookup_result == ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
         result = git_retire_account_identity_published(
             account, publication, cleared);
-    } else if (lookup_result == ACCOUNT_PUBLICATION_LOOKUP_ABSENT &&
-               (!account->gpg_enabled || account->gpg_key_id[0] == '\0')) {
-        /* No record ever existed for this legacy SSH-only account. M9 removes
-         * this compatibility reconstruction once all SSH retirement is
-         * record-backed. A present exact record always wins, even after edit
-         * disabled the feature that originally published its credential leg. */
-        clear_error();
-        result = git_retire_account_identity(account, cleared);
     }
     publication_ledger_clear(&ledger);
     return result;
@@ -4090,6 +4082,7 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
     int status_result = 0;
     git_current_config_t *git_config = NULL;
     publication_ledger_t publication_ledger;
+    bool repository_probe_allowed = true;
 
     publication_ledger_init(&publication_ledger);
 
@@ -4107,6 +4100,48 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
     
     if (ctx->current_account) {
         const account_t *account = ctx->current_account;
+        const publication_record_t *publication = NULL;
+        char publication_status_error[512] = "";
+        uint32_t publication_capabilities =
+            PUBLICATION_CAP_DESTINATION |
+            PUBLICATION_CAP_POST_GENERATION;
+        bool ssh_expected = account->ssh_enabled &&
+                            account->ssh_key_path[0] != '\0';
+        bool signing_expected = account->gpg_enabled &&
+                                account->gpg_key_id[0] != '\0';
+        bool publication_required = ssh_expected || signing_expected;
+        bool publication_available = true;
+
+        if (ssh_expected) {
+            publication_capabilities |= PUBLICATION_CAP_SSH_COMMAND |
+                                        PUBLICATION_CAP_SSH_PROGRAM;
+        }
+        if (signing_expected) {
+            publication_capabilities |= PUBLICATION_CAP_GPG_FINGERPRINT |
+                                        PUBLICATION_CAP_GPG_PROGRAM |
+                                        PUBLICATION_CAP_GPG_SELECTOR;
+        }
+        if (publication_required &&
+            load_unique_account_publication(
+                ctx, account, publication_capabilities,
+                &publication_ledger, &publication) !=
+                ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
+            const error_context_t *error = get_last_error();
+
+            publication_available = false;
+            /* Missing SSH provenance must not fall through to any Git/PATH
+             * probe: there is no trustworthy command to compare. GPG-only
+             * status can still inspect Git and render its established
+             * per-field unavailable diagnostics without reconstructing any
+             * executable selection. */
+            if (ssh_expected) repository_probe_allowed = false;
+            status_result = -1;
+            if (error && error->message[0] != '\0') {
+                (void)snprintf(publication_status_error,
+                               sizeof(publication_status_error), "%s",
+                               error->message);
+            }
+        }
         
         printf("Active Account: %s (ID: %u)\n", account->name, account->id);
         printf("Email: %s\n", account->email);
@@ -4167,20 +4202,34 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         
         /* Git Configuration Status */
         printf("\nGit Configuration:\n");
-        git_config = calloc(1, sizeof(*git_config));
-        if (!git_config) {
+        if (!publication_available && ssh_expected) {
+            printf("  Match Status: [ERROR] Durable publication provenance unavailable\n");
+            printf("    SSH provenance: [UNAVAILABLE] ");
+            print_terminal_safe(
+                publication_status_error[0] != '\0'
+                    ? publication_status_error
+                    : "complete switch-time SSH publication is required");
+            printf("\n");
+            printf("  Effective SSH Command: [ERROR] Publication provenance unavailable\n");
+            if (signing_expected) {
+                printf("    OpenPGP provenance: [UNAVAILABLE] ");
+                print_terminal_safe(
+                    publication_status_error[0] != '\0'
+                        ? publication_status_error
+                        : "complete switch-time OpenPGP publication is required");
+                printf("\n");
+            }
+        } else if ((git_config = calloc(1, sizeof(*git_config))) == NULL) {
             set_error(ERR_SYSTEM_CALL,
                       "Cannot allocate Git status snapshot: %s",
                       strerror(errno));
             if (print_git_status_read_failure() != 0) status_result = -1;
         } else if (git_get_current_config(git_config) == 0) {
-            char expected_ssh[GIT_CONFIG_VALUE_MAX] = "";
             char expected_gpg_program[MAX_PATH_LEN] = "";
             char ssh_status_error[512] = "";
             char gpg_program_status_error[512] = "";
             char signing_status_error[512] = "";
             char current_gpg_selector[MAX_GPG_SELECTOR_LEN] = "";
-            const publication_record_t *publication = NULL;
             bool identity_matches;
             bool ssh_matches;
             bool ssh_status_determined = true;
@@ -4193,7 +4242,6 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             bool signing_fingerprint_matches = false;
             bool signing_selector_mismatch = false;
             bool signing_enabled_matches;
-            bool signing_expected;
 
             printf("  Current Name: ");
             print_terminal_safe(git_config->name);
@@ -4213,50 +4261,48 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             identity_matches =
                 strcmp(git_config->name, account->name) == 0 &&
                 strcmp(git_config->email, account->email) == 0;
-            if (account->ssh_enabled && account->ssh_key_path[0] != '\0') {
-                if (git_expected_ssh_command(account, expected_ssh,
-                                             sizeof(expected_ssh)) != 0) {
+            if (ssh_expected) {
+                git_ssh_publication_result_t ssh_result =
+                    git_ssh_command_matches_publication(
+                        account, publication, git_config);
+
+                ssh_matches = ssh_result == GIT_SSH_PUBLICATION_MATCH;
+                if (ssh_result == GIT_SSH_PUBLICATION_ERROR) {
                     const error_context_t *error = get_last_error();
                     ssh_status_determined = false;
-                    ssh_matches = false;
                     status_result = -1;
                     if (error && error->message[0] != '\0') {
                         (void)snprintf(ssh_status_error,
                                        sizeof(ssh_status_error), "%s",
                                        error->message);
                     }
-                } else {
-                    ssh_matches =
-                        git_config->ssh_command.present &&
-                        !git_config->ssh_command.value_unknown &&
-                        strcmp(git_config->ssh_command.value, expected_ssh) == 0;
                 }
             } else {
                 ssh_matches = !git_config->ssh_command.present;
             }
-            signing_expected = account->gpg_enabled &&
-                               account->gpg_key_id[0] != '\0';
             foreign_gpg_program_present =
                 git_config->gpg_program.present ||
                 git_config->gpg_x509_program.present ||
                 git_config->gpg_ssh_program.present;
             if (signing_expected) {
-                if (load_unique_account_publication(
-                        ctx, account,
-                        PUBLICATION_CAP_DESTINATION |
-                            PUBLICATION_CAP_POST_GENERATION |
-                            PUBLICATION_CAP_GPG_FINGERPRINT |
-                            PUBLICATION_CAP_GPG_PROGRAM |
-                            PUBLICATION_CAP_GPG_SELECTOR,
-                        &publication_ledger, &publication) !=
-                        ACCOUNT_PUBLICATION_LOOKUP_FOUND ||
-                    safe_strncpy(expected_gpg_program,
-                                 publication->gpg_program,
-                                 sizeof(expected_gpg_program)) != 0 ||
-                    git_publication_verify_program_identity(
-                        publication->gpg_program,
-                        &publication->gpg_program_identity,
-                        "OpenPGP") != 0) {
+                if (!publication) {
+                    gpg_program_status_determined = false;
+                    gpg_openpgp_matches = false;
+                    gpg_programs_match = false;
+                    status_result = -1;
+                    (void)snprintf(
+                        gpg_program_status_error,
+                        sizeof(gpg_program_status_error), "%s",
+                        publication_status_error[0] != '\0'
+                            ? publication_status_error
+                            : "complete switch-time OpenPGP publication is required");
+                } else if (safe_strncpy(expected_gpg_program,
+                                        publication->gpg_program,
+                                        sizeof(expected_gpg_program)) != 0 ||
+                           git_publication_verify_program_identity(
+                               publication->gpg_program,
+                               &publication->gpg_program_identity,
+                               "OpenPGP") != 0) {
                     const error_context_t *error = get_last_error();
 
                     gpg_program_status_determined = false;
@@ -4506,7 +4552,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         
         /* Repository context */
         printf("\nRepository Context:\n");
-        if (git_is_repository()) {
+        if (!repository_probe_allowed) {
+            printf("  Repository: [UNAVAILABLE] Publication provenance unavailable\n");
+        } else if (git_is_repository()) {
             char repo_root[MAX_PATH_LEN];
             if (git_get_repo_root(repo_root, sizeof(repo_root)) == 0) {
                 printf("  Repository: [FOUND] ");

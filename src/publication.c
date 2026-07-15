@@ -178,9 +178,72 @@ static bool publication_selector_valid(const char *selector) {
            strcmp(selector, normalized) == 0;
 }
 
+int publication_extract_ssh_program(const char *command, char *out,
+                                    size_t out_size) {
+    size_t command_length;
+    size_t cursor;
+    size_t used = 0;
+
+    if (!out || out_size == 0U) {
+        return publication_invalid("Invalid publication SSH program output");
+    }
+    out[0] = '\0';
+    if (!command || command[0] != '\'') {
+        return publication_invalid(
+            "Publication SSH command has no canonical executable word");
+    }
+    command_length = strnlen(command, PUBLICATION_SSH_COMMAND_MAX);
+    if (command_length == PUBLICATION_SSH_COMMAND_MAX) {
+        return publication_invalid(
+            "Publication SSH command exceeds durable storage");
+    }
+
+    cursor = 1U;
+    while (cursor < command_length) {
+        unsigned char byte = (unsigned char)command[cursor];
+
+        if (byte == (unsigned char)'\'') {
+            if (cursor + 3U < command_length &&
+                command[cursor + 1U] == '\\' &&
+                command[cursor + 2U] == '\'' &&
+                command[cursor + 3U] == '\'') {
+                if (used + 1U >= out_size) goto too_long;
+                out[used++] = '\'';
+                cursor += 4U;
+                continue;
+            }
+            cursor++;
+            if (command_length - cursor < sizeof(" -i '") - 1U ||
+                memcmp(command + cursor, " -i '",
+                       sizeof(" -i '") - 1U) != 0 ||
+                used == 0U || out[0] != '/') {
+                return publication_invalid(
+                    "Publication SSH command does not match the managed command grammar");
+            }
+            out[used] = '\0';
+            return 0;
+        }
+        if (byte < 0x20U || byte == 0x7fU) {
+            return publication_invalid(
+                "Publication SSH executable contains a control character");
+        }
+        if (used + 1U >= out_size) goto too_long;
+        out[used++] = command[cursor++];
+    }
+    return publication_invalid(
+        "Publication SSH command has an unterminated executable word");
+
+too_long:
+    out[0] = '\0';
+    return publication_invalid(
+        "Publication SSH executable exceeds durable storage");
+}
+
 int publication_record_validate(const publication_record_t *record) {
     bool local_destination;
     uint32_t gpg_capabilities;
+    uint32_t ssh_capabilities;
+    char extracted_ssh_program[MAX_PATH_LEN];
     if (!record) return publication_invalid("NULL publication record");
     if (!publication_string_terminated(record->config_path,
                                        sizeof(record->config_path)) ||
@@ -243,6 +306,19 @@ int publication_record_validate(const publication_record_t *record) {
         return publication_invalid(
             "Publication GPG provenance requires a post-config generation");
     }
+    ssh_capabilities = record->capabilities &
+        (PUBLICATION_CAP_SSH_COMMAND | PUBLICATION_CAP_SSH_PROGRAM);
+    if (ssh_capabilities != 0U &&
+        ssh_capabilities !=
+            (PUBLICATION_CAP_SSH_COMMAND | PUBLICATION_CAP_SSH_PROGRAM)) {
+        return publication_invalid(
+            "Incomplete publication SSH provenance tuple");
+    }
+    if (ssh_capabilities != 0U &&
+        (record->capabilities & PUBLICATION_CAP_POST_GENERATION) == 0U) {
+        return publication_invalid(
+            "Publication SSH provenance requires a post-config generation");
+    }
     if (record->config_path[0] != '/' ||
         !publication_identity_is_type(&record->config_parent, true)) {
         return publication_invalid(
@@ -303,21 +379,26 @@ int publication_record_validate(const publication_record_t *record) {
         return publication_invalid(
             "Publication GPG program lacks its capability bit");
     }
-    if ((record->capabilities & PUBLICATION_CAP_SSH_COMMAND) == 0U &&
-        record->ssh_command[0] != '\0') {
+    if (ssh_capabilities == 0U && record->ssh_command[0] != '\0') {
         return publication_invalid(
             "Publication SSH command lacks its capability bit");
     }
-    if ((record->capabilities & PUBLICATION_CAP_SSH_COMMAND) != 0U &&
-        record->ssh_command[0] == '\0') {
+    if (ssh_capabilities != 0U && record->ssh_command[0] == '\0') {
         return publication_invalid("Publication SSH command is empty");
     }
-    if ((record->capabilities & PUBLICATION_CAP_SSH_PROGRAM) != 0U) {
+    if (ssh_capabilities != 0U) {
         if (record->ssh_program[0] != '/' ||
             !publication_identity_is_type(&record->ssh_program_identity,
                                           false)) {
             return publication_invalid(
                 "Publication SSH program requires an absolute path and regular-file identity");
+        }
+        if (publication_extract_ssh_program(
+                record->ssh_command, extracted_ssh_program,
+                sizeof(extracted_ssh_program)) != 0 ||
+            strcmp(extracted_ssh_program, record->ssh_program) != 0) {
+            return publication_invalid(
+                "Publication SSH command executable does not match its persisted program");
         }
     } else if (record->ssh_program[0] != '\0' ||
                !publication_identity_is_zero(

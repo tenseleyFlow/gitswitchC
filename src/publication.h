@@ -92,6 +92,11 @@ bool publication_identity_equal(const publication_identity_t *left,
                                 const publication_identity_t *right);
 int publication_normalize_gpg_selector(
     const char *selector, char normalized[MAX_GPG_SELECTOR_LEN]);
+/* Extract the absolute executable from the first quoted word of the exact
+ * managed core.sshCommand grammar. This performs no filesystem or PATH
+ * lookup; callers can use it to bind and validate durable provenance. */
+int publication_extract_ssh_program(const char *command, char *out,
+                                    size_t out_size);
 void publication_record_init(publication_record_t *record);
 int publication_record_validate(const publication_record_t *record);
 bool publication_record_same_destination(const publication_record_t *left,

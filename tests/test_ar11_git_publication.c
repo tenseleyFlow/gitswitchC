@@ -445,6 +445,7 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     publication_identity_t expected_parent;
     publication_identity_t expected_post;
     publication_identity_t expected_program;
+    publication_identity_t expected_ssh_program;
     publication_identity_t empty_identity;
     gpg_config_t gpg_config;
     account_t account;
@@ -452,8 +453,12 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     struct stat parent_stat;
     struct stat post_stat;
     struct stat program_stat;
+    struct stat ssh_program_stat;
     char git_path[MAX_PATH_LEN];
     char gpg_program[MAX_PATH_LEN];
+    char ssh_program[MAX_PATH_LEN];
+    char ssh_key[MAX_PATH_LEN];
+    char expected_ssh_command[GIT_CONFIG_VALUE_MAX];
     char restored_value[64];
     bool snapshot_active = false;
     int rc;
@@ -463,6 +468,7 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     memset(&expected_parent, 0, sizeof(expected_parent));
     memset(&expected_post, 0, sizeof(expected_post));
     memset(&expected_program, 0, sizeof(expected_program));
+    memset(&expected_ssh_program, 0, sizeof(expected_ssh_program));
     memset(&empty_identity, 0, sizeof(empty_identity));
     memset(&gpg_config, 0, sizeof(gpg_config));
 
@@ -471,6 +477,9 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     if (gpg_manager_resolve_executable(gpg_program,
                                        sizeof(gpg_program)) != 0) {
         TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
+    if (find_command_path("ssh", ssh_program, sizeof(ssh_program)) != 0) {
+        TS_SKIP("openssh", "no trusted SSH executable on this host");
     }
     rc = find_command_path("git", git_path, sizeof(git_path));
     CHECK_EQ_INT(rc, 0);
@@ -488,7 +497,22 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     if (rc != 0) goto cleanup;
     publication_identity_from_stat(&expected_parent, &parent_stat);
 
+    if (safe_snprintf(ssh_key, sizeof(ssh_key), "%s/id_ed25519",
+                      fixture.home) != 0 ||
+        write_text_file(ssh_key,
+                        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                        0600) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
     account = publication_account();
+    account.ssh_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account.ssh_key_path, ssh_key,
+                              sizeof(account.ssh_key_path)), 0);
+    rc = git_expected_ssh_command(&account, expected_ssh_command,
+                                  sizeof(expected_ssh_command));
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
     CHECK_EQ_INT(safe_strncpy(gpg_config.current_key_id,
                               account.gpg_key_id,
                               sizeof(gpg_config.current_key_id)), 0);
@@ -534,8 +558,13 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     rc = lstat(gpg_program, &program_stat);
     CHECK_EQ_INT(rc, 0);
     if (rc != 0) goto cleanup;
+    rc = lstat(ssh_program, &ssh_program_stat);
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
     publication_identity_from_stat(&expected_post, &post_stat);
     publication_identity_from_stat(&expected_program, &program_stat);
+    publication_identity_from_stat(&expected_ssh_program,
+                                   &ssh_program_stat);
 
     rc = git_config_export_sealed_publication(&record,
                                                TEST_SOURCE_SELECTOR);
@@ -551,7 +580,9 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
                      PUBLICATION_CAP_POST_GENERATION |
                      PUBLICATION_CAP_GPG_FINGERPRINT |
                      PUBLICATION_CAP_GPG_PROGRAM |
-                     PUBLICATION_CAP_GPG_SELECTOR);
+                     PUBLICATION_CAP_GPG_SELECTOR |
+                     PUBLICATION_CAP_SSH_COMMAND |
+                     PUBLICATION_CAP_SSH_PROGRAM);
     CHECK_STR_EQ(record.config_path, fixture.global_config);
     CHECK(publication_identity_equal(&record.config_parent,
                                      &expected_parent));
@@ -563,10 +594,10 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     CHECK_STR_EQ(record.gpg_program, gpg_program);
     CHECK(publication_identity_equal(&record.gpg_program_identity,
                                      &expected_program));
-    CHECK_STR_EQ(record.ssh_command, "");
-    CHECK_STR_EQ(record.ssh_program, "");
+    CHECK_STR_EQ(record.ssh_command, expected_ssh_command);
+    CHECK_STR_EQ(record.ssh_program, ssh_program);
     CHECK(publication_identity_equal(&record.ssh_program_identity,
-                                     &empty_identity));
+                                     &expected_ssh_program));
 
     rc = git_config_restore();
     CHECK_EQ_INT(rc, 0);
@@ -598,16 +629,20 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
     publication_identity_t expected_parent;
     publication_identity_t expected_post;
     publication_identity_t expected_program;
+    publication_identity_t expected_ssh_program;
     publication_identity_t expected_repository;
-    publication_identity_t empty_identity;
     gpg_config_t gpg_config;
     account_t account;
     struct stat parent_stat;
     struct stat post_stat;
     struct stat program_stat;
+    struct stat ssh_program_stat;
     struct stat repository_stat;
     char git_path[MAX_PATH_LEN];
     char gpg_program[MAX_PATH_LEN];
+    char ssh_program[MAX_PATH_LEN];
+    char ssh_key[MAX_PATH_LEN];
+    char expected_ssh_command[GIT_CONFIG_VALUE_MAX];
     char git_dir[MAX_PATH_LEN];
     char local_config[MAX_PATH_LEN];
     char restored_value[64];
@@ -623,8 +658,8 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
     memset(&expected_parent, 0, sizeof(expected_parent));
     memset(&expected_post, 0, sizeof(expected_post));
     memset(&expected_program, 0, sizeof(expected_program));
+    memset(&expected_ssh_program, 0, sizeof(expected_ssh_program));
     memset(&expected_repository, 0, sizeof(expected_repository));
-    memset(&empty_identity, 0, sizeof(empty_identity));
     memset(&gpg_config, 0, sizeof(gpg_config));
 
     CHECK(run_uses_default_runner());
@@ -632,6 +667,9 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
     if (gpg_manager_resolve_executable(gpg_program,
                                        sizeof(gpg_program)) != 0) {
         TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
+    if (find_command_path("ssh", ssh_program, sizeof(ssh_program)) != 0) {
+        TS_SKIP("openssh", "no trusted SSH executable on this host");
     }
     rc = find_command_path("git", git_path, sizeof(git_path));
     CHECK_EQ_INT(rc, 0);
@@ -668,8 +706,23 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
     publication_identity_from_stat(&expected_parent, &parent_stat);
     publication_identity_from_stat(&expected_repository, &repository_stat);
 
+    if (safe_snprintf(ssh_key, sizeof(ssh_key), "%s/id_ed25519",
+                      fixture.home) != 0 ||
+        write_text_file(ssh_key,
+                        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+                        0600) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
     account = publication_account();
     account.preferred_scope = GIT_SCOPE_LOCAL;
+    account.ssh_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account.ssh_key_path, ssh_key,
+                              sizeof(account.ssh_key_path)), 0);
+    rc = git_expected_ssh_command(&account, expected_ssh_command,
+                                  sizeof(expected_ssh_command));
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
     CHECK_EQ_INT(safe_strncpy(gpg_config.current_key_id,
                               account.gpg_key_id,
                               sizeof(gpg_config.current_key_id)), 0);
@@ -698,8 +751,13 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
     rc = lstat(gpg_program, &program_stat);
     CHECK_EQ_INT(rc, 0);
     if (rc != 0) goto cleanup;
+    rc = lstat(ssh_program, &ssh_program_stat);
+    CHECK_EQ_INT(rc, 0);
+    if (rc != 0) goto cleanup;
     publication_identity_from_stat(&expected_post, &post_stat);
     publication_identity_from_stat(&expected_program, &program_stat);
+    publication_identity_from_stat(&expected_ssh_program,
+                                   &ssh_program_stat);
 
     rc = git_config_export_sealed_publication(&record,
                                                TEST_SOURCE_SELECTOR);
@@ -715,7 +773,9 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
                      PUBLICATION_CAP_POST_GENERATION |
                      PUBLICATION_CAP_GPG_FINGERPRINT |
                      PUBLICATION_CAP_GPG_PROGRAM |
-                     PUBLICATION_CAP_GPG_SELECTOR);
+                     PUBLICATION_CAP_GPG_SELECTOR |
+                     PUBLICATION_CAP_SSH_COMMAND |
+                     PUBLICATION_CAP_SSH_PROGRAM);
     CHECK_STR_EQ(record.config_path, local_config);
     CHECK(publication_identity_equal(&record.config_parent,
                                      &expected_parent));
@@ -728,10 +788,10 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
     CHECK_STR_EQ(record.gpg_program, gpg_program);
     CHECK(publication_identity_equal(&record.gpg_program_identity,
                                      &expected_program));
-    CHECK_STR_EQ(record.ssh_command, "");
-    CHECK_STR_EQ(record.ssh_program, "");
+    CHECK_STR_EQ(record.ssh_command, expected_ssh_command);
+    CHECK_STR_EQ(record.ssh_program, ssh_program);
     CHECK(publication_identity_equal(&record.ssh_program_identity,
-                                     &empty_identity));
+                                     &expected_ssh_program));
 
     rc = git_config_restore();
     CHECK_EQ_INT(rc, 0);

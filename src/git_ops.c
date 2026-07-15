@@ -51,6 +51,9 @@ static int git_configure_ssh_impl(const account_t *account,
                                   git_scope_t scope);
 static int git_configure_gpg_impl(const account_t *account,
                                   git_scope_t scope);
+static int build_expected_ssh_command_with_program(
+    const account_t *account, const char *ssh_path, char *command,
+    size_t command_size, char *expanded_path, size_t expanded_path_size);
 
 /* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
 
@@ -3278,60 +3281,6 @@ static int git_publication_copy_post_value(const char *key, char *out,
     return 0;
 }
 
-/* Invert the first shell word emitted by ssh_command_append_quoted(). The
- * command builder always publishes `'<absolute ssh>' -i ...`; accepting any
- * other grammar would manufacture executable provenance from a foreign
- * command string. */
-static int git_publication_extract_ssh_program(const char *command, char *out,
-                                               size_t out_size) {
-    const char *cursor;
-    size_t used = 0;
-
-    if (!command || !out || out_size == 0 || command[0] != '\'') {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Sealed core.sshCommand has no canonical executable word");
-        return -1;
-    }
-    out[0] = '\0';
-    cursor = command + 1;
-    while (*cursor) {
-        if (*cursor == '\'') {
-            if (cursor[1] == '\\' && cursor[2] == '\'' &&
-                cursor[3] == '\'') {
-                if (used + 1U >= out_size) goto too_long;
-                out[used++] = '\'';
-                cursor += 4;
-                continue;
-            }
-            cursor++;
-            if (strncmp(cursor, " -i '", sizeof(" -i '") - 1U) != 0 ||
-                used == 0 || out[0] != '/') {
-                set_error(ERR_GIT_CONFIG_FAILED,
-                          "Sealed core.sshCommand does not match the managed command grammar");
-                return -1;
-            }
-            out[used] = '\0';
-            return 0;
-        }
-        if ((unsigned char)*cursor < 0x20U ||
-            (unsigned char)*cursor == 0x7fU) {
-            set_error(ERR_GIT_CONFIG_FAILED,
-                      "Sealed core.sshCommand executable contains a control character");
-            return -1;
-        }
-        if (used + 1U >= out_size) goto too_long;
-        out[used++] = *cursor++;
-    }
-    set_error(ERR_GIT_CONFIG_FAILED,
-              "Sealed core.sshCommand has an unterminated executable word");
-    return -1;
-
-too_long:
-    set_error(ERR_GIT_CONFIG_FAILED,
-              "Sealed core.sshCommand executable exceeds durable storage");
-    return -1;
-}
-
 /* Re-run the complete executable trust walk against the absolute program
  * stored in Git, and bind the durable identity only while the named object is
  * unchanged across that proof. find_command_path() returns the canonical path
@@ -3530,9 +3479,11 @@ int git_config_export_sealed_publication(publication_record_t *out,
         return -1;
     }
     if (ssh_command_present) {
-        if (git_publication_extract_ssh_program(
+        if (publication_extract_ssh_program(
                 record.ssh_command, record.ssh_program,
                 sizeof(record.ssh_program)) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed core.sshCommand has invalid executable provenance");
             return -1;
         }
         if (git_publication_capture_program_identity(
@@ -4587,6 +4538,64 @@ git_signing_publication_result_t git_signing_key_matches_publication(
                : GIT_SIGNING_PUBLICATION_MISMATCH;
 }
 
+git_ssh_publication_result_t git_ssh_command_matches_publication(
+    const account_t *account, const publication_record_t *publication,
+    const git_current_config_t *current) {
+    static const char file_origin_prefix[] = "file:";
+    char current_account_command[GIT_CFG_VALUE_MAX];
+    char expanded_path[MAX_PATH_LEN];
+    const char *origin_path;
+    const uint32_t required_capabilities =
+        PUBLICATION_CAP_DESTINATION |
+        PUBLICATION_CAP_POST_GENERATION |
+        PUBLICATION_CAP_SSH_COMMAND |
+        PUBLICATION_CAP_SSH_PROGRAM;
+
+    if (!account || !publication || !current || !account->ssh_enabled ||
+        account->ssh_key_path[0] == '\0' ||
+        !account->incarnation_persisted ||
+        publication->account_id != account->id ||
+        strcmp(publication->account_incarnation,
+               account->incarnation) != 0 ||
+        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        (publication->capabilities & required_capabilities) !=
+            required_capabilities) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Complete SSH publication provenance is unavailable");
+        return GIT_SSH_PUBLICATION_ERROR;
+    }
+    if (publication_record_validate(publication) != 0) {
+        return GIT_SSH_PUBLICATION_ERROR;
+    }
+
+    if (build_expected_ssh_command_with_program(
+            account, publication->ssh_program, current_account_command,
+            sizeof(current_account_command), expanded_path,
+            sizeof(expanded_path)) != 0 ||
+        git_publication_verify_program_identity(
+            publication->ssh_program, &publication->ssh_program_identity,
+            "SSH") != 0) {
+        return GIT_SSH_PUBLICATION_ERROR;
+    }
+
+    if (strcmp(current_account_command, publication->ssh_command) != 0 ||
+        !current->ssh_command.present ||
+        current->ssh_command.value_unknown ||
+        strcmp(current->ssh_command.value, publication->ssh_command) != 0 ||
+        !git_publication_scope_matches_origin(
+            publication->scope, current->ssh_command.scope) ||
+        strncmp(current->ssh_command.origin, file_origin_prefix,
+                sizeof(file_origin_prefix) - 1U) != 0) {
+        return GIT_SSH_PUBLICATION_MISMATCH;
+    }
+    origin_path = current->ssh_command.origin +
+                  sizeof(file_origin_prefix) - 1U;
+    return git_publication_origin_matches_path(origin_path, publication)
+               ? GIT_SSH_PUBLICATION_MATCH
+               : GIT_SSH_PUBLICATION_MISMATCH;
+}
+
 /* Unset one attributed credential key for git_retire_account_identity,
  * preserving the first diagnostic and counting only keys that were present.
  * first_error must be larger than an error message plus the "scope key: "
@@ -4608,12 +4617,8 @@ static void git_retire_unset(const char *key, git_scope_t scope,
 
 static int git_retire_account_identity_with_fingerprint(
     const account_t *account, const char *canonical_fingerprint,
-    const char *published_ssh_command, bool restrict_scope,
-    git_scope_t published_scope, size_t *cleared) {
-    git_scope_t scopes[3];
-    size_t scope_count = 0;
-    char expected_ssh[GIT_CFG_VALUE_MAX] = "";
-    bool expected_ssh_known = false;
+    const char *published_ssh_command, git_scope_t published_scope,
+    size_t *cleared) {
     char value[GIT_CFG_VALUE_MAX];
     /* Wide enough for a full error message plus the "scope key: " prefix
      * git_retire_unset prepends (gcc's -Wformat-truncation checks this). */
@@ -4628,55 +4633,17 @@ static int git_retire_account_identity_with_fingerprint(
         return -1;
     }
 
-    /* A durable record carries the exact command actually published and never
-     * repeats PATH resolution. The compatibility entry point has no such
-     * record and retains its historical reconstruction only for the SSH leg;
-     * M8 deliberately gives it no signing-key attribution. */
-    if (published_ssh_command && published_ssh_command[0] != '\0') {
-        if (safe_strncpy(expected_ssh, published_ssh_command,
-                         sizeof(expected_ssh)) == 0) {
-            expected_ssh_known = true;
-        }
-    } else if (!restrict_scope && account->ssh_enabled &&
-               account->ssh_key_path[0] != '\0') {
-        if (git_expected_ssh_command(account, expected_ssh,
-                                     sizeof(expected_ssh)) == 0) {
-            expected_ssh_known = true;
-        } else {
-            log_warning("Cannot rebuild expected core.sshCommand for '%s'; "
-                        "leaving any persisted value in place: %s",
-                        account->name, get_last_error()->message);
-        }
-    }
+    {
+        git_scope_t scope = published_scope;
 
-    if (restrict_scope) {
-        if ((published_scope == GIT_SCOPE_LOCAL ||
-             published_scope == GIT_SCOPE_WORKTREE_INTERNAL) &&
-            !git_is_repository()) {
-            set_error(ERR_GIT_NOT_REPOSITORY,
-                      "Recorded Git publication destination is not the current repository");
-            return -1;
-        }
-        scopes[scope_count++] = published_scope;
-    } else {
-        scopes[scope_count++] = GIT_SCOPE_GLOBAL;
-        if (git_is_repository()) {
-            bool worktree_present = false;
-            scopes[scope_count++] = GIT_SCOPE_LOCAL;
-            if (git_detect_managed_worktree_scope(&worktree_present) == 0 &&
-                worktree_present) {
-                scopes[scope_count++] = GIT_SCOPE_WORKTREE_INTERNAL;
-            }
-        }
-    }
-
-    for (size_t s = 0; s < scope_count; s++) {
-        git_scope_t scope = scopes[s];
-
-        if (expected_ssh_known &&
+        /* Retirement uses the exact sealed command as a scalar ownership
+         * witness. It intentionally does not stat, execute, or re-resolve the
+         * recorded SSH program: relocation/removal cannot strand a matching
+         * Git value, while an unequal foreign replacement remains untouched. */
+        if (published_ssh_command && published_ssh_command[0] != '\0' &&
             git_get_config_value(GIT_CONFIG_CORE_SSHCOMMAND, value,
                                  sizeof(value), scope) == 0 &&
-            strcmp(value, expected_ssh) == 0) {
+            strcmp(value, published_ssh_command) == 0) {
             git_retire_unset(GIT_CONFIG_CORE_SSHCOMMAND, scope, &removed,
                              &failures, first_error, sizeof(first_error));
         }
@@ -4729,12 +4696,20 @@ static int git_retire_account_identity_with_fingerprint(
     return 0;
 }
 
-/* See git_ops.h (AR-10 M1). The compatibility entry point has no durable
- * publication record, so it may retire the exactly reconstructed SSH leg but
- * must never attribute a signing leg from an account selector alone. */
+/* See git_ops.h. No credential mutation is attributable without the sealed
+ * command/fingerprint, exact destination, and publication generation. */
 int git_retire_account_identity(const account_t *account, size_t *cleared) {
-    return git_retire_account_identity_with_fingerprint(
-        account, NULL, NULL, false, GIT_SCOPE_GLOBAL, cleared);
+    if (cleared) *cleared = 0;
+    if (!account) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "NULL account to git_retire_account_identity");
+        return -1;
+    }
+    errno = ESTALE;
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Durable Git publication provenance is required for retirement");
+    return -1;
 }
 
 static int git_scope_from_publication(publication_scope_t publication_scope,
@@ -4887,7 +4862,7 @@ int git_retire_account_identity_published(
         return -1;
     }
     return git_retire_account_identity_with_fingerprint(
-        account, fingerprint, ssh_command, true, scope, cleared);
+        account, fingerprint, ssh_command, scope, cleared);
 }
 
 /* AR-06 F59: git_validate_repository() and git_get_config_scope() were removed
@@ -5342,6 +5317,23 @@ static int build_expected_ssh_command(const account_t *account,
                                       char *expanded_path,
                                       size_t expanded_path_size) {
     char ssh_path[MAX_PATH_LEN];
+
+    if (find_command_path("ssh", ssh_path, sizeof(ssh_path)) != 0) {
+        set_error(ERR_SSH_NOT_FOUND,
+                  "No trusted SSH executable was found in PATH");
+        return -1;
+    }
+    return build_expected_ssh_command_with_program(
+        account, ssh_path, command, command_size, expanded_path,
+        expanded_path_size);
+}
+
+/* Serialize the current account model using a previously proven absolute SSH
+ * executable. Status uses this path from the publication ledger so account
+ * key/hostname edits remain visible without repeating PATH resolution. */
+static int build_expected_ssh_command_with_program(
+    const account_t *account, const char *ssh_path, char *command,
+    size_t command_size, char *expanded_path, size_t expanded_path_size) {
     size_t used = 0;
     bool has_alias;
 
@@ -5350,8 +5342,8 @@ static int build_expected_ssh_command(const account_t *account,
                   "SSH command requested for an account without an SSH key");
         return -1;
     }
-    if (!command || command_size == 0 || !expanded_path ||
-        expanded_path_size == 0) {
+    if (!ssh_path || ssh_path[0] != '/' || !command || command_size == 0 ||
+        !expanded_path || expanded_path_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid SSH command output buffer");
         return -1;
     }
@@ -5385,16 +5377,9 @@ static int build_expected_ssh_command(const account_t *account,
         return -1;
     }
 
-    /* Resolve the executable through the same complete owner/mode/ACL ancestry
-     * proof used for immediate helper launches. Persisting a bare `ssh` would
-     * make a later Git process repeat PATH lookup under unrelated, possibly
-     * writable search directories. The absolute trusted spelling makes that
-     * later lookup impossible. */
-    if (find_command_path("ssh", ssh_path, sizeof(ssh_path)) != 0) {
-        set_error(ERR_SSH_NOT_FOUND,
-                  "No trusted SSH executable was found in PATH");
-        return -1;
-    }
+    /* The caller either just resolved this executable through the hardened
+     * trust walk or loaded the exact switch-time spelling from a validated
+     * publication record. Never substitute a new PATH result here. */
     for (const unsigned char *byte = (const unsigned char *)ssh_path;
          *byte; byte++) {
         if (*byte < 0x20 || *byte == 0x7f) {

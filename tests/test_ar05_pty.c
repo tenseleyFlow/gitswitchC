@@ -751,10 +751,27 @@ TEST(embedded_sock_name_status_attribution) {
 TEST(stale_runtime_link_falls_back_to_saved) {
     sandbox_t sb;
     const char *st_argv[] = { "gitswitch", "status", NULL };
+    const char *cfg =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "active_account = \"work\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"work\"\n"
+        "email = \"w@example.com\"\n"
+        "description = \"work account\"\n"
+        "\n"
+        "[accounts.2]\n"
+        "name = \"other\"\n"
+        "email = \"o@example.com\"\n"
+        "description = \"other account\"\n";
 
     SKIP_IF_NO_PTY();
     if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
-    CHECK_EQ_INT(write_cfg_work_other(&sb, "work"), 0);
+    /* This regression isolates runtime-account attribution. An SSH-bearing
+     * active account now correctly requires durable Git publication
+     * provenance before status can claim that credential state matches. */
+    CHECK_EQ_INT(sandbox_write_cfg(&sb, cfg), 0);
     /* Stale link left behind by an account that no longer exists. */
     CHECK_EQ_INT(plant_runtime_link(&sb, "ghost"), 0);
 

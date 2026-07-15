@@ -197,6 +197,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_signing_key_matches_publication);
     REQUIRE_PUBLIC_API(git_publication_verify_program_identity);
     REQUIRE_PUBLIC_API(git_signing_key_selects_account);
+    REQUIRE_PUBLIC_API(git_ssh_command_matches_publication);
     REQUIRE_PUBLIC_API(git_test_config);
     REQUIRE_PUBLIC_API(git_unset_config_value);
     REQUIRE_PUBLIC_API(gpg_configure_git_signing);
@@ -252,6 +253,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(process_is_running);
     REQUIRE_PUBLIC_API(publication_identity_equal);
     REQUIRE_PUBLIC_API(publication_identity_from_stat);
+    REQUIRE_PUBLIC_API(publication_extract_ssh_program);
     REQUIRE_PUBLIC_API(publication_normalize_gpg_selector);
     REQUIRE_PUBLIC_API(publication_ledger_clear);
     REQUIRE_PUBLIC_API(publication_ledger_find);
