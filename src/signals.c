@@ -54,6 +54,20 @@ static bool g_dispatch_mask_restore_pending = false;
  * Set/cleared only in normal context. */
 static volatile sig_atomic_t g_rollback_in_progress = 0;
 
+/* The historical public rollback API is intentionally idempotent. Account
+ * transactions additionally need exact nesting and owner matching, so keep
+ * the two sources independent and derive the handler-visible Boolean from
+ * both. Normal-context code is single-threaded; the handler reads only the
+ * sig_atomic_t publication above. */
+static bool g_legacy_rollback_in_progress = false;
+static uint64_t g_owned_rollback_token = 0;
+static size_t g_owned_rollback_depth = 0;
+
+static void publish_rollback_state(void) {
+    g_rollback_in_progress =
+        (g_legacy_rollback_in_progress || g_owned_rollback_depth > 0) ? 1 : 0;
+}
+
 /* AR-03 L8: the pid of the subprocess run_argv is currently blocked on, or 0.
  * Published right after fork() and retired with its matching guarded reap;
  * WNOWAIT keeps the PID unreusable until that transition. The handler can
@@ -394,11 +408,60 @@ void signals_reset_for_child(const sigset_t *inherited_mask) {
 }
 
 void signals_rollback_begin(void) {
-    g_rollback_in_progress = 1;
+    g_legacy_rollback_in_progress = true;
+    publish_rollback_state();
 }
 
 void signals_rollback_end(void) {
-    g_rollback_in_progress = 0;
+    g_legacy_rollback_in_progress = false;
+    publish_rollback_state();
+}
+
+int signals_rollback_begin_owned(uint64_t token) {
+    if (token == 0) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "A checked signal rollback owner requires a nonzero token");
+        return -1;
+    }
+    if (g_owned_rollback_depth > 0 && g_owned_rollback_token != token) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Signal rollback is owned by another transaction token");
+        return -1;
+    }
+    if (g_owned_rollback_depth == SIZE_MAX) {
+        errno = EOVERFLOW;
+        set_error(ERR_SYSTEM_CALL,
+                  "Signal rollback nesting depth overflow");
+        return -1;
+    }
+    if (g_owned_rollback_depth == 0) {
+        g_owned_rollback_token = token;
+    }
+    g_owned_rollback_depth++;
+    publish_rollback_state();
+    return 0;
+}
+
+int signals_rollback_end_owned(uint64_t token) {
+    if (token == 0 || g_owned_rollback_depth == 0 ||
+        g_owned_rollback_token != token) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Signal rollback finalizer does not match its owner token");
+        return -1;
+    }
+    g_owned_rollback_depth--;
+    if (g_owned_rollback_depth == 0) {
+        g_owned_rollback_token = 0;
+    }
+    publish_rollback_state();
+    return 0;
+}
+
+bool signals_rollback_active(void) {
+    return g_rollback_in_progress != 0;
 }
 
 void signals_child_spawned(pid_t pid) {
@@ -696,6 +759,10 @@ begin_failed:
     g_guard_state = GUARD_ACTIVE;
     log_debug("Signal guard installed for switch critical section");
     return 0;
+}
+
+bool signals_guard_active(void) {
+    return g_guard_state != GUARD_INACTIVE;
 }
 
 int signals_guard_end(void) {

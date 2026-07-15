@@ -77,6 +77,7 @@ static active_session_t g_session = {0};
 typedef struct {
     bool active;
     bool abort_only;
+    accounts_transaction_token_t token;
     gitswitch_ctx_t *ctx;
     account_t previous_account;
     bool had_previous_account;
@@ -98,6 +99,7 @@ static pending_switch_t g_pending_switch = {0};
 
 typedef struct {
     bool active;
+    accounts_transaction_token_t token;
     gitswitch_ctx_t *ctx;
     account_t original;
     account_t candidate;
@@ -117,12 +119,238 @@ static pending_edit_t g_pending_edit = {0};
  * behavior by committing this record before accounts_remove() returns. */
 typedef struct {
     bool active;
+    accounts_transaction_token_t token;
     gitswitch_ctx_t *ctx;
     char alias[MAX_NAME_LEN];
     bool alias_exclusive;
 } pending_remove_t;
 
 static pending_remove_t g_pending_remove = {0};
+
+typedef struct {
+    bool active;
+    accounts_transaction_token_t token;
+    gitswitch_ctx_t *ctx;
+    size_t account_count_before;
+    uint32_t current_account_id;
+    bool had_current_account;
+} pending_add_t;
+
+static pending_add_t g_pending_add = {0};
+
+typedef struct {
+    accounts_transaction_kind_t kind;
+    accounts_transaction_phase_t phase;
+    accounts_transaction_token_t token;
+    gitswitch_ctx_t *ctx;
+    size_t rollback_depth;
+} accounts_transaction_owner_t;
+
+static accounts_transaction_owner_t g_transaction_owner = {0};
+static accounts_transaction_token_t g_next_transaction_token = 0;
+
+static const char *transaction_kind_name(accounts_transaction_kind_t kind) {
+    switch (kind) {
+        case ACCOUNTS_TRANSACTION_INITIALIZE: return "initialization";
+        case ACCOUNTS_TRANSACTION_SWITCH: return "switch";
+        case ACCOUNTS_TRANSACTION_ADD: return "add";
+        case ACCOUNTS_TRANSACTION_EDIT: return "edit";
+        case ACCOUNTS_TRANSACTION_REMOVE: return "remove";
+        case ACCOUNTS_TRANSACTION_RESET: return "reset";
+        case ACCOUNTS_TRANSACTION_NONE: return "none";
+        default: return "invalid";
+    }
+}
+
+static bool transaction_kind_valid(accounts_transaction_kind_t kind) {
+    return kind >= ACCOUNTS_TRANSACTION_INITIALIZE &&
+           kind <= ACCOUNTS_TRANSACTION_RESET;
+}
+
+static bool pending_account_record_live(void) {
+    return g_pending_switch.active || g_pending_edit.active ||
+           g_pending_remove.active || g_pending_add.active;
+}
+
+static int transaction_require(gitswitch_ctx_t *ctx,
+                               accounts_transaction_kind_t kind,
+                               accounts_transaction_token_t token,
+                               const char *operation) {
+    if (!ctx || !transaction_kind_valid(kind) || token == 0 ||
+        g_transaction_owner.kind != kind ||
+        g_transaction_owner.ctx != ctx ||
+        g_transaction_owner.token != token) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot %s %s transaction: owner kind, context, or token does not match",
+                  operation ? operation : "finalize",
+                  transaction_kind_name(kind));
+        return -1;
+    }
+    return 0;
+}
+
+static int transaction_require_phase(
+    accounts_transaction_kind_t kind,
+    accounts_transaction_phase_t first,
+    accounts_transaction_phase_t second,
+    const char *operation) {
+    if (g_transaction_owner.kind == kind &&
+        (g_transaction_owner.phase == first ||
+         g_transaction_owner.phase == second)) {
+        return 0;
+    }
+    errno = EBUSY;
+    set_error(ERR_SYSTEM_CALL,
+              "Cannot %s %s transaction from phase %d",
+              operation ? operation : "finalize",
+              transaction_kind_name(kind),
+              (int)g_transaction_owner.phase);
+    return -1;
+}
+
+int accounts_transaction_begin(gitswitch_ctx_t *ctx,
+                               accounts_transaction_kind_t kind,
+                               accounts_transaction_token_t *token) {
+    accounts_transaction_token_t next;
+
+    /* A live process-global owner wins before per-call validation. This is
+     * both the serialization boundary and a causal guarantee: even a broken
+     * competing request cannot observe a different admission path or consume
+     * any pending finalizer state. */
+    if (g_transaction_owner.kind != ACCOUNTS_TRANSACTION_NONE ||
+        pending_account_record_live()) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot begin %s transaction: %s transaction token %llu is already pending (%s)",
+                  transaction_kind_name(kind),
+                  transaction_kind_name(g_transaction_owner.kind),
+                  (unsigned long long)g_transaction_owner.token,
+                  g_transaction_owner.phase == ACCOUNTS_TRANSACTION_ABORT_ONLY
+                      ? "awaiting abort retry" : "active");
+        return -1;
+    }
+    if (!ctx || !token || !transaction_kind_valid(kind)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid account transaction admission");
+        return -1;
+    }
+    if (signals_guard_active() || signals_rollback_active()) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot begin %s transaction while signal cleanup or rollback ownership is active",
+                  transaction_kind_name(kind));
+        return -1;
+    }
+
+    if (g_next_transaction_token == UINT64_MAX) {
+        errno = EOVERFLOW;
+        set_error(ERR_SYSTEM_CALL,
+                  "Account transaction token space is exhausted");
+        return -1;
+    }
+    next = g_next_transaction_token + 1;
+    g_next_transaction_token = next;
+    g_transaction_owner.kind = kind;
+    g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ENTERING;
+    g_transaction_owner.token = next;
+    g_transaction_owner.ctx = ctx;
+    g_transaction_owner.rollback_depth = 0;
+    *token = next;
+    return 0;
+}
+
+int accounts_transaction_rollback_begin(
+    gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
+    accounts_transaction_token_t token) {
+    if (transaction_require(ctx, kind, token, "extend rollback for") != 0) {
+        return -1;
+    }
+    if (g_transaction_owner.rollback_depth == SIZE_MAX) {
+        errno = EOVERFLOW;
+        set_error(ERR_SYSTEM_CALL,
+                  "Account transaction rollback nesting depth overflow");
+        return -1;
+    }
+    if (signals_rollback_begin_owned(token) != 0) return -1;
+    g_transaction_owner.rollback_depth++;
+    return 0;
+}
+
+int accounts_transaction_rollback_end(
+    gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
+    accounts_transaction_token_t token) {
+    if (transaction_require(ctx, kind, token, "reduce rollback for") != 0) {
+        return -1;
+    }
+    if (g_transaction_owner.rollback_depth == 0) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Account transaction has no rollback depth to release");
+        return -1;
+    }
+    if (signals_rollback_end_owned(token) != 0) return -1;
+    g_transaction_owner.rollback_depth--;
+    return 0;
+}
+
+int accounts_transaction_finish(gitswitch_ctx_t *ctx,
+                                accounts_transaction_kind_t kind,
+                                accounts_transaction_token_t token) {
+    if (transaction_require(ctx, kind, token, "finish") != 0) return -1;
+    if (g_transaction_owner.rollback_depth != 0) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot finish %s transaction with rollback depth %zu",
+                  transaction_kind_name(kind),
+                  g_transaction_owner.rollback_depth);
+        return -1;
+    }
+    memset(&g_transaction_owner, 0, sizeof(g_transaction_owner));
+    return 0;
+}
+
+static int transaction_mark_phase(gitswitch_ctx_t *ctx,
+                                  accounts_transaction_kind_t kind,
+                                  accounts_transaction_token_t token,
+                                  accounts_transaction_phase_t phase) {
+    if (transaction_require(ctx, kind, token, "advance") != 0) return -1;
+    g_transaction_owner.phase = phase;
+    return 0;
+}
+
+static int transaction_ensure_rollback(accounts_transaction_kind_t kind) {
+    if (g_transaction_owner.kind != kind || !g_transaction_owner.ctx ||
+        g_transaction_owner.token == 0) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot arm rollback without the matching %s transaction owner",
+                  transaction_kind_name(kind));
+        return -1;
+    }
+    if (g_transaction_owner.rollback_depth != 0) return 0;
+    return accounts_transaction_rollback_begin(
+        g_transaction_owner.ctx, kind, g_transaction_owner.token);
+}
+
+static int transaction_finish_after_call(
+    gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
+    accounts_transaction_token_t token, bool transfer_signal_deferral) {
+    if (g_transaction_owner.kind != kind ||
+        g_transaction_owner.token != token) {
+        return 0;
+    }
+    if (transfer_signal_deferral &&
+        g_transaction_owner.rollback_depth > 0) {
+        signals_rollback_begin();
+    }
+    while (g_transaction_owner.rollback_depth > 0) {
+        if (accounts_transaction_rollback_end(ctx, kind, token) != 0) {
+            return -1;
+        }
+    }
+    return accounts_transaction_finish(ctx, kind, token);
+}
 
 /* Internal helper functions */
 static uint32_t get_next_available_id(const gitswitch_ctx_t *ctx);
@@ -139,10 +367,32 @@ static bool gpg_session_cleanup_needed(void) {
            g_session.gpg_config.current_key_id[0] != '\0';
 }
 
+static bool account_session_cleanup_needed(void) {
+    return g_session.ssh_active || gpg_session_cleanup_needed();
+}
+
+static int accounts_session_cleanup_internal(void);
+
 /* Initialize accounts system */
 int accounts_init(gitswitch_ctx_t *ctx) {
+    accounts_transaction_token_t token;
+
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to accounts_init");
+        return -1;
+    }
+
+    /* This API initializes only caller-owned model storage. Process-global
+     * session, transaction, guard, and rollback state has an explicit cleanup
+     * path and must never disappear behind a convenience initializer. */
+    if (account_session_cleanup_needed()) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot initialize accounts while runtime session cleanup is pending");
+        return -1;
+    }
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_INITIALIZE,
+                                   &token) != 0) {
         return -1;
     }
 
@@ -151,17 +401,27 @@ int accounts_init(gitswitch_ctx_t *ctx) {
     ctx->account_count = 0;
     ctx->current_account = NULL;
 
-    /* Initialize session state */
-    memset(&g_session, 0, sizeof(g_session));
-
     log_debug("Accounts system initialized");
-    return 0;
+    return accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_INITIALIZE,
+                                       token);
 }
 
 /* Clean up active session resources. If an owned SSH/GPG side effect survives,
  * retain the complete session as its retry handle; clearing any of it would
  * make the still-live identity/environment untrackable and misreport success. */
 int accounts_session_cleanup(void) {
+    if (g_transaction_owner.kind != ACCOUNTS_TRANSACTION_NONE) {
+        errno = EBUSY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Cannot clean the account session while %s transaction token %llu is active",
+                  transaction_kind_name(g_transaction_owner.kind),
+                  (unsigned long long)g_transaction_owner.token);
+        return -1;
+    }
+    return accounts_session_cleanup_internal();
+}
+
+static int accounts_session_cleanup_internal(void) {
     log_debug("Cleaning up active session resources");
 
     /* Clean up SSH agent if we started one */
@@ -511,7 +771,11 @@ static int abort_failed_switch_checked(const account_t *prev,
      * handler's emergency-kill branch and die mid-git_config_restore, leaving
      * a chimera (or fully-new) identity persisted. Defer the emergency exit
      * until the whole restore sequence has completed. */
-    signals_rollback_begin();
+    if (transaction_ensure_rollback(ACCOUNTS_TRANSACTION_SWITCH) != 0) {
+        complete = false;
+        safe_strncpy(first_detail, get_last_error()->message,
+                     sizeof(first_detail));
+    }
     if (git_written) {
         if (git_config_restore() != 0) {
             complete = false;
@@ -579,7 +843,17 @@ static int abort_failed_switch_checked(const account_t *prev,
     /* SIG-02: drop any registered scratch temp files. */
     signals_scratch_cleanup();
     if (!keep_rollback_active) {
-        signals_rollback_end();
+        if (g_transaction_owner.kind == ACCOUNTS_TRANSACTION_SWITCH &&
+            g_transaction_owner.rollback_depth > 0 &&
+            accounts_transaction_rollback_end(
+                g_transaction_owner.ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                g_transaction_owner.token) != 0) {
+            complete = false;
+            if (first_detail[0] == '\0') {
+                safe_strncpy(first_detail, get_last_error()->message,
+                             sizeof(first_detail));
+            }
+        }
     }
     runtime_state_lock_release(runtime_lock_fd);
     if (git_remaining) *git_remaining = git_left;
@@ -666,6 +940,9 @@ static bool abort_switch_failure(pending_switch_t *prepared,
     prepared->runtime_lock_fd = runtime_lock_fd;
     prepared->abort_only = true;
     g_pending_switch = *prepared;
+    (void)transaction_mark_phase(prepared->ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                 prepared->token,
+                                 ACCOUNTS_TRANSACTION_ABORT_ONLY);
 
     (void)accounts_switch_abort(prepared->ctx, false);
     if (!g_pending_switch.active || g_pending_switch.ctx != prepared->ctx) {
@@ -808,28 +1085,10 @@ static void set_retained_alias_publication_error(
  * or resume-style competing call is still forbidden from observing or
  * consuming any part of that transaction.  Only its matching commit/abort
  * APIs may inspect the retained record. */
-static int reject_pending_switch_entry(void) {
-    if (!g_pending_switch.active) return 0;
-
-    if (g_pending_switch.abort_only) {
-        set_error(
-            ERR_SYSTEM_CALL,
-            "An account switch rollback is already pending; retry it with "
-            "its matching accounts_switch_abort() before starting another "
-            "switch");
-    } else {
-        set_error(
-            ERR_SYSTEM_CALL,
-            "An account switch is already pending; finish it with its "
-            "matching accounts_switch_commit() or accounts_switch_abort() "
-            "before starting another switch");
-    }
-    return -1;
-}
-
 /* Switch to specified account with SSH isolation and validation. */
 static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
-                                bool defer_commit) {
+                                bool defer_commit,
+                                accounts_transaction_token_t token) {
     account_t *account;
     account_t switch_target;
     const char *scope_str;
@@ -964,6 +1223,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         char prev_gpg_home[MAX_PATH_LEN] = "";
         bool prev_gpg_present = false;
         pending_switch_t prepared_owner = {0};
+        prepared_owner.token = token;
         safe_strncpy(prev_active, ctx->config.active_account,
                      sizeof(prev_active));
         if (gpg_manager_snapshot_current(prev_gpg_home,
@@ -1119,7 +1379,19 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * is started. A second signal in that cleanup window must remain
          * pending until the old runtime has either been restored or the
          * switch has reached a completed commit/abort. */
-        signals_rollback_begin();
+        if (accounts_transaction_rollback_begin(
+                ctx, ACCOUNTS_TRANSACTION_SWITCH, token) != 0) {
+            error_context_t rollback_error = *get_last_error();
+            int rollback_errno = errno;
+
+            if (write_git) git_config_commit();
+            runtime_state_lock_release(runtime_lock_fd);
+            (void)finish_signal_guard_checked(
+                "Switch rollback ownership setup failed");
+            g_last_error = rollback_error;
+            errno = rollback_errno;
+            return -1;
+        }
 
         /* A prior successful accounts_switch() can leave an owned agent in
          * this process's session state. Stopping it is a real mutation: do it
@@ -1129,7 +1401,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * early failure on a repeated switch leaves the live session entirely
          * untouched. */
         ssh_dirty = g_session.ssh_active;
-        if (accounts_session_cleanup() != 0) {
+        if (accounts_session_cleanup_internal() != 0) {
             char detail[sizeof(g_last_error.message)];
             bool rollback_complete = true;
 
@@ -1484,6 +1756,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                         memset(&g_pending_switch, 0, sizeof(g_pending_switch));
                         g_pending_switch.active = true;
                         g_pending_switch.abort_only = true;
+                        g_pending_switch.token = token;
                         g_pending_switch.ctx = ctx;
                         if (prev_account) {
                             g_pending_switch.previous_account = *prev_account;
@@ -1505,6 +1778,9 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                         g_pending_switch.scope = scope;
                         g_pending_switch.ssh_ok = ssh_ok;
                         g_pending_switch.gpg_ok = gpg_ok;
+                        (void)transaction_mark_phase(
+                            ctx, ACCOUNTS_TRANSACTION_SWITCH, token,
+                            ACCOUNTS_TRANSACTION_ABORT_ONLY);
                         set_error(
                             ERR_FILE_IO,
                             "Failed to commit SSH host alias for account '%s' "
@@ -1521,7 +1797,8 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                         return -1;
                     }
                     if (!defer_signal_dispatch) {
-                        signals_rollback_end();
+                        (void)accounts_transaction_rollback_end(
+                            ctx, ACCOUNTS_TRANSACTION_SWITCH, token);
                         if (finish_signal_guard_checked(
                                 "SSH alias publication failed after the "
                                 "switch rollback completed") != 0) {
@@ -1561,6 +1838,9 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             prepared_owner.ssh_ok = ssh_ok;
             prepared_owner.gpg_ok = gpg_ok;
             g_pending_switch = prepared_owner;
+            (void)transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                         token,
+                                         ACCOUNTS_TRANSACTION_PREPARED);
         } else {
             /* Direct callers retain the historical one-call commit. Release
              * the cross-manager lock before best-effort probes. */
@@ -1615,7 +1895,10 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
      * Restore failures are reported truthfully after the already-committed
      * switch; the signal layer retains failed entries for a later retry. */
     if (!ctx->config.dry_run && !defer_signal_dispatch) {
-        signals_rollback_end();
+        if (accounts_transaction_rollback_end(
+                ctx, ACCOUNTS_TRANSACTION_SWITCH, token) != 0) {
+            return -1;
+        }
         if (finish_signal_guard_checked(
                 "Account switch committed, but restoring the caller's "
                 "signal dispositions failed") != 0) {
@@ -1632,18 +1915,46 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
 }
 
 int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
-    if (reject_pending_switch_entry() != 0) return -1;
-    return accounts_switch_impl(ctx, identifier, false);
+    accounts_transaction_token_t token;
+    int rc;
+
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                   &token) != 0) {
+        return -1;
+    }
+    rc = accounts_switch_impl(ctx, identifier, false, token);
+    if (g_pending_switch.active && g_pending_switch.token == token) return rc;
+    if (transaction_finish_after_call(
+            ctx, ACCOUNTS_TRANSACTION_SWITCH, token,
+            ctx && ctx->config.defer_signal_cleanup) != 0) {
+        return -1;
+    }
+    return rc;
 }
 
 int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
-    if (reject_pending_switch_entry() != 0) return -1;
+    accounts_transaction_token_t token;
+    int rc;
+
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                   &token) != 0) {
+        return -1;
+    }
     if (!ctx || ctx->config.dry_run || ctx->config.resuming) {
         set_error(ERR_INVALID_ARGS,
                   "A transactional switch requires a non-preview CLI switch");
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                          token);
         return -1;
     }
-    return accounts_switch_impl(ctx, identifier, true);
+    rc = accounts_switch_impl(ctx, identifier, true, token);
+    if (g_pending_switch.active && g_pending_switch.token == token) return rc;
+    if (transaction_finish_after_call(
+            ctx, ACCOUNTS_TRANSACTION_SWITCH, token,
+            ctx && ctx->config.defer_signal_cleanup) != 0) {
+        return -1;
+    }
+    return rc;
 }
 
 int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
@@ -1663,10 +1974,19 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         set_error(ERR_INVALID_ARGS, "No prepared account switch to commit");
         return -1;
     }
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                            g_pending_switch.token, "commit") != 0) {
+        return -1;
+    }
     if (g_pending_switch.abort_only) {
         set_error(ERR_INVALID_ARGS,
                   "A failed switch preparation can only be retried through "
                   "accounts_switch_abort");
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_SWITCH, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_PREPARED, "commit") != 0) {
         return -1;
     }
     for (size_t i = 0; i < ctx->account_count; i++) {
@@ -1678,6 +1998,11 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
     if (!target) {
         set_error(ERR_ACCOUNT_NOT_FOUND,
                   "Prepared switch target disappeared before commit");
+        return -1;
+    }
+    if (transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                               g_pending_switch.token,
+                               ACCOUNTS_TRANSACTION_FINALIZING) != 0) {
         return -1;
     }
 
@@ -1692,6 +2017,7 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         safe_strncpy(alias_publication_detail, get_last_error()->message,
                      sizeof(alias_publication_detail));
         if (!ssh_alias_publication_is_installed(alias_publication)) {
+            g_transaction_owner.phase = ACCOUNTS_TRANSACTION_PREPARED;
             return -1;
         }
         final_state = accounts_commit_state_for_alias(alias_publication);
@@ -1701,6 +2027,7 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         git_config_commit();
     }
 
+    accounts_transaction_token_t token = g_pending_switch.token;
     runtime_state_lock_release(g_pending_switch.runtime_lock_fd);
     g_pending_switch.runtime_lock_fd = -1;
     finish_switch_success(ctx, target, &g_pending_switch.switch_target,
@@ -1709,6 +2036,20 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                           g_pending_switch.ssh_ok,
                           g_pending_switch.gpg_ok);
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));
+    if (g_transaction_owner.rollback_depth > 0 &&
+        accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_SWITCH, token) != 0) {
+        return -1;
+    }
+    if (accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                    token) != 0) {
+        return -1;
+    }
+    if (!ctx->config.defer_signal_cleanup &&
+        finish_signal_guard_checked(
+            "Prepared switch committed, but restoring the caller's signal dispositions failed") != 0) {
+        return -1;
+    }
     if (state) {
         *state = final_state;
     }
@@ -1737,8 +2078,20 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
         set_error(ERR_INVALID_ARGS, "No prepared account switch to roll back");
         return -1;
     }
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                            g_pending_switch.token, "abort") != 0) {
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_SWITCH, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_ABORT_ONLY, "abort") != 0) {
+        return -1;
+    }
 
     pending = g_pending_switch;
+    g_transaction_owner.phase = pending.abort_only
+        ? ACCOUNTS_TRANSACTION_ABORT_ONLY
+        : ACCOUNTS_TRANSACTION_FINALIZING;
     if (pending.runtime_lock_fd < 0) {
         pending.runtime_lock_fd = runtime_state_lock_acquire();
         if (pending.runtime_lock_fd < 0) {
@@ -1782,6 +2135,7 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
          * armed as part of that retry handle: dropping either before a
          * completed abort would let a repeated signal strand mixed state. */
         g_pending_switch = pending;
+        g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
         set_error(
             ERR_SYSTEM_CALL,
             "The prepared switch could not be rolled back completely; "
@@ -1795,10 +2149,21 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
      * A standalone prepared-API caller has completed every rollback here:
      * only now is it safe to restore caller dispositions and dispatch. */
     if (continue_persistence_rollback) {
+        signals_rollback_begin();
+        if (g_transaction_owner.rollback_depth > 0 &&
+            accounts_transaction_rollback_end(
+                ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token) != 0) {
+            return -1;
+        }
         memset(&g_pending_switch, 0, sizeof(g_pending_switch));
-        return 0;
+        return accounts_transaction_finish(
+            ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token);
     }
-    signals_rollback_end();
+    if (g_transaction_owner.rollback_depth > 0 &&
+        accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token) != 0) {
+        return -1;
+    }
     guard_rc = finish_signal_guard_checked(
         "Prepared switch rolled back, but restoring the caller's signal "
         "dispositions failed");
@@ -1813,10 +2178,12 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
         pending.gpg_dirty = false;
         pending.runtime_lock_fd = -1;
         g_pending_switch = pending;
+        g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
         return -1;
     }
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));
-    return 0;
+    return accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                       pending.token);
 }
 
 /* Fields whose persisted value must agree with the live Git/SSH/GPG state.
@@ -1938,15 +2305,28 @@ static int restore_pending_edit_alias(void) {
 int accounts_edit_abort(gitswitch_ctx_t *ctx) {
     account_t *slot;
     int alias_rc;
+    accounts_transaction_token_t token;
 
     if (!ctx || !g_pending_edit.active || g_pending_edit.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account edit to roll back");
         return -1;
     }
+    token = g_pending_edit.token;
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_EDIT, token,
+                            "abort") != 0) {
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_EDIT, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_ABORT_ONLY, "abort") != 0) {
+        return -1;
+    }
+    g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
 
     alias_rc = restore_pending_edit_alias();
     slot = account_by_id(ctx, g_pending_edit.original.id);
     if (!slot) {
+        g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
         set_error(ERR_ACCOUNT_NOT_FOUND,
                   "Edited account disappeared before rollback");
         return -1;
@@ -1954,22 +2334,75 @@ int accounts_edit_abort(gitswitch_ctx_t *ctx) {
     secure_zero_memory(slot, sizeof(*slot));
     *slot = g_pending_edit.original;
 
-    if (alias_rc != 0) return -1;
+    if (alias_rc != 0) {
+        g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
+        return -1;
+    }
     memset(&g_pending_edit, 0, sizeof(g_pending_edit));
+    if (ctx->config.defer_signal_cleanup &&
+        g_transaction_owner.rollback_depth > 0) {
+        signals_rollback_begin();
+    }
+    if (g_transaction_owner.rollback_depth > 0 &&
+        accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_EDIT, token) != 0) {
+        return -1;
+    }
+    if (accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_EDIT,
+                                    token) != 0) {
+        return -1;
+    }
+    if (!ctx->config.defer_signal_cleanup &&
+        finish_signal_guard_checked(
+            "Account edit rolled back, but restoring the caller's signal dispositions failed") != 0) {
+        return -1;
+    }
     return 0;
 }
 
 int accounts_edit_commit(gitswitch_ctx_t *ctx) {
+    accounts_transaction_token_t token;
+
     if (!ctx || !g_pending_edit.active || g_pending_edit.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account edit to commit");
         return -1;
     }
+    token = g_pending_edit.token;
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_EDIT, token,
+                            "commit") != 0) {
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_EDIT, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_PREPARED, "commit") != 0) {
+        return -1;
+    }
+    g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
     memset(&g_pending_edit, 0, sizeof(g_pending_edit));
+    if (ctx->config.defer_signal_cleanup &&
+        g_transaction_owner.rollback_depth > 0) {
+        signals_rollback_begin();
+    }
+    if (g_transaction_owner.rollback_depth > 0 &&
+        accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_EDIT, token) != 0) {
+        return -1;
+    }
+    if (accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_EDIT,
+                                    token) != 0) {
+        return -1;
+    }
+    if (!ctx->config.defer_signal_cleanup &&
+        finish_signal_guard_checked(
+            "Account edit committed, but restoring the caller's signal dispositions failed") != 0) {
+        return -1;
+    }
     return 0;
 }
 
-int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
-                                    const account_t *candidate) {
+static int accounts_edit_candidate_prepare_owned(
+    gitswitch_ctx_t *ctx, const account_t *candidate,
+    accounts_transaction_token_t token) {
     account_t edited;
     account_t *existing;
     bool editing_active;
@@ -1980,11 +2413,6 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
 
     if (!ctx || !candidate) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to account edit prepare");
-        return -1;
-    }
-    if (g_pending_edit.active) {
-        set_error(ERR_SYSTEM_CALL,
-                  "A prepared account edit is already awaiting completion");
         return -1;
     }
     existing = account_by_id(ctx, candidate->id);
@@ -2023,6 +2451,7 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
     }
 
     memset(&g_pending_edit, 0, sizeof(g_pending_edit));
+    g_pending_edit.token = token;
     g_pending_edit.ctx = ctx;
     g_pending_edit.original = *existing;
     g_pending_edit.candidate = edited;
@@ -2042,6 +2471,8 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
         return -1;
     }
     g_pending_edit.active = true;
+    (void)transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_EDIT, token,
+                                 ACCOUNTS_TRANSACTION_PREPARED);
     if (signals_guard_begin() != 0) {
         error_context_t guard_error = *get_last_error();
         int guard_errno = errno;
@@ -2065,7 +2496,15 @@ int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
         errno = guard_errno;
         return -1;
     }
-    signals_rollback_begin();
+    if (accounts_transaction_rollback_begin(
+            ctx, ACCOUNTS_TRANSACTION_EDIT, token) != 0) {
+        error_context_t rollback_error = *get_last_error();
+        int rollback_errno = errno;
+        (void)accounts_edit_abort(ctx);
+        g_last_error = rollback_error;
+        errno = rollback_errno;
+        return -1;
+    }
 
     if (retire_ssh || retire_gpg) {
         runtime_lock_fd = runtime_state_lock_acquire();
@@ -2179,19 +2618,27 @@ prepare_fail:
         } else {
             g_last_error = cause;
         }
-        /* Transactional callers (main) own the final cleanup and re-raise.
-         * Leave a pending signal guarded and rollback-class until that common
-         * tail has released the config lock and securely freed its context. */
-        if (!ctx->config.defer_signal_cleanup) {
-            signals_rollback_end();
-            if (finish_signal_guard_checked(
-                    "Account edit failed and rolled back, but restoring the "
-                    "caller's signal dispositions failed") != 0) {
-                return -1;
-            }
-        }
         return -1;
     }
+}
+
+int accounts_edit_candidate_prepare(gitswitch_ctx_t *ctx,
+                                    const account_t *candidate) {
+    accounts_transaction_token_t token;
+    int rc;
+
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_EDIT,
+                                   &token) != 0) {
+        return -1;
+    }
+    rc = accounts_edit_candidate_prepare_owned(ctx, candidate, token);
+    if (g_pending_edit.active && g_pending_edit.token == token) return rc;
+    if (transaction_finish_after_call(
+            ctx, ACCOUNTS_TRANSACTION_EDIT, token,
+            ctx && ctx->config.defer_signal_cleanup) != 0) {
+        return -1;
+    }
+    return rc;
 }
 
 /* Shared interactive add/edit flow. `existing` is NULL for add, or points at
@@ -2233,7 +2680,8 @@ static int account_read_prompt(const char *prompt_text, char *input,
     return 0;
 }
 
-static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
+static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
+                               accounts_transaction_token_t token) {
     account_t acct;
     char input[512];
     char expanded_path[MAX_PATH_LEN];
@@ -2525,7 +2973,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     }
 
     if (edit) {
-        return accounts_edit_candidate_prepare(ctx, &acct);
+        return accounts_edit_candidate_prepare_owned(ctx, &acct, token);
     }
 
     if (config_add_account(ctx, &acct) != 0) {
@@ -2534,31 +2982,150 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing) {
     return 0;
 }
 
-/* Add new account interactively with basic validation */
-int accounts_add_interactive(gitswitch_ctx_t *ctx) {
+int accounts_add_interactive_prepare(gitswitch_ctx_t *ctx) {
+    accounts_transaction_token_t token;
+    size_t count_before;
+    uint32_t current_id = 0;
+    bool had_current;
+    int rc;
+
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_ADD,
+                                   &token) != 0) {
+        return -1;
+    }
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to accounts_add_interactive");
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_ADD,
+                                          token);
         return -1;
     }
     if (ctx->account_count >= MAX_ACCOUNTS) {
         set_error(ERR_ACCOUNT_EXISTS, "Maximum number of accounts reached: %d", MAX_ACCOUNTS);
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_ADD,
+                                          token);
         return -1;
     }
-    return add_or_edit_account(ctx, NULL);
+    count_before = ctx->account_count;
+    had_current = ctx->current_account != NULL;
+    if (had_current) current_id = ctx->current_account->id;
+    rc = add_or_edit_account(ctx, NULL, token);
+    if (rc != 0) {
+        (void)transaction_finish_after_call(
+            ctx, ACCOUNTS_TRANSACTION_ADD, token,
+            ctx->config.defer_signal_cleanup);
+        return -1;
+    }
+    memset(&g_pending_add, 0, sizeof(g_pending_add));
+    g_pending_add.active = true;
+    g_pending_add.token = token;
+    g_pending_add.ctx = ctx;
+    g_pending_add.account_count_before = count_before;
+    g_pending_add.current_account_id = current_id;
+    g_pending_add.had_current_account = had_current;
+    (void)transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_ADD, token,
+                                 ACCOUNTS_TRANSACTION_PREPARED);
+    return 0;
+}
+
+int accounts_add_commit(gitswitch_ctx_t *ctx) {
+    accounts_transaction_token_t token;
+
+    if (!ctx || !g_pending_add.active || g_pending_add.ctx != ctx) {
+        set_error(ERR_INVALID_ARGS, "No prepared account addition to commit");
+        return -1;
+    }
+    token = g_pending_add.token;
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_ADD, token,
+                            "commit") != 0) {
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_ADD, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_PREPARED, "commit") != 0) {
+        return -1;
+    }
+    g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
+    memset(&g_pending_add, 0, sizeof(g_pending_add));
+    return accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_ADD,
+                                       token);
+}
+
+int accounts_add_abort(gitswitch_ctx_t *ctx) {
+    pending_add_t pending;
+
+    if (!ctx || !g_pending_add.active || g_pending_add.ctx != ctx) {
+        set_error(ERR_INVALID_ARGS, "No prepared account addition to abort");
+        return -1;
+    }
+    pending = g_pending_add;
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_ADD, pending.token,
+                            "abort") != 0) {
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_ADD, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_ABORT_ONLY, "abort") != 0) {
+        return -1;
+    }
+    g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
+    if (ctx->account_count < pending.account_count_before) {
+        g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
+        set_error(ERR_SYSTEM_CALL,
+                  "Account model changed before addition rollback");
+        return -1;
+    }
+    for (size_t i = pending.account_count_before; i < ctx->account_count; i++) {
+        secure_zero_memory(&ctx->accounts[i], sizeof(ctx->accounts[i]));
+    }
+    ctx->account_count = pending.account_count_before;
+    ctx->current_account = NULL;
+    if (pending.had_current_account) {
+        ctx->current_account = account_by_id(ctx, pending.current_account_id);
+    }
+    memset(&g_pending_add, 0, sizeof(g_pending_add));
+    return accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_ADD,
+                                       pending.token);
+}
+
+/* Add new account interactively with basic validation. Direct/library callers
+ * retain the historical one-call model mutation; CLI callers use prepare and
+ * settle it after durable persistence. */
+int accounts_add_interactive(gitswitch_ctx_t *ctx) {
+    if (accounts_add_interactive_prepare(ctx) != 0) return -1;
+    return accounts_add_commit(ctx);
 }
 
 int accounts_edit_interactive_prepare(gitswitch_ctx_t *ctx,
                                       const char *identifier) {
+    accounts_transaction_token_t token;
+    account_t *account;
+    int rc;
+
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_EDIT,
+                                   &token) != 0) {
+        return -1;
+    }
     if (!ctx || !identifier) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid arguments to accounts_edit_interactive_prepare");
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_EDIT,
+                                          token);
         return -1;
     }
-    account_t *account = config_find_account(ctx, identifier);
+    account = config_find_account(ctx, identifier);
     if (!account) {
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_EDIT,
+                                          token);
         return -1; /* error already set with candidate list */
     }
-    return add_or_edit_account(ctx, account);
+    rc = add_or_edit_account(ctx, account, token);
+    if (g_pending_edit.active && g_pending_edit.token == token) return rc;
+    if (transaction_finish_after_call(
+            ctx, ACCOUNTS_TRANSACTION_EDIT, token,
+            ctx->config.defer_signal_cleanup) != 0) {
+        return -1;
+    }
+    return rc;
 }
 
 /* Direct/library compatibility: callers that do not own the CLI persistence
@@ -2568,16 +3135,6 @@ int accounts_edit_interactive(gitswitch_ctx_t *ctx, const char *identifier) {
         return -1;
     }
     if (accounts_edit_commit(ctx) != 0) {
-        signals_rollback_end();
-        (void)finish_signal_guard_checked(
-            "Account edit commit failed, and restoring the caller's signal "
-            "dispositions also failed");
-        return -1;
-    }
-    signals_rollback_end();
-    if (finish_signal_guard_checked(
-            "Account edit committed, but restoring the caller's signal "
-            "dispositions failed") != 0) {
         return -1;
     }
     return 0;
@@ -2592,7 +3149,16 @@ int accounts_remove_commit(gitswitch_ctx_t *ctx) {
     }
 
     pending = g_pending_remove;
-    memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_REMOVE, pending.token,
+                            "commit") != 0) {
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_REMOVE, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_PREPARED, "commit") != 0) {
+        return -1;
+    }
+    g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
     if (pending.alias[0] != '\0' && !pending.alias_exclusive) {
         log_warning("Retaining shared ~/.ssh/config host-alias block for '%s'; "
                     "another account still claims the same alias",
@@ -2606,21 +3172,71 @@ int accounts_remove_commit(gitswitch_ctx_t *ctx) {
         log_warning("Could not remove ~/.ssh/config host-alias block for '%s': %s",
                     pending.alias, get_last_error()->message);
     }
+    memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    if (ctx->config.defer_signal_cleanup &&
+        g_transaction_owner.rollback_depth > 0) {
+        signals_rollback_begin();
+    }
+    if (g_transaction_owner.rollback_depth > 0 &&
+        accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_REMOVE, pending.token) != 0) {
+        return -1;
+    }
+    if (accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                    pending.token) != 0) {
+        return -1;
+    }
+    if (!ctx->config.defer_signal_cleanup &&
+        finish_signal_guard_checked(
+            "Account removal committed, but restoring the caller's signal dispositions failed") != 0) {
+        return -1;
+    }
     REMOVE_TEST_CHECKPOINT(4);
     return 0;
 }
 
 int accounts_remove_abort(gitswitch_ctx_t *ctx) {
+    accounts_transaction_token_t token;
+
     if (!g_pending_remove.active || !ctx || g_pending_remove.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account removal to abort");
         return -1;
     }
+    token = g_pending_remove.token;
+    if (transaction_require(ctx, ACCOUNTS_TRANSACTION_REMOVE, token,
+                            "abort") != 0) {
+        return -1;
+    }
+    if (transaction_require_phase(
+            ACCOUNTS_TRANSACTION_REMOVE, ACCOUNTS_TRANSACTION_PREPARED,
+            ACCOUNTS_TRANSACTION_ABORT_ONLY, "abort") != 0) {
+        return -1;
+    }
+    g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
 
     /* The installed accounts.toml still contains the account, so the alias is
      * deliberately untouched as its matching retry route. Runtime teardown
      * cannot be undone, but the durable account remains a valid reset/remove
      * handle for the next invocation. */
     memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    if (ctx->config.defer_signal_cleanup &&
+        g_transaction_owner.rollback_depth > 0) {
+        signals_rollback_begin();
+    }
+    if (g_transaction_owner.rollback_depth > 0 &&
+        accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_REMOVE, token) != 0) {
+        return -1;
+    }
+    if (accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                    token) != 0) {
+        return -1;
+    }
+    if (!ctx->config.defer_signal_cleanup &&
+        finish_signal_guard_checked(
+            "Account removal aborted, but restoring the caller's signal dispositions failed") != 0) {
+        return -1;
+    }
     REMOVE_TEST_CHECKPOINT(4);
     return 0;
 }
@@ -2643,14 +3259,18 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     int gpg_rc;
     int runtime_lock_fd;
     int result = -1;
+    accounts_transaction_token_t token;
+    bool guard_started = false;
+
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                   &token) != 0) {
+        return -1;
+    }
     
     if (!ctx || !identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_remove");
-        return -1;
-    }
-    if (g_pending_remove.active) {
-        set_error(ERR_INVALID_ARGS,
-                  "An account removal is already awaiting commit or abort");
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                          token);
         return -1;
     }
     
@@ -2658,6 +3278,8 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
      * only) — never a substring, so `remove work` can't delete "work-old". */
     account = config_find_account_destructive(ctx, identifier);
     if (!account) {
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                          token);
         return -1; /* error already set with an explanatory message */
     }
     
@@ -2683,10 +3305,14 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         confirmed = prompt_confirm_exact_yes();
         if (confirmed < 0) {
             set_error(ERR_FILE_IO, "Failed to read confirmation");
+            (void)accounts_transaction_finish(
+                ctx, ACCOUNTS_TRANSACTION_REMOVE, token);
             return -1;
         }
         if (confirmed == 0) {
             printf("Account removal cancelled.\n");
+            (void)accounts_transaction_finish(
+                ctx, ACCOUNTS_TRANSACTION_REMOVE, token);
             return 0;
         }
     }
@@ -2698,11 +3324,20 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
      * model deletion, alias removal, and persistence would leave a split
      * identity. CLI callers own the outer transaction tail; direct callers
      * release the guard at remove_done below. */
-    signals_rollback_begin();
-    if (signals_guard_begin() != 0) {
-        signals_rollback_end();
+    if (accounts_transaction_rollback_begin(
+            ctx, ACCOUNTS_TRANSACTION_REMOVE, token) != 0) {
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                          token);
         return -1;
     }
+    if (signals_guard_begin() != 0) {
+        (void)accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_REMOVE, token);
+        (void)accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_REMOVE,
+                                          token);
+        return -1;
+    }
+    guard_started = true;
     
     if (safe_strncpy(account_name, account->name, sizeof(account_name)) != 0) {
         goto remove_done;
@@ -2813,6 +3448,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
 
     memset(&g_pending_remove, 0, sizeof(g_pending_remove));
     g_pending_remove.active = true;
+    g_pending_remove.token = token;
     g_pending_remove.ctx = ctx;
     g_pending_remove.alias_exclusive = removed_alias_exclusive;
     if (safe_strncpy(g_pending_remove.alias, removed_alias,
@@ -2820,6 +3456,8 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         memset(&g_pending_remove, 0, sizeof(g_pending_remove));
         goto remove_done;
     }
+    (void)transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_REMOVE, token,
+                                 ACCOUNTS_TRANSACTION_PREPARED);
 
     /* A direct library call has no outer save transaction and retains the
      * historical one-call alias cleanup. The CLI sets defer_signal_cleanup and
@@ -2832,8 +3470,28 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     result = 0;
 
 remove_done:
-    if (!ctx->config.defer_signal_cleanup) {
-        signals_rollback_end();
+    if (!g_pending_remove.active &&
+        g_transaction_owner.kind == ACCOUNTS_TRANSACTION_REMOVE &&
+        g_transaction_owner.token == token) {
+        if (ctx->config.defer_signal_cleanup &&
+            g_transaction_owner.rollback_depth > 0) {
+            signals_rollback_begin();
+        }
+        while (g_transaction_owner.rollback_depth > 0) {
+            if (accounts_transaction_rollback_end(
+                    ctx, ACCOUNTS_TRANSACTION_REMOVE, token) != 0) {
+                result = -1;
+                break;
+            }
+        }
+        if (g_transaction_owner.rollback_depth == 0 &&
+            accounts_transaction_finish(
+                ctx, ACCOUNTS_TRANSACTION_REMOVE, token) != 0) {
+            result = -1;
+        }
+    }
+    if (!ctx->config.defer_signal_cleanup && guard_started &&
+        !signals_rollback_active()) {
         if (finish_signal_guard_checked(
                 "Account removal finished, but restoring the caller's "
                 "signal dispositions failed") != 0) {

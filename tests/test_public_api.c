@@ -38,7 +38,10 @@
 #endif
 
 TEST(all_retained_public_apis_compile_and_link) {
+    REQUIRE_PUBLIC_API(accounts_add_abort);
+    REQUIRE_PUBLIC_API(accounts_add_commit);
     REQUIRE_PUBLIC_API(accounts_add_interactive);
+    REQUIRE_PUBLIC_API(accounts_add_interactive_prepare);
     REQUIRE_PUBLIC_API(accounts_detect_current);
     REQUIRE_PUBLIC_API(accounts_edit_abort);
     REQUIRE_PUBLIC_API(accounts_edit_candidate_prepare);
@@ -58,6 +61,10 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_switch_commit);
     REQUIRE_PUBLIC_API(accounts_switch_commit_result);
     REQUIRE_PUBLIC_API(accounts_switch_prepare);
+    REQUIRE_PUBLIC_API(accounts_transaction_begin);
+    REQUIRE_PUBLIC_API(accounts_transaction_finish);
+    REQUIRE_PUBLIC_API(accounts_transaction_rollback_begin);
+    REQUIRE_PUBLIC_API(accounts_transaction_rollback_end);
     REQUIRE_PUBLIC_API(accounts_validate);
     REQUIRE_PUBLIC_API(atomic_symlink);
     REQUIRE_PUBLIC_API(atomic_symlink_at);
@@ -267,12 +274,16 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(signals_dispatch_pending);
     REQUIRE_PUBLIC_API(signals_guard_begin);
     REQUIRE_PUBLIC_API(signals_guard_end);
+    REQUIRE_PUBLIC_API(signals_guard_active);
     REQUIRE_PUBLIC_API(signals_pending);
     REQUIRE_PUBLIC_API(signals_pending_signal);
     REQUIRE_PUBLIC_API(signals_reset_for_child);
     REQUIRE_PUBLIC_API(signals_restore_after_child_spawn);
     REQUIRE_PUBLIC_API(signals_rollback_begin);
+    REQUIRE_PUBLIC_API(signals_rollback_begin_owned);
     REQUIRE_PUBLIC_API(signals_rollback_end);
+    REQUIRE_PUBLIC_API(signals_rollback_end_owned);
+    REQUIRE_PUBLIC_API(signals_rollback_active);
     REQUIRE_PUBLIC_API(signals_scratch_cleanup);
     REQUIRE_PUBLIC_API(signals_scratch_register);
     REQUIRE_PUBLIC_API(signals_scratch_unregister);

@@ -146,9 +146,11 @@ typedef struct {
     command_save_kind_t save_kind;
     command_notice_kind_t notice_kind;
     bool switch_prepared;
+    bool add_prepared;
     bool edit_prepared;
     bool remove_prepared;
     bool reset_guarded;
+    accounts_transaction_token_t reset_token;
     config_resume_hint_snapshot_t hint_snapshot;
     char previous_active[MAX_NAME_LEN];
     char subject[MAX_NAME_LEN];
@@ -864,6 +866,19 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        if (mutation.add_prepared) {
+            if (save_rc == 0) {
+                if (accounts_add_commit(ctx) != 0) {
+                    save_rc = -1;
+                    safe_strncpy(save_error, get_last_error()->message,
+                                 sizeof(save_error));
+                }
+            } else if (accounts_add_abort(ctx) != 0) {
+                safe_strncpy(save_error, get_last_error()->message,
+                             sizeof(save_error));
+            }
+        }
+
         bool remove_finalize_complete = true;
         char remove_finalize_detail[sizeof(g_last_error.message)] = "";
         if (mutation.remove_prepared) {
@@ -1049,6 +1064,23 @@ cleanup:
     signals_rollback_begin();
     config_resume_hint_snapshot_clear(&mutation.hint_snapshot);
 
+    if (ctx && mutation.reset_token != 0) {
+        if (accounts_transaction_rollback_end(
+                ctx, ACCOUNTS_TRANSACTION_RESET,
+                mutation.reset_token) != 0 ||
+            accounts_transaction_finish(
+                ctx, ACCOUNTS_TRANSACTION_RESET,
+                mutation.reset_token) != 0) {
+            fprintf(stderr,
+                    "gitswitch: reset transaction ownership cleanup failed: %s\n",
+                    get_last_error()->message[0]
+                        ? get_last_error()->message
+                        : "unknown ownership error");
+            exit_code = EXIT_FAILURE;
+        }
+        mutation.reset_token = 0;
+    }
+
     /* Release the config write-lock now that load+mutate+save is done (harmless
      * no-op for read-only commands that never took it; the OS would also drop it
      * at exit). */
@@ -1161,7 +1193,7 @@ static command_result_t handle_add_command(gitswitch_ctx_t *ctx) {
         return result;
     }
 
-    if (accounts_add_interactive(ctx) != 0) {
+    if (accounts_add_interactive_prepare(ctx) != 0) {
         display_error("Failed to add account", "%s", get_last_error()->message);
         return result;
     }
@@ -1169,6 +1201,7 @@ static command_result_t handle_add_command(gitswitch_ctx_t *ctx) {
     result.status = EXIT_SUCCESS;
     result.save_kind = COMMAND_SAVE_FULL;
     result.notice_kind = COMMAND_NOTICE_ADD;
+    result.add_prepared = true;
     return result;
 }
 
@@ -2112,9 +2145,27 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
      * deferred as rollback-class work so they cannot strand a half-reset
      * identity. Main owns the end of this window and truthful re-raise after
      * config unlock plus secure context cleanup. */
-    signals_rollback_begin();
+    if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_RESET,
+                                   &result.reset_token) != 0) {
+        display_error("Cannot own reset transaction", "%s",
+                      get_last_error()->message);
+        return result;
+    }
+    if (accounts_transaction_rollback_begin(
+            ctx, ACCOUNTS_TRANSACTION_RESET, result.reset_token) != 0) {
+        (void)accounts_transaction_finish(
+            ctx, ACCOUNTS_TRANSACTION_RESET, result.reset_token);
+        result.reset_token = 0;
+        display_error("Cannot defer reset transaction signals", "%s",
+                      get_last_error()->message);
+        return result;
+    }
     if (signals_guard_begin() != 0) {
-        signals_rollback_end();
+        (void)accounts_transaction_rollback_end(
+            ctx, ACCOUNTS_TRANSACTION_RESET, result.reset_token);
+        (void)accounts_transaction_finish(
+            ctx, ACCOUNTS_TRANSACTION_RESET, result.reset_token);
+        result.reset_token = 0;
         display_error("Cannot guard reset transaction", "%s",
                       get_last_error()->message);
         return result;

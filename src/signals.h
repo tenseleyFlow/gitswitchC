@@ -49,6 +49,7 @@
 #define SIGNALS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <signal.h>
 #include <sys/types.h>
 
@@ -63,6 +64,12 @@
  * the originating errno; only an inherited SIG_IGN is intentionally skipped.
  */
 int signals_guard_begin(void);
+
+/** Read-only guard ownership query. True includes a guard whose disposition
+ * restoration is incomplete, because starting another process-global
+ * transaction in that state could consume or overwrite the retained cleanup
+ * obligation. */
+bool signals_guard_active(void);
 
 /* Deterministic, one-shot fault injection for each sigaction(2) stage used by
  * the guard. Failures are stored independently by stage, so a test can arm an
@@ -125,6 +132,17 @@ int signals_guard_end(void);
  */
 void signals_rollback_begin(void);
 void signals_rollback_end(void);
+
+/** Checked rollback ownership for transaction coordinators. A nonzero token
+ * may enter recursively; only that exact token may leave, and the handler's
+ * rollback deferral remains armed until the matching depth reaches zero.
+ * Legacy signals_rollback_begin()/end() ownership is tracked independently,
+ * so an unrelated compatibility caller cannot clear a checked owner. */
+int signals_rollback_begin_owned(uint64_t token);
+int signals_rollback_end_owned(uint64_t token);
+
+/** True while either legacy or checked rollback deferral is active. */
+bool signals_rollback_active(void);
 
 /**
  * Reset only signals whose dispositions signals_guard_begin() actually

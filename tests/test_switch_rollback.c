@@ -121,6 +121,103 @@ static bool runtime_lock_available_to_child(void) {
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
+typedef struct {
+    pid_t pid;
+    int release_fd;
+} runtime_lock_holder_t;
+
+/* Hold the shared runtime lock in a separate process. A distinct process is
+ * the portable contention fixture: same-process flock behavior differs
+ * across supported kernels and would not prove the inter-process boundary. */
+static int start_runtime_lock_holder(runtime_lock_holder_t *holder) {
+    int ready[2] = {-1, -1};
+    int release[2] = {-1, -1};
+    pid_t pid;
+    char marker = '\0';
+    ssize_t count;
+
+    if (!holder || pipe(ready) != 0 || pipe(release) != 0) {
+        int saved_errno = errno;
+        if (ready[0] >= 0) close(ready[0]);
+        if (ready[1] >= 0) close(ready[1]);
+        if (release[0] >= 0) close(release[0]);
+        if (release[1] >= 0) close(release[1]);
+        errno = saved_errno;
+        return -1;
+    }
+    pid = fork();
+    if (pid < 0) {
+        int saved_errno = errno;
+        close(ready[0]);
+        close(ready[1]);
+        close(release[0]);
+        close(release[1]);
+        errno = saved_errno;
+        return -1;
+    }
+    if (pid == 0) {
+        int lock_fd;
+
+        close(ready[0]);
+        close(release[1]);
+        lock_fd = runtime_state_lock_acquire();
+        marker = lock_fd >= 0 ? 'R' : 'E';
+        do {
+            count = write(ready[1], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(ready[1]);
+        if (lock_fd < 0 || count != 1) _exit(1);
+        do {
+            count = read(release[0], &marker, 1);
+        } while (count < 0 && errno == EINTR);
+        close(release[0]);
+        runtime_state_lock_release(lock_fd);
+        _exit(count == 1 ? 0 : 2);
+    }
+
+    close(ready[1]);
+    close(release[0]);
+    do {
+        count = read(ready[0], &marker, 1);
+    } while (count < 0 && errno == EINTR);
+    close(ready[0]);
+    if (count != 1 || marker != 'R') {
+        int status = 0;
+        close(release[1]);
+        (void)waitpid(pid, &status, 0);
+        errno = EBUSY;
+        return -1;
+    }
+    holder->pid = pid;
+    holder->release_fd = release[1];
+    return 0;
+}
+
+static int stop_runtime_lock_holder(runtime_lock_holder_t *holder) {
+    char marker = 'X';
+    ssize_t count;
+    pid_t waited;
+    int status = 0;
+
+    if (!holder || holder->pid <= 0 || holder->release_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    do {
+        count = write(holder->release_fd, &marker, 1);
+    } while (count < 0 && errno == EINTR);
+    close(holder->release_fd);
+    holder->release_fd = -1;
+    do {
+        waited = waitpid(holder->pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    holder->pid = -1;
+    return count == 1 && waited > 0 && WIFEXITED(status) &&
+                   WEXITSTATUS(status) == 0
+               ? 0
+               : -1;
+}
+
 /* The GPG runner below fakes key inventory and transfer, but production still
  * pins and validates the source keyring directory around every child spawn.
  * Give those tests a private external source so they never depend on the
@@ -1343,6 +1440,8 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
     char first_key[512];
     char target[512];
     ssize_t target_len;
+    gitswitch_ctx_t init_target;
+    gitswitch_ctx_t init_before;
 
     if (!command_exists("ssh-agent") || !command_exists("ssh-add")) {
         TS_SKIP("openssh", "ssh-agent/ssh-add unavailable in trusted PATH");
@@ -1365,6 +1464,15 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
     command_runner_fn previous_runner = run_set_runner(ssh_git_runner);
     CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
     signals_guard_end();
+
+    /* AR-11 M1: accounts_init owns caller model storage only. It must reject
+     * byte-exactly while the first switch still owns a live process-global
+     * SSH session, leaving the original session record available for the
+     * exact cleanup below. */
+    memset(&init_target, 0x5A, sizeof(init_target));
+    init_before = init_target;
+    CHECK_EQ_INT(accounts_init(&init_target), -1);
+    CHECK(memcmp(&init_target, &init_before, sizeof(init_target)) == 0);
 
     target_len = readlink(g_ssh_sock, target, sizeof(target) - 1);
     CHECK(target_len > 0);
@@ -1398,6 +1506,9 @@ TEST(repeated_switch_validation_failure_keeps_live_session) {
     }
 
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    CHECK_EQ_INT(accounts_init(&init_target), 0);
+    CHECK_EQ_INT(init_target.account_count, 0);
+    CHECK(init_target.current_account == NULL);
     run_set_runner(previous_runner);
     g_fail_list_config = false;
 }
@@ -2849,6 +2960,7 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     gitswitch_ctx_t contender;
     gitswitch_ctx_t contender_before;
     command_runner_fn previous_runner;
+    runtime_lock_holder_t lock_holder = {.pid = -1, .release_fd = -1};
     int runner_calls;
 
     CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
@@ -2940,11 +3052,44 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
         CHECK(switch_actions_equal(&observed, &guarded[i]));
     }
 
+    /* AR-11 M2: the abort-only owner must survive a transient failure to
+     * reacquire its cross-manager lock. While a child owns the lock, the exact
+     * abort fails before rollback; no commit or cross-type admission may
+     * consume the owner, its signal guard, or checked rollback depth. Once the
+     * child releases the lock, the same abort remains authorized and clears
+     * the original obligation. */
+    CHECK_EQ_INT(start_runtime_lock_holder(&lock_holder), 0);
+    CHECK(!runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), -1);
+    CHECK(strstr(get_last_error()->message, "shared runtime lock") != NULL);
+    CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
+    CHECK(memcmp(&contender, &contender_before, sizeof(contender)) == 0);
+    CHECK_EQ_INT(g_fake_runner_calls, runner_calls);
+    CHECK_STR_EQ(g_store_name, "preseal-writer");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(signals_guard_active());
+    CHECK(signals_rollback_active());
+    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
+    CHECK_EQ_INT(accounts_init(&contender), -1);
+    CHECK(memcmp(&contender, &contender_before, sizeof(contender)) == 0);
+    for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
+        struct sigaction observed;
+
+        CHECK_EQ_INT(sigaction(switch_guarded_signals[i], NULL,
+                               &observed), 0);
+        CHECK(switch_actions_equal(&observed, &guarded[i]));
+    }
+    CHECK_EQ_INT(stop_runtime_lock_holder(&lock_holder), 0);
+    CHECK(runtime_lock_available_to_child());
+
     safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
     CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
     CHECK_STR_EQ(g_store_name, "Previous Name");
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(runtime_lock_available_to_child());
+    CHECK(!signals_guard_active());
+    CHECK(!signals_rollback_active());
     for (size_t i = 0; i < SWITCH_GUARDED_SIGNAL_COUNT; i++) {
         struct sigaction observed;
 

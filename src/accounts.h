@@ -5,6 +5,30 @@
 
 #include "gitswitch.h"
 
+/* One process-global owner serializes every account mutation family. Tokens
+ * are monotonically assigned and must match every rollback/finalizer call;
+ * kind and context identity are checked independently so a stale or
+ * cross-type finalizer cannot consume another operation's obligation. */
+typedef uint64_t accounts_transaction_token_t;
+
+typedef enum {
+    ACCOUNTS_TRANSACTION_NONE = 0,
+    ACCOUNTS_TRANSACTION_INITIALIZE,
+    ACCOUNTS_TRANSACTION_SWITCH,
+    ACCOUNTS_TRANSACTION_ADD,
+    ACCOUNTS_TRANSACTION_EDIT,
+    ACCOUNTS_TRANSACTION_REMOVE,
+    ACCOUNTS_TRANSACTION_RESET
+} accounts_transaction_kind_t;
+
+typedef enum {
+    ACCOUNTS_TRANSACTION_IDLE = 0,
+    ACCOUNTS_TRANSACTION_ENTERING,
+    ACCOUNTS_TRANSACTION_PREPARED,
+    ACCOUNTS_TRANSACTION_ABORT_ONLY,
+    ACCOUNTS_TRANSACTION_FINALIZING
+} accounts_transaction_phase_t;
+
 /* Account validation result */
 typedef struct {
     bool valid;
@@ -31,6 +55,24 @@ typedef enum {
  * Initialize accounts system
  */
 int accounts_init(gitswitch_ctx_t *ctx);
+
+/* Low-level owner boundary used by the CLI reset flow and focused embedders.
+ * Most callers should use the operation-specific APIs below. Begin fails
+ * before mutation if another owner, signal guard, or rollback obligation is
+ * live. Rollback calls nest only for the exact token. Finish requires zero
+ * owned rollback depth and consumes only the matching kind/context/token. */
+int accounts_transaction_begin(gitswitch_ctx_t *ctx,
+                               accounts_transaction_kind_t kind,
+                               accounts_transaction_token_t *token);
+int accounts_transaction_rollback_begin(
+    gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
+    accounts_transaction_token_t token);
+int accounts_transaction_rollback_end(
+    gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
+    accounts_transaction_token_t token);
+int accounts_transaction_finish(gitswitch_ctx_t *ctx,
+                                accounts_transaction_kind_t kind,
+                                accounts_transaction_token_t token);
 
 /**
  * Switch to specified account
@@ -65,6 +107,9 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
  * - Saves to configuration
  */
 int accounts_add_interactive(gitswitch_ctx_t *ctx);
+int accounts_add_interactive_prepare(gitswitch_ctx_t *ctx);
+int accounts_add_commit(gitswitch_ctx_t *ctx);
+int accounts_add_abort(gitswitch_ctx_t *ctx);
 
 /**
  * Edit an existing account interactively (prompts default to current values)
