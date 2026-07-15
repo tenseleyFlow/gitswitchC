@@ -54,6 +54,24 @@ static toml_section_t *find_section(toml_document_t *doc, const char *section_na
 static toml_section_t *find_or_create_section(toml_document_t *doc, const char *section_name);
 static toml_keyvalue_t *find_key(toml_section_t *section, const char *key_name);
 static bool section_name_is_valid(const char *section_name);
+static bool decoded_string_value_is_valid(const char *value, size_t length);
+static int toml_validate_config_file_path(const char *file_path,
+                                          const char *path_role);
+static bool toml_table_namespace_is_available(const toml_document_t *doc,
+                                              const char *table_name);
+static bool toml_scalar_namespace_is_available(const toml_document_t *doc,
+                                               const char *section_name,
+                                               const char *key_name);
+static int toml_validate_model_invariants(const toml_document_t *doc,
+                                          bool require_schema_fields);
+static int toml_resolve_getter_value(const toml_document_t *doc,
+                                     const char *section_name,
+                                     const char *key_name,
+                                     toml_value_type_t expected_type,
+                                     const toml_keyvalue_t **resolved);
+static bool toml_bool_object_value(const bool *object, bool *value);
+static bool toml_canonical_integer(const char *value, int *parsed);
+static bool toml_canonical_boolean(const char *value, bool *parsed);
 static bool toml_same_file(const struct stat *left, const struct stat *right);
 static bool toml_temp_identity_is_private(const struct stat *identity);
 static toml_document_init_hook_fn g_document_init_hook;
@@ -87,6 +105,33 @@ static bool key_name_is_valid(const char *key_name) {
         if (!ascii_key_continuation_is_valid(c)) return false;
     }
     return false;
+}
+
+/* Config file paths are operating-system objects, not stored SSH-key data.
+ * The one application limit is the public document's source-path capacity;
+ * lstat/open and openat/rename remain authoritative for smaller component or
+ * platform limits. Keep this admission pass shared by reader and writer. */
+static int toml_validate_config_file_path(const char *file_path,
+                                          const char *path_role) {
+    size_t length;
+
+    if (!file_path || file_path[0] == '\0') {
+        set_error(ERR_INVALID_PATH, "TOML %s path is empty", path_role);
+        return -1;
+    }
+    length = strnlen(file_path, MAX_PATH_LEN);
+    if (length == MAX_PATH_LEN) {
+        set_error(ERR_INVALID_PATH,
+                  "TOML %s path exceeds the application limit of %d bytes",
+                  path_role, MAX_PATH_LEN - 1);
+        return -1;
+    }
+    if (file_path[length - 1] == '/') {
+        set_error(ERR_INVALID_PATH,
+                  "TOML %s path must name a file, not a directory", path_role);
+        return -1;
+    }
+    return 0;
 }
 
 toml_document_init_hook_fn toml_set_document_init_hook_fn(
@@ -130,7 +175,7 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     int fd = -1;
     int result = -1;
     bool delegated_to_string_parser = false;
-    
+
     if (!doc) {
         set_error(ERR_INVALID_ARGS, "NULL arguments to toml_parse_file");
         return -1;
@@ -140,10 +185,8 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
         set_error(ERR_INVALID_ARGS, "NULL arguments to toml_parse_file");
         return -1;
     }
-    
-    /* Security: Validate file path */
-    if (!toml_validate_file_path(file_path)) {
-        set_error(ERR_CONFIG_INVALID, "Invalid file path: %s", file_path);
+
+    if (toml_validate_config_file_path(file_path, "source") != 0) {
         goto cleanup;
     }
     
@@ -248,8 +291,8 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
     result = toml_parse_string(buffer, file_size, doc);
     if (result == 0 &&
         safe_strncpy(doc->file_path, file_path, sizeof(doc->file_path)) != 0) {
-        set_error(ERR_CONFIG_INVALID, "Configuration file path is too long: %s",
-                  file_path);
+        set_error(ERR_CONFIG_INVALID,
+                  "Configuration file path exceeded its validated capacity");
         doc->is_valid = false;
         result = -1;
     }
@@ -378,6 +421,12 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
                     set_parser_error(&state, dup_msg);
                     break;
                 }
+                if (!toml_table_namespace_is_available(doc, section_name)) {
+                    set_parser_error(
+                        &state,
+                        "Table name collides with an existing scalar value");
+                    break;
+                }
                 current_section = find_or_create_section(doc, section_name);
                 if (!current_section) {
                     set_parser_error(&state, "Failed to create section");
@@ -429,6 +478,13 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
                     set_parser_error(&state, dup_msg);
                     break;
                 }
+                if (!toml_scalar_namespace_is_available(
+                        doc, current_section->name, kv->key)) {
+                    set_parser_error(
+                        &state,
+                        "Scalar key collides with an existing table namespace");
+                    break;
+                }
                 /* Nothing but whitespace/comment may follow the value — no
                  * second `key = value` on the same physical line (AR-06 F70).
                  * Checked before committing the pair so a trailing-junk line is
@@ -475,36 +531,14 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
 /* Get string value from TOML document */
 int toml_get_string(const toml_document_t *doc, const char *section,
                     const char *key, char *value, size_t value_size) {
-    const toml_section_t *sec;
     const toml_keyvalue_t *kv;
 
     if (!doc || !section || !key || !value || value_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_get_string");
         return -1;
     }
-
-    if (!doc->is_valid) {
-        set_error(ERR_CONFIG_INVALID, "TOML document is not valid");
-        return -1;
-    }
-
-    sec = find_section((toml_document_t *)doc, section);
-    if (!sec || !sec->is_set) {
-        /* Section not found — or schema-invalidated (is_set cleared, AR-03
-         * M5): a skipped-on-load account must read as absent in every field
-         * so the loader skips it whole instead of loading a partial account.
-         * Return silently, caller handles missing data. */
-        return -1;
-    }
-
-    kv = find_key((toml_section_t *)sec, key);
-    if (!kv || !kv->is_set) {
-        /* Key not found - return silently, caller handles missing data */
-        return -1;
-    }
-
-    if (kv->type != TOML_TYPE_STRING) {
-        set_error(ERR_CONFIG_INVALID, "Key %s.%s is not a string", section, key);
+    if (toml_resolve_getter_value(doc, section, key, TOML_TYPE_STRING,
+                                  &kv) != 0) {
         return -1;
     }
 
@@ -543,91 +577,47 @@ int toml_get_string(const toml_document_t *doc, const char *section,
 /* Get integer value from TOML document */
 int toml_get_integer(const toml_document_t *doc, const char *section,
                      const char *key, int *value) {
-    const toml_section_t *sec;
     const toml_keyvalue_t *kv;
-    char *endptr;
-    long parsed_value;
+    int parsed_value;
 
     if (!doc || !section || !key || !value) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_get_integer");
         return -1;
     }
-
-    if (!doc->is_valid) {
-        set_error(ERR_CONFIG_INVALID, "TOML document is not valid");
+    if (toml_resolve_getter_value(doc, section, key, TOML_TYPE_INTEGER,
+                                  &kv) != 0) {
         return -1;
     }
 
-    sec = find_section((toml_document_t *)doc, section);
-    if (!sec || !sec->is_set) {
-        /* Not found, or schema-invalidated (see toml_get_string) - return
-         * silently, caller handles missing data */
+    if (!toml_canonical_integer(kv->value, &parsed_value)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Integer value for %s.%s is not canonical", section, key);
         return -1;
     }
 
-    kv = find_key((toml_section_t *)sec, key);
-    if (!kv || !kv->is_set) {
-        /* Key not found - return silently, caller handles missing data */
-        return -1;
-    }
-
-    if (kv->type != TOML_TYPE_INTEGER) {
-        set_error(ERR_CONFIG_INVALID, "Key %s.%s is not an integer", section, key);
-        return -1;
-    }
-    
-    errno = 0;
-    parsed_value = strtol(kv->value, &endptr, 10);
-    
-    if (errno != 0 || *endptr != '\0') {
-        set_error(ERR_CONFIG_INVALID, "Invalid integer value: %s", kv->value);
-        return -1;
-    }
-    
-    if (parsed_value < INT_MIN || parsed_value > INT_MAX) {
-        set_error(ERR_CONFIG_INVALID, "Integer value out of range: %ld", parsed_value);
-        return -1;
-    }
-    
-    *value = (int)parsed_value;
+    *value = parsed_value;
     return 0;
 }
 
 /* Get boolean value from TOML document */
 int toml_get_boolean(const toml_document_t *doc, const char *section,
                      const char *key, bool *value) {
-    const toml_section_t *sec;
     const toml_keyvalue_t *kv;
 
     if (!doc || !section || !key || !value) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_get_boolean");
         return -1;
     }
-
-    if (!doc->is_valid) {
-        set_error(ERR_CONFIG_INVALID, "TOML document is not valid");
+    if (toml_resolve_getter_value(doc, section, key, TOML_TYPE_BOOLEAN,
+                                  &kv) != 0) {
         return -1;
     }
 
-    sec = find_section((toml_document_t *)doc, section);
-    if (!sec || !sec->is_set) {
-        /* Not found, or schema-invalidated (see toml_get_string) - return
-         * silently, caller handles missing data */
+    if (!toml_canonical_boolean(kv->value, value)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Boolean value for %s.%s is not canonical", section, key);
         return -1;
     }
-
-    kv = find_key((toml_section_t *)sec, key);
-    if (!kv || !kv->is_set) {
-        /* Key not found - return silently, caller handles missing data */
-        return -1;
-    }
-
-    if (kv->type != TOML_TYPE_BOOLEAN) {
-        set_error(ERR_CONFIG_INVALID, "Key %s.%s is not a boolean", section, key);
-        return -1;
-    }
-    
-    *value = (strcmp(kv->value, "true") == 0);
     return 0;
 }
 
@@ -704,6 +694,10 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
      * after the whole schema pass succeeds. */
     doc->is_valid = false;
 
+    if (toml_validate_model_invariants(doc, true) != 0) {
+        return -1;
+    }
+
     /* Account visibility is derived from this complete validation attempt.
      * Revoke every candidate before validating settings or any account: an
      * earlier fatal error may return before the main pass reaches a later
@@ -730,6 +724,8 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
             bool has_default_scope = false;
             for (size_t j = 0; j < section->key_count; j++) {
                 const toml_keyvalue_t *kv = &section->keys[j];
+
+                if (!kv->is_set) continue;
                 
                 if (strcmp(kv->key, "default_scope") == 0) {
                     has_default_scope = true;
@@ -776,6 +772,8 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
 
             for (size_t j = 0; j < section->key_count; j++) {
                 const toml_keyvalue_t *kv = &section->keys[j];
+
+                if (!kv->is_set) continue;
                 
                 if (strcmp(kv->key, "name") == 0) {
                     has_name = true;
@@ -1050,6 +1048,506 @@ static bool decoded_string_value_is_valid(const char *value, size_t length) {
            toml_validate_safe_characters(value, length);
 }
 
+static bool toml_canonical_integer(const char *value, int *parsed) {
+    char canonical[32];
+    char *end = NULL;
+    long number;
+    int written;
+
+    if (!value || strnlen(value, TOML_MAX_VALUE_LEN) == TOML_MAX_VALUE_LEN) {
+        return false;
+    }
+    errno = 0;
+    number = strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        number < INT_MIN || number > INT_MAX) {
+        return false;
+    }
+    written = snprintf(canonical, sizeof(canonical), "%d", (int)number);
+    if (written < 0 || (size_t)written >= sizeof(canonical) ||
+        strcmp(canonical, value) != 0) {
+        return false;
+    }
+    if (parsed) *parsed = (int)number;
+    return true;
+}
+
+static bool toml_canonical_boolean(const char *value, bool *parsed) {
+    if (!value || strnlen(value, TOML_MAX_VALUE_LEN) == TOML_MAX_VALUE_LEN) {
+        return false;
+    }
+    if (strcmp(value, "true") == 0) {
+        if (parsed) *parsed = true;
+        return true;
+    }
+    if (strcmp(value, "false") == 0) {
+        if (parsed) *parsed = false;
+        return true;
+    }
+    return false;
+}
+
+/* The public model is caller-mutable, including through byte-oriented APIs.
+ * Inspect a _Bool's representation without evaluating a possibly-invalid
+ * typed value (which is itself undefined behavior under UBSan). Comparing to
+ * representations produced by this implementation also avoids assuming that
+ * sizeof(bool) is one. */
+static bool toml_bool_object_value(const bool *object, bool *value) {
+    unsigned char raw[sizeof(bool)];
+    unsigned char false_raw[sizeof(bool)];
+    unsigned char true_raw[sizeof(bool)];
+    bool false_value = false;
+    bool true_value = true;
+
+    if (!object) return false;
+    memcpy(raw, object, sizeof(raw));
+    memcpy(false_raw, &false_value, sizeof(false_raw));
+    memcpy(true_raw, &true_value, sizeof(true_raw));
+    if (memcmp(raw, false_raw, sizeof(raw)) == 0) {
+        if (value) *value = false;
+        return true;
+    }
+    if (memcmp(raw, true_raw, sizeof(raw)) == 0) {
+        if (value) *value = true;
+        return true;
+    }
+    return false;
+}
+
+/* Resolve one getter route without turning a hot read into a whole-document
+ * schema/namespace scan. The outer section count is bounded before iteration;
+ * every inspected section name and visibility flag is proved safe so a later
+ * duplicate or malformed entry cannot hide behind an early match. Only the
+ * matching section's key array and matching value payload are inspected.
+ * Thus the work is O(section_count + matching_key_count + value_length), while
+ * still failing closed on every object the requested lookup would rely on. */
+static int toml_resolve_getter_value(const toml_document_t *doc,
+                                     const char *section_name,
+                                     const char *key_name,
+                                     toml_value_type_t expected_type,
+                                     const toml_keyvalue_t **resolved) {
+    const toml_section_t *matched_section = NULL;
+    const toml_keyvalue_t *matched_key = NULL;
+    bool document_is_valid;
+    bool matched_section_is_set = false;
+    bool matched_key_is_set = false;
+    size_t value_length;
+
+    if (!toml_bool_object_value(&doc->is_valid, &document_is_valid)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML document has an invalid validity representation");
+        return -1;
+    }
+    if (!document_is_valid) {
+        set_error(ERR_CONFIG_INVALID, "TOML document is not valid");
+        return -1;
+    }
+    if (doc->section_count > TOML_MAX_SECTIONS) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML section count exceeds the public model capacity");
+        return -1;
+    }
+
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const toml_section_t *candidate = &doc->sections[i];
+        bool candidate_is_set;
+
+        if (!memchr(candidate->name, '\0', sizeof(candidate->name))) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML section %zu has no terminating NUL", i);
+            return -1;
+        }
+        if (candidate->name[0] == '\0') {
+            if (i != 0) {
+                set_error(ERR_CONFIG_INVALID,
+                          "The implicit TOML root section must be first");
+                return -1;
+            }
+        } else if (!section_name_is_valid(candidate->name)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML section %zu has an invalid name", i);
+            return -1;
+        }
+        if (!toml_bool_object_value(&candidate->is_set,
+                                    &candidate_is_set)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML section %zu has an invalid visibility representation",
+                      i);
+            return -1;
+        }
+        if (strcmp(candidate->name, section_name) != 0) continue;
+        if (matched_section) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML getter route has duplicate section [%s]",
+                      section_name);
+            return -1;
+        }
+        matched_section = candidate;
+        matched_section_is_set = candidate_is_set;
+    }
+
+    /* Missing, or schema-invalidated (is_set cleared): callers intentionally
+     * treat a skipped account as wholly absent instead of loading it partly. */
+    if (!matched_section || !matched_section_is_set) return -1;
+    if (matched_section->key_count > TOML_MAX_KEYS_PER_SECTION) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML section [%s] key count exceeds capacity",
+                  section_name);
+        return -1;
+    }
+
+    for (size_t i = 0; i < matched_section->key_count; i++) {
+        const toml_keyvalue_t *candidate = &matched_section->keys[i];
+        bool candidate_is_set;
+
+        if (!memchr(candidate->key, '\0', sizeof(candidate->key)) ||
+            !key_name_is_valid(candidate->key)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML key %zu in section [%s] has an invalid name", i,
+                      section_name);
+            return -1;
+        }
+        if (!toml_bool_object_value(&candidate->is_set,
+                                    &candidate_is_set)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML key %zu in section [%s] has an invalid set-state representation",
+                      i, section_name);
+            return -1;
+        }
+        if (strcmp(candidate->key, key_name) != 0) continue;
+        if (matched_key) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML getter route has duplicate key %s.%s",
+                      section_name, key_name);
+            return -1;
+        }
+        matched_key = candidate;
+        matched_key_is_set = candidate_is_set;
+    }
+
+    if (!matched_key || !matched_key_is_set) return -1;
+    value_length = strnlen(matched_key->value, sizeof(matched_key->value));
+    if (value_length == sizeof(matched_key->value)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML value for %s.%s has no terminating NUL", section_name,
+                  key_name);
+        return -1;
+    }
+    if (matched_key->type != expected_type) {
+        const char *expected_name =
+            expected_type == TOML_TYPE_STRING ? "string" :
+            expected_type == TOML_TYPE_INTEGER ? "integer" : "boolean";
+        set_error(ERR_CONFIG_INVALID, "Key %s.%s is not a %s", section_name,
+                  key_name, expected_name);
+        return -1;
+    }
+    switch (expected_type) {
+        case TOML_TYPE_STRING:
+            if (!decoded_string_value_is_valid(matched_key->value,
+                                               value_length)) {
+                set_error(ERR_CONFIG_INVALID,
+                          "String value for %s.%s is invalid", section_name,
+                          key_name);
+                return -1;
+            }
+            break;
+        case TOML_TYPE_INTEGER:
+            if (!toml_canonical_integer(matched_key->value, NULL)) {
+                set_error(ERR_CONFIG_INVALID,
+                          "Integer value for %s.%s is not canonical",
+                          section_name, key_name);
+                return -1;
+            }
+            break;
+        case TOML_TYPE_BOOLEAN:
+            if (!toml_canonical_boolean(matched_key->value, NULL)) {
+                set_error(ERR_CONFIG_INVALID,
+                          "Boolean value for %s.%s is not canonical",
+                          section_name, key_name);
+                return -1;
+            }
+            break;
+        case TOML_TYPE_INVALID:
+        default:
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML getter requested an invalid value type");
+            return -1;
+    }
+    *resolved = matched_key;
+    return 0;
+}
+
+#define TOML_MAX_FQN_LEN (TOML_MAX_SECTION_LEN + TOML_MAX_KEY_LEN)
+
+static bool toml_make_scalar_fqn(const char *section_name,
+                                 const char *key_name,
+                                 char fqn[TOML_MAX_FQN_LEN]) {
+    int written;
+
+    if (section_name[0] == '\0') {
+        written = snprintf(fqn, TOML_MAX_FQN_LEN, "%s", key_name);
+    } else {
+        written = snprintf(fqn, TOML_MAX_FQN_LEN, "%s.%s", section_name,
+                           key_name);
+    }
+    return written >= 0 && (size_t)written < TOML_MAX_FQN_LEN;
+}
+
+/* A scalar may be below a table (the ordinary `[table] key = value` case),
+ * but it may never be the table itself or an ancestor that a later table
+ * would need to reinterpret. */
+static bool toml_fqn_is_equal_or_ancestor(const char *possible_ancestor,
+                                          const char *candidate) {
+    size_t ancestor_length = strlen(possible_ancestor);
+    size_t candidate_length = strlen(candidate);
+
+    return ancestor_length <= candidate_length &&
+           memcmp(possible_ancestor, candidate, ancestor_length) == 0 &&
+           (candidate[ancestor_length] == '\0' ||
+            candidate[ancestor_length] == '.');
+}
+
+static bool toml_table_namespace_is_available(const toml_document_t *doc,
+                                              const char *table_name) {
+    char scalar[TOML_MAX_FQN_LEN];
+
+    if (!doc || !table_name) return false;
+    if (table_name[0] == '\0') return true; /* implicit root, not a table */
+
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const toml_section_t *section = &doc->sections[i];
+        for (size_t j = 0; j < section->key_count; j++) {
+            const toml_keyvalue_t *kv = &section->keys[j];
+            if (!kv->is_set ||
+                !toml_make_scalar_fqn(section->name, kv->key, scalar)) {
+                continue;
+            }
+            if (toml_fqn_is_equal_or_ancestor(scalar, table_name)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool toml_scalar_namespace_is_available(const toml_document_t *doc,
+                                               const char *section_name,
+                                               const char *key_name) {
+    char scalar[TOML_MAX_FQN_LEN];
+
+    if (!doc || !section_name || !key_name ||
+        !toml_make_scalar_fqn(section_name, key_name, scalar)) {
+        return false;
+    }
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const char *table = doc->sections[i].name;
+        if (table[0] != '\0' &&
+            toml_fqn_is_equal_or_ancestor(scalar, table)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Validate public, caller-mutable model storage without changing it. Every
+ * bound is proved before an array element or string is inspected, so corrupt
+ * counts and missing terminators fail closed under ASan instead of becoming a
+ * writer-side memory walk. Writers additionally request the required-set
+ * contract, but deliberately do not run mutating gitswitch schema semantics. */
+static int toml_validate_model_invariants(const toml_document_t *doc,
+                                          bool require_schema_fields) {
+    bool model_flag;
+
+    if (!doc) {
+        set_error(ERR_INVALID_ARGS, "NULL TOML document");
+        return -1;
+    }
+    if (g_metadata_test_hook) {
+        (void)g_metadata_test_hook(TOML_METADATA_TEST_MODEL_PREFLIGHT);
+    }
+    if (doc->section_count > TOML_MAX_SECTIONS) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML section count exceeds the public model capacity");
+        return -1;
+    }
+    if (!toml_bool_object_value(&doc->is_valid, &model_flag)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML document has an invalid validity representation");
+        return -1;
+    }
+
+    /* Pass one proves every bound and terminator. No helper that scans the
+     * complete model is called until this pass has made that scan safe. */
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const toml_section_t *section = &doc->sections[i];
+
+        if (!memchr(section->name, '\0', sizeof(section->name))) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML section %zu has no terminating NUL", i);
+            return -1;
+        }
+        if (section->name[0] == '\0') {
+            if (i != 0) {
+                set_error(ERR_CONFIG_INVALID,
+                          "The implicit TOML root section must be first");
+                return -1;
+            }
+        } else if (!section_name_is_valid(section->name)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML section %zu has an invalid name", i);
+            return -1;
+        }
+        if (!toml_bool_object_value(&section->is_set, &model_flag)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML section %zu has an invalid visibility representation",
+                      i);
+            return -1;
+        }
+        for (size_t prior = 0; prior < i; prior++) {
+            if (strcmp(doc->sections[prior].name, section->name) == 0) {
+                set_error(ERR_CONFIG_INVALID,
+                          "TOML section %zu duplicates section %zu", i,
+                          prior);
+                return -1;
+            }
+        }
+        if (section->key_count > TOML_MAX_KEYS_PER_SECTION) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML section %zu key count exceeds capacity", i);
+            return -1;
+        }
+
+        for (size_t j = 0; j < section->key_count; j++) {
+            const toml_keyvalue_t *kv = &section->keys[j];
+            size_t value_length;
+            bool is_set;
+
+            if (!memchr(kv->key, '\0', sizeof(kv->key)) ||
+                !key_name_is_valid(kv->key)) {
+                set_error(ERR_CONFIG_INVALID,
+                          "TOML key %zu in section %zu has an invalid name",
+                          j, i);
+                return -1;
+            }
+            for (size_t prior = 0; prior < j; prior++) {
+                if (strcmp(section->keys[prior].key, kv->key) == 0) {
+                    set_error(ERR_CONFIG_INVALID,
+                              "TOML key %zu in section %zu is duplicated", j,
+                              i);
+                    return -1;
+                }
+            }
+            if (!toml_bool_object_value(&kv->is_set, &is_set)) {
+                set_error(ERR_CONFIG_INVALID,
+                          "TOML key %zu in section %zu has an invalid set-state representation",
+                          j, i);
+                return -1;
+            }
+            if (!is_set) continue;
+
+            value_length = strnlen(kv->value, sizeof(kv->value));
+            if (value_length == sizeof(kv->value)) {
+                set_error(ERR_CONFIG_INVALID,
+                          "TOML value %zu in section %zu has no terminating NUL",
+                          j, i);
+                return -1;
+            }
+            switch (kv->type) {
+                case TOML_TYPE_STRING:
+                    if (!decoded_string_value_is_valid(kv->value,
+                                                       value_length)) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "TOML string %zu in section %zu is invalid",
+                                  j, i);
+                        return -1;
+                    }
+                    break;
+                case TOML_TYPE_INTEGER:
+                    if (!toml_canonical_integer(kv->value, NULL)) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "TOML integer %zu in section %zu is not canonical",
+                                  j, i);
+                        return -1;
+                    }
+                    break;
+                case TOML_TYPE_BOOLEAN:
+                    if (!toml_canonical_boolean(kv->value, NULL)) {
+                        set_error(ERR_CONFIG_INVALID,
+                                  "TOML boolean %zu in section %zu is not canonical",
+                                  j, i);
+                        return -1;
+                    }
+                    break;
+                case TOML_TYPE_INVALID:
+                default:
+                    set_error(ERR_CONFIG_INVALID,
+                              "TOML value %zu in section %zu has an invalid type",
+                              j, i);
+                    return -1;
+            }
+        }
+    }
+
+    /* Pass two may safely scan the complete model for namespace and required
+     * key relationships. Unset scalars remain structurally present records,
+     * but they occupy neither a namespace nor a required-field slot. */
+    for (size_t i = 0; i < doc->section_count; i++) {
+        const toml_section_t *section = &doc->sections[i];
+        bool has_default_scope = false;
+        bool has_name = false;
+        bool has_email = false;
+
+        if (section->name[0] != '\0' &&
+            !toml_table_namespace_is_available(doc, section->name)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "TOML table namespace at section %zu collides with a scalar",
+                      i);
+            return -1;
+        }
+        for (size_t j = 0; j < section->key_count; j++) {
+            const toml_keyvalue_t *kv = &section->keys[j];
+            bool is_set;
+
+            /* Pass one proved this representation. Decode it again without a
+             * typed read so the proof remains local and sanitizer-clean. */
+            if (!toml_bool_object_value(&kv->is_set, &is_set) || !is_set) {
+                continue;
+            }
+            if (!toml_scalar_namespace_is_available(doc, section->name,
+                                                    kv->key)) {
+                set_error(ERR_CONFIG_INVALID,
+                          "TOML scalar namespace at section %zu key %zu collides with a table",
+                          i, j);
+                return -1;
+            }
+            if (strcmp(section->name, "settings") == 0 &&
+                strcmp(kv->key, "default_scope") == 0) {
+                has_default_scope = true;
+            }
+            if (string_starts_with(section->name, "accounts.")) {
+                if (strcmp(kv->key, "name") == 0) has_name = true;
+                if (strcmp(kv->key, "email") == 0) has_email = true;
+            }
+        }
+
+        if (strcmp(section->name, "settings") == 0) {
+            if (require_schema_fields && !has_default_scope) {
+                set_error(ERR_CONFIG_INVALID,
+                          "settings section missing set required default_scope");
+                return -1;
+            }
+        }
+        if (require_schema_fields &&
+            string_starts_with(section->name, "accounts.") &&
+            (!has_name || !has_email)) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Account section missing set required name or email");
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* Sanitize string value. Strips what a value must never carry into callers:
  * C0 controls (incl. newline/CR — the ~/.ssh/config IdentityFile sink and
  * core.sshCommand depend on values staying single-line), DEL, quotes and
@@ -1241,6 +1739,9 @@ static toml_section_t *find_or_create_section(toml_document_t *doc, const char *
     
     /* Create new section */
     if (doc->section_count >= TOML_MAX_SECTIONS) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Maximum number of TOML sections exceeded (%d)",
+                  TOML_MAX_SECTIONS);
         log_error("Maximum number of sections exceeded: %d", TOML_MAX_SECTIONS);
         return NULL;
     }
@@ -1430,11 +1931,25 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
     
     while (!is_at_end(state) && current_char(state) != '"' && 
            value_pos < value_size - 1) {
-        char c = advance_char(state);
+        char c = current_char(state);
+
+        /* Diagnose raw controls at the byte that violates the grammar. In
+         * particular, do not advance a newline to the next line/column before
+         * publishing the error location. */
+        if ((unsigned char)c < 0x20) {
+            set_parser_error(state, "Control character in string value");
+            return -1;
+        }
+        c = advance_char(state);
         
         /* Handle escape sequences */
         if (c == '\\' && !is_at_end(state)) {
-            char next = advance_char(state);
+            char next = current_char(state);
+            if ((unsigned char)next < 0x20) {
+                set_parser_error(state, "Control character in string value");
+                return -1;
+            }
+            next = advance_char(state);
             switch (next) {
                 case 'n': value[value_pos++] = '\n'; break;
                 case 't': value[value_pos++] = '\t'; break;
@@ -1445,14 +1960,6 @@ static int parse_string_value(toml_parser_state_t *state, char *value, size_t va
                     set_parser_error(state, "Invalid escape sequence");
                     return -1;
             }
-        } else if ((unsigned char)c < 0x20) {
-            /* TOML basic strings may not contain literal control characters
-             * (newline, CR, tab, ...); they must be escaped. Rejecting them
-             * here keeps the validated value identical to the byte string
-             * toml_get_string later hands to callers, so schema validation
-             * cannot be bypassed by smuggling in a raw newline. */
-            set_parser_error(state, "Control character in string value");
-            return -1;
         } else {
             value[value_pos++] = c;
         }
@@ -1685,9 +2192,12 @@ int toml_get_sections(const toml_document_t *doc, char sections[][TOML_MAX_SECTI
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_get_sections");
         return -1;
     }
-    
+
     *section_count = 0;
-    
+    if (toml_validate_model_invariants(doc, false) != 0) {
+        return -1;
+    }
+
     for (size_t i = 0; i < doc->section_count && *section_count < max_sections; i++) {
         safe_strncpy(sections[*section_count], doc->sections[i].name, TOML_MAX_SECTION_LEN);
         (*section_count)++;
@@ -1743,6 +2253,17 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
         set_error(ERR_CONFIG_INVALID,
                   "Value for %s.%s contains an unsupported control byte or "
                   "malformed/unsafe UTF-8",
+                  section_name, key_name);
+        return -1;
+    }
+
+    if (toml_validate_model_invariants(doc, false) != 0) {
+        return -1;
+    }
+    if (!toml_table_namespace_is_available(doc, section_name) ||
+        !toml_scalar_namespace_is_available(doc, section_name, key_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML namespace for %s.%s collides with an existing scalar or table",
                   section_name, key_name);
         return -1;
     }
@@ -1812,6 +2333,17 @@ int toml_set_boolean(toml_document_t *doc, const char *section_name,
         return -1;
     }
 
+    if (toml_validate_model_invariants(doc, false) != 0) {
+        return -1;
+    }
+    if (!toml_table_namespace_is_available(doc, section_name) ||
+        !toml_scalar_namespace_is_available(doc, section_name, key_name)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "TOML namespace for %s.%s collides with an existing scalar or table",
+                  section_name, key_name);
+        return -1;
+    }
+
     /* Find or create section */
     section = find_or_create_section(doc, section_name);
     if (!section) {
@@ -1878,10 +2410,13 @@ static int toml_serialize_stream(const toml_document_t *doc, FILE *file,
     for (size_t i = 0; i < doc->section_count; i++) {
         const toml_section_t *section = &doc->sections[i];
 
-        if (fprintf(file, "[%s]\n", section->name) < 0) {
-            *failure_context = "Failed to write TOML section header";
-            *saved_errno = errno ? errno : EIO;
-            return -1;
+        /* Root keys precede every named table and have no table header. */
+        if (section->name[0] != '\0') {
+            if (fprintf(file, "[%s]\n", section->name) < 0) {
+                *failure_context = "Failed to write TOML section header";
+                *saved_errno = errno ? errno : EIO;
+                return -1;
+            }
         }
 
         for (size_t j = 0; j < section->key_count; j++) {
@@ -1955,6 +2490,9 @@ int toml_write_fd(const toml_document_t *doc, int fd) {
 
     if (!doc || fd < 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_write_fd");
+        return -1;
+    }
+    if (toml_validate_model_invariants(doc, true) != 0) {
         return -1;
     }
     if (fstat(fd, &before) != 0) {
@@ -2119,7 +2657,6 @@ int toml_write_file(const toml_document_t *doc, const char *file_path) {
     char *temp_path = NULL;
     char temp_name[128] = "";
     FILE *file = NULL;
-    size_t file_path_length;
     size_t dir_length;
     struct stat pinned_dir;
     struct stat temp_identity;
@@ -2134,14 +2671,14 @@ int toml_write_file(const toml_document_t *doc, const char *file_path) {
     bool temp_created = false;
     bool have_temp_identity = false;
 
-    if (!doc || !file_path || file_path[0] == '\0') {
+    if (!doc || !file_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to toml_write_file");
         return -1;
     }
-
-    file_path_length = strlen(file_path);
-    if (file_path[file_path_length - 1] == '/') {
-        set_error(ERR_INVALID_PATH, "Invalid TOML destination path: %s", file_path);
+    if (toml_validate_config_file_path(file_path, "destination") != 0) {
+        return -1;
+    }
+    if (toml_validate_model_invariants(doc, true) != 0) {
         return -1;
     }
 
