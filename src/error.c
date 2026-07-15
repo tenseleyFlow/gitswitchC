@@ -368,6 +368,8 @@ static bool error_accumulator_append_entry(error_accumulator_t *accumulator,
                           sizeof(accumulator->accumulated_details));
     size_t message_length = strnlen(error->message,
                                     sizeof(error->message));
+    size_t details_length = strnlen(error->details,
+                                    sizeof(error->details));
     size_t label_length = strnlen(entry_label,
                                   sizeof(accumulator->accumulated_details));
     bool complete = true;
@@ -389,10 +391,29 @@ static bool error_accumulator_append_entry(error_accumulator_t *accumulator,
                                         sizeof(accumulator->accumulated_details),
                                         &used, error->message, message_length);
     complete = span_complete && complete;
+    if (details_length > 0) {
+        const char *separator = error->details[0] == ';' ? "" : "; ";
+        size_t separator_length = strlen(separator);
+
+        span_complete = append_display_span(
+            accumulator->accumulated_details,
+            sizeof(accumulator->accumulated_details), &used, separator,
+            separator_length);
+        complete = span_complete && complete;
+        span_complete = append_display_span(
+            accumulator->accumulated_details,
+            sizeof(accumulator->accumulated_details), &used, error->details,
+            details_length);
+        complete = span_complete && complete;
+    }
     if (label_length == sizeof(accumulator->accumulated_details)) {
         complete = false;
     }
     if (message_length == sizeof(error->message) || error->message_truncated) {
+        complete = false;
+    }
+    if (details_length == sizeof(error->details) ||
+        error->details_truncated) {
         complete = false;
     }
 

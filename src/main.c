@@ -191,6 +191,7 @@ typedef void (*reset_test_hook_fn)(int stage);
 typedef void (*remove_test_hook_fn)(int stage);
 typedef void (*switch_abort_test_hook_fn)(gitswitch_ctx_t *ctx);
 typedef void (*switch_prepare_failure_test_hook_fn)(void);
+typedef void (*switch_rollback_publish_test_hook_fn)(void);
 reset_test_hook_fn gitswitch_test_set_reset_hook(reset_test_hook_fn hook);
 remove_test_hook_fn gitswitch_test_set_remove_hook(remove_test_hook_fn hook);
 switch_abort_test_hook_fn gitswitch_test_set_switch_abort_hook(
@@ -198,6 +199,9 @@ switch_abort_test_hook_fn gitswitch_test_set_switch_abort_hook(
 switch_prepare_failure_test_hook_fn
 gitswitch_test_set_switch_prepare_failure_hook(
     switch_prepare_failure_test_hook_fn hook);
+switch_rollback_publish_test_hook_fn
+gitswitch_test_set_switch_rollback_publish_hook(
+    switch_rollback_publish_test_hook_fn hook);
 void gitswitch_test_remove_checkpoint(int stage);
 int gitswitch_test_context_allocations(void);
 int gitswitch_test_context_allocation_total(void);
@@ -207,6 +211,8 @@ static remove_test_hook_fn g_remove_test_hook;
 static switch_abort_test_hook_fn g_switch_abort_test_hook;
 static switch_prepare_failure_test_hook_fn
     g_switch_prepare_failure_test_hook;
+static switch_rollback_publish_test_hook_fn
+    g_switch_rollback_publish_test_hook;
 static int g_context_allocations;
 static int g_context_allocation_total;
 
@@ -237,6 +243,16 @@ gitswitch_test_set_switch_prepare_failure_hook(
         g_switch_prepare_failure_test_hook;
 
     g_switch_prepare_failure_test_hook = hook;
+    return previous;
+}
+
+switch_rollback_publish_test_hook_fn
+gitswitch_test_set_switch_rollback_publish_hook(
+    switch_rollback_publish_test_hook_fn hook) {
+    switch_rollback_publish_test_hook_fn previous =
+        g_switch_rollback_publish_test_hook;
+
+    g_switch_rollback_publish_test_hook = hook;
     return previous;
 }
 
@@ -276,9 +292,41 @@ static void switch_prepare_failure_test_checkpoint(void) {
 #endif
 }
 
+static void switch_rollback_publish_test_checkpoint(void) {
+#ifdef GITSWITCH_TESTING
+    switch_rollback_publish_test_hook_fn hook =
+        g_switch_rollback_publish_test_hook;
+
+    g_switch_rollback_publish_test_hook = NULL;
+    if (hook) hook();
+#endif
+}
+
 static void restore_cli_error(const error_context_t *error, int saved_errno) {
     if (error) g_last_error = *error;
     errno = saved_errno;
+}
+
+static void capture_cli_error_once(error_context_t *error, int *saved_errno,
+                                   bool *captured) {
+    if (!error || !saved_errno || !captured || *captured) return;
+    *error = *get_last_error();
+    *saved_errno = errno;
+    *captured = true;
+}
+
+static void display_error_chain(const char *context,
+                                const error_context_t *error) {
+    const char *separator;
+
+    if (!error) return;
+    if (error->details[0] == '\0') {
+        display_error(context, "%s", error->message);
+        return;
+    }
+    separator = error->details[0] == ';' ? "" : "; ";
+    display_error(context, "%s%s%s", error->message, separator,
+                  error->details);
 }
 
 static void retain_cli_switch_context(gitswitch_ctx_t *ctx,
@@ -1001,18 +1049,37 @@ int main(int argc, char *argv[]) {
     if (has_mutation_result &&
         mutation.switch_prepare_state ==
             ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED) {
+        error_accumulator_t preparation_errors;
         error_context_t preparation_error = *get_last_error();
+        error_context_t published_error;
         int preparation_errno = errno;
+        int published_errno;
+        int abort_rc;
+
+        error_accumulator_init(&preparation_errors);
+        errno = preparation_errno;
+        (void)error_accumulator_add(&preparation_errors,
+                                    "switch preparation",
+                                    &preparation_error);
 
         switch_abort_test_checkpoint(ctx);
-        (void)accounts_switch_abort(ctx, false);
+        abort_rc = accounts_switch_abort(ctx, false);
+        if (abort_rc != 0) {
+            (void)error_accumulator_add_last(&preparation_errors,
+                                             "account switch abort");
+        }
+        (void)error_accumulator_publish(&preparation_errors);
+        published_error = *get_last_error();
+        published_errno = errno;
+        switch_rollback_publish_test_checkpoint();
         if (!accounts_transaction_context_release_safe(ctx)) {
             retain_cli_switch_context(ctx,
                                       RETAINED_CLI_CONTEXT_SWITCH_ABORT,
-                                      &preparation_error,
-                                      preparation_errno);
+                                      &published_error,
+                                      published_errno);
         }
-        restore_cli_error(&preparation_error, preparation_errno);
+        display_error_chain("Failed to switch account", &published_error);
+        restore_cli_error(&published_error, published_errno);
         exit_code = EXIT_FAILURE;
     }
 
@@ -1025,6 +1092,9 @@ int main(int argc, char *argv[]) {
         bool switch_commit_retained = false;
         accounts_switch_commit_state_t switch_commit_state =
             ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+        error_context_t save_error_context = {0};
+        int save_error_errno = 0;
+        bool save_error_captured = false;
         char save_error[sizeof(g_last_error.message)] = "";
 
         if (mutation.save_kind != COMMAND_SAVE_NONE) {
@@ -1032,6 +1102,9 @@ int main(int argc, char *argv[]) {
                       command, ctx->account_count);
             if (signals_guard_begin() != 0) {
                 save_rc = -1;
+                capture_cli_error_once(&save_error_context,
+                                       &save_error_errno,
+                                       &save_error_captured);
                 safe_strncpy(save_error, get_last_error()->message,
                              sizeof(save_error));
             } else {
@@ -1057,6 +1130,9 @@ int main(int argc, char *argv[]) {
                         ctx, ctx->config.config_path);
                 }
                 if (save_rc != 0) {
+                    capture_cli_error_once(&save_error_context,
+                                           &save_error_errno,
+                                           &save_error_captured);
                     safe_strncpy(save_error, get_last_error()->message,
                                  sizeof(save_error));
                 }
@@ -1070,6 +1146,9 @@ int main(int argc, char *argv[]) {
             if (accounts_switch_commit_result(ctx, &switch_commit_state) != 0) {
                 save_rc = -1;
                 config_installed = true;
+                capture_cli_error_once(&save_error_context,
+                                       &save_error_errno,
+                                       &save_error_captured);
                 safe_strncpy(save_error, get_last_error()->message,
                              sizeof(save_error));
                 switch_commit_retained =
@@ -1106,10 +1185,16 @@ int main(int argc, char *argv[]) {
             if (save_rc == 0) {
                 if (accounts_add_commit(ctx) != 0) {
                     save_rc = -1;
+                    capture_cli_error_once(&save_error_context,
+                                           &save_error_errno,
+                                           &save_error_captured);
                     safe_strncpy(save_error, get_last_error()->message,
                                  sizeof(save_error));
                 }
             } else if (accounts_add_abort(ctx) != 0) {
+                capture_cli_error_once(&save_error_context,
+                                       &save_error_errno,
+                                       &save_error_captured);
                 safe_strncpy(save_error, get_last_error()->message,
                              sizeof(save_error));
             }
@@ -1143,8 +1228,23 @@ int main(int argc, char *argv[]) {
                 ACCOUNTS_SWITCH_PREPARE_PREPARED &&
             save_rc != 0 &&
             !switch_commit_retained) {
+            error_accumulator_t rollback_errors;
+            error_context_t rollback_error;
+            int rollback_errno;
             bool rollback_complete = true;
-            char rollback_detail[sizeof(g_last_error.message)] = "";
+
+            error_accumulator_init(&rollback_errors);
+            if (!save_error_captured) {
+                capture_cli_error_once(&save_error_context,
+                                       &save_error_errno,
+                                       &save_error_captured);
+            }
+            if (save_error_captured) {
+                errno = save_error_errno;
+                (void)error_accumulator_add(&rollback_errors,
+                                            "configuration persistence",
+                                            &save_error_context);
+            }
 
             /* Keep the cross-HOME runtime lock owned by the prepared switch
              * until the persistence before-images are restored. Reversing
@@ -1163,29 +1263,31 @@ int main(int argc, char *argv[]) {
                 config_resume_hint_snapshot_restore(
                     &mutation.hint_snapshot) != 0) {
                 rollback_complete = false;
-                safe_strncpy(rollback_detail, get_last_error()->message,
-                             sizeof(rollback_detail));
+                (void)error_accumulator_add_last(
+                    &rollback_errors, "resume-hint rollback");
             }
             /* accounts_switch_abort is deliberately last: it restores
              * Git/runtime and releases the retained shared-runtime lock only
              * after every config/hint rollback attempt has finished. */
             if (accounts_switch_abort(ctx, true) != 0) {
                 rollback_complete = false;
-                safe_strncpy(rollback_detail, get_last_error()->message,
-                             sizeof(rollback_detail));
+                (void)error_accumulator_add_last(
+                    &rollback_errors, "account switch abort");
             }
+            (void)error_accumulator_publish(&rollback_errors);
+            rollback_error = *get_last_error();
+            rollback_errno = errno;
+            switch_rollback_publish_test_checkpoint();
             if (rollback_complete) {
-                display_error("Failed to save configuration changes; previous switch state restored",
-                              "%s", save_error[0] ? save_error :
-                              "unknown persistence error");
+                display_error_chain(
+                    "Failed to save configuration changes; previous switch state restored",
+                    &rollback_error);
             } else {
-                display_error("Failed to save configuration changes; switch rollback incomplete",
-                              "%s; rollback error: %s",
-                              save_error[0] ? save_error :
-                              "unknown persistence error",
-                              rollback_detail[0] ? rollback_detail :
-                              "unknown rollback error");
+                display_error_chain(
+                    "Failed to save configuration changes; switch rollback incomplete",
+                    &rollback_error);
             }
+            restore_cli_error(&rollback_error, rollback_errno);
             exit_code = EXIT_FAILURE;
             if (signals_pending()) {
                 /* Keep repeats deferred through config unlock and heap cleanup;
@@ -1610,8 +1712,14 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
         error_context_t preparation_error = *get_last_error();
         int preparation_errno = errno;
 
-        display_error("Failed to switch account", "%s",
-                      preparation_error.message);
+        /* An abort-required failure is rendered only after main has attempted
+         * every rollback stage and assembled its complete causal chain. A
+         * clean failure has no later account-owned diagnostic to add. */
+        if (result.switch_prepare_state !=
+            ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED) {
+            display_error_chain("Failed to switch account",
+                                &preparation_error);
+        }
         config_resume_hint_snapshot_clear(&result.hint_snapshot);
         /* Display and snapshot cleanup are outside the account transaction
          * and may touch errno or the shared diagnostic. Main must classify

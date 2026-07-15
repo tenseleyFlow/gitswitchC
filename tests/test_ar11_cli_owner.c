@@ -22,6 +22,7 @@
 
 typedef void (*switch_abort_test_hook_fn)(gitswitch_ctx_t *ctx);
 typedef void (*switch_prepare_failure_test_hook_fn)(void);
+typedef void (*switch_rollback_publish_test_hook_fn)(void);
 
 int gitswitch_cli_main(int argc, char **argv);
 switch_abort_test_hook_fn gitswitch_test_set_switch_abort_hook(
@@ -29,6 +30,9 @@ switch_abort_test_hook_fn gitswitch_test_set_switch_abort_hook(
 switch_prepare_failure_test_hook_fn
 gitswitch_test_set_switch_prepare_failure_hook(
     switch_prepare_failure_test_hook_fn hook);
+switch_rollback_publish_test_hook_fn
+gitswitch_test_set_switch_rollback_publish_hook(
+    switch_rollback_publish_test_hook_fn hook);
 int gitswitch_test_context_allocations(void);
 int gitswitch_test_context_allocation_total(void);
 
@@ -56,7 +60,13 @@ static int g_hook_commit_rc;
 static int g_hook_holder_rc;
 static int g_hook_prepare_errno;
 static error_context_t g_hook_prepare_error;
+static int g_publish_called;
+static int g_publish_errno;
+static error_context_t g_publish_error;
 static char g_hook_commit_error[512];
+static cli_owner_fixture_t g_persistence_fault_fixture;
+static bool g_persistence_fault_armed;
+static int g_persistence_fault_mutation_rc;
 
 static const int guarded_signals[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
 static const char expected_accounts_config[] =
@@ -72,6 +82,14 @@ static const char expected_gitconfig[] =
     "[user]\n"
     "\tname = Before Name\n"
     "\temail = before@example.test\n";
+static const char concurrent_gitconfig[] =
+    "[user]\n"
+    "\tname = Concurrent Name\n"
+    "\temail = work@example.test\n"
+    "[commit]\n"
+    "\tgpgsign = false\n"
+    "[gpg]\n"
+    "\tformat = openpgp\n";
 
 static int write_private(const char *path, const char *text) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
@@ -92,6 +110,23 @@ static int write_private(const char *path, const char *text) {
         }
     }
     return close(fd);
+}
+
+static bool diverge_persistence_rollback(config_io_boundary_t boundary) {
+    int hint_rc;
+    int git_rc;
+
+    if (!g_persistence_fault_armed ||
+        boundary != CONFIG_IO_STATE_BEFORE_DIR_SYNC) {
+        return false;
+    }
+    g_persistence_fault_armed = false;
+    hint_rc = write_private(g_persistence_fault_fixture.hint,
+                            "none\nactive=later\n");
+    git_rc = write_private(g_persistence_fault_fixture.gitconfig,
+                           concurrent_gitconfig);
+    g_persistence_fault_mutation_rc = hint_rc == 0 && git_rc == 0 ? 0 : -1;
+    return true;
 }
 
 static size_t read_text(const char *path, char *text, size_t size) {
@@ -290,6 +325,12 @@ static void clobber_prepare_failure(void) {
     errno = EOVERFLOW;
 }
 
+static void capture_published_rollback(void) {
+    g_publish_called++;
+    g_publish_errno = errno;
+    g_publish_error = *get_last_error();
+}
+
 static void inherited_handler(int signal_number) {
     (void)signal_number;
 }
@@ -373,6 +414,9 @@ static int run_cli_owner_case(const cli_owner_fixture_t *fixture,
         g_hook_holder_rc = 0;
         g_hook_prepare_errno = 0;
         memset(&g_hook_prepare_error, 0, sizeof(g_hook_prepare_error));
+        g_publish_called = 0;
+        g_publish_errno = 0;
+        memset(&g_publish_error, 0, sizeof(g_publish_error));
         g_hook_commit_error[0] = '\0';
         signals_test_fail_sigaction(SIGTERM,
                                     SIGNALS_TEST_SIGACTION_INSTALL, EPERM);
@@ -382,28 +426,53 @@ static int run_cli_owner_case(const cli_owner_fixture_t *fixture,
         (void)gitswitch_test_set_switch_prepare_failure_hook(
             clobber_prepare_failure);
         (void)gitswitch_test_set_switch_abort_hook(inspect_abort_owner);
+        (void)gitswitch_test_set_switch_rollback_publish_hook(
+            capture_published_rollback);
 
         optind = 1;
         first_rc = gitswitch_cli_main(4, switch_argv);
         if (first_rc == 0) _exit(102);
-        if (g_hook_called != 1 || g_hook_prepare_errno != EAGAIN ||
+        if (g_hook_called != 1 || g_hook_prepare_errno != EPERM ||
             g_hook_prepare_error.code != ERR_SYSTEM_CALL ||
+            g_hook_prepare_error.system_errno != EPERM ||
             strstr(g_hook_prepare_error.message,
-                   "rollback ownership remains published") == NULL ||
+                   "Failed to install guarded disposition") == NULL ||
+            strstr(g_hook_prepare_error.details,
+                   "[signal guard release]") == NULL ||
+            g_publish_called != 1 || g_publish_errno != EPERM ||
+            g_publish_error.code != ERR_SYSTEM_CALL ||
+            g_publish_error.system_errno != EPERM ||
+            strcmp(g_publish_error.message,
+                   g_hook_prepare_error.message) != 0 ||
             g_hook_commit_rc != -1 ||
             strstr(g_hook_commit_error, "can only be retried") == NULL) {
             fprintf(stderr,
                     "AR-11 CLI owner hook mismatch: called=%d "
                     "prepare_errno=%d prepare_code=%d prepare_error=%s "
-                    "commit_rc=%d commit_error=%s\n",
+                    "publish_called=%d publish_errno=%d "
+                    "publish_code=%d publish_error=%s "
+                    "publish_details=%s commit_rc=%d commit_error=%s\n",
                     g_hook_called, g_hook_prepare_errno,
                     (int)g_hook_prepare_error.code,
                     g_hook_prepare_error.message[0]
                         ? g_hook_prepare_error.message
                         : "(empty)",
+                    g_publish_called, g_publish_errno,
+                    (int)g_publish_error.code,
+                    g_publish_error.message[0]
+                        ? g_publish_error.message
+                        : "(empty)",
+                    g_publish_error.details[0]
+                        ? g_publish_error.details
+                        : "(empty)",
                     g_hook_commit_rc,
                     g_hook_commit_error[0] ? g_hook_commit_error : "(empty)");
             _exit(103);
+        }
+        if (persist_first_abort &&
+            strstr(g_publish_error.details,
+                   "[account switch abort]") == NULL) {
+            _exit(112);
         }
         if (!config_lock_available()) _exit(104);
 
@@ -468,6 +537,83 @@ static int run_cli_owner_case(const cli_owner_fixture_t *fixture,
     }
 }
 
+static int run_cli_aggregate_case(const cli_owner_fixture_t *fixture) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char force_global[] = "-g";
+        char account[] = "work";
+        char *switch_argv[] = {
+            program, no_color, force_global, account, NULL
+        };
+        const char *resume_entry;
+        const char *abort_entry;
+        int first_rc;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            redirect_output(fixture->output) != 0) {
+            _exit(120);
+        }
+
+        g_persistence_fault_fixture = *fixture;
+        g_persistence_fault_armed = true;
+        g_persistence_fault_mutation_rc = -1;
+        g_publish_called = 0;
+        g_publish_errno = 0;
+        memset(&g_publish_error, 0, sizeof(g_publish_error));
+        (void)config_set_io_fault_fn(diverge_persistence_rollback);
+        (void)gitswitch_test_set_switch_rollback_publish_hook(
+            capture_published_rollback);
+
+        optind = 1;
+        first_rc = gitswitch_cli_main(4, switch_argv);
+        (void)config_set_io_fault_fn(NULL);
+        if (first_rc == 0 || g_persistence_fault_mutation_rc != 0 ||
+            g_publish_called != 1 || g_publish_errno != EIO ||
+            g_publish_error.code != ERR_FILE_IO ||
+            g_publish_error.system_errno != EIO ||
+            strstr(g_publish_error.file, "config.c") == NULL ||
+            g_publish_error.line <= 0 ||
+            g_publish_error.function[0] == '\0') {
+            _exit(121);
+        }
+        resume_entry = strstr(g_publish_error.details,
+                              "[resume-hint rollback]");
+        abort_entry = strstr(g_publish_error.details,
+                             "[account switch abort]");
+        if (!resume_entry || !abort_entry || resume_entry >= abort_entry) {
+            _exit(122);
+        }
+        if (gitswitch_test_context_allocations() != 1 ||
+            gitswitch_test_context_allocation_total() != 1 ||
+            !signals_guard_active() || !signals_rollback_active() ||
+            !config_lock_available()) {
+            _exit(123);
+        }
+        if (fflush(NULL) != 0) _exit(124);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
 static bool config_dir_has_temporary(const char *path) {
     DIR *directory = opendir(path);
     struct dirent *entry;
@@ -512,13 +658,51 @@ static void check_case_artifacts(const cli_owner_fixture_t *fixture,
         fprintf(stderr, "AR-11 CLI owner captured output:\n%s\n", output);
     }
     CHECK(strstr(output, "Failed to install guarded disposition") != NULL);
+    CHECK(strstr(output, "[signal guard release]") != NULL);
     CHECK(strstr(output, "Switched to:") == NULL);
     if (persistent) {
+        CHECK(strstr(output, "[account switch abort]") != NULL);
         CHECK(strstr(output, "application context was retained") != NULL);
         CHECK(strstr(output, GITSWITCH_VERSION) != NULL);
     } else {
         CHECK(strstr(output, "application context was retained") == NULL);
     }
+}
+
+static void check_aggregate_artifacts(const cli_owner_fixture_t *fixture) {
+    char config[512];
+    char gitconfig[256];
+    char hint[128];
+    char output[16384];
+    int status = run_cli_aggregate_case(fixture);
+
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+    CHECK(read_text(fixture->config, config, sizeof(config)) > 0);
+    CHECK_STR_EQ(config, expected_accounts_config);
+    CHECK(read_text(fixture->gitconfig, gitconfig, sizeof(gitconfig)) > 0);
+    CHECK(strstr(gitconfig, "Concurrent Name") != NULL);
+    CHECK(strstr(gitconfig, "work@example.test") != NULL);
+    CHECK(strstr(gitconfig, "before@example.test") == NULL);
+    CHECK(read_text(fixture->hint, hint, sizeof(hint)) > 0);
+    CHECK_STR_EQ(hint, "none\nactive=later\n");
+    errno = 0;
+    CHECK(lstat(fixture->ssh_config, &(struct stat){0}) != 0 &&
+          errno == ENOENT);
+    CHECK(!config_dir_has_temporary(fixture->config_dir));
+    CHECK(read_text(fixture->output, output, sizeof(output)) > 0);
+    if (status < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "AR-11 CLI aggregate captured output:\n%s\n",
+                output);
+    }
+    CHECK(strstr(output, "Cannot durably commit resume hint") != NULL);
+    CHECK(strstr(output, "[resume-hint rollback]") != NULL);
+    CHECK(strstr(output, "[account switch abort]") != NULL);
+    CHECK(strstr(output, "application context was retained") != NULL);
+    CHECK(strstr(output, "Switched to:") == NULL);
 }
 
 TEST(one_shot_exact_abort_releases_cli_context) {
@@ -535,7 +719,15 @@ TEST(persistent_runtime_lock_retains_then_settles_before_next_entry) {
     check_case_artifacts(&fixture, true);
 }
 
+TEST(persistence_and_abort_failures_keep_first_context_and_causal_order) {
+    cli_owner_fixture_t fixture;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    check_aggregate_artifacts(&fixture);
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(one_shot_exact_abort_releases_cli_context);
     RUN_TEST(persistent_runtime_lock_retains_then_settles_before_next_entry);
+    RUN_TEST(persistence_and_abort_failures_keep_first_context_and_causal_order);
 TEST_MAIN_END()

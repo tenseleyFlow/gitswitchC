@@ -407,7 +407,8 @@ TEST(error_accumulator_appends_in_order_and_publishes_first_cause) {
 
     later.code = ERR_SYSTEM_CALL;
     snprintf(later.message, sizeof(later.message), "%s", "abort failed");
-    snprintf(later.details, sizeof(later.details), "%s", "later detail");
+    snprintf(later.details, sizeof(later.details), "%s",
+             "; [nested cleanup] nested failure");
     snprintf(later.file, sizeof(later.file), "%s", "accounts.c");
     later.line = 63;
     snprintf(later.function, sizeof(later.function), "%s", "abort_switch");
@@ -422,7 +423,7 @@ TEST(error_accumulator_appends_in_order_and_publishes_first_cause) {
     CHECK(!accumulator.chain_truncated);
     CHECK_STR_EQ(accumulator.accumulated_details,
                  "save errno detail; [resume restore] metadata restore failed; "
-                 "[account abort] abort failed");
+                 "[account abort] abort failed; [nested cleanup] nested failure");
     CHECK(memcmp(&accumulator.first_error, &first_bytes,
                  sizeof(first_bytes)) == 0);
 
@@ -436,7 +437,7 @@ TEST(error_accumulator_appends_in_order_and_publishes_first_cause) {
     CHECK_STR_EQ(g_last_error.message, "save failed");
     CHECK_STR_EQ(g_last_error.details,
                  "save errno detail; [resume restore] metadata restore failed; "
-                 "[account abort] abort failed");
+                 "[account abort] abort failed; [nested cleanup] nested failure");
     CHECK_STR_EQ(g_last_error.file, "resume.c");
     CHECK_EQ_INT(g_last_error.line, 41);
     CHECK_STR_EQ(g_last_error.function, "restore_resume");

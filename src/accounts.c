@@ -811,12 +811,21 @@ static int abort_failed_switch_checked(const account_t *prev,
                                        bool *gpg_remaining,
                                        bool *rollback_complete,
                                        char *rollback_detail,
-                                       size_t rollback_detail_size) {
+                                       size_t rollback_detail_size,
+                                       error_accumulator_t *rollback_errors) {
+    error_accumulator_t local_errors;
+    error_accumulator_t *errors = rollback_errors;
+    bool publish_errors = false;
     bool complete = true;
     bool git_left = git_written;
     bool ssh_left = ssh_dirty;
     bool gpg_left = gpg_dirty;
-    char first_detail[sizeof(g_last_error.message)] = "";
+
+    if (!errors) {
+        error_accumulator_init(&local_errors);
+        errors = &local_errors;
+        publish_errors = true;
+    }
 
     if (rollback_detail && rollback_detail_size > 0) {
         rollback_detail[0] = '\0';
@@ -828,14 +837,14 @@ static int abort_failed_switch_checked(const account_t *prev,
      * until the whole restore sequence has completed. */
     if (transaction_ensure_rollback(ACCOUNTS_TRANSACTION_SWITCH) != 0) {
         complete = false;
-        safe_strncpy(first_detail, get_last_error()->message,
-                     sizeof(first_detail));
+        (void)error_accumulator_add_last(errors,
+                                         "transaction rollback admission");
     }
     if (git_written) {
         if (git_config_restore() != 0) {
             complete = false;
-            safe_strncpy(first_detail, get_last_error()->message,
-                         sizeof(first_detail));
+            (void)error_accumulator_add_last(errors,
+                                             "Git configuration restore");
             log_warning("Incomplete rollback of Git configuration: %s",
                         get_last_error()->message);
         } else {
@@ -861,10 +870,7 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (deactivate_runtime_isolation(ssh_dirty, false) != 0) {
         complete = false;
         ssh_deactivate_failed = true;
-        if (first_detail[0] == '\0') {
-            safe_strncpy(first_detail, get_last_error()->message,
-                         sizeof(first_detail));
-        }
+        (void)error_accumulator_add_last(errors, "SSH runtime deactivation");
         log_warning("Incomplete rollback of the new account's SSH state: %s",
                     get_last_error()->message);
     }
@@ -873,10 +879,7 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (restore_previous_gpg_isolation(prev_gpg_home, prev_gpg_present,
                                        gpg_dirty) != 0) {
         complete = false;
-        if (first_detail[0] == '\0') {
-            safe_strncpy(first_detail, get_last_error()->message,
-                         sizeof(first_detail));
-        }
+        (void)error_accumulator_add_last(errors, "GPG isolation restore");
     } else {
         gpg_left = false;
     }
@@ -887,10 +890,8 @@ static int abort_failed_switch_checked(const account_t *prev,
     if (!ssh_deactivate_failed) {
         if (restore_previous_ssh_isolation(prev, ssh_dirty) != 0) {
             complete = false;
-            if (first_detail[0] == '\0') {
-                safe_strncpy(first_detail, get_last_error()->message,
-                             sizeof(first_detail));
-            }
+            (void)error_accumulator_add_last(errors,
+                                             "SSH isolation restore");
         } else {
             ssh_left = false;
         }
@@ -904,36 +905,40 @@ static int abort_failed_switch_checked(const account_t *prev,
                 g_transaction_owner.ctx, ACCOUNTS_TRANSACTION_SWITCH,
                 g_transaction_owner.token) != 0) {
             complete = false;
-            if (first_detail[0] == '\0') {
-                safe_strncpy(first_detail, get_last_error()->message,
-                             sizeof(first_detail));
-            }
+            (void)error_accumulator_add_last(errors,
+                                             "transaction rollback release");
         }
     }
     runtime_state_lock_release(runtime_lock_fd);
-    if (git_remaining) *git_remaining = git_left;
-    if (ssh_remaining) *ssh_remaining = ssh_left;
-    if (gpg_remaining) *gpg_remaining = gpg_left;
-    if (rollback_complete) {
-        *rollback_complete = complete;
-    }
-    if (rollback_detail && rollback_detail_size > 0 && first_detail[0]) {
-        safe_strncpy(rollback_detail, first_detail, rollback_detail_size);
-    }
     if (signals_pending() && !keep_rollback_active) {
         fprintf(stderr, "\ngitswitch: interrupted — switch rolled back, previous identity kept\n");
         set_error(ERR_SYSTEM_CALL, "Switch interrupted by signal %d",
                   signals_pending_signal());
         if (end_guard &&
             finish_signal_guard_checked("Switch rollback completed") != 0) {
-            return -1;
+            complete = false;
+            (void)error_accumulator_add_last(errors, "signal guard release");
         }
     } else if (signals_pending()) {
         log_warning("Switch interruption remains deferred until config and "
                     "resume-hint rollback completes");
     } else if (end_guard &&
                finish_signal_guard_checked("Switch rollback completed") != 0) {
-        return -1;
+        complete = false;
+        (void)error_accumulator_add_last(errors, "signal guard release");
+    }
+    if (git_remaining) *git_remaining = git_left;
+    if (ssh_remaining) *ssh_remaining = ssh_left;
+    if (gpg_remaining) *gpg_remaining = gpg_left;
+    if (rollback_complete) {
+        *rollback_complete = complete;
+    }
+    if (rollback_detail && rollback_detail_size > 0 && errors->active) {
+        safe_strncpy(rollback_detail, errors->first_error.message,
+                     rollback_detail_size);
+    }
+    if (publish_errors && errors->active) {
+        (void)error_accumulator_publish(errors);
     }
     return -1;
 }
@@ -948,8 +953,12 @@ static int abort_failed_switch(const account_t *prev, const char *prev_gpg_home,
                                        runtime_lock_fd,
                                        !defer_signal_dispatch,
                                        defer_signal_dispatch,
-                                       NULL, NULL, NULL, NULL, NULL, 0);
+                                       NULL, NULL, NULL, NULL, NULL, 0, NULL);
 }
+
+static int accounts_switch_abort_accumulated(
+    gitswitch_ctx_t *ctx, bool continue_persistence_rollback,
+    error_accumulator_t *abort_errors);
 
 /* A failed prepared switch has not handed ownership to its caller. Publish
  * the rollback record first, then drive the same checked abort API a caller
@@ -965,11 +974,9 @@ static bool abort_switch_failure(pending_switch_t *prepared,
                                  bool ssh_dirty, bool gpg_dirty,
                                  int runtime_lock_fd,
                                  bool defer_signal_dispatch) {
+    error_accumulator_t failures;
     error_context_t failure;
-    char failure_detail[sizeof(g_last_error.message)];
-    char rollback_detail[sizeof(g_last_error.message)];
     int failure_errno;
-    int rollback_errno;
 
     if (!prepared) {
         abort_failed_switch(prev, prev_gpg_home, prev_gpg_present,
@@ -988,7 +995,9 @@ static bool abort_switch_failure(pending_switch_t *prepared,
     }
     failure = *get_last_error();
     failure_errno = errno;
-    safe_strncpy(failure_detail, failure.message, sizeof(failure_detail));
+    error_accumulator_init(&failures);
+    errno = failure_errno;
+    (void)error_accumulator_add(&failures, "switch preparation", &failure);
     prepared->git_written = git_written;
     prepared->ssh_dirty = ssh_dirty;
     prepared->gpg_dirty = gpg_dirty;
@@ -999,23 +1008,10 @@ static bool abort_switch_failure(pending_switch_t *prepared,
                                  prepared->token,
                                  ACCOUNTS_TRANSACTION_ABORT_ONLY);
 
-    (void)accounts_switch_abort(prepared->ctx, false);
+    (void)accounts_switch_abort_accumulated(prepared->ctx, false, &failures);
     if (!g_pending_switch.active || g_pending_switch.ctx != prepared->ctx) {
-        g_last_error = failure;
-        errno = failure_errno;
         return false;
     }
-
-    rollback_errno = errno;
-    safe_strncpy(rollback_detail, get_last_error()->message,
-                 sizeof(rollback_detail));
-    set_error(
-        ERR_SYSTEM_CALL,
-        "Account switch preparation failed (%s); rollback ownership remains "
-        "published for accounts_switch_abort() retry: %s",
-        failure_detail[0] ? failure_detail : "unknown preparation error",
-        rollback_detail[0] ? rollback_detail : "unknown rollback error");
-    errno = rollback_errno;
     return true;
 }
 
@@ -1479,7 +1475,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                     prev_account, prev_gpg_home, prev_gpg_present, false,
                     ssh_dirty, false, runtime_lock_fd,
                     !defer_signal_dispatch, defer_signal_dispatch,
-                    NULL, NULL, NULL, &rollback_complete, NULL, 0);
+                    NULL, NULL, NULL, &rollback_complete, NULL, 0, NULL);
             }
             set_error(ERR_SYSTEM_CALL,
                       "Cannot switch away from the active runtime session: %s%s",
@@ -1807,7 +1803,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                         write_git, ssh_dirty, gpg_dirty, runtime_lock_fd,
                         false, true, &git_remaining, &ssh_remaining,
                         &gpg_remaining, &rollback_complete, rollback_detail,
-                        sizeof(rollback_detail));
+                        sizeof(rollback_detail), NULL);
                     if (!rollback_complete) {
                         memset(&g_pending_switch, 0, sizeof(g_pending_switch));
                         g_pending_switch.active = true;
@@ -2199,26 +2195,44 @@ int accounts_switch_commit(gitswitch_ctx_t *ctx) {
     return accounts_switch_commit_result(ctx, NULL);
 }
 
-int accounts_switch_abort(gitswitch_ctx_t *ctx,
-                          bool continue_persistence_rollback) {
+static int publish_abort_result(error_accumulator_t *errors, int result) {
+    if (errors && errors->active) {
+        (void)error_accumulator_publish(errors);
+    }
+    return result;
+}
+
+static int accounts_switch_abort_accumulated(
+    gitswitch_ctx_t *ctx, bool continue_persistence_rollback,
+    error_accumulator_t *abort_errors) {
+    error_accumulator_t local_errors;
+    error_accumulator_t *errors = abort_errors;
     pending_switch_t pending;
     const account_t *previous = NULL;
     bool rollback_complete = true;
     int guard_rc;
     char rollback_detail[sizeof(g_last_error.message)] = "";
 
+    if (!errors) {
+        error_accumulator_init(&local_errors);
+        errors = &local_errors;
+    }
+
     if (!g_pending_switch.active || !ctx || g_pending_switch.ctx != ctx) {
         set_error(ERR_INVALID_ARGS, "No prepared account switch to roll back");
-        return -1;
+        (void)error_accumulator_add_last(errors, "account abort admission");
+        return publish_abort_result(errors, -1);
     }
     if (transaction_require(ctx, ACCOUNTS_TRANSACTION_SWITCH,
                             g_pending_switch.token, "abort") != 0) {
-        return -1;
+        (void)error_accumulator_add_last(errors, "account abort ownership");
+        return publish_abort_result(errors, -1);
     }
     if (transaction_require_phase(
             ACCOUNTS_TRANSACTION_SWITCH, ACCOUNTS_TRANSACTION_PREPARED,
             ACCOUNTS_TRANSACTION_ABORT_ONLY, "abort") != 0) {
-        return -1;
+        (void)error_accumulator_add_last(errors, "account abort phase");
+        return publish_abort_result(errors, -1);
     }
 
     pending = g_pending_switch;
@@ -2228,7 +2242,9 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
     if (pending.runtime_lock_fd < 0) {
         pending.runtime_lock_fd = runtime_state_lock_acquire();
         if (pending.runtime_lock_fd < 0) {
-            return -1;
+            (void)error_accumulator_add_last(errors,
+                                             "runtime lock reacquisition");
+            return publish_abort_result(errors, -1);
         }
         g_pending_switch.runtime_lock_fd = pending.runtime_lock_fd;
     }
@@ -2245,7 +2261,8 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
                                 &pending.ssh_dirty,
                                 &pending.gpg_dirty,
                                 &rollback_complete,
-                                rollback_detail, sizeof(rollback_detail));
+                                rollback_detail, sizeof(rollback_detail),
+                                errors);
     pending.runtime_lock_fd = -1;
 
     safe_strncpy(ctx->config.active_account, pending.previous_active,
@@ -2269,13 +2286,7 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
          * completed abort would let a repeated signal strand mixed state. */
         g_pending_switch = pending;
         g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
-        set_error(
-            ERR_SYSTEM_CALL,
-            "The prepared switch could not be rolled back completely; "
-            "retry material and transaction signal ownership were retained: %s",
-            rollback_detail[0] ? rollback_detail
-                               : "unknown rollback error");
-        return -1;
+        return publish_abort_result(errors, -1);
     }
     /* main() may still need to reverse its active-account file and resume
      * hint, so CLI-owned abort keeps both layers armed until common cleanup.
@@ -2286,16 +2297,25 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
         if (g_transaction_owner.rollback_depth > 0 &&
             accounts_transaction_rollback_end(
                 ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token) != 0) {
-            return -1;
+            (void)error_accumulator_add_last(
+                errors, "transaction rollback release");
+            return publish_abort_result(errors, -1);
         }
         memset(&g_pending_switch, 0, sizeof(g_pending_switch));
-        return accounts_transaction_finish(
+        guard_rc = accounts_transaction_finish(
             ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token);
+        if (guard_rc != 0) {
+            (void)error_accumulator_add_last(
+                errors, "account transaction finish");
+        }
+        return publish_abort_result(errors, guard_rc);
     }
     if (g_transaction_owner.rollback_depth > 0 &&
         accounts_transaction_rollback_end(
             ctx, ACCOUNTS_TRANSACTION_SWITCH, pending.token) != 0) {
-        return -1;
+        (void)error_accumulator_add_last(errors,
+                                         "transaction rollback release");
+        return publish_abort_result(errors, -1);
     }
     guard_rc = finish_signal_guard_checked(
         "Prepared switch rolled back, but restoring the caller's signal "
@@ -2312,11 +2332,23 @@ int accounts_switch_abort(gitswitch_ctx_t *ctx,
         pending.runtime_lock_fd = -1;
         g_pending_switch = pending;
         g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
-        return -1;
+        (void)error_accumulator_add_last(errors, "signal guard release");
+        return publish_abort_result(errors, -1);
     }
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));
-    return accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_SWITCH,
-                                       pending.token);
+    guard_rc = accounts_transaction_finish(ctx, ACCOUNTS_TRANSACTION_SWITCH,
+                                           pending.token);
+    if (guard_rc != 0) {
+        (void)error_accumulator_add_last(errors,
+                                         "account transaction finish");
+    }
+    return publish_abort_result(errors, guard_rc);
+}
+
+int accounts_switch_abort(gitswitch_ctx_t *ctx,
+                          bool continue_persistence_rollback) {
+    return accounts_switch_abort_accumulated(
+        ctx, continue_persistence_rollback, NULL);
 }
 
 /* Fields whose persisted value must agree with the live Git/SSH/GPG state.

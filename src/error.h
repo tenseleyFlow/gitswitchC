@@ -172,8 +172,9 @@ void error_accumulator_init(error_accumulator_t *accumulator);
 /**
  * Retain an error without changing the global error context or errno. The
  * first context and ambient errno are captured exactly. Later failures are
- * appended as "; [label] message" while space permits. Returns false for an
- * invalid call or when the new entry cannot be rendered completely.
+ * appended as "; [label] message" followed by their existing detail chain
+ * while space permits. Returns false for an invalid call or when the new
+ * entry cannot be rendered completely.
  */
 bool error_accumulator_add(error_accumulator_t *accumulator,
                            const char *label,

@@ -1289,8 +1289,8 @@ TEST(late_runtime_teardown_failure_rolls_back_git_and_gpg) {
         gpg_target[n] = '\0';
         CHECK(strstr(gpg_target, "/prevhome") != NULL);
     }
-    CHECK(strstr(get_last_error()->message,
-                 "rollback ownership remains published") != NULL);
+    CHECK(strstr(get_last_error()->details,
+                 "[SSH runtime deactivation]") != NULL);
     CHECK(runtime_lock_available_to_child());
     CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
@@ -1579,8 +1579,8 @@ TEST(repeated_switch_reap_failure_preserves_live_session) {
     CHECK_EQ_INT(accounts_switch_prepare(&ctx, "second"), -1);
     ssh_manager_set_reap_fn(previous_reap);
 
-    CHECK(strstr(get_last_error()->message,
-                 "rollback ownership remains published") != NULL);
+    CHECK(strstr(get_last_error()->details,
+                 "[SSH runtime deactivation]") != NULL);
     CHECK(runtime_lock_available_to_child());
     CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
@@ -2392,6 +2392,120 @@ static int gpg_fault_setenv(const char *name, const char *value,
         return -1;
     }
     return setenv(name, value, overwrite);
+}
+
+/* AR-11 L25: the public abort owns one causal diagnostic across every
+ * best-effort rollback component. A sealed Git post-image conflict is the
+ * first failure; GPG then restores its stable link but cannot restore the
+ * process environment. The published context must retain the Git provenance
+ * and ambient errno exactly while appending the later GPG cause. Both retry
+ * records remain live, and one exact retry completes them without replaying a
+ * generic wrapper error over the original evidence. */
+TEST(abort_accumulates_git_then_gpg_failure_and_retries_exactly) {
+    char expected_details[sizeof(g_last_error.details)];
+    char gpg_target[MAX_PATH_LEN];
+    error_context_t failure;
+    gitswitch_ctx_t ctx;
+    account_t *target;
+    account_t *previous;
+    command_runner_fn previous_runner;
+    ssize_t target_length;
+    int failure_errno;
+
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
+    }
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
+    CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
+    ctx = make_ctx();
+    target = &ctx.accounts[0];
+    previous = add_previous_account(&ctx);
+    target->gpg_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(target->gpg_key_id, "FEEDFACE01234567",
+                              sizeof(target->gpg_key_id)), 0);
+    previous->gpg_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(previous->gpg_key_id, "0123456789ABCDEF",
+                              sizeof(previous->gpg_key_id)), 0);
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(gpg_git_runner);
+
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK(getenv("GNUPGHOME") != NULL);
+    if (getenv("GNUPGHOME")) {
+        CHECK_EQ_INT(safe_strncpy(gpg_target, getenv("GNUPGHOME"),
+                                  sizeof(gpg_target)), 0);
+    } else {
+        gpg_target[0] = '\0';
+    }
+
+    /* Two independent changes fail in rollback order. Git no longer matches
+     * the sealed post-image, while the GPG environment setter fails only
+     * after its stable link has been restored. */
+    CHECK_EQ_INT(safe_strncpy(g_store_name, "concurrent-git-writer",
+                              sizeof(g_store_name)), 0);
+    gpg_fail_session_env_restore = true;
+    gpg_manager_set_setenv_fn(gpg_fault_setenv);
+    errno = EDOM;
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    failure = *get_last_error();
+    failure_errno = errno;
+
+    CHECK_EQ_INT(failure.code, ERR_GIT_CONFIG_FAILED);
+    CHECK_EQ_INT(failure.system_errno, 0);
+    CHECK(!failure.message_truncated);
+    CHECK(!failure.details_truncated);
+    CHECK(strstr(failure.message,
+                 "Git rollback incomplete: 1 managed vector(s) changed "
+                 "outside this transaction") != NULL);
+    CHECK_STR_EQ(failure.file, "src/git_ops.c");
+    CHECK(failure.line > 0);
+    CHECK_STR_EQ(failure.function, "git_config_restore");
+    CHECK_EQ_INT(failure_errno, EDOM);
+    CHECK((size_t)snprintf(
+              expected_details, sizeof(expected_details),
+              "; [GPG isolation restore] Failed to restore GNUPGHOME "
+              "environment variable (%s); System error: %s (errno=%d)",
+              strerror(EIO), strerror(EIO), EIO) <
+          sizeof(expected_details));
+    CHECK_STR_EQ(failure.details, expected_details);
+    CHECK_STR_EQ(g_store_name, "concurrent-git-writer");
+    CHECK(getenv("GNUPGHOME") != NULL);
+    if (getenv("GNUPGHOME")) CHECK_STR_EQ(getenv("GNUPGHOME"), gpg_target);
+    target_length = readlink(g_gpg_link, gpg_target,
+                             sizeof(gpg_target) - 1);
+    CHECK(target_length > 0);
+    if (target_length > 0) {
+        gpg_target[target_length] = '\0';
+        CHECK(strstr(gpg_target, "/prevhome") != NULL);
+    }
+    CHECK(signals_guard_active());
+    CHECK(signals_rollback_active());
+
+    /* Restore only the exact states each retained token expects. The retry
+     * must recover the original Git identity and GPG environment, then release
+     * the transaction and signal owners. */
+    CHECK_EQ_INT(safe_strncpy(g_store_name, "testacct",
+                              sizeof(g_store_name)), 0);
+    gpg_fail_session_env_restore = false;
+    gpg_manager_set_setenv_fn(NULL);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK_STR_EQ(getenv("GNUPGHOME"), g_gpg_source_home);
+    CHECK(!signals_guard_active());
+    CHECK(!signals_rollback_active());
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    unsetenv("GNUPGHOME");
 }
 
 TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback) {
@@ -3321,8 +3435,8 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     previous_runner = run_set_runner(fake_runner);
     CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), -1);
     g_mutate_name_before_seal = false;
-    CHECK(strstr(get_last_error()->message,
-                 "rollback ownership remains published") != NULL);
+    CHECK(strstr(get_last_error()->details,
+                 "[Git configuration restore]") != NULL);
     CHECK_STR_EQ(g_store_name, "preseal-writer");
     CHECK_STR_EQ(g_store_email, "prev@example.com");
     CHECK(runtime_lock_available_to_child());
@@ -3518,8 +3632,8 @@ TEST(guard_begin_restore_retry_publishes_abort_only_handle) {
     run_set_runner(previous_runner);
 
     CHECK_EQ_INT(rc, -1);
-    CHECK(strstr(get_last_error()->message,
-                 "rollback ownership remains published") != NULL);
+    CHECK(strstr(get_last_error()->details,
+                 "[signal guard release]") != NULL);
     CHECK(runtime_lock_available_to_child());
     CHECK_EQ_INT(git_config_seal(), -1);
     CHECK(strstr(get_last_error()->message, "No Git snapshot to seal") !=
@@ -3684,8 +3798,8 @@ TEST(prepared_seal_failure_retains_abort_retry_handle) {
     /* Non-conflicting vectors are restored immediately; only the externally
      * changed name remains in the retained retry record. */
     CHECK_STR_EQ(g_store_email, "prev@example.com");
-    CHECK(strstr(get_last_error()->message,
-                 "rollback ownership remains published") != NULL);
+    CHECK(strstr(get_last_error()->details,
+                 "[Git configuration restore]") != NULL);
     CHECK(runtime_lock_available_to_child());
     CHECK_EQ_INT(accounts_switch_commit(&ctx), -1);
     CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
@@ -4201,6 +4315,7 @@ TEST_MAIN_BEGIN()
         return 1;
     }
     RUN_TEST(failed_inner_gpg_retarget_is_finished_by_accounts_rollback);
+    RUN_TEST(abort_accumulates_git_then_gpg_failure_and_retries_exactly);
     RUN_TEST(signing_capability_failure_precedes_runtime_and_git_publication);
     RUN_TEST(prepared_commit_accepts_unchanged_gpg_selector_after_normalization);
     RUN_TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry);
