@@ -2877,6 +2877,72 @@ static bool switch_actions_equal(const struct sigaction *left,
     return true;
 }
 
+/* AR-11 M4: the structured prepare result is a caller-lifetime contract.
+ * Only an exact successful handoff is PREPARED; a failed call that publishes
+ * an abort-only record says so explicitly, while validation or competing-
+ * owner failures remain clean. The legacy wrapper keeps its integer result. */
+TEST(structured_prepare_result_tracks_exact_context_ownership) {
+    gitswitch_ctx_t owner;
+    gitswitch_ctx_t contender;
+    accounts_switch_prepare_state_t state;
+    command_runner_fn previous_runner;
+
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    owner = make_ctx();
+    state = ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
+    CHECK_EQ_INT(accounts_switch_prepare_result(&owner, "missing", &state),
+                 -1);
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
+    CHECK(accounts_transaction_context_release_safe(&owner));
+    CHECK_EQ_INT(accounts_switch_prepare(&owner, "missing"), -1);
+    CHECK(accounts_transaction_context_release_safe(&owner));
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    owner = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    state = ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
+    CHECK_EQ_INT(accounts_switch_prepare_result(&owner, "testacct", &state),
+                 0);
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_PREPARED);
+    CHECK(!accounts_transaction_context_release_safe(&owner));
+    CHECK_EQ_INT(accounts_switch_commit(&owner), 0);
+    CHECK(accounts_transaction_context_release_safe(&owner));
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    owner = make_ctx();
+    contender = make_ctx();
+    seed_previous_git_identity();
+    CHECK_EQ_INT(accounts_switch_prepare(&owner, "testacct"), 0);
+    CHECK(!accounts_transaction_context_release_safe(&owner));
+    state = ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
+    CHECK_EQ_INT(accounts_switch_prepare_result(&contender, NULL, &state),
+                 -1);
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
+    CHECK(accounts_transaction_context_release_safe(&contender));
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK(accounts_transaction_context_release_safe(&owner));
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    owner = make_ctx();
+    seed_previous_git_identity();
+    g_mutate_name_before_seal = true;
+    state = ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
+    CHECK_EQ_INT(accounts_switch_prepare_result(&owner, "testacct", &state),
+                 -1);
+    g_mutate_name_before_seal = false;
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED);
+    CHECK(!accounts_transaction_context_release_safe(&owner));
+    CHECK_EQ_INT(accounts_switch_commit(&owner), -1);
+    CHECK(strstr(get_last_error()->message, "can only be retried") != NULL);
+    safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    CHECK_EQ_INT(accounts_switch_abort(&owner, false), 0);
+    CHECK(accounts_transaction_context_release_safe(&owner));
+
+    run_set_runner(previous_runner);
+}
+
 typedef enum {
     ACCOUNT_MUTATION_ID = 0,
     ACCOUNT_MUTATION_NAME,
@@ -4147,6 +4213,7 @@ TEST_MAIN_BEGIN()
         fprintf(stderr, "HARNESS FAIL: cannot restore PATH after GPG tests\n");
         return 1;
     }
+    RUN_TEST(structured_prepare_result_tracks_exact_context_ownership);
     RUN_TEST(clean_pending_switch_excludes_competing_entry_matrix);
     RUN_TEST(prepared_commit_rejects_every_frozen_account_field_change);
     RUN_TEST(prepared_switch_gates_public_account_model_mutation_matrix);

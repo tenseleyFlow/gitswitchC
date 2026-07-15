@@ -49,6 +49,17 @@ typedef enum {
     ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED
 } accounts_switch_commit_state_t;
 
+/* Transactional prepare outcome. A nonzero return with CLEAN_FAILURE owns no
+ * caller context. ABORT_REQUIRED means the exact caller context is still
+ * referenced by an abort-only process-global record and must remain alive
+ * until accounts_switch_abort() consumes it. PREPARED is the only state that
+ * authorizes persistence and commit. */
+typedef enum {
+    ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE = 0,
+    ACCOUNTS_SWITCH_PREPARE_PREPARED,
+    ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED
+} accounts_switch_prepare_state_t;
+
 /* Function prototypes */
 
 /**
@@ -83,6 +94,11 @@ int accounts_transaction_authorize_model_mutation(
     gitswitch_ctx_t *ctx, accounts_transaction_kind_t kind,
     accounts_transaction_token_t token);
 
+/* True only when no process-global account owner or pending account record
+ * retains the caller's context address. This is a storage-lifetime query, not
+ * an operation capability and it exposes no owner token. */
+bool accounts_transaction_context_release_safe(const gitswitch_ctx_t *ctx);
+
 /**
  * Switch to specified account
  * - Validates account exists and is properly configured
@@ -100,6 +116,9 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier);
  * using accounts_switch().
  */
 int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier);
+int accounts_switch_prepare_result(gitswitch_ctx_t *ctx,
+                                   const char *identifier,
+                                   accounts_switch_prepare_state_t *state);
 int accounts_switch_commit(gitswitch_ctx_t *ctx);
 int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                                   accounts_switch_commit_state_t *state);

@@ -805,6 +805,15 @@ $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+# AR-11 M4 drives two consecutive invocations of the real CLI entry in one
+# process so a retained abort-only context cannot hide behind process exit.
+$(BINDIR)/test_ar11_cli_owner: $(OBJDIR)/test_ar11_cli_owner.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 $(BINDIR)/test_ar08_remove_signal: $(OBJDIR)/test_ar08_remove_signal.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(AR08_REMOVE_ACCOUNTS_OBJECT) \

@@ -349,6 +349,22 @@ int accounts_transaction_authorize_model_mutation(
     return 0;
 }
 
+bool accounts_transaction_context_release_safe(const gitswitch_ctx_t *ctx) {
+    if (!ctx) return false;
+
+    if (g_transaction_owner.kind != ACCOUNTS_TRANSACTION_NONE &&
+        g_transaction_owner.ctx == ctx) {
+        return false;
+    }
+    if ((g_pending_switch.active && g_pending_switch.ctx == ctx) ||
+        (g_pending_add.active && g_pending_add.ctx == ctx) ||
+        (g_pending_edit.active && g_pending_edit.ctx == ctx) ||
+        (g_pending_remove.active && g_pending_remove.ctx == ctx)) {
+        return false;
+    }
+    return true;
+}
+
 static int transaction_mark_phase(gitswitch_ctx_t *ctx,
                                   accounts_transaction_kind_t kind,
                                   accounts_transaction_token_t token,
@@ -1973,10 +1989,19 @@ int accounts_switch(gitswitch_ctx_t *ctx, const char *identifier) {
     return rc;
 }
 
-int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
+int accounts_switch_prepare_result(gitswitch_ctx_t *ctx,
+                                   const char *identifier,
+                                   accounts_switch_prepare_state_t *state) {
     accounts_transaction_token_t token;
     int rc;
 
+    if (!state) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "A transactional switch prepare result is required");
+        return -1;
+    }
+    *state = ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE;
     if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_SWITCH,
                                    &token) != 0) {
         return -1;
@@ -1989,13 +2014,53 @@ int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
         return -1;
     }
     rc = accounts_switch_impl(ctx, identifier, true, token);
-    if (g_pending_switch.active && g_pending_switch.token == token) return rc;
+    if (g_pending_switch.active && g_pending_switch.token == token &&
+        g_pending_switch.ctx == ctx) {
+        bool exact_owner =
+            g_transaction_owner.kind == ACCOUNTS_TRANSACTION_SWITCH &&
+            g_transaction_owner.token == token &&
+            g_transaction_owner.ctx == ctx;
+
+        if (exact_owner && !g_pending_switch.abort_only && rc == 0 &&
+            g_transaction_owner.phase == ACCOUNTS_TRANSACTION_PREPARED) {
+            *state = ACCOUNTS_SWITCH_PREPARE_PREPARED;
+        } else if (exact_owner && g_pending_switch.abort_only &&
+                   g_transaction_owner.phase ==
+                       ACCOUNTS_TRANSACTION_ABORT_ONLY) {
+            *state = ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
+        } else {
+            /* An exact newly-created pending record can never be reported as
+             * clean: it still retains ctx. Convert any impossible rc/phase
+             * combination to the one fail-closed public settlement state.
+             * The matching abort may itself reject a corrupted owner, but the
+             * caller will then retain the context instead of freeing it. */
+            if (rc == 0) {
+                errno = EBUSY;
+                set_error(ERR_SYSTEM_CALL,
+                          "Account switch preparation retained an inconsistent transaction owner");
+                rc = -1;
+            }
+            g_pending_switch.abort_only = true;
+            if (exact_owner) {
+                g_transaction_owner.phase =
+                    ACCOUNTS_TRANSACTION_ABORT_ONLY;
+            }
+            *state = ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
+        }
+        return rc;
+    }
     if (transaction_finish_after_call(
             ctx, ACCOUNTS_TRANSACTION_SWITCH, token,
             ctx && ctx->config.defer_signal_cleanup) != 0) {
         return -1;
     }
     return rc;
+}
+
+int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
+    accounts_switch_prepare_state_t state;
+
+    return accounts_switch_prepare_result(ctx, identifier, &state);
 }
 
 /* Compare semantic account fields one by one. Avoiding a struct memcmp keeps

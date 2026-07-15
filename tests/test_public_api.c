@@ -61,7 +61,9 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_switch_commit);
     REQUIRE_PUBLIC_API(accounts_switch_commit_result);
     REQUIRE_PUBLIC_API(accounts_switch_prepare);
+    REQUIRE_PUBLIC_API(accounts_switch_prepare_result);
     REQUIRE_PUBLIC_API(accounts_transaction_begin);
+    REQUIRE_PUBLIC_API(accounts_transaction_context_release_safe);
     REQUIRE_PUBLIC_API(accounts_transaction_finish);
     REQUIRE_PUBLIC_API(accounts_transaction_authorize_model_mutation);
     REQUIRE_PUBLIC_API(accounts_transaction_rollback_begin);

@@ -145,7 +145,7 @@ typedef struct {
     int status;
     command_save_kind_t save_kind;
     command_notice_kind_t notice_kind;
-    bool switch_prepared;
+    accounts_switch_prepare_state_t switch_prepare_state;
     bool add_prepared;
     bool edit_prepared;
     bool remove_prepared;
@@ -155,6 +155,26 @@ typedef struct {
     char previous_active[MAX_NAME_LEN];
     char subject[MAX_NAME_LEN];
 } command_result_t;
+
+/* An abort-only switch record stores the caller context address. A renamed
+ * in-process CLI entry used by tests can return without terminating the
+ * process, so an incomplete exact abort must retain that storage and settle
+ * it before any later entry allocates another context. */
+typedef enum {
+    RETAINED_CLI_CONTEXT_NONE = 0,
+    RETAINED_CLI_CONTEXT_SWITCH_ABORT,
+    RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER
+} retained_cli_context_kind_t;
+
+typedef struct {
+    retained_cli_context_kind_t kind;
+    gitswitch_ctx_t *ctx;
+    char config_path[MAX_PATH_LEN];
+    error_context_t primary_error;
+    int primary_errno;
+} retained_cli_switch_t;
+
+static retained_cli_switch_t g_retained_cli_switch;
 
 /* Deterministic reset transaction checkpoints used only by the dedicated
  * AR-07 regression binary.  The production main object contains no injectable
@@ -169,14 +189,24 @@ enum {
 #ifdef GITSWITCH_TESTING
 typedef void (*reset_test_hook_fn)(int stage);
 typedef void (*remove_test_hook_fn)(int stage);
+typedef void (*switch_abort_test_hook_fn)(gitswitch_ctx_t *ctx);
+typedef void (*switch_prepare_failure_test_hook_fn)(void);
 reset_test_hook_fn gitswitch_test_set_reset_hook(reset_test_hook_fn hook);
 remove_test_hook_fn gitswitch_test_set_remove_hook(remove_test_hook_fn hook);
+switch_abort_test_hook_fn gitswitch_test_set_switch_abort_hook(
+    switch_abort_test_hook_fn hook);
+switch_prepare_failure_test_hook_fn
+gitswitch_test_set_switch_prepare_failure_hook(
+    switch_prepare_failure_test_hook_fn hook);
 void gitswitch_test_remove_checkpoint(int stage);
 int gitswitch_test_context_allocations(void);
 int gitswitch_test_context_allocation_total(void);
 
 static reset_test_hook_fn g_reset_test_hook;
 static remove_test_hook_fn g_remove_test_hook;
+static switch_abort_test_hook_fn g_switch_abort_test_hook;
+static switch_prepare_failure_test_hook_fn
+    g_switch_prepare_failure_test_hook;
 static int g_context_allocations;
 static int g_context_allocation_total;
 
@@ -192,6 +222,24 @@ remove_test_hook_fn gitswitch_test_set_remove_hook(remove_test_hook_fn hook) {
     return previous;
 }
 
+switch_abort_test_hook_fn gitswitch_test_set_switch_abort_hook(
+    switch_abort_test_hook_fn hook) {
+    switch_abort_test_hook_fn previous = g_switch_abort_test_hook;
+
+    g_switch_abort_test_hook = hook;
+    return previous;
+}
+
+switch_prepare_failure_test_hook_fn
+gitswitch_test_set_switch_prepare_failure_hook(
+    switch_prepare_failure_test_hook_fn hook) {
+    switch_prepare_failure_test_hook_fn previous =
+        g_switch_prepare_failure_test_hook;
+
+    g_switch_prepare_failure_test_hook = hook;
+    return previous;
+}
+
 void gitswitch_test_remove_checkpoint(int stage) {
     if (g_remove_test_hook) g_remove_test_hook(stage);
 }
@@ -204,6 +252,163 @@ int gitswitch_test_context_allocation_total(void) {
     return g_context_allocation_total;
 }
 #endif
+
+static void switch_abort_test_checkpoint(gitswitch_ctx_t *ctx) {
+#ifdef GITSWITCH_TESTING
+    switch_abort_test_hook_fn hook = g_switch_abort_test_hook;
+
+    /* Consume before invocation so a callback cannot accidentally arm itself
+     * recursively through another CLI entry. */
+    g_switch_abort_test_hook = NULL;
+    if (hook) hook(ctx);
+#else
+    (void)ctx;
+#endif
+}
+
+static void switch_prepare_failure_test_checkpoint(void) {
+#ifdef GITSWITCH_TESTING
+    switch_prepare_failure_test_hook_fn hook =
+        g_switch_prepare_failure_test_hook;
+
+    g_switch_prepare_failure_test_hook = NULL;
+    if (hook) hook();
+#endif
+}
+
+static void restore_cli_error(const error_context_t *error, int saved_errno) {
+    if (error) g_last_error = *error;
+    errno = saved_errno;
+}
+
+static void retain_cli_switch_context(gitswitch_ctx_t *ctx,
+                                      retained_cli_context_kind_t kind,
+                                      const error_context_t *primary_error,
+                                      int primary_errno) {
+    if (!ctx || kind == RETAINED_CLI_CONTEXT_NONE || !primary_error) return;
+    if (g_retained_cli_switch.ctx && g_retained_cli_switch.ctx != ctx) {
+        return;
+    }
+
+    memset(&g_retained_cli_switch, 0, sizeof(g_retained_cli_switch));
+    g_retained_cli_switch.kind = kind;
+    g_retained_cli_switch.ctx = ctx;
+    memcpy(g_retained_cli_switch.config_path, ctx->config.config_path,
+           sizeof(g_retained_cli_switch.config_path));
+    g_retained_cli_switch.config_path[
+        sizeof(g_retained_cli_switch.config_path) - 1] = '\0';
+    g_retained_cli_switch.primary_error = *primary_error;
+    g_retained_cli_switch.primary_errno = primary_errno;
+}
+
+/* Settle retained account ownership before option parsing, informational
+ * exits, or a second heap context. The original failure remains the primary
+ * diagnostic across path checks, lock release, and retry errors. */
+static int settle_retained_cli_switch(void) {
+    error_context_t primary;
+    error_context_t retry_error;
+    gitswitch_ctx_t *retained;
+    char current_path[MAX_PATH_LEN];
+    int primary_errno;
+    int retry_errno;
+    int config_lock_fd;
+    int abort_rc;
+    bool release_safe;
+
+    retained = g_retained_cli_switch.ctx;
+    if (!retained) return 0;
+    primary = g_retained_cli_switch.primary_error;
+    primary_errno = g_retained_cli_switch.primary_errno;
+
+    if (g_retained_cli_switch.kind !=
+        RETAINED_CLI_CONTEXT_SWITCH_ABORT) {
+        fprintf(stderr,
+                "gitswitch: an unexpected account transaction still owns the "
+                "retained application context; refusing a new CLI entry. "
+                "Original failure: %s\n",
+                primary.message[0] ? primary.message :
+                                     "unknown account ownership error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+
+    if (config_get_path(current_path, sizeof(current_path)) != 0) {
+        retry_error = *get_last_error();
+        fprintf(stderr,
+                "gitswitch: retained switch rollback cannot verify its "
+                "configuration path: %s; original failure: %s\n",
+                retry_error.message[0] ? retry_error.message :
+                                         "unknown path error",
+                primary.message[0] ? primary.message :
+                                     "unknown preparation error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+    if (strcmp(current_path, g_retained_cli_switch.config_path) != 0) {
+        fprintf(stderr,
+                "gitswitch: retained switch rollback belongs to a different "
+                "configuration path; restore the original HOME and retry. "
+                "Original failure: %s\n",
+                primary.message[0] ? primary.message :
+                                     "unknown preparation error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+
+    config_lock_fd = config_write_lock();
+    if (config_lock_fd < 0) {
+        retry_error = *get_last_error();
+        fprintf(stderr,
+                "gitswitch: retained switch rollback could not reacquire the "
+                "configuration lock: %s; original failure: %s\n",
+                retry_error.message[0] ? retry_error.message :
+                                         "unknown lock error",
+                primary.message[0] ? primary.message :
+                                     "unknown preparation error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+
+    abort_rc = accounts_switch_abort(retained, false);
+    release_safe = accounts_transaction_context_release_safe(retained);
+    retry_error = *get_last_error();
+    retry_errno = errno;
+    config_write_unlock(config_lock_fd);
+
+    if (!release_safe) {
+        fprintf(stderr,
+                "gitswitch: retained switch rollback is still incomplete: "
+                "%s; original failure: %s\n",
+                retry_error.message[0] ? retry_error.message :
+                                         "unknown rollback error",
+                primary.message[0] ? primary.message :
+                                     "unknown preparation error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+
+    secure_zero_memory(retained, sizeof(*retained));
+    free(retained);
+#ifdef GITSWITCH_TESTING
+    g_context_allocations--;
+#endif
+    secure_zero_memory(&g_retained_cli_switch,
+                       sizeof(g_retained_cli_switch));
+
+    if (abort_rc != 0) {
+        fprintf(stderr,
+                "gitswitch: retained switch ownership was released, but its "
+                "final cleanup reported: %s\n",
+                retry_error.message[0] ? retry_error.message :
+                                         "unknown rollback error");
+        restore_cli_error(&retry_error, retry_errno);
+        return -1;
+    }
+
+    clear_error();
+    errno = 0;
+    return 0;
+}
 
 static void reset_test_checkpoint(int stage) {
 #ifdef GITSWITCH_TESTING
@@ -408,6 +613,7 @@ int main(int argc, char *argv[]) {
     command_result_t mutation = command_result(EXIT_SUCCESS);
     bool has_mutation_result = false;
     bool signal_guard_cleanup_failed = false;
+    bool retained_account_context = false;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
     int opt;
@@ -466,6 +672,11 @@ int main(int argc, char *argv[]) {
     if (error_init(LOG_LEVEL_WARNING, NULL) != 0) {
 #endif
         fprintf(stderr, "Failed to initialize error handling\n");
+        return EXIT_FAILURE;
+    }
+
+    if (settle_retained_cli_switch() != 0) {
+        error_cleanup();
         return EXIT_FAILURE;
     }
     
@@ -783,6 +994,28 @@ int main(int argc, char *argv[]) {
         exit_code = mutation.status;
     }
 
+    /* A failed prepare may still own an abort-only account transaction. Try
+     * its exact abort immediately while the original config lock and context
+     * are alive. The first preparation error remains byte-exact even when the
+     * abort attempt reports another failure. */
+    if (has_mutation_result &&
+        mutation.switch_prepare_state ==
+            ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED) {
+        error_context_t preparation_error = *get_last_error();
+        int preparation_errno = errno;
+
+        switch_abort_test_checkpoint(ctx);
+        (void)accounts_switch_abort(ctx, false);
+        if (!accounts_transaction_context_release_safe(ctx)) {
+            retain_cli_switch_context(ctx,
+                                      RETAINED_CLI_CONTEXT_SWITCH_ABORT,
+                                      &preparation_error,
+                                      preparation_errno);
+        }
+        restore_cli_error(&preparation_error, preparation_errno);
+        exit_code = EXIT_FAILURE;
+    }
+
     /* Mutating handlers never print their final success. This centralized
      * commit path persists their structured outcome first, then either commits
      * a prepared switch or rolls it and the active/hint metadata back. */
@@ -810,7 +1043,8 @@ int main(int argc, char *argv[]) {
                     } else {
                         save_rc = config_save(ctx, ctx->config.config_path);
                     }
-                } else if (mutation.switch_prepared) {
+                } else if (mutation.switch_prepare_state ==
+                           ACCOUNTS_SWITCH_PREPARE_PREPARED) {
                     save_rc =
                         config_save_active_account_transactional_guarded(
                             ctx, ctx->config.config_path, &config_installed,
@@ -830,7 +1064,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (mutation.switch_prepared && save_rc == 0) {
+        if (mutation.switch_prepare_state ==
+                ACCOUNTS_SWITCH_PREPARE_PREPARED &&
+            save_rc == 0) {
             if (accounts_switch_commit_result(ctx, &switch_commit_state) != 0) {
                 save_rc = -1;
                 config_installed = true;
@@ -903,7 +1139,9 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        if (mutation.switch_prepared && save_rc != 0 &&
+        if (mutation.switch_prepare_state ==
+                ACCOUNTS_SWITCH_PREPARE_PREPARED &&
+            save_rc != 0 &&
             !switch_commit_retained) {
             bool rollback_complete = true;
             char rollback_detail[sizeof(g_last_error.message)] = "";
@@ -956,7 +1194,9 @@ int main(int argc, char *argv[]) {
                 pending_signal_notice =
                     "gitswitch: interrupted — switch rollback attempt completed\n";
             }
-        } else if (mutation.switch_prepared && switch_commit_retained) {
+        } else if (mutation.switch_prepare_state ==
+                       ACCOUNTS_SWITCH_PREPARE_PREPARED &&
+                   switch_commit_retained) {
             /* The SSH config rename crossed its publication point. The
              * structured account result has already committed Git/runtime and
              * released rollback ownership, so retain the matching active file
@@ -1081,6 +1321,24 @@ cleanup:
         mutation.reset_token = 0;
     }
 
+    if (ctx && !accounts_transaction_context_release_safe(ctx)) {
+        retained_account_context = true;
+        exit_code = EXIT_FAILURE;
+        if (!g_retained_cli_switch.ctx) {
+            error_context_t ownership_error = *get_last_error();
+            int ownership_errno = errno;
+
+            retained_cli_context_kind_t kind =
+                mutation.switch_prepare_state ==
+                    ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE
+                    ? RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER
+                    : RETAINED_CLI_CONTEXT_SWITCH_ABORT;
+
+            retain_cli_switch_context(ctx, kind, &ownership_error,
+                                      ownership_errno);
+        }
+    }
+
     /* Release the config write-lock now that load+mutate+save is done (harmless
      * no-op for read-only commands that never took it; the OS would also drop it
      * at exit). */
@@ -1092,13 +1350,22 @@ cleanup:
      * release, including initialization/error exits, and keep a confirmed
      * reset's deferral window armed until both this cleanup and lock release
      * have completed. */
-    if (ctx) {
+    if (ctx && !retained_account_context) {
         secure_zero_memory(ctx, sizeof(*ctx));
         free(ctx);
         ctx = NULL;
 #ifdef GITSWITCH_TESTING
         g_context_allocations--;
 #endif
+    }
+    if (ctx && retained_account_context) {
+        fprintf(stderr,
+                "gitswitch: account rollback ownership remains active; the "
+                "application context was retained for a checked retry: %s\n",
+                g_retained_cli_switch.primary_error.message[0]
+                    ? g_retained_cli_switch.primary_error.message
+                    : "unknown account transaction error");
+        ctx = NULL;
     }
     if (mutation.notice_kind == COMMAND_NOTICE_REMOVE) {
         remove_test_checkpoint(6);
@@ -1115,7 +1382,8 @@ cleanup:
      * when a signal is pending; pre-ending here would turn a one-shot restore
      * failure into an unchecked immediate retry that could erase the pending
      * interruption. */
-    if (!signals_pending() && signals_guard_end() != 0) {
+    if (!retained_account_context && !signals_pending() &&
+        signals_guard_end() != 0) {
         int retained_signal = signals_pending_signal();
         const char *restore_detail = get_last_error()->message[0]
                                          ? get_last_error()->message
@@ -1140,7 +1408,8 @@ cleanup:
 
     /* Recheck after a successful guard_end: a signal may have run our handler
      * between the initial pending test and restoration of its disposition. */
-    if (signals_pending() && !pending_signal_notice) {
+    if (!retained_account_context && signals_pending() &&
+        !pending_signal_notice) {
         pending_signal_notice = mutation.reset_guarded
             ? "gitswitch: interrupted — reset transaction cleanup completed\n"
             : "gitswitch: interrupted — command cleanup completed\n";
@@ -1149,7 +1418,8 @@ cleanup:
     /* Cleanup error handling */
     error_cleanup();
 
-    if (!signal_guard_cleanup_failed && pending_signal_notice &&
+    if (!retained_account_context && !signal_guard_cleanup_failed &&
+        pending_signal_notice &&
         signals_pending()) {
         fputs(pending_signal_notice, stderr);
         if (signals_dispatch_pending() != 0) {
@@ -1335,7 +1605,25 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
     }
     safe_strncpy(result.previous_active, ctx->config.active_account,
                  sizeof(result.previous_active));
-    if (accounts_switch_prepare(ctx, identifier) != 0) {
+    if (accounts_switch_prepare_result(ctx, identifier,
+                                       &result.switch_prepare_state) != 0) {
+        error_context_t preparation_error = *get_last_error();
+        int preparation_errno = errno;
+
+        display_error("Failed to switch account", "%s",
+                      preparation_error.message);
+        config_resume_hint_snapshot_clear(&result.hint_snapshot);
+        /* Display and snapshot cleanup are outside the account transaction
+         * and may touch errno or the shared diagnostic. Main must classify
+         * and retain the exact preparation failure, not a cleanup side
+         * effect. The test checkpoint deliberately clobbers both. */
+        switch_prepare_failure_test_checkpoint();
+        restore_cli_error(&preparation_error, preparation_errno);
+        return result;
+    }
+    if (result.switch_prepare_state != ACCOUNTS_SWITCH_PREPARE_PREPARED) {
+        set_error(ERR_SYSTEM_CALL,
+                  "Account switch preparation returned without ownership");
         display_error("Failed to switch account", "%s",
                       get_last_error()->message);
         config_resume_hint_snapshot_clear(&result.hint_snapshot);
@@ -1345,7 +1633,6 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
     result.status = EXIT_SUCCESS;
     result.save_kind = COMMAND_SAVE_ACTIVE;
     result.notice_kind = COMMAND_NOTICE_SWITCH;
-    result.switch_prepared = true;
     if (ctx->current_account) {
         safe_strncpy(result.subject, ctx->current_account->name,
                      sizeof(result.subject));

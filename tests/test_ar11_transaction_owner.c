@@ -135,9 +135,14 @@ TEST(every_kind_pair_requires_exact_context_token_and_depth) {
         make_base_context(&contender);
         owner_before = owner;
         contender_before = contender;
+        CHECK(accounts_transaction_context_release_safe(&owner));
+        CHECK(accounts_transaction_context_release_safe(&contender));
+        CHECK(!accounts_transaction_context_release_safe(NULL));
         CHECK_EQ_INT(accounts_transaction_begin(&owner, owner_kind, &token),
                      0);
         if (token == 0) return;
+        CHECK(!accounts_transaction_context_release_safe(&owner));
+        CHECK(accounts_transaction_context_release_safe(&contender));
         foreign = token ^ UINT64_C(0x8000000000000000);
         if (foreign == 0 || foreign == token) foreign = token + 1U;
 
@@ -208,6 +213,7 @@ TEST(every_kind_pair_requires_exact_context_token_and_depth) {
                          &owner, owner_kind, token), -1);
         CHECK_EQ_INT(accounts_transaction_finish(&owner, owner_kind, token),
                      0);
+        CHECK(accounts_transaction_context_release_safe(&owner));
 
         /* Exact finalization reopens admission and never reuses a token. */
         {
@@ -335,11 +341,13 @@ TEST(add_prepare_settles_only_through_exact_commit_or_abort) {
     make_base_context(&wrong);
     CHECK_EQ_INT(prepare_add_silently(&committed, "committed",
                                       "committed@example.test"), 0);
+    CHECK(!accounts_transaction_context_release_safe(&committed));
     CHECK_EQ_INT(committed.account_count, 2);
     CHECK_EQ_INT(accounts_add_commit(&wrong), -1);
     CHECK_EQ_INT(accounts_add_abort(&wrong), -1);
     CHECK_EQ_INT(accounts_init(&wrong), -1);
     CHECK_EQ_INT(accounts_add_commit(&committed), 0);
+    CHECK(accounts_transaction_context_release_safe(&committed));
     CHECK_EQ_INT(committed.account_count, 2);
     CHECK_STR_EQ(committed.accounts[1].name, "committed");
     CHECK_EQ_INT(accounts_transaction_begin(
@@ -353,9 +361,11 @@ TEST(add_prepare_settles_only_through_exact_commit_or_abort) {
     aborted_before = aborted;
     CHECK_EQ_INT(prepare_add_silently(&aborted, "aborted",
                                       "aborted@example.test"), 0);
+    CHECK(!accounts_transaction_context_release_safe(&aborted));
     CHECK_EQ_INT(aborted.account_count, 2);
     CHECK_EQ_INT(accounts_add_abort(&wrong), -1);
     CHECK_EQ_INT(accounts_add_abort(&aborted), 0);
+    CHECK(accounts_transaction_context_release_safe(&aborted));
     CHECK(memcmp(&aborted, &aborted_before, sizeof(aborted)) == 0);
 }
 
@@ -414,6 +424,8 @@ TEST(prepared_edit_retains_guard_rollback_and_exact_abort_owner) {
                               sizeof(candidate.description)), 0);
 
     CHECK_EQ_INT(accounts_edit_candidate_prepare(&owner, &candidate), 0);
+    CHECK(!accounts_transaction_context_release_safe(&owner));
+    CHECK(accounts_transaction_context_release_safe(&contender));
     CHECK(signals_guard_active());
     CHECK(signals_rollback_active());
     CHECK_STR_EQ(owner.accounts[0].description, "prepared description");
@@ -426,6 +438,7 @@ TEST(prepared_edit_retains_guard_rollback_and_exact_abort_owner) {
     CHECK(signals_rollback_active());
 
     CHECK_EQ_INT(accounts_edit_abort(&owner), 0);
+    CHECK(accounts_transaction_context_release_safe(&owner));
     CHECK(memcmp(&owner, &owner_before, sizeof(owner)) == 0);
     CHECK(!signals_guard_active());
     CHECK(!signals_rollback_active());
