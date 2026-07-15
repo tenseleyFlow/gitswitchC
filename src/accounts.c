@@ -1046,7 +1046,11 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
     }
 
     if (!ctx->config.dry_run && write_git &&
-        git_test_config(switch_target, scope) != 0) {
+        git_test_config(
+            switch_target, scope,
+            switch_target->gpg_enabled && switch_target->gpg_key_id[0] != '\0'
+                ? g_session.gpg_config.executable_path
+                : NULL) != 0) {
         log_warning("Git configuration validation failed: %s",
                     get_last_error()->message);
     }
@@ -3878,11 +3882,16 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             if (print_git_status_read_failure() != 0) status_result = -1;
         } else if (git_get_current_config(git_config) == 0) {
             char expected_ssh[GIT_CONFIG_VALUE_MAX] = "";
+            char expected_gpg_program[MAX_PATH_LEN] = "";
             char ssh_status_error[512] = "";
+            char gpg_program_status_error[512] = "";
             bool identity_matches;
             bool ssh_matches;
             bool ssh_status_determined = true;
-            bool gpg_program_matches;
+            bool gpg_openpgp_matches;
+            bool gpg_programs_match;
+            bool gpg_program_status_determined = true;
+            bool foreign_gpg_program_present;
             bool signing_key_matches;
             bool signing_enabled_matches;
             bool signing_expected;
@@ -3926,11 +3935,42 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             } else {
                 ssh_matches = !git_config->ssh_command.present;
             }
-            /* gitswitch selects an isolated keyring through GNUPGHOME and
-             * intentionally expects no persisted gpg.program override. */
-            gpg_program_matches = !git_config->gpg_program.present;
             signing_expected = account->gpg_enabled &&
                                account->gpg_key_id[0] != '\0';
+            foreign_gpg_program_present =
+                git_config->gpg_program.present ||
+                git_config->gpg_x509_program.present ||
+                git_config->gpg_ssh_program.present;
+            if (signing_expected) {
+                if (gpg_manager_resolve_executable(
+                        expected_gpg_program,
+                        sizeof(expected_gpg_program)) != 0) {
+                    const error_context_t *error = get_last_error();
+
+                    gpg_program_status_determined = false;
+                    gpg_openpgp_matches = false;
+                    gpg_programs_match = false;
+                    status_result = -1;
+                    if (error && error->message[0] != '\0') {
+                        (void)snprintf(gpg_program_status_error,
+                                       sizeof(gpg_program_status_error), "%s",
+                                       error->message);
+                    }
+                } else {
+                    gpg_openpgp_matches =
+                        git_config->gpg_openpgp_program.present &&
+                        !git_config->gpg_openpgp_program.value_unknown &&
+                        strcmp(git_config->gpg_openpgp_program.value,
+                               expected_gpg_program) == 0;
+                    gpg_programs_match = gpg_openpgp_matches &&
+                                         !foreign_gpg_program_present;
+                }
+            } else {
+                gpg_openpgp_matches =
+                    !git_config->gpg_openpgp_program.present;
+                gpg_programs_match = gpg_openpgp_matches &&
+                                     !foreign_gpg_program_present;
+            }
             signing_key_matches =
                 status_signing_key_matches(account, git_config);
             signing_enabled_matches =
@@ -3938,15 +3978,24 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                 (signing_expected && account->gpg_signing_enabled);
             
             /* Check if git config matches account */
-            if (!ssh_status_determined) {
-                printf("  Match Status: [ERROR] Unable to determine trusted expected SSH command");
-                if (ssh_status_error[0] != '\0') {
-                    printf(": ");
-                    print_terminal_safe(ssh_status_error);
+            if (!ssh_status_determined || !gpg_program_status_determined) {
+                printf("  Match Status: [ERROR] Unable to determine trusted expected configuration\n");
+                if (!ssh_status_determined) {
+                    printf("    SSH command: ");
+                    print_terminal_safe(ssh_status_error[0] != '\0'
+                                            ? ssh_status_error
+                                            : "unknown resolution failure");
+                    printf("\n");
                 }
-                printf("\n");
+                if (!gpg_program_status_determined) {
+                    printf("    OpenPGP program: ");
+                    print_terminal_safe(gpg_program_status_error[0] != '\0'
+                                            ? gpg_program_status_error
+                                            : "unknown resolution failure");
+                    printf("\n");
+                }
             } else if (identity_matches && ssh_matches &&
-                       gpg_program_matches && signing_key_matches &&
+                       gpg_programs_match && signing_key_matches &&
                        signing_enabled_matches) {
                 printf("  Match Status: [OK] Git config matches account\n");
             } else {
@@ -3983,6 +4032,15 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                            git_config->gpg_signing_enabled
                                ? "[YES]" : "[NO]");
                 }
+                if (!gpg_openpgp_matches) {
+                    printf("    Expected OpenPGP Program: ");
+                    if (signing_expected) {
+                        print_terminal_safe(expected_gpg_program);
+                    } else {
+                        printf("[ABSENT]");
+                    }
+                    printf("\n");
+                }
             }
 
             if (ssh_status_determined) {
@@ -3993,9 +4051,29 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             }
             print_git_value_origin(&git_config->ssh_command);
             printf("\n");
-            printf("  Effective GPG Program: %s",
-                   gpg_program_matches ? "[ABSENT]" : "[MISMATCH]");
+            printf("  Effective OpenPGP Program: %s",
+                   !gpg_program_status_determined
+                       ? "[ERROR]"
+                       : (signing_expected
+                              ? (gpg_openpgp_matches
+                                     ? "[MATCH]" : "[MISMATCH]")
+                              : (git_config->gpg_openpgp_program.present
+                                     ? "[MISMATCH]" : "[ABSENT]")));
+            print_git_value_origin(&git_config->gpg_openpgp_program);
+            printf("\n");
+            printf("  Effective Legacy GPG Program: %s",
+                   git_config->gpg_program.present ? "[FOREIGN]" : "[ABSENT]");
             print_git_value_origin(&git_config->gpg_program);
+            printf("\n");
+            printf("  Effective X.509 GPG Program: %s",
+                   git_config->gpg_x509_program.present
+                       ? "[FOREIGN]" : "[ABSENT]");
+            print_git_value_origin(&git_config->gpg_x509_program);
+            printf("\n");
+            printf("  Effective SSH Signing Program: %s",
+                   git_config->gpg_ssh_program.present
+                       ? "[FOREIGN]" : "[ABSENT]");
+            print_git_value_origin(&git_config->gpg_ssh_program);
             printf("\n");
             
             /* GPG signing status */
@@ -4065,13 +4143,32 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             printf("\n");
             printf("  GPG Signing Enabled: %s\n",
                    git_config->gpg_signing_enabled ? "[YES]" : "[NO]");
-            printf("  Effective GPG Program: %s",
+            printf("  Effective OpenPGP Program: %s",
+                   git_config->gpg_openpgp_program.present
+                       ? "[SET]" : "[ABSENT]");
+            print_git_value_origin(&git_config->gpg_openpgp_program);
+            printf("\n");
+            printf("  Effective Legacy GPG Program: %s",
                    git_config->gpg_program.present ? "[SET]" : "[ABSENT]");
             print_git_value_origin(&git_config->gpg_program);
             printf("\n");
+            printf("  Effective X.509 GPG Program: %s",
+                   git_config->gpg_x509_program.present
+                       ? "[SET]" : "[ABSENT]");
+            print_git_value_origin(&git_config->gpg_x509_program);
+            printf("\n");
+            printf("  Effective SSH Signing Program: %s",
+                   git_config->gpg_ssh_program.present
+                       ? "[SET]" : "[ABSENT]");
+            print_git_value_origin(&git_config->gpg_ssh_program);
+            printf("\n");
             if (git_config->ssh_command.present ||
                 git_config->signing_key[0] != '\0' ||
-                git_config->gpg_signing_enabled) {
+                git_config->gpg_signing_enabled ||
+                git_config->gpg_program.present ||
+                git_config->gpg_openpgp_program.present ||
+                git_config->gpg_x509_program.present ||
+                git_config->gpg_ssh_program.present) {
                 printf("  [WARN] Durable Git credential configuration is set "
                        "while no account is active.\n");
             }

@@ -7,6 +7,7 @@
 #include "accounts.h"
 #include "error.h"
 #include "git_ops.h"
+#include "gpg_manager.h"
 #include "ssh_manager.h"
 #include "utils.h"
 
@@ -760,6 +761,9 @@ TEST(active_status_propagates_required_key_inspection_failure) {
 static int capture_signing_status(const account_t *account,
                                   const char *signing_key,
                                   const char *gpg_signing,
+                                  const char *openpgp_program,
+                                  const char *foreign_program_key,
+                                  const char *foreign_program,
                                   char *status, size_t status_size) {
     gitswitch_ctx_t context;
     command_runner_fn previous;
@@ -783,6 +787,17 @@ static int capture_signing_status(const account_t *account,
                                  "commit.gpgsign", gpg_signing,
                                  strlen(gpg_signing)));
     }
+    if (openpgp_program) {
+        CHECK(fake_append_record("global", "file:/ar09/global",
+                                 GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                 openpgp_program,
+                                 strlen(openpgp_program)));
+    }
+    if (foreign_program_key && foreign_program) {
+        CHECK(fake_append_record("global", "file:/ar09/global",
+                                 foreign_program_key, foreign_program,
+                                 strlen(foreign_program)));
+    }
 
     memset(&context, 0, sizeof(context));
     context.account_count = 1;
@@ -804,6 +819,12 @@ TEST(active_status_includes_every_selected_signing_field) {
         "0123456789ABCDEF0123456789ABCDEFFEDCBA98";
     account_t account;
     char status[8192];
+    char expected_program[MAX_PATH_LEN];
+
+    if (gpg_manager_resolve_executable(expected_program,
+                                       sizeof(expected_program)) != 0) {
+        TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
 
     memset(&account, 0, sizeof(account));
     account.id = 9;
@@ -819,38 +840,111 @@ TEST(active_status_includes_every_selected_signing_field) {
     /* A successful switch publishes the canonical primary fingerprint even
      * when the persisted account retains a shorter, 0x-prefixed selector. */
     CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
+                                        expected_program, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
+    CHECK(strstr(status, "Effective OpenPGP Program: [MATCH]") != NULL);
+
+    /* Missing/wrong OpenPGP bindings and foreign selector spellings are all
+     * mismatches. In particular, the exact same path under legacy
+     * gpg.program must not be accepted as equivalent to gpg.openpgp.program. */
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
+                                        NULL, NULL, NULL,
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
+                                        "/wrong/ar11/gpg", NULL, NULL,
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
+                                        NULL, GIT_CONFIG_GPG_PROGRAM,
+                                        expected_program,
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
+                                        expected_program,
+                                        GIT_CONFIG_GPG_X509_PROGRAM,
+                                        expected_program,
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+
+    CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "true",
+                                        expected_program,
+                                        GIT_CONFIG_GPG_SSH_PROGRAM,
+                                        expected_program,
+                                        status, sizeof(status)), 0);
+    CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
     CHECK_EQ_INT(capture_signing_status(&account, NULL, "true",
+                                        expected_program, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
     CHECK_EQ_INT(capture_signing_status(&account, wrong_key, "true",
+                                        expected_program, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
     CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
+                                        expected_program, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
     account.gpg_signing_enabled = false;
     CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
+                                        expected_program, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
 
     account.gpg_enabled = false;
     CHECK_EQ_INT(capture_signing_status(&account, NULL, "false",
+                                        NULL, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [OK]") != NULL);
 
     CHECK_EQ_INT(capture_signing_status(&account, canonical_key, "false",
+                                        NULL, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
 
     CHECK_EQ_INT(capture_signing_status(&account, NULL, "true",
+                                        NULL, NULL, NULL,
                                         status, sizeof(status)), 0);
     CHECK(strstr(status, "Match Status: [WARN]") != NULL);
+}
+
+TEST(no_active_account_warns_for_residual_openpgp_program) {
+    char status[8192];
+    command_runner_fn previous;
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", "file:/ar11/global", "user.name",
+                             "Residual User", strlen("Residual User")));
+    CHECK(fake_append_record("global", "file:/ar11/global", "user.email",
+                             "residual@example.test",
+                             strlen("residual@example.test")));
+    CHECK(fake_append_record("global", "file:/ar11/global",
+                             GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                             "/trusted/ar11/gpg",
+                             strlen("/trusted/ar11/gpg")));
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output(status, sizeof(status)), 0);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+
+    CHECK(strstr(status, "No account currently active.") != NULL);
+    CHECK(strstr(status, "Effective OpenPGP Program: [SET]") != NULL);
+    CHECK(strstr(status,
+                 "[WARN] Durable Git credential configuration is set") !=
+          NULL);
 }
 
 static int setup_isolated_git(char *base, size_t base_size,
@@ -1174,6 +1268,226 @@ cleanup:
     restore_env("PATH", &path);
 }
 
+static int set_local_value_with_git(const char *git_path, const char *key,
+                                    const char *value) {
+    const char *argv[] = {
+        git_path, "config", "--local", key, value, NULL
+    };
+    run_result_t result;
+
+    memset(&result, 0, sizeof(result));
+    return run_command(argv, NULL, 0, &result);
+}
+
+/* M11b causal witness: Git must consume the exact absolute OpenPGP program
+ * published by the switch. A later writable PATH entry contains a marker shim
+ * named gpg; a real signed commit must invoke wrapper A and leave shim B
+ * untouched. The generated keyring and secret key live only in this registered
+ * temporary fixture and are recursively removed before the test returns. */
+TEST(persisted_absolute_openpgp_ignores_later_writable_path_shadow) {
+    static const char signing_identity[] =
+        "AR11 Binding Witness <ar11-binding@example.test>";
+    char real_gpg[MAX_PATH_LEN] = "";
+    char real_git[MAX_PATH_LEN] = "";
+    char real_gpgconf[MAX_PATH_LEN] = "";
+    char original_cwd[MAX_PATH_LEN] = "";
+    char base[MAX_PATH_LEN] = "/tmp/gsw_ar11_gpg_binding_XXXXXX";
+    char home[MAX_PATH_LEN] = "";
+    char gnupg_home[MAX_PATH_LEN] = "";
+    char repo[MAX_PATH_LEN] = "";
+    char shim_dir[MAX_PATH_LEN] = "";
+    char wrapper_a[MAX_PATH_LEN] = "";
+    char shim_b[MAX_PATH_LEN] = "";
+    char marker_a[MAX_PATH_LEN] = "";
+    char marker_b[MAX_PATH_LEN] = "";
+    char global_config[MAX_PATH_LEN] = "";
+    char hostile_path[MAX_PATH_LEN * 2U] = "";
+    char commit_object[16384];
+    saved_env_t path;
+    saved_env_t home_env;
+    saved_env_t gnupg_env;
+    saved_env_t global;
+    saved_env_t nosystem;
+    saved_env_t config_count;
+    saved_env_t real_gpg_env;
+    saved_env_t trusted_marker_env;
+    saved_env_t hostile_marker_env;
+    bool fixture_created = false;
+    int rc;
+
+    if (gpg_manager_resolve_executable(real_gpg, sizeof(real_gpg)) != 0) {
+        TS_SKIP("gpg", "no trusted OpenPGP executable on this host");
+    }
+    if (find_command_path("git", real_git, sizeof(real_git)) != 0) {
+        TS_SKIP("git", "no trusted Git executable on this host");
+    }
+    /* Optional cleanup aid. The fixture is still removed if gpgconf is not
+     * installed, but when present this prevents an ephemeral agent process
+     * from retaining the deleted GNUPGHOME until its idle timeout. */
+    (void)find_command_path("gpgconf", real_gpgconf, sizeof(real_gpgconf));
+
+    path = save_env("PATH");
+    home_env = save_env("HOME");
+    gnupg_env = save_env("GNUPGHOME");
+    global = save_env("GIT_CONFIG_GLOBAL");
+    nosystem = save_env("GIT_CONFIG_NOSYSTEM");
+    config_count = save_env("GIT_CONFIG_COUNT");
+    real_gpg_env = save_env("AR11_REAL_GPG");
+    trusted_marker_env = save_env("AR11_TRUSTED_GPG_MARKER");
+    hostile_marker_env = save_env("AR11_HOSTILE_GPG_MARKER");
+
+    if (!getcwd(original_cwd, sizeof(original_cwd))) {
+        CHECK(false);
+        goto cleanup;
+    }
+    if (!ts_mkdtemp(base)) {
+        CHECK(false);
+        goto cleanup;
+    }
+    fixture_created = true;
+    if ((size_t)snprintf(home, sizeof(home), "%s/home", base) >=
+            sizeof(home) ||
+        (size_t)snprintf(gnupg_home, sizeof(gnupg_home), "%s/gnupg", base) >=
+            sizeof(gnupg_home) ||
+        (size_t)snprintf(repo, sizeof(repo), "%s/repo", base) >=
+            sizeof(repo) ||
+        (size_t)snprintf(shim_dir, sizeof(shim_dir), "%s/shim", base) >=
+            sizeof(shim_dir) ||
+        (size_t)snprintf(wrapper_a, sizeof(wrapper_a), "%s/wrapper-a", base) >=
+            sizeof(wrapper_a) ||
+        (size_t)snprintf(shim_b, sizeof(shim_b), "%s/gpg", shim_dir) >=
+            sizeof(shim_b) ||
+        (size_t)snprintf(marker_a, sizeof(marker_a), "%s/a.marker", base) >=
+            sizeof(marker_a) ||
+        (size_t)snprintf(marker_b, sizeof(marker_b), "%s/b.marker", base) >=
+            sizeof(marker_b) ||
+        (size_t)snprintf(global_config, sizeof(global_config),
+                         "%s/global.gitconfig", base) >=
+            sizeof(global_config) ||
+        (size_t)snprintf(hostile_path, sizeof(hostile_path), "%s:/usr/bin:/bin",
+                         shim_dir) >= sizeof(hostile_path)) {
+        CHECK(false);
+        goto cleanup;
+    }
+    if (mkdir(home, 0700) != 0 || mkdir(gnupg_home, 0700) != 0 ||
+        mkdir(repo, 0700) != 0 || mkdir(shim_dir, 0700) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    if (write_text_file(
+            wrapper_a,
+            "#!/bin/sh\n"
+            ": > \"$AR11_TRUSTED_GPG_MARKER\"\n"
+            "exec \"$AR11_REAL_GPG\" \"$@\"\n",
+            0700) != 0 ||
+        write_text_file(
+            shim_b,
+            "#!/bin/sh\n"
+            ": > \"$AR11_HOSTILE_GPG_MARKER\"\n"
+            "exit 99\n",
+            0700) != 0 ||
+        setenv("HOME", home, 1) != 0 ||
+        setenv("GNUPGHOME", gnupg_home, 1) != 0 ||
+        setenv("GIT_CONFIG_GLOBAL", global_config, 1) != 0 ||
+        setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+        unsetenv("GIT_CONFIG_COUNT") != 0 ||
+        setenv("AR11_REAL_GPG", real_gpg, 1) != 0 ||
+        setenv("AR11_TRUSTED_GPG_MARKER", marker_a, 1) != 0 ||
+        setenv("AR11_HOSTILE_GPG_MARKER", marker_b, 1) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+
+    {
+        const char *argv[] = {
+            real_gpg, "--batch", "--pinentry-mode", "loopback",
+            "--passphrase", "", "--quick-generate-key", signing_identity,
+            "rsa2048", "sign", "0", NULL
+        };
+        run_result_t result;
+        memset(&result, 0, sizeof(result));
+        rc = run_command(argv, NULL, 0, &result);
+        CHECK_EQ_INT(rc, 0);
+        if (rc != 0) goto cleanup;
+    }
+    {
+        const char *argv[] = { real_git, "init", "-q", repo, NULL };
+        run_result_t result;
+        memset(&result, 0, sizeof(result));
+        rc = run_command(argv, NULL, 0, &result);
+        CHECK_EQ_INT(rc, 0);
+        if (rc != 0 || chdir(repo) != 0) {
+            CHECK(rc == 0);
+            goto cleanup;
+        }
+    }
+    CHECK_EQ_INT(set_local_value_with_git(real_git, "user.name",
+                                           "AR11 Binding Witness"), 0);
+    CHECK_EQ_INT(set_local_value_with_git(real_git, "user.email",
+                                           "ar11-binding@example.test"), 0);
+    CHECK_EQ_INT(set_local_value_with_git(real_git, "user.signingkey",
+                                           "ar11-binding@example.test"), 0);
+    CHECK_EQ_INT(set_local_value_with_git(real_git, "commit.gpgsign", "true"),
+                 0);
+    CHECK_EQ_INT(set_local_value_with_git(real_git, "gpg.format", "openpgp"),
+                 0);
+    CHECK_EQ_INT(set_local_value_with_git(real_git,
+                                           GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                           wrapper_a), 0);
+
+    /* The hostile selector becomes the first gpg in PATH only after the exact
+     * absolute program has been persisted. */
+    CHECK_EQ_INT(setenv("PATH", hostile_path, 1), 0);
+    {
+        const char *argv[] = {
+            real_git, "commit", "--allow-empty", "-S", "-m",
+            "AR11 exact OpenPGP binding", NULL
+        };
+        run_result_t result;
+        memset(&result, 0, sizeof(result));
+        rc = run_command(argv, NULL, 0, &result);
+        CHECK_EQ_INT(rc, 0);
+        if (rc != 0) goto cleanup;
+    }
+
+    CHECK_EQ_INT(access(marker_a, F_OK), 0);
+    errno = 0;
+    CHECK_EQ_INT(access(marker_b, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    {
+        const char *argv[] = { real_git, "cat-file", "commit", "HEAD", NULL };
+        run_result_t result;
+        memset(&result, 0, sizeof(result));
+        memset(commit_object, 0, sizeof(commit_object));
+        CHECK_EQ_INT(run_command(argv, commit_object, sizeof(commit_object),
+                                 &result), 0);
+        CHECK(strstr(commit_object,
+                     "gpgsig -----BEGIN PGP SIGNATURE-----") != NULL);
+    }
+
+cleanup:
+    if (real_gpgconf[0] != '\0' && gnupg_home[0] != '\0') {
+        const char *argv[] = {
+            real_gpgconf, "--homedir", gnupg_home, "--kill", "gpg-agent",
+            NULL
+        };
+        run_result_t result;
+        memset(&result, 0, sizeof(result));
+        (void)run_command(argv, NULL, 0, &result);
+    }
+    if (original_cwd[0] != '\0') CHECK_EQ_INT(chdir(original_cwd), 0);
+    restore_env("AR11_HOSTILE_GPG_MARKER", &hostile_marker_env);
+    restore_env("AR11_TRUSTED_GPG_MARKER", &trusted_marker_env);
+    restore_env("AR11_REAL_GPG", &real_gpg_env);
+    restore_env("GIT_CONFIG_COUNT", &config_count);
+    restore_env("GIT_CONFIG_NOSYSTEM", &nosystem);
+    restore_env("GIT_CONFIG_GLOBAL", &global);
+    restore_env("GNUPGHOME", &gnupg_env);
+    restore_env("HOME", &home_env);
+    restore_env("PATH", &path);
+    if (fixture_created) ts_rm_rf(base);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(oversized_unrelated_config_is_captured_without_losing_identity);
@@ -1188,7 +1502,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(active_status_reports_expected_ssh_resolution_failure);
     RUN_TEST(active_status_propagates_required_key_inspection_failure);
     RUN_TEST(active_status_includes_every_selected_signing_field);
+    RUN_TEST(no_active_account_warns_for_residual_openpgp_program);
     RUN_TEST(real_malformed_config_retains_gits_diagnostic);
     RUN_TEST(git_boolean_grammar_matches_gits_canonical_oracle);
     RUN_TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow);
+    RUN_TEST(persisted_absolute_openpgp_ignores_later_writable_path_shadow);
 TEST_MAIN_END()

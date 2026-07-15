@@ -356,6 +356,7 @@ static bool g_fail_user_name_set;   /* fail `git config <scope> user.name X` */
 static bool g_raise_on_user_name;   /* raise SIGINT during that same command */
 static bool g_fail_list_config;     /* fail exact snapshot acquisition */
 static bool g_mutate_name_before_seal;
+static char g_preseal_gpgopenpgp_observed[MAX_PATH_LEN];
 static int g_worktree_probe_failures; /* fail the next N --show-scope probes */
 static int g_user_name_writes;
 static int g_fake_runner_calls;
@@ -603,6 +604,9 @@ static int fake_runner(const char *const argv[], const run_opts_t *opts,
     }
     if (is_config_list(argv)) {
         if (g_mutate_name_before_seal && g_user_name_writes > 0) {
+            safe_strncpy(g_preseal_gpgopenpgp_observed,
+                         g_store_gpgopenpgp,
+                         sizeof(g_preseal_gpgopenpgp_observed));
             safe_strncpy(g_store_name, "preseal-writer",
                          sizeof(g_store_name));
             g_mutate_name_before_seal = false;
@@ -1082,6 +1086,7 @@ static void seed_previous_git_identity(void) {
     g_store_gpgopenpgp[0] = '\0';
     g_store_gpgx509[0] = '\0';
     g_store_gpgssh[0] = '\0';
+    g_preseal_gpgopenpgp_observed[0] = '\0';
     g_effective_signingkey_observed[0] = '\0';
     g_fail_list_config = false;
     g_mutate_name_before_seal = false;
@@ -2765,6 +2770,8 @@ TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry) {
 }
 
 TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
+    char expected_program[MAX_PATH_LEN];
+
     if (!gpg_test_command_available()) {
         TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
     }
@@ -2781,6 +2788,15 @@ TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
     seed_previous_git_identity();
     safe_strncpy(g_store_gpgprogram, "/foreign/gpg-wrapper",
                  sizeof(g_store_gpgprogram));
+    safe_strncpy(g_store_gpgopenpgp, "/foreign/openpgp-wrapper",
+                 sizeof(g_store_gpgopenpgp));
+    safe_strncpy(g_store_gpgx509, "/foreign/x509-wrapper",
+                 sizeof(g_store_gpgx509));
+    safe_strncpy(g_store_gpgssh, "/foreign/ssh-wrapper",
+                 sizeof(g_store_gpgssh));
+    safe_strncpy(g_store_gpgformat, "ssh", sizeof(g_store_gpgformat));
+    CHECK_EQ_INT(safe_snprintf(expected_program, sizeof(expected_program),
+                               "%s/gpg", g_gpg_command_dir), 0);
     g_fail_user_name_set = false;
     g_raise_on_user_name = false;
     g_log = NULL;
@@ -2795,7 +2811,91 @@ TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled) {
     CHECK_STR_EQ(g_effective_signingkey_observed,
                  "0123456789ABCDEF0123456789ABCDEF01234567");
     CHECK_STR_EQ(g_store_gpgsign, "false");
+    CHECK_STR_EQ(g_store_gpgformat, "openpgp");
     CHECK(g_store_gpgprogram[0] == '\0');
+    CHECK_STR_EQ(g_store_gpgopenpgp, expected_program);
+    CHECK(g_store_gpgx509[0] == '\0');
+    CHECK(g_store_gpgssh[0] == '\0');
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    unsetenv("GITSWITCH_ALLOW_TMP_GPG");
+    unsetenv("GNUPGHOME");
+}
+
+/* M11b: the bound OpenPGP program joins the managed Git post-image before
+ * sealing. A later writer can conflict with user.name, but every unaffected
+ * selector must still restore its exact before-image;
+ * the retained abort retry owns only the conflicting name. */
+TEST(late_seal_failure_restores_exact_gpg_selector_vectors) {
+    static const char old_format[] = "ssh";
+    static const char old_legacy[] = "/before/legacy-gpg";
+    static const char old_openpgp[] = "/before/openpgp-gpg";
+    static const char old_x509[] = "/before/x509-gpg";
+    static const char old_ssh[] = "/before/ssh-gpg";
+    char expected_program[MAX_PATH_LEN];
+    gitswitch_ctx_t ctx;
+    account_t *account;
+    command_runner_fn previous_runner;
+    int rc;
+
+    if (!gpg_test_command_available()) {
+        TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
+    }
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_gpg_source_home(), 0);
+    CHECK_EQ_INT(setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1), 0);
+    ctx = make_ctx();
+    account = &ctx.accounts[0];
+    account->gpg_enabled = true;
+    account->gpg_signing_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account->gpg_key_id, "FEEDFACE01234567",
+                              sizeof(account->gpg_key_id)), 0);
+    seed_previous_git_identity();
+    CHECK_EQ_INT(safe_strncpy(g_store_gpgformat, old_format,
+                              sizeof(g_store_gpgformat)), 0);
+    CHECK_EQ_INT(safe_strncpy(g_store_gpgprogram, old_legacy,
+                              sizeof(g_store_gpgprogram)), 0);
+    CHECK_EQ_INT(safe_strncpy(g_store_gpgopenpgp, old_openpgp,
+                              sizeof(g_store_gpgopenpgp)), 0);
+    CHECK_EQ_INT(safe_strncpy(g_store_gpgx509, old_x509,
+                              sizeof(g_store_gpgx509)), 0);
+    CHECK_EQ_INT(safe_strncpy(g_store_gpgssh, old_ssh,
+                              sizeof(g_store_gpgssh)), 0);
+    CHECK_EQ_INT(safe_snprintf(expected_program, sizeof(expected_program),
+                               "%s/gpg", g_gpg_command_dir), 0);
+    g_mutate_name_before_seal = true;
+    previous_runner = run_set_runner(gpg_git_runner);
+
+    rc = accounts_switch_prepare(&ctx, "testacct");
+    g_mutate_name_before_seal = false;
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_STR_EQ(g_preseal_gpgopenpgp_observed, expected_program);
+    CHECK_STR_EQ(g_store_name, "preseal-writer");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK_STR_EQ(g_store_gpgformat, old_format);
+    CHECK_STR_EQ(g_store_gpgprogram, old_legacy);
+    CHECK_STR_EQ(g_store_gpgopenpgp, old_openpgp);
+    CHECK_STR_EQ(g_store_gpgx509, old_x509);
+    CHECK_STR_EQ(g_store_gpgssh, old_ssh);
+    CHECK(strstr(get_last_error()->details,
+                 "[Git configuration restore]") != NULL);
+    CHECK(signals_guard_active());
+    CHECK(signals_rollback_active());
+
+    CHECK_EQ_INT(safe_strncpy(g_store_name, "testacct",
+                              sizeof(g_store_name)), 0);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK_STR_EQ(g_store_gpgformat, old_format);
+    CHECK_STR_EQ(g_store_gpgprogram, old_legacy);
+    CHECK_STR_EQ(g_store_gpgopenpgp, old_openpgp);
+    CHECK_STR_EQ(g_store_gpgx509, old_x509);
+    CHECK_STR_EQ(g_store_gpgssh, old_ssh);
+    CHECK(!signals_guard_active());
+    CHECK(!signals_rollback_active());
+
+    run_set_runner(previous_runner);
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");
     unsetenv("GNUPGHOME");
@@ -4321,6 +4421,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry);
     RUN_TEST(repeated_switch_partial_cleanup_restores_ssh_and_retains_gpg_retry);
     RUN_TEST(accounts_git_readback_uses_canonical_key_when_signing_is_disabled);
+    RUN_TEST(late_seal_failure_restores_exact_gpg_selector_vectors);
     RUN_TEST(gpg_stable_link_obstruction_aborts_integrated_switch);
     RUN_TEST(failed_switch_retargets_gpg_current_to_previous_home);
     RUN_TEST(failed_switch_does_not_overwrite_later_gpg_writer);

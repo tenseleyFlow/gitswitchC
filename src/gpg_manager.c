@@ -3646,6 +3646,7 @@ out:
 
 /* Configure git GPG signing */
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, git_scope_t scope) {
+    account_t configured_account;
     const char *signing_value;
 
     if (!gpg_config || !account) {
@@ -3656,6 +3657,17 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
     if (gpg_config->current_key_id[0] == '\0') {
         set_error(ERR_GPG_KEY_FAILED,
                   "Cannot configure Git signing before canonical GPG key resolution");
+        return -1;
+    }
+    if (gpg_bind_executable_if_needed(gpg_config) != 0) {
+        return -1;
+    }
+    configured_account = *account;
+    if (safe_strncpy(configured_account.gpg_key_id,
+                     gpg_config->current_key_id,
+                     sizeof(configured_account.gpg_key_id)) != 0) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "Canonical GPG fingerprint exceeds account runtime storage");
         return -1;
     }
 
@@ -3679,12 +3691,35 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
         return -1;
     }
 
-    /* GNUPGHOME is already set via gpg_set_environment() - no need to override
-     * gpg.program. git inherits the env var and gpg uses it automatically.
-     * Setting gpg.program to "gpg --homedir ..." breaks because git execs it
-     * as a single binary path, not a shell command. */
+    /* Git inherits the isolated GNUPGHOME, but executable selection is a
+     * separate trust decision. Publish the exact absolute program already
+     * retained by this manager transaction so Git signing and manager helpers
+     * cannot diverge after PATH changes. Keep unrelated format selectors out
+     * of the effective OpenPGP model. */
     if (git_unset_config_value(GIT_CONFIG_GPG_PROGRAM, scope) != 0) {
         set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.program");
+        return -1;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_X509_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.x509.program");
+        return -1;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_SSH_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.ssh.program");
+        return -1;
+    }
+    if (git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                             gpg_config->executable_path, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to set gpg.openpgp.program");
+        return -1;
+    }
+
+    /* This is the last publication step before accounts.c seals the generic
+     * managed-key transaction. Require the fresh merged image to select the
+     * same executable and use it for any uncached secret-key probe. */
+    if (git_test_config(&configured_account, scope,
+                        gpg_config->executable_path) != 0) {
         return -1;
     }
 

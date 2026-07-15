@@ -35,6 +35,9 @@ static struct {
 static int fk_execs;           /* every subprocess the code under test spawned */
 static int fk_identity_reads;  /* `git config <scope> user.name|user.email` reads */
 static int fk_effective_reads; /* atomic merged managed-key listing reads */
+static int fk_non_git_execs;
+static char fk_last_non_git_program[MAX_PATH_LEN];
+static const char *fk_allowed_gpg_program;
 static bool fk_is_repo;        /* what `git rev-parse --git-dir` reports */
 static const char *fk_repo_root_output;
 static int fk_repo_root_exit;
@@ -44,6 +47,9 @@ static void fk_reset(void) {
     fk_execs = 0;
     fk_identity_reads = 0;
     fk_effective_reads = 0;
+    fk_non_git_execs = 0;
+    fk_last_non_git_program[0] = '\0';
+    fk_allowed_gpg_program = NULL;
     fk_is_repo = false;
     fk_repo_root_output = NULL;
     fk_repo_root_exit = 1;
@@ -104,7 +110,18 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
         result->spawned = true;
     }
 
-    if (strcmp(argv[0], "git") != 0 || !argv[1]) {
+    if (strcmp(argv[0], "git") != 0) {
+        fk_non_git_execs++;
+        (void)safe_strncpy(fk_last_non_git_program, argv[0],
+                           sizeof(fk_last_non_git_program));
+        if (fk_allowed_gpg_program &&
+            strcmp(argv[0], fk_allowed_gpg_program) == 0 && argv[1] &&
+            strcmp(argv[1], "--list-secret-keys") == 0) {
+            return fk_ret(result, 0);
+        }
+        return fk_ret(result, 1);
+    }
+    if (!argv[1]) {
         return fk_ret(result, 1);
     }
 
@@ -867,7 +884,7 @@ TEST(git_test_config_rechecks_external_identity) {
         snprintf(fk_store[in].value, sizeof(fk_store[in].value), "%s",
                  "External User");
     }
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL, NULL), -1);
     CHECK_EQ_INT(fk_identity_reads, 2);
     CHECK_EQ_INT(fk_effective_reads, 2);
     if (in >= 0) CHECK_STR_EQ(fk_store[in].value, "External User");
@@ -879,6 +896,12 @@ TEST(git_test_config_rechecks_external_identity) {
 /* ---- L13: public Git validation enforces the selected signing model ----- */
 
 TEST(git_test_config_rejects_wrong_effective_signing_state) {
+    static const char expected_program[] = "/trusted/ar11/gpg";
+    static const char wrong_program[] = "/wrong/ar11/gpg";
+    static const char *const other_foreign_programs[] = {
+        GIT_CONFIG_GPG_X509_PROGRAM,
+        GIT_CONFIG_GPG_SSH_PROGRAM
+    };
     git_ops_test_reset_caches();
     fk_reset();
     command_runner_fn prev = run_set_runner(fake_git_runner);
@@ -895,10 +918,58 @@ TEST(git_test_config_rejects_wrong_effective_signing_state) {
                  sizeof(acct.gpg_key_id));
 
     CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
     gpg_manager_note_key_available(acct.gpg_key_id);
     signing_key = fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY);
     signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
     CHECK(signing_key >= 0 && signing_enabled >= 0);
+
+    /* Only the exact OpenPGP selector is the selected program model. Missing
+     * or wrong values fail, and the same path under legacy gpg.program is a
+     * foreign selector rather than an equivalent spelling. */
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), 0);
+    CHECK_EQ_INT(git_unset_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                        GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      wrong_program,
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
+    CHECK_EQ_INT(git_unset_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                        GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
+    CHECK_EQ_INT(git_unset_config_value(GIT_CONFIG_GPG_PROGRAM,
+                                        GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), 0);
+    for (size_t i = 0;
+         i < sizeof(other_foreign_programs) /
+                 sizeof(other_foreign_programs[0]);
+         i++) {
+        CHECK_EQ_INT(git_set_config_value(other_foreign_programs[i],
+                                          expected_program,
+                                          GIT_SCOPE_GLOBAL), 0);
+        CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                     expected_program), -1);
+        CHECK_EQ_INT(git_unset_config_value(other_foreign_programs[i],
+                                            GIT_SCOPE_GLOBAL), 0);
+        CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                     expected_program), 0);
+    }
 
     /* A nonempty key is not sufficient: it must be the selected key. */
     if (signing_key >= 0) {
@@ -906,7 +977,8 @@ TEST(git_test_config_rejects_wrong_effective_signing_state) {
                  sizeof(fk_store[signing_key].value), "%s",
                  "AAAAAAAAAAAAAAAA");
     }
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
 
     /* Signing enabled/disabled is selected account state, not a warning. */
     if (signing_key >= 0) {
@@ -918,17 +990,22 @@ TEST(git_test_config_rejects_wrong_effective_signing_state) {
         snprintf(fk_store[signing_enabled].value,
                  sizeof(fk_store[signing_enabled].value), "%s", "false");
     }
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
 
     acct.gpg_signing_enabled = false;
     CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
     signing_enabled = fk_find("--global", GIT_CONFIG_COMMIT_GPGSIGN);
     CHECK(signing_enabled >= 0);
     if (signing_enabled >= 0) {
         snprintf(fk_store[signing_enabled].value,
                  sizeof(fk_store[signing_enabled].value), "%s", "true");
     }
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
 
     /* A non-signing account must reject stale signing state as well. */
     acct.gpg_enabled = false;
@@ -942,7 +1019,7 @@ TEST(git_test_config_rejects_wrong_effective_signing_state) {
         snprintf(fk_store[signing_enabled].value,
                  sizeof(fk_store[signing_enabled].value), "%s", "true");
     }
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL, NULL), -1);
 
     run_set_runner(prev);
 }
@@ -980,6 +1057,7 @@ TEST(v5_fingerprint_survives_git_current_config_snapshot) {
  * runner refuses every non-git argv, so a gpg spawn here FAILS the check —
  * the post-memo success is only reachable via the skip. */
 TEST(git_test_config_skips_gpg_probe_when_key_seen) {
+    static const char expected_program[] = "/trusted/ar11/cached-gpg";
     git_ops_test_reset_caches();
     fk_reset();
     command_runner_fn prev = run_set_runner(fake_git_runner);
@@ -993,17 +1071,85 @@ TEST(git_test_config_skips_gpg_probe_when_key_seen) {
     safe_strncpy(acct.gpg_key_id, "0123FEED4567BEEF", sizeof(acct.gpg_key_id));
 
     CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
 
     /* Key not yet proven by any gpg spawn: the probe runs, the fake runner
      * refuses it, the check fails — proving the probe is still reachable
      * when nothing vouches for the key. */
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), -1);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), -1);
 
     /* Once proven (as every real switch does before its read-back validation),
      * the probe is skipped and the identical call succeeds with no gpg exec. */
     gpg_manager_note_key_available(acct.gpg_key_id);
-    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), 0);
 
+    run_set_runner(prev);
+}
+
+TEST(git_test_config_probes_with_exact_absolute_program) {
+    static const char expected_program[] = "/trusted/ar11/exact-gpg";
+    account_t acct;
+    command_runner_fn prev;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "AR11 Probe User", sizeof(acct.name));
+    safe_strncpy(acct.email, "ar11-probe@example.test", sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "A11000000000BEEF",
+                 sizeof(acct.gpg_key_id));
+
+    prev = run_set_runner(fake_git_runner);
+    CHECK_EQ_INT(git_set_config(&acct, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                      expected_program,
+                                      GIT_SCOPE_GLOBAL), 0);
+    fk_allowed_gpg_program = expected_program;
+    fk_non_git_execs = 0;
+    fk_last_non_git_program[0] = '\0';
+
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 expected_program), 0);
+    CHECK_EQ_INT(fk_non_git_execs, 1);
+    CHECK_STR_EQ(fk_last_non_git_program, expected_program);
+
+    run_set_runner(prev);
+}
+
+TEST(git_test_config_rejects_invalid_program_contract_before_exec) {
+    account_t acct;
+    command_runner_fn prev;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    memset(&acct, 0, sizeof(acct));
+    safe_strncpy(acct.name, "AR11 Contract User", sizeof(acct.name));
+    safe_strncpy(acct.email, "ar11-contract@example.test",
+                 sizeof(acct.email));
+    acct.gpg_enabled = true;
+    acct.gpg_signing_enabled = true;
+    safe_strncpy(acct.gpg_key_id, "A11000000000CAFE",
+                 sizeof(acct.gpg_key_id));
+
+    prev = run_set_runner(fake_git_runner);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL, NULL), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL, "gpg"), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+
+    acct.gpg_enabled = false;
+    acct.gpg_signing_enabled = false;
+    acct.gpg_key_id[0] = '\0';
+    CHECK_EQ_INT(git_test_config(&acct, GIT_SCOPE_GLOBAL,
+                                 "/trusted/ar11/gpg"), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(fk_execs, 0);
     run_set_runner(prev);
 }
 
@@ -1113,6 +1259,11 @@ TEST(retire_clears_signing_legs_that_select_the_account) {
     fk_seed("--global", "user.signingkey", RETIRE_FPR);
     fk_seed("--global", "commit.gpgsign", "true");
     fk_seed("--global", "gpg.format", "openpgp");
+    fk_seed("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+            "/trusted/ar11/gpg");
+    fk_seed("--global", GIT_CONFIG_GPG_PROGRAM, "/foreign/legacy-gpg");
+    fk_seed("--global", GIT_CONFIG_GPG_X509_PROGRAM, "/foreign/x509-gpg");
+    fk_seed("--global", GIT_CONFIG_GPG_SSH_PROGRAM, "/foreign/ssh-gpg");
     /* A foreign SSH command must survive: the account is not SSH-enabled, so
      * nothing attributes it. */
     fk_seed("--global", "core.sshcommand", "ssh -i /someone/elses/key");
@@ -1122,13 +1273,17 @@ TEST(retire_clears_signing_legs_that_select_the_account) {
     run_set_runner(prev);
 
     CHECK_EQ_INT(rc, 0);
-    CHECK_EQ_INT((int)cleared, 3);
+    CHECK_EQ_INT((int)cleared, 4);
     CHECK(fk_find("--global", "user.signingkey") < 0);
     CHECK(fk_find("--global", "commit.gpgsign") < 0);
     CHECK(fk_find("--global", "gpg.format") < 0);
+    CHECK(fk_find("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM) < 0);
     /* Plain identity and unattributed credentials are left untouched. */
     CHECK(fk_find("--global", "user.name") >= 0);
     CHECK(fk_find("--global", "user.email") >= 0);
+    CHECK(fk_find("--global", GIT_CONFIG_GPG_PROGRAM) >= 0);
+    CHECK(fk_find("--global", GIT_CONFIG_GPG_X509_PROGRAM) >= 0);
+    CHECK(fk_find("--global", GIT_CONFIG_GPG_SSH_PROGRAM) >= 0);
     CHECK(fk_find("--global", "core.sshcommand") >= 0);
 }
 
@@ -1141,6 +1296,8 @@ TEST(retire_leaves_foreign_signing_key_in_place) {
     retire_fill_account(&acct, NULL);
     fk_seed("--global", "user.signingkey", RETIRE_FOREIGN_FPR);
     fk_seed("--global", "commit.gpgsign", "true");
+    fk_seed("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+            "/trusted/ar11/gpg");
 
     command_runner_fn prev = run_set_runner(fake_git_runner);
     int rc = git_retire_account_identity(&acct, &cleared);
@@ -1150,6 +1307,7 @@ TEST(retire_leaves_foreign_signing_key_in_place) {
     CHECK_EQ_INT((int)cleared, 0);
     CHECK(fk_find("--global", "user.signingkey") >= 0);
     CHECK(fk_find("--global", "commit.gpgsign") >= 0);
+    CHECK(fk_find("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM) >= 0);
 }
 
 TEST(retire_clears_exactly_matching_ssh_command) {
@@ -1251,6 +1409,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_test_config_rejects_wrong_effective_signing_state);
     RUN_TEST(v5_fingerprint_survives_git_current_config_snapshot);
     RUN_TEST(git_test_config_skips_gpg_probe_when_key_seen);
+    RUN_TEST(git_test_config_probes_with_exact_absolute_program);
+    RUN_TEST(git_test_config_rejects_invalid_program_contract_before_exec);
     RUN_TEST(retire_clears_signing_legs_that_select_the_account);
     RUN_TEST(retire_leaves_foreign_signing_key_in_place);
     RUN_TEST(retire_clears_exactly_matching_ssh_command);

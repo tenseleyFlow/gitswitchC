@@ -56,7 +56,14 @@ typedef struct {
     git_config_origin_scope_t effective_name_scope;
     char effective_name_origin[MAX_PATH_LEN];
     git_config_effective_value_t ssh_command;
+    /* Keep every Git-supported program selector distinct. Folding them into
+     * one value loses both selector semantics and origin attribution when a
+     * foreign format-specific override coexists with the managed OpenPGP
+     * program. */
     git_config_effective_value_t gpg_program;
+    git_config_effective_value_t gpg_openpgp_program;
+    git_config_effective_value_t gpg_x509_program;
+    git_config_effective_value_t gpg_ssh_program;
     bool valid;
 } git_current_config_t;
 
@@ -130,11 +137,13 @@ bool git_signing_key_selects_account(const account_t *account,
  * GNUPGHOME. Checks the global scope plus, inside a repository, the local and
  * distinct managed-worktree scopes, and unsets only values attributable to
  * `account`: an exactly matching rebuilt core.sshCommand, and a signing key
- * accepted by git_signing_key_selects_account() (with its commit.gpgsign and
- * gpg.format companions at the same scope). user.name/user.email are plain
- * identity, not credentials, and are left untouched. Every scope and key is
- * attempted; *cleared (optional) reports how many present keys were removed
- * even on failure. Returns 0 when every attempted unset succeeded.
+ * accepted by git_signing_key_selects_account() (with its commit.gpgsign,
+ * gpg.format, and gpg.openpgp.program companions at the same scope). Legacy,
+ * X.509, and SSH program selectors are foreign to an account-owned OpenPGP
+ * leg and are preserved. user.name/user.email are plain identity, not
+ * credentials, and are left untouched. Every scope and key is attempted;
+ * *cleared (optional) reports how many present keys were removed even on
+ * failure. Returns 0 when every attempted unset succeeded.
  */
 int git_retire_account_identity(const account_t *account, size_t *cleared);
 
@@ -189,13 +198,16 @@ void git_config_commit(void);
 /**
  * Validate that Git's fresh merged effective configuration exactly represents
  * the selected account: identity, managed SSH command, signing key and enabled
- * state, OpenPGP format, and absence of managed GPG program overrides. When
- * GPG is enabled, also require the selected secret key to be locally
- * available. `scope` must be a valid public scope but does not limit the
- * effective read. This function creates no commit or signature and performs
- * no remote authentication or other network access.
+ * state, OpenPGP format, the exact bound gpg.openpgp.program, and absence of
+ * legacy/X.509/SSH program selectors. `expected_gpg_program` must be a
+ * nonempty absolute path when the account enables GPG and NULL or empty when
+ * it does not. When GPG is enabled, use that same path for the local secret-key
+ * availability probe. `scope` must be a valid public scope but does not limit
+ * the effective read. This function creates no commit or signature and
+ * performs no remote authentication or other network access.
  */
-int git_test_config(const account_t *account, git_scope_t scope);
+int git_test_config(const account_t *account, git_scope_t scope,
+                    const char *expected_gpg_program);
 
 /**
  * Set single git configuration value
@@ -230,7 +242,8 @@ int git_configure_ssh(const account_t *account, git_scope_t scope);
  * Configure GPG for git operations
  * - Sets user.signingkey
  * - Enables/disables commit.gpgsign
- * - Sets gpg.program if using custom GPG
+ * - The isolated GPG manager separately publishes gpg.openpgp.program after
+ *   canonical key resolution
  */
 int git_configure_gpg(const account_t *account, git_scope_t scope);
 

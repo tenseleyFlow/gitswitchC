@@ -299,6 +299,9 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
                                "ssh -i /stale/key"), 0);
     CHECK_EQ_INT(set_git_value("--worktree", GIT_CONFIG_GPG_PROGRAM,
                                "/stale/gpg"), 0);
+    CHECK_EQ_INT(set_git_value("--worktree",
+                               GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                               "/stale/gpg"), 0);
 
     CHECK_EQ_INT(git_get_current_config(&current), 0);
     CHECK(current.ssh_command.present);
@@ -306,6 +309,16 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
     CHECK(strstr(current.ssh_command.origin, "config.worktree") != NULL);
     CHECK(current.gpg_program.present);
     CHECK_EQ_INT(current.gpg_program.scope, GIT_CONFIG_ORIGIN_WORKTREE);
+    /* Selector identity is data: the same bytes under legacy gpg.program do
+     * not become an OpenPGP binding, and neither field may overwrite the
+     * other while effective configuration is captured. */
+    CHECK(current.gpg_openpgp_program.present);
+    CHECK_EQ_INT(current.gpg_openpgp_program.scope,
+                 GIT_CONFIG_ORIGIN_WORKTREE);
+    CHECK_STR_EQ(current.gpg_program.value, "/stale/gpg");
+    CHECK_STR_EQ(current.gpg_openpgp_program.value, "/stale/gpg");
+    CHECK(!current.gpg_x509_program.present);
+    CHECK(!current.gpg_ssh_program.present);
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.account_count = 1;
@@ -335,7 +348,12 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
 
     CHECK(strstr(output, "Match Status: [WARN]") != NULL);
     CHECK(strstr(output, "Effective SSH Command: [MISMATCH] (worktree scope") != NULL);
-    CHECK(strstr(output, "Effective GPG Program: [MISMATCH] (worktree scope") != NULL);
+    CHECK(strstr(output,
+                 "Effective OpenPGP Program: [MISMATCH] (worktree scope") !=
+          NULL);
+    CHECK(strstr(output,
+                 "Effective Legacy GPG Program: [FOREIGN] (worktree scope") !=
+          NULL);
     CHECK(strstr(output, "global\\x0Aconfig") != NULL);
     CHECK(strstr(output, "global\nconfig") == NULL);
 }

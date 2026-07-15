@@ -180,7 +180,8 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
  * Configure git GPG signing
  * - Sets user.signingkey
  * - Enables/disables commit.gpgsign
- * - Sets gpg.program if needed
+ * - Publishes the manager's exact bound path as gpg.openpgp.program
+ * - Verifies the complete effective Git/GPG post-image before returning
  */
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, 
                               git_scope_t scope);

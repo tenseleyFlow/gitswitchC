@@ -215,14 +215,23 @@ static bool g_fake_git_used_fingerprint;
 static bool g_fake_listing_used_v5_selector;
 static bool g_fake_git_used_v5_fingerprint;
 static int g_fake_listing_calls;
+static char g_fake_git_name[MAX_NAME_LEN];
+static char g_fake_git_email[MAX_EMAIL_LEN];
 static char g_fake_git_signingkey[MAX_GPG_FINGERPRINT_LEN];
 static char g_fake_git_gpgsign[16];
+static char g_fake_git_gpgformat[16];
+static char g_fake_git_openpgp_program[MAX_PATH_LEN];
 static bool g_fake_git_program_unset;
+static bool g_fake_git_x509_program_unset;
+static bool g_fake_git_ssh_program_unset;
 enum fake_git_failure {
     FAKE_GIT_OK,
     FAKE_GIT_FAIL_SIGNINGKEY,
     FAKE_GIT_FAIL_GPGSIGN,
-    FAKE_GIT_FAIL_PROGRAM_UNSET
+    FAKE_GIT_FAIL_PROGRAM_UNSET,
+    FAKE_GIT_FAIL_X509_PROGRAM_UNSET,
+    FAKE_GIT_FAIL_SSH_PROGRAM_UNSET,
+    FAKE_GIT_FAIL_OPENPGP_PROGRAM_SET
 };
 static enum fake_git_failure g_fake_git_failure;
 
@@ -234,6 +243,91 @@ static bool argv_has(const char *const argv[], const char *needle) {
         if (strcmp(argv[i], needle) == 0) return true;
     }
     return false;
+}
+
+static const char *git_config_set_value(const char *const argv[],
+                                        const char *key) {
+    if (!argv || !key || !argv[0] || !argv[1] || !argv[2] || !argv[3] ||
+        !argv[4] || argv[5] || strcmp(argv[0], "git") != 0 ||
+        strcmp(argv[1], "config") != 0 || strcmp(argv[3], key) != 0) {
+        return NULL;
+    }
+    return argv[4];
+}
+
+static bool git_config_unsets(const char *const argv[], const char *key) {
+    return argv && key && argv[0] && argv[1] && argv[2] && argv[3] &&
+           argv[4] && !argv[5] && strcmp(argv[0], "git") == 0 &&
+           strcmp(argv[1], "config") == 0 &&
+           (strcmp(argv[3], "--unset") == 0 ||
+            strcmp(argv[3], "--unset-all") == 0) &&
+           strcmp(argv[4], key) == 0;
+}
+
+static int append_effective_record(char *output, size_t output_size,
+                                   size_t *used, const char *key,
+                                   const char *value) {
+    static const char scope[] = "global";
+    static const char origin[] = "file:/fake/global";
+    size_t required;
+
+    if (!output || !used || !key || !value) return -1;
+    required = sizeof(scope) + sizeof(origin) + strlen(key) + 1U +
+               strlen(value) + 1U;
+    if (*used > output_size || required > output_size - *used) return -1;
+    memcpy(output + *used, scope, sizeof(scope));
+    *used += sizeof(scope);
+    memcpy(output + *used, origin, sizeof(origin));
+    *used += sizeof(origin);
+    *used += (size_t)snprintf(output + *used, output_size - *used,
+                             "%s\n%s", key, value) + 1U;
+    return 0;
+}
+
+static int emit_fake_effective_config(const run_opts_t *opts,
+                                      run_result_t *result) {
+    size_t used = 0;
+
+    if (!opts || !opts->out || opts->out_size == 0) return -1;
+#define APPEND_FAKE_VALUE(key_, value_)                                      \
+    do {                                                                      \
+        if ((value_)[0] != '\0' &&                                          \
+            append_effective_record(opts->out, opts->out_size, &used,         \
+                                    (key_), (value_)) != 0) {                  \
+            if (result) result->out_truncated = true;                          \
+            return -1;                                                        \
+        }                                                                     \
+    } while (0)
+    APPEND_FAKE_VALUE(GIT_CONFIG_USER_NAME, g_fake_git_name);
+    APPEND_FAKE_VALUE(GIT_CONFIG_USER_EMAIL, g_fake_git_email);
+    APPEND_FAKE_VALUE(GIT_CONFIG_USER_SIGNINGKEY, g_fake_git_signingkey);
+    APPEND_FAKE_VALUE(GIT_CONFIG_COMMIT_GPGSIGN, g_fake_git_gpgsign);
+    APPEND_FAKE_VALUE(GIT_CONFIG_GPG_FORMAT, g_fake_git_gpgformat);
+    APPEND_FAKE_VALUE(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                      g_fake_git_openpgp_program);
+#undef APPEND_FAKE_VALUE
+    if (result) {
+        result->exit_code = 0;
+        result->out_len = used;
+    }
+    return 0;
+}
+
+static void prepare_fake_git_model(const account_t *account) {
+    if (!account) return;
+    git_ops_test_reset_caches();
+    safe_strncpy(g_fake_git_name, account->name,
+                 sizeof(g_fake_git_name));
+    safe_strncpy(g_fake_git_email, account->email,
+                 sizeof(g_fake_git_email));
+    safe_strncpy(g_fake_git_gpgformat, "openpgp",
+                 sizeof(g_fake_git_gpgformat));
+    g_fake_git_signingkey[0] = '\0';
+    g_fake_git_gpgsign[0] = '\0';
+    g_fake_git_openpgp_program[0] = '\0';
+    g_fake_git_program_unset = false;
+    g_fake_git_x509_program_unset = false;
+    g_fake_git_ssh_program_unset = false;
 }
 
 static void fill_account(account_t *account, const char *name,
@@ -776,6 +870,12 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
 
+    if (argv && argv[0] && argv[1] && argv[2] &&
+        strcmp(argv[0], "git") == 0 && strcmp(argv[1], "config") == 0 &&
+        strcmp(argv[2], "--show-origin") == 0) {
+        return emit_fake_effective_config(opts, result);
+    }
+
     if (listing) {
         bool source_listing;
         const char *inventory =
@@ -839,7 +939,25 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
         g_fake_git_used_v5_fingerprint = true;
     }
     if (strcmp(argv[0], "git") == 0) {
+        const char *openpgp_program =
+            git_config_set_value(argv, GIT_CONFIG_GPG_OPENPGP_PROGRAM);
         size_t i;
+
+        if ((g_fake_git_failure == FAKE_GIT_FAIL_SIGNINGKEY &&
+             git_config_set_value(argv, GIT_CONFIG_USER_SIGNINGKEY)) ||
+            (g_fake_git_failure == FAKE_GIT_FAIL_GPGSIGN &&
+             git_config_set_value(argv, GIT_CONFIG_COMMIT_GPGSIGN)) ||
+            (g_fake_git_failure == FAKE_GIT_FAIL_PROGRAM_UNSET &&
+             git_config_unsets(argv, GIT_CONFIG_GPG_PROGRAM)) ||
+            (g_fake_git_failure == FAKE_GIT_FAIL_X509_PROGRAM_UNSET &&
+             git_config_unsets(argv, GIT_CONFIG_GPG_X509_PROGRAM)) ||
+            (g_fake_git_failure == FAKE_GIT_FAIL_SSH_PROGRAM_UNSET &&
+             git_config_unsets(argv, GIT_CONFIG_GPG_SSH_PROGRAM)) ||
+            (g_fake_git_failure == FAKE_GIT_FAIL_OPENPGP_PROGRAM_SET &&
+             openpgp_program)) {
+            if (result) result->exit_code = 2;
+            return -1;
+        }
 
         for (i = 0; argv[i]; i++) {
             if (strcmp(argv[i], GIT_CONFIG_USER_SIGNINGKEY) == 0 &&
@@ -850,18 +968,18 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
                        argv[i + 1]) {
                 safe_strncpy(g_fake_git_gpgsign, argv[i + 1],
                              sizeof(g_fake_git_gpgsign));
-            } else if (strcmp(argv[i], GIT_CONFIG_GPG_PROGRAM) == 0) {
-                g_fake_git_program_unset = true;
             }
         }
-        if ((g_fake_git_failure == FAKE_GIT_FAIL_SIGNINGKEY &&
-             argv_has(argv, GIT_CONFIG_USER_SIGNINGKEY)) ||
-            (g_fake_git_failure == FAKE_GIT_FAIL_GPGSIGN &&
-             argv_has(argv, GIT_CONFIG_COMMIT_GPGSIGN)) ||
-            (g_fake_git_failure == FAKE_GIT_FAIL_PROGRAM_UNSET &&
-             argv_has(argv, GIT_CONFIG_GPG_PROGRAM))) {
-            if (result) result->exit_code = 2;
-            return -1;
+        if (git_config_unsets(argv, GIT_CONFIG_GPG_PROGRAM)) {
+            g_fake_git_program_unset = true;
+        } else if (git_config_unsets(argv, GIT_CONFIG_GPG_X509_PROGRAM)) {
+            g_fake_git_x509_program_unset = true;
+        } else if (git_config_unsets(argv, GIT_CONFIG_GPG_SSH_PROGRAM)) {
+            g_fake_git_ssh_program_unset = true;
+        }
+        if (openpgp_program) {
+            safe_strncpy(g_fake_git_openpgp_program, openpgp_program,
+                         sizeof(g_fake_git_openpgp_program));
         }
     }
     return 0;
@@ -915,6 +1033,7 @@ TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);
     CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
     fill_account(&account, "unique", "01234567", true);
+    prepare_fake_git_model(&account);
     g_fake_mode = FAKE_FIRST_IMPORT;
     g_fake_imported = false;
     g_fake_exported = false;
@@ -930,6 +1049,7 @@ TEST(unique_selector_threads_fingerprint_through_import_and_publication) {
     CHECK(g_fake_imported);
     CHECK(g_fake_export_used_fingerprint);
     CHECK(g_fake_git_used_fingerprint);
+    CHECK_STR_EQ(g_fake_git_openpgp_program, config.executable_path);
     CHECK_STR_EQ(config.current_key_id, PRIMARY_FPR);
     CHECK_EQ_INT(safe_strncpy(isolated_home, config.gnupg_home,
                               sizeof(isolated_home)), 0);
@@ -981,6 +1101,7 @@ TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication) {
     CHECK_EQ_INT(mkdir(source_home, 0700), 0);
     CHECK_EQ_INT(setenv("GNUPGHOME", source_home, 1), 0);
     fill_account(&account, "v5", V5_FPR, true);
+    prepare_fake_git_model(&account);
     CHECK_EQ_INT((int)strlen(V5_FPR), 64);
     CHECK_EQ_INT((int)strlen(account.gpg_key_id), 64);
     CHECK_STR_EQ(account.gpg_key_id, V5_FPR);
@@ -1011,17 +1132,18 @@ TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication) {
 }
 
 TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
+    static const char bound_program[] = "/trusted/ar11/gpg";
     gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
     account_t account;
     command_runner_fn previous;
 
     fill_account(&account, "manual", "01234567", false);
+    prepare_fake_git_model(&account);
     CHECK_EQ_INT(safe_strncpy(config.current_key_id, PRIMARY_FPR,
                               sizeof(config.current_key_id)), 0);
+    CHECK_EQ_INT(safe_strncpy(config.executable_path, bound_program,
+                              sizeof(config.executable_path)), 0);
     g_fake_git_failure = FAKE_GIT_OK;
-    g_fake_git_signingkey[0] = '\0';
-    g_fake_git_gpgsign[0] = '\0';
-    g_fake_git_program_unset = false;
     git_ops_test_reset_caches();
     previous = run_set_runner(strict_key_runner);
     CHECK_EQ_INT(gpg_configure_git_signing(&config, &account,
@@ -1030,6 +1152,9 @@ TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
     CHECK_STR_EQ(g_fake_git_signingkey, PRIMARY_FPR);
     CHECK_STR_EQ(g_fake_git_gpgsign, "false");
     CHECK(g_fake_git_program_unset);
+    CHECK(g_fake_git_x509_program_unset);
+    CHECK(g_fake_git_ssh_program_unset);
+    CHECK_STR_EQ(g_fake_git_openpgp_program, bound_program);
 
     g_fake_git_failure = FAKE_GIT_FAIL_SIGNINGKEY;
     git_ops_test_reset_caches();
@@ -1051,6 +1176,29 @@ TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal) {
     CHECK_EQ_INT(gpg_configure_git_signing(&config, &account,
                                            GIT_SCOPE_GLOBAL), -1);
     run_set_runner(previous);
+
+    g_fake_git_failure = FAKE_GIT_FAIL_X509_PROGRAM_UNSET;
+    git_ops_test_reset_caches();
+    previous = run_set_runner(strict_key_runner);
+    CHECK_EQ_INT(gpg_configure_git_signing(&config, &account,
+                                           GIT_SCOPE_GLOBAL), -1);
+    run_set_runner(previous);
+
+    g_fake_git_failure = FAKE_GIT_FAIL_SSH_PROGRAM_UNSET;
+    git_ops_test_reset_caches();
+    previous = run_set_runner(strict_key_runner);
+    CHECK_EQ_INT(gpg_configure_git_signing(&config, &account,
+                                           GIT_SCOPE_GLOBAL), -1);
+    run_set_runner(previous);
+
+    g_fake_git_failure = FAKE_GIT_FAIL_OPENPGP_PROGRAM_SET;
+    g_fake_git_openpgp_program[0] = '\0';
+    git_ops_test_reset_caches();
+    previous = run_set_runner(strict_key_runner);
+    CHECK_EQ_INT(gpg_configure_git_signing(&config, &account,
+                                           GIT_SCOPE_GLOBAL), -1);
+    run_set_runner(previous);
+    CHECK(g_fake_git_openpgp_program[0] == '\0');
     g_fake_git_failure = FAKE_GIT_OK;
 }
 

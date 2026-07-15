@@ -43,7 +43,8 @@ static int git_get_config_value_ex(const char *key, char *value,
                                    size_t value_size, git_scope_t scope,
                                    bool *value_too_long);
 static int git_detect_managed_worktree_scope(bool *present);
-static int git_verify_merged_account(const account_t *account);
+static int git_verify_merged_account(const account_t *account,
+                                     const char *expected_gpg_program);
 static int git_reject_ssh_command_override(void);
 
 /* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
@@ -3307,7 +3308,11 @@ static int git_verify_effective_account(const account_t *account,
                                              GIT_SCOPE_LOCAL) != 0)
                 return -1;
     }
-    return git_verify_merged_account(account);
+    /* The manager publishes its retained executable after this staged Git
+     * image succeeds. At this boundary every program selector must therefore
+     * still be absent; gpg_configure_git_signing() performs the exact final
+     * verification before the transaction can be sealed. */
+    return git_verify_merged_account(account, NULL);
 }
 
 /* Set git configuration for account */
@@ -3722,7 +3727,8 @@ static int effective_key_matches(const git_effective_listing_t *listing,
     return strcmp(listing->keys[index].value, expected) == 0 ? 0 : -1;
 }
 
-static int git_verify_merged_account(const account_t *account) {
+static int git_verify_merged_account(const account_t *account,
+                                     const char *expected_gpg_program) {
     git_effective_listing_t *effective;
     char expected_ssh[GIT_CFG_VALUE_MAX];
     bool ssh_present = account->ssh_enabled && account->ssh_key_path[0] != '\0';
@@ -3755,14 +3761,18 @@ static int git_verify_merged_account(const account_t *account) {
                   "Effective merged Git configuration does not match the selected account");
         return -1;
     }
-    for (size_t i = 0;
-         i < sizeof(g_gpg_program_keys) / sizeof(g_gpg_program_keys[0]); i++) {
-        if (effective_key_matches(effective, g_gpg_program_keys[i], NULL,
-                                  false) != 0) {
-            set_error(ERR_GIT_CONFIG_FAILED,
-                      "Effective merged Git GPG program configuration does not match the selected account");
-            return -1;
-        }
+    if (effective_key_matches(effective, GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                              expected_gpg_program,
+                              expected_gpg_program != NULL) != 0 ||
+        effective_key_matches(effective, GIT_CONFIG_GPG_PROGRAM, NULL,
+                              false) != 0 ||
+        effective_key_matches(effective, GIT_CONFIG_GPG_X509_PROGRAM, NULL,
+                              false) != 0 ||
+        effective_key_matches(effective, GIT_CONFIG_GPG_SSH_PROGRAM, NULL,
+                              false) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective merged Git GPG program configuration does not match the selected account");
+        return -1;
     }
     return 0;
 }
@@ -3794,9 +3804,6 @@ int git_get_current_config(git_current_config_t *config) {
     const int k_gpgx509 = cfg_key_index(GIT_CONFIG_GPG_X509_PROGRAM);
     const int k_gpgssh = cfg_key_index(GIT_CONFIG_GPG_SSH_PROGRAM);
     const int k_sshcommand = cfg_key_index(GIT_CONFIG_CORE_SSHCOMMAND);
-    const int gpg_program_indices[] = {
-        k_gpgprogram, k_gpgopenpgp, k_gpgx509, k_gpgssh
-    };
 
     if (!config) {
         set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
@@ -3896,15 +3903,11 @@ int git_get_current_config(git_current_config_t *config) {
     }
 
     copy_effective_value(&config->ssh_command, effective, k_sshcommand);
-    memset(&config->gpg_program, 0, sizeof(config->gpg_program));
-    for (size_t i = 0;
-         i < sizeof(gpg_program_indices) / sizeof(gpg_program_indices[0]); i++) {
-        int index = gpg_program_indices[i];
-        if (effective->keys[index].present) {
-            copy_effective_value(&config->gpg_program, effective, index);
-            break;
-        }
-    }
+    copy_effective_value(&config->gpg_program, effective, k_gpgprogram);
+    copy_effective_value(&config->gpg_openpgp_program, effective,
+                         k_gpgopenpgp);
+    copy_effective_value(&config->gpg_x509_program, effective, k_gpgx509);
+    copy_effective_value(&config->gpg_ssh_program, effective, k_gpgssh);
 
     config->valid = true;
     return 0;
@@ -4074,6 +4077,15 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
                 git_retire_unset(GIT_CONFIG_GPG_FORMAT, scope, &removed,
                                  &failures, first_error, sizeof(first_error));
             }
+            /* The account-owned signing key is the attribution anchor for
+             * the OpenPGP executable published by the same switch. Other
+             * format selectors are foreign configuration and must survive. */
+            if (git_get_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM, value,
+                                     sizeof(value), scope) == 0) {
+                git_retire_unset(GIT_CONFIG_GPG_OPENPGP_PROGRAM, scope,
+                                 &removed, &failures, first_error,
+                                 sizeof(first_error));
+            }
         }
     }
 
@@ -4099,7 +4111,10 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
  * rest of git_ops does not use). */
 
 /* Validate the account model Git will actually consume. */
-int git_test_config(const account_t *account, git_scope_t scope) {
+int git_test_config(const account_t *account, git_scope_t scope,
+                    const char *expected_gpg_program) {
+    bool gpg_expected;
+
     if (!account) {
         set_error(ERR_INVALID_ARGS, "NULL account to git_test_config");
         return -1;
@@ -4109,13 +4124,29 @@ int git_test_config(const account_t *account, git_scope_t scope) {
         return -1;
     }
 
+    gpg_expected = account->gpg_enabled && account->gpg_key_id[0] != '\0';
+    if (gpg_expected) {
+        if (!expected_gpg_program || expected_gpg_program[0] != '/') {
+            set_error(ERR_INVALID_ARGS,
+                      "GPG-enabled Git validation requires the bound absolute OpenPGP program");
+            return -1;
+        }
+    } else if (expected_gpg_program && expected_gpg_program[0] != '\0') {
+        set_error(ERR_INVALID_ARGS,
+                  "Git validation received a GPG program for an account without GPG");
+        return -1;
+    }
+
     log_info("Testing git configuration for account: %s", account->name);
 
     /* Reuse the switch path's strict merged-account model: exact identity,
-     * SSH command, signing key/state and format, with every managed GPG
-     * program override absent. A selected-scope-only read is insufficient
-     * because a higher-precedence scope may override the values Git uses. */
-    if (git_verify_merged_account(account) != 0) return -1;
+     * SSH command, signing key/state and format, with the exact bound OpenPGP
+     * program and no foreign program selectors. A selected-scope-only read is
+     * insufficient because a higher-precedence scope may override the values
+     * Git uses. */
+    if (git_verify_merged_account(account,
+                                  gpg_expected ? expected_gpg_program : NULL) != 0)
+        return -1;
 
     /* Check local key availability when signing is configured. This does not
      * create a commit or signature; functional signing must be tested by a
@@ -4123,10 +4154,11 @@ int git_test_config(const account_t *account, git_scope_t scope) {
      * consults is decided by GNUPGHOME — by the time a switch validates itself
      * that is already the account's isolated home. The probe is skipped when
      * an earlier spawn already proved the key's presence (AR-02 #14). */
-    if (account->gpg_enabled && account->gpg_key_id[0] != '\0' &&
+    if (gpg_expected &&
         !gpg_manager_key_available_cached(account->gpg_key_id)) {
         const char *gpg_argv[] = {
-            "gpg", "--list-secret-keys", account->gpg_key_id, NULL
+            expected_gpg_program, "--list-secret-keys",
+            account->gpg_key_id, NULL
         };
         run_opts_t gpg_opts;
         memset(&gpg_opts, 0, sizeof(gpg_opts));
