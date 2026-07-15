@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <pwd.h>
 
 /* Minimal valid config: one account, no key material (so no key-permission
  * checks fire in validate_account_security). */
@@ -670,6 +671,7 @@ TEST(config_init_rejects_nondirectory_final_components) {
 
 TEST(config_init_secures_real_or_absent_final_directory) {
     char home[128], saved_home[512], dotconfig[256], final[256];
+    char accounts[512];
     struct stat st;
     gitswitch_ctx_t ctx;
 
@@ -687,6 +689,9 @@ TEST(config_init_secures_real_or_absent_final_directory) {
     CHECK_EQ_INT(lstat(final, &st), 0);
     CHECK(S_ISDIR(st.st_mode));
     CHECK_EQ_INT((long)(st.st_mode & 0777), 0700);
+    snprintf(accounts, sizeof(accounts), "%s/accounts.toml", final);
+    CHECK_EQ_INT(access(accounts, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
 
     /* Absent final component (and parent) is still created normally. */
     char home2[128], final2[256];
@@ -698,8 +703,60 @@ TEST(config_init_secures_real_or_absent_final_directory) {
     CHECK_EQ_INT(lstat(final2, &st), 0);
     CHECK(S_ISDIR(st.st_mode));
     CHECK_EQ_INT((long)(st.st_mode & 0777), 0700);
+    snprintf(accounts, sizeof(accounts), "%s/accounts.toml", final2);
+    CHECK_STR_EQ(ctx.config.config_path, accounts);
+    CHECK_EQ_INT(access(accounts, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
 
     restore_home_env(saved_home);
+}
+
+TEST(config_get_path_uses_home_or_passwd_without_filesystem_mutation) {
+    char root[128];
+    char saved_home[512];
+    char home_a[256];
+    char home_b[256];
+    char path[MAX_PATH_LEN];
+    char expected[MAX_PATH_LEN];
+    struct passwd *pw;
+    struct stat missing;
+
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(make_scratch_dir(root, sizeof(root)), 0);
+    snprintf(home_a, sizeof(home_a), "%s/not-created-a", root);
+    snprintf(home_b, sizeof(home_b), "%s/not-created-b", root);
+
+    CHECK_EQ_INT(setenv("HOME", home_a, 1), 0);
+    CHECK_EQ_INT(config_get_path(path, sizeof(path)), 0);
+    CHECK(snprintf(expected, sizeof(expected),
+                   "%s/.config/gitswitch/accounts.toml", home_a) <
+          (int)sizeof(expected));
+    CHECK_STR_EQ(path, expected);
+    CHECK_EQ_INT(lstat(home_a, &missing), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+
+    CHECK_EQ_INT(setenv("HOME", home_b, 1), 0);
+    CHECK_EQ_INT(config_get_path(path, sizeof(path)), 0);
+    CHECK(snprintf(expected, sizeof(expected),
+                   "%s/.config/gitswitch/accounts.toml", home_b) <
+          (int)sizeof(expected));
+    CHECK_STR_EQ(path, expected);
+    CHECK_EQ_INT(lstat(home_b, &missing), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+
+    CHECK_EQ_INT(unsetenv("HOME"), 0);
+    pw = getpwuid(getuid());
+    CHECK(pw != NULL);
+    if (pw) {
+        CHECK_EQ_INT(config_get_path(path, sizeof(path)), 0);
+        CHECK(snprintf(expected, sizeof(expected),
+                       "%s/.config/gitswitch/accounts.toml", pw->pw_dir) <
+              (int)sizeof(expected));
+        CHECK_STR_EQ(path, expected);
+    }
+
+    restore_home_env(saved_home);
+    ts_rm_rf(root);
 }
 
 /* ---- AR-04: private metadata nodes are no-follow and nonblocking -------- */
@@ -1116,7 +1173,6 @@ TEST(account_model_admitted_states_roundtrip_exactly) {
     char dir[128], path[256], key[256];
 
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
-    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
     snprintf(key, sizeof(key), "%s/id_roundtrip", dir);
     CHECK_EQ_INT(write_config(
                      key,
@@ -1130,6 +1186,8 @@ TEST(account_model_admitted_states_roundtrip_exactly) {
         gitswitch_ctx_t reloaded;
         account_t account;
 
+        CHECK(snprintf(path, sizeof(path), "%s/accounts-%zu.toml", dir, i) <
+              (int)sizeof(path));
         memset(&ctx, 0, sizeof(ctx));
         ctx.config.default_scope = GIT_SCOPE_LOCAL;
         fill_account(&account, 1, "roundtrip", "roundtrip@example.com",
@@ -2261,6 +2319,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(config_init_rejects_symlinked_final_directory_without_mutation);
     RUN_TEST(config_init_rejects_nondirectory_final_components);
     RUN_TEST(config_init_secures_real_or_absent_final_directory);
+    RUN_TEST(config_get_path_uses_home_or_passwd_without_filesystem_mutation);
     RUN_TEST(config_lock_rejects_symlink_fifo_and_unsafe_mode);
     RUN_TEST(config_lock_release_preserves_reused_fd_and_retires_context);
     RUN_TEST(config_lock_survives_post_acquisition_namespace_replacement);

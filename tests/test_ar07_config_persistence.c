@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <sys/wait.h>
 
@@ -122,18 +123,84 @@ static config_io_boundary_t fault_target;
 static char generation_swap_source[256];
 static char generation_swap_replacement[256];
 static int generation_swap_error;
+static config_io_boundary_t generation_swap_boundary;
 static config_io_boundary_t rollback_replace_boundary;
 static char rollback_replace_hint[256];
 static char rollback_replace_source[256];
 static int rollback_replace_error;
+static size_t generation_document_malloc_calls;
+static size_t generation_io_boundary_calls;
+static char state_rewrite_hint[256];
+static char state_rewrite_content[64];
+static int state_rewrite_error;
+static char document_rewrite_path[256];
+static const char *document_rewrite_content;
+static struct stat document_rewrite_before;
+static struct stat document_rewrite_after;
+static int document_rewrite_error;
 
 static bool inject_fault(config_io_boundary_t boundary) {
     return boundary == fault_target;
 }
 
-static bool replace_source_at_state_publication(
+static void *count_generation_document_malloc(size_t size) {
+    generation_document_malloc_calls++;
+    return malloc(size);
+}
+
+static bool count_generation_io_boundary(config_io_boundary_t boundary) {
+    (void)boundary;
+    generation_io_boundary_calls++;
+    return false;
+}
+
+static int rewrite_private_in_place(const char *path, const char *text) {
+    int fd = open(path, O_WRONLY | O_TRUNC | O_CLOEXEC | O_NOFOLLOW);
+    size_t length = strlen(text);
+    size_t total = 0;
+
+    if (fd < 0) return -1;
+    while (total < length) {
+        ssize_t written = write(fd, text + total, length - total);
+        if (written > 0) total += (size_t)written;
+        else if (written < 0 && errno == EINTR) continue;
+        else { close(fd); return -1; }
+    }
+    if (fsync(fd) != 0) { close(fd); return -1; }
+    return close(fd);
+}
+
+static bool rewrite_state_before_publication(
     config_io_boundary_t boundary) {
     if (boundary == CONFIG_IO_STATE_BEFORE_RENAME &&
+        state_rewrite_hint[0] != '\0') {
+        if (rewrite_private_in_place(state_rewrite_hint,
+                                     state_rewrite_content) != 0) {
+            state_rewrite_error = errno ? errno : EIO;
+        }
+        state_rewrite_hint[0] = '\0';
+    }
+    return false;
+}
+
+static bool rewrite_document_before_directory_sync(
+    config_io_boundary_t boundary) {
+    if (boundary == CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC &&
+        document_rewrite_path[0] != '\0') {
+        if (lstat(document_rewrite_path, &document_rewrite_before) != 0 ||
+            rewrite_private_in_place(document_rewrite_path,
+                                     document_rewrite_content) != 0 ||
+            lstat(document_rewrite_path, &document_rewrite_after) != 0) {
+            document_rewrite_error = errno ? errno : EIO;
+        }
+        document_rewrite_path[0] = '\0';
+    }
+    return false;
+}
+
+static bool replace_source_at_state_publication(
+    config_io_boundary_t boundary) {
+    if (boundary == generation_swap_boundary &&
         generation_swap_source[0] != '\0') {
         if (rename(generation_swap_replacement,
                    generation_swap_source) != 0) {
@@ -554,10 +621,348 @@ TEST(full_save_rollback_preserves_a_later_state_generation) {
     }
 }
 
+TEST(full_save_binds_and_refreshes_the_exact_source_generation) {
+    char dir[128];
+    char active_dir[256];
+    char uncertain_dir[256];
+    char path[256];
+    char active_path[512];
+    char uncertain_path[512];
+    struct stat current;
+    struct stat first_generation;
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t active_ctx;
+    gitswitch_ctx_t uncertain_ctx;
+    gitswitch_ctx_t uncertain_before;
+    bool installed = false;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(active_dir, sizeof(active_dir), "%s/active", dir);
+    snprintf(uncertain_dir, sizeof(uncertain_dir), "%s/uncertain", dir);
+    CHECK_EQ_INT(mkdir(active_dir, 0700), 0);
+    CHECK_EQ_INT(mkdir(uncertain_dir, 0700), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(active_path, sizeof(active_path), "%s/accounts.toml", active_dir);
+    snprintf(uncertain_path, sizeof(uncertain_path),
+             "%s/accounts.toml", uncertain_dir);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(ctx.config.source_generation_valid);
+    CHECK_STR_EQ(ctx.config.config_path, path);
+    CHECK_EQ_INT(lstat(path, &current), 0);
+    CHECK(same_identity(&ctx.config.source_generation, &current));
+    first_generation = ctx.config.source_generation;
+
+    ctx.config.default_scope = GIT_SCOPE_GLOBAL;
+    installed = false;
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(ctx.config.source_generation_valid);
+    CHECK_EQ_INT(lstat(path, &current), 0);
+    CHECK(same_identity(&ctx.config.source_generation, &current));
+    CHECK(!same_identity(&first_generation, &ctx.config.source_generation));
+
+    /* Active-only publication against an absent document falls back to the
+     * full first-save path. That conditional path must refresh the same
+     * context so its next ordinary full save is not generationless. */
+    memset(&active_ctx, 0, sizeof(active_ctx));
+    active_ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    active_ctx.account_count = 1;
+    active_ctx.accounts[0].id = 1;
+    active_ctx.accounts[0].preferred_scope = GIT_SCOPE_LOCAL;
+    snprintf(active_ctx.accounts[0].name,
+             sizeof(active_ctx.accounts[0].name), "%s", "alice");
+    snprintf(active_ctx.accounts[0].email,
+             sizeof(active_ctx.accounts[0].email), "%s",
+             "alice@example.com");
+    snprintf(active_ctx.config.active_account,
+             sizeof(active_ctx.config.active_account), "%s", "alice");
+    installed = false;
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &active_ctx, active_path, &installed), 0);
+    CHECK(installed);
+    CHECK(active_ctx.config.source_generation_valid);
+    CHECK_STR_EQ(active_ctx.config.config_path, active_path);
+    active_ctx.config.default_scope = GIT_SCOPE_GLOBAL;
+    CHECK_EQ_INT(config_save(&active_ctx, active_path), 0);
+    CHECK_EQ_INT(lstat(active_path, &current), 0);
+    CHECK(same_identity(&active_ctx.config.source_generation, &current));
+
+    /* A post-rename directory-sync failure is installed but not a fully
+     * durable success. The caller's entire context remains byte-exact and is
+     * not rebound to an uncertain generation. */
+    memset(&uncertain_ctx, 0, sizeof(uncertain_ctx));
+    uncertain_ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    uncertain_before = uncertain_ctx;
+    fault_target = CONFIG_IO_DOCUMENT_BEFORE_DIR_SYNC;
+    config_set_io_fault_fn(inject_fault);
+    installed = false;
+    CHECK_EQ_INT(config_save_transactional(
+                     &uncertain_ctx, uncertain_path, &installed), -1);
+    config_set_io_fault_fn(NULL);
+    CHECK(installed);
+    CHECK(memcmp(&uncertain_ctx, &uncertain_before,
+                 sizeof(uncertain_ctx)) == 0);
+    CHECK_EQ_INT(access(uncertain_path, F_OK), 0);
+    CHECK_EQ_INT(count_prefix(uncertain_dir, "accounts.toml.tmp."), 0);
+}
+
+TEST(full_save_rejects_stale_absent_and_generationless_sources_early) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char document_before[2048];
+    char document_after[2048];
+    char state_before[128];
+    char state_after[128];
+    gitswitch_ctx_t creator;
+    gitswitch_ctx_t first;
+    gitswitch_ctx_t second;
+    gitswitch_ctx_t second_before;
+    gitswitch_ctx_t generationless;
+    gitswitch_ctx_t generationless_before;
+    gitswitch_ctx_t disappeared;
+    gitswitch_ctx_t disappeared_before;
+    config_document_malloc_fn previous_malloc;
+    bool installed = false;
+    int backups_before;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    memset(&creator, 0, sizeof(creator));
+    creator.config.default_scope = GIT_SCOPE_LOCAL;
+    CHECK_EQ_INT(config_save(&creator, path), 0);
+
+    memset(&first, 0, sizeof(first));
+    memset(&second, 0, sizeof(second));
+    CHECK_EQ_INT(config_load(&first, path), 0);
+    CHECK_EQ_INT(config_load(&second, path), 0);
+    first.config.default_scope = GIT_SCOPE_GLOBAL;
+    CHECK_EQ_INT(config_save(&first, path), 0);
+    CHECK(read_text(path, document_before, sizeof(document_before)) > 0);
+    CHECK(read_text(hint, state_before, sizeof(state_before)) > 0);
+    backups_before = count_prefix(dir, "accounts.toml.backup.");
+    CHECK(backups_before >= 0);
+
+    second_before = second;
+    generation_document_malloc_calls = 0;
+    generation_io_boundary_calls = 0;
+    previous_malloc = config_set_document_malloc_fn(
+        count_generation_document_malloc);
+    config_set_io_fault_fn(count_generation_io_boundary);
+    clear_error();
+    installed = true;
+    CHECK_EQ_INT(config_save_transactional(&second, path, &installed), -1);
+    config_set_io_fault_fn(NULL);
+    CHECK(config_set_document_malloc_fn(previous_malloc) ==
+          count_generation_document_malloc);
+    CHECK(!installed);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK_EQ_INT(generation_document_malloc_calls, 0);
+    CHECK_EQ_INT(generation_io_boundary_calls, 0);
+    CHECK(memcmp(&second, &second_before, sizeof(second)) == 0);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), backups_before);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    CHECK(read_text(path, document_after, sizeof(document_after)) > 0);
+    CHECK_STR_EQ(document_after, document_before);
+    CHECK(read_text(hint, state_after, sizeof(state_after)) > 0);
+    CHECK_STR_EQ(state_after, state_before);
+
+    memset(&generationless, 0, sizeof(generationless));
+    generationless.config.default_scope = GIT_SCOPE_LOCAL;
+    generationless_before = generationless;
+    generation_document_malloc_calls = 0;
+    generation_io_boundary_calls = 0;
+    previous_malloc = config_set_document_malloc_fn(
+        count_generation_document_malloc);
+    config_set_io_fault_fn(count_generation_io_boundary);
+    clear_error();
+    CHECK_EQ_INT(config_save(&generationless, path), -1);
+    config_set_io_fault_fn(NULL);
+    config_set_document_malloc_fn(previous_malloc);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK_EQ_INT(generation_document_malloc_calls, 0);
+    CHECK_EQ_INT(generation_io_boundary_calls, 0);
+    CHECK(memcmp(&generationless, &generationless_before,
+                 sizeof(generationless)) == 0);
+
+    disappeared = first;
+    disappeared_before = disappeared;
+    CHECK_EQ_INT(unlink(path), 0);
+    generation_document_malloc_calls = 0;
+    generation_io_boundary_calls = 0;
+    previous_malloc = config_set_document_malloc_fn(
+        count_generation_document_malloc);
+    config_set_io_fault_fn(count_generation_io_boundary);
+    clear_error();
+    CHECK_EQ_INT(config_save(&disappeared, path), -1);
+    config_set_io_fault_fn(NULL);
+    config_set_document_malloc_fn(previous_malloc);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK_EQ_INT(generation_document_malloc_calls, 0);
+    CHECK_EQ_INT(generation_io_boundary_calls, 0);
+    CHECK(memcmp(&disappeared, &disappeared_before,
+                 sizeof(disappeared)) == 0);
+    CHECK_EQ_INT(access(path, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK(read_text(hint, state_after, sizeof(state_after)) > 0);
+    CHECK_STR_EQ(state_after, state_before);
+}
+
+static void exercise_full_save_late_generation_conflict(
+    bool loaded_generation, config_io_boundary_t boundary) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char replacement[256];
+    char text[2048];
+    struct stat competitor_before;
+    struct stat competitor_after;
+    struct stat state_before;
+    struct stat state_after;
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t ctx_before;
+    bool installed = true;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    snprintf(replacement, sizeof(replacement), "%s/competitor.toml", dir);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    if (loaded_generation) {
+        CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+        CHECK_EQ_INT(write_private(hint, "none\n"), 0);
+        CHECK_EQ_INT(config_load(&ctx, path), 0);
+        ctx.config.default_scope = GIT_SCOPE_GLOBAL;
+        CHECK_EQ_INT(lstat(hint, &state_before), 0);
+    }
+    ctx_before = ctx;
+
+    CHECK_EQ_INT(write_private(replacement, replacement_account), 0);
+    CHECK_EQ_INT(lstat(replacement, &competitor_before), 0);
+    snprintf(generation_swap_source, sizeof(generation_swap_source),
+             "%s", path);
+    snprintf(generation_swap_replacement,
+             sizeof(generation_swap_replacement), "%s", replacement);
+    generation_swap_boundary = boundary;
+    generation_swap_error = 0;
+    config_set_io_fault_fn(replace_source_at_state_publication);
+    clear_error();
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), -1);
+    config_set_io_fault_fn(NULL);
+
+    CHECK_EQ_INT(generation_swap_error, 0);
+    CHECK(generation_swap_source[0] == '\0');
+    CHECK(!installed);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
+    CHECK_EQ_INT(lstat(path, &competitor_after), 0);
+    CHECK(same_identity(&competitor_before, &competitor_after));
+    CHECK(read_text(path, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, replacement_account);
+    CHECK_EQ_INT(access(replacement, F_OK), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+
+    if (loaded_generation) {
+        CHECK_EQ_INT(lstat(hint, &state_after), 0);
+        CHECK_EQ_INT((long)(state_after.st_mode & 0777), 0600);
+        CHECK(read_text(hint, text, sizeof(text)) > 0);
+        CHECK_STR_EQ(text, "none\n");
+        if (boundary == CONFIG_IO_STATE_BEFORE_RENAME) {
+            CHECK(same_identity(&state_before, &state_after));
+        }
+    } else {
+        CHECK_EQ_INT(access(hint, F_OK), -1);
+        CHECK_EQ_INT(errno, ENOENT);
+    }
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 0);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.restore."), 0);
+}
+
+TEST(full_save_rechecks_loaded_generation_across_state_publication) {
+    const config_io_boundary_t boundaries[] = {
+        CONFIG_IO_STATE_BEFORE_RENAME,
+        CONFIG_IO_STATE_BEFORE_DIR_SYNC
+    };
+
+    for (size_t i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
+        exercise_full_save_late_generation_conflict(true, boundaries[i]);
+    }
+}
+
+TEST(full_save_rechecks_absence_across_state_publication) {
+    const config_io_boundary_t boundaries[] = {
+        CONFIG_IO_STATE_BEFORE_RENAME,
+        CONFIG_IO_STATE_BEFORE_DIR_SYNC
+    };
+
+    for (size_t i = 0; i < sizeof(boundaries) / sizeof(boundaries[0]); i++) {
+        exercise_full_save_late_generation_conflict(false, boundaries[i]);
+    }
+}
+
+TEST(full_save_does_not_adopt_post_install_in_place_rewrite) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char text[2048];
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t ctx_before;
+    bool installed = false;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx_before = ctx;
+
+    snprintf(document_rewrite_path, sizeof(document_rewrite_path),
+             "%s", path);
+    document_rewrite_content = replacement_account;
+    memset(&document_rewrite_before, 0, sizeof(document_rewrite_before));
+    memset(&document_rewrite_after, 0, sizeof(document_rewrite_after));
+    document_rewrite_error = 0;
+    config_set_io_fault_fn(rewrite_document_before_directory_sync);
+    clear_error();
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), -1);
+    config_set_io_fault_fn(NULL);
+
+    CHECK_EQ_INT(document_rewrite_error, 0);
+    CHECK(document_rewrite_path[0] == '\0');
+    CHECK(installed);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
+    CHECK(document_rewrite_before.st_dev == document_rewrite_after.st_dev);
+    CHECK(document_rewrite_before.st_ino == document_rewrite_after.st_ino);
+    CHECK(read_text(path, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, replacement_account);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.backup."), 0);
+    CHECK_EQ_INT(count_prefix(dir, "accounts.toml.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.restore."), 0);
+}
+
 TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
     char dir[128], path[256], hint[256], text[1024];
     struct stat config_before, config_after, state_before, state_after;
     gitswitch_ctx_t ctx;
+    gitswitch_ctx_t ctx_before;
 
     CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
     snprintf(path, sizeof(path), "%s/accounts.toml", dir);
@@ -571,7 +976,9 @@ TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
     CHECK(read_text(hint, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, "none\n"); /* loading is observational */
 
+    ctx_before = ctx;
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
+    CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
     CHECK(read_text(hint, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, "none\nactive=alice\n");
     CHECK_EQ_INT(lstat(path, &config_after), 0);
@@ -579,9 +986,11 @@ TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
 
     snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
              "%s", "bob"); /* case-different exact match */
+    ctx_before = ctx;
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
+    CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
     CHECK(read_text(hint, text, sizeof(text)) > 0);
-    CHECK_STR_EQ(text, "none\nactive=bob\n");
+    CHECK_STR_EQ(text, "none\nactive=Bob\n");
     CHECK_EQ_INT(lstat(hint, &state_before), 0);
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
     CHECK_EQ_INT(lstat(hint, &state_after), 0);
@@ -593,7 +1002,7 @@ TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
              "%s", "ghost");
     CHECK_EQ_INT(config_save_active_account(&ctx, path), -1);
     CHECK(read_text(hint, text, sizeof(text)) > 0);
-    CHECK_STR_EQ(text, "none\nactive=bob\n");
+    CHECK_STR_EQ(text, "none\nactive=Bob\n");
 
     ctx.config.active_account[0] = '\0';
     CHECK_EQ_INT(config_save_active_account(&ctx, path), 0);
@@ -601,6 +1010,85 @@ TEST(active_state_only_save_preserves_accounts_and_is_idempotent) {
     CHECK_STR_EQ(text, "none\ninactive=v1\n");
     CHECK_EQ_INT(lstat(path, &config_after), 0);
     CHECK(same_identity(&config_before, &config_after));
+}
+
+TEST(active_state_case_variants_normalize_and_publish_canonical_name) {
+    char home[128];
+    char config_parent[160];
+    char config_dir[192];
+    char runtime_dir[160];
+    char path[256];
+    char hint[256];
+    char saved_home[1024];
+    char saved_runtime[1024];
+    char text[1024];
+    const char *original_home = getenv("HOME");
+    const char *original_runtime = getenv("XDG_RUNTIME_DIR");
+    struct stat canonical_state;
+    struct stat after_idempotent;
+    gitswitch_ctx_t runtime_ctx;
+    gitswitch_ctx_t readonly_ctx;
+    gitswitch_ctx_t ctx_before;
+    bool had_home = original_home != NULL;
+    bool had_runtime = original_runtime != NULL;
+
+    if (had_home) {
+        snprintf(saved_home, sizeof(saved_home), "%s", original_home);
+    }
+    if (had_runtime) {
+        snprintf(saved_runtime, sizeof(saved_runtime), "%s",
+                 original_runtime);
+    }
+    CHECK_EQ_INT(private_dir(home, sizeof(home)), 0);
+    snprintf(config_parent, sizeof(config_parent), "%s/.config", home);
+    snprintf(config_dir, sizeof(config_dir), "%s/gitswitch", config_parent);
+    snprintf(runtime_dir, sizeof(runtime_dir), "%s/runtime", home);
+    CHECK_EQ_INT(mkdir(config_parent, 0700), 0);
+    CHECK_EQ_INT(mkdir(config_dir, 0700), 0);
+    CHECK_EQ_INT(mkdir(runtime_dir, 0700), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", config_dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", config_dir);
+    CHECK_EQ_INT(write_private(path, two_accounts_legacy), 0);
+    CHECK_EQ_INT(write_private(hint, "none\nactive=bob\n"), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime_dir, 1), 0);
+
+    memset(&runtime_ctx, 0, sizeof(runtime_ctx));
+    CHECK_EQ_INT(config_init(&runtime_ctx), 0);
+    CHECK_STR_EQ(runtime_ctx.config.active_account, "Bob");
+    CHECK(runtime_ctx.current_account != NULL);
+    if (runtime_ctx.current_account) {
+        CHECK_STR_EQ(runtime_ctx.current_account->name, "Bob");
+    }
+
+    memset(&readonly_ctx, 0, sizeof(readonly_ctx));
+    CHECK_EQ_INT(config_init_readonly(&readonly_ctx), 0);
+    CHECK_STR_EQ(readonly_ctx.config.active_account, "Bob");
+    CHECK(readonly_ctx.current_account != NULL);
+    if (readonly_ctx.current_account) {
+        CHECK_STR_EQ(readonly_ctx.current_account->name, "Bob");
+    }
+
+    ctx_before = runtime_ctx;
+    CHECK_EQ_INT(config_save_active_account(&runtime_ctx, path), 0);
+    CHECK(memcmp(&runtime_ctx, &ctx_before, sizeof(runtime_ctx)) == 0);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=Bob\n");
+    CHECK_EQ_INT(lstat(hint, &canonical_state), 0);
+    CHECK_EQ_INT(config_save_active_account(&runtime_ctx, path), 0);
+    CHECK_EQ_INT(lstat(hint, &after_idempotent), 0);
+    CHECK(same_identity(&canonical_state, &after_idempotent));
+
+    if (had_home) {
+        CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("HOME"), 0);
+    }
+    if (had_runtime) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_runtime, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
 }
 
 TEST(active_state_save_is_bound_to_loaded_config_generation) {
@@ -656,6 +1144,7 @@ TEST(active_state_save_is_bound_to_loaded_config_generation) {
              "%s", path);
     snprintf(generation_swap_replacement,
              sizeof(generation_swap_replacement), "%s", replacement);
+    generation_swap_boundary = CONFIG_IO_STATE_BEFORE_RENAME;
     generation_swap_error = 0;
     installed = true;
     config_set_io_fault_fn(replace_source_at_state_publication);
@@ -671,6 +1160,69 @@ TEST(active_state_save_is_bound_to_loaded_config_generation) {
     CHECK_STR_EQ(text, two_accounts_legacy);
     CHECK(read_text(hint, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, "none\ninactive=v1\n");
+}
+
+TEST(active_state_publish_reproves_exact_before_image_after_hook) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char text[128];
+    struct stat before;
+    struct stat after;
+    gitswitch_ctx_t ctx;
+    gitswitch_ctx_t ctx_before;
+    bool installed = true;
+    int fds_before;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    CHECK_EQ_INT(write_private(hint, "none\nactive=alice\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_STR_EQ(ctx.config.active_account, "alice");
+    ctx.config.active_account[0] = '\0';
+    ctx_before = ctx;
+    CHECK_EQ_INT(lstat(hint, &before), 0);
+    fds_before = count_open_fds();
+
+    CHECK_EQ_INT((long)strlen("none\nactive=alice\n"),
+                 (long)strlen("none\nactive=ALICE\n"));
+    snprintf(state_rewrite_hint, sizeof(state_rewrite_hint), "%s", hint);
+    snprintf(state_rewrite_content, sizeof(state_rewrite_content), "%s",
+             "none\nactive=ALICE\n");
+    state_rewrite_error = 0;
+    config_set_io_fault_fn(rewrite_state_before_publication);
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1);
+    config_set_io_fault_fn(NULL);
+
+    CHECK_EQ_INT(state_rewrite_error, 0);
+    CHECK(!installed);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ESTALE);
+    CHECK(strstr(get_last_error()->message,
+                 "Resume hint changed before update") != NULL);
+    CHECK(memcmp(&ctx, &ctx_before, sizeof(ctx)) == 0);
+    CHECK_EQ_INT(lstat(hint, &after), 0);
+    CHECK(before.st_dev == after.st_dev && before.st_ino == after.st_ino);
+    CHECK_EQ_INT(before.st_size, after.st_size);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\nactive=ALICE\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+    CHECK_EQ_INT(count_open_fds(), fds_before);
+
+    /* The rejected writer owns no residue; the same still-loaded account
+     * generation can retry against the later state and replace it normally. */
+    installed = false;
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
 }
 
 TEST(historical_active_state_migrates_without_reset_resurrection) {
@@ -865,8 +1417,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(backup_pruning_requires_complete_directory_enumeration);
     RUN_TEST(backup_faults_abort_and_full_save_rolls_state_back);
     RUN_TEST(full_save_rollback_preserves_a_later_state_generation);
+    RUN_TEST(full_save_binds_and_refreshes_the_exact_source_generation);
+    RUN_TEST(full_save_rejects_stale_absent_and_generationless_sources_early);
+    RUN_TEST(full_save_rechecks_loaded_generation_across_state_publication);
+    RUN_TEST(full_save_rechecks_absence_across_state_publication);
+    RUN_TEST(full_save_does_not_adopt_post_install_in_place_rewrite);
     RUN_TEST(active_state_only_save_preserves_accounts_and_is_idempotent);
+    RUN_TEST(active_state_case_variants_normalize_and_publish_canonical_name);
     RUN_TEST(active_state_save_is_bound_to_loaded_config_generation);
+    RUN_TEST(active_state_publish_reproves_exact_before_image_after_hook);
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
     RUN_TEST(active_state_rejects_corruption_and_crash_mismatches);
     RUN_TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds);

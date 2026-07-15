@@ -144,10 +144,17 @@ static void config_rebind_current_id(gitswitch_ctx_t *ctx,
 static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
                                        const account_t *account,
                                        size_t ignore_index);
+typedef enum {
+    CONFIG_SOURCE_GENERATION_UNBOUND = 0,
+    CONFIG_SOURCE_GENERATION_REQUIRE_LOADED,
+    CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE
+} config_source_generation_requirement_t;
+
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed,
-                                     bool require_loaded_source,
+                                     config_source_generation_requirement_t
+                                         generation_requirement,
                                      config_resume_hint_snapshot_t *rollback_snapshot);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
@@ -156,8 +163,14 @@ static void config_unlink_created_temp(const char *path,
                                        bool have_created_identity);
 static bool config_metadata_snapshot_same(const struct stat *a,
                                           const struct stat *b);
+static bool config_is_namespace_change_errno(int error);
 static int config_require_loaded_source_generation(
     const gitswitch_ctx_t *ctx, const char *config_path);
+static int config_admit_full_save_generation(const gitswitch_ctx_t *ctx,
+                                             const char *config_path);
+static int config_require_full_save_generation_snapshot(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool destination_existed, const struct stat *destination);
 static bool config_metadata_ctime_only_change(const struct stat *before,
                                               const struct stat *after);
 static bool config_refresh_publication_identity(
@@ -183,9 +196,19 @@ typedef struct {
     char active_account[MAX_NAME_LEN];
 } config_active_state_t;
 
+#define CONFIG_ACTIVE_STATE_MAX 1024U
+
+typedef struct {
+    bool existed;
+    struct stat metadata;
+    unsigned char data[CONFIG_ACTIVE_STATE_MAX];
+    size_t length;
+} config_active_state_generation_t;
+
 static int config_read_active_state(const char *config_path,
                                     config_active_state_t *state,
-                                    bool require_private_mode);
+                                    bool require_private_mode,
+                                    config_active_state_generation_t *generation);
 
 typedef enum {
     CONFIG_INIT_NORMAL = 0,
@@ -534,8 +557,6 @@ static int config_read_document(const char *config_path, toml_document_t *doc,
                                          loaded_identity);
 }
 
-#define CONFIG_ACTIVE_STATE_MAX 1024U
-
 static bool config_state_needs_valid(const char *line, size_t length) {
     return (length == 3 && memcmp(line, "ssh", 3) == 0) ||
            (length == 3 && memcmp(line, "gpg", 3) == 0) ||
@@ -587,7 +608,8 @@ static int config_state_path_for_config(const char *config_path,
 
 static int config_read_active_state(const char *config_path,
                                     config_active_state_t *state,
-                                    bool require_private_mode) {
+                                    bool require_private_mode,
+                                    config_active_state_generation_t *generation) {
     char hint[MAX_PATH_LEN];
     char dir[MAX_PATH_LEN];
     char buffer[CONFIG_ACTIVE_STATE_MAX + 1];
@@ -606,6 +628,9 @@ static int config_read_active_state(const char *config_path,
         return -1;
     }
     memset(state, 0, sizeof(*state));
+    if (generation) {
+        memset(generation, 0, sizeof(*generation));
+    }
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0) {
         return -1;
     }
@@ -685,6 +710,13 @@ static int config_read_active_state(const char *config_path,
     }
     close(fd);
     buffer[total] = '\0';
+
+    if (generation) {
+        generation->existed = true;
+        generation->metadata = opened;
+        memcpy(generation->data, buffer, total);
+        generation->length = total;
+    }
 
     if (memchr(buffer, '\0', total) != NULL) {
         set_error(ERR_CONFIG_INVALID,
@@ -936,7 +968,7 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
      * runtime-needs marker) migrates from settings.active_account. Reset writes
      * the tombstone atomically, so absence can safely retain its pre-T12 meaning
      * without resurrecting a post-T12 reset. */
-    if (config_read_active_state(config_path, &active_state, false) != 0) {
+    if (config_read_active_state(config_path, &active_state, false, NULL) != 0) {
         return -1;
     }
     if (active_state.exists && active_state.inactive_tombstone) {
@@ -986,6 +1018,10 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
                       "Active-state runtime needs '%s' do not match account '%s' (expected '%s')",
                       active_state.needs, ctx->config.active_account,
                       config_account_runtime_needs(state_account));
+            return -1;
+        } else if (safe_strncpy(ctx->config.active_account,
+                                state_account->name,
+                                sizeof(ctx->config.active_account)) != 0) {
             return -1;
         }
     }
@@ -1073,6 +1109,7 @@ static bool config_metadata_snapshot_same(const struct stat *a,
 static int config_require_loaded_source_generation(
     const gitswitch_ctx_t *ctx, const char *config_path) {
     struct stat current;
+    int lookup_errno;
 
     if (!ctx || !config_path || !ctx->config.source_generation_valid ||
         strcmp(ctx->config.config_path, config_path) != 0) {
@@ -1081,11 +1118,21 @@ static int config_require_loaded_source_generation(
         return -1;
     }
     errno = 0;
-    if (lstat(config_path, &current) != 0 ||
-        !config_metadata_file_is_safe(&current, true) ||
+    if (lstat(config_path, &current) != 0) {
+        lookup_errno = errno ? errno : EIO;
+        errno = config_is_namespace_change_errno(lookup_errno)
+                    ? ESTALE
+                    : lookup_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Configuration changed since it was loaded; refusing active-state publication: %s",
+            config_path);
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&current, true) ||
         !config_metadata_snapshot_same(&ctx->config.source_generation,
                                        &current)) {
-        errno = errno ? errno : ESTALE;
+        errno = ESTALE;
         set_system_error(
             ERR_FILE_IO,
             "Configuration changed since it was loaded; refusing active-state publication: %s",
@@ -1093,6 +1140,84 @@ static int config_require_loaded_source_generation(
         return -1;
     }
     return 0;
+}
+
+static int config_require_full_save_generation_snapshot(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool destination_existed, const struct stat *destination) {
+    if (!ctx || !config_path || (destination_existed && !destination)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid full-save generation proof arguments");
+        return -1;
+    }
+    if (strnlen(config_path, sizeof(ctx->config.config_path)) >=
+        sizeof(ctx->config.config_path)) {
+        set_error(ERR_INVALID_PATH, "Config path is too long");
+        return -1;
+    }
+
+    if (ctx->config.source_generation_valid) {
+        if (strcmp(ctx->config.config_path, config_path) != 0) {
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Full save requires the exact path from the loaded configuration generation");
+            return -1;
+        }
+        if (!destination_existed ||
+            !config_metadata_file_is_safe(destination, true) ||
+            !config_metadata_snapshot_same(&ctx->config.source_generation,
+                                           destination)) {
+            errno = ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Configuration changed since it was loaded; refusing full-document save: %s",
+                config_path);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (destination_existed) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Refusing generationless overwrite of existing configuration; load it before saving: %s",
+            config_path);
+        return -1;
+    }
+    return 0;
+}
+
+/* A full rebuild is allowed to create a genuinely absent first document, but
+ * it may replace an existing document only when the caller presents the exact
+ * generation admitted by config_load or by its own last durable full save.
+ * Run this immediately after taking the destination lock, before allocating or
+ * mutating the serialized model, capturing resume state, or creating backups. */
+static int config_admit_full_save_generation(const gitswitch_ctx_t *ctx,
+                                             const char *config_path) {
+    struct stat current;
+    bool existed = false;
+
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid full-save generation admission arguments");
+        return -1;
+    }
+    errno = 0;
+    if (lstat(config_path, &current) == 0) {
+        existed = true;
+    } else if (errno == ENOENT ||
+               (ctx->config.source_generation_valid &&
+                config_is_namespace_change_errno(errno))) {
+        existed = false;
+    } else {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot establish configuration generation: %s",
+                         config_path);
+        return -1;
+    }
+    return config_require_full_save_generation_snapshot(
+        ctx, config_path, existed, existed ? &current : NULL);
 }
 
 /* FreeBSD UFS may materialize a ctime update only when a related directory is
@@ -1161,6 +1286,268 @@ static bool config_pread_full(int fd, unsigned char *buffer, size_t length,
         }
     }
     return true;
+}
+
+/* A no-follow lookup reports namespace replacement differently across the
+ * supported platforms: Linux/macOS commonly use ELOOP or ENOTDIR, while
+ * FreeBSD may report EMLINK for the terminal symlink. These all mean that the
+ * expected pathname generation disappeared; unrelated syscall failures retain
+ * their original errno. */
+static bool config_is_namespace_change_errno(int error) {
+    if (error == ENOENT || error == ELOOP || error == ENOTDIR) return true;
+#ifdef EMLINK
+    if (error == EMLINK) return true;
+#endif
+    return false;
+}
+
+/* Re-prove a published regular-file generation against both strict metadata
+ * and an independent byte snapshot captured before publication. FreeBSD may
+ * materialize only ctime when the containing directory is synced; admit that
+ * narrow metadata transition only when the complete bytes still match. */
+static int config_reprove_published_file_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *current_generation) {
+    unsigned char observed[4096];
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    unsigned char trailing;
+    ssize_t trailing_count;
+    off_t offset = 0;
+    int fd = -1;
+    int failure_errno = ESTALE;
+
+    if (dir_fd < 0 || !name || !expected ||
+        (!expected_data && expected_length != 0) || !current_generation) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    errno = 0;
+    if (fstatat(dir_fd, name, &named_before, AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_before, true) ||
+        named_before.st_size < 0 ||
+        (uintmax_t)named_before.st_size != expected_length ||
+        (!config_metadata_snapshot_same(expected, &named_before) &&
+         !config_metadata_ctime_only_change(expected, &named_before))) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    errno = 0;
+    fd = openat(dir_fd, name,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto proof_fail;
+    }
+    if (fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&opened, true) ||
+        opened.st_size < 0 ||
+        (uintmax_t)opened.st_size != expected_length ||
+        (!config_metadata_snapshot_same(expected, &opened) &&
+         !config_metadata_ctime_only_change(expected, &opened))) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    while ((size_t)offset < expected_length) {
+        size_t remaining = expected_length - (size_t)offset;
+        size_t chunk = remaining < sizeof(observed)
+                           ? remaining
+                           : sizeof(observed);
+        errno = 0;
+        if (!config_pread_full(fd, observed, chunk, offset)) {
+            failure_errno = errno ? errno : EIO;
+            goto proof_fail;
+        }
+        if (memcmp(observed, expected_data + (size_t)offset, chunk) != 0) {
+            failure_errno = ESTALE;
+            goto proof_fail;
+        }
+        offset += (off_t)chunk;
+    }
+    errno = 0;
+    do {
+        trailing_count = pread(fd, &trailing, 1, (off_t)expected_length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count < 0) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    if (trailing_count != 0) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    errno = 0;
+    if (fstat(fd, &descriptor_after) != 0 ||
+        fstatat(dir_fd, name, &named_after, AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, true) ||
+        !config_metadata_file_is_safe(&named_after, true) ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
+        !config_metadata_snapshot_same(&opened, &named_after)) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    *current_generation = named_after;
+    close(fd);
+    secure_zero_memory(observed, sizeof(observed));
+    return 0;
+
+proof_fail:
+    if (fd >= 0) close(fd);
+    secure_zero_memory(observed, sizeof(observed));
+    errno = failure_errno;
+    return -1;
+}
+
+/* Re-prove the exact bounded active-state before-image immediately before its
+ * replacement. Strict metadata catches ordinary edits, while the byte proof
+ * also rejects an in-place same-length rewrite even if timestamp evidence is
+ * unavailable or has been restored. */
+static int config_require_active_state_generation(
+    const char *hint, const config_active_state_generation_t *expected) {
+    unsigned char observed[CONFIG_ACTIVE_STATE_MAX];
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    unsigned char trailing;
+    ssize_t trailing_count;
+    int fd = -1;
+    int failure_errno = ESTALE;
+
+    if (!hint || !expected || expected->length > sizeof(expected->data)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid active-state generation proof arguments");
+        return -1;
+    }
+
+    if (!expected->existed) {
+        errno = 0;
+        if (lstat(hint, &named_before) != 0) {
+            if (errno == ENOENT) return 0;
+            failure_errno = config_is_namespace_change_errno(errno)
+                                ? ESTALE
+                                : (errno ? errno : EIO);
+        }
+        errno = failure_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Resume hint changed before update; refusing replacement: %s",
+            hint);
+        return -1;
+    }
+
+    errno = 0;
+    if (lstat(hint, &named_before) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto generation_mismatch;
+    }
+    if (!config_metadata_file_is_safe(&named_before, false) ||
+        !config_metadata_snapshot_same(&expected->metadata, &named_before)) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    errno = 0;
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto generation_mismatch;
+    }
+    errno = 0;
+    if (fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    if (!config_metadata_file_is_safe(&opened, false) ||
+        !config_metadata_snapshot_same(&expected->metadata, &opened) ||
+        opened.st_size < 0 ||
+        (uintmax_t)opened.st_size != expected->length) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    errno = 0;
+    if (!config_pread_full(fd, observed, expected->length, 0)) {
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    if (memcmp(observed, expected->data, expected->length) != 0) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    errno = 0;
+    do {
+        trailing_count = pread(fd, &trailing, 1, (off_t)expected->length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count < 0) {
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    if (trailing_count != 0) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    errno = 0;
+    if (fstat(fd, &descriptor_after) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    errno = 0;
+    if (lstat(hint, &named_after) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto generation_mismatch;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, false) ||
+        !config_metadata_file_is_safe(&named_after, false) ||
+        !config_metadata_snapshot_same(&expected->metadata,
+                                       &descriptor_after) ||
+        !config_metadata_snapshot_same(&expected->metadata, &named_after)) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+
+    close(fd);
+    secure_zero_memory(observed, sizeof(observed));
+    return 0;
+
+generation_mismatch:
+    {
+        if (fd >= 0) close(fd);
+        secure_zero_memory(observed, sizeof(observed));
+        errno = failure_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Resume hint changed before update; refusing replacement: %s",
+            hint);
+    }
+    return -1;
 }
 
 /* Refresh a publication baseline only when the new durable backup proves the
@@ -1521,7 +1908,7 @@ int config_resume_hint_probe(char *needs, size_t size) {
     }
     needs[0] = '\0';
     if (config_get_path(config_path, sizeof(config_path)) != 0 ||
-        config_read_active_state(config_path, &state, true) != 0) {
+        config_read_active_state(config_path, &state, true, NULL) != 0) {
         return -1;
     }
     if (!state.exists) {
@@ -2036,9 +2423,11 @@ int config_resume_hint_snapshot_restore(
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed,
-                                     bool require_loaded_source,
+                                     config_source_generation_requirement_t
+                                         generation_requirement,
                                      config_resume_hint_snapshot_t *rollback_snapshot) {
     config_active_state_t existing_state;
+    config_active_state_generation_t state_before;
     const account_t *active_account = NULL;
     const char *needs;
     char content[MAX_NAME_LEN + 32];
@@ -2046,10 +2435,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     char hint[MAX_PATH_LEN];
     char temp[MAX_PATH_LEN];
     struct stat dir_identity;
-    struct stat before;
     struct stat temp_identity;
     struct stat after;
-    bool existed = false;
     bool have_temp_identity = false;
     bool temp_registered = false;
     int fd = -1;
@@ -2067,8 +2454,18 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             config_path, rollback_snapshot) != 0) {
         return -1;
     }
-    if (require_loaded_source &&
-        config_require_loaded_source_generation(ctx, config_path) != 0) {
+    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
+        if (config_require_loaded_source_generation(ctx, config_path) != 0) {
+            return -1;
+        }
+    } else if (generation_requirement ==
+               CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE) {
+        if (config_admit_full_save_generation(ctx, config_path) != 0) {
+            return -1;
+        }
+    } else if (generation_requirement != CONFIG_SOURCE_GENERATION_UNBOUND) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid source-generation requirement for active-state commit");
         return -1;
     }
 
@@ -2103,7 +2500,8 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                   "Cannot safely update the resume hint: config directory is unavailable");
         return -1;
     }
-    if (config_read_active_state(config_path, &existing_state, false) != 0) {
+    if (config_read_active_state(config_path, &existing_state, false,
+                                 &state_before) != 0) {
         return -1;
     }
     if (ctx->config.active_account[0] == '\0') {
@@ -2149,7 +2547,7 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         else if (wants_gpg)              needs = "gpg";
         else                             needs = "none";
         if ((size_t)snprintf(content, sizeof(content), "%s\nactive=%s\n",
-                             needs, ctx->config.active_account) >= sizeof(content)) {
+                             needs, active_account->name) >= sizeof(content)) {
             set_error(ERR_CONFIG_INVALID, "Active-state content is too long");
             return -1;
         }
@@ -2157,26 +2555,15 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             !existing_state.inactive_tombstone &&
             strcmp(existing_state.needs, needs) == 0 &&
             strcmp(existing_state.active_account,
-                   ctx->config.active_account) == 0) {
+                   active_account->name) == 0) {
             return 0;
         }
     }
 
-    /* Never open the destination for writing. Capture its exact identity (or
-     * absence), build a fresh 0600 inode beside it, then verify that neither
-     * the destination nor its private directory changed before rename. */
-    if (lstat(hint, &before) == 0) {
-        existed = true;
-        if (!config_metadata_file_is_safe(&before, false)) {
-            set_error(ERR_PERMISSION_DENIED,
-                      "Refusing to replace unsafe resume hint metadata: %s", hint);
-            return -1;
-        }
-    } else if (errno != ENOENT) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect resume hint before update: %s", hint);
-        return -1;
-    }
+    /* Never open the destination for writing. The validated reader above
+     * retained strict metadata plus every bounded before-image byte. Build a
+     * fresh inode beside it, then re-prove that exact generation after the
+     * public pre-rename checkpoint. */
     if ((size_t)snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", hint) >= sizeof(temp)) {
         set_error(ERR_INVALID_PATH, "Resume hint temporary path is too long");
         return -1;
@@ -2252,29 +2639,22 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                   "Resume hint metadata changed before installation: %s", hint);
         goto hint_fail;
     }
-    if (lstat(hint, &after) == 0) {
-        if (!existed || !config_metadata_file_is_safe(&after, false) ||
-            !config_metadata_same_file(&before, &after)) {
-            set_error(ERR_FILE_IO,
-                      "Resume hint changed before update; refusing replacement: %s",
-                      hint);
-            goto hint_fail;
-        }
-    } else if (existed || errno != ENOENT) {
-        set_error(ERR_FILE_IO,
-                  "Resume hint changed before update; refusing replacement: %s",
-                  hint);
-        goto hint_fail;
-    }
-
     if (config_io_fault(CONFIG_IO_STATE_BEFORE_RENAME,
                         "active-state rename")) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install resume hint atomically: %s", hint);
         goto hint_fail;
     }
-    if (require_loaded_source &&
-        config_require_loaded_source_generation(ctx, config_path) != 0) {
+    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
+        if (config_require_loaded_source_generation(ctx, config_path) != 0) {
+            goto hint_fail;
+        }
+    } else if (generation_requirement ==
+                   CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE &&
+               config_admit_full_save_generation(ctx, config_path) != 0) {
+        goto hint_fail;
+    }
+    if (config_require_active_state_generation(hint, &state_before) != 0) {
         goto hint_fail;
     }
     /* Every public config/state save holds the destination's internal lock
@@ -2357,7 +2737,8 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
                                         const char *config_path,
                                         bool make_backup,
                                         bool update_hint,
-                                        bool *config_installed) {
+                                        bool *config_installed,
+                                        struct stat *committed_generation) {
     char dir_path[MAX_PATH_LEN];
     char temp_path[MAX_PATH_LEN];
     char temp_name[MAX_PATH_LEN];
@@ -2366,8 +2747,12 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     struct stat pinned_dir;
     struct stat destination_before;
     struct stat destination_now;
+    struct stat installed_generation;
     struct stat temp_identity;
+    struct stat temp_generation;
     struct stat temp_now;
+    unsigned char *document_bytes = NULL;
+    size_t document_length = 0;
     bool destination_existed = false;
     bool temp_exists = false;
     bool temp_registered = false;
@@ -2377,6 +2762,9 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
 
     if (config_installed) {
         *config_installed = false;
+    }
+    if (committed_generation) {
+        memset(committed_generation, 0, sizeof(*committed_generation));
     }
 
     /* Refuse to write through or next to a symlink (cfg-symlink-01). rename()
@@ -2436,16 +2824,26 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     if (fstatat(dir_fd, target_name, &destination_before,
                 AT_SYMLINK_NOFOLLOW) == 0) {
         destination_existed = true;
-        if (!config_metadata_file_is_safe(&destination_before, false)) {
-            errno = EPERM;
-            set_error(ERR_PERMISSION_DENIED,
-                      "Config destination is not a safe owned regular file: %s",
-                      config_path);
-            goto document_fail;
-        }
     } else if (errno != ENOENT) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Cannot identify config destination: %s", config_path);
+        goto document_fail;
+    }
+    /* The state publisher may have run callbacks and a directory sync since
+     * full-save admission. Tie this first pinned-directory destination snapshot
+     * back to the caller's loaded generation (or proven first-save absence)
+     * before backups or document temporaries create any side effects. */
+    if (config_require_full_save_generation_snapshot(
+            ctx, config_path, destination_existed,
+            destination_existed ? &destination_before : NULL) != 0) {
+        goto document_fail;
+    }
+    if (destination_existed &&
+        !config_metadata_file_is_safe(&destination_before, false)) {
+        errno = EPERM;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Config destination is not a safe owned regular file: %s",
+                  config_path);
         goto document_fail;
     }
 
@@ -2493,7 +2891,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
     temp_fd = openat(dir_fd, temp_name,
-                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                     O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                      PERM_USER_RW);
     if (temp_fd < 0) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
@@ -2530,17 +2928,57 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
     errno = 0;
-    if (fstat(temp_fd, &temp_now) != 0 ||
-        !config_metadata_file_is_safe(&temp_now, true) ||
-        !config_metadata_same_file(&temp_identity, &temp_now) ||
+    if (fstat(temp_fd, &temp_generation) != 0 ||
+        !config_metadata_file_is_safe(&temp_generation, true) ||
+        !config_metadata_same_file(&temp_identity, &temp_generation) ||
         fstatat(dir_fd, temp_name, &temp_now, AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&temp_now, true) ||
-        !config_metadata_same_file(&temp_identity, &temp_now)) {
+        !config_metadata_snapshot_same(&temp_generation, &temp_now) ||
+        temp_generation.st_size < 0 ||
+        temp_generation.st_size > (off_t)TOML_MAX_FILE_SIZE) {
         errno = errno ? errno : ESTALE;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Temporary config changed before publication: %s",
                          temp_path);
         goto document_fail;
+    }
+    document_length = (size_t)temp_generation.st_size;
+    document_bytes = malloc(document_length ? document_length : 1U);
+    if (!document_bytes) {
+        errno = ENOMEM;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot snapshot temporary config before publication: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    if (!config_pread_full(temp_fd, document_bytes, document_length, 0)) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot snapshot temporary config before publication: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    {
+        unsigned char trailing;
+        ssize_t trailing_count;
+
+        errno = 0;
+        do {
+            trailing_count = pread(temp_fd, &trailing, 1,
+                                   (off_t)document_length);
+        } while (trailing_count < 0 && errno == EINTR);
+        if (trailing_count != 0 ||
+            fstat(temp_fd, &temp_now) != 0 ||
+            !config_metadata_snapshot_same(&temp_generation, &temp_now) ||
+            fstatat(dir_fd, temp_name, &temp_now,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !config_metadata_snapshot_same(&temp_generation, &temp_now)) {
+            errno = errno ? errno : ESTALE;
+            set_system_error(
+                ERR_CONFIG_WRITE_FAILED,
+                "Temporary config changed while snapshotting publication bytes: %s",
+                temp_path);
+            goto document_fail;
+        }
     }
     if (close(temp_fd) != 0) {
         temp_fd = -1;
@@ -2614,6 +3052,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
                          config_path);
         goto document_fail;
     }
+    installed_generation = destination_now;
 
     /* AR-05 L11: per POSIX a rename() is only durable once the directory
      * holding the new entry is itself fsynced. toml_write_fd already fsyncs
@@ -2633,9 +3072,33 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
 
-    if (update_hint &&
-        config_update_resume_hint(ctx, config_path, NULL, false, NULL) != 0) {
+    /* Capture the context's next admission generation only after the payload
+     * and directory entry are both durable. A post-rename failure remains an
+     * installed-but-uncertain result and deliberately leaves the caller bound
+     * to its old generation until it reloads. */
+    errno = 0;
+    if (config_reprove_published_file_at(
+            dir_fd, target_name, &installed_generation, document_bytes,
+            document_length, &destination_now) != 0) {
+        int proof_errno = errno ? errno : EIO;
+        errno = proof_errno;
+        set_system_error(
+            proof_errno == ESTALE ? ERR_FILE_IO : ERR_CONFIG_WRITE_FAILED,
+            "Durable config generation changed before context refresh: %s",
+            config_path);
         goto document_fail;
+    }
+    free(document_bytes);
+    document_bytes = NULL;
+
+    if (update_hint &&
+        config_update_resume_hint(ctx, config_path, NULL,
+                                  CONFIG_SOURCE_GENERATION_UNBOUND,
+                                  NULL) != 0) {
+        goto document_fail;
+    }
+    if (committed_generation) {
+        *committed_generation = destination_now;
     }
     close(dir_fd);
     log_info("Configuration document committed to: %s", config_path);
@@ -2671,6 +3134,7 @@ document_fail:
             signals_scratch_unregister(temp_path);
         }
         if (dir_fd >= 0) close(dir_fd);
+        free(document_bytes);
         errno = saved_errno;
     }
     return -1;
@@ -2736,7 +3200,7 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx) {
 }
 
 /* Save configuration to TOML file */
-static int config_save_mode(const gitswitch_ctx_t *ctx,
+static int config_save_mode(gitswitch_ctx_t *ctx,
                             const char *config_path,
                             bool update_hint,
                             bool *config_installed,
@@ -2747,6 +3211,7 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     toml_document_t *toml_doc = NULL;
     bool document_installed = false;
     bool state_installed = false;
+    struct stat committed_generation;
     int write_lock_fd = -1;
     int result = -1;
 
@@ -2760,6 +3225,10 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
     write_lock_fd = config_write_lock_path(config_path);
     if (write_lock_fd < 0) {
         return -1;
+    }
+
+    if (config_admit_full_save_generation(ctx, config_path) != 0) {
+        goto cleanup;
     }
 
     /* GIT_SCOPE_SYSTEM remains part of the public observation model because
@@ -2840,7 +3309,8 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
             goto cleanup;
         }
         if (config_update_resume_hint(ctx, config_path,
-                                      &state_installed, false,
+                                      &state_installed,
+                                      CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE,
                                       state_before) != 0) {
             if (state_installed) {
                 error_context_t state_error = *get_last_error();
@@ -2860,7 +3330,8 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         }
     }
     result = config_write_document_atomic(ctx, toml_doc, config_path, true,
-                                          false, &document_installed);
+                                          false, &document_installed,
+                                          &committed_generation);
     if (config_installed) {
         *config_installed = document_installed;
     }
@@ -2879,6 +3350,12 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
             g_last_error = write_error;
         }
     }
+    if (result == 0) {
+        memmove(ctx->config.config_path, config_path,
+                strlen(config_path) + 1U);
+        ctx->config.source_generation = committed_generation;
+        ctx->config.source_generation_valid = true;
+    }
 
 cleanup:
     if (!rollback_snapshot) {
@@ -2891,11 +3368,11 @@ cleanup:
     return result;
 }
 
-int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
+int config_save(gitswitch_ctx_t *ctx, const char *config_path) {
     return config_save_mode(ctx, config_path, true, NULL, NULL);
 }
 
-int config_save_transactional(const gitswitch_ctx_t *ctx,
+int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed) {
     if (!config_installed) {
@@ -2911,7 +3388,7 @@ int config_save_transactional(const gitswitch_ctx_t *ctx,
  * parse or replace accounts.toml: switch/reset state is orthogonal to the
  * account schema and remains writable even when a healthy subset was loaded
  * from a non-reconstructable config. */
-static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
+static int config_save_active_account_mode(gitswitch_ctx_t *ctx,
                                            const char *config_path,
                                            bool *config_installed,
                                            config_resume_hint_snapshot_t *rollback_snapshot) {
@@ -2937,18 +3414,19 @@ static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
                                   config_installed, rollback_snapshot);
     } else {
         result = config_update_resume_hint(ctx, config_path, config_installed,
-                                           true, rollback_snapshot);
+                                           CONFIG_SOURCE_GENERATION_REQUIRE_LOADED,
+                                           rollback_snapshot);
     }
     config_write_unlock(write_lock_fd);
     return result;
 }
 
-int config_save_active_account(const gitswitch_ctx_t *ctx,
+int config_save_active_account(gitswitch_ctx_t *ctx,
                                const char *config_path) {
     return config_save_active_account_mode(ctx, config_path, NULL, NULL);
 }
 
-int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
+int config_save_active_account_transactional(gitswitch_ctx_t *ctx,
                                              const char *config_path,
                                              bool *config_installed) {
     if (!config_installed) {
@@ -2962,7 +3440,7 @@ int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
 }
 
 int config_save_active_account_transactional_guarded(
-    const gitswitch_ctx_t *ctx, const char *config_path,
+    gitswitch_ctx_t *ctx, const char *config_path,
     bool *config_installed,
     config_resume_hint_snapshot_t *rollback_snapshot) {
     if (!config_installed || !rollback_snapshot ||
@@ -2977,7 +3455,7 @@ int config_save_active_account_transactional_guarded(
                                            rollback_snapshot);
 }
 
-int config_restore_active_account(const gitswitch_ctx_t *ctx,
+int config_restore_active_account(gitswitch_ctx_t *ctx,
                                   const char *config_path) {
     return config_save_active_account_mode(ctx, config_path, NULL, NULL);
 }

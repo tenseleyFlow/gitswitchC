@@ -87,9 +87,10 @@ config_backup_readdir_fn config_set_backup_readdir_fn(
 
 /**
  * Initialize configuration system
- * - Locates configuration file
- * - Creates default config if none exists
- * - Validates configuration format
+ * - Resolves and stores the normal configuration path
+ * - Creates or secures the private configuration directory
+ * - Loads and validates accounts.toml when it already exists
+ * - Leaves first-file creation to the first successful save
  */
 int config_init(gitswitch_ctx_t *ctx);
 
@@ -135,11 +136,13 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
  * changes through the final pre-rename checkpoint, so the unsupported race is
  * explicitly bounded to the last check-to-rename interval.
  */
-int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
+int config_save(gitswitch_ctx_t *ctx, const char *config_path);
 /* Full-document transactional save. `config_installed` becomes true once the
  * new accounts.toml inode is renamed into place, including a later directory-
- * sync failure whose visible result must be treated as installed/uncertain. */
-int config_save_transactional(const gitswitch_ctx_t *ctx,
+ * sync failure whose visible result must be treated as installed/uncertain.
+ * On complete durable success, the mutable context is rebound to the exact
+ * installed source generation so another save from that context is admitted. */
+int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed);
 
@@ -161,9 +164,11 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx);
  * either the exact active account or a versioned inactive tombstone. Falls back
  * to config_save when no config exists. For an existing config, the context
  * must come from a successful load of that exact path and the source generation
- * must still be installed; otherwise the save fails closed.
+ * must still be installed; otherwise the save fails closed. If accounts.toml
+ * is absent, this entry point performs the required full first save and then
+ * binds the mutable context to that newly installed source generation.
  */
-int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path);
+int config_save_active_account(gitswitch_ctx_t *ctx, const char *config_path);
 
 /**
  * Write the path of the consolidated active-state/resume-hint file into buf.
@@ -214,7 +219,7 @@ void config_resume_hint_snapshot_clear(config_resume_hint_snapshot_t *snapshot);
  * new state-artifact inode has been renamed into place, even if its subsequent
  * directory sync fails. Use the guarded variant when later transaction phases
  * may need to restore an exact snapshot. */
-int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
+int config_save_active_account_transactional(gitswitch_ctx_t *ctx,
                                              const char *config_path,
                                              bool *config_installed);
 /* Switch-transaction variant: rollback_snapshot must be a valid before-image
@@ -222,10 +227,10 @@ int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
  * that snapshot so config_resume_hint_snapshot_restore can perform a guarded
  * compare-before-restore instead of overwriting a later writer. */
 int config_save_active_account_transactional_guarded(
-    const gitswitch_ctx_t *ctx, const char *config_path,
+    gitswitch_ctx_t *ctx, const char *config_path,
     bool *config_installed,
     config_resume_hint_snapshot_t *rollback_snapshot);
-int config_restore_active_account(const gitswitch_ctx_t *ctx,
+int config_restore_active_account(gitswitch_ctx_t *ctx,
                                   const char *config_path);
 
 /**
@@ -260,9 +265,10 @@ int config_validate_account_model(const account_t *account);
 
 /**
  * Get the configuration file path (<config dir>/accounts.toml).
- * Builds the path only — it does NOT read environment variables and does NOT
- * create any directory (AR-06 F53: the old doc claimed both). Directory
- * creation is config_init/config_create_default's job.
+ * Resolves the home directory from HOME when it is set, otherwise from the
+ * current user's password-database entry, and builds the path only. This query
+ * does not create, chmod, or otherwise modify any filesystem object; directory
+ * creation and security repair belong to config_init/config_create_default.
  */
 int config_get_path(char *path_buffer, size_t buffer_size);
 
