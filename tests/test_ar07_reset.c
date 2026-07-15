@@ -6,6 +6,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 
 typedef void (*reset_test_hook_fn)(int stage);
@@ -31,6 +32,12 @@ typedef struct {
     char hint[PATH_MAX];
     char output[PATH_MAX];
 } reset_fixture_t;
+
+typedef struct {
+    int status;
+    int launch_errno;
+    int wait_errno;
+} reset_child_result_t;
 
 static int g_inject_stage;
 static int g_trace_fd = -1;
@@ -174,20 +181,76 @@ static int redirect_output(const char *path) {
     return 0;
 }
 
-static int run_reset_child(const reset_fixture_t *fixture,
-                           const char *selector, int inject_stage,
-                           char *trace, size_t trace_size) {
+static void describe_wait_status(int status, char *description, size_t size) {
+    if (status < 0) {
+        (void)snprintf(description, size, "unavailable");
+    } else if (WIFEXITED(status)) {
+        (void)snprintf(description, size, "exit code %d", WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        (void)snprintf(description, size, "signal %d", WTERMSIG(status));
+    } else if (WIFSTOPPED(status)) {
+        (void)snprintf(description, size, "stopped by signal %d",
+                       WSTOPSIG(status));
+    } else {
+        (void)snprintf(description, size, "raw wait status 0x%x",
+                       (unsigned int)status);
+    }
+}
+
+static void diagnose_reset_child_precheckpoint(
+    const reset_fixture_t *fixture, const reset_child_result_t *result,
+    const char *trace) {
+    char status_description[64];
+    char output[4096];
+    size_t output_length;
+
+    if (result->launch_errno != 0) {
+        fprintf(stderr, "  reset child launch failed: errno=%d (%s)\n",
+                result->launch_errno, strerror(result->launch_errno));
+        return;
+    }
+    if (result->wait_errno != 0) {
+        fprintf(stderr, "  reset child reap failed: errno=%d (%s)\n",
+                result->wait_errno, strerror(result->wait_errno));
+        return;
+    }
+    if (trace && trace[0] != '\0') return;
+
+    describe_wait_status(result->status, status_description,
+                         sizeof(status_description));
+    output_length = read_text(fixture->output, output, sizeof(output));
+    fprintf(stderr,
+            "  reset child ended before its first checkpoint: %s "
+            "(raw=0x%x); captured output (%zu bytes):\n%s%s",
+            status_description, (unsigned int)result->status, output_length,
+            output_length > 0 ? output : "<empty or unavailable>",
+            output_length > 0 && output[output_length - 1] == '\n' ? "" :
+                                                                    "\n");
+}
+
+static reset_child_result_t run_reset_child(const reset_fixture_t *fixture,
+                                             const char *selector,
+                                             int inject_stage, char *trace,
+                                             size_t trace_size) {
     int trace_pipe[2];
     pid_t child;
-    int status;
     size_t total = 0;
+    reset_child_result_t result = { -1, 0, 0 };
 
-    if (pipe(trace_pipe) != 0) return -1;
+    if (trace && trace_size > 0) trace[0] = '\0';
+
+    if (pipe(trace_pipe) != 0) {
+        result.launch_errno = errno;
+        return result;
+    }
     child = fork();
     if (child < 0) {
+        int saved_errno = errno;
         close(trace_pipe[0]);
         close(trace_pipe[1]);
-        return -1;
+        result.launch_errno = saved_errno;
+        errno = saved_errno;
+        return result;
     }
     if (child == 0) {
         char arg0[] = "gitswitch";
@@ -224,8 +287,9 @@ static int run_reset_child(const reset_fixture_t *fixture,
         trace[total] = '\0';
     }
     close(trace_pipe[0]);
-    status = wait_status(child);
-    return status;
+    result.status = wait_status(child);
+    if (result.status < 0) result.wait_errno = errno;
+    return result;
 }
 
 static int run_simple_child(const reset_fixture_t *fixture,
@@ -388,6 +452,39 @@ TEST(empty_reset_selector_is_rejected_before_any_reset_work) {
     }
 }
 
+TEST(reset_child_launch_failure_initializes_trace_and_reports_errno) {
+    reset_fixture_t fixture;
+    reset_child_result_t result;
+    struct rlimit original_limit;
+    struct rlimit exhausted_limit;
+    char trace[16];
+    int observed_errno;
+
+    memset(&fixture, 0, sizeof(fixture));
+    memset(trace, 'x', sizeof(trace));
+    if (getrlimit(RLIMIT_NOFILE, &original_limit) != 0) {
+        CHECK(0 && "failed to read RLIMIT_NOFILE");
+        return;
+    }
+    exhausted_limit = original_limit;
+    exhausted_limit.rlim_cur = 0;
+    if (setrlimit(RLIMIT_NOFILE, &exhausted_limit) != 0) {
+        CHECK(0 && "failed to constrain RLIMIT_NOFILE");
+        return;
+    }
+
+    errno = 0;
+    result = run_reset_child(&fixture, NULL, 0, trace, sizeof(trace));
+    observed_errno = errno;
+    CHECK_EQ_INT(setrlimit(RLIMIT_NOFILE, &original_limit), 0);
+
+    CHECK_EQ_INT(result.status, -1);
+    CHECK_EQ_INT(result.launch_errno, EMFILE);
+    CHECK_EQ_INT(result.wait_errno, 0);
+    CHECK_EQ_INT(observed_errno, EMFILE);
+    CHECK_STR_EQ(trace, "");
+}
+
 TEST(repeated_signals_defer_across_every_reset_boundary) {
     const int stages[] = {
         RESET_TEST_AFTER_SSH,
@@ -401,13 +498,18 @@ TEST(repeated_signals_defer_across_every_reset_boundary) {
         char trace[16];
         char hint[128];
         char output[4096];
-        int status;
+        reset_child_result_t result;
 
         CHECK_EQ_INT(fixture_setup(&fixture), 0);
-        status = run_reset_child(&fixture, NULL, stages[i], trace,
+        result = run_reset_child(&fixture, NULL, stages[i], trace,
                                  sizeof(trace));
-        CHECK(WIFSIGNALED(status));
-        if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
+        diagnose_reset_child_precheckpoint(&fixture, &result, trace);
+        CHECK_EQ_INT(result.launch_errno, 0);
+        CHECK_EQ_INT(result.wait_errno, 0);
+        CHECK(result.status >= 0 && WIFSIGNALED(result.status));
+        if (result.status >= 0 && WIFSIGNALED(result.status)) {
+            CHECK_EQ_INT(WTERMSIG(result.status), SIGTERM);
+        }
         CHECK_STR_EQ(trace, "1234");
         CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
         CHECK_STR_EQ(hint, "none\ninactive=v1\n");
@@ -424,7 +526,7 @@ TEST(manager_failure_keeps_retry_state_while_signal_is_deferred) {
     char trace[16];
     char hint[128];
     char output[4096];
-    int status;
+    reset_child_result_t result;
 
     CHECK_EQ_INT(fixture_setup(&fixture), 0);
     CHECK_EQ_INT(join_path(foreign, sizeof(foreign), fixture.root,
@@ -434,10 +536,15 @@ TEST(manager_failure_keeps_retry_state_while_signal_is_deferred) {
     CHECK_EQ_INT(mkdir(foreign, 0700), 0);
     CHECK_EQ_INT(symlink(foreign, ssh_base), 0);
 
-    status = run_reset_child(&fixture, NULL, RESET_TEST_AFTER_SSH,
+    result = run_reset_child(&fixture, NULL, RESET_TEST_AFTER_SSH,
                              trace, sizeof(trace));
-    CHECK(WIFSIGNALED(status));
-    if (WIFSIGNALED(status)) CHECK_EQ_INT(WTERMSIG(status), SIGTERM);
+    diagnose_reset_child_precheckpoint(&fixture, &result, trace);
+    CHECK_EQ_INT(result.launch_errno, 0);
+    CHECK_EQ_INT(result.wait_errno, 0);
+    CHECK(result.status >= 0 && WIFSIGNALED(result.status));
+    if (result.status >= 0 && WIFSIGNALED(result.status)) {
+        CHECK_EQ_INT(WTERMSIG(result.status), SIGTERM);
+    }
     CHECK_STR_EQ(trace, "12");
     CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
     CHECK_STR_EQ(hint, "none\nactive=work\n");
@@ -453,13 +560,18 @@ TEST(case_different_active_account_clears_by_name_id_and_email) {
         reset_fixture_t fixture;
         char trace[16];
         char hint[128];
-        int status;
+        reset_child_result_t result;
 
         CHECK_EQ_INT(fixture_setup(&fixture), 0);
-        status = run_reset_child(&fixture, selectors[i], 0,
+        result = run_reset_child(&fixture, selectors[i], 0,
                                  trace, sizeof(trace));
-        CHECK(WIFEXITED(status));
-        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+        diagnose_reset_child_precheckpoint(&fixture, &result, trace);
+        CHECK_EQ_INT(result.launch_errno, 0);
+        CHECK_EQ_INT(result.wait_errno, 0);
+        CHECK(result.status >= 0 && WIFEXITED(result.status));
+        if (result.status >= 0 && WIFEXITED(result.status)) {
+            CHECK_EQ_INT(WEXITSTATUS(result.status), 0);
+        }
         CHECK_STR_EQ(trace, "1234");
         CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
         CHECK_STR_EQ(hint, "none\ninactive=v1\n");
@@ -470,6 +582,7 @@ int main(void) {
     RUN_TEST(add_persistence_guard_failure_leaves_config_unchanged);
     RUN_TEST(informational_and_config_paths_obey_context_lifetime);
     RUN_TEST(empty_reset_selector_is_rejected_before_any_reset_work);
+    RUN_TEST(reset_child_launch_failure_initializes_trace_and_reports_errno);
     RUN_TEST(repeated_signals_defer_across_every_reset_boundary);
     RUN_TEST(manager_failure_keeps_retry_state_while_signal_is_deferred);
     RUN_TEST(case_different_active_account_clears_by_name_id_and_email);
