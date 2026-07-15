@@ -693,8 +693,10 @@ static bool base_memory_backed_cached(const char *base) {
 }
 
 /* Compute the base directory that holds per-account isolated GNUPGHOMEs and the
- * stable `current` symlink. Two-way like the SSH side: prefer XDG_RUNTIME_DIR,
- * else /tmp/gitswitch-gpg-<uid>. There is deliberately no HOME fallback: that
+ * stable `current` symlink. Two-way like the SSH side: use a configured,
+ * valid XDG_RUNTIME_DIR, or /tmp/gitswitch-gpg-<uid> only when that variable
+ * is unset/empty. A configured missing/invalid root fails closed. There is
+ * deliberately no HOME fallback: that
  * branch would place secret-key material on persistent disk, and its longer
  * paths risk overrunning the gpg-agent socket sun_path limit. Returns 0 on
  * success. */

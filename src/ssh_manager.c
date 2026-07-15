@@ -4739,8 +4739,10 @@ static int setup_ssh_environment(ssh_config_t *ssh_config) {
     return 0;
 }
 
-/* Public: compute the stable SSH_AUTH_SOCK symlink path.
- * Mirrors the selection done by create_isolated_agent_socket_dir() so shell
+/* Public: compute the stable SSH_AUTH_SOCK symlink path. A configured
+ * nonempty XDG_RUNTIME_DIR is authoritative and missing/invalid roots fail;
+ * /tmp is selected only when the variable is unset or empty. Mirrors the
+ * selection done by create_isolated_agent_socket_dir() so shell
  * integration emitted by `gitswitch init` points at the same socket the
  * runtime maintains. */
 int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size) {

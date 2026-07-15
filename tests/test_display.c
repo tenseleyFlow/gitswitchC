@@ -1087,10 +1087,12 @@ TEST(zero_size_pty_falls_back_to_default_dimensions) {
     /* AR-10 L33: a fresh pty legitimately reports 0x0 from a SUCCEEDING
      * TIOCGWINSZ; get_terminal_size must reject it so display_init falls
      * back to 80x24 instead of collapsing the layout. */
+    clear_error();
     int pty_rc = init_display_on_pty(0, 0);
 
     if (pty_rc == 1) TS_SKIP("pty", "no usable pseudo-terminal");
     CHECK_EQ_INT(pty_rc, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SUCCESS);
 
     CHECK_EQ_INT(build_boxed_expected(expected, sizeof(expected),
                                       "Title", 38, 16), 0);

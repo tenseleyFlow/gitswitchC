@@ -44,6 +44,10 @@ int join_path(char *result, size_t result_size, const char *base, const char *co
 bool path_exists(const char *path);
 bool is_directory(const char *path);
 bool is_regular_file(const char *path);
+/* Create every absent component descriptor-relatively and validate every
+ * existing component as a directory. Intermediate symlinks to directories
+ * remain supported; the final component must be a real directory. The final
+ * public path is re-opened and matched to the pinned inode before success. */
 int create_directory_recursive(const char *path, mode_t mode);
 int get_file_permissions(const char *path, mode_t *mode);
 
@@ -71,7 +75,9 @@ int ensure_private_dir(const char *path);
  * descriptor names the validated inode even if its pathname is subsequently
  * renamed.  When XDG_RUNTIME_DIR is absent or empty, the system /tmp target is
  * opened and the absolute /tmp spelling is returned for the uid-specific
- * fallback directories.
+ * fallback directories. A configured nonempty XDG_RUNTIME_DIR is
+ * authoritative: if it is missing or inaccessible, this fails closed rather
+ * than silently selecting /tmp.
  */
 int open_runtime_parent(char *path, size_t path_size);
 
@@ -87,7 +93,8 @@ int open_private_subdir_at(int parent_fd, const char *name, bool create,
 
 /**
  * Acquire the replace-resistant private lock domain for dir_fd.  The returned
- * descriptor is an opaque token, not the legacy lock-file descriptor; release
+ * descriptor is an anonymous opaque token, never an alias of the legacy
+ * lock-file descriptor; release
  * it with unlock_private_file().  Acquisition retains locks on the pinned
  * parent directory, the leaf directory, and the validated legacy lock file so
  * replacing either named entry cannot create a concurrent lock domain.
@@ -135,6 +142,9 @@ int atomic_symlink_at(int dir_fd, const char *target, const char *link_name);
  */
 int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size);
 int write_string_to_file(const char *file_path, const char *content, mode_t mode);
+/* Copy into a regular, non-symlink destination leaf relative to a pinned
+ * parent. Success additionally proves that the public parent/leaf still name
+ * the descriptors used for the copy. */
 int copy_file(const char *src_path, const char *dst_path);
 int backup_file(const char *file_path, const char *backup_suffix);
 bool file_is_readable(const char *file_path);

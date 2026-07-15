@@ -568,6 +568,61 @@ TEST(help_and_init_share_the_exact_six_shell_matrix) {
     }
 }
 
+TEST(shell_generators_fail_closed_for_missing_configured_runtime_root) {
+    char missing[PATH_MAX];
+    char output_path[PATH_MAX];
+    char output[32768];
+    char command[PATH_MAX * 5];
+
+    CHECK_EQ_INT(join_path(missing, sizeof(missing), g_fixture.root,
+                           "/missing-runtime"), 0);
+    CHECK_EQ_INT(join_path(output_path, sizeof(output_path), g_fixture.root,
+                           "/missing-runtime.out"), 0);
+    for (size_t i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
+        int written = snprintf(
+            command, sizeof(command),
+            "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, missing, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written < 0 || (size_t)written >= sizeof(command)) continue;
+        CHECK(run_shell(command) != 0);
+        CHECK_STR_EQ(read_text(output_path, output, sizeof(output)), "");
+
+        written = snprintf(
+            command, sizeof(command),
+            "env -u XDG_RUNTIME_DIR HOME='%s' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written >= 0 && (size_t)written < sizeof(command)) {
+            CHECK_EQ_INT(run_shell(command), 0);
+            CHECK(read_text(output_path, output, sizeof(output))[0] != '\0');
+        }
+
+        written = snprintf(
+            command, sizeof(command),
+            "HOME='%s' XDG_RUNTIME_DIR='' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written >= 0 && (size_t)written < sizeof(command)) {
+            CHECK_EQ_INT(run_shell(command), 0);
+            CHECK(read_text(output_path, output, sizeof(output))[0] != '\0');
+        }
+    }
+
+    CHECK_EQ_INT(mkdir_private(missing), 0);
+    for (size_t i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
+        int written = snprintf(
+            command, sizeof(command),
+            "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, missing, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written >= 0 && (size_t)written < sizeof(command)) {
+            CHECK_EQ_INT(run_shell(command), 0);
+            CHECK(read_text(output_path, output, sizeof(output))[0] != '\0');
+        }
+    }
+}
+
 TEST(generated_snippets_use_only_the_bounded_resume_hint_probe) {
     char contents[32768];
 
@@ -1209,6 +1264,7 @@ int main(int argc, char **argv) {
     }
 
     RUN_TEST(help_and_init_share_the_exact_six_shell_matrix);
+    RUN_TEST(shell_generators_fail_closed_for_missing_configured_runtime_root);
     RUN_TEST(generated_snippets_use_only_the_bounded_resume_hint_probe);
     RUN_TEST(resume_hint_probe_accepts_only_safe_exact_artifacts);
     RUN_TEST(resume_hint_probe_is_noncreating_and_rejects_other_grammar);

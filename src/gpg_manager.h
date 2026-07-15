@@ -218,7 +218,9 @@ int gpg_manager_resolve_system_key(const char *selector,
  * Compute the stable GNUPGHOME path (a `current` symlink under the isolated
  * GPG base directory) that `gitswitch init` exports into the shell and that
  * each switch retargets to the active account's home. Uses
- * $XDG_RUNTIME_DIR/gitswitch-gpg/current, else /tmp/gitswitch-gpg-<uid>/current.
+ * $XDG_RUNTIME_DIR/gitswitch-gpg/current when a nonempty configured root is
+ * valid, else /tmp/gitswitch-gpg-<uid>/current only when XDG_RUNTIME_DIR is
+ * unset or empty. A configured invalid/missing root is an error.
  * Shared by the runtime switch logic and the `init` command so both agree.
  * Returns 0 on success, -1 if the computed path would overflow buf.
  */

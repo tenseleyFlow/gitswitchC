@@ -24,6 +24,30 @@ bool runtime_entry_test_may_be_replaced(
     bool parent_acl_trusted, uid_t child_uid, bool child_acl_trusted,
     bool child_owner_can_add_delete_acl);
 
+typedef void (*create_directory_test_hook_fn)(int stage, const char *path);
+create_directory_test_hook_fn gitswitch_test_set_create_directory_hook(
+    create_directory_test_hook_fn hook);
+
+enum {
+    CREATE_DIRECTORY_TEST_AFTER_FINAL_OPEN = 1
+};
+
+static const char *g_create_race_parent;
+static const char *g_create_race_moved;
+static int g_create_race_calls;
+static int g_create_race_error;
+
+static void replace_created_directory_parent(int stage, const char *path) {
+    (void)path;
+    if (stage != CREATE_DIRECTORY_TEST_AFTER_FINAL_OPEN) return;
+    g_create_race_calls++;
+    if (!g_create_race_parent || !g_create_race_moved ||
+        rename(g_create_race_parent, g_create_race_moved) != 0 ||
+        mkdir(g_create_race_parent, 0700) != 0) {
+        g_create_race_error = errno ? errno : EIO;
+    }
+}
+
 /* Recording runner: captures the argv vector instead of executing anything. */
 static char rec_argv[16][512];
 static int rec_argc;
@@ -219,6 +243,72 @@ TEST(ensure_private_dir_contract_matches_adoption_policy) {
     rmdir(created_dir);
     rmdir(private_dir);
     rmdir(root);
+}
+
+TEST(create_directory_recursive_validates_every_component_and_symlink_policy) {
+    char root[] = "/tmp/gs_mkdir_walk_XXXXXX";
+    char nested[512], repeated[512], regular[512], regular_child[512];
+    char fifo_path[512], fifo_child[512], target[512], link_path[512];
+    char link_child[512], final_link[512];
+    struct stat st;
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(nested, sizeof(nested), "%s/a/b", root);
+    snprintf(repeated, sizeof(repeated), "%s//repeated///leaf///", root);
+    snprintf(regular, sizeof(regular), "%s/regular", root);
+    snprintf(regular_child, sizeof(regular_child), "%s/regular/child", root);
+    snprintf(fifo_path, sizeof(fifo_path), "%s/fifo", root);
+    snprintf(fifo_child, sizeof(fifo_child), "%s/fifo/child", root);
+    snprintf(target, sizeof(target), "%s/target", root);
+    snprintf(link_path, sizeof(link_path), "%s/link", root);
+    snprintf(link_child, sizeof(link_child), "%s/link/child", root);
+    snprintf(final_link, sizeof(final_link), "%s/final-link", root);
+
+    CHECK_EQ_INT(create_directory_recursive("/", 0700), 0);
+    CHECK_EQ_INT(create_directory_recursive(nested, 0700), 0);
+    CHECK_EQ_INT(create_directory_recursive(nested, 0700), 0);
+    CHECK_EQ_INT(stat(nested, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK_EQ_INT(create_directory_recursive(repeated, 0700), 0);
+
+    CHECK_EQ_INT(write_string_to_file(regular, "file", 0600), 0);
+    CHECK_EQ_INT(create_directory_recursive(regular, 0700), -1);
+    CHECK_EQ_INT(create_directory_recursive(regular_child, 0700), -1);
+    CHECK_EQ_INT(mkfifo(fifo_path, 0600), 0);
+    CHECK_EQ_INT(create_directory_recursive(fifo_path, 0700), -1);
+    CHECK_EQ_INT(create_directory_recursive(fifo_child, 0700), -1);
+
+    CHECK_EQ_INT(mkdir(target, 0700), 0);
+    CHECK_EQ_INT(symlink(target, link_path), 0);
+    CHECK_EQ_INT(create_directory_recursive(link_child, 0700), 0);
+    CHECK_EQ_INT(stat(link_child, &st), 0);
+    CHECK(S_ISDIR(st.st_mode));
+    CHECK_EQ_INT(symlink(target, final_link), 0);
+    CHECK_EQ_INT(create_directory_recursive(final_link, 0700), -1);
+}
+
+TEST(create_directory_recursive_detects_ancestor_replacement) {
+    char root[] = "/tmp/gs_mkdir_replace_XXXXXX";
+    char parent[512], moved[512], path[512];
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(parent, sizeof(parent), "%s/parent", root);
+    snprintf(moved, sizeof(moved), "%s/moved", root);
+    snprintf(path, sizeof(path), "%s/parent/leaf", root);
+    CHECK_EQ_INT(mkdir(parent, 0700), 0);
+    g_create_race_parent = parent;
+    g_create_race_moved = moved;
+    g_create_race_calls = 0;
+    g_create_race_error = 0;
+    (void)gitswitch_test_set_create_directory_hook(
+        replace_created_directory_parent);
+    CHECK_EQ_INT(create_directory_recursive(path, 0700), -1);
+    (void)gitswitch_test_set_create_directory_hook(NULL);
+    g_create_race_parent = NULL;
+    g_create_race_moved = NULL;
+    CHECK_EQ_INT(g_create_race_calls, 1);
+    CHECK_EQ_INT(g_create_race_error, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
 }
 
 /* AR-05 L13: the runtime lock is non-blocking — a contender while another
@@ -782,6 +872,28 @@ static int replace_fd_with_devnull(int target_fd) {
     return target_fd;
 }
 
+static int replace_fd_with_lock_path(int target_fd, const char *path) {
+    int replacement = open(path, O_RDWR | O_CLOEXEC);
+
+    if (replacement < 0) return -1;
+    if (replacement != target_fd) {
+        if (dup2(replacement, target_fd) != target_fd) {
+            int saved_errno = errno;
+            close(replacement);
+            errno = saved_errno;
+            return -1;
+        }
+        close(replacement);
+        if (fcntl(target_fd, F_SETFD, FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            close(target_fd);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    return target_fd;
+}
+
 static int occupy_fds_through(int target_fd, int *fds, size_t capacity,
                               size_t *count_out) {
     size_t count = 0;
@@ -845,6 +957,44 @@ static int private_lock_child_outcome(const char *directory,
     }
     if (waitpid(child, &status, 0) != child || !WIFEXITED(status)) return 5;
     return WEXITSTATUS(status);
+}
+
+TEST(private_lock_token_is_anonymous_and_lock_path_rebind_survives_release) {
+    char root[] = "/tmp/gs_private_lock_anon_XXXXXX";
+    char lock_path[512];
+    struct stat token_st;
+    struct stat lock_st;
+    int dir_fd = -1;
+    int token = -1;
+    int replacement = -1;
+
+    if (!ts_mkdtemp(root)) { CHECK(!"mkdtemp failed"); return; }
+    snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
+    dir_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    CHECK(dir_fd >= 0);
+    if (dir_fd < 0) goto cleanup;
+    token = lock_private_file_at(dir_fd, ".test-lock");
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+    CHECK_EQ_INT(fstat(token, &token_st), 0);
+    CHECK_EQ_INT(stat(lock_path, &lock_st), 0);
+    CHECK(token_st.st_dev != lock_st.st_dev || token_st.st_ino != lock_st.st_ino);
+
+    close(token);
+    replacement = replace_fd_with_lock_path(token, lock_path);
+    CHECK_EQ_INT(replacement, token);
+    if (replacement < 0) goto cleanup;
+    unlock_private_file(token);
+    token = -1;
+    CHECK(fcntl(replacement, F_GETFD) >= 0);
+    CHECK_EQ_INT(private_lock_child_outcome(root, ".test-lock"), 0);
+
+cleanup:
+    if (token >= 0) unlock_private_file(token);
+    if (replacement >= 0) close(replacement);
+    if (dir_fd >= 0) close(dir_fd);
+    (void)unlink(lock_path);
+    (void)rmdir(root);
 }
 
 /* AR-08 L7: an exposed token is only an opaque handle. Closing it and reusing
@@ -1160,11 +1310,59 @@ cleanup:
     }
 }
 
+TEST(runtime_lock_token_is_anonymous_and_lock_path_rebind_survives_release) {
+    char runtime[] = "/tmp/gs_runtime_token_anon_XXXXXX";
+    char lock_dir[512], lock_path[512];
+    char saved_xdg[MAX_PATH_LEN] = "";
+    const char *old_xdg = getenv("XDG_RUNTIME_DIR");
+    bool had_xdg = old_xdg && *old_xdg;
+    struct stat token_st;
+    struct stat lock_st;
+    int token = -1;
+    int replacement = -1;
+
+    if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
+    if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-runtime/.lock", runtime);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    token = runtime_state_lock_acquire();
+    CHECK(token >= 0);
+    if (token < 0) goto cleanup;
+    CHECK_EQ_INT(fstat(token, &token_st), 0);
+    CHECK_EQ_INT(stat(lock_path, &lock_st), 0);
+    CHECK(token_st.st_dev != lock_st.st_dev || token_st.st_ino != lock_st.st_ino);
+
+    close(token);
+    replacement = replace_fd_with_lock_path(token, lock_path);
+    CHECK_EQ_INT(replacement, token);
+    if (replacement < 0) goto cleanup;
+    runtime_state_lock_release(token);
+    token = -1;
+    CHECK(fcntl(replacement, F_GETFD) >= 0);
+    CHECK_EQ_INT(runtime_lock_child_outcome(), 0);
+
+cleanup:
+    if (token >= 0) runtime_state_lock_release(token);
+    if (replacement >= 0) close(replacement);
+    (void)unlink(lock_path);
+    (void)rmdir(lock_dir);
+    (void)rmdir(runtime);
+    if (had_xdg) {
+        CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", saved_xdg, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    }
+}
+
 /* Opaque lock tokens inherited across fork may be closed and their numeric fd
  * reused before the child releases them.  Releasing stale bookkeeping must
  * never close the unrelated replacement descriptor. */
 TEST(private_lock_release_ignores_reused_inherited_token) {
     char root[] = "/tmp/gs_private_lock_fork_XXXXXX";
+    char lock_path[512];
+    struct stat token_st;
+    struct stat lock_st;
     int dir_fd = -1;
     int token = -1;
     pid_t child = -1;
@@ -1177,6 +1375,10 @@ TEST(private_lock_release_ignores_reused_inherited_token) {
     token = lock_private_file_at(dir_fd, ".test-lock");
     CHECK(token >= 0);
     if (token < 0) goto cleanup;
+    snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
+    CHECK_EQ_INT(fstat(token, &token_st), 0);
+    CHECK_EQ_INT(stat(lock_path, &lock_st), 0);
+    CHECK(token_st.st_dev != lock_st.st_dev || token_st.st_ino != lock_st.st_ino);
 
     fflush(NULL);
     child = fork();
@@ -1185,14 +1387,10 @@ TEST(private_lock_release_ignores_reused_inherited_token) {
         int replacement;
 
         close(token);
-        replacement = open("/dev/null", O_RDONLY | O_CLOEXEC);
-        if (replacement < 0) _exit(2);
-        if (replacement != token) {
-            if (dup2(replacement, token) != token) _exit(3);
-            close(replacement);
-        }
+        replacement = replace_fd_with_lock_path(token, lock_path);
+        if (replacement != token) _exit(2);
         unlock_private_file(token);
-        _exit(fcntl(token, F_GETFD) >= 0 ? 0 : 4);
+        _exit(fcntl(token, F_GETFD) >= 0 ? 0 : 3);
     }
     if (child > 0) {
         CHECK_EQ_INT(waitpid(child, &status, 0), child);
@@ -1205,11 +1403,13 @@ cleanup:
         (void)kill(child, SIGKILL);
         (void)waitpid(child, NULL, 0);
     }
-    if (token >= 0) unlock_private_file(token);
+    if (token >= 0) {
+        unlock_private_file(token);
+        token = -1;
+        CHECK_EQ_INT(private_lock_child_outcome(root, ".test-lock"), 0);
+    }
     if (dir_fd >= 0) close(dir_fd);
     {
-        char lock_path[512];
-        snprintf(lock_path, sizeof(lock_path), "%s/.test-lock", root);
         (void)unlink(lock_path);
     }
     (void)rmdir(root);
@@ -1227,6 +1427,8 @@ TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
     int parent_lock = -1;
     pid_t child = -1;
     int status = 0;
+    struct stat token_st;
+    struct stat lock_st;
 
     if (had_xdg) safe_strncpy(saved_xdg, old_xdg, sizeof(saved_xdg));
     if (!ts_mkdtemp(runtime)) { CHECK(!"mkdtemp failed"); return; }
@@ -1234,6 +1436,11 @@ TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
     parent_lock = runtime_state_lock_acquire();
     CHECK(parent_lock >= 3);
     if (parent_lock < 3) goto cleanup;
+    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-runtime/.lock", runtime);
+    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    CHECK_EQ_INT(fstat(parent_lock, &token_st), 0);
+    CHECK_EQ_INT(stat(lock_path, &lock_st), 0);
+    CHECK(token_st.st_dev != lock_st.st_dev || token_st.st_ino != lock_st.st_ino);
 
     fflush(NULL);
     child = fork();
@@ -1243,19 +1450,20 @@ TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers) {
         int count = 0;
 
         for (int fd = 3; fd <= parent_lock; fd++) close(fd);
-        while (count < (int)(sizeof(replacements) / sizeof(replacements[0]))) {
+        while (count < (int)(sizeof(replacements) / sizeof(replacements[0])) &&
+               count + 3 < parent_lock) {
             int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
             if (fd < 0) _exit(2);
-            if (fd > parent_lock) {
-                close(fd);
-                break;
-            }
+            if (fd != count + 3) _exit(3);
             replacements[count++] = fd;
         }
-        if (count == 0) _exit(3);
+        replacements[count] = replace_fd_with_lock_path(parent_lock,
+                                                        lock_path);
+        if (replacements[count] != parent_lock) _exit(4);
+        count++;
         runtime_state_lock_release(parent_lock);
         for (int i = 0; i < count; i++) {
-            if (fcntl(replacements[i], F_GETFD) < 0) _exit(4);
+            if (fcntl(replacements[i], F_GETFD) < 0) _exit(5);
         }
         _exit(0);
     }
@@ -1270,9 +1478,11 @@ cleanup:
         (void)kill(child, SIGKILL);
         (void)waitpid(child, NULL, 0);
     }
-    if (parent_lock >= 0) runtime_state_lock_release(parent_lock);
-    snprintf(lock_path, sizeof(lock_path), "%s/gitswitch-runtime/.lock", runtime);
-    snprintf(lock_dir, sizeof(lock_dir), "%s/gitswitch-runtime", runtime);
+    if (parent_lock >= 0) {
+        runtime_state_lock_release(parent_lock);
+        parent_lock = -1;
+        CHECK_EQ_INT(runtime_lock_child_outcome(), 0);
+    }
     (void)unlink(lock_path);
     (void)rmdir(lock_dir);
     (void)rmdir(runtime);
@@ -1632,17 +1842,21 @@ TEST_MAIN_BEGIN()
     RUN_TEST(command_exists_basic);
     RUN_TEST(file_helpers_apply_descriptor_permissions);
     RUN_TEST(ensure_private_dir_contract_matches_adoption_policy);
+    RUN_TEST(create_directory_recursive_validates_every_component_and_symlink_policy);
+    RUN_TEST(create_directory_recursive_detects_ancestor_replacement);
     RUN_TEST(runtime_state_lock_excludes_shared_xdg_writers_fail_fast);
     RUN_TEST(runtime_state_lock_rejects_unsafe_xdg_runtime_dir);
     RUN_TEST(runtime_entry_replacement_classification_is_lifetime_safe);
     RUN_TEST(runtime_state_lock_excludes_contender_after_ancestor_replacement);
     RUN_TEST(runtime_state_lock_rejects_namespace_replacement_while_waiting);
     RUN_TEST(runtime_state_lock_excludes_contender_after_leaf_replacement);
+    RUN_TEST(private_lock_token_is_anonymous_and_lock_path_rebind_survives_release);
     RUN_TEST(private_lock_release_identity_checks_reused_and_nested_tokens);
     RUN_TEST(private_lock_release_preserves_newer_registered_token_on_aba);
     RUN_TEST(runtime_lock_release_ignores_foreign_private_token);
     RUN_TEST(runtime_lock_release_preserves_newer_registered_token_on_aba);
     RUN_TEST(runtime_lock_release_preserves_reused_nested_token);
+    RUN_TEST(runtime_lock_token_is_anonymous_and_lock_path_rebind_survives_release);
     RUN_TEST(private_lock_release_ignores_reused_inherited_token);
     RUN_TEST(runtime_lock_fork_reset_preserves_reused_descriptor_numbers);
     RUN_TEST(find_command_path_skips_world_writable_dir);

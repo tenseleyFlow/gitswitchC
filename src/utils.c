@@ -89,6 +89,9 @@ typedef struct {
     int token_fd;
     dev_t token_dev;
     ino_t token_ino;
+    int guard_fd;
+    dev_t guard_dev;
+    ino_t guard_ino;
     uint64_t token_generation;
     size_t parent_slot;
     size_t leaf_slot;
@@ -117,9 +120,13 @@ static pid_t g_runtime_lock_pid;
 static uint64_t g_private_lock_next_generation;
 
 static int dup_cloexec(int fd, int minimum);
+static int private_lock_create_token(int *token_fd, int *guard_fd,
+                                     struct stat *token_stat,
+                                     struct stat *guard_stat);
 static int private_lock_inode_acquire(int owned_fd, bool nonblocking,
                                       size_t *slot_out);
 static void private_lock_inode_release(size_t slot);
+static bool same_fs_identity(const struct stat *a, const struct stat *b);
 static bool exec_fd_acl_is_trusted(int fd);
 #ifdef GITSWITCH_TESTING
 bool runtime_entry_test_may_be_replaced(
@@ -326,45 +333,180 @@ bool is_regular_file(const char *path) {
     return path && stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+#ifdef GITSWITCH_TESTING
+typedef void (*create_directory_test_hook_fn)(int stage, const char *path);
+create_directory_test_hook_fn gitswitch_test_set_create_directory_hook(
+    create_directory_test_hook_fn hook);
+
+static create_directory_test_hook_fn g_create_directory_test_hook;
+
+create_directory_test_hook_fn gitswitch_test_set_create_directory_hook(
+    create_directory_test_hook_fn hook) {
+    create_directory_test_hook_fn previous = g_create_directory_test_hook;
+    g_create_directory_test_hook = hook;
+    return previous;
+}
+
+#define CREATE_DIRECTORY_TEST_CHECKPOINT(stage, path) \
+    do { \
+        if (g_create_directory_test_hook) \
+            g_create_directory_test_hook((stage), (path)); \
+    } while (0)
+#else
+#define CREATE_DIRECTORY_TEST_CHECKPOINT(stage, path) \
+    do { (void)(stage); (void)(path); } while (0)
+#endif
+
+enum {
+    CREATE_DIRECTORY_TEST_AFTER_FINAL_OPEN = 1
+};
+
 int create_directory_recursive(const char *path, mode_t mode) {
+    char *path_copy = NULL;
+    char *saveptr = NULL;
+    char *component;
+    int current_fd = -1;
+    int final_fd = -1;
+    int named_fd = -1;
+    int result = -1;
+    int open_flags = O_RDONLY;
+    struct stat opened;
+    struct stat entry;
+    struct stat named;
+
     if (!path || !*path) {
         /* Reject an empty path too (AR-06 F78): the trailing-slash check below
          * reads temp_path[len-1], an out-of-bounds stack read when len == 0. */
         set_error(ERR_INVALID_ARGS, "NULL or empty path to create_directory_recursive");
         return -1;
     }
-
-    char temp_path[MAX_PATH_LEN];
-    char *p = NULL;
-    size_t len;
-
-    if ((size_t)snprintf(temp_path, sizeof(temp_path), "%s", path) >= sizeof(temp_path)) {
+    if (strlen(path) >= MAX_PATH_LEN) {
         set_error(ERR_INVALID_ARGS, "Path too long");
         return -1;
     }
-
-    len = strlen(temp_path);
-    if (temp_path[len - 1] == '/') {
-        temp_path[len - 1] = '\0';
-    }
-    
-    for (p = temp_path + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            if (mkdir(temp_path, mode) != 0 && errno != EEXIST) {
-                set_system_error(ERR_FILE_IO, "Failed to create directory: %s", temp_path);
-                return -1;
-            }
-            *p = '/';
-        }
-    }
-    
-    if (mkdir(temp_path, mode) != 0 && errno != EEXIST) {
-        set_system_error(ERR_FILE_IO, "Failed to create directory: %s", temp_path);
+    path_copy = strdup(path);
+    if (!path_copy) {
+        set_system_error(ERR_MEMORY_ALLOCATION,
+                         "Failed to copy directory path");
         return -1;
     }
+#ifdef O_DIRECTORY
+    open_flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+    open_flags |= O_CLOEXEC;
+#endif
+    current_fd = open(path[0] == '/' ? "/" : ".", open_flags);
+    if (current_fd < 0) {
+        set_system_error(ERR_FILE_IO, "Failed to open directory walk root: %s",
+                         path);
+        goto cleanup;
+    }
 
-    return 0;
+    component = strtok_r(path_copy, "/", &saveptr);
+    if (!component) {
+        final_fd = current_fd;
+        current_fd = -1;
+    }
+    while (component) {
+        char *next = strtok_r(NULL, "/", &saveptr);
+        bool final = next == NULL;
+        int child_fd;
+        int child_flags = open_flags;
+
+        if (mkdirat(current_fd, component, mode) != 0 && errno != EEXIST) {
+            set_system_error(ERR_FILE_IO, "Failed to create directory: %s",
+                             path);
+            goto cleanup;
+        }
+#ifdef O_NOFOLLOW
+        if (final) child_flags |= O_NOFOLLOW;
+#endif
+        child_fd = openat(current_fd, component, child_flags);
+        if (child_fd < 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to open directory path component: %s",
+                             path);
+            goto cleanup;
+        }
+        if (fstat(child_fd, &opened) != 0) {
+            int saved_errno = errno;
+            close(child_fd);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Failed to inspect directory path component: %s",
+                             path);
+            goto cleanup;
+        }
+        if (!S_ISDIR(opened.st_mode)) {
+            close(child_fd);
+            errno = ENOTDIR;
+            set_system_error(ERR_FILE_IO,
+                             "Directory path component is not a directory: %s",
+                             path);
+            goto cleanup;
+        }
+        int entry_rc = fstatat(current_fd, component, &entry,
+                               final ? AT_SYMLINK_NOFOLLOW : 0);
+        if (entry_rc != 0 || !S_ISDIR(entry.st_mode) ||
+            !same_fs_identity(&opened, &entry)) {
+            int saved_errno = entry_rc != 0
+                                  ? errno
+                                  : (!S_ISDIR(entry.st_mode) ? ENOTDIR
+                                                             : EAGAIN);
+            close(child_fd);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Directory path changed during creation: %s",
+                             path);
+            goto cleanup;
+        }
+        close(current_fd);
+        current_fd = -1;
+        if (final) {
+            final_fd = child_fd;
+        } else {
+            current_fd = child_fd;
+        }
+        component = next;
+    }
+
+    CREATE_DIRECTORY_TEST_CHECKPOINT(CREATE_DIRECTORY_TEST_AFTER_FINAL_OPEN,
+                                     path);
+    {
+        int named_flags = open_flags;
+#ifdef O_NOFOLLOW
+        named_flags |= O_NOFOLLOW;
+#endif
+        named_fd = open(path, named_flags);
+    }
+    if (named_fd < 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Directory path changed during creation: %s", path);
+        goto cleanup;
+    }
+    if (fstat(final_fd, &opened) != 0 || fstat(named_fd, &named) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to verify created directory: %s", path);
+        goto cleanup;
+    }
+    if (!S_ISDIR(named.st_mode) || !same_fs_identity(&opened, &named)) {
+        errno = !S_ISDIR(named.st_mode) ? ENOTDIR : EAGAIN;
+        set_system_error(ERR_FILE_IO,
+                         "Directory path changed during creation: %s", path);
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup: {
+        int saved_errno = errno;
+        if (named_fd >= 0) close(named_fd);
+        if (final_fd >= 0) close(final_fd);
+        if (current_fd >= 0) close(current_fd);
+        free(path_copy);
+        errno = saved_errno;
+        return result;
+    }
 }
 
 int ensure_private_dir(const char *path) {
@@ -857,7 +999,12 @@ static int open_runtime_parent_impl(char *path, size_t path_size,
             return -1;
         }
         if (open_error != ENOENT) {
-            if (runtime_path_component_error(open_error)) {
+            if (open_error == EACCES || open_error == EPERM) {
+                errno = open_error;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot access XDG_RUNTIME_DIR: %s",
+                                 configured_xdg);
+            } else if (runtime_path_component_error(open_error)) {
                 set_error(ERR_PERMISSION_DENIED,
                           "XDG_RUNTIME_DIR contains an unsafe path component: %s",
                           configured_xdg);
@@ -869,6 +1016,11 @@ static int open_runtime_parent_impl(char *path, size_t path_size,
             }
             return -1;
         }
+        errno = open_error;
+        set_system_error(ERR_FILE_IO,
+                         "Configured XDG_RUNTIME_DIR does not exist: %s",
+                         configured_xdg);
+        return -1;
     }
 
     /* /tmp is a symlink to /private/tmp on macOS.  Open its canonical target
@@ -1054,6 +1206,43 @@ static int dup_cloexec(int fd, int minimum) {
 #endif
 }
 
+/* Return an anonymous descriptor as the public lock token.  The retained peer
+ * keeps the anonymous object alive even if a caller closes the public token,
+ * preventing the token inode from being recycled while stale bookkeeping
+ * exists.  Neither endpoint aliases the real lock-file description. */
+static int private_lock_create_token(int *token_fd, int *guard_fd,
+                                     struct stat *token_stat,
+                                     struct stat *guard_stat) {
+    int pipe_fds[2] = {-1, -1};
+
+    if (!token_fd || !guard_fd || !token_stat || !guard_stat) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (pipe(pipe_fds) != 0) return -1;
+    for (size_t i = 0; i < 2; i++) {
+        int flags = fcntl(pipe_fds[i], F_GETFD);
+        if (flags < 0 || fcntl(pipe_fds[i], F_SETFD, flags | FD_CLOEXEC) != 0) {
+            int saved_errno = errno;
+            close(pipe_fds[0]);
+            close(pipe_fds[1]);
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    if (fstat(pipe_fds[0], token_stat) != 0 ||
+        fstat(pipe_fds[1], guard_stat) != 0) {
+        int saved_errno = errno;
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        errno = saved_errno;
+        return -1;
+    }
+    *token_fd = pipe_fds[0];
+    *guard_fd = pipe_fds[1];
+    return 0;
+}
+
 /* flock state is inherited across fork because parent and child initially
  * share the same open descriptions.  The child must discard that inherited
  * bookkeeping before trying to acquire anything: treating it as reentrant
@@ -1075,6 +1264,11 @@ static void private_lock_prepare_process(void) {
             private_lock_fd_has_identity(ctx->token_fd, ctx->token_dev,
                                          ctx->token_ino)) {
             close(ctx->token_fd);
+        }
+        if (ctx->active &&
+            private_lock_fd_has_identity(ctx->guard_fd, ctx->guard_dev,
+                                         ctx->guard_ino)) {
+            close(ctx->guard_fd);
         }
     }
     for (size_t i = 0; i < PRIVATE_LOCK_INODES; i++) {
@@ -1176,6 +1370,9 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
     int leaf_fd = -1;
     int file_fd = -1;
     int token_fd = -1;
+    int guard_fd = -1;
+    struct stat token_stat;
+    struct stat guard_stat;
     uint64_t token_generation = 0;
     size_t parent_slot = PRIVATE_LOCK_INODES;
     size_t leaf_slot = PRIVATE_LOCK_INODES;
@@ -1266,14 +1463,17 @@ static int lock_private_file_at_mode(int dir_fd, const char *name,
         errno = EACCES;
         goto fail;
     }
-    token_fd = dup_cloexec(g_private_lock_inodes[file_slot].fd, 0);
-    if (token_fd < 0) goto fail;
+    if (private_lock_create_token(&token_fd, &guard_fd, &token_stat,
+                                  &guard_stat) != 0) goto fail;
     if (private_lock_allocate_generation(&token_generation) != 0) goto fail;
 
     g_private_lock_contexts[context_slot].active = true;
     g_private_lock_contexts[context_slot].token_fd = token_fd;
-    g_private_lock_contexts[context_slot].token_dev = opened.st_dev;
-    g_private_lock_contexts[context_slot].token_ino = opened.st_ino;
+    g_private_lock_contexts[context_slot].token_dev = token_stat.st_dev;
+    g_private_lock_contexts[context_slot].token_ino = token_stat.st_ino;
+    g_private_lock_contexts[context_slot].guard_fd = guard_fd;
+    g_private_lock_contexts[context_slot].guard_dev = guard_stat.st_dev;
+    g_private_lock_contexts[context_slot].guard_ino = guard_stat.st_ino;
     g_private_lock_contexts[context_slot].token_generation = token_generation;
     g_private_lock_contexts[context_slot].parent_slot = parent_slot;
     g_private_lock_contexts[context_slot].leaf_slot = leaf_slot;
@@ -1284,6 +1484,7 @@ fail: {
         int saved_errno = errno;
         if (file_fd >= 0) close(file_fd);
         if (token_fd >= 0) close(token_fd);
+        if (guard_fd >= 0) close(guard_fd);
         private_lock_inode_release(file_slot);
         private_lock_inode_release(leaf_slot);
         private_lock_inode_release(parent_slot);
@@ -1323,6 +1524,10 @@ static void private_lock_context_retire(private_lock_context_t *ctx,
         private_lock_fd_has_identity(ctx->token_fd, ctx->token_dev,
                                      ctx->token_ino)) {
         close(ctx->token_fd);
+    }
+    if (private_lock_fd_has_identity(ctx->guard_fd, ctx->guard_dev,
+                                     ctx->guard_ino)) {
+        close(ctx->guard_fd);
     }
     memset(ctx, 0, sizeof(*ctx));
     private_lock_inode_release(file_slot);
@@ -1882,55 +2087,162 @@ enum {
     COPY_FILE_TEST_BEFORE_DESTINATION_OPEN
 };
 
+static int copy_file_split_destination(const char *path, char **parent_out,
+                                       char **leaf_out) {
+    const char *slash;
+    char *parent = NULL;
+    char *leaf = NULL;
+
+    if (!path || !*path || !parent_out || !leaf_out) {
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(path, '/');
+    if (!slash) {
+        parent = strdup(".");
+        leaf = strdup(path);
+    } else {
+        if (slash[1] == '\0') {
+            errno = EINVAL;
+            return -1;
+        }
+        parent = slash == path
+                     ? strdup("/")
+                     : strndup(path, (size_t)(slash - path));
+        leaf = strdup(slash + 1);
+    }
+    if (!parent || !leaf) {
+        int saved_errno = errno ? errno : ENOMEM;
+        free(parent);
+        free(leaf);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!*leaf || strcmp(leaf, ".") == 0 || strcmp(leaf, "..") == 0) {
+        free(parent);
+        free(leaf);
+        errno = EINVAL;
+        return -1;
+    }
+    *parent_out = parent;
+    *leaf_out = leaf;
+    return 0;
+}
+
 int copy_file(const char *src_path, const char *dst_path) {
     FILE *src = NULL;
     FILE *dst = NULL;
+    char *dst_parent = NULL;
+    char *dst_leaf = NULL;
     char buffer[4096];
     size_t bytes;
     int result = 0;
+    int operation_errno = 0;
+    int parent_fd = -1;
     int dst_fd = -1;
+    int verify_fd = -1;
+    int named_parent_fd = -1;
     int dst_flags = O_WRONLY | O_CREAT;
+    int parent_flags = O_RDONLY;
     struct stat src_stat;
     struct stat dst_stat;
+    struct stat entry_stat;
+    struct stat parent_stat;
+    struct stat named_parent_stat;
 #ifdef GITSWITCH_TESTING
     bool first_write_checkpointed = false;
 #endif
     
-    if (!src_path || !dst_path) {
+    if (!src_path || !dst_path || !*dst_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to copy_file");
+        return -1;
+    }
+    if (copy_file_split_destination(dst_path, &dst_parent, &dst_leaf) != 0) {
+        if (errno == EINVAL) {
+            set_error(ERR_INVALID_ARGS, "Invalid destination path: %s",
+                      dst_path);
+        } else {
+            set_system_error(ERR_MEMORY_ALLOCATION,
+                             "Failed to allocate destination path state");
+        }
         return -1;
     }
     
     src = fopen(src_path, "rbe");
     if (!src) {
         set_system_error(ERR_FILE_IO, "Failed to open source file: %s", src_path);
-        return -1;
+        result = -1;
+        goto cleanup;
     }
     
     /* Capture metadata from the same source object whose bytes are copied. */
     if (fstat(fileno(src), &src_stat) != 0) {
         int saved_errno = errno;
-        fclose(src);
+        (void)fclose(src);
+        src = NULL;
         errno = saved_errno;
         set_system_error(ERR_FILE_IO, "Failed to inspect source file: %s", src_path);
-        return -1;
+        result = -1;
+        goto cleanup;
     }
 
+#ifdef O_DIRECTORY
+    parent_flags |= O_DIRECTORY;
+#endif
+#ifdef O_CLOEXEC
+    parent_flags |= O_CLOEXEC;
+#endif
+    parent_fd = open(dst_parent, parent_flags);
+    if (parent_fd < 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to open destination parent: %s", dst_parent);
+        result = -1;
+        goto cleanup;
+    }
+    if (fstat(parent_fd, &parent_stat) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to inspect destination parent: %s",
+                         dst_parent);
+        result = -1;
+        goto cleanup;
+    }
+    if (!S_ISDIR(parent_stat.st_mode)) {
+        errno = ENOTDIR;
+        set_system_error(ERR_FILE_IO,
+                         "Destination parent is not a directory: %s",
+                         dst_parent);
+        result = -1;
+        goto cleanup;
+    }
 #ifdef O_CLOEXEC
     dst_flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    dst_flags |= O_NOFOLLOW;
+#endif
+#ifdef O_NONBLOCK
+    /* Refuse special nodes without waiting for a FIFO peer or device. The
+     * flag is removed after the descriptor is proven to be a regular file. */
+    dst_flags |= O_NONBLOCK;
 #endif
     COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_BEFORE_DESTINATION_OPEN, dst_path);
     /* A new destination is born private even under umask(000). For an
      * existing destination, the creation mode is ignored, so fchmod the
      * already-open descriptor before fdopen or the first byte write. */
-    dst_fd = open(dst_path, dst_flags, 0600);
+    dst_fd = openat(parent_fd, dst_leaf, dst_flags, 0600);
     if (dst_fd < 0) {
         int saved_errno = errno;
-        fclose(src);
         errno = saved_errno;
-        set_system_error(ERR_FILE_IO, "Failed to open destination file: %s",
-                         dst_path);
-        return -1;
+        if (saved_errno == ELOOP) {
+            set_error(ERR_INVALID_ARGS,
+                      "Refusing symlink destination: %s", dst_path);
+        } else {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to open destination file: %s",
+                             dst_path);
+        }
+        result = -1;
+        goto cleanup;
     }
 #ifndef O_CLOEXEC
     {
@@ -1938,77 +2250,121 @@ int copy_file(const char *src_path, const char *dst_path) {
         if (fd_flags < 0 ||
             fcntl(dst_fd, F_SETFD, fd_flags | FD_CLOEXEC) != 0) {
             int saved_errno = errno;
-            close(dst_fd);
-            fclose(src);
             errno = saved_errno;
             set_system_error(ERR_FILE_IO,
                              "Failed to secure destination descriptor: %s",
                              dst_path);
-            return -1;
+            result = -1;
+            goto cleanup;
         }
     }
 #endif
     if (fstat(dst_fd, &dst_stat) != 0) {
         int saved_errno = errno;
-        close(dst_fd);
-        fclose(src);
         errno = saved_errno;
         set_system_error(ERR_FILE_IO, "Failed to inspect destination file: %s",
                          dst_path);
-        return -1;
+        result = -1;
+        goto cleanup;
+    }
+    if (!S_ISREG(dst_stat.st_mode)) {
+        errno = EINVAL;
+        set_system_error(ERR_FILE_IO,
+                         "Destination is not a regular file: %s", dst_path);
+        result = -1;
+        goto cleanup;
+    }
+#ifdef O_NONBLOCK
+    {
+        int status_flags = fcntl(dst_fd, F_GETFL);
+        if (status_flags < 0 ||
+            fcntl(dst_fd, F_SETFL, status_flags & ~O_NONBLOCK) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to normalize destination descriptor: %s",
+                             dst_path);
+            result = -1;
+            goto cleanup;
+        }
+    }
+#endif
+    if (fstatat(parent_fd, dst_leaf, &entry_stat,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to re-inspect destination: %s", dst_path);
+        result = -1;
+        goto cleanup;
+    }
+    if (!S_ISREG(entry_stat.st_mode) ||
+        !same_fs_identity(&dst_stat, &entry_stat)) {
+        errno = !S_ISREG(entry_stat.st_mode) ? EINVAL : EAGAIN;
+        set_system_error(ERR_FILE_IO,
+                         "Destination changed while being opened: %s",
+                         dst_path);
+        result = -1;
+        goto cleanup;
     }
     if (src_stat.st_dev == dst_stat.st_dev &&
         src_stat.st_ino == dst_stat.st_ino) {
-        close(dst_fd);
-        fclose(src);
         set_error(ERR_INVALID_ARGS,
                   "Source and destination refer to the same file");
-        return -1;
+        result = -1;
+        goto cleanup;
+    }
+    verify_fd = dup_cloexec(dst_fd, 0);
+    if (verify_fd < 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to retain destination identity: %s",
+                         dst_path);
+        result = -1;
+        goto cleanup;
     }
     if (ftruncate(dst_fd, 0) != 0) {
         int saved_errno = errno;
-        close(dst_fd);
-        fclose(src);
         errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Failed to truncate destination file: %s", dst_path);
-        return -1;
+        result = -1;
+        goto cleanup;
     }
     COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_DESTINATION_OPEN, dst_path);
     if (fchmod(dst_fd, src_stat.st_mode & 0777) != 0) {
         int saved_errno = errno;
-        close(dst_fd);
-        fclose(src);
         errno = saved_errno;
         set_system_error(ERR_PERMISSION_DENIED,
                          "Failed to set destination permissions: %s", dst_path);
-        return -1;
+        result = -1;
+        goto cleanup;
     }
     dst = fdopen(dst_fd, "wb");
     if (!dst) {
         int saved_errno = errno;
-        close(dst_fd);
-        fclose(src);
         errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Failed to open destination stream: %s", dst_path);
-        return -1;
+        result = -1;
+        goto cleanup;
     }
     dst_fd = -1; /* fdopen owns it from here. */
 
     while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
         if (fwrite(buffer, 1, bytes, dst) != bytes) {
+            int saved_errno = errno ? errno : EIO;
+            errno = saved_errno;
             set_system_error(ERR_FILE_IO, "Failed to write to destination file: %s", dst_path);
             result = -1;
+            operation_errno = saved_errno;
             break;
         }
 #ifdef GITSWITCH_TESTING
         if (!first_write_checkpointed) {
             if (fflush(dst) != 0) {
+                int saved_errno = errno ? errno : EIO;
+                errno = saved_errno;
                 set_system_error(ERR_FILE_IO,
                                  "Failed to flush destination file: %s",
                                  dst_path);
                 result = -1;
+                operation_errno = saved_errno;
                 break;
             }
             COPY_FILE_TEST_CHECKPOINT(COPY_FILE_TEST_AFTER_FIRST_WRITE,
@@ -2018,26 +2374,99 @@ int copy_file(const char *src_path, const char *dst_path) {
 #endif
     }
     
-    if (ferror(src)) {
+    if (ferror(src) && result == 0) {
+        int saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
         set_system_error(ERR_FILE_IO, "Error reading source file: %s", src_path);
         result = -1;
+        operation_errno = saved_errno;
     }
 
     if (result == 0 && fflush(dst) != 0) {
+        int saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
         set_system_error(ERR_FILE_IO, "Failed to flush destination file: %s", dst_path);
         result = -1;
+        operation_errno = saved_errno;
     }
 
     if (fclose(src) != 0 && result == 0) {
+        int saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
         set_system_error(ERR_FILE_IO, "Failed to close source file: %s", src_path);
         result = -1;
+        operation_errno = saved_errno;
     }
+    src = NULL;
     if (fclose(dst) != 0 && result == 0) {
+        int saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
         set_system_error(ERR_FILE_IO, "Failed to close destination file: %s", dst_path);
+        result = -1;
+        operation_errno = saved_errno;
+    }
+    dst = NULL;
+    if (result != 0 && operation_errno != 0) errno = operation_errno;
+
+    if (result == 0 && fstat(verify_fd, &dst_stat) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to verify copied destination: %s", dst_path);
+        result = -1;
+    }
+    if (result == 0) {
+        named_parent_fd = open(dst_parent, parent_flags);
+        if (named_parent_fd < 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to reopen destination parent: %s",
+                             dst_parent);
+            result = -1;
+        }
+    }
+    if (result == 0 && fstat(named_parent_fd, &named_parent_stat) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to verify destination parent: %s",
+                         dst_parent);
+        result = -1;
+    }
+    if (result == 0 &&
+        !same_fs_identity(&parent_stat, &named_parent_stat)) {
+        errno = EAGAIN;
+        set_system_error(ERR_FILE_IO,
+                         "Destination parent changed during copy: %s",
+                         dst_parent);
+        result = -1;
+    }
+    if (result == 0 &&
+        fstatat(named_parent_fd, dst_leaf, &entry_stat,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to verify published destination: %s",
+                         dst_path);
+        result = -1;
+    }
+    if (result == 0 &&
+        (!S_ISREG(entry_stat.st_mode) ||
+         !same_fs_identity(&dst_stat, &entry_stat))) {
+        errno = !S_ISREG(entry_stat.st_mode) ? EINVAL : EAGAIN;
+        set_system_error(ERR_FILE_IO,
+                         "Destination path changed during copy: %s",
+                         dst_path);
         result = -1;
     }
 
-    return result;
+cleanup: {
+        int saved_errno = errno;
+        if (dst) (void)fclose(dst);
+        else if (dst_fd >= 0) close(dst_fd);
+        if (src) (void)fclose(src);
+        if (verify_fd >= 0) close(verify_fd);
+        if (named_parent_fd >= 0) close(named_parent_fd);
+        if (parent_fd >= 0) close(parent_fd);
+        free(dst_parent);
+        free(dst_leaf);
+        errno = saved_errno;
+        return result;
+    }
 }
 
 int backup_file(const char *file_path, const char *backup_suffix) {
@@ -4913,9 +5342,6 @@ int get_terminal_size(int *width, int *height) {
      * back to 80x24 on nonzero return); report failure so callers use their
      * defaults. */
     if (ws.ws_col == 0 || ws.ws_row == 0) {
-        set_error(ERR_SYSTEM_CALL,
-                  "Terminal reported a zero dimension (%ux%u)",
-                  (unsigned)ws.ws_col, (unsigned)ws.ws_row);
         return -1;
     }
 

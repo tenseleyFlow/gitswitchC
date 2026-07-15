@@ -51,6 +51,9 @@ typedef struct {
 static copy_observation_t g_observation;
 static const char *g_replacement_source;
 static const char *g_replacement_displaced;
+static const char *g_race_parent;
+static const char *g_race_moved_parent;
+static const char *g_race_replacement_content;
 static int g_replacement_hook_calls;
 static int g_replacement_hook_error;
 static int g_read_fault_stage;
@@ -152,6 +155,35 @@ static void replace_destination_before_open(int stage, const char *dst_path) {
     if (!g_replacement_source || !g_replacement_displaced ||
         rename(dst_path, g_replacement_displaced) != 0 ||
         link(g_replacement_source, dst_path) != 0) {
+        g_replacement_hook_error = errno ? errno : EIO;
+    }
+}
+
+static void replace_destination_after_write(int stage, const char *dst_path) {
+    if (stage != COPY_FILE_TEST_AFTER_FIRST_WRITE) return;
+    g_replacement_hook_calls++;
+    if (!g_replacement_displaced || !g_race_replacement_content ||
+        rename(dst_path, g_replacement_displaced) != 0 ||
+        write_text_mode(dst_path, g_race_replacement_content, 0600) != 0) {
+        g_replacement_hook_error = errno ? errno : EIO;
+    }
+}
+
+static void replace_destination_parent_after_write(int stage,
+                                                   const char *dst_path) {
+    const char *leaf;
+    char replacement[512];
+
+    if (stage != COPY_FILE_TEST_AFTER_FIRST_WRITE) return;
+    g_replacement_hook_calls++;
+    leaf = strrchr(dst_path, '/');
+    if (!g_race_parent || !g_race_moved_parent ||
+        !g_race_replacement_content || !leaf ||
+        rename(g_race_parent, g_race_moved_parent) != 0 ||
+        mkdir(g_race_parent, 0700) != 0 ||
+        (size_t)snprintf(replacement, sizeof(replacement), "%s/%s",
+                         g_race_parent, leaf + 1) >= sizeof(replacement) ||
+        write_text_mode(replacement, g_race_replacement_content, 0600) != 0) {
         g_replacement_hook_error = errno ? errno : EIO;
     }
 }
@@ -474,6 +506,101 @@ TEST(destination_replaced_with_alias_before_open_is_rejected) {
     CHECK(file_state_matches(&displaced_before, &displaced_after));
 }
 
+TEST(destination_leaf_replacement_after_open_is_detected_without_corruption) {
+    char root[] = "/tmp/gs_copy_leaf_replace_XXXXXX";
+    char src[512], dst[512], displaced[512];
+    file_state_t replacement;
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(src, sizeof(src), "%s/source", root) < sizeof(src));
+    CHECK((size_t)snprintf(dst, sizeof(dst), "%s/destination", root) <
+          sizeof(dst));
+    CHECK((size_t)snprintf(displaced, sizeof(displaced), "%s/displaced", root) <
+          sizeof(displaced));
+    CHECK_EQ_INT(write_source(src), 0);
+    CHECK_EQ_INT(write_text_mode(dst, "old-destination", 0600), 0);
+    g_replacement_displaced = displaced;
+    g_race_replacement_content = "replacement-must-stay-intact";
+    g_replacement_hook_calls = 0;
+    g_replacement_hook_error = 0;
+    (void)gitswitch_test_set_copy_file_hook(replace_destination_after_write);
+    CHECK_EQ_INT(copy_file(src, dst), -1);
+    (void)gitswitch_test_set_copy_file_hook(NULL);
+    g_replacement_displaced = NULL;
+    g_race_replacement_content = NULL;
+
+    CHECK_EQ_INT(g_replacement_hook_calls, 1);
+    CHECK_EQ_INT(g_replacement_hook_error, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(read_file_state(dst, &replacement), 0);
+    CHECK_STR_EQ(replacement.content, "replacement-must-stay-intact");
+}
+
+TEST(destination_parent_replacement_after_open_is_detected_without_corruption) {
+    char root[] = "/tmp/gs_copy_parent_replace_XXXXXX";
+    char parent[512], moved[512], src[512], dst[512], replacement_path[512];
+    file_state_t replacement;
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(parent, sizeof(parent), "%s/parent", root) <
+          sizeof(parent));
+    CHECK((size_t)snprintf(moved, sizeof(moved), "%s/moved", root) <
+          sizeof(moved));
+    CHECK((size_t)snprintf(src, sizeof(src), "%s/source", root) < sizeof(src));
+    CHECK((size_t)snprintf(dst, sizeof(dst), "%s/destination", parent) <
+          sizeof(dst));
+    CHECK((size_t)snprintf(replacement_path, sizeof(replacement_path),
+                           "%s/destination", parent) < sizeof(replacement_path));
+    CHECK_EQ_INT(mkdir(parent, 0700), 0);
+    CHECK_EQ_INT(write_source(src), 0);
+    CHECK_EQ_INT(write_text_mode(dst, "old-destination", 0600), 0);
+    g_race_parent = parent;
+    g_race_moved_parent = moved;
+    g_race_replacement_content = "new-parent-replacement";
+    g_replacement_hook_calls = 0;
+    g_replacement_hook_error = 0;
+    (void)gitswitch_test_set_copy_file_hook(
+        replace_destination_parent_after_write);
+    CHECK_EQ_INT(copy_file(src, dst), -1);
+    (void)gitswitch_test_set_copy_file_hook(NULL);
+    g_race_parent = NULL;
+    g_race_moved_parent = NULL;
+    g_race_replacement_content = NULL;
+
+    CHECK_EQ_INT(g_replacement_hook_calls, 1);
+    CHECK_EQ_INT(g_replacement_hook_error, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(read_file_state(replacement_path, &replacement), 0);
+    CHECK_STR_EQ(replacement.content, "new-parent-replacement");
+}
+
+TEST(destination_leaf_shape_is_rejected_before_open) {
+    char root[] = "/tmp/gs_copy_leaf_shape_XXXXXX";
+    char src[512], trailing[512], dot[512], dotdot[512], fifo_path[512];
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(src, sizeof(src), "%s/source", root) < sizeof(src));
+    CHECK((size_t)snprintf(trailing, sizeof(trailing), "%s/", root) <
+          sizeof(trailing));
+    CHECK((size_t)snprintf(dot, sizeof(dot), "%s/.", root) < sizeof(dot));
+    CHECK((size_t)snprintf(dotdot, sizeof(dotdot), "%s/..", root) <
+          sizeof(dotdot));
+    CHECK((size_t)snprintf(fifo_path, sizeof(fifo_path), "%s/fifo", root) <
+          sizeof(fifo_path));
+    CHECK_EQ_INT(write_text_mode(src, "source", 0600), 0);
+    CHECK_EQ_INT(copy_file(src, ""), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(copy_file(src, trailing), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(copy_file(src, dot), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(copy_file(src, dotdot), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(mkfifo(fifo_path, 0600), 0);
+    CHECK_EQ_INT(copy_file(src, fifo_path), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+}
+
 TEST(read_file_accepts_seven_bytes_in_eight_byte_buffer) {
     char root[] = "/tmp/gs_read_fit_XXXXXX";
     char path[512];
@@ -550,6 +677,9 @@ int main(void) {
     RUN_TEST(distinct_existing_destination_is_replaced_in_place);
     RUN_TEST(empty_backup_suffix_is_rejected_without_mutation);
     RUN_TEST(destination_replaced_with_alias_before_open_is_rejected);
+    RUN_TEST(destination_leaf_replacement_after_open_is_detected_without_corruption);
+    RUN_TEST(destination_parent_replacement_after_open_is_detected_without_corruption);
+    RUN_TEST(destination_leaf_shape_is_rejected_before_open);
     RUN_TEST(read_file_accepts_seven_bytes_in_eight_byte_buffer);
     RUN_TEST(read_file_rejects_eight_bytes_in_eight_byte_buffer);
     RUN_TEST(read_file_reports_injected_initial_read_error);

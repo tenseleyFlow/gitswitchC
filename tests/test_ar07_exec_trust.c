@@ -832,7 +832,9 @@ TEST(runtime_root_is_absolute_private_and_cwd_independent) {
     if (fd >= 0) close(fd);
 
     CHECK_EQ_INT(chmod(runtime, 0000), 0);
+    clear_error();
     CHECK_EQ_INT(open_runtime_parent(observed, sizeof(observed)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
     CHECK_EQ_INT(chmod(runtime, 0700), 0);
     CHECK_EQ_INT(symlink(runtime, link_path), 0);
 
@@ -849,12 +851,19 @@ TEST(runtime_root_is_absolute_private_and_cwd_independent) {
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", variant, 1), 0);
     CHECK_EQ_INT(open_runtime_parent(rejected, sizeof(rejected)), -1);
 
-    /* A missing configured directory takes the documented absolute fallback;
-     * it must never leave the relative/missing spelling in emitted state. */
+    /* A configured nonempty root is authoritative: absence must fail closed,
+     * while creating that exact directory makes the same configuration usable. */
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", missing, 1), 0);
+    clear_error();
+    fd = open_runtime_parent(observed, sizeof(observed));
+    CHECK_EQ_INT(fd, -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(mkdir(missing, 0700), 0);
+    clear_error();
     fd = open_runtime_parent(observed, sizeof(observed));
     CHECK(fd >= 0);
-    CHECK_STR_EQ(observed, fallback);
+    CHECK_STR_EQ(observed, missing);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SUCCESS);
     if (fd >= 0) close(fd);
 
     restore_environment("XDG_RUNTIME_DIR", saved_xdg, had_xdg);
