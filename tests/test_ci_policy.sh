@@ -491,6 +491,13 @@ check_policy()
                     freebsd_errexit_count++
                     freebsd_errexit_serial = step_command_serial[i]
                 }
+                if (current_job == "freebsd" && source == "direct" &&
+                    command ~ /^export GITSWITCH_TEST_REQUIRED_CAPS=/) {
+                    freebsd_caps_count++
+                    freebsd_caps_serial = step_command_serial[i]
+                    if (command != "export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets,freebsd-nullfs")
+                        reject("FreeBSD required test capabilities are missing or unsafe")
+                }
                 if (current_job == "linux" && source == "direct") {
                     if (command ~ /(^|[;&|][[:space:]]*)(sudo[[:space:]]+)?make([[:space:]]|$)/)
                         linux_unqualified_make = 1
@@ -1353,6 +1360,9 @@ check_policy()
             if (freebsd_release_step_count != 1 ||
                 freebsd_cpa_shell_step_count != 1)
                 reject("FreeBSD release gates need exactly one cpa shell step")
+            if (freebsd_caps_count != 1 ||
+                freebsd_caps_serial >= release_gate_serial["freebsd-test"])
+                reject("FreeBSD required test capabilities are missing or unsafe")
             if (!linux_first_make_serial ||
                 release_gate_serial["linux-make-provenance"] >= linux_first_make_serial)
                 reject("Linux build-tool provenance must precede every make invocation")
@@ -2747,6 +2757,20 @@ linux|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
 linux|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
 macos|make BUILD_TYPE=release READLINE=1 WERROR=1 test
 EOF
+
+awk '
+    !changed &&
+        $0 == "          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets,freebsd-nullfs" {
+        print "          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets"
+        changed = 1
+        next
+    }
+    { print }
+    END { if (!changed) exit 1 }
+' "$workflow" >"$tmp/freebsd-capability-downgrade.yml"
+expect_structural_rejected_for "FreeBSD nullfs capability downgrade" \
+    "$tmp/freebsd-capability-downgrade.yml" "$today" \
+    "FreeBSD required test capabilities are missing or unsafe"
 
 # Count the env mapping itself as well as its entries. Duplicate YAML keys have
 # loader-dependent first/last-key semantics; neither an empty map before nor an

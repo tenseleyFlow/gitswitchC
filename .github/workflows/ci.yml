@@ -181,9 +181,9 @@ jobs:
           export READELF="$readelf_tool"
           gmake BUILD_TYPE=release WERROR=1
           # AR-10 L35: provisioned runtimes are mandatory, matching the
-          # Linux/macOS lanes (minus ksh per above; mount-namespace is
-          # Linux-only).
-          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets
+          # Linux/macOS lanes (minus ksh per above). nullfs lineage is a
+          # FreeBSD-only security contract and may not green-skip here.
+          export GITSWITCH_TEST_REQUIRED_CAPS=pty,readline,bash,zsh,fish,sh,dash,openssh,gpg,unix-sockets,freebsd-nullfs
           gmake BUILD_TYPE=release WERROR=1 test
           gmake BUILD_TYPE=release WERROR=1 release-artifact-test
           # Compiles and exercises FreeBSD's descriptor-conditioned

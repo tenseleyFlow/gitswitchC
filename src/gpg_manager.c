@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <ctype.h>
+#include <limits.h>
 #include <time.h>
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -81,12 +82,19 @@ typedef struct {
     int unsupported;
 #endif
 } gpg_mount_identity_t;
+typedef struct gpg_source_proof gpg_source_proof_t;
 typedef struct {
     int fd;
     char path[MAX_PATH_LEN];
     struct stat identity;
     gpg_mount_identity_t mount;
+    gpg_source_proof_t *proof;
 } gpg_source_home_t;
+typedef enum {
+    GPG_SOURCE_PATH_EXTERNAL = 0,
+    GPG_SOURCE_PATH_MANAGED_CANONICAL = 1,
+    GPG_SOURCE_PATH_MANAGED_DESCENDANT = 2
+} gpg_source_path_class_t;
 static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                                         const gpg_pinned_home_t *home,
                                         const char *selector,
@@ -4880,20 +4888,36 @@ static int gpg_resolve_path_aliases(const char *input, char *output,
     }
 }
 
-static bool gpg_path_is_managed(const char *base, const char *candidate) {
+static gpg_source_path_class_t gpg_classify_managed_path(
+    const char *base, const char *candidate) {
     char current[MAX_PATH_LEN];
+    size_t base_len;
+    size_t candidate_len;
 
-    return strcmp(base, candidate) == 0 ||
-           (gpg_current_path_from_base(base, current, sizeof(current)) == 0 &&
-            strcmp(current, candidate) == 0) ||
-           gpg_target_is_managed_child(base, candidate);
+    if (!base || !*base || !candidate || !*candidate) {
+        return GPG_SOURCE_PATH_EXTERNAL;
+    }
+    if (strcmp(base, candidate) == 0 ||
+        (gpg_current_path_from_base(base, current, sizeof(current)) == 0 &&
+         strcmp(current, candidate) == 0) ||
+        gpg_target_is_managed_child(base, candidate)) {
+        return GPG_SOURCE_PATH_MANAGED_CANONICAL;
+    }
+    base_len = strlen(base);
+    candidate_len = strlen(candidate);
+    if (candidate_len > base_len &&
+        strncmp(candidate, base, base_len) == 0 &&
+        candidate[base_len] == '/') {
+        return GPG_SOURCE_PATH_MANAGED_DESCENDANT;
+    }
+    return GPG_SOURCE_PATH_EXTERNAL;
 }
 
-/* Classify one source spelling: 0 is an external resolved path, 1 is a
- * managed GPG path (the caller may deliberately fall back to HOME/.gnupg),
- * and -1 is resolution uncertainty. Keeping those states distinct prevents an
- * overlong/inaccessible input from masquerading as a managed path and then
- * silently selecting defaults. */
+/* Classify one source spelling: external paths are returned resolved;
+ * canonical managed entry points may deliberately select HOME/.gnupg, while
+ * deeper descendants are always fatal. Keeping descendants distinct prevents
+ * arbitrary subdirectories of an isolated keyring from being recast as a
+ * system source. -1 is resolution uncertainty. */
 static int gpg_classify_source_path(const char *candidate,
                                     char *resolved_out,
                                     size_t resolved_out_size) {
@@ -4902,6 +4926,8 @@ static int gpg_classify_source_path(const char *candidate,
     char normalized_candidate[MAX_PATH_LEN];
     char resolved_base[MAX_PATH_LEN];
     char resolved_candidate[MAX_PATH_LEN];
+    gpg_source_path_class_t normalized_class;
+    gpg_source_path_class_t resolved_class;
 
     if (!candidate || !*candidate || !resolved_out || resolved_out_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG source-home path");
@@ -4918,13 +4944,15 @@ static int gpg_classify_source_path(const char *candidate,
                   candidate);
         return -1;
     }
-    if (gpg_path_is_managed(normalized_base, normalized_candidate)) {
-        return 1;
-    }
+    normalized_class = gpg_classify_managed_path(
+        normalized_base, normalized_candidate);
 
     /* Resolve aliases even when their final targets do not exist yet.  Any
      * uncertainty fails closed instead of letting an alias become managed
-     * between classification and the GPG child spawn. */
+     * between classification and the GPG child spawn. A resolved descendant
+     * dominates a canonical direct-child spelling: otherwise a symlink at a
+     * canonical account path could hide a nested managed source and trigger
+     * the ordinary HOME/.gnupg fallback. */
     if (gpg_resolve_path_aliases(normalized_base, resolved_base,
                                  sizeof(resolved_base)) != 0 ||
         gpg_resolve_path_aliases(normalized_candidate, resolved_candidate,
@@ -4934,7 +4962,16 @@ static int gpg_classify_source_path(const char *candidate,
                          candidate);
         return -1;
     }
-    if (gpg_path_is_managed(resolved_base, resolved_candidate)) return 1;
+    resolved_class = gpg_classify_managed_path(
+        resolved_base, resolved_candidate);
+    if (normalized_class == GPG_SOURCE_PATH_MANAGED_DESCENDANT ||
+        resolved_class == GPG_SOURCE_PATH_MANAGED_DESCENDANT) {
+        return GPG_SOURCE_PATH_MANAGED_DESCENDANT;
+    }
+    if (normalized_class == GPG_SOURCE_PATH_MANAGED_CANONICAL ||
+        resolved_class == GPG_SOURCE_PATH_MANAGED_CANONICAL) {
+        return GPG_SOURCE_PATH_MANAGED_CANONICAL;
+    }
     if (safe_strncpy(resolved_out, resolved_candidate,
                      resolved_out_size) != 0) {
         set_error(ERR_INVALID_PATH, "GPG source-home path is too long");
@@ -4970,6 +5007,12 @@ static int gpg_user_source_home(char *buf, size_t size) {
             }
             return 0;
         }
+        if (classification == GPG_SOURCE_PATH_MANAGED_DESCENDANT) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing managed GPG descendant as the system keyring: %s",
+                      env_gh);
+            return -1;
+        }
     }
     home = getenv("HOME");
     if (!home || !*home) {
@@ -4988,8 +5031,13 @@ static int gpg_user_source_home(char *buf, size_t size) {
         return -1;
     }
     if (classification > 0) {
-        set_error(ERR_INVALID_PATH,
-                  "Refusing managed HOME/.gnupg as a system keyring");
+        if (classification == GPG_SOURCE_PATH_MANAGED_DESCENDANT) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing managed GPG descendant as HOME/.gnupg");
+        } else {
+            set_error(ERR_INVALID_PATH,
+                      "Refusing managed HOME/.gnupg as a system keyring");
+        }
         return -1;
     }
     if (safe_strncpy(buf, resolved, size) != 0) {
@@ -4999,24 +5047,423 @@ static int gpg_user_source_home(char *buf, size_t size) {
     return 0;
 }
 
-static int gpg_source_matches_managed_object(
-    const gpg_source_home_t *source, int candidate_fd,
-    const char *description) {
-    struct stat candidate;
-    gpg_mount_identity_t candidate_mount;
+enum {
+    GPG_SOURCE_PROOF_MAX_DEPTH = 64,
+    GPG_SOURCE_PROOF_MAX_DIRECTORIES = 16384,
+    GPG_SOURCE_PROOF_MAX_ENTRIES = 65536,
+    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32
+};
 
-    if (!source || source->fd < 0 || candidate_fd < 0 ||
-        fstat(candidate_fd, &candidate) != 0 ||
-        gpg_mount_identity_fd(candidate_fd, &candidate_mount) != 0) {
-        set_system_error(ERR_PERMISSION_DENIED,
-                         "Cannot prove GPG source provenance against %s",
-                         description ? description : "managed state");
+typedef struct {
+    size_t directories;
+    size_t entries;
+} gpg_source_proof_budget_t;
+
+typedef struct {
+    int fd;
+    struct stat identity;
+    gpg_mount_identity_t mount;
+    bool versioned;
+    bool has_parent;
+    size_t parent_index;
+    char name[NAME_MAX + 1];
+} gpg_source_proof_entry_t;
+
+struct gpg_source_proof {
+    gpg_source_proof_entry_t *entries;
+    size_t count;
+    size_t capacity;
+    bool base_absent;
+    char base_path[MAX_PATH_LEN];
+    struct stat base_identity;
+    gpg_mount_identity_t base_mount;
+};
+
+static void gpg_source_proof_destroy(gpg_source_proof_t *proof) {
+    size_t index;
+
+    if (!proof) return;
+    for (index = 0; index < proof->count; index++) {
+        if (proof->entries[index].fd >= 0) {
+            close(proof->entries[index].fd);
+        }
+    }
+    free(proof->entries);
+    free(proof);
+}
+
+/* Transfer one descriptor into the retained proof. Managed-tree entries keep
+ * a full directory-version witness; a FreeBSD nullfs backing descriptor keeps
+ * only stable object/mount identity because GnuPG may legitimately update an
+ * external source directory while the helper is running. */
+static int gpg_source_proof_add_owned(
+    gpg_source_proof_t *proof, int fd, const struct stat *identity,
+    const gpg_mount_identity_t *mount, bool versioned,
+    size_t parent_index, const char *name, size_t *index_out) {
+    const size_t maximum = GPG_SOURCE_PROOF_MAX_DIRECTORIES +
+                           GPG_SOURCE_PROOF_MAX_NULLFS_HOPS + 1U;
+    gpg_source_proof_entry_t *grown;
+    gpg_source_proof_entry_t *entry;
+    bool has_parent = parent_index != SIZE_MAX;
+    size_t capacity;
+
+    if (!proof || fd < 0 || !identity || !mount ||
+        (has_parent && (!name || !*name || parent_index >= proof->count)) ||
+        (!has_parent && name)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid retained GPG source proof");
         return -1;
     }
-    if (candidate.st_dev == source->identity.st_dev &&
-        candidate.st_ino == source->identity.st_ino) {
+    if (proof->count >= maximum) {
+        errno = E2BIG;
         set_error(ERR_PERMISSION_DENIED,
-                  gpg_same_mount(&source->mount, &candidate_mount)
+                  "Managed GPG ancestry exceeds the retained proof bound");
+        return -1;
+    }
+    if (proof->count == proof->capacity) {
+        capacity = proof->capacity == 0 ? 16U : proof->capacity * 2U;
+        if (capacity > maximum) capacity = maximum;
+        grown = realloc(proof->entries, capacity * sizeof(*grown));
+        if (!grown) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot retain the managed GPG ancestry proof");
+            return -1;
+        }
+        proof->entries = grown;
+        proof->capacity = capacity;
+    }
+    entry = &proof->entries[proof->count];
+    memset(entry, 0, sizeof(*entry));
+    if (has_parent && safe_strncpy(entry->name, name,
+                                   sizeof(entry->name)) != 0) {
+        errno = ENAMETOOLONG;
+        set_error(ERR_INVALID_PATH,
+                  "Managed GPG ancestry entry name is too long");
+        return -1;
+    }
+    entry->fd = fd;
+    entry->identity = *identity;
+    entry->mount = *mount;
+    entry->versioned = versioned;
+    entry->has_parent = has_parent;
+    entry->parent_index = parent_index;
+    if (index_out) *index_out = proof->count;
+    proof->count++;
+    return 0;
+}
+
+/* The complete managed-tree witness remains open until the source helper is
+ * done. Revalidating every retained directory immediately before and after a
+ * helper prevents a cross-branch rename from entering an already-scanned
+ * directory unnoticed. Every child is also reopened through its retained
+ * parent/name edge so an overlay mount cannot hide behind the old child fd.
+ * The public base name is rebound to the exact visible object that supplied
+ * the witness. */
+static int gpg_source_proof_revalidate(const gpg_source_proof_t *proof) {
+    char current_base[MAX_PATH_LEN];
+    bool absent = false;
+    struct stat current;
+    gpg_mount_identity_t current_mount;
+    size_t index;
+    int base_fd;
+
+    if (!proof || !proof->base_path[0]) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid managed GPG ancestry witness");
+        return -1;
+    }
+    base_fd = gpg_open_base_dir(current_base, sizeof(current_base),
+                                false, &absent);
+    if (proof->base_absent) {
+        if (base_fd >= 0) close(base_fd);
+        if (base_fd >= 0 || !absent ||
+            strcmp(current_base, proof->base_path) != 0) {
+            errno = ESTALE;
+            set_error(ERR_PERMISSION_DENIED,
+                      "Managed GPG base appeared or changed after source proof");
+            return -1;
+        }
+        return 0;
+    }
+    if (base_fd < 0) {
+        if (absent) {
+            errno = ESTALE;
+            set_error(ERR_PERMISSION_DENIED,
+                      "Managed GPG base disappeared after source proof");
+        }
+        return -1;
+    }
+    errno = 0;
+    if (strcmp(current_base, proof->base_path) != 0 ||
+        fstat(base_fd, &current) != 0 ||
+        gpg_mount_identity_fd(base_fd, &current_mount) != 0 ||
+        !gpg_same_reset_entry(&proof->base_identity, &current) ||
+        !gpg_same_mount(&proof->base_mount, &current_mount)) {
+        int saved_errno = errno ? errno : ESTALE;
+        close(base_fd);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Managed GPG base changed after source proof");
+        return -1;
+    }
+    close(base_fd);
+
+    for (index = 0; index < proof->count; index++) {
+        const gpg_source_proof_entry_t *entry = &proof->entries[index];
+        struct stat named_before;
+        struct stat named_after;
+        struct stat reopened;
+        gpg_mount_identity_t reopened_mount;
+        int reopened_fd = -1;
+
+        errno = 0;
+        if (fstat(entry->fd, &current) != 0 ||
+            gpg_mount_identity_fd(entry->fd, &current_mount) != 0 ||
+            !gpg_same_mount(&entry->mount, &current_mount) ||
+            !gpg_same_reset_entry(&entry->identity, &current) ||
+            (entry->versioned &&
+             !gpg_same_file_version(&entry->identity, &current))) {
+            int saved_errno = errno ? errno : ESTALE;
+            errno = saved_errno;
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "Managed GPG ancestry changed after source proof");
+            return -1;
+        }
+        if (!entry->has_parent) continue;
+        if (entry->parent_index >= index ||
+            entry->parent_index >= proof->count) {
+            errno = ESTALE;
+            set_error(ERR_PERMISSION_DENIED,
+                      "Managed GPG ancestry witness is internally inconsistent");
+            return -1;
+        }
+        errno = 0;
+        if (fstatat(proof->entries[entry->parent_index].fd, entry->name,
+                    &named_before, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !S_ISDIR(named_before.st_mode) ||
+            (reopened_fd = openat(
+                 proof->entries[entry->parent_index].fd, entry->name,
+                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)) < 0 ||
+            fstat(reopened_fd, &reopened) != 0 ||
+            gpg_mount_identity_fd(reopened_fd, &reopened_mount) != 0 ||
+            fstatat(proof->entries[entry->parent_index].fd, entry->name,
+                    &named_after, AT_SYMLINK_NOFOLLOW) != 0 ||
+            !gpg_same_file_version(&named_before, &reopened) ||
+            !gpg_same_file_version(&reopened, &named_after) ||
+            !gpg_same_mount(&entry->mount, &reopened_mount) ||
+            !gpg_same_reset_entry(&entry->identity, &reopened) ||
+            (entry->versioned &&
+             !gpg_same_file_version(&entry->identity, &reopened))) {
+            int saved_errno = errno ? errno : ESTALE;
+            if (reopened_fd >= 0) close(reopened_fd);
+            errno = saved_errno;
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "Managed GPG ancestry changed after source proof");
+            return -1;
+        }
+        close(reopened_fd);
+    }
+    return 0;
+}
+
+#ifdef __FreeBSD__
+static bool gpg_freebsd_mount_snapshot_valid(const struct statfs *mounted) {
+    return mounted &&
+           memchr(mounted->f_fstypename, '\0',
+                  sizeof(mounted->f_fstypename)) != NULL &&
+           memchr(mounted->f_mntonname, '\0',
+                  sizeof(mounted->f_mntonname)) != NULL &&
+           memchr(mounted->f_mntfromname, '\0',
+                  sizeof(mounted->f_mntfromname)) != NULL;
+}
+
+static bool gpg_freebsd_same_mount_snapshot(const struct statfs *left,
+                                            const struct statfs *right) {
+    return gpg_freebsd_mount_snapshot_valid(left) &&
+           gpg_freebsd_mount_snapshot_valid(right) &&
+           memcmp(&left->f_fsid, &right->f_fsid,
+                  sizeof(left->f_fsid)) == 0 &&
+           strcmp(left->f_fstypename, right->f_fstypename) == 0 &&
+           strcmp(left->f_mntonname, right->f_mntonname) == 0 &&
+           strcmp(left->f_mntfromname, right->f_mntfromname) == 0;
+}
+
+/* mount_nullfs(8) guarantees that the virtual copy changes st_dev but is
+ * otherwise indistinguishable from the lower object. Compare all stable
+ * directory fields that matter to this proof while deliberately excluding
+ * atime (descriptor reads may advance it) and st_dev. */
+static bool gpg_freebsd_same_nullfs_directory(const struct stat *upper,
+                                              const struct stat *lower) {
+    return upper && lower && S_ISDIR(upper->st_mode) &&
+           S_ISDIR(lower->st_mode) && upper->st_ino == lower->st_ino &&
+           upper->st_mode == lower->st_mode &&
+           upper->st_nlink == lower->st_nlink &&
+           upper->st_uid == lower->st_uid &&
+           upper->st_gid == lower->st_gid &&
+           upper->st_size == lower->st_size &&
+           upper->st_blocks == lower->st_blocks &&
+           upper->st_blksize == lower->st_blksize &&
+           upper->st_flags == lower->st_flags &&
+           upper->st_gen == lower->st_gen &&
+           upper->st_mtim.tv_sec == lower->st_mtim.tv_sec &&
+           upper->st_mtim.tv_nsec == lower->st_mtim.tv_nsec &&
+           upper->st_ctim.tv_sec == lower->st_ctim.tv_sec &&
+           upper->st_ctim.tv_nsec == lower->st_ctim.tv_nsec;
+}
+
+/* Pin the terminal lower directory beneath a bounded stack of FreeBSD nullfs
+ * mounts. f_mntonname supplies the visible prefix and f_mntfromname its lower
+ * replacement. Each mapped path is resolved, opened without following the
+ * leaf, matched to the upper vnode under the documented nullfs stat contract,
+ * and revalidated. Renamed, truncated, cyclic, or ambiguous mount origins fail
+ * closed instead of being treated as external. */
+static int gpg_freebsd_unwrap_nullfs_directory(
+    const char *visible_path, int visible_fd, char *backing_path,
+    size_t backing_path_size, int *backing_fd, bool *backing_fd_owned,
+    struct stat *backing_identity, gpg_mount_identity_t *backing_mount) {
+    char current_path[MAX_PATH_LEN];
+    int current_fd = visible_fd;
+    bool current_owned = false;
+    unsigned int hop;
+
+    if (!visible_path || visible_fd < 0 || !backing_path ||
+        backing_path_size == 0 || !backing_fd || !backing_fd_owned ||
+        !backing_identity || !backing_mount ||
+        safe_strncpy(current_path, visible_path, sizeof(current_path)) != 0) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid FreeBSD nullfs source proof");
+        return -1;
+    }
+    for (hop = 0; ; hop++) {
+        struct stat upper_before;
+        struct stat upper_after;
+        struct stat lower_opened;
+        struct stat lower_named;
+        struct statfs mount_before;
+        struct statfs mount_after;
+        const char *suffix;
+        size_t mountpoint_len;
+        char lower_raw[MAX_PATH_LEN];
+        char lower_resolved[MAX_PATH_LEN];
+        int lower_fd;
+
+        errno = 0;
+        if (fstat(current_fd, &upper_before) != 0 ||
+            fstatfs(current_fd, &mount_before) != 0 ||
+            !gpg_freebsd_mount_snapshot_valid(&mount_before)) {
+            int saved_errno = errno ? errno : ESTALE;
+            if (current_owned) close(current_fd);
+            errno = saved_errno;
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Cannot inspect FreeBSD GPG mount lineage");
+            return -1;
+        }
+        if (strcmp(mount_before.f_fstypename, "nullfs") != 0) {
+            if (safe_strncpy(backing_path, current_path,
+                             backing_path_size) != 0 ||
+                gpg_mount_identity_fd(current_fd, backing_mount) != 0) {
+                int saved_errno = errno ? errno : ENAMETOOLONG;
+                if (current_owned) close(current_fd);
+                errno = saved_errno;
+                set_system_error(ERR_PERMISSION_DENIED,
+                                 "Cannot retain FreeBSD GPG mount lineage");
+                return -1;
+            }
+            *backing_fd = current_fd;
+            *backing_fd_owned = current_owned;
+            *backing_identity = upper_before;
+            return 0;
+        }
+        if (hop >= GPG_SOURCE_PROOF_MAX_NULLFS_HOPS ||
+            mount_before.f_mntonname[0] != '/' ||
+            mount_before.f_mntfromname[0] != '/') {
+            if (current_owned) close(current_fd);
+            errno = ELOOP;
+            set_error(ERR_PERMISSION_DENIED,
+                      "FreeBSD nullfs GPG lineage is unbounded or non-absolute");
+            return -1;
+        }
+        mountpoint_len = strlen(mount_before.f_mntonname);
+        if (strcmp(mount_before.f_mntonname, "/") == 0) {
+            suffix = strcmp(current_path, "/") == 0 ? "" : current_path;
+        } else if (strcmp(current_path, mount_before.f_mntonname) == 0) {
+            suffix = "";
+        } else if (strncmp(current_path, mount_before.f_mntonname,
+                           mountpoint_len) == 0 &&
+                   current_path[mountpoint_len] == '/') {
+            suffix = current_path + mountpoint_len;
+        } else {
+            if (current_owned) close(current_fd);
+            errno = ESTALE;
+            set_error(ERR_PERMISSION_DENIED,
+                      "FreeBSD nullfs mount does not contain the pinned GPG path");
+            return -1;
+        }
+        if ((strcmp(mount_before.f_mntfromname, "/") == 0
+                 ? safe_snprintf(lower_raw, sizeof(lower_raw), "%s",
+                                 suffix[0] ? suffix : "/")
+                 : safe_snprintf(lower_raw, sizeof(lower_raw), "%s%s",
+                                 mount_before.f_mntfromname, suffix)) != 0 ||
+            !lower_raw[0] ||
+            gpg_resolve_path_aliases(lower_raw, lower_resolved,
+                                     sizeof(lower_resolved)) != 0 ||
+            strcmp(lower_resolved, current_path) == 0) {
+            int saved_errno = errno ? errno : ESTALE;
+            if (current_owned) close(current_fd);
+            errno = saved_errno;
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "Cannot resolve FreeBSD nullfs GPG origin");
+            return -1;
+        }
+        errno = 0;
+        lower_fd = open(lower_resolved,
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        if (lower_fd < 0 || fstat(lower_fd, &lower_opened) != 0 ||
+            lstat(lower_resolved, &lower_named) != 0 ||
+            fstat(current_fd, &upper_after) != 0 ||
+            fstatfs(current_fd, &mount_after) != 0 ||
+            !gpg_same_file_version(&upper_before, &upper_after) ||
+            !gpg_freebsd_same_mount_snapshot(&mount_before, &mount_after) ||
+            !gpg_freebsd_same_nullfs_directory(&upper_after, &lower_opened) ||
+            !gpg_same_file_version(&lower_opened, &lower_named)) {
+            int saved_errno = errno ? errno : ESTALE;
+            if (lower_fd >= 0) close(lower_fd);
+            if (current_owned) close(current_fd);
+            errno = saved_errno;
+            set_system_error(ERR_PERMISSION_DENIED,
+                             "FreeBSD nullfs GPG origin changed during proof");
+            return -1;
+        }
+        if (current_owned) close(current_fd);
+        current_fd = lower_fd;
+        current_owned = true;
+        if (safe_strncpy(current_path, lower_resolved,
+                         sizeof(current_path)) != 0) {
+            close(current_fd);
+            errno = ENAMETOOLONG;
+            set_error(ERR_INVALID_PATH,
+                      "FreeBSD nullfs GPG origin path is too long");
+            return -1;
+        }
+    }
+}
+#endif
+
+static int gpg_source_matches_managed_identity(
+    const gpg_source_home_t *source, const struct stat *candidate,
+    const gpg_mount_identity_t *candidate_mount) {
+    if (!source || source->fd < 0 || !candidate || !candidate_mount) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid managed GPG source-provenance proof");
+        return -1;
+    }
+    if (candidate->st_dev == source->identity.st_dev &&
+        candidate->st_ino == source->identity.st_ino) {
+        set_error(ERR_PERMISSION_DENIED,
+                  gpg_same_mount(&source->mount, candidate_mount)
                       ? "Refusing managed GPG home as the system keyring: %s"
                       : "Refusing bind-mounted alias of a managed GPG home: %s",
                   source->path);
@@ -5025,44 +5472,104 @@ static int gpg_source_matches_managed_object(
     return 0;
 }
 
-/* Compare the opened source object—not its spelling—to the managed base and
- * every live account-home directory. A bind alias preserves st_dev/st_ino
- * while acquiring a distinct mount id, so equality rejects both ordinary
- * aliases and bind-mounted aliases; the mount comparison makes the latter
- * diagnosis explicit. */
-static int gpg_source_matches_managed_home(
-    const gpg_source_home_t *source) {
-    char base[MAX_PATH_LEN];
-    bool absent = false;
-    int base_fd;
-    int scan_fd = -1;
-    DIR *dir = NULL;
+/* Compare the pinned source against every descriptor-opened directory below
+ * the managed base. Each entry is observed without following links, opened,
+ * matched to that observation, recursively inspected, and then re-statted.
+ * A source exposed through an external bind mount keeps the nested directory's
+ * device/inode pair and is therefore rejected even though its mount ID differs.
+ * Nested mounts and unstable/oversized trees fail closed: skipping either
+ * would turn an incomplete search into false external provenance. */
+static int gpg_source_matches_managed_tree_at(
+    const gpg_source_home_t *source, int directory_fd,
+    const gpg_mount_identity_t *base_mount, unsigned int depth,
+    gpg_source_proof_budget_t *budget, gpg_source_proof_t *proof,
+    size_t parent_index, const char *entry_name) {
+    struct stat directory_before;
+    struct stat directory_after;
+    gpg_mount_identity_t directory_mount;
+    int scan_fd;
+    DIR *dir;
     struct dirent *entry;
+    size_t directory_index;
     int match;
 
-    base_fd = gpg_open_base_dir(base, sizeof(base), false, &absent);
-    if (base_fd < 0) {
-        return absent ? 0 : -1;
-    }
-    match = gpg_source_matches_managed_object(source, base_fd,
-                                               "the managed GPG base");
-    if (match != 0) {
-        close(base_fd);
-        return match;
-    }
-    scan_fd = dup(base_fd);
-    if (scan_fd < 0 || (dir = fdopendir(scan_fd)) == NULL) {
-        int saved_errno = errno;
-        if (scan_fd >= 0) close(scan_fd);
-        close(base_fd);
-        errno = saved_errno;
-        set_system_error(ERR_FILE_IO,
-                         "Cannot enumerate managed GPG homes for source proof");
+    if (!source || directory_fd < 0 || !base_mount || !budget || !proof) {
+        if (directory_fd >= 0) close(directory_fd);
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid managed GPG ancestry proof");
         return -1;
     }
-    scan_fd = -1; /* owned by dir */
+    if (depth > GPG_SOURCE_PROOF_MAX_DEPTH) {
+        close(directory_fd);
+        errno = E2BIG;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Managed GPG ancestry exceeds the bounded source-proof depth");
+        return -1;
+    }
+    if (++budget->directories > GPG_SOURCE_PROOF_MAX_DIRECTORIES) {
+        close(directory_fd);
+        errno = E2BIG;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Managed GPG ancestry exceeds the retained directory bound");
+        return -1;
+    }
+    errno = 0;
+    if (fstat(directory_fd, &directory_before) != 0 ||
+        !S_ISDIR(directory_before.st_mode) ||
+        directory_before.st_uid != getuid() ||
+        (directory_before.st_mode & 022) != 0) {
+        int saved_errno = errno ? errno : EACCES;
+        close(directory_fd);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot prove a managed GPG descendant directory");
+        return -1;
+    }
+    if (depth == 0) {
+        directory_mount = *base_mount;
+    } else if (gpg_mount_identity_fd(directory_fd, &directory_mount) != 0) {
+        int saved_errno = errno;
+        close(directory_fd);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot prove a managed GPG descendant mount");
+        return -1;
+    }
+    match = gpg_source_matches_managed_identity(
+        source, &directory_before, &directory_mount);
+    if (match != 0) {
+        close(directory_fd);
+        return match;
+    }
+    if (!gpg_same_mount(base_mount, &directory_mount)) {
+        close(directory_fd);
+        errno = EXDEV;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Cannot prove GPG source ancestry across a nested managed mount");
+        return -1;
+    }
+    if (gpg_source_proof_add_owned(
+            proof, directory_fd, &directory_before, &directory_mount, true,
+            parent_index, entry_name, &directory_index) != 0) {
+        close(directory_fd);
+        return -1;
+    }
+
+    scan_fd = openat(directory_fd, ".",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!dir) {
+        int saved_errno = errno;
+        if (scan_fd >= 0) close(scan_fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot enumerate managed GPG descendants for source proof");
+        return -1;
+    }
     for (;;) {
         struct stat named;
+        struct stat opened;
+        struct stat revalidated;
         int child_fd;
 
         errno = 0;
@@ -5071,63 +5578,222 @@ static int gpg_source_matches_managed_home(
             if (errno != 0) {
                 int saved_errno = errno;
                 closedir(dir);
-                close(base_fd);
                 errno = saved_errno;
                 set_system_error(
                     ERR_FILE_IO,
-                    "Cannot enumerate managed GPG homes for source proof");
+                    "Cannot enumerate managed GPG descendants for source proof");
                 return -1;
             }
             break;
         }
-        if (!validate_name(entry->d_name)) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
             continue;
         }
-        if (fstatat(base_fd, entry->d_name, &named,
+        if (++budget->entries > GPG_SOURCE_PROOF_MAX_ENTRIES) {
+            closedir(dir);
+            errno = E2BIG;
+            set_error(ERR_PERMISSION_DENIED,
+                      "Managed GPG ancestry exceeds the bounded source-proof size");
+            return -1;
+        }
+        if (fstatat(directory_fd, entry->d_name, &named,
                     AT_SYMLINK_NOFOLLOW) != 0) {
-            if (errno == ENOENT) continue;
-            {
-                int saved_errno = errno;
-                closedir(dir);
-                close(base_fd);
-                errno = saved_errno;
-                set_system_error(
-                    ERR_FILE_IO,
-                    "Cannot inspect managed GPG home for source proof");
-                return -1;
-            }
+            int saved_errno = errno;
+            closedir(dir);
+            errno = saved_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot inspect a managed GPG descendant for source proof");
+            return -1;
         }
         if (!S_ISDIR(named.st_mode)) continue;
-        child_fd = openat(base_fd, entry->d_name,
+
+        child_fd = openat(directory_fd, entry->d_name,
                           O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-        if (child_fd < 0) {
-            if (errno == ENOENT) continue;
-            {
-                char child_name[MAX_NAME_LEN];
-                int saved_errno = errno;
-                safe_strncpy(child_name, entry->d_name,
-                             sizeof(child_name));
-                closedir(dir);
-                close(base_fd);
-                errno = saved_errno;
-                set_system_error(
-                    ERR_FILE_IO,
-                    "Cannot pin managed GPG home for source proof: %s",
-                    child_name);
-                return -1;
-            }
+        if (child_fd < 0 || fstat(child_fd, &opened) != 0 ||
+            !S_ISDIR(opened.st_mode) || opened.st_uid != getuid() ||
+            (opened.st_mode & 022) != 0 ||
+            !gpg_same_reset_entry(&named, &opened)) {
+            int saved_errno = errno ? errno : ESTALE;
+            if (child_fd >= 0) close(child_fd);
+            closedir(dir);
+            errno = saved_errno;
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "Managed GPG descendant changed while proving source ancestry");
+            return -1;
         }
-        match = gpg_source_matches_managed_object(
-            source, child_fd, "a managed GPG account home");
-        close(child_fd);
+        match = gpg_source_matches_managed_tree_at(
+            source, child_fd, base_mount, depth + 1U, budget, proof,
+            directory_index, entry->d_name);
+        errno = 0;
+        if (match == 0 &&
+            (fstatat(directory_fd, entry->d_name, &revalidated,
+                     AT_SYMLINK_NOFOLLOW) != 0 ||
+             !gpg_same_file_version(&opened, &revalidated))) {
+            errno = errno ? errno : ESTALE;
+            set_system_error(
+                ERR_PERMISSION_DENIED,
+                "Managed GPG descendant changed during source ancestry proof");
+            match = -1;
+        }
         if (match != 0) {
             closedir(dir);
-            close(base_fd);
             return match;
         }
     }
+    errno = 0;
+    if (fstat(directory_fd, &directory_after) != 0 ||
+        !gpg_same_file_version(&directory_before, &directory_after)) {
+        int saved_errno = errno ? errno : ESTALE;
+        closedir(dir);
+        errno = saved_errno;
+        set_system_error(
+            ERR_PERMISSION_DENIED,
+            "Managed GPG directory changed during source ancestry proof");
+        return -1;
+    }
     closedir(dir);
-    close(base_fd);
+    return 0;
+}
+
+static int gpg_source_matches_managed_home(
+    gpg_source_home_t *source) {
+    char base[MAX_PATH_LEN];
+    bool absent = false;
+    struct stat base_identity;
+    gpg_mount_identity_t base_mount;
+    gpg_source_proof_budget_t budget;
+    gpg_source_proof_t *proof;
+    gpg_source_home_t proof_source;
+    int base_fd;
+    int tree_fd = -1;
+    int match;
+#ifdef __FreeBSD__
+    char source_backing[MAX_PATH_LEN];
+    char base_backing[MAX_PATH_LEN];
+    struct stat source_backing_identity;
+    struct stat base_backing_identity;
+    gpg_mount_identity_t source_backing_mount;
+    gpg_mount_identity_t base_backing_mount;
+    int source_backing_fd = -1;
+    int base_backing_fd = -1;
+    bool source_backing_owned = false;
+    bool base_backing_owned = false;
+    gpg_source_path_class_t backing_class;
+#endif
+
+    if (!source || source->fd < 0 || source->proof) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS, "Invalid GPG source ancestry handle");
+        return -1;
+    }
+    proof = calloc(1, sizeof(*proof));
+    if (!proof) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate the managed GPG ancestry proof");
+        return -1;
+    }
+
+    base_fd = gpg_open_base_dir(base, sizeof(base), false, &absent);
+    if (base_fd < 0) {
+        if (!absent || safe_strncpy(proof->base_path, base,
+                                    sizeof(proof->base_path)) != 0) {
+            gpg_source_proof_destroy(proof);
+            return -1;
+        }
+        proof->base_absent = true;
+        source->proof = proof;
+        return 0;
+    }
+    errno = 0;
+    if (fstat(base_fd, &base_identity) != 0 ||
+        gpg_mount_identity_fd(base_fd, &base_mount) != 0 ||
+        safe_strncpy(proof->base_path, base,
+                     sizeof(proof->base_path)) != 0) {
+        int saved_errno = errno ? errno : ENAMETOOLONG;
+        close(base_fd);
+        gpg_source_proof_destroy(proof);
+        errno = saved_errno;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Cannot pin the managed GPG base for source proof");
+        return -1;
+    }
+    proof->base_identity = base_identity;
+    proof->base_mount = base_mount;
+    proof_source = *source;
+    proof_source.proof = NULL;
+
+#ifdef __FreeBSD__
+    if (gpg_freebsd_unwrap_nullfs_directory(
+            source->path, source->fd, source_backing,
+            sizeof(source_backing), &source_backing_fd,
+            &source_backing_owned, &source_backing_identity,
+            &source_backing_mount) != 0 ||
+        gpg_freebsd_unwrap_nullfs_directory(
+            base, base_fd, base_backing, sizeof(base_backing),
+            &base_backing_fd, &base_backing_owned,
+            &base_backing_identity, &base_backing_mount) != 0) {
+        if (source_backing_owned && source_backing_fd >= 0) {
+            close(source_backing_fd);
+        }
+        close(base_fd);
+        gpg_source_proof_destroy(proof);
+        return -1;
+    }
+    proof_source.fd = source_backing_fd;
+    proof_source.identity = source_backing_identity;
+    proof_source.mount = source_backing_mount;
+    if (source_backing_owned &&
+        gpg_source_proof_add_owned(
+            proof, source_backing_fd, &source_backing_identity,
+            &source_backing_mount, false, SIZE_MAX, NULL, NULL) != 0) {
+        close(source_backing_fd);
+        if (base_backing_owned) close(base_backing_fd);
+        close(base_fd);
+        gpg_source_proof_destroy(proof);
+        return -1;
+    }
+    source_backing_owned = false;
+    backing_class = gpg_classify_managed_path(base_backing,
+                                              source_backing);
+    if (backing_class != GPG_SOURCE_PATH_EXTERNAL) {
+        if (base_backing_owned) close(base_backing_fd);
+        close(base_fd);
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing nullfs alias of a managed GPG home: %s",
+                  source->path);
+        gpg_source_proof_destroy(proof);
+        return 1;
+    }
+    tree_fd = base_backing_fd;
+    if (base_backing_owned) {
+        close(base_fd);
+        base_fd = -1;
+    } else {
+        base_fd = -1;
+    }
+    (void)base_backing_identity;
+    base_mount = base_backing_mount;
+#else
+    tree_fd = base_fd;
+    base_fd = -1;
+#endif
+    memset(&budget, 0, sizeof(budget));
+    match = gpg_source_matches_managed_tree_at(
+        &proof_source, tree_fd, &base_mount, 0, &budget, proof,
+        SIZE_MAX, NULL);
+    tree_fd = -1;
+    if (match == 0 && gpg_source_proof_revalidate(proof) != 0) {
+        match = -1;
+    }
+    if (match != 0) {
+        if (base_fd >= 0) close(base_fd);
+        gpg_source_proof_destroy(proof);
+        return match;
+    }
+    source->proof = proof;
     return 0;
 }
 
@@ -5135,7 +5801,7 @@ static int gpg_validate_source_home(const gpg_source_home_t *source) {
     struct stat current;
     gpg_mount_identity_t current_mount;
 
-    if (!source || source->fd < 0 || !source->path[0] ||
+    if (!source || source->fd < 0 || !source->path[0] || !source->proof ||
         fstat(source->fd, &current) != 0 ||
         gpg_mount_identity_fd(source->fd, &current_mount) != 0 ||
         !S_ISDIR(current.st_mode) || current.st_uid != getuid() ||
@@ -5148,7 +5814,7 @@ static int gpg_validate_source_home(const gpg_source_home_t *source) {
                   source && source->path[0] ? source->path : "(unknown)");
         return -1;
     }
-    return 0;
+    return gpg_source_proof_revalidate(source->proof);
 }
 
 /* Return 0 with a retained descriptor, 1 only for confirmed ENOENT, and -1
@@ -5198,7 +5864,9 @@ static int gpg_open_user_source_home(gpg_source_home_t *source) {
 static void gpg_close_source_home(gpg_source_home_t *source) {
     if (!source) return;
     if (source->fd >= 0) close(source->fd);
+    gpg_source_proof_destroy(source->proof);
     source->fd = -1;
+    source->proof = NULL;
 }
 
 /* Set up gpg-agent.conf for the isolated environment.

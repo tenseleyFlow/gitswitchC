@@ -796,6 +796,63 @@ TEST(agent_config_defaults_require_confirmed_source_absence) {
     run_set_runner(previous);
 }
 
+TEST(managed_descendant_agent_config_is_rejected_without_mutation) {
+    static const char retained[] =
+        "# existing isolated policy\n"
+        "default-cache-ttl 17\n";
+    static const char managed_source[] =
+        "# must never be inherited from managed state\n"
+        "default-cache-ttl 999\n";
+    char xdg[128], base[256], home[320], nested[384];
+    char source_conf[448], installed[384], content[512];
+    const char *inherited_gnupghome = getenv("GNUPGHOME");
+    bool had_gnupghome = inherited_gnupghome != NULL;
+    char *saved_gnupghome = had_gnupghome
+                                ? strdup(inherited_gnupghome)
+                                : NULL;
+    command_runner_fn previous;
+    int home_fd;
+
+    if (had_gnupghome && !saved_gnupghome) {
+        CHECK(!"failed to retain GNUPGHOME for managed-source fixture");
+        return;
+    }
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "ancestry"), 0);
+    CHECK_EQ_INT(safe_snprintf(nested, sizeof(nested), "%s/nested",
+                               home), 0);
+    CHECK_EQ_INT(safe_snprintf(source_conf, sizeof(source_conf),
+                               "%s/gpg-agent.conf", nested), 0);
+    CHECK_EQ_INT(safe_snprintf(installed, sizeof(installed),
+                               "%s/gpg-agent.conf", home), 0);
+    CHECK_EQ_INT(mkdir(nested, 0700), 0);
+    CHECK_EQ_INT(make_file(source_conf, managed_source), 0);
+    CHECK_EQ_INT(make_file(installed, retained), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", nested, 1), 0);
+    home_fd = open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(home_fd >= 0);
+
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "managed GPG descendant") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+    CHECK(!has_agent_conf_scratch(home));
+
+    if (home_fd >= 0) CHECK_EQ_INT(close(home_fd), 0);
+    if (had_gnupghome) {
+        CHECK_EQ_INT(setenv("GNUPGHOME", saved_gnupghome, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GNUPGHOME"), 0);
+    }
+    free(saved_gnupghome);
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("ancestry"), 0);
+    run_set_runner(previous);
+}
+
 TEST(agent_config_registration_failure_is_atomic_and_retryable) {
     static const char source[] =
         "default-cache-ttl 31\n"
@@ -872,5 +929,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(byte_identical_agent_config_performs_no_commit);
     RUN_TEST(agent_config_sync_failures_return_nonzero);
     RUN_TEST(agent_config_defaults_require_confirmed_source_absence);
+    RUN_TEST(managed_descendant_agent_config_is_rejected_without_mutation);
     RUN_TEST(agent_config_registration_failure_is_atomic_and_retryable);
 TEST_MAIN_END()

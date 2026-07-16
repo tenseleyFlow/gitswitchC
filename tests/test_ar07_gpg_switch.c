@@ -89,6 +89,54 @@ static int enter_private_mount_namespace(void) {
 }
 #endif
 
+#ifdef __FreeBSD__
+static int freebsd_sudo_command(const char *command, const char *arg1,
+                                const char *arg2, const char *arg3) {
+    const char *sudo_path = access("/usr/local/bin/sudo", X_OK) == 0
+                                ? "/usr/local/bin/sudo"
+                                : "/usr/bin/sudo";
+    pid_t child;
+    int status;
+
+    if (!command || !arg1 || access(sudo_path, X_OK) != 0) return -1;
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        int null_fd = open("/dev/null", O_RDWR);
+        if (null_fd >= 0) {
+            (void)dup2(null_fd, STDOUT_FILENO);
+            (void)dup2(null_fd, STDERR_FILENO);
+            if (null_fd > STDERR_FILENO) close(null_fd);
+        }
+        if (arg3) {
+            execl(sudo_path, "sudo", "-n", command, arg1, arg2, arg3,
+                  (char *)NULL);
+        } else if (arg2) {
+            execl(sudo_path, "sudo", "-n", command, arg1, arg2,
+                  (char *)NULL);
+        } else {
+            execl(sudo_path, "sudo", "-n", command, arg1, (char *)NULL);
+        }
+        _exit(127);
+    }
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+static int freebsd_mount_nullfs(const char *source, const char *target) {
+    return freebsd_sudo_command("/sbin/mount_nullfs", source, target, NULL);
+}
+
+static int freebsd_unmount_nullfs(const char *target) {
+    if (freebsd_sudo_command("/sbin/umount", target, NULL, NULL) == 0) {
+        return 0;
+    }
+    return freebsd_sudo_command("/sbin/umount", "-f", target, NULL);
+}
+#endif
+
 static int make_runtime(char *xdg, size_t size) {
     char canonical[MAX_PATH_LEN];
     size_t length;
@@ -461,6 +509,29 @@ static int listing_result_runner(const char *const argv[],
     return 0;
 }
 
+#ifdef __linux__
+static char g_source_overlay_from[MAX_PATH_LEN];
+static char g_source_overlay_target[MAX_PATH_LEN];
+static bool g_source_overlay_attempted;
+static int g_source_overlay_rc;
+
+/* Install an overlay while the source helper is in flight. The post-helper
+ * ancestry proof must reopen the managed child through its parent and reject
+ * the result; fstat-only retained descriptors cannot see this mount. */
+static int overlay_listing_result_runner(const char *const argv[],
+                                         const run_opts_t *opts,
+                                         run_result_t *result) {
+    if (argv_has(argv, "--list-secret-keys") &&
+        !g_source_overlay_attempted) {
+        g_source_overlay_attempted = true;
+        g_source_overlay_rc = mount(g_source_overlay_from,
+                                    g_source_overlay_target, NULL,
+                                    MS_BIND, NULL);
+    }
+    return listing_result_runner(argv, opts, result);
+}
+#endif
+
 static int run_listing_result_case(enum listing_result_mode mode,
                                    int *listing_calls,
                                    int *export_calls,
@@ -730,6 +801,8 @@ TEST(system_key_helper_stays_on_pinned_source_after_directory_replacement) {
 #ifdef __linux__
 TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
     char xdg[128], base[MAX_PATH_LEN], managed[MAX_PATH_LEN];
+    char nested[MAX_PATH_LEN], overlay[MAX_PATH_LEN];
+    char external[MAX_PATH_LEN];
     char alias[MAX_PATH_LEN];
     char trusted_program_dir[MAX_PATH_LEN];
     char trusted_gpg[MAX_PATH_LEN];
@@ -751,10 +824,19 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
                                "%s/gitswitch-gpg", xdg), 0);
     CHECK_EQ_INT(safe_snprintf(managed, sizeof(managed),
                                "%s/managed", base), 0);
+    CHECK_EQ_INT(safe_snprintf(nested, sizeof(nested),
+                               "%s/nested", managed), 0);
+    CHECK_EQ_INT(safe_snprintf(overlay, sizeof(overlay),
+                               "%s/overlay", managed), 0);
+    CHECK_EQ_INT(safe_snprintf(external, sizeof(external),
+                               "%s/external", xdg), 0);
     CHECK_EQ_INT(safe_snprintf(alias, sizeof(alias),
                                "%s/bind-alias", xdg), 0);
     CHECK_EQ_INT(mkdir(base, 0700), 0);
     CHECK_EQ_INT(mkdir(managed, 0700), 0);
+    CHECK_EQ_INT(mkdir(nested, 0700), 0);
+    CHECK_EQ_INT(mkdir(overlay, 0700), 0);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
     CHECK_EQ_INT(mkdir(alias, 0700), 0);
 
     /* A user-namespace fallback maps host root-owned executables to the
@@ -809,11 +891,13 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
     CHECK(child >= 0);
     if (child == 0) {
         command_runner_fn previous;
+        gpg_config_t nested_config = config;
+        gpg_config_t overlay_config = config;
+        gpg_config_t external_config = config;
         int rc;
 
         if (enter_private_mount_namespace() != 0 ||
-            mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0 ||
-            mount(managed, alias, NULL, MS_BIND, NULL) != 0) {
+            mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
             _exit(77);
         }
         if (setenv("GNUPGHOME", alias, 1) != 0) {
@@ -824,8 +908,12 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
         g_listing_result_calls = 0;
         g_listing_result_mode = LISTING_RESULT_MATCH;
         previous = run_set_runner(listing_result_runner);
+
+        if (mount(managed, alias, NULL, MS_BIND, NULL) != 0) {
+            run_set_runner(previous);
+            _exit(77);
+        }
         rc = gpg_switch_account(&config, &account);
-        run_set_runner(previous);
         if (rc != -1 || g_listing_result_calls != 0 ||
             strstr(get_last_error()->message,
                    "bind-mounted alias of a managed GPG home") == NULL) {
@@ -837,10 +925,97 @@ TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch) {
             _exit(9);
         }
         if (umount2(alias, MNT_DETACH) != 0) {
-            fprintf(stderr, "bind-alias child: unmount failed: %s\n",
+            fprintf(stderr, "direct bind-alias child: unmount failed: %s\n",
                     strerror(errno));
             _exit(9);
         }
+
+        g_listing_result_calls = 0;
+        if (mount(nested, alias, NULL, MS_BIND, NULL) != 0) {
+            run_set_runner(previous);
+            _exit(77);
+        }
+        rc = gpg_switch_account(&nested_config, &account);
+        if (rc != -1 || g_listing_result_calls != 0 ||
+            strstr(get_last_error()->message,
+                   "bind-mounted alias of a managed GPG home") == NULL) {
+            fprintf(stderr,
+                    "nested bind-alias child: rc=%d calls=%d error=%d message=%s\n",
+                    rc, g_listing_result_calls, get_last_error()->code,
+                    get_last_error()->message);
+            (void)umount2(alias, MNT_DETACH);
+            _exit(9);
+        }
+        if (umount2(alias, MNT_DETACH) != 0) {
+            fprintf(stderr, "nested bind-alias child: unmount failed: %s\n",
+                    strerror(errno));
+            _exit(9);
+        }
+
+        /* A managed child overlaid only after the initial traversal must be
+         * detected by the retained parent/name edge before any helper result
+         * is accepted. */
+        g_listing_result_calls = 0;
+        if (mount(external, alias, NULL, MS_BIND, NULL) != 0 ||
+            safe_strncpy(g_source_overlay_from, external,
+                         sizeof(g_source_overlay_from)) != 0 ||
+            safe_strncpy(g_source_overlay_target, overlay,
+                         sizeof(g_source_overlay_target)) != 0) {
+            run_set_runner(previous);
+            _exit(77);
+        }
+        g_source_overlay_attempted = false;
+        g_source_overlay_rc = -1;
+        run_set_runner(overlay_listing_result_runner);
+        rc = gpg_switch_account(&overlay_config, &account);
+        run_set_runner(listing_result_runner);
+        if (!g_source_overlay_attempted || g_source_overlay_rc != 0) {
+            (void)umount2(overlay, MNT_DETACH);
+            (void)umount2(alias, MNT_DETACH);
+            run_set_runner(previous);
+            _exit(77);
+        }
+        if (rc != -1 || g_listing_result_calls != 1 ||
+            strstr(get_last_error()->message,
+                   "Managed GPG ancestry changed after source proof") == NULL) {
+            fprintf(stderr,
+                    "late overlay child: rc=%d calls=%d error=%d message=%s\n",
+                    rc, g_listing_result_calls, get_last_error()->code,
+                    get_last_error()->message);
+            (void)umount2(overlay, MNT_DETACH);
+            (void)umount2(alias, MNT_DETACH);
+            _exit(9);
+        }
+        if (umount2(overlay, MNT_DETACH) != 0 ||
+            umount2(alias, MNT_DETACH) != 0) {
+            fprintf(stderr, "late overlay child: unmount failed: %s\n",
+                    strerror(errno));
+            _exit(9);
+        }
+
+        /* A distinct external bind mount is still a valid pinned source.
+         * This positive control prevents replacing ancestry proof with a
+         * blanket rejection of every mount alias. */
+        g_listing_result_calls = 0;
+        if (mount(external, alias, NULL, MS_BIND, NULL) != 0) {
+            run_set_runner(previous);
+            _exit(77);
+        }
+        rc = gpg_switch_account(&external_config, &account);
+        if (rc != 0 || g_listing_result_calls != 1) {
+            fprintf(stderr,
+                    "external bind-alias child: rc=%d calls=%d error=%d message=%s\n",
+                    rc, g_listing_result_calls, get_last_error()->code,
+                    get_last_error()->message);
+            (void)umount2(alias, MNT_DETACH);
+            _exit(9);
+        }
+        if (umount2(alias, MNT_DETACH) != 0) {
+            fprintf(stderr, "external bind-alias child: unmount failed: %s\n",
+                    strerror(errno));
+            _exit(9);
+        }
+        run_set_runner(previous);
         _exit(0);
     }
     if (child > 0) {
@@ -1234,6 +1409,392 @@ static int source_identity_runner(const char *const argv[],
         if (result) result->out_len = strlen(opts->out);
     }
     return 0;
+}
+
+enum source_proof_mutation_mode {
+    SOURCE_PROOF_RENAME_MANAGED_CHILD,
+    SOURCE_PROOF_CREATE_MANAGED_BASE
+};
+
+static enum source_proof_mutation_mode g_source_proof_mutation_mode;
+static char g_source_proof_mutation_from[MAX_PATH_LEN];
+static char g_source_proof_mutation_to[MAX_PATH_LEN];
+static int g_source_proof_mutation_calls;
+static int g_source_proof_mutation_rc;
+
+static int source_proof_mutation_runner(const char *const argv[],
+                                        const run_opts_t *opts,
+                                        run_result_t *result) {
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv_has(argv, "--list-secret-keys")) return 0;
+
+    g_source_proof_mutation_calls++;
+    if (g_source_proof_mutation_calls == 1) {
+        g_source_proof_mutation_rc =
+            g_source_proof_mutation_mode ==
+                    SOURCE_PROOF_RENAME_MANAGED_CHILD
+                ? rename(g_source_proof_mutation_from,
+                         g_source_proof_mutation_to)
+                : mkdir(g_source_proof_mutation_to, 0700);
+    }
+    if (opts && opts->out && opts->out_size > 0) {
+        snprintf(opts->out, opts->out_size, "%s", PRIMARY_SIGN);
+        if (result) result->out_len = strlen(opts->out);
+    }
+    return 0;
+}
+
+TEST(source_proof_rejects_managed_tree_mutation_during_helper) {
+    char xdg[128], base[MAX_PATH_LEN], account[MAX_PATH_LEN];
+    char inside[MAX_PATH_LEN];
+    char injected[MAX_PATH_LEN], external[MAX_PATH_LEN];
+    char absent_xdg[128], absent_base[MAX_PATH_LEN];
+    char absent_external[MAX_PATH_LEN];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char diagnostic[512];
+    const char *inherited_gnupghome = getenv("GNUPGHOME");
+    bool had_gnupghome = inherited_gnupghome != NULL;
+    char *saved_gnupghome = had_gnupghome
+                                ? strdup(inherited_gnupghome)
+                                : NULL;
+    command_runner_fn previous;
+    int rc;
+
+    if (had_gnupghome && !saved_gnupghome) {
+        CHECK(!"failed to retain GNUPGHOME for source-proof fixture");
+        return;
+    }
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(base, sizeof(base),
+                               "%s/gitswitch-gpg", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(account, sizeof(account),
+                               "%s/account", base), 0);
+    CHECK_EQ_INT(safe_snprintf(inside, sizeof(inside),
+                               "%s/inside", account), 0);
+    CHECK_EQ_INT(safe_snprintf(injected, sizeof(injected),
+                               "%s/injected", inside), 0);
+    CHECK_EQ_INT(safe_snprintf(external, sizeof(external),
+                               "%s/external", xdg), 0);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(account, 0700), 0);
+    CHECK_EQ_INT(mkdir(inside, 0700), 0);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", external, 1), 0);
+    CHECK_EQ_INT(safe_strncpy(g_source_proof_mutation_from, external,
+                              sizeof(g_source_proof_mutation_from)), 0);
+    CHECK_EQ_INT(safe_strncpy(g_source_proof_mutation_to, injected,
+                              sizeof(g_source_proof_mutation_to)), 0);
+    g_source_proof_mutation_mode = SOURCE_PROOF_RENAME_MANAGED_CHILD;
+    g_source_proof_mutation_calls = 0;
+    g_source_proof_mutation_rc = -1;
+    previous = run_set_runner(source_proof_mutation_runner);
+    rc = gpg_manager_resolve_system_key("01234567", true, fingerprint,
+                                        sizeof(fingerprint));
+    safe_strncpy(diagnostic, get_last_error()->message, sizeof(diagnostic));
+    run_set_runner(previous);
+    CHECK_EQ_INT(g_source_proof_mutation_calls, 1);
+    CHECK_EQ_INT(g_source_proof_mutation_rc, 0);
+    CHECK_EQ_INT(rc, -1);
+    CHECK(fingerprint[0] == '\0');
+    CHECK(path_exists(injected));
+    CHECK(strstr(diagnostic,
+                 "Managed GPG ancestry changed after source proof") != NULL);
+
+    /* The no-base state is a distinct witness. Creating the base while the
+     * helper is in flight must invalidate the result instead of accepting a
+     * proof that was complete only at the initial observation. */
+    CHECK_EQ_INT(make_runtime(absent_xdg, sizeof(absent_xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(absent_base, sizeof(absent_base),
+                               "%s/gitswitch-gpg", absent_xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(absent_external, sizeof(absent_external),
+                               "%s/external", absent_xdg), 0);
+    CHECK_EQ_INT(mkdir(absent_external, 0700), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", absent_external, 1), 0);
+    g_source_proof_mutation_from[0] = '\0';
+    CHECK_EQ_INT(safe_strncpy(g_source_proof_mutation_to, absent_base,
+                              sizeof(g_source_proof_mutation_to)), 0);
+    g_source_proof_mutation_mode = SOURCE_PROOF_CREATE_MANAGED_BASE;
+    g_source_proof_mutation_calls = 0;
+    g_source_proof_mutation_rc = -1;
+    previous = run_set_runner(source_proof_mutation_runner);
+    rc = gpg_manager_resolve_system_key("01234567", true, fingerprint,
+                                        sizeof(fingerprint));
+    safe_strncpy(diagnostic, get_last_error()->message, sizeof(diagnostic));
+    run_set_runner(previous);
+    CHECK_EQ_INT(g_source_proof_mutation_calls, 1);
+    CHECK_EQ_INT(g_source_proof_mutation_rc, 0);
+    CHECK_EQ_INT(rc, -1);
+    CHECK(fingerprint[0] == '\0');
+    CHECK(strstr(diagnostic,
+                 "Managed GPG base appeared or changed after source proof") !=
+          NULL);
+
+    if (had_gnupghome) {
+        CHECK_EQ_INT(setenv("GNUPGHOME", saved_gnupghome, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GNUPGHOME"), 0);
+    }
+    free(saved_gnupghome);
+}
+
+#ifdef __FreeBSD__
+TEST(nullfs_alias_of_managed_home_is_rejected_before_helper_launch) {
+    char xdg[128], base[MAX_PATH_LEN], managed[MAX_PATH_LEN];
+    char nested[MAX_PATH_LEN], external[MAX_PATH_LEN];
+    char alias[MAX_PATH_LEN], fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char diagnostic[512];
+    const char *inherited_gnupghome = getenv("GNUPGHOME");
+    bool had_gnupghome = inherited_gnupghome != NULL;
+    char *saved_gnupghome = had_gnupghome
+                                ? strdup(inherited_gnupghome)
+                                : NULL;
+    command_runner_fn previous;
+    int rc;
+
+    if (had_gnupghome && !saved_gnupghome) {
+        CHECK(!"failed to retain GNUPGHOME for nullfs fixture");
+        return;
+    }
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(base, sizeof(base),
+                               "%s/gitswitch-gpg", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(managed, sizeof(managed),
+                               "%s/managed", base), 0);
+    CHECK_EQ_INT(safe_snprintf(nested, sizeof(nested),
+                               "%s/nested", managed), 0);
+    CHECK_EQ_INT(safe_snprintf(external, sizeof(external),
+                               "%s/external", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(alias, sizeof(alias),
+                               "%s/nullfs-alias", xdg), 0);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(managed, 0700), 0);
+    CHECK_EQ_INT(mkdir(nested, 0700), 0);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
+    CHECK_EQ_INT(mkdir(alias, 0700), 0);
+
+    if (freebsd_mount_nullfs(managed, alias) != 0) {
+        free(saved_gnupghome);
+        TS_SKIP("freebsd-nullfs",
+                "passwordless sudo/nullfs mount unavailable");
+    }
+    previous = run_set_runner(source_identity_runner);
+    CHECK_EQ_INT(setenv("GNUPGHOME", alias, 1), 0);
+    g_source_identity_calls = 0;
+    rc = gpg_manager_resolve_system_key("01234567", true, fingerprint,
+                                        sizeof(fingerprint));
+    safe_strncpy(diagnostic, get_last_error()->message, sizeof(diagnostic));
+    if (freebsd_unmount_nullfs(alias) != 0) {
+        CHECK(!"failed to unmount direct managed nullfs fixture");
+        run_set_runner(previous);
+        goto restore_environment;
+    }
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK(strstr(diagnostic, "nullfs alias of a managed GPG home") != NULL);
+
+    if (freebsd_mount_nullfs(nested, alias) != 0) {
+        CHECK(!"failed to mount nested managed nullfs fixture");
+        run_set_runner(previous);
+        goto restore_environment;
+    }
+    g_source_identity_calls = 0;
+    rc = gpg_manager_resolve_system_key("01234567", true, fingerprint,
+                                        sizeof(fingerprint));
+    safe_strncpy(diagnostic, get_last_error()->message, sizeof(diagnostic));
+    if (freebsd_unmount_nullfs(alias) != 0) {
+        CHECK(!"failed to unmount nested managed nullfs fixture");
+        run_set_runner(previous);
+        goto restore_environment;
+    }
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK(strstr(diagnostic, "nullfs alias of a managed GPG home") != NULL);
+
+    /* Positive control: the helper receives the pinned visible nullfs vnode,
+     * while successful resolution proves that its terminal lower directory
+     * was independently backed rather than managed. */
+    if (freebsd_mount_nullfs(external, alias) != 0) {
+        CHECK(!"failed to mount external nullfs fixture");
+        run_set_runner(previous);
+        goto restore_environment;
+    }
+    CHECK_EQ_INT(stat(alias, &g_expected_source_identity), 0);
+    g_source_identity_calls = 0;
+    g_source_identity_pinned = false;
+    rc = gpg_manager_resolve_system_key("01234567", true, fingerprint,
+                                        sizeof(fingerprint));
+    if (freebsd_unmount_nullfs(alias) != 0) {
+        CHECK(!"failed to unmount external nullfs fixture");
+        run_set_runner(previous);
+        goto restore_environment;
+    }
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(g_source_identity_calls, 1);
+    CHECK(g_source_identity_pinned);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+    run_set_runner(previous);
+
+restore_environment:
+    if (had_gnupghome) {
+        CHECK_EQ_INT(setenv("GNUPGHOME", saved_gnupghome, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GNUPGHOME"), 0);
+    }
+    free(saved_gnupghome);
+}
+#endif
+
+TEST(nested_managed_source_spellings_fail_before_helper_launch) {
+    char xdg[128], home[MAX_PATH_LEN], fallback[MAX_PATH_LEN];
+    char base[MAX_PATH_LEN], managed[MAX_PATH_LEN], nested[MAX_PATH_LEN];
+    char deep[MAX_PATH_LEN], normalized[MAX_PATH_LEN];
+    char managed_alias[MAX_PATH_LEN], direct_alias[MAX_PATH_LEN];
+    char external[MAX_PATH_LEN], external_alias[MAX_PATH_LEN];
+    char fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    const char *inherited_home = getenv("HOME");
+    const char *inherited_gnupghome = getenv("GNUPGHOME");
+    bool had_home = inherited_home != NULL;
+    bool had_gnupghome = inherited_gnupghome != NULL;
+    char *saved_home = had_home ? strdup(inherited_home) : NULL;
+    char *saved_gnupghome = had_gnupghome
+                                ? strdup(inherited_gnupghome)
+                                : NULL;
+    command_runner_fn previous;
+
+    if ((had_home && !saved_home) || (had_gnupghome && !saved_gnupghome)) {
+        free(saved_home);
+        free(saved_gnupghome);
+        CHECK(!"failed to retain source-classification environment");
+        return;
+    }
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(safe_snprintf(home, sizeof(home), "%s/home", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(fallback, sizeof(fallback), "%s/.gnupg",
+                               home), 0);
+    CHECK_EQ_INT(safe_snprintf(base, sizeof(base), "%s/gitswitch-gpg",
+                               xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(managed, sizeof(managed), "%s/account",
+                               base), 0);
+    CHECK_EQ_INT(safe_snprintf(nested, sizeof(nested), "%s/nested",
+                               managed), 0);
+    CHECK_EQ_INT(safe_snprintf(deep, sizeof(deep), "%s/deeper/leaf",
+                               nested), 0);
+    CHECK_EQ_INT(safe_snprintf(normalized, sizeof(normalized),
+                               "%s/./child/../nested", managed), 0);
+    CHECK_EQ_INT(safe_snprintf(managed_alias, sizeof(managed_alias),
+                               "%s/managed-alias", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(direct_alias, sizeof(direct_alias),
+                               "%s/canonical-alias", base), 0);
+    CHECK_EQ_INT(safe_snprintf(external, sizeof(external), "%s/external",
+                               xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(external_alias, sizeof(external_alias),
+                               "%s/external-alias", xdg), 0);
+    CHECK_EQ_INT(mkdir(home, 0700), 0);
+    CHECK_EQ_INT(mkdir(fallback, 0700), 0);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    CHECK_EQ_INT(mkdir(managed, 0700), 0);
+    CHECK_EQ_INT(mkdir(nested, 0700), 0);
+    {
+        char deeper[MAX_PATH_LEN];
+        CHECK_EQ_INT(safe_snprintf(deeper, sizeof(deeper), "%s/deeper",
+                                   nested), 0);
+        CHECK_EQ_INT(mkdir(deeper, 0700), 0);
+    }
+    CHECK_EQ_INT(mkdir(deep, 0700), 0);
+    CHECK_EQ_INT(mkdir(external, 0700), 0);
+    CHECK_EQ_INT(symlink(deep, managed_alias), 0);
+    CHECK_EQ_INT(symlink(deep, direct_alias), 0);
+    CHECK_EQ_INT(symlink(external, external_alias), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    previous = run_set_runner(source_identity_runner);
+
+    /* A symlink to a genuinely external home remains usable, and the helper
+     * receives the resolved object through its pinned cwd descriptor. */
+    CHECK_EQ_INT(stat(external, &g_expected_source_identity), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", external_alias, 1), 0);
+    g_source_identity_calls = 0;
+    g_source_identity_pinned = false;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), 0);
+    CHECK_EQ_INT(g_source_identity_calls, 1);
+    CHECK(g_source_identity_pinned);
+    CHECK_STR_EQ(fingerprint, PRIMARY_FPR);
+
+    CHECK_EQ_INT(setenv("GNUPGHOME", nested, 1), 0);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK(fingerprint[0] == '\0');
+    CHECK(strstr(get_last_error()->message,
+                 "managed GPG descendant") != NULL);
+
+    /* A direct-child spelling is normally a canonical managed entry point,
+     * but its resolved target is deeper managed state. Descendant
+     * classification must dominate instead of selecting HOME/.gnupg. */
+    CHECK_EQ_INT(setenv("GNUPGHOME", direct_alias, 1), 0);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK(fingerprint[0] == '\0');
+    CHECK(strstr(get_last_error()->message,
+                 "managed GPG descendant") != NULL);
+
+    CHECK_EQ_INT(setenv("GNUPGHOME", normalized, 1), 0);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK(fingerprint[0] == '\0');
+    CHECK(strstr(get_last_error()->message,
+                 "managed GPG descendant") != NULL);
+
+    CHECK_EQ_INT(setenv("GNUPGHOME", managed_alias, 1), 0);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK(fingerprint[0] == '\0');
+    CHECK(strstr(get_last_error()->message,
+                 "managed GPG descendant") != NULL);
+
+    /* Canonical managed GNUPGHOME still selects HOME/.gnupg, but that
+     * fallback is not allowed to resolve back into a nested managed object. */
+    CHECK_EQ_INT(rmdir(fallback), 0);
+    CHECK_EQ_INT(symlink(nested, fallback), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", managed, 1), 0);
+    g_source_identity_calls = 0;
+    CHECK_EQ_INT(gpg_manager_resolve_system_key(
+                     "01234567", true, fingerprint,
+                     sizeof(fingerprint)), -1);
+    CHECK_EQ_INT(g_source_identity_calls, 0);
+    CHECK(fingerprint[0] == '\0');
+    CHECK(strstr(get_last_error()->message,
+                 "managed GPG descendant") != NULL);
+
+    run_set_runner(previous);
+    if (had_home) {
+        CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("HOME"), 0);
+    }
+    if (had_gnupghome) {
+        CHECK_EQ_INT(setenv("GNUPGHOME", saved_gnupghome, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GNUPGHOME"), 0);
+    }
+    free(saved_home);
+    free(saved_gnupghome);
 }
 
 TEST(system_resolver_classifies_managed_aliases_before_helper_launch) {
@@ -1975,11 +2536,16 @@ TEST_MAIN_BEGIN()
 #ifdef __linux__
     RUN_TEST(bind_alias_of_managed_home_is_rejected_before_helper_launch);
 #endif
+#ifdef __FreeBSD__
+    RUN_TEST(nullfs_alias_of_managed_home_is_rejected_before_helper_launch);
+#endif
+    RUN_TEST(source_proof_rejects_managed_tree_mutation_during_helper);
     RUN_TEST(ambiguous_selector_exports_and_imports_nothing);
     RUN_TEST(unique_selector_threads_fingerprint_through_import_and_publication);
     RUN_TEST(post_import_fingerprint_mismatch_is_not_signing_readiness);
     RUN_TEST(full_v5_fingerprint_selector_survives_switch_and_git_publication);
     RUN_TEST(disabled_signing_keeps_canonical_identity_and_all_writes_are_fatal);
+    RUN_TEST(nested_managed_source_spellings_fail_before_helper_launch);
     RUN_TEST(system_resolver_classifies_managed_aliases_before_helper_launch);
     RUN_TEST(busy_runtime_never_claims_requested_account_live);
     RUN_TEST(failed_retarget_retains_dirty_state_until_controlled_retry);
