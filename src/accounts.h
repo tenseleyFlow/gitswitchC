@@ -61,6 +61,16 @@ typedef enum {
     ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED
 } accounts_switch_prepare_state_t;
 
+/* Classification supplied by the outer CLI save boundary after Git
+ * retirement has been published.  A proven pre-install failure authorizes
+ * exact Git restoration; an installed-but-uncertain result must retain the
+ * retired state and its durable activation blocker. */
+typedef enum {
+    ACCOUNTS_RETIREMENT_SAVE_DURABLE = 0,
+    ACCOUNTS_RETIREMENT_SAVE_UNCERTAIN,
+    ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED
+} accounts_retirement_save_outcome_t;
+
 /* Function prototypes */
 
 /**
@@ -164,14 +174,37 @@ int accounts_edit_commit(gitswitch_ctx_t *ctx);
 int accounts_edit_abort(gitswitch_ctx_t *ctx);
 
 /* Remove transaction. accounts_remove() confirms, tears down runtime state,
- * and removes the account from the in-memory model. CLI callers defer signal
- * cleanup and must then call commit after accounts.toml was installed, or
- * abort after a proven pre-install save failure. Commit retires only an
- * exclusively owned SSH alias; abort deliberately leaves it paired with the
- * retained durable account. Direct callers retain one-call behavior. */
+ * and removes the account from the in-memory model. CLI/outer-transaction
+ * callers defer signal cleanup and must classify persistence with
+ * accounts_remove_finalize(): DURABLE after proven directory sync, UNCERTAIN
+ * after installation without proven durability, or PREINSTALL_FAILED only
+ * when the account document was not installed. The commit/abort wrappers are
+ * retained for direct one-call compatibility. Finalization retires only an
+ * exclusively owned SSH alias after installation; a pre-install failure
+ * deliberately leaves it paired with the retained durable account. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier);
 int accounts_remove_commit(gitswitch_ctx_t *ctx);
 int accounts_remove_abort(gitswitch_ctx_t *ctx);
+int accounts_remove_finalize(
+    gitswitch_ctx_t *ctx, accounts_retirement_save_outcome_t outcome);
+
+/* Reset owns runtime teardown in main, but its Git retirement must survive
+ * until main classifies the active-state save. `target == NULL` batches all
+ * accounts into one shared-destination-aware transaction. The strict order is
+ * prepare, publish, then finalize; cancel is valid only before publication.
+ * A wrong-phase call is rejected without consuming the pending transaction or
+ * clearing its durable blocker. */
+int accounts_reset_retirement_prepare(
+    gitswitch_ctx_t *ctx, accounts_transaction_token_t token,
+    const account_t *target);
+int accounts_reset_retirement_publish(
+    gitswitch_ctx_t *ctx, accounts_transaction_token_t token,
+    size_t *cleared);
+int accounts_reset_retirement_cancel(
+    gitswitch_ctx_t *ctx, accounts_transaction_token_t token);
+int accounts_reset_retirement_finalize(
+    gitswitch_ctx_t *ctx, accounts_transaction_token_t token,
+    accounts_retirement_save_outcome_t outcome);
 
 /**
  * List all configured accounts

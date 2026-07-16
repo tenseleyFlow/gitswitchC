@@ -27,6 +27,7 @@ remove_test_hook_fn gitswitch_test_set_remove_hook(remove_test_hook_fn hook);
 int gitswitch_test_context_allocations(void);
 
 enum {
+    REMOVE_TEST_BEFORE_RUNTIME = 0,
     REMOVE_TEST_AFTER_SSH = 1,
     REMOVE_TEST_AFTER_GPG,
     REMOVE_TEST_AFTER_MODEL,
@@ -386,6 +387,15 @@ static int null_runner(const char *const argv[], const run_opts_t *opts,
 
 static void inject_repeated_signal(int stage) {
     char marker = (char)('0' + stage);
+
+    /* Git retirement preparation must use the production default runner.
+     * Only after its descriptor-pinned snapshot exists may this fixture fake
+     * the destructive SSH/GPG runtime helpers. Stage zero is deliberately
+     * omitted from the visible transaction trace. */
+    if (stage == REMOVE_TEST_BEFORE_RUNTIME) {
+        (void)run_set_runner(null_runner);
+        return;
+    }
     if (g_trace_fd >= 0) {
         ssize_t written;
         do {
@@ -397,9 +407,9 @@ static void inject_repeated_signal(int stage) {
         gitswitch_test_context_allocations() != 0) {
         _exit(122);
     }
-    /* Runtime managers use the deterministic fake. Durable Git retirement
-     * starts after the GPG checkpoint and must use the descriptor-pinned real
-     * runner so this sealed credential fixture exercises actual file state. */
+    /* Runtime managers use the deterministic fake. After their final
+     * checkpoint, restore the default runner for Git publication and every
+     * subsequent cleanup path. */
     if (stage == REMOVE_TEST_AFTER_GPG) {
         (void)run_set_runner(NULL);
     }
@@ -466,7 +476,6 @@ static int run_remove_child(const remove_fixture_t *fixture, int stage,
         (void)setenv("HOME", fixture->home, 1);
         (void)setenv("XDG_RUNTIME_DIR", fixture->runtime, 1);
         (void)setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1);
-        (void)run_set_runner(null_runner);
         if (g_inject_config_fault) {
             (void)config_set_io_fault_fn(fail_config_at_selected_boundary);
         }

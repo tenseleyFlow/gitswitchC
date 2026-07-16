@@ -1188,7 +1188,7 @@ TEST(read_only_commands_never_repair_or_replace_wrong_mode_manager_lock) {
     }
 }
 
-TEST(save_failures_never_print_final_mutation_success) {
+TEST(mutation_failures_never_print_final_mutation_success) {
     static const char *const publish_old[] = {
         "gitswitch", "--global", "--yes", "switch", "old", NULL
     };
@@ -1210,6 +1210,13 @@ TEST(save_failures_never_print_final_mutation_success) {
         "Account removed successfully",
         "Reset all gitswitch SSH/GPG state",
     };
+    const char *failure_context[] = {
+        "Failed to save configuration changes",
+        "Failed to save configuration changes",
+        "Failed to remove account: Cannot acquire the retirement lifecycle lock",
+        "reset failed; account and active-state metadata were preserved for retry: "
+            "Cannot acquire the retirement lifecycle lock",
+    };
 
     if (getuid() == 0) {
         TS_SKIP("unprivileged",
@@ -1228,10 +1235,11 @@ TEST(save_failures_never_print_final_mutation_success) {
         CHECK_EQ_INT(write_account_config(home, false, config_dir,
                                           sizeof(config_dir)), 0);
 
-        /* Remove/reset must reach the deliberately denied outer config save,
-         * not fail earlier at M17's exact-retirement admission check.  Seed
-         * their authority through the real switch/publication path while the
-         * fixture is still writable. */
+        /* Remove/reset install their retirement guard before any runtime
+         * cleanup or config mutation. The deliberately unwritable directory
+         * therefore exercises that fail-closed admission boundary rather than
+         * the later save reached by add/edit. Seed publication authority while
+         * the fixture is writable so ownership admission is not the failure. */
         if (i >= 2U) {
             rc = run_cli(home, runtime, publish_old,
                          output_path, sizeof(output_path));
@@ -1261,8 +1269,13 @@ TEST(save_failures_never_print_final_mutation_success) {
             fprintf(stderr, "  save-failure case '%s' returned %d:\n%s\n",
                     cases[i].label, rc, output);
         }
+        if (strstr(output, failure_context[i]) == NULL) {
+            fprintf(stderr,
+                    "  save-failure case '%s' omitted expected context '%s':\n%s\n",
+                    cases[i].label, failure_context[i], output);
+        }
         CHECK(rc > 0 && rc < 126);
-        CHECK(strstr(output, "Failed to save configuration changes") != NULL);
+        CHECK(strstr(output, failure_context[i]) != NULL);
         CHECK(strstr(output, banner[i]) == NULL);
 
         CHECK_EQ_INT(chmod(config_dir, 0700), 0);
@@ -1522,7 +1535,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(dry_run_does_not_repair_existing_config_directory_permissions);
     RUN_TEST(read_only_commands_never_create_or_repair_runtime_manager_lock);
     RUN_TEST(read_only_commands_never_repair_or_replace_wrong_mode_manager_lock);
-    RUN_TEST(save_failures_never_print_final_mutation_success);
+    RUN_TEST(mutation_failures_never_print_final_mutation_success);
     RUN_TEST(switch_save_failure_restores_git_config_active_and_exact_hint);
     RUN_TEST(valid_legacy_switch_migrates_before_publication);
     RUN_TEST(production_ignores_inherited_test_fault_environment);

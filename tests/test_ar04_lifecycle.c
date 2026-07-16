@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -32,6 +33,8 @@ static char g_self[PATH_MAX];
     "1111111111111111111111111111111111111111111111111111111111111111"
 #define LIFE_OTHER_INCARNATION \
     "2222222222222222222222222222222222222222222222222222222222222222"
+
+int gitswitch_cli_main(int argc, char **argv);
 
 static int install_live_current_socket(const char *runtime,
                                        const char *account_name);
@@ -669,6 +672,84 @@ static int run_remove(const char *home, const char *runtime,
     return run_shell(cmd);
 }
 
+static size_t life_config_faults_remaining;
+
+static bool life_config_fault_once(config_io_boundary_t boundary) {
+    if (boundary != CONFIG_IO_STATE_BEFORE_RENAME ||
+        life_config_faults_remaining == 0U) {
+        return false;
+    }
+    life_config_faults_remaining--;
+    return true;
+}
+
+/* Drive the real CLI entry in an isolated child so the lifecycle suite can
+ * inject one precise PREINSTALL state-save failure. The callback is exhausted
+ * before rollback reconciliation writes the refreshed publication generation,
+ * proving the blocker is cleared only after that second write succeeds. */
+static int run_remove_with_one_shot_save_fault(
+    const char *home, const char *runtime, const char *shim_dir,
+    const char *account, const char *output) {
+    char trusted_path[2U * PATH_MAX];
+    char gnupg_home[PATH_MAX];
+    char git_config[PATH_MAX];
+    pid_t child;
+    int status = 0;
+
+    if (!home || !runtime || !shim_dir || !account || !output ||
+        safe_snprintf(trusted_path, sizeof(trusted_path),
+                      "%s:/usr/local/bin:/usr/bin:/bin", shim_dir) != 0 ||
+        safe_snprintf(gnupg_home, sizeof(gnupg_home),
+                      "%s/.gnupg", home) != 0 ||
+        safe_snprintf(git_config, sizeof(git_config),
+                      "%s/.gitconfig", home) != 0) {
+        return -1;
+    }
+    (void)fflush(NULL);
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char assume_yes[] = "-y";
+        char remove[] = "remove";
+        char *argv[] = {
+            program, no_color, assume_yes, remove, (char *)account, NULL
+        };
+        int output_fd = open(output,
+                             O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                             0600);
+        int rc;
+
+        if (output_fd < 0 || dup2(output_fd, STDOUT_FILENO) < 0 ||
+            dup2(output_fd, STDERR_FILENO) < 0 ||
+            setenv("HOME", home, 1) != 0 ||
+            setenv("GNUPGHOME", gnupg_home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", git_config, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("PATH", trusted_path, 1) != 0 ||
+            unsetenv("GIT_CONFIG_COUNT") != 0) {
+            if (output_fd >= 0) (void)close(output_fd);
+            _exit(120);
+        }
+        if (output_fd > STDERR_FILENO) (void)close(output_fd);
+        life_config_faults_remaining = 1U;
+        (void)config_set_io_fault_fn(life_config_fault_once);
+        optind = 1;
+        rc = gitswitch_cli_main(5, argv);
+        (void)fflush(NULL);
+        _exit(rc);
+    }
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (!WIFEXITED(status)) {
+        return WIFSIGNALED(status) ? -(1000 + WTERMSIG(status)) : -1;
+    }
+    return WEXITSTATUS(status);
+}
+
 static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
     char home[256], runtime[256], shims[512], path[1024], target[1024];
     char output[1024], contents[8192], cmd[PATH_MAX + 4096], pid_text[64];
@@ -768,19 +849,13 @@ TEST(remove_reaps_real_agent_before_deleting_account) {
 }
 
 TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
-    char home[256], runtime[256], shims[512], config_dir[1024];
+    char home[256], runtime[256], shims[512];
     char path[1024], target[1024], output[1024], cmd[8192], contents[8192];
     char key_path[1024], config_body[4096], current_path[1024];
     char socket_path[1024], pid_path[1024], link_target[1024];
     struct stat st;
     ssize_t link_len;
     pid_t retry_pid = -1;
-    FILE *lock_file;
-
-    if (getuid() == 0) {
-        TS_SKIP("unprivileged",
-                "save permission denial requires an unprivileged uid");
-    }
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
@@ -818,17 +893,13 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     snprintf(path, sizeof(path), "%s/gitswitch-gpg/current", runtime);
     CHECK_EQ_INT(symlink(target, path), 0);
 
-    snprintf(config_dir, sizeof(config_dir), "%s/.config/gitswitch", home);
-    CHECK_EQ_INT(life_join_path(path, sizeof(path), config_dir,
-                                "/.config.lock"), 0);
-    lock_file = fopen(path, "w");
-    CHECK(lock_file != NULL);
-    if (lock_file) fclose(lock_file);
-    CHECK_EQ_INT(chmod(path, 0600), 0);
-    CHECK_EQ_INT(chmod(config_dir, 0500), 0);
-
+    /* M18 publishes its durable blocker before runtime teardown, so inject a
+     * one-shot state-save fault only after the runtime and Git retirement
+     * phases. The rollback refresh gets a clean second write and must clear
+     * the blocker while retaining the durable account retry handle. */
     snprintf(output, sizeof(output), "%s/remove-save-failure.out", runtime);
-    CHECK(run_remove(home, runtime, shims, "work", output) != 0);
+    CHECK(run_remove_with_one_shot_save_fault(
+              home, runtime, shims, "work", output) != 0);
     slurp(output, contents, sizeof(contents));
     CHECK(strstr(contents, "Failed to save configuration changes") != NULL);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg/work", runtime);
@@ -841,7 +912,6 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     /* Reload by switching again after the persistence fault is removed. This
      * proves the retained account is not merely listable: its SSH runtime can
      * be recreated cleanly after the earlier teardown. */
-    CHECK_EQ_INT(chmod(config_dir, 0700), 0);
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
              "GIT_CONFIG_GLOBAL='%s/.gitconfig' GIT_CONFIG_NOSYSTEM=1 "
@@ -906,6 +976,8 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "none", "work", NULL), 0);
     snprintf(target, sizeof(target), "%s/foreign-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(target), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
@@ -937,6 +1009,8 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "none", "work", NULL), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
     snprintf(target, sizeof(target), "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
@@ -1091,8 +1165,8 @@ TEST(remove_without_publication_provenance_retains_account_for_retry) {
     CHECK(strstr(contents, "name = \"work\"") != NULL);
     CHECK(strstr(contents, "active_account = \"work\"") != NULL);
     slurp(output, contents, sizeof(contents));
-    CHECK(strstr(contents, "durable Git retirement failed") != NULL);
-    CHECK(strstr(contents, "account metadata was retained for retry") != NULL);
+    CHECK(strstr(contents, "Failed to remove account") != NULL);
+    CHECK(strstr(contents, "No canonical publication provenance exists") != NULL);
     CHECK(strstr(contents, "removed successfully") == NULL);
 
     remove_tree(home);

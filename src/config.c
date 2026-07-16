@@ -71,6 +71,66 @@ resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
 #define RESUME_HINT_TEST_CHECKPOINT(stage) ((void)(stage))
 #endif
 
+#ifdef GITSWITCH_TESTING
+typedef enum {
+    RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE = 0,
+    RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_CLEAR_BEFORE_FILE_SYNC,
+    RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
+    RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+} retirement_guard_clear_test_stage_t;
+typedef int (*retirement_guard_clear_test_hook_fn)(
+    retirement_guard_clear_test_stage_t stage, int directory_fd,
+    const char *marker_name);
+retirement_guard_clear_test_hook_fn
+gitswitch_test_set_retirement_guard_clear_hook(
+    retirement_guard_clear_test_hook_fn hook);
+static retirement_guard_clear_test_hook_fn
+    g_retirement_guard_clear_test_hook;
+
+retirement_guard_clear_test_hook_fn
+gitswitch_test_set_retirement_guard_clear_hook(
+    retirement_guard_clear_test_hook_fn hook) {
+    retirement_guard_clear_test_hook_fn previous =
+        g_retirement_guard_clear_test_hook;
+    g_retirement_guard_clear_test_hook = hook;
+    return previous;
+}
+
+static int config_retirement_guard_clear_test_checkpoint(
+    retirement_guard_clear_test_stage_t stage, int directory_fd,
+    const char *marker_name) {
+    if (!g_retirement_guard_clear_test_hook) return 0;
+    if (g_retirement_guard_clear_test_hook(
+            stage, directory_fd, marker_name) == 0) {
+        return 0;
+    }
+    if (errno == 0) errno = EIO;
+    return -1;
+}
+
+#define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
+    config_retirement_guard_clear_test_checkpoint((stage), (fd), (name))
+#else
+enum {
+    RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE = 0,
+    RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_CLEAR_BEFORE_FILE_SYNC,
+    RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
+    RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+};
+#define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
+    ((void)(stage), (void)(fd), (void)(name), 0)
+#endif
+
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
 "# gitswitch-c Configuration File\n"
@@ -159,13 +219,22 @@ typedef enum {
     CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE
 } config_source_generation_requirement_t;
 
+typedef struct {
+    const config_retirement_owner_t *owners;
+    size_t owner_count;
+    const config_retirement_destination_t *destinations;
+    size_t destination_count;
+} config_retirement_refresh_request_t;
+
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed,
                                      config_source_generation_requirement_t
                                          generation_requirement,
                                      config_resume_hint_snapshot_t *rollback_snapshot,
-                                     const publication_record_t *publication);
+                                     const publication_record_t *publication,
+                                     const config_retirement_refresh_request_t
+                                         *retirement_refresh);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
 static void config_unlink_created_temp(const char *path,
@@ -1901,6 +1970,1454 @@ static int config_directory_for_path(const char *config_path, char *dir,
     return 0;
 }
 
+#define CONFIG_RETIREMENT_GUARD_NAME ".retirement-incomplete"
+#define CONFIG_RETIREMENT_COMPLETE_NAME ".retirement-complete"
+#define CONFIG_RETIREMENT_STAGE_NAME ".retirement-transition"
+#define CONFIG_RETIREMENT_LOCK_NAME ".retirement.lock"
+#define CONFIG_RETIREMENT_GUARD_HEADER \
+    "gitswitch-retirement-incomplete-v1"
+#define CONFIG_RETIREMENT_GUARD_MAX_BYTES 8192U
+
+typedef struct {
+    config_retirement_kind_t kind;
+    config_retirement_owner_t owners[MAX_ACCOUNTS];
+    size_t owner_count;
+    char token[ACCOUNT_INCARNATION_LEN];
+} config_retirement_guard_model_t;
+
+struct config_retirement_guard {
+    int directory_fd;
+    int lock_fd;
+    char directory[MAX_PATH_LEN];
+    struct stat directory_identity;
+    struct stat marker_identity;
+    unsigned char *marker_data;
+    size_t marker_length;
+    char token[ACCOUNT_INCARNATION_LEN];
+    bool created;
+};
+
+/* The application is single-threaded and owns at most one outer retirement
+ * transaction. The filesystem lock serializes independent processes; this
+ * process-local owner closes its intentionally re-entrant lock helper's
+ * second-handle loophole and also rejects a fork child that inherited an
+ * unfinished parent transaction. */
+static pid_t g_retirement_guard_owner_pid;
+
+static const char *config_retirement_kind_name(
+    config_retirement_kind_t kind) {
+    switch (kind) {
+        case CONFIG_RETIREMENT_REMOVE:
+            return "remove";
+        case CONFIG_RETIREMENT_RESET:
+            return "reset";
+        default:
+            return NULL;
+    }
+}
+
+static int config_retirement_owner_compare(const void *left,
+                                           const void *right) {
+    const config_retirement_owner_t *a = left;
+    const config_retirement_owner_t *b = right;
+
+    if (a->account_id < b->account_id) return -1;
+    if (a->account_id > b->account_id) return 1;
+    return strcmp(a->account_incarnation, b->account_incarnation);
+}
+
+static int config_retirement_canonicalize_owners(
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_owner_t canonical[MAX_ACCOUNTS]) {
+    if (!owners || owner_count == 0U || owner_count > MAX_ACCOUNTS ||
+        !canonical) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "A retirement guard requires one bounded owner set");
+        return -1;
+    }
+    for (size_t i = 0; i < owner_count; i++) {
+        if (!config_account_id_is_valid(owners[i].account_id) ||
+            !account_incarnation_is_valid(
+                owners[i].account_incarnation)) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "Retirement guard owner %zu is not an exact account incarnation",
+                      i);
+            return -1;
+        }
+        canonical[i] = owners[i];
+    }
+    qsort(canonical, owner_count, sizeof(canonical[0]),
+          config_retirement_owner_compare);
+    for (size_t i = 1; i < owner_count; i++) {
+        if (config_retirement_owner_compare(&canonical[i - 1],
+                                            &canonical[i]) == 0) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "Retirement guard owner set contains a duplicate");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static bool config_retirement_next_line(const unsigned char **cursor,
+                                        const unsigned char *end,
+                                        const unsigned char **line,
+                                        size_t *line_length) {
+    const unsigned char *newline;
+
+    if (!cursor || !*cursor || !end || !line || !line_length ||
+        *cursor >= end) {
+        return false;
+    }
+    newline = memchr(*cursor, '\n', (size_t)(end - *cursor));
+    if (!newline) return false;
+    *line = *cursor;
+    *line_length = (size_t)(newline - *cursor);
+    *cursor = newline + 1;
+    return true;
+}
+
+static bool config_retirement_line_equals(const unsigned char *line,
+                                          size_t line_length,
+                                          const char *expected) {
+    size_t expected_length = strlen(expected);
+    return line_length == expected_length &&
+           memcmp(line, expected, expected_length) == 0;
+}
+
+static bool config_retirement_parse_uint(const unsigned char *value,
+                                         size_t length,
+                                         uint32_t *parsed) {
+    uint32_t result = 0;
+
+    if (!value || length == 0U || !parsed ||
+        (length > 1U && value[0] == (unsigned char)'0')) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        uint32_t digit;
+        if (value[i] < (unsigned char)'0' ||
+            value[i] > (unsigned char)'9') {
+            return false;
+        }
+        digit = (uint32_t)(value[i] - (unsigned char)'0');
+        if (result > (UINT32_MAX - digit) / 10U) return false;
+        result = result * 10U + digit;
+    }
+    if (!config_account_id_is_valid(result)) return false;
+    *parsed = result;
+    return true;
+}
+
+static bool config_retirement_parse_count(const unsigned char *value,
+                                          size_t length,
+                                          size_t *parsed) {
+    size_t result = 0;
+
+    if (!value || length == 0U || !parsed ||
+        (length > 1U && value[0] == (unsigned char)'0')) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        size_t digit;
+        if (value[i] < (unsigned char)'0' ||
+            value[i] > (unsigned char)'9') {
+            return false;
+        }
+        digit = (size_t)(value[i] - (unsigned char)'0');
+        if (result > (SIZE_MAX - digit) / 10U) return false;
+        result = result * 10U + digit;
+    }
+    if (result == 0U || result > MAX_ACCOUNTS) return false;
+    *parsed = result;
+    return true;
+}
+
+static int config_retirement_guard_parse(
+    const unsigned char *data, size_t length,
+    config_retirement_guard_model_t *model) {
+    static const char token_prefix[] = "token=";
+    static const char operation_prefix[] = "operation=";
+    static const char owners_prefix[] = "owners=";
+    static const char owner_prefix[] = "owner=";
+    const unsigned char *cursor = data;
+    const unsigned char *end;
+    const unsigned char *line;
+    size_t line_length;
+
+    if (!data || length == 0U ||
+        length > CONFIG_RETIREMENT_GUARD_MAX_BYTES || !model) {
+        goto malformed;
+    }
+    memset(model, 0, sizeof(*model));
+    end = data + length;
+
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        !config_retirement_line_equals(
+            line, line_length, CONFIG_RETIREMENT_GUARD_HEADER)) {
+        goto malformed;
+    }
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        line_length != sizeof(token_prefix) - 1U +
+                           ACCOUNT_INCARNATION_HEX_LEN ||
+        memcmp(line, token_prefix, sizeof(token_prefix) - 1U) != 0) {
+        goto malformed;
+    }
+    memcpy(model->token, line + sizeof(token_prefix) - 1U,
+           ACCOUNT_INCARNATION_HEX_LEN);
+    model->token[ACCOUNT_INCARNATION_HEX_LEN] = '\0';
+    if (!account_incarnation_is_valid(model->token)) goto malformed;
+
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        line_length <= sizeof(operation_prefix) - 1U ||
+        memcmp(line, operation_prefix,
+               sizeof(operation_prefix) - 1U) != 0) {
+        goto malformed;
+    }
+    line += sizeof(operation_prefix) - 1U;
+    line_length -= sizeof(operation_prefix) - 1U;
+    if (config_retirement_line_equals(line, line_length, "remove")) {
+        model->kind = CONFIG_RETIREMENT_REMOVE;
+    } else if (config_retirement_line_equals(line, line_length, "reset")) {
+        model->kind = CONFIG_RETIREMENT_RESET;
+    } else {
+        goto malformed;
+    }
+
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        line_length <= sizeof(owners_prefix) - 1U ||
+        memcmp(line, owners_prefix, sizeof(owners_prefix) - 1U) != 0 ||
+        !config_retirement_parse_count(
+            line + sizeof(owners_prefix) - 1U,
+            line_length - (sizeof(owners_prefix) - 1U),
+            &model->owner_count)) {
+        goto malformed;
+    }
+
+    for (size_t i = 0; i < model->owner_count; i++) {
+        const unsigned char *colon;
+        size_t id_length;
+        const unsigned char *incarnation;
+
+        if (!config_retirement_next_line(&cursor, end, &line,
+                                         &line_length) ||
+            line_length <= sizeof(owner_prefix) - 1U ||
+            memcmp(line, owner_prefix, sizeof(owner_prefix) - 1U) != 0) {
+            goto malformed;
+        }
+        line += sizeof(owner_prefix) - 1U;
+        line_length -= sizeof(owner_prefix) - 1U;
+        colon = memchr(line, ':', line_length);
+        if (!colon) goto malformed;
+        id_length = (size_t)(colon - line);
+        incarnation = colon + 1;
+        if (!config_retirement_parse_uint(
+                line, id_length, &model->owners[i].account_id) ||
+            (size_t)((line + line_length) - incarnation) !=
+                ACCOUNT_INCARNATION_HEX_LEN) {
+            goto malformed;
+        }
+        memcpy(model->owners[i].account_incarnation, incarnation,
+               ACCOUNT_INCARNATION_HEX_LEN);
+        model->owners[i]
+            .account_incarnation[ACCOUNT_INCARNATION_HEX_LEN] = '\0';
+        if (!account_incarnation_is_valid(
+                model->owners[i].account_incarnation) ||
+            (i > 0U &&
+             config_retirement_owner_compare(&model->owners[i - 1],
+                                             &model->owners[i]) >= 0)) {
+            goto malformed;
+        }
+    }
+    if (cursor != end) goto malformed;
+    return 0;
+
+malformed:
+    if (model) secure_zero_memory(model, sizeof(*model));
+    errno = EINVAL;
+    set_error(ERR_CONFIG_INVALID,
+              "Retirement-incomplete marker is malformed");
+    return -1;
+}
+
+static int config_retirement_guard_serialize(
+    config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const char token[ACCOUNT_INCARNATION_LEN],
+    unsigned char **serialized, size_t *serialized_length) {
+    unsigned char *data;
+    size_t used = 0;
+    const char *kind_name = config_retirement_kind_name(kind);
+    int written;
+
+    if (!kind_name || !owners || owner_count == 0U ||
+        owner_count > MAX_ACCOUNTS ||
+        !account_incarnation_is_valid(token) || !serialized ||
+        !serialized_length) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard serialization arguments");
+        return -1;
+    }
+    *serialized = NULL;
+    *serialized_length = 0;
+    data = malloc(CONFIG_RETIREMENT_GUARD_MAX_BYTES);
+    if (!data) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate retirement guard marker");
+        return -1;
+    }
+#define CONFIG_RETIREMENT_ACCEPT_WRITE()                                   \
+    do {                                                                   \
+        if (written < 0 ||                                                 \
+            (size_t)written >=                                             \
+                CONFIG_RETIREMENT_GUARD_MAX_BYTES - used) {                \
+            secure_zero_memory(data, CONFIG_RETIREMENT_GUARD_MAX_BYTES);   \
+            free(data);                                                    \
+            errno = EOVERFLOW;                                             \
+            set_error(ERR_CONFIG_INVALID,                                  \
+                      "Retirement guard marker exceeds its byte limit");  \
+            return -1;                                                     \
+        }                                                                  \
+        used += (size_t)written;                                           \
+    } while (0)
+
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "%s\n", CONFIG_RETIREMENT_GUARD_HEADER);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "token=%s\n", token);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "operation=%s\n", kind_name);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "owners=%zu\n", owner_count);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    for (size_t i = 0; i < owner_count; i++) {
+        written = snprintf((char *)data + used,
+                           CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                           "owner=%u:%s\n",
+                           (unsigned int)owners[i].account_id,
+                           owners[i].account_incarnation);
+        CONFIG_RETIREMENT_ACCEPT_WRITE();
+    }
+#undef CONFIG_RETIREMENT_ACCEPT_WRITE
+    *serialized = data;
+    *serialized_length = used;
+    return 0;
+}
+
+/* Open only an already-existing private config directory. Probe uses the
+ * `allow_absent` result to report a cleanly absent marker without creating or
+ * repairing any namespace object. */
+static int config_retirement_open_directory(
+    const char *config_path, bool allow_absent, char directory[MAX_PATH_LEN],
+    struct stat *directory_identity, int *directory_fd) {
+    struct stat opened;
+    int fd;
+
+    if (!config_path || !directory || !directory_identity || !directory_fd) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard directory arguments");
+        return -1;
+    }
+    *directory_fd = -1;
+    if (config_directory_for_path(config_path, directory, MAX_PATH_LEN) != 0) {
+        return -1;
+    }
+    errno = 0;
+    if (lstat(directory, directory_identity) != 0) {
+        if (allow_absent && errno == ENOENT) return 1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect retirement guard directory: %s",
+                         directory);
+        return -1;
+    }
+    if (!config_metadata_dir_is_safe(directory_identity)) {
+        errno = EACCES;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Retirement guard directory is not private and self-owned: %s",
+                  directory);
+        return -1;
+    }
+    fd = open(directory,
+              O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_dir_is_safe(&opened) ||
+        !config_metadata_same_file(directory_identity, &opened) ||
+        !config_named_directory_matches(directory, directory_identity)) {
+        int saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot pin retirement guard directory: %s",
+                         directory);
+        return -1;
+    }
+    *directory_fd = fd;
+    return 0;
+}
+
+static int config_retirement_guard_read_named_at(
+    int directory_fd, const char *name, bool *absent, unsigned char **data,
+    size_t *length, struct stat *identity,
+    config_retirement_guard_model_t *model) {
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    unsigned char *buffer = NULL;
+    unsigned char extra;
+    ssize_t extra_count;
+    int fd = -1;
+    int failure_errno = EIO;
+
+    if (directory_fd < 0 || !name || name[0] == '\0' || !absent || !data ||
+        !length || !identity || !model) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard read arguments");
+        return -1;
+    }
+    *absent = false;
+    *data = NULL;
+    *length = 0;
+    memset(identity, 0, sizeof(*identity));
+    memset(model, 0, sizeof(*model));
+
+    errno = 0;
+    if (fstatat(directory_fd, name, &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *absent = true;
+            return 0;
+        }
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_before, true) ||
+        named_before.st_size <= 0 ||
+        (uintmax_t)named_before.st_size >
+            CONFIG_RETIREMENT_GUARD_MAX_BYTES) {
+        failure_errno = EACCES;
+        goto read_fail;
+    }
+    fd = openat(directory_fd, name,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(&named_before, &opened) ||
+        opened.st_size <= 0 ||
+        (uintmax_t)opened.st_size > CONFIG_RETIREMENT_GUARD_MAX_BYTES) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    *length = (size_t)opened.st_size;
+    buffer = malloc(*length);
+    if (!buffer) {
+        failure_errno = ENOMEM;
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate retirement guard read buffer");
+        goto read_fail_preserve_error;
+    }
+    if (!config_pread_full(fd, buffer, *length, 0)) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    do {
+        errno = 0;
+        extra_count = pread(fd, &extra, 1, (off_t)*length);
+    } while (extra_count < 0 && errno == EINTR);
+    if (extra_count != 0 || fstat(fd, &descriptor_after) != 0 ||
+        fstatat(directory_fd, name, &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, true) ||
+        !config_metadata_file_is_safe(&named_after, true) ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
+        !config_metadata_snapshot_same(&opened, &named_after)) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    if (config_retirement_guard_parse(buffer, *length, model) != 0) {
+        failure_errno = errno ? errno : EINVAL;
+        goto read_fail_preserve_error;
+    }
+
+    close(fd);
+    *identity = named_after;
+    *data = buffer;
+    return 0;
+
+read_fail:
+    errno = failure_errno;
+    set_system_error(ERR_FILE_IO,
+                     "Cannot read a stable private retirement-incomplete marker");
+read_fail_preserve_error:
+    if (fd >= 0) close(fd);
+    if (buffer) {
+        secure_zero_memory(buffer, *length);
+        free(buffer);
+    }
+    *data = NULL;
+    *length = 0;
+    secure_zero_memory(model, sizeof(*model));
+    errno = failure_errno;
+    return -1;
+}
+
+/* Earlier M18 builds could retain random clear witnesses. They are never
+ * silently reclaimed: any such residue remains a fail-closed compatibility
+ * blocker until an operator inspects it. New transitions use one fixed stage
+ * name and therefore cannot grow this namespace. */
+static int config_retirement_guard_legacy_residue_present_at(
+    int directory_fd, bool *present) {
+    static const char prefix[] = CONFIG_RETIREMENT_GUARD_NAME ".clear.";
+    DIR *stream;
+    struct dirent *entry;
+    int scan_fd;
+    int scan_errno;
+    int close_result;
+
+    if (directory_fd < 0 || !present) {
+        errno = EINVAL;
+        return -1;
+    }
+    *present = true;
+    scan_fd = openat(directory_fd, ".",
+                     O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (scan_fd < 0) return -1;
+    stream = fdopendir(scan_fd);
+    if (!stream) {
+        int saved_errno = errno ? errno : EIO;
+        close(scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    *present = false;
+    errno = 0;
+    while ((entry = readdir(stream)) != NULL) {
+        if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1U) == 0 &&
+            entry->d_name[sizeof(prefix) - 1U] != '\0') {
+            *present = true;
+            break;
+        }
+    }
+    scan_errno = errno;
+    close_result = closedir(stream);
+    if (scan_errno != 0 || close_result != 0) {
+        errno = scan_errno != 0 ? scan_errno : (errno ? errno : EIO);
+        *present = true;
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    bool marker_absent;
+    bool completion_absent;
+    bool stage_present;
+    unsigned char *marker_data;
+    size_t marker_length;
+    struct stat marker_identity;
+    config_retirement_guard_model_t marker_model;
+    unsigned char *completion_data;
+    size_t completion_length;
+    struct stat completion_identity;
+    config_retirement_guard_model_t completion_model;
+} config_retirement_guard_pair_t;
+
+static void config_retirement_guard_pair_clear(
+    config_retirement_guard_pair_t *pair) {
+    if (!pair) return;
+    if (pair->marker_data) {
+        secure_zero_memory(pair->marker_data, pair->marker_length);
+        free(pair->marker_data);
+    }
+    if (pair->completion_data) {
+        secure_zero_memory(pair->completion_data,
+                           pair->completion_length);
+        free(pair->completion_data);
+    }
+    secure_zero_memory(pair, sizeof(*pair));
+}
+
+static int config_retirement_guard_stage_state_at(
+    int directory_fd, bool *present, struct stat *identity) {
+    struct stat named;
+
+    if (directory_fd < 0 || !present) {
+        errno = EINVAL;
+        return -1;
+    }
+    *present = true;
+    if (identity) memset(identity, 0, sizeof(*identity));
+    errno = 0;
+    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *present = false;
+            return 0;
+        }
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&named, true) ||
+        named.st_size < 0 ||
+        (uintmax_t)named.st_size > CONFIG_RETIREMENT_GUARD_MAX_BYTES) {
+        errno = EACCES;
+        return -1;
+    }
+    if (identity) *identity = named;
+    return 0;
+}
+
+static int config_retirement_guard_name_stable_at(
+    int directory_fd, const char *name, bool absent,
+    const struct stat *expected) {
+    struct stat named;
+
+    errno = 0;
+    if (fstatat(directory_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (absent && errno == ENOENT) return 0;
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    if (absent || !expected ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_snapshot_same(expected, &named)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+/* Read C and S as one generation. Each individual reader pins and re-proves
+ * its descriptor; the final name reproof closes the mixed-generation window
+ * across the two reads. A transition stage is part of the snapshot and always
+ * blocks probe, even if C/S otherwise form an exact completed pair. */
+static int config_retirement_guard_pair_read_at(
+    int directory_fd, config_retirement_guard_pair_t *pair) {
+    struct stat stage_before;
+    struct stat stage_after;
+    bool stage_after_present = false;
+
+    if (directory_fd < 0 || !pair) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(pair, 0, sizeof(*pair));
+    if (config_retirement_guard_stage_state_at(
+            directory_fd, &pair->stage_present, &stage_before) != 0 ||
+        config_retirement_guard_read_named_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            &pair->marker_absent, &pair->marker_data,
+            &pair->marker_length, &pair->marker_identity,
+            &pair->marker_model) != 0) {
+        goto pair_fail;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
+        config_retirement_guard_read_named_at(
+            directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            &pair->completion_absent, &pair->completion_data,
+            &pair->completion_length, &pair->completion_identity,
+            &pair->completion_model) != 0 ||
+        config_retirement_guard_name_stable_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            pair->marker_absent, &pair->marker_identity) != 0 ||
+        config_retirement_guard_name_stable_at(
+            directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            pair->completion_absent, &pair->completion_identity) != 0 ||
+        config_retirement_guard_stage_state_at(
+            directory_fd, &stage_after_present, &stage_after) != 0) {
+        goto pair_fail;
+    }
+    if (pair->stage_present != stage_after_present ||
+        (pair->stage_present &&
+         !config_metadata_snapshot_same(&stage_before, &stage_after))) {
+        errno = ESTALE;
+        goto pair_fail;
+    }
+    return 0;
+
+pair_fail:
+    config_retirement_guard_pair_clear(pair);
+    return -1;
+}
+
+static bool config_retirement_guard_pair_exact(
+    const config_retirement_guard_pair_t *pair) {
+    return pair && !pair->marker_absent && !pair->completion_absent &&
+           !pair->stage_present &&
+           pair->marker_length == pair->completion_length &&
+           memcmp(pair->marker_data, pair->completion_data,
+                  pair->marker_length) == 0;
+}
+
+static bool config_retirement_owner_sets_equal(
+    const config_retirement_guard_model_t *model,
+    config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count) {
+    if (!model || model->kind != kind ||
+        model->owner_count != owner_count) {
+        return false;
+    }
+    for (size_t i = 0; i < owner_count; i++) {
+        if (model->owners[i].account_id != owners[i].account_id ||
+            strcmp(model->owners[i].account_incarnation,
+                   owners[i].account_incarnation) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int config_retirement_guard_stage_remove_at(int directory_fd) {
+    struct stat before;
+    struct stat opened;
+    struct stat named;
+    bool present = false;
+    int fd = -1;
+    int saved_errno;
+
+    if (config_retirement_guard_stage_state_at(
+            directory_fd, &present, &before) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect retirement transition stage");
+        return -1;
+    }
+    if (!present) return 0;
+    fd = openat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(&before, &opened) ||
+        fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_snapshot_same(&opened, &named)) {
+        saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement transition stage changed during recovery");
+        return -1;
+    }
+    if (unlinkat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, 0) != 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot remove retained retirement transition stage");
+        return -1;
+    }
+    if (close(fd) != 0 || fsync(directory_fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot durably remove retirement transition stage");
+        return -1;
+    }
+    return 0;
+}
+
+static int config_retirement_guard_stage_write_at(
+    int directory_fd, const unsigned char *data, size_t length,
+    bool clear_transition, struct stat *stage_identity) {
+    struct stat opened;
+    struct stat named;
+    size_t total = 0U;
+    int fd = -1;
+    int saved_errno;
+
+    if (directory_fd < 0 || !data || length == 0U ||
+        length > CONFIG_RETIREMENT_GUARD_MAX_BYTES || !stage_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (clear_transition &&
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE,
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Retirement completion failed before stage creation");
+        return -1;
+    }
+    fd = openat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                PERM_USER_RW);
+    if (fd < 0 || fchmod(fd, PERM_USER_RW) != 0 ||
+        fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true)) {
+        saved_errno = errno ? errno : EIO;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot create private retirement transition stage");
+        return -1;
+    }
+    while (total < length) {
+        ssize_t count = write(fd, data + total, length - total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            saved_errno = errno ? errno : EIO;
+            close(fd);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot write retirement transition stage");
+            return -1;
+        }
+    }
+    if (clear_transition &&
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME) != 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement completion failed after stage write");
+        return -1;
+    }
+    if (clear_transition &&
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_FILE_SYNC,
+            fd, CONFIG_RETIREMENT_STAGE_NAME) != 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement completion stage sync was interrupted");
+        return -1;
+    }
+    if (fsync(fd) != 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true) ||
+        opened.st_size < 0 || (uintmax_t)opened.st_size != length) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot sync retirement transition stage");
+        return -1;
+    }
+    if (close(fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close retirement transition stage");
+        return -1;
+    }
+    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_snapshot_same(&opened, &named)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement transition stage changed before publication");
+        return -1;
+    }
+    *stage_identity = named;
+    return 0;
+}
+
+static int config_retirement_guard_stage_publish_at(
+    int directory_fd, const char *destination,
+    const struct stat *stage_identity, struct stat *published_identity) {
+    struct stat named;
+
+    if (directory_fd < 0 || !destination || !stage_identity ||
+        !published_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (renameat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                 directory_fd, destination) != 0 ||
+        fstatat(directory_fd, destination, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_same_file(stage_identity, &named)) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    *published_identity = named;
+    return 0;
+}
+
+static void config_retirement_guard_free(
+    config_retirement_guard_t *guard) {
+    if (!guard) return;
+    if (g_retirement_guard_owner_pid == getpid()) {
+        g_retirement_guard_owner_pid = 0;
+    }
+    if (guard->lock_fd >= 0) unlock_private_file(guard->lock_fd);
+    if (guard->directory_fd >= 0) close(guard->directory_fd);
+    if (guard->marker_data) {
+        secure_zero_memory(guard->marker_data, guard->marker_length);
+        free(guard->marker_data);
+    }
+    secure_zero_memory(guard, sizeof(*guard));
+    free(guard);
+}
+
+static int config_retirement_guard_make_handle(
+    int directory_fd, int lock_fd, const char *directory,
+    const struct stat *directory_identity, const struct stat *marker_identity,
+    unsigned char *marker_data, size_t marker_length,
+    const char token[ACCOUNT_INCARNATION_LEN], bool created,
+    config_retirement_guard_t **out) {
+    config_retirement_guard_t *guard = calloc(1, sizeof(*guard));
+
+    if (!guard) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate retirement guard handle");
+        return -1;
+    }
+    guard->directory_fd = directory_fd;
+    guard->lock_fd = lock_fd;
+    guard->directory_identity = *directory_identity;
+    guard->marker_identity = *marker_identity;
+    guard->marker_data = marker_data;
+    guard->marker_length = marker_length;
+    memcpy(guard->token, token, sizeof(guard->token));
+    guard->created = created;
+    if (safe_strncpy(guard->directory, directory,
+                     sizeof(guard->directory)) != 0) {
+        /* Ownership of fd/data transfers only after the handle is complete. */
+        guard->directory_fd = -1;
+        guard->lock_fd = -1;
+        guard->marker_data = NULL;
+        free(guard);
+        return -1;
+    }
+    g_retirement_guard_owner_pid = getpid();
+    *out = guard;
+    return 0;
+}
+
+int config_retirement_guard_install_or_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard) {
+    static const char hexadecimal[] = "0123456789ABCDEF";
+    config_retirement_owner_t canonical[MAX_ACCOUNTS];
+    config_retirement_guard_pair_t pair;
+    config_retirement_guard_pair_t revalidated_pair;
+    char directory[MAX_PATH_LEN];
+    char token[ACCOUNT_INCARNATION_LEN];
+    struct stat directory_identity;
+    struct stat published_identity;
+    struct stat stage_identity;
+    unsigned char *marker_data = NULL;
+    size_t marker_length = 0U;
+    int directory_fd = -1;
+    int lock_fd = -1;
+    int result = -1;
+    int saved_errno = EIO;
+    bool legacy_residue = false;
+
+    if (!guard || *guard || !config_path ||
+        !config_retirement_kind_name(kind)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard installation arguments");
+        return -1;
+    }
+    if (g_retirement_guard_owner_pid != 0) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "This process already owns a retirement lifecycle transaction");
+        return -1;
+    }
+    memset(canonical, 0, sizeof(canonical));
+    memset(&pair, 0, sizeof(pair));
+    memset(&revalidated_pair, 0, sizeof(revalidated_pair));
+    memset(token, 0, sizeof(token));
+    if (config_retirement_canonicalize_owners(
+            owners, owner_count, canonical) != 0) {
+        goto install_done;
+    }
+    result = config_retirement_open_directory(
+        config_path, false, directory, &directory_identity, &directory_fd);
+    if (result != 0) goto install_done;
+    /* From here onward only the two handle-publication paths may report
+     * success. Keep every validation, lock, sync, and reproof failure at -1
+     * instead of leaking the directory-open success code with a NULL handle. */
+    result = -1;
+
+    lock_fd = try_lock_private_file_at(
+        directory_fd, CONFIG_RETIREMENT_LOCK_NAME);
+    if (lock_fd < 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot acquire the retirement lifecycle lock");
+        goto install_done;
+    }
+    if (config_retirement_guard_legacy_residue_present_at(
+            directory_fd, &legacy_residue) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot inspect legacy retirement guard residue");
+        goto install_done;
+    }
+    if (legacy_residue) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "A retained retirement guard clear witness blocks configuration mutation");
+        goto install_done;
+    }
+    if (config_retirement_guard_stage_remove_at(directory_fd) != 0 ||
+        config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+
+    if (!pair.marker_absent &&
+        !config_retirement_guard_pair_exact(&pair)) {
+        if (!config_retirement_owner_sets_equal(
+                &pair.marker_model, kind, canonical, owner_count)) {
+            errno = EBUSY;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "A different retirement-incomplete operation already blocks configuration mutation");
+            goto install_done;
+        }
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+                directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
+            fsync(directory_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot prove the retained retirement guard generation durable");
+            goto install_done;
+        }
+        if (config_retirement_guard_pair_read_at(
+                directory_fd, &revalidated_pair) != 0 ||
+            revalidated_pair.marker_absent ||
+            revalidated_pair.stage_present ||
+            config_retirement_guard_pair_exact(&revalidated_pair) ||
+            !config_metadata_snapshot_same(
+                &pair.marker_identity,
+                &revalidated_pair.marker_identity) ||
+            pair.marker_length != revalidated_pair.marker_length ||
+            memcmp(pair.marker_data, revalidated_pair.marker_data,
+                   pair.marker_length) != 0 ||
+            strcmp(pair.marker_model.token,
+                   revalidated_pair.marker_model.token) != 0 ||
+            !config_retirement_owner_sets_equal(
+                &revalidated_pair.marker_model, kind,
+                canonical, owner_count) ||
+            !config_named_directory_matches(
+                directory, &directory_identity)) {
+            errno = errno ? errno : ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Retained retirement guard changed during durability proof");
+            goto install_done;
+        }
+        memcpy(token, revalidated_pair.marker_model.token, sizeof(token));
+        if (config_retirement_guard_make_handle(
+                directory_fd, lock_fd, directory, &directory_identity,
+                &revalidated_pair.marker_identity,
+                revalidated_pair.marker_data,
+                revalidated_pair.marker_length,
+                token, false, guard) != 0) {
+            goto install_done;
+        }
+        revalidated_pair.marker_data = NULL;
+        revalidated_pair.marker_length = 0U;
+        directory_fd = -1;
+        lock_fd = -1;
+        result = 0;
+        goto install_done;
+    }
+    if (pair.marker_absent && !pair.completion_absent) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "A lone retirement completion certificate blocks configuration mutation");
+        goto install_done;
+    }
+
+    for (unsigned int attempt = 0U; attempt < 16U; attempt++) {
+        if (generate_random_string(
+                token, sizeof(token), hexadecimal) != 0 ||
+            !account_incarnation_is_valid(token) ||
+            config_retirement_guard_serialize(
+                kind, canonical, owner_count, token, &marker_data,
+                &marker_length) != 0) {
+            goto install_done;
+        }
+        if (pair.completion_absent ||
+            marker_length != pair.completion_length ||
+            memcmp(marker_data, pair.completion_data,
+                   marker_length) != 0) {
+            break;
+        }
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+        marker_data = NULL;
+        marker_length = 0U;
+        secure_zero_memory(token, sizeof(token));
+    }
+    if (!marker_data) {
+        errno = EEXIST;
+        set_error(
+            ERR_FILE_IO,
+            "Cannot generate a fresh retirement guard generation");
+        goto install_done;
+    }
+    if (config_retirement_guard_stage_write_at(
+            directory_fd, marker_data, marker_length, false,
+            &stage_identity) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+    if (config_retirement_guard_stage_publish_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            &stage_identity, &published_identity) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot publish the fresh retirement guard generation");
+        goto install_done;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
+        fsync(directory_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot durably publish the fresh retirement guard generation");
+        goto install_done;
+    }
+    if (config_reprove_published_file_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            &published_identity, marker_data, marker_length,
+            &published_identity) != 0) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Fresh retirement guard changed during commit");
+        goto install_done;
+    }
+
+    config_retirement_guard_pair_clear(&pair);
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        pair.marker_absent || pair.stage_present ||
+        !config_metadata_same_file(
+            &published_identity, &pair.marker_identity) ||
+        pair.marker_length != marker_length ||
+        memcmp(pair.marker_data, marker_data, marker_length) != 0 ||
+        config_retirement_guard_pair_exact(&pair) ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Fresh retirement guard is not a stable blocking generation");
+        goto install_done;
+    }
+    if (config_retirement_guard_make_handle(
+            directory_fd, lock_fd, directory, &directory_identity,
+            &pair.marker_identity, marker_data, marker_length,
+            token, true, guard) != 0) {
+        goto install_done;
+    }
+    marker_data = NULL;
+    marker_length = 0U;
+    directory_fd = -1;
+    lock_fd = -1;
+    result = 0;
+
+install_done:
+    if (result != 0) saved_errno = errno ? errno : EIO;
+    if (lock_fd >= 0) unlock_private_file(lock_fd);
+    if (directory_fd >= 0) close(directory_fd);
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&revalidated_pair);
+    if (marker_data) {
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+    }
+    secure_zero_memory(canonical, sizeof(canonical));
+    secure_zero_memory(token, sizeof(token));
+    if (result != 0) errno = saved_errno;
+    return result;
+}
+int config_retirement_guard_probe(
+    const char *config_path, bool *blocked) {
+    config_retirement_guard_pair_t pair;
+    char directory[MAX_PATH_LEN];
+    struct stat directory_identity;
+    int directory_fd = -1;
+    int result;
+    bool legacy_residue = false;
+
+    if (!config_path || !blocked) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard probe arguments");
+        return -1;
+    }
+    *blocked = true;
+    memset(&pair, 0, sizeof(pair));
+    result = config_retirement_open_directory(
+        config_path, true, directory, &directory_identity, &directory_fd);
+    if (result == 1) {
+        *blocked = false;
+        return 0;
+    }
+    if (result != 0) return -1;
+
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        config_retirement_guard_legacy_residue_present_at(
+            directory_fd, &legacy_residue) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        result = -1;
+        goto probe_done;
+    }
+    if (!pair.stage_present && !legacy_residue &&
+        ((pair.marker_absent && pair.completion_absent) ||
+         config_retirement_guard_pair_exact(&pair))) {
+        *blocked = false;
+    }
+    result = 0;
+
+probe_done:
+    config_retirement_guard_pair_clear(&pair);
+    close(directory_fd);
+    return result;
+}
+bool config_retirement_guard_was_created(
+    const config_retirement_guard_t *guard) {
+    return guard && guard->created;
+}
+
+/* Bind completion to the exact canonical blocker generation held by this
+ * handle.  Both inode identity and complete serialized bytes must still match;
+ * a replaced, rewritten, or mixed-generation marker cannot be certified. */
+static bool config_retirement_guard_pair_matches_handle(
+    const config_retirement_guard_t *guard,
+    const config_retirement_guard_pair_t *pair) {
+    return guard && pair && !pair->marker_absent &&
+           config_metadata_same_file(
+               &guard->marker_identity, &pair->marker_identity) &&
+           guard->marker_length == pair->marker_length &&
+           memcmp(guard->marker_data, pair->marker_data,
+                  guard->marker_length) == 0 &&
+           strcmp(guard->token, pair->marker_model.token) == 0;
+}
+
+int config_retirement_guard_clear(
+    config_retirement_guard_t **guard_ptr) {
+    config_retirement_guard_t *guard;
+    config_retirement_guard_pair_t pair;
+    struct stat published_identity;
+    struct stat stage_identity;
+    error_context_t primary_error;
+    int primary_errno = 0;
+    bool have_primary = false;
+    bool publication_attempted = false;
+
+    if (!guard_ptr || !*guard_ptr) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard clear handle");
+        return -1;
+    }
+    guard = *guard_ptr;
+    memset(&pair, 0, sizeof(pair));
+    memset(&primary_error, 0, sizeof(primary_error));
+
+    if (!config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement guard directory changed before completion");
+        goto clear_fail;
+    }
+
+    if (config_retirement_guard_stage_remove_at(
+            guard->directory_fd) != 0) {
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) != 0 ||
+        !config_retirement_guard_pair_matches_handle(
+            guard, &pair) ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        if (get_last_error()->message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Retirement guard generation changed before completion");
+        }
+        goto clear_fail;
+    }
+    if (config_retirement_guard_pair_exact(&pair)) {
+        goto clear_success;
+    }
+    config_retirement_guard_pair_clear(&pair);
+
+    if (config_retirement_guard_stage_write_at(
+            guard->directory_fd, guard->marker_data,
+            guard->marker_length, true, &stage_identity) != 0) {
+        goto clear_fail;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion failed before certificate publication");
+        goto clear_fail;
+    }
+
+    publication_attempted = true;
+    if (config_retirement_guard_stage_publish_at(
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            &stage_identity, &published_identity) != 0) {
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        if (primary_error.message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot publish retirement completion certificate");
+            primary_error = *get_last_error();
+        }
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion acknowledgement failed after publication");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion directory sync was interrupted");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (fsync(guard->directory_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot sync retirement completion certificate");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion directory sync acknowledgement was lost");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+    }
+
+classify_commit:
+    config_retirement_guard_pair_clear(&pair);
+    if (config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) == 0 &&
+        config_retirement_guard_pair_matches_handle(
+            guard, &pair) &&
+        config_retirement_guard_pair_exact(&pair) &&
+        config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        if (have_primary || publication_attempted) {
+            if (have_primary) {
+                log_warning(
+                    "Retirement completion is exact despite a lost filesystem acknowledgement: %s",
+                    primary_error.message[0]
+                        ? primary_error.message
+                        : "unknown completion acknowledgement");
+            }
+        }
+        goto clear_success;
+    }
+    if (have_primary) {
+        g_last_error = primary_error;
+        errno = primary_errno;
+    } else {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion certificate is not an exact stable pair");
+    }
+    goto clear_fail;
+
+clear_success:
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_free(guard);
+    *guard_ptr = NULL;
+    clear_error();
+    errno = 0;
+    return 0;
+
+clear_fail:
+    config_retirement_guard_pair_clear(&pair);
+    return -1;
+}
+
+void config_retirement_guard_abandon(
+    config_retirement_guard_t **guard) {
+    if (!guard || !*guard) return;
+    /* clear() never removes or renames the canonical blocker. A failed
+     * transition may retain the one fixed stage, which probe also classifies
+     * as blocked; releasing the lifecycle lock cannot reopen mutation. */
+    config_retirement_guard_free(*guard);
+    *guard = NULL;
+}
 static int config_write_lock_directory(const char *dir) {
     char lockpath[MAX_PATH_LEN];
     struct stat dir_identity;
@@ -2601,6 +4118,110 @@ int config_resume_hint_snapshot_restore(
     return result;
 }
 
+static bool config_retirement_refresh_owns_record(
+    const config_retirement_refresh_request_t *request,
+    const publication_record_t *record) {
+    for (size_t i = 0; i < request->owner_count; i++) {
+        if (request->owners[i].account_id == record->account_id &&
+            strcmp(request->owners[i].account_incarnation,
+                   record->account_incarnation) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A reverse retirement publish can restore the exact prior Git bytes through
+ * a newly materialized inode generation. Refresh only that generation field;
+ * the owner/destination witnesses and every unrelated record remain intact.
+ * Inputs are treated as an exact set so a truncated caller result cannot make
+ * a partially refreshed ledger look complete. */
+static int config_apply_retirement_publication_refresh(
+    publication_ledger_t *publications,
+    const config_retirement_refresh_request_t *request) {
+    bool destination_used[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    size_t matching_records = 0;
+
+    if (!publications || !request || !request->owners ||
+        request->owner_count == 0U ||
+        request->owner_count > MAX_ACCOUNTS || !request->destinations ||
+        request->destination_count == 0U ||
+        request->destination_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement publication refresh set");
+        return -1;
+    }
+    for (size_t i = 0; i < request->destination_count; i++) {
+        size_t path_length = strnlen(request->destinations[i].config_path,
+                                    MAX_PATH_LEN);
+        if (path_length == 0U || path_length >= MAX_PATH_LEN) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "Retirement publication destination %zu has an invalid config path",
+                      i);
+            return -1;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(request->destinations[i].config_path,
+                       request->destinations[j].config_path) == 0) {
+                errno = EINVAL;
+                set_error(ERR_INVALID_ARGS,
+                          "Retirement publication refresh contains duplicate config path %s",
+                          request->destinations[i].config_path);
+                return -1;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < publications->count; i++) {
+        publication_record_t *record = &publications->records[i];
+        size_t destination_index = request->destination_count;
+
+        if (record->state != PUBLICATION_STATE_PUBLISHED ||
+            !config_retirement_refresh_owns_record(request, record)) {
+            continue;
+        }
+        for (size_t j = 0; j < request->destination_count; j++) {
+            if (strcmp(record->config_path,
+                       request->destinations[j].config_path) == 0) {
+                destination_index = j;
+                break;
+            }
+        }
+        if (destination_index == request->destination_count) {
+            errno = ESTALE;
+            set_error(ERR_CONFIG_INVALID,
+                      "Retirement publication refresh is missing Git config destination %s",
+                      record->config_path);
+            return -1;
+        }
+        record->post_config =
+            request->destinations[destination_index].post_config;
+        if (publication_record_validate(record) != 0) {
+            return -1;
+        }
+        destination_used[destination_index] = true;
+        matching_records++;
+    }
+    if (matching_records == 0U) {
+        errno = ESTALE;
+        set_error(ERR_CONFIG_INVALID,
+                  "Retirement publication refresh found no matching PUBLISHED owner records");
+        return -1;
+    }
+    for (size_t i = 0; i < request->destination_count; i++) {
+        if (!destination_used[i]) {
+            errno = ESTALE;
+            set_error(ERR_CONFIG_INVALID,
+                      "Retirement publication refresh destination is not owned by the requested records: %s",
+                      request->destinations[i].config_path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* Atomically replace the consolidated active-state artifact. Its first line
  * keeps the exact legacy runtime-needs contract consumed by generated shell
  * code; its second line records either active=<name> or the versioned inactive
@@ -2611,7 +4232,9 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      config_source_generation_requirement_t
                                          generation_requirement,
                                      config_resume_hint_snapshot_t *rollback_snapshot,
-                                     const publication_record_t *publication) {
+                                     const publication_record_t *publication,
+                                     const config_retirement_refresh_request_t
+                                         *retirement_refresh) {
     config_active_state_t existing_state;
     config_active_state_generation_t state_before = {0};
     publication_ledger_t publications;
@@ -2731,7 +4354,42 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             }
         }
     }
-    if (ctx->config.active_account[0] == '\0') {
+    if (retirement_refresh &&
+        config_apply_retirement_publication_refresh(
+            &publications, retirement_refresh) != 0) {
+        goto state_cleanup;
+    }
+    if (retirement_refresh) {
+        /* Git rollback reconciliation runs after the caller has already
+         * mutated its in-memory remove/reset model.  Rebuilding this header
+         * from `ctx` would therefore publish that uncommitted model even
+         * though the outer save failed before installation.  Preserve the
+         * stable on-disk header semantically and change only the matching
+         * publication generations below. */
+        if (!existing_state.exists || existing_state.legacy_needs_only) {
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Retirement publication refresh requires a versioned active-state header");
+            goto state_cleanup;
+        }
+        if (existing_state.inactive_tombstone) {
+            if (safe_strncpy(header, "none\ninactive=v1\n",
+                             sizeof(header)) != 0) {
+                goto state_cleanup;
+            }
+        } else if (existing_state.active_account[0] == '\0' ||
+                   (size_t)snprintf(header, sizeof(header),
+                                    "%s\nactive=%s\n",
+                                    existing_state.needs,
+                                    existing_state.active_account) >=
+                       sizeof(header)) {
+            errno = ESTALE;
+            set_error(ERR_CONFIG_INVALID,
+                      "Retirement publication refresh found an invalid active-state header");
+            goto state_cleanup;
+        }
+    } else if (ctx->config.active_account[0] == '\0') {
         if (safe_strncpy(header, "none\ninactive=v1\n",
                          sizeof(header)) != 0) {
             goto state_cleanup;
@@ -3360,7 +5018,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     if (update_hint &&
         config_update_resume_hint(ctx, config_path, NULL,
                                   CONFIG_SOURCE_GENERATION_UNBOUND,
-                                  NULL, NULL) != 0) {
+                                  NULL, NULL, NULL) != 0) {
         goto document_fail;
     }
     if (committed_generation) {
@@ -3613,7 +5271,7 @@ static int config_save_mode(gitswitch_ctx_t *ctx,
         if (config_update_resume_hint(ctx, config_path,
                                       &state_installed,
                                       CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE,
-                                      state_before, publication) != 0) {
+                                      state_before, publication, NULL) != 0) {
             if (state_installed) {
                 error_context_t state_error = *get_last_error();
                 if (config_resume_hint_snapshot_restore_at(config_path,
@@ -3760,7 +5418,8 @@ static int config_save_active_account_mode(gitswitch_ctx_t *ctx,
     } else {
         result = config_update_resume_hint(ctx, config_path, config_installed,
                                            CONFIG_SOURCE_GENERATION_REQUIRE_LOADED,
-                                           rollback_snapshot, publication);
+                                           rollback_snapshot, publication,
+                                           NULL);
     }
     config_write_unlock(write_lock_fd);
     return result;
@@ -3783,6 +5442,52 @@ int config_save_active_account_transactional(gitswitch_ctx_t *ctx,
     *config_installed = false;
     return config_save_active_account_mode(ctx, config_path,
                                            config_installed, NULL, NULL);
+}
+
+int config_refresh_retirement_publications_transactional(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_destination_t *destinations,
+    size_t destination_count, bool *state_installed) {
+    config_retirement_owner_t canonical[MAX_ACCOUNTS];
+    config_retirement_refresh_request_t request;
+    int write_lock_fd;
+    int result;
+    int saved_errno;
+
+    if (state_installed) *state_installed = false;
+    if (!ctx || !config_path || !state_installed || !destinations ||
+        destination_count == 0U ||
+        destination_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid transactional retirement publication refresh");
+        return -1;
+    }
+    memset(canonical, 0, sizeof(canonical));
+    if (config_retirement_canonicalize_owners(
+            owners, owner_count, canonical) != 0) {
+        secure_zero_memory(canonical, sizeof(canonical));
+        return -1;
+    }
+    request.owners = canonical;
+    request.owner_count = owner_count;
+    request.destinations = destinations;
+    request.destination_count = destination_count;
+
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
+        secure_zero_memory(canonical, sizeof(canonical));
+        return -1;
+    }
+    result = config_update_resume_hint(
+        ctx, config_path, state_installed,
+        CONFIG_SOURCE_GENERATION_REQUIRE_LOADED, NULL, NULL, &request);
+    saved_errno = result == 0 ? 0 : (errno ? errno : EIO);
+    config_write_unlock(write_lock_fd);
+    secure_zero_memory(canonical, sizeof(canonical));
+    if (result != 0) errno = saved_errno;
+    return result;
 }
 
 int config_save_active_account_transactional_guarded(

@@ -156,6 +156,7 @@ typedef struct {
     bool edit_prepared;
     bool remove_prepared;
     bool reset_guarded;
+    bool reset_retirement_prepared;
     accounts_transaction_token_t reset_token;
     command_failure_kind_t failure_kind;
     error_accumulator_t failure_errors;
@@ -700,6 +701,13 @@ static int handle_config_command(gitswitch_ctx_t *ctx);
 static int handle_init_command(const char *shell);
 static int handle_resume_command(gitswitch_ctx_t *ctx);
 static int handle_resume_check_command(gitswitch_ctx_t *ctx);
+static bool command_activates_account(const char *command,
+                                      bool resume_check);
+static bool command_mutates_unrelated_retirement_state(const char *command);
+static bool retirement_guard_blocks_activation(const gitswitch_ctx_t *ctx);
+static bool retirement_guard_rejects_command(
+    const gitswitch_ctx_t *ctx, const char *command, bool resume_check,
+    bool activation_command, bool unrelated_mutation, int *exit_code);
 static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                                              const char *account);
 static const char *detect_shell_from_env(void);
@@ -872,6 +880,8 @@ int main(int argc, char *argv[]) {
     bool retained_account_context = false;
     bool reset_rollback_pending = false;
     bool read_only_command = false;
+    bool activation_command = false;
+    bool unrelated_retirement_mutation = false;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
     int opt;
@@ -1110,6 +1120,27 @@ int main(int argc, char *argv[]) {
     g_context_allocation_total++;
 #endif
 
+    activation_command = command_activates_account(command, resume_check);
+    unrelated_retirement_mutation =
+        command_mutates_unrelated_retirement_state(command);
+
+    /* Inspect before acquiring a lock or loading configuration so an existing
+     * durable retirement marker blocks unrelated work without first creating,
+     * repairing, or probing runtime state. A missing/unsafe configuration path
+     * also fails closed for these commands. Recovery remove/reset commands and
+     * genuinely read-only commands deliberately do not pass through this gate. */
+    if (activation_command || unrelated_retirement_mutation) {
+        if (config_get_path(ctx->config.config_path,
+                            sizeof(ctx->config.config_path)) != 0) {
+            ctx->config.config_path[0] = '\0';
+        }
+        if (retirement_guard_rejects_command(
+                ctx, command, resume_check, activation_command,
+                unrelated_retirement_mutation, &exit_code)) {
+            goto cleanup;
+        }
+    }
+
     /* For commands that mutate shared state, hold an exclusive cross-process
      * lock across the WHOLE load->mutate->save cycle. That is not just the
      * config read-modify-writers (add/edit/remove, a bare-account switch that
@@ -1166,6 +1197,18 @@ int main(int argc, char *argv[]) {
                 goto cleanup;
             }
         }
+    }
+
+    /* Close the probe-to-lock race for real mutations. A remove/reset that
+     * installs a marker after the first observation must release this same
+     * lock before we can acquire it, so this locked recheck is authoritative
+     * for the following load->mutate->save cycle. */
+    if (config_lock_fd >= 0 &&
+        (activation_command || unrelated_retirement_mutation) &&
+        retirement_guard_rejects_command(
+            ctx, command, resume_check, activation_command,
+            unrelated_retirement_mutation, &exit_code)) {
+        goto cleanup;
     }
 
     /* Completion invokes `list --names` on every TAB. Give exactly that
@@ -1420,25 +1463,59 @@ int main(int argc, char *argv[]) {
         bool remove_finalize_complete = true;
         char remove_finalize_detail[sizeof(g_last_error.message)] = "";
         if (mutation.remove_prepared) {
+            accounts_retirement_save_outcome_t remove_outcome;
+
             /* The account document is the removal's publication authority.
              * Rename success (even with later durability uncertainty) commits
-             * exclusive-alias cleanup. A proven pre-install failure aborts
-             * that cleanup and leaves the durable account/alias pair intact. */
-            if (save_rc == 0 || config_installed) {
-                if (accounts_remove_commit(ctx) != 0) {
-                    remove_finalize_complete = false;
-                    safe_strncpy(remove_finalize_detail,
-                                 get_last_error()->message,
-                                 sizeof(remove_finalize_detail));
-                    save_rc = -1;
-                    config_installed = true;
-                }
-            } else if (accounts_remove_abort(ctx) != 0) {
+             * exclusive-alias cleanup and accepts Git retirement. A proven
+             * pre-install failure restores Git, refreshes the exact ledger
+             * generation, and leaves the durable account/alias pair intact. */
+            if (save_rc == 0) {
+                remove_outcome = ACCOUNTS_RETIREMENT_SAVE_DURABLE;
+            } else if (config_installed) {
+                remove_outcome = ACCOUNTS_RETIREMENT_SAVE_UNCERTAIN;
+            } else {
+                remove_outcome =
+                    ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED;
+            }
+            if (accounts_remove_finalize(ctx, remove_outcome) != 0) {
                 remove_finalize_complete = false;
                 safe_strncpy(remove_finalize_detail,
                              get_last_error()->message,
                              sizeof(remove_finalize_detail));
+                if (save_rc == 0) {
+                    save_rc = -1;
+                    /* The account document was durable even though exact
+                     * retirement/guard cleanup was not. */
+                    config_installed = true;
+                }
             }
+        }
+
+        bool reset_finalize_complete = true;
+        bool reset_retirement_finalized = false;
+        accounts_retirement_save_outcome_t reset_outcome =
+            ACCOUNTS_RETIREMENT_SAVE_DURABLE;
+        char reset_finalize_detail[sizeof(g_last_error.message)] = "";
+        if (mutation.reset_retirement_prepared) {
+            reset_retirement_finalized = true;
+            if (save_rc == 0) {
+                reset_outcome = ACCOUNTS_RETIREMENT_SAVE_DURABLE;
+            } else if (config_installed) {
+                reset_outcome = ACCOUNTS_RETIREMENT_SAVE_UNCERTAIN;
+            } else {
+                reset_outcome =
+                    ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED;
+            }
+            if (accounts_reset_retirement_finalize(
+                    ctx, mutation.reset_token, reset_outcome) != 0) {
+                reset_finalize_complete = false;
+                safe_strncpy(reset_finalize_detail,
+                             get_last_error()->message,
+                             sizeof(reset_finalize_detail));
+                if (save_rc == 0) save_rc = -1;
+            }
+            mutation.reset_retirement_prepared = false;
         }
 
         if (mutation.switch_prepare_state ==
@@ -1559,13 +1636,13 @@ int main(int argc, char *argv[]) {
                 display_error(
                     "Configuration installed but removal durability is uncertain",
                     "%s; the account deletion was installed and its exclusive "
-                    "SSH alias removal was committed. Verify filesystem "
-                    "durability before retrying",
+                    "SSH alias removal was committed. A durable retirement "
+                    "marker blocks activation until the outcome is recovered",
                     save_error[0] ? save_error :
                                     "unknown persistence error");
             } else if (config_installed) {
                 display_error(
-                    "Account deletion installed, but SSH alias cleanup failed",
+                    "Account deletion installed, but retirement cleanup is incomplete",
                     "%s%s%s",
                     save_error[0] ? save_error :
                                     "configuration save completed",
@@ -1575,11 +1652,41 @@ int main(int argc, char *argv[]) {
                 display_error(
                     "Failed to save configuration changes",
                     "%s; the durable account remains installed and its SSH "
-                    "alias was retained%s%s",
+                    "alias was retained%s%s%s",
                     save_error[0] ? save_error :
                                     "unknown persistence error",
                     remove_finalize_detail[0] ? "; abort error: " : "",
-                    remove_finalize_detail[0] ? remove_finalize_detail : "");
+                    remove_finalize_detail[0] ? remove_finalize_detail : "",
+                    remove_finalize_complete
+                        ? "; exact Git identity and publication provenance were restored"
+                        : "; activation remains blocked by the retirement marker");
+            }
+            exit_code = EXIT_FAILURE;
+        } else if (reset_retirement_finalized && save_rc != 0) {
+            if (reset_outcome ==
+                    ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED &&
+                reset_finalize_complete) {
+                display_error(
+                    "Failed to save reset state; prior Git identity was restored",
+                    "%s; active-state publication provenance was reconciled "
+                    "before the retirement marker was cleared",
+                    save_error[0] ? save_error :
+                                    "unknown persistence error");
+            } else if (reset_outcome ==
+                       ACCOUNTS_RETIREMENT_SAVE_DURABLE) {
+                display_error(
+                    "Reset state was saved, but retirement cleanup is incomplete",
+                    "the active-state save completed durably%s%s",
+                    reset_finalize_detail[0] ? "; finalization error: " : "",
+                    reset_finalize_detail[0] ? reset_finalize_detail : "");
+            } else {
+                display_error(
+                    "Reset retirement is incomplete; account activation is blocked",
+                    "%s%s%s",
+                    save_error[0] ? save_error :
+                                    "the reset state could not be proven durable",
+                    reset_finalize_detail[0] ? "; finalization error: " : "",
+                    reset_finalize_detail[0] ? reset_finalize_detail : "");
             }
             exit_code = EXIT_FAILURE;
         } else if (save_rc != 0) {
@@ -1942,6 +2049,17 @@ static command_result_t handle_switch_command(gitswitch_ctx_t *ctx,
         }
         display_success("DRY RUN complete - no changes were made");
         result.status = EXIT_SUCCESS;
+        return result;
+    }
+
+    if (retirement_guard_blocks_activation(ctx)) {
+        display_error(
+            "Cannot switch accounts while Git retirement is incomplete",
+            "%s; inspect and reconcile the exact retirement marker before "
+            "publishing another identity",
+            get_last_error()->message[0] != '\0'
+                ? get_last_error()->message
+                : "durable account and Git identity state may disagree");
         return result;
     }
 
@@ -2618,6 +2736,129 @@ static bool resume_already_applied(const account_t *acct) {
     return true;
 }
 
+static bool command_activates_account(const char *command,
+                                      bool resume_check) {
+    if (resume_check) return true;
+    if (!command) return false;
+    if (strcmp(command, "resume") == 0 ||
+        strcmp(command, "switch") == 0) {
+        return true;
+    }
+
+    /* Every unrecognized positional is the established implicit-switch form.
+     * Keep the complete non-activation command set explicit so a new command
+     * defaults to the safer activation gate until it is classified. */
+    return strcmp(command, "add") != 0 &&
+           strcmp(command, "edit") != 0 &&
+           strcmp(command, "list") != 0 &&
+           strcmp(command, "ls") != 0 &&
+           strcmp(command, "remove") != 0 &&
+           strcmp(command, "rm") != 0 &&
+           strcmp(command, "delete") != 0 &&
+           strcmp(command, "status") != 0 &&
+           strcmp(command, "doctor") != 0 &&
+           strcmp(command, "health") != 0 &&
+           strcmp(command, "config") != 0 &&
+           strcmp(command, "reset") != 0 &&
+           strcmp(command, "init") != 0;
+}
+
+static bool command_mutates_unrelated_retirement_state(const char *command) {
+    return command &&
+           (strcmp(command, "add") == 0 ||
+            strcmp(command, "edit") == 0 ||
+            strcmp(command, "config") == 0);
+}
+
+/* A retirement guard means durable Git credential state may no longer agree
+ * with the account/active-state document.  Activation is the one operation
+ * that could silently turn that split state back into live runtime identity,
+ * so both a valid marker and an unreadable/unsafe marker fail closed.  The
+ * shell readiness probe treats the block as "no automatic work required";
+ * an explicit resume renders the diagnostic below. */
+static bool retirement_guard_blocks_activation(const gitswitch_ctx_t *ctx) {
+    bool blocked = true;
+    int probe_errno;
+
+    if (!ctx) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Cannot inspect .retirement-incomplete without an application context");
+        return true;
+    }
+    if (ctx->config.config_path[0] == '\0' ||
+        strnlen(ctx->config.config_path,
+                sizeof(ctx->config.config_path)) >=
+            sizeof(ctx->config.config_path)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_PATH,
+                  "Cannot inspect .retirement-incomplete without a valid configuration path");
+        return true;
+    }
+
+    clear_error();
+    errno = 0;
+    if (config_retirement_guard_probe(ctx->config.config_path, &blocked) != 0) {
+        probe_errno = errno ? errno : EIO;
+        if (get_last_error()->message[0] == '\0') {
+            errno = probe_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot validate .retirement-incomplete; account activation remains blocked");
+        }
+        errno = probe_errno;
+        return true;
+    }
+    if (blocked) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "A durable .retirement-incomplete marker records unresolved account and Git state");
+        return true;
+    }
+
+    clear_error();
+    errno = 0;
+    return false;
+}
+
+static bool retirement_guard_rejects_command(
+    const gitswitch_ctx_t *ctx, const char *command, bool resume_check,
+    bool activation_command, bool unrelated_mutation, int *exit_code) {
+    const char *detail;
+
+    if ((!activation_command && !unrelated_mutation) ||
+        !retirement_guard_blocks_activation(ctx)) {
+        return false;
+    }
+    if (exit_code) *exit_code = resume_check ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (resume_check) return true;
+
+    detail = get_last_error()->message[0] != '\0'
+        ? get_last_error()->message
+        : "durable account and Git identity state may disagree";
+    if (unrelated_mutation) {
+        display_error(
+            "Cannot modify account state while Git retirement is incomplete",
+            "%s; inspect and reconcile the exact retirement marker before "
+            "changing unrelated account configuration",
+            detail);
+    } else if (command && strcmp(command, "resume") == 0) {
+        display_error(
+            "Cannot resume while Git retirement is incomplete",
+            "%s; inspect and reconcile the exact retirement marker before "
+            "activating an account",
+            detail);
+    } else {
+        display_error(
+            "Cannot switch accounts while Git retirement is incomplete",
+            "%s; inspect and reconcile the exact retirement marker before "
+            "publishing another identity",
+            detail);
+    }
+    return true;
+}
+
 /* Non-switching readiness predicate consumed by generated shell integration.
  * Manager inspection may acquire internal runtime locks, but this path never
  * changes config, identity, or agent/key routing. A successful result means
@@ -2628,6 +2869,11 @@ static int handle_resume_check_command(gitswitch_ctx_t *ctx) {
     account_t *acct;
 
     if (!ctx) return EXIT_FAILURE;
+    /* Success suppresses the login-shell fallback to explicit `resume`.  The
+     * guard is not a claim that runtime state is live; it is a durable command
+     * to leave that identity inactive until the exact retirement record is
+     * reconciled. */
+    if (retirement_guard_blocks_activation(ctx)) return EXIT_SUCCESS;
     if (ctx->config.active_account[0] == '\0') return EXIT_SUCCESS;
 
     acct = config_find_account_exact(ctx, ctx->config.active_account);
@@ -2656,6 +2902,17 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
      * connection test — this runs from the login shell and must not stall the
      * prompt on a network round trip. */
     ctx->config.resuming = true;
+
+    if (retirement_guard_blocks_activation(ctx)) {
+        display_error(
+            "Cannot resume while Git retirement is incomplete",
+            "%s; inspect and reconcile the exact retirement marker before "
+            "activating an account",
+            get_last_error()->message[0] != '\0'
+                ? get_last_error()->message
+                : "durable account and Git identity state may disagree");
+        return EXIT_FAILURE;
+    }
 
     if (ctx->config.active_account[0] == '\0') {
         log_debug("No saved account to resume");
@@ -2749,7 +3006,7 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     int gpg_rc;
     int runtime_lock_fd;
     size_t identity_cleared_total = 0U;
-    bool retirement_failed = false;
+    bool reset_retirement_prepared = false;
 
     if (!ctx) return result;
     error_accumulator_init(&retirement_errors);
@@ -2859,8 +3116,48 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     }
     result.reset_guarded = true;
 
+    /* Bind the exact reset owner set and retain every Git before-image before
+     * runtime teardown.  A different/malformed durable guard therefore fails
+     * before agents, key homes, or Git state are touched. */
+    if (target_account || ctx->account_count != 0U) {
+        if (accounts_reset_retirement_prepare(
+                ctx, result.reset_token, target_account) != 0) {
+            error_context_t retirement_error = *get_last_error();
+            int retirement_errno = errno;
+
+            (void)error_accumulator_add(
+                &retirement_errors, "Git retirement preparation",
+                &retirement_error);
+            result.failure_kind = COMMAND_FAILURE_RESET_RETIREMENT;
+            result.failure_errors = retirement_errors;
+            errno = retirement_errno;
+            return result;
+        }
+        reset_retirement_prepared = true;
+    }
+
     runtime_lock_fd = runtime_state_lock_acquire();
     if (runtime_lock_fd < 0) {
+        if (reset_retirement_prepared) {
+            error_context_t runtime_error = *get_last_error();
+            int runtime_errno = errno ? errno : EIO;
+
+            if (accounts_reset_retirement_cancel(
+                    ctx, result.reset_token) != 0) {
+                error_accumulator_init(&retirement_errors);
+                errno = runtime_errno;
+                (void)error_accumulator_add(
+                    &retirement_errors, "runtime lock acquisition",
+                    &runtime_error);
+                (void)error_accumulator_add_last(
+                    &retirement_errors, "Git retirement cancellation");
+                result.failure_kind = COMMAND_FAILURE_RESET_RETIREMENT;
+                result.failure_errors = retirement_errors;
+            } else {
+                restore_cli_error(&runtime_error, runtime_errno);
+            }
+            reset_retirement_prepared = false;
+        }
         display_error("Cannot lock shared runtime state", "%s",
                       get_last_error()->message);
         return result;
@@ -2905,6 +3202,26 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         fprintf(stderr,
                 "gitswitch: reset failed; retry metadata was preserved\n");
         set_error(ERR_SYSTEM_CALL, "SSH/GPG reset did not complete");
+        if (reset_retirement_prepared) {
+            error_context_t runtime_error = *get_last_error();
+            int runtime_errno = errno ? errno : EIO;
+
+            if (accounts_reset_retirement_cancel(
+                    ctx, result.reset_token) != 0) {
+                error_accumulator_init(&retirement_errors);
+                errno = runtime_errno;
+                (void)error_accumulator_add(
+                    &retirement_errors, "SSH/GPG reset",
+                    &runtime_error);
+                (void)error_accumulator_add_last(
+                    &retirement_errors, "Git retirement cancellation");
+                result.failure_kind = COMMAND_FAILURE_RESET_RETIREMENT;
+                result.failure_errors = retirement_errors;
+            } else {
+                restore_cli_error(&runtime_error, runtime_errno);
+            }
+            reset_retirement_prepared = false;
+        }
         return result;
     }
 
@@ -2918,66 +3235,22 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
      * attributable to the reset account(s). A detected retirement failure
      * keeps the account and active-state metadata as exact retry attribution,
      * returns nonzero, and suppresses the centralized success notice. */
-    {
-        if (target_account) {
-            size_t identity_cleared = 0U;
-
-            if (accounts_retire_git_identity(ctx, target_account,
-                                             &identity_cleared) != 0) {
-                error_context_t retirement_error = *get_last_error();
-                int retirement_errno = errno;
-
-                (void)error_accumulator_add(
-                    &retirement_errors, target_account->name,
-                    &retirement_error);
-                retirement_failed = true;
-                fprintf(stderr,
-                        "gitswitch: durable Git retirement failed for reset "
-                        "account '%s': %s\n",
-                        target,
-                        retirement_error.message[0] != '\0'
-                            ? retirement_error.message
-                            : "unknown Git retirement error");
-                errno = retirement_errno;
-            }
-            identity_cleared_total = identity_cleared;
-        } else {
-            for (size_t i = 0; i < ctx->account_count; i++) {
-                size_t account_cleared = 0;
-                if (accounts_retire_git_identity(ctx, &ctx->accounts[i],
-                                                 &account_cleared) != 0) {
-                    error_context_t retirement_error = *get_last_error();
-                    int retirement_errno = errno;
-
-                    (void)error_accumulator_add(
-                        &retirement_errors, ctx->accounts[i].name,
-                        &retirement_error);
-                    retirement_failed = true;
-                    fprintf(stderr,
-                            "gitswitch: durable Git retirement failed for "
-                            "reset account '%s': %s\n",
-                            ctx->accounts[i].name,
-                            retirement_error.message[0] != '\0'
-                                ? retirement_error.message
-                                : "unknown Git retirement error");
-                    errno = retirement_errno;
-                }
-                if (SIZE_MAX - identity_cleared_total < account_cleared) {
-                    identity_cleared_total = SIZE_MAX;
-                } else {
-                    identity_cleared_total += account_cleared;
-                }
-            }
-        }
-    }
-
-    if (retirement_failed) {
+    if (reset_retirement_prepared &&
+        accounts_reset_retirement_publish(
+            ctx, result.reset_token, &identity_cleared_total) != 0) {
+        error_context_t retirement_error = *get_last_error();
         int retirement_errno;
 
+        retirement_errno = errno;
+        (void)error_accumulator_add(
+            &retirement_errors,
+            target_account ? target_account->name : "reset account set",
+            &retirement_error);
         (void)error_accumulator_publish(&retirement_errors);
         retirement_errno = errno;
         result.failure_kind = COMMAND_FAILURE_RESET_RETIREMENT;
         result.failure_errors = retirement_errors;
+        reset_retirement_prepared = false;
         if (identity_cleared_total > 0U) {
             fprintf(stderr,
                     "gitswitch: retired %zu durable Git identity setting(s) "
@@ -2987,17 +3260,7 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         errno = retirement_errno;
         return result;
     }
-    if (identity_cleared_total > 0U) {
-        if (target_account) {
-            printf("Cleared %zu durable Git identity setting(s) that selected "
-                   "'%s'.\n",
-                   identity_cleared_total, target);
-        } else {
-            printf("Cleared %zu durable Git identity setting(s) across reset "
-                   "accounts.\n",
-                   identity_cleared_total);
-        }
-    }
+    result.reset_retirement_prepared = reset_retirement_prepared;
 
     /* When the reset covered the saved active account (or everything), clear
      * the persisted active_account: main()'s settings-only save then records

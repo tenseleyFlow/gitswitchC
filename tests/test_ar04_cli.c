@@ -301,8 +301,8 @@ static int write_active_config(const char *home) {
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     if (write_text(path, body, 0600) != 0) return -1;
-    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
-    return write_text(path, "ssh gpg\n", 0600);
+    return seed_account_publication(home, 1U,
+                                    AR04_CLI_WORK_INCARNATION);
 }
 
 static int write_two_account_active_config(const char *home,

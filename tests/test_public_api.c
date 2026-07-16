@@ -55,6 +55,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(accounts_remove);
     REQUIRE_PUBLIC_API(accounts_remove_abort);
     REQUIRE_PUBLIC_API(accounts_remove_commit);
+    REQUIRE_PUBLIC_API(accounts_remove_finalize);
+    REQUIRE_PUBLIC_API(accounts_reset_retirement_cancel);
+    REQUIRE_PUBLIC_API(accounts_reset_retirement_finalize);
+    REQUIRE_PUBLIC_API(accounts_reset_retirement_prepare);
+    REQUIRE_PUBLIC_API(accounts_reset_retirement_publish);
     REQUIRE_PUBLIC_API(accounts_retire_git_identity);
     REQUIRE_PUBLIC_API(accounts_session_cleanup);
     REQUIRE_PUBLIC_API(accounts_show_status);
@@ -100,6 +105,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_migrate_account_incarnations);
     REQUIRE_PUBLIC_API(config_parse_scope);
     REQUIRE_PUBLIC_API(config_publication_preflight);
+    REQUIRE_PUBLIC_API(config_refresh_retirement_publications_transactional);
     REQUIRE_PUBLIC_API(config_remove_account);
     REQUIRE_PUBLIC_API(config_remove_account_owned);
     REQUIRE_PUBLIC_API(config_restore_active_account);
@@ -108,6 +114,11 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_capture);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_clear);
     REQUIRE_PUBLIC_API(config_resume_hint_snapshot_restore);
+    REQUIRE_PUBLIC_API(config_retirement_guard_abandon);
+    REQUIRE_PUBLIC_API(config_retirement_guard_clear);
+    REQUIRE_PUBLIC_API(config_retirement_guard_install_or_adopt);
+    REQUIRE_PUBLIC_API(config_retirement_guard_probe);
+    REQUIRE_PUBLIC_API(config_retirement_guard_was_created);
     REQUIRE_PUBLIC_API(config_save);
     REQUIRE_PUBLIC_API(config_save_active_account);
     REQUIRE_PUBLIC_API(config_save_active_account_publication_transactional_guarded);
@@ -192,6 +203,12 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_retire_account_identity);
     REQUIRE_PUBLIC_API(git_retire_account_identity_published);
     REQUIRE_PUBLIC_API(git_retire_account_identity_publications);
+    REQUIRE_PUBLIC_API(git_retirement_transaction_abort);
+    REQUIRE_PUBLIC_API(git_retirement_transaction_commit);
+    REQUIRE_PUBLIC_API(git_retirement_transaction_prepare);
+    REQUIRE_PUBLIC_API(git_retirement_transaction_publish);
+    REQUIRE_PUBLIC_API(git_retirement_transaction_restored_destination);
+    REQUIRE_PUBLIC_API(git_retirement_transaction_restored_destination_count);
     REQUIRE_PUBLIC_API(git_scope_to_flag);
     REQUIRE_PUBLIC_API(git_set_config);
     REQUIRE_PUBLIC_API(git_set_config_value);

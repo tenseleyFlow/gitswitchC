@@ -852,6 +852,7 @@ TEST(reset_all_continues_after_first_account_retirement_failure) {
     m17_bytes_t output = {0};
     const char *primary;
     const char *summary;
+    const char *batch_summary;
     bool fault_observed = false;
     int setup_result;
     int status;
@@ -884,13 +885,17 @@ TEST(reset_all_continues_after_first_account_retirement_failure) {
     CHECK(m17_output_has_no_success((const char *)output.data));
     primary = strstr(
         (const char *)output.data,
-        "reset account 'work': Injected Git retirement locked-read failure");
+        "account 'work' destination 1 preparation (--global): "
+        "Injected Git retirement locked-read failure");
     summary = strstr(
         (const char *)output.data,
         "reset failed; account and active-state metadata were preserved for retry");
+    batch_summary = strstr((const char *)output.data,
+                           "[retirement summary]");
     CHECK(primary != NULL);
     CHECK(summary != NULL);
-    if (primary && summary) CHECK(primary < summary);
+    CHECK(batch_summary != NULL);
+    if (primary && batch_summary) CHECK(primary < batch_summary);
     CHECK(strstr((const char *)output.data,
                  "durable Git retirement failed for reset account 'later'") ==
           NULL);

@@ -209,6 +209,94 @@ int config_resume_hint_path(char *buf, size_t size);
  * fails with no output value. */
 int config_resume_hint_probe(char *needs, size_t size);
 
+/* Durable fail-closed witness for an outer remove/reset transaction whose Git
+ * retirement may no longer agree with the account/active-state document. The
+ * marker is a versioned 0600 sibling of accounts.toml and binds one operation
+ * kind to an exact canonical owner set. Its handle is intentionally opaque:
+ * callers may clear only the exact marker generation they installed/adopted.
+ */
+typedef enum {
+    CONFIG_RETIREMENT_REMOVE = 1,
+    CONFIG_RETIREMENT_RESET
+} config_retirement_kind_t;
+
+typedef struct {
+    uint32_t account_id;
+    char account_incarnation[ACCOUNT_INCARNATION_LEN];
+} config_retirement_owner_t;
+
+typedef struct {
+    char config_path[MAX_PATH_LEN];
+    publication_identity_t post_config;
+} config_retirement_destination_t;
+
+typedef struct config_retirement_guard config_retirement_guard_t;
+
+/* Under an internally owned retirement lifecycle lock, install a fresh
+ * incomplete generation or adopt an active generation only when its kind and
+ * sorted owner set match exactly. Adoption first syncs the pinned directory,
+ * then jointly re-reads the same blocking generation, so an earlier
+ * rename-without-directory-sync failure cannot authorize Git mutation. A
+ * stable exact marker/certificate pair is a completed prior operation and is
+ * rotated to a fresh token; its stale certificate then keeps the new
+ * generation blocked until clear(). Unsafe, malformed, unstable, or
+ * mismatched state fails closed. `owners` may be in any order; duplicate
+ * tuples are refused. The returned handle owns the lock and must be passed to
+ * clear() or abandon().
+ */
+int config_retirement_guard_install_or_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard);
+
+/* Read-only retirement gate. On return 0, `blocked` is false only when both
+ * fixed records are absent or one jointly revalidated canonical marker and
+ * byte-identical `.retirement-complete` certificate form an exact pair. A
+ * lone record, stale/mismatched pair, fixed transition stage, or retained
+ * legacy clear witness returns blocked. Unsafe, malformed, unreadable, or
+ * unstable state returns -1 with `blocked` still true. The two names are
+ * re-statted after both descriptor reads so mixed-generation snapshots cannot
+ * unblock. This probe never creates, chmods, or repairs a path.
+ */
+int config_retirement_guard_probe(const char *config_path, bool *blocked);
+
+/* True only when this invocation installed the marker. A matching retry that
+ * adopted a prior marker returns false, allowing pre-install rollback to
+ * preserve the older incomplete witness.
+ */
+bool config_retirement_guard_was_created(
+    const config_retirement_guard_t *guard);
+
+/* Complete only the exact owned marker generation (inode, complete bytes, and
+ * embedded token) by atomically replacing the fixed completion certificate;
+ * the canonical blocker is never renamed or deleted. Before certificate
+ * publication every failure retains a blocking marker and the handle. Once a
+ * jointly revalidated exact pair is observable, publication is the no-fail
+ * logical commit point: a later file/directory sync acknowledgement failure is
+ * reported as success because a crash can yield only the exact completed pair
+ * or the older blocking state. Success frees and NULLs the lock-owning handle.
+ */
+int config_retirement_guard_clear(config_retirement_guard_t **guard);
+
+/* Release the lifecycle lock and free/NULL the handle without namespace
+ * repair. clear() never removes the canonical marker; a failed transition may
+ * retain the one fixed stage, and both states remain probe-blocking. */
+void config_retirement_guard_abandon(config_retirement_guard_t **guard);
+
+/* Refresh only the Git post-config generation witnesses for PUBLISHED ledger
+ * records owned by `owners`. Every matching record must find exactly one
+ * destination with the same Git config path; duplicate, missing, or unused
+ * destination inputs fail before publication. The active header and all other
+ * records are preserved semantically through the ordinary atomic active-state
+ * writer. `state_installed` follows the same rename/dir-sync classification as
+ * config_save_active_account_transactional().
+ */
+int config_refresh_retirement_publications_transactional(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_destination_t *destinations,
+    size_t destination_count, bool *state_installed);
+
 /* Exact before-image for the consolidated active-state/resume-hint file. A CLI
  * switch captures it before runtime/Git mutation so a failed active-state
  * commit can restore the previous bytes (or previous absence) exactly.

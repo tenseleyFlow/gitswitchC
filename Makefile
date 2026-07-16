@@ -803,6 +803,16 @@ $(PUBLIC_API_PRODUCTION_TARGET): $(PUBLIC_API_PRODUCTION_OBJECT) \
 	@echo "Linking production public API profile..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+# The lifecycle suite drives one remove through the real CLI entry with a
+# one-shot post-runtime persistence fault; the production executable remains
+# free of the renamed testing entry point.
+$(BINDIR)/test_ar04_lifecycle: $(OBJDIR)/test_ar04_lifecycle.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(AR09_DISPATCH_SIGNALS_OBJECT) \
@@ -815,6 +825,16 @@ $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
 # checkpoints. The production entry point remains unchanged.
 $(BINDIR)/test_ar11_retirement_outcome: \
 		$(OBJDIR)/test_ar11_retirement_outcome.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# AR-11 M18 drives post-retirement config/state failures through the real CLI
+# entry and proves the outer transaction's restore-or-block-resume contract.
+$(BINDIR)/test_ar11_retirement_outer: \
+		$(OBJDIR)/test_ar11_retirement_outer.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(AR09_DISPATCH_SIGNALS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
@@ -839,6 +859,15 @@ $(BINDIR)/test_ar08_remove_signal: $(OBJDIR)/test_ar08_remove_signal.o \
 
 $(BINDIR)/test_ar08_resume_hint_race: \
 		$(OBJDIR)/test_ar08_resume_hint_race.o \
+		$(AR08_HINT_CONFIG_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# Deterministic retirement-guard namespace races use the same private config
+# checkpoint object. Broad config suites continue to link production config.o.
+$(BINDIR)/test_ar11_guard_clear: \
+		$(OBJDIR)/test_ar11_guard_clear.o \
 		$(AR08_HINT_CONFIG_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."

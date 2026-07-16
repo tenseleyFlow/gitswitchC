@@ -43,6 +43,7 @@ static const char *fk_repo_root_output;
 static int fk_repo_root_exit;
 static unsigned int fk_write_attempts;
 static unsigned int fk_fail_write_ordinal;
+static const char *fk_fail_write_output;
 /* Exact-file retirement deliberately ignores the caller's current Git
  * environment. Tests that seed the simple global in-memory store bind its
  * persisted publication path here so the fake can model `git config --file`
@@ -62,6 +63,7 @@ static void fk_reset(void) {
     fk_repo_root_exit = 1;
     fk_write_attempts = 0U;
     fk_fail_write_ordinal = 0U;
+    fk_fail_write_output = NULL;
     fk_exact_global_path[0] = '\0';
 }
 
@@ -192,6 +194,10 @@ static int fk_emit_scope_listing(const char *scope, const run_opts_t *opts,
 static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
                            run_result_t *result) {
     fk_execs++;
+    /* A replacement runner owns the same capture-buffer contract as
+     * run_argv_real: even a failure that emits no bytes returns an empty C
+     * string, never untouched caller stack. */
+    if (opts && opts->out && opts->out_size > 0U) opts->out[0] = '\0';
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
@@ -299,6 +305,11 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
             fk_write_attempts++;
             if (fk_fail_write_ordinal != 0U &&
                 fk_write_attempts == fk_fail_write_ordinal) {
+                if (fk_fail_write_output && opts && opts->out &&
+                    opts->out_size > 0U) {
+                    (void)snprintf(opts->out, opts->out_size, "%s",
+                                   fk_fail_write_output);
+                }
                 return fk_ret(result, 1);
             }
             int i = fk_find(scope, argv[3]);
@@ -785,6 +796,36 @@ TEST(partial_account_writer_failure_invalidates_prior_complete_publication) {
           NULL);
     git_config_commit();
 
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+}
+
+TEST(fake_runner_zero_output_failure_has_stable_diagnostic) {
+    command_runner_fn previous;
+
+    git_ops_test_reset_caches();
+    fk_reset();
+    previous = run_set_runner(fake_git_runner);
+    fk_fail_write_ordinal = 1U;
+    clear_error();
+
+    CHECK_EQ_INT(git_set_config_value(
+                     "commit.gpgsign", "true", GIT_SCOPE_GLOBAL), -1);
+    CHECK_STR_EQ(get_last_error()->message,
+                 "Failed to set git config commit.gpgsign: "
+                 "git produced no diagnostic output");
+
+    fk_write_attempts = 0U;
+    fk_fail_write_output = "synthetic git failure detail";
+    clear_error();
+    CHECK_EQ_INT(git_set_config_value(
+                     "commit.gpgsign", "true", GIT_SCOPE_GLOBAL), -1);
+    CHECK_STR_EQ(get_last_error()->message,
+                 "Failed to set git config commit.gpgsign: "
+                 "synthetic git failure detail");
+
+    fk_fail_write_ordinal = 0U;
+    fk_fail_write_output = NULL;
     run_set_runner(previous);
     git_ops_test_reset_caches();
 }
@@ -2632,6 +2673,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(effective_config_capture_enforces_maximum);
     RUN_TEST(git_set_config_value_skips_duplicate_managed_write);
     RUN_TEST(partial_account_writer_failure_invalidates_prior_complete_publication);
+    RUN_TEST(fake_runner_zero_output_failure_has_stable_diagnostic);
     RUN_TEST(rollback_z_parser_survives_embedded_newline);
     RUN_TEST(snapshot_seeds_cache_and_clear_elides_proven_absent);
     RUN_TEST(restore_unsets_keys_written_after_snapshot);

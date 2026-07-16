@@ -229,6 +229,81 @@ int git_retire_account_identity_publications(
     const publication_record_t *const publications[],
     size_t publication_count, size_t *cleared);
 
+/* Opaque owner of one prepared, descriptor-pinned Git retirement batch. */
+typedef struct git_retirement_transaction git_retirement_transaction_t;
+
+/**
+ * Prepare one outer Git retirement transaction from aligned account and
+ * publication vectors. Every item is copied and validated before filesystem
+ * work. Records that share a physical configuration destination are planned
+ * and locked as one group, so reset-all cannot overwrite one destination from
+ * multiple stale snapshots. Preparation may create checked private staging
+ * and canonical-lock artifacts, but never changes a canonical Git config.
+ *
+ * Operational failures local to one destination are retained inside the
+ * transaction so publish can preserve independent-destination progress; an
+ * indeterminate preflight snapshot still blocks publication everywhere.
+ * Invalid input, malformed provenance, allocation failure, and a non-default
+ * command runner fail immediately with `*transaction == NULL`.
+ */
+int git_retirement_transaction_prepare(
+    const account_t *const accounts[],
+    const publication_record_t *const publications[], size_t item_count,
+    git_retirement_transaction_t **transaction);
+
+/**
+ * Publish every healthy prepared destination and retain exact before/post
+ * witnesses only when the complete batch succeeds. On any destination
+ * failure, healthy destinations retain the historical partial-progress
+ * behavior, all transaction artifacts are checked-cleaned, and the returned
+ * transaction may only be committed/disposed (not rolled back). `cleared`
+ * receives the number of keys installed by fully successful destinations.
+ */
+int git_retirement_transaction_publish(
+    git_retirement_transaction_t *transaction, size_t *cleared);
+
+/**
+ * Accept the current transaction state, checked-clean every owned artifact,
+ * securely release witnesses, free the transaction, and set the caller's
+ * pointer to NULL. This is valid for prepared, fully published, fully
+ * aborted, and publish-failed transactions. Cleanup failure is reported
+ * after durable recovery authority has been retained where possible; the
+ * handle is still consumed.
+ */
+int git_retirement_transaction_commit(
+    git_retirement_transaction_t **transaction);
+
+/**
+ * Roll back a completely published batch. Each canonical destination and its
+ * held Git lock must still equal the retained post-image witnesses before the
+ * original pinned file is restored and the directory is synced. The handle
+ * and locks remain owned after success so the caller can durably refresh
+ * publication-generation witnesses before commit consumes the transaction.
+ * A failed restoration likewise leaves the handle available for retry.
+ */
+int git_retirement_transaction_abort(
+    git_retirement_transaction_t *transaction);
+
+/**
+ * Number of canonical destinations reconciled by a successful abort. This
+ * includes both changed generations restored from the retained before-image
+ * and safely locked no-op destinations whose existing generation must remain
+ * represented in the caller's exact publication-refresh set.
+ */
+size_t git_retirement_transaction_restored_destination_count(
+    const git_retirement_transaction_t *transaction);
+
+/**
+ * Return one reconciled canonical path and its freshly re-proved exact file
+ * identity. `index` addresses changed-and-restored and unchanged/no-op
+ * destinations exactly once per physical configuration namespace. The
+ * transaction must remain uncommitted and fully aborted.
+ */
+int git_retirement_transaction_restored_destination(
+    const git_retirement_transaction_t *transaction, size_t index,
+    char *config_path, size_t path_size,
+    publication_identity_t *post_config);
+
 /**
  * Snapshot the gitswitch-managed config keys (identity/signing keys,
  * gpg.format, every Git-supported GPG program selector, and core.sshCommand)
