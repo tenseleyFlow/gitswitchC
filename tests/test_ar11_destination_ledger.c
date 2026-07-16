@@ -13,7 +13,12 @@
     "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333"
 #define M10_FOREIGN_FINGERPRINT \
     "9999888877776666555544440000111122223333"
+#define M10_FOREIGN_BEFORE_FINGERPRINT \
+    "111122223333444455556666777788889999AAAA"
+#define M10_FOREIGN_AFTER_FINGERPRINT \
+    "BBBBCCCCDDDDEEEEFFFF00001111222233334444"
 #define M10_SELECTOR "22223333"
+#define M10_VALUE_CAPACITY 4U
 
 void git_ops_test_reset_caches(void);
 
@@ -34,9 +39,8 @@ static const char *const m10_keys[M10_KEY_COUNT] = {
 
 typedef struct {
     char path[MAX_PATH_LEN];
-    char fingerprint[MAX_GPG_FINGERPRINT_LEN];
-    char program[MAX_PATH_LEN];
-    bool present[M10_KEY_COUNT];
+    char values[M10_KEY_COUNT][M10_VALUE_CAPACITY][MAX_PATH_LEN];
+    size_t value_count[M10_KEY_COUNT];
     bool fail_unset[M10_KEY_COUNT];
     size_t gets;
     size_t unsets;
@@ -68,6 +72,7 @@ static bool m10_saw_scope_flag;
 static bool m10_saw_rev_parse;
 static bool m10_saw_unknown_path;
 static bool m10_first_git_saw_preflight_failure;
+static bool m10_fail_stale_stage_snapshot;
 
 static unsigned char m10_status_listing[4096];
 static size_t m10_status_listing_length;
@@ -186,7 +191,9 @@ static int m10_make_record(publication_record_t *record,
                            PUBLICATION_CAP_POST_GENERATION |
                            PUBLICATION_CAP_GPG_FINGERPRINT |
                            PUBLICATION_CAP_GPG_PROGRAM |
-                           PUBLICATION_CAP_GPG_SELECTOR;
+                           PUBLICATION_CAP_GPG_SELECTOR |
+                           PUBLICATION_CAP_GPG_SIGNING_STATE;
+    record->gpg_signing_enabled = true;
     if (safe_strncpy(record->gpg_fingerprint, M10_FINGERPRINT,
                      sizeof(record->gpg_fingerprint)) != 0 ||
         safe_strncpy(record->gpg_selector, M10_SELECTOR,
@@ -340,6 +347,66 @@ static int m10_add_record(m10_fixture_t *fixture,
     return 0;
 }
 
+static int m10_destination_insert_value(m10_destination_t *destination,
+                                        size_t key, size_t index,
+                                        const char *value) {
+    size_t count;
+
+    if (!destination || key >= M10_KEY_COUNT || !value) return -1;
+    count = destination->value_count[key];
+    if (count >= M10_VALUE_CAPACITY || index > count) return -1;
+    for (size_t i = count; i > index; i--) {
+        memcpy(destination->values[key][i],
+               destination->values[key][i - 1U],
+               sizeof(destination->values[key][i]));
+    }
+    if (safe_strncpy(destination->values[key][index], value,
+                     sizeof(destination->values[key][index])) != 0) {
+        return -1;
+    }
+    destination->value_count[key]++;
+    return 0;
+}
+
+static int m10_destination_append_value(m10_destination_t *destination,
+                                        size_t key, const char *value) {
+    if (!destination || key >= M10_KEY_COUNT) return -1;
+    return m10_destination_insert_value(
+        destination, key, destination->value_count[key], value);
+}
+
+static size_t m10_destination_remove_exact(m10_destination_t *destination,
+                                           size_t key,
+                                           const char *value) {
+    size_t survivors = 0U;
+    size_t removed = 0U;
+
+    if (!destination || key >= M10_KEY_COUNT || !value) return 0U;
+    for (size_t i = 0U; i < destination->value_count[key]; i++) {
+        if (strcmp(destination->values[key][i], value) == 0) {
+            removed++;
+            continue;
+        }
+        if (survivors != i) {
+            memcpy(destination->values[key][survivors],
+                   destination->values[key][i],
+                   sizeof(destination->values[key][survivors]));
+        }
+        survivors++;
+    }
+    for (size_t i = survivors; i < destination->value_count[key]; i++) {
+        destination->values[key][i][0] = '\0';
+    }
+    destination->value_count[key] = survivors;
+    return removed;
+}
+
+static void m10_destination_clear_values(m10_destination_t *destination) {
+    if (!destination) return;
+    memset(destination->values, 0, sizeof(destination->values));
+    memset(destination->value_count, 0, sizeof(destination->value_count));
+}
+
 static void m10_model_records(const m10_fixture_t *fixture) {
     memset(m10_destinations, 0, sizeof(m10_destinations));
     m10_destination_count = fixture->record_count;
@@ -347,21 +414,25 @@ static void m10_model_records(const m10_fixture_t *fixture) {
         CHECK_EQ_INT(safe_strncpy(m10_destinations[i].path,
                                   fixture->records[i].config_path,
                                   sizeof(m10_destinations[i].path)), 0);
-        CHECK_EQ_INT(safe_strncpy(m10_destinations[i].fingerprint,
-                                  fixture->records[i].gpg_fingerprint,
-                                  sizeof(m10_destinations[i].fingerprint)), 0);
-        CHECK_EQ_INT(safe_strncpy(m10_destinations[i].program,
-                                  fixture->records[i].gpg_program,
-                                  sizeof(m10_destinations[i].program)), 0);
-        for (size_t key = 0; key < M10_KEY_COUNT; key++) {
-            m10_destinations[i].present[key] = true;
-        }
+        CHECK_EQ_INT(m10_destination_append_value(
+                         &m10_destinations[i], M10_SIGNING_KEY,
+                         fixture->records[i].gpg_fingerprint), 0);
+        CHECK_EQ_INT(m10_destination_append_value(
+                         &m10_destinations[i], M10_SIGNING_ENABLED,
+                         "true"), 0);
+        CHECK_EQ_INT(m10_destination_append_value(
+                         &m10_destinations[i], M10_GPG_FORMAT,
+                         "openpgp"), 0);
+        CHECK_EQ_INT(m10_destination_append_value(
+                         &m10_destinations[i], M10_GPG_PROGRAM,
+                         fixture->records[i].gpg_program), 0);
     }
     m10_runner_calls = 0U;
     m10_saw_scope_flag = false;
     m10_saw_rev_parse = false;
     m10_saw_unknown_path = false;
     m10_first_git_saw_preflight_failure = false;
+    m10_fail_stale_stage_snapshot = false;
 }
 
 static int m10_finish(run_result_t *result, int exit_code) {
@@ -384,6 +455,29 @@ static int m10_output(const run_opts_t *opts, run_result_t *result,
         return m10_finish(result, 2);
     }
     if (result) result->out_len = (size_t)length;
+    return m10_finish(result, 0);
+}
+
+static int m10_output_values(const m10_destination_t *destination,
+                             size_t key, const run_opts_t *opts,
+                             run_result_t *result) {
+    size_t used = 0U;
+
+    if (!destination || key >= M10_KEY_COUNT ||
+        destination->value_count[key] == 0U || !opts || !opts->out ||
+        opts->out_size == 0U) {
+        return m10_finish(result, 1);
+    }
+    for (size_t i = 0U; i < destination->value_count[key]; i++) {
+        int length = snprintf(opts->out + used, opts->out_size - used,
+                              "%s\n", destination->values[key][i]);
+
+        if (length < 0 || (size_t)length >= opts->out_size - used) {
+            return m10_finish(result, 2);
+        }
+        used += (size_t)length;
+    }
+    if (result) result->out_len = used;
     return m10_finish(result, 0);
 }
 
@@ -585,6 +679,28 @@ static int m10_key_slot(const char *key) {
     return -1;
 }
 
+static bool m10_path_is_stage(const char *path,
+                              const m10_destination_t *destination) {
+    static const char stage_prefix[] = "/.gitswitch-config-";
+    const char *slash;
+    size_t parent_length;
+
+    if (!path || !destination) return false;
+    slash = strrchr(destination->path, '/');
+    if (!slash) return false;
+    parent_length = (size_t)(slash - destination->path);
+    return strncmp(path, destination->path, parent_length) == 0 &&
+           strncmp(path + parent_length, stage_prefix,
+                   sizeof(stage_prefix) - 1U) == 0;
+}
+
+static bool m10_path_is_destination_or_stage(
+    const char *path, const m10_destination_t *destination) {
+    return path && destination &&
+           (strcmp(path, destination->path) == 0 ||
+            m10_path_is_stage(path, destination));
+}
+
 static int m10_snapshot_output(const m10_destination_t *destination,
                                const run_opts_t *opts,
                                run_result_t *result) {
@@ -593,26 +709,23 @@ static int m10_snapshot_output(const m10_destination_t *destination,
 
     if (!destination) return m10_finish(result, 2);
     for (size_t slot = 0U; slot < M10_KEY_COUNT; slot++) {
-        const char *value;
-        size_t key_length;
-        size_t value_length;
+        for (size_t value_index = 0U;
+             value_index < destination->value_count[slot]; value_index++) {
+            const char *value = destination->values[slot][value_index];
+            size_t key_length = strlen(m10_keys[slot]);
+            size_t value_length = strlen(value);
 
-        if (!destination->present[slot]) continue;
-        if (slot == M10_SIGNING_KEY) value = destination->fingerprint;
-        else if (slot == M10_SIGNING_ENABLED) value = "true";
-        else if (slot == M10_GPG_FORMAT) value = "openpgp";
-        else value = destination->program;
-        key_length = strlen(m10_keys[slot]);
-        value_length = strlen(value);
-        if (key_length + value_length + 2U > sizeof(listing) - length) {
-            return m10_finish(result, 2);
+            if (key_length + value_length + 2U >
+                sizeof(listing) - length) {
+                return m10_finish(result, 2);
+            }
+            memcpy(listing + length, m10_keys[slot], key_length);
+            length += key_length;
+            listing[length++] = '\n';
+            memcpy(listing + length, value, value_length);
+            length += value_length;
+            listing[length++] = '\0';
         }
-        memcpy(listing + length, m10_keys[slot], key_length);
-        length += key_length;
-        listing[length++] = '\n';
-        memcpy(listing + length, value, value_length);
-        length += value_length;
-        listing[length++] = '\0';
     }
     return m10_binary_output(opts, result, listing, length);
 }
@@ -621,9 +734,6 @@ static int m10_retirement_runner(const char *const argv[],
                                  const run_opts_t *opts,
                                  run_result_t *result) {
     m10_destination_t *destination = NULL;
-    const char *operation;
-    const char *key;
-    size_t operation_index;
     int slot;
 
     m10_runner_calls++;
@@ -655,7 +765,8 @@ static int m10_retirement_runner(const char *const argv[],
         return m10_finish(result, 2);
     }
     for (size_t i = 0; i < m10_destination_count; i++) {
-        if (strcmp(argv[3], m10_destinations[i].path) == 0) {
+        if (m10_path_is_destination_or_stage(
+                argv[3], &m10_destinations[i])) {
             destination = &m10_destinations[i];
             break;
         }
@@ -670,28 +781,36 @@ static int m10_retirement_runner(const char *const argv[],
             return m10_finish(result, 2);
         }
         destination->gets++;
+        if (m10_fail_stale_stage_snapshot &&
+            m10_path_is_stage(argv[3], destination)) {
+            m10_fail_stale_stage_snapshot = false;
+            return m10_finish(result, 2);
+        }
         return m10_snapshot_output(destination, opts, result);
     }
-    operation_index = strcmp(argv[4], "--no-includes") == 0 ? 5U : 4U;
-    if (!argv[operation_index] || !argv[operation_index + 1U]) {
+    if (strcmp(argv[4], "--no-includes") != 0 || !argv[5]) {
         return m10_finish(result, 2);
     }
-    operation = argv[operation_index];
-    key = argv[operation_index + 1U];
-    slot = m10_key_slot(key);
-    if (slot < 0) return m10_finish(result, 2);
-    if (strcmp(operation, "--get") == 0 ||
-        strcmp(operation, "--get-all") == 0) {
-        const char *value;
+    if (strcmp(argv[5], "--get") == 0 ||
+        strcmp(argv[5], "--get-all") == 0) {
+        if (!argv[6] || argv[7]) return m10_finish(result, 2);
+        slot = m10_key_slot(argv[6]);
+        if (slot < 0) return m10_finish(result, 2);
         destination->gets++;
-        if (!destination->present[slot]) return m10_finish(result, 1);
-        if (slot == M10_SIGNING_KEY) value = destination->fingerprint;
-        else if (slot == M10_SIGNING_ENABLED) value = "true";
-        else if (slot == M10_GPG_FORMAT) value = "openpgp";
-        else value = destination->program;
-        return m10_output(opts, result, value);
+        if (strcmp(argv[5], "--get") == 0) {
+            if (destination->value_count[slot] == 0U) {
+                return m10_finish(result, 1);
+            }
+            return m10_output(opts, result,
+                              destination->values[slot][0]);
+        }
+        return m10_output_values(destination, (size_t)slot, opts, result);
     }
-    if (strcmp(operation, "--unset-all") == 0) {
+    if (strcmp(argv[5], "--fixed-value") == 0 && argv[6] &&
+        strcmp(argv[6], "--unset-all") == 0 && argv[7] && argv[8] &&
+        !argv[9]) {
+        slot = m10_key_slot(argv[7]);
+        if (slot < 0) return m10_finish(result, 2);
         destination->unsets++;
         if (destination->fail_unset[slot]) {
             if (opts && opts->out && opts->out_size > 0U) {
@@ -701,8 +820,10 @@ static int m10_retirement_runner(const char *const argv[],
             }
             return m10_finish(result, 2);
         }
-        if (!destination->present[slot]) return m10_finish(result, 5);
-        destination->present[slot] = false;
+        if (m10_destination_remove_exact(
+                destination, (size_t)slot, argv[8]) == 0U) {
+            return m10_finish(result, 5);
+        }
         return m10_finish(result, 0);
     }
     return m10_finish(result, 2);
@@ -710,14 +831,14 @@ static int m10_retirement_runner(const char *const argv[],
 
 static bool m10_destination_cleared(size_t index) {
     for (size_t key = 0; key < M10_KEY_COUNT; key++) {
-        if (m10_destinations[index].present[key]) return false;
+        if (m10_destinations[index].value_count[key] != 0U) return false;
     }
     return true;
 }
 
 static bool m10_destination_unchanged(size_t index) {
     for (size_t key = 0; key < M10_KEY_COUNT; key++) {
-        if (!m10_destinations[index].present[key]) return false;
+        if (m10_destinations[index].value_count[key] != 1U) return false;
     }
     return true;
 }
@@ -727,6 +848,49 @@ static void m10_check_exact_file_only(void) {
     CHECK(!m10_saw_scope_flag);
     CHECK(!m10_saw_rev_parse);
     CHECK(!m10_saw_unknown_path);
+}
+
+static bool m10_error_contains(const char *text) {
+    const error_context_t *error = get_last_error();
+
+    return text && error &&
+           (strstr(error->message, text) != NULL ||
+            strstr(error->details, text) != NULL);
+}
+
+static bool m10_retirement_artifacts_absent(const char *config_path) {
+    static const char stage_prefix[] = ".gitswitch-config-";
+    char parent[MAX_PATH_LEN];
+    char lock_leaf[MAX_PATH_LEN];
+    const char *leaf;
+    char *slash;
+    DIR *directory;
+    struct dirent *entry;
+    bool absent = true;
+
+    if (!config_path ||
+        safe_strncpy(parent, config_path, sizeof(parent)) != 0) {
+        return false;
+    }
+    slash = strrchr(parent, '/');
+    if (!slash || !slash[1]) return false;
+    leaf = slash + 1U;
+    if (safe_snprintf(lock_leaf, sizeof(lock_leaf), "%s.lock", leaf) != 0) {
+        return false;
+    }
+    *slash = '\0';
+    directory = opendir(parent[0] != '\0' ? parent : "/");
+    if (!directory) return false;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, lock_leaf) == 0 ||
+            strncmp(entry->d_name, stage_prefix,
+                    sizeof(stage_prefix) - 1U) == 0) {
+            absent = false;
+            break;
+        }
+    }
+    if (closedir(directory) != 0) return false;
+    return absent;
 }
 
 TEST(removal_from_repository_b_retires_repository_a_and_b_destinations) {
@@ -1094,19 +1258,24 @@ TEST(linked_repository_witnesses_share_one_local_config_retirement) {
     CHECK_EQ_INT(safe_strncpy(m10_destinations[0].path,
                               fixture.repo_a_local,
                               sizeof(m10_destinations[0].path)), 0);
-    CHECK_EQ_INT(safe_strncpy(m10_destinations[0].fingerprint,
-                              M10_FINGERPRINT,
-                              sizeof(m10_destinations[0].fingerprint)), 0);
-    CHECK_EQ_INT(safe_strncpy(m10_destinations[0].program, fixture.program,
-                              sizeof(m10_destinations[0].program)), 0);
-    for (size_t key = 0; key < M10_KEY_COUNT; key++) {
-        m10_destinations[0].present[key] = true;
-    }
+    CHECK_EQ_INT(m10_destination_append_value(
+                     &m10_destinations[0], M10_SIGNING_KEY,
+                     M10_FINGERPRINT), 0);
+    CHECK_EQ_INT(m10_destination_append_value(
+                     &m10_destinations[0], M10_SIGNING_ENABLED,
+                     "true"), 0);
+    CHECK_EQ_INT(m10_destination_append_value(
+                     &m10_destinations[0], M10_GPG_FORMAT,
+                     "openpgp"), 0);
+    CHECK_EQ_INT(m10_destination_append_value(
+                     &m10_destinations[0], M10_GPG_PROGRAM,
+                     fixture.program), 0);
     m10_runner_calls = 0U;
     m10_saw_scope_flag = false;
     m10_saw_rev_parse = false;
     m10_saw_unknown_path = false;
     m10_first_git_saw_preflight_failure = false;
+    m10_fail_stale_stage_snapshot = false;
 
     previous = run_set_runner(m10_retirement_runner);
     CHECK_EQ_INT(accounts_retire_git_identity(
@@ -1279,9 +1448,8 @@ TEST(stale_later_generation_is_preserved_after_all_record_preflight) {
     CHECK(m10_destination_unchanged(1U));
     CHECK_EQ_INT((long)m10_destinations[0].unsets, (long)M10_KEY_COUNT);
     CHECK_EQ_INT((long)m10_destinations[1].unsets, 0);
-    CHECK(m10_first_git_saw_preflight_failure);
-    CHECK(strstr(get_last_error()->message,
-                 "inaccessible or changed") != NULL);
+    CHECK(!m10_first_git_saw_preflight_failure);
+    CHECK(m10_error_contains("attributed values"));
     CHECK(strstr(get_last_error()->details,
                  "retirement summary") != NULL);
     CHECK(strstr(get_last_error()->details,
@@ -1328,12 +1496,70 @@ TEST(stale_first_destination_does_not_block_later_valid_retirement) {
     CHECK(m10_destination_cleared(1U));
     CHECK_EQ_INT((long)m10_destinations[0].unsets, 0);
     CHECK_EQ_INT((long)m10_destinations[1].unsets, (long)M10_KEY_COUNT);
-    CHECK(m10_first_git_saw_preflight_failure);
+    CHECK(!m10_first_git_saw_preflight_failure);
     m10_check_exact_file_only();
-    CHECK(strstr(get_last_error()->message,
-                 "inaccessible or changed") != NULL);
+    CHECK(m10_error_contains("attributed values"));
     CHECK(strstr(get_last_error()->details,
                  "cleared 4 key(s)") != NULL);
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(stale_locked_read_failure_cleans_artifacts_and_retry_succeeds) {
+    static const char replacement_contents[] =
+        "[foreign]\nvalue = clean-post-publication-target\n";
+    m10_fixture_t fixture;
+    command_runner_fn previous;
+    char replaced[MAX_PATH_LEN];
+    char observed[128];
+    size_t cleared = 99U;
+
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_add_record(&fixture, PUBLICATION_SCOPE_LOCAL,
+                                fixture.repo_a_local, fixture.repo_a), 0);
+    CHECK_EQ_INT(m10_add_record(&fixture, PUBLICATION_SCOPE_LOCAL,
+                                fixture.repo_b_local, fixture.repo_b), 0);
+    CHECK_EQ_INT(m10_write_ledger(&fixture), 0);
+    m10_model_records(&fixture);
+    CHECK_EQ_INT(safe_snprintf(replaced, sizeof(replaced), "%s.old",
+                               fixture.repo_a_local), 0);
+    CHECK_EQ_INT(rename(fixture.repo_a_local, replaced), 0);
+    CHECK_EQ_INT(m10_write_file(fixture.repo_a_local,
+                                replacement_contents), 0);
+    m10_destination_clear_values(&m10_destinations[0]);
+    m10_fail_stale_stage_snapshot = true;
+
+    clear_error();
+    previous = run_set_runner(m10_retirement_runner);
+    CHECK_EQ_INT(accounts_retire_git_identity(
+                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), -1);
+    run_set_runner(previous);
+    CHECK_EQ_INT((long)cleared, (long)M10_KEY_COUNT);
+    CHECK_EQ_INT((long)m10_destinations[0].unsets, 0);
+    CHECK(m10_destination_cleared(0U));
+    CHECK(m10_destination_cleared(1U));
+    CHECK_EQ_INT((long)m10_destinations[1].unsets,
+                 (long)M10_KEY_COUNT);
+    CHECK(!m10_fail_stale_stage_snapshot);
+    CHECK(m10_error_contains("re-read stale Git retirement destination"));
+    CHECK(m10_retirement_artifacts_absent(fixture.repo_a_local));
+    CHECK_EQ_INT(read_file_to_string(fixture.repo_a_local, observed,
+                                     sizeof(observed)),
+                 (int)(sizeof(replacement_contents) - 1U));
+    CHECK_STR_EQ(observed, replacement_contents);
+
+    clear_error();
+    cleared = 99U;
+    previous = run_set_runner(m10_retirement_runner);
+    CHECK_EQ_INT(accounts_retire_git_identity(
+                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), 0);
+    run_set_runner(previous);
+    CHECK_EQ_INT((long)cleared, 0);
+    CHECK(m10_retirement_artifacts_absent(fixture.repo_a_local));
+    CHECK_EQ_INT(read_file_to_string(fixture.repo_a_local, observed,
+                                     sizeof(observed)),
+                 (int)(sizeof(replacement_contents) - 1U));
+    CHECK_STR_EQ(observed, replacement_contents);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SUCCESS);
     m10_fixture_cleanup(&fixture);
 }
 
@@ -1432,7 +1658,52 @@ TEST(replaced_repository_identity_preserves_external_config_and_retires_later_de
     m10_fixture_cleanup(&fixture);
 }
 
-TEST(partial_failures_aggregate_cleared_count_and_continue_later_records) {
+TEST(exact_retirement_preserves_ordered_foreign_occurrences) {
+    static const char *const before[M10_KEY_COUNT] = {
+        M10_FOREIGN_BEFORE_FINGERPRINT,
+        "false",
+        "ssh",
+        "/foreign/before/gpg"
+    };
+    static const char *const after[M10_KEY_COUNT] = {
+        M10_FOREIGN_AFTER_FINGERPRINT,
+        "maybe",
+        "x509",
+        "/foreign/after/gpg"
+    };
+    m10_fixture_t fixture;
+    command_runner_fn previous;
+    size_t cleared = 0U;
+
+    CHECK_EQ_INT(m10_fixture_init(&fixture), 0);
+    CHECK_EQ_INT(m10_add_record(&fixture, PUBLICATION_SCOPE_LOCAL,
+                                fixture.repo_a_local, fixture.repo_a), 0);
+    CHECK_EQ_INT(m10_write_ledger(&fixture), 0);
+    m10_model_records(&fixture);
+    for (size_t key = 0U; key < M10_KEY_COUNT; key++) {
+        CHECK_EQ_INT(m10_destination_insert_value(
+                         &m10_destinations[0], key, 0U, before[key]), 0);
+        CHECK_EQ_INT(m10_destination_append_value(
+                         &m10_destinations[0], key, after[key]), 0);
+    }
+
+    previous = run_set_runner(m10_retirement_runner);
+    CHECK_EQ_INT(accounts_retire_git_identity(
+                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), 0);
+    run_set_runner(previous);
+
+    CHECK_EQ_INT((long)cleared, (long)M10_KEY_COUNT);
+    CHECK_EQ_INT((long)m10_destinations[0].unsets, (long)M10_KEY_COUNT);
+    for (size_t key = 0U; key < M10_KEY_COUNT; key++) {
+        CHECK_EQ_INT((long)m10_destinations[0].value_count[key], 2);
+        CHECK_STR_EQ(m10_destinations[0].values[key][0], before[key]);
+        CHECK_STR_EQ(m10_destinations[0].values[key][1], after[key]);
+    }
+    m10_check_exact_file_only();
+    m10_fixture_cleanup(&fixture);
+}
+
+TEST(partial_failure_keeps_anchor_and_continues_later_destinations) {
     m10_fixture_t fixture;
     command_runner_fn previous;
     size_t cleared = 0U;
@@ -1449,20 +1720,25 @@ TEST(partial_failures_aggregate_cleared_count_and_continue_later_records) {
     CHECK_EQ_INT(accounts_retire_git_identity(
                      &fixture.ctx, &fixture.ctx.accounts[0], &cleared), -1);
     run_set_runner(previous);
-    CHECK_EQ_INT((long)cleared, (long)(2U * M10_KEY_COUNT - 1U));
-    CHECK(m10_destinations[0].present[M10_GPG_FORMAT]);
+    /* The fake command path removes companion values before the signing-key
+     * anchor and stops this destination at the first failed companion. The
+     * later independent destination still completes. */
+    CHECK_EQ_INT((long)cleared, (long)(M10_KEY_COUNT + 1U));
+    CHECK_EQ_INT((long)m10_destinations[0].value_count[M10_SIGNING_ENABLED],
+                 0);
+    CHECK_EQ_INT((long)m10_destinations[0].value_count[M10_SIGNING_KEY], 1);
+    CHECK_EQ_INT((long)m10_destinations[0].value_count[M10_GPG_FORMAT], 1);
+    CHECK_EQ_INT((long)m10_destinations[0].value_count[M10_GPG_PROGRAM], 1);
     CHECK(m10_destination_cleared(1U));
-    CHECK_EQ_INT((long)m10_destinations[0].unsets, (long)M10_KEY_COUNT);
+    CHECK_EQ_INT((long)m10_destinations[0].unsets, 2);
     CHECK_EQ_INT((long)m10_destinations[1].unsets, (long)M10_KEY_COUNT);
     m10_check_exact_file_only();
-    CHECK(strstr(get_last_error()->message,
-                 "Failed to retire 1 durable Git identity key") != NULL);
     CHECK(strstr(get_last_error()->details,
                  "retirement summary") != NULL);
     m10_fixture_cleanup(&fixture);
 }
 
-TEST(foreign_replacement_survives_while_other_destination_retires) {
+TEST(foreign_anchor_with_owned_companions_fails_while_other_destination_retires) {
     m10_fixture_t fixture;
     command_runner_fn previous;
     size_t cleared = 0U;
@@ -1474,18 +1750,21 @@ TEST(foreign_replacement_survives_while_other_destination_retires) {
                                 fixture.repo_b_local, fixture.repo_b), 0);
     CHECK_EQ_INT(m10_write_ledger(&fixture), 0);
     m10_model_records(&fixture);
-    CHECK_EQ_INT(safe_strncpy(m10_destinations[1].fingerprint,
-                              M10_FOREIGN_FINGERPRINT,
-                              sizeof(m10_destinations[1].fingerprint)), 0);
+    CHECK_EQ_INT(safe_strncpy(
+                     m10_destinations[1].values[M10_SIGNING_KEY][0],
+                     M10_FOREIGN_FINGERPRINT,
+                     sizeof(m10_destinations[1]
+                                .values[M10_SIGNING_KEY][0])), 0);
     previous = run_set_runner(m10_retirement_runner);
     CHECK_EQ_INT(accounts_retire_git_identity(
-                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), 0);
+                     &fixture.ctx, &fixture.ctx.accounts[0], &cleared), -1);
     run_set_runner(previous);
     CHECK_EQ_INT((long)cleared, (long)M10_KEY_COUNT);
     CHECK(m10_destination_cleared(0U));
     CHECK(m10_destination_unchanged(1U));
     CHECK_EQ_INT((long)m10_destinations[1].unsets, 0);
     m10_check_exact_file_only();
+    CHECK(m10_error_contains("ambiguous repeated attributed values"));
     m10_fixture_cleanup(&fixture);
 }
 
@@ -1557,12 +1836,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(status_ignores_stale_same_path_membership_in_both_ledger_orders);
     RUN_TEST(stale_later_generation_is_preserved_after_all_record_preflight);
     RUN_TEST(stale_first_destination_does_not_block_later_valid_retirement);
+    RUN_TEST(stale_locked_read_failure_cleans_artifacts_and_retry_succeeds);
     RUN_TEST(
         replaced_config_parent_preserves_replacement_and_retires_later_destination);
     RUN_TEST(
         replaced_repository_identity_preserves_external_config_and_retires_later_destination);
-    RUN_TEST(partial_failures_aggregate_cleared_count_and_continue_later_records);
-    RUN_TEST(foreign_replacement_survives_while_other_destination_retires);
+    RUN_TEST(exact_retirement_preserves_ordered_foreign_occurrences);
+    RUN_TEST(partial_failure_keeps_anchor_and_continues_later_destinations);
+    RUN_TEST(
+        foreign_anchor_with_owned_companions_fails_while_other_destination_retires);
     RUN_TEST(different_incarnation_in_multi_destination_set_fails_before_git);
     RUN_TEST(retiring_record_in_multi_destination_set_fails_before_git);
 TEST_MAIN_END()

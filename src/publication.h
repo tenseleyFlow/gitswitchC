@@ -21,7 +21,8 @@
 #define PUBLICATION_CAP_SSH_COMMAND     UINT32_C(0x00000010)
 #define PUBLICATION_CAP_SSH_PROGRAM     UINT32_C(0x00000020)
 #define PUBLICATION_CAP_GPG_SELECTOR    UINT32_C(0x00000040)
-#define PUBLICATION_CAP_ALL             UINT32_C(0x0000007f)
+#define PUBLICATION_CAP_GPG_SIGNING_STATE UINT32_C(0x00000080)
+#define PUBLICATION_CAP_ALL               UINT32_C(0x000000ff)
 
 typedef enum {
     PUBLICATION_SCOPE_LOCAL = 0,
@@ -67,6 +68,10 @@ typedef struct {
     char gpg_selector[MAX_GPG_SELECTOR_LEN];
     char gpg_program[MAX_PATH_LEN];
     publication_identity_t gpg_program_identity;
+    /* Exact commit.gpgsign value sealed with the OpenPGP publication. The
+     * capability bit distinguishes a recorded false value from a legacy
+     * record that predates this witness. */
+    bool gpg_signing_enabled;
     char ssh_command[PUBLICATION_SSH_COMMAND_MAX];
     char ssh_program[MAX_PATH_LEN];
     publication_identity_t ssh_program_identity;

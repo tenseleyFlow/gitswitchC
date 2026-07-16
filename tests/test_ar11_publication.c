@@ -432,6 +432,20 @@ static void check_replaced_publication_field_rejected(
     free(corrupted);
 }
 
+static void check_publication_bytes_rejected(
+    const unsigned char *serialized, size_t serialized_length) {
+    publication_ledger_t parsed;
+
+    publication_ledger_init(&parsed);
+    clear_error();
+    CHECK_EQ_INT(publication_ledger_parse(
+                     serialized, serialized_length, &parsed), -1);
+    CHECK(!parsed.present);
+    CHECK_EQ_INT((long)parsed.count, 0);
+    CHECK(parsed.records == NULL);
+    publication_ledger_clear(&parsed);
+}
+
 static void fill_active_context(gitswitch_ctx_t *ctx) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->config.default_scope = GIT_SCOPE_GLOBAL;
@@ -460,17 +474,28 @@ static int retirement_runner_calls;
 static int retirement_unset_attempts;
 static bool retirement_signing_key_present;
 static char retirement_expected_config_path[MAX_PATH_LEN];
+static char retirement_expected_gpg_program[MAX_PATH_LEN];
 
 static bool fail_publication_boundary(config_io_boundary_t boundary) {
     return boundary == publication_fault_target;
 }
 
+static int append_retirement_snapshot_record(
+    char *buffer, size_t capacity, size_t *used,
+    const char *key, const char *value) {
+    int written;
+
+    if (!buffer || !used || !key || !value || *used >= capacity) return -1;
+    written = snprintf(buffer + *used, capacity - *used,
+                       "%s\n%s", key, value);
+    if (written < 0 || (size_t)written >= capacity - *used) return -1;
+    *used += (size_t)written + 1U;
+    return 0;
+}
+
 static int count_unexpected_retirement_runner(
     const char *const argv[], const run_opts_t *opts, run_result_t *result) {
-    static const char signing_snapshot[] =
-        "user.signingkey\n" FINGERPRINT_A;
     const char *operation;
-    const char *key;
 
     retirement_runner_calls++;
     if (result) {
@@ -486,52 +511,50 @@ static int count_unexpected_retirement_runner(
         return -1;
     }
     if (strcmp(argv[4], "--list") == 0) {
+        size_t used = 0U;
+
         if (!argv[5] || strcmp(argv[5], "-z") != 0 || !argv[6] ||
             strcmp(argv[6], "--no-includes") != 0 || argv[7] ||
-            !opts || !opts->out ||
-            opts->out_size <= sizeof(signing_snapshot)) {
+            !opts || !opts->out) {
             if (result) result->exit_code = 2;
             return -1;
         }
         if (retirement_signing_key_present) {
-            /* `git config --list -z` emits key, newline, value, then NUL;
-             * out_len includes that record terminator. The extra byte keeps
-             * the runner's ordinary capture-buffer contract as well. */
-            memcpy(opts->out, signing_snapshot, sizeof(signing_snapshot));
-            opts->out[sizeof(signing_snapshot)] = '\0';
-            if (result) result->out_len = sizeof(signing_snapshot);
+            if (append_retirement_snapshot_record(
+                    opts->out, opts->out_size, &used,
+                    "user.signingkey", FINGERPRINT_A) != 0 ||
+                append_retirement_snapshot_record(
+                    opts->out, opts->out_size, &used,
+                    "commit.gpgsign", "true") != 0 ||
+                append_retirement_snapshot_record(
+                    opts->out, opts->out_size, &used,
+                    "gpg.format", "openpgp") != 0 ||
+                append_retirement_snapshot_record(
+                    opts->out, opts->out_size, &used,
+                    "gpg.openpgp.program",
+                    retirement_expected_gpg_program) != 0) {
+                if (result) result->exit_code = 2;
+                return -1;
+            }
+            if (result) result->out_len = used;
         } else {
             opts->out[0] = '\0';
         }
         if (result) result->exit_code = 0;
         return 0;
     }
-    if (strcmp(argv[4], "--no-includes") != 0 ||
-        !argv[5] || !argv[6] || argv[7]) {
+    if (strcmp(argv[4], "--no-includes") != 0 || !argv[5] ||
+        strcmp(argv[5], "--fixed-value") != 0 || !argv[6] ||
+        !argv[7] || !argv[8] || argv[9]) {
         if (result) result->exit_code = 2;
         return -1;
     }
-    operation = argv[5];
-    key = argv[6];
+    operation = argv[6];
     if (strcmp(operation, "--unset-all") == 0) {
         retirement_unset_attempts++;
         /* Inject a pre-mutation Git failure: the modeled key remains present. */
         if (result) result->exit_code = 2;
         return -1;
-    }
-    if (strcmp(operation, "--get-all") == 0 &&
-        strcmp(key, "user.signingkey") == 0 &&
-        retirement_signing_key_present && opts && opts->out &&
-        opts->out_size > sizeof(FINGERPRINT_A)) {
-        int written = snprintf(opts->out, opts->out_size, "%s\n",
-                               FINGERPRINT_A);
-        if (written > 0 && (size_t)written < opts->out_size) {
-            if (result) {
-                result->exit_code = 0;
-                result->out_len = (size_t)written;
-            }
-            return 0;
-        }
     }
     if (result) result->exit_code = 1;
     return -1;
@@ -1071,6 +1094,240 @@ TEST(legacy_gpg_pair_without_selector_field_remains_retirement_compatible) {
     free(legacy);
     free(serialized);
     publication_ledger_clear(&loaded);
+    publication_ledger_clear(&source);
+}
+
+TEST(gpg_signing_state_true_and_false_round_trip_canonically) {
+    static const bool states[] = {true, false};
+    publication_record_t record;
+
+    for (size_t i = 0U; i < sizeof(states) / sizeof(states[0]); i++) {
+        publication_ledger_t source;
+        publication_ledger_t loaded;
+        const publication_record_t *found = NULL;
+        unsigned char *serialized = NULL;
+        unsigned char *reserialized = NULL;
+        size_t serialized_length = 0U;
+        size_t reserialized_length = 0U;
+        size_t program_identity_offset;
+        size_t signing_state_offset;
+        size_t ssh_command_offset;
+        const char *expected_field = states[i]
+            ? "p.0.gpg_signing_enabled=true\n"
+            : "p.0.gpg_signing_enabled=false\n";
+
+        fill_gpg_record(&record, "/tmp/ar11-publication/repository",
+                        FINGERPRINT_A);
+        record.capabilities |= PUBLICATION_CAP_GPG_SIGNING_STATE;
+        record.gpg_signing_enabled = states[i];
+        publication_ledger_init(&source);
+        publication_ledger_init(&loaded);
+
+        CHECK_EQ_INT(publication_record_validate(&record), 0);
+        CHECK_EQ_INT(publication_ledger_upsert(&source, &record), 0);
+        CHECK_EQ_INT(publication_ledger_serialize(
+                         &source, &serialized, &serialized_length), 0);
+        CHECK(serialized != NULL);
+        program_identity_offset = find_serialized_bytes(
+            serialized, serialized_length, "p.0.gpg_program_identity=");
+        signing_state_offset = find_serialized_bytes(
+            serialized, serialized_length, expected_field);
+        ssh_command_offset = find_serialized_bytes(
+            serialized, serialized_length, "p.0.ssh_command=");
+        CHECK(program_identity_offset != SIZE_MAX);
+        CHECK(signing_state_offset != SIZE_MAX);
+        CHECK(ssh_command_offset != SIZE_MAX);
+        CHECK(program_identity_offset < signing_state_offset);
+        CHECK(signing_state_offset < ssh_command_offset);
+
+        if (serialized) {
+            CHECK_EQ_INT(publication_ledger_parse(
+                             serialized, serialized_length, &loaded), 0);
+        }
+        CHECK_LOOKUP_STATUS(publication_ledger_find(
+                         &loaded, UINT32_C(41), INCARNATION_A,
+                         PUBLICATION_SCOPE_LOCAL,
+                         "/tmp/ar11-publication/repository/.git/config",
+                         "/tmp/ar11-publication/repository", &found),
+                     PUBLICATION_LOOKUP_FOUND);
+        CHECK(found != NULL);
+        if (found) {
+            CHECK((found->capabilities &
+                   PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U);
+            CHECK(found->gpg_signing_enabled == states[i]);
+        }
+
+        CHECK_EQ_INT(publication_ledger_serialize(
+                         &loaded, &reserialized, &reserialized_length), 0);
+        CHECK_EQ_INT((long)reserialized_length, (long)serialized_length);
+        if (serialized && reserialized &&
+            serialized_length == reserialized_length) {
+            CHECK(memcmp(serialized, reserialized, serialized_length) == 0);
+        }
+
+        free(reserialized);
+        free(serialized);
+        publication_ledger_clear(&loaded);
+        publication_ledger_clear(&source);
+    }
+}
+
+TEST(legacy_gpg_signing_state_absence_remains_compatible) {
+    static const char signing_state_prefix[] =
+        "p.0.gpg_signing_enabled=";
+    publication_record_t record;
+    publication_ledger_t source;
+    publication_ledger_t loaded;
+    const publication_record_t *found = NULL;
+    unsigned char *serialized = NULL;
+    unsigned char *reserialized = NULL;
+    size_t serialized_length = 0U;
+    size_t reserialized_length = 0U;
+
+    fill_gpg_record(&record, "/tmp/ar11-publication/repository",
+                    FINGERPRINT_A);
+    CHECK((record.capabilities & PUBLICATION_CAP_GPG_SIGNING_STATE) == 0U);
+    CHECK(!record.gpg_signing_enabled);
+    CHECK_EQ_INT(publication_record_validate(&record), 0);
+
+    publication_ledger_init(&source);
+    publication_ledger_init(&loaded);
+    CHECK_EQ_INT(publication_ledger_upsert(&source, &record), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK(find_serialized_bytes(serialized, serialized_length,
+                                signing_state_prefix) == SIZE_MAX);
+    if (serialized) {
+        CHECK_EQ_INT(publication_ledger_parse(
+                         serialized, serialized_length, &loaded), 0);
+    }
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &loaded, UINT32_C(41), INCARNATION_A,
+                     PUBLICATION_SCOPE_LOCAL,
+                     "/tmp/ar11-publication/repository/.git/config",
+                     "/tmp/ar11-publication/repository", &found),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(found != NULL);
+    if (found) {
+        CHECK((found->capabilities &
+               PUBLICATION_CAP_GPG_SIGNING_STATE) == 0U);
+        CHECK(!found->gpg_signing_enabled);
+        CHECK_EQ_INT(publication_record_validate(found), 0);
+    }
+
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &loaded, &reserialized, &reserialized_length), 0);
+    CHECK(find_serialized_bytes(reserialized, reserialized_length,
+                                signing_state_prefix) == SIZE_MAX);
+    CHECK_EQ_INT((long)reserialized_length, (long)serialized_length);
+    if (serialized && reserialized &&
+        serialized_length == reserialized_length) {
+        CHECK(memcmp(serialized, reserialized, serialized_length) == 0);
+    }
+
+    free(reserialized);
+    free(serialized);
+    publication_ledger_clear(&loaded);
+    publication_ledger_clear(&source);
+}
+
+TEST(gpg_signing_state_validation_requires_capability_and_gpg_witnesses) {
+    publication_record_t record;
+    publication_record_t candidate;
+
+    fill_gpg_record(&record, "/tmp/ar11-publication/repository",
+                    FINGERPRINT_A);
+
+    candidate = record;
+    candidate.gpg_signing_enabled = true;
+    clear_error();
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "signing state lacks its capability bit") != NULL);
+
+    fill_ssh_record(&candidate);
+    candidate.capabilities |= PUBLICATION_CAP_GPG_SIGNING_STATE;
+    clear_error();
+    CHECK_EQ_INT(publication_record_validate(&candidate), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "signing state requires complete GPG provenance") != NULL);
+}
+
+TEST(persisted_gpg_signing_state_rejects_malformed_fields_and_order) {
+    static const char signing_state_prefix[] =
+        "p.0.gpg_signing_enabled=";
+    static const char capabilities_prefix[] = "p.0.capabilities=";
+    static const char gpg_program_prefix[] = "p.0.gpg_program=";
+    static const char *const malformed_tokens[] = {
+        "", "TRUE", "False", "1", "yes", "true "
+    };
+    static const char duplicate_state[] =
+        "true\np.0.gpg_signing_enabled=true";
+    static const char early_state[] =
+        "2F7573722F62696E2F677067\n"
+        "p.0.gpg_signing_enabled=true";
+    publication_record_t record;
+    publication_ledger_t source;
+    unsigned char *serialized = NULL;
+    unsigned char *without_state = NULL;
+    unsigned char *misordered = NULL;
+    size_t serialized_length = 0U;
+    size_t without_state_length = 0U;
+    size_t misordered_length = 0U;
+
+    fill_gpg_record(&record, "/tmp/ar11-publication/repository",
+                    FINGERPRINT_A);
+    record.capabilities |= PUBLICATION_CAP_GPG_SIGNING_STATE;
+    record.gpg_signing_enabled = true;
+    publication_ledger_init(&source);
+    CHECK_EQ_INT(publication_ledger_upsert(&source, &record), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(
+                     &source, &serialized, &serialized_length), 0);
+    CHECK(find_serialized_bytes(serialized, serialized_length,
+                                "p.0.capabilities=000000CF\n") != SIZE_MAX);
+
+    for (size_t i = 0U;
+         i < sizeof(malformed_tokens) / sizeof(malformed_tokens[0]); i++) {
+        check_replaced_publication_field_rejected(
+            serialized, serialized_length, signing_state_prefix,
+            malformed_tokens[i]);
+    }
+
+    /* A field without its bit, and a bit without its field, are distinct
+     * malformed states. The bit also cannot stand in for the GPG witnesses. */
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, capabilities_prefix, "0000004F");
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, capabilities_prefix, "00000083");
+
+    without_state = remove_serialized_field_line(
+        serialized, serialized_length, signing_state_prefix,
+        &without_state_length);
+    CHECK(without_state != NULL);
+    if (without_state) {
+        check_publication_bytes_rejected(without_state,
+                                         without_state_length);
+    }
+
+    check_replaced_publication_field_rejected(
+        serialized, serialized_length, signing_state_prefix,
+        duplicate_state);
+
+    /* Move the state line before gpg_program_identity. v1 is an ordered
+     * grammar, so even a correctly spelled token in the wrong slot fails. */
+    if (without_state) {
+        misordered = replace_serialized_field_value(
+            without_state, without_state_length, gpg_program_prefix,
+            early_state, &misordered_length);
+    }
+    CHECK(misordered != NULL);
+    if (misordered) {
+        check_publication_bytes_rejected(misordered, misordered_length);
+    }
+
+    free(misordered);
+    free(without_state);
+    free(serialized);
     publication_ledger_clear(&source);
 }
 
@@ -2375,6 +2632,9 @@ TEST(removed_account_publication_reserves_recycled_id_without_git_mutation) {
     CHECK_EQ_INT(safe_strncpy(retirement_expected_config_path,
                               record.config_path,
                               sizeof(retirement_expected_config_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(retirement_expected_gpg_program,
+                              record.gpg_program,
+                              sizeof(retirement_expected_gpg_program)), 0);
     previous_runner = run_set_runner(count_unexpected_retirement_runner);
     cleared = 123U;
     CHECK_EQ_INT(accounts_retire_git_identity(&ctx, &removed, &cleared), -1);
@@ -2382,7 +2642,8 @@ TEST(removed_account_publication_reserves_recycled_id_without_git_mutation) {
     CHECK(retirement_runner_calls > 0);
     CHECK_EQ_INT(retirement_unset_attempts, 1);
     CHECK(retirement_signing_key_present);
-    CHECK(strstr(get_last_error()->message, "Failed to retire") != NULL);
+    CHECK(strstr(get_last_error()->message,
+                 "Failed to remove exact Git config") != NULL);
 
     /* Account-model deletion then commits through the ordinary full-save
      * transaction. Its paired state save must retain the provenance record as
@@ -2500,6 +2761,10 @@ TEST_MAIN_BEGIN()
     RUN_TEST(complete_ssh_tuple_round_trip_preserves_exact_record);
     RUN_TEST(complete_gpg_selector_tuple_round_trip_preserves_exact_record);
     RUN_TEST(legacy_gpg_pair_without_selector_field_remains_retirement_compatible);
+    RUN_TEST(gpg_signing_state_true_and_false_round_trip_canonically);
+    RUN_TEST(legacy_gpg_signing_state_absence_remains_compatible);
+    RUN_TEST(gpg_signing_state_validation_requires_capability_and_gpg_witnesses);
+    RUN_TEST(persisted_gpg_signing_state_rejects_malformed_fields_and_order);
     RUN_TEST(persisted_gpg_selector_schema_rejects_malformed_fields_and_tuples);
     RUN_TEST(publication_lookup_distinguishes_absence_from_invalid_or_ambiguous_data);
     RUN_TEST(raw_incarnation_uniformity_includes_skipped_and_rejected_accounts);

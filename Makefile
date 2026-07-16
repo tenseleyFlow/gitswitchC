@@ -788,6 +788,11 @@ $(AR09_DISPATCH_TEST_OBJECT): $(TESTDIR)/test_signals.c $(BUILDTYPE_STAMP) | $(O
 # Test executables (exclude main.o to avoid multiple main functions)
 # AR-10 L15: suites link the GITSWITCH_TESTING signals object — the sigaction
 # fault / guard-end sabotage seams no longer exist in the production object.
+# AR-11 M13-M15: keep the real-Git exact-retirement transaction suite visible
+# as an explicit focused target while retaining the common test link profile.
+$(BINDIR)/test_ar11_retirement_atomic: \
+		$(OBJDIR)/test_ar11_retirement_atomic.o
+
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(AR09_DISPATCH_SIGNALS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."

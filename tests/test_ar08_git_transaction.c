@@ -384,12 +384,16 @@ static void add_name_before_restore_lock(git_scope_t scope) {
 }
 
 static void replace_config_after_rollback_publish(git_scope_t scope) {
+    static const char replacement[] =
+        "[user]\n"
+        "\tname = later-replacement\n"
+        "[audit]\n"
+        "\treplacement = must-survive\n";
+
     if (scope != GIT_SCOPE_LOCAL || g_postpublish_writer_calls != 0) return;
     g_postpublish_writer_calls++;
     if (rename(g_postpublish_config, g_postpublish_installed) != 0 ||
-        git_set_file(g_postpublish_config, "user.name", "later-replacement") != 0 ||
-        git_set_file(g_postpublish_config, "audit.replacement",
-                     "must-survive") != 0) {
+        write_text_file(g_postpublish_config, replacement, 0600) != 0) {
         g_postpublish_writer_calls = -1;
     }
 }

@@ -364,18 +364,24 @@ static int m12_runner(const char *const argv[], const run_opts_t *opts,
     }
 
     if (!argv[4] || strcmp(argv[4], "--no-includes") != 0 ||
-        !argv[5] || !argv[6] || argv[7]) {
-        m12_unexpected_command = true;
-        return m12_publish(opts, result, NULL, 0U, true, 2, 0, false);
-    }
-    slot = m12_key_slot(argv[6]);
-    if (slot < 0) {
+        !argv[5]) {
         m12_unexpected_command = true;
         return m12_publish(opts, result, NULL, 0U, true, 2, 0, false);
     }
     if (strcmp(argv[5], "--get-all") == 0) {
         const char *value;
 
+        if (!argv[6] || argv[7]) {
+            m12_unexpected_command = true;
+            return m12_publish(opts, result, NULL, 0U, true, 2, 0,
+                               false);
+        }
+        slot = m12_key_slot(argv[6]);
+        if (slot < 0) {
+            m12_unexpected_command = true;
+            return m12_publish(opts, result, NULL, 0U, true, 2, 0,
+                               false);
+        }
         destination->scalar_reads++;
         if (destination == &m12_destinations[0] &&
             m12_fault != M12_READ_CLEAN_ABSENCE &&
@@ -390,7 +396,15 @@ static int m12_runner(const char *const argv[], const run_opts_t *opts,
         return m12_publish(opts, result, value, strlen(value), true, 0, 0,
                            false);
     }
-    if (strcmp(argv[5], "--unset-all") == 0) {
+    if (strcmp(argv[5], "--fixed-value") == 0 && argv[6] &&
+        strcmp(argv[6], "--unset-all") == 0 && argv[7] && argv[8] &&
+        !argv[9]) {
+        slot = m12_key_slot(argv[7]);
+        if (slot < 0 || strcmp(argv[8], m12_key_value(slot)) != 0) {
+            m12_unexpected_command = true;
+            return m12_publish(opts, result, NULL, 0U, true, 2, 0,
+                               false);
+        }
         if (m12_destinations[0].snapshot_reads == 0U ||
             m12_destinations[1].snapshot_reads == 0U) {
             m12_unset_before_all_snapshots = true;

@@ -88,6 +88,36 @@ static bool fk_unset_all(const char *scope, const char *key) {
     return found;
 }
 
+static bool fk_unset_exact(const char *scope, const char *key,
+                           const char *value) {
+    bool found = false;
+
+    for (int i = 0; i < FK_MAX; i++) {
+        if (fk_store[i].used && strcmp(fk_store[i].scope, scope) == 0 &&
+            strcmp(fk_store[i].key, key) == 0 &&
+            strcmp(fk_store[i].value, value) == 0) {
+            fk_store[i].used = false;
+            found = true;
+        }
+    }
+    return found;
+}
+
+static bool fk_is_exact_global_or_stage_path(const char *path) {
+    static const char stage_prefix[] = "/.gitswitch-config-";
+    const char *slash;
+    size_t parent_length;
+
+    if (!path || fk_exact_global_path[0] == '\0') return false;
+    if (strcmp(path, fk_exact_global_path) == 0) return true;
+    slash = strrchr(fk_exact_global_path, '/');
+    if (!slash) return false;
+    parent_length = (size_t)(slash - fk_exact_global_path);
+    return strncmp(path, fk_exact_global_path, parent_length) == 0 &&
+           strncmp(path + parent_length, stage_prefix,
+                   sizeof(stage_prefix) - 1U) == 0;
+}
+
 /* A custom runner fully replaces run_argv, so — like the real run_argv_real —
  * it must publish result->exit_code (WEXITSTATUS), not just a return value:
  * git_unset_config_value now inspects res.exit_code to tell "removed"/"absent"
@@ -209,7 +239,7 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
 
     if (strcmp(argv[1], "config") == 0 && argv[2] && argv[3]) {
         if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] &&
-            argv[6] && strcmp(argv[3], fk_exact_global_path) == 0 &&
+            argv[6] && fk_is_exact_global_or_stage_path(argv[3]) &&
             strcmp(argv[4], "--list") == 0 &&
             strcmp(argv[5], "-z") == 0 &&
             strcmp(argv[6], "--no-includes") == 0) {
@@ -219,14 +249,13 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
             return fk_emit_scope_listing("--global", opts, result);
         }
         if (strcmp(argv[2], "--file") == 0 && argv[4] && argv[5] &&
-            argv[6] && strcmp(argv[3], fk_exact_global_path) == 0 &&
+            fk_is_exact_global_or_stage_path(argv[3]) &&
             strcmp(argv[4], "--no-includes") == 0) {
             const char *scope = "--global";
-            const char *operation = argv[5];
-            const char *key = argv[6];
 
-            if (strcmp(operation, "--get-all") == 0) {
-                int i = fk_find(scope, key);
+            if (strcmp(argv[5], "--get-all") == 0 && argv[6] &&
+                !argv[7]) {
+                int i = fk_find(scope, argv[6]);
                 if (i < 0) return fk_ret(result, 1);
                 if (opts && opts->out && opts->out_size > 0) {
                     (void)snprintf(opts->out, opts->out_size, "%s\n",
@@ -235,8 +264,13 @@ static int fake_git_runner(const char *const argv[], const run_opts_t *opts,
                 }
                 return fk_ret(result, 0);
             }
-            if (strcmp(operation, "--unset-all") == 0) {
-                return fk_ret(result, fk_unset_all(scope, key) ? 0 : 5);
+            if (strcmp(argv[5], "--fixed-value") == 0 && argv[6] &&
+                strcmp(argv[6], "--unset-all") == 0 && argv[7] &&
+                argv[8] && !argv[9]) {
+                return fk_ret(result,
+                              fk_unset_exact(scope, argv[7], argv[8])
+                                  ? 0
+                                  : 5);
             }
             return fk_ret(result, 1);
         }
@@ -1535,7 +1569,9 @@ static void retire_fill_publication(publication_record_t *publication,
                                 PUBLICATION_CAP_POST_GENERATION |
                                 PUBLICATION_CAP_GPG_FINGERPRINT |
                                 PUBLICATION_CAP_GPG_PROGRAM |
-                                PUBLICATION_CAP_GPG_SELECTOR;
+                                PUBLICATION_CAP_GPG_SELECTOR |
+                                PUBLICATION_CAP_GPG_SIGNING_STATE;
+    publication->gpg_signing_enabled = true;
     safe_strncpy(publication->gpg_fingerprint, RETIRE_FPR,
                  sizeof(publication->gpg_fingerprint));
     CHECK_EQ_INT(publication_normalize_gpg_selector(
@@ -1559,6 +1595,7 @@ static void retire_fill_ssh_publication(
     publication->gpg_fingerprint[0] = '\0';
     publication->gpg_selector[0] = '\0';
     publication->gpg_program[0] = '\0';
+    publication->gpg_signing_enabled = false;
     memset(&publication->gpg_program_identity, 0,
            sizeof(publication->gpg_program_identity));
     CHECK_EQ_INT(safe_strncpy(publication->ssh_command, ssh_command,
@@ -1706,15 +1743,22 @@ static int retire_destination_runner(const char *const argv[],
         if (strcmp(argv[4], "--no-includes") != 0) {
             return fk_ret(result, 1);
         }
-        key = retire_destination_key_index(argv[6]);
-        if (key < 0) return fk_ret(result, 1);
-        if (strcmp(argv[5], "--unset-all") == 0) {
+        if (strcmp(argv[5], "--fixed-value") == 0 && argv[6] &&
+            strcmp(argv[6], "--unset-all") == 0 && argv[7] && argv[8] &&
+            !argv[9]) {
+            key = retire_destination_key_index(argv[7]);
+            if (key < 0 ||
+                strcmp(argv[8], retire_destination_expected[key]) != 0) {
+                return fk_ret(result, 1);
+            }
             if (!retire_destination_values[repository][key]) {
                 return fk_ret(result, 5);
             }
             retire_destination_values[repository][key] = false;
             return fk_ret(result, 0);
         }
+        key = retire_destination_key_index(argv[6]);
+        if (key < 0) return fk_ret(result, 1);
         if (strcmp(argv[5], "--get-all") != 0 ||
             !retire_destination_values[repository][key]) {
             return fk_ret(result, 1);
@@ -2112,7 +2156,7 @@ TEST(retire_legacy_publication_without_selector_uses_exact_fingerprint) {
     CHECK(fk_find("--global", GIT_CONFIG_USER_SIGNINGKEY) < 0);
 }
 
-TEST(retire_leaves_foreign_signing_key_in_place) {
+TEST(retire_refuses_foreign_anchor_with_owned_companions) {
     account_t acct;
     publication_record_t publication;
     size_t cleared = 99;
@@ -2131,11 +2175,12 @@ TEST(retire_leaves_foreign_signing_key_in_place) {
         &acct, &publication, &cleared);
     run_set_runner(prev);
 
-    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(rc, -1);
     CHECK_EQ_INT((int)cleared, 0);
     CHECK(fk_find("--global", "user.signingkey") >= 0);
     CHECK(fk_find("--global", "commit.gpgsign") >= 0);
     CHECK(fk_find("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM) >= 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
 }
 
 TEST(retire_preserves_legacy_selector_without_canonical_record) {
@@ -2168,7 +2213,7 @@ TEST(retire_preserves_legacy_selector_without_canonical_record) {
     CHECK(fk_find("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM) >= 0);
 }
 
-TEST(retire_preserves_shared_suffix_foreign_signing_leg) {
+TEST(retire_refuses_shared_suffix_foreign_anchor_with_owned_companions) {
     account_t acct;
     publication_record_t publication;
     size_t cleared = 99;
@@ -2188,12 +2233,13 @@ TEST(retire_preserves_shared_suffix_foreign_signing_leg) {
         &acct, &publication, &cleared);
     run_set_runner(prev);
 
-    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(rc, -1);
     CHECK_EQ_INT((int)cleared, 0);
     CHECK(fk_find("--global", "user.signingkey") >= 0);
     CHECK(fk_find("--global", "commit.gpgsign") >= 0);
     CHECK(fk_find("--global", "gpg.format") >= 0);
     CHECK(fk_find("--global", GIT_CONFIG_GPG_OPENPGP_PROGRAM) >= 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_FAILED);
 }
 
 TEST(retire_without_publication_refuses_matching_ssh_command) {
@@ -2603,9 +2649,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(retire_local_publication_targets_recorded_repository_from_other_repository);
     RUN_TEST(retire_exact_published_fingerprint_clears_signing_leg);
     RUN_TEST(retire_legacy_publication_without_selector_uses_exact_fingerprint);
-    RUN_TEST(retire_leaves_foreign_signing_key_in_place);
+    RUN_TEST(retire_refuses_foreign_anchor_with_owned_companions);
     RUN_TEST(retire_preserves_legacy_selector_without_canonical_record);
-    RUN_TEST(retire_preserves_shared_suffix_foreign_signing_leg);
+    RUN_TEST(retire_refuses_shared_suffix_foreign_anchor_with_owned_companions);
     RUN_TEST(retire_without_publication_refuses_matching_ssh_command);
     RUN_TEST(retire_leaves_foreign_ssh_command_in_place);
     RUN_TEST(published_ssh_retirement_uses_saved_command_after_program_removal);

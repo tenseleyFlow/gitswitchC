@@ -581,6 +581,7 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
                      PUBLICATION_CAP_GPG_FINGERPRINT |
                      PUBLICATION_CAP_GPG_PROGRAM |
                      PUBLICATION_CAP_GPG_SELECTOR |
+                     PUBLICATION_CAP_GPG_SIGNING_STATE |
                      PUBLICATION_CAP_SSH_COMMAND |
                      PUBLICATION_CAP_SSH_PROGRAM);
     CHECK_STR_EQ(record.config_path, fixture.global_config);
@@ -594,6 +595,7 @@ TEST(default_runner_exports_exact_sealed_global_publication) {
     CHECK_STR_EQ(record.gpg_program, gpg_program);
     CHECK(publication_identity_equal(&record.gpg_program_identity,
                                      &expected_program));
+    CHECK(record.gpg_signing_enabled);
     CHECK_STR_EQ(record.ssh_command, expected_ssh_command);
     CHECK_STR_EQ(record.ssh_program, ssh_program);
     CHECK(publication_identity_equal(&record.ssh_program_identity,
@@ -774,6 +776,7 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
                      PUBLICATION_CAP_GPG_FINGERPRINT |
                      PUBLICATION_CAP_GPG_PROGRAM |
                      PUBLICATION_CAP_GPG_SELECTOR |
+                     PUBLICATION_CAP_GPG_SIGNING_STATE |
                      PUBLICATION_CAP_SSH_COMMAND |
                      PUBLICATION_CAP_SSH_PROGRAM);
     CHECK_STR_EQ(record.config_path, local_config);
@@ -788,6 +791,7 @@ TEST(default_runner_exports_exact_sealed_local_publication) {
     CHECK_STR_EQ(record.gpg_program, gpg_program);
     CHECK(publication_identity_equal(&record.gpg_program_identity,
                                      &expected_program));
+    CHECK(record.gpg_signing_enabled);
     CHECK_STR_EQ(record.ssh_command, expected_ssh_command);
     CHECK_STR_EQ(record.ssh_program, ssh_program);
     CHECK(publication_identity_equal(&record.ssh_program_identity,

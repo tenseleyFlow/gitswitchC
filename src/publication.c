@@ -335,6 +335,20 @@ int publication_record_validate(const publication_record_t *record) {
         return publication_invalid(
             "Publication GPG provenance requires a post-config generation");
     }
+    if ((record->capabilities &
+         PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U) {
+        if ((gpg_capabilities &
+             (PUBLICATION_CAP_GPG_FINGERPRINT |
+              PUBLICATION_CAP_GPG_PROGRAM)) !=
+            (PUBLICATION_CAP_GPG_FINGERPRINT |
+             PUBLICATION_CAP_GPG_PROGRAM)) {
+            return publication_invalid(
+                "Publication signing state requires complete GPG provenance");
+        }
+    } else if (record->gpg_signing_enabled) {
+        return publication_invalid(
+            "Publication signing state lacks its capability bit");
+    }
     ssh_capabilities = record->capabilities &
         (PUBLICATION_CAP_SSH_COMMAND | PUBLICATION_CAP_SSH_PROGRAM);
     if (ssh_capabilities != 0U &&
@@ -1059,6 +1073,34 @@ static int publication_parse_record(publication_reader_t *reader,
     READ_FIELD("gpg_program_identity");
     if (publication_parse_identity(value, length,
                                    &record->gpg_program_identity) != 0) return -1;
+    /* Signing-state provenance was added compatibly to the internal v1
+     * ledger. Its capability bit distinguishes an explicit false value from
+     * an older record with no durable commit.gpgsign witness. */
+    if (publication_next_field_is(reader, index,
+                                  "gpg_signing_enabled")) {
+        if ((record->capabilities &
+             PUBLICATION_CAP_GPG_SIGNING_STATE) == 0U) {
+            return publication_invalid(
+                "Publication signing-state field lacks its capability bit");
+        }
+        READ_FIELD("gpg_signing_enabled");
+        if (publication_copy_token(value, length, token,
+                                   sizeof(token)) != 0) {
+            return -1;
+        }
+        if (strcmp(token, "true") == 0) {
+            record->gpg_signing_enabled = true;
+        } else if (strcmp(token, "false") == 0) {
+            record->gpg_signing_enabled = false;
+        } else {
+            return publication_invalid(
+                "Invalid publication signing-state token");
+        }
+    } else if ((record->capabilities &
+                PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U) {
+        return publication_invalid(
+            "Publication signing-state capability lacks its field");
+    }
     READ_FIELD("ssh_command");
     if (publication_decode_hex(value, length, record->ssh_command,
                                sizeof(record->ssh_command)) != 0) return -1;
@@ -1223,6 +1265,18 @@ static int publication_writer_named_identity(
            publication_writer_append(writer, "\n", 1U) == 0 ? 0 : -1;
 }
 
+static int publication_writer_signing_state(
+    publication_writer_t *writer, size_t index,
+    const publication_record_t *record) {
+    if ((record->capabilities &
+         PUBLICATION_CAP_GPG_SIGNING_STATE) == 0U) {
+        return 0;
+    }
+    return publication_writer_printf(
+        writer, "p.%zu.gpg_signing_enabled=%s\n", index,
+        record->gpg_signing_enabled ? "true" : "false");
+}
+
 static const char *publication_scope_name(publication_scope_t scope) {
     switch (scope) {
         case PUBLICATION_SCOPE_LOCAL: return "local";
@@ -1313,6 +1367,7 @@ int publication_ledger_serialize(const publication_ledger_t *ledger,
             publication_writer_named_identity(
                 &writer, i, "gpg_program_identity",
                 &record->gpg_program_identity) != 0 ||
+            publication_writer_signing_state(&writer, i, record) != 0 ||
             publication_writer_named_hex(&writer, i, "ssh_command",
                                          record->ssh_command) != 0 ||
             publication_writer_named_hex(&writer, i, "ssh_program",
