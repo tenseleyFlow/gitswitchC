@@ -45,6 +45,9 @@
 #include "error.h"
 #include "utils.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_status_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "ssh_manager.h"
 #include "gpg_manager.h"
 #include "prompt.h"
@@ -3905,6 +3908,113 @@ static void print_git_value_origin(const git_config_effective_value_t *value) {
     printf(")");
 }
 
+static void print_git_effective_text(
+    const git_config_effective_value_t *value) {
+    if (!value || !value->present) {
+        printf("[ABSENT]");
+        return;
+    }
+    if (value->value_unknown) {
+        printf("[ERROR]");
+    } else if (value->value[0] == '\0') {
+        printf("[EMPTY]");
+    } else {
+        print_terminal_safe(value->value);
+    }
+    print_git_value_origin(value);
+}
+
+static void print_git_effective_set_value(
+    const git_config_effective_value_t *value) {
+    if (!value || !value->present) {
+        printf("[ABSENT]");
+        return;
+    }
+    if (value->value_unknown) {
+        printf("[ERROR]");
+    } else {
+        printf("[SET] ");
+        if (value->value[0] == '\0') {
+            printf("[EMPTY]");
+        } else {
+            print_terminal_safe(value->value);
+        }
+    }
+    print_git_value_origin(value);
+}
+
+static bool git_status_snapshot_has_complete_identity(
+    const git_status_snapshot_t *snapshot) {
+    return snapshot && snapshot->user_name.present &&
+           snapshot->user_email.present;
+}
+
+static bool git_status_snapshot_has_credential_residue(
+    const git_status_snapshot_t *snapshot) {
+    return snapshot &&
+           (snapshot->ssh_command.present ||
+            snapshot->user_signing_key.present ||
+            snapshot->commit_gpgsign.present ||
+            snapshot->gpg_format.present || snapshot->gpg_program.present ||
+            snapshot->gpg_openpgp_program.present ||
+            snapshot->gpg_x509_program.present ||
+            snapshot->gpg_ssh_program.present);
+}
+
+static void print_git_status_snapshot_identity(
+    const git_status_snapshot_t *snapshot, bool active_account) {
+    printf(active_account ? "  Current Name: " : "  Name: ");
+    print_git_effective_text(snapshot ? &snapshot->user_name : NULL);
+    printf(active_account ? "\n  Current Email: " : "\n  Email: ");
+    print_git_effective_text(snapshot ? &snapshot->user_email : NULL);
+    printf("\n");
+}
+
+static void print_git_status_snapshot_credentials(
+    const git_status_snapshot_t *snapshot) {
+    printf("  Effective SSH Command: ");
+    print_git_effective_set_value(snapshot ? &snapshot->ssh_command : NULL);
+    printf("\n  GPG Signing Key: ");
+    print_git_effective_text(snapshot ? &snapshot->user_signing_key : NULL);
+    printf("\n  GPG Signing Enabled: ");
+    if (!snapshot || !snapshot->commit_gpgsign.present) {
+        printf("[ABSENT]");
+    } else if (snapshot->commit_gpgsign_invalid ||
+               snapshot->commit_gpgsign.value_unknown) {
+        printf("[ERROR]");
+        print_git_value_origin(&snapshot->commit_gpgsign);
+    } else {
+        printf(snapshot->gpg_signing_enabled ? "[YES]" : "[NO]");
+        print_git_value_origin(&snapshot->commit_gpgsign);
+    }
+    printf("\n  Effective GPG Format: ");
+    if (snapshot && snapshot->gpg_format_invalid) {
+        printf("[ERROR]");
+        print_git_value_origin(&snapshot->gpg_format);
+    } else {
+        print_git_effective_set_value(snapshot ? &snapshot->gpg_format : NULL);
+    }
+    printf("\n  Effective OpenPGP Program: ");
+    print_git_effective_set_value(
+        snapshot ? &snapshot->gpg_openpgp_program : NULL);
+    printf("\n  Effective Legacy GPG Program: ");
+    print_git_effective_set_value(snapshot ? &snapshot->gpg_program : NULL);
+    printf("\n  Effective X.509 GPG Program: ");
+    print_git_effective_set_value(
+        snapshot ? &snapshot->gpg_x509_program : NULL);
+    printf("\n  Effective SSH Signing Program: ");
+    print_git_effective_set_value(snapshot ? &snapshot->gpg_ssh_program : NULL);
+    printf("\n");
+}
+
+static void print_git_status_captured_state(
+    const git_status_snapshot_t *snapshot, bool active_account) {
+    if (!snapshot) return;
+    printf("  Captured Managed Git State:\n");
+    print_git_status_snapshot_identity(snapshot, active_account);
+    print_git_status_snapshot_credentials(snapshot);
+}
+
 /* Absence is a normal status state; an unreadable, malformed, or invalid Git
  * configuration is not. Keep the distinction visible so status cannot turn a
  * failed/truncated inspection into the reassuring appearance of no config. */
@@ -4087,10 +4197,12 @@ int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
 
 static git_signing_publication_result_t status_signing_key_matches(
     const account_t *account, const publication_record_t *publication,
-    const git_current_config_t *git_config) {
-    if (!account || !git_config) return GIT_SIGNING_PUBLICATION_MISMATCH;
+    const git_current_config_t *git_config,
+    const git_status_snapshot_t *git_status) {
+    if (!account || !git_config || !git_status)
+        return GIT_SIGNING_PUBLICATION_MISMATCH;
     if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') {
-        return git_config->signing_key[0] == '\0'
+        return !git_status->user_signing_key.present
                    ? GIT_SIGNING_PUBLICATION_MATCH
                    : GIT_SIGNING_PUBLICATION_MISMATCH;
     }
@@ -4299,6 +4411,7 @@ select_current_account_publication(
 int accounts_show_status(const gitswitch_ctx_t *ctx) {
     int status_result = 0;
     git_current_config_t *git_config = NULL;
+    git_status_snapshot_t *git_status = NULL;
     publication_ledger_t publication_ledger;
     bool repository_probe_allowed = true;
 
@@ -4439,12 +4552,35 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
                         : "complete switch-time OpenPGP publication is required");
                 printf("\n");
             }
+        } else if (git_status_snapshot_read(&git_status) != 0) {
+            if (print_git_status_read_failure() != 0) status_result = -1;
+            print_git_status_captured_state(git_status, true);
+        } else if (!git_status->any_present) {
+            set_error(ERR_GIT_CONFIG_NOT_FOUND,
+                      "No managed git configuration found");
+            if (print_git_status_read_failure() != 0) status_result = -1;
+        } else if (!git_status_snapshot_has_complete_identity(git_status)) {
+            print_git_status_snapshot_identity(git_status, true);
+            printf("  Match Status: [WARN] Effective Git identity is incomplete\n");
+            printf("    Expected: %s <%s>\n", account->name,
+                   account->email);
+            printf("    Current:  ");
+            print_git_effective_text(&git_status->user_name);
+            printf(" <");
+            print_git_effective_text(&git_status->user_email);
+            printf(">\n");
+            print_git_status_snapshot_credentials(git_status);
+            if (git_status_snapshot_has_credential_residue(git_status)) {
+                printf("  [WARN] Durable Git credential configuration is set with an incomplete identity.\n");
+            }
         } else if ((git_config = calloc(1, sizeof(*git_config))) == NULL) {
             set_error(ERR_SYSTEM_CALL,
                       "Cannot allocate Git status snapshot: %s",
                       strerror(errno));
             if (print_git_status_read_failure() != 0) status_result = -1;
-        } else if (git_get_current_config(git_config) == 0) {
+            print_git_status_captured_state(git_status, true);
+        } else if (git_status_snapshot_to_current(git_status, git_config) ==
+                   0) {
             char expected_gpg_program[MAX_PATH_LEN] = "";
             char ssh_status_error[512] = "";
             char gpg_program_status_error[512] = "";
@@ -4584,7 +4720,7 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             {
                 git_signing_publication_result_t signing_result =
                     status_signing_key_matches(account, publication,
-                                               git_config);
+                                               git_config, git_status);
                 signing_key_matches =
                     signing_result == GIT_SIGNING_PUBLICATION_MATCH;
                 if (signing_result == GIT_SIGNING_PUBLICATION_ERROR) {
@@ -4764,6 +4900,9 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             }
             print_git_value_origin(&git_config->ssh_command);
             printf("\n");
+            printf("  Effective GPG Format: ");
+            print_git_effective_set_value(&git_status->gpg_format);
+            printf("\n");
             printf("  Effective OpenPGP Program: %s",
                    !gpg_program_status_determined
                        ? "[ERROR]"
@@ -4789,17 +4928,21 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             print_git_value_origin(&git_config->gpg_ssh_program);
             printf("\n");
             
-            /* GPG signing status */
-            if (strlen(git_config->signing_key) > 0) {
-                printf("  GPG Signing Key: ");
-                print_terminal_safe(git_config->signing_key);
-                printf("\n");
-                printf("  GPG Signing Enabled: %s\n", git_config->gpg_signing_enabled ? "[YES]" : "[NO]");
+            /* Preserve explicit-empty and explicit-false state instead of
+             * projecting both onto scalar absence/defaults. */
+            printf("  GPG Signing Key: ");
+            print_git_effective_text(&git_status->user_signing_key);
+            printf("\n  GPG Signing Enabled: ");
+            if (!git_status->commit_gpgsign.present) {
+                printf("[ABSENT]");
             } else {
-                printf("  GPG Signing: [NOT CONFIGURED]\n");
+                printf(git_status->gpg_signing_enabled ? "[YES]" : "[NO]");
+                print_git_value_origin(&git_status->commit_gpgsign);
             }
+            printf("\n");
         } else {
             if (print_git_status_read_failure() != 0) status_result = -1;
+            print_git_status_captured_state(git_status, true);
         }
         
         /* Repository context */
@@ -4826,69 +4969,24 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         
         /* Show current git config even without active account */
         printf("\nCurrent Git Configuration:\n");
-        git_config = calloc(1, sizeof(*git_config));
-        if (!git_config) {
-            set_error(ERR_SYSTEM_CALL,
-                      "Cannot allocate Git status snapshot: %s",
-                      strerror(errno));
+        if (git_status_snapshot_read(&git_status) != 0) {
             if (print_git_status_read_failure() != 0) status_result = -1;
-        } else if (git_get_current_config(git_config) == 0) {
-            printf("  Name: ");
-            print_terminal_safe(git_config->name);
-            printf("\n  Email: ");
-            print_terminal_safe(git_config->email);
-            printf("\n");
-            printf("  Scope: %s\n",
-                   git_config_origin_scope_to_string(
-                       git_config->effective_name_scope));
+            print_git_status_captured_state(git_status, false);
+        } else if (!git_status->any_present) {
+            set_error(ERR_GIT_CONFIG_NOT_FOUND,
+                      "No managed git configuration found");
+            if (print_git_status_read_failure() != 0) status_result = -1;
+        } else {
+            print_git_status_snapshot_identity(git_status, false);
             /* AR-10 M1: the credential legs stay authoritative for fetch/push
              * and signing even with no active account. Render them here so
              * residue from a removed/reset account cannot hide in exactly the
              * state that retirement produces. */
-            printf("  Effective SSH Command: %s",
-                   git_config->ssh_command.present ? "[SET]" : "[ABSENT]");
-            print_git_value_origin(&git_config->ssh_command);
-            printf("\n");
-            printf("  GPG Signing Key: ");
-            if (git_config->signing_key[0] != '\0') {
-                print_terminal_safe(git_config->signing_key);
-            } else {
-                printf("[ABSENT]");
-            }
-            printf("\n");
-            printf("  GPG Signing Enabled: %s\n",
-                   git_config->gpg_signing_enabled ? "[YES]" : "[NO]");
-            printf("  Effective OpenPGP Program: %s",
-                   git_config->gpg_openpgp_program.present
-                       ? "[SET]" : "[ABSENT]");
-            print_git_value_origin(&git_config->gpg_openpgp_program);
-            printf("\n");
-            printf("  Effective Legacy GPG Program: %s",
-                   git_config->gpg_program.present ? "[SET]" : "[ABSENT]");
-            print_git_value_origin(&git_config->gpg_program);
-            printf("\n");
-            printf("  Effective X.509 GPG Program: %s",
-                   git_config->gpg_x509_program.present
-                       ? "[SET]" : "[ABSENT]");
-            print_git_value_origin(&git_config->gpg_x509_program);
-            printf("\n");
-            printf("  Effective SSH Signing Program: %s",
-                   git_config->gpg_ssh_program.present
-                       ? "[SET]" : "[ABSENT]");
-            print_git_value_origin(&git_config->gpg_ssh_program);
-            printf("\n");
-            if (git_config->ssh_command.present ||
-                git_config->signing_key[0] != '\0' ||
-                git_config->gpg_signing_enabled ||
-                git_config->gpg_program.present ||
-                git_config->gpg_openpgp_program.present ||
-                git_config->gpg_x509_program.present ||
-                git_config->gpg_ssh_program.present) {
+            print_git_status_snapshot_credentials(git_status);
+            if (git_status_snapshot_has_credential_residue(git_status)) {
                 printf("  [WARN] Durable Git credential configuration is set "
                        "while no account is active.\n");
             }
-        } else {
-            if (print_git_status_read_failure() != 0) status_result = -1;
         }
         
         /* Repository context */
@@ -4905,6 +5003,7 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
         secure_zero_memory(git_config, sizeof(*git_config));
         free(git_config);
     }
+    git_status_snapshot_free(git_status);
     publication_ledger_clear(&publication_ledger);
     return status_result;
 }

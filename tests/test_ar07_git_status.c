@@ -7,6 +7,9 @@
 #include "accounts.h"
 #include "error.h"
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_status_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
 #include "ssh_manager.h"
 #include "utils.h"
@@ -404,6 +407,26 @@ static size_t count_text(const char *haystack, const char *needle) {
     return count;
 }
 
+static void check_effective_git_value(
+    const git_config_effective_value_t *value, bool expected_present,
+    const char *expected_value, const char *expected_origin) {
+    CHECK(value != NULL);
+    if (!value) return;
+
+    CHECK_EQ_INT(value->present, expected_present);
+    if (!expected_present) {
+        CHECK_EQ_INT(value->scope, GIT_CONFIG_ORIGIN_UNKNOWN);
+        CHECK(value->origin[0] == '\0');
+        CHECK(value->value[0] == '\0');
+        return;
+    }
+
+    CHECK(!value->value_unknown);
+    CHECK_STR_EQ(value->value, expected_value);
+    CHECK_EQ_INT(value->scope, GIT_CONFIG_ORIGIN_GLOBAL);
+    CHECK_STR_EQ(value->origin, expected_origin);
+}
+
 TEST(status_escapes_and_bounds_every_external_value) {
     static const unsigned char hostile_name[] = {
         'G', 'i', 't', '\n', 'N', 'a', 'm', 'e', 0x1b, '[', '3', '1', 'm'
@@ -568,16 +591,366 @@ TEST(absent_identity_remains_a_normal_status_result) {
     CHECK(strstr(status, "Status: [ERROR]") == NULL);
 }
 
-TEST(absent_identity_with_invalid_boolean_reports_error) {
+TEST(partial_identity_renders_every_credential_leg) {
+    static const struct {
+        bool include_name;
+        bool include_email;
+    } cases[] = {
+        { false, true },
+        { true, false },
+        { false, false }
+    };
+    static const char origin[] = "file:/ar11/partial.gitconfig";
+    static const char name[] = "Partial Residue User";
+    static const char email[] = "partial-residue@example.test";
+    static const char fingerprint[] =
+        "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+    static const char ssh_command[] =
+        "'/trusted/ar11/ssh' -i '/keys/ar11-residue' -F '/dev/null'";
+    static const char openpgp_program[] = "/trusted/ar11/openpgp";
+    static const char legacy_program[] = "/foreign/ar11/legacy-gpg";
+    static const char x509_program[] = "/foreign/ar11/x509-gpg";
+    static const char ssh_program[] = "/foreign/ar11/ssh-gpg";
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        git_status_snapshot_t *current = NULL;
+        git_current_config_t legacy;
+        char status[8192];
+        command_runner_fn previous;
+
+        fake_listing_len = 0;
+        fake_listing_calls = 0;
+        fake_execution_failure = false;
+        fake_repository = false;
+        if (cases[i].include_name) {
+            CHECK(fake_append_record("global", origin, GIT_CONFIG_USER_NAME,
+                                     name, strlen(name)));
+        }
+        if (cases[i].include_email) {
+            CHECK(fake_append_record("global", origin, GIT_CONFIG_USER_EMAIL,
+                                     email, strlen(email)));
+        }
+        CHECK(fake_append_record("global", origin,
+                                 GIT_CONFIG_CORE_SSHCOMMAND, ssh_command,
+                                 strlen(ssh_command)));
+        CHECK(fake_append_record("global", origin,
+                                 GIT_CONFIG_USER_SIGNINGKEY, fingerprint,
+                                 strlen(fingerprint)));
+        CHECK(fake_append_record("global", origin,
+                                 GIT_CONFIG_COMMIT_GPGSIGN, "true",
+                                 strlen("true")));
+        CHECK(fake_append_record("global", origin, GIT_CONFIG_GPG_FORMAT,
+                                 "openpgp", strlen("openpgp")));
+        CHECK(fake_append_record("global", origin, GIT_CONFIG_GPG_PROGRAM,
+                                 legacy_program, strlen(legacy_program)));
+        CHECK(fake_append_record("global", origin,
+                                 GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                                 openpgp_program, strlen(openpgp_program)));
+        CHECK(fake_append_record("global", origin,
+                                 GIT_CONFIG_GPG_X509_PROGRAM, x509_program,
+                                 strlen(x509_program)));
+        CHECK(fake_append_record("global", origin,
+                                 GIT_CONFIG_GPG_SSH_PROGRAM, ssh_program,
+                                 strlen(ssh_program)));
+
+        git_ops_test_reset_caches();
+        previous = run_set_runner(status_fake_runner);
+        CHECK_EQ_INT(git_status_snapshot_read(&current), 0);
+        run_set_runner(previous);
+
+        CHECK(current != NULL);
+        CHECK(current && current->valid);
+        if (!current) continue;
+        check_effective_git_value(&current->user_name,
+                                  cases[i].include_name, name, origin);
+        check_effective_git_value(&current->user_email,
+                                  cases[i].include_email, email, origin);
+        check_effective_git_value(&current->user_signing_key, true,
+                                  fingerprint, origin);
+        check_effective_git_value(&current->commit_gpgsign, true, "true",
+                                  origin);
+        check_effective_git_value(&current->gpg_format, true, "openpgp",
+                                  origin);
+        check_effective_git_value(&current->ssh_command, true, ssh_command,
+                                  origin);
+        check_effective_git_value(&current->gpg_program, true, legacy_program,
+                                  origin);
+        check_effective_git_value(&current->gpg_openpgp_program, true,
+                                  openpgp_program, origin);
+        check_effective_git_value(&current->gpg_x509_program, true,
+                                  x509_program, origin);
+        check_effective_git_value(&current->gpg_ssh_program, true,
+                                  ssh_program, origin);
+        CHECK(current->gpg_signing_enabled);
+        git_status_snapshot_free(current);
+        current = NULL;
+
+        /* The retained caller-owned API keeps its historical complete-
+         * identity contract; the richer internal projection cannot change
+         * its layout or mixed-version behavior. */
+        git_ops_test_reset_caches();
+        previous = run_set_runner(status_fake_runner);
+        memset(&legacy, 0, sizeof(legacy));
+        CHECK_EQ_INT(git_get_current_config(&legacy), -1);
+        run_set_runner(previous);
+        CHECK_EQ_INT(get_last_error()->code, ERR_GIT_CONFIG_NOT_FOUND);
+        CHECK(!legacy.valid);
+
+        git_ops_test_reset_caches();
+        previous = run_set_runner(status_fake_runner);
+        CHECK_EQ_INT(capture_status_output(status, sizeof(status)), 0);
+        run_set_runner(previous);
+        git_ops_test_reset_caches();
+
+        CHECK(strstr(status, "No account currently active.") != NULL);
+        CHECK(strstr(status,
+                     cases[i].include_name
+                         ? "Name: Partial Residue User"
+                         : "Name: [ABSENT]") != NULL);
+        CHECK(strstr(status,
+                     cases[i].include_email
+                         ? "Email: partial-residue@example.test"
+                         : "Email: [ABSENT]") != NULL);
+        CHECK(strstr(status, "Effective SSH Command: [SET]") != NULL);
+        CHECK(strstr(status, "GPG Signing Key: ") != NULL);
+        CHECK(strstr(status, fingerprint) != NULL);
+        CHECK(strstr(status, "GPG Signing Enabled: [YES]") != NULL);
+        CHECK(strstr(status, "Effective GPG Format: [SET]") != NULL);
+        CHECK(strstr(status, "Effective OpenPGP Program: [SET]") != NULL);
+        CHECK(strstr(status, "Effective Legacy GPG Program: [SET]") != NULL);
+        CHECK(strstr(status, "Effective X.509 GPG Program: [SET]") != NULL);
+        CHECK(strstr(status, "Effective SSH Signing Program: [SET]") != NULL);
+        CHECK(count_text(status, origin) >= 8U);
+        CHECK(strstr(status,
+                     "[WARN] Durable Git credential configuration is set") !=
+              NULL);
+        CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
+        CHECK(strstr(status, "Status: [ERROR]") == NULL);
+    }
+}
+
+TEST(explicit_false_signing_state_is_present_residue) {
+    static const char origin[] = "file:/ar11/false-signing.gitconfig";
+    git_status_snapshot_t *current = NULL;
     char status[8192];
     command_runner_fn previous;
 
     fake_listing_len = 0;
     fake_listing_calls = 0;
     fake_execution_failure = false;
-    CHECK(fake_append_record("global", "file:/ar07/global",
+    fake_repository = false;
+    CHECK(fake_append_record("global", origin, GIT_CONFIG_COMMIT_GPGSIGN,
+                             "false", strlen("false")));
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(git_status_snapshot_read(&current), 0);
+    run_set_runner(previous);
+
+    CHECK(current != NULL);
+    CHECK(current && current->valid);
+    if (!current) return;
+    check_effective_git_value(&current->user_name, false, "", "");
+    check_effective_git_value(&current->user_email, false, "", "");
+    check_effective_git_value(&current->commit_gpgsign, true, "false", origin);
+    CHECK(!current->gpg_signing_enabled);
+    git_status_snapshot_free(current);
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output(status, sizeof(status)), 0);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+
+    CHECK(strstr(status, "Name: [ABSENT]") != NULL);
+    CHECK(strstr(status, "Email: [ABSENT]") != NULL);
+    CHECK(strstr(status, "GPG Signing Key: [ABSENT]") != NULL);
+    CHECK(strstr(status, "GPG Signing Enabled: [NO]") != NULL);
+    CHECK(strstr(status, origin) != NULL);
+    CHECK(strstr(status, "Effective GPG Format: [ABSENT]") != NULL);
+    CHECK(strstr(status,
+                 "[WARN] Durable Git credential configuration is set") !=
+          NULL);
+    CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
+    CHECK(strstr(status, "Status: [ERROR]") == NULL);
+}
+
+TEST(explicit_openpgp_format_is_visible_residue) {
+    static const char origin[] = "file:/ar11/format-only.gitconfig";
+    git_status_snapshot_t *current = NULL;
+    char status[8192];
+    command_runner_fn previous;
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", origin, GIT_CONFIG_GPG_FORMAT,
+                             "openpgp", strlen("openpgp")));
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(git_status_snapshot_read(&current), 0);
+    run_set_runner(previous);
+
+    CHECK(current != NULL);
+    CHECK(current && current->valid);
+    if (!current) return;
+    check_effective_git_value(&current->gpg_format, true, "openpgp", origin);
+    check_effective_git_value(&current->commit_gpgsign, false, "", "");
+    git_status_snapshot_free(current);
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output(status, sizeof(status)), 0);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+
+    CHECK(strstr(status, "Name: [ABSENT]") != NULL);
+    CHECK(strstr(status, "Email: [ABSENT]") != NULL);
+    CHECK(strstr(status, "GPG Signing Enabled: [ABSENT]") != NULL);
+    CHECK(strstr(status, "Effective GPG Format: [SET]") != NULL);
+    CHECK(strstr(status, origin) != NULL);
+    CHECK(strstr(status,
+                 "[WARN] Durable Git credential configuration is set") !=
+          NULL);
+    CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
+    CHECK(strstr(status, "Status: [ERROR]") == NULL);
+}
+
+TEST(active_partial_identity_renders_residue_without_trusted_match) {
+    static const char origin[] = "file:/ar11/active-partial.gitconfig";
+    static const char ssh_command[] =
+        "'/trusted/ar11/ssh' -i '/keys/active-partial' -F '/dev/null'";
+    gitswitch_ctx_t context;
+    char status[8192];
+    command_runner_fn previous;
+
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1U;
+    context.accounts[0].id = 61U;
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].name,
+                              "Expected Active User",
+                              sizeof(context.accounts[0].name)), 0);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
+                              "expected-active@example.test",
+                              sizeof(context.accounts[0].email)), 0);
+    bind_status_test_incarnation(&context.accounts[0]);
+    context.current_account = &context.accounts[0];
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", origin, GIT_CONFIG_USER_EMAIL,
+                             context.accounts[0].email,
+                             strlen(context.accounts[0].email)));
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_CORE_SSHCOMMAND, ssh_command,
+                             strlen(ssh_command)));
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_COMMIT_GPGSIGN, "false",
+                             strlen("false")));
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), 0);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+
+    CHECK(strstr(status, "Current Name: [ABSENT]") != NULL);
+    CHECK(strstr(status,
+                 "Current Email: expected-active@example.test") != NULL);
+    CHECK(strstr(status,
+                 "Match Status: [WARN] Effective Git identity is incomplete") !=
+          NULL);
+    CHECK(strstr(status, "Match Status: [OK]") == NULL);
+    CHECK(strstr(status, "Effective SSH Command: [SET]") != NULL);
+    CHECK(strstr(status, "GPG Signing Enabled: [NO]") != NULL);
+    CHECK(strstr(status, origin) != NULL);
+    CHECK(strstr(status,
+                 "Durable Git credential configuration is set with an incomplete identity") !=
+                 NULL);
+}
+
+TEST(active_projection_failure_still_renders_captured_residue) {
+    static const char origin[] = "file:/ar11/projection-failure.gitconfig";
+    static const char ssh_command[] =
+        "'/trusted/ar11/ssh' -i '/keys/projection-failure' -F '/dev/null'";
+    char oversized_signing_key[MAX_GPG_FINGERPRINT_LEN + 16U];
+    gitswitch_ctx_t context;
+    char status[32768];
+    command_runner_fn previous;
+
+    memset(oversized_signing_key, 'A', sizeof(oversized_signing_key) - 1U);
+    oversized_signing_key[sizeof(oversized_signing_key) - 1U] = '\0';
+    memset(&context, 0, sizeof(context));
+    context.account_count = 1U;
+    context.accounts[0].id = 62U;
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].name,
+                              "Projection User",
+                              sizeof(context.accounts[0].name)), 0);
+    CHECK_EQ_INT(safe_strncpy(context.accounts[0].email,
+                              "projection@example.test",
+                              sizeof(context.accounts[0].email)), 0);
+    bind_status_test_incarnation(&context.accounts[0]);
+    context.current_account = &context.accounts[0];
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    fake_repository = false;
+    CHECK(fake_append_record("global", origin, GIT_CONFIG_USER_NAME,
+                             context.accounts[0].name,
+                             strlen(context.accounts[0].name)));
+    CHECK(fake_append_record("global", origin, GIT_CONFIG_USER_EMAIL,
+                             context.accounts[0].email,
+                             strlen(context.accounts[0].email)));
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_USER_SIGNINGKEY,
+                             oversized_signing_key,
+                             strlen(oversized_signing_key)));
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_CORE_SSHCOMMAND, ssh_command,
+                             strlen(ssh_command)));
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output_for(&context, status,
+                                           sizeof(status)), -1);
+    run_set_runner(previous);
+    git_ops_test_reset_caches();
+
+    CHECK(strstr(status, "Status: [ERROR]") != NULL);
+    CHECK(strstr(status,
+                 "Effective Git signing key exceeds supported field length") !=
+          NULL);
+    CHECK(strstr(status, "Captured Managed Git State:") != NULL);
+    CHECK(strstr(status, "Current Name: Projection User") != NULL);
+    CHECK(strstr(status, oversized_signing_key) != NULL);
+    CHECK(strstr(status, "Effective SSH Command: [SET]") != NULL);
+    CHECK(strstr(status, ssh_command) != NULL);
+    CHECK(strstr(status, origin) != NULL);
+    CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
+}
+
+TEST(absent_identity_with_invalid_boolean_reports_error) {
+    static const char origin[] = "file:/ar07/global";
+    static const char ssh_command[] =
+        "'/trusted/ar11/ssh' -i '/keys/invalid-bool' -F '/dev/null'";
+    char status[8192];
+    command_runner_fn previous;
+
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    CHECK(fake_append_record("global", origin,
                              "commit.gpgsign", "not-a-git-boolean",
                              strlen("not-a-git-boolean")));
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_CORE_SSHCOMMAND, ssh_command,
+                             strlen(ssh_command)));
     git_ops_test_reset_caches();
     previous = run_set_runner(status_fake_runner);
     CHECK_EQ_INT(capture_status_output(status, sizeof(status)), -1);
@@ -585,6 +958,10 @@ TEST(absent_identity_with_invalid_boolean_reports_error) {
 
     CHECK(strstr(status, "Status: [ERROR]") != NULL);
     CHECK(strstr(status, "Invalid effective Git Boolean") != NULL);
+    CHECK(strstr(status, "Captured Managed Git State:") != NULL);
+    CHECK(strstr(status, "GPG Signing Enabled: [ERROR]") != NULL);
+    CHECK(strstr(status, "Effective SSH Command: [SET]") != NULL);
+    CHECK(strstr(status, ssh_command) != NULL);
     CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
 }
 
@@ -653,6 +1030,40 @@ TEST(absent_identity_with_oversized_managed_value_reports_error) {
     CHECK(strstr(status, "Status: [ERROR]") != NULL);
     CHECK(strstr(status, "exceeds the supported status representation") !=
           NULL);
+    CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
+}
+
+TEST(oversized_signing_boolean_is_not_rendered_as_false) {
+    static char oversized[GIT_CONFIG_VALUE_MAX + 1U];
+    static const char origin[] = "file:/ar11/oversized-signing.gitconfig";
+    static const char ssh_command[] =
+        "'/trusted/ar11/ssh' -i '/keys/oversized-signing' -F '/dev/null'";
+    char status[32768];
+    command_runner_fn previous;
+
+    memset(oversized, '7', sizeof(oversized));
+    fake_listing_len = 0;
+    fake_listing_calls = 0;
+    fake_execution_failure = false;
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_COMMIT_GPGSIGN, oversized,
+                             sizeof(oversized)));
+    CHECK(fake_append_record("global", origin,
+                             GIT_CONFIG_CORE_SSHCOMMAND, ssh_command,
+                             strlen(ssh_command)));
+
+    git_ops_test_reset_caches();
+    previous = run_set_runner(status_fake_runner);
+    CHECK_EQ_INT(capture_status_output(status, sizeof(status)), -1);
+    run_set_runner(previous);
+
+    CHECK(strstr(status, "Status: [ERROR]") != NULL);
+    CHECK(strstr(status, "Captured Managed Git State:") != NULL);
+    CHECK(strstr(status, "GPG Signing Enabled: [ERROR]") != NULL);
+    CHECK(strstr(status, "GPG Signing Enabled: [NO]") == NULL);
+    CHECK(strstr(status, "Effective SSH Command: [SET]") != NULL);
+    CHECK(strstr(status, ssh_command) != NULL);
+    CHECK(strstr(status, origin) != NULL);
     CHECK(strstr(status, "Status: [NOT FOUND]") == NULL);
 }
 
@@ -2319,9 +2730,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(execution_failure_retains_diagnostic_and_status_reports_error);
     RUN_TEST(execution_diagnostic_is_sanitized_before_error_logging);
     RUN_TEST(absent_identity_remains_a_normal_status_result);
+    RUN_TEST(partial_identity_renders_every_credential_leg);
+    RUN_TEST(explicit_false_signing_state_is_present_residue);
+    RUN_TEST(explicit_openpgp_format_is_visible_residue);
+    RUN_TEST(active_partial_identity_renders_residue_without_trusted_match);
+    RUN_TEST(active_projection_failure_still_renders_captured_residue);
     RUN_TEST(absent_identity_with_invalid_boolean_reports_error);
     RUN_TEST(int_min_boolean_follows_selected_gits_grammar);
     RUN_TEST(absent_identity_with_oversized_managed_value_reports_error);
+    RUN_TEST(oversized_signing_boolean_is_not_rendered_as_false);
     RUN_TEST(active_ssh_without_publication_fails_before_any_git_probe);
     RUN_TEST(active_ssh_status_uses_saved_program_and_exact_destination);
     RUN_TEST(active_status_propagates_required_key_inspection_failure);

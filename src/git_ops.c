@@ -31,6 +31,9 @@
 #endif
 
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_status_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
 #include "error.h"
 #include "utils.h"
@@ -5764,8 +5767,9 @@ static void copy_effective_value(git_config_effective_value_t *dest,
     }
 }
 
-int git_get_current_config(git_current_config_t *config) {
+int git_status_snapshot_read(git_status_snapshot_t **snapshot) {
     git_effective_listing_t *effective;
+    git_status_snapshot_t *captured;
     const int k_name = cfg_key_index(GIT_CONFIG_USER_NAME);
     const int k_email = cfg_key_index(GIT_CONFIG_USER_EMAIL);
     const int k_signkey = cfg_key_index(GIT_CONFIG_USER_SIGNINGKEY);
@@ -5777,14 +5781,12 @@ int git_get_current_config(git_current_config_t *config) {
     const int k_gpgssh = cfg_key_index(GIT_CONFIG_GPG_SSH_PROGRAM);
     const int k_sshcommand = cfg_key_index(GIT_CONFIG_CORE_SSHCOMMAND);
 
-    if (!config) {
-        set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
+    if (!snapshot) {
+        set_error(ERR_INVALID_ARGS, "NULL Git status snapshot output");
         return -1;
     }
+    *snapshot = NULL;
 
-    /* Initialize structure */
-    memset(config, 0, sizeof(git_current_config_t));
-    config->valid = false;
     if (git_reject_ssh_command_override() != 0) return -1;
 
     if (k_name < 0 || k_email < 0 || k_signkey < 0 || k_gpgsign < 0 ||
@@ -5794,6 +5796,32 @@ int git_get_current_config(git_current_config_t *config) {
         return -1;
     }
     if (git_read_effective_keys(&effective) != 0) return -1;
+
+    captured = calloc(1, sizeof(*captured));
+    if (!captured) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory projecting effective Git status");
+        return -1;
+    }
+    *snapshot = captured;
+
+    copy_effective_value(&captured->user_name, effective, k_name);
+    copy_effective_value(&captured->user_email, effective, k_email);
+    copy_effective_value(&captured->user_signing_key, effective, k_signkey);
+    copy_effective_value(&captured->commit_gpgsign, effective, k_gpgsign);
+    copy_effective_value(&captured->gpg_format, effective, k_gpgformat);
+    copy_effective_value(&captured->ssh_command, effective, k_sshcommand);
+    copy_effective_value(&captured->gpg_program, effective, k_gpgprogram);
+    copy_effective_value(&captured->gpg_openpgp_program, effective,
+                         k_gpgopenpgp);
+    copy_effective_value(&captured->gpg_x509_program, effective, k_gpgx509);
+    copy_effective_value(&captured->gpg_ssh_program, effective, k_gpgssh);
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (effective->keys[i].present) {
+            captured->any_present = true;
+            break;
+        }
+    }
 
     /* Validate every present managed value before classifying a missing
      * identity. Otherwise an absent user.name can hide an invalid Boolean or
@@ -5822,71 +5850,105 @@ int git_get_current_config(git_current_config_t *config) {
         (effective->keys[k_gpgformat].implicit ||
          strcmp(effective->keys[k_gpgformat].value,
                 GIT_GPG_FORMAT_OPENPGP) != 0)) {
+        captured->gpg_format_invalid = true;
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Effective gpg.format is not openpgp");
-        return -1;
-    }
-
-    if ((effective->keys[k_name].present &&
-         safe_strncpy(config->name, effective->keys[k_name].value,
-                      sizeof(config->name)) != 0) ||
-        (effective->keys[k_email].present &&
-         safe_strncpy(config->email, effective->keys[k_email].value,
-                      sizeof(config->email)) != 0)) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Effective Git identity exceeds supported field length");
-        return -1;
-    }
-    if (effective->keys[k_signkey].present &&
-        safe_strncpy(config->signing_key,
-                     effective->keys[k_signkey].value,
-                     sizeof(config->signing_key)) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Effective Git signing key exceeds supported field length");
         return -1;
     }
     if (effective->keys[k_gpgsign].present &&
         git_parse_effective_bool(&effective->keys[k_gpgsign],
                                  GIT_CONFIG_COMMIT_GPGSIGN,
-                                 &config->gpg_signing_enabled) != 0) {
-        return -1;
-    }
-    if (!effective->keys[k_name].present) {
-        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.name configured");
-        return -1;
-    }
-    if (!effective->keys[k_email].present) {
-        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
+                                 &captured->gpg_signing_enabled) != 0) {
+        captured->commit_gpgsign_invalid = true;
         return -1;
     }
 
-    config->effective_name_scope = effective->scopes[k_name];
-    snprintf(config->effective_name_origin,
-             sizeof(config->effective_name_origin), "%s",
-             effective->origins[k_name]);
-    config->effective_signing_key_scope = effective->scopes[k_signkey];
-    snprintf(config->effective_signing_key_origin,
-             sizeof(config->effective_signing_key_origin), "%s",
-             effective->origins[k_signkey]);
-    switch (config->effective_name_scope) {
-        case GIT_CONFIG_ORIGIN_GLOBAL: config->scope = GIT_SCOPE_GLOBAL; break;
-        case GIT_CONFIG_ORIGIN_SYSTEM: config->scope = GIT_SCOPE_SYSTEM; break;
+    captured->valid = true;
+    return 0;
+}
+
+void git_status_snapshot_free(git_status_snapshot_t *snapshot) {
+    if (!snapshot) return;
+    secure_zero_memory(snapshot, sizeof(*snapshot));
+    free(snapshot);
+}
+
+int git_status_snapshot_to_current(const git_status_snapshot_t *snapshot,
+                                   git_current_config_t *current) {
+    if (!snapshot || !current || !snapshot->valid) {
+        set_error(ERR_INVALID_ARGS, "Invalid effective Git status projection");
+        return -1;
+    }
+    memset(current, 0, sizeof(*current));
+    if ((snapshot->user_name.present &&
+         safe_strncpy(current->name, snapshot->user_name.value,
+                      sizeof(current->name)) != 0) ||
+        (snapshot->user_email.present &&
+         safe_strncpy(current->email, snapshot->user_email.value,
+                      sizeof(current->email)) != 0)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective Git identity exceeds supported field length");
+        return -1;
+    }
+    if (snapshot->user_signing_key.present &&
+        safe_strncpy(current->signing_key,
+                     snapshot->user_signing_key.value,
+                     sizeof(current->signing_key)) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective Git signing key exceeds supported field length");
+        return -1;
+    }
+    current->gpg_signing_enabled = snapshot->gpg_signing_enabled;
+    if (!snapshot->user_name.present) {
+        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.name configured");
+        return -1;
+    }
+    if (!snapshot->user_email.present) {
+        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
+        return -1;
+    }
+    current->effective_name_scope = snapshot->user_name.scope;
+    snprintf(current->effective_name_origin,
+             sizeof(current->effective_name_origin), "%s",
+             snapshot->user_name.origin);
+    current->effective_signing_key_scope = snapshot->user_signing_key.scope;
+    snprintf(current->effective_signing_key_origin,
+             sizeof(current->effective_signing_key_origin), "%s",
+             snapshot->user_signing_key.origin);
+    switch (current->effective_name_scope) {
+        case GIT_CONFIG_ORIGIN_GLOBAL: current->scope = GIT_SCOPE_GLOBAL; break;
+        case GIT_CONFIG_ORIGIN_SYSTEM: current->scope = GIT_SCOPE_SYSTEM; break;
         case GIT_CONFIG_ORIGIN_LOCAL:
         case GIT_CONFIG_ORIGIN_WORKTREE:
         case GIT_CONFIG_ORIGIN_COMMAND:
         case GIT_CONFIG_ORIGIN_UNKNOWN:
-        default: config->scope = GIT_SCOPE_LOCAL; break;
+        default: current->scope = GIT_SCOPE_LOCAL; break;
     }
-
-    copy_effective_value(&config->ssh_command, effective, k_sshcommand);
-    copy_effective_value(&config->gpg_program, effective, k_gpgprogram);
-    copy_effective_value(&config->gpg_openpgp_program, effective,
-                         k_gpgopenpgp);
-    copy_effective_value(&config->gpg_x509_program, effective, k_gpgx509);
-    copy_effective_value(&config->gpg_ssh_program, effective, k_gpgssh);
-
-    config->valid = true;
+    current->ssh_command = snapshot->ssh_command;
+    current->gpg_program = snapshot->gpg_program;
+    current->gpg_openpgp_program = snapshot->gpg_openpgp_program;
+    current->gpg_x509_program = snapshot->gpg_x509_program;
+    current->gpg_ssh_program = snapshot->gpg_ssh_program;
+    current->valid = true;
     return 0;
+}
+
+int git_get_current_config(git_current_config_t *config) {
+    git_status_snapshot_t *snapshot = NULL;
+    int result;
+
+    if (!config) {
+        set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
+        return -1;
+    }
+    memset(config, 0, sizeof(*config));
+    if (git_status_snapshot_read(&snapshot) != 0) {
+        git_status_snapshot_free(snapshot);
+        return -1;
+    }
+    result = git_status_snapshot_to_current(snapshot, config);
+    git_status_snapshot_free(snapshot);
+    return result;
 }
 
 /* Clear git configuration */
