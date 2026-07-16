@@ -578,6 +578,17 @@ TEST(reset_account_removes_current_sock_pointing_at_it) {
         return;
     }
     CHECK_EQ_INT(write_config(home, two_ssh_accounts_config()), 0);
+
+    /* A successful switch is the production path that establishes the exact
+     * account incarnation and PUBLISHED Git-destination record reset must
+     * retire.  Do not let this positive reset test depend on the pre-M17
+     * implicit-authority fallback. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --global -y work >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+
     CHECK_EQ_INT(setup_agent_dir(rt, cur, sizeof(cur)), 0);
 
     snprintf(cmd, sizeof(cmd),
@@ -606,6 +617,16 @@ TEST(reset_other_account_keeps_current_sock) {
         return;
     }
     CHECK_EQ_INT(write_config(home, two_ssh_accounts_config()), 0);
+
+    /* Publish the account being retired so this remains a genuine successful
+     * reset.  The synthetic current.sock below deliberately points at work,
+     * independently of the active publication identity. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --global -y other >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+
     CHECK_EQ_INT(setup_agent_dir(rt, cur, sizeof(cur)), 0);
 
     snprintf(cmd, sizeof(cmd),
@@ -777,6 +798,14 @@ TEST(utf8_account_name_cli_round_trip) {
     CHECK_EQ_INT(rc, 0);
     slurp(out_path, out, sizeof(out));
     CHECK(strstr(out, "Jos\xC3\xA9 Work") != NULL); /* byte-identical, not "Jos" */
+
+    /* Publish the UTF-8 account through the normal switch path so successful
+     * removal carries an exact incarnation and Git destination record. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' --global -y 1 >/dev/null 2>&1",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
 
     /* The tool itself can remove the accented account (pre-fix it could not
      * even load the file to try). */

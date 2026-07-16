@@ -190,10 +190,11 @@ int accounts_list(const gitswitch_ctx_t *ctx);
  */
 int accounts_show_status(const gitswitch_ctx_t *ctx);
 
-/* Retire only durable Git credential state whose ownership is proven by the
- * publication ledger belonging to `ctx`. Accounts with a credential leg fail
- * before mutation when canonical provenance is absent, incomplete, or
- * ambiguous; legacy SSH state is never reconstructed from the live model. */
+/* Retire only durable Git identity/credential state whose ownership is proven
+ * by a sealed PUBLISHED record in the ledger belonging to `ctx`. Missing,
+ * incomplete, ambiguous, or non-authorizing provenance fails closed before
+ * Git/PATH work; callers must retain the exact account/incarnation as the
+ * retry handle. Legacy state is never reconstructed from the live model. */
 int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
                                  const account_t *account,
                                  size_t *cleared);

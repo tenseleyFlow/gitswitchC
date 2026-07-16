@@ -1,5 +1,7 @@
 /* AR-07 T6: constrained-stack entry, reset atomicity, and canonical identity. */
 #include "test.h"
+#include "config.h"
+#include "publication.h"
 #include "signals.h"
 
 #include <fcntl.h>
@@ -8,6 +10,9 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+
+#define RESET_INCARNATION \
+    "1717171717171717171717171717171717171717171717171717171717171717"
 
 typedef void (*reset_test_hook_fn)(int stage);
 
@@ -30,6 +35,7 @@ typedef struct {
     char config_dir[PATH_MAX];
     char config[PATH_MAX];
     char hint[PATH_MAX];
+    char git_config[PATH_MAX];
     char output[PATH_MAX];
 } reset_fixture_t;
 
@@ -86,12 +92,109 @@ static size_t read_text(const char *path, char *text, size_t size) {
     return total;
 }
 
+static int write_all(int fd, const void *data, size_t length) {
+    const unsigned char *cursor = data;
+    size_t total = 0;
+
+    while (total < length) {
+        ssize_t written = write(fd, cursor + total, length - total);
+        if (written > 0) total += (size_t)written;
+        else if (written < 0 && errno == EINTR) continue;
+        else return -1;
+    }
+    return 0;
+}
+
+static int write_publication_state(const reset_fixture_t *fixture,
+                                   const char *header) {
+    publication_record_t *record = NULL;
+    publication_ledger_t ledger;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0;
+    struct stat st;
+    int fd = -1;
+    int result = -1;
+
+    publication_ledger_init(&ledger);
+    record = calloc(1U, sizeof(*record));
+    if (!record) return -1;
+    publication_record_init(record);
+    record->account_id = UINT32_C(1);
+    record->scope = PUBLICATION_SCOPE_GLOBAL;
+    record->state = PUBLICATION_STATE_PUBLISHED;
+    record->capabilities = PUBLICATION_CAP_DESTINATION |
+                           PUBLICATION_CAP_POST_GENERATION;
+    if ((size_t)snprintf(record->account_incarnation,
+                         sizeof(record->account_incarnation), "%s",
+                         RESET_INCARNATION) >=
+            sizeof(record->account_incarnation) ||
+        (size_t)snprintf(record->config_path, sizeof(record->config_path),
+                         "%s", fixture->git_config) >=
+            sizeof(record->config_path) ||
+        stat(fixture->home, &st) != 0) {
+        goto cleanup;
+    }
+    publication_identity_from_stat(&record->config_parent, &st);
+    if (stat(fixture->git_config, &st) != 0) goto cleanup;
+    publication_identity_from_stat(&record->post_config, &st);
+    if (publication_record_validate(record) != 0) goto cleanup;
+
+    if (publication_ledger_upsert(&ledger, record) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0) {
+        goto cleanup;
+    }
+    fd = open(fixture->hint,
+              O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 || write_all(fd, header, strlen(header)) != 0 ||
+        write_all(fd, tail, tail_length) != 0 || fsync(fd) != 0 ||
+        close(fd) != 0) {
+        if (fd >= 0) (void)close(fd);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    result = 0;
+
+cleanup:
+    if (fd >= 0) (void)close(fd);
+    free(tail);
+    free(record);
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
+static bool state_has_header(const char *state, const char *header) {
+    size_t header_length = strlen(header);
+
+    return state && strncmp(state, header, header_length) == 0;
+}
+
+static bool ledger_has_published_reset_record(
+    const reset_fixture_t *fixture) {
+    publication_ledger_t ledger;
+    const publication_record_t *record = NULL;
+    publication_lookup_status_t lookup;
+    bool matches = false;
+
+    publication_ledger_init(&ledger);
+    if (config_load_publication_ledger(fixture->config, &ledger) == 0) {
+        lookup = publication_ledger_find(
+            &ledger, UINT32_C(1), RESET_INCARNATION,
+            PUBLICATION_SCOPE_GLOBAL, fixture->git_config, "", &record);
+        matches = lookup == PUBLICATION_LOOKUP_FOUND && record &&
+                  record->state == PUBLICATION_STATE_PUBLISHED;
+    }
+    publication_ledger_clear(&ledger);
+    return matches;
+}
+
 static int fixture_setup(reset_fixture_t *fixture) {
     const char config_body[] =
         "[settings]\n"
         "default_scope = \"global\"\n"
         "active_account = \"work\"\n"
         "[accounts.1]\n"
+        "incarnation = \"" RESET_INCARNATION "\"\n"
         "name = \"Work\"\n"
         "email = \"work@example.com\"\n"
         "description = \"case fixture\"\n";
@@ -126,13 +229,20 @@ static int fixture_setup(reset_fixture_t *fixture) {
         (size_t)snprintf(fixture->hint, sizeof(fixture->hint),
                          "%s/.resume-hint", fixture->config_dir) >=
         sizeof(fixture->hint) ||
+        (size_t)snprintf(fixture->git_config,
+                         sizeof(fixture->git_config),
+                         "%s/.gitconfig-reset", fixture->home) >=
+        sizeof(fixture->git_config) ||
         (size_t)snprintf(fixture->output, sizeof(fixture->output),
                          "%s/output", fixture->root) >=
         sizeof(fixture->output)) {
         return -1;
     }
     if (write_private(fixture->config, config_body) != 0 ||
-        write_private(fixture->hint, "none\nactive=work\n") != 0) {
+        write_private(fixture->git_config,
+                      "[fixture]\n\tmarker = keep\n") != 0 ||
+        write_publication_state(fixture,
+                                "none\nactive=work\n") != 0) {
         return -1;
     }
     return 0;
@@ -442,7 +552,8 @@ TEST(empty_reset_selector_is_rejected_before_any_reset_work) {
         CHECK(access(marker, F_OK) == 0);
         CHECK(access(config_lock, F_OK) != 0 && errno == ENOENT);
         CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
-        CHECK_STR_EQ(hint, "none\nactive=work\n");
+        CHECK(state_has_header(hint, "none\nactive=work\n"));
+        CHECK(ledger_has_published_reset_record(&fixture));
         CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
         CHECK(strstr(output, "reset account selector must not be empty") != NULL);
         CHECK(strstr(output, "kill ALL") == NULL);
@@ -512,7 +623,8 @@ TEST(repeated_signals_defer_across_every_reset_boundary) {
         }
         CHECK_STR_EQ(trace, "1234");
         CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
-        CHECK_STR_EQ(hint, "none\ninactive=v1\n");
+        CHECK(state_has_header(hint, "none\ninactive=v1\n"));
+        CHECK(ledger_has_published_reset_record(&fixture));
         CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
         CHECK(strstr(output, "Reset all gitswitch SSH/GPG state") == NULL);
         CHECK(strstr(output, "reset transaction cleanup completed") != NULL);
@@ -547,7 +659,8 @@ TEST(manager_failure_keeps_retry_state_while_signal_is_deferred) {
     }
     CHECK_STR_EQ(trace, "12");
     CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
-    CHECK_STR_EQ(hint, "none\nactive=work\n");
+    CHECK(state_has_header(hint, "none\nactive=work\n"));
+    CHECK(ledger_has_published_reset_record(&fixture));
     CHECK(read_text(fixture.output, output, sizeof(output)) > 0);
     CHECK(strstr(output, "reset failed; retry metadata was preserved") != NULL);
     CHECK(strstr(output, "Reset all gitswitch SSH/GPG state") == NULL);
@@ -574,7 +687,8 @@ TEST(case_different_active_account_clears_by_name_id_and_email) {
         }
         CHECK_STR_EQ(trace, "1234");
         CHECK(read_text(fixture.hint, hint, sizeof(hint)) > 0);
-        CHECK_STR_EQ(hint, "none\ninactive=v1\n");
+        CHECK(state_has_header(hint, "none\ninactive=v1\n"));
+        CHECK(ledger_has_published_reset_record(&fixture));
     }
 }
 

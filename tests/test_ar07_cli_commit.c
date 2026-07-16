@@ -1189,6 +1189,9 @@ TEST(read_only_commands_never_repair_or_replace_wrong_mode_manager_lock) {
 }
 
 TEST(save_failures_never_print_final_mutation_success) {
+    static const char *const publish_old[] = {
+        "gitswitch", "--global", "--yes", "switch", "old", NULL
+    };
     cli_case_t cases[] = {
         {"add", {"gitswitch", "--yes", "add", NULL}},
         {"edit", {"gitswitch", "--yes", "edit", "old", NULL}},
@@ -1224,6 +1227,24 @@ TEST(save_failures_never_print_final_mutation_success) {
                                       "gitswitch-ar07-run"), 0);
         CHECK_EQ_INT(write_account_config(home, false, config_dir,
                                           sizeof(config_dir)), 0);
+
+        /* Remove/reset must reach the deliberately denied outer config save,
+         * not fail earlier at M17's exact-retirement admission check.  Seed
+         * their authority through the real switch/publication path while the
+         * fixture is still writable. */
+        if (i >= 2U) {
+            rc = run_cli(home, runtime, publish_old,
+                         output_path, sizeof(output_path));
+            if (rc != 0) {
+                slurp(output_path, output, sizeof(output));
+                fprintf(stderr,
+                        "  publication setup for save-failure case '%s' "
+                        "returned %d:\n%s\n",
+                        cases[i].label, rc, output);
+            }
+            CHECK_EQ_INT(rc, 0);
+            unlink(output_path);
+        }
         input_path[0] = '\0';
         if (input[i]) {
             snprintf(input_path, sizeof(input_path), "%s/input", runtime);

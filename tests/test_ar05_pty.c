@@ -4,7 +4,7 @@
  * add/edit flows) with the flows the existing suites do NOT touch:
  *
  *   - `--yes reset` confirmation bypass, including the persisted
- *     active_account clear + .resume-hint removal, targeted (non-active)
+ *     active_account clear + inactive .resume-hint publication, targeted (non-active)
  *     reset leaving the config byte-identical, and reset of an unknown
  *     account failing with a nonzero exit;
  *   - the up-front "Cannot add/edit/remove ... right now" refusal when the
@@ -38,6 +38,10 @@
 #endif
 
 #include "test.h"
+#include "config.h"
+#include "error.h"
+#include "publication.h"
+#include "utils.h"
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -57,6 +61,10 @@
 
 #define EXPECT_TIMEOUT_MS 10000
 #define EXIT_TIMEOUT_MS   15000
+#define PTY_WORK_INCARNATION \
+    "3535353535353535353535353535353535353535353535353535353535353535"
+#define PTY_OTHER_INCARNATION \
+    "4545454545454545454545454545454545454545454545454545454545454545"
 
 static char g_bin[4096];
 static int g_no_pty = 0;
@@ -126,6 +134,24 @@ static int write_file_mode(const char *path, const char *body, mode_t mode) {
     fputs(body, f);
     if (fclose(f) != 0) return -1;
     return chmod(path, mode);
+}
+
+static int write_all_fd(int fd, const void *data, size_t length) {
+    const unsigned char *cursor = data;
+    size_t total = 0U;
+
+    while (total < length) {
+        ssize_t written = write(fd, cursor + total, length - total);
+
+        if (written > 0) {
+            total += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 /* Base sandbox: throwaway HOME (with a dummy 0600 SSH key and 0700 config
@@ -509,10 +535,174 @@ static int write_cfg_work_other(sandbox_t *sb, const char *active) {
     return sandbox_write_cfg(sb, cfg);
 }
 
-static int write_resume_hint(const sandbox_t *sb, const char *body) {
-    char path[300];
-    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", sb->home);
-    return write_file_mode(path, body, 0600);
+/* M17 successful-reset fixtures are deliberately credentialless: their only
+ * durable Git authority is the exact destination/generation a completed
+ * credentialless switch sealed. Keep the legacy writer above unchanged for
+ * negative and unrelated PTY flows that must not acquire reset authority. */
+static int write_reset_cfg_work_other(sandbox_t *sb, const char *active) {
+    char cfg[1024];
+
+    if ((size_t)snprintf(
+            cfg, sizeof(cfg),
+            "[settings]\n"
+            "default_scope = \"global\"\n"
+            "%s%s%s"
+            "\n"
+            "[accounts.1]\n"
+            "incarnation = \"" PTY_WORK_INCARNATION "\"\n"
+            "name = \"work\"\n"
+            "email = \"w@example.com\"\n"
+            "description = \"credentialless work reset fixture\"\n"
+            "\n"
+            "[accounts.2]\n"
+            "incarnation = \"" PTY_OTHER_INCARNATION "\"\n"
+            "name = \"other\"\n"
+            "email = \"o@example.com\"\n"
+            "description = \"credentialless other reset fixture\"\n",
+            active ? "active_account = \"" : "",
+            active ? active : "",
+            active ? "\"\n" : "") >= sizeof(cfg)) {
+        return -1;
+    }
+    return sandbox_write_cfg(sb, cfg);
+}
+
+static int seed_reset_publications(const sandbox_t *sb, bool include_work,
+                                   bool include_other, const char *header) {
+    static const char git_body[] =
+        "[fixture]\n"
+        "\tmarker = ar05-reset\n";
+    publication_ledger_t ledger;
+    publication_record_t record;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0U;
+    char git_path[256];
+    char hint_path[300];
+    struct stat parent_stat;
+    struct stat config_stat;
+    int fd = -1;
+    int result = -1;
+
+    if (!sb || !header || (!include_work && !include_other) ||
+        (size_t)snprintf(hint_path, sizeof(hint_path),
+                         "%s/.config/gitswitch/.resume-hint", sb->home) >=
+            sizeof(hint_path) ||
+        stat(sb->home, &parent_stat) != 0) {
+        return -1;
+    }
+
+    publication_ledger_init(&ledger);
+    for (size_t i = 0U; i < 2U; i++) {
+        const bool include = i == 0U ? include_work : include_other;
+        const char *incarnation = i == 0U ? PTY_WORK_INCARNATION
+                                          : PTY_OTHER_INCARNATION;
+
+        if (!include) continue;
+        if ((size_t)snprintf(git_path, sizeof(git_path),
+                             "%s/.gitconfig-%s", sb->home,
+                             i == 0U ? "work" : "other") >=
+                sizeof(git_path) ||
+            write_file_mode(git_path, git_body, 0600) != 0 ||
+            stat(git_path, &config_stat) != 0) {
+            goto cleanup;
+        }
+        publication_record_init(&record);
+        record.account_id = i == 0U ? UINT32_C(1) : UINT32_C(2);
+        record.scope = PUBLICATION_SCOPE_GLOBAL;
+        record.state = PUBLICATION_STATE_PUBLISHED;
+        record.capabilities = PUBLICATION_CAP_DESTINATION |
+                              PUBLICATION_CAP_POST_GENERATION;
+        if (safe_strncpy(record.account_incarnation, incarnation,
+                         sizeof(record.account_incarnation)) != 0 ||
+            safe_strncpy(record.config_path, git_path,
+                         sizeof(record.config_path)) != 0) {
+            goto cleanup;
+        }
+        publication_identity_from_stat(&record.config_parent, &parent_stat);
+        publication_identity_from_stat(&record.post_config, &config_stat);
+        if (publication_record_validate(&record) != 0 ||
+            publication_ledger_upsert(&ledger, &record) != 0) {
+            goto cleanup;
+        }
+    }
+    if (publication_ledger_serialize(&ledger, &tail, &tail_length) != 0) {
+        goto cleanup;
+    }
+    fd = open(hint_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 || write_all_fd(fd, header, strlen(header)) != 0 ||
+        write_all_fd(fd, tail, tail_length) != 0 || fsync(fd) != 0) {
+        if (fd >= 0) (void)close(fd);
+        fd = -1;
+        goto cleanup;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    result = 0;
+
+cleanup:
+    if (fd >= 0) (void)close(fd);
+    if (tail) {
+        secure_zero_memory(tail, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
+static bool reset_ledger_matches(const sandbox_t *sb, bool include_work,
+                                 bool include_other,
+                                 publication_state_t state) {
+    publication_ledger_t ledger;
+    char git_path[256];
+    bool matches = false;
+    size_t expected_count = (include_work ? 1U : 0U) +
+                            (include_other ? 1U : 0U);
+
+    if (!sb) return false;
+    publication_ledger_init(&ledger);
+    if (config_load_publication_ledger(sb->cfg, &ledger) != 0 ||
+        ledger.count != expected_count) {
+        goto cleanup;
+    }
+    for (size_t i = 0U; i < 2U; i++) {
+        const bool include = i == 0U ? include_work : include_other;
+        const char *incarnation = i == 0U ? PTY_WORK_INCARNATION
+                                          : PTY_OTHER_INCARNATION;
+        const publication_record_t *record = NULL;
+        publication_lookup_status_t lookup;
+
+        if (!include) continue;
+        if ((size_t)snprintf(git_path, sizeof(git_path),
+                             "%s/.gitconfig-%s", sb->home,
+                             i == 0U ? "work" : "other") >=
+            sizeof(git_path)) {
+            goto cleanup;
+        }
+        lookup = publication_ledger_find(
+            &ledger, i == 0U ? UINT32_C(1) : UINT32_C(2), incarnation,
+            PUBLICATION_SCOPE_GLOBAL, git_path, "", &record);
+        if (lookup != PUBLICATION_LOOKUP_FOUND || !record ||
+            record->state != state ||
+            record->capabilities !=
+                (PUBLICATION_CAP_DESTINATION |
+                 PUBLICATION_CAP_POST_GENERATION) ||
+            publication_record_validate(record) != 0) {
+            goto cleanup;
+        }
+    }
+    matches = true;
+
+cleanup:
+    publication_ledger_clear(&ledger);
+    return matches;
+}
+
+static bool state_has_header(const char *state, const char *header) {
+    return state && header &&
+           strncmp(state, header, strlen(header)) == 0;
 }
 
 static int resume_hint_exists(const sandbox_t *sb) {
@@ -536,8 +726,9 @@ TEST(reset_yes_bypass_clears_active_state) {
 
     SKIP_IF_NO_PTY();
     if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
-    CHECK_EQ_INT(write_cfg_work_other(&sb, "work"), 0);
-    CHECK_EQ_INT(write_resume_hint(&sb, "ssh\n"), 0);
+    CHECK_EQ_INT(write_reset_cfg_work_other(&sb, "work"), 0);
+    CHECK_EQ_INT(seed_reset_publications(
+                     &sb, true, true, "none\nactive=work\n"), 0);
 
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
     CHECK_EQ_INT(pty_expect(&g_p, "Reset all gitswitch SSH/GPG state"), 0);
@@ -552,7 +743,9 @@ TEST(reset_yes_bypass_clears_active_state) {
     CHECK(strstr(cfg, "active_account = \"work\"") != NULL);
     snprintf(hint, sizeof(hint), "%s/.config/gitswitch/.resume-hint", sb.home);
     CHECK(slurp(hint, cfg, sizeof(cfg)) > 0);
-    CHECK_STR_EQ(cfg, "none\ninactive=v1\n");
+    CHECK(state_has_header(cfg, "none\ninactive=v1\n"));
+    CHECK(reset_ledger_matches(
+        &sb, true, true, PUBLICATION_STATE_PUBLISHED));
 
     pty_close(&g_p);
     sandbox_teardown(&sb);
@@ -564,15 +757,22 @@ TEST(reset_yes_bypass_clears_active_state) {
 TEST(reset_targeted_nonactive_keeps_config) {
     sandbox_t sb;
     char before[16384], after[16384];
-    size_t before_len, after_len;
+    char hint_path[300], hint_before[16384], hint_after[16384];
+    size_t before_len, after_len, hint_before_len, hint_after_len;
     const char *argv[] = { "gitswitch", "-y", "reset", "other", NULL };
 
     SKIP_IF_NO_PTY();
     if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
-    CHECK_EQ_INT(write_cfg_work_other(&sb, "work"), 0);
-    CHECK_EQ_INT(write_resume_hint(&sb, "ssh\n"), 0);
+    CHECK_EQ_INT(write_reset_cfg_work_other(&sb, "work"), 0);
+    CHECK_EQ_INT(seed_reset_publications(
+                     &sb, false, true, "none\nactive=work\n"), 0);
     before_len = slurp(sb.cfg, before, sizeof(before));
     CHECK(before_len > 0);
+    snprintf(hint_path, sizeof(hint_path),
+             "%s/.config/gitswitch/.resume-hint", sb.home);
+    hint_before_len = slurp(hint_path, hint_before, sizeof(hint_before));
+    CHECK(hint_before_len > 0);
+    CHECK(hint_before_len < sizeof(hint_before) - 1U);
 
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
     CHECK_EQ_INT(pty_expect(&g_p, "Reset gitswitch state for: other"), 0);
@@ -581,7 +781,13 @@ TEST(reset_targeted_nonactive_keeps_config) {
 
     after_len = slurp(sb.cfg, after, sizeof(after));
     CHECK(after_len == before_len && memcmp(before, after, before_len) == 0);
-    CHECK(resume_hint_exists(&sb));
+    hint_after_len = slurp(hint_path, hint_after, sizeof(hint_after));
+    CHECK(hint_after_len < sizeof(hint_after) - 1U);
+    CHECK(hint_after_len == hint_before_len &&
+          memcmp(hint_before, hint_after, hint_before_len) == 0);
+    CHECK(state_has_header(hint_after, "none\nactive=work\n"));
+    CHECK(reset_ledger_matches(
+        &sb, false, true, PUBLICATION_STATE_PUBLISHED));
 
     pty_close(&g_p);
     sandbox_teardown(&sb);

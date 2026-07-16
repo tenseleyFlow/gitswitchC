@@ -138,6 +138,12 @@ typedef enum {
     COMMAND_NOTICE_RESET_ALL
 } command_notice_kind_t;
 
+typedef enum {
+    COMMAND_FAILURE_NONE = 0,
+    COMMAND_FAILURE_REMOVE,
+    COMMAND_FAILURE_RESET_RETIREMENT
+} command_failure_kind_t;
+
 /* Mutating handlers describe what they changed; main owns persistence and the
  * final user-visible success. A prepared switch also carries the resume-hint
  * before-image needed to undo a post-mutation commit failure. */
@@ -151,30 +157,36 @@ typedef struct {
     bool remove_prepared;
     bool reset_guarded;
     accounts_transaction_token_t reset_token;
+    command_failure_kind_t failure_kind;
+    error_accumulator_t failure_errors;
     config_resume_hint_snapshot_t hint_snapshot;
     char previous_active[MAX_NAME_LEN];
     char subject[MAX_NAME_LEN];
 } command_result_t;
 
-/* An abort-only switch record stores the caller context address. A renamed
- * in-process CLI entry used by tests can return without terminating the
- * process, so an incomplete exact abort must retain that storage and settle
- * it before any later entry allocates another context. */
+/* An account transaction can retain the caller context after a failed final
+ * release. A renamed in-process CLI entry used by tests can return without
+ * terminating the process, so exact recovery metadata must keep that storage
+ * alive and settle it before any later entry allocates another context. */
 typedef enum {
     RETAINED_CLI_CONTEXT_NONE = 0,
     RETAINED_CLI_CONTEXT_SWITCH_ABORT,
+    RETAINED_CLI_CONTEXT_RESET_RELEASE,
+    RETAINED_CLI_CONTEXT_SIGNAL_GUARD_RELEASE,
     RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER
 } retained_cli_context_kind_t;
 
 typedef struct {
     retained_cli_context_kind_t kind;
     gitswitch_ctx_t *ctx;
+    accounts_transaction_token_t transaction_token;
+    bool reset_rollback_pending;
     char config_path[MAX_PATH_LEN];
     error_context_t primary_error;
     int primary_errno;
-} retained_cli_switch_t;
+} retained_cli_context_t;
 
-static retained_cli_switch_t g_retained_cli_switch;
+static retained_cli_context_t g_retained_cli_context;
 
 /* Deterministic reset transaction checkpoints used only by the dedicated
  * AR-07 regression binary.  The production main object contains no injectable
@@ -329,30 +341,187 @@ static void display_error_chain(const char *context,
                   error->details);
 }
 
-static void retain_cli_switch_context(gitswitch_ctx_t *ctx,
-                                      retained_cli_context_kind_t kind,
-                                      const error_context_t *primary_error,
-                                      int primary_errno) {
+static void command_failure_add_last(command_result_t *result,
+                                     const char *label) {
+    if (!result || !result->failure_errors.active) return;
+    (void)error_accumulator_add_last(&result->failure_errors, label);
+}
+
+static void command_failure_publish_and_display(command_result_t *result) {
+    error_context_t published;
+    int published_errno;
+    const char *context;
+
+    if (!result || !result->failure_errors.active) return;
+    if (!error_accumulator_publish(&result->failure_errors)) return;
+    published = *get_last_error();
+    published_errno = errno;
+    switch (result->failure_kind) {
+        case COMMAND_FAILURE_REMOVE:
+            context = "Failed to remove account";
+            break;
+        case COMMAND_FAILURE_RESET_RETIREMENT:
+            context = "reset failed; account and active-state metadata were preserved for retry";
+            break;
+        case COMMAND_FAILURE_NONE:
+        default:
+            context = "Command failed";
+            break;
+    }
+    display_error_chain(context, &published);
+    restore_cli_error(&published, published_errno);
+}
+
+/* Return 0 for an ordinary exact release, 1 when a missing checked signal
+ * owner was repaired before the exact RESET owner was released, and -1 when
+ * ownership remains live. The first cleanup anomaly stays published on both
+ * nonzero outcomes so callers can append or retain it without replacement. */
+static int release_reset_transaction_owner(
+    gitswitch_ctx_t *ctx, accounts_transaction_token_t token,
+    bool *rollback_pending) {
+    error_accumulator_t release_errors;
+
+    if (!ctx || token == 0 || !rollback_pending) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retained reset transaction release state");
+        return -1;
+    }
+
+    error_accumulator_init(&release_errors);
+    if (*rollback_pending) {
+        if (accounts_transaction_rollback_end(
+                ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0) {
+            (void)error_accumulator_add_last(
+                &release_errors, "checked rollback release");
+
+            /* The account owner and checked signal owner advance together.
+             * If an interrupted/faulted finalizer cleared only the latter,
+             * restore the exact token once and retry the account-owned edge.
+             * A foreign checked owner rejects this without mutation. */
+            if (signals_rollback_begin_owned(token) != 0) {
+                (void)error_accumulator_add_last(
+                    &release_errors, "checked rollback reconciliation");
+                (void)error_accumulator_publish(&release_errors);
+                return -1;
+            }
+            if (accounts_transaction_rollback_end(
+                    ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0) {
+                (void)error_accumulator_add_last(
+                    &release_errors, "checked rollback retry");
+                if (signals_rollback_end_owned(token) != 0) {
+                    (void)error_accumulator_add_last(
+                        &release_errors,
+                        "checked rollback reconciliation undo");
+                }
+                (void)error_accumulator_publish(&release_errors);
+                return -1;
+            }
+        }
+        *rollback_pending = false;
+    }
+
+    if (accounts_transaction_finish(
+            ctx, ACCOUNTS_TRANSACTION_RESET, token) != 0) {
+        (void)error_accumulator_add_last(
+            &release_errors, "account transaction finish");
+        (void)error_accumulator_publish(&release_errors);
+        return -1;
+    }
+    if (release_errors.active) {
+        (void)error_accumulator_publish(&release_errors);
+        return 1;
+    }
+    return 0;
+}
+
+static void retain_cli_context(
+    gitswitch_ctx_t *ctx, retained_cli_context_kind_t kind,
+    accounts_transaction_token_t transaction_token,
+    bool reset_rollback_pending, const error_context_t *primary_error,
+    int primary_errno) {
     if (!ctx || kind == RETAINED_CLI_CONTEXT_NONE || !primary_error) return;
-    if (g_retained_cli_switch.ctx && g_retained_cli_switch.ctx != ctx) {
+    if (g_retained_cli_context.ctx && g_retained_cli_context.ctx != ctx) {
         return;
     }
 
-    memset(&g_retained_cli_switch, 0, sizeof(g_retained_cli_switch));
-    g_retained_cli_switch.kind = kind;
-    g_retained_cli_switch.ctx = ctx;
-    memcpy(g_retained_cli_switch.config_path, ctx->config.config_path,
-           sizeof(g_retained_cli_switch.config_path));
-    g_retained_cli_switch.config_path[
-        sizeof(g_retained_cli_switch.config_path) - 1] = '\0';
-    g_retained_cli_switch.primary_error = *primary_error;
-    g_retained_cli_switch.primary_errno = primary_errno;
+    memset(&g_retained_cli_context, 0, sizeof(g_retained_cli_context));
+    g_retained_cli_context.kind = kind;
+    g_retained_cli_context.ctx = ctx;
+    g_retained_cli_context.transaction_token = transaction_token;
+    g_retained_cli_context.reset_rollback_pending = reset_rollback_pending;
+    memcpy(g_retained_cli_context.config_path, ctx->config.config_path,
+           sizeof(g_retained_cli_context.config_path));
+    g_retained_cli_context.config_path[
+        sizeof(g_retained_cli_context.config_path) - 1] = '\0';
+    g_retained_cli_context.primary_error = *primary_error;
+    g_retained_cli_context.primary_errno = primary_errno;
+}
+
+/* A failed final signal operation owns no heap context, but it still owns
+ * process-global disposition or caller-mask recovery state. Preserve that
+ * exact obligation across renamed in-process CLI entries just as strictly as
+ * retained account ownership. */
+static void retain_signal_guard_marker(const error_context_t *primary_error,
+                                       int primary_errno) {
+    if (!primary_error ||
+        g_retained_cli_context.kind != RETAINED_CLI_CONTEXT_NONE) {
+        return;
+    }
+
+    memset(&g_retained_cli_context, 0, sizeof(g_retained_cli_context));
+    g_retained_cli_context.kind =
+        RETAINED_CLI_CONTEXT_SIGNAL_GUARD_RELEASE;
+    g_retained_cli_context.primary_error = *primary_error;
+    g_retained_cli_context.primary_errno = primary_errno;
+}
+
+/* Context and config-lock release must precede disposition restoration and
+ * deferred delivery. If either signal operation fails, retain a context-free
+ * marker so no later informational or mutating CLI entry can silently proceed
+ * under gitswitch's still-installed handlers. */
+static int settle_retained_signal_guard(void) {
+    error_context_t primary = g_retained_cli_context.primary_error;
+    error_context_t retry_error;
+    int primary_errno = g_retained_cli_context.primary_errno;
+    int restore_rc;
+
+    /* Dispatch owns two obligations that are not equivalent to a published
+     * pending signal: it may still owe an exact caller-mask restoration after
+     * a returning handler consumed the signal. Always let it discharge that
+     * debt first, then restore a still-live guard, then recheck dispatch for a
+     * signal that landed during disposition restoration. */
+    restore_rc = signals_dispatch_pending();
+    if (restore_rc == 0 && signals_guard_active()) {
+        restore_rc = signals_guard_end();
+    }
+    if (restore_rc == 0) {
+        restore_rc = signals_dispatch_pending();
+    }
+    if (restore_rc != 0) {
+        retry_error = *get_last_error();
+        fprintf(stderr,
+                "gitswitch: retained signal-guard cleanup is still "
+                "incomplete: %s; original failure: %s\n",
+                retry_error.message[0] ? retry_error.message
+                                       : "unknown signal restoration error",
+                primary.message[0] ? primary.message
+                                   : "unknown cleanup error");
+        restore_cli_error(&primary, primary_errno);
+        return -1;
+    }
+
+    secure_zero_memory(&g_retained_cli_context,
+                       sizeof(g_retained_cli_context));
+    clear_error();
+    errno = 0;
+    return 0;
 }
 
 /* Settle retained account ownership before option parsing, informational
  * exits, or a second heap context. The original failure remains the primary
  * diagnostic across path checks, lock release, and retry errors. */
-static int settle_retained_cli_switch(void) {
+static int settle_retained_cli_context(void) {
     error_context_t primary;
     error_context_t retry_error;
     gitswitch_ctx_t *retained;
@@ -360,16 +529,23 @@ static int settle_retained_cli_switch(void) {
     int primary_errno;
     int retry_errno;
     int config_lock_fd;
-    int abort_rc;
+    int settlement_rc;
     bool release_safe;
 
-    retained = g_retained_cli_switch.ctx;
-    if (!retained) return 0;
-    primary = g_retained_cli_switch.primary_error;
-    primary_errno = g_retained_cli_switch.primary_errno;
+    if (g_retained_cli_context.kind ==
+        RETAINED_CLI_CONTEXT_SIGNAL_GUARD_RELEASE) {
+        return settle_retained_signal_guard();
+    }
 
-    if (g_retained_cli_switch.kind !=
-        RETAINED_CLI_CONTEXT_SWITCH_ABORT) {
+    retained = g_retained_cli_context.ctx;
+    if (!retained) return 0;
+    primary = g_retained_cli_context.primary_error;
+    primary_errno = g_retained_cli_context.primary_errno;
+
+    if (g_retained_cli_context.kind !=
+            RETAINED_CLI_CONTEXT_SWITCH_ABORT &&
+        g_retained_cli_context.kind !=
+            RETAINED_CLI_CONTEXT_RESET_RELEASE) {
         fprintf(stderr,
                 "gitswitch: an unexpected account transaction still owns the "
                 "retained application context; refusing a new CLI entry. "
@@ -392,9 +568,9 @@ static int settle_retained_cli_switch(void) {
         restore_cli_error(&primary, primary_errno);
         return -1;
     }
-    if (strcmp(current_path, g_retained_cli_switch.config_path) != 0) {
+    if (strcmp(current_path, g_retained_cli_context.config_path) != 0) {
         fprintf(stderr,
-                "gitswitch: retained switch rollback belongs to a different "
+                "gitswitch: retained account cleanup belongs to a different "
                 "configuration path; restore the original HOME and retry. "
                 "Original failure: %s\n",
                 primary.message[0] ? primary.message :
@@ -417,7 +593,14 @@ static int settle_retained_cli_switch(void) {
         return -1;
     }
 
-    abort_rc = accounts_switch_abort(retained, false);
+    if (g_retained_cli_context.kind ==
+        RETAINED_CLI_CONTEXT_SWITCH_ABORT) {
+        settlement_rc = accounts_switch_abort(retained, false);
+    } else {
+        settlement_rc = release_reset_transaction_owner(
+            retained, g_retained_cli_context.transaction_token,
+            &g_retained_cli_context.reset_rollback_pending);
+    }
     release_safe = accounts_transaction_context_release_safe(retained);
     retry_error = *get_last_error();
     retry_errno = errno;
@@ -425,7 +608,7 @@ static int settle_retained_cli_switch(void) {
 
     if (!release_safe) {
         fprintf(stderr,
-                "gitswitch: retained switch rollback is still incomplete: "
+                "gitswitch: retained account cleanup is still incomplete: "
                 "%s; original failure: %s\n",
                 retry_error.message[0] ? retry_error.message :
                                          "unknown rollback error",
@@ -435,17 +618,42 @@ static int settle_retained_cli_switch(void) {
         return -1;
     }
 
-    secure_zero_memory(retained, sizeof(*retained));
-    free(retained);
-#ifdef GITSWITCH_TESTING
-    g_context_allocations--;
-#endif
-    secure_zero_memory(&g_retained_cli_switch,
-                       sizeof(g_retained_cli_switch));
+    {
+        retained_cli_context_kind_t retained_kind =
+            g_retained_cli_context.kind;
 
-    if (abort_rc != 0) {
+        secure_zero_memory(retained, sizeof(*retained));
+        free(retained);
+#ifdef GITSWITCH_TESTING
+        g_context_allocations--;
+#endif
+        g_retained_cli_context.ctx = NULL;
+
+        if (retained_kind == RETAINED_CLI_CONTEXT_RESET_RELEASE) {
+            g_retained_cli_context.kind =
+                RETAINED_CLI_CONTEXT_SIGNAL_GUARD_RELEASE;
+            g_retained_cli_context.transaction_token = 0;
+            g_retained_cli_context.reset_rollback_pending = false;
+            if (settle_retained_signal_guard() != 0) return -1;
+            if (settlement_rc < 0) {
+                fprintf(stderr,
+                        "gitswitch: retained reset ownership was released, "
+                        "but its final cleanup reported: %s\n",
+                        retry_error.message[0]
+                            ? retry_error.message
+                            : "unknown rollback error");
+                restore_cli_error(&retry_error, retry_errno);
+                return -1;
+            }
+            return 0;
+        }
+    }
+    secure_zero_memory(&g_retained_cli_context,
+                       sizeof(g_retained_cli_context));
+
+    if (settlement_rc < 0) {
         fprintf(stderr,
-                "gitswitch: retained switch ownership was released, but its "
+                "gitswitch: retained account ownership was released, but its "
                 "final cleanup reported: %s\n",
                 retry_error.message[0] ? retry_error.message :
                                          "unknown rollback error");
@@ -662,6 +870,7 @@ int main(int argc, char *argv[]) {
     bool has_mutation_result = false;
     bool signal_guard_cleanup_failed = false;
     bool retained_account_context = false;
+    bool reset_rollback_pending = false;
     bool read_only_command = false;
     const char *pending_signal_notice = NULL;
     int config_lock_fd = -1;
@@ -724,7 +933,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (settle_retained_cli_switch() != 0) {
+    if (settle_retained_cli_context() != 0) {
         error_cleanup();
         return EXIT_FAILURE;
     }
@@ -1075,10 +1284,9 @@ int main(int argc, char *argv[]) {
         published_errno = errno;
         switch_rollback_publish_test_checkpoint();
         if (!accounts_transaction_context_release_safe(ctx)) {
-            retain_cli_switch_context(ctx,
-                                      RETAINED_CLI_CONTEXT_SWITCH_ABORT,
-                                      &published_error,
-                                      published_errno);
+            retain_cli_context(ctx, RETAINED_CLI_CONTEXT_SWITCH_ABORT,
+                               0, false, &published_error,
+                               published_errno);
         }
         display_error_chain("Failed to switch account", &published_error);
         restore_cli_error(&published_error, published_errno);
@@ -1416,12 +1624,14 @@ cleanup:
     config_resume_hint_snapshot_clear(&mutation.hint_snapshot);
 
     if (ctx && mutation.reset_token != 0) {
-        if (accounts_transaction_rollback_end(
-                ctx, ACCOUNTS_TRANSACTION_RESET,
-                mutation.reset_token) != 0 ||
-            accounts_transaction_finish(
-                ctx, ACCOUNTS_TRANSACTION_RESET,
-                mutation.reset_token) != 0) {
+        int release_rc;
+
+        reset_rollback_pending = true;
+        release_rc = release_reset_transaction_owner(
+            ctx, mutation.reset_token, &reset_rollback_pending);
+        if (release_rc != 0) {
+            command_failure_add_last(
+                &mutation, "reset transaction ownership release");
             fprintf(stderr,
                     "gitswitch: reset transaction ownership cleanup failed: %s\n",
                     get_last_error()->message[0]
@@ -1429,24 +1639,34 @@ cleanup:
                         : "unknown ownership error");
             exit_code = EXIT_FAILURE;
         }
-        mutation.reset_token = 0;
+        if (release_rc >= 0) mutation.reset_token = 0;
     }
 
     if (ctx && !accounts_transaction_context_release_safe(ctx)) {
+        if (mutation.failure_errors.active) {
+            (void)error_accumulator_publish(&mutation.failure_errors);
+        }
         retained_account_context = true;
         exit_code = EXIT_FAILURE;
-        if (!g_retained_cli_switch.ctx) {
+        if (!g_retained_cli_context.ctx) {
             error_context_t ownership_error = *get_last_error();
             int ownership_errno = errno;
+            retained_cli_context_kind_t kind;
 
-            retained_cli_context_kind_t kind =
-                mutation.switch_prepare_state ==
-                    ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE
-                    ? RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER
-                    : RETAINED_CLI_CONTEXT_SWITCH_ABORT;
+            if (mutation.reset_token != 0) {
+                kind = RETAINED_CLI_CONTEXT_RESET_RELEASE;
+            } else if (mutation.switch_prepare_state ==
+                           ACCOUNTS_SWITCH_PREPARE_PREPARED ||
+                       mutation.switch_prepare_state ==
+                           ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED) {
+                kind = RETAINED_CLI_CONTEXT_SWITCH_ABORT;
+            } else {
+                kind = RETAINED_CLI_CONTEXT_UNEXPECTED_ACCOUNT_OWNER;
+            }
 
-            retain_cli_switch_context(ctx, kind, &ownership_error,
-                                      ownership_errno);
+            retain_cli_context(ctx, kind, mutation.reset_token,
+                               reset_rollback_pending, &ownership_error,
+                               ownership_errno);
         }
     }
 
@@ -1473,8 +1693,8 @@ cleanup:
         fprintf(stderr,
                 "gitswitch: account rollback ownership remains active; the "
                 "application context was retained for a checked retry: %s\n",
-                g_retained_cli_switch.primary_error.message[0]
-                    ? g_retained_cli_switch.primary_error.message
+                g_retained_cli_context.primary_error.message[0]
+                    ? g_retained_cli_context.primary_error.message
                     : "unknown account transaction error");
         ctx = NULL;
     }
@@ -1495,10 +1715,14 @@ cleanup:
      * interruption. */
     if (!retained_account_context && !signals_pending() &&
         signals_guard_end() != 0) {
+        error_context_t restore_error = *get_last_error();
+        int restore_errno = errno;
         int retained_signal = signals_pending_signal();
-        const char *restore_detail = get_last_error()->message[0]
-                                         ? get_last_error()->message
+        const char *restore_detail = restore_error.message[0]
+                                         ? restore_error.message
                                          : "unknown signal restoration error";
+
+        retain_signal_guard_marker(&restore_error, restore_errno);
 
         if (retained_signal != 0) {
             fprintf(stderr,
@@ -1514,6 +1738,7 @@ cleanup:
                     restore_detail);
         }
         signal_guard_cleanup_failed = true;
+        command_failure_add_last(&mutation, "signal guard restoration");
         exit_code = EXIT_FAILURE;
     }
 
@@ -1526,23 +1751,30 @@ cleanup:
             : "gitswitch: interrupted — command cleanup completed\n";
     }
 
-    /* Cleanup error handling */
-    error_cleanup();
-
     if (!retained_account_context && !signal_guard_cleanup_failed &&
         pending_signal_notice &&
         signals_pending()) {
         fputs(pending_signal_notice, stderr);
         if (signals_dispatch_pending() != 0) {
+            error_context_t dispatch_error = *get_last_error();
+            int dispatch_errno = errno;
+
+            retain_signal_guard_marker(&dispatch_error, dispatch_errno);
             fprintf(stderr,
                     "gitswitch: deferred signal remains pending because "
                     "restoring its saved disposition failed: %s\n",
-                    get_last_error()->message[0]
-                        ? get_last_error()->message
+                    dispatch_error.message[0]
+                        ? dispatch_error.message
                         : "unknown signal restoration error");
+            command_failure_add_last(
+                &mutation, "deferred signal dispatch");
             exit_code = EXIT_FAILURE;
         }
     }
+    command_failure_publish_and_display(&mutation);
+
+    /* Cleanup error handling */
+    error_cleanup();
     return exit_code;
 }
 
@@ -1669,7 +1901,14 @@ static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
     }
 
     if (accounts_remove(ctx, identifier) != 0) {
-        display_error("Failed to remove account", "%s", get_last_error()->message);
+        error_context_t removal_error = *get_last_error();
+        int removal_errno = errno;
+
+        result.failure_kind = COMMAND_FAILURE_REMOVE;
+        errno = removal_errno;
+        (void)error_accumulator_add(&result.failure_errors,
+                                    "account removal", &removal_error);
+        errno = removal_errno;
         return result;
     }
 
@@ -2500,6 +2739,7 @@ static int handle_resume_command(gitswitch_ctx_t *ctx) {
 static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
                                              const char *account) {
     command_result_t result = command_result(EXIT_FAILURE);
+    error_accumulator_t retirement_errors;
     account_t *target_account = NULL;
     account_t *active_account = NULL;
     const char *target = NULL;
@@ -2508,8 +2748,11 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
     int ssh_rc;
     int gpg_rc;
     int runtime_lock_fd;
+    size_t identity_cleared_total = 0U;
+    bool retirement_failed = false;
 
     if (!ctx) return result;
+    error_accumulator_init(&retirement_errors);
 
     /* Resolve the argument to a real account first so a typo can't report a
      * false success while the intended account's on-disk secret-key copy is
@@ -2672,38 +2915,87 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
      * persisted commit.gpgsign=true keeps instructing Git to sign, so later
      * commits fail or silently fall back to the system keyring — and pushes
      * keep authenticating with the reset account's key. Scrub the legs still
-     * attributable to the reset account(s); best-effort, the reset itself
-     * already succeeded. */
+     * attributable to the reset account(s). A detected retirement failure
+     * keeps the account and active-state metadata as exact retry attribution,
+     * returns nonzero, and suppresses the centralized success notice. */
     {
-        size_t identity_cleared = 0;
         if (target_account) {
+            size_t identity_cleared = 0U;
+
             if (accounts_retire_git_identity(ctx, target_account,
                                              &identity_cleared) != 0) {
+                error_context_t retirement_error = *get_last_error();
+                int retirement_errno = errno;
+
+                (void)error_accumulator_add(
+                    &retirement_errors, target_account->name,
+                    &retirement_error);
+                retirement_failed = true;
                 fprintf(stderr,
-                        "gitswitch: WARNING: durable Git configuration may "
-                        "still select reset account '%s': %s\n",
-                        target, get_last_error()->message);
+                        "gitswitch: durable Git retirement failed for reset "
+                        "account '%s': %s\n",
+                        target,
+                        retirement_error.message[0] != '\0'
+                            ? retirement_error.message
+                            : "unknown Git retirement error");
+                errno = retirement_errno;
             }
-            if (identity_cleared > 0) {
-                printf("Cleared %zu durable Git identity setting(s) that "
-                       "selected '%s'.\n", identity_cleared, target);
-            }
+            identity_cleared_total = identity_cleared;
         } else {
             for (size_t i = 0; i < ctx->account_count; i++) {
                 size_t account_cleared = 0;
                 if (accounts_retire_git_identity(ctx, &ctx->accounts[i],
                                                  &account_cleared) != 0) {
+                    error_context_t retirement_error = *get_last_error();
+                    int retirement_errno = errno;
+
+                    (void)error_accumulator_add(
+                        &retirement_errors, ctx->accounts[i].name,
+                        &retirement_error);
+                    retirement_failed = true;
                     fprintf(stderr,
-                            "gitswitch: WARNING: durable Git configuration "
-                            "may still select reset account '%s': %s\n",
-                            ctx->accounts[i].name, get_last_error()->message);
+                            "gitswitch: durable Git retirement failed for "
+                            "reset account '%s': %s\n",
+                            ctx->accounts[i].name,
+                            retirement_error.message[0] != '\0'
+                                ? retirement_error.message
+                                : "unknown Git retirement error");
+                    errno = retirement_errno;
                 }
-                if (account_cleared > 0) {
-                    printf("Cleared %zu durable Git identity setting(s) that "
-                           "selected '%s'.\n",
-                           account_cleared, ctx->accounts[i].name);
+                if (SIZE_MAX - identity_cleared_total < account_cleared) {
+                    identity_cleared_total = SIZE_MAX;
+                } else {
+                    identity_cleared_total += account_cleared;
                 }
             }
+        }
+    }
+
+    if (retirement_failed) {
+        int retirement_errno;
+
+        (void)error_accumulator_publish(&retirement_errors);
+        retirement_errno = errno;
+        result.failure_kind = COMMAND_FAILURE_RESET_RETIREMENT;
+        result.failure_errors = retirement_errors;
+        if (identity_cleared_total > 0U) {
+            fprintf(stderr,
+                    "gitswitch: retired %zu durable Git identity setting(s) "
+                    "before the failure; cleanup remains incomplete\n",
+                    identity_cleared_total);
+        }
+        errno = retirement_errno;
+        return result;
+    }
+    if (identity_cleared_total > 0U) {
+        if (target_account) {
+            printf("Cleared %zu durable Git identity setting(s) that selected "
+                   "'%s'.\n",
+                   identity_cleared_total, target);
+        } else {
+            printf("Cleared %zu durable Git identity setting(s) across reset "
+                   "accounts.\n",
+                   identity_cleared_total);
         }
     }
 

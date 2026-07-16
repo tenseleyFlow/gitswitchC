@@ -3547,6 +3547,7 @@ int accounts_remove_abort(gitswitch_ctx_t *ctx) {
  * classified config_save_transactional() as pre- or post-install. */
 int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     account_t *account;
+    error_accumulator_t retirement_errors;
     char account_name[MAX_NAME_LEN];
     char ssh_error[sizeof(g_last_error.message)] = "";
     char gpg_error[sizeof(g_last_error.message)] = "";
@@ -3563,6 +3564,7 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     accounts_transaction_token_t token;
     bool guard_started = false;
 
+    error_accumulator_init(&retirement_errors);
     if (accounts_transaction_begin(ctx, ACCOUNTS_TRANSACTION_REMOVE,
                                    &token) != 0) {
         return -1;
@@ -3710,19 +3712,37 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
      * for every fetch/push and commit. Runtime teardown alone leaves them
      * selecting the retired identity: pushes keep authenticating with the
      * removed account's key and signing config outlives it. Scrub exactly
-     * the legs still attributable to this account. Best-effort: the durable
-     * removal must stay committable, so a failed unset warns loudly instead
-     * of aborting — the residue stays visible in `status`. */
+     * the legs still attributable to this account. A retirement failure is
+     * not best-effort: deleting the account would turn its immutable
+     * incarnation and PUBLISHED records into a non-authorizing tombstone,
+     * destroying the supported retry handle while residue remains live. */
     {
         size_t identity_cleared = 0;
         if (accounts_retire_git_identity(ctx, account,
                                          &identity_cleared) != 0) {
+            error_context_t retirement_error = *get_last_error();
+            int retirement_errno = errno;
+
+            (void)error_accumulator_add(
+                &retirement_errors, "durable Git retirement",
+                &retirement_error);
             fprintf(stderr,
-                    "gitswitch: WARNING: durable Git configuration may still "
-                    "select removed account '%s': %s\n",
-                    account_name, get_last_error()->message);
-        }
-        if (identity_cleared > 0) {
+                    "gitswitch: durable Git retirement failed for '%s'; "
+                    "account metadata was retained for retry: %s\n",
+                    account_name,
+                    retirement_error.message[0] != '\0'
+                        ? retirement_error.message
+                        : "unknown Git retirement error");
+            if (identity_cleared > 0) {
+                fprintf(stderr,
+                        "gitswitch: retired %zu durable Git identity "
+                        "setting(s) before the failure; cleanup remains "
+                        "incomplete\n",
+                        identity_cleared);
+            }
+            errno = retirement_errno;
+            goto remove_done;
+        } else if (identity_cleared > 0) {
             printf("Cleared %zu durable Git identity setting(s) that "
                    "selected '%s'.\n",
                    identity_cleared, account_name);
@@ -3787,6 +3807,11 @@ remove_done:
         while (g_transaction_owner.rollback_depth > 0) {
             if (accounts_transaction_rollback_end(
                     ctx, ACCOUNTS_TRANSACTION_REMOVE, token) != 0) {
+                if (retirement_errors.active) {
+                    (void)error_accumulator_add_last(
+                        &retirement_errors,
+                        "remove transaction rollback release");
+                }
                 result = -1;
                 break;
             }
@@ -3794,6 +3819,11 @@ remove_done:
         if (g_transaction_owner.rollback_depth == 0 &&
             accounts_transaction_finish(
                 ctx, ACCOUNTS_TRANSACTION_REMOVE, token) != 0) {
+            if (retirement_errors.active) {
+                (void)error_accumulator_add_last(
+                    &retirement_errors,
+                    "remove transaction ownership release");
+            }
             result = -1;
         }
     }
@@ -3802,8 +3832,16 @@ remove_done:
         if (finish_signal_guard_checked(
                 "Account removal finished, but restoring the caller's "
                 "signal dispositions failed") != 0) {
+            if (retirement_errors.active) {
+                (void)error_accumulator_add_last(
+                    &retirement_errors, "remove signal guard release");
+            }
             result = -1;
         }
+    }
+    if (retirement_errors.active) {
+        (void)error_accumulator_publish(&retirement_errors);
+        result = -1;
     }
     return result;
 }
@@ -3963,9 +4001,9 @@ static bool git_status_snapshot_has_credential_residue(
 
 static void print_git_status_snapshot_identity(
     const git_status_snapshot_t *snapshot, bool active_account) {
-    printf(active_account ? "  Current Name: " : "  Name: ");
+    fputs(active_account ? "  Current Name: " : "  Name: ", stdout);
     print_git_effective_text(snapshot ? &snapshot->user_name : NULL);
-    printf(active_account ? "\n  Current Email: " : "\n  Email: ");
+    fputs(active_account ? "\n  Current Email: " : "\n  Email: ", stdout);
     print_git_effective_text(snapshot ? &snapshot->user_email : NULL);
     printf("\n");
 }
@@ -3984,7 +4022,7 @@ static void print_git_status_snapshot_credentials(
         printf("[ERROR]");
         print_git_value_origin(&snapshot->commit_gpgsign);
     } else {
-        printf(snapshot->gpg_signing_enabled ? "[YES]" : "[NO]");
+        fputs(snapshot->gpg_signing_enabled ? "[YES]" : "[NO]", stdout);
         print_git_value_origin(&snapshot->commit_gpgsign);
     }
     printf("\n  Effective GPG Format: ");
@@ -4936,7 +4974,8 @@ int accounts_show_status(const gitswitch_ctx_t *ctx) {
             if (!git_status->commit_gpgsign.present) {
                 printf("[ABSENT]");
             } else {
-                printf(git_status->gpg_signing_enabled ? "[YES]" : "[NO]");
+                fputs(git_status->gpg_signing_enabled ? "[YES]" : "[NO]",
+                      stdout);
                 print_git_value_origin(&git_status->commit_gpgsign);
             }
             printf("\n");

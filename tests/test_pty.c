@@ -351,6 +351,43 @@ static void pty_close(pty_proc_t *p) {
     }
 }
 
+static int sandbox_publish_account(sandbox_t *sb, const char *account) {
+    const char *switch_argv[] = {
+        "gitswitch", "--global", "--yes", account, NULL
+    };
+    pty_proc_t publish_proc;
+
+    if (pty_spawn(&publish_proc, switch_argv, sb) != 0) {
+        return -1;
+    }
+    if (pty_wait_exit(&publish_proc) != 0) {
+        pty_close(&publish_proc);
+        return -1;
+    }
+    pty_close(&publish_proc);
+    return 0;
+}
+
+/* The positive half of the reset-consent test needs real durable retirement
+ * authority.  Keep that fixture credentialless so a normal switch can publish
+ * the exact global Git destination without involving SSH/GPG test doubles. */
+static int sandbox_prepare_published_reset_account(sandbox_t *sb) {
+    static const char config[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"work\"\n"
+        "email = \"w@example.com\"\n"
+        "description = \"credentialless reset fixture\"\n"
+        "preferred_scope = \"global\"\n";
+
+    if (write_file_mode(sb->cfg, config, 0600) != 0) {
+        return -1;
+    }
+    return sandbox_publish_account(sb, "work");
+}
+
 /* Expect-then-type: every answer is sent only after its prompt is visible,
  * which also guarantees the terminal is in whatever mode the reader uses. */
 static int expect_send(pty_proc_t *p, const char *prompt, const char *answer) {
@@ -466,6 +503,10 @@ TEST(yes_flag_skips_confirmation) {
     CHECK_EQ_INT(pty_wait_exit(&g_p), 0);
     CHECK(strstr(g_p.out, "this account? (y/N)") == NULL);
     pty_close(&g_p);
+
+    /* Publish the credentialless removal target through the real switch path;
+     * M17 requires exact retirement authority for every successful removal. */
+    CHECK_EQ_INT(sandbox_publish_account(&sb, "other"), 0);
 
     /* remove: no typed-'yes' gate at all. */
     if (pty_spawn(&g_p, rm_argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
@@ -613,7 +654,10 @@ TEST(reset_typed_yes_confirmation_semantics) {
     CHECK(strstr(g_p.out, "Reset all gitswitch") == NULL);
     pty_close(&g_p);
 
-    /* A typed 'yes' proceeds. */
+    /* A typed 'yes' proceeds against a genuinely published destination, so
+     * the success assertion exercises retirement rather than a legacy
+     * missing-provenance shortcut. */
+    CHECK_EQ_INT(sandbox_prepare_published_reset_account(&sb), 0);
     if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
     CHECK_EQ_INT(expect_send(&g_p, "Type 'yes' to continue:", "yes\n"), 0);
     CHECK_EQ_INT(pty_expect(&g_p, "Reset all gitswitch SSH/GPG state"), 0);

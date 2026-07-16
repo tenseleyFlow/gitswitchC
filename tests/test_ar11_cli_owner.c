@@ -67,6 +67,12 @@ static char g_hook_commit_error[512];
 static cli_owner_fixture_t g_persistence_fault_fixture;
 static bool g_persistence_fault_armed;
 static int g_persistence_fault_mutation_rc;
+static volatile sig_atomic_t g_returning_signal_calls;
+
+typedef enum {
+    SIGNAL_MARKER_GUARD_RESTORE = 0,
+    SIGNAL_MARKER_DISPATCH_RESTORE
+} signal_marker_case_t;
 
 static const int guarded_signals[] = { SIGINT, SIGTERM, SIGHUP, SIGQUIT };
 static const char expected_accounts_config[] =
@@ -334,6 +340,16 @@ static void capture_published_rollback(void) {
 
 static void inherited_handler(int signal_number) {
     (void)signal_number;
+}
+
+static void returning_signal_handler(int signal_number) {
+    (void)signal_number;
+    g_returning_signal_calls++;
+}
+
+static void queue_returning_signal_and_fail_dispatch(void) {
+    (void)raise(SIGTERM);
+    signals_test_fail_dispatch(SIGNALS_TEST_DISPATCH_MASK_RESTORE, EIO);
 }
 
 static bool actions_equal(const struct sigaction *left,
@@ -615,6 +631,111 @@ static int run_cli_aggregate_case(const cli_owner_fixture_t *fixture) {
     }
 }
 
+static int run_signal_marker_case(const cli_owner_fixture_t *fixture,
+                                  signal_marker_case_t marker_case) {
+    pid_t child = fork();
+
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char force_global[] = "-g";
+        char account[] = "work";
+        char version[] = "--version";
+        char *switch_argv[] = {
+            program, no_color, force_global, account, NULL
+        };
+        char *version_argv[] = { program, version, NULL };
+        int first_rc;
+        int second_rc;
+        int third_rc;
+
+        if (setenv("HOME", fixture->home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", fixture->runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", fixture->gitconfig, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("GITSWITCH_ALLOW_TMP_GPG", "1", 1) != 0 ||
+            unsetenv("XDG_CONFIG_HOME") != 0 ||
+            unsetenv("GNUPGHOME") != 0 ||
+            redirect_output(fixture->output) != 0) {
+            _exit(140);
+        }
+
+        g_returning_signal_calls = 0;
+        if (marker_case == SIGNAL_MARKER_GUARD_RESTORE) {
+            signals_test_fail_sigaction(
+                SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EIO);
+        } else {
+            struct sigaction action;
+
+            memset(&action, 0, sizeof(action));
+            action.sa_handler = returning_signal_handler;
+            if (sigemptyset(&action.sa_mask) != 0 ||
+                sigaction(SIGTERM, &action, NULL) != 0) {
+                _exit(141);
+            }
+            (void)signals_test_set_guard_end_hook(
+                queue_returning_signal_and_fail_dispatch);
+        }
+
+        optind = 1;
+        first_rc = gitswitch_cli_main(4, switch_argv);
+        if (first_rc != EXIT_FAILURE ||
+            gitswitch_test_context_allocations() != 0 ||
+            signals_rollback_active()) {
+            _exit(142);
+        }
+        if (marker_case == SIGNAL_MARKER_GUARD_RESTORE) {
+            if (!signals_guard_active() || g_returning_signal_calls != 0) {
+                _exit(143);
+            }
+            signals_test_fail_sigaction(
+                SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE, EAGAIN);
+        } else {
+            if (signals_guard_active() || g_returning_signal_calls != 1) {
+                _exit(144);
+            }
+            signals_test_fail_dispatch(
+                SIGNALS_TEST_DISPATCH_MASK_RESTORE, EAGAIN);
+        }
+
+        /* The next informational entry must settle the context-free signal
+         * obligation before parsing --version. A repeated injected failure
+         * proves it cannot silently bypass the retained marker. */
+        optind = 1;
+        second_rc = gitswitch_cli_main(2, version_argv);
+        if (second_rc != EXIT_FAILURE ||
+            gitswitch_test_context_allocations() != 0 ||
+            g_returning_signal_calls !=
+                (marker_case == SIGNAL_MARKER_DISPATCH_RESTORE ? 1 : 0)) {
+            _exit(145);
+        }
+
+        optind = 1;
+        third_rc = gitswitch_cli_main(2, version_argv);
+        if (third_rc != EXIT_SUCCESS || signals_guard_active() ||
+            signals_rollback_active() ||
+            gitswitch_test_context_allocations() != 0 ||
+            gitswitch_test_context_allocation_total() != 1 ||
+            g_returning_signal_calls !=
+                (marker_case == SIGNAL_MARKER_DISPATCH_RESTORE ? 1 : 0)) {
+            _exit(146);
+        }
+        if (fflush(NULL) != 0) _exit(147);
+        _exit(0);
+    }
+
+    {
+        int status = 0;
+        pid_t waited;
+
+        do {
+            waited = waitpid(child, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return waited == child ? status : -1;
+    }
+}
+
 static bool config_dir_has_temporary(const char *path) {
     DIR *directory = opendir(path);
     struct dirent *entry;
@@ -727,8 +848,38 @@ TEST(persistence_and_abort_failures_keep_first_context_and_causal_order) {
     check_aggregate_artifacts(&fixture);
 }
 
+TEST(ordinary_guard_restore_failure_fences_next_cli_entry) {
+    cli_owner_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    status = run_signal_marker_case(&fixture,
+                                    SIGNAL_MARKER_GUARD_RESTORE);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
+TEST(ordinary_dispatch_restore_failure_fences_next_cli_entry) {
+    cli_owner_fixture_t fixture;
+    int status;
+
+    CHECK_EQ_INT(fixture_setup(&fixture), 0);
+    status = run_signal_marker_case(&fixture,
+                                    SIGNAL_MARKER_DISPATCH_RESTORE);
+    CHECK(status >= 0);
+    if (status >= 0) {
+        CHECK(WIFEXITED(status));
+        if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    }
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(one_shot_exact_abort_releases_cli_context);
     RUN_TEST(persistent_runtime_lock_retains_then_settles_before_next_entry);
     RUN_TEST(persistence_and_abort_failures_keep_first_context_and_causal_order);
+    RUN_TEST(ordinary_guard_restore_failure_fences_next_cli_entry);
+    RUN_TEST(ordinary_dispatch_restore_failure_fences_next_cli_entry);
 TEST_MAIN_END()

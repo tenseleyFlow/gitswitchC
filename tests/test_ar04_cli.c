@@ -4,8 +4,11 @@
  * gitswitch binary in isolated HOME/XDG_RUNTIME_DIR fixtures. */
 
 #include "test.h"
+#include "error.h"
+#include "publication.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +21,11 @@
 #include <unistd.h>
 
 static char g_bin[PATH_MAX];
+
+#define AR04_CLI_WORK_INCARNATION \
+    "4141414141414141414141414141414141414141414141414141414141414141"
+#define AR04_CLI_OTHER_INCARNATION \
+    "4242424242424242424242424242424242424242424242424242424242424242"
 
 static int resolve_binary(void) {
     const char *bin = getenv("GITSWITCH_BIN");
@@ -131,6 +139,102 @@ static int write_text(const char *path, const char *text, mode_t mode) {
     return chmod(path, mode);
 }
 
+static int write_all(int fd, const void *data, size_t length) {
+    const unsigned char *cursor = data;
+    size_t written = 0U;
+
+    while (written < length) {
+        ssize_t result = write(fd, cursor + written, length - written);
+
+        if (result > 0) {
+            written += (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Successful reset fixtures carry the same immutable attribution a completed
+ * switch would have persisted. These accounts are genuinely credentialless,
+ * so destination plus exact post-generation is the complete authority. */
+static int seed_account_publication(const char *home, uint32_t account_id,
+                                    const char *incarnation) {
+    static const char git_body[] =
+        "[fixture]\n"
+        "\tgeneration = ar04-cli\n";
+    static const char state_header[] = "none\nactive=work\n";
+    char git_path[PATH_MAX];
+    char state_path[PATH_MAX];
+    publication_ledger_t ledger;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0U;
+    struct stat parent_st;
+    struct stat config_st;
+    int fd = -1;
+    int result = -1;
+
+    if (!home ||
+        snprintf(git_path, sizeof(git_path), "%s/.gitconfig", home) < 0 ||
+        snprintf(state_path, sizeof(state_path),
+                 "%s/.config/gitswitch/.resume-hint", home) < 0 ||
+        write_text(git_path, git_body, 0600) != 0 ||
+        stat(home, &parent_st) != 0 || stat(git_path, &config_st) != 0) {
+        return -1;
+    }
+
+    publication_ledger_init(&ledger);
+    {
+        publication_record_t record;
+
+        publication_record_init(&record);
+        record.account_id = account_id;
+        record.scope = PUBLICATION_SCOPE_GLOBAL;
+        record.state = PUBLICATION_STATE_PUBLISHED;
+        record.capabilities = PUBLICATION_CAP_DESTINATION |
+                              PUBLICATION_CAP_POST_GENERATION;
+        if (!incarnation ||
+            safe_strncpy(record.account_incarnation, incarnation,
+                         sizeof(record.account_incarnation)) != 0 ||
+            safe_strncpy(record.config_path, git_path,
+                         sizeof(record.config_path)) != 0) {
+            goto cleanup;
+        }
+        publication_identity_from_stat(&record.config_parent, &parent_st);
+        publication_identity_from_stat(&record.post_config, &config_st);
+        if (publication_record_validate(&record) != 0 ||
+            publication_ledger_upsert(&ledger, &record) != 0) {
+            goto cleanup;
+        }
+    }
+    if (publication_ledger_serialize(&ledger, &tail, &tail_length) != 0) {
+        goto cleanup;
+    }
+
+    fd = open(state_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write_all(fd, state_header, sizeof(state_header) - 1U) != 0 ||
+        write_all(fd, tail, tail_length) != 0 || fsync(fd) != 0 ||
+        close(fd) != 0) {
+        if (fd >= 0) (void)close(fd);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    result = 0;
+
+cleanup:
+    if (fd >= 0) (void)close(fd);
+    if (tail) {
+        memset(tail, 0, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
 static const char *slurp(const char *path, char *buf, size_t size) {
     FILE *f;
     size_t n;
@@ -186,6 +290,7 @@ static int write_active_config(const char *home) {
         "active_account = \"work\"\n"
         "\n"
         "[accounts.1]\n"
+        "incarnation = \"" AR04_CLI_WORK_INCARNATION "\"\n"
         "name = \"work\"\n"
         "email = \"work@example.com\"\n"
         "preferred_scope = \"global\"\n";
@@ -200,7 +305,9 @@ static int write_active_config(const char *home) {
     return write_text(path, "ssh gpg\n", 0600);
 }
 
-static int write_two_account_active_config(const char *home) {
+static int write_two_account_active_config(const char *home,
+                                           uint32_t published_account_id,
+                                           const char *published_incarnation) {
     char path[PATH_MAX];
     static const char body[] =
         "[settings]\n"
@@ -208,11 +315,13 @@ static int write_two_account_active_config(const char *home) {
         "active_account = \"work\"\n"
         "\n"
         "[accounts.1]\n"
+        "incarnation = \"" AR04_CLI_WORK_INCARNATION "\"\n"
         "name = \"work\"\n"
         "email = \"work@example.com\"\n"
         "preferred_scope = \"global\"\n"
         "\n"
         "[accounts.2]\n"
+        "incarnation = \"" AR04_CLI_OTHER_INCARNATION "\"\n"
         "name = \"other\"\n"
         "email = \"other@example.com\"\n"
         "preferred_scope = \"global\"\n";
@@ -223,8 +332,8 @@ static int write_two_account_active_config(const char *home) {
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     if (write_text(path, body, 0600) != 0) return -1;
-    snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
-    return write_text(path, "ssh gpg\n", 0600);
+    return seed_account_publication(home, published_account_id,
+                                    published_incarnation);
 }
 
 static void assert_retry_state_preserved(const char *home) {
@@ -356,10 +465,12 @@ TEST(reset_reports_both_subsystem_failures_once) {
 TEST(targeted_reset_metadata_matches_active_account_scope) {
     char home[PATH_MAX], runtime[PATH_MAX], config[PATH_MAX];
     char hint[PATH_MAX], output[PATH_MAX], contents[8192];
+    int reset_rc;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
-    CHECK_EQ_INT(write_two_account_active_config(home), 0);
+    CHECK_EQ_INT(write_two_account_active_config(
+                     home, 1U, AR04_CLI_WORK_INCARNATION), 0);
     CHECK_EQ_INT(join_path(config, sizeof(config), home,
                            "/.config/gitswitch/accounts.toml"), 0);
     CHECK_EQ_INT(join_path(hint, sizeof(hint), home,
@@ -369,22 +480,29 @@ TEST(targeted_reset_metadata_matches_active_account_scope) {
     /* Resetting the active account installs an authoritative inactive
      * tombstone; the legacy settings key may remain byte-identical but cannot
      * be resurrected on reload. Both account records remain. */
-    CHECK_EQ_INT(run_targeted_reset(home, runtime, "work", output), 0);
+    reset_rc = run_targeted_reset(home, runtime, "work", output);
+    CHECK_EQ_INT(reset_rc, 0);
     slurp(config, contents, sizeof(contents));
     CHECK(strstr(contents, "active_account = \"work\"") != NULL);
     CHECK(strstr(contents, "name = \"work\"") != NULL);
     CHECK(strstr(contents, "name = \"other\"") != NULL);
     slurp(hint, contents, sizeof(contents));
-    CHECK_STR_EQ(contents, "none\ninactive=v1\n");
+    CHECK(strncmp(contents, "none\ninactive=v1\n",
+                  strlen("none\ninactive=v1\n")) == 0);
+    CHECK(strstr(contents, "publications=v1\n") != NULL);
 
     /* Resetting an inactive account must not rewrite the active marker or its
      * exact retry hint. Recreate the starting document to exercise that arm. */
-    CHECK_EQ_INT(write_two_account_active_config(home), 0);
-    CHECK_EQ_INT(run_targeted_reset(home, runtime, "other", output), 0);
+    CHECK_EQ_INT(write_two_account_active_config(
+                     home, 2U, AR04_CLI_OTHER_INCARNATION), 0);
+    reset_rc = run_targeted_reset(home, runtime, "other", output);
+    CHECK_EQ_INT(reset_rc, 0);
     slurp(config, contents, sizeof(contents));
     CHECK(strstr(contents, "active_account = \"work\"") != NULL);
     slurp(hint, contents, sizeof(contents));
-    CHECK_STR_EQ(contents, "ssh gpg\n");
+    CHECK(strncmp(contents, "none\nactive=work\n",
+                  strlen("none\nactive=work\n")) == 0);
+    CHECK(strstr(contents, "publications=v1\n") != NULL);
 
     remove_tree(home);
     remove_tree(runtime);

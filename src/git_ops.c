@@ -2360,7 +2360,8 @@ static int git_recovery_format_header(char *header, size_t header_size,
         errno = EINVAL;
         return -1;
     }
-    written = snprintf(
+    written = snprintf( /* Flawfinder: ignore — bounded destination and a
+                         * compile-time literal assembled from PRI macros. */
         header, header_size,
         GIT_RECOVERY_MARKER_MAGIC
         " %s %" PRIuMAX " %" PRIuMAX " %" PRIuMAX " %" PRIuMAX

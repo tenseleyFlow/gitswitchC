@@ -9,6 +9,7 @@
 #include "test.h"
 #include "accounts.h"
 #include "error.h"
+#include "publication.h"
 #include "ssh_manager.h"
 #include "utils.h"
 
@@ -28,6 +29,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#define REAL_RESUME_INCARNATION \
+    "1111111111111111111111111111111111111111111111111111111111111111"
 
 typedef enum {
     SHELL_POSIX = 0,
@@ -119,6 +123,70 @@ static int write_bytes(const char *path, const void *bytes, size_t length,
     }
     if (fchmod(fd, mode) != 0) { close(fd); return -1; }
     return close(fd);
+}
+
+/* Model an earlier successful credentialless publication followed by an
+ * external replacement of ~/.gitconfig.  The stale generation remains exact
+ * enough for reset to reconcile non-destructively, but can never authorize a
+ * mutation of the external replacement. */
+static int seed_stale_global_publication(const char *home,
+                                         const char *hint,
+                                         const char *git_config) {
+    static const char published_body[] =
+        "[user]\n\tname = work\n\temail = work@example.test\n";
+    static const char state_header[] = "ssh\nactive=work\n";
+    publication_ledger_t ledger;
+    publication_record_t record;
+    unsigned char *tail = NULL;
+    unsigned char *state = NULL;
+    size_t tail_length = 0U;
+    size_t header_length = sizeof(state_header) - 1U;
+    struct stat parent_st;
+    struct stat config_st;
+    int result = -1;
+
+    publication_ledger_init(&ledger);
+    publication_record_init(&record);
+    if (write_text(git_config, published_body, 0600) != 0 ||
+        stat(home, &parent_st) != 0 || stat(git_config, &config_st) != 0) {
+        goto cleanup;
+    }
+    record.account_id = 1U;
+    record.scope = PUBLICATION_SCOPE_GLOBAL;
+    record.state = PUBLICATION_STATE_PUBLISHED;
+    record.capabilities = PUBLICATION_CAP_DESTINATION |
+                          PUBLICATION_CAP_POST_GENERATION;
+    if (safe_strncpy(record.account_incarnation, REAL_RESUME_INCARNATION,
+                     sizeof(record.account_incarnation)) != 0 ||
+        safe_strncpy(record.config_path, git_config,
+                     sizeof(record.config_path)) != 0) {
+        goto cleanup;
+    }
+    publication_identity_from_stat(&record.config_parent, &parent_st);
+    publication_identity_from_stat(&record.post_config, &config_st);
+    if (publication_record_validate(&record) != 0 ||
+        publication_ledger_upsert(&ledger, &record) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0 ||
+        tail_length > SIZE_MAX - header_length) {
+        goto cleanup;
+    }
+    state = malloc(header_length + tail_length);
+    if (!state) goto cleanup;
+    memcpy(state, state_header, header_length);
+    memcpy(state + header_length, tail, tail_length);
+    result = write_bytes(hint, state, header_length + tail_length, 0600);
+
+cleanup:
+    if (state) {
+        secure_zero_memory(state, header_length + tail_length);
+        free(state);
+    }
+    if (tail) {
+        secure_zero_memory(tail, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
 }
 
 static const char *read_text(const char *path, char *text, size_t size) {
@@ -1222,13 +1290,16 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
              "default_scope = \"global\"\n"
              "active_account = \"work\"\n\n"
              "[accounts.1]\n"
+             "incarnation = \"" REAL_RESUME_INCARNATION "\"\n"
              "name = \"work\"\n"
              "email = \"work@example.test\"\n"
              "preferred_scope = \"global\"\n"
              "ssh_key = \"%s\"\n",
              key);
     CHECK_EQ_INT(write_text(config_path, config_body, 0600), 0);
-    CHECK_EQ_INT(write_text(hint, "ssh\nactive=work\n", 0600), 0);
+    CHECK_EQ_INT(seed_stale_global_publication(home, hint, git_config), 0);
+    /* Replacing the published generation is the external edit this test must
+     * preserve across both resume and the later retirement reconciliation. */
     CHECK_EQ_INT(write_text(git_config, git_config_body, 0600), 0);
     read_text(git_config, before, sizeof(before));
 
@@ -1246,6 +1317,8 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
              "GIT_CONFIG_NOSYSTEM=1 '%s' -C -y reset >/dev/null 2>&1",
              home, runtime, g_bin);
     CHECK_EQ_INT(run_shell(command), 0);
+    read_text(git_config, after, sizeof(after));
+    CHECK_STR_EQ(after, before);
     ts_rm_rf(root);
 }
 

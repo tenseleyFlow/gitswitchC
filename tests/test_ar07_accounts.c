@@ -9,6 +9,7 @@
 #include "config.h"
 #include "error.h"
 #include "gpg_manager.h"
+#include "publication.h"
 #include "signals.h"
 #include "ssh_manager.h"
 #include "utils.h"
@@ -21,6 +22,9 @@
 #define STATUS_NO_SECRET_KEY \
     "[GNUPG:] ERROR keylist.getkey 17\n" \
     "[GNUPG:] FAILURE gpg-exit 33554433\n"
+
+#define ALIAS_REMOVE_INCARNATION \
+    "2727272727272727272727272727272727272727272727272727272727272727"
 
 static const char private_key_text[] =
     "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
@@ -230,6 +234,118 @@ static int write_mode(const char *path, const char *text, mode_t mode) {
     }
     if (close(fd) != 0) return -1;
     return chmod(path, mode);
+}
+
+static int write_all_fd(int fd, const void *data, size_t length) {
+    const unsigned char *cursor = data;
+    size_t total = 0U;
+
+    while (total < length) {
+        ssize_t written = write(fd, cursor + total, length - total);
+
+        if (written > 0) total += (size_t)written;
+        else if (written < 0 && errno == EINTR) continue;
+        else return -1;
+    }
+    return 0;
+}
+
+/* A direct removal still retires every durable Git destination before it may
+ * discard the account handle. Seed the exact authority a completed
+ * credentialless global switch would have persisted: immutable account
+ * ownership plus a destination and its sealed post-generation. */
+static int seed_credentialless_publication(const char *root,
+                                           gitswitch_ctx_t *ctx,
+                                           const account_t *account) {
+    static const char git_body[] =
+        "[fixture]\n"
+        "\tgeneration = alias-removal\n";
+    static const char state_header[] = "none\ninactive=v1\n";
+    char config_path[512];
+    char git_path[512];
+    char state_path[512];
+    char config_body[2048];
+    publication_record_t record;
+    publication_ledger_t ledger;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0U;
+    struct stat st;
+    int fd = -1;
+    int written;
+    int result = -1;
+
+    if (!root || !ctx || !account || !account->incarnation_persisted ||
+        (size_t)snprintf(config_path, sizeof(config_path),
+                         "%s/accounts.toml", root) >= sizeof(config_path) ||
+        (size_t)snprintf(git_path, sizeof(git_path), "%s/.gitconfig",
+                         root) >= sizeof(git_path) ||
+        (size_t)snprintf(state_path, sizeof(state_path), "%s/.resume-hint",
+                         root) >= sizeof(state_path)) {
+        return -1;
+    }
+    written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "[accounts.%u]\n"
+        "incarnation = \"%s\"\n"
+        "name = \"%s\"\n"
+        "email = \"%s\"\n"
+        "description = \"%s\"\n",
+        account->id, account->incarnation, account->name, account->email,
+        account->description);
+    if (written < 0 || (size_t)written >= sizeof(config_body) ||
+        write_mode(config_path, config_body, 0600) != 0 ||
+        write_mode(git_path, git_body, 0600) != 0 ||
+        safe_strncpy(ctx->config.config_path, config_path,
+                     sizeof(ctx->config.config_path)) != 0) {
+        return -1;
+    }
+
+    publication_record_init(&record);
+    record.account_id = account->id;
+    record.scope = PUBLICATION_SCOPE_GLOBAL;
+    record.state = PUBLICATION_STATE_PUBLISHED;
+    record.capabilities = PUBLICATION_CAP_DESTINATION |
+                          PUBLICATION_CAP_POST_GENERATION;
+    if (safe_strncpy(record.account_incarnation, account->incarnation,
+                     sizeof(record.account_incarnation)) != 0 ||
+        safe_strncpy(record.config_path, git_path,
+                     sizeof(record.config_path)) != 0 ||
+        stat(root, &st) != 0) {
+        return -1;
+    }
+    publication_identity_from_stat(&record.config_parent, &st);
+    if (stat(git_path, &st) != 0) return -1;
+    publication_identity_from_stat(&record.post_config, &st);
+    if (publication_record_validate(&record) != 0) return -1;
+
+    publication_ledger_init(&ledger);
+    if (publication_ledger_upsert(&ledger, &record) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0) {
+        goto cleanup;
+    }
+    fd = open(state_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 ||
+        write_all_fd(fd, state_header, sizeof(state_header) - 1U) != 0 ||
+        write_all_fd(fd, tail, tail_length) != 0 || fsync(fd) != 0) {
+        goto cleanup;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    result = 0;
+
+cleanup:
+    if (fd >= 0) (void)close(fd);
+    if (tail) {
+        secure_zero_memory(tail, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
 }
 
 static size_t read_text(const char *path, char *text, size_t size) {
@@ -485,14 +601,26 @@ TEST(case_varied_alias_blocks_reconcile_and_shared_remove_is_non_destructive) {
     CHECK(strstr(before, key_one) == NULL);
 
     /* Corrupted contexts can predate admission. Removing one claimant must
-     * preserve the shared block for the survivor. */
+     * preserve the shared block for the survivor. Keep the removed claimant
+     * credentialless while retaining its stale alias metadata so its durable
+     * publication authority does not falsely claim an SSH credential leg. */
+    one.ssh_enabled = false;
+    one.ssh_key_path[0] = '\0';
+    one.ssh_hostname[0] = '\0';
+    one.preferred_scope = GIT_SCOPE_GLOBAL;
+    one.incarnation_persisted = true;
+    CHECK_EQ_INT(safe_strncpy(one.incarnation, ALIAS_REMOVE_INCARNATION,
+                              sizeof(one.incarnation)), 0);
     memset(&ctx, 0, sizeof(ctx));
     ctx.accounts[0] = one;
     ctx.accounts[1] = two;
     ctx.account_count = 2;
     ctx.config.assume_yes = true;
+    CHECK_EQ_INT(seed_credentialless_publication(root, &ctx,
+                                                 &ctx.accounts[0]), 0);
     CHECK_EQ_INT(accounts_remove(&ctx, "1"), 0);
     CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "github-work");
     CHECK(read_text(ssh_path, after, sizeof(after)) > 0);
     CHECK_STR_EQ(after, before);
 }
