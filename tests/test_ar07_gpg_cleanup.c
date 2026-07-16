@@ -601,8 +601,9 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK_EQ_INT(gpg_create_isolated_home(&config, &account), 0);
     CHECK_EQ_INT(stat(installed, &first), 0);
     CHECK_EQ_INT(g_precommit_calls, 1);
-    CHECK_EQ_INT(g_file_syncs, 1);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    /* Config temp, durable reload obligation, then completed-reload state. */
+    CHECK_EQ_INT(g_file_syncs, 3);
+    CHECK_EQ_INT(g_directory_syncs, 2);
 
     g_file_syncs = 0;
     g_directory_syncs = 0;
@@ -626,8 +627,8 @@ TEST(byte_identical_agent_config_performs_no_commit) {
                  (int)(sizeof(changed) - 1));
     CHECK_STR_EQ(content, changed);
     CHECK(!has_agent_conf_scratch(config.gnupg_home));
-    CHECK_EQ_INT(g_file_syncs, 1);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    CHECK_EQ_INT(g_file_syncs, 3);
+    CHECK_EQ_INT(g_directory_syncs, 2);
     gpg_manager_set_agent_conf_precommit_fn(old_hook);
     gpg_manager_set_agent_conf_sync_fn(old_sync);
 
@@ -680,27 +681,29 @@ TEST(agent_config_sync_failures_return_nonzero) {
     g_directory_syncs = 0;
     g_fail_file_sync = false;
     CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
-    CHECK_EQ_INT(g_file_syncs, 1);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    /* The focused writer publishes a durable pending obligation; only the
+     * production prepare path may run gpgconf and mark it complete. */
+    CHECK_EQ_INT(g_file_syncs, 2);
+    CHECK_EQ_INT(g_directory_syncs, 2);
     CHECK_EQ_INT(make_file(source_conf, changed), 0);
 
     g_file_syncs = 0;
     g_directory_syncs = 0;
     g_fail_directory_sync = true;
     CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
-    CHECK_EQ_INT(g_file_syncs, 1);
+    CHECK_EQ_INT(g_file_syncs, 2);
     CHECK_EQ_INT(g_directory_syncs, 1);
     CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
-                 (int)(sizeof(changed) - 1));
-    CHECK_STR_EQ(content, changed);
+                 (int)(sizeof(original) - 1));
+    CHECK_STR_EQ(content, original);
     CHECK(!has_agent_conf_scratch(home));
 
     g_fail_directory_sync = false;
     g_file_syncs = 0;
     g_directory_syncs = 0;
     CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
-    CHECK_EQ_INT(g_file_syncs, 0);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    CHECK_EQ_INT(g_file_syncs, 2);
+    CHECK_EQ_INT(g_directory_syncs, 2);
     CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
                  (int)(sizeof(changed) - 1));
     CHECK_STR_EQ(content, changed);

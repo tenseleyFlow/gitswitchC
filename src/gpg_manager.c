@@ -72,6 +72,14 @@ typedef struct {
     const char *path;
 } gpg_pinned_home_t;
 typedef struct {
+    bool reload_required;
+    int config_fd;
+    struct stat config_identity;
+    int marker_fd;
+    struct stat marker_identity;
+    char gpgconf_path[MAX_PATH_LEN];
+} gpg_agent_config_update_t;
+typedef struct {
     bool injected;
     uint64_t injected_id;
 #ifdef __linux__
@@ -101,7 +109,10 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
                                         bool require_signing,
                                         char *fingerprint,
                                         size_t fingerprint_size);
-static int setup_gpg_agent_config(int home_fd, const char *gnupg_home);
+static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
+                                  gpg_agent_config_update_t *update);
+static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
+                                   gpg_agent_config_update_t *update);
 static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
                                         const account_t *account,
                                         int base_fd, const char *base,
@@ -149,6 +160,32 @@ static gpg_reset_current_hook_fn g_reset_current_hook;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
+
+static void gpg_agent_config_update_init(gpg_agent_config_update_t *update) {
+    if (!update) return;
+    memset(update, 0, sizeof(*update));
+    update->config_fd = -1;
+    update->marker_fd = -1;
+}
+
+static int gpg_agent_config_update_close(gpg_agent_config_update_t *update) {
+    int saved_errno = 0;
+
+    if (!update) return 0;
+    if (update->config_fd >= 0 && close(update->config_fd) != 0) {
+        saved_errno = errno;
+    }
+    if (update->marker_fd >= 0 && close(update->marker_fd) != 0 &&
+        saved_errno == 0) {
+        saved_errno = errno;
+    }
+    gpg_agent_config_update_init(update);
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
 
 gpg_readdir_fn gpg_manager_set_readdir_fn(gpg_readdir_fn fn) {
     gpg_readdir_fn previous = g_gpg_readdir;
@@ -3544,16 +3581,19 @@ static int gpg_prepare_base_dir(char *base, size_t size) {
 }
 
 /* Create and pin one account home relative to an already-opened, locked base.
- * Configuration installation is intentionally best effort as before, but a
- * public namespace replacement is fatal even when the descriptor-relative
- * installation itself safely wrote only to the original directory. */
+ * Agent configuration is part of activation, not a cosmetic best effort:
+ * changed bytes must be made visible to a retained agent before any account
+ * identity can be published. */
 static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
                                         const account_t *account,
                                         int base_fd, const char *base,
                                         int *home_fd_out) {
     char gnupg_home[MAX_PATH_LEN];
     gpg_pinned_home_t pinned;
+    gpg_agent_config_update_t update;
     int home_fd;
+
+    gpg_agent_config_update_init(&update);
 
     if (!gpg_config || !account || base_fd < 0 || !base || !*base ||
         !home_fd_out || !validate_name(account->name)) {
@@ -3581,9 +3621,22 @@ static int gpg_prepare_isolated_home_at(gpg_config_t *gpg_config,
         return -1;
     }
 
-    if (setup_gpg_agent_config(home_fd, gnupg_home) != 0) {
-        log_warning("Failed to set up GPG agent config: %s",
-                    get_last_error()->message);
+    if (setup_gpg_agent_config(home_fd, gnupg_home, &update) != 0) {
+        gpg_agent_config_update_close(&update);
+        close(home_fd);
+        return -1;
+    }
+    if (update.reload_required &&
+        gpg_reload_agent_config(&pinned, &update) != 0) {
+        gpg_agent_config_update_close(&update);
+        close(home_fd);
+        return -1;
+    }
+    if (gpg_agent_config_update_close(&update) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close applied GPG agent configuration");
+        close(home_fd);
+        return -1;
     }
     if (gpg_validate_pinned_home(&pinned) != 0) {
         close(home_fd);
@@ -4571,6 +4624,9 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
 
 enum { GPG_AGENT_CONF_MAX = 64 * 1024 };
 
+#define GPG_AGENT_RELOAD_STATE ".gitswitch-gpg-agent-reload.state"
+enum { GPG_AGENT_RELOAD_STATE_MAX = 256 };
+
 static bool conf_bytes_have_pinentry(const unsigned char *bytes, size_t len) {
     size_t offset = 0;
 
@@ -4641,7 +4697,8 @@ static int append_conf_bytes(unsigned char *dest, size_t capacity,
  * The comparator opens no write descriptor and performs no fsync or rename;
  * its caller still syncs the directory before accepting an identical retry. */
 static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
-                                  size_t desired_len) {
+                                  size_t desired_len, int *matched_fd_out,
+                                  struct stat *identity_out) {
     struct stat before;
     struct stat opened;
     struct stat after;
@@ -4649,6 +4706,13 @@ static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
     size_t offset = 0;
     int fd;
     int result = 0;
+
+    if ((matched_fd_out == NULL) != (identity_out == NULL)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG agent config comparison outputs");
+        return -1;
+    }
+    if (matched_fd_out) *matched_fd_out = -1;
 
     if (fstatat(home_fd, "gpg-agent.conf", &before,
                 AT_SYMLINK_NOFOLLOW) != 0) {
@@ -4702,12 +4766,422 @@ static int gpg_agent_conf_matches(int home_fd, const unsigned char *desired,
         after.st_nlink != 1 || before.st_nlink != 1) {
         result = -1;
     }
-    if (close(fd) != 0) result = -1;
+    if (result == 1 && matched_fd_out) {
+        *matched_fd_out = fd;
+        *identity_out = opened;
+        fd = -1;
+    }
+    if (fd >= 0 && close(fd) != 0) result = -1;
     if (result < 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to compare installed gpg-agent.conf safely");
     }
     return result;
+}
+
+/* The retained state file is a durable reload obligation. Exact zero length
+ * means a successful pinned-home reload is still required; nonzero contents
+ * are only a candidate clean record and must match the installed config's
+ * exact generation. Absence therefore forces one migration reload. Keeping
+ * one inode and changing its contents avoids an identity-unsafe unlink race. */
+static int gpg_open_agent_reload_state(int home_fd, int *fd_out,
+                                       struct stat *identity_out,
+                                       bool *present_out,
+                                       bool *pending_out) {
+    struct stat before;
+    struct stat opened;
+    struct stat after;
+    int fd;
+
+    if (home_fd < 0 || !fd_out || !identity_out || !present_out ||
+        !pending_out) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG agent reload state outputs");
+        return -1;
+    }
+    *fd_out = -1;
+    *present_out = false;
+    *pending_out = false;
+    if (fstatat(home_fd, GPG_AGENT_RELOAD_STATE, &before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) return 0;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to inspect GPG agent reload state");
+        return -1;
+    }
+    if (!S_ISREG(before.st_mode) || before.st_uid != getuid() ||
+        before.st_nlink != 1 || (before.st_mode & 0777) != 0600 ||
+        before.st_size < 0 || before.st_size > GPG_AGENT_RELOAD_STATE_MAX) {
+        set_error(ERR_PERMISSION_DENIED,
+                  "Refusing unsafe GPG agent reload state");
+        return -1;
+    }
+    fd = openat(home_fd, GPG_AGENT_RELOAD_STATE,
+                O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !gpg_same_file_version(&before, &opened) ||
+        !S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+        opened.st_nlink != 1 || (opened.st_mode & 0777) != 0600) {
+        if (fd >= 0) close(fd);
+        set_error(ERR_FILE_IO, "GPG agent reload state changed while opening");
+        return -1;
+    }
+    if (fstat(fd, &after) != 0 ||
+        fstatat(home_fd, GPG_AGENT_RELOAD_STATE, &before,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_same_file_version(&opened, &after) ||
+        !gpg_same_file_version(&opened, &before)) {
+        close(fd);
+        set_error(ERR_FILE_IO,
+                  "GPG agent reload state changed while being read");
+        return -1;
+    }
+    *fd_out = fd;
+    *identity_out = opened;
+    *present_out = true;
+    *pending_out = opened.st_size == 0;
+    return 0;
+}
+
+/* A clean record certifies one exact installed config generation. Binding the
+ * inode plus size/mtime/ctime closes both the pre-M20 migration gap (no record)
+ * and non-cooperating same-uid rewrites which leave desired bytes unchanged
+ * but may have reloaded a different intermediate configuration. */
+static int gpg_format_agent_reload_clean(
+    const struct stat *config_identity, unsigned char *output,
+    size_t output_size, size_t *length_out) {
+    int written;
+    intmax_t mtime_sec;
+    long mtime_nsec;
+    intmax_t ctime_sec;
+    long ctime_nsec;
+
+    if (!config_identity || !output || output_size == 0 || !length_out ||
+        config_identity->st_size < 0) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG agent clean-state record");
+        return -1;
+    }
+#ifdef __APPLE__
+    mtime_sec = (intmax_t)config_identity->st_mtimespec.tv_sec;
+    mtime_nsec = config_identity->st_mtimespec.tv_nsec;
+    ctime_sec = (intmax_t)config_identity->st_ctimespec.tv_sec;
+    ctime_nsec = config_identity->st_ctimespec.tv_nsec;
+#else
+    mtime_sec = (intmax_t)config_identity->st_mtim.tv_sec;
+    mtime_nsec = config_identity->st_mtim.tv_nsec;
+    ctime_sec = (intmax_t)config_identity->st_ctim.tv_sec;
+    ctime_nsec = config_identity->st_ctim.tv_nsec;
+#endif
+    written = snprintf(
+        (char *)output, output_size,
+        "C1:%ju:%ju:%ju:%jd:%ld:%jd:%ld\n",
+        (uintmax_t)config_identity->st_dev,
+        (uintmax_t)config_identity->st_ino,
+        (uintmax_t)config_identity->st_size,
+        mtime_sec, mtime_nsec, ctime_sec, ctime_nsec);
+    if (written < 0 || (size_t)written >= output_size) {
+        set_error(ERR_FILE_IO, "GPG agent clean-state record is too large");
+        return -1;
+    }
+    *length_out = (size_t)written;
+    return 0;
+}
+
+static int gpg_agent_reload_state_matches_config(
+    int home_fd, int state_fd, const struct stat *state_identity,
+    const struct stat *config_identity, bool *matches_out) {
+    unsigned char expected[GPG_AGENT_RELOAD_STATE_MAX];
+    unsigned char actual[GPG_AGENT_RELOAD_STATE_MAX] = {0};
+    struct stat opened;
+    struct stat named;
+    size_t expected_len;
+    size_t offset = 0;
+
+    if (home_fd < 0 || state_fd < 0 || !state_identity ||
+        !config_identity || !matches_out ||
+        gpg_format_agent_reload_clean(config_identity, expected,
+                                      sizeof(expected), &expected_len) != 0) {
+        return -1;
+    }
+    *matches_out = false;
+    if ((uintmax_t)state_identity->st_size == (uintmax_t)expected_len) {
+        while (offset < expected_len) {
+            ssize_t n = pread(state_fd, actual + offset,
+                              expected_len - offset, (off_t)offset);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) {
+                if (n < 0) {
+                    set_system_error(ERR_FILE_IO,
+                                     "Failed to read GPG agent clean state");
+                } else {
+                    set_error(ERR_FILE_IO,
+                              "Short read of GPG agent clean state");
+                }
+                return -1;
+            }
+            offset += (size_t)n;
+        }
+        *matches_out = memcmp(actual, expected, expected_len) == 0;
+    }
+    if (fstat(state_fd, &opened) != 0 ||
+        fstatat(home_fd, GPG_AGENT_RELOAD_STATE, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_same_file_version(state_identity, &opened) ||
+        !gpg_same_file_version(state_identity, &named)) {
+        set_error(ERR_FILE_IO,
+                  "GPG agent clean state changed while being verified");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_validate_agent_update_entry(
+    int home_fd, const char *name, int fd, const struct stat *identity,
+    off_t required_size, const char *description) {
+    struct stat opened;
+    struct stat named;
+
+    if (home_fd < 0 || !name || fd < 0 || !identity || !description ||
+        fstat(fd, &opened) != 0 ||
+        fstatat(home_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_same_file_version(identity, &opened) ||
+        !gpg_same_file_version(identity, &named) ||
+        !S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+        opened.st_nlink != 1 || (opened.st_mode & 0777) != 0600 ||
+        opened.st_size != required_size) {
+        set_error(ERR_FILE_IO, "%s changed during GPG agent activation",
+                  description);
+        return -1;
+    }
+    return 0;
+}
+
+/* Persist the obligation before publishing changed config bytes. Existing
+ * pending state is adopted after a failed attempt; clean state is changed in
+ * place through its retained descriptor. */
+static int gpg_set_agent_reload_pending(int home_fd,
+                                        gpg_agent_config_update_t *update) {
+    struct stat opened;
+    struct stat named;
+    bool present = false;
+    bool pending = false;
+    int fd = -1;
+
+    if (home_fd < 0 || !update) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG agent reload transition");
+        return -1;
+    }
+    if (update->marker_fd < 0) {
+        if (gpg_open_agent_reload_state(home_fd, &fd, &opened, &present,
+                                        &pending) != 0) {
+            return -1;
+        }
+        if (!present) {
+            fd = openat(home_fd, GPG_AGENT_RELOAD_STATE,
+                        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                        0600);
+            if (fd < 0) {
+                if (errno == EEXIST) {
+                    if (gpg_open_agent_reload_state(
+                            home_fd, &fd, &opened, &present, &pending) != 0 ||
+                        !present) {
+                        return -1;
+                    }
+                } else {
+                    set_system_error(ERR_FILE_IO,
+                                     "Failed to create GPG agent reload state");
+                    return -1;
+                }
+            } else {
+                if (fchmod(fd, 0600) != 0 || fstat(fd, &opened) != 0 ||
+                    !S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+                    opened.st_nlink != 1 ||
+                    (opened.st_mode & 0777) != 0600 || opened.st_size != 0) {
+                    close(fd);
+                    set_error(ERR_PERMISSION_DENIED,
+                              "Created unsafe GPG agent reload state");
+                    return -1;
+                }
+                pending = true;
+            }
+        }
+        update->marker_fd = fd;
+        update->marker_identity = opened;
+    } else {
+        pending = update->marker_identity.st_size == 0;
+    }
+
+    if (!pending && ftruncate(update->marker_fd, 0) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to mark GPG agent reload pending");
+        return -1;
+    }
+    if (g_agent_conf_sync(update->marker_fd, false) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to flush GPG agent reload obligation");
+        return -1;
+    }
+    if (fstat(update->marker_fd, &opened) != 0 ||
+        fstatat(home_fd, GPG_AGENT_RELOAD_STATE, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to inspect GPG agent reload obligation");
+        return -1;
+    }
+    if (!gpg_same_reset_entry(&opened, &named) ||
+        !S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+        opened.st_nlink != 1 || named.st_nlink != 1 ||
+        (opened.st_mode & 0777) != 0600 || opened.st_size != 0 ||
+        named.st_size != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG agent reload obligation changed while synchronizing");
+        return -1;
+    }
+    update->marker_identity = opened;
+    if (g_agent_conf_sync(home_fd, true) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to publish GPG agent reload obligation");
+        return -1;
+    }
+    if (gpg_validate_agent_update_entry(
+            home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
+            &update->marker_identity, 0, "GPG agent reload state") != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_set_agent_reload_clean(int home_fd,
+                                      gpg_agent_config_update_t *update) {
+    unsigned char clean[GPG_AGENT_RELOAD_STATE_MAX];
+    struct stat opened;
+    struct stat named;
+    size_t clean_len;
+    size_t offset = 0;
+    bool matches = false;
+
+    if (!update || update->marker_fd < 0 ||
+        gpg_format_agent_reload_clean(&update->config_identity, clean,
+                                      sizeof(clean), &clean_len) != 0 ||
+        gpg_validate_agent_update_entry(
+            home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
+            &update->marker_identity, 0, "GPG agent reload state") != 0) {
+        return -1;
+    }
+    while (offset < clean_len) {
+        ssize_t n = pwrite(update->marker_fd, clean + offset,
+                           clean_len - offset, (off_t)offset);
+        if (n > 0) {
+            offset += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else if (n < 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to write completed GPG agent reload");
+            return -1;
+        } else {
+            set_error(ERR_FILE_IO,
+                      "Short write recording completed GPG agent reload");
+            return -1;
+        }
+    }
+    if (ftruncate(update->marker_fd, (off_t)clean_len) != 0 ||
+        g_agent_conf_sync(update->marker_fd, false) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to persist completed GPG agent reload");
+        return -1;
+    }
+    if (fstat(update->marker_fd, &opened) != 0 ||
+        fstatat(home_fd, GPG_AGENT_RELOAD_STATE, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to verify completed GPG agent reload");
+        return -1;
+    }
+    if (!gpg_same_reset_entry(&opened, &named) ||
+        !S_ISREG(opened.st_mode) || opened.st_uid != getuid() ||
+        opened.st_nlink != 1 || named.st_nlink != 1 ||
+        (opened.st_mode & 0777) != 0600 ||
+        (uintmax_t)opened.st_size != (uintmax_t)clean_len ||
+        (uintmax_t)named.st_size != (uintmax_t)clean_len) {
+        set_error(ERR_FILE_IO,
+                  "GPG agent reload state changed while completing");
+        return -1;
+    }
+    update->marker_identity = opened;
+    if (gpg_agent_reload_state_matches_config(
+            home_fd, update->marker_fd, &update->marker_identity,
+            &update->config_identity, &matches) != 0) {
+        return -1;
+    }
+    if (!matches) {
+        set_error(ERR_FILE_IO,
+                  "Completed GPG agent reload state is corrupt");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
+                                   gpg_agent_config_update_t *update) {
+    const char *env[] = {"GNUPGHOME=.", NULL};
+    const char *argv[4];
+    run_opts_t opts;
+    run_result_t result;
+    int run_rc;
+
+    if (!home || !update || !update->reload_required ||
+        update->config_fd < 0 || update->marker_fd < 0 ||
+        update->gpgconf_path[0] != '/') {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG agent reload request");
+        return -1;
+    }
+    if (gpg_validate_pinned_home(home) != 0 ||
+        gpg_validate_agent_update_entry(
+            home->home_fd, "gpg-agent.conf", update->config_fd,
+            &update->config_identity, update->config_identity.st_size,
+            "Installed gpg-agent.conf") != 0 ||
+        gpg_validate_agent_update_entry(
+            home->home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
+            &update->marker_identity, 0, "GPG agent reload state") != 0) {
+        return -1;
+    }
+
+    argv[0] = update->gpgconf_path;
+    argv[1] = "--reload";
+    argv[2] = "gpg-agent";
+    argv[3] = NULL;
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    opts.extra_env = env;
+    opts.stderr_to_devnull = true;
+    opts.cwd_fd = home->home_fd;
+    opts.use_cwd_fd = true;
+    run_rc = run_argv(argv, &opts, &result);
+    if (run_rc != 0 || !result.spawned || result.exit_code != 0 ||
+        result.term_signal != 0) {
+        set_error(ERR_SYSTEM_COMMAND_FAILED,
+                  "Failed to reload GPG agent configuration; retry required");
+        return -1;
+    }
+    if (gpg_validate_pinned_home(home) != 0 ||
+        gpg_validate_agent_update_entry(
+            home->home_fd, "gpg-agent.conf", update->config_fd,
+            &update->config_identity, update->config_identity.st_size,
+            "Installed gpg-agent.conf") != 0 ||
+        gpg_validate_agent_update_entry(
+            home->home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
+            &update->marker_identity, 0, "GPG agent reload state") != 0 ||
+        gpg_set_agent_reload_clean(home->home_fd, update) != 0 ||
+        gpg_validate_agent_update_entry(
+            home->home_fd, "gpg-agent.conf", update->config_fd,
+            &update->config_identity, update->config_identity.st_size,
+            "Installed gpg-agent.conf") != 0 ||
+        gpg_validate_pinned_home(home) != 0) {
+        return -1;
+    }
+    log_debug("Reloaded GPG agent configuration for %s", home->path);
+    return 0;
 }
 
 static int gpg_write_all(int fd, const unsigned char *bytes, size_t len) {
@@ -5877,7 +6351,8 @@ static void gpg_close_source_home(gpg_source_home_t *source) {
  * defaults, and a *detected* pinentry is appended only if none is already set
  * (the compiled-in default can be wrong, e.g. on FreeBSD). Re-run each switch,
  * so edits to the user's real config propagate. */
-static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
+static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
+                                  gpg_agent_config_update_t *update) {
     static const char default_conf[] =
         "# GPG Agent configuration for gitswitch isolated environment\n"
         "default-cache-ttl 3600\n"
@@ -5900,16 +6375,22 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     bool have_created_identity = false;
     bool temp_registered = false;
     bool installed = false;
+    bool state_present = false;
+    bool state_pending = false;
+    bool state_matches = false;
     int source_fd = -1;
     int fd = -1;
+    int matched_fd = -1;
     int match;
     int source_rc;
+    struct stat matched_identity;
     gpg_source_home_t source = { .fd = -1 };
-    
-    if (home_fd < 0 || !gnupg_home) {
+
+    if (home_fd < 0 || !gnupg_home || !update) {
         set_error(ERR_INVALID_ARGS, "Invalid GPG agent config destination");
         return -1;
     }
+    gpg_agent_config_update_init(update);
     if (safe_snprintf(gpg_agent_conf_path, sizeof(gpg_agent_conf_path),
                       "%s/gpg-agent.conf", gnupg_home) != 0) {
         set_error(ERR_INVALID_PATH, "GPG agent config path too long");
@@ -6060,7 +6541,8 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
         }
     }
 
-    match = gpg_agent_conf_matches(home_fd, desired, desired_len);
+    match = gpg_agent_conf_matches(home_fd, desired, desired_len,
+                                   &matched_fd, &matched_identity);
     if (match < 0) goto fail;
     if (match > 0) {
         /* Matching bytes do not prove that a prior rename is directory-durable.
@@ -6072,8 +6554,59 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
                 "Failed to synchronize unchanged installed gpg-agent.conf");
             goto fail;
         }
+        if (gpg_open_agent_reload_state(
+                home_fd, &update->marker_fd, &update->marker_identity,
+                &state_present, &state_pending) != 0) {
+            goto fail;
+        }
+        if (state_present && !state_pending &&
+            gpg_agent_reload_state_matches_config(
+                home_fd, update->marker_fd, &update->marker_identity,
+                &matched_identity, &state_matches) != 0) {
+            goto fail;
+        }
+        if (state_matches &&
+            gpg_validate_agent_update_entry(
+                home_fd, "gpg-agent.conf", matched_fd,
+                &matched_identity, matched_identity.st_size,
+                "Installed gpg-agent.conf") != 0) {
+            goto fail;
+        }
+        if (state_matches) {
+            update->config_fd = matched_fd;
+            update->config_identity = matched_identity;
+            matched_fd = -1;
+            if (gpg_agent_config_update_close(update) != 0) {
+                free(desired);
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Failed to close unchanged GPG agent configuration");
+                return -1;
+            }
+            free(desired);
+            log_debug("Reused unchanged GPG agent configuration: %s",
+                      gpg_agent_conf_path);
+            return 0;
+        }
+        if (find_command_path("gpgconf", update->gpgconf_path,
+                              sizeof(update->gpgconf_path)) != 0) {
+            int resolve_errno = errno;
+            errno = resolve_errno;
+            set_system_error(
+                ERR_SYSTEM_COMMAND_FAILED,
+                "Cannot resolve trusted gpgconf for GPG agent reload");
+            errno = resolve_errno;
+            goto fail;
+        }
+        update->config_fd = matched_fd;
+        update->config_identity = matched_identity;
+        matched_fd = -1;
+        update->reload_required = true;
+        if (gpg_set_agent_reload_pending(home_fd, update) != 0) {
+            goto fail;
+        }
         free(desired);
-        log_debug("Reused unchanged GPG agent configuration: %s",
+        log_debug("Reused pending GPG agent configuration: %s",
                   gpg_agent_conf_path);
         return 0;
     }
@@ -6149,6 +6682,22 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
                   "Temporary gpg-agent.conf changed before atomic commit");
         goto fail;
     }
+    if (find_command_path("gpgconf", update->gpgconf_path,
+                          sizeof(update->gpgconf_path)) != 0) {
+        int resolve_errno = errno;
+        errno = resolve_errno;
+        set_system_error(
+            ERR_SYSTEM_COMMAND_FAILED,
+            "Cannot resolve trusted gpgconf for GPG agent reload");
+        errno = resolve_errno;
+        goto fail;
+    }
+    if (gpg_open_agent_reload_state(
+            home_fd, &update->marker_fd, &update->marker_identity,
+            &state_present, &state_pending) != 0 ||
+        gpg_set_agent_reload_pending(home_fd, update) != 0) {
+        goto fail;
+    }
     if (renameat(home_fd, temp_name, home_fd, "gpg-agent.conf") != 0) {
         set_system_error(ERR_FILE_IO, "Failed to install gpg-agent.conf atomically");
         goto fail;
@@ -6156,9 +6705,11 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
     installed = true;
     signals_scratch_unregister(temp_path);
     temp_registered = false;
-    if (fstatat(home_fd, "gpg-agent.conf", &entry,
+    if (fstat(fd, &fd_now) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &entry,
                 AT_SYMLINK_NOFOLLOW) != 0 ||
         entry.st_dev != created.st_dev || entry.st_ino != created.st_ino ||
+        !gpg_same_file_version(&fd_now, &entry) ||
         !S_ISREG(entry.st_mode) || entry.st_uid != getuid() ||
         entry.st_nlink != 1 || (entry.st_mode & 0777) != 0600) {
         set_error(ERR_FILE_IO,
@@ -6170,13 +6721,17 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
                          "Failed to synchronize installed gpg-agent.conf");
         goto fail;
     }
-    if (close(fd) != 0) {
-        fd = -1;
-        free(desired);
-        set_system_error(ERR_FILE_IO,
-                         "Failed to close installed gpg-agent.conf");
-        return -1;
+    if (fstat(fd, &fd_now) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &entry,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_same_file_version(&fd_now, &entry)) {
+        set_error(ERR_FILE_IO,
+                  "Installed gpg-agent.conf changed after synchronization");
+        goto fail;
     }
+    update->config_fd = fd;
+    update->config_identity = fd_now;
+    update->reload_required = true;
     fd = -1;
 
     free(desired);
@@ -6186,7 +6741,9 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home) {
 fail:
     if (source_fd >= 0) close(source_fd);
     gpg_close_source_home(&source);
+    if (matched_fd >= 0) close(matched_fd);
     if (fd >= 0) close(fd);
+    gpg_agent_config_update_close(update);
     /* A failed commit must never delete a pathname another process substituted.
      * Remove only names which still resolve to the inode created above. */
     if (!installed && have_created_identity && temp_name[0] &&
@@ -6201,5 +6758,17 @@ fail:
 
 int gpg_manager_setup_agent_config_for_test(int home_fd,
                                             const char *gnupg_home) {
-    return setup_gpg_agent_config(home_fd, gnupg_home);
+    gpg_agent_config_update_t update;
+    int close_rc;
+    int rc;
+
+    gpg_agent_config_update_init(&update);
+    rc = setup_gpg_agent_config(home_fd, gnupg_home, &update);
+    close_rc = gpg_agent_config_update_close(&update);
+    if (rc == 0 && close_rc != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close staged GPG agent configuration");
+        rc = -1;
+    }
+    return rc;
 }

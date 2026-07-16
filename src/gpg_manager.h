@@ -132,8 +132,8 @@ gpg_agent_conf_sync_fn
 gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
 
 /* Focused verification entry point for the otherwise-internal managed writer.
- * It preserves the switch's existing best-effort policy while allowing tests
- * to assert the writer's own sync-error return contract directly. */
+ * It stages a durable reload obligation but never launches gpgconf; production
+ * prepare owns applying and completing that obligation before activation. */
 int gpg_manager_setup_agent_config_for_test(int home_fd,
                                             const char *gnupg_home);
 

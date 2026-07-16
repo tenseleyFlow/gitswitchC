@@ -820,7 +820,7 @@ TEST(inherited_readonly_agent_config_is_installed_atomically_at_0600) {
  * writer; O_NOFOLLOW alone does not make FIFO open nonblocking. */
 TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
     char xdg[128], source_home[256], canonical_source_home[MAX_PATH_LEN];
-    char installed[MAX_PATH_LEN];
+    char managed_home[MAX_PATH_LEN], installed[MAX_PATH_LEN];
     char original[128] = "";
     gpg_config_t cfg;
     account_t acct;
@@ -850,8 +850,10 @@ TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
     cfg.mode = GPG_MODE_ISOLATED;
     memset(&acct, 0, sizeof(acct));
     snprintf(acct.name, sizeof(acct.name), "fifoswap");
-    snprintf(installed, sizeof(installed),
-             "%s/gitswitch-gpg/fifoswap/gpg-agent.conf", xdg);
+    CHECK_EQ_INT(safe_snprintf(managed_home, sizeof(managed_home),
+                               "%s/gitswitch-gpg/fifoswap", xdg), 0);
+    CHECK_EQ_INT(safe_snprintf(installed, sizeof(installed),
+                               "%s/gpg-agent.conf", managed_home), 0);
 
     fflush(NULL);
     pid = fork();
@@ -867,8 +869,8 @@ TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
             swap_agent_conf_to_fifo);
         rc = gpg_create_isolated_home(&cfg, &acct);
         gpg_manager_set_agent_conf_preopen_fn(previous);
-        if (rc != 0 || !g_fifo_swap_ok || path_exists(installed) ||
-            has_gpg_config_scratch(cfg.gnupg_home) ||
+        if (rc != -1 || !g_fifo_swap_ok || path_exists(installed) ||
+            has_gpg_config_scratch(managed_home) ||
             lstat(g_fifo_source, &fifo_st) != 0 || !S_ISFIFO(fifo_st.st_mode)) {
             _exit(9);
         }
@@ -905,7 +907,7 @@ TEST(inherited_agent_config_fifo_swap_is_nonblocking_and_rejected) {
 
 TEST(inherited_agent_config_refuses_symlink_and_oversize_source) {
     char xdg[128], source_home[256], source_conf[320], victim[320];
-    char installed[MAX_PATH_LEN], content[64];
+    char managed_home[MAX_PATH_LEN], installed[MAX_PATH_LEN], content[64];
     struct stat st;
     gpg_config_t cfg;
     account_t acct;
@@ -925,12 +927,14 @@ TEST(inherited_agent_config_refuses_symlink_and_oversize_source) {
     cfg.mode = GPG_MODE_ISOLATED;
     memset(&acct, 0, sizeof(acct));
     snprintf(acct.name, sizeof(acct.name), "confsymlink");
-
-    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), 0);
+    CHECK_EQ_INT(safe_snprintf(managed_home, sizeof(managed_home),
+                               "%s/gitswitch-gpg/%s", xdg, acct.name), 0);
     CHECK_EQ_INT(safe_snprintf(installed, sizeof(installed),
-                               "%s/gpg-agent.conf", cfg.gnupg_home), 0);
+                               "%s/gpg-agent.conf", managed_home), 0);
+
+    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), -1);
     CHECK(lstat(installed, &st) != 0 && errno == ENOENT);
-    CHECK(!has_gpg_config_scratch(cfg.gnupg_home));
+    CHECK(!has_gpg_config_scratch(managed_home));
     CHECK_EQ_INT(read_file_to_string(victim, content, sizeof(content)), 12);
     CHECK_STR_EQ(content, "do-not-copy\n");
 
@@ -939,11 +943,13 @@ TEST(inherited_agent_config_refuses_symlink_and_oversize_source) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = GPG_MODE_ISOLATED;
     snprintf(acct.name, sizeof(acct.name), "confoversize");
-    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), 0);
+    CHECK_EQ_INT(safe_snprintf(managed_home, sizeof(managed_home),
+                               "%s/gitswitch-gpg/%s", xdg, acct.name), 0);
     CHECK_EQ_INT(safe_snprintf(installed, sizeof(installed),
-                               "%s/gpg-agent.conf", cfg.gnupg_home), 0);
+                               "%s/gpg-agent.conf", managed_home), 0);
+    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), -1);
     CHECK(lstat(installed, &st) != 0 && errno == ENOENT);
-    CHECK(!has_gpg_config_scratch(cfg.gnupg_home));
+    CHECK(!has_gpg_config_scratch(managed_home));
     CHECK_EQ_INT(stat(source_conf, &st), 0);
     CHECK_EQ_INT((long long)st.st_size, (long long)(64U * 1024U + 1U));
 
@@ -953,7 +959,8 @@ TEST(inherited_agent_config_refuses_symlink_and_oversize_source) {
 
 TEST(agent_config_temp_substitution_is_rejected_without_deleting_replacement) {
     static const char replacement[] = "replacement-not-written-by-gitswitch\n";
-    char xdg[128], source_home[256], installed[MAX_PATH_LEN];
+    char xdg[128], source_home[256], managed_home[MAX_PATH_LEN];
+    char installed[MAX_PATH_LEN];
     char saved[MAX_PATH_LEN], substitute[MAX_PATH_LEN], content[256];
     struct stat st;
     gpg_agent_conf_precommit_fn previous;
@@ -971,22 +978,24 @@ TEST(agent_config_temp_substitution_is_rejected_without_deleting_replacement) {
     cfg.mode = GPG_MODE_ISOLATED;
     memset(&acct, 0, sizeof(acct));
     snprintf(acct.name, sizeof(acct.name), "tempswap");
+    CHECK_EQ_INT(safe_snprintf(managed_home, sizeof(managed_home),
+                               "%s/gitswitch-gpg/%s", xdg, acct.name), 0);
 
     g_conf_commit_saved[0] = '\0';
     g_conf_commit_replacement[0] = '\0';
     g_conf_commit_swap_ok = false;
     previous = gpg_manager_set_agent_conf_precommit_fn(
         swap_agent_conf_temp_before_commit);
-    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), 0);
+    CHECK_EQ_INT(gpg_create_isolated_home(&cfg, &acct), -1);
     gpg_manager_set_agent_conf_precommit_fn(previous);
 
     CHECK(g_conf_commit_swap_ok);
     CHECK_EQ_INT(safe_snprintf(installed, sizeof(installed),
-                               "%s/gpg-agent.conf", cfg.gnupg_home), 0);
+                               "%s/gpg-agent.conf", managed_home), 0);
     CHECK_EQ_INT(safe_snprintf(saved, sizeof(saved), "%s/%s",
-                               cfg.gnupg_home, g_conf_commit_saved), 0);
+                               managed_home, g_conf_commit_saved), 0);
     CHECK_EQ_INT(safe_snprintf(substitute, sizeof(substitute), "%s/%s",
-                               cfg.gnupg_home,
+                               managed_home,
                                g_conf_commit_replacement), 0);
     CHECK(lstat(installed, &st) != 0 && errno == ENOENT);
     CHECK_EQ_INT(read_file_to_string(substitute, content, sizeof(content)),
