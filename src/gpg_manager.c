@@ -3890,7 +3890,14 @@ static bool gpg_record_has_direct_signing(const char *line, size_t line_len) {
            memchr(field, 's', field_len) != NULL;
 }
 
-static bool gpg_record_has_secret_material(const char *line, size_t line_len) {
+typedef enum {
+    GPG_SECRET_LISTING_MODERN,
+    GPG_SECRET_LISTING_20
+} gpg_secret_listing_contract_t;
+
+static bool gpg_record_has_secret_material(
+    const char *line, size_t line_len,
+    gpg_secret_listing_contract_t contract) {
     const char *field;
     size_t field_len;
     size_t i;
@@ -3902,12 +3909,23 @@ static bool gpg_record_has_secret_material(const char *line, size_t line_len) {
         return true;
     }
 
+    /* GnuPG 2.0's --list-secret-keys implementation reads secring.gpg and
+     * emits sec/ssb only for secret records. Its colon writer leaves field 15
+     * empty for an ordinary disk-backed key, writes '#' for a simple stub,
+     * and writes the token serial for external material. GnuPG 2.1 moved
+     * private keys into gpg-agent and added '+' as explicit availability
+     * evidence. Empty is therefore usable only after the caller has bound the
+     * capture to a positively identified 2.0 helper. */
+    if (field_len == 0) {
+        return contract == GPG_SECRET_LISTING_20;
+    }
+
     /* Field 15 is either the exact availability marker '+' or a token serial
      * encoded as whole bytes in hexadecimal. '#' is explicitly a simple stub;
-     * empty, odd-length, decorated, or non-hex strings are not usable secret
+     * odd-length, decorated, or non-hex strings are not usable secret
      * material. Substring tests (the old '+'/'>' check) accepted malformed
      * records and rejected real smartcard-backed signing keys. */
-    if (field_len == 0 || (field_len % 2) != 0) {
+    if ((field_len % 2) != 0) {
         return false;
     }
     for (i = 0; i < field_len; i++) {
@@ -3918,10 +3936,10 @@ static bool gpg_record_has_secret_material(const char *line, size_t line_len) {
     return true;
 }
 
-int gpg_manager_resolve_secret_key_listing(const char *listing,
-                                           bool require_signing,
-                                           char *fingerprint,
-                                           size_t fingerprint_size) {
+static int gpg_resolve_secret_key_listing_contract(
+    const char *listing, bool require_signing,
+    gpg_secret_listing_contract_t contract, char *fingerprint,
+    size_t fingerprint_size) {
     const char *line;
     size_t primary_count = 0;
     bool primary_usable = false;
@@ -3967,13 +3985,15 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
             if (record_len == 3 && memcmp(record, "sec", 3) == 0) {
                 primary_count++;
                 if (primary_count == 1) {
+                    bool primary_secret = gpg_record_has_secret_material(
+                        line, line_len, contract);
+
                     primary_usable =
                         gpg_record_is_currently_usable(line, line_len);
                     signing_usable = primary_usable &&
                         gpg_record_has_direct_signing(line, line_len) &&
-                        gpg_record_has_secret_material(line, line_len);
-                    have_secret_material =
-                        gpg_record_has_secret_material(line, line_len);
+                        primary_secret;
+                    have_secret_material = primary_secret;
                     awaiting_primary_fingerprint = true;
                 }
             } else if (record_len == 3 &&
@@ -4006,8 +4026,8 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
             } else if (record_len == 3 &&
                        memcmp(record, "ssb", 3) == 0 &&
                        primary_count == 1) {
-                bool subkey_secret =
-                    gpg_record_has_secret_material(line, line_len);
+                bool subkey_secret = gpg_record_has_secret_material(
+                    line, line_len, contract);
                 have_secret_material = have_secret_material || subkey_secret;
                 if (primary_usable && subkey_secret &&
                     gpg_record_is_currently_usable(line, line_len) &&
@@ -4058,6 +4078,51 @@ int gpg_manager_resolve_secret_key_listing(const char *listing,
         return -1;
     }
     return 0;
+}
+
+int gpg_manager_resolve_secret_key_listing(const char *listing,
+                                           bool require_signing,
+                                           char *fingerprint,
+                                           size_t fingerprint_size) {
+    /* A detached listing has no trustworthy producer-version evidence. Keep
+     * this public parser on the modern explicit-material contract; production
+     * resolution selects the 2.0 contract only after querying the same bound
+     * executable that produced the capture. */
+    return gpg_resolve_secret_key_listing_contract(
+        listing, require_signing, GPG_SECRET_LISTING_MODERN, fingerprint,
+        fingerprint_size);
+}
+
+static bool gpg_listing_has_empty_secret_material(const char *listing) {
+    const char *line;
+
+    if (!listing) return false;
+    for (line = listing; *line; ) {
+        const char *eol = strchr(line, '\n');
+        size_t line_len = eol ? (size_t)(eol - line) : strlen(line);
+        const char *record;
+        const char *material;
+        size_t record_len;
+        size_t material_len;
+        bool secret_record;
+
+        if (!(line_len >= 9 && memcmp(line, "[GNUPG:] ", 9) == 0) &&
+            gpg_colon_field(line, line_len, 0, &record, &record_len)) {
+            secret_record =
+                record_len == 3 &&
+                (memcmp(record, "sec", 3) == 0 ||
+                 memcmp(record, "ssb", 3) == 0);
+            if (secret_record &&
+                gpg_colon_field(line, line_len, 14, &material,
+                                &material_len) &&
+                material_len == 0) {
+                return true;
+            }
+        }
+        if (!eol) break;
+        line = eol + 1;
+    }
+    return false;
 }
 
 typedef struct {
@@ -4268,6 +4333,156 @@ static int gpg_classify_secret_listing_run(int run_rc,
     return -1;
 }
 
+static bool gpg_parse_version_component(const char **cursor, const char *end,
+                                        unsigned int *value_out) {
+    unsigned int value = 0;
+    bool have_digit = false;
+
+    if (!cursor || !*cursor || !end || !value_out) return false;
+    while (*cursor < end && isdigit((unsigned char)**cursor)) {
+        unsigned int digit = (unsigned int)(**cursor - '0');
+
+        if (value > (UINT_MAX - digit) / 10U) return false;
+        value = value * 10U + digit;
+        (*cursor)++;
+        have_digit = true;
+    }
+    if (!have_digit) return false;
+    *value_out = value;
+    return true;
+}
+
+static bool gpg_version_suffix_is_valid(const char *cursor,
+                                        const char *end) {
+    if (cursor == end) return true;
+    if (*cursor == '.') {
+        cursor++;
+        if (cursor == end || !isdigit((unsigned char)*cursor)) return false;
+        while (cursor < end && isdigit((unsigned char)*cursor)) cursor++;
+        if (cursor == end) return true;
+    }
+    if (*cursor++ != '-' || cursor == end ||
+        !isalnum((unsigned char)*cursor)) {
+        return false;
+    }
+    for (; cursor < end; cursor++) {
+        unsigned char ch = (unsigned char)*cursor;
+
+        if (!isalnum(ch) && ch != '.' && ch != '-' && ch != '+' &&
+            ch != '~') {
+            return false;
+        }
+    }
+    return isalnum((unsigned char)end[-1]);
+}
+
+static int gpg_parse_listing_contract_version(
+    const char *output, gpg_secret_listing_contract_t *contract) {
+    static const char prefix[] = "gpg (GnuPG) ";
+    const char *cursor;
+    const char *end;
+    unsigned int major;
+    unsigned int minor;
+
+    if (!output || !contract ||
+        strncmp(output, prefix, sizeof(prefix) - 1U) != 0) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG version output does not identify a supported helper");
+        return -1;
+    }
+    cursor = output + sizeof(prefix) - 1U;
+    end = strchr(cursor, '\n');
+    if (!end) end = cursor + strlen(cursor);
+    if (end > cursor && end[-1] == '\r') end--;
+    if (!gpg_parse_version_component(&cursor, end, &major) ||
+        cursor >= end || *cursor++ != '.' ||
+        !gpg_parse_version_component(&cursor, end, &minor) ||
+        !gpg_version_suffix_is_valid(cursor, end)) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG version output is malformed or incomplete");
+        return -1;
+    }
+    if (major < 2U) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG version %u.%u is below the supported 2.x contract",
+                  major, minor);
+        return -1;
+    }
+    *contract = major == 2U && minor == 0U
+                    ? GPG_SECRET_LISTING_20
+                    : GPG_SECRET_LISTING_MODERN;
+    return 0;
+}
+
+static int gpg_query_secret_listing_contract(
+    const gpg_config_t *gpg_config, const gpg_pinned_home_t *home,
+    const gpg_source_home_t *source,
+    gpg_secret_listing_contract_t *contract) {
+    enum { GPG_VERSION_OUTPUT_CAP = 1024 };
+    const char *env[2] = {"GNUPGHOME=.", NULL};
+    const char *argv[] = {NULL, "--version", NULL};
+    char output[GPG_VERSION_OUTPUT_CAP];
+    run_opts_t opts;
+    run_result_t result;
+    int run_rc;
+
+    if (!gpg_config || gpg_config->executable_path[0] != '/' ||
+        (!home && !source) || (home && source) || !contract) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid GPG version-contract query arguments");
+        return -1;
+    }
+    output[0] = '\0';
+    argv[0] = gpg_config->executable_path;
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.stderr_to_devnull = true;
+    opts.extra_env = env;
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+
+    if (home) {
+        if (gpg_validate_pinned_home(home) != 0) return -1;
+        opts.cwd_fd = home->home_fd;
+        opts.use_cwd_fd = true;
+        run_rc = run_argv(argv, &opts, &result);
+        if (gpg_validate_pinned_home(home) != 0) return -1;
+    } else {
+        if (gpg_validate_source_home(source) != 0) return -1;
+        opts.cwd_fd = source->fd;
+        opts.use_cwd_fd = true;
+        run_rc = run_argv(argv, &opts, &result);
+        if (gpg_validate_source_home(source) != 0) return -1;
+    }
+    if (result.out_truncated) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG version output exceeds the %d-byte capture limit",
+                  GPG_VERSION_OUTPUT_CAP);
+        return -1;
+    }
+    if (run_rc != 0 || !result.spawned || result.exit_code != 0 ||
+        result.term_signal != 0) {
+        if (!result.spawned) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG version probe failed before spawn");
+        } else if (result.term_signal != 0) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG version probe was terminated by signal %d",
+                      result.term_signal);
+        } else if (result.exit_code != 0) {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG version probe failed with exit status %d",
+                      result.exit_code);
+        } else {
+            set_error(ERR_GPG_KEY_FAILED,
+                      "GPG version probe transport failed after exit 0");
+        }
+        return -1;
+    }
+    return gpg_parse_listing_contract_version(output, contract);
+}
+
 /* Return 0 for one validated key, 1 only for GnuPG's ordinary listing miss,
  * and -1 for incomplete, ambiguous, or operationally failed evidence. */
 static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
@@ -4287,15 +4502,18 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
     char *listing;
     run_opts_t opts;
     run_result_t res;
+    gpg_secret_listing_contract_t contract = GPG_SECRET_LISTING_MODERN;
     int run_rc;
     int status;
 
     if (!gpg_config || gpg_config->executable_path[0] != '/' ||
-        (!home && !source) || (home && source) || !selector || !*selector) {
+        (!home && !source) || (home && source) || !selector || !*selector ||
+        !fingerprint || fingerprint_size == 0) {
         set_error(ERR_INVALID_ARGS,
                   "Invalid GPG secret-key listing source");
         return -1;
     }
+    fingerprint[0] = '\0';
     listing = malloc(GPG_KEY_LISTING_CAP);
     if (!listing) {
         set_error(ERR_MEMORY_ALLOCATION,
@@ -4345,9 +4563,17 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
         free(listing);
         return status;
     }
+    if (gpg_listing_has_empty_secret_material(listing) &&
+        gpg_query_secret_listing_contract(gpg_config, home, source,
+                                          &contract) != 0) {
+        secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
+        free(listing);
+        return -1;
+    }
     {
-        int parse_rc = gpg_manager_resolve_secret_key_listing(
-            listing, require_signing, fingerprint, fingerprint_size);
+        int parse_rc = gpg_resolve_secret_key_listing_contract(
+            listing, require_signing, contract, fingerprint,
+            fingerprint_size);
         secure_zero_memory(listing, GPG_KEY_LISTING_CAP);
         free(listing);
         return parse_rc;

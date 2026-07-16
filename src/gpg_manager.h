@@ -199,12 +199,13 @@ int gpg_set_environment(gpg_config_t *gpg_config);
  * that must be restored before the transaction can be forgotten. */
 bool gpg_manager_runtime_restore_pending(const gpg_config_t *gpg_config);
 
-/** Strict parser used by the switch and exposed for mutation-sensitive colon
- * record tests. Accepts GnuPG's fixed colon-format secret records, including
- * the documented pre-2.1 form whose validity field is empty, while requiring
- * independent expiry, capability, and secret-material evidence. Resolves
- * exactly one usable primary secret key, writes its canonical fingerprint,
- * and optionally requires a usable signing record. */
+/** Strict detached-listing parser exposed for mutation-sensitive colon-record
+ * tests. It accepts the documented pre-2.1 empty validity field, but requires
+ * explicit modern secret-material evidence because a detached capture cannot
+ * prove which helper produced it. The production resolver separately binds
+ * an empty field 15 to the same retained executable's verified GnuPG 2.0
+ * version contract. Resolves exactly one usable primary secret key, writes its
+ * canonical fingerprint, and optionally requires a usable signing record. */
 int gpg_manager_resolve_secret_key_listing(const char *listing,
                                            bool require_signing,
                                            char *fingerprint,
