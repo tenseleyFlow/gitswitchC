@@ -1214,8 +1214,8 @@ TEST(mutation_failures_never_print_final_mutation_success) {
         "Failed to save configuration changes",
         "Failed to save configuration changes",
         "Failed to remove account: Cannot acquire the retirement lifecycle lock",
-        "reset failed; account and active-state metadata were preserved for retry: "
-            "Cannot acquire the retirement lifecycle lock",
+        ("reset failed; account and active-state metadata were preserved for retry: "
+         "Cannot acquire the retirement lifecycle lock"),
     };
 
     if (getuid() == 0) {
