@@ -447,7 +447,8 @@ static bool prompt_host_alias_valid(const char *alias);
 static int validate_gpg_key_availability(const char *gpg_key_id);
 static int validate_gpg_key_availability_fresh(const char *gpg_key_id);
 static int check_ssh_key_local_file(const account_t *account);
-static int check_gpg_key_local_state(const account_t *account);
+static int check_gpg_key_local_state(
+    const account_t *account, gpg_account_key_readiness_t *readiness);
 static int pending_retirement_prepare(
     const gitswitch_ctx_t *ctx, config_retirement_kind_t kind,
     const account_t *const targets[], size_t target_count,
@@ -1133,9 +1134,13 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
                         account->name);
         }
         if (account->gpg_enabled && strlen(account->gpg_key_id) > 0 &&
-            !gpg_ok && check_gpg_key_local_state(account) != 0) {
-            log_warning("GPG key local metadata/material check failed for "
-                        "account: %s", account->name);
+            !gpg_ok) {
+            gpg_account_key_readiness_t readiness;
+
+            if (check_gpg_key_local_state(account, &readiness) != 0) {
+                log_warning("GPG key local metadata/material check failed for "
+                            "account: %s", account->name);
+            }
         }
     }
 
@@ -5911,18 +5916,15 @@ static int check_ssh_key_local_file(const account_t *account) {
     return ssh_validate_key_file(expanded_path);
 }
 
-/* Re-read the selected local keyring and validate current metadata plus secret
- * material. When signing is configured, require a currently usable signing
- * capability. This still does not perform a cryptographic signing operation. */
-static int check_gpg_key_local_state(const account_t *account) {
-    char canonical[GPG_FINGERPRINT_BUFSIZE];
-
+/* Mirror activation's retained-home-first resolver order and report whether
+ * the same key could be recovered from the persistent source keyring. This
+ * still does not perform a cryptographic signing operation. */
+static int check_gpg_key_local_state(
+    const account_t *account, gpg_account_key_readiness_t *readiness) {
     log_debug("GPG key local metadata/material check for %s: %s",
               account->name, account->gpg_key_id);
 
-    return gpg_manager_resolve_system_key(
-        account->gpg_key_id, account->gpg_signing_enabled, canonical,
-        sizeof(canonical));
+    return gpg_manager_check_account_key(account, readiness);
 }
 
 /* Run bounded local readiness checks on all accounts. */
@@ -5969,13 +5971,48 @@ int accounts_health_check(const gitswitch_ctx_t *ctx) {
             
             /* Validate current local GPG metadata/material without signing. */
             if (account->gpg_enabled && strlen(account->gpg_key_id) > 0) {
-                if (check_gpg_key_local_state(account) == 0) {
+                gpg_account_key_readiness_t readiness;
+
+                if (check_gpg_key_local_state(account, &readiness) == 0) {
                     if (account->gpg_signing_enabled) {
                         printf("[OK]: GPG key has current signing-capable "
-                               "secret material (signature not attempted)\n");
+                               "secret material%s (signature not attempted)\n",
+                               readiness.retained_home_usable
+                                   ? " in the retained isolated GPG home"
+                                   : "");
                     } else {
                         printf("[OK]: GPG secret key is present and locally "
-                               "usable (signing not tested)\n");
+                               "usable%s (signing not tested)\n",
+                               readiness.retained_home_usable
+                                   ? " in the retained isolated GPG home"
+                                   : "");
+                    }
+                    switch (readiness.source_recovery) {
+                        case GPG_SOURCE_RECOVERY_AVAILABLE:
+                            printf("[OK]: GPG source keyring currently contains "
+                                   "the same locally usable identity for "
+                                   "recovery\n");
+                            break;
+                        case GPG_SOURCE_RECOVERY_MISSING:
+                            printf("[WARN]: GPG source keyring does not contain "
+                                   "this identity; the retained isolated GPG "
+                                   "home is usable, but reset or home loss "
+                                   "would leave no recovery source in that "
+                                   "keyring\n");
+                            break;
+                        case GPG_SOURCE_RECOVERY_MISMATCH:
+                            printf("[WARN]: GPG source keyring resolves the "
+                                   "selector to a different identity; the "
+                                   "retained isolated GPG home is usable, but "
+                                   "cannot be recovered from that source\n");
+                            break;
+                        case GPG_SOURCE_RECOVERY_ERROR:
+                        case GPG_SOURCE_RECOVERY_UNKNOWN:
+                        default:
+                            printf("[WARN]: GPG source keyring recoverability "
+                                   "could not be verified; the retained "
+                                   "isolated GPG home is currently usable\n");
+                            break;
                     }
                 } else {
                     if (account->gpg_signing_enabled) {

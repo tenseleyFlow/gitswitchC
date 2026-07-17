@@ -58,16 +58,29 @@ static const char account_system_listing[] =
 
 #define HEALTH_NONSIGNING_FPR "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
 #define HEALTH_EXPIRED_FPR "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD"
+#define HEALTH_OTHER_FPR "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"
 static const char health_nonsigning_listing[] =
     "sec:u:4096:1:CCCCCCCCCCCCCCCC:1700000000:::-:::eE:::+:::23::0:\n"
     "fpr:::::::::" HEALTH_NONSIGNING_FPR ":\n";
 static const char health_expired_listing[] =
     "sec:u:4096:1:DDDDDDDDDDDDDDDD:1700000000:1::-:::scESC:::+:::23::0:\n"
     "fpr:::::::::" HEALTH_EXPIRED_FPR ":\n";
+static const char health_other_listing[] =
+    "sec:u:4096:1:EEEEEEEEEEEEEEEE:1700000000:::-:::eE:::+:::23::0:\n"
+    "fpr:::::::::" HEALTH_OTHER_FPR ":\n";
 static const char *g_health_listing;
 static int g_health_gpg_list_calls;
 static int g_health_ssh_calls;
 static bool g_health_probe_pinned;
+static struct stat g_health_retained_home_identity;
+static struct stat g_health_source_home_identity;
+static const char *g_health_retained_listing;
+static const char *g_health_source_listing;
+static bool g_health_retained_missing;
+static bool g_health_source_missing;
+static bool g_health_source_error;
+static int g_health_retained_list_calls;
+static int g_health_source_list_calls;
 
 static bool source_probe_uses_pinned_home(const run_opts_t *opts) {
     const char *const *env;
@@ -212,6 +225,71 @@ static int health_local_probe_runner(const char *const argv[],
         }
     }
     return 0;
+}
+
+static bool health_probe_uses_directory(const run_opts_t *opts,
+                                        const struct stat *expected) {
+    struct stat actual;
+
+    return opts && opts->use_cwd_fd && opts->cwd_fd >= 0 && expected &&
+           fstat(opts->cwd_fd, &actual) == 0 &&
+           actual.st_dev == expected->st_dev &&
+           actual.st_ino == expected->st_ino;
+}
+
+static int health_retained_probe_runner(const char *const argv[],
+                                        const run_opts_t *opts,
+                                        run_result_t *result) {
+    const char *listing = NULL;
+    bool list_secret = false;
+    bool missing = false;
+    bool operational_error = false;
+
+    if (argv && argv[0] &&
+        (ts_command_is(argv[0], "gpg") || ts_command_is(argv[0], "gpg2"))) {
+        for (size_t i = 1; argv[i]; i++) {
+            if (strcmp(argv[i], "--list-secret-keys") == 0) {
+                list_secret = true;
+                break;
+            }
+        }
+    }
+    if (!list_secret) return null_runner(argv, opts, result);
+
+    if (health_probe_uses_directory(opts,
+                                    &g_health_retained_home_identity)) {
+        g_health_retained_list_calls++;
+        listing = g_health_retained_listing;
+        missing = g_health_retained_missing;
+    } else if (health_probe_uses_directory(
+                   opts, &g_health_source_home_identity)) {
+        g_health_source_list_calls++;
+        listing = g_health_source_listing;
+        missing = g_health_source_missing;
+        operational_error = g_health_source_error;
+    } else {
+        return null_runner(argv, opts, result);
+    }
+
+    if (missing) listing = STATUS_NO_SECRET_KEY;
+
+    if (opts && opts->out && opts->out_size > 0) {
+        size_t length = operational_error ? 0U
+                                          : (listing ? strlen(listing) : 0U);
+        size_t copied = length < opts->out_size - 1U
+                            ? length : opts->out_size - 1U;
+
+        if (copied > 0) memcpy(opts->out, listing, copied);
+        opts->out[copied] = '\0';
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+            result->exit_code = operational_error ? 126 : (missing ? 2 : 0);
+            result->out_len = copied;
+            result->out_truncated = copied < length;
+        }
+    }
+    return missing || operational_error ? -1 : 0;
 }
 
 static int fail_predelete(int home_fd) {
@@ -1032,6 +1110,146 @@ TEST(health_reports_only_the_local_capabilities_it_proves) {
     g_health_listing = NULL;
 }
 
+TEST(health_uses_retained_gpg_home_before_source_recovery) {
+    char root[256], key_one[512], key_two[512], source_home[512];
+    char retained_home[512], marker[768], output[8192];
+    gitswitch_ctx_t ctx;
+    account_t account;
+    command_runner_fn previous_runner;
+    int health_result = 0;
+
+    CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
+                              key_two, sizeof(key_two)), 0);
+    CHECK((size_t)snprintf(source_home, sizeof(source_home), "%s/.gnupg",
+                           root) < sizeof(source_home));
+    CHECK_EQ_INT(mkdir(source_home, 0700), 0);
+    CHECK_EQ_INT(make_gpg_home(root, "retained", retained_home,
+                               sizeof(retained_home), marker,
+                               sizeof(marker)), 0);
+    CHECK_EQ_INT(stat(source_home, &g_health_source_home_identity), 0);
+    CHECK_EQ_INT(stat(retained_home, &g_health_retained_home_identity), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&account, 1, "retained", "retained@example.com", NULL,
+                 NULL);
+    account.gpg_enabled = true;
+    snprintf(account.gpg_key_id, sizeof(account.gpg_key_id), "%s",
+             HEALTH_NONSIGNING_FPR);
+    CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+
+    g_health_retained_listing = health_nonsigning_listing;
+    g_health_source_listing = NULL;
+    g_health_retained_missing = false;
+    g_health_source_missing = true;
+    g_health_source_error = false;
+    g_health_retained_list_calls = 0;
+    g_health_source_list_calls = 0;
+    previous_runner = run_set_runner(health_retained_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, 0);
+    CHECK_EQ_INT(g_health_retained_list_calls, 1);
+    CHECK_EQ_INT(g_health_source_list_calls, 1);
+    CHECK(strstr(output, "retained isolated GPG home") != NULL);
+    CHECK(strstr(output, "source keyring") != NULL);
+    CHECK(strstr(output, "recover") != NULL);
+
+    /* A matching source identity is independently recognized as a complete
+     * recovery path, without changing retained-home authority. */
+    g_health_source_listing = health_nonsigning_listing;
+    g_health_source_missing = false;
+    g_health_retained_list_calls = 0;
+    g_health_source_list_calls = 0;
+    previous_runner = run_set_runner(health_retained_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, 0);
+    CHECK_EQ_INT(g_health_retained_list_calls, 1);
+    CHECK_EQ_INT(g_health_source_list_calls, 1);
+    CHECK(strstr(output,
+                 "source keyring currently contains the same locally usable "
+                 "identity for recovery") != NULL);
+
+    /* A selector that resolves differently in the source keyring cannot
+     * recover the retained identity, but does not make that retained key
+     * unusable today. */
+    g_health_source_listing = health_other_listing;
+    g_health_retained_list_calls = 0;
+    g_health_source_list_calls = 0;
+    previous_runner = run_set_runner(health_retained_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, 0);
+    CHECK_EQ_INT(g_health_retained_list_calls, 1);
+    CHECK_EQ_INT(g_health_source_list_calls, 1);
+    CHECK(strstr(output, "resolves the selector to a different identity") !=
+          NULL);
+
+    /* A source helper failure is recoverability uncertainty, not evidence
+     * against the retained key that was just validated. */
+    g_health_source_listing = NULL;
+    g_health_source_error = true;
+    g_health_retained_list_calls = 0;
+    g_health_source_list_calls = 0;
+    previous_runner = run_set_runner(health_retained_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, 0);
+    CHECK_EQ_INT(g_health_retained_list_calls, 1);
+    CHECK_EQ_INT(g_health_source_list_calls, 1);
+    CHECK(strstr(output, "recoverability could not be verified") != NULL);
+
+    /* Only an ordinary retained-key miss may continue to the source. */
+    g_health_retained_missing = true;
+    g_health_source_listing = health_nonsigning_listing;
+    g_health_source_error = false;
+    g_health_retained_list_calls = 0;
+    g_health_source_list_calls = 0;
+    previous_runner = run_set_runner(health_retained_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, 0);
+    CHECK_EQ_INT(g_health_retained_list_calls, 1);
+    CHECK_EQ_INT(g_health_source_list_calls, 1);
+    CHECK(strstr(output, "retained isolated GPG home") == NULL);
+    CHECK(strstr(output,
+                 "source keyring currently contains the same locally usable "
+                 "identity for recovery") != NULL);
+
+    /* A retained-home operational failure is not an ordinary key miss and
+     * must not be hidden by an otherwise usable source fallback. */
+    snprintf(ctx.accounts[0].gpg_key_id,
+             sizeof(ctx.accounts[0].gpg_key_id), "%s", HEALTH_EXPIRED_FPR);
+    g_health_retained_listing = health_expired_listing;
+    g_health_retained_missing = false;
+    g_health_retained_list_calls = 0;
+    g_health_source_list_calls = 0;
+    previous_runner = run_set_runner(health_retained_probe_runner);
+    CHECK_EQ_INT(capture_health_output(&ctx, output, sizeof(output),
+                                       &health_result), 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(health_result, -1);
+    CHECK_EQ_INT(g_health_retained_list_calls, 1);
+    CHECK_EQ_INT(g_health_source_list_calls, 0);
+    CHECK(strstr(output, "presence/usability check failed") != NULL);
+    g_health_retained_listing = NULL;
+    g_health_source_listing = NULL;
+    g_health_retained_missing = false;
+    g_health_source_missing = false;
+    g_health_source_error = false;
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(edit_guard_failure_restores_candidate_before_image);
     RUN_TEST(duplicate_email_is_ambiguous_for_every_account_selector);
@@ -1046,4 +1264,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(targeted_gpg_reset_still_requires_a_fresh_system_key_source);
     RUN_TEST(gpg_signing_only_edit_preserves_the_isolated_home);
     RUN_TEST(health_reports_only_the_local_capabilities_it_proves);
+    RUN_TEST(health_uses_retained_gpg_home_before_source_recovery);
 TEST_MAIN_END()

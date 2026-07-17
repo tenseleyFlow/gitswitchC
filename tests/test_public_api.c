@@ -234,6 +234,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(gpg_manager_resolve_executable);
     REQUIRE_PUBLIC_API(gpg_manager_resolve_secret_key_listing);
     REQUIRE_PUBLIC_API(gpg_manager_resolve_system_key);
+    REQUIRE_PUBLIC_API(gpg_manager_check_account_key);
     REQUIRE_PUBLIC_API(gpg_manager_restore_current_if);
     REQUIRE_PUBLIC_API(gpg_manager_retarget_current);
     REQUIRE_PUBLIC_API(gpg_manager_runtime_restore_pending);

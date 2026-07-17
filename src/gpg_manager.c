@@ -4173,6 +4173,117 @@ int gpg_manager_resolve_system_key(const char *selector,
                                   fingerprint_size);
 }
 
+int gpg_manager_check_account_key(
+    const account_t *account, gpg_account_key_readiness_t *readiness) {
+    char base[MAX_PATH_LEN];
+    char home_path[MAX_PATH_LEN];
+    char retained_fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    char source_fingerprint[GPG_FINGERPRINT_BUFSIZE];
+    gpg_config_t resolver_config;
+    gpg_pinned_home_t pinned_home = {
+        .base_fd = -1,
+        .home_fd = -1,
+        .base = NULL,
+        .name = NULL,
+        .path = NULL
+    };
+    bool base_absent = false;
+    bool home_absent = false;
+    int base_fd = -1;
+    int home_fd = -1;
+    int retained_rc = 1;
+
+    if (readiness) {
+        memset(readiness, 0, sizeof(*readiness));
+    }
+    if (!account || !readiness || !account->gpg_enabled ||
+        !validate_name(account->name) || account->gpg_key_id[0] == '\0') {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account GPG-readiness arguments");
+        return -1;
+    }
+    memset(&resolver_config, 0, sizeof(resolver_config));
+    resolver_config.mode = GPG_MODE_ISOLATED;
+    if (gpg_bind_executable_if_needed(&resolver_config) != 0 ||
+        gpg_get_base_dir(base, sizeof(base)) != 0) {
+        return -1;
+    }
+
+    base_fd = gpg_open_base_dir(base, sizeof(base), false, &base_absent);
+    if (base_fd < 0 && !base_absent) {
+        return -1;
+    }
+    if (base_fd >= 0) {
+        if (safe_snprintf(home_path, sizeof(home_path), "%s/%s", base,
+                          account->name) != 0) {
+            close(base_fd);
+            set_error(ERR_INVALID_PATH, "GNUPGHOME path too long");
+            return -1;
+        }
+        home_fd = open_private_subdir_at(base_fd, account->name, false,
+                                         &home_absent);
+        if (home_fd < 0 && !home_absent) {
+            close(base_fd);
+            return -1;
+        }
+        if (home_fd >= 0) {
+            pinned_home.base_fd = base_fd;
+            pinned_home.home_fd = home_fd;
+            pinned_home.base = base;
+            pinned_home.name = account->name;
+            pinned_home.path = home_path;
+            if (gpg_validate_pinned_home(&pinned_home) != 0) {
+                close(home_fd);
+                close(base_fd);
+                return -1;
+            }
+            retained_rc = gpg_resolve_pinned_key(
+                &resolver_config, &pinned_home, account->gpg_key_id,
+                account->gpg_signing_enabled, retained_fingerprint,
+                sizeof(retained_fingerprint));
+            close(home_fd);
+        }
+        close(base_fd);
+    }
+
+    if (retained_rc < 0) {
+        return -1;
+    }
+    if (retained_rc == 0) {
+        error_context_t prior_error = g_last_error;
+        int prior_errno = errno;
+        int source_rc;
+
+        readiness->retained_home_usable = true;
+        source_rc = gpg_resolve_source_key(
+            &resolver_config, account->gpg_key_id,
+            account->gpg_signing_enabled, source_fingerprint,
+            sizeof(source_fingerprint));
+        if (source_rc == 0) {
+            readiness->source_recovery =
+                strcmp(source_fingerprint, retained_fingerprint) == 0
+                    ? GPG_SOURCE_RECOVERY_AVAILABLE
+                    : GPG_SOURCE_RECOVERY_MISMATCH;
+        } else if (get_last_error()->code == ERR_GPG_KEY_NOT_FOUND) {
+            readiness->source_recovery = GPG_SOURCE_RECOVERY_MISSING;
+        } else {
+            readiness->source_recovery = GPG_SOURCE_RECOVERY_ERROR;
+        }
+        g_last_error = prior_error;
+        errno = prior_errno;
+        return 0;
+    }
+
+    if (gpg_resolve_source_key(
+            &resolver_config, account->gpg_key_id,
+            account->gpg_signing_enabled, source_fingerprint,
+            sizeof(source_fingerprint)) != 0) {
+        return -1;
+    }
+    readiness->source_recovery = GPG_SOURCE_RECOVERY_AVAILABLE;
+    return 0;
+}
+
 static bool gpg_colon_field(const char *line, size_t line_len, size_t wanted,
                             const char **field, size_t *field_len) {
     const char *start = line;

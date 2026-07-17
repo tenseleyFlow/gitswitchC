@@ -237,6 +237,31 @@ int gpg_manager_resolve_system_key(const char *selector,
                                    char *fingerprint,
                                    size_t fingerprint_size);
 
+typedef enum {
+    GPG_SOURCE_RECOVERY_UNKNOWN = 0,
+    GPG_SOURCE_RECOVERY_AVAILABLE,
+    GPG_SOURCE_RECOVERY_MISSING,
+    GPG_SOURCE_RECOVERY_MISMATCH,
+    GPG_SOURCE_RECOVERY_ERROR
+} gpg_source_recovery_t;
+
+typedef struct {
+    bool retained_home_usable;
+    gpg_source_recovery_t source_recovery;
+} gpg_account_key_readiness_t;
+
+/** Check an account key without creating, importing, retargeting, or changing
+ * process environment. Mirrors isolated activation order: a safe retained
+ * account home is authoritative; only an ordinary key miss falls back to the
+ * real source keyring, while malformed/unusable/operational retained-home
+ * evidence fails closed. When the retained home succeeds, the source is
+ * probed separately and must resolve the same canonical fingerprint and
+ * configured capability to be considered recoverable. Returns 0 when the
+ * account can be activated from either source and fills `readiness`; returns
+ * -1 when neither activation path is currently usable. */
+int gpg_manager_check_account_key(
+    const account_t *account, gpg_account_key_readiness_t *readiness);
+
 /**
  * Compute the stable GNUPGHOME path (a `current` symlink under the isolated
  * GPG base directory) that `gitswitch init` exports into the shell and that
