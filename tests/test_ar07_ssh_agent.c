@@ -29,7 +29,16 @@
 
 #define FP_EXPECTED "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
-static bool g_identity_capture_truncated;
+typedef enum {
+    IDENTITY_LIST_RAW = 0,
+    IDENTITY_LIST_CERTIFICATE,
+    IDENTITY_LIST_RAW_AND_CERTIFICATE,
+    IDENTITY_LIST_MALFORMED,
+    IDENTITY_LIST_EMBEDDED_NUL,
+    IDENTITY_LIST_TRUNCATED
+} identity_listing_mode_t;
+
+static identity_listing_mode_t g_identity_listing_mode;
 static int g_dirsync_calls;
 static int g_dirsync_fail_call;
 static int g_key_open_calls;
@@ -55,7 +64,7 @@ static int fake_identity_runner(const char *const argv[],
 
     if (strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
         strcmp(argv[1], "-l") == 0) {
-        if (g_identity_capture_truncated) {
+        if (g_identity_listing_mode == IDENTITY_LIST_TRUNCATED) {
             int prefix = snprintf(opts->out, opts->out_size,
                                   "256 %s ", FP_EXPECTED);
             if (prefix < 0 || (size_t)prefix >= opts->out_size) return -1;
@@ -68,9 +77,41 @@ static int fake_identity_runner(const char *const argv[],
                  * first line; the runner contract reports that fact here. */
                 result->out_truncated = true;
             }
+        } else if (g_identity_listing_mode == IDENTITY_LIST_EMBEDDED_NUL) {
+            static const char suffix[] = "hidden expected (ED25519)\n";
+            int prefix = snprintf(opts->out, opts->out_size,
+                                  "256 %s ", FP_EXPECTED);
+            size_t required;
+
+            if (prefix < 0) return -1;
+            required = (size_t)prefix + 1U + sizeof(suffix);
+            if (required > opts->out_size) return -1;
+            opts->out[prefix] = '\0';
+            memcpy(opts->out + (size_t)prefix + 1U, suffix, sizeof(suffix));
+            if (result) {
+                result->out_len = (size_t)prefix + 1U + sizeof(suffix) - 1U;
+            }
         } else {
-            snprintf(opts->out, opts->out_size,
-                     "256 %s expected (ED25519)\n", FP_EXPECTED);
+            if (g_identity_listing_mode == IDENTITY_LIST_CERTIFICATE) {
+                snprintf(opts->out, opts->out_size,
+                         "256 %s misleading (ED25519) comment "
+                         "(ED25519-CERT)\n",
+                         FP_EXPECTED);
+            } else if (g_identity_listing_mode ==
+                       IDENTITY_LIST_RAW_AND_CERTIFICATE) {
+                snprintf(opts->out, opts->out_size,
+                         "256 %s expected (ED25519)\n"
+                         "256 %s expected (ED25519-CERT)\n",
+                         FP_EXPECTED, FP_EXPECTED);
+            } else if (g_identity_listing_mode == IDENTITY_LIST_MALFORMED) {
+                snprintf(opts->out, opts->out_size,
+                         "256 %s expected ED25519\n", FP_EXPECTED);
+            } else {
+                snprintf(opts->out, opts->out_size,
+                         "256 %s misleading (ED25519-CERT) comment "
+                         "(ED25519)\n",
+                         FP_EXPECTED);
+            }
             if (result) result->out_len = strlen(opts->out);
         }
         return 0;
@@ -447,12 +488,40 @@ static int make_runtime_dir(char *xdg, size_t xdg_size,
 TEST(truncated_identity_listing_never_proves_exclusivity) {
     command_runner_fn previous = run_set_runner(fake_identity_runner);
 
-    g_identity_capture_truncated = false;
+    g_identity_listing_mode = IDENTITY_LIST_RAW;
     CHECK(ssh_manager_test_socket_has_key(-1, "agent.sock",
                                           "/tmp/key-expected"));
-    g_identity_capture_truncated = true;
+    g_identity_listing_mode = IDENTITY_LIST_TRUNCATED;
     CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
                                            "/tmp/key-expected"));
+    g_identity_listing_mode = IDENTITY_LIST_RAW;
+
+    run_set_runner(previous);
+}
+
+TEST(identity_listing_requires_one_well_formed_raw_record) {
+    command_runner_fn previous = run_set_runner(fake_identity_runner);
+
+    g_identity_listing_mode = IDENTITY_LIST_RAW;
+    CHECK(ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                          "/tmp/key-expected"));
+
+    g_identity_listing_mode = IDENTITY_LIST_CERTIFICATE;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+
+    g_identity_listing_mode = IDENTITY_LIST_RAW_AND_CERTIFICATE;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+
+    g_identity_listing_mode = IDENTITY_LIST_MALFORMED;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+
+    g_identity_listing_mode = IDENTITY_LIST_EMBEDDED_NUL;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+    g_identity_listing_mode = IDENTITY_LIST_RAW;
 
     run_set_runner(previous);
 }
@@ -1215,6 +1284,7 @@ TEST(account_status_reuses_one_descriptor_backed_key_inspection) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(truncated_identity_listing_never_proves_exclusivity);
+    RUN_TEST(identity_listing_requires_one_well_formed_raw_record);
     RUN_TEST(pid_sidecar_sync_failure_retains_complete_recovery_record);
     RUN_TEST(pid_postrename_identity_failure_is_synced_and_explicitly_uncertain);
     RUN_TEST(equal_length_substitution_survives_restoration_sync_failure_and_resets);

@@ -605,18 +605,34 @@ static int generate_key(const char *path) {
     return run_external(argv, NULL, output, sizeof(output));
 }
 
-static int agent_command(const char *socket_path, const char *arg) {
+static int agent_run(const char *socket_path,
+                     const char *first_arg,
+                     const char *second_arg,
+                     const char *third_arg,
+                     char *output,
+                     size_t output_size) {
     char environment[PATH_MAX + 32];
     const char *env[] = {environment, NULL};
-    const char *argv[] = {"ssh-add", arg, NULL};
-    char output[2048];
+    const char *argv[] = {
+        "ssh-add", first_arg, second_arg, third_arg, NULL
+    };
+    char discarded_output[2048];
 
-    if ((size_t)snprintf(environment, sizeof(environment),
+    if (!first_arg ||
+        (size_t)snprintf(environment, sizeof(environment),
                          "SSH_AUTH_SOCK=%s", socket_path) >=
         sizeof(environment)) {
         return -1;
     }
-    return run_external(argv, env, output, sizeof(output));
+    if (!output || output_size == 0U) {
+        output = discarded_output;
+        output_size = sizeof(discarded_output);
+    }
+    return run_external(argv, env, output, output_size);
+}
+
+static int agent_command(const char *socket_path, const char *arg) {
+    return agent_run(socket_path, arg, NULL, NULL, NULL, 0U);
 }
 
 TEST(help_and_init_share_the_exact_six_shell_matrix) {
@@ -1152,6 +1168,7 @@ TEST(fish_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths) {
 }
 
 TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
+    static const char certificate_suffix[] = "(ED25519-CERT)\n";
     char root[PATH_MAX] = "/tmp/gitswitch-ar07-live.XXXXXX";
     char runtime[PATH_MAX];
     char agent_dir[PATH_MAX];
@@ -1160,7 +1177,11 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     char current[PATH_MAX];
     char agent_lock[PATH_MAX];
     char expected_key[PATH_MAX];
+    char expected_pub[PATH_MAX];
+    char ca_key[PATH_MAX];
     char other_key[PATH_MAX];
+    char expected_fingerprint[256] = {0};
+    char agent_fingerprint[256] = {0};
     char output[4096];
     char *saved_runtime = NULL;
     const char *old_runtime = getenv("XDG_RUNTIME_DIR");
@@ -1187,6 +1208,9 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         join_path(current, sizeof(current), agent_dir, "/current.sock") != 0 ||
         join_path(agent_lock, sizeof(agent_lock), agent_dir, "/.lock") != 0 ||
         join_path(expected_key, sizeof(expected_key), root, "/expected") != 0 ||
+        join_path(expected_pub, sizeof(expected_pub), root,
+                  "/expected.pub") != 0 ||
+        join_path(ca_key, sizeof(ca_key), root, "/ca") != 0 ||
         join_path(other_key, sizeof(other_key), root, "/other") != 0 ||
         mkdir_private(runtime) != 0 || mkdir_private(agent_dir) != 0 ||
         write_bytes(agent_lock, "", 0, 0600) != 0 ||
@@ -1197,6 +1221,7 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         return;
     }
     CHECK_EQ_INT(generate_key(expected_key), 0);
+    CHECK_EQ_INT(generate_key(ca_key), 0);
     CHECK_EQ_INT(generate_key(other_key), 0);
     CHECK_EQ_INT(run_external(agent_argv, NULL, output, sizeof(output)), 0);
     agent_pid = parse_agent_pid(output);
@@ -1240,6 +1265,53 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
 
     CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
     CHECK_EQ_INT(agent_command(agent_sock, expected_key), 0);
+    live = false;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(live);
+
+    /* OpenSSH gives a certificate the same fingerprint as its raw public
+     * key. Loading a private key beside its sibling certificate adds both;
+     * deleting only the raw public identity leaves a deterministic
+     * certificate-only agent that must not satisfy raw-key liveness. */
+    {
+        const char *sign_argv[] = {
+            "ssh-keygen", "-q", "-s", ca_key, "-I", "ar11-m24",
+            "-n", "work", expected_pub, NULL
+        };
+        const char *fingerprint_argv[] = {
+            "ssh-keygen", "-lf", expected_pub, NULL
+        };
+        CHECK_EQ_INT(run_external(sign_argv, NULL, output, sizeof(output)), 0);
+        CHECK_EQ_INT(run_external(fingerprint_argv, NULL, output,
+                                  sizeof(output)), 0);
+        CHECK_EQ_INT(sscanf(output, "%*s %255s", expected_fingerprint), 1);
+    }
+    CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
+    CHECK_EQ_INT(agent_command(agent_sock, expected_key), 0);
+    live = true;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(!live); /* raw plus its same-fingerprint certificate is not exact */
+    CHECK_EQ_INT(agent_run(agent_sock, "-k", "-d", expected_pub,
+                           NULL, 0U), 0);
+    CHECK_EQ_INT(agent_run(agent_sock, "-l", NULL, NULL,
+                           output, sizeof(output)), 0);
+    CHECK(strlen(output) >= sizeof(certificate_suffix) - 1U &&
+          memcmp(output + strlen(output) - (sizeof(certificate_suffix) - 1U),
+                 certificate_suffix,
+                 sizeof(certificate_suffix) - 1U) == 0);
+    CHECK(strchr(output, '\n') != NULL &&
+          strchr(output, '\n')[1] == '\0');
+    CHECK_EQ_INT(sscanf(output, "%*s %255s", agent_fingerprint), 1);
+    CHECK_STR_EQ(agent_fingerprint, expected_fingerprint);
+    live = true;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(!live);
+
+    /* The configured raw key alone remains a valid exact identity. `-k`
+     * prevents ssh-add from automatically loading the sibling certificate. */
+    CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
+    CHECK_EQ_INT(agent_run(agent_sock, "-k", expected_key, NULL,
+                           NULL, 0U), 0);
     live = false;
     CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
     CHECK(live);

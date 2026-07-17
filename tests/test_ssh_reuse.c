@@ -42,6 +42,7 @@
 #define FP_B "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
 static int g_agent_start_attempts; /* execs of ssh-agent (i.e. reuse REFUSED) */
+static bool g_agent_lists_certificate;
 static const char *g_pid_link_to_plant;
 static const char *g_pid_link_target;
 static bool g_replace_dir_on_key_probe;
@@ -210,14 +211,18 @@ static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
         return 0;
     }
 
-    /* ssh-add -l (against the socket in opts->extra_env): agent holds keyA. */
+    /* ssh-add -l (against the socket in opts->extra_env): agent holds keyA.
+     * The certificate mode exposes the OpenSSH substitution case: a raw key
+     * and its certificate intentionally share one fingerprint. */
     if (strcmp(argv[0], "ssh-add") == 0 && argv[1] && strcmp(argv[1], "-l") == 0) {
         if (g_replace_dir_on_key_probe) {
             g_replace_dir_on_key_probe = false;
             if (replace_agent_dir_namespace() != 0) return -1;
         }
         if (opts && opts->out) {
-            snprintf(opts->out, opts->out_size, "256 %s agent-key (ED25519)\n", FP_A);
+            snprintf(opts->out, opts->out_size, "256 %s agent-key (%s)\n",
+                     FP_A,
+                     g_agent_lists_certificate ? "ED25519-CERT" : "ED25519");
             if (result) result->out_len = strlen(opts->out);
         }
         return 0;
@@ -347,6 +352,36 @@ TEST(ssh_fingerprint_reuse_rejects_different_key) {
      * keeping the wrong key active. */
     CHECK_EQ_INT(rc, -1);
     /* The stale wrong-key agent socket was reaped, not left adoptable. */
+    CHECK(!path_exists(sock));
+}
+
+/* A certificate and its underlying public key deliberately have the same
+ * fingerprint. Fingerprint equality alone therefore cannot prove that the
+ * configured raw identity is loaded: a certificate-only agent must be
+ * refused and replaced just like an agent holding a different key. */
+TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate) {
+    char sock[256];
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+    int rc;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    make_account(&acct, "keyA");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_agent_start_attempts = 0;
+    g_agent_lists_certificate = true;
+    prev = run_set_runner(fake_ssh_runner);
+    rc = ssh_start_isolated_agent(&cfg, &acct);
+    run_set_runner(prev);
+    g_agent_lists_certificate = false;
+
+    CHECK_EQ_INT(g_agent_start_attempts, 1);
+    CHECK(!cfg.key_already_loaded);
+    CHECK_EQ_INT(rc, -1);
     CHECK(!path_exists(sock));
 }
 
@@ -1211,6 +1246,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ssh_fingerprint_reuse_adopts_matching_key);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
+    RUN_TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate);
     RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
     RUN_TEST(isolated_switch_retains_generation_between_fingerprint_and_load);
     RUN_TEST(fresh_commit_revalidates_public_agent_directory);
