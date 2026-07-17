@@ -2723,6 +2723,8 @@ TEST(prepared_commit_accepts_unchanged_gpg_selector_after_normalization) {
 
 TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     char active_home[MAX_PATH_LEN];
+    struct stat home_before = {0};
+    struct stat home_after = {0};
 
     if (!gpg_test_command_available()) {
         TS_SKIP("gpg", "gpg preflight or trusted test probe unavailable");
@@ -2751,6 +2753,11 @@ TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     } else {
         active_home[0] = '\0';
     }
+    CHECK(active_home[0] != '\0');
+    if (active_home[0] != '\0') {
+        CHECK_EQ_INT(stat(active_home, &home_before), 0);
+        CHECK(S_ISDIR(home_before.st_mode));
+    }
     gpg_fail_session_env_restore = true;
     gpg_manager_set_setenv_fn(gpg_fault_setenv);
     CHECK_EQ_INT(accounts_session_cleanup(), -1);
@@ -2761,6 +2768,12 @@ TEST(accounts_cleanup_retains_gpg_environment_for_checked_retry) {
     gpg_manager_set_setenv_fn(NULL);
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     CHECK_STR_EQ(getenv("GNUPGHOME"), g_gpg_source_home);
+    if (active_home[0] != '\0') {
+        CHECK_EQ_INT(stat(active_home, &home_after), 0);
+        CHECK(S_ISDIR(home_after.st_mode));
+        CHECK(home_after.st_dev == home_before.st_dev);
+        CHECK(home_after.st_ino == home_before.st_ino);
+    }
 
     run_set_runner(previous_runner);
     unsetenv("GITSWITCH_ALLOW_TMP_GPG");

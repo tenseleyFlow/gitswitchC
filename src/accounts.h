@@ -251,11 +251,17 @@ int accounts_validate(const account_t *account);
 int accounts_health_check(const gitswitch_ctx_t *ctx);
 
 /**
- * Clean up active session resources
- * - Stops SSH agent if one was started
- * - Restores original GNUPGHOME environment
- * - Cleans up isolated GPG home if created
- * Call this before program exit or when switching accounts
+ * Finish cleanup of process-scoped account session state
+ * - Stops any SSH agent owned by this process session
+ * - Restores manager-owned GNUPGHOME and GPG_AGENT_INFO changes and completes
+ *   any retained GPG publication rollback
+ * - Deliberately retains reusable per-account isolated GPG homes; use
+ *   `gitswitch reset [account]` to stop their agents, delete their homes,
+ *   retire stable links, and synchronize the GPG namespace
+ * - Retains incomplete session state after failure so cleanup can be retried
+ * Returns -1 during an active account transaction or while cleanup remains
+ * incomplete. Account switching performs guarded cleanup internally; direct
+ * callers may use this after a transaction, before exit, or for a retry.
  */
 int accounts_session_cleanup(void);
 
