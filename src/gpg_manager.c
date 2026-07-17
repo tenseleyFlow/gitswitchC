@@ -4346,13 +4346,15 @@ static int gpg_resolve_secret_key_listing_contract(
                 if (primary_count == 1) {
                     bool primary_secret = gpg_record_has_secret_material(
                         line, line_len, contract);
+                    bool primary_secret_usable;
 
                     primary_usable =
                         gpg_record_is_currently_usable(line, line_len);
-                    signing_usable = primary_usable &&
-                        gpg_record_has_direct_signing(line, line_len) &&
-                        primary_secret;
-                    have_secret_material = primary_secret;
+                    primary_secret_usable =
+                        primary_usable && primary_secret;
+                    have_secret_material = primary_secret_usable;
+                    signing_usable = primary_secret_usable &&
+                        gpg_record_has_direct_signing(line, line_len);
                     awaiting_primary_fingerprint = true;
                 }
             } else if (record_len == 3 &&
@@ -4387,9 +4389,13 @@ static int gpg_resolve_secret_key_listing_contract(
                        primary_count == 1) {
                 bool subkey_secret = gpg_record_has_secret_material(
                     line, line_len, contract);
-                have_secret_material = have_secret_material || subkey_secret;
-                if (primary_usable && subkey_secret &&
-                    gpg_record_is_currently_usable(line, line_len) &&
+                bool subkey_secret_usable =
+                    subkey_secret &&
+                    gpg_record_is_currently_usable(line, line_len);
+
+                have_secret_material =
+                    have_secret_material || subkey_secret_usable;
+                if (primary_usable && subkey_secret_usable &&
                     gpg_record_has_direct_signing(line, line_len)) {
                     signing_usable = true;
                 }
