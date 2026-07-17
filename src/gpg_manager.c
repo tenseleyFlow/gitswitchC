@@ -2937,7 +2937,9 @@ static int gpg_walk_tree_contents_fd(
     scan_fd = openat(dir_fd, ".", scan_flags);
     dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
     if (!dir) {
+        int saved_errno = errno;
         if (scan_fd >= 0) close(scan_fd);
+        errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Cannot enumerate isolated GPG home: %s",
                          display_path);
@@ -3243,7 +3245,9 @@ static int gpg_verify_reset_all_final_locked(int base_fd, int lock_fd,
     scan_fd = openat(base_fd, ".", flags);
     dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
     if (!dir) {
+        int saved_errno = errno;
         if (scan_fd >= 0) close(scan_fd);
+        errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Cannot verify final GPG reset state: %s", base);
         return -1;
@@ -3655,6 +3659,15 @@ static int gpg_remove_captured_current_locked(
     return 0;
 }
 
+/* Snapshot each progressive reset failure before another cleanup step can
+ * replace the global context. The accumulator owns the complete first cause
+ * and renders later causes in the order they occur. */
+static void gpg_record_reset_failure(error_accumulator_t *failures,
+                                     bool *failed, const char *label) {
+    (void)error_accumulator_add_last(failures, label);
+    *failed = true;
+}
+
 /* Tear down isolated GPG homes: one account, or all when account is NULL.
  * Each removable home has its agent stopped before its contents are unlinked.
  * A successful full reset retires every captured `current` symlink, regardless
@@ -3669,10 +3682,13 @@ static int gpg_remove_captured_current_locked(
 int gpg_manager_reset(const char *account) {
     char base[MAX_PATH_LEN];
     char current[MAX_PATH_LEN];
+    error_accumulator_t failures;
     bool absent = false;
     int base_fd = -1;
     int lock_fd = -1;
     bool failed = false;
+
+    error_accumulator_init(&failures);
 
     if (account && !validate_name(account)) {
         set_error(ERR_INVALID_ARGS, "Invalid account name for reset");
@@ -3716,13 +3732,15 @@ int gpg_manager_reset(const char *account) {
                 unlock_gpg_dir(base_fd, lock_fd);
                 return -1;
             } else if (gpg_kill_and_remove_home(base_fd, base, account) != 0) {
-                failed = true;
+                gpg_record_reset_failure(&failures, &failed,
+                                         "target GPG home cleanup");
             }
         } else if (errno != ENOENT) {
             set_system_error(ERR_FILE_IO,
                              "Cannot inspect isolated GPG home: %s/%s",
                              base, account);
-            failed = true;
+            gpg_record_reset_failure(&failures, &failed,
+                                     "target GPG home inspection");
         }
     } else {
         int scan_flags = O_RDONLY | O_CLOEXEC;
@@ -3735,9 +3753,12 @@ int gpg_manager_reset(const char *account) {
         int scan_fd = openat(base_fd, ".", scan_flags);
         DIR *d = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
         if (!d) {
+            int saved_errno = errno;
             if (scan_fd >= 0) close(scan_fd);
+            errno = saved_errno;
             set_system_error(ERR_FILE_IO, "Cannot enumerate GPG base directory: %s", base);
-            failed = true;
+            gpg_record_reset_failure(&failures, &failed,
+                                     "GPG base enumeration");
         } else {
             struct dirent *ent;
             for (;;) {
@@ -3748,7 +3769,8 @@ int gpg_manager_reset(const char *account) {
                         set_system_error(ERR_FILE_IO,
                                          "Failed while enumerating GPG base directory: %s",
                                          base);
-                        failed = true;
+                        gpg_record_reset_failure(
+                            &failures, &failed, "GPG base enumeration read");
                     }
                     break;
                 }
@@ -3765,7 +3787,8 @@ int gpg_manager_reset(const char *account) {
                     set_error(ERR_PERMISSION_DENIED,
                               "Refusing unmanaged GPG reset entry: %s",
                               ent->d_name);
-                    failed = true;
+                    gpg_record_reset_failure(
+                        &failures, &failed, "unmanaged GPG base entry");
                     continue;
                 }
                 struct stat est;
@@ -3774,7 +3797,8 @@ int gpg_manager_reset(const char *account) {
                     set_system_error(ERR_FILE_IO,
                                      "Cannot inspect GPG home during reset: %s/%s",
                                      base, ent->d_name);
-                    failed = true;
+                    gpg_record_reset_failure(
+                        &failures, &failed, "GPG home inspection");
                     continue;
                 }
                 if (!S_ISDIR(est.st_mode) || est.st_uid != getuid() ||
@@ -3782,16 +3806,19 @@ int gpg_manager_reset(const char *account) {
                     set_error(ERR_PERMISSION_DENIED,
                               "Refusing unsafe GPG home during reset: %s/%s",
                               base, ent->d_name);
-                    failed = true;
+                    gpg_record_reset_failure(
+                        &failures, &failed, "unsafe GPG home");
                     continue;
                 }
                 if (gpg_kill_and_remove_home(base_fd, base, ent->d_name) != 0) {
-                    failed = true;
+                    gpg_record_reset_failure(&failures, &failed,
+                                             "GPG home cleanup");
                 }
             }
             if (closedir(d) != 0) {
                 set_system_error(ERR_FILE_IO, "Failed to close GPG base directory: %s", base);
-                failed = true;
+                gpg_record_reset_failure(&failures, &failed,
+                                         "GPG base enumeration close");
             }
         }
     }
@@ -3803,7 +3830,8 @@ int gpg_manager_reset(const char *account) {
      * remains addressable for retry. Targeted reset keeps an unrelated live
      * account selected and removes only stale/invalid links. */
     if (gpg_current_path_from_base(base, current, sizeof(current)) != 0) {
-        failed = true;
+        gpg_record_reset_failure(&failures, &failed,
+                                 "stable GNUPGHOME path");
     } else {
         gpg_link_identity_t captured_current;
         int current_rc = gpg_capture_link_at(base_fd, "current",
@@ -3814,7 +3842,8 @@ int gpg_manager_reset(const char *account) {
                 if (gpg_remove_captured_current_locked(
                         base_fd, base, &captured_current,
                         &current_changed) != 0 || current_changed) {
-                    failed = true;
+                    gpg_record_reset_failure(
+                        &failures, &failed, "stable GNUPGHOME retirement");
                 }
                 goto reset_finalize;
             }
@@ -3831,7 +3860,8 @@ int gpg_manager_reset(const char *account) {
                     set_system_error(ERR_FILE_IO,
                                      "Cannot inspect managed GNUPGHOME target: %s",
                                      captured_current.target);
-                    failed = true;
+                    gpg_record_reset_failure(
+                        &failures, &failed, "stable GNUPGHOME target inspection");
                 }
             } else if (component &&
                        (!S_ISDIR(target_st.st_mode) ||
@@ -3844,52 +3874,41 @@ int gpg_manager_reset(const char *account) {
                 if (gpg_remove_captured_current_locked(
                         base_fd, base, &captured_current,
                         &current_changed) != 0 || current_changed) {
-                    failed = true;
+                    gpg_record_reset_failure(
+                        &failures, &failed, "stable GNUPGHOME retirement");
                 }
             }
         } else if (current_rc < 0) {
-            failed = true;
+            gpg_record_reset_failure(&failures, &failed,
+                                     "stable GNUPGHOME capture");
         }
     }
 reset_finalize:
     if (!account && !failed) {
         if (g_reset_final_hook && g_reset_final_hook(base_fd) != 0) {
             set_error(ERR_FILE_IO, "GPG reset final-verification hook failed");
-            failed = true;
+            gpg_record_reset_failure(&failures, &failed,
+                                     "GPG reset final verification");
         } else if (gpg_verify_reset_all_final_locked(base_fd, lock_fd,
                                                      base) != 0) {
-            failed = true;
+            gpg_record_reset_failure(&failures, &failed,
+                                     "GPG reset final verification");
         }
     }
-    {
-        char prior[sizeof(g_last_error.message)] = "";
-        if (failed) {
-            safe_strncpy(prior, get_last_error()->message, sizeof(prior));
-        }
-        /* Every successful reset — including an otherwise byte-for-byte retry
-         * after an earlier fsync failure — repairs the durability boundary of
-         * home/current namespace changes before releasing the manager lock. */
-        if (g_sync_base(base_fd) != 0) {
-            char sync_error[sizeof(g_last_error.message)];
-            set_system_error(
-                ERR_FILE_IO,
-                "GPG reset changed the namespace but the base directory is not durable; retry reset");
-            safe_strncpy(sync_error, get_last_error()->message,
-                         sizeof(sync_error));
-            if (prior[0] != '\0') {
-                set_error(ERR_FILE_IO, "%s; %s", prior, sync_error);
-            }
-            failed = true;
-        }
+
+    /* Every successful reset — including an otherwise byte-for-byte retry
+     * after an earlier fsync failure — repairs the durability boundary of
+     * home/current namespace changes before releasing the manager lock. */
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "GPG reset changed the namespace but the base directory is not durable; retry reset");
+        gpg_record_reset_failure(&failures, &failed,
+                                 "GPG base directory synchronization");
     }
     unlock_gpg_dir(base_fd, lock_fd);
     if (failed) {
-        char detail[sizeof(g_last_error.message)];
-        safe_strncpy(detail, get_last_error()->message, sizeof(detail));
-        if (detail[0]) {
-            set_error(ERR_FILE_IO,
-                      "GPG reset incomplete; retained state for retry: %s", detail);
-        } else {
+        if (!error_accumulator_publish(&failures)) {
             set_error(ERR_FILE_IO,
                       "GPG reset incomplete; retained remaining state for retry");
         }

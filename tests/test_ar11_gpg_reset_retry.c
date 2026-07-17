@@ -131,7 +131,10 @@ static void assert_retry_after_stage(
     CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
     CHECK(g_hook_fired);
     CHECK(g_quarantine[0] != '\0');
-    CHECK(strstr(get_last_error()->message, "retained state for retry") != NULL);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_STR_EQ(get_last_error()->function,
+                 "gpg_remove_captured_current_locked");
+    CHECK(strstr(get_last_error()->message, "retry state retained") != NULL);
     CHECK(lstat(home, &retained_st) != 0 && errno == ENOENT);
     CHECK(lstat(current, &retained_st) != 0 && errno == ENOENT);
     CHECK(snprintf(retained, sizeof(retained), "%s/%s", base,
