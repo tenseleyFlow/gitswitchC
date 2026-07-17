@@ -64,7 +64,7 @@ typedef struct {
  * (bool -> int) undefined behavior — clang rejects it under -Wvarargs. */
 static int ssh_run(char *output, size_t output_size, int merge_stderr, ...);
 static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          int merge_stderr, ...);
+                          run_result_t *result, int merge_stderr, ...);
 static int ssh_add_key_pinned(int dir_fd, const char *socket_arg,
                               const char *key_path,
                               const ssh_key_snapshot_t *snapshot);
@@ -105,6 +105,10 @@ static int publish_current_socket_link(int dir_fd, const char *socket_path,
 static int remove_current_socket_link_if_unchanged(
     int dir_fd, const ssh_current_link_identity_t *identity);
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config);
+static bool parse_complete_ssh_agent_pid(const char *output,
+                                         size_t output_len,
+                                         bool output_truncated,
+                                         pid_t *pid_out);
 static int kill_orphaned_gitswitch_agents(int dir_fd, const char *socket_dir,
                                           const char *keep_account);
 static bool same_runtime_identity(const struct stat *before,
@@ -2326,6 +2330,9 @@ static int ssh_start_isolated_agent_with_key(
               launch_socket_arg);
     {
         struct stat marker_stat;
+        struct stat launched_socket;
+        run_result_t launch_result;
+        char runner_detail[sizeof(g_last_error.message)] = "";
         int run_rc;
         if (mkdirat(dir_fd, provenance_marker, 0700) != 0 && errno != EEXIST) {
             set_system_error(ERR_FILE_IO,
@@ -2341,7 +2348,19 @@ static int ssh_start_isolated_agent_with_key(
                       "Refusing unsafe SSH provenance marker");
             goto done;
         }
-        run_rc = ssh_run_in_dir(dir_fd, output, sizeof(output), false,
+        /* A runner failure after fork does not prove ssh-agent failed to
+         * daemonize. Clear any prior in-memory handle before launch, retain
+         * the runner's spawned bit/output, and recover the exact managed
+         * socket below if the launch outcome is ambiguous. */
+        ssh_config->agent_pid = -1;
+        ssh_config->agent_owned = false;
+        ssh_config->agent_socket_path[0] = '\0';
+        ssh_config->agent_socket_arg[0] = '\0';
+        memset(&launch_result, 0, sizeof(launch_result));
+        launch_result.exit_code = -1;
+        clear_error();
+        run_rc = ssh_run_in_dir(dir_fd, output, sizeof(output),
+                                &launch_result, false,
                                 "ssh-agent", "-s", "-a",
                                 launch_socket_arg,
                                 (const char *)NULL);
@@ -2351,7 +2370,67 @@ static int ssh_start_isolated_agent_with_key(
                         provenance_marker);
         }
         if (run_rc != 0) {
-            set_error(ERR_SSH_AGENT_START_FAILED, "Failed to start SSH agent");
+            pid_t recovery_pid = -1;
+            int socket_rc = fstatat(dir_fd, socket_name, &launched_socket,
+                                    AT_SYMLINK_NOFOLLOW);
+            int socket_errno = socket_rc == 0 ? 0 : errno;
+            bool socket_may_exist =
+                socket_rc == 0 || socket_errno != ENOENT;
+            bool have_recovery_pid =
+                launch_result.out_len < sizeof(output) &&
+                parse_complete_ssh_agent_pid(
+                    output, launch_result.out_len,
+                    launch_result.out_truncated, &recovery_pid);
+
+            safe_strncpy(runner_detail, get_last_error()->message,
+                         sizeof(runner_detail));
+
+            if (launch_result.spawned || socket_may_exist ||
+                have_recovery_pid) {
+                bool retained;
+
+                /* Even when the runner itself failed, a complete captured
+                 * assignment may identify the daemon. Never feed partial
+                 * failure output through the activation parser: a truncated
+                 * numeric prefix could target the wrong PID, make its identity
+                 * look unrelated, and unlink the real daemon's last socket. */
+                if (have_recovery_pid) {
+                    ssh_config->agent_pid = recovery_pid;
+                }
+                safe_strncpy(ssh_config->agent_socket_path, socket_path,
+                             sizeof(ssh_config->agent_socket_path));
+                safe_strncpy(ssh_config->agent_socket_arg,
+                             launch_socket_arg,
+                             sizeof(ssh_config->agent_socket_arg));
+                retained = reap_unrecorded_agent(
+                    ssh_config->agent_pid, launch_socket_arg, dir_fd,
+                    socket_name, pid_name, socket_path, socket_dir);
+                ssh_config->agent_owned =
+                    retained && ssh_config->agent_pid > 1;
+                if (!retained) {
+                    ssh_config->agent_pid = -1;
+                    ssh_config->agent_socket_path[0] = '\0';
+                    ssh_config->agent_socket_arg[0] = '\0';
+                }
+                const char *summary = retained
+                    ? "SSH agent runner failed after an ambiguous launch; runtime retained for retry"
+                    : "SSH agent runner failed after an ambiguous launch; spawned runtime removed";
+                if (runner_detail[0] != '\0') {
+                    set_error(ERR_SSH_AGENT_START_FAILED, "%s: %s",
+                              summary, runner_detail);
+                } else {
+                    set_error(ERR_SSH_AGENT_START_FAILED, "%s", summary);
+                }
+            } else {
+                if (runner_detail[0] != '\0') {
+                    set_error(ERR_SSH_AGENT_START_FAILED,
+                              "Failed to start SSH agent before spawn: %s",
+                              runner_detail);
+                } else {
+                    set_error(ERR_SSH_AGENT_START_FAILED,
+                              "Failed to start SSH agent before spawn");
+                }
+            }
             goto done;
         }
     }
@@ -4749,13 +4828,14 @@ static int ssh_run(char *output, size_t output_size, int merge_stderr, ...) {
  * relative socket argument only after fchdir()ing to the validated directory;
  * a concurrent rename/replacement of its public pathname cannot redirect it. */
 static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
-                          int merge_stderr, ...) {
+                          run_result_t *result, int merge_stderr, ...) {
     const char *argv[16];
     size_t n = 0;
     va_list ap;
     const char *a;
     run_opts_t opts;
-    run_result_t res;
+    run_result_t local_result;
+    run_result_t *res = result ? result : &local_result;
     int rc;
 
     va_start(ap, merge_stderr);
@@ -4771,16 +4851,20 @@ static int ssh_run_in_dir(int cwd_fd, char *output, size_t output_size,
     argv[n] = NULL;
 
     memset(&opts, 0, sizeof(opts));
-    memset(&res, 0, sizeof(res));
+    memset(res, 0, sizeof(*res));
+    res->exit_code = -1;
     opts.out = output;
     opts.out_size = output_size;
     opts.merge_stderr = merge_stderr;
     opts.cwd_fd = cwd_fd;
     opts.use_cwd_fd = true;
-    rc = run_argv(argv, &opts, &res);
-    if (output && output_size > 0 && res.out_len > 0 &&
-        output[res.out_len - 1] == '\n') {
-        output[res.out_len - 1] = '\0';
+    if (output && output_size > 0) output[0] = '\0';
+    rc = run_argv(argv, &opts, res);
+    if (output && output_size > 0 && res->out_len > 0 &&
+        res->out_len < output_size &&
+        output[res->out_len - 1] == '\n') {
+        res->out_len--;
+        output[res->out_len] = '\0';
     }
     return rc == 0 ? 0 : -1;
 }
@@ -5543,6 +5627,51 @@ static int reconcile_current_socket_quarantines(int dir_fd,
 }
 
 /* Parse ssh-agent output */
+static bool parse_complete_ssh_agent_pid(const char *output,
+                                         size_t output_len,
+                                         bool output_truncated,
+                                         pid_t *pid_out) {
+    static const char prefix[] = "SSH_AGENT_PID=";
+    bool found = false;
+    pid_t parsed_pid = -1;
+
+    if (!output || !pid_out || output_len == 0U || output_truncated ||
+        strnlen(output, output_len) != output_len) {
+        return false;
+    }
+    for (size_t i = 0; i + sizeof(prefix) - 1U < output_len; i++) {
+        size_t cursor;
+        uintmax_t value = 0U;
+        pid_t candidate;
+
+        if ((i != 0U && output[i - 1U] != '\n') ||
+            memcmp(output + i, prefix, sizeof(prefix) - 1U) != 0) {
+            continue;
+        }
+        cursor = i + sizeof(prefix) - 1U;
+        if (cursor >= output_len || output[cursor] < '0' ||
+            output[cursor] > '9') {
+            return false;
+        }
+        while (cursor < output_len && output[cursor] >= '0' &&
+               output[cursor] <= '9') {
+            unsigned digit = (unsigned)(output[cursor] - '0');
+            if (value > (UINTMAX_MAX - digit) / 10U) return false;
+            value = value * 10U + digit;
+            cursor++;
+        }
+        if (cursor >= output_len || output[cursor] != ';') return false;
+        candidate = (pid_t)value;
+        if (candidate <= 1 || (uintmax_t)candidate != value) return false;
+        if (found && parsed_pid != candidate) return false;
+        found = true;
+        parsed_pid = candidate;
+        i = cursor;
+    }
+    if (found) *pid_out = parsed_pid;
+    return found;
+}
+
 static int parse_ssh_agent_output(const char *output, ssh_config_t *ssh_config) {
     char *line;
     char *output_copy;

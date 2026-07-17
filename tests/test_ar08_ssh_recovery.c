@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #define TEST_PID ((pid_t)1073741824)
+#define TEST_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 typedef struct {
     char xdg[64];
@@ -953,6 +954,202 @@ static int missing_pid_agent_runner(const char *const argv[],
     return 0;
 }
 
+static int failed_after_agent_spawn_runner(const char *const argv[],
+                                           const run_opts_t *opts,
+                                           run_result_t *result) {
+    const char *socket_arg;
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 0;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv || !argv[0] || strcmp(argv[0], "ssh-agent") != 0) return 0;
+
+    socket_arg = runner_socket_arg(argv);
+    if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
+        return -1;
+    }
+    if (opts && opts->out) {
+        int written = snprintf(
+            opts->out, opts->out_size,
+            "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
+            "SSH_AGENT_PID=%ld; export SSH_AGENT_PID;\n",
+            socket_arg, (long)TEST_PID);
+        if (written < 0 || (size_t)written >= opts->out_size) return -1;
+        if (result) result->out_len = (size_t)written;
+    }
+    return -1;
+}
+
+static int failed_with_truncated_pid_and_socket_runner(
+    const char *const argv[], const run_opts_t *opts, run_result_t *result) {
+    const char *socket_arg;
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->exit_code = -1;
+        result->out_truncated = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv || !argv[0] || strcmp(argv[0], "ssh-agent") != 0) return 0;
+
+    socket_arg = runner_socket_arg(argv);
+    if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
+        return -1;
+    }
+    if (opts && opts->out) {
+        int written = snprintf(opts->out, opts->out_size,
+                               "SSH_AGENT_PID=%ld",
+                               (long)TEST_PID);
+        if (written < 0 || (size_t)written >= opts->out_size) return -1;
+        if (result) result->out_len = (size_t)written;
+    }
+    return -1;
+}
+
+static int successful_agent_runner(const char *const argv[],
+                                   const run_opts_t *opts,
+                                   run_result_t *result) {
+    const char *socket_arg;
+    int written;
+
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+        result->exit_code = 0;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (!argv || !argv[0] || !opts || !opts->out || opts->out_size == 0U) {
+        return -1;
+    }
+    if (strcmp(argv[0], "ssh-agent") == 0) {
+        socket_arg = runner_socket_arg(argv);
+        if (!socket_arg || bind_runner_socket(socket_arg, 0600, opts) != 0) {
+            return -1;
+        }
+        written = snprintf(
+            opts->out, opts->out_size,
+            "SSH_AUTH_SOCK=%s; export SSH_AUTH_SOCK;\n"
+            "SSH_AGENT_PID=%ld; export SSH_AGENT_PID;\n",
+            socket_arg, (long)TEST_PID);
+    } else if (strcmp(argv[0], "ssh-add") == 0 ||
+               strcmp(argv[0], "ssh-keygen") == 0) {
+        written = snprintf(opts->out, opts->out_size,
+                           "256 %s account-key (ED25519)\n", TEST_FP);
+    } else {
+        return 0;
+    }
+    if (written < 0 || (size_t)written >= opts->out_size) return -1;
+    if (result) result->out_len = (size_t)written;
+    return 0;
+}
+
+TEST(runner_failure_indeterminate_reap_publishes_retry_tuple) {
+    ssh_fixture_t fixture;
+    account_t account;
+    ssh_config_t config;
+    command_runner_fn previous_runner;
+    ssh_reap_fn previous_reap;
+    char current[192];
+    char sidecar_text[64];
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar11runretry"), 0);
+    if (fixture.dir_fd < 0) return;
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    CHECK_EQ_INT(safe_strncpy(account.name, "work",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "work@example.invalid",
+                              sizeof(account.email)), 0);
+    account.ssh_enabled = true;
+    CHECK((size_t)snprintf(account.ssh_key_path,
+                           sizeof(account.ssh_key_path), "%s/key",
+                           fixture.xdg) < sizeof(account.ssh_key_path));
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+
+    previous_runner = run_set_runner(failed_after_agent_spawn_runner);
+    previous_reap = ssh_manager_set_reap_fn(reap_indeterminate);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(config.agent_pid, TEST_PID);
+    CHECK(config.agent_owned);
+    CHECK(path_exists(fixture.socket));
+    CHECK(path_exists(fixture.sidecar));
+    CHECK(read_file_to_string(fixture.sidecar, sidecar_text,
+                              sizeof(sidecar_text)) > 0);
+    CHECK_STR_EQ(sidecar_text, "1073741824\n");
+    CHECK(strstr(get_last_error()->message,
+                 "runtime retained for retry") != NULL);
+    CHECK((size_t)snprintf(current, sizeof(current), "%s/current.sock",
+                           fixture.runtime) < sizeof(current));
+    CHECK(!path_exists(current));
+
+    ssh_manager_set_reap_fn(reap_gone);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    ssh_manager_set_reap_fn(previous_reap);
+    CHECK(!path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+    previous_runner = run_set_runner(successful_agent_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), 0);
+    run_set_runner(previous_runner);
+    CHECK(path_exists(fixture.socket));
+    CHECK(path_exists(fixture.sidecar));
+    CHECK(path_exists(current));
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(!path_exists(current));
+    close(fixture.dir_fd);
+}
+
+TEST(socket_evidence_recovers_without_trusting_truncated_pid) {
+    ssh_fixture_t fixture;
+    account_t account;
+    ssh_config_t config;
+    command_runner_fn previous_runner;
+    ssh_reap_fn previous_reap;
+
+    CHECK_EQ_INT(make_fixture(&fixture, "gsar11runsock"), 0);
+    if (fixture.dir_fd < 0) return;
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    CHECK_EQ_INT(safe_strncpy(account.name, "work",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email, "work@example.invalid",
+                              sizeof(account.email)), 0);
+    account.ssh_enabled = true;
+    CHECK((size_t)snprintf(account.ssh_key_path,
+                           sizeof(account.ssh_key_path), "%s/key",
+                           fixture.xdg) < sizeof(account.ssh_key_path));
+    memset(&config, 0, sizeof(config));
+    config.mode = SSH_AGENT_ISOLATED;
+    config.agent_pid = -1;
+
+    previous_runner = run_set_runner(
+        failed_with_truncated_pid_and_socket_runner);
+    previous_reap = ssh_manager_set_reap_fn(reap_indeterminate);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&config, &account), -1);
+    ssh_manager_set_reap_fn(previous_reap);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(config.agent_pid, -1);
+    CHECK(!config.agent_owned);
+    CHECK(!path_exists(fixture.socket));
+    CHECK(!path_exists(fixture.sidecar));
+    CHECK(strstr(get_last_error()->message,
+                 "spawned runtime removed") != NULL);
+    close(fixture.dir_fd);
+}
+
 TEST(pre_sidecar_failed_reap_publishes_retry_tuple) {
     ssh_fixture_t fixture;
     account_t account;
@@ -1168,6 +1365,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(unrelated_live_pid_is_not_signaled);
     RUN_TEST(signal_storm_preserves_term_and_kill_deadlines);
     RUN_TEST(runtime_root_provenance_prevents_cross_root_reap);
+    RUN_TEST(runner_failure_indeterminate_reap_publishes_retry_tuple);
+    RUN_TEST(socket_evidence_recovers_without_trusting_truncated_pid);
     RUN_TEST(pre_sidecar_failed_reap_publishes_retry_tuple);
     RUN_TEST(pre_sidecar_cleanup_preserves_reaped_socket_replacement);
     RUN_TEST(pre_sidecar_probe_cleanup_preserves_socket_replacement);

@@ -31,6 +31,7 @@
 
 static char g_xdg[64]; /* keep AF_UNIX paths below sun_path's small cap */
 static int g_runner_calls;
+static pid_t g_post_spawn_agent_pid = -1;
 
 static int test_write_exact(int fd, const void *buf, size_t len) {
     const unsigned char *p = buf;
@@ -386,6 +387,29 @@ static int fake_agent_runner(const char *const argv[], const run_opts_t *opts,
         return 0;
     }
     return 0;
+}
+
+/* Start a real daemon successfully, preserve the runner's truthful spawned
+ * result and output, then report a parent-side runner failure. This models a
+ * capture/status failure after ssh-agent has already daemonized and bound the
+ * managed socket. */
+static int post_spawn_failure_runner(const char *const argv[],
+                                     const run_opts_t *opts,
+                                     run_result_t *result) {
+    int rc;
+
+    if (strcmp(argv[0], "ssh-agent") != 0) {
+        return fake_agent_runner(argv, opts, result);
+    }
+    rc = run_argv_real(argv, opts, result);
+    if (rc == 0 && opts && opts->out) {
+        const char *pid_text = strstr(opts->out, "SSH_AGENT_PID=");
+        if (pid_text) {
+            g_post_spawn_agent_pid = (pid_t)strtol(
+                pid_text + strlen("SSH_AGENT_PID="), NULL, 10);
+        }
+    }
+    return rc == 0 ? -1 : rc;
 }
 
 /* Fail only the second environment write so the test proves that a partially
@@ -845,6 +869,72 @@ cleanup:
     close(listener);
     (void)unlink(current);
     (void)unlink(sock);
+}
+
+TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry) {
+    char agent_dir[128], current[192], sock[192], pidfile[192];
+    ssh_config_t cfg;
+    account_t account;
+    command_runner_fn previous;
+    bool pid_gone;
+
+    if (!command_exists("ssh-agent")) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
+    snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
+    snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
+    snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+    make_account(&account);
+
+    g_post_spawn_agent_pid = -1;
+    previous = run_set_runner(post_spawn_failure_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &account), -1);
+    run_set_runner(previous);
+
+    CHECK(g_post_spawn_agent_pid > 1);
+    for (int i = 0; i < 50 && g_post_spawn_agent_pid > 1 &&
+                        kill(g_post_spawn_agent_pid, 0) == 0; i++) {
+        int status = 0;
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000L};
+        pid_t waited = waitpid(g_post_spawn_agent_pid, &status, WNOHANG);
+        if (waited == g_post_spawn_agent_pid) break;
+        nanosleep(&delay, NULL);
+    }
+    pid_gone = g_post_spawn_agent_pid > 1 &&
+               kill(g_post_spawn_agent_pid, 0) != 0 && errno == ESRCH;
+    CHECK(pid_gone);
+    CHECK(!entry_exists(sock));
+    CHECK(!entry_exists(pidfile));
+    CHECK(!entry_exists(current));
+    CHECK(!cfg.agent_owned);
+    CHECK_EQ_INT(cfg.agent_pid, -1);
+    CHECK(cfg.agent_socket_path[0] == '\0');
+
+    /* Keep the causal pre-fix run leak-free, then prove the recovered
+     * namespace accepts an immediate subsequent start and reset. */
+    if (!pid_gone || entry_exists(sock) || entry_exists(pidfile) ||
+        entry_exists(current)) {
+        stop_real_agent(g_post_spawn_agent_pid, sock, current);
+        (void)unlink(pidfile);
+    }
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+    previous = run_set_runner(fake_agent_runner);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &account), 0);
+    run_set_runner(previous);
+    CHECK(entry_exists(sock));
+    CHECK(entry_exists(pidfile));
+    CHECK(entry_exists(current));
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!entry_exists(sock));
+    CHECK(!entry_exists(pidfile));
+    CHECK(!entry_exists(current));
 }
 
 TEST(fresh_agent_retarget_failure_reaps_and_restores_environment) {
@@ -1494,6 +1584,7 @@ int main(int argc, char **argv) {
     RUN_TEST(current_account_rejects_unsafe_malformed_and_stale_state);
     RUN_TEST(current_account_accepts_longest_bindable_name_without_truncation);
     RUN_TEST(current_account_fails_fast_when_manager_lock_held);
+    RUN_TEST(post_spawn_runner_failure_reaps_runtime_and_allows_retry);
     RUN_TEST(fresh_agent_retarget_failure_reaps_and_restores_environment);
     RUN_TEST(fresh_agent_environment_failure_reaps_and_restores_partial_mutation);
     RUN_TEST(fresh_agent_aborts_when_orphan_cleanup_is_incomplete);
