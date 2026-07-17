@@ -3922,6 +3922,23 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                                  errno, 126);
         }
 
+        /* Apply removals before additions so callers can express a clean
+         * baseline and still deliberately replace one of the same names.
+         * Neither operation mutates the parent process environment. */
+        if (opts->unset_env) {
+            for (size_t i = 0; opts->unset_env[i]; i++) {
+                const char *name = opts->unset_env[i];
+                if (!*name || strchr(name, '=') != NULL) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, EINVAL, 126);
+                }
+                if (unsetenv(name) != 0) {
+                    child_report_failure(child_status_fd,
+                                         CHILD_STAGE_ENV, errno, 126);
+                }
+            }
+        }
+
         if (opts->extra_env) {
             for (size_t i = 0; opts->extra_env[i]; i++) {
                 const char *e = opts->extra_env[i];

@@ -114,6 +114,14 @@ static const char *m20_extra_env(const run_opts_t *opts,
     return NULL;
 }
 
+static bool m20_unsets_env(const run_opts_t *opts, const char *name) {
+    if (!opts || !opts->unset_env || !name) return false;
+    for (size_t i = 0; opts->unset_env[i]; i++) {
+        if (strcmp(opts->unset_env[i], name) == 0) return true;
+    }
+    return false;
+}
+
 static bool m20_argv_has(const char *const argv[], const char *value) {
     if (!argv || !value) return false;
     for (size_t i = 0; argv[i]; i++) {
@@ -164,6 +172,12 @@ static int m20_runner(const char *const argv[], const run_opts_t *opts,
         result->exit_code = 0;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (argv && argv[0] &&
+        (ts_command_is(argv[0], "gpg") ||
+         ts_command_is(argv[0], "gpg2") ||
+         ts_command_is(argv[0], "gpgconf"))) {
+        CHECK(m20_unsets_env(opts, "GPG_AGENT_INFO"));
+    }
 
     if (argv && argv[0] && ts_command_is(argv[0], "gpgconf")) {
         char installed[512];

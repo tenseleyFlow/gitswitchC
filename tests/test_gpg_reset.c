@@ -44,10 +44,19 @@
 #include <sys/mount.h>
 #endif
 
+static bool unsets_environment(const run_opts_t *opts, const char *name) {
+    if (!opts || !opts->unset_env || !name) return false;
+    for (size_t i = 0; opts->unset_env[i]; i++) {
+        if (strcmp(opts->unset_env[i], name) == 0) return true;
+    }
+    return false;
+}
+
 /* Swallow gpgconf --kill (and anything else) without executing it. */
 static int null_runner(const char *const argv[], const run_opts_t *opts,
                        run_result_t *result) {
     (void)argv;
+    CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     if (result) {
         memset(result, 0, sizeof(*result));
@@ -82,6 +91,7 @@ static int failing_gpgconf_runner(const char *const argv[], const run_opts_t *op
                   cwd_st.st_ino == g_bad_home_ino;
     bool fail = !g_fail_only_bad_home || is_bad;
     (void)argv;
+    CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
@@ -153,6 +163,7 @@ static int swapping_gpgconf_runner(const char *const argv[],
     struct stat named_st;
     const char *home = extra_env_value(opts, "GNUPGHOME=");
     (void)argv;
+    CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     if (result) {
         memset(result, 0, sizeof(*result));

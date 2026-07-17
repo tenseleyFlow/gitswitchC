@@ -194,6 +194,7 @@ typedef struct {
     bool        use_stdin_fd;       /* duplicate current offset to child fd 0; mutually exclusive with input */
     bool        merge_stderr;       /* true => child stderr merged into captured stdout (2>&1) */
     bool        stderr_to_devnull;  /* when !merge_stderr: silence child stderr */
+    const char *const *unset_env;   /* NULL-terminated variable names removed from the child first */
     const char *const *extra_env;   /* NULL-terminated "KEY=VALUE" entries set in the child (e.g. GNUPGHOME) */
     int         cwd_fd;             /* pinned directory inherited across fork; ignored unless use_cwd_fd */
     bool        use_cwd_fd;         /* fchdir(cwd_fd) in the child before closing inherited descriptors */

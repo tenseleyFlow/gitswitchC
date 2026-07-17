@@ -293,6 +293,16 @@ static bool argv_has(const char *const argv[], const char *needle) {
     return false;
 }
 
+static bool opts_unsets_environment(const run_opts_t *opts,
+                                    const char *name) {
+    const char *const *entry;
+
+    for (entry = opts ? opts->unset_env : NULL; entry && *entry; entry++) {
+        if (strcmp(*entry, name) == 0) return true;
+    }
+    return false;
+}
+
 static const char *git_config_set_value(const char *const argv[],
                                         const char *key) {
     if (!argv || !key || !argv[0] || !argv[1] || !argv[2] || !argv[3] ||
@@ -1044,6 +1054,13 @@ static int strict_key_runner(const char *const argv[], const run_opts_t *opts,
         result->spawned = true;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+
+    if (argv && argv[0] &&
+        (ts_command_is(argv[0], "gpg") ||
+         ts_command_is(argv[0], "gpg2") ||
+         ts_command_is(argv[0], "gpgconf"))) {
+        CHECK(opts_unsets_environment(opts, "GPG_AGENT_INFO"));
+    }
 
     if (argv && argv[0] && argv[1] && argv[2] &&
         strcmp(argv[0], "git") == 0 && strcmp(argv[1], "config") == 0 &&
@@ -2450,10 +2467,11 @@ TEST(failed_retarget_retains_dirty_state_until_controlled_retry) {
     CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/before-rollback");
 }
 
-static bool g_fail_env_set;
-static bool g_fail_env_unset;
+static const char *g_fail_env_set_name;
+static const char *g_fail_env_unset_name;
+static bool g_unset_before_failure;
 static int fault_setenv(const char *name, const char *value, int overwrite) {
-    if (g_fail_env_set && strcmp(name, "GNUPGHOME") == 0) {
+    if (g_fail_env_set_name && strcmp(name, g_fail_env_set_name) == 0) {
         errno = EIO;
         return -1;
     }
@@ -2461,7 +2479,10 @@ static int fault_setenv(const char *name, const char *value, int overwrite) {
 }
 
 static int fault_unsetenv(const char *name) {
-    if (g_fail_env_unset && strcmp(name, "GNUPGHOME") == 0) {
+    if (g_fail_env_unset_name && strcmp(name, g_fail_env_unset_name) == 0) {
+        if (g_unset_before_failure) {
+            (void)unsetenv(name);
+        }
         errno = EIO;
         return -1;
     }
@@ -2480,21 +2501,21 @@ TEST(environment_failures_are_fatal_and_retryable) {
     fill_account(&account, "envset", "01234567", true);
     g_fake_mode = FAKE_PRESENT;
     previous = run_set_runner(strict_key_runner);
-    g_fail_env_set = true;
+    g_fail_env_set_name = "GNUPGHOME";
     gpg_manager_set_setenv_fn(fault_setenv);
     CHECK_EQ_INT(gpg_switch_account(&config, &account), -1);
     CHECK_EQ_INT(gpg_manager_get_home_path(current, sizeof(current)), 0);
     CHECK(lstat(current, &st) != 0 && errno == ENOENT);
     CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/env-before");
-    g_fail_env_set = false;
+    g_fail_env_set_name = NULL;
     gpg_manager_set_setenv_fn(NULL);
     CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
-    g_fail_env_set = true;
+    g_fail_env_set_name = "GNUPGHOME";
     gpg_manager_set_setenv_fn(fault_setenv);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), -1);
     CHECK(config.environment_installed);
     CHECK(config.current_key_id[0] != '\0');
-    g_fail_env_set = false;
+    g_fail_env_set_name = NULL;
     gpg_manager_set_setenv_fn(NULL);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
     CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/env-before");
@@ -2504,12 +2525,12 @@ TEST(environment_failures_are_fatal_and_retryable) {
     config.mode = GPG_MODE_ISOLATED;
     fill_account(&account, "envunset", "01234567", true);
     CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
-    g_fail_env_unset = true;
+    g_fail_env_unset_name = "GNUPGHOME";
     gpg_manager_set_unsetenv_fn(fault_unsetenv);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), -1);
     CHECK(config.environment_installed);
     CHECK(config.current_key_id[0] != '\0');
-    g_fail_env_unset = false;
+    g_fail_env_unset_name = NULL;
     gpg_manager_set_unsetenv_fn(NULL);
     CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
     CHECK(getenv("GNUPGHOME") == NULL);
@@ -2523,6 +2544,206 @@ TEST(environment_failures_are_fatal_and_retryable) {
     CHECK(getenv("GNUPGHOME") != NULL);
     if (getenv("GNUPGHOME")) CHECK_STR_EQ(getenv("GNUPGHOME"), "");
     run_set_runner(previous);
+}
+
+TEST(legacy_agent_environment_failures_are_fatal_and_retryable) {
+    char xdg[128], current[MAX_PATH_LEN];
+    char overlong_agent[MAX_PATH_LEN + 1U];
+    const char *seeded_agent = "/external/S.gpg-agent:4242:1";
+    const char *inherited_home = getenv("GNUPGHOME");
+    const char *inherited_agent = getenv("GPG_AGENT_INFO");
+    char *saved_home = inherited_home ? strdup(inherited_home) : NULL;
+    char *saved_agent = inherited_agent ? strdup(inherited_agent) : NULL;
+    bool home_present = inherited_home != NULL;
+    bool agent_present = inherited_agent != NULL;
+    struct stat st;
+    gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
+    account_t account;
+    command_runner_fn previous;
+
+    CHECK(!home_present || saved_home != NULL);
+    CHECK(!agent_present || saved_agent != NULL);
+    if ((home_present && !saved_home) || (agent_present && !saved_agent)) {
+        free(saved_home);
+        free(saved_agent);
+        return;
+    }
+
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", "/external/agent-before", 1), 0);
+    g_fake_mode = FAKE_PRESENT;
+    previous = run_set_runner(strict_key_runner);
+
+    /* An unrestorable inherited selector is rejected before either process
+     * variable is mutated or the stable runtime is published. */
+    memset(overlong_agent, 'A', MAX_PATH_LEN);
+    overlong_agent[MAX_PATH_LEN] = '\0';
+    CHECK_EQ_INT(setenv("GPG_AGENT_INFO", overlong_agent, 1), 0);
+    fill_account(&account, "agent-overlong", "01234567", true);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "GPG_AGENT_INFO is too long") != NULL);
+    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/agent-before");
+    CHECK(getenv("GPG_AGENT_INFO") != NULL);
+    if (getenv("GPG_AGENT_INFO")) {
+        CHECK_EQ_INT((long)strlen(getenv("GPG_AGENT_INFO")), MAX_PATH_LEN);
+    }
+    CHECK(!config.environment_installed);
+    CHECK_EQ_INT(gpg_manager_get_home_path(current, sizeof(current)), 0);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+
+    memset(&config, 0, sizeof(config));
+    config.mode = GPG_MODE_ISOLATED;
+    CHECK_EQ_INT(setenv("GPG_AGENT_INFO", seeded_agent, 1), 0);
+
+    /* Suppression is part of installation, not a best-effort cleanup. Its
+     * failure rolls GNUPGHOME back and publishes no stable runtime. */
+    fill_account(&account, "agent-suppress", "01234567", true);
+    g_fail_env_unset_name = "GPG_AGENT_INFO";
+    gpg_manager_set_unsetenv_fn(fault_unsetenv);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), -1);
+    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/agent-before");
+    CHECK_STR_EQ(getenv("GPG_AGENT_INFO"), seeded_agent);
+    CHECK(!config.environment_installed);
+    CHECK(!config.gnupg_home_environment_installed);
+    CHECK(!config.gpg_agent_info_suppressed);
+    CHECK_EQ_INT(gpg_manager_get_home_path(current, sizeof(current)), 0);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+    g_fail_env_unset_name = NULL;
+    gpg_manager_set_unsetenv_fn(NULL);
+
+    /* A failing environment primitive may have changed the process before
+     * reporting its error. Rollback ownership is published before the call,
+     * so this ambiguous failure still restores the exact inherited value. */
+    memset(&config, 0, sizeof(config));
+    config.mode = GPG_MODE_ISOLATED;
+    CHECK_EQ_INT(setenv("GPG_AGENT_INFO", seeded_agent, 1), 0);
+    fill_account(&account, "agent-mutating-failure", "01234567", true);
+    g_unset_before_failure = true;
+    g_fail_env_unset_name = "GPG_AGENT_INFO";
+    gpg_manager_set_unsetenv_fn(fault_unsetenv);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), -1);
+    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/agent-before");
+    CHECK_STR_EQ(getenv("GPG_AGENT_INFO"), seeded_agent);
+    CHECK(!config.environment_installed);
+    CHECK(!config.gnupg_home_environment_installed);
+    CHECK(!config.gpg_agent_info_suppressed);
+    g_unset_before_failure = false;
+    g_fail_env_unset_name = NULL;
+    gpg_manager_set_unsetenv_fn(NULL);
+
+    /* A failed exact-value restore keeps only the selector leg pending. The
+     * already-restored GNUPGHOME is not rewritten during the retry. */
+    memset(&config, 0, sizeof(config));
+    config.mode = GPG_MODE_ISOLATED;
+    fill_account(&account, "agent-restore", "01234567", true);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
+    CHECK(getenv("GPG_AGENT_INFO") == NULL);
+    g_fail_env_set_name = "GPG_AGENT_INFO";
+    gpg_manager_set_setenv_fn(fault_setenv);
+    CHECK_EQ_INT(gpg_manager_cleanup(&config), -1);
+    CHECK(config.environment_installed);
+    CHECK(!config.gnupg_home_environment_installed);
+    CHECK(config.gpg_agent_info_suppressed);
+    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/agent-before");
+    CHECK(getenv("GPG_AGENT_INFO") == NULL);
+    CHECK_EQ_INT(gpg_set_environment(&config), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "environment restoration is incomplete") != NULL);
+    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/agent-before");
+    CHECK(getenv("GPG_AGENT_INFO") == NULL);
+    g_fail_env_set_name = NULL;
+    gpg_manager_set_setenv_fn(NULL);
+    CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
+    CHECK_STR_EQ(getenv("GPG_AGENT_INFO"), seeded_agent);
+
+    /* Absence is also exact state. A failed unset remains retryable after the
+     * home leg succeeds, then a second cleanup restores absence. */
+    CHECK_EQ_INT(unsetenv("GPG_AGENT_INFO"), 0);
+    memset(&config, 0, sizeof(config));
+    config.mode = GPG_MODE_ISOLATED;
+    fill_account(&account, "agent-absent", "01234567", true);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
+    g_fail_env_unset_name = "GPG_AGENT_INFO";
+    gpg_manager_set_unsetenv_fn(fault_unsetenv);
+    CHECK_EQ_INT(gpg_manager_cleanup(&config), -1);
+    CHECK(config.environment_installed);
+    CHECK(!config.gnupg_home_environment_installed);
+    CHECK(config.gpg_agent_info_suppressed);
+    CHECK_STR_EQ(getenv("GNUPGHOME"), "/external/agent-before");
+    CHECK(getenv("GPG_AGENT_INFO") == NULL);
+    g_fail_env_unset_name = NULL;
+    gpg_manager_set_unsetenv_fn(NULL);
+    CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
+    CHECK(getenv("GPG_AGENT_INFO") == NULL);
+
+    /* Explicit emptiness remains distinct from absence for both variables. */
+    CHECK_EQ_INT(setenv("GNUPGHOME", "", 1), 0);
+    CHECK_EQ_INT(setenv("GPG_AGENT_INFO", "", 1), 0);
+    memset(&config, 0, sizeof(config));
+    config.mode = GPG_MODE_ISOLATED;
+    fill_account(&account, "agent-empty", "01234567", true);
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
+    CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
+    CHECK(getenv("GNUPGHOME") != NULL);
+    CHECK(getenv("GPG_AGENT_INFO") != NULL);
+    if (getenv("GNUPGHOME")) CHECK_STR_EQ(getenv("GNUPGHOME"), "");
+    if (getenv("GPG_AGENT_INFO")) {
+        CHECK_STR_EQ(getenv("GPG_AGENT_INFO"), "");
+    }
+
+    run_set_runner(previous);
+    g_fail_env_set_name = NULL;
+    g_fail_env_unset_name = NULL;
+    g_unset_before_failure = false;
+    gpg_manager_set_setenv_fn(NULL);
+    gpg_manager_set_unsetenv_fn(NULL);
+    if (home_present) {
+        CHECK_EQ_INT(setenv("GNUPGHOME", saved_home, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GNUPGHOME"), 0);
+    }
+    if (agent_present) {
+        CHECK_EQ_INT(setenv("GPG_AGENT_INFO", saved_agent, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GPG_AGENT_INFO"), 0);
+    }
+    free(saved_home);
+    free(saved_agent);
+}
+
+TEST(legacy_agent_environment_is_suppressed_and_restored) {
+    char xdg[128];
+    const char *seeded_agent = "/external/S.gpg-agent:4242:1";
+    char *saved_agent = NULL;
+    const char *previous_agent = getenv("GPG_AGENT_INFO");
+    gpg_config_t config = { .mode = GPG_MODE_ISOLATED };
+    account_t account;
+    command_runner_fn previous_runner;
+
+    if (previous_agent) {
+        saved_agent = strdup(previous_agent);
+        CHECK(saved_agent != NULL);
+        if (!saved_agent) return;
+    }
+    CHECK_EQ_INT(make_runtime(xdg, sizeof(xdg)), 0);
+    CHECK_EQ_INT(setenv("GPG_AGENT_INFO", seeded_agent, 1), 0);
+    fill_account(&account, "legacy-agent", "01234567", true);
+    g_fake_mode = FAKE_PRESENT;
+    previous_runner = run_set_runner(strict_key_runner);
+
+    CHECK_EQ_INT(gpg_switch_account(&config, &account), 0);
+    CHECK(getenv("GPG_AGENT_INFO") == NULL);
+    CHECK_EQ_INT(gpg_manager_cleanup(&config), 0);
+    CHECK_STR_EQ(getenv("GPG_AGENT_INFO"), seeded_agent);
+
+    run_set_runner(previous_runner);
+    if (saved_agent) {
+        CHECK_EQ_INT(setenv("GPG_AGENT_INFO", saved_agent, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GPG_AGENT_INFO"), 0);
+    }
+    free(saved_agent);
 }
 
 TEST_MAIN_BEGIN()
@@ -2554,4 +2775,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(public_done_retry_reproves_owned_present_identity);
     RUN_TEST(public_done_retry_reproves_absence_and_direct_publication);
     RUN_TEST(environment_failures_are_fatal_and_retryable);
+    RUN_TEST(legacy_agent_environment_failures_are_fatal_and_retryable);
+    RUN_TEST(legacy_agent_environment_is_suppressed_and_restored);
 TEST_MAIN_END()

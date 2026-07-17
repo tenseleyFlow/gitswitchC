@@ -537,7 +537,9 @@ static int run_wrapper_script(bool fish, const char *script,
     if (strcmp(kind, "unset") == 0) {
         written = snprintf(
             command, sizeof(command),
-            "env -u SSH_AUTH_SOCK -u GNUPGHOME HOME='%s' "
+            "env -u SSH_AUTH_SOCK -u GNUPGHOME "
+            "GPG_AGENT_INFO='/foreign/S.gpg-agent:4242:1' "
+            "GS_AGENT_INFO='/foreign/S.gpg-agent:4242:1' HOME='%s' "
             "XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' ENV=/dev/null "
             "GS_KIND=unset GS_SNIPPET='%s' GS_HELPER='%s' GS_SOCK='%s' "
             "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' "
@@ -550,7 +552,9 @@ static int run_wrapper_script(bool fish, const char *script,
         const char *value = strcmp(kind, "empty") == 0 ? "" : "/foreign/value";
         written = snprintf(
             command, sizeof(command),
-            "env SSH_AUTH_SOCK='%s' GNUPGHOME='%s' HOME='%s' "
+            "env SSH_AUTH_SOCK='%s' GNUPGHOME='%s' "
+            "GPG_AGENT_INFO='/foreign/S.gpg-agent:4242:1' "
+            "GS_AGENT_INFO='/foreign/S.gpg-agent:4242:1' HOME='%s' "
             "XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' ENV=/dev/null "
             "GS_KIND='%s' GS_SNIPPET='%s' GS_HELPER='%s' GS_SOCK='%s' "
             "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' "
@@ -989,6 +993,7 @@ TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership) {
     char script[PATH_MAX];
     static const char body[] =
         ". \"$GS_SNIPPET\" || exit 10\n"
+        "[ \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\" ] || exit 21\n"
         "case $GS_KIND in\n"
         "unset) [ \"${SSH_AUTH_SOCK+x}\" != x ] && [ \"${GNUPGHOME+x}\" != x ] || exit 11 ;;\n"
         "empty) [ \"${SSH_AUTH_SOCK+x}:$SSH_AUTH_SOCK\" = x: ] && [ \"${GNUPGHOME+x}:$GNUPGHOME\" = x: ] || exit 12 ;;\n"
@@ -997,12 +1002,21 @@ TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "gitswitch switch work || exit 14\n"
         "[ \"$SSH_AUTH_SOCK\" = \"$GS_SOCK\" ] || exit 15\n"
         "[ \"$GNUPGHOME\" = \"$GS_GPG\" ] || exit 16\n"
+        "[ \"${GPG_AGENT_INFO+x}\" != x ] || exit 22\n"
         "gitswitch reset || exit 17\n"
         "case $GS_KIND in\n"
         "unset) [ \"${SSH_AUTH_SOCK+x}\" != x ] && [ \"${GNUPGHOME+x}\" != x ] || exit 18 ;;\n"
         "empty) [ \"${SSH_AUTH_SOCK+x}:$SSH_AUTH_SOCK\" = x: ] && [ \"${GNUPGHOME+x}:$GNUPGHOME\" = x: ] || exit 19 ;;\n"
         "foreign) [ \"$SSH_AUTH_SOCK\" = /foreign/value ] && [ \"$GNUPGHOME\" = /foreign/value ] || exit 20 ;;\n"
-        "esac\n";
+        "esac\n"
+        "[ \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\" ] || exit 23\n"
+        "gitswitch switch work || exit 24\n"
+        "[ \"${GPG_AGENT_INFO+x}\" != x ] || exit 25\n"
+        "GPG_AGENT_INFO=/manual/S.gpg-agent:5252:1; export GPG_AGENT_INFO\n"
+        "gitswitch switch work || exit 26\n"
+        "[ \"${GPG_AGENT_INFO+x}\" != x ] || exit 27\n"
+        "gitswitch reset || exit 28\n"
+        "[ \"$GPG_AGENT_INFO\" = /manual/S.gpg-agent:5252:1 ] || exit 29\n";
 
     CHECK_EQ_INT(join_path(script, sizeof(script), g_fixture.root,
                            "/posix-transition.sh"), 0);
@@ -1017,6 +1031,7 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
     char script[PATH_MAX];
     static const char body[] =
         "source \"$GS_SNIPPET\"; or exit 10\n"
+        "test \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\"; or exit 21\n"
         "switch $GS_KIND\n"
         "case unset\n"
         "    not set -q SSH_AUTH_SOCK; and not set -q GNUPGHOME; or exit 11\n"
@@ -1028,6 +1043,7 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "gitswitch switch work; or exit 14\n"
         "test \"$SSH_AUTH_SOCK\" = \"$GS_SOCK\"; or exit 15\n"
         "test \"$GNUPGHOME\" = \"$GS_GPG\"; or exit 16\n"
+        "not set -q GPG_AGENT_INFO; or exit 22\n"
         "gitswitch reset; or exit 17\n"
         "switch $GS_KIND\n"
         "case unset\n"
@@ -1036,7 +1052,15 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "    set -q SSH_AUTH_SOCK; and test -z \"$SSH_AUTH_SOCK\"; and set -q GNUPGHOME; and test -z \"$GNUPGHOME\"; or exit 19\n"
         "case foreign\n"
         "    test \"$SSH_AUTH_SOCK\" = /foreign/value; and test \"$GNUPGHOME\" = /foreign/value; or exit 20\n"
-        "end\n";
+        "end\n"
+        "test \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\"; or exit 23\n"
+        "gitswitch switch work; or exit 24\n"
+        "not set -q GPG_AGENT_INFO; or exit 25\n"
+        "set -gx GPG_AGENT_INFO /manual/S.gpg-agent:5252:1\n"
+        "gitswitch switch work; or exit 26\n"
+        "not set -q GPG_AGENT_INFO; or exit 27\n"
+        "gitswitch reset; or exit 28\n"
+        "test \"$GPG_AGENT_INFO\" = /manual/S.gpg-agent:5252:1; or exit 29\n";
 
     if (resolve_executable("fish", fish_path, sizeof(fish_path)) != 0) {
         TS_SKIP("fish", "native fish executable is unavailable");

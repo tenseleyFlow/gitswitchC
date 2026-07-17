@@ -97,6 +97,16 @@ static bool argv_contains(const char *const argv[], const char *value) {
     return false;
 }
 
+static bool opts_unsets_environment(const run_opts_t *opts,
+                                    const char *name) {
+    const char *const *entry;
+
+    for (entry = opts ? opts->unset_env : NULL; entry && *entry; entry++) {
+        if (strcmp(*entry, name) == 0) return true;
+    }
+    return false;
+}
+
 static int emit_output(const run_opts_t *opts, run_result_t *result,
                        const char *output) {
     size_t length;
@@ -142,6 +152,7 @@ static int legacy_listing_runner(const char *const argv[],
         result->exit_code = 0;
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    CHECK(opts_unsets_environment(opts, "GPG_AGENT_INFO"));
 
     if (argv_contains(argv, "--list-secret-keys")) {
         g_listing_calls++;

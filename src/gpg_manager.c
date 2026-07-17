@@ -154,6 +154,10 @@ static gpg_rename_noreplace_fn g_rename_noreplace =
     gpg_native_rename_noreplace;
 static gpg_setenv_fn g_gpg_setenv = setenv;
 static gpg_unsetenv_fn g_gpg_unsetenv = unsetenv;
+static const char *const g_gpg_child_unset_env[] = {
+    "GPG_AGENT_INFO",
+    NULL
+};
 static gpg_cleanup_predelete_fn g_cleanup_predelete;
 static gpg_reset_final_hook_fn g_reset_final_hook;
 static gpg_reset_current_hook_fn g_reset_current_hook;
@@ -462,25 +466,67 @@ int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode) {
     return 0;
 }
 
+static void gpg_clear_environment_snapshot(gpg_config_t *gpg_config) {
+    if (!gpg_config) return;
+    gpg_config->previous_gnupg_home_present = false;
+    gpg_config->previous_gnupg_home[0] = '\0';
+    gpg_config->previous_gpg_agent_info_present = false;
+    gpg_config->previous_gpg_agent_info[0] = '\0';
+}
+
 static int gpg_restore_environment(gpg_config_t *gpg_config) {
     int env_rc;
 
     if (!gpg_config || !gpg_config->environment_installed) {
         return 0;
     }
-    if (gpg_config->previous_gnupg_home_present) {
-        env_rc = g_gpg_setenv("GNUPGHOME", gpg_config->previous_gnupg_home, 1);
-    } else {
-        env_rc = g_gpg_unsetenv("GNUPGHOME");
+
+    /* Restore the home before reintroducing a legacy agent selector. If the
+     * home leg fails, leaving GPG_AGENT_INFO suppressed is the only safe
+     * retryable state: a managed home must never be paired with an unrelated
+     * inherited GnuPG 2.0 agent. */
+    if (gpg_config->gnupg_home_environment_installed) {
+        if (gpg_config->previous_gnupg_home_present) {
+            env_rc = g_gpg_setenv("GNUPGHOME",
+                                  gpg_config->previous_gnupg_home, 1);
+        } else {
+            env_rc = g_gpg_unsetenv("GNUPGHOME");
+        }
+        if (env_rc != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Failed to restore GNUPGHOME environment variable");
+            return -1;
+        }
+        gpg_config->gnupg_home_environment_installed = false;
+        gpg_config->previous_gnupg_home_present = false;
+        gpg_config->previous_gnupg_home[0] = '\0';
     }
-    if (env_rc != 0) {
-        set_system_error(ERR_SYSTEM_CALL,
-                         "Failed to restore GNUPGHOME environment variable");
-        return -1;
+
+    if (gpg_config->gpg_agent_info_suppressed) {
+        if (gpg_config->previous_gpg_agent_info_present) {
+            env_rc = g_gpg_setenv("GPG_AGENT_INFO",
+                                  gpg_config->previous_gpg_agent_info, 1);
+        } else {
+            env_rc = g_gpg_unsetenv("GPG_AGENT_INFO");
+        }
+        if (env_rc != 0) {
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Failed to restore GPG_AGENT_INFO environment variable");
+            return -1;
+        }
+        gpg_config->gpg_agent_info_suppressed = false;
+        gpg_config->previous_gpg_agent_info_present = false;
+        gpg_config->previous_gpg_agent_info[0] = '\0';
     }
-    gpg_config->environment_installed = false;
-    gpg_config->previous_gnupg_home_present = false;
-    gpg_config->previous_gnupg_home[0] = '\0';
+
+    gpg_config->environment_installed =
+        gpg_config->gnupg_home_environment_installed ||
+        gpg_config->gpg_agent_info_suppressed;
+    if (!gpg_config->environment_installed) {
+        gpg_clear_environment_snapshot(gpg_config);
+    }
     return 0;
 }
 
@@ -3325,6 +3371,7 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     memset(&opts, 0, sizeof(opts));
     memset(&result, 0, sizeof(result));
     result.exit_code = -1;
+    opts.unset_env = g_gpg_child_unset_env;
     opts.extra_env = env;
     opts.stderr_to_devnull = true;
     opts.cwd_fd = home_fd;
@@ -4111,24 +4158,39 @@ int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account
 
 /* Set environment variables for GPG operation */
 int gpg_set_environment(gpg_config_t *gpg_config) {
-    const char *previous;
+    const char *previous_home;
+    const char *previous_agent;
+    bool beginning_transaction;
 
     if (!gpg_config) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to gpg_set_environment");
         return -1;
     }
+    if (gpg_config->environment_installed &&
+        (!gpg_config->gnupg_home_environment_installed ||
+         !gpg_config->gpg_agent_info_suppressed)) {
+        set_error(ERR_GPG_KEY_FAILED,
+                  "GPG environment restoration is incomplete; cleanup must "
+                  "succeed before it can be installed again");
+        return -1;
+    }
+    beginning_transaction = !gpg_config->environment_installed;
     
     /* Set GNUPGHOME if using isolated mode */
-    if (gpg_config->mode == GPG_MODE_ISOLATED && strlen(gpg_config->gnupg_home) > 0) {
+    if (gpg_config->mode == GPG_MODE_ISOLATED &&
+        strlen(gpg_config->gnupg_home) > 0) {
         if (!gpg_config->environment_installed) {
-            previous = getenv("GNUPGHOME");
+            previous_home = getenv("GNUPGHOME");
+            previous_agent = getenv("GPG_AGENT_INFO");
             /* Preserve presence separately from contents: an explicitly empty
              * value must be restored as empty, not converted into absence. */
-            if (previous) {
-                if (safe_strncpy(gpg_config->previous_gnupg_home, previous,
+            if (previous_home) {
+                if (safe_strncpy(gpg_config->previous_gnupg_home,
+                                 previous_home,
                                  sizeof(gpg_config->previous_gnupg_home)) != 0) {
                     set_error(ERR_INVALID_PATH,
                               "Existing GNUPGHOME is too long to restore safely");
+                    gpg_clear_environment_snapshot(gpg_config);
                     return -1;
                 }
                 gpg_config->previous_gnupg_home_present = true;
@@ -4136,14 +4198,62 @@ int gpg_set_environment(gpg_config_t *gpg_config) {
                 gpg_config->previous_gnupg_home[0] = '\0';
                 gpg_config->previous_gnupg_home_present = false;
             }
+            if (previous_agent) {
+                if (safe_strncpy(
+                        gpg_config->previous_gpg_agent_info,
+                        previous_agent,
+                        sizeof(gpg_config->previous_gpg_agent_info)) != 0) {
+                    set_error(
+                        ERR_INVALID_PATH,
+                        "Existing GPG_AGENT_INFO is too long to restore safely");
+                    gpg_clear_environment_snapshot(gpg_config);
+                    return -1;
+                }
+                gpg_config->previous_gpg_agent_info_present = true;
+            } else {
+                gpg_config->previous_gpg_agent_info[0] = '\0';
+                gpg_config->previous_gpg_agent_info_present = false;
+            }
         }
         if (g_gpg_setenv("GNUPGHOME", gpg_config->gnupg_home, 1) != 0) {
-            set_system_error(ERR_SYSTEM_CALL, "Failed to set GNUPGHOME environment variable");
+            set_system_error(ERR_SYSTEM_CALL,
+                             "Failed to set GNUPGHOME environment variable");
+            if (beginning_transaction) {
+                gpg_clear_environment_snapshot(gpg_config);
+            }
+            return -1;
+        }
+        gpg_config->gnupg_home_environment_installed = true;
+        gpg_config->environment_installed = true;
+
+        /* Publish rollback ownership before the call: an injected or platform
+         * failure may be reported after the environment was already changed. */
+        gpg_config->gpg_agent_info_suppressed = true;
+        if (g_gpg_unsetenv("GPG_AGENT_INFO") != 0) {
+            char original[sizeof(g_last_error.message)];
+            char rollback[sizeof(g_last_error.message)];
+
+            set_system_error(
+                ERR_SYSTEM_CALL,
+                "Failed to suppress GPG_AGENT_INFO environment variable");
+            safe_strncpy(original, get_last_error()->message,
+                         sizeof(original));
+            if (gpg_restore_environment(gpg_config) != 0) {
+                safe_strncpy(rollback, get_last_error()->message,
+                             sizeof(rollback));
+                set_error(ERR_SYSTEM_CALL,
+                          "%s; environment rollback failed: %s",
+                          original, rollback);
+            } else {
+                set_error(ERR_SYSTEM_CALL, "%s", original);
+            }
             return -1;
         }
         gpg_config->environment_installed = true;
-        
-        log_debug("Set GNUPGHOME environment variable: %s", gpg_config->gnupg_home);
+
+        log_debug("Set GNUPGHOME environment variable and suppressed "
+                  "GPG_AGENT_INFO: %s",
+                  gpg_config->gnupg_home);
     }
     
     return 0;
@@ -4914,6 +5024,7 @@ static int gpg_query_secret_listing_contract(
     opts.out = output;
     opts.out_size = sizeof(output);
     opts.stderr_to_devnull = true;
+    opts.unset_env = g_gpg_child_unset_env;
     opts.extra_env = env;
     memset(&result, 0, sizeof(result));
     result.exit_code = -1;
@@ -5001,6 +5112,7 @@ static int gpg_capture_secret_listing(const gpg_config_t *gpg_config,
     opts.out = listing;
     opts.out_size = GPG_KEY_LISTING_CAP;
     opts.stderr_to_devnull = true;
+    opts.unset_env = g_gpg_child_unset_env;
     opts.extra_env = env;
     memset(&res, 0, sizeof(res));
     res.exit_code = -1;
@@ -5211,6 +5323,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         opts.out = key_data;
         opts.out_size = KEY_DATA_CAP;
         opts.stderr_to_devnull = true;
+        opts.unset_env = g_gpg_child_unset_env;
         opts.extra_env = export_env;
         opts.cwd_fd = source.fd;
         opts.use_cwd_fd = true;
@@ -5288,6 +5401,7 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
         opts.out = import_diag;
         opts.out_size = sizeof(import_diag);
         opts.merge_stderr = true;
+        opts.unset_env = g_gpg_child_unset_env;
         opts.extra_env = env;
         opts.cwd_fd = home->home_fd;
         opts.use_cwd_fd = true;
@@ -5855,6 +5969,7 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
     memset(&opts, 0, sizeof(opts));
     memset(&result, 0, sizeof(result));
     result.exit_code = -1;
+    opts.unset_env = g_gpg_child_unset_env;
     opts.extra_env = env;
     opts.stderr_to_devnull = true;
     opts.cwd_fd = home->home_fd;

@@ -438,6 +438,48 @@ TEST(run_passes_extra_env) {
     CHECK_STR_EQ(out, "hello_env\n");
 }
 
+TEST(run_unsets_environment_before_applying_additions) {
+    const char *name = "GITSWITCH_TEST_UNSET_VAR";
+    const char *argv[] = {"printenv", "GITSWITCH_TEST_UNSET_VAR", NULL};
+    const char *unset_env[] = {"GITSWITCH_TEST_UNSET_VAR", NULL};
+    const char *extra_env[] = {"GITSWITCH_TEST_UNSET_VAR=child", NULL};
+    const char *inherited = getenv(name);
+    char *saved = inherited ? strdup(inherited) : NULL;
+    char out[64];
+    run_opts_t opts;
+    run_result_t res;
+
+    CHECK(!inherited || saved != NULL);
+    if (inherited && !saved) return;
+    CHECK_EQ_INT(setenv(name, "parent", 1), 0);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    opts.out = out;
+    opts.out_size = sizeof(out);
+    opts.unset_env = unset_env;
+    CHECK_EQ_INT(run_argv(argv, &opts, &res), -1);
+    CHECK(res.spawned);
+    CHECK_EQ_INT(res.exit_code, 1);
+    CHECK_STR_EQ(out, "");
+    CHECK_STR_EQ(getenv(name), "parent");
+
+    memset(&res, 0, sizeof(res));
+    opts.extra_env = extra_env;
+    CHECK_EQ_INT(run_argv(argv, &opts, &res), 0);
+    CHECK(res.spawned);
+    CHECK_EQ_INT(res.exit_code, 0);
+    CHECK_STR_EQ(out, "child\n");
+    CHECK_STR_EQ(getenv(name), "parent");
+
+    if (saved) {
+        CHECK_EQ_INT(setenv(name, saved, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv(name), 0);
+    }
+    free(saved);
+}
+
 TEST(run_uses_pinned_child_working_directory) {
     char dir[] = "/tmp/gswrunpwd_XXXXXX";
     /* PATH_MAX: glibc's fortified realpath (__realpath_chk) aborts the whole
@@ -584,6 +626,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_feeds_binary_stdin_at_exact_length);
     RUN_TEST(run_null_input_retains_devnull_eof);
     RUN_TEST(run_passes_extra_env);
+    RUN_TEST(run_unsets_environment_before_applying_additions);
     RUN_TEST(run_uses_pinned_child_working_directory);
     RUN_TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio);
     RUN_TEST(run_empty_argv_fails);

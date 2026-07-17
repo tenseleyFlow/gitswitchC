@@ -61,6 +61,10 @@ typedef struct {
      * retryable rather than erasing evidence of a partially committed switch. */
     char previous_gnupg_home[MAX_PATH_LEN];
     bool previous_gnupg_home_present;
+    char previous_gpg_agent_info[MAX_PATH_LEN];
+    bool previous_gpg_agent_info_present;
+    bool gnupg_home_environment_installed;
+    bool gpg_agent_info_suppressed;
     bool environment_installed;
     gpg_link_identity_t published_link;
     bool published_link_valid;
