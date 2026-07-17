@@ -100,6 +100,17 @@ typedef int (*gpg_reset_final_hook_fn)(int base_fd);
  * that pathname into a private quarantine. Tests use this boundary to prove
  * that a same-uid writer replacing `current` is restored, never unlinked. */
 typedef int (*gpg_reset_current_hook_fn)(int base_fd);
+typedef enum {
+    GPG_RESET_QUARANTINE_HOOK_AFTER_RENAME,
+    GPG_RESET_QUARANTINE_HOOK_BEFORE_REVALIDATE,
+    GPG_RESET_QUARANTINE_HOOK_BEFORE_UNLINK
+} gpg_reset_quarantine_hook_stage_t;
+/* Deterministic post-publication failure seam for reset's durable
+ * quarantine/witness pair. The named quarantine and its hard-link witness are
+ * synchronized before AFTER_RENAME runs; failures retain both for retry. */
+typedef int (*gpg_reset_quarantine_hook_fn)(
+    int base_fd, gpg_reset_quarantine_hook_stage_t stage,
+    const char *quarantine);
 /* Deterministic mount-identity and managed-writer durability seams. NULL
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
@@ -126,6 +137,8 @@ gpg_reset_final_hook_fn
 gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn);
 gpg_reset_current_hook_fn
 gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn);
+gpg_reset_quarantine_hook_fn
+gpg_manager_set_reset_quarantine_hook_fn(gpg_reset_quarantine_hook_fn fn);
 gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn

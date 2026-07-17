@@ -708,14 +708,17 @@ TEST(targeted_reset_sync_failure_is_retryable) {
     old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
     previous = run_set_runner(null_runner);
     CHECK_EQ_INT(gpg_manager_reset("work"), -1);
-    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK_EQ_INT(g_reset_sync_calls, 2);
     CHECK(strstr(get_last_error()->message, "not durable") != NULL);
     CHECK(lstat(home, &st) != 0 && errno == ENOENT);
-    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+    /* Reset cannot publish its quarantine until the identity witness is
+     * durable, so an early fsync failure deliberately retains `current`. */
+    CHECK_EQ_INT(lstat(current, &st), 0);
 
     g_fail_reset_sync = false;
     CHECK_EQ_INT(gpg_manager_reset("work"), 0);
-    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    CHECK_EQ_INT(g_reset_sync_calls, 8);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
     run_set_runner(previous);
     gpg_manager_set_sync_base_fn(old_sync);
 }
@@ -741,14 +744,15 @@ TEST(full_reset_sync_failure_is_retryable) {
     old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
     previous = run_set_runner(null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
-    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK_EQ_INT(g_reset_sync_calls, 2);
     CHECK(strstr(get_last_error()->message, "not durable") != NULL);
     CHECK(lstat(home, &st) != 0 && errno == ENOENT);
-    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(lstat(current, &st), 0);
 
     g_fail_reset_sync = false;
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
-    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    CHECK_EQ_INT(g_reset_sync_calls, 8);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
     run_set_runner(previous);
     gpg_manager_set_sync_base_fn(old_sync);
 }

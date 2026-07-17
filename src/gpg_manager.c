@@ -157,6 +157,7 @@ static gpg_unsetenv_fn g_gpg_unsetenv = unsetenv;
 static gpg_cleanup_predelete_fn g_cleanup_predelete;
 static gpg_reset_final_hook_fn g_reset_final_hook;
 static gpg_reset_current_hook_fn g_reset_current_hook;
+static gpg_reset_quarantine_hook_fn g_reset_quarantine_hook;
 static gpg_mount_identity_probe_fn g_mount_identity_probe;
 static gpg_agent_conf_sync_fn g_agent_conf_sync =
     gpg_default_agent_conf_sync;
@@ -271,6 +272,13 @@ gpg_reset_current_hook_fn
 gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn) {
     gpg_reset_current_hook_fn previous = g_reset_current_hook;
     g_reset_current_hook = fn;
+    return previous;
+}
+
+gpg_reset_quarantine_hook_fn
+gpg_manager_set_reset_quarantine_hook_fn(gpg_reset_quarantine_hook_fn fn) {
+    gpg_reset_quarantine_hook_fn previous = g_reset_quarantine_hook;
+    g_reset_quarantine_hook = fn;
     return previous;
 }
 
@@ -1061,6 +1069,8 @@ static int gpg_current_path_from_base(const char *base, char *buf, size_t size) 
 
 #define GPG_ROLLBACK_PREFIX ".gitswitch-gpg-rollback."
 #define GPG_PUBLISH_PREFIX ".gitswitch-gpg-publish."
+#define GPG_RESET_PREFIX ".gitswitch-gpg-reset."
+#define GPG_RESET_WITNESS_SUFFIX ".witness"
 
 /* Capture a symlink as one indivisible logical identity. The two stat calls
  * make a concurrent replacement observable; the target alone is insufficient
@@ -1174,7 +1184,8 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
             break;
         }
         if ((gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) ||
-             gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)) &&
+             gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) ||
+             gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) &&
             (!allowed_name || strcmp(entry->d_name, allowed_name) != 0)) {
             char stale[GPG_QUARANTINE_NAME_LEN];
             safe_strncpy(stale, entry->d_name, sizeof(stale));
@@ -1205,6 +1216,233 @@ static int gpg_make_private_name(char *name, size_t size,
         return -1;
     }
     return 0;
+}
+
+typedef struct {
+    bool quarantine_present;
+    bool witness_present;
+    char quarantine[GPG_QUARANTINE_NAME_LEN];
+    char witness[GPG_QUARANTINE_NAME_LEN];
+} gpg_reset_retry_state_t;
+
+static bool gpg_valid_private_name(const char *name, const char *prefix) {
+    const char *cursor;
+    const char *random;
+    size_t prefix_len;
+
+    if (!name || !prefix) return false;
+    prefix_len = strlen(prefix);
+    if (strncmp(name, prefix, prefix_len) != 0) return false;
+    cursor = name + prefix_len;
+    if (*cursor < '1' || *cursor > '9') return false;
+    while (isdigit((unsigned char)*cursor)) cursor++;
+    if (*cursor != '.') return false;
+    random = ++cursor;
+    if (strlen(random) != 16U) return false;
+    for (size_t i = 0; i < 16U; i++) {
+        if (!strchr("0123456789abcdef", random[i])) return false;
+    }
+    return true;
+}
+
+static int gpg_reset_witness_name(const char *quarantine,
+                                  char *witness, size_t size) {
+    int written;
+
+    if (!quarantine || !witness || size == 0 ||
+        !gpg_valid_private_name(quarantine, GPG_RESET_PREFIX)) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG reset retry name");
+        return -1;
+    }
+    written = snprintf(witness, size, "%s%s", quarantine,
+                       GPG_RESET_WITNESS_SUFFIX);
+    if (written < 0 || (size_t)written >= size) {
+        set_error(ERR_INVALID_PATH, "GPG reset witness name is too long");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_scan_reset_retry_locked(int base_fd,
+                                       gpg_reset_retry_state_t *state) {
+    int flags = O_RDONLY | O_CLOEXEC;
+    int scan_fd;
+    DIR *dir;
+    struct dirent *entry;
+    size_t suffix_len = strlen(GPG_RESET_WITNESS_SUFFIX);
+
+    if (base_fd < 0 || !state) {
+        set_error(ERR_INVALID_ARGS, "Invalid GPG reset retry scan");
+        return -1;
+    }
+    memset(state, 0, sizeof(*state));
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    scan_fd = openat(base_fd, ".", flags);
+    dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
+    if (!dir) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect GPG reset retry state");
+        return -1;
+    }
+    for (;;) {
+        bool witness_entry;
+        char quarantine[GPG_QUARANTINE_NAME_LEN];
+        size_t name_len;
+        size_t quarantine_len;
+
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot enumerate GPG reset retry state");
+                return -1;
+            }
+            break;
+        }
+        if (!gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) continue;
+        name_len = strlen(entry->d_name);
+        witness_entry = name_len > suffix_len &&
+            strcmp(entry->d_name + name_len - suffix_len,
+                   GPG_RESET_WITNESS_SUFFIX) == 0;
+        quarantine_len = witness_entry ? name_len - suffix_len : name_len;
+        if (quarantine_len == 0 || quarantine_len >= sizeof(quarantine) ||
+            (witness_entry && name_len >= sizeof(state->witness))) {
+            char residue[GPG_QUARANTINE_NAME_LEN];
+            safe_strncpy(residue, entry->d_name, sizeof(residue));
+            closedir(dir);
+            set_error(ERR_FILE_IO,
+                      "Malformed GPG reset retry entry blocks mutation: %s",
+                      residue);
+            return -1;
+        }
+        memcpy(quarantine, entry->d_name, quarantine_len);
+        quarantine[quarantine_len] = '\0';
+        if (!gpg_valid_private_name(quarantine, GPG_RESET_PREFIX) ||
+            (witness_entry && state->witness_present) ||
+            (!witness_entry && state->quarantine_present)) {
+            char residue[GPG_QUARANTINE_NAME_LEN];
+            safe_strncpy(residue, entry->d_name, sizeof(residue));
+            closedir(dir);
+            set_error(ERR_FILE_IO,
+                      "Ambiguous GPG reset retry entry blocks mutation: %s",
+                      residue);
+            return -1;
+        }
+        if (witness_entry) {
+            safe_strncpy(state->witness, entry->d_name,
+                         sizeof(state->witness));
+            state->witness_present = true;
+            if (state->quarantine_present &&
+                strcmp(state->quarantine, quarantine) != 0) {
+                closedir(dir);
+                set_error(ERR_FILE_IO,
+                          "Multiple GPG reset retry transactions block mutation");
+                return -1;
+            }
+            if (!state->quarantine_present) {
+                safe_strncpy(state->quarantine, quarantine,
+                             sizeof(state->quarantine));
+            }
+        } else {
+            safe_strncpy(state->quarantine, entry->d_name,
+                         sizeof(state->quarantine));
+            state->quarantine_present = true;
+            if (state->witness_present) {
+                char expected[GPG_QUARANTINE_NAME_LEN];
+                if (gpg_reset_witness_name(quarantine, expected,
+                                           sizeof(expected)) != 0 ||
+                    strcmp(expected, state->witness) != 0) {
+                    closedir(dir);
+                    set_error(ERR_FILE_IO,
+                              "Multiple GPG reset retry transactions block mutation");
+                    return -1;
+                }
+            }
+        }
+    }
+    if (closedir(dir) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close GPG reset retry scan");
+        return -1;
+    }
+    return 0;
+}
+
+static int gpg_retire_reset_link_locked(
+    int base_fd, const char *name, const gpg_link_identity_t *expected,
+    const char *description) {
+    gpg_link_identity_t observed;
+
+    if (gpg_capture_link_at(base_fd, name, &observed) != 0 ||
+        !gpg_same_link(&observed, expected)) {
+        set_error(ERR_FILE_IO,
+                  "%s changed; preserving replacement: %s", description,
+                  name);
+        return -1;
+    }
+    if (unlinkat(base_fd, name, 0) != 0) {
+        set_system_error(ERR_FILE_IO, "Cannot remove %s: %s", description,
+                         name);
+        return -1;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(ERR_FILE_IO, "Cannot synchronize %s", description);
+        return -1;
+    }
+    return 0;
+}
+
+/* A reset publishes a hard-link witness before moving `current`.  The witness
+ * name encodes the generated quarantine name and its inode is the captured
+ * symlink identity, so a later process can recover without guessing from an
+ * untrusted serialized record.  Retirement is ordered quarantine -> fsync ->
+ * witness -> fsync: no durable state can expose an unauthenticated quarantine
+ * after the last identity witness has disappeared. */
+static int gpg_reconcile_reset_retry_locked(int base_fd) {
+    gpg_reset_retry_state_t state;
+    gpg_link_identity_t quarantine;
+    gpg_link_identity_t witness;
+
+    if (gpg_scan_reset_retry_locked(base_fd, &state) != 0) return -1;
+    if (!state.quarantine_present && !state.witness_present) return 0;
+    if (!state.witness_present) {
+        set_error(ERR_FILE_IO,
+                  "Unwitnessed GPG reset quarantine preserved: %s",
+                  state.quarantine);
+        return -1;
+    }
+    if (gpg_capture_link_at(base_fd, state.witness, &witness) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot identify GPG reset retry witness: %s",
+                  state.witness);
+        return -1;
+    }
+    if (state.quarantine_present) {
+        if (gpg_capture_link_at(base_fd, state.quarantine, &quarantine) != 0 ||
+            !gpg_same_link(&quarantine, &witness)) {
+            set_error(ERR_FILE_IO,
+                      "GPG reset quarantine differs from its witness; replacement preserved: %s",
+                      state.quarantine);
+            return -1;
+        }
+        if (gpg_retire_reset_link_locked(
+                base_fd, state.quarantine, &witness,
+                "witnessed GPG reset quarantine") != 0) {
+            return -1;
+        }
+    }
+    return gpg_retire_reset_link_locked(
+        base_fd, state.witness, &witness, "GPG reset retry witness");
 }
 
 /* Validate an existing base before taking its lock, then verify that the path
@@ -2903,7 +3141,8 @@ static int gpg_preflight_reset_all_locked(int base_fd, const char *base) {
             continue;
         }
         if (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) ||
-            gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)) {
+            gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) ||
+            gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) {
             char residue[GPG_QUARANTINE_NAME_LEN];
             safe_strncpy(residue, entry->d_name, sizeof(residue));
             closedir(dir);
@@ -3140,19 +3379,22 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     return 0;
 }
 
-/* Remove only the exact `current` inode reset inspected. Moving the public
- * name to an unpredictable quarantine is the atomic ownership boundary: if a
- * same-uid writer replaced it after capture, the moved inode will not compare
- * equal and is restored with no-replace semantics. A writer that appears after
- * the move remains at `current` while reset retires only its private inode. */
+/* Remove only the exact `current` inode reset inspected. Before moving the
+ * public name, publish and synchronize a private hard-link witness whose name
+ * encodes the destination quarantine. Both names then carry the same symlink
+ * inode and target. A later reset can retire that exact pair without relying
+ * on the already-deleted home or on unauthenticated serialized metadata. */
 static int gpg_remove_captured_current_locked(
     int base_fd, const char *base, const gpg_link_identity_t *captured,
     bool *changed) {
     char quarantine[GPG_QUARANTINE_NAME_LEN] = "";
+    char witness_name[GPG_QUARANTINE_NAME_LEN] = "";
     gpg_link_identity_t moved;
     gpg_link_identity_t current;
+    gpg_link_identity_t witness;
     int current_rc;
     int quarantine_rc;
+    int witness_rc;
 
     if (base_fd < 0 || !base || !*base || !captured || !captured->valid ||
         !changed) {
@@ -3161,16 +3403,61 @@ static int gpg_remove_captured_current_locked(
     }
     *changed = false;
     if (gpg_make_private_name(quarantine, sizeof(quarantine),
-                              GPG_ROLLBACK_PREFIX) != 0 ||
-        gpg_reject_stale_quarantines_locked(base_fd, quarantine) != 0) {
+                              GPG_RESET_PREFIX) != 0 ||
+        gpg_reset_witness_name(quarantine, witness_name,
+                               sizeof(witness_name)) != 0 ||
+        gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
         return -1;
     }
     if (g_reset_current_hook && g_reset_current_hook(base_fd) != 0) {
         set_error(ERR_FILE_IO, "GPG reset current-link hook failed");
         return -1;
     }
+    if (linkat(base_fd, "current", base_fd, witness_name, 0) != 0) {
+        int saved_errno = errno;
+        if (saved_errno == ENOENT) {
+            *changed = true;
+            set_error(ERR_FILE_IO,
+                      "Stable GNUPGHOME changed during reset; later absence preserved");
+        } else {
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot publish GPG reset identity witness");
+        }
+        return -1;
+    }
+    witness_rc = gpg_capture_link_at(base_fd, witness_name, &witness);
+    if (witness_rc != 0) {
+        (void)g_sync_base(base_fd);
+        set_error(ERR_FILE_IO,
+                  "Cannot identify GPG reset witness; retry state retained");
+        return -1;
+    }
+    if (!gpg_same_link(&witness, captured)) {
+        if (gpg_retire_reset_link_locked(
+                base_fd, witness_name, &witness,
+                "superseded GPG reset witness") != 0) {
+            return -1;
+        }
+        *changed = true;
+        set_error(ERR_FILE_IO,
+                  "Stable GNUPGHOME changed during reset; later writer preserved: %s",
+                  witness.target);
+        return 0;
+    }
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize GPG reset witness; retry state retained");
+        return -1;
+    }
     if (g_rename_noreplace(base_fd, "current", base_fd, quarantine) != 0) {
         int saved_errno = errno;
+        if (gpg_retire_reset_link_locked(
+                base_fd, witness_name, &witness,
+                "unpublished GPG reset witness") != 0) {
+            return -1;
+        }
         if (saved_errno == ENOENT) {
             *changed = true;
             set_error(ERR_FILE_IO,
@@ -3189,14 +3476,34 @@ static int gpg_remove_captured_current_locked(
         }
         return -1;
     }
-    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &moved);
-    if (quarantine_rc != 0) {
+    if (g_sync_base(base_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot synchronize GPG reset quarantine; retry state retained");
+        return -1;
+    }
+    if (g_reset_quarantine_hook &&
+        g_reset_quarantine_hook(
+            base_fd, GPG_RESET_QUARANTINE_HOOK_AFTER_RENAME,
+            quarantine) != 0) {
         set_error(ERR_FILE_IO,
-                  "Cannot identify quarantined GNUPGHOME; reset state retained for retry");
+                  "GPG reset quarantine capture hook failed; retry state retained");
+        return -1;
+    }
+    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &moved);
+    witness_rc = gpg_capture_link_at(base_fd, witness_name, &current);
+    if (quarantine_rc != 0 || witness_rc != 0) {
+        set_error(ERR_FILE_IO,
+                  "Cannot identify witnessed GNUPGHOME quarantine; reset state retained for retry");
         return -1;
     }
 
-    if (!gpg_same_link(&moved, captured)) {
+    if (!gpg_same_link(&current, captured)) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset identity witness changed; preserving retry state");
+        return -1;
+    }
+    if (!gpg_same_link(&moved, &current)) {
         current_rc = gpg_capture_link_at(base_fd, "current", &current);
         if (current_rc < 0) return -1;
         if (current_rc == 0) {
@@ -3228,6 +3535,17 @@ static int gpg_remove_captured_current_locked(
                 return -1;
             }
         }
+        if (g_sync_base(base_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot synchronize restored GNUPGHOME replacement");
+            return -1;
+        }
+        if (gpg_retire_reset_link_locked(
+                base_fd, witness_name, &witness,
+                "restored-writer GPG reset witness") != 0) {
+            return -1;
+        }
         *changed = true;
         set_error(ERR_FILE_IO,
                   "Stable GNUPGHOME changed during reset; later writer preserved: %s",
@@ -3235,11 +3553,48 @@ static int gpg_remove_captured_current_locked(
         return 0;
     }
 
-    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &current);
-    if (quarantine_rc != 0 || !gpg_same_link(&current, &moved) ||
-        unlinkat(base_fd, quarantine, 0) != 0) {
+    if (g_reset_quarantine_hook &&
+        g_reset_quarantine_hook(
+            base_fd, GPG_RESET_QUARANTINE_HOOK_BEFORE_REVALIDATE,
+            quarantine) != 0) {
         set_error(ERR_FILE_IO,
-                  "Captured GNUPGHOME quarantine changed; preserving replacement");
+                  "GPG reset quarantine revalidation hook failed; retry state retained");
+        return -1;
+    }
+    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &current);
+    witness_rc = gpg_capture_link_at(base_fd, witness_name, &witness);
+    if (quarantine_rc != 0 || witness_rc != 0 ||
+        !gpg_same_link(&current, &moved) ||
+        !gpg_same_link(&witness, &moved)) {
+        set_error(ERR_FILE_IO,
+                  "Witnessed GNUPGHOME quarantine changed; preserving replacement");
+        return -1;
+    }
+    if (g_reset_quarantine_hook &&
+        g_reset_quarantine_hook(
+            base_fd, GPG_RESET_QUARANTINE_HOOK_BEFORE_UNLINK,
+            quarantine) != 0) {
+        set_error(ERR_FILE_IO,
+                  "GPG reset quarantine unlink hook failed; retry state retained");
+        return -1;
+    }
+    quarantine_rc = gpg_capture_link_at(base_fd, quarantine, &current);
+    witness_rc = gpg_capture_link_at(base_fd, witness_name, &witness);
+    if (quarantine_rc != 0 || witness_rc != 0 ||
+        !gpg_same_link(&current, &moved) ||
+        !gpg_same_link(&witness, &moved)) {
+        set_error(ERR_FILE_IO,
+                  "Witnessed GNUPGHOME quarantine changed; preserving replacement");
+        return -1;
+    }
+    if (gpg_retire_reset_link_locked(
+            base_fd, quarantine, &moved,
+            "witnessed GPG reset quarantine") != 0) {
+        return -1;
+    }
+    if (gpg_retire_reset_link_locked(
+            base_fd, witness_name, &witness,
+            "GPG reset identity witness") != 0) {
         return -1;
     }
     current_rc = gpg_capture_link_at(base_fd, "current", &current);
@@ -3287,6 +3642,10 @@ int gpg_manager_reset(const char *account) {
     if (lock_fd < 0) {
         close(base_fd);
         set_system_error(ERR_FILE_IO, "Failed to lock GPG base directory: %s", base);
+        return -1;
+    }
+    if (gpg_reconcile_reset_retry_locked(base_fd) != 0) {
+        unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
     if (gpg_reject_stale_quarantines_locked(base_fd, NULL) != 0) {
