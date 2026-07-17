@@ -195,7 +195,9 @@ int toml_validate_gitswitch_schema(toml_document_t *doc);
 /**
  * Validate the two distinct SSH host fields used by the config schema.
  * `ssh_host` is a managed OpenSSH Host pattern and may contain '*'/'?'.
- * `ssh_hostname` is a literal canonical destination and never may.
+ * `ssh_hostname` is one host-only canonical destination: an ASCII name/IPv4
+ * value or an unbracketed IPv6 literal. Endpoint `host:port` syntax is not
+ * modeled and is rejected.
  */
 bool toml_validate_ssh_host_alias(const char *alias);
 bool toml_validate_ssh_hostname(const char *hostname);

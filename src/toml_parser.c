@@ -2,6 +2,7 @@
  * Built specifically for gitswitch-c with comprehensive input validation
  */
 
+#include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -649,11 +650,13 @@ bool toml_validate_ssh_host_alias(const char *alias) {
     return true;
 }
 
-/* `ssh_hostname` is emitted as a literal HostName destination. In particular,
- * it is not an OpenSSH pattern and cannot carry '%' token expansion. This
- * conservative ASCII grammar covers DNS names and unbracketed IPv4/IPv6
- * literals without admitting whitespace, quoting, escapes, or wildcards. */
+/* `ssh_hostname` is emitted as one literal HostName destination. It is not an
+ * endpoint, an OpenSSH pattern, or a token-expansion surface. A colon-bearing
+ * value must therefore be a complete unbracketed IPv6 literal; accepting a
+ * loose ASCII token such as "host:2222" would make OpenSSH resolve that whole
+ * string as the hostname while silently retaining port 22. */
 bool toml_validate_ssh_hostname(const char *hostname) {
+    bool has_colon = false;
     size_t len;
 
     if (!hostname) {
@@ -669,6 +672,15 @@ bool toml_validate_ssh_hostname(const char *hostname) {
               *p == (unsigned char)':')) {
             return false;
         }
+        if (*p == (unsigned char)':') has_colon = true;
+    }
+    if (has_colon) {
+        struct in6_addr address;
+        int saved_errno = errno;
+        int parsed = inet_pton(AF_INET6, hostname, &address);
+
+        errno = saved_errno;
+        return parsed == 1;
     }
     return true;
 }
@@ -944,8 +956,9 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                     }
                     if (!toml_validate_ssh_hostname(kv->value)) {
                         set_error(ERR_CONFIG_INVALID,
-                                  "ssh_hostname must contain only ASCII letters, "
-                                  "digits, '.', '-', '_', or ':'");
+                                  "ssh_hostname must be a host-only ASCII name "
+                                  "or IPv4 value, or a valid unbracketed IPv6 "
+                                  "literal; embedded ports are unsupported");
                         return -1;
                     }
                 }

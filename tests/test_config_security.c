@@ -1183,6 +1183,7 @@ TEST(account_model_admitted_states_roundtrip_exactly) {
         {true, NULL, NULL, false, false},
         {true, NULL, "github.com", false, false},
         {true, "github-work", "github.com", false, false},
+        {true, "ipv6-work", "2001:db8::1:2222", false, false},
         {false, NULL, NULL, true, false},
         {false, NULL, NULL, true, true},
         {true, "github-work", "github.com", true, true},
@@ -1414,14 +1415,18 @@ TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
 TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     static const char *const invalid[] = {
         "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
-        "*.example.com", "host?", "h\xC3\xB6st.example", NULL
+        "*.example.com", "host?", "h\xC3\xB6st.example",
+        "git.example.test:2222", "192.0.2.1:2222", "example:port",
+        ":2222", "2001:db8:::1", "[2001:db8::1]",
+        "[2001:db8::1]:2222", NULL
     };
-    char dir[128], path[256], key[256];
+    char dir[128], path[256], save_path[256], key[256], cfg[2048];
     gitswitch_ctx_t ctx;
     account_t account;
 
     CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
     snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(save_path, sizeof(save_path), "%s/save-boundary.toml", dir);
     snprintf(key, sizeof(key), "%s/id_hostname", dir);
     CHECK_EQ_INT(write_config(
                      key,
@@ -1433,8 +1438,12 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
                  "#ssh_host = \"github.com-work\"") != NULL);
     CHECK(strstr(default_config_template,
                  "#ssh_hostname = \"github.com\"") != NULL);
-    CHECK(toml_validate_ssh_hostname("git.example.test:2222"));
+    CHECK(toml_validate_ssh_hostname("git.example.test"));
+    CHECK(toml_validate_ssh_hostname("192.0.2.1"));
     CHECK(toml_validate_ssh_hostname("2001:db8::1"));
+    CHECK(toml_validate_ssh_hostname("::1"));
+    CHECK(toml_validate_ssh_hostname("::ffff:192.0.2.1"));
+    CHECK(toml_validate_ssh_hostname("2001:db8::1:2222"));
     CHECK(!toml_validate_ssh_hostname(""));
     CHECK(toml_validate_ssh_host_alias("github-*"));
     for (size_t i = 0; invalid[i]; i++) {
@@ -1448,6 +1457,48 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
                 sizeof(account.ssh_hostname) - 1);
         CHECK_EQ_INT(config_add_account(&ctx, &account), -1);
         CHECK_EQ_INT(ctx.account_count, 0);
+    }
+
+    /* A hand-edited endpoint spelling must fail at schema validation instead
+     * of loading a destination that OpenSSH would treat as a literal hostname
+     * on its default port. */
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"endpoint\"\n"
+                   "email = \"endpoint@example.com\"\n"
+                   "ssh_key = \"%s\"\n"
+                   "ssh_hostname = \"git.example.test:2222\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_CONFIG_INVALID);
+    CHECK_EQ_INT(ctx.account_count, 0);
+
+    /* Save is also a public boundary: an invalid in-memory destination must
+     * not replace a previously valid file. */
+    {
+        char before[4096], after[4096];
+
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.config.default_scope = GIT_SCOPE_LOCAL;
+        fill_account(&account, 1, "saved", "saved@example.com", "saved");
+        account.ssh_enabled = true;
+        strncpy(account.ssh_key_path, key,
+                sizeof(account.ssh_key_path) - 1U);
+        strncpy(account.ssh_hostname, "github.com",
+                sizeof(account.ssh_hostname) - 1U);
+        CHECK_EQ_INT(config_add_account(&ctx, &account), 0);
+        CHECK_EQ_INT(config_save(&ctx, save_path), 0);
+        CHECK(slurp(save_path, before, sizeof(before)) > 0U);
+        CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].ssh_hostname,
+                                  "git.example.test:2222",
+                                  sizeof(ctx.accounts[0].ssh_hostname)), 0);
+        CHECK_EQ_INT(config_save(&ctx, save_path), -1);
+        CHECK(slurp(save_path, after, sizeof(after)) > 0U);
+        CHECK_STR_EQ(after, before);
     }
 
     /* Canonical destinations are deliberately not unique account resources. */

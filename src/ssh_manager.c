@@ -3859,6 +3859,36 @@ static int ssh_config_recheck_before_rename(int dir_fd,
     return 0;
 }
 
+/* M25 narrowed new destinations so any colon-bearing value must be real IPv6.
+ * Blocks emitted by older gitswitch versions could nevertheless contain a
+ * host:port-shaped value under the former injection-safe ASCII grammar. The
+ * ownership parser must recognize that exact historical output so configure
+ * and remove can repair it. This helper is read/retirement compatibility only;
+ * all admission and emission continue through toml_validate_ssh_hostname(). */
+static bool ssh_config_historical_managed_hostname_valid(
+    const char *hostname) {
+    size_t len;
+
+    if (!hostname) return false;
+    len = strlen(hostname);
+    if (len == 0U || len >= MAX_NAME_LEN) return false;
+    for (const unsigned char *p = (const unsigned char *)hostname; *p; p++) {
+        bool alphanumeric = (*p >= (unsigned char)'A' &&
+                             *p <= (unsigned char)'Z') ||
+                            (*p >= (unsigned char)'a' &&
+                             *p <= (unsigned char)'z') ||
+                            (*p >= (unsigned char)'0' &&
+                             *p <= (unsigned char)'9');
+
+        if (!(alphanumeric || *p == (unsigned char)'.' ||
+              *p == (unsigned char)'-' || *p == (unsigned char)'_' ||
+              *p == (unsigned char)':')) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Parse every exact gitswitch marker line in the complete file. A block is
  * owned only when begin/end aliases match, Host names the same alias, and all
  * intervening lines are recognized options with exact cardinality. Incidental
@@ -3966,7 +3996,7 @@ static int ssh_filter_managed_blocks(const char *buf, size_t len,
                 char hostname[MAX_NAME_LEN];
                 memcpy(hostname, value, value_len);
                 hostname[value_len] = '\0';
-                if (!toml_validate_ssh_hostname(hostname)) {
+                if (!ssh_config_historical_managed_hostname_valid(hostname)) {
                     set_error(ERR_FILE_IO,
                               "Malformed HostName in gitswitch SSH block for '%s'",
                               block_alias);

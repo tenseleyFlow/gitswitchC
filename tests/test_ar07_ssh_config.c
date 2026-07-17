@@ -368,7 +368,101 @@ TEST(identityfile_quoting_and_hostname_are_serialized_safely) {
     }
 }
 
+TEST(host_port_hostname_is_rejected_without_mutating_config) {
+    static const char original[] = "Host preserved\n  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+    struct stat before;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(stat(config, &before), 0);
+    snprintf(key, sizeof(key), "%s/id_endpoint", home);
+    make_account(&account, key);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname,
+                              "git.example.test:2222",
+                              sizeof(account.ssh_hostname)), 0);
+
+    CHECK_EQ_INT(ssh_configure_host_alias(&account), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    check_unchanged(config, original, sizeof(original) - 1U, &before);
+}
+
+TEST(historical_host_port_block_can_be_repaired_after_upgrade) {
+    static const char historical[] =
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName git.example.test:2222\n"
+        "  IdentityFile \"/old/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "# >>> gitswitch other-work >>>\n"
+        "Host other-work\n"
+        "  HostName other.example:2200\n"
+        "  IdentityFile \"/old/other-key\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch other-work <<<\n"
+        "Host preserved\n  User alice\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    account_t account;
+    size_t content_len = 0U;
+    char *content;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, historical, sizeof(historical) - 1U), 0);
+    snprintf(key, sizeof(key), "%s/id_repaired", home);
+    make_account(&account, key);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname, "git.example.test",
+                              sizeof(account.ssh_hostname)), 0);
+
+    CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
+    content = read_bytes(config, &content_len);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(strstr(content, "Host preserved\n  User alice\n") != NULL);
+        CHECK(strstr(content, "HostName git.example.test:2222") == NULL);
+        CHECK(strstr(content, "  HostName git.example.test\n") != NULL);
+        CHECK(strstr(content, key) != NULL);
+        CHECK(strstr(content, "  HostName other.example:2200\n") != NULL);
+        CHECK(strstr(content, "  IdentityFile \"/old/other-key\"\n") !=
+              NULL);
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 1);
+        CHECK_EQ_INT(count_text(content, END_MARK), 1);
+        free(content);
+    }
+}
+
+TEST(historical_host_port_block_can_be_removed_after_upgrade) {
+    static const char historical[] =
+        "Host preserved\n  User alice\n"
+        BEGIN_MARK "\n"
+        "Host " TEST_ALIAS "\n"
+        "  HostName git.example.test:2222\n"
+        "  IdentityFile \"/old/key\"\n"
+        "  IdentitiesOnly yes\n"
+        END_MARK "\n"
+        "Host tail\n  User bob\n";
+    char home[96], config[MAX_PATH_LEN];
+    size_t content_len = 0U;
+    char *content;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, historical, sizeof(historical) - 1U), 0);
+    CHECK_EQ_INT(ssh_remove_host_alias(TEST_ALIAS), 0);
+    content = read_bytes(config, &content_len);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(strstr(content, BEGIN_MARK) == NULL);
+        CHECK(strstr(content, END_MARK) == NULL);
+        CHECK(strstr(content, "git.example.test:2222") == NULL);
+        CHECK(strstr(content, "Host preserved\n  User alice\n") != NULL);
+        CHECK(strstr(content, "Host tail\n  User bob\n") != NULL);
+        free(content);
+    }
+}
+
 TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
+    static const char ipv6_hostname[] = "2001:db8::1";
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
     char output[32768];
     account_t account;
@@ -381,6 +475,8 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
     CHECK_EQ_INT(setup_home(home, config), 0);
     snprintf(key, sizeof(key), "%s/key dir/id\\backslash", home);
     make_account(&account, key);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname, ipv6_hostname,
+                              sizeof(account.ssh_hostname)), 0);
     CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
     memset(&opts, 0, sizeof(opts));
     memset(&result, 0, sizeof(result));
@@ -394,7 +490,8 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
         CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
     }
     CHECK(!result.out_truncated);
-    CHECK(output_has_value(output, "hostname", TEST_HOSTNAME));
+    CHECK(output_has_value(output, "hostname", ipv6_hostname));
+    CHECK(output_has_value(output, "port", "22"));
     CHECK(output_has_value(output, "identityfile", key));
 }
 
@@ -486,7 +583,9 @@ TEST(malformed_nested_and_mismatched_blocks_fail_closed) {
         "  IdentitiesOnly yes\n# <<< gitswitch other <<<\n",
         BEGIN_MARK "\nHost " TEST_ALIAS "\n  IdentityFile /valid\n"
         "  IdentitiesOnly yes\n" END_MARK "\n"
-        BEGIN_MARK "\nHost " TEST_ALIAS "\n  ProxyCommand false\n" END_MARK "\n"
+        BEGIN_MARK "\nHost " TEST_ALIAS "\n  ProxyCommand false\n" END_MARK "\n",
+        BEGIN_MARK "\nHost " TEST_ALIAS "\n  HostName bad%h\n"
+        "  IdentityFile /old\n  IdentitiesOnly yes\n" END_MARK "\n"
     };
 
     for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
@@ -1063,6 +1162,9 @@ cleanup:
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(identityfile_quoting_and_hostname_are_serialized_safely);
+    RUN_TEST(host_port_hostname_is_rejected_without_mutating_config);
+    RUN_TEST(historical_host_port_block_can_be_repaired_after_upgrade);
+    RUN_TEST(historical_host_port_block_can_be_removed_after_upgrade);
     RUN_TEST(identityfile_quoting_and_hostname_match_openssh_oracle);
     RUN_TEST(openssh_percent_and_environment_expansions_are_safe);
     RUN_TEST(embedded_nul_at_every_region_fails_without_mutation);

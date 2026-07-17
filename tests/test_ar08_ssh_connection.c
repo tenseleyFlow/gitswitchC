@@ -313,6 +313,29 @@ TEST(managed_alias_probe_rejects_a_missing_canonical_destination) {
     run_set_runner(previous);
 }
 
+TEST(managed_alias_probe_rejects_host_port_without_running_ssh) {
+    account_t account;
+    command_runner_fn previous;
+
+    make_account(&account, true);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname,
+                              "git.example.test:2222",
+                              sizeof(account.ssh_hostname)), 0);
+    previous = run_set_runner(connection_runner);
+    g_argc = 99;
+
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi intended-user! You've successfully authenticated, "
+                     "but GitHub does not provide shell access.",
+                     1, 0, true, false),
+                 -1);
+    CHECK_EQ_INT(g_argc, 99);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+
+    run_set_runner(previous);
+}
+
 TEST(managed_git_command_ignores_shared_config_and_pins_destination) {
     account_t account;
     char command[GIT_CONFIG_VALUE_MAX];
@@ -327,6 +350,62 @@ TEST(managed_git_command_ignores_shared_config_and_pins_destination) {
     CHECK(strstr(command, " -i '/tmp/intended-account-key'") != NULL);
     CHECK(strstr(command, " -o IdentitiesOnly=yes") != NULL);
     CHECK(strstr(command, " -o HostName='github.com'") != NULL);
+}
+
+TEST(managed_git_command_rejects_host_port_destination) {
+    account_t account;
+    char command[GIT_CONFIG_VALUE_MAX];
+
+    if (!command_exists("ssh")) {
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
+    }
+    make_account(&account, true);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname,
+                              "git.example.test:2222",
+                              sizeof(account.ssh_hostname)), 0);
+    memset(command, 'X', sizeof(command));
+
+    CHECK_EQ_INT(git_expected_ssh_command(&account, command,
+                                          sizeof(command)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(command[0], '\0');
+}
+
+TEST(managed_ipv6_destination_is_preserved_in_probe) {
+    static const char ipv6_hostname[] = "2001:db8::1";
+    account_t account;
+    command_runner_fn previous;
+
+    make_account(&account, true);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname, ipv6_hostname,
+                              sizeof(account.ssh_hostname)), 0);
+    previous = run_set_runner(connection_runner);
+
+    CHECK_EQ_INT(scripted_probe(
+                     &account,
+                     "Hi intended-user! You've successfully authenticated, "
+                     "but GitHub does not provide shell access.",
+                     1, 0, true, false),
+                 0);
+    CHECK_EQ_INT(g_argc, 15);
+    CHECK_STR_EQ(g_argv[13], "HostName=2001:db8::1");
+    CHECK_STR_EQ(g_argv[14], "work-github");
+    run_set_runner(previous);
+}
+
+TEST(managed_ipv6_destination_is_preserved_in_git_command) {
+    account_t account;
+    char command[GIT_CONFIG_VALUE_MAX];
+
+    if (!command_exists("ssh")) {
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
+    }
+    make_account(&account, true);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_hostname, "2001:db8::1",
+                              sizeof(account.ssh_hostname)), 0);
+    CHECK_EQ_INT(git_expected_ssh_command(&account, command,
+                                          sizeof(command)), 0);
+    CHECK(strstr(command, " -o HostName='2001:db8::1'") != NULL);
 }
 
 static bool output_has_identity_file(const char *output, const char *path) {
@@ -509,7 +588,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(direct_probe_offers_only_the_intended_account_key);
     RUN_TEST(managed_alias_probe_ignores_shared_config_and_pins_destination);
     RUN_TEST(managed_alias_probe_rejects_a_missing_canonical_destination);
+    RUN_TEST(managed_alias_probe_rejects_host_port_without_running_ssh);
     RUN_TEST(managed_git_command_ignores_shared_config_and_pins_destination);
+    RUN_TEST(managed_git_command_rejects_host_port_destination);
+    RUN_TEST(managed_ipv6_destination_is_preserved_in_probe);
+    RUN_TEST(managed_ipv6_destination_is_preserved_in_git_command);
     RUN_TEST(openssh_effective_config_confirms_direct_probe_isolation);
     RUN_TEST(openssh_effective_config_confirms_managed_alias_isolation);
 TEST_MAIN_END()

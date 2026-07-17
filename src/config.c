@@ -161,7 +161,8 @@ const char *default_config_template =
 "#ssh_key = \"~/.ssh/id_rsa_work\"\n"
 "#gpg_key = \"ABCDEF1234567890\"\n"
 "#gpg_signing_enabled = true\n"
-"# ssh_host is the alias used in Git remotes; ssh_hostname is its real destination\n"
+"# ssh_host is the Git remote alias; ssh_hostname is its host-only destination\n"
+"# Use unbracketed IPv6 when needed; appended ports are not supported\n"
 "#ssh_host = \"github.com-work\"\n"
 "#ssh_hostname = \"github.com\"\n"
 "\n"
@@ -8330,8 +8331,8 @@ static int validate_account_security(const account_t *account) {
     if (account->ssh_hostname[0] != '\0' &&
         !toml_validate_ssh_hostname(account->ssh_hostname)) {
         set_error(ERR_ACCOUNT_INVALID,
-                  "Invalid SSH canonical hostname (ASCII letters, digits, "
-                  "'.', '-', '_', and ':' only): %s",
+                  "Invalid SSH canonical hostname (host-only ASCII name/IPv4 "
+                  "or unbracketed IPv6; embedded ports are unsupported): %s",
                   account->ssh_hostname);
         return -1;
     }
