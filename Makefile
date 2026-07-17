@@ -1241,7 +1241,8 @@ export GITSWITCH_DIST_ROOT
 override DIST_MANIFEST := src tests tools completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
 .PHONY: release-manifest-check dist distcheck release-contract-test \
-	release-artifact-test qa-contract-test sig-repro-test rpm
+	freebsd-platform-contract-test release-artifact-test qa-contract-test \
+	sig-repro-test rpm
 # Fail closed before producing an artifact when any tracked or untracked
 # release-manifest path differs from the exact commit selected above. Besides
 # preventing a live VERSION from naming committed payload, this makes the spec
@@ -1324,9 +1325,16 @@ distcheck: dist
 		"$$GITSWITCH_DIST_ROOT" \
 		"$(PREFIX)" "$(MAKE_COMMAND)"
 
+# Keep the declared FreeBSD floor tied to both its required headers and the
+# exact hosted release that executes publication/reset behavior.
+freebsd-platform-contract-test:
+	@FREEBSD_CONTRACT_CC="$(CC)" \
+		sh tests/test_ar11_freebsd_floor.sh "$(CURDIR)"
+
 # Negative release-input checks run in isolated local clones, so they can dirty
 # VERSION/spec/manifest fixtures without touching the operator's checkout.
-release-contract-test: $(DIST_PUBLISH_NAMED_TEST_HELPER)
+release-contract-test: freebsd-platform-contract-test \
+		$(DIST_PUBLISH_NAMED_TEST_HELPER)
 	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)" \
 		"$(CURDIR)/$(DIST_PUBLISH_NAMED_TEST_HELPER)"
 

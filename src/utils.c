@@ -3288,7 +3288,7 @@ static int child_close_fds_from(
             }
             if (require_bulk_close) return -1;
 #elif defined(__FreeBSD__)
-            /* FreeBSD has closefrom(2) since 8.0, well before our 12.2 floor.
+            /* FreeBSD has closefrom(2) since 8.0, well before our 14.4 floor.
              * Its void return means completing the call is success. */
             observation->close_syscalls++;
             closefrom(lowfd);

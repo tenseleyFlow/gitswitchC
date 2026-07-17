@@ -4,6 +4,8 @@
 #define _GNU_SOURCE 1
 #endif
 
+#include "../src/freebsd_compat.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>

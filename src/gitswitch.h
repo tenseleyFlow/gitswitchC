@@ -3,6 +3,8 @@
 #ifndef GITSWITCH_H
 #define GITSWITCH_H
 
+#include "freebsd_compat.h"
+
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
