@@ -2564,6 +2564,83 @@ TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch) {
     setenv("HOME", saved_home, 1);
 }
 
+/* L35 parent durability fails before any alias bytes are public. The prepared
+ * switch must therefore retain abort ownership instead of classifying the
+ * empty, uncertain .ssh entry as an installed account commit. */
+TEST(first_ssh_home_sync_failure_remains_abortable_preinstall) {
+    char home[600], saved_home[4096], config_path[700], ssh_dir[700];
+    char lock_path[760];
+    error_context_t failure;
+    struct stat directory_identity;
+    struct stat directory_after_abort;
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_dirsync_fn previous_sync;
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_fake_home(home, sizeof(home), saved_home,
+                                 sizeof(saved_home)), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(config_path, sizeof(config_path), "%s/config",
+                           ssh_dir) < sizeof(config_path));
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path),
+                           "%s/.gitswitch-config.lock", ssh_dir) <
+          sizeof(lock_path));
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
+    clear_error();
+    rc = accounts_switch_commit_result(&ctx, &state);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK_EQ_INT(failure.system_errno, EIO);
+    CHECK(strstr(failure.message, "HOME") != NULL);
+    CHECK(strstr(failure.message, "uncertain") != NULL);
+    CHECK_EQ_INT(lstat(ssh_dir, &directory_identity), 0);
+    CHECK(S_ISDIR(directory_identity.st_mode));
+    CHECK_EQ_INT(directory_identity.st_uid, getuid());
+    CHECK_EQ_INT(directory_identity.st_mode & 0777, 0700);
+    errno = 0;
+    CHECK(access(config_path, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK_EQ_INT(lstat(ssh_dir, &directory_after_abort), 0);
+    CHECK(S_ISDIR(directory_after_abort.st_mode));
+    CHECK_EQ_INT(directory_after_abort.st_uid, getuid());
+    CHECK_EQ_INT(directory_after_abort.st_mode & 0777, 0700);
+    CHECK(directory_after_abort.st_dev == directory_identity.st_dev);
+    CHECK(directory_after_abort.st_ino == directory_identity.st_ino);
+    errno = 0;
+    CHECK(access(config_path, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
+}
+
 /* A pre-rename alias failure remains rollback-authorized. If M7 detects an
  * external Git vector at that late point, direct API callers receive both the
  * cause and the retained retry handle instead of losing signal ownership. */
@@ -5188,6 +5265,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(failed_switch_restarts_previous_accounts_agent);
     RUN_TEST(postrename_alias_verification_failure_retains_complete_direct_switch);
     RUN_TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch);
+    RUN_TEST(first_ssh_home_sync_failure_remains_abortable_preinstall);
     RUN_TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry);
     RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);
     RUN_TEST(failed_switch_never_creates_ssh_config);

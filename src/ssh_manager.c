@@ -3577,73 +3577,242 @@ static bool ssh_config_directory_is_safe(const struct stat *identity) {
            (identity->st_mode & (S_IWGRP | S_IWOTH)) == 0;
 }
 
-static int recheck_ssh_config_directory(const char *path,
-                                        const struct stat *identity) {
-    struct stat current;
+typedef struct {
+    char path[MAX_PATH_LEN];
+    struct stat home_identity;
+    struct stat dir_identity;
+    int home_fd;
+    int dir_fd;
+    bool absent;
+    bool home_entry_synced;
+} ssh_config_directory_t;
 
-    if (lstat(path, &current) != 0 ||
-        !ssh_config_directory_is_safe(&current) ||
-        !same_ssh_config_directory(identity, &current)) {
+static int recheck_ssh_home_directory(
+    const char *home, const ssh_config_directory_t *directory) {
+    struct stat pinned;
+    struct stat named;
+
+    if (fstat(directory->home_fd, &pinned) != 0 ||
+        stat(home, &named) != 0 ||
+        !same_ssh_config_directory(&directory->home_identity, &pinned) ||
+        !same_ssh_config_directory(&directory->home_identity, &named)) {
         set_error(ERR_FILE_IO,
-                  "SSH config directory changed during update: %s", path);
+                  "HOME changed during SSH config update: %s", home);
         return -1;
     }
     return 0;
 }
 
-/* Pin ~/.ssh itself, not just its current pathname. All config/temp operations
- * below are relative to this O_NOFOLLOW directory descriptor. Rechecking the
- * public path before and after rename prevents a swapped-out directory from
- * turning a successful write to an unreachable inode into reported success. */
-static int open_ssh_config_directory(const char *home, bool create,
-                                     char *path, size_t path_size,
-                                     struct stat *identity, bool *absent) {
+static int recheck_ssh_config_directory(
+    const char *home, const ssh_config_directory_t *directory) {
+    struct stat current;
+
+    if (recheck_ssh_home_directory(home, directory) != 0) return -1;
+    if (fstatat(directory->home_fd, ".ssh", &current,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !ssh_config_directory_is_safe(&current) ||
+        !same_ssh_config_directory(&directory->dir_identity, &current)) {
+        set_error(ERR_FILE_IO,
+                  "SSH config directory changed during update: %s",
+                  directory->path);
+        return -1;
+    }
+    return 0;
+}
+
+static int sync_ssh_home_entry(
+    const char *home, ssh_config_directory_t *directory) {
+    if (recheck_ssh_config_directory(home, directory) != 0) return -1;
+    if (g_ssh_dirsync(directory->home_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to sync HOME for first SSH config publication; "
+            "the .ssh entry durability is uncertain");
+        return -1;
+    }
+    if (recheck_ssh_config_directory(home, directory) != 0) return -1;
+    directory->home_entry_synced = true;
+    return 0;
+}
+
+/* mkdirat() has already made the child name live, so do not place any
+ * fallible inspection between that namespace mutation and its parent sync.
+ * The resolved HOME descriptor is the durability boundary; the pathname
+ * recheck after fsync rejects a concurrently retargeted symlinked HOME. */
+static int sync_new_ssh_home_entry(
+    const char *home, ssh_config_directory_t *directory) {
+    if (g_ssh_dirsync(directory->home_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Failed to sync HOME after creating .ssh; "
+            "the .ssh entry durability is uncertain");
+        return -1;
+    }
+    if (recheck_ssh_home_directory(home, directory) != 0) return -1;
+    directory->home_entry_synced = true;
+    return 0;
+}
+
+/* Pin HOME and ~/.ssh as one descriptor-anchored namespace. Creation is
+ * serialized on the resolved HOME inode and performed with mkdirat(), so two
+ * first-time writers cannot let one publish before the other's parent sync.
+ * A symlinked HOME remains supported; only the .ssh leaf is no-follow. */
+static int open_ssh_config_directory(
+    const char *home, bool create, ssh_config_directory_t *directory) {
+    struct stat named_home;
+    struct stat opened_home;
     struct stat before;
     struct stat opened;
-    int dir_fd;
+    bool home_locked = false;
+    bool created = false;
+    int lock_rc;
 
-    *absent = false;
-    memset(identity, 0, sizeof(*identity));
-    if ((size_t)snprintf(path, path_size, "%s/.ssh", home) >= path_size) {
+    memset(directory, 0, sizeof(*directory));
+    directory->home_fd = -1;
+    directory->dir_fd = -1;
+    if ((size_t)snprintf(directory->path, sizeof(directory->path),
+                         "%s/.ssh", home) >= sizeof(directory->path)) {
         set_error(ERR_INVALID_PATH, "SSH config directory path too long");
         return -1;
     }
-    if (lstat(path, &before) != 0) {
+    if (stat(home, &named_home) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect HOME for SSH config: %s", home);
+        return -1;
+    }
+    if (!S_ISDIR(named_home.st_mode)) {
+        errno = ENOTDIR;
+        set_system_error(ERR_FILE_IO,
+                         "HOME is not a directory for SSH config: %s", home);
+        return -1;
+    }
+    directory->home_fd =
+        open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (directory->home_fd < 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to pin HOME for SSH config safely: %s",
+                         home);
+        return -1;
+    }
+    if (fstat(directory->home_fd, &opened_home) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to inspect pinned HOME for SSH config: %s",
+                         home);
+        goto fail;
+    }
+    if (!same_ssh_config_directory(&named_home, &opened_home)) {
+        errno = EAGAIN;
+        set_system_error(ERR_FILE_IO,
+                         "HOME changed while being pinned for SSH config: %s",
+                         home);
+        goto fail;
+    }
+    directory->home_identity = opened_home;
+
+    if (create) {
+        do {
+            lock_rc = flock(directory->home_fd, LOCK_EX);
+        } while (lock_rc != 0 && errno == EINTR);
+        if (lock_rc != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to lock HOME for SSH config creation");
+            goto fail;
+        }
+        home_locked = true;
+        if (recheck_ssh_home_directory(home, directory) != 0) goto fail;
+    }
+
+    if (fstatat(directory->home_fd, ".ssh", &before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
         if (errno == ENOENT && !create) {
-            *absent = true;
-            return -1;
+            directory->absent = true;
+            goto fail;
         }
         if (errno != ENOENT || !create) {
             set_system_error(ERR_FILE_IO,
-                             "Cannot inspect SSH config directory: %s", path);
-            return -1;
+                             "Cannot inspect SSH config directory: %s",
+                             directory->path);
+            goto fail;
         }
-        if (create_directory_recursive(path, 0700) != 0 ||
-            lstat(path, &before) != 0) {
-            return -1;
+        /* Deterministic namespace-race seam: production leaves the metadata
+         * hook NULL. Tests may retarget a symlinked HOME after the absence
+         * observation to prove mkdirat remains anchored to home_fd. */
+        if (g_metadata_test_hook) {
+            (void)g_metadata_test_hook(
+                SSH_METADATA_TEST_CONFIG_HOME_CREATE);
+        }
+        if (mkdirat(directory->home_fd, ".ssh", 0700) == 0) {
+            created = true;
+        } else if (errno != EEXIST) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot create SSH config directory: %s",
+                             directory->path);
+            goto fail;
+        }
+        if (created && sync_new_ssh_home_entry(home, directory) != 0) {
+            goto fail;
+        }
+        if (fstatat(directory->home_fd, ".ssh", &before,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect created SSH config directory: %s",
+                             directory->path);
+            goto fail;
         }
     }
     if (!ssh_config_directory_is_safe(&before)) {
         set_error(ERR_PERMISSION_DENIED,
                   "Refusing unsafe or symlinked SSH config directory: %s",
-                  path);
-        return -1;
+                  directory->path);
+        goto fail;
     }
 
-    dir_fd = open(path, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
-    if (dir_fd < 0 || fstat(dir_fd, &opened) != 0 ||
-        !ssh_config_directory_is_safe(&opened) ||
-        !same_ssh_config_directory(&before, &opened)) {
-        int saved_errno = errno;
-        if (dir_fd >= 0) close(dir_fd);
-        errno = saved_errno;
+    directory->dir_fd =
+        openat(directory->home_fd, ".ssh",
+               O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (directory->dir_fd < 0) {
         set_system_error(ERR_PERMISSION_DENIED,
                          "Failed to pin SSH config directory safely: %s",
-                         path);
+                         directory->path);
+        goto fail;
+    }
+    if (fstat(directory->dir_fd, &opened) != 0) {
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Failed to inspect pinned SSH config directory: %s",
+                         directory->path);
+        goto fail;
+    }
+    if (!ssh_config_directory_is_safe(&opened) ||
+        !same_ssh_config_directory(&before, &opened)) {
+        errno = !ssh_config_directory_is_safe(&opened) ? EACCES : EAGAIN;
+        set_system_error(ERR_PERMISSION_DENIED,
+                         "Failed to pin SSH config directory safely: %s",
+                         directory->path);
+        goto fail;
+    }
+    directory->dir_identity = opened;
+    if (recheck_ssh_config_directory(home, directory) != 0) goto fail;
+
+    if (home_locked) {
+        if (flock(directory->home_fd, LOCK_UN) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to unlock HOME after SSH config creation");
+            goto fail;
+        }
+        home_locked = false;
+    }
+    return 0;
+
+fail: {
+        int saved_errno = errno;
+        if (home_locked) (void)flock(directory->home_fd, LOCK_UN);
+        if (directory->dir_fd >= 0) close(directory->dir_fd);
+        if (directory->home_fd >= 0) close(directory->home_fd);
+        directory->dir_fd = -1;
+        directory->home_fd = -1;
+        errno = saved_errno;
         return -1;
     }
-    *identity = opened;
-    return dir_fd;
 }
 
 static bool ssh_config_next_line(const char *buf, size_t len, size_t offset,
@@ -4315,19 +4484,16 @@ static int ssh_filter_managed_blocks(const char *buf, size_t len,
 }
 
 int ssh_preflight_host_alias_config(const account_t *account) {
-    char ssh_config_dir[MAX_PATH_LEN];
     char ssh_config_path[MAX_PATH_LEN];
     char *buf = NULL;
     char *filtered = NULL;
     const char *home = getenv("HOME");
-    struct stat dir_identity;
     struct stat config_identity;
+    ssh_config_directory_t directory;
     size_t buf_len = 0;
     size_t filtered_len = 0;
     size_t removed = 0;
-    bool dir_absent = false;
     bool config_existed = false;
-    int dir_fd = -1;
     int pinned_config_fd = -1;
     int rc = -1;
 
@@ -4351,19 +4517,16 @@ int ssh_preflight_host_alias_config(const account_t *account) {
         return -1;
     }
 
-    dir_fd = open_ssh_config_directory(home, false, ssh_config_dir,
-                                       sizeof(ssh_config_dir), &dir_identity,
-                                       &dir_absent);
-    if (dir_fd < 0) {
-        return dir_absent ? 0 : -1;
+    if (open_ssh_config_directory(home, false, &directory) != 0) {
+        return directory.absent ? 0 : -1;
     }
     if ((size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config",
-                         ssh_config_dir) >= sizeof(ssh_config_path)) {
+                         directory.path) >= sizeof(ssh_config_path)) {
         set_error(ERR_INVALID_PATH,
                   "Cannot preflight ~/.ssh/config: path is too long");
         goto done;
     }
-    if (read_ssh_config_at(dir_fd, ssh_config_path, &buf, &buf_len,
+    if (read_ssh_config_at(directory.dir_fd, ssh_config_path, &buf, &buf_len,
                            &config_existed, &config_identity,
                            &pinned_config_fd) != 0) {
         goto done;
@@ -4382,9 +4545,14 @@ done:
                          "Failed to close preflighted SSH config");
         rc = -1;
     }
-    if (dir_fd >= 0 && close(dir_fd) != 0 && rc == 0) {
+    if (directory.dir_fd >= 0 && close(directory.dir_fd) != 0 && rc == 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to close preflighted SSH config directory");
+        rc = -1;
+    }
+    if (directory.home_fd >= 0 && close(directory.home_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close preflighted SSH config HOME");
         rc = -1;
     }
     return rc;
@@ -4395,7 +4563,7 @@ done:
  * then fsync the directory entry. A post-rename verification/sync failure is
  * explicitly reported as changed/uncertain; callers must never claim success. */
 static int ssh_write_config_atomic_at(
-    int dir_fd, const char *dir_path, const struct stat *dir_identity,
+    const char *home, const ssh_config_directory_t *directory,
     const char *display_path, const char *content, size_t content_len,
     bool config_existed, const struct stat *config_identity,
     int pinned_config_fd, const char *original_content,
@@ -4409,6 +4577,8 @@ static int ssh_write_config_atomic_at(
     struct stat current_temp;
     struct stat installed;
     size_t written = 0;
+    int dir_fd = directory->dir_fd;
+    const char *dir_path = directory->path;
     int fd = -1;
     bool have_temp_identity = false;
     bool temp_registered = false;
@@ -4494,7 +4664,7 @@ static int ssh_write_config_atomic_at(
         set_error(ERR_FILE_IO, "Injected SSH config commit interruption");
         goto fail;
     }
-    if (recheck_ssh_config_directory(dir_path, dir_identity) != 0 ||
+    if (recheck_ssh_config_directory(home, directory) != 0 ||
         ssh_config_recheck_before_rename(dir_fd, display_path, config_existed,
                                          config_identity,
                                          pinned_config_fd,
@@ -4528,7 +4698,7 @@ static int ssh_write_config_atomic_at(
                   "their public identity is uncertain");
         return -1;
     }
-    if (recheck_ssh_config_directory(dir_path, dir_identity) != 0 ||
+    if (recheck_ssh_config_directory(home, directory) != 0 ||
         fstatat(dir_fd, "config", &installed, AT_SYMLINK_NOFOLLOW) != 0 ||
         !same_installed_ssh_config(&temp_identity, &installed)) {
         set_error(ERR_FILE_IO,
@@ -4571,19 +4741,16 @@ fail:
  * nothing ever deleted a managed block. No-op if the config or the block is
  * absent. Returns 0 on success (including no-op), -1 on I/O failure. */
 int ssh_remove_host_alias(const char *alias) {
-    char ssh_config_dir[MAX_PATH_LEN];
     char ssh_config_path[MAX_PATH_LEN];
     char *buf = NULL;
     char *filtered = NULL;
     const char *home = getenv("HOME");
-    struct stat dir_identity;
     struct stat config_identity;
+    ssh_config_directory_t directory;
     size_t buf_len = 0;
     size_t filtered_len = 0;
     size_t removed = 0;
-    bool dir_absent = false;
     bool config_existed;
-    int dir_fd = -1;
     int config_lock_fd = -1;
     int pinned_config_fd = -1;
     int rc = -1;
@@ -4599,11 +4766,8 @@ int ssh_remove_host_alias(const char *alias) {
         set_error(ERR_INVALID_ARGS, "Invalid SSH host alias: %s", alias);
         return -1;
     }
-    dir_fd = open_ssh_config_directory(home, false, ssh_config_dir,
-                                       sizeof(ssh_config_dir), &dir_identity,
-                                       &dir_absent);
-    if (dir_fd < 0) {
-        if (dir_absent) return 0;
+    if (open_ssh_config_directory(home, false, &directory) != 0) {
+        if (directory.absent) return 0;
         return -1;
     }
     /* Serialize the complete read/transform/publish transaction.  Locking only
@@ -4612,18 +4776,19 @@ int ssh_remove_host_alias(const char *alias) {
      * private-lock helper pins the parent and ~/.ssh directory as well as this
      * lock inode, so a namespace replacement cannot create a second unlocked
      * writer domain. */
-    config_lock_fd = lock_private_file_at(dir_fd, ".gitswitch-config.lock");
+    config_lock_fd = lock_private_file_at(directory.dir_fd,
+                                          ".gitswitch-config.lock");
     if (config_lock_fd < 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to lock SSH config transaction");
         goto done;
     }
     if ((size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config",
-                         ssh_config_dir) >= sizeof(ssh_config_path)) {
+                         directory.path) >= sizeof(ssh_config_path)) {
         set_error(ERR_INVALID_PATH, "SSH config path too long");
         goto done;
     }
-    if (read_ssh_config_at(dir_fd, ssh_config_path, &buf, &buf_len,
+    if (read_ssh_config_at(directory.dir_fd, ssh_config_path, &buf, &buf_len,
                            &config_existed, &config_identity,
                            &pinned_config_fd) != 0) {
         goto done;
@@ -4641,7 +4806,7 @@ int ssh_remove_host_alias(const char *alias) {
         goto done;
     }
 
-    if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
+    if (ssh_write_config_atomic_at(home, &directory,
                                    ssh_config_path, filtered, filtered_len,
                                    config_existed, &config_identity,
                                    pinned_config_fd, buf, buf_len, NULL) != 0) {
@@ -4659,9 +4824,14 @@ done:
         rc = -1;
     }
     if (config_lock_fd >= 0) unlock_private_file(config_lock_fd);
-    if (dir_fd >= 0 && close(dir_fd) != 0 && rc == 0) {
+    if (directory.dir_fd >= 0 && close(directory.dir_fd) != 0 && rc == 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to close pinned SSH config directory");
+        rc = -1;
+    }
+    if (directory.home_fd >= 0 && close(directory.home_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close pinned SSH config HOME");
         rc = -1;
     }
     return rc;
@@ -4670,7 +4840,6 @@ done:
 int ssh_configure_host_alias_result(
     const account_t *account,
     ssh_config_publication_state_t *publication) {
-    char ssh_config_dir[MAX_PATH_LEN];
     char ssh_config_path[MAX_PATH_LEN];
     char expanded_key_path[MAX_PATH_LEN];
     char begin_marker[MAX_NAME_LEN + 32];
@@ -4686,11 +4855,12 @@ int ssh_configure_host_alias_result(
     size_t separator_len;
     size_t newbuf_len;
     const char *home = getenv("HOME");
-    struct stat dir_identity;
     struct stat config_identity;
-    bool dir_absent = false;
+    ssh_config_directory_t directory = {
+        .home_fd = -1,
+        .dir_fd = -1
+    };
     bool config_existed;
-    int dir_fd = -1;
     int config_lock_fd = -1;
     int pinned_config_fd = -1;
     int rc = -1;
@@ -4752,23 +4922,21 @@ int ssh_configure_host_alias_result(
         goto done;
     }
 
-    dir_fd = open_ssh_config_directory(home, true, ssh_config_dir,
-                                       sizeof(ssh_config_dir), &dir_identity,
-                                       &dir_absent);
-    if (dir_fd < 0) goto done;
-    config_lock_fd = lock_private_file_at(dir_fd, ".gitswitch-config.lock");
+    if (open_ssh_config_directory(home, true, &directory) != 0) goto done;
+    config_lock_fd = lock_private_file_at(directory.dir_fd,
+                                          ".gitswitch-config.lock");
     if (config_lock_fd < 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to lock SSH config transaction");
         goto done;
     }
     if ((size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config",
-                         ssh_config_dir) >= sizeof(ssh_config_path)) {
+                         directory.path) >= sizeof(ssh_config_path)) {
         set_error(ERR_INVALID_PATH, "SSH config path too long");
         goto done;
     }
 
-    if (read_ssh_config_at(dir_fd, ssh_config_path, &buf, &buf_len,
+    if (read_ssh_config_at(directory.dir_fd, ssh_config_path, &buf, &buf_len,
                            &config_existed, &config_identity,
                            &pinned_config_fd) != 0) {
         goto done;
@@ -4824,10 +4992,21 @@ int ssh_configure_host_alias_result(
         goto done;
     }
 
+    /* A failed or interrupted first-creation HOME sync can leave an empty
+     * .ssh in the live namespace without proving that entry crash-durable.
+     * There is no trustworthy on-disk provenance marker that distinguishes
+     * that residue from an older config-less .ssh, so the first config
+     * publication conservatively re-syncs HOME unless this call already
+     * proved the parent sync. */
+    if (!config_existed && !directory.home_entry_synced &&
+        sync_ssh_home_entry(home, &directory) != 0) {
+        goto done;
+    }
+
     /* Install atomically at 0600 via the shared writer (AR-06 F15 factored the
      * mkstemp + checked-write/fsync + recheck + rename dance out so remove can
      * reuse it). */
-    if (ssh_write_config_atomic_at(dir_fd, ssh_config_dir, &dir_identity,
+    if (ssh_write_config_atomic_at(home, &directory,
                                    ssh_config_path, newbuf, newbuf_len,
                                    config_existed, &config_identity,
                                    pinned_config_fd, buf, buf_len,
@@ -4850,9 +5029,14 @@ done:
         rc = -1;
     }
     if (config_lock_fd >= 0) unlock_private_file(config_lock_fd);
-    if (dir_fd >= 0 && close(dir_fd) != 0 && rc == 0) {
+    if (directory.dir_fd >= 0 && close(directory.dir_fd) != 0 && rc == 0) {
         set_system_error(ERR_FILE_IO,
                          "Failed to close pinned SSH config directory");
+        rc = -1;
+    }
+    if (directory.home_fd >= 0 && close(directory.home_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close pinned SSH config HOME");
         rc = -1;
     }
     return rc;

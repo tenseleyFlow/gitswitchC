@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -32,22 +33,58 @@
 #define END_MARK "# <<< gitswitch " TEST_ALIAS " <<<"
 
 static int g_dirsync_calls;
+#define DIRSYNC_OBSERVATION_MAX 4
+static struct stat g_dirsync_observations[DIRSYNC_OBSERVATION_MAX];
+static size_t g_dirsync_observation_count;
+static struct stat g_expected_home_identity;
+static bool g_fail_home_dirsync;
+static char g_public_home_link[MAX_PATH_LEN];
+static char g_replacement_home[MAX_PATH_LEN];
+static bool g_home_create_retarget_succeeded;
 static char g_public_ssh_dir[MAX_PATH_LEN];
 static char g_moved_ssh_dir[MAX_PATH_LEN];
 static int g_transaction_ready_fd = -1;
 static int g_transaction_release_fd = -1;
 static int g_transaction_commit_fd = -1;
 
+static int setup_home_without_ssh(char home[96],
+                                  char config[MAX_PATH_LEN]) {
+    snprintf(home, 96, "/tmp/gswar07sshcfgXXXXXX");
+    if (!ts_mkdtemp(home) || setenv("HOME", home, 1) != 0) return -1;
+    if ((size_t)snprintf(config, MAX_PATH_LEN, "%s/.ssh/config", home) >=
+        MAX_PATH_LEN) {
+        return -1;
+    }
+    return 0;
+}
+
 static int setup_home(char home[96], char config[MAX_PATH_LEN]) {
     char ssh_dir[MAX_PATH_LEN];
 
-    snprintf(home, 96, "/tmp/gswar07sshcfgXXXXXX");
-    if (!ts_mkdtemp(home) || setenv("HOME", home, 1) != 0) return -1;
-    if ((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) >=
+    if (setup_home_without_ssh(home, config) != 0 ||
+        (size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) >=
             sizeof(ssh_dir) ||
-        mkdir(ssh_dir, 0700) != 0 ||
-        (size_t)snprintf(config, MAX_PATH_LEN, "%s/config", ssh_dir) >=
-            MAX_PATH_LEN) {
+        mkdir(ssh_dir, 0700) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int setup_symlinked_home(char root[96],
+                                char real_home[MAX_PATH_LEN],
+                                char public_home[MAX_PATH_LEN],
+                                char config[MAX_PATH_LEN]) {
+    snprintf(root, 96, "/tmp/gswar07sshlinkXXXXXX");
+    if (!ts_mkdtemp(root) ||
+        (size_t)snprintf(real_home, MAX_PATH_LEN, "%s/real", root) >=
+            MAX_PATH_LEN ||
+        (size_t)snprintf(public_home, MAX_PATH_LEN, "%s/home", root) >=
+            MAX_PATH_LEN ||
+        mkdir(real_home, 0700) != 0 ||
+        symlink(real_home, public_home) != 0 ||
+        setenv("HOME", public_home, 1) != 0 ||
+        (size_t)snprintf(config, MAX_PATH_LEN, "%s/.ssh/config",
+                         public_home) >= MAX_PATH_LEN) {
         return -1;
     }
     return 0;
@@ -198,6 +235,58 @@ static int fail_dirsync(int dir_fd) {
     g_dirsync_calls++;
     errno = EIO;
     return -1;
+}
+
+static void reset_dirsync_observations(const struct stat *home_identity,
+                                       bool fail_home) {
+    memset(g_dirsync_observations, 0, sizeof(g_dirsync_observations));
+    g_dirsync_observation_count = 0;
+    g_expected_home_identity = *home_identity;
+    g_fail_home_dirsync = fail_home;
+}
+
+static int observe_dirsync(int dir_fd) {
+    struct stat identity;
+
+    if (fstat(dir_fd, &identity) != 0) return -1;
+    if (g_dirsync_observation_count >= DIRSYNC_OBSERVATION_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    g_dirsync_observations[g_dirsync_observation_count++] = identity;
+    if (g_fail_home_dirsync &&
+        ts_same_identity(&identity, &g_expected_home_identity)) {
+        errno = EIO;
+        return -1;
+    }
+    return fsync(dir_fd);
+}
+
+static int retarget_home_during_dirsync(int dir_fd) {
+    struct stat identity;
+
+    if (fstat(dir_fd, &identity) != 0) return -1;
+    if (g_dirsync_observation_count >= DIRSYNC_OBSERVATION_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    g_dirsync_observations[g_dirsync_observation_count++] = identity;
+    if (ts_same_identity(&identity, &g_expected_home_identity)) {
+        if (unlink(g_public_home_link) != 0 ||
+            symlink(g_replacement_home, g_public_home_link) != 0) {
+            return -1;
+        }
+    }
+    return fsync(dir_fd);
+}
+
+static bool retarget_home_before_ssh_create(
+    ssh_metadata_test_stage_t stage) {
+    if (stage != SSH_METADATA_TEST_CONFIG_HOME_CREATE) return false;
+    g_home_create_retarget_succeeded =
+        unlink(g_public_home_link) == 0 &&
+        symlink(g_replacement_home, g_public_home_link) == 0;
+    return false;
 }
 
 static int fail_postrename_verification(int dir_fd) {
@@ -776,6 +865,369 @@ TEST(byte_identical_config_skips_all_write_and_sync_work) {
     CHECK(same_mtime(&before, &after));
 }
 
+TEST(first_ssh_directory_syncs_home_before_child) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat ssh_identity;
+    struct stat config_identity;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous;
+    size_t length = 0;
+    char *content;
+    int before;
+
+    CHECK_EQ_INT(setup_home_without_ssh(home, config), 0);
+    CHECK_EQ_INT(stat(home, &home_identity), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    before = test_open_fd_count();
+    reset_dirsync_observations(&home_identity, false);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    CHECK_EQ_INT(g_dirsync_observation_count, 2);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    CHECK_EQ_INT(lstat(ssh_dir, &ssh_identity), 0);
+    CHECK(S_ISDIR(ssh_identity.st_mode));
+    CHECK_EQ_INT(ssh_identity.st_uid, getuid());
+    CHECK_EQ_INT(ssh_identity.st_mode & 0777, 0700);
+    CHECK(ts_same_identity(&g_dirsync_observations[1], &ssh_identity));
+    CHECK_EQ_INT(lstat(config, &config_identity), 0);
+    CHECK(S_ISREG(config_identity.st_mode));
+    CHECK_EQ_INT(config_identity.st_mode & 0777, 0600);
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 1);
+        CHECK_EQ_INT(count_text(content, END_MARK), 1);
+        free(content);
+    }
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(first_ssh_directory_home_sync_failure_is_preinstall_and_retryable) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN], lock_path[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat ssh_identity;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous;
+    size_t length = 0;
+    char *content;
+    int before;
+
+    CHECK_EQ_INT(setup_home_without_ssh(home, config), 0);
+    CHECK_EQ_INT(stat(home, &home_identity), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path),
+                           "%s/.gitswitch-config.lock", ssh_dir) <
+          sizeof(lock_path));
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    before = test_open_fd_count();
+    reset_dirsync_observations(&home_identity, true);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK_EQ_INT(failure.system_errno, EIO);
+    CHECK(strstr(failure.message, "HOME") != NULL);
+    CHECK(strstr(failure.message, "uncertain") != NULL);
+    CHECK_EQ_INT(g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    CHECK_EQ_INT(lstat(ssh_dir, &ssh_identity), 0);
+    CHECK(S_ISDIR(ssh_identity.st_mode));
+    CHECK_EQ_INT(ssh_identity.st_uid, getuid());
+    CHECK_EQ_INT(ssh_identity.st_mode & 0777, 0700);
+    errno = 0;
+    CHECK(access(config, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(lock_path, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+
+    /* The retained directory from the failed attempt is not proof that its
+     * HOME entry became durable. A retry creating the first config must
+     * re-establish the parent sync before publishing inside the child. */
+    reset_dirsync_observations(&home_identity, false);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    CHECK_EQ_INT(g_dirsync_observation_count, 2);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    CHECK(ts_same_identity(&g_dirsync_observations[1], &ssh_identity));
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 1);
+        free(content);
+    }
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(existing_ssh_directory_syncs_only_child) {
+    static const char original[] = "Host existing\n  User preserved\n";
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat ssh_identity;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous;
+    size_t length = 0;
+    char *content;
+    int before;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
+    CHECK_EQ_INT(stat(home, &home_identity), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(stat(ssh_dir, &ssh_identity), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    before = test_open_fd_count();
+    reset_dirsync_observations(&home_identity, false);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    CHECK_EQ_INT(g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &ssh_identity));
+    CHECK(!ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    content = read_bytes(config, &length);
+    CHECK(content != NULL);
+    if (content) {
+        CHECK(strstr(content, "Host existing\n") != NULL);
+        CHECK_EQ_INT(count_text(content, BEGIN_MARK), 1);
+        free(content);
+    }
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(configless_existing_ssh_syncs_parent_before_first_publication) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat ssh_identity;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous;
+
+    CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(stat(home, &home_identity), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK_EQ_INT(stat(ssh_dir, &ssh_identity), 0);
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+
+    reset_dirsync_observations(&home_identity, false);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    CHECK_EQ_INT(g_dirsync_observation_count, 2);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    CHECK(ts_same_identity(&g_dirsync_observations[1], &ssh_identity));
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+}
+
+TEST(symlinked_home_first_publication_syncs_resolved_parent) {
+    char root[96];
+    char real_home[MAX_PATH_LEN], public_home[MAX_PATH_LEN];
+    char config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat ssh_identity;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous;
+    int before;
+
+    CHECK_EQ_INT(setup_symlinked_home(root, real_home, public_home, config), 0);
+    CHECK_EQ_INT(stat(real_home, &home_identity), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", real_home) <
+          sizeof(ssh_dir));
+    snprintf(key, sizeof(key), "%s/id", root);
+    make_account(&account, key);
+
+    before = test_open_fd_count();
+    reset_dirsync_observations(&home_identity, false);
+    previous = ssh_manager_set_dirsync_fn(observe_dirsync);
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), 0);
+    ssh_manager_set_dirsync_fn(previous);
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    CHECK_EQ_INT(g_dirsync_observation_count, 2);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    CHECK_EQ_INT(stat(ssh_dir, &ssh_identity), 0);
+    CHECK(ts_same_identity(&g_dirsync_observations[1], &ssh_identity));
+    CHECK_EQ_INT(access(config, F_OK), 0);
+    CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(descriptor_relative_first_creation_ignores_home_retarget) {
+    char root[96];
+    char real_home[MAX_PATH_LEN], public_home[MAX_PATH_LEN];
+    char config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char original_ssh[MAX_PATH_LEN], original_config[MAX_PATH_LEN];
+    char replacement_ssh[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat ssh_identity;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_dirsync_fn previous_sync;
+    int before;
+
+    CHECK_EQ_INT(setup_symlinked_home(root, real_home, public_home, config), 0);
+    CHECK((size_t)snprintf(g_replacement_home,
+                           sizeof(g_replacement_home), "%s/replacement",
+                           root) < sizeof(g_replacement_home));
+    CHECK_EQ_INT(mkdir(g_replacement_home, 0700), 0);
+    CHECK_EQ_INT(stat(real_home, &home_identity), 0);
+    CHECK((size_t)snprintf(g_public_home_link,
+                           sizeof(g_public_home_link), "%s", public_home) <
+          sizeof(g_public_home_link));
+    CHECK((size_t)snprintf(original_ssh, sizeof(original_ssh), "%s/.ssh",
+                           real_home) < sizeof(original_ssh));
+    CHECK((size_t)snprintf(original_config, sizeof(original_config),
+                           "%s/config", original_ssh) <
+          sizeof(original_config));
+    CHECK((size_t)snprintf(replacement_ssh, sizeof(replacement_ssh),
+                           "%s/.ssh", g_replacement_home) <
+          sizeof(replacement_ssh));
+    snprintf(key, sizeof(key), "%s/id", root);
+    make_account(&account, key);
+
+    before = test_open_fd_count();
+    g_home_create_retarget_succeeded = false;
+    reset_dirsync_observations(&home_identity, false);
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        retarget_home_before_ssh_create);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+    g_public_home_link[0] = '\0';
+    g_replacement_home[0] = '\0';
+
+    CHECK(g_home_create_retarget_succeeded);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK(strstr(failure.message, "HOME changed") != NULL);
+    CHECK_EQ_INT(g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    CHECK_EQ_INT(lstat(original_ssh, &ssh_identity), 0);
+    CHECK(S_ISDIR(ssh_identity.st_mode));
+    CHECK_EQ_INT(ssh_identity.st_uid, getuid());
+    CHECK_EQ_INT(ssh_identity.st_mode & 0777, 0700);
+    errno = 0;
+    CHECK(access(original_config, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(original_ssh), 0);
+    errno = 0;
+    CHECK(access(replacement_ssh, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
+TEST(symlinked_home_retarget_during_parent_sync_fails_preinstall) {
+    char root[96];
+    char real_home[MAX_PATH_LEN], public_home[MAX_PATH_LEN];
+    char config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char original_ssh[MAX_PATH_LEN], original_config[MAX_PATH_LEN];
+    char original_lock[MAX_PATH_LEN], replacement_ssh[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat replacement_identity;
+    struct stat public_identity;
+    struct stat ssh_identity;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous;
+    int before;
+
+    CHECK_EQ_INT(setup_symlinked_home(root, real_home, public_home, config), 0);
+    CHECK((size_t)snprintf(g_replacement_home,
+                           sizeof(g_replacement_home), "%s/replacement",
+                           root) < sizeof(g_replacement_home));
+    CHECK_EQ_INT(mkdir(g_replacement_home, 0700), 0);
+    CHECK_EQ_INT(stat(real_home, &home_identity), 0);
+    CHECK_EQ_INT(stat(g_replacement_home, &replacement_identity), 0);
+    CHECK((size_t)snprintf(g_public_home_link,
+                           sizeof(g_public_home_link), "%s", public_home) <
+          sizeof(g_public_home_link));
+    CHECK((size_t)snprintf(original_ssh, sizeof(original_ssh), "%s/.ssh",
+                           real_home) < sizeof(original_ssh));
+    CHECK((size_t)snprintf(original_config, sizeof(original_config),
+                           "%s/config", original_ssh) <
+          sizeof(original_config));
+    CHECK((size_t)snprintf(original_lock, sizeof(original_lock),
+                           "%s/.gitswitch-config.lock", original_ssh) <
+          sizeof(original_lock));
+    CHECK((size_t)snprintf(replacement_ssh, sizeof(replacement_ssh),
+                           "%s/.ssh", g_replacement_home) <
+          sizeof(replacement_ssh));
+    snprintf(key, sizeof(key), "%s/id", root);
+    make_account(&account, key);
+
+    before = test_open_fd_count();
+    reset_dirsync_observations(&home_identity, false);
+    previous = ssh_manager_set_dirsync_fn(retarget_home_during_dirsync);
+    clear_error();
+    CHECK_EQ_INT(ssh_configure_host_alias_result(&account, &publication), -1);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous);
+    g_public_home_link[0] = '\0';
+    g_replacement_home[0] = '\0';
+
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK(strstr(failure.message, "HOME changed") != NULL);
+    CHECK_EQ_INT(g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &home_identity));
+    CHECK_EQ_INT(stat(public_home, &public_identity), 0);
+    CHECK(ts_same_identity(&public_identity, &replacement_identity));
+    CHECK_EQ_INT(lstat(original_ssh, &ssh_identity), 0);
+    CHECK(S_ISDIR(ssh_identity.st_mode));
+    CHECK_EQ_INT(ssh_identity.st_uid, getuid());
+    CHECK_EQ_INT(ssh_identity.st_mode & 0777, 0700);
+    errno = 0;
+    CHECK(access(original_config, F_OK) != 0 && errno == ENOENT);
+    errno = 0;
+    CHECK(access(original_lock, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(count_temps_in(original_ssh), 0);
+    errno = 0;
+    CHECK(access(replacement_ssh, F_OK) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
 TEST(config_registration_failure_is_atomic_and_retryable) {
     char scratch[TEST_SCRATCH_PROBE_MAX][TEST_SCRATCH_PATH_SIZE];
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
@@ -818,6 +1270,7 @@ TEST(config_registration_failure_is_atomic_and_retryable) {
 }
 
 TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
+    static const char original[] = "Host existing\n  User preserved\n";
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     account_t account;
     ssh_dirsync_fn previous;
@@ -826,6 +1279,7 @@ TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
     char *content;
 
     CHECK_EQ_INT(setup_home(home, config), 0);
+    CHECK_EQ_INT(write_bytes(config, original, sizeof(original) - 1U), 0);
     snprintf(key, sizeof(key), "%s/id", home);
     snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home);
     make_account(&account, key);
@@ -972,6 +1426,109 @@ TEST(pinned_directory_swap_fails_without_touching_replacement_or_leaking_temp) {
     CHECK_EQ_INT(errno, ENOENT);
 }
 
+TEST(first_ssh_creation_waits_for_home_namespace_lock) {
+    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    struct stat identity;
+    int started[2] = {-1, -1};
+    int completed[2] = {-1, -1};
+    int home_lock_fd = -1;
+    pid_t child = -1;
+    int status = 0;
+    int completion_state;
+    bool home_locked = false;
+    bool completed_early = false;
+    int before;
+
+    if (setup_home_without_ssh(home, config) != 0 ||
+        (size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) >=
+            sizeof(ssh_dir)) {
+        CHECK(false);
+        return;
+    }
+    snprintf(key, sizeof(key), "%s/id", home);
+    make_account(&account, key);
+    before = test_open_fd_count();
+    home_lock_fd = open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+    if (home_lock_fd < 0 || flock(home_lock_fd, LOCK_EX) != 0 ||
+        pipe(started) != 0 || pipe(completed) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    home_locked = true;
+
+    child = fork();
+    if (child < 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    if (child == 0) {
+        int rc;
+        int marker_rc;
+
+        close_test_fd(&started[0]);
+        close_test_fd(&completed[0]);
+        close_test_fd(&home_lock_fd);
+        if (write_marker(started[1], 's') != 0) _exit(10);
+        close_test_fd(&started[1]);
+        rc = ssh_configure_host_alias(&account);
+        marker_rc = rc == 0 ? write_marker(completed[1], 'd') : -1;
+        close_test_fd(&completed[1]);
+        _exit(rc == 0 && marker_rc == 0 ? 0 : 11);
+    }
+
+    close_test_fd(&started[1]);
+    close_test_fd(&completed[1]);
+    if (wait_readable(started[0], 5000) != 1 ||
+        read_marker(started[0]) != 0) {
+        CHECK(false);
+        goto cleanup;
+    }
+    close_test_fd(&started[0]);
+
+    completion_state = wait_readable(completed[0], 1000);
+    CHECK_EQ_INT(completion_state, 0);
+    if (completion_state == 1) {
+        completed_early = true;
+        CHECK_EQ_INT(read_marker(completed[0]), 0);
+    }
+    errno = 0;
+    CHECK(lstat(ssh_dir, &identity) != 0 && errno == ENOENT);
+
+    CHECK_EQ_INT(flock(home_lock_fd, LOCK_UN), 0);
+    home_locked = false;
+    close_test_fd(&home_lock_fd);
+    if (!completed_early) {
+        completion_state = wait_readable(completed[0], 5000);
+        CHECK_EQ_INT(completion_state, 1);
+        if (completion_state == 1) {
+            CHECK_EQ_INT(read_marker(completed[0]), 0);
+        }
+    }
+    close_test_fd(&completed[0]);
+    CHECK_EQ_INT(wait_child(child, &status, 5000), 0);
+    child = -1;
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK_EQ_INT(lstat(ssh_dir, &identity), 0);
+    CHECK(S_ISDIR(identity.st_mode));
+    CHECK_EQ_INT(access(config, F_OK), 0);
+
+cleanup:
+    if (home_locked && home_lock_fd >= 0) {
+        (void)flock(home_lock_fd, LOCK_UN);
+    }
+    close_test_fd(&home_lock_fd);
+    close_test_fd(&started[0]);
+    close_test_fd(&started[1]);
+    close_test_fd(&completed[0]);
+    close_test_fd(&completed[1]);
+    if (child > 0) {
+        CHECK_EQ_INT(wait_child(child, &status, 5000), 0);
+    }
+    CHECK_EQ_INT(test_open_fd_count(), before);
+}
+
 TEST(config_transaction_lock_prevents_two_process_lost_update) {
     char home[96], config[MAX_PATH_LEN];
     char first_key[MAX_PATH_LEN], second_key[MAX_PATH_LEN];
@@ -995,7 +1552,7 @@ TEST(config_transaction_lock_prevents_two_process_lost_update) {
     struct stat before;
     struct stat after;
 
-    if (setup_home(home, config) != 0) {
+    if (setup_home_without_ssh(home, config) != 0) {
         CHECK(false);
         return;
     }
@@ -1174,11 +1731,19 @@ TEST_MAIN_BEGIN()
     RUN_TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes);
     RUN_TEST(crlf_remove_preserves_all_unmanaged_bytes);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
+    RUN_TEST(first_ssh_directory_syncs_home_before_child);
+    RUN_TEST(first_ssh_directory_home_sync_failure_is_preinstall_and_retryable);
+    RUN_TEST(existing_ssh_directory_syncs_only_child);
+    RUN_TEST(configless_existing_ssh_syncs_parent_before_first_publication);
+    RUN_TEST(symlinked_home_first_publication_syncs_resolved_parent);
+    RUN_TEST(descriptor_relative_first_creation_ignores_home_retarget);
+    RUN_TEST(symlinked_home_retarget_during_parent_sync_fails_preinstall);
     RUN_TEST(config_registration_failure_is_atomic_and_retryable);
     RUN_TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp);
     RUN_TEST(postrename_verification_failure_reports_installed_unverified);
     RUN_TEST(ctime_only_drift_revalidates_exact_pinned_bytes);
     RUN_TEST(ctime_only_metadata_shape_does_not_hide_content_change);
     RUN_TEST(pinned_directory_swap_fails_without_touching_replacement_or_leaking_temp);
+    RUN_TEST(first_ssh_creation_waits_for_home_namespace_lock);
     RUN_TEST(config_transaction_lock_prevents_two_process_lost_update);
 TEST_MAIN_END()

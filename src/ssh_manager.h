@@ -78,7 +78,8 @@ typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
 typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
 typedef enum {
     SSH_METADATA_TEST_RUNTIME_PIN = 1,
-    SSH_METADATA_TEST_RESET_QUARANTINE
+    SSH_METADATA_TEST_RESET_QUARANTINE,
+    SSH_METADATA_TEST_CONFIG_HOME_CREATE
 } ssh_metadata_test_stage_t;
 typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
