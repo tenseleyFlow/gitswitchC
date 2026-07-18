@@ -3112,29 +3112,69 @@ static command_result_t handle_reset_command(gitswitch_ctx_t *ctx,
         return result;
     }
 
-    if (target) {
-        printf("This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
-               "'%s', removing its on-disk secret-key copy.\n", target);
-    } else {
-        printf("This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
-               "homes, removing every on-disk secret-key copy.\n");
-    }
-
     /* This is the most destructive operation (it deletes the exported
      * secret-key copies), so require a typed 'yes' — matching remove and
      * stronger than a bare 'y', which is easy to hit by muscle memory. --yes
      * skips the prompt for scripting. */
     if (!ctx->config.assume_yes) {
-        printf("Type 'yes' to continue: ");
-        fflush(stdout);
+        char confirmation_prompt[MAX_NAME_LEN + 256];
+        int confirmed;
+        int prompt_length;
+
+        if (target) {
+            prompt_length = snprintf(
+                confirmation_prompt, sizeof(confirmation_prompt),
+                "This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
+                "'%s', removing its on-disk secret-key copy.\n"
+                "Type 'yes' to continue: ", target);
+        } else {
+            prompt_length = snprintf(
+                confirmation_prompt, sizeof(confirmation_prompt),
+                "This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
+                "homes, removing every on-disk secret-key copy.\n"
+                "Type 'yes' to continue: ");
+        }
+        if (prompt_length < 0 ||
+            (size_t)prompt_length >= sizeof(confirmation_prompt)) {
+            set_error(ERR_UNKNOWN,
+                      "Failed to format the reset confirmation prompt");
+            display_error("Cannot confirm reset", "%s",
+                          get_last_error()->message);
+            return result;
+        }
+
         /* AR-10 L20: shared exact-'yes' rule; this site previously applied
-         * no whitespace trimming at all. EOF/read failure stays a polite
-         * cancel — nothing has been destroyed yet. */
-        if (prompt_confirm_exact_yes() != 1) {
+         * no whitespace trimming at all. Clean EOF stays a polite cancel;
+         * an input/output failure is a command failure. Nothing has been
+         * destroyed at either boundary. */
+        confirmed = prompt_confirm_exact_yes_prompt(confirmation_prompt);
+        if (confirmed == PROMPT_LINE_ERROR) {
+            error_context_t confirmation_error;
+            int confirmation_errno = errno != 0 ? errno : EIO;
+
+            errno = confirmation_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Failed to display or read reset confirmation");
+            confirmation_error = *get_last_error();
+            errno = confirmation_errno;
+            display_error("Cannot confirm reset", "%s",
+                          confirmation_error.message);
+            g_last_error = confirmation_error;
+            errno = confirmation_errno;
+            return result;
+        }
+        if (confirmed != 1) {
             printf("Reset cancelled.\n");
             result.status = EXIT_SUCCESS;
             return result;
         }
+    } else if (target) {
+        printf("This kills the SSH/GPG agents and deletes the isolated GPG home for\n"
+               "'%s', removing its on-disk secret-key copy.\n", target);
+    } else {
+        printf("This kills ALL gitswitch SSH/GPG agents and deletes ALL isolated GPG\n"
+               "homes, removing every on-disk secret-key copy.\n");
     }
 
     /* From the instant the destructive operation is confirmed until the

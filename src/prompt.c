@@ -27,6 +27,48 @@ static int prompt_drain_line(void) {
                                         : PROMPT_LINE_OK;
 }
 
+/* A prompt is part of an interactive authorization exchange, not decorative
+ * output.  Finish every byte before touching stdin so an affirmative answer
+ * cannot authorize work after the warning or prompt was lost.  Keep this
+ * helper observational: callers own the user-facing error context, while the
+ * first output errno remains available for a truthful system diagnostic. */
+static int prompt_emit_checked(const char *prompt) {
+    int saved_errno = 0;
+    bool failed = false;
+
+    if (ferror(stdout)) {
+        /* A FILE error indicator has no portable association with the errno
+         * from the operation that first set it.  Do not misreport whatever
+         * unrelated errno happens to be ambient now. */
+        saved_errno = EIO;
+        failed = true;
+    }
+    if (!failed && prompt) {
+        int write_result;
+
+        errno = 0;
+        write_result = fputs(prompt, stdout);
+        if (write_result == EOF || ferror(stdout)) {
+            saved_errno = errno;
+            failed = true;
+        }
+    }
+    if (!failed) {
+        int flush_result;
+
+        errno = 0;
+        flush_result = fflush(stdout);
+        if (flush_result != 0 || ferror(stdout)) {
+            saved_errno = errno;
+            failed = true;
+        }
+    }
+    if (!failed) return PROMPT_LINE_OK;
+
+    errno = saved_errno != 0 ? saved_errno : EIO;
+    return PROMPT_LINE_ERROR;
+}
+
 /* Byte-wise reader instead of fgets (AR-10 L32): fgets gives no length back,
  * so an embedded NUL hid the newline fgets HAD consumed from the strchr scan
  * — the "is the next byte a newline?" probe then ate the first byte of the
@@ -40,9 +82,8 @@ static int prompt_line_stdio(const char *prompt, char *buf, size_t size) {
     if (!buf || size == 0) return PROMPT_LINE_ERROR;
     buf[0] = '\0';
 
-    if (prompt) {
-        fputs(prompt, stdout);
-        fflush(stdout);
+    if (prompt_emit_checked(prompt) != PROMPT_LINE_OK) {
+        return PROMPT_LINE_ERROR;
     }
 
     for (;;) {
@@ -93,13 +134,22 @@ static int prompt_line_stdio(const char *prompt, char *buf, size_t size) {
 /* See prompt.h (AR-10 L20). Deliberately the plain stdio reader on every
  * build: a final destructive confirmation gains nothing from line editing,
  * and identical byte-level semantics across builds matter more. */
-int prompt_confirm_exact_yes(void) {
+int prompt_confirm_exact_yes_prompt(const char *prompt) {
     char input[64];
-    int result = prompt_line_stdio(NULL, input, sizeof(input));
+    int result = prompt_line_stdio(prompt, input, sizeof(input));
 
     if (result == PROMPT_LINE_TRUNCATED) return 0;
-    if (result != PROMPT_LINE_OK) return -1;
+    if (result != PROMPT_LINE_OK) return result;
     return strcmp(input, "yes") == 0 ? 1 : 0;
+}
+
+int prompt_confirm_exact_yes(void) {
+    int result = prompt_confirm_exact_yes_prompt(NULL);
+
+    /* Preserve the original public contract for existing callers.  New
+     * authorization sites use the detailed sibling above when they need to
+     * distinguish clean EOF from an input/output failure. */
+    return result < 0 ? -1 : result;
 }
 
 #ifdef HAVE_READLINE

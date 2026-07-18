@@ -26,12 +26,17 @@ typedef enum {
  * as a successful prefix. Every non-success result leaves buf empty. */
 int prompt_line(const char *prompt, char *buf, size_t size, bool path_completion);
 
-/* AR-10 L20: THE confirmation rule for destructive operations. The caller
- * prints its own warning/prompt text; this reads one line from stdin and
- * returns 1 only for the exact word "yes" after trimming surrounding
- * whitespace, 0 for any other answer (including an overlong line), and -1
- * when no answer could be read (EOF or input error). The three former
- * open-coded confirmations disagreed on leading-whitespace handling. */
+/* Checked destructive-confirmation variant. The complete prompt is flushed
+ * before stdin is touched. Returns 1 only for exact `yes`, 0 for any other or
+ * overlong answer, PROMPT_LINE_EOF for clean EOF, and PROMPT_LINE_ERROR for a
+ * prompt-output or input failure while preserving the causal errno. */
+int prompt_confirm_exact_yes_prompt(const char *prompt);
+
+/* AR-10 L20 compatibility entry point for the shared exact-yes rule. It
+ * flushes any caller-emitted warning/prompt before reading, returns 1 only for
+ * exact `yes` after surrounding-whitespace trimming, 0 for any other or
+ * overlong answer, and -1 for EOF or input/output failure. New destructive
+ * callers use the detailed variant above. */
 int prompt_confirm_exact_yes(void);
 
 #endif /* PROMPT_H */

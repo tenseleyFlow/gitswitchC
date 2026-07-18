@@ -2941,9 +2941,20 @@ static int account_prompt_line(const char *prompt_text, char *input,
 static int account_read_prompt(const char *prompt_text, char *input,
                                size_t input_size, bool path_completion,
                                const char *field) {
-    if (account_prompt_line(prompt_text, input, input_size, path_completion) !=
-        PROMPT_LINE_OK) {
-        set_error(ERR_FILE_IO, "Failed to read %s", field);
+    int result = account_prompt_line(prompt_text, input, input_size,
+                                     path_completion);
+
+    if (result != PROMPT_LINE_OK) {
+        if (result == PROMPT_LINE_ERROR) {
+            int prompt_errno = errno != 0 ? errno : EIO;
+
+            errno = prompt_errno;
+            set_system_error(ERR_FILE_IO, "Failed to display or read %s",
+                             field);
+            errno = prompt_errno;
+        } else {
+            set_error(ERR_FILE_IO, "Failed to read %s", field);
+        }
         return -1;
     }
     return 0;
@@ -3585,15 +3596,29 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     if (!ctx->config.assume_yes) {
         int confirmed;
 
-        printf("\n[WARN]: This will permanently remove the account from configuration.\n");
-        printf("Are you sure? (type 'yes' to confirm): ");
-        fflush(stdout);
-
-        confirmed = prompt_confirm_exact_yes();
+        confirmed = prompt_confirm_exact_yes_prompt(
+            "\n[WARN]: This will permanently remove the account from configuration.\n"
+            "Are you sure? (type 'yes' to confirm): ");
         if (confirmed < 0) {
-            set_error(ERR_FILE_IO, "Failed to read confirmation");
+            error_context_t confirmation_error;
+            int confirmation_errno;
+
+            if (confirmed == PROMPT_LINE_ERROR) {
+                confirmation_errno = errno != 0 ? errno : EIO;
+                errno = confirmation_errno;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Failed to display or read removal confirmation");
+                errno = confirmation_errno;
+            } else {
+                set_error(ERR_FILE_IO, "Failed to read confirmation");
+                confirmation_errno = errno;
+            }
+            confirmation_error = *get_last_error();
             (void)accounts_transaction_finish(
                 ctx, ACCOUNTS_TRANSACTION_REMOVE, token);
+            g_last_error = confirmation_error;
+            errno = confirmation_errno;
             return -1;
         }
         if (confirmed == 0) {

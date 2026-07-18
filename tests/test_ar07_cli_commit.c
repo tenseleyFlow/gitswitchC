@@ -271,16 +271,25 @@ static bool directory_has_exact_entries(const char *path,
     return found_count == expected_count;
 }
 
+static bool modification_timestamp_equal(const struct stat *before,
+                                         const struct stat *after) {
+#ifdef __APPLE__
+    return before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+           before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec;
+#else
+    return before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec;
+#endif
+}
+
 static bool mutation_timestamps_equal(const struct stat *before,
                                       const struct stat *after) {
 #ifdef __APPLE__
-    return before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
-           before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec &&
+    return modification_timestamp_equal(before, after) &&
            before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
            before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
 #else
-    return before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
-           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec &&
+    return modification_timestamp_equal(before, after) &&
            before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
            before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
 #endif
@@ -328,6 +337,18 @@ static bool preserved_metadata_equal(const struct stat *before,
            before->st_gid == after->st_gid &&
            before->st_size == after->st_size &&
            mutation_timestamps_equal(before, after);
+}
+
+static bool preserved_file_identity_equal(const struct stat *before,
+                                          const struct stat *after) {
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_mode == after->st_mode &&
+           before->st_nlink == after->st_nlink &&
+           before->st_uid == after->st_uid &&
+           before->st_gid == after->st_gid &&
+           before->st_size == after->st_size &&
+           modification_timestamp_equal(before, after);
 }
 
 static int snapshot_text_file(const char *path, struct stat *metadata,
@@ -413,6 +434,39 @@ static bool persisted_tree_unchanged(
                                     &after.resume_hint) &&
            preserved_metadata_equal(&before->config_lock,
                                     &after.config_lock) &&
+           preserved_metadata_equal(&before->git_config,
+                                    &after.git_config) &&
+           strcmp(before->accounts_contents, after.accounts_contents) == 0 &&
+           strcmp(before->resume_hint_contents,
+                  after.resume_hint_contents) == 0 &&
+           strcmp(before->config_lock_contents,
+                  after.config_lock_contents) == 0 &&
+           strcmp(before->git_config_contents,
+                  after.git_config_contents) == 0;
+}
+
+/* Mutating command admission revalidates the persistent lock mode before
+ * dispatch and can therefore advance only that inode's ctime.  Authorization
+ * failure must retain its identity/ownership/mode/size/bytes and preserve all
+ * account authority files with exact metadata and contents. */
+static bool persisted_authority_unchanged(
+    const char *home, const char *config_dir,
+    const persisted_tree_snapshot_t *before) {
+    persisted_tree_snapshot_t after;
+
+    if (!before || snapshot_persisted_tree(home, config_dir, &after) != 0) {
+        return false;
+    }
+    return preserved_metadata_equal(&before->home, &after.home) &&
+           preserved_metadata_equal(&before->config_parent,
+                                    &after.config_parent) &&
+           preserved_metadata_equal(&before->config_dir,
+                                    &after.config_dir) &&
+           preserved_metadata_equal(&before->accounts, &after.accounts) &&
+           preserved_metadata_equal(&before->resume_hint,
+                                    &after.resume_hint) &&
+           preserved_file_identity_equal(&before->config_lock,
+                                         &after.config_lock) &&
            preserved_metadata_equal(&before->git_config,
                                     &after.git_config) &&
            strcmp(before->accounts_contents, after.accounts_contents) == 0 &&
@@ -1283,6 +1337,92 @@ TEST(mutation_failures_never_print_final_mutation_success) {
     }
 }
 
+TEST(destructive_prompt_output_failure_blocks_authorization) {
+    static const char *const publish_old[] = {
+        "gitswitch", "--global", "--yes", "switch", "old", NULL
+    };
+    cli_case_t cases[] = {
+        {"remove", {"gitswitch", "remove", "old", NULL}},
+        {"reset", {"gitswitch", "reset", NULL}},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char home[128], publish_runtime[128], runtime[128];
+        char config_dir[4096], output_path[128];
+        char input_path[] = "/tmp/gitswitch-ar11-prompt-input.XXXXXX";
+        persisted_tree_snapshot_t persisted_before;
+        struct stat runtime_before = {0}, runtime_after = {0};
+        bool durable_unchanged;
+        int input_fd;
+        int rc;
+
+        CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                      "gitswitch-ar11-home"), 0);
+        CHECK_EQ_INT(make_private_dir(publish_runtime,
+                                      sizeof(publish_runtime),
+                                      "gitswitch-ar11-publish-run"), 0);
+        CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                      "gitswitch-ar11-run"), 0);
+        CHECK_EQ_INT(write_account_config(home, false, config_dir,
+                                          sizeof(config_dir)), 0);
+
+        /* Successful remove/reset now requires exact durable publication
+         * authority. Seed that authority through the real switch path, but use
+         * a separate runtime root so the authorization-failure assertion starts
+         * from an exactly empty runtime tree. */
+        rc = run_cli(home, publish_runtime, publish_old,
+                     output_path, sizeof(output_path));
+        if (rc != 0) {
+            char output[16384];
+
+            fprintf(stderr,
+                    "  publication setup for prompt-output case '%s' "
+                    "returned %d:\n%s\n",
+                    cases[i].label, rc,
+                    slurp(output_path, output, sizeof(output)));
+        }
+        CHECK_EQ_INT(rc, EXIT_SUCCESS);
+        unlink(output_path);
+
+        CHECK_EQ_INT(snapshot_persisted_tree(home, config_dir,
+                                             &persisted_before), 0);
+        CHECK(directory_empty(runtime));
+        CHECK_EQ_INT(stat(runtime, &runtime_before), 0);
+
+        input_fd = mkstemp(input_path);
+        CHECK(input_fd >= 0);
+        if (input_fd >= 0) {
+            CHECK_EQ_INT(close(input_fd), 0);
+            CHECK_EQ_INT(write_text_mode(input_path, "yes\n", 0600), 0);
+        }
+
+        rc = run_cli_input_posixly(home, runtime, input_path,
+                                   cases[i].argv, POSIXLY_INHERIT,
+                                   CLI_STDOUT_READ_ONLY, output_path,
+                                   sizeof(output_path));
+        if (rc != EXIT_FAILURE) {
+            fprintf(stderr,
+                    "  prompt-output case '%s' returned %d, expected %d\n",
+                    cases[i].label, rc, EXIT_FAILURE);
+        }
+        CHECK_EQ_INT(rc, EXIT_FAILURE);
+        durable_unchanged = persisted_authority_unchanged(
+            home, config_dir, &persisted_before);
+        if (!durable_unchanged) {
+            fprintf(stderr,
+                    "  prompt-output case '%s' changed durable authority\n",
+                    cases[i].label);
+        }
+        CHECK(durable_unchanged);
+        CHECK_EQ_INT(stat(runtime, &runtime_after), 0);
+        CHECK(preserved_metadata_equal(&runtime_before, &runtime_after));
+        CHECK(directory_empty(runtime));
+
+        unlink(input_path);
+        unlink(output_path);
+    }
+}
+
 TEST(switch_save_failure_restores_git_config_active_and_exact_hint) {
     char home[128], runtime[128], config_dir[4096];
     char output_path[128], output[16384], path[8192], contents[16384];
@@ -1536,6 +1676,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(read_only_commands_never_create_or_repair_runtime_manager_lock);
     RUN_TEST(read_only_commands_never_repair_or_replace_wrong_mode_manager_lock);
     RUN_TEST(mutation_failures_never_print_final_mutation_success);
+    RUN_TEST(destructive_prompt_output_failure_blocks_authorization);
     RUN_TEST(switch_save_failure_restores_git_config_active_and_exact_hint);
     RUN_TEST(valid_legacy_switch_migrates_before_publication);
     RUN_TEST(production_ignores_inherited_test_fault_environment);

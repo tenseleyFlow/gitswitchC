@@ -667,7 +667,41 @@ TEST(reset_typed_yes_confirmation_semantics) {
     sandbox_teardown(&sb);
 }
 
-/* 8. Declining the final confirm of add and edit must leave accounts.toml
+/* 8. remove uses the same exact-'yes' rule: a near miss cancels without a
+ *    durable config edit, while a visible prompt followed by exact consent
+ *    removes a genuinely published destination. */
+TEST(remove_typed_yes_confirmation_semantics) {
+    sandbox_t sb;
+    char before[16384], after[16384];
+    size_t before_len, after_len;
+    const char *argv[] = { "gitswitch", "remove", "other", NULL };
+
+    SKIP_IF_NO_PTY();
+    if (sandbox_setup(&sb) != 0) { CHECK(!"sandbox setup failed"); return; }
+
+    before_len = slurp(sb.cfg, before, sizeof(before));
+    CHECK(before_len > 0);
+    if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
+    CHECK_EQ_INT(expect_send(&g_p, "Are you sure? (type 'yes' to confirm):", "y\n"), 0);
+    CHECK_EQ_INT(pty_expect(&g_p, "Account removal cancelled"), 0);
+    CHECK_EQ_INT(pty_wait_exit(&g_p), 0);
+    pty_close(&g_p);
+    after_len = slurp(sb.cfg, after, sizeof(after));
+    CHECK(after_len == before_len && memcmp(before, after, before_len) == 0);
+
+    CHECK_EQ_INT(sandbox_publish_account(&sb, "other"), 0);
+    if (pty_spawn(&g_p, argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
+    CHECK_EQ_INT(expect_send(&g_p, "Are you sure? (type 'yes' to confirm):", "yes\n"), 0);
+    CHECK_EQ_INT(pty_expect(&g_p, "Account removed successfully"), 0);
+    CHECK_EQ_INT(pty_wait_exit(&g_p), 0);
+    pty_close(&g_p);
+    CHECK(slurp(sb.cfg, after, sizeof(after)) > 0);
+    CHECK(strstr(after, "name = \"other\"") == NULL);
+
+    sandbox_teardown(&sb);
+}
+
+/* 9. Declining the final confirm of add and edit must leave accounts.toml
  *    byte-identical (no save, no backup rewrite of the live file). */
 TEST(cancelled_ops_leave_config_byte_identical) {
     sandbox_t sb;
@@ -713,7 +747,7 @@ TEST(cancelled_ops_leave_config_byte_identical) {
     sandbox_teardown(&sb);
 }
 
-/* 9. Invalid name/email/scope answers re-prompt instead of aborting, and the
+/* 10. Invalid name/email/scope answers re-prompt instead of aborting, and the
  *    flow still completes once valid input arrives. */
 TEST(invalid_input_reprompt_loops) {
     sandbox_t sb;
@@ -774,6 +808,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(eof_ctrl_d_cancels_cleanly);
     RUN_TEST(ssh_key_path_tab_completion_and_inhibition);
     RUN_TEST(reset_typed_yes_confirmation_semantics);
+    RUN_TEST(remove_typed_yes_confirmation_semantics);
     RUN_TEST(cancelled_ops_leave_config_byte_identical);
     RUN_TEST(invalid_input_reprompt_loops);
 TEST_MAIN_END()

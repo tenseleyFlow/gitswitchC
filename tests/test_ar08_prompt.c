@@ -10,6 +10,9 @@
 #include "gpg_manager.h"
 #include "prompt.h"
 
+#include <signal.h>
+#include <sys/wait.h>
+
 #ifdef HAVE_READLINE
 #include <readline/readline.h>
 #endif
@@ -40,6 +43,7 @@ static void restore_fd(int target_fd, redirected_stream_t *redirected) {
         redirected->saved_fd = -1;
     }
     if (target_fd == STDIN_FILENO) clearerr(stdin);
+    if (target_fd == STDOUT_FILENO) clearerr(stdout);
 }
 
 static FILE *input_stream(const char *text) {
@@ -62,6 +66,156 @@ static int begin_input(FILE *stream, redirected_stream_t *redirected) {
 
 static void end_input(redirected_stream_t *redirected) {
     restore_fd(STDIN_FILENO, redirected);
+}
+
+/* AR-11 M33: emitting a prompt is part of the authorization boundary. A
+ * caller must never consume a pre-fed affirmative answer after the operator
+ * could not see the prompt, and the low-level prompt reader must leave both
+ * the causal write errno and an unrelated global error report intact. */
+static void exercise_prompt_output_failure(FILE *failure_stream,
+                                           int expected_errno,
+                                           const char *prompt_text) {
+    typedef struct {
+        int result;
+        int saved_errno;
+        int buffer_empty;
+        int error_same;
+    } prompt_failure_result_t;
+
+    FILE *input = input_stream("yes\nnext\n");
+    prompt_failure_result_t child_result = {0};
+    int result_pipe[2] = {-1, -1};
+    off_t input_offset_before = -1;
+    off_t input_offset_after = -1;
+    size_t result_used = 0;
+    int flush_result;
+    int status = 0;
+    pid_t child = -1;
+
+    CHECK(input != NULL);
+    CHECK(failure_stream != NULL);
+    if (!input || !failure_stream) goto cleanup;
+
+    flush_result = fflush(stdout);
+    CHECK_EQ_INT(flush_result, 0);
+    if (flush_result != 0) goto cleanup;
+    CHECK_EQ_INT(pipe(result_pipe), 0);
+    if (result_pipe[0] < 0 || result_pipe[1] < 0) goto cleanup;
+
+    input_offset_before = lseek(fileno(input), 0, SEEK_CUR);
+    CHECK(input_offset_before >= 0);
+    if (input_offset_before < 0) goto cleanup;
+
+    child = fork();
+    CHECK(child >= 0);
+    if (child < 0) goto cleanup;
+    if (child == 0) {
+        char buffer[16] = "secret";
+        error_context_t before_error;
+        error_context_t after_error;
+        size_t written = 0;
+
+        close(result_pipe[0]);
+        if (dup2(fileno(input), STDIN_FILENO) < 0 ||
+            dup2(fileno(failure_stream), STDOUT_FILENO) < 0) {
+            _exit(2);
+        }
+        clearerr(stdin);
+        clearerr(stdout);
+        set_error(ERR_UNKNOWN,
+                  "preserve context across prompt output failure");
+        before_error = *get_last_error();
+        errno = 0;
+        child_result.result = prompt_line(
+            prompt_text, buffer, sizeof(buffer), false);
+        child_result.saved_errno = errno;
+        after_error = *get_last_error();
+        child_result.buffer_empty = buffer[0] == '\0';
+        child_result.error_same =
+            memcmp(&after_error, &before_error, sizeof(before_error)) == 0;
+
+        while (written < sizeof(child_result)) {
+            ssize_t count = write(
+                result_pipe[1],
+                (const char *)&child_result + written,
+                sizeof(child_result) - written);
+
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) _exit(3);
+            written += (size_t)count;
+        }
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    result_pipe[1] = -1;
+    while (result_used < sizeof(child_result)) {
+        ssize_t count = read(
+            result_pipe[0], (char *)&child_result + result_used,
+            sizeof(child_result) - result_used);
+
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        result_used += (size_t)count;
+    }
+    {
+        pid_t waited = waitpid(child, &status, 0);
+
+        CHECK(waited == child);
+        if (waited != child) goto cleanup;
+    }
+    child = -1;
+    CHECK(WIFEXITED(status));
+    if (!WIFEXITED(status)) goto cleanup;
+    CHECK_EQ_INT(WEXITSTATUS(status), 0);
+    CHECK(result_used == sizeof(child_result));
+    if (result_used != sizeof(child_result)) goto cleanup;
+
+    input_offset_after = lseek(fileno(input), 0, SEEK_CUR);
+    CHECK_EQ_INT(child_result.result, PROMPT_LINE_ERROR);
+    CHECK(child_result.buffer_empty);
+    CHECK_EQ_INT(child_result.saved_errno, expected_errno);
+    CHECK(child_result.error_same);
+    CHECK(input_offset_after == input_offset_before);
+
+cleanup:
+    if (child > 0) {
+        (void)kill(child, SIGKILL);
+        (void)waitpid(child, NULL, 0);
+    }
+    if (result_pipe[0] >= 0) close(result_pipe[0]);
+    if (result_pipe[1] >= 0) close(result_pipe[1]);
+    if (input) fclose(input);
+}
+
+TEST(prompt_write_ebadf_fails_before_consuming_confirmation) {
+    char oversized_prompt[(BUFSIZ * 2U) + 1U];
+    FILE *read_only_stdout = fopen("/dev/null", "r");
+
+    CHECK(read_only_stdout != NULL);
+    if (!read_only_stdout) return;
+    memset(oversized_prompt, 'P', sizeof(oversized_prompt) - 1U);
+    oversized_prompt[sizeof(oversized_prompt) - 1U] = '\0';
+    /* Larger than stdout's configured buffer, so this case fails inside the
+     * checked fputs rather than waiting for the explicit final flush. */
+    exercise_prompt_output_failure(read_only_stdout, EBADF,
+                                   oversized_prompt);
+    fclose(read_only_stdout);
+}
+
+TEST(prompt_flush_enospc_fails_before_consuming_confirmation) {
+    FILE *full_stdout;
+
+    if (access("/dev/full", W_OK) != 0) {
+        TS_SKIP("dev-full", "/dev/full is unavailable or not writable");
+    }
+    full_stdout = fopen("/dev/full", "w");
+    CHECK(full_stdout != NULL);
+    if (!full_stdout) return;
+    exercise_prompt_output_failure(
+        full_stdout, ENOSPC, "Type 'yes' to continue: ");
+    fclose(full_stdout);
 }
 
 TEST(exact_boundary_is_accepted) {
@@ -758,6 +912,12 @@ TEST_MAIN_BEGIN()
     /* Prevent stdio read-ahead from retaining bytes across dup2-backed input
      * fixtures; readline already consumes each complete logical line. */
     (void)setvbuf(stdin, NULL, _IONBF, 0);
+    /* Keep prompt bytes buffered until the explicit flush so the /dev/full
+     * regression exercises the buffered-output failure path deterministically
+     * even when the suite itself is launched from an interactive terminal. */
+    (void)setvbuf(stdout, NULL, _IOFBF, BUFSIZ);
+    RUN_TEST(prompt_write_ebadf_fails_before_consuming_confirmation);
+    RUN_TEST(prompt_flush_enospc_fails_before_consuming_confirmation);
     RUN_TEST(exact_boundary_is_accepted);
     RUN_TEST(oversized_line_is_rejected_and_next_line_recovers);
     RUN_TEST(embedded_nul_rejects_one_line_and_preserves_the_next);
