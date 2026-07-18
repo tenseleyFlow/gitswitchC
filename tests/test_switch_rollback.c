@@ -360,6 +360,7 @@ static char g_preseal_gpgopenpgp_observed[MAX_PATH_LEN];
 static int g_worktree_probe_failures; /* fail the next N --show-scope probes */
 static int g_user_name_writes;
 static int g_fake_runner_calls;
+static int g_ssh_git_runner_calls;
 static int g_ssh_activation_commands;
 static bool g_fail_ssh_add;
 static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
@@ -854,6 +855,7 @@ static int bind_fake_agent_socket_for_runner(const char *path,
 #define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
+    g_ssh_git_runner_calls++;
     if (strcmp(argv[0], "ssh-agent") == 0) {
         g_ssh_activation_commands++;
         /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
@@ -1970,6 +1972,65 @@ static int setup_alias_config_file(char *home, size_t home_size,
     return chmod(config_path, 0600);
 }
 
+static int write_exact_bytes(const char *path, const void *bytes,
+                             size_t length) {
+    const unsigned char *cursor = bytes;
+    size_t written = 0;
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+
+    if (fd < 0) return -1;
+    while (written < length) {
+        ssize_t count = write(fd, cursor + written, length - written);
+
+        if (count > 0) {
+            written += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            close(fd);
+            return -1;
+        }
+    }
+    return close(fd);
+}
+
+static bool file_matches_exact_bytes(const char *path, const void *bytes,
+                                     size_t length) {
+    const unsigned char *expected = bytes;
+    unsigned char chunk[256];
+    size_t offset = 0;
+    bool matches = true;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0) return false;
+    while (offset < length) {
+        size_t wanted = length - offset;
+        ssize_t count;
+
+        if (wanted > sizeof(chunk)) wanted = sizeof(chunk);
+        do {
+            count = read(fd, chunk, wanted);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0 ||
+            memcmp(chunk, expected + offset, (size_t)count) != 0) {
+            matches = false;
+            break;
+        }
+        offset += (size_t)count;
+    }
+    if (matches) {
+        unsigned char extra;
+        ssize_t count;
+
+        do {
+            count = read(fd, &extra, 1);
+        } while (count < 0 && errno == EINTR);
+        matches = count == 0;
+    }
+    if (close(fd) != 0) matches = false;
+    return matches;
+}
+
 /* M5 direct-library policy: once renameat has installed the alias, a failed
  * public-inode verification is a committed-but-uncertain switch, not a reason
  * to restore Git/runtime around the retained new alias. */
@@ -2398,7 +2459,160 @@ TEST(symlinked_ssh_config_fails_before_switch_mutation) {
     CHECK_STR_EQ(after, target_content);
     CHECK_EQ_INT(stat(target_path, &st), 0);
     CHECK_EQ_INT(st.st_mode & 0777, 0640);
-    CHECK(strstr(get_last_error()->message, "SSH config is a symlink") != NULL);
+    CHECK(strstr(get_last_error()->message, "symlinked SSH config") != NULL);
+}
+
+/* AR-11 L33: the exact parser used by the final alias publisher is part of
+ * read-only switch admission. Binary input and malformed owned markers must
+ * fail before Git inspection, agent activation, transaction artifacts, or
+ * account publication instead of relying on a late rollback. */
+TEST(structurally_invalid_ssh_config_fails_before_switch_mutation) {
+    static const unsigned char embedded_nul[] =
+        "Host personal\n  User alice\n\0Host hidden\n  User mallory\n";
+    static const unsigned char mismatched_marker[] =
+        "# >>> gitswitch other >>>\n"
+        "Host other\n"
+        "  HostName github.com\n"
+        "  IdentityFile \"/tmp/old\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch third <<<\n";
+    static const struct {
+        const unsigned char *bytes;
+        size_t length;
+        const char *diagnostic;
+    } fixtures[] = {
+        {embedded_nul, sizeof(embedded_nul) - 1U, "embedded NUL"},
+        {mismatched_marker, sizeof(mismatched_marker) - 1U, "mismatched"}
+    };
+
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
+        char home[600], saved_home[4096], ssh_dir[700], config_path[700];
+        char lock_path[700], persistence_path[700];
+        char failure[sizeof(get_last_error()->message)];
+        char ssh_target_before[512], ssh_target_after[512];
+        char gpg_target_before[512], gpg_target_after[512];
+        struct stat before;
+        struct stat after;
+        struct stat ssh_before;
+        struct stat ssh_after;
+        struct stat gpg_before;
+        struct stat gpg_after;
+        gitswitch_ctx_t ctx;
+        accounts_switch_prepare_state_t prepare_state;
+        account_t *before_current;
+        command_runner_fn previous_runner;
+        ssize_t ssh_before_len;
+        ssize_t ssh_after_len;
+        ssize_t gpg_before_len;
+        ssize_t gpg_after_len;
+        int rc;
+
+        CHECK_EQ_INT(setup_runtime_dir(), 0);
+        CHECK_EQ_INT(setup_fake_home(home, sizeof(home), saved_home,
+                                     sizeof(saved_home)), 0);
+        CHECK(safe_snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) == 0);
+        CHECK_EQ_INT(mkdir(ssh_dir, 0700), 0);
+        CHECK(safe_snprintf(config_path, sizeof(config_path), "%s/config",
+                            ssh_dir) == 0);
+        CHECK(safe_snprintf(lock_path, sizeof(lock_path),
+                            "%s/.gitswitch-config.lock", ssh_dir) == 0);
+        CHECK(safe_snprintf(persistence_path, sizeof(persistence_path),
+                            "%s/accounts.toml", home) == 0);
+        CHECK_EQ_INT(write_exact_bytes(config_path, fixtures[i].bytes,
+                                       fixtures[i].length), 0);
+        CHECK_EQ_INT(stat(config_path, &before), 0);
+        CHECK_EQ_INT(lstat(g_ssh_sock, &ssh_before), 0);
+        CHECK_EQ_INT(lstat(g_gpg_link, &gpg_before), 0);
+        ssh_before_len = readlink(g_ssh_sock, ssh_target_before,
+                                  sizeof(ssh_target_before) - 1U);
+        gpg_before_len = readlink(g_gpg_link, gpg_target_before,
+                                  sizeof(gpg_target_before) - 1U);
+        CHECK(ssh_before_len > 0);
+        CHECK(gpg_before_len > 0);
+        if (ssh_before_len > 0) ssh_target_before[ssh_before_len] = '\0';
+        if (gpg_before_len > 0) gpg_target_before[gpg_before_len] = '\0';
+
+        ctx = make_ctx();
+        CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+        safe_strncpy(ctx.config.active_account, "prev",
+                     sizeof(ctx.config.active_account));
+        safe_strncpy(ctx.config.config_path, persistence_path,
+                     sizeof(ctx.config.config_path));
+        before_current = ctx.current_account;
+        seed_previous_git_identity();
+        g_fail_user_name_set = false;
+        g_raise_on_user_name = false;
+        g_ssh_git_runner_calls = 0;
+        g_ssh_activation_commands = 0;
+        g_log = NULL;
+        clear_error();
+
+        previous_runner = run_set_runner(ssh_git_runner);
+        prepare_state = ACCOUNTS_SWITCH_PREPARE_ABORT_REQUIRED;
+        rc = accounts_switch_prepare_result(&ctx, "testacct",
+                                            &prepare_state);
+        safe_strncpy(failure, get_last_error()->message, sizeof(failure));
+        run_set_runner(previous_runner);
+
+        CHECK_EQ_INT(rc, -1);
+        CHECK_EQ_INT(prepare_state, ACCOUNTS_SWITCH_PREPARE_CLEAN_FAILURE);
+        CHECK(strstr(failure, fixtures[i].diagnostic) != NULL);
+        CHECK_EQ_INT(g_ssh_git_runner_calls, 0);
+        CHECK_EQ_INT(g_fake_runner_calls, 0);
+        CHECK_EQ_INT(g_ssh_activation_commands, 0);
+        CHECK_EQ_INT(g_user_name_writes, 0);
+        CHECK_STR_EQ(g_store_name, "Previous Name");
+        CHECK_STR_EQ(g_store_email, "prev@example.com");
+        CHECK(ctx.current_account == before_current);
+        CHECK_STR_EQ(ctx.config.active_account, "prev");
+        CHECK_EQ_INT(lstat(g_ssh_sock, &ssh_after), 0);
+        CHECK_EQ_INT(lstat(g_gpg_link, &gpg_after), 0);
+        CHECK(S_ISLNK(ssh_after.st_mode));
+        CHECK(S_ISLNK(gpg_after.st_mode));
+        CHECK(ssh_after.st_dev == ssh_before.st_dev);
+        CHECK(ssh_after.st_ino == ssh_before.st_ino);
+        CHECK(gpg_after.st_dev == gpg_before.st_dev);
+        CHECK(gpg_after.st_ino == gpg_before.st_ino);
+        ssh_after_len = readlink(g_ssh_sock, ssh_target_after,
+                                 sizeof(ssh_target_after) - 1U);
+        gpg_after_len = readlink(g_gpg_link, gpg_target_after,
+                                 sizeof(gpg_target_after) - 1U);
+        CHECK_EQ_INT(ssh_after_len, ssh_before_len);
+        CHECK_EQ_INT(gpg_after_len, gpg_before_len);
+        if (ssh_after_len > 0) ssh_target_after[ssh_after_len] = '\0';
+        if (gpg_after_len > 0) gpg_target_after[gpg_after_len] = '\0';
+        if (ssh_before_len > 0 && ssh_after_len > 0) {
+            CHECK_STR_EQ(ssh_target_after, ssh_target_before);
+        }
+        if (gpg_before_len > 0 && gpg_after_len > 0) {
+            CHECK_STR_EQ(gpg_target_after, gpg_target_before);
+        }
+        CHECK_EQ_INT(stat(config_path, &after), 0);
+        CHECK(after.st_dev == before.st_dev);
+        CHECK(after.st_ino == before.st_ino);
+        CHECK_EQ_INT(after.st_mode, before.st_mode);
+        CHECK_EQ_INT(after.st_size, before.st_size);
+        CHECK_EQ_INT(after.st_mtime, before.st_mtime);
+        CHECK(file_matches_exact_bytes(config_path, fixtures[i].bytes,
+                                       fixtures[i].length));
+        errno = 0;
+        CHECK(lstat(lock_path, &after) != 0);
+        CHECK_EQ_INT(errno, ENOENT);
+        errno = 0;
+        CHECK(lstat(persistence_path, &after) != 0);
+        CHECK_EQ_INT(errno, ENOENT);
+        CHECK(runtime_lock_available_to_child());
+        CHECK(accounts_transaction_context_release_safe(&ctx));
+        CHECK(!signals_guard_active());
+        CHECK(!signals_rollback_active());
+        CHECK_EQ_INT(git_config_seal(), -1);
+        CHECK(strstr(get_last_error()->message,
+                     "No Git snapshot to seal") != NULL);
+        CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+        CHECK(strstr(get_last_error()->message,
+                     "No prepared account switch") != NULL);
+        CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    }
 }
 
 /* ---- AR-03 T1: the GPG half of the failed-switch rollback ---------------- */
@@ -4488,6 +4702,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(failed_switch_preserves_concurrent_ssh_config_replacement);
     RUN_TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back);
     RUN_TEST(symlinked_ssh_config_fails_before_switch_mutation);
+    RUN_TEST(structurally_invalid_ssh_config_fails_before_switch_mutation);
     int gpg_preflight_rc = host_gpg_preflight();
     if (gpg_preflight_rc < 0) {
         fprintf(stderr, "HARNESS FAIL: cannot run host GPG preflight\n");

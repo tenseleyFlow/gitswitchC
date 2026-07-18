@@ -2,9 +2,8 @@
  * Implements secure account switching and management for gitswitch-c
  */
 
-/* Enable POSIX extensions for setenv/unsetenv. Darwin's strict POSIX
- * namespace hides O_NOFOLLOW, so restore the extension namespace before any
- * system header is included. */
+/* Enable POSIX extensions for setenv/unsetenv and related process APIs.
+ * Darwin needs its extension namespace restored before system headers. */
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE 1
 #endif
@@ -17,27 +16,7 @@
 #include <strings.h>
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <sys/stat.h>
 #include <unistd.h>
-
-#ifndef O_CLOEXEC
-#define O_CLOEXEC 0
-#endif
-
-/* O_NOFOLLOW is load-bearing for the SSH-config preflight below. Every
- * supported kernel provides it, so a feature-profile regression must fail at
- * compile time instead of silently turning the flag into zero. Explicitly
- * acknowledged exotic platforms retain the prior compile-only fallback; the
- * lstat/fstat identity checks still reject a different opened inode before
- * any bytes are read. */
-#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
-# if !defined(O_NOFOLLOW) || O_NOFOLLOW == 0
-#  error "O_NOFOLLOW is required on supported platforms"
-# endif
-#elif !defined(O_NOFOLLOW)
-#define O_NOFOLLOW 0
-#endif
 
 #include "accounts.h"
 #include "config.h"
@@ -47,8 +26,8 @@
 #include "git_ops.h"
 #define GITSWITCH_INTERNAL_API
 #include "git_status_internal.h"
+#include "ssh_manager_internal.h"
 #undef GITSWITCH_INTERNAL_API
-#include "ssh_manager.h"
 #include "gpg_manager.h"
 #include "prompt.h"
 #include "signals.h"
@@ -717,106 +696,6 @@ static int restore_previous_gpg_isolation(const char *prev_gpg_home,
     return 0;
 }
 
-/* M4: validate ~/.ssh/config before any runtime/Git mutation, but do not
- * rewrite it yet. The managed alias block is committed only after every step
- * that can still trigger rollback has succeeded, which removes the unsafe
- * check-then-rename restoration path entirely. The final writer repeats these
- * no-follow and identity checks immediately before its atomic rename. */
-static int ssh_user_config_preflight(const account_t *account) {
-    /* AR-06 F29: the writer now heap-sizes the config, so the preflight ceiling
-     * is the same generous shared limit rather than the old 64 KiB cap that
-     * failed the whole switch for any larger-but-valid config. */
-    const size_t SSH_CONFIG_MAX_BYTES = GITSWITCH_SSH_CONFIG_MAX_BYTES;
-    char path[MAX_PATH_LEN];
-    char chunk[4096];
-    struct stat before;
-    struct stat opened;
-    const char *home = getenv("HOME");
-    size_t total = 0;
-    int fd;
-
-    if (!account || !account->ssh_enabled ||
-        strlen(account->ssh_key_path) == 0 ||
-        strlen(account->ssh_host_alias) == 0) {
-        return 0;
-    }
-    if (!home || !*home) {
-        set_error(ERR_INVALID_PATH,
-                  "Cannot preflight ~/.ssh/config: HOME is not set");
-        return -1;
-    }
-    if ((size_t)snprintf(path, sizeof(path), "%s/.ssh/config", home) >=
-        sizeof(path)) {
-        set_error(ERR_INVALID_PATH,
-                  "Cannot preflight ~/.ssh/config: path is too long");
-        return -1;
-    }
-    if (lstat(path, &before) != 0) {
-        if (errno == ENOENT) {
-            return 0;
-        }
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect SSH config before switch: %s", path);
-        return -1;
-    }
-    if (S_ISLNK(before.st_mode)) {
-        set_error(ERR_PERMISSION_DENIED,
-                  "Refusing to switch: SSH config is a symlink: %s", path);
-        return -1;
-    }
-    if (!S_ISREG(before.st_mode)) {
-        set_error(ERR_PERMISSION_DENIED,
-                  "Refusing to switch: SSH config is not a regular file: %s", path);
-        return -1;
-    }
-    if (before.st_size < 0 || (size_t)before.st_size > SSH_CONFIG_MAX_BYTES) {
-        set_error(ERR_FILE_IO,
-                  "Refusing to switch: SSH config is too large to update safely: %s",
-                  path);
-        return -1;
-    }
-
-    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (fd < 0) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot open SSH config safely before switch: %s", path);
-        return -1;
-    }
-    if (fstat(fd, &opened) != 0 || !S_ISREG(opened.st_mode) ||
-        opened.st_dev != before.st_dev || opened.st_ino != before.st_ino) {
-        close(fd);
-        set_error(ERR_FILE_IO,
-                  "SSH config changed while it was being preflighted: %s", path);
-        return -1;
-    }
-    for (;;) {
-        ssize_t n = read(fd, chunk, sizeof(chunk));
-        if (n > 0) {
-            total += (size_t)n;
-            if (total > SSH_CONFIG_MAX_BYTES) {
-                close(fd);
-                set_error(ERR_FILE_IO,
-                          "SSH config grew too large while being preflighted: %s",
-                          path);
-                return -1;
-            }
-            continue;
-        }
-        if (n == 0) {
-            break;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        close(fd);
-        set_system_error(ERR_FILE_IO,
-                         "Cannot read SSH config safely before switch: %s", path);
-        return -1;
-    }
-    close(fd);
-    return 0;
-}
-
 /* Complete signal ownership with exactly one restoration attempt. A pending
  * signal is dispatched only after every saved disposition is back; on any
  * restoration failure both the guard's failed bitmap and the pending signal
@@ -1282,6 +1161,15 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
         return -1;
     }
 
+    /* L33: admission must execute the exact NUL/managed-block parser used by
+     * the final alias publisher before even read-only Git discovery can spawn
+     * a child. This is only a current-snapshot validation: the publisher still
+     * locks, rereads, and identity-checks the then-current file at commit. */
+    if (write_git && !ctx->config.dry_run &&
+        ssh_preflight_host_alias_config(account) != 0) {
+        return -1;
+    }
+
     /* Determine git scope. Explicit --global/--local override the account
      * preference. Writing an identity GLOBALLY affects every repository on the
      * machine, so we never silently promote local->global outside a repo:
@@ -1446,20 +1334,6 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
                     return -1;
                 }
             }
-        }
-
-        /* Prove the host-alias sink is readable and policy-compliant before
-         * arming rollback. The actual writer remains the final commit.
-         * Skipped on resume for the same reason write_git is forced false:
-         * ~/.ssh/config is persistent state the original switch already
-         * wrote, so resume has no business reading or rewriting it — and the
-         * preflight's symlink refusal (correct for an interactive switch)
-         * otherwise aborted resume BEFORE agent restoration for every
-         * dotfile-managed ~/.ssh/config (chezmoi/stow/yadm), re-failing on
-         * each login shell (AR-05 M1). */
-        if (!ctx->config.resuming && ssh_user_config_preflight(account) != 0) {
-            runtime_state_lock_release(runtime_lock_fd);
-            return -1;
         }
 
         /* AR-07 M24: snapshot capture is part of read-only preflight, not the

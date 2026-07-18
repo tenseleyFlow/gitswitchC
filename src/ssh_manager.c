@@ -38,7 +38,9 @@
 #include <sys/sysctl.h>
 #endif
 
-#include "ssh_manager.h"
+#define GITSWITCH_INTERNAL_API
+#include "ssh_manager_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "error.h"
 #include "utils.h"
 #include "display.h"
@@ -4304,6 +4306,82 @@ static int ssh_filter_managed_blocks(const char *buf, size_t len,
     *filtered_len_out = written;
     *removed_out = removed;
     return 0;
+}
+
+int ssh_preflight_host_alias_config(const account_t *account) {
+    char ssh_config_dir[MAX_PATH_LEN];
+    char ssh_config_path[MAX_PATH_LEN];
+    char *buf = NULL;
+    char *filtered = NULL;
+    const char *home = getenv("HOME");
+    struct stat dir_identity;
+    struct stat config_identity;
+    size_t buf_len = 0;
+    size_t filtered_len = 0;
+    size_t removed = 0;
+    bool dir_absent = false;
+    bool config_existed = false;
+    int dir_fd = -1;
+    int pinned_config_fd = -1;
+    int rc = -1;
+
+    if (!account) {
+        set_error(ERR_INVALID_ARGS,
+                  "Cannot preflight SSH config for a null account");
+        return -1;
+    }
+    if (!account->ssh_enabled || account->ssh_key_path[0] == '\0' ||
+        account->ssh_host_alias[0] == '\0') {
+        return 0;
+    }
+    if (!valid_ssh_host_alias(account->ssh_host_alias)) {
+        set_error(ERR_INVALID_ARGS, "Invalid SSH host alias: %s",
+                  account->ssh_host_alias);
+        return -1;
+    }
+    if (!home || !*home) {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot preflight ~/.ssh/config: HOME is not set");
+        return -1;
+    }
+
+    dir_fd = open_ssh_config_directory(home, false, ssh_config_dir,
+                                       sizeof(ssh_config_dir), &dir_identity,
+                                       &dir_absent);
+    if (dir_fd < 0) {
+        return dir_absent ? 0 : -1;
+    }
+    if ((size_t)snprintf(ssh_config_path, sizeof(ssh_config_path), "%s/config",
+                         ssh_config_dir) >= sizeof(ssh_config_path)) {
+        set_error(ERR_INVALID_PATH,
+                  "Cannot preflight ~/.ssh/config: path is too long");
+        goto done;
+    }
+    if (read_ssh_config_at(dir_fd, ssh_config_path, &buf, &buf_len,
+                           &config_existed, &config_identity,
+                           &pinned_config_fd) != 0) {
+        goto done;
+    }
+    if (ssh_filter_managed_blocks(buf, buf_len, account->ssh_host_alias,
+                                  &filtered, &filtered_len, &removed) != 0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    free(buf);
+    free(filtered);
+    if (pinned_config_fd >= 0 && close(pinned_config_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close preflighted SSH config");
+        rc = -1;
+    }
+    if (dir_fd >= 0 && close(dir_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close preflighted SSH config directory");
+        rc = -1;
+    }
+    return rc;
 }
 
 /* Create a random O_EXCL temp under the pinned directory, write and fsync its

@@ -12,8 +12,8 @@
  * 64 KiB and failed the whole switch for any account with an alias when the
  * user's config was larger. The buffers are now heap-sized to the file; this
  * ceiling only guards against a pathological/hostile giant file and is set well
- * beyond any realistic ssh config. Shared by the writer (ssh_manager.c) and the
- * switch preflight (accounts.c) so the two never disagree. */
+ * beyond any realistic ssh config. Shared by the writer and its read-only
+ * structural preflight in ssh_manager.c so the two never disagree. */
 #define GITSWITCH_SSH_CONFIG_MAX_BYTES (8u * 1024u * 1024u)
 
 /* SSH agent management modes */
