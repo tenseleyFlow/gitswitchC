@@ -851,7 +851,7 @@ static int bind_fake_agent_socket_for_runner(const char *path,
  * teardown's reaper can never find — let alone signal — a real process behind
  * it. */
 #define FAKE_AGENT_PID 1073741824
-#define FAKE_AGENT_FP "SHA256:rollback-fixture-fingerprint"
+#define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
     if (strcmp(argv[0], "ssh-agent") == 0) {

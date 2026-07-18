@@ -56,6 +56,7 @@ static int g_generation_loads;
 static const char *g_generation_loaded_fp;
 static char g_generation_key_path[MAX_PATH_LEN];
 static char g_generation_replacement[MAX_PATH_LEN];
+static bool g_keygen_used_admitted_bytes;
 
 static const char *runner_generation_fingerprint(
     const char *const argv[], const run_opts_t *opts) {
@@ -203,7 +204,11 @@ static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
     /* ssh-keygen -lf <key>: fingerprint derives from the key file name. */
     if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
         strcmp(argv[1], "-lf") == 0 && argv[2]) {
-        const char *fp = strstr(argv[2], "keyB") ? FP_B : FP_A;
+        const char *fp = runner_generation_fingerprint(argv, opts);
+        g_keygen_used_admitted_bytes =
+            opts && ((opts->use_stdin_fd && opts->stdin_fd >= 0) ||
+                     (opts->use_cwd_fd &&
+                      strstr(argv[2], ".key-fingerprint.") != NULL));
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size, "256 %s user@host (ED25519)\n", fp);
             if (result) result->out_len = strlen(opts->out);
@@ -278,13 +283,29 @@ static int setup_agent_socket(const char *account, char *sock_out, size_t size) 
     return chmod(sock_out, 0600);
 }
 
-static void make_account(account_t *a, const char *key_basename) {
+static int make_account(account_t *a, const char *key_basename) {
+    static const char private_prefix[] =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n";
+    static const char private_suffix[] =
+        "\n-----END OPENSSH PRIVATE KEY-----\n";
+    const char *generation = strstr(key_basename, "keyB")
+                                 ? "generation-b"
+                                 : "generation-a";
+    char key_data[256];
+
     memset(a, 0, sizeof(*a));
     a->id = 1;
-    safe_strncpy(a->name, "work", sizeof(a->name));
-    safe_strncpy(a->email, "w@x.com", sizeof(a->email));
+    if (safe_strncpy(a->name, "work", sizeof(a->name)) != 0 ||
+        safe_strncpy(a->email, "w@x.com", sizeof(a->email)) != 0 ||
+        (size_t)snprintf(a->ssh_key_path, sizeof(a->ssh_key_path), "%s/%s",
+                         g_xdg, key_basename) >= sizeof(a->ssh_key_path) ||
+        (size_t)snprintf(key_data, sizeof(key_data), "%s%s%s",
+                         private_prefix, generation, private_suffix) >=
+            sizeof(key_data)) {
+        return -1;
+    }
     a->ssh_enabled = true;
-    snprintf(a->ssh_key_path, sizeof(a->ssh_key_path), "%s/%s", g_xdg, key_basename);
+    return write_string_to_file(a->ssh_key_path, key_data, 0600);
 }
 
 /* Adoption control: agent holds the account's own key -> reused in place
@@ -298,13 +319,14 @@ TEST(ssh_fingerprint_reuse_adopts_matching_key) {
     int rc;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
-    make_account(&acct, "keyA"); /* matches the FP_A the fake agent reports */
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
     CHECK_EQ_INT(setenv("SSH_AGENT_PID", "99999", 1), 0);
 
     g_agent_start_attempts = 0;
+    g_keygen_used_admitted_bytes = false;
     prev = run_set_runner(fake_ssh_runner);
     rc = ssh_start_isolated_agent(&cfg, &acct);
     run_set_runner(prev);
@@ -315,6 +337,7 @@ TEST(ssh_fingerprint_reuse_adopts_matching_key) {
     CHECK_EQ_INT(cfg.agent_pid, -1);
     CHECK(getenv("SSH_AGENT_PID") == NULL);
     CHECK_EQ_INT(g_agent_start_attempts, 0); /* no restart, no re-prompt */
+    CHECK(g_keygen_used_admitted_bytes);
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK(path_exists(sock));            /* the live agent was not reaped */
 
@@ -335,7 +358,7 @@ TEST(ssh_fingerprint_reuse_rejects_different_key) {
     int rc;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
-    make_account(&acct, "keyB"); /* FP_B: NOT what the fake agent holds */
+    CHECK_EQ_INT(make_account(&acct, "keyB"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -367,7 +390,7 @@ TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate) {
     int rc;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -499,7 +522,7 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
     snprintf(sock, sizeof(sock), "%s/gitswitch-ssh/ssh-agent.work.sock", g_xdg);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -533,7 +556,7 @@ TEST(isolated_switch_retains_generation_between_fingerprint_and_load) {
     command_runner_fn previous;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     CHECK_EQ_INT(write_string_to_file(acct.ssh_key_path, generation_a, 0600),
                  0);
     CHECK_EQ_INT(safe_strncpy(g_generation_key_path, acct.ssh_key_path,
@@ -587,7 +610,7 @@ TEST(fresh_commit_revalidates_public_agent_directory) {
     snprintf(public_current, sizeof(public_current), "%s/current.sock",
              public_dir);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -626,7 +649,7 @@ TEST(ssh_reuse_refuses_symlinked_agent_socket) {
     snprintf(external, sizeof(external), "%s/external-agent.sock", g_xdg);
     CHECK_EQ_INT(rename(sock, external), 0);
     CHECK_EQ_INT(symlink(external, sock), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -658,7 +681,7 @@ TEST(ssh_reuse_refuses_symlinked_pid_sidecar) {
     snprintf(victim, sizeof(victim), "%s/precious", g_xdg);
     CHECK_EQ_INT(write_string_to_file(victim, "424242\n", 0600), 0);
     CHECK_EQ_INT(symlink(victim, pid_path), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -693,7 +716,7 @@ TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
     snprintf(victim, sizeof(victim), "%s/precious", g_xdg);
     CHECK_EQ_INT(write_string_to_file(victim, "keep\n", 0600), 0);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -729,7 +752,7 @@ TEST(reuse_aborts_on_agent_directory_namespace_replacement) {
 
     CHECK_EQ_INT(setup_agent_socket("work", public_sock,
                                     sizeof(public_sock)), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -770,7 +793,7 @@ TEST(fresh_start_aborts_and_cleans_on_namespace_replacement) {
     snprintf(public_sock, sizeof(public_sock),
              "%s/ssh-agent.work.sock", public_dir);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -815,7 +838,7 @@ TEST(pid_sidecar_rejects_temp_path_inode_swap) {
              "%s/.ssh-agent.work.pid.tmp.%d", dir, (int)getpid());
     snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;

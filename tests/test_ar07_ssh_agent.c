@@ -38,7 +38,18 @@ typedef enum {
     IDENTITY_LIST_TRUNCATED
 } identity_listing_mode_t;
 
+typedef enum {
+    KEYGEN_LISTING_COMPLETE = 0,
+    KEYGEN_LISTING_OVERSIZED_OUTPUT,
+    KEYGEN_LISTING_TRUNCATED_FINGERPRINT,
+    KEYGEN_LISTING_UNTERMINATED_FINGERPRINT,
+    KEYGEN_LISTING_SHORT_FINGERPRINT,
+    KEYGEN_LISTING_MISPLACED_FINGERPRINT,
+    KEYGEN_LISTING_EMBEDDED_NUL
+} keygen_listing_mode_t;
+
 static identity_listing_mode_t g_identity_listing_mode;
+static keygen_listing_mode_t g_keygen_listing_mode;
 static int g_dirsync_calls;
 static int g_dirsync_fail_call;
 static int g_key_open_calls;
@@ -118,9 +129,64 @@ static int fake_identity_runner(const char *const argv[],
     }
     if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
         strcmp(argv[1], "-lf") == 0) {
-        snprintf(opts->out, opts->out_size,
-                 "256 %s expected (ED25519)\n", FP_EXPECTED);
-        if (result) result->out_len = strlen(opts->out);
+        if (g_keygen_listing_mode == KEYGEN_LISTING_OVERSIZED_OUTPUT) {
+            int prefix = snprintf(opts->out, opts->out_size,
+                                  "256 %s ", FP_EXPECTED);
+            if (prefix < 0 || (size_t)prefix >= opts->out_size) return -1;
+            memset(opts->out + prefix, 'c',
+                   opts->out_size - (size_t)prefix - 1U);
+            opts->out[opts->out_size - 1U] = '\0';
+            if (result) {
+                result->out_len = opts->out_size - 1U;
+                result->out_truncated = true;
+            }
+        } else if (g_keygen_listing_mode ==
+                   KEYGEN_LISTING_TRUNCATED_FINGERPRINT) {
+            int prefix = snprintf(opts->out, opts->out_size, "256 SHA256:");
+            if (prefix < 0 || (size_t)prefix >= opts->out_size) return -1;
+            memset(opts->out + prefix, 'A',
+                   opts->out_size - (size_t)prefix - 1U);
+            opts->out[opts->out_size - 1U] = '\0';
+            if (result) {
+                result->out_len = opts->out_size - 1U;
+                result->out_truncated = true;
+            }
+        } else if (g_keygen_listing_mode ==
+                   KEYGEN_LISTING_UNTERMINATED_FINGERPRINT) {
+            snprintf(opts->out, opts->out_size, "256 %s", FP_EXPECTED);
+            if (result) result->out_len = strlen(opts->out);
+        } else if (g_keygen_listing_mode ==
+                   KEYGEN_LISTING_SHORT_FINGERPRINT) {
+            snprintf(opts->out, opts->out_size,
+                     "256 SHA256:A expected (ED25519)\n");
+            if (result) result->out_len = strlen(opts->out);
+        } else if (g_keygen_listing_mode ==
+                   KEYGEN_LISTING_MISPLACED_FINGERPRINT) {
+            snprintf(opts->out, opts->out_size,
+                     "comment %s expected (ED25519)\n", FP_EXPECTED);
+            if (result) result->out_len = strlen(opts->out);
+        } else if (g_keygen_listing_mode == KEYGEN_LISTING_EMBEDDED_NUL) {
+            static const char hidden[] = " hidden (ED25519)\n";
+            int prefix = snprintf(opts->out, opts->out_size,
+                                  "256 %s ", FP_EXPECTED);
+            size_t required;
+
+            if (prefix < 0) return -1;
+            required = (size_t)prefix + 1501U + sizeof(hidden);
+            if (required > opts->out_size) return -1;
+            memset(opts->out + prefix, 'c', 1500U);
+            opts->out[(size_t)prefix + 1500U] = '\0';
+            memcpy(opts->out + (size_t)prefix + 1501U,
+                   hidden, sizeof(hidden));
+            if (result) {
+                result->out_len = (size_t)prefix + 1501U +
+                                  sizeof(hidden) - 1U;
+            }
+        } else {
+            snprintf(opts->out, opts->out_size,
+                     "256 %s expected (ED25519)\n", FP_EXPECTED);
+            if (result) result->out_len = strlen(opts->out);
+        }
         return 0;
     }
     return -1;
@@ -523,6 +589,45 @@ TEST(identity_listing_requires_one_well_formed_raw_record) {
                                            "/tmp/key-expected"));
     g_identity_listing_mode = IDENTITY_LIST_RAW;
 
+    run_set_runner(previous);
+}
+
+TEST(keygen_fingerprint_requires_one_complete_leading_token) {
+    command_runner_fn previous = run_set_runner(fake_identity_runner);
+
+    g_identity_listing_mode = IDENTITY_LIST_RAW;
+    g_keygen_listing_mode = KEYGEN_LISTING_COMPLETE;
+    CHECK(ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                          "/tmp/key-expected"));
+
+    /* Whole-output capture remains bounded: an output larger than the
+     * admitted-file-derived cap is indeterminate even if field two fits. */
+    g_keygen_listing_mode = KEYGEN_LISTING_OVERSIZED_OUTPUT;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+
+    /* Truncation cannot manufacture a token boundary, and even a complete
+     * token without its following delimiter is not a complete field. */
+    g_keygen_listing_mode = KEYGEN_LISTING_TRUNCATED_FINGERPRINT;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+    g_keygen_listing_mode = KEYGEN_LISTING_UNTERMINATED_FINGERPRINT;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+    g_keygen_listing_mode = KEYGEN_LISTING_SHORT_FINGERPRINT;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+
+    /* A fingerprint-looking comment or binary capture must not be searched
+     * as a substitute for canonical leading fields. */
+    g_keygen_listing_mode = KEYGEN_LISTING_MISPLACED_FINGERPRINT;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+    g_keygen_listing_mode = KEYGEN_LISTING_EMBEDDED_NUL;
+    CHECK(!ssh_manager_test_socket_has_key(-1, "agent.sock",
+                                           "/tmp/key-expected"));
+
+    g_keygen_listing_mode = KEYGEN_LISTING_COMPLETE;
     run_set_runner(previous);
 }
 
@@ -1285,6 +1390,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(truncated_identity_listing_never_proves_exclusivity);
     RUN_TEST(identity_listing_requires_one_well_formed_raw_record);
+    RUN_TEST(keygen_fingerprint_requires_one_complete_leading_token);
     RUN_TEST(pid_sidecar_sync_failure_retains_complete_recovery_record);
     RUN_TEST(pid_postrename_identity_failure_is_synced_and_explicitly_uncertain);
     RUN_TEST(equal_length_substitution_survives_restoration_sync_failure_and_resets);

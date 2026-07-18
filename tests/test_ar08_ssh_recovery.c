@@ -52,6 +52,11 @@ typedef struct {
 } ssh_fixture_t;
 
 static int make_fixture(ssh_fixture_t *fixture, const char *stem) {
+    static const char private_key[] =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "recovery-fixture\n"
+        "-----END OPENSSH PRIVATE KEY-----\n";
+    char key[128];
     int written;
 
     if (!fixture || !stem) return -1;
@@ -65,6 +70,11 @@ static int make_fixture(ssh_fixture_t *fixture, const char *stem) {
                                  sizeof(fixture->xdg)) != 0 ||
         chmod(fixture->xdg, 0700) != 0 ||
         setenv("XDG_RUNTIME_DIR", fixture->xdg, 1) != 0) {
+        return -1;
+    }
+    written = snprintf(key, sizeof(key), "%s/key", fixture->xdg);
+    if (written < 0 || (size_t)written >= sizeof(key) ||
+        write_string_to_file(key, private_key, 0600) != 0) {
         return -1;
     }
     written = snprintf(fixture->runtime, sizeof(fixture->runtime),

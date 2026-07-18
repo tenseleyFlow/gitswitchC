@@ -1178,8 +1178,11 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     char agent_lock[PATH_MAX];
     char expected_key[PATH_MAX];
     char expected_pub[PATH_MAX];
+    char other_pub[PATH_MAX];
     char ca_key[PATH_MAX];
     char other_key[PATH_MAX];
+    char expected_public_text[2048];
+    char other_public_text[2048];
     char expected_fingerprint[256] = {0};
     char agent_fingerprint[256] = {0};
     char output[4096];
@@ -1210,6 +1213,7 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         join_path(expected_key, sizeof(expected_key), root, "/expected") != 0 ||
         join_path(expected_pub, sizeof(expected_pub), root,
                   "/expected.pub") != 0 ||
+        join_path(other_pub, sizeof(other_pub), root, "/other.pub") != 0 ||
         join_path(ca_key, sizeof(ca_key), root, "/ca") != 0 ||
         join_path(other_key, sizeof(other_key), root, "/other") != 0 ||
         mkdir_private(runtime) != 0 || mkdir_private(agent_dir) != 0 ||
@@ -1268,6 +1272,25 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
     live = false;
     CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
     CHECK(live);
+
+    /* `ssh-keygen -lf <private>` prefers `<private>.pub` when it exists.
+     * Replace only that untrusted sibling with the other key: liveness must
+     * continue deriving identity from the descriptor-admitted private bytes,
+     * not accept whichever public file happens to sit beside the pathname. */
+    CHECK(read_text(expected_pub, expected_public_text,
+                    sizeof(expected_public_text))[0] != '\0');
+    CHECK(read_text(other_pub, other_public_text,
+                    sizeof(other_public_text))[0] != '\0');
+    CHECK_EQ_INT(write_text(expected_pub, other_public_text, 0600), 0);
+    live = false;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(live); /* private A still matches the agent's A */
+    CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
+    CHECK_EQ_INT(agent_command(agent_sock, other_key), 0);
+    live = true;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(!live); /* sibling B must not authorize agent B for private A */
+    CHECK_EQ_INT(write_text(expected_pub, expected_public_text, 0600), 0);
 
     /* OpenSSH gives a certificate the same fingerprint as its raw public
      * key. Loading a private key beside its sibling certificate adds both;

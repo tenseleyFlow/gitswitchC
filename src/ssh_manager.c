@@ -50,6 +50,16 @@
  * cannot turn account switching into an unbounded secret-bearing allocation. */
 #define SSH_PRIVATE_KEY_SNAPSHOT_MAX_BYTES (8U * 1024U * 1024U)
 
+/* OpenSSH's text formatter can expand one stored comment byte into several
+ * rendered bytes. Capture one complete fingerprint listing in a single child
+ * execution, bounded from the admitted input size, instead of retrying across
+ * extra scheduling points or accepting a prefix with an unknowable suffix. */
+#define SSH_KEYGEN_FINGERPRINT_CAPTURE_MIN_BYTES (8U * 1024U)
+#define SSH_KEYGEN_FINGERPRINT_CAPTURE_OVERHEAD_BYTES (4U * 1024U)
+#define SSH_KEYGEN_FINGERPRINT_CAPTURE_MAX_BYTES \
+    (4U * SSH_PRIVATE_KEY_SNAPSHOT_MAX_BYTES + \
+     SSH_KEYGEN_FINGERPRINT_CAPTURE_OVERHEAD_BYTES)
+
 typedef struct {
     char *data;
     size_t length;
@@ -1329,10 +1339,42 @@ typedef struct {
     bool created;
     bool have_identity;
     bool registered;
-    char name[64];
+    char name[MAX_PATH_LEN];
     char path[MAX_PATH_LEN];
     struct stat identity;
 } ssh_fingerprint_scratch_t;
+
+/* OpenSSH probes `<private-path>.pub` before extracting the public portion of
+ * the private key itself. Give the portable scratch an exact NAME_MAX-byte
+ * component: the scratch remains openable, while the kernel must reject the
+ * appended `.pub` component as ENAMETOOLONG before any sibling lookup. This
+ * avoids both accidental sidecar selection and an otherwise unavoidable
+ * same-UID sentinel replacement race. */
+static int ssh_fingerprint_scratch_name(int dir_fd, char *name, size_t size) {
+    static const char prefix[] = ".key-fingerprint.";
+    static const char random_chars[] =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const size_t prefix_length = sizeof(prefix) - 1U;
+    long name_max;
+    size_t random_size;
+
+    if (dir_fd < 0 || !name || size == 0U) return -1;
+    errno = 0;
+    name_max = fpathconf(dir_fd, _PC_NAME_MAX);
+    if (name_max < 0 || (uintmax_t)name_max >= (uintmax_t)size ||
+        (uintmax_t)name_max < (uintmax_t)(prefix_length + 16U)) {
+        return -1;
+    }
+    memcpy(name, prefix, prefix_length);
+    random_size = (size_t)name_max - prefix_length + 1U;
+    if (generate_random_string(name + prefix_length, random_size,
+                               random_chars) != 0 ||
+        strnlen(name, size) != (size_t)name_max) {
+        secure_zero_memory(name, size);
+        return -1;
+    }
+    return 0;
+}
 
 static bool ssh_fingerprint_scratch_matches(
     int dir_fd, const ssh_fingerprint_scratch_t *scratch,
@@ -1475,9 +1517,6 @@ static int ssh_fingerprint_scratch_cleanup(
 static int ssh_fingerprint_scratch_create(
     int dir_fd, const char *dir_path, const ssh_key_snapshot_t *snapshot,
     ssh_fingerprint_scratch_t *scratch) {
-    static const char random_chars[] =
-        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    char suffix[17];
     struct stat created;
     struct stat named;
 
@@ -1489,10 +1528,8 @@ static int ssh_fingerprint_scratch_create(
     scratch->fd = -1;
 
     for (unsigned int attempt = 0; attempt < 16; attempt++) {
-        if (generate_random_string(suffix, sizeof(suffix), random_chars) != 0 ||
-            (size_t)snprintf(scratch->name, sizeof(scratch->name),
-                             ".key-fingerprint.%s", suffix) >=
-                sizeof(scratch->name) ||
+        if (ssh_fingerprint_scratch_name(
+                dir_fd, scratch->name, sizeof(scratch->name)) != 0 ||
             (size_t)snprintf(scratch->path, sizeof(scratch->path), "%s/%s",
                              dir_path, scratch->name) >= sizeof(scratch->path)) {
             return -1;
@@ -1542,19 +1579,138 @@ static int ssh_fingerprint_scratch_create(
 }
 #endif
 
+static size_t ssh_keygen_fingerprint_capture_size(
+    const char *key_path, const ssh_key_snapshot_t *snapshot) {
+    struct stat st;
+    size_t source_size = 0U;
+    size_t capture_size;
+
+    if (snapshot) {
+        source_size = snapshot->length;
+    } else if (key_path && stat(key_path, &st) == 0 && S_ISREG(st.st_mode) &&
+               st.st_size > 0 &&
+               (uintmax_t)st.st_size <=
+                   (uintmax_t)SSH_PRIVATE_KEY_SNAPSHOT_MAX_BYTES) {
+        source_size = (size_t)st.st_size;
+    }
+    if (source_size >
+        (SSH_KEYGEN_FINGERPRINT_CAPTURE_MAX_BYTES -
+         SSH_KEYGEN_FINGERPRINT_CAPTURE_OVERHEAD_BYTES) / 4U) {
+        return SSH_KEYGEN_FINGERPRINT_CAPTURE_MAX_BYTES;
+    }
+    capture_size = source_size * 4U +
+                   SSH_KEYGEN_FINGERPRINT_CAPTURE_OVERHEAD_BYTES;
+    if (capture_size < SSH_KEYGEN_FINGERPRINT_CAPTURE_MIN_BYTES) {
+        capture_size = SSH_KEYGEN_FINGERPRINT_CAPTURE_MIN_BYTES;
+    }
+    return capture_size;
+}
+
+static bool ssh_fingerprint_token_is_canonical(
+    const char *fingerprint, size_t fingerprint_length) {
+    static const char sha256_prefix[] = "SHA256:";
+    static const char md5_prefix[] = "MD5:";
+
+    if (fingerprint_length == 50U &&
+        memcmp(fingerprint, sha256_prefix, sizeof(sha256_prefix) - 1U) == 0) {
+        for (size_t i = sizeof(sha256_prefix) - 1U;
+             i < fingerprint_length; i++) {
+            unsigned char byte = (unsigned char)fingerprint[i];
+            if (!((byte >= (unsigned char)'A' &&
+                   byte <= (unsigned char)'Z') ||
+                  (byte >= (unsigned char)'a' &&
+                   byte <= (unsigned char)'z') ||
+                  (byte >= (unsigned char)'0' &&
+                   byte <= (unsigned char)'9') || byte == (unsigned char)'+' ||
+                  byte == (unsigned char)'/')) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (fingerprint_length == 51U &&
+        memcmp(fingerprint, md5_prefix, sizeof(md5_prefix) - 1U) == 0) {
+        for (size_t i = sizeof(md5_prefix) - 1U;
+             i < fingerprint_length; i++) {
+            size_t body_offset = i - (sizeof(md5_prefix) - 1U);
+            unsigned char byte = (unsigned char)fingerprint[i];
+
+            if (body_offset % 3U == 2U) {
+                if (byte != (unsigned char)':') return false;
+            } else if (!((byte >= (unsigned char)'0' &&
+                         byte <= (unsigned char)'9') ||
+                        (byte >= (unsigned char)'a' &&
+                         byte <= (unsigned char)'f') ||
+                        (byte >= (unsigned char)'A' &&
+                         byte <= (unsigned char)'F'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+/* Parse complete canonical leading fields from one fully captured
+ * `ssh-keygen -lf` result. Fingerprint-looking comment text, embedded binary
+ * data, destination truncation, and an unterminated field all fail closed. */
+static bool ssh_keygen_fingerprint_prefix(
+    const char *listing, size_t listing_length,
+    char *fingerprint, size_t fingerprint_size) {
+    const char *end;
+    const char *cursor;
+    const char *fingerprint_start;
+    size_t fingerprint_length;
+
+    if (!listing || listing_length == 0U || !fingerprint ||
+        fingerprint_size == 0U ||
+        memchr(listing, '\0', listing_length) != NULL) {
+        return false;
+    }
+
+    end = listing + listing_length;
+    cursor = listing;
+    while (cursor < end && *cursor != ' ' && *cursor != '\t') {
+        if (*cursor < '0' || *cursor > '9') return false;
+        cursor++;
+    }
+    if (cursor == listing || cursor == end) return false;
+    while (cursor < end && (*cursor == ' ' || *cursor == '\t')) cursor++;
+
+    fingerprint_start = cursor;
+    while (cursor < end && *cursor != ' ' && *cursor != '\t') {
+        unsigned char byte = (unsigned char)*cursor;
+        if (byte < 0x21U || byte > 0x7eU) return false;
+        cursor++;
+    }
+    fingerprint_length = (size_t)(cursor - fingerprint_start);
+    if (fingerprint_length == 0U || cursor == end ||
+        fingerprint_length >= fingerprint_size ||
+        !ssh_fingerprint_token_is_canonical(fingerprint_start,
+                                            fingerprint_length)) {
+        return false;
+    }
+
+    memcpy(fingerprint, fingerprint_start, fingerprint_length);
+    fingerprint[fingerprint_length] = '\0';
+    return true;
+}
+
 /* Copy the SHA256:... fingerprint token of the admitted key generation into
  * `buf`. Linux can name the retained regular descriptor through procfs: each
  * ssh-keygen reopen gets an independent file offset. Darwin and FreeBSD
  * /dev/fd entries use dup-style shared offsets; OpenSSH reads the private-key header,
  * reopens the path, and otherwise starts the second read at EOF. On those
- * platforms, expose the already-captured bytes briefly through a random 0600
- * file in the pinned, locked manager directory. Its exact inode and contents
- * are checked before and after ssh-keygen, then scrubbed and unlinked. */
+ * platforms, expose the already-captured bytes briefly through a 0600 file in
+ * the pinned, locked manager directory. Its NAME_MAX component prevents
+ * OpenSSH from selecting an adjacent `.pub`; its exact inode and contents are
+ * checked before and after ssh-keygen, then scrubbed and unlinked. */
 static int ssh_key_fingerprint_generation(
     int dir_fd, bool use_cwd_fd, const char *dir_path,
     const char *key_path, const ssh_key_snapshot_t *snapshot,
     char *buf, size_t size) {
-    char out[1024];
+    char *out;
+    size_t out_size;
 #if defined(__linux__)
     const char *stdin_path = "/proc/self/fd/0";
 #endif
@@ -1573,21 +1729,30 @@ static int ssh_key_fingerprint_generation(
         !buf || size == 0) {
         return -1;
     }
+    out_size = ssh_keygen_fingerprint_capture_size(key_path, snapshot);
+    out = malloc(out_size);
+    if (!out) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory capturing SSH key fingerprint");
+        return -1;
+    }
     memset(&opts, 0, sizeof(opts));
     memset(&res, 0, sizeof(res));
     opts.out = out;
-    opts.out_size = sizeof(out);
+    opts.out_size = out_size;
     opts.stderr_to_devnull = true;
     if (snapshot) {
         if (!ssh_key_snapshot_fd_matches(snapshot)) {
             set_error(ERR_SSH_KEY_INVALID,
                       "Validated SSH key changed before fingerprinting");
+            free(out);
             return -1;
         }
 #if defined(__linux__)
         if (lseek(snapshot->fd, 0, SEEK_SET) != 0) {
             set_error(ERR_SSH_KEY_INVALID,
                       "Validated SSH key could not be rewound for fingerprinting");
+            free(out);
             return -1;
         }
         argv[2] = stdin_path;
@@ -1598,6 +1763,7 @@ static int ssh_key_fingerprint_generation(
                 dir_fd, dir_path, snapshot, &scratch) != 0) {
             set_error(ERR_SSH_KEY_INVALID,
                       "Cannot stage the validated SSH key for portable fingerprinting");
+            free(out);
             return -1;
         }
         argv[2] = scratch.name;
@@ -1618,6 +1784,7 @@ static int ssh_key_fingerprint_generation(
     if (cleanup_rc != 0) {
         set_error(ERR_SSH_KEY_INVALID,
                   "Portable SSH fingerprint scratch could not be retired safely");
+        free(out);
         return -1;
     }
 #else
@@ -1628,24 +1795,16 @@ static int ssh_key_fingerprint_generation(
     if (!generation_matches) {
         set_error(ERR_SSH_KEY_INVALID,
                   "Validated SSH key changed while fingerprinting");
+        free(out);
         return -1;
     }
-    if (run_rc != 0 || res.out_truncated) return -1;
-
-    /* Output: "<bits> SHA256:<hash> <comment> (<type>)". Extract the token
-     * that starts with "SHA256:" (or "MD5:" on legacy setups). */
-    const char *fp = strstr(out, "SHA256:");
-    if (!fp) fp = strstr(out, "MD5:");
-    if (!fp) return -1;
-
-    size_t i = 0;
-    while (fp[i] && fp[i] != ' ' && fp[i] != '\t' && fp[i] != '\n' &&
-           i + 1 < size) {
-        buf[i] = fp[i];
-        i++;
+    if (run_rc != 0 || res.out_truncated || res.out_len >= out_size ||
+        !ssh_keygen_fingerprint_prefix(out, res.out_len, buf, size)) {
+        free(out);
+        return -1;
     }
-    buf[i] = '\0';
-    return i > 0 ? 0 : -1;
+    free(out);
+    return 0;
 }
 
 static bool ssh_agent_type_is_certificate(const char *type, size_t length) {
@@ -2024,7 +2183,26 @@ done:
 
 /* Start isolated SSH agent */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account) {
-    return ssh_start_isolated_agent_with_key(ssh_config, account, NULL);
+    ssh_key_snapshot_t key_snapshot;
+    char expanded_key_path[MAX_PATH_LEN];
+    int rc;
+
+    memset(&key_snapshot, 0, sizeof(key_snapshot));
+    if (!ssh_config || !account || !account->ssh_enabled ||
+        account->ssh_key_path[0] == '\0') {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid arguments to ssh_start_isolated_agent");
+        return -1;
+    }
+    if (expand_path(account->ssh_key_path, expanded_key_path,
+                    sizeof(expanded_key_path)) != 0 ||
+        ssh_key_snapshot_capture(expanded_key_path, &key_snapshot) != 0) {
+        ssh_key_snapshot_clear(&key_snapshot);
+        return -1;
+    }
+    rc = ssh_start_isolated_agent_with_key(ssh_config, account, &key_snapshot);
+    ssh_key_snapshot_clear(&key_snapshot);
+    return rc;
 }
 
 static int ssh_start_isolated_agent_with_key(
@@ -6346,6 +6524,7 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     char expected_path[MAX_PATH_LEN];
     ssh_runtime_pin_t current_pin;
     ssh_runtime_pin_t socket_pin;
+    ssh_key_snapshot_t key_snapshot;
     const char *component;
     size_t current_len;
     size_t dir_len;
@@ -6361,6 +6540,7 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
 
     ssh_runtime_pin_init(&current_pin);
     ssh_runtime_pin_init(&socket_pin);
+    memset(&key_snapshot, 0, sizeof(key_snapshot));
 
     if (expected_live) {
         *expected_live = false;
@@ -6561,7 +6741,10 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
                             sizeof(key_path)) != 0) {
                 goto done;
             }
-            reachable = ssh_socket_has_key(dir_fd, component, key_path);
+            if (ssh_key_snapshot_capture(key_path, &key_snapshot) == 0) {
+                reachable = ssh_socket_has_key_generation(
+                    dir_fd, socket_dir, component, key_path, &key_snapshot);
+            }
             if (!reachable) {
                 /* Empty/wrong/extra identities are ordinary stale runtime,
                  * not an API failure. The caller will perform a real resume. */
@@ -6596,6 +6779,7 @@ static int ssh_manager_inspect_current_account(char *name, size_t name_size,
     rc = 0;
 
 done:
+    ssh_key_snapshot_clear(&key_snapshot);
     if (release_ssh_runtime_pin(dir_fd, &socket_pin) != 0) rc = -1;
     if (release_ssh_runtime_pin(dir_fd, &current_pin) != 0) rc = -1;
     unlock_agent_dir(lock_fd);

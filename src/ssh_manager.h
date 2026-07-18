@@ -136,8 +136,9 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account);
 /**
  * Start isolated SSH agent for account
  * Returns socket path and PID for cleanup
- * This low-level legacy entry point does not validate the key pathname. Use
- * ssh_switch_account() for the descriptor-admitted validation/use contract.
+ * This low-level legacy entry point now admits one descriptor-backed private
+ * key generation for reuse verification and loading. Use ssh_switch_account()
+ * for the complete account-switch transaction and rollback contract.
  */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account);
 

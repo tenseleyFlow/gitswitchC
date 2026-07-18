@@ -425,6 +425,11 @@ static int fail_agent_pid_setenv(const char *name, const char *value,
 }
 
 static int setup_runtime(char *agent_dir, size_t size) {
+    static const char private_key[] =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+        "ar04-fixture\n"
+        "-----END OPENSSH PRIVATE KEY-----\n";
+    char key_path[128];
     char lock_path[192];
     int lock_fd;
 
@@ -432,7 +437,12 @@ static int setup_runtime(char *agent_dir, size_t size) {
     if (!ts_mkdtemp(g_xdg) ||
         ts_canonicalize_dir_path(g_xdg, sizeof(g_xdg)) != 0 ||
         chmod(g_xdg, 0700) != 0) return -1;
-    if (setenv("XDG_RUNTIME_DIR", g_xdg, 1) != 0) return -1;
+    if (setenv("XDG_RUNTIME_DIR", g_xdg, 1) != 0 ||
+        (size_t)snprintf(key_path, sizeof(key_path), "%s/key", g_xdg) >=
+            sizeof(key_path) ||
+        write_string_to_file(key_path, private_key, 0600) != 0) {
+        return -1;
+    }
     if ((size_t)snprintf(agent_dir, size, "%s/gitswitch-ssh", g_xdg) >= size) {
         return -1;
     }
