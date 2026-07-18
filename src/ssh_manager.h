@@ -35,6 +35,8 @@ typedef struct {
     bool agent_owned;      /* Whether we started this agent */
     bool key_already_loaded; /* The isolated agent already holds the account key;
                               * reuse avoids a passphrase re-prompt. */
+    bool reused_existing_agent; /* This activation adopted an already-live,
+                                  * matching isolated agent. */
 } ssh_config_t;
 
 /* One truthful process-state vocabulary for identity, liveness, and reap.

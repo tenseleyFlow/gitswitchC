@@ -93,6 +93,11 @@ typedef struct {
     char accumulated_details[sizeof(((error_context_t *)0)->details)];
 } error_accumulator_t;
 
+/* Synchronous best-effort work can use this callback shape when its
+ * diagnostics must remain observational rather than becoming the caller's
+ * causal error report. */
+typedef int (*error_observation_fn)(void *context);
+
 /* Global error context */
 extern error_context_t g_last_error;
 
@@ -160,11 +165,27 @@ int set_system_error_context(error_code_t code, const char *file, int line,
 const error_context_t *get_last_error(void);
 
 /**
- * Return the monotonic generation of causal reports published through
- * set_error_context() or set_system_error_context(). Clearing or restoring a
- * retained context does not manufacture a new report and does not advance it.
+ * Return the generation of committed caller-visible causal reports published
+ * through set_error_context() or set_system_error_context(). Ordinary reports
+ * advance monotonically. A report published inside error_run_observational()
+ * is provisional, and the scope restores its entry generation on return.
+ * Clearing or restoring a retained context does not manufacture a new report.
  */
 uint64_t error_report_generation(void);
+
+/**
+ * Run one synchronous observational operation while preserving the complete
+ * caller-visible error state: context bytes, causal report generation, and
+ * ambient errno. Callback diagnostics, generation advances, clears, and errno
+ * changes are provisional and discarded on normal return; the callback's
+ * integer result is returned unchanged. Other callback side effects are not
+ * rolled back. A NULL callback is API misuse and publishes ERR_INVALID_ARGS
+ * with errno EINVAL before returning -1.
+ *
+ * The callback must return normally and must not overlap concurrent access to
+ * the process-global error subsystem.
+ */
+int error_run_observational(error_observation_fn operation, void *context);
 
 /**
  * Clear last error

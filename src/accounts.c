@@ -969,6 +969,32 @@ static bool abort_switch_failure(pending_switch_t *prepared,
 /* Best-effort probes and informational output run only after the switch's
  * required commits are complete. In the CLI transaction that means after the
  * active-account file and resume hint have both committed. */
+typedef struct {
+    const account_t *account;
+    const char *host;
+} ssh_probe_observation_t;
+
+static int invoke_ssh_probe_observation(void *context) {
+    const ssh_probe_observation_t *probe = context;
+
+    if (!probe) return -1;
+    return ssh_test_connection(probe->account, probe->host);
+}
+
+static int run_informational_ssh_probe(const account_t *account,
+                                       const char *host) {
+    ssh_probe_observation_t probe = {
+        .account = account,
+        .host = host,
+    };
+
+    /* Resolver, spawn, pipe, and signal-cleanup failures can publish a useful
+     * runner diagnostic. This post-commit probe is explicitly observational,
+     * so it must not replace or causally advance the operation's pre-existing
+     * error contract. */
+    return error_run_observational(invoke_ssh_probe_observation, &probe);
+}
+
 static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
                                   const account_t *switch_target,
                                   git_scope_t scope, bool write_git,
@@ -978,11 +1004,12 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
     }
 
     if (!ctx->config.dry_run && account->ssh_enabled &&
-        strlen(account->ssh_key_path) > 0 && !ctx->config.resuming &&
-        !g_session.ssh_config.key_already_loaded && !signals_pending()) {
+        strlen(account->ssh_key_path) > 0 && ssh_ok &&
+        !ctx->config.resuming &&
+        !g_session.ssh_config.reused_existing_agent && !signals_pending()) {
         if (strlen(account->ssh_host_alias) > 0) {
-            if (ssh_test_connection(switch_target,
-                                    account->ssh_host_alias) == 0) {
+            if (run_informational_ssh_probe(
+                    switch_target, account->ssh_host_alias) == 0) {
                 printf("  [OK] SSH connection verified (%s)\n",
                        account->ssh_host_alias);
             } else {
@@ -990,8 +1017,8 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
                        account->ssh_host_alias);
             }
         } else if (ctx->config.verbose &&
-                   ssh_test_connection(switch_target,
-                                       "git@github.com") == 0) {
+                   run_informational_ssh_probe(
+                       switch_target, "git@github.com") == 0) {
             printf("  [OK] SSH connection verified (github.com)\n");
         }
     }

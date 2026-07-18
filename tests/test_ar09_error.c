@@ -6,6 +6,122 @@
 #include <errno.h>
 #include <string.h>
 
+typedef struct {
+    uint64_t generation_before;
+    uint64_t generation_during;
+} observational_failure_t;
+
+typedef struct {
+    bool inner_result_preserved;
+    bool inner_context_restored;
+    bool inner_generation_restored;
+    bool inner_errno_restored;
+} nested_observation_t;
+
+static int publish_observational_failure(void *context) {
+    observational_failure_t *observation = context;
+
+    set_error(ERR_NETWORK_ERROR, "first observational failure");
+    errno = EIO;
+    set_system_error(ERR_SYSTEM_CALL, "second observational failure");
+    observation->generation_during = error_report_generation();
+    clear_error();
+    errno = ENOSPC;
+    return 73;
+}
+
+static int publish_nested_observational_failure(void *context) {
+    (void)context;
+    errno = ENOTTY;
+    set_system_error(ERR_FILE_IO, "nested observational failure");
+    errno = ECHILD;
+    return 19;
+}
+
+static int run_nested_observation(void *context) {
+    nested_observation_t *observation = context;
+    error_context_t outer_error;
+    uint64_t outer_generation;
+    int nested_result;
+
+    set_error(ERR_NETWORK_ERROR, "outer observational failure");
+    outer_error = *get_last_error();
+    outer_generation = error_report_generation();
+    errno = EPIPE;
+    nested_result = error_run_observational(
+        publish_nested_observational_failure, NULL);
+
+    observation->inner_result_preserved = nested_result == 19;
+    observation->inner_context_restored =
+        memcmp(get_last_error(), &outer_error, sizeof(outer_error)) == 0;
+    observation->inner_generation_restored =
+        error_report_generation() == outer_generation;
+    observation->inner_errno_restored = errno == EPIPE;
+    return 29;
+}
+
+TEST(observational_scope_restores_context_generation_and_errno) {
+    observational_failure_t observation = {0};
+    error_context_t saved;
+
+    set_error(ERR_ACCOUNT_INVALID, "retained causal diagnostic");
+    saved = *get_last_error();
+    errno = EAGAIN;
+    observation.generation_before = error_report_generation();
+
+    CHECK_EQ_INT(error_run_observational(publish_observational_failure,
+                                         &observation),
+                 73);
+    CHECK(observation.generation_during != observation.generation_before);
+    CHECK(error_report_generation() == observation.generation_before);
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK_EQ_INT(get_last_error()->code, saved.code);
+    CHECK_STR_EQ(get_last_error()->message, saved.message);
+    CHECK_STR_EQ(get_last_error()->details, saved.details);
+    CHECK_STR_EQ(get_last_error()->file, saved.file);
+    CHECK_STR_EQ(get_last_error()->function, saved.function);
+    CHECK_EQ_INT(get_last_error()->line, saved.line);
+    CHECK_EQ_INT(get_last_error()->system_errno, saved.system_errno);
+}
+
+TEST(nested_observational_scopes_restore_in_lifo_order) {
+    nested_observation_t observation = {0};
+    error_context_t saved;
+    uint64_t saved_generation;
+
+    set_error(ERR_ACCOUNT_INVALID, "nested retained diagnostic");
+    saved = *get_last_error();
+    saved_generation = error_report_generation();
+    errno = EAGAIN;
+
+    CHECK_EQ_INT(error_run_observational(run_nested_observation,
+                                         &observation),
+                 29);
+    CHECK(observation.inner_result_preserved);
+    CHECK(observation.inner_context_restored);
+    CHECK(observation.inner_generation_restored);
+    CHECK(observation.inner_errno_restored);
+    CHECK(memcmp(get_last_error(), &saved, sizeof(saved)) == 0);
+    CHECK(error_report_generation() == saved_generation);
+    CHECK_EQ_INT(errno, EAGAIN);
+}
+
+TEST(null_observational_callback_publishes_api_misuse) {
+    uint64_t saved_generation;
+
+    set_error(ERR_ACCOUNT_INVALID, "replaced diagnostic");
+    saved_generation = error_report_generation();
+    errno = 0;
+
+    CHECK_EQ_INT(error_run_observational(NULL, NULL), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(get_last_error()->system_errno, EINVAL);
+    CHECK_STR_EQ(get_last_error()->message,
+                 "NULL observational error callback (Invalid argument)");
+    CHECK(error_report_generation() != saved_generation);
+}
+
 TEST(direct_error_context_copies_mutable_provenance) {
     char file[64] = "mutable-source.c";
     char function[64] = "mutable_function";
@@ -514,6 +630,9 @@ TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
+    RUN_TEST(observational_scope_restores_context_generation_and_errno);
+    RUN_TEST(nested_observational_scopes_restore_in_lifo_order);
+    RUN_TEST(null_observational_callback_publishes_api_misuse);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
     RUN_TEST(system_error_context_copies_mutable_provenance);
     RUN_TEST(error_context_value_copy_has_independent_provenance);

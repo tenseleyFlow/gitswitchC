@@ -368,6 +368,30 @@ uint64_t error_report_generation(void) {
     return g_error_report_generation;
 }
 
+int error_run_observational(error_observation_fn operation, void *context) {
+    error_context_t saved_error;
+    uint64_t saved_generation;
+    int saved_errno;
+    int result;
+
+    if (!operation) {
+        errno = EINVAL;
+        (void)set_system_error(ERR_INVALID_ARGS,
+                               "NULL observational error callback");
+        errno = EINVAL;
+        return -1;
+    }
+
+    saved_errno = errno;
+    saved_error = g_last_error;
+    saved_generation = g_error_report_generation;
+    result = operation(context);
+    g_last_error = saved_error;
+    g_error_report_generation = saved_generation;
+    errno = saved_errno;
+    return result;
+}
+
 /* Clear last error */
 void clear_error(void) {
     memset(&g_last_error, 0, sizeof(g_last_error));

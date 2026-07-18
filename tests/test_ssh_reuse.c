@@ -333,6 +333,7 @@ TEST(ssh_fingerprint_reuse_adopts_matching_key) {
 
     CHECK_EQ_INT(rc, 0);
     CHECK(cfg.key_already_loaded);       /* caller skips ssh_add_key */
+    CHECK(cfg.reused_existing_agent);    /* caller skips the network probe */
     CHECK(!cfg.agent_owned);             /* no verified PID => never claim ownership */
     CHECK_EQ_INT(cfg.agent_pid, -1);
     CHECK(getenv("SSH_AGENT_PID") == NULL);
@@ -371,6 +372,7 @@ TEST(ssh_fingerprint_reuse_rejects_different_key) {
     /* Reuse refused: the code moved on to a fresh agent start... */
     CHECK_EQ_INT(g_agent_start_attempts, 1);
     CHECK(!cfg.key_already_loaded);
+    CHECK(!cfg.reused_existing_agent);
     /* ...whose (fake-injected) failure fails the switch instead of silently
      * keeping the wrong key active. */
     CHECK_EQ_INT(rc, -1);
@@ -404,6 +406,7 @@ TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate) {
 
     CHECK_EQ_INT(g_agent_start_attempts, 1);
     CHECK(!cfg.key_already_loaded);
+    CHECK(!cfg.reused_existing_agent);
     CHECK_EQ_INT(rc, -1);
     CHECK(!path_exists(sock));
 }
@@ -526,6 +529,9 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
+    /* A new activation owns this outcome. Prove it actively clears a stale
+     * marker retained in a caller-reused configuration object. */
+    cfg.reused_existing_agent = true;
 
     prev = run_set_runner(fake_quoting_agent_runner);
     rc = ssh_start_isolated_agent(&cfg, &acct);
@@ -535,6 +541,7 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     CHECK(strchr(cfg.agent_socket_path, '"') == NULL); /* quotes stripped */
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK(g_key_load_used_pinned_socket);
+    CHECK(!cfg.reused_existing_agent);
 }
 
 /* A stale agent forces a fingerprint-before-fresh-load sequence. Replacing
@@ -875,6 +882,7 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
                  sizeof(cfg.agent_socket_arg));
     cfg.agent_pid = 12345;
     cfg.agent_owned = true;
+    cfg.reused_existing_agent = true;
     CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", sock, 1), 0);
     CHECK_EQ_INT(setenv("SSH_AGENT_PID", "12345", 1), 0);
 
@@ -883,6 +891,7 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
     ssh_manager_set_reap_fn(prev_reap);
 
     CHECK(cfg.agent_owned);
+    CHECK(cfg.reused_existing_agent);
     CHECK_EQ_INT(cfg.agent_pid, 12345);
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK_STR_EQ(cfg.agent_socket_arg, "ssh-agent.work.sock");
@@ -894,6 +903,7 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
     prev_reap = ssh_manager_set_reap_fn(classify_agent_gone);
     CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
     ssh_manager_set_reap_fn(prev_reap);
+    CHECK(!cfg.reused_existing_agent);
     CHECK(!path_exists(sock));
     CHECK(!path_exists(pid_path));
 }

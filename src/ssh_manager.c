@@ -2235,6 +2235,10 @@ static int ssh_start_isolated_agent_with_key(
         set_error(ERR_INVALID_ARGS, "Invalid arguments to ssh_start_isolated_agent");
         return -1;
     }
+    /* Activation outcome, not key presence: publish true only through the
+     * committed adoption path below. A failed retry must never retain a stale
+     * reuse decision from an earlier successful call. */
+    ssh_config->reused_existing_agent = false;
 
     log_info("Starting isolated SSH agent for account: %s", account->name);
 
@@ -2359,6 +2363,7 @@ static int ssh_start_isolated_agent_with_key(
         adopted.agent_pid = -1;
         adopted.agent_owned = false;
         adopted.key_already_loaded = true;
+        adopted.reused_existing_agent = true;
 
         /* Recover the PID from the sidecar so cleanup/stop can still target
          * it — but only after verifying it is genuinely OUR agent on this
@@ -3088,6 +3093,7 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
     /* Reset state only after both recovery names are durably absent. */
     ssh_config->agent_pid = -1;
     ssh_config->agent_owned = false;
+    ssh_config->reused_existing_agent = false;
     ssh_config->agent_socket_path[0] = '\0';
     ssh_config->agent_socket_arg[0] = '\0';
 

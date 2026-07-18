@@ -500,6 +500,7 @@ TEST(agent_probe_precedes_fingerprint_computation) {
 
     CHECK_EQ_INT(rc, 0);
     CHECK(cfg.key_already_loaded); /* single exact match: adopted */
+    CHECK(cfg.reused_existing_agent);
     /* L18: the cheap liveness probe must come first — a stale socket (dead
      * agent, the common miss) must not cost an ssh-keygen fork+exec. */
     CHECK_STR_EQ(g_first_probe, "ssh-add");

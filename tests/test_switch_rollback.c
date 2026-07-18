@@ -362,6 +362,24 @@ static int g_user_name_writes;
 static int g_fake_runner_calls;
 static int g_ssh_git_runner_calls;
 static int g_ssh_activation_commands;
+static int g_ssh_connection_probes;
+static int g_ssh_alias_probes;
+static int g_ssh_default_probes;
+static bool g_fail_ssh_probe;
+static char g_ssh_probe_target[MAX_NAME_LEN + sizeof("git@")];
+static char g_ssh_probe_hostname[sizeof("HostName=") + MAX_NAME_LEN];
+static gitswitch_ctx_t *g_probe_expected_ctx;
+static const char *g_probe_expected_config_path;
+static const char *g_probe_expected_alias;
+static bool g_probe_observed_committed_state;
+static error_context_t g_probe_error_before;
+static int g_probe_errno_before;
+static uint64_t g_probe_generation_before;
+static bool g_probe_failure_pending_observation;
+static bool g_post_probe_diagnostic_observed;
+static error_context_t g_post_probe_error;
+static int g_post_probe_errno;
+static uint64_t g_post_probe_generation;
 static bool g_fail_ssh_add;
 static const char *g_retarget_gpg_on_user_name; /* simulate a later XDG writer */
 static FILE *g_log;                 /* when set, every argv is logged here */
@@ -853,9 +871,105 @@ static int bind_fake_agent_socket_for_runner(const char *path,
  * it. */
 #define FAKE_AGENT_PID 1073741824
 #define FAKE_AGENT_FP "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+static bool ssh_probe_observes_committed_switch(void) {
+    char config[4096];
+    char header[MAX_NAME_LEN + sizeof("Host \n")];
+    char current_socket[MAX_PATH_LEN];
+    char socket_target[MAX_PATH_LEN];
+    ssize_t socket_target_len;
+    account_t *target;
+
+    if (!g_probe_expected_ctx) return true;
+    target = &g_probe_expected_ctx->accounts[0];
+    if (g_probe_expected_ctx->current_account != target ||
+        strcmp(g_probe_expected_ctx->config.active_account, target->name) != 0 ||
+        strcmp(g_store_name, target->name) != 0 ||
+        strcmp(g_store_email, target->email) != 0 ||
+        !strstr(g_store_sshcmd, target->ssh_key_path)) {
+        return false;
+    }
+    if (g_probe_expected_config_path && g_probe_expected_alias) {
+        if (read_file_to_string(g_probe_expected_config_path, config,
+                                sizeof(config)) < 0 ||
+            snprintf(header, sizeof(header), "Host %s\n",
+                     g_probe_expected_alias) < 0 ||
+            !strstr(config, header)) {
+            return false;
+        }
+    }
+    if (safe_snprintf(current_socket, sizeof(current_socket),
+                      "%s/gitswitch-ssh/current.sock", g_xdg) != 0) {
+        return false;
+    }
+    socket_target_len = readlink(current_socket, socket_target,
+                                 sizeof(socket_target) - 1U);
+    if (socket_target_len <= 0) return false;
+    socket_target[socket_target_len] = '\0';
+    return strstr(socket_target, "ssh-agent.testacct.sock") != NULL;
+}
+
 static int ssh_git_runner(const char *const argv[], const run_opts_t *opts,
                           run_result_t *result) {
+    if (g_probe_failure_pending_observation && strcmp(argv[0], "ssh") != 0) {
+        g_post_probe_error = *get_last_error();
+        g_post_probe_errno = errno;
+        g_post_probe_generation = error_report_generation();
+        g_post_probe_diagnostic_observed = true;
+        g_probe_failure_pending_observation = false;
+    }
     g_ssh_git_runner_calls++;
+    if (strcmp(argv[0], "ssh") == 0) {
+        bool alias_probe = false;
+
+        g_probe_error_before = *get_last_error();
+        g_probe_errno_before = errno;
+        g_probe_generation_before = error_report_generation();
+        g_ssh_connection_probes++;
+        g_ssh_probe_target[0] = '\0';
+        g_ssh_probe_hostname[0] = '\0';
+        for (size_t i = 1; argv[i]; i++) {
+            if (strncmp(argv[i], "HostName=", sizeof("HostName=") - 1U) == 0) {
+                alias_probe = true;
+                safe_strncpy(g_ssh_probe_hostname, argv[i],
+                             sizeof(g_ssh_probe_hostname));
+            }
+            if (strncmp(argv[i], "git@", sizeof("git@") - 1U) == 0) {
+                safe_strncpy(g_ssh_probe_target, argv[i],
+                             sizeof(g_ssh_probe_target));
+            }
+        }
+        if (alias_probe) {
+            g_ssh_alias_probes++;
+        } else {
+            g_ssh_default_probes++;
+        }
+        g_probe_observed_committed_state =
+            ssh_probe_observes_committed_switch();
+        if (result) {
+            memset(result, 0, sizeof(*result));
+            result->spawned = true;
+            result->exit_code = g_fail_ssh_probe ? 255 : 1;
+        }
+        if (opts && opts->out && opts->out_size > 0) {
+            if (g_fail_ssh_probe) {
+                opts->out[0] = '\0';
+            } else {
+                snprintf(opts->out, opts->out_size,
+                         "Hi testacct! You've successfully authenticated, "
+                         "but GitHub does not provide shell access.\n");
+            }
+            if (result) result->out_len = strlen(opts->out);
+        }
+        if (g_fail_ssh_probe) {
+            g_probe_failure_pending_observation = true;
+            errno = EIO;
+            set_system_error(ERR_SYSTEM_COMMAND_FAILED,
+                             "Injected SSH connection probe failure");
+            return -1;
+        }
+        return 0;
+    }
     if (strcmp(argv[0], "ssh-agent") == 0) {
         g_ssh_activation_commands++;
         /* Find "-a <path>" wherever it sits: the AR-03 H1 fix passes an
@@ -1115,6 +1229,25 @@ static void seed_previous_git_identity(void) {
     g_fail_list_config = false;
     g_mutate_name_before_seal = false;
     g_fail_ssh_add = false;
+    g_ssh_activation_commands = 0;
+    g_ssh_connection_probes = 0;
+    g_ssh_alias_probes = 0;
+    g_ssh_default_probes = 0;
+    g_fail_ssh_probe = false;
+    g_ssh_probe_target[0] = '\0';
+    g_ssh_probe_hostname[0] = '\0';
+    g_probe_expected_ctx = NULL;
+    g_probe_expected_config_path = NULL;
+    g_probe_expected_alias = NULL;
+    g_probe_observed_committed_state = false;
+    memset(&g_probe_error_before, 0, sizeof(g_probe_error_before));
+    g_probe_errno_before = 0;
+    g_probe_generation_before = 0U;
+    g_probe_failure_pending_observation = false;
+    g_post_probe_diagnostic_observed = false;
+    memset(&g_post_probe_error, 0, sizeof(g_post_probe_error));
+    g_post_probe_errno = 0;
+    g_post_probe_generation = 0U;
 }
 
 static int write_fake_key(const char *path);
@@ -2029,6 +2162,303 @@ static bool file_matches_exact_bytes(const char *path, const void *bytes,
     }
     if (close(fd) != 0) matches = false;
     return matches;
+}
+
+static bool ssh_probe_fixture_available(void) {
+    return command_exists("ssh-agent") && command_exists("ssh-add") &&
+           command_exists("ssh-keygen");
+}
+
+static int enable_switch_target_ssh(gitswitch_ctx_t *ctx,
+                                    const char *alias) {
+    char key_path[MAX_PATH_LEN];
+    account_t *target;
+
+    if (!ctx || ctx->account_count == 0 ||
+        safe_snprintf(key_path, sizeof(key_path), "%s/key_target", g_xdg) != 0 ||
+        write_fake_key(key_path) != 0) {
+        return -1;
+    }
+    target = &ctx->accounts[0];
+    target->ssh_enabled = true;
+    if (safe_strncpy(target->ssh_key_path, key_path,
+                     sizeof(target->ssh_key_path)) != 0) {
+        return -1;
+    }
+    if (alias && alias[0] != '\0') {
+        if (safe_strncpy(target->ssh_host_alias, alias,
+                         sizeof(target->ssh_host_alias)) != 0 ||
+            safe_strncpy(target->ssh_hostname, "github.com",
+                         sizeof(target->ssh_hostname)) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* AR-11 L34: a freshly activated managed identity reaches the historical
+ * best-effort connection probe exactly once, after Git, runtime, in-memory
+ * account state, and the final alias bytes have all committed. */
+TEST(fresh_alias_switch_runs_one_postcommit_probe) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700], after[4096];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    int rc;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+    seed_previous_git_identity();
+    g_probe_expected_ctx = &ctx;
+    g_probe_expected_config_path = config_path;
+    g_probe_expected_alias = "github.com-tgt";
+    previous_runner = run_set_runner(ssh_git_runner);
+    rc = accounts_switch(&ctx, "testacct");
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 1);
+    CHECK_EQ_INT(g_ssh_alias_probes, 1);
+    CHECK_EQ_INT(g_ssh_default_probes, 0);
+    CHECK_STR_EQ(g_ssh_probe_target, "git@github.com-tgt");
+    CHECK_STR_EQ(g_ssh_probe_hostname, "HostName=github.com");
+    CHECK(g_ssh_activation_commands > 0);
+    CHECK(g_probe_observed_committed_state);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK(strstr(after, "Host github.com-tgt\n") != NULL);
+    CHECK(runtime_lock_available_to_child());
+
+    g_probe_expected_ctx = NULL;
+    g_probe_expected_config_path = NULL;
+    g_probe_expected_alias = NULL;
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+}
+
+/* The prepared path must retain the fresh-vs-reused activation outcome until
+ * its later commit. A verbose alias-less switch probes the default GitHub
+ * transport once at commit, never during prepare. */
+TEST(prepared_verbose_fresh_switch_runs_one_default_probe) {
+    gitswitch_ctx_t ctx;
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    command_runner_fn previous_runner;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    ctx = make_ctx();
+    ctx.config.verbose = true;
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, NULL), 0);
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 0);
+    g_probe_expected_ctx = &ctx;
+    CHECK_EQ_INT(accounts_switch_commit_result(&ctx, &state), 0);
+
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_COMMIT_COMPLETE);
+    CHECK_EQ_INT(g_ssh_connection_probes, 1);
+    CHECK_EQ_INT(g_ssh_alias_probes, 0);
+    CHECK_EQ_INT(g_ssh_default_probes, 1);
+    CHECK_STR_EQ(g_ssh_probe_target, "git@github.com");
+    CHECK_STR_EQ(g_ssh_probe_hostname, "");
+    CHECK(g_probe_observed_committed_state);
+    CHECK(accounts_transaction_context_release_safe(&ctx));
+    CHECK(runtime_lock_available_to_child());
+
+    g_probe_expected_ctx = NULL;
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+}
+
+/* Authentication and transport failures are observational only. The probe
+ * runner injects a structured operational error after verifying the exact
+ * committed state visible at invocation; the successful switch must retain
+ * that state and restore the caller-visible diagnostic it had beforehand. */
+TEST(failed_postcommit_probe_preserves_switch_and_diagnostic) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700], after[4096];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    const error_context_t *observed_error;
+    int rc;
+    int observed_errno;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+    seed_previous_git_identity();
+    g_fail_ssh_probe = true;
+    g_probe_expected_ctx = &ctx;
+    g_probe_expected_config_path = config_path;
+    g_probe_expected_alias = "github.com-tgt";
+    clear_error();
+    errno = 0;
+    previous_runner = run_set_runner(ssh_git_runner);
+    rc = accounts_switch(&ctx, "testacct");
+    observed_error = get_last_error();
+    observed_errno = errno;
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 1);
+    CHECK_EQ_INT(g_ssh_alias_probes, 1);
+    CHECK_EQ_INT(g_ssh_default_probes, 0);
+    CHECK(g_probe_observed_committed_state);
+    CHECK_EQ_INT(observed_error->code, g_probe_error_before.code);
+    CHECK_STR_EQ(observed_error->message, g_probe_error_before.message);
+    CHECK_STR_EQ(observed_error->details, g_probe_error_before.details);
+    CHECK_EQ_INT(observed_error->system_errno,
+                 g_probe_error_before.system_errno);
+    CHECK(g_post_probe_diagnostic_observed);
+    CHECK_EQ_INT(g_post_probe_error.code, g_probe_error_before.code);
+    CHECK_STR_EQ(g_post_probe_error.message, g_probe_error_before.message);
+    CHECK_STR_EQ(g_post_probe_error.details, g_probe_error_before.details);
+    CHECK_EQ_INT(g_post_probe_error.system_errno,
+                 g_probe_error_before.system_errno);
+    CHECK_EQ_INT(g_post_probe_errno, g_probe_errno_before);
+    CHECK(g_post_probe_generation == g_probe_generation_before);
+    CHECK(observed_errno != EIO);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK(strstr(after, "Host github.com-tgt\n") != NULL);
+    CHECK(ssh_probe_observes_committed_switch());
+    CHECK(accounts_transaction_context_release_safe(&ctx));
+    CHECK(runtime_lock_available_to_child());
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message, "No prepared account switch") !=
+          NULL);
+
+    g_fail_ssh_probe = false;
+    g_probe_expected_ctx = NULL;
+    g_probe_expected_config_path = NULL;
+    g_probe_expected_alias = NULL;
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+}
+
+/* Each existing policy exclusion gets an independent full-switch witness.
+ * Fresh nonverbose no-alias and resume still activate SSH; dry-run and an
+ * SSH-disabled account do not. None may execute a connection probe. */
+TEST(postcommit_probe_policy_skip_matrix) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    previous_runner = run_set_runner(ssh_git_runner);
+
+    ctx = make_ctx();
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, NULL), 0);
+    seed_previous_git_identity();
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 0);
+    CHECK(g_ssh_activation_commands > 0);
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    ctx = make_ctx();
+    ctx.config.resuming = true;
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+    seed_previous_git_identity();
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 0);
+    CHECK(g_ssh_activation_commands > 0);
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    ctx = make_ctx();
+    ctx.config.dry_run = true;
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+    seed_previous_git_identity();
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 0);
+    CHECK_EQ_INT(g_ssh_activation_commands, 0);
+    CHECK(ctx.current_account == NULL);
+    CHECK_STR_EQ(ctx.config.active_account, "");
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, NULL), 0);
+    ctx.accounts[0].ssh_enabled = false;
+    safe_strncpy(ctx.accounts[0].ssh_host_alias, "github.com-tgt",
+                 sizeof(ctx.accounts[0].ssh_host_alias));
+    safe_strncpy(ctx.accounts[0].ssh_hostname, "github.com",
+                 sizeof(ctx.accounts[0].ssh_hostname));
+    seed_previous_git_identity();
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 0);
+    CHECK_EQ_INT(g_ssh_activation_commands, 0);
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+}
+
+/* A matching already-live account agent is adopted without loading a key or
+ * contacting the host. Seed it outside accounts' process session so the
+ * switch cannot reap it as a previous in-process activation first. */
+TEST(reused_agent_skips_postcommit_probe) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    ssh_config_t seeded_agent;
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(ssh_manager_init(&seeded_agent, SSH_AGENT_ISOLATED), 0);
+    CHECK_EQ_INT(ssh_start_isolated_agent(&seeded_agent, &ctx.accounts[0]), 0);
+    CHECK(seeded_agent.key_already_loaded);
+    CHECK(g_ssh_activation_commands > 0);
+
+    g_ssh_activation_commands = 0;
+    g_ssh_connection_probes = 0;
+    g_ssh_alias_probes = 0;
+    g_ssh_default_probes = 0;
+    CHECK_EQ_INT(accounts_switch(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(g_ssh_connection_probes, 0);
+    CHECK_EQ_INT(g_ssh_activation_commands, 0);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
 }
 
 /* M5 direct-library policy: once renameat has installed the alias, a failed
@@ -3367,6 +3797,12 @@ static void raise_during_guard_end(void) {
     raise(g_guard_end_hook_signal);
 }
 
+static int raise_sigint_after_alias_rename(int dir_fd) {
+    (void)dir_fd;
+    raise(SIGINT);
+    return 0;
+}
+
 /* sigaction has implementation padding, so compare the semantic fields and
  * every mask member this fixture deliberately varies. */
 static bool switch_actions_equal(const struct sigaction *left,
@@ -3386,6 +3822,62 @@ static bool switch_actions_equal(const struct sigaction *left,
         }
     }
     return true;
+}
+
+/* A late signal can arrive after the alias rename has crossed the switch's
+ * final commit point. It must suppress the optional network probe while the
+ * already-committed switch remains intact and the caller's returning handler
+ * receives the deferred signal during guard teardown. */
+TEST(pending_postcommit_signal_skips_ssh_probe) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700], after[4096];
+    struct sigaction original_action;
+    struct sigaction returning_action;
+    ssh_config_postrename_hook_fn previous_hook;
+    command_runner_fn previous_runner;
+    gitswitch_ctx_t ctx;
+    int rc;
+
+    if (!ssh_probe_fixture_available()) {
+        TS_SKIP("openssh", "SSH command fixture prerequisites unavailable");
+    }
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(enable_switch_target_ssh(&ctx, "github.com-tgt"), 0);
+    seed_previous_git_identity();
+    memset(&returning_action, 0, sizeof(returning_action));
+    returning_action.sa_handler = switch_inherited_handler;
+    sigemptyset(&returning_action.sa_mask);
+    CHECK_EQ_INT(sigaction(SIGINT, NULL, &original_action), 0);
+    CHECK_EQ_INT(sigaction(SIGINT, &returning_action, NULL), 0);
+    g_guard_end_checkpoint_signal = 0;
+    previous_runner = run_set_runner(ssh_git_runner);
+    previous_hook = ssh_manager_set_config_postrename_hook_fn(
+        raise_sigint_after_alias_rename);
+    rc = accounts_switch(&ctx, "testacct");
+    ssh_manager_set_config_postrename_hook_fn(previous_hook);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(g_guard_end_checkpoint_signal, SIGINT);
+    CHECK(!signals_pending());
+    CHECK_EQ_INT(g_ssh_connection_probes, 0);
+    CHECK(g_ssh_activation_commands > 0);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK(strstr(after, "Host github.com-tgt\n") != NULL);
+    CHECK(accounts_transaction_context_release_safe(&ctx));
+    CHECK(runtime_lock_available_to_child());
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(sigaction(SIGINT, &original_action, NULL), 0);
+    CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
 }
 
 /* AR-11 M4: the structured prepare result is a caller-lifetime contract.
@@ -4703,6 +5195,12 @@ TEST_MAIN_BEGIN()
     RUN_TEST(final_alias_commit_rejects_concurrent_symlink_and_rolls_back);
     RUN_TEST(symlinked_ssh_config_fails_before_switch_mutation);
     RUN_TEST(structurally_invalid_ssh_config_fails_before_switch_mutation);
+    RUN_TEST(fresh_alias_switch_runs_one_postcommit_probe);
+    RUN_TEST(prepared_verbose_fresh_switch_runs_one_default_probe);
+    RUN_TEST(failed_postcommit_probe_preserves_switch_and_diagnostic);
+    RUN_TEST(postcommit_probe_policy_skip_matrix);
+    RUN_TEST(reused_agent_skips_postcommit_probe);
+    RUN_TEST(pending_postcommit_signal_skips_ssh_probe);
     int gpg_preflight_rc = host_gpg_preflight();
     if (gpg_preflight_rc < 0) {
         fprintf(stderr, "HARNESS FAIL: cannot run host GPG preflight\n");
