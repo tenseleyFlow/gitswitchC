@@ -79,7 +79,9 @@ typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
 typedef enum {
     SSH_METADATA_TEST_RUNTIME_PIN = 1,
     SSH_METADATA_TEST_RESET_QUARANTINE,
-    SSH_METADATA_TEST_CONFIG_HOME_CREATE
+    SSH_METADATA_TEST_CONFIG_HOME_CREATE,
+    SSH_METADATA_TEST_CONFIG_UNCHANGED_RECHECK,
+    SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK
 } ssh_metadata_test_stage_t;
 typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
@@ -90,9 +92,9 @@ typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
 
 /* Public-state result for one ~/.ssh/config alias publication.  Failure is
  * transactionally reversible only while PREINSTALL_FAILED remains current.
- * The two uncertain states mean renameat() already made the new bytes public;
- * callers must retain the matching account transaction instead of rolling its
- * Git/runtime/config state back around an installed alias. */
+ * The two uncertain states mean renameat() already made the replacement
+ * public; callers must retain the matching account transaction instead of
+ * rolling its Git/runtime/config state back around an installed alias. */
 typedef enum {
     SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED,
     SSH_CONFIG_PUBLICATION_UNCHANGED,

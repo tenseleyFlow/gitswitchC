@@ -46,6 +46,13 @@ static char g_moved_ssh_dir[MAX_PATH_LEN];
 static int g_transaction_ready_fd = -1;
 static int g_transaction_release_fd = -1;
 static int g_transaction_commit_fd = -1;
+static int g_identical_commit_hook_calls;
+static int g_identical_postrename_hook_calls;
+static char g_unchanged_recheck_config[MAX_PATH_LEN];
+static int g_unchanged_recheck_hook_calls;
+static bool g_unchanged_recheck_chmod_succeeded;
+static int g_unchanged_final_recheck_hook_calls;
+static bool g_unchanged_final_recheck_swap_succeeded;
 
 static int setup_home_without_ssh(char home[96],
                                   char config[MAX_PATH_LEN]) {
@@ -209,6 +216,67 @@ static size_t count_temps_in(const char *dir_path) {
     return count;
 }
 
+typedef struct {
+    char home[96];
+    char config[MAX_PATH_LEN];
+    char ssh_dir[MAX_PATH_LEN];
+    account_t account;
+    struct stat home_identity;
+    struct stat ssh_identity;
+    struct stat config_identity;
+    char *content;
+    size_t content_len;
+    int open_fds;
+} identical_config_fixture_t;
+
+static int setup_identical_config_fixture(identical_config_fixture_t *fixture,
+                                          mode_t mode) {
+    char key[MAX_PATH_LEN];
+
+    memset(fixture, 0, sizeof(*fixture));
+    if (setup_home(fixture->home, fixture->config) != 0 ||
+        (size_t)snprintf(fixture->ssh_dir, sizeof(fixture->ssh_dir),
+                         "%s/.ssh", fixture->home) >=
+            sizeof(fixture->ssh_dir) ||
+        (size_t)snprintf(key, sizeof(key), "%s/id", fixture->home) >=
+            sizeof(key)) {
+        return -1;
+    }
+    make_account(&fixture->account, key);
+    if (ssh_configure_host_alias(&fixture->account) != 0 ||
+        chmod(fixture->config, mode) != 0 ||
+        stat(fixture->home, &fixture->home_identity) != 0 ||
+        stat(fixture->ssh_dir, &fixture->ssh_identity) != 0 ||
+        stat(fixture->config, &fixture->config_identity) != 0) {
+        return -1;
+    }
+    fixture->content = read_bytes(fixture->config, &fixture->content_len);
+    if (!fixture->content) return -1;
+    fixture->open_fds = test_open_fd_count();
+    return 0;
+}
+
+static void check_exact_file_bytes(const char *path, const char *expected,
+                                   size_t expected_len) {
+    size_t actual_len = 0;
+    char *actual = read_bytes(path, &actual_len);
+
+    CHECK(actual != NULL);
+    if (actual) {
+        CHECK_EQ_INT(actual_len, expected_len);
+        CHECK(actual_len != expected_len ||
+              memcmp(actual, expected, expected_len) == 0);
+    }
+    free(actual);
+}
+
+static void check_identical_fixture_clean(identical_config_fixture_t *fixture) {
+    CHECK_EQ_INT(count_temps_in(fixture->ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), fixture->open_fds);
+    free(fixture->content);
+    fixture->content = NULL;
+}
+
 static bool output_has_value(const char *output, const char *keyword,
                              const char *expected) {
     size_t keyword_len = strlen(keyword);
@@ -289,8 +357,32 @@ static bool retarget_home_before_ssh_create(
     return false;
 }
 
+static bool make_config_writable_before_unchanged_recheck(
+    ssh_metadata_test_stage_t stage) {
+    if (stage != SSH_METADATA_TEST_CONFIG_UNCHANGED_RECHECK) return false;
+    g_unchanged_recheck_hook_calls++;
+    g_unchanged_recheck_chmod_succeeded =
+        chmod(g_unchanged_recheck_config, 0666) == 0;
+    return false;
+}
+
 static int fail_postrename_verification(int dir_fd) {
     (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static int fail_identical_config_commit(int dir_fd, const char *temp_name) {
+    (void)dir_fd;
+    (void)temp_name;
+    g_identical_commit_hook_calls++;
+    errno = EIO;
+    return -1;
+}
+
+static int fail_identical_postrename_verification(int dir_fd) {
+    (void)dir_fd;
+    g_identical_postrename_hook_calls++;
     errno = EIO;
     return -1;
 }
@@ -309,6 +401,17 @@ static int swap_public_ssh_directory(int dir_fd, const char *temp_name) {
         return -1;
     }
     return 0;
+}
+
+static bool swap_ssh_directory_before_unchanged_final_recheck(
+    ssh_metadata_test_stage_t stage) {
+    if (stage != SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK) {
+        return false;
+    }
+    g_unchanged_final_recheck_hook_calls++;
+    g_unchanged_final_recheck_swap_succeeded =
+        swap_public_ssh_directory(-1, NULL) == 0;
+    return false;
 }
 
 static int write_marker(int fd, char marker) {
@@ -584,6 +687,79 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
     CHECK(output_has_value(output, "identityfile", key));
 }
 
+TEST(openssh_include_rejects_group_or_other_writable_config) {
+    static const mode_t accepted_modes[] = {0600, 0644};
+    static const mode_t rejected_modes[] = {0620, 0602, 0666};
+    static const char included_text[] =
+        "Host l36-probe\n"
+        "  HostName l36.example.test\n"
+        "  User l36-user\n";
+    static const char *const clean_locale[] = {"LC_ALL=C", NULL};
+    char home[96], included[MAX_PATH_LEN], wrapper[MAX_PATH_LEN];
+    char wrapper_text[MAX_PATH_LEN + 16U];
+    char output[32768];
+    run_opts_t opts;
+    run_result_t result;
+    int needed;
+
+    if (!command_exists("ssh")) {
+        TS_SKIP("openssh", "ssh unavailable in trusted PATH");
+    }
+    CHECK_EQ_INT(setup_home(home, included), 0);
+    CHECK((size_t)snprintf(wrapper, sizeof(wrapper), "%s/.ssh/wrapper",
+                           home) < sizeof(wrapper));
+    needed = snprintf(wrapper_text, sizeof(wrapper_text), "Include %s\n",
+                      included);
+    CHECK(needed > 0 && (size_t)needed < sizeof(wrapper_text));
+    CHECK_EQ_INT(write_bytes(included, included_text,
+                             sizeof(included_text) - 1U), 0);
+    CHECK_EQ_INT(write_bytes(wrapper, wrapper_text,
+                             needed > 0 ? (size_t)needed : 0U), 0);
+    CHECK_EQ_INT(chmod(wrapper, 0600), 0);
+
+    memset(&opts, 0, sizeof(opts));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+    opts.extra_env = clean_locale;
+
+    for (size_t i = 0;
+         i < sizeof(accepted_modes) / sizeof(accepted_modes[0]); i++) {
+        const char *const argv[] = {
+            "ssh", "-G", "-T", "-F", wrapper, "l36-probe", NULL
+        };
+
+        CHECK_EQ_INT(chmod(included, accepted_modes[i]), 0);
+        memset(output, 0, sizeof(output));
+        memset(&result, 0, sizeof(result));
+        CHECK_EQ_INT(run_argv(argv, &opts, &result), 0);
+        CHECK(result.spawned);
+        CHECK_EQ_INT(result.exit_code, 0);
+        CHECK_EQ_INT(result.term_signal, 0);
+        CHECK(!result.out_truncated);
+        CHECK(output_has_value(output, "hostname", "l36.example.test"));
+        CHECK(output_has_value(output, "user", "l36-user"));
+    }
+
+    for (size_t i = 0;
+         i < sizeof(rejected_modes) / sizeof(rejected_modes[0]); i++) {
+        const char *const argv[] = {
+            "ssh", "-G", "-T", "-F", wrapper, "l36-probe", NULL
+        };
+
+        CHECK_EQ_INT(chmod(included, rejected_modes[i]), 0);
+        memset(output, 0, sizeof(output));
+        memset(&result, 0, sizeof(result));
+        CHECK_EQ_INT(run_argv(argv, &opts, &result), -1);
+        CHECK(result.spawned);
+        CHECK(result.exit_code != 0);
+        CHECK_EQ_INT(result.term_signal, 0);
+        CHECK(!result.out_truncated);
+        CHECK(strstr(output, "Bad owner or permissions") != NULL);
+        CHECK(strstr(output, included) != NULL);
+    }
+}
+
 TEST(openssh_percent_and_environment_expansions_are_safe) {
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
     account_t account;
@@ -844,25 +1020,463 @@ TEST(crlf_remove_preserves_all_unmanaged_bytes) {
 }
 
 TEST(byte_identical_config_skips_all_write_and_sync_work) {
-    char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN];
-    account_t account;
-    struct stat before;
-    struct stat after;
-    ssh_dirsync_fn previous;
+    static const mode_t safe_modes[] = {0600, 0644};
 
-    CHECK_EQ_INT(setup_home(home, config), 0);
-    snprintf(key, sizeof(key), "%s/id", home);
-    make_account(&account, key);
-    CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
-    CHECK_EQ_INT(stat(config, &before), 0);
+    for (size_t i = 0; i < sizeof(safe_modes) / sizeof(safe_modes[0]); i++) {
+        identical_config_fixture_t fixture;
+        struct stat after;
+        ssh_config_publication_state_t publication;
+        ssh_config_commit_hook_fn previous_commit;
+        ssh_dirsync_fn previous_sync;
+        int rc;
+
+        if (setup_identical_config_fixture(&fixture, safe_modes[i]) != 0) {
+            CHECK(false);
+            continue;
+        }
+        CHECK_EQ_INT(fixture.config_identity.st_uid, getuid());
+        CHECK_EQ_INT(fixture.config_identity.st_mode & 0777, safe_modes[i]);
+
+        g_identical_commit_hook_calls = 0;
+        g_dirsync_calls = 0;
+        previous_commit = ssh_manager_set_config_commit_hook_fn(
+            fail_identical_config_commit);
+        previous_sync = ssh_manager_set_dirsync_fn(fail_dirsync);
+        rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+        ssh_manager_set_dirsync_fn(previous_sync);
+        ssh_manager_set_config_commit_hook_fn(previous_commit);
+
+        CHECK_EQ_INT(rc, 0);
+        CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
+        CHECK_EQ_INT(g_identical_commit_hook_calls, 0);
+        CHECK_EQ_INT(g_dirsync_calls, 0);
+        CHECK_EQ_INT(stat(fixture.config, &after), 0);
+        CHECK(ts_same_identity(&fixture.config_identity, &after));
+        CHECK(same_mtime(&fixture.config_identity, &after));
+        CHECK_EQ_INT(after.st_mode & 0777, safe_modes[i]);
+        CHECK_EQ_INT(after.st_uid, getuid());
+        check_exact_file_bytes(fixture.config, fixture.content,
+                               fixture.content_len);
+        check_identical_fixture_clean(&fixture);
+    }
+}
+
+TEST(byte_identical_safe_config_rechecks_mode_before_noop) {
+    identical_config_fixture_t fixture;
+    struct stat raced;
+    struct stat normalized;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_dirsync_fn previous_sync;
+    int rc;
+
+    if (setup_identical_config_fixture(&fixture, 0600) != 0) {
+        CHECK(false);
+        return;
+    }
+    CHECK((size_t)snprintf(g_unchanged_recheck_config,
+                           sizeof(g_unchanged_recheck_config), "%s",
+                           fixture.config) <
+          sizeof(g_unchanged_recheck_config));
+    g_unchanged_recheck_hook_calls = 0;
+    g_unchanged_recheck_chmod_succeeded = false;
+    g_identical_commit_hook_calls = 0;
     g_dirsync_calls = 0;
-    previous = ssh_manager_set_dirsync_fn(fail_dirsync);
-    CHECK_EQ_INT(ssh_configure_host_alias(&account), 0);
-    ssh_manager_set_dirsync_fn(previous);
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        make_config_writable_before_unchanged_recheck);
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        fail_identical_config_commit);
+    previous_sync = ssh_manager_set_dirsync_fn(fail_dirsync);
+    clear_error();
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+    g_unchanged_recheck_config[0] = '\0';
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK(strstr(failure.message, "SSH config changed") != NULL);
+    CHECK_EQ_INT(g_unchanged_recheck_hook_calls, 1);
+    CHECK(g_unchanged_recheck_chmod_succeeded);
+    CHECK_EQ_INT(g_identical_commit_hook_calls, 0);
     CHECK_EQ_INT(g_dirsync_calls, 0);
-    CHECK_EQ_INT(stat(config, &after), 0);
-    CHECK(before.st_ino == after.st_ino);
+    CHECK_EQ_INT(lstat(fixture.config, &raced), 0);
+    CHECK(ts_same_identity(&fixture.config_identity, &raced));
+    CHECK(same_mtime(&fixture.config_identity, &raced));
+    CHECK_EQ_INT(raced.st_mode & 0777, 0666);
+    check_exact_file_bytes(fixture.config, fixture.content,
+                           fixture.content_len);
+    CHECK_EQ_INT(count_temps_in(fixture.ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), fixture.open_fds);
+
+    reset_dirsync_observations(&fixture.home_identity, false);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    ssh_manager_set_dirsync_fn(previous_sync);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    CHECK_EQ_INT(g_dirsync_observation_count, 1);
+    CHECK_EQ_INT(lstat(fixture.config, &normalized), 0);
+    CHECK(!ts_same_identity(&fixture.config_identity, &normalized));
+    CHECK_EQ_INT(normalized.st_uid, getuid());
+    CHECK_EQ_INT(normalized.st_mode & 0777, 0600);
+    CHECK_EQ_INT(normalized.st_nlink, 1);
+    check_exact_file_bytes(fixture.config, fixture.content,
+                           fixture.content_len);
+    check_identical_fixture_clean(&fixture);
+}
+
+TEST(byte_identical_safe_config_rebinds_final_public_directory) {
+    static const char replacement[] =
+        "Host replacement\n  User untouched\n";
+    identical_config_fixture_t fixture;
+    char moved_config[MAX_PATH_LEN];
+    struct stat public_after;
+    struct stat moved_after;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_metadata_test_hook_fn previous_metadata;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_dirsync_fn previous_sync;
+    int rc;
+
+    if (setup_identical_config_fixture(&fixture, 0600) != 0) {
+        CHECK(false);
+        return;
+    }
+    CHECK((size_t)snprintf(g_public_ssh_dir, sizeof(g_public_ssh_dir), "%s",
+                           fixture.ssh_dir) < sizeof(g_public_ssh_dir));
+    CHECK((size_t)snprintf(g_moved_ssh_dir, sizeof(g_moved_ssh_dir),
+                           "%s/.ssh.noop-pinned", fixture.home) <
+          sizeof(g_moved_ssh_dir));
+    CHECK((size_t)snprintf(moved_config, sizeof(moved_config), "%s/config",
+                           g_moved_ssh_dir) < sizeof(moved_config));
+    g_unchanged_final_recheck_hook_calls = 0;
+    g_unchanged_final_recheck_swap_succeeded = false;
+    g_identical_commit_hook_calls = 0;
+    g_dirsync_calls = 0;
+    previous_metadata = ssh_manager_set_metadata_test_hook_fn(
+        swap_ssh_directory_before_unchanged_final_recheck);
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        fail_identical_config_commit);
+    previous_sync = ssh_manager_set_dirsync_fn(fail_dirsync);
+    clear_error();
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+    ssh_manager_set_metadata_test_hook_fn(previous_metadata);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK(strstr(failure.message, "SSH config directory changed") != NULL);
+    CHECK_EQ_INT(g_unchanged_final_recheck_hook_calls, 1);
+    CHECK(g_unchanged_final_recheck_swap_succeeded);
+    CHECK_EQ_INT(g_identical_commit_hook_calls, 0);
+    CHECK_EQ_INT(g_dirsync_calls, 0);
+    CHECK_EQ_INT(lstat(fixture.config, &public_after), 0);
+    CHECK_EQ_INT(lstat(moved_config, &moved_after), 0);
+    CHECK(!ts_same_identity(&fixture.config_identity, &public_after));
+    CHECK(ts_same_identity(&fixture.config_identity, &moved_after));
+    CHECK_EQ_INT(public_after.st_uid, getuid());
+    CHECK_EQ_INT(public_after.st_mode & 0777, 0600);
+    CHECK_EQ_INT(moved_after.st_uid, getuid());
+    CHECK_EQ_INT(moved_after.st_mode & 0777, 0600);
+    check_exact_file_bytes(fixture.config, replacement,
+                           sizeof(replacement) - 1U);
+    check_exact_file_bytes(moved_config, fixture.content,
+                           fixture.content_len);
+    CHECK_EQ_INT(count_temps_in(g_public_ssh_dir), 0);
+    CHECK_EQ_INT(count_temps_in(g_moved_ssh_dir), 0);
+    CHECK_EQ_INT(test_open_fd_count(), fixture.open_fds);
+    g_public_ssh_dir[0] = '\0';
+    g_moved_ssh_dir[0] = '\0';
+    check_identical_fixture_clean(&fixture);
+}
+
+TEST(byte_identical_safe_hardlink_remains_unchanged) {
+    identical_config_fixture_t fixture;
+    char witness[MAX_PATH_LEN];
+    struct stat before;
+    struct stat witness_before;
+    struct stat after;
+    struct stat witness_after;
+    ssh_config_publication_state_t publication;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_dirsync_fn previous_sync;
+    int rc;
+
+    if (setup_identical_config_fixture(&fixture, 0600) != 0) {
+        CHECK(false);
+        return;
+    }
+    if ((size_t)snprintf(witness, sizeof(witness), "%s/config.safe-witness",
+                         fixture.ssh_dir) >= sizeof(witness) ||
+        link(fixture.config, witness) != 0 ||
+        lstat(fixture.config, &before) != 0 ||
+        lstat(witness, &witness_before) != 0) {
+        CHECK(false);
+        check_identical_fixture_clean(&fixture);
+        return;
+    }
+    CHECK(ts_same_identity(&before, &witness_before));
+    CHECK_EQ_INT(before.st_nlink, 2);
+    CHECK_EQ_INT(before.st_mode & 0777, 0600);
+
+    g_identical_commit_hook_calls = 0;
+    g_dirsync_calls = 0;
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        fail_identical_config_commit);
+    previous_sync = ssh_manager_set_dirsync_fn(fail_dirsync);
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    ssh_manager_set_dirsync_fn(previous_sync);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
+    CHECK_EQ_INT(g_identical_commit_hook_calls, 0);
+    CHECK_EQ_INT(g_dirsync_calls, 0);
+    CHECK_EQ_INT(lstat(fixture.config, &after), 0);
+    CHECK_EQ_INT(lstat(witness, &witness_after), 0);
+    CHECK(ts_same_identity(&before, &after));
+    CHECK(ts_same_identity(&before, &witness_after));
     CHECK(same_mtime(&before, &after));
+    CHECK_EQ_INT(after.st_nlink, 2);
+    CHECK_EQ_INT(after.st_mode & 0777, 0600);
+    check_exact_file_bytes(fixture.config, fixture.content,
+                           fixture.content_len);
+    check_exact_file_bytes(witness, fixture.content, fixture.content_len);
+    check_identical_fixture_clean(&fixture);
+}
+
+TEST(byte_identical_writable_mode_matrix_is_atomically_normalized) {
+    static const mode_t writable_modes[] = {0620, 0602, 0666};
+
+    for (size_t i = 0;
+         i < sizeof(writable_modes) / sizeof(writable_modes[0]); i++) {
+        identical_config_fixture_t fixture;
+        struct stat after;
+        ssh_config_publication_state_t publication;
+        ssh_dirsync_fn previous_sync;
+        int rc;
+
+        if (setup_identical_config_fixture(&fixture, writable_modes[i]) != 0) {
+            CHECK(false);
+            continue;
+        }
+        CHECK_EQ_INT(fixture.config_identity.st_uid, getuid());
+        CHECK_EQ_INT(fixture.config_identity.st_mode & 0777,
+                     writable_modes[i]);
+
+        reset_dirsync_observations(&fixture.home_identity, false);
+        previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+        rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+        ssh_manager_set_dirsync_fn(previous_sync);
+
+        CHECK_EQ_INT(rc, 0);
+        CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+        CHECK_EQ_INT(g_dirsync_observation_count, 1);
+        if (g_dirsync_observation_count == 1) {
+            CHECK(ts_same_identity(&g_dirsync_observations[0],
+                                   &fixture.ssh_identity));
+            CHECK(!ts_same_identity(&g_dirsync_observations[0],
+                                    &fixture.home_identity));
+        }
+        CHECK_EQ_INT(lstat(fixture.config, &after), 0);
+        CHECK(S_ISREG(after.st_mode));
+        CHECK(!ts_same_identity(&fixture.config_identity, &after));
+        CHECK_EQ_INT(after.st_uid, getuid());
+        CHECK_EQ_INT(after.st_mode & 0777, 0600);
+        CHECK_EQ_INT(after.st_nlink, 1);
+        check_exact_file_bytes(fixture.config, fixture.content,
+                               fixture.content_len);
+        check_identical_fixture_clean(&fixture);
+    }
+}
+
+TEST(byte_identical_writable_hardlink_is_replaced_not_chmodded) {
+    identical_config_fixture_t fixture;
+    char witness[MAX_PATH_LEN];
+    struct stat before;
+    struct stat witness_before;
+    struct stat after;
+    struct stat witness_after;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous_sync;
+    int rc;
+
+    if (setup_identical_config_fixture(&fixture, 0666) != 0) {
+        CHECK(false);
+        return;
+    }
+    if ((size_t)snprintf(witness, sizeof(witness), "%s/config.mode-witness",
+                         fixture.ssh_dir) >= sizeof(witness) ||
+        link(fixture.config, witness) != 0 ||
+        lstat(fixture.config, &before) != 0 ||
+        lstat(witness, &witness_before) != 0) {
+        CHECK(false);
+        check_identical_fixture_clean(&fixture);
+        return;
+    }
+    CHECK(ts_same_identity(&before, &witness_before));
+    CHECK(before.st_nlink >= 2);
+    CHECK_EQ_INT(before.st_mode & 0777, 0666);
+
+    reset_dirsync_observations(&fixture.home_identity, false);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    ssh_manager_set_dirsync_fn(previous_sync);
+
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_COMMITTED);
+    CHECK_EQ_INT(g_dirsync_observation_count, 1);
+    if (g_dirsync_observation_count == 1) {
+        CHECK(ts_same_identity(&g_dirsync_observations[0],
+                               &fixture.ssh_identity));
+        CHECK(!ts_same_identity(&g_dirsync_observations[0],
+                                &fixture.home_identity));
+    }
+    CHECK_EQ_INT(lstat(fixture.config, &after), 0);
+    CHECK_EQ_INT(lstat(witness, &witness_after), 0);
+    CHECK(S_ISREG(after.st_mode));
+    CHECK(!ts_same_identity(&before, &after));
+    CHECK_EQ_INT(after.st_uid, getuid());
+    CHECK_EQ_INT(after.st_mode & 0777, 0600);
+    CHECK_EQ_INT(after.st_nlink, 1);
+    CHECK(ts_same_identity(&before, &witness_after));
+    CHECK_EQ_INT(witness_after.st_mode & 0777, 0666);
+    check_exact_file_bytes(fixture.config, fixture.content,
+                           fixture.content_len);
+    check_exact_file_bytes(witness, fixture.content, fixture.content_len);
+    check_identical_fixture_clean(&fixture);
+}
+
+TEST(byte_identical_writable_preinstall_failure_preserves_original) {
+    identical_config_fixture_t fixture;
+    struct stat after;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_config_commit_hook_fn previous_commit;
+    ssh_dirsync_fn previous_sync;
+    int rc;
+
+    if (setup_identical_config_fixture(&fixture, 0666) != 0) {
+        CHECK(false);
+        return;
+    }
+    g_identical_commit_hook_calls = 0;
+    reset_dirsync_observations(&fixture.home_identity, false);
+    previous_commit = ssh_manager_set_config_commit_hook_fn(
+        fail_identical_config_commit);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+    ssh_manager_set_config_commit_hook_fn(previous_commit);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK_EQ_INT(g_identical_commit_hook_calls, 1);
+    CHECK_EQ_INT(g_dirsync_observation_count, 0);
+    CHECK_EQ_INT(lstat(fixture.config, &after), 0);
+    CHECK(ts_same_identity(&fixture.config_identity, &after));
+    CHECK(same_mtime(&fixture.config_identity, &after));
+    CHECK_EQ_INT(after.st_mode & 0777, 0666);
+    check_exact_file_bytes(fixture.config, fixture.content,
+                           fixture.content_len);
+    check_identical_fixture_clean(&fixture);
+}
+
+TEST(byte_identical_writable_postrename_failure_reports_installed) {
+    identical_config_fixture_t fixture;
+    struct stat after;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_config_postrename_hook_fn previous_postrename;
+    ssh_dirsync_fn previous_sync;
+    int rc;
+
+    if (setup_identical_config_fixture(&fixture, 0666) != 0) {
+        CHECK(false);
+        return;
+    }
+    g_identical_postrename_hook_calls = 0;
+    reset_dirsync_observations(&fixture.home_identity, false);
+    previous_postrename = ssh_manager_set_config_postrename_hook_fn(
+        fail_identical_postrename_verification);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+    ssh_manager_set_config_postrename_hook_fn(previous_postrename);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK_EQ_INT(g_identical_postrename_hook_calls, 1);
+    CHECK_EQ_INT(g_dirsync_observation_count, 0);
+    CHECK_EQ_INT(lstat(fixture.config, &after), 0);
+    CHECK(S_ISREG(after.st_mode));
+    CHECK(!ts_same_identity(&fixture.config_identity, &after));
+    CHECK_EQ_INT(after.st_uid, getuid());
+    CHECK_EQ_INT(after.st_mode & 0777, 0600);
+    CHECK_EQ_INT(after.st_nlink, 1);
+    check_exact_file_bytes(fixture.config, fixture.content,
+                           fixture.content_len);
+    check_identical_fixture_clean(&fixture);
+}
+
+TEST(byte_identical_writable_dirsync_failure_reports_uncertain) {
+    identical_config_fixture_t fixture;
+    struct stat after;
+    error_context_t failure;
+    ssh_config_publication_state_t publication;
+    ssh_dirsync_fn previous_sync;
+    int rc;
+
+    if (setup_identical_config_fixture(&fixture, 0666) != 0) {
+        CHECK(false);
+        return;
+    }
+    reset_dirsync_observations(&fixture.ssh_identity, true);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
+    clear_error();
+    rc = ssh_configure_host_alias_result(&fixture.account, &publication);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(publication,
+                 SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK_EQ_INT(failure.system_errno, EIO);
+    CHECK_EQ_INT(g_dirsync_observation_count, 1);
+    if (g_dirsync_observation_count == 1) {
+        CHECK(ts_same_identity(&g_dirsync_observations[0],
+                               &fixture.ssh_identity));
+        CHECK(!ts_same_identity(&g_dirsync_observations[0],
+                                &fixture.home_identity));
+    }
+    CHECK_EQ_INT(lstat(fixture.config, &after), 0);
+    CHECK(S_ISREG(after.st_mode));
+    CHECK(!ts_same_identity(&fixture.config_identity, &after));
+    CHECK_EQ_INT(after.st_uid, getuid());
+    CHECK_EQ_INT(after.st_mode & 0777, 0600);
+    CHECK_EQ_INT(after.st_nlink, 1);
+    check_exact_file_bytes(fixture.config, fixture.content,
+                           fixture.content_len);
+    check_identical_fixture_clean(&fixture);
 }
 
 TEST(first_ssh_directory_syncs_home_before_child) {
@@ -1269,7 +1883,7 @@ TEST(config_registration_failure_is_atomic_and_retryable) {
     CHECK_EQ_INT(count_temps_in(ssh_dir), 0);
 }
 
-TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
+TEST(postrename_dirsync_failure_is_durability_uncertain_without_temp) {
     static const char original[] = "Host existing\n  User preserved\n";
     char home[96], config[MAX_PATH_LEN], key[MAX_PATH_LEN], ssh_dir[MAX_PATH_LEN];
     account_t account;
@@ -1290,7 +1904,7 @@ TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp) {
     CHECK_EQ_INT(publication,
                  SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN);
     CHECK_EQ_INT(g_dirsync_calls, 1);
-    CHECK(strstr(get_last_error()->message, "changed bytes") != NULL);
+    CHECK(strstr(get_last_error()->message, "replacement") != NULL);
     CHECK(strstr(get_last_error()->message, "uncertain") != NULL);
     content = read_bytes(config, &length);
     CHECK(content != NULL);
@@ -1723,6 +2337,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(historical_host_port_block_can_be_repaired_after_upgrade);
     RUN_TEST(historical_host_port_block_can_be_removed_after_upgrade);
     RUN_TEST(identityfile_quoting_and_hostname_match_openssh_oracle);
+    RUN_TEST(openssh_include_rejects_group_or_other_writable_config);
     RUN_TEST(openssh_percent_and_environment_expansions_are_safe);
     RUN_TEST(embedded_nul_at_every_region_fails_without_mutation);
     RUN_TEST(exact_marker_parser_preserves_incidental_substrings);
@@ -1731,6 +2346,14 @@ TEST_MAIN_BEGIN()
     RUN_TEST(crlf_duplicates_collapse_and_preserve_unrelated_bytes);
     RUN_TEST(crlf_remove_preserves_all_unmanaged_bytes);
     RUN_TEST(byte_identical_config_skips_all_write_and_sync_work);
+    RUN_TEST(byte_identical_safe_config_rechecks_mode_before_noop);
+    RUN_TEST(byte_identical_safe_config_rebinds_final_public_directory);
+    RUN_TEST(byte_identical_safe_hardlink_remains_unchanged);
+    RUN_TEST(byte_identical_writable_mode_matrix_is_atomically_normalized);
+    RUN_TEST(byte_identical_writable_hardlink_is_replaced_not_chmodded);
+    RUN_TEST(byte_identical_writable_preinstall_failure_preserves_original);
+    RUN_TEST(byte_identical_writable_postrename_failure_reports_installed);
+    RUN_TEST(byte_identical_writable_dirsync_failure_reports_uncertain);
     RUN_TEST(first_ssh_directory_syncs_home_before_child);
     RUN_TEST(first_ssh_directory_home_sync_failure_is_preinstall_and_retryable);
     RUN_TEST(existing_ssh_directory_syncs_only_child);
@@ -1739,7 +2362,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(descriptor_relative_first_creation_ignores_home_retarget);
     RUN_TEST(symlinked_home_retarget_during_parent_sync_fails_preinstall);
     RUN_TEST(config_registration_failure_is_atomic_and_retryable);
-    RUN_TEST(postrename_dirsync_failure_is_changed_uncertain_without_temp);
+    RUN_TEST(postrename_dirsync_failure_is_durability_uncertain_without_temp);
     RUN_TEST(postrename_verification_failure_reports_installed_unverified);
     RUN_TEST(ctime_only_drift_revalidates_exact_pinned_bytes);
     RUN_TEST(ctime_only_metadata_shape_does_not_hide_content_change);

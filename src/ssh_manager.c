@@ -3577,6 +3577,11 @@ static bool ssh_config_directory_is_safe(const struct stat *identity) {
            (identity->st_mode & (S_IWGRP | S_IWOTH)) == 0;
 }
 
+static bool ssh_config_file_is_safe_unchanged(const struct stat *identity) {
+    return S_ISREG(identity->st_mode) && identity->st_uid == getuid() &&
+           (identity->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
 typedef struct {
     char path[MAX_PATH_LEN];
     struct stat home_identity;
@@ -4275,7 +4280,7 @@ static int ssh_config_recheck_before_rename(int dir_fd,
     }
     if (!existed || !same_ssh_config_snapshot(&expected, &now)) {
         set_error(ERR_FILE_IO,
-                  "SSH config changed before update; refusing to replace it: %s "
+                  "SSH config changed before update; refusing to continue: %s "
                   "[existed=%d regular=%d dev=%d ino=%d mode=%d uid=%d gid=%d "
                   "nlink=%d size=%d mtime=%d ctime=%d]",
                   display_path, existed, S_ISREG(now.st_mode),
@@ -4291,6 +4296,56 @@ static int ssh_config_recheck_before_rename(int dir_fd,
         return -1;
     }
     return 0;
+}
+
+/* Rebind the final no-op proof to the currently public HOME/.ssh path. Opening
+ * the public directory through the pinned HOME descriptor prevents an earlier
+ * check of the retained directory fd from authorizing UNCHANGED after .ssh is
+ * replaced. The trailing directory recheck detects a swap during this proof. */
+static int ssh_config_recheck_public_unchanged(
+    const char *home, const ssh_config_directory_t *directory,
+    const char *display_path, const struct stat *identity, int pinned_fd,
+    const char *original, size_t original_len) {
+    struct stat current_directory;
+    int current_dir_fd = -1;
+    int rc = -1;
+
+    if (recheck_ssh_home_directory(home, directory) != 0) return -1;
+    current_dir_fd = openat(directory->home_fd, ".ssh",
+                            O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (current_dir_fd < 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot reopen public SSH config directory: %s",
+                         directory->path);
+        return -1;
+    }
+    if (fstat(current_dir_fd, &current_directory) != 0 ||
+        !ssh_config_directory_is_safe(&current_directory) ||
+        !same_ssh_config_directory(&directory->dir_identity,
+                                   &current_directory)) {
+        set_error(ERR_FILE_IO,
+                  "SSH config directory changed during final unchanged "
+                  "verification: %s",
+                  directory->path);
+        goto done;
+    }
+    if (ssh_config_recheck_before_rename(
+            current_dir_fd, display_path, true, identity, pinned_fd, original,
+            original_len) != 0 ||
+        recheck_ssh_config_directory(home, directory) != 0) {
+        goto done;
+    }
+    rc = 0;
+
+done:
+    if (close(current_dir_fd) != 0 && rc == 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close final public SSH config directory "
+                         "verification descriptor: %s",
+                         directory->path);
+        return -1;
+    }
+    return rc;
 }
 
 /* M25 narrowed new destinations so any colon-bearing value must be real IPv6.
@@ -4561,7 +4616,8 @@ done:
 /* Create a random O_EXCL temp under the pinned directory, write and fsync its
  * exact byte length, revalidate directory/config/temp identities, renameat,
  * then fsync the directory entry. A post-rename verification/sync failure is
- * explicitly reported as changed/uncertain; callers must never claim success. */
+ * explicitly reported as installed/uncertain; callers must never claim
+ * success. */
 static int ssh_write_config_atomic_at(
     const char *home, const ssh_config_directory_t *directory,
     const char *display_path, const char *content, size_t content_len,
@@ -4694,8 +4750,8 @@ static int ssh_write_config_atomic_at(
         g_ssh_config_postrename_hook(dir_fd) != 0) {
         set_error(ERR_FILE_IO,
                   "SSH config was installed but injected post-rename "
-                  "verification failed; the new bytes were retained and "
-                  "their public identity is uncertain");
+                  "verification failed; the replacement was retained and "
+                  "its public identity is uncertain");
         return -1;
     }
     if (recheck_ssh_config_directory(home, directory) != 0 ||
@@ -4703,7 +4759,7 @@ static int ssh_write_config_atomic_at(
         !same_installed_ssh_config(&temp_identity, &installed)) {
         set_error(ERR_FILE_IO,
                   "SSH config was replaced but post-rename verification failed; "
-                  "the commit changed bytes and its public state is uncertain");
+                  "the replacement's public state is uncertain");
         return -1;
     }
     if (publication) {
@@ -4713,7 +4769,7 @@ static int ssh_write_config_atomic_at(
         set_system_error(
             ERR_FILE_IO,
             "SSH config was replaced but its directory sync failed; "
-            "the commit changed bytes and durability is uncertain");
+            "replacement durability is uncertain");
         return -1;
     }
     if (publication) {
@@ -4984,12 +5040,45 @@ int ssh_configure_host_alias_result(
     }
     if (config_existed && newbuf_len == buf_len &&
         memcmp(newbuf, buf, buf_len) == 0) {
-        log_debug("SSH host alias block already current; skipping rewrite");
-        if (publication) {
-            *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+        if (ssh_config_file_is_safe_unchanged(&config_identity)) {
+            /* The read-side snapshot alone cannot authorize a no-op: mode,
+             * ownership, the public name, or either containing directory may
+             * change while the managed block is rebuilt. Tests may mutate at
+             * this exact boundary; production leaves the hook NULL. */
+            if (g_metadata_test_hook) {
+                (void)g_metadata_test_hook(
+                    SSH_METADATA_TEST_CONFIG_UNCHANGED_RECHECK);
+            }
+            if (recheck_ssh_config_directory(home, &directory) != 0 ||
+                ssh_config_recheck_before_rename(
+                    directory.dir_fd, ssh_config_path, true,
+                    &config_identity, pinned_config_fd, buf, buf_len) != 0) {
+                goto done;
+            }
+            if (g_metadata_test_hook) {
+                (void)g_metadata_test_hook(
+                    SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK);
+            }
+            if (ssh_config_recheck_public_unchanged(
+                    home, &directory, ssh_config_path, &config_identity,
+                    pinned_config_fd, buf, buf_len) != 0) {
+                goto done;
+            }
+            log_debug(
+                "SSH host alias block already current and private; "
+                "skipping rewrite");
+            if (publication) {
+                *publication = SSH_CONFIG_PUBLICATION_UNCHANGED;
+            }
+            rc = 0;
+            goto done;
         }
-        rc = 0;
-        goto done;
+        /* Preserve the exact bytes, but sever any writable hard link or open
+         * writer from the public config name by using the same atomic 0600
+         * replacement protocol as a content change. */
+        log_debug(
+            "SSH host alias block is current but its owner or mode is unsafe; "
+            "normalizing with an atomic replacement");
     }
 
     /* A failed or interrupted first-creation HOME sync can leave an empty

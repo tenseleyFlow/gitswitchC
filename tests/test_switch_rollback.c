@@ -32,7 +32,9 @@
 #include "gpg_manager.h"
 #include "utils.h"
 #include "error.h"
+#include "scratch_registry_test.h"
 
+#include <dirent.h>
 #include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -1050,6 +1052,13 @@ static int fail_alias_postrename_verification(int dir_fd) {
 
 static int fail_alias_dirsync(int dir_fd) {
     (void)dir_fd;
+    errno = EIO;
+    return -1;
+}
+
+static int fail_alias_before_rename(int dir_fd, const char *temp_name) {
+    (void)dir_fd;
+    (void)temp_name;
     errno = EIO;
     return -1;
 }
@@ -2105,6 +2114,69 @@ static int setup_alias_config_file(char *home, size_t home_size,
     return chmod(config_path, 0600);
 }
 
+static int format_managed_alias_config(char *buffer, size_t buffer_size,
+                                       const account_t *account) {
+    int needed;
+
+    if (!buffer || buffer_size == 0 || !account) return -1;
+    needed = snprintf(
+        buffer, buffer_size,
+        "# >>> gitswitch %s >>>\n"
+        "Host %s\n"
+        "  HostName %s\n"
+        "  IdentityFile \"%s\"\n"
+        "  IdentitiesOnly yes\n"
+        "# <<< gitswitch %s <<<\n",
+        account->ssh_host_alias, account->ssh_host_alias,
+        account->ssh_hostname, account->ssh_key_path,
+        account->ssh_host_alias);
+    return needed >= 0 && (size_t)needed < buffer_size ? needed : -1;
+}
+
+static int count_alias_config_temps(const char *ssh_dir) {
+    DIR *dir = opendir(ssh_dir);
+    struct dirent *entry;
+    int count = 0;
+
+    if (!dir) return -1;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "config.gitswitch.", 17) == 0) count++;
+    }
+    if (closedir(dir) != 0) return -1;
+    return count;
+}
+
+/* The config transaction uses an opaque process-local token. Probe from a
+ * fresh process so a leaked/reentrant registration cannot masquerade as an
+ * available lock in the test process. */
+static bool alias_config_lock_available_to_child(const char *ssh_dir) {
+    int status = 0;
+    pid_t pid;
+
+    fflush(NULL);
+    pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int dir_fd = open(ssh_dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+        int token_fd;
+
+        if (dir_fd < 0) _exit(1);
+        token_fd = try_lock_private_file_at(
+            dir_fd, ".gitswitch-config.lock");
+        if (token_fd < 0) {
+            close(dir_fd);
+            _exit(2);
+        }
+        unlock_private_file(token_fd);
+        close(dir_fd);
+        _exit(0);
+    }
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) return false;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 static int write_exact_bytes(const char *path, const void *bytes,
                              size_t length) {
     const unsigned char *cursor = bytes;
@@ -2639,6 +2711,211 @@ TEST(first_ssh_home_sync_failure_remains_abortable_preinstall) {
     CHECK_EQ_INT(accounts_session_cleanup(), 0);
     run_set_runner(previous_runner);
     setenv("HOME", saved_home, 1);
+}
+
+/* AR-11 L36: mode-only normalization is still a publication. If its secured
+ * replacement fails before rename, the original byte-identical 0666 inode is
+ * untouched and the prepared switch retains exact abort authority. */
+TEST(identical_insecure_alias_prerename_failure_remains_abortable) {
+    char home[600], saved_home[4096], config_path[700], ssh_dir[700];
+    char lock_path[760], expected[4096];
+    struct stat before;
+    struct stat after;
+    struct stat lock_identity;
+    error_context_t failure;
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_config_commit_hook_fn previous_hook;
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN;
+    size_t expected_len;
+    int formatted;
+    int before_fds;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), NULL), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path),
+                           "%s/.gitswitch-config.lock", ssh_dir) <
+          sizeof(lock_path));
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    formatted = format_managed_alias_config(
+        expected, sizeof(expected), &ctx.accounts[0]);
+    CHECK(formatted > 0);
+    expected_len = formatted > 0 ? (size_t)formatted : 0U;
+    CHECK_EQ_INT(write_exact_bytes(config_path, expected, expected_len), 0);
+
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    before_fds = test_open_fd_count();
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(chmod(config_path, 0666), 0);
+    CHECK_EQ_INT(stat(config_path, &before), 0);
+    CHECK(S_ISREG(before.st_mode));
+    CHECK_EQ_INT(before.st_uid, getuid());
+    CHECK_EQ_INT(before.st_mode & 0777, 0666);
+    previous_hook = ssh_manager_set_config_commit_hook_fn(
+        fail_alias_before_rename);
+    clear_error();
+    rc = accounts_switch_commit_result(&ctx, &state);
+    failure = *get_last_error();
+    ssh_manager_set_config_commit_hook_fn(previous_hook);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK(strstr(failure.message,
+                 "Injected SSH config commit interruption") != NULL);
+    CHECK(file_matches_exact_bytes(config_path, expected, expected_len));
+    CHECK_EQ_INT(stat(config_path, &after), 0);
+    CHECK(after.st_dev == before.st_dev);
+    CHECK(after.st_ino == before.st_ino);
+    CHECK_EQ_INT(after.st_uid, before.st_uid);
+    CHECK_EQ_INT(after.st_mode & 0777, 0666);
+    CHECK_EQ_INT(count_alias_config_temps(ssh_dir), 0);
+    CHECK_EQ_INT(stat(lock_path, &lock_identity), 0);
+    CHECK(S_ISREG(lock_identity.st_mode));
+    CHECK_EQ_INT(lock_identity.st_uid, getuid());
+    CHECK_EQ_INT(lock_identity.st_mode & 0777, 0600);
+    CHECK(alias_config_lock_available_to_child(ssh_dir));
+    CHECK(!runtime_lock_available_to_child());
+
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK(ctx.current_account == &ctx.accounts[1]);
+    CHECK_STR_EQ(ctx.config.active_account, "prev");
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_STR_EQ(g_store_email, "prev@example.com");
+    CHECK(file_matches_exact_bytes(config_path, expected, expected_len));
+    CHECK_EQ_INT(stat(config_path, &after), 0);
+    CHECK(after.st_dev == before.st_dev);
+    CHECK(after.st_ino == before.st_ino);
+    CHECK_EQ_INT(after.st_mode & 0777, 0666);
+    CHECK_EQ_INT(count_alias_config_temps(ssh_dir), 0);
+    CHECK(alias_config_lock_available_to_child(ssh_dir));
+    CHECK(accounts_transaction_context_release_safe(&ctx));
+    CHECK(runtime_lock_available_to_child());
+
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before_fds);
+}
+
+/* AR-11 L36: once the identical bytes have been atomically replaced by a
+ * self-owned 0600 inode, a child-directory sync failure is post-commit
+ * uncertainty. The switch and secured config remain installed and abort is no
+ * longer authorized. */
+TEST(identical_insecure_alias_dirsync_failure_retains_normalized_commit) {
+    char home[600], saved_home[4096], config_path[700], ssh_dir[700];
+    char lock_path[760], expected[4096];
+    struct stat before;
+    struct stat after;
+    struct stat lock_identity;
+    error_context_t failure;
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_dirsync_fn previous_sync;
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    size_t expected_len;
+    int formatted;
+    int before_fds;
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), NULL), 0);
+    CHECK((size_t)snprintf(ssh_dir, sizeof(ssh_dir), "%s/.ssh", home) <
+          sizeof(ssh_dir));
+    CHECK((size_t)snprintf(lock_path, sizeof(lock_path),
+                           "%s/.gitswitch-config.lock", ssh_dir) <
+          sizeof(lock_path));
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    formatted = format_managed_alias_config(
+        expected, sizeof(expected), &ctx.accounts[0]);
+    CHECK(formatted > 0);
+    expected_len = formatted > 0 ? (size_t)formatted : 0U;
+    CHECK_EQ_INT(write_exact_bytes(config_path, expected, expected_len), 0);
+
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    before_fds = test_open_fd_count();
+    previous_runner = run_set_runner(ssh_git_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    CHECK_EQ_INT(chmod(config_path, 0666), 0);
+    CHECK_EQ_INT(stat(config_path, &before), 0);
+    CHECK(S_ISREG(before.st_mode));
+    CHECK_EQ_INT(before.st_uid, getuid());
+    CHECK_EQ_INT(before.st_mode & 0777, 0666);
+    previous_sync = ssh_manager_set_dirsync_fn(fail_alias_dirsync);
+    clear_error();
+    rc = accounts_switch_commit_result(&ctx, &state);
+    failure = *get_last_error();
+    ssh_manager_set_dirsync_fn(previous_sync);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(state,
+                 ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN);
+    CHECK_EQ_INT(failure.code, ERR_FILE_IO);
+    CHECK_EQ_INT(failure.system_errno, EIO);
+    CHECK(strstr(failure.message,
+                 "published SSH config state was retained") != NULL);
+    CHECK(strstr(failure.message,
+                 "SSH config entry could not be made directory-durable") !=
+          NULL);
+    CHECK(strstr(failure.message, "new SSH alias") == NULL);
+    CHECK(strstr(failure.message, "installed bytes") == NULL);
+    CHECK(ctx.current_account == &ctx.accounts[0]);
+    CHECK_STR_EQ(ctx.config.active_account, "testacct");
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    CHECK(file_matches_exact_bytes(config_path, expected, expected_len));
+    CHECK_EQ_INT(stat(config_path, &after), 0);
+    CHECK(S_ISREG(after.st_mode));
+    CHECK_EQ_INT(after.st_uid, getuid());
+    CHECK_EQ_INT(after.st_mode & 0777, 0600);
+    CHECK(after.st_dev != before.st_dev || after.st_ino != before.st_ino);
+    CHECK_EQ_INT(count_alias_config_temps(ssh_dir), 0);
+    CHECK_EQ_INT(stat(lock_path, &lock_identity), 0);
+    CHECK(S_ISREG(lock_identity.st_mode));
+    CHECK_EQ_INT(lock_identity.st_uid, getuid());
+    CHECK_EQ_INT(lock_identity.st_mode & 0777, 0600);
+    CHECK(alias_config_lock_available_to_child(ssh_dir));
+    CHECK(accounts_transaction_context_release_safe(&ctx));
+
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK(file_matches_exact_bytes(config_path, expected, expected_len));
+    CHECK_EQ_INT(stat(config_path, &after), 0);
+    CHECK_EQ_INT(after.st_uid, getuid());
+    CHECK_EQ_INT(after.st_mode & 0777, 0600);
+    CHECK_EQ_INT(count_alias_config_temps(ssh_dir), 0);
+    CHECK(alias_config_lock_available_to_child(ssh_dir));
+
+    signals_rollback_end();
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    CHECK(runtime_lock_available_to_child());
+    run_set_runner(previous_runner);
+    CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    CHECK_EQ_INT(test_open_fd_count(), before_fds);
 }
 
 /* A pre-rename alias failure remains rollback-authorized. If M7 detects an
@@ -5266,6 +5543,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(postrename_alias_verification_failure_retains_complete_direct_switch);
     RUN_TEST(postrename_alias_fsync_failure_retains_complete_prepared_switch);
     RUN_TEST(first_ssh_home_sync_failure_remains_abortable_preinstall);
+    RUN_TEST(identical_insecure_alias_prerename_failure_remains_abortable);
+    RUN_TEST(identical_insecure_alias_dirsync_failure_retains_normalized_commit);
     RUN_TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry);
     RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);
     RUN_TEST(failed_switch_never_creates_ssh_config);

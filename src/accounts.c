@@ -1091,15 +1091,18 @@ static accounts_switch_commit_state_t accounts_commit_state_for_alias(
 
 static void set_retained_alias_publication_error(
     const char *account_name, ssh_config_publication_state_t publication,
-    const char *detail) {
+    const char *detail, int system_errno) {
+    char causal_detail[sizeof(g_last_error.message)];
     const char *truth;
 
     switch (publication) {
         case SSH_CONFIG_PUBLICATION_INSTALLED_UNVERIFIED:
-            truth = "its installed public inode could not be verified";
+            truth = "the installed SSH config public inode could not be "
+                    "verified";
             break;
         case SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN:
-            truth = "its installed bytes could not be made directory-durable";
+            truth = "the installed SSH config entry could not be made "
+                    "directory-durable";
             break;
         case SSH_CONFIG_PUBLICATION_COMMITTED:
             truth = "post-commit resource cleanup failed";
@@ -1110,11 +1113,37 @@ static void set_retained_alias_publication_error(
             truth = "publication returned an unexpected installed-state result";
             break;
     }
-    set_error(ERR_FILE_IO,
-              "Account switch to '%s' committed and its new SSH alias was "
-              "retained, but %s: %s",
-              account_name, truth,
-              detail && detail[0] ? detail : "unknown SSH config error");
+    safe_strncpy(causal_detail,
+                 detail && detail[0] ? detail : "unknown SSH config error",
+                 sizeof(causal_detail));
+    if (system_errno != 0) {
+        char suffix[sizeof(causal_detail)];
+        int suffix_length = snprintf(suffix, sizeof(suffix), " (%s)",
+                                     strerror(system_errno));
+        size_t detail_length = strlen(causal_detail);
+
+        /* Nested set_system_error() already rendered strerror(). Remove that
+         * copy before wrapping so the causal errno survives without a
+         * duplicate human-readable suffix. */
+        if (suffix_length > 0 && (size_t)suffix_length < sizeof(suffix) &&
+            detail_length >= (size_t)suffix_length &&
+            memcmp(causal_detail + detail_length - (size_t)suffix_length,
+                   suffix, (size_t)suffix_length) == 0) {
+            causal_detail[detail_length - (size_t)suffix_length] = '\0';
+        }
+        errno = system_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Account switch to '%s' committed and its published SSH config "
+            "state was retained, but %s: %s",
+            account_name, truth, causal_detail);
+    } else {
+        set_error(
+            ERR_FILE_IO,
+            "Account switch to '%s' committed and its published SSH config "
+            "state was retained, but %s: %s",
+            account_name, truth, causal_detail);
+    }
 }
 
 /* g_pending_switch owns singleton Git, runtime-lock, and signal-guard state.
@@ -1136,6 +1165,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
     ssh_config_publication_state_t alias_publication =
         SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED;
     char alias_publication_detail[sizeof(g_last_error.message)] = "";
+    int alias_publication_system_errno = 0;
 
     if (!ctx || !identifier || !*identifier) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to accounts_switch");
@@ -1828,6 +1858,8 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
             strlen(account->ssh_host_alias) > 0) {
             if (ssh_configure_host_alias_result(&switch_target,
                                                 &alias_publication) != 0) {
+                alias_publication_system_errno =
+                    get_last_error()->system_errno;
                 safe_strncpy(alias_publication_detail,
                              get_last_error()->message,
                              sizeof(alias_publication_detail));
@@ -2005,7 +2037,8 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
     if (alias_publication_retained) {
         set_retained_alias_publication_error(account->name,
                                              alias_publication,
-                                             alias_publication_detail);
+                                             alias_publication_detail,
+                                             alias_publication_system_errno);
         return -1;
     }
     return 0;
@@ -2132,6 +2165,7 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
     accounts_switch_commit_state_t final_state =
         ACCOUNTS_SWITCH_COMMIT_COMPLETE;
     char alias_publication_detail[sizeof(g_last_error.message)] = "";
+    int alias_publication_system_errno = 0;
 
     if (state) {
         *state = ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
@@ -2189,6 +2223,7 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         target->ssh_host_alias[0] != '\0' &&
         ssh_configure_host_alias_result(&g_pending_switch.switch_target,
                                         &alias_publication) != 0) {
+        alias_publication_system_errno = get_last_error()->system_errno;
         safe_strncpy(alias_publication_detail, get_last_error()->message,
                      sizeof(alias_publication_detail));
         if (!ssh_alias_publication_is_installed(alias_publication)) {
@@ -2231,7 +2266,8 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
     if (final_state != ACCOUNTS_SWITCH_COMMIT_COMPLETE) {
         set_retained_alias_publication_error(target->name,
                                              alias_publication,
-                                             alias_publication_detail);
+                                             alias_publication_detail,
+                                             alias_publication_system_errno);
         return -1;
     }
     return 0;
