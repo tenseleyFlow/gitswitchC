@@ -253,6 +253,122 @@ TEST(init_fails_on_enospc) {
     remove_tree(rt);
 }
 
+/* ---------- AR-11 M32: names plumbing must report stdout failure ---------- */
+
+TEST(list_names_protocol_is_exact_and_empty_set_succeeds) {
+    char home[256], rt[256], out_path[4352], cmd[16384], out[8192];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) ||
+        !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(
+                     home,
+                     "[settings]\n"
+                     "default_scope = \"global\"\n"
+                     "\n"
+                     "[accounts.1]\n"
+                     "name = \"alpha\"\n"
+                     "email = \"alpha@example.test\"\n"
+                     "\n"
+                     "[accounts.2]\n"
+                     "name = \"Beta Work\"\n"
+                     "email = \"beta@example.test\"\n"),
+                 0);
+
+    snprintf(out_path, sizeof(out_path), "%s/names.out", rt);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' list --names "
+             ">'%s' 2>/dev/null",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_STR_EQ(slurp(out_path, out, sizeof(out)), "alpha\nBeta Work\n");
+
+    CHECK_EQ_INT(write_config(
+                     home,
+                     "[settings]\n"
+                     "default_scope = \"global\"\n"),
+                 0);
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' list --names "
+             ">'%s' 2>/dev/null",
+             home, rt, g_bin, out_path);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_STR_EQ(slurp(out_path, out, sizeof(out)), "");
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+TEST(list_names_fails_when_stdout_is_unwritable) {
+    char home[256], rt[256], cmd[16384];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) ||
+        !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(
+                     home,
+                     "[settings]\n"
+                     "default_scope = \"global\"\n"
+                     "\n"
+                     "[accounts.1]\n"
+                     "name = \"alpha\"\n"
+                     "email = \"alpha@example.test\"\n"),
+                 0);
+
+    /* Keep descriptor 1 occupied by a read-only file so runtimes cannot
+     * recycle a merely closed descriptor into a writable sink before main. */
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' list --names "
+             "1</dev/null 2>/dev/null",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, EXIT_FAILURE);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
+TEST(list_names_fails_on_enospc) {
+    char home[256], rt[256], cmd[16384];
+    int rc;
+
+    if (access("/dev/full", W_OK) != 0) {
+        TS_SKIP("dev-full", "/dev/full is unavailable or not writable");
+    }
+    if (!make_temp_dir(home, sizeof(home)) ||
+        !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(
+                     home,
+                     "[settings]\n"
+                     "default_scope = \"global\"\n"
+                     "\n"
+                     "[accounts.1]\n"
+                     "name = \"alpha\"\n"
+                     "email = \"alpha@example.test\"\n"),
+                 0);
+
+    snprintf(cmd, sizeof(cmd),
+             "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' list --names "
+             ">/dev/full 2>/dev/null",
+             home, rt, g_bin);
+    rc = run_shell(cmd);
+    CHECK_EQ_INT(rc, EXIT_FAILURE);
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 /* ---------- F2: resume gating for GPG-only accounts ---------- */
 
 static const char *gpg_only_config(const char *scope, char *buf, size_t size) {
@@ -1428,6 +1544,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(init_snippet_gates_probe_on_hint_content);
     RUN_TEST(init_fails_when_stdout_is_closed);
     RUN_TEST(init_fails_on_enospc);
+    RUN_TEST(list_names_protocol_is_exact_and_empty_set_succeeds);
+    RUN_TEST(list_names_fails_when_stdout_is_unwritable);
+    RUN_TEST(list_names_fails_on_enospc);
     RUN_TEST(resume_gpg_only_noops_silently_when_state_live);
     RUN_TEST(resume_gpg_only_attempts_restore_after_boot_wipe);
     RUN_TEST(resume_gpg_only_restores_when_current_points_at_other_account);

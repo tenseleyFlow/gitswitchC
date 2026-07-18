@@ -1963,11 +1963,20 @@ static int handle_list_command(gitswitch_ctx_t *ctx) {
 
 /* Plumbing for shell completion: one account name per line, nothing else. */
 static int handle_list_names(gitswitch_ctx_t *ctx) {
+    bool write_failed = false;
+
     if (!ctx) return EXIT_FAILURE;
     for (size_t i = 0; i < ctx->account_count; i++) {
-        printf("%s\n", ctx->accounts[i].name);
+        if (printf("%s\n", ctx->accounts[i].name) < 0) {
+            write_failed = true;
+            break;
+        }
     }
-    return EXIT_SUCCESS;
+    /* A successful printf may only have filled stdio's buffer. Always finish
+     * the machine-readable response here so late ENOSPC/EBADF failures become
+     * the command status, including the healthy empty-account case. */
+    if (finish_stdout_output() != 0) write_failed = true;
+    return write_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 static command_result_t handle_remove_command(gitswitch_ctx_t *ctx,
