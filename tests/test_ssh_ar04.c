@@ -495,6 +495,19 @@ static int write_text_file(const char *path, const char *text) {
     return 0;
 }
 
+static int write_bytes_file(const char *path, const void *content,
+                            size_t content_len) {
+    int write_rc;
+    int fd;
+
+    if (!path || (!content && content_len != 0U)) return -1;
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+              0600);
+    if (fd < 0) return -1;
+    write_rc = test_write_exact(fd, content, content_len);
+    return close(fd) == 0 && write_rc == 0 ? 0 : -1;
+}
+
 static bool entry_exists(const char *path) {
     struct stat st;
     return lstat(path, &st) == 0;
@@ -1024,13 +1037,17 @@ TEST(fresh_agent_aborts_when_orphan_cleanup_is_incomplete) {
     ssh_config_t cfg;
     account_t account;
     command_runner_fn previous;
+    int listener;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(stale_pid, sizeof(stale_pid), "%s/ssh-agent.personal.pid", agent_dir);
     snprintf(stale_sock, sizeof(stale_sock), "%s/ssh-agent.personal.sock", agent_dir);
     snprintf(new_sock, sizeof(new_sock), "%s/ssh-agent.work.sock", agent_dir);
     CHECK_EQ_INT(write_text_file(stale_pid, "not-a-pid\n"), 0);
-    CHECK_EQ_INT(write_text_file(stale_sock, "retained runtime\n"), 0);
+    listener = listen_socket(stale_sock);
+    CHECK(listener >= 0);
+    if (listener < 0) return;
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
@@ -1047,6 +1064,11 @@ TEST(fresh_agent_aborts_when_orphan_cleanup_is_incomplete) {
     CHECK(entry_exists(stale_sock));
     CHECK(!entry_exists(new_sock));
     CHECK(!cfg.agent_owned);
+
+    CHECK_EQ_INT(close(listener), 0);
+    CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
+    CHECK(!entry_exists(stale_pid));
+    CHECK(!entry_exists(stale_sock));
 }
 
 TEST(reused_agent_retarget_failure_does_not_adopt_or_reap) {
@@ -1091,6 +1113,7 @@ TEST(reused_agent_aborts_when_other_orphan_cleanup_is_incomplete) {
     account_t account;
     command_runner_fn previous;
     ssize_t target_len;
+    int listener;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
     REQUIRE_UNIX_SOCKET_BIND(agent_dir);
@@ -1101,7 +1124,9 @@ TEST(reused_agent_aborts_when_other_orphan_cleanup_is_incomplete) {
     CHECK_EQ_INT(bind_socket(work_sock), 0);
     CHECK_EQ_INT(symlink(work_sock, current), 0);
     CHECK_EQ_INT(write_text_file(stale_pid, "invalid\n"), 0);
-    CHECK_EQ_INT(write_text_file(stale_sock, "retained runtime\n"), 0);
+    listener = listen_socket(stale_sock);
+    CHECK(listener >= 0);
+    if (listener < 0) return;
     CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", "/before/reuse-cleanup.sock", 1), 0);
     CHECK_EQ_INT(setenv("SSH_AGENT_PID", "987", 1), 0);
 
@@ -1128,6 +1153,13 @@ TEST(reused_agent_aborts_when_other_orphan_cleanup_is_incomplete) {
     CHECK(cfg.agent_socket_path[0] == '\0');
     CHECK_STR_EQ(getenv("SSH_AUTH_SOCK"), "/before/reuse-cleanup.sock");
     CHECK_STR_EQ(getenv("SSH_AGENT_PID"), "987");
+
+    CHECK_EQ_INT(close(listener), 0);
+    CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
+    CHECK(!entry_exists(stale_pid));
+    CHECK(!entry_exists(stale_sock));
+    CHECK(!entry_exists(work_sock));
+    CHECK(!entry_exists(current));
 }
 
 static int setup_home(char *home, size_t size, char *config, size_t config_size) {
@@ -1276,17 +1308,21 @@ TEST(reset_fails_closed_when_lock_is_unavailable) {
     CHECK(entry_exists(current));
 }
 
-/* If a sidecar cannot establish a valid target PID, reset cannot confirm the
- * agent stopped. Retain the complete pid/socket/current retry tuple. */
+/* A malformed sidecar is not authority to reap a reachable agent. Retain the
+ * complete pid/socket/current retry tuple until the socket is proven dead. */
 TEST(reset_retains_artifacts_when_agent_stop_is_unconfirmed) {
     char agent_dir[128], pidfile[192], sock[192], current[192];
+    int listener;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
     CHECK_EQ_INT(write_text_file(pidfile, "not-a-pid\n"), 0);
-    CHECK_EQ_INT(write_text_file(sock, "socket marker\n"), 0);
+    listener = listen_socket(sock);
+    CHECK(listener >= 0);
+    if (listener < 0) return;
     CHECK_EQ_INT(symlink(sock, current), 0);
 
     CHECK_EQ_INT(ssh_manager_reset("work"), -1); /* pre-fix: 0 + artifacts lost */
@@ -1294,6 +1330,13 @@ TEST(reset_retains_artifacts_when_agent_stop_is_unconfirmed) {
     CHECK(entry_exists(sock));
     CHECK(entry_exists(current));
     CHECK(strstr(get_last_error()->message, "retained state for retry") != NULL);
+
+    CHECK_EQ_INT(close(listener), 0);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!entry_exists(pidfile));
+    CHECK(!entry_exists(sock));
+    CHECK(!entry_exists(current));
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
 }
 
 /* Socket removal precedes stable-link removal. If the socket final component
@@ -1330,17 +1373,21 @@ TEST(reset_reports_stable_link_cleanup_failure) {
 }
 
 /* All-account reset continues independent cleanup but returns aggregate
- * failure and preserves the failed account's complete retry tuple. */
+ * failure and preserves a live account's malformed-sidecar retry tuple. */
 TEST(reset_all_aggregates_failures_and_continues) {
     char agent_dir[128], bad_pid[192], bad_sock[192], good_sock[192], current[192];
+    int listener;
 
     CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    REQUIRE_UNIX_SOCKET_BIND(agent_dir);
     snprintf(bad_pid, sizeof(bad_pid), "%s/ssh-agent.work.pid", agent_dir);
     snprintf(bad_sock, sizeof(bad_sock), "%s/ssh-agent.work.sock", agent_dir);
     snprintf(good_sock, sizeof(good_sock), "%s/ssh-agent.personal.sock", agent_dir);
     snprintf(current, sizeof(current), "%s/current.sock", agent_dir);
     CHECK_EQ_INT(write_text_file(bad_pid, "invalid\n"), 0);
-    CHECK_EQ_INT(write_text_file(bad_sock, "bad socket\n"), 0);
+    listener = listen_socket(bad_sock);
+    CHECK(listener >= 0);
+    if (listener < 0) return;
     CHECK_EQ_INT(write_text_file(good_sock, "stale socket\n"), 0);
     CHECK_EQ_INT(symlink(bad_sock, current), 0);
 
@@ -1349,6 +1396,13 @@ TEST(reset_all_aggregates_failures_and_continues) {
     CHECK(entry_exists(bad_sock));
     CHECK(entry_exists(current));
     CHECK(!entry_exists(good_sock)); /* independent cleanup continued */
+
+    CHECK_EQ_INT(close(listener), 0);
+    CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
+    CHECK(!entry_exists(bad_pid));
+    CHECK(!entry_exists(bad_sock));
+    CHECK(!entry_exists(current));
+    CHECK_EQ_INT(ssh_manager_reset(NULL), 0);
 }
 
 /* HIGH regression: the absence of a sidecar does not prove an agent is dead.
@@ -1381,6 +1435,60 @@ TEST(targeted_reset_preserves_live_agent_when_sidecar_is_missing) {
     CHECK(strstr(get_last_error()->message, "no safely matched PID") != NULL);
 
     stop_real_agent(pid, sock, current);
+}
+
+/* A numeric prefix followed by an embedded NUL is malformed bytes, not a PID
+ * record. Even when the prefix names the real managed ssh-agent, reset must
+ * never reap it; once the listener is gone the malformed record is removable. */
+TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix) {
+    static const unsigned char suffix[] = "untrusted-trailing-data\n";
+    char agent_dir[128], sock[192], current[192], pidfile[192];
+    unsigned char sidecar_content[128];
+    pid_t pid = -1;
+    int prefix_len;
+    int start_rc;
+    size_t content_len;
+
+    CHECK_EQ_INT(setup_runtime(agent_dir, sizeof(agent_dir)), 0);
+    start_rc = start_real_agent_without_sidecar(agent_dir, "work",
+                                                 sock, sizeof(sock),
+                                                 current, sizeof(current), &pid);
+    if (start_rc == TEST_REAL_AGENT_START_OPENSSH_UNAVAILABLE) {
+        TS_SKIP("openssh", "ssh-agent unavailable in trusted PATH");
+    }
+    if (start_rc == TEST_REAL_AGENT_START_UNIX_SOCKETS_UNAVAILABLE) {
+        TS_SKIP("unix-sockets", "sandbox forbids AF_UNIX bind");
+    }
+    CHECK_EQ_INT(start_rc, TEST_REAL_AGENT_START_OK);
+    if (start_rc != TEST_REAL_AGENT_START_OK) return;
+
+    snprintf(pidfile, sizeof(pidfile), "%s/ssh-agent.work.pid", agent_dir);
+    prefix_len = snprintf((char *)(void *)sidecar_content,
+                          sizeof(sidecar_content), "%ld", (long)pid);
+    CHECK(prefix_len > 0);
+    content_len = (size_t)prefix_len + 1U + sizeof(suffix) - 1U;
+    CHECK(content_len <= sizeof(sidecar_content));
+    if (prefix_len <= 0 || content_len > sizeof(sidecar_content)) {
+        stop_real_agent(pid, sock, current);
+        return;
+    }
+    memcpy(sidecar_content + (size_t)prefix_len + 1U,
+           suffix, sizeof(suffix) - 1U);
+    CHECK_EQ_INT(write_bytes_file(pidfile, sidecar_content, content_len), 0);
+
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(pid, 0), 0);
+    CHECK(entry_exists(pidfile));
+    CHECK(entry_exists(sock));
+    CHECK(entry_exists(current));
+    CHECK_EQ_INT(ssh_manager_reset("work"), -1);
+    CHECK_EQ_INT(kill(pid, 0), 0);
+    CHECK(entry_exists(pidfile));
+
+    stop_real_agent(pid, sock, current);
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
+    CHECK(!entry_exists(pidfile));
+    CHECK_EQ_INT(ssh_manager_reset("work"), 0);
 }
 
 /* A syntactically valid sidecar can be stale while another agent owns the
@@ -1609,6 +1717,7 @@ int main(int argc, char **argv) {
     RUN_TEST(reset_reports_stable_link_cleanup_failure);
     RUN_TEST(reset_all_aggregates_failures_and_continues);
     RUN_TEST(targeted_reset_preserves_live_agent_when_sidecar_is_missing);
+    RUN_TEST(targeted_reset_never_reaps_embedded_nul_pid_prefix);
     RUN_TEST(targeted_reset_preserves_live_socket_when_sidecar_pid_is_bystander);
     RUN_TEST(reset_all_preserves_live_agent_when_sidecar_is_missing);
 #ifdef __APPLE__

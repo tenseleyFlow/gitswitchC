@@ -87,6 +87,7 @@ typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
 typedef void (*ssh_key_snapshot_clear_hook_fn)(const void *data, size_t length,
                                                int retained_fd);
+typedef int (*ssh_socket_probe_fn)(const char *path, bool *reachable);
 typedef int64_t (*ssh_probe_clock_fn)(void);
 typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
 
@@ -198,6 +199,10 @@ ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
  * a deterministic test seam; NULL restores the production no-op. */
 ssh_key_snapshot_clear_hook_fn ssh_manager_set_key_snapshot_clear_hook_fn(
     ssh_key_snapshot_clear_hook_fn fn);
+/* Test-only probe seam. Install/restore it only when no concurrent SSH
+ * manager operation is running. A failing callback must publish a structured
+ * error (for example with set_system_error()) before returning -1. */
+ssh_socket_probe_fn ssh_manager_set_socket_probe_fn(ssh_socket_probe_fn fn);
 ssh_probe_clock_fn ssh_manager_set_probe_clock_fn(ssh_probe_clock_fn fn);
 ssh_probe_poll_fn ssh_manager_set_probe_poll_fn(ssh_probe_poll_fn fn);
 

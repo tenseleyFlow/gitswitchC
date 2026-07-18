@@ -391,6 +391,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(ssh_manager_set_reap_test_ops);
     REQUIRE_PUBLIC_API(ssh_manager_set_reset_retire_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_setenv_fn);
+    REQUIRE_PUBLIC_API(ssh_manager_set_socket_probe_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_unrecorded_cleanup_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_metadata_test_hook_fn);
     REQUIRE_PUBLIC_API(ssh_manager_set_key_snapshot_clear_hook_fn);
