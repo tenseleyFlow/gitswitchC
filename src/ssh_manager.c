@@ -4891,6 +4891,7 @@ int ssh_test_connection(const account_t *account, const char *host) {
     char output[1024] = {0};
     char expanded_key_path[MAX_PATH_LEN];
     char hostname_option[sizeof("HostName=") + MAX_NAME_LEN];
+    char alias_target[sizeof("git@") + MAX_NAME_LEN];
     run_opts_t opts;
     run_result_t result;
 
@@ -4923,7 +4924,7 @@ int ssh_test_connection(const account_t *account, const char *host) {
             "ssh", "-T", "-F", "none", "-o", "ConnectTimeout=5", "-o",
             "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i",
             expanded_key_path, "-o", hostname_option,
-            account->ssh_host_alias, NULL};
+            alias_target, NULL};
 
         if (!valid_ssh_host_alias(account->ssh_host_alias) ||
             !toml_validate_ssh_hostname(account->ssh_hostname)) {
@@ -4932,8 +4933,13 @@ int ssh_test_connection(const account_t *account, const char *host) {
                       "hostname");
             return -1;
         }
+        /* `-F none` deliberately removes every configured `User` value too.
+         * Keep the managed probe aligned with Git's direct transport target
+         * instead of silently authenticating as the local login account. */
         if (safe_snprintf(hostname_option, sizeof(hostname_option),
-                          "HostName=%s", account->ssh_hostname) != 0) {
+                          "HostName=%s", account->ssh_hostname) != 0 ||
+            safe_snprintf(alias_target, sizeof(alias_target), "git@%s",
+                          account->ssh_host_alias) != 0) {
             return -1;
         }
         (void)run_argv(alias_argv, &opts, &result);

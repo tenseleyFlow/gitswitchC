@@ -117,7 +117,8 @@ static int connection_runner(const char *const argv[],
     } else if (g_mode == CONNECTION_CAUSAL_ACCEPT_MANAGED_ALIAS) {
         bool exact_alias = exact_identity && destination_pinned &&
                            g_argc > 0 &&
-                           strcmp(g_argv[g_argc - 1], "work-github") == 0;
+                           strcmp(g_argv[g_argc - 1],
+                                  "git@work-github") == 0;
         output = exact_alias
                      ? "Hi intended-user! You've successfully authenticated, "
                        "but GitHub does not provide shell access."
@@ -263,7 +264,7 @@ TEST(direct_probe_offers_only_the_intended_account_key) {
     run_set_runner(previous);
 }
 
-TEST(managed_alias_probe_ignores_shared_config_and_pins_destination) {
+TEST(managed_alias_probe_pins_git_user_destination_and_config) {
     account_t account;
     command_runner_fn previous;
 
@@ -287,7 +288,7 @@ TEST(managed_alias_probe_ignores_shared_config_and_pins_destination) {
     CHECK_STR_EQ(g_argv[11], "/tmp/intended-account-key");
     CHECK_STR_EQ(g_argv[12], "-o");
     CHECK_STR_EQ(g_argv[13], "HostName=github.com");
-    CHECK_STR_EQ(g_argv[14], "work-github");
+    CHECK_STR_EQ(g_argv[14], "git@work-github");
 
     run_set_runner(previous);
 }
@@ -389,7 +390,7 @@ TEST(managed_ipv6_destination_is_preserved_in_probe) {
                  0);
     CHECK_EQ_INT(g_argc, 15);
     CHECK_STR_EQ(g_argv[13], "HostName=2001:db8::1");
-    CHECK_STR_EQ(g_argv[14], "work-github");
+    CHECK_STR_EQ(g_argv[14], "git@work-github");
     run_set_runner(previous);
 }
 
@@ -569,11 +570,12 @@ TEST(openssh_effective_config_confirms_managed_alias_isolation) {
         const char *const isolated_argv[] = {
             "ssh", "-G", "-F", "none", "-o",
             "IdentitiesOnly=yes", "-i", intended_key, "-o",
-            "HostName=github.com", "work-github", NULL};
+            "HostName=github.com", "git@work-github", NULL};
         CHECK_EQ_INT(run_argv(isolated_argv, &opts, &result), 0);
     }
     CHECK(!result.out_truncated);
     CHECK(output_has_setting(output, "hostname github.com"));
+    CHECK(output_has_setting(output, "user git"));
     CHECK(output_has_identity_file(output, intended_key));
     CHECK_EQ_INT((int)output_identity_file_count(output), 1);
 
@@ -586,7 +588,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(diagnostic_fragments_never_authenticate);
     RUN_TEST(provider_greetings_require_exact_lines_and_exit_classes);
     RUN_TEST(direct_probe_offers_only_the_intended_account_key);
-    RUN_TEST(managed_alias_probe_ignores_shared_config_and_pins_destination);
+    RUN_TEST(managed_alias_probe_pins_git_user_destination_and_config);
     RUN_TEST(managed_alias_probe_rejects_a_missing_canonical_destination);
     RUN_TEST(managed_alias_probe_rejects_host_port_without_running_ssh);
     RUN_TEST(managed_git_command_ignores_shared_config_and_pins_destination);
