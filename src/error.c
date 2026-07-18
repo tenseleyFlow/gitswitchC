@@ -577,6 +577,7 @@ void log_message(log_level_t level, const char *file, int line,
     va_list args;
     char timestamp[32];
     char message[1024];
+    int formatted_length;
     
     /* Check if this level should be logged */
     if (!should_log(level)) {
@@ -586,11 +587,16 @@ void log_message(log_level_t level, const char *file, int line,
     /* Format the message. AR-10 L11: a vsnprintf encoding failure leaves the
      * buffer indeterminate; never hand that to fprintf. */
     va_start(args, fmt);
-    if (vsnprintf(message, sizeof(message), fmt, args) < 0) { /* Flawfinder: ignore — bounded; fmt from internal callers */
+    formatted_length = vsnprintf( /* Flawfinder: ignore — bounded; fmt from
+                                   * internal callers; truncation checked */
+        message, sizeof(message), fmt, args);
+    va_end(args);
+    if (formatted_length < 0) {
         static const char unformattable[] = "(unformattable log message)";
         memcpy(message, unformattable, sizeof(unformattable));
+    } else if ((size_t)formatted_length >= sizeof(message)) {
+        mark_text_truncated(message, sizeof(message));
     }
-    va_end(args);
     
     /* Get timestamp */
     get_timestamp(timestamp, sizeof(timestamp));

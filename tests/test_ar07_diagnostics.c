@@ -619,6 +619,100 @@ TEST(every_log_level_has_a_bounded_exact_label) {
     g_log_level = saved_log_level;
 }
 
+TEST(exact_fit_log_payload_remains_complete) {
+    static const char sentinel[] = "|M34-END|";
+    char source[1024];
+    char output[2048] = "";
+    char *payload;
+    FILE *capture = tmpfile();
+    FILE *saved_log_file = g_log_file;
+    bool saved_log_to_stderr = g_log_to_stderr;
+    log_level_t saved_log_level = g_log_level;
+    const size_t sentinel_length = sizeof(sentinel) - 1U;
+
+    CHECK(capture != NULL);
+    if (!capture) return;
+
+    memset(source, 'e', sizeof(source) - 1U);
+    memcpy(source + sizeof(source) - 1U - sentinel_length, sentinel,
+           sentinel_length);
+    source[sizeof(source) - 1U] = '\0';
+
+    g_log_file = capture;
+    g_log_to_stderr = false;
+    g_log_level = LOG_LEVEL_DEBUG;
+    log_message(LOG_LEVEL_INFO, "m34.c", 1023, "m34_probe", "%s", source);
+
+    CHECK_EQ_INT(read_log(capture, output, sizeof(output)), 0);
+    payload = strstr(output, " (m34_probe) - ");
+    CHECK(payload != NULL);
+    if (payload) {
+        payload += strlen(" (m34_probe) - ");
+        CHECK(memcmp(payload, source, sizeof(source) - 1U) == 0);
+        CHECK(payload[sizeof(source) - 1U] == '\n');
+        CHECK(payload[sizeof(source)] == '\0');
+        CHECK(strstr(payload, ERROR_MESSAGE_TRUNCATION_MARKER) == NULL);
+        CHECK(strstr(payload, sentinel) ==
+              payload + sizeof(source) - 1U - sentinel_length);
+    }
+
+    fclose(capture);
+    g_log_file = saved_log_file;
+    g_log_to_stderr = saved_log_to_stderr;
+    g_log_level = saved_log_level;
+}
+
+TEST(oversized_log_payload_is_explicitly_marked) {
+    static const char sentinel[] = "|M34-END|";
+    static const char marker[] = ERROR_MESSAGE_TRUNCATION_MARKER;
+    char source[1025];
+    char output[2048] = "";
+    char *payload;
+    FILE *capture = tmpfile();
+    FILE *saved_log_file = g_log_file;
+    bool saved_log_to_stderr = g_log_to_stderr;
+    log_level_t saved_log_level = g_log_level;
+    error_context_t error_before;
+    uint64_t generation_before;
+    const size_t sentinel_length = sizeof(sentinel) - 1U;
+    const size_t marker_length = sizeof(marker) - 1U;
+    const size_t retained_prefix = 1023U - marker_length;
+
+    CHECK(capture != NULL);
+    if (!capture) return;
+
+    memset(source, 'o', sizeof(source) - 1U);
+    memcpy(source + sizeof(source) - 1U - sentinel_length, sentinel,
+           sentinel_length);
+    source[sizeof(source) - 1U] = '\0';
+
+    g_log_file = capture;
+    g_log_to_stderr = false;
+    g_log_level = LOG_LEVEL_DEBUG;
+    error_before = *get_last_error();
+    generation_before = error_report_generation();
+    log_message(LOG_LEVEL_INFO, "m34.c", 1024, "m34_probe", "%s", source);
+
+    CHECK(memcmp(get_last_error(), &error_before, sizeof(error_before)) == 0);
+    CHECK(error_report_generation() == generation_before);
+    CHECK_EQ_INT(read_log(capture, output, sizeof(output)), 0);
+    payload = strstr(output, " (m34_probe) - ");
+    CHECK(payload != NULL);
+    if (payload) {
+        payload += strlen(" (m34_probe) - ");
+        CHECK(memcmp(payload, source, retained_prefix) == 0);
+        CHECK(memcmp(payload + retained_prefix, marker, marker_length) == 0);
+        CHECK(payload[1023] == '\n');
+        CHECK(payload[1024] == '\0');
+        CHECK(strstr(payload, sentinel) == NULL);
+    }
+
+    fclose(capture);
+    g_log_file = saved_log_file;
+    g_log_to_stderr = saved_log_to_stderr;
+    g_log_level = saved_log_level;
+}
+
 TEST_MAIN_BEGIN()
     RUN_TEST(child_reset_preserves_every_inherited_ignore_and_mask);
     RUN_TEST(child_reset_defaults_and_unblocks_only_installed_handlers);
@@ -632,4 +726,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(inaccessible_runtime_parent_reports_permission_failure_and_releases);
     RUN_TEST(replaced_runtime_parent_and_directory_are_reported_separately);
     RUN_TEST(every_log_level_has_a_bounded_exact_label);
+    RUN_TEST(exact_fit_log_payload_remains_complete);
+    RUN_TEST(oversized_log_payload_is_explicitly_marked);
 TEST_MAIN_END()
