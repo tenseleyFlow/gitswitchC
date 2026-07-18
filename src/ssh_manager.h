@@ -214,7 +214,9 @@ int ssh_stop_agent(ssh_config_t *ssh_config);
 /**
  * Explicitly clear all keys from the selected SSH agent. This primitive is
  * destructive and nontransactional; cleared private identities cannot be
- * exported or restored. Account switching never calls it.
+ * exported or restored. key_already_loaded is cleared whenever a completed
+ * ssh-add child is known to have exited zero, even if later parent-side runner
+ * cleanup makes this function report failure. Account switching never calls it.
  */
 int ssh_clear_agent_keys(ssh_config_t *ssh_config);
 

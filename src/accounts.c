@@ -534,7 +534,7 @@ static int accounts_session_cleanup_internal(void) {
     if (g_session.ssh_active) {
         log_info("Stopping SSH agent (pid=%d)", g_session.ssh_config.agent_pid);
         if (ssh_manager_cleanup(&g_session.ssh_config) != 0) {
-            log_warning("Active SSH session survived cleanup; retaining session for retry");
+            log_warning("Active SSH session cleanup remains retryable; retaining session state");
             return -1;
         }
         g_session.ssh_active = false;

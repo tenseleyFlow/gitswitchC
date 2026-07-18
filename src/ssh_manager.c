@@ -2093,8 +2093,10 @@ int ssh_manager_init(ssh_config_t *ssh_config, ssh_agent_mode_t mode) {
     return 0;
 }
 
-/* Cleanup SSH manager. A surviving owned agent is retained verbatim so the
- * caller keeps the only truthful retry handle instead of zeroing it. */
+/* Cleanup SSH manager. A retryable owned-agent teardown retains its process
+ * and artifact recovery handles instead of zeroing them. Once retirement is
+ * conclusive, key-presence truth may already be false even if artifact
+ * cleanup still needs a later retry. */
 int ssh_manager_cleanup(ssh_config_t *ssh_config) {
     if (!ssh_config) {
         set_error(ERR_INVALID_ARGS, "NULL SSH configuration to cleanup");
@@ -2112,7 +2114,7 @@ int ssh_manager_cleanup(ssh_config_t *ssh_config) {
         }
         log_info("Stopping owned SSH agent (PID: %d)", ssh_config->agent_pid);
         if (ssh_stop_agent(ssh_config) != 0) {
-            log_warning("SSH manager cleanup retained live agent state for retry");
+            log_warning("SSH manager cleanup retained agent recovery state for retry");
             return -1;
         }
     }
@@ -2249,6 +2251,7 @@ static int ssh_start_isolated_agent_with_key(
     ssh_runtime_pin_t reuse_pin;
     bool reuse_pin_active = false;
     int dir_fd = -1;
+    bool prior_key_names_reuse_target = false;
 
     ssh_runtime_pin_init(&reuse_pin);
 
@@ -2287,7 +2290,6 @@ static int ssh_start_isolated_agent_with_key(
 
     int rc = -1;
     memset(&env_snapshot, 0, sizeof(env_snapshot));
-    ssh_config->key_already_loaded = false;
 
     /* Build this account's per-account socket path up front. Guard against the
      * kernel's sockaddr_un.sun_path cap (108 on Linux, 104 on the BSDs), NOT
@@ -2313,6 +2315,8 @@ static int ssh_start_isolated_agent_with_key(
                   spn, sizeof(((struct sockaddr_un *)0)->sun_path));
         goto done;
     }
+    prior_key_names_reuse_target = ssh_config->key_already_loaded &&
+        strcmp(ssh_config->agent_socket_path, socket_path) == 0;
     if (build_provenance_socket_arg(
             dir_fd, socket_name, launch_socket_arg,
             sizeof(launch_socket_arg), provenance_marker,
@@ -2441,6 +2445,9 @@ static int ssh_start_isolated_agent_with_key(
          * reaped would violate the isolation promise. Running this before the
          * environment/link commit also leaves the prior stable link untouched
          * on failure. */
+        if (!prior_key_names_reuse_target) {
+            ssh_config->key_already_loaded = false;
+        }
         if (kill_orphaned_gitswitch_agents(dir_fd, socket_dir,
                                            account->name) != 0) {
             goto done;
@@ -2511,6 +2518,7 @@ static int ssh_start_isolated_agent_with_key(
 
     /* Kill any orphaned gitswitch agents from previous runs (including a stale
      * agent for this same account, which we're about to replace). */
+    ssh_config->key_already_loaded = false;
     if (kill_orphaned_gitswitch_agents(dir_fd, socket_dir, NULL) != 0) {
         goto done;
     }
@@ -3128,6 +3136,10 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
         log_warning("SSH agent teardown was not conclusive; retaining ownership state");
         return -1;
     }
+    /* GONE and UNRELATED both disprove the key-presence assertion even when
+     * stale socket/sidecar names still need a later cleanup retry. Keep those
+     * recovery handles, but do not claim their retired agent still has a key. */
+    ssh_config->key_already_loaded = false;
     log_debug("SSH agent stopped");
 
     if (cleanup_stopped_agent_runtime(ssh_config) != 0) {
@@ -3151,7 +3163,14 @@ int ssh_stop_agent(ssh_config_t *ssh_config) {
 
 /* Clear all keys from SSH agent */
 int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
+    const char *argv[] = {"ssh-add", "-D", NULL};
     char output[512];
+    run_opts_t opts;
+    run_result_t result;
+    uint64_t error_generation_before;
+    bool child_cleared_keys;
+    bool runner_reported_error;
+    int run_rc;
     
     if (!ssh_config || strlen(ssh_config->agent_socket_path) == 0) {
         log_debug("No SSH agent available to clear keys");
@@ -3170,8 +3189,44 @@ int ssh_clear_agent_keys(ssh_config_t *ssh_config) {
      * never calls it. A nonzero result is not evidence that the agent was
      * already empty: it can also mean the agent was unreachable or rejected
      * the operation. */
-    if (ssh_run(output, sizeof(output), false, "ssh-add", "-D",
-                (const char *)NULL) != 0) {
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    result.exit_code = -1;
+    output[0] = '\0';
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    error_generation_before = error_report_generation();
+    run_rc = run_argv(argv, &opts, &result);
+    runner_reported_error =
+        error_report_generation() != error_generation_before;
+    if (result.out_len > 0 && result.out_len < sizeof(output) &&
+        output[result.out_len - 1] == '\n') {
+        output[result.out_len - 1] = '\0';
+    }
+    /* A parent-side pipe or signal-state cleanup failure can make run_argv()
+     * return -1 after ssh-add itself exited zero. The destructive transition
+     * still happened, so publish the new key state from either success proof. */
+    child_cleared_keys =
+        run_rc == 0 ||
+        (result.spawned && result.term_signal == 0 && result.exit_code == 0);
+    if (child_cleared_keys) {
+        ssh_config->key_already_loaded = false;
+    }
+    if (run_rc != 0) {
+        if (child_cleared_keys) {
+            /* run_argv() already published the causal parent-side failure.
+             * Keep it byte-for-byte instead of falsely reporting that the
+             * destructive ssh-add operation failed. A test runner that
+             * violates the structured-error contract still gets a truthful
+             * fallback diagnostic. */
+            if (!runner_reported_error ||
+                get_last_error()->code == ERR_SUCCESS) {
+                set_error(
+                    ERR_SYSTEM_CALL,
+                    "SSH agent keys were cleared, but command runner cleanup failed");
+            }
+            return -1;
+        }
         set_error(ERR_SSH_KEY_LOAD_FAILED,
                   "Failed to clear SSH agent before key replacement: %s",
                   output);
