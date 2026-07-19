@@ -9,6 +9,7 @@
 #include "error.h"
 
 #include <locale.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <wchar.h>
 
@@ -287,6 +288,183 @@ static int open_test_pty(int *master_out, int *slave_out) {
     return 0;
 }
 
+typedef enum {
+    MIXED_COLOR_DISABLED,
+    MIXED_COLOR_FORCED,
+    MIXED_COLOR_AUTOMATIC
+} mixed_color_policy_t;
+
+static bool error_is_would_block(int error_number) {
+    if (error_number == EAGAIN) return true;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    if (error_number == EWOULDBLOCK) return true;
+#endif
+    return false;
+}
+
+/* Drain a closed PTY peer without assuming whether the host reports the end
+ * as EOF (macOS/FreeBSD) or EIO (Linux). The output under test is tiny; the
+ * explicit bound also turns an accidental output loop into a test failure. */
+static int read_pty_capture(int master, char **text_out, size_t *length_out) {
+    enum { CAPTURE_LIMIT = 4096, POLL_TIMEOUT_MS = 250 };
+    struct pollfd descriptor;
+    char *text;
+    size_t length = 0;
+    int flags;
+
+    if (master < 0 || !text_out || !length_out) return -1;
+    *text_out = NULL;
+    *length_out = 0;
+    text = malloc(CAPTURE_LIMIT + 1U);
+    if (!text) return -1;
+
+    flags = fcntl(master, F_GETFL);
+    if (flags < 0 || fcntl(master, F_SETFL, flags | O_NONBLOCK) != 0) {
+        free(text);
+        return -1;
+    }
+    descriptor.fd = master;
+    descriptor.events = POLLIN | POLLHUP;
+
+    for (;;) {
+        ssize_t count;
+
+        if (length == CAPTURE_LIMIT) {
+            free(text);
+            return -1;
+        }
+        count = read(master, text + length, CAPTURE_LIMIT - length);
+        if (count > 0) {
+            length += (size_t)count;
+            continue;
+        }
+        if (count == 0 || (count < 0 && errno == EIO)) break;
+        if (count < 0 && errno == EINTR) continue;
+        if (count < 0 && error_is_would_block(errno)) {
+            int ready;
+
+            descriptor.revents = 0;
+            do {
+                ready = poll(&descriptor, 1, POLL_TIMEOUT_MS);
+            } while (ready < 0 && errno == EINTR);
+            if (ready > 0) continue;
+        }
+        free(text);
+        return -1;
+    }
+
+    text[length] = '\0';
+    *text_out = text;
+    *length_out = length;
+    return 0;
+}
+
+/* Route one logical status line to each standard stream while exactly one
+ * destination is a PTY. Assertions run only after restoration so harness
+ * diagnostics cannot contaminate either capture. Returns 1 only when a PTY
+ * is unavailable, matching open_test_pty(). */
+static int capture_mixed_color_output(bool stdout_is_tty,
+                                      mixed_color_policy_t policy,
+                                      captured_output_t *captured,
+                                      bool *observed_stdout_tty,
+                                      bool *observed_stderr_tty) {
+    FILE *file_capture = NULL;
+    char *file_text = NULL;
+    char *pty_text = NULL;
+    size_t file_length = 0;
+    size_t pty_length = 0;
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    int master = -1;
+    int slave = -1;
+    bool stdout_redirected = false;
+    bool stderr_redirected = false;
+    int pty_result;
+    int result = -1;
+
+    if (!captured || !observed_stdout_tty || !observed_stderr_tty) return -1;
+    memset(captured, 0, sizeof(*captured));
+    *observed_stdout_tty = false;
+    *observed_stderr_tty = false;
+
+    pty_result = open_test_pty(&master, &slave);
+    if (pty_result != 0) return pty_result;
+    file_capture = tmpfile();
+    if (!file_capture || fflush(NULL) != 0) goto cleanup;
+    saved_stdout = dup(STDOUT_FILENO);
+    saved_stderr = dup(STDERR_FILENO);
+    if (saved_stdout < 0 || saved_stderr < 0) goto cleanup;
+
+    if (dup2(stdout_is_tty ? slave : fileno(file_capture),
+             STDOUT_FILENO) != STDOUT_FILENO) {
+        goto cleanup;
+    }
+    stdout_redirected = true;
+    if (dup2(stdout_is_tty ? fileno(file_capture) : slave,
+             STDERR_FILENO) != STDERR_FILENO) {
+        goto cleanup;
+    }
+    stderr_redirected = true;
+    *observed_stdout_tty = isatty(STDOUT_FILENO) == 1;
+    *observed_stderr_tty = isatty(STDERR_FILENO) == 1;
+
+    if (policy == MIXED_COLOR_DISABLED) {
+        if (display_init(false, true) != 0) goto cleanup;
+    } else if (policy == MIXED_COLOR_FORCED) {
+        if (display_init(true, false) != 0) goto cleanup;
+    } else {
+        if (display_init(false, false) != 0) goto cleanup;
+    }
+    display_status("success", "stdout-probe");
+    display_status("error", "stderr-probe");
+    if (fflush(stdout) != 0 || fflush(stderr) != 0) goto cleanup;
+
+    if (dup2(saved_stdout, STDOUT_FILENO) != STDOUT_FILENO) goto cleanup;
+    stdout_redirected = false;
+    if (dup2(saved_stderr, STDERR_FILENO) != STDERR_FILENO) goto cleanup;
+    stderr_redirected = false;
+    close(slave);
+    slave = -1;
+
+    if (read_capture(file_capture, &file_text, &file_length) != 0 ||
+        read_pty_capture(master, &pty_text, &pty_length) != 0) {
+        goto cleanup;
+    }
+    if (stdout_is_tty) {
+        captured->standard_output = pty_text;
+        captured->standard_output_length = pty_length;
+        captured->standard_error = file_text;
+        captured->standard_error_length = file_length;
+    } else {
+        captured->standard_output = file_text;
+        captured->standard_output_length = file_length;
+        captured->standard_error = pty_text;
+        captured->standard_error_length = pty_length;
+    }
+    pty_text = NULL;
+    file_text = NULL;
+    result = 0;
+
+cleanup:
+    if (stdout_redirected && saved_stdout >= 0) {
+        (void)fflush(stdout);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+    }
+    if (stderr_redirected && saved_stderr >= 0) {
+        (void)fflush(stderr);
+        (void)dup2(saved_stderr, STDERR_FILENO);
+    }
+    if (saved_stdout >= 0) close(saved_stdout);
+    if (saved_stderr >= 0) close(saved_stderr);
+    if (slave >= 0) close(slave);
+    if (master >= 0) close(master);
+    if (file_capture) fclose(file_capture);
+    free(file_text);
+    free(pty_text);
+    if (result != 0) captured_output_free(captured);
+    return result;
+}
+
 TEST(retained_public_display_api_links) {
     int (*init_fn)(bool, bool) = display_init;
     void (*header_fn)(const char *) = display_header;
@@ -437,6 +615,76 @@ TEST(automatic_color_requires_tty_and_color_environment) {
 cleanup:
     if (slave >= 0) close(slave);
     if (master >= 0) close(master);
+    CHECK_EQ_INT(restore_color_environment(&saved), 0);
+}
+
+TEST(color_policy_tracks_each_actual_destination_stream) {
+    static const struct {
+        bool stdout_is_tty;
+        mixed_color_policy_t policy;
+        bool color_stdout;
+        bool color_stderr;
+    } cases[] = {
+        { true,  MIXED_COLOR_DISABLED,  false, false },
+        { false, MIXED_COLOR_DISABLED,  false, false },
+        { true,  MIXED_COLOR_FORCED,    true,  true  },
+        { false, MIXED_COLOR_FORCED,    true,  true  },
+        { true,  MIXED_COLOR_AUTOMATIC, true,  false },
+        { false, MIXED_COLOR_AUTOMATIC, false, true  }
+    };
+    saved_color_environment_t saved;
+
+    if (isolate_color_environment(&saved) != 0) {
+        CHECK(false);
+        return;
+    }
+    CHECK_EQ_INT(set_color_environment("xterm-256color", NULL), 0);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        captured_output_t captured;
+        bool observed_stdout_tty;
+        bool observed_stderr_tty;
+        int capture_result = capture_mixed_color_output(
+            cases[i].stdout_is_tty, cases[i].policy, &captured,
+            &observed_stdout_tty, &observed_stderr_tty);
+
+        if (capture_result == 1) {
+            CHECK_EQ_INT(restore_color_environment(&saved), 0);
+            TS_SKIP("pty", "host cannot provide a usable pseudo-terminal");
+        }
+        CHECK_EQ_INT(capture_result, 0);
+        if (capture_result != 0) continue;
+
+        CHECK(observed_stdout_tty == cases[i].stdout_is_tty);
+        CHECK(observed_stderr_tty != cases[i].stdout_is_tty);
+        CHECK(strstr(captured.standard_output, STATUS_SUCCESS) != NULL);
+        CHECK(strstr(captured.standard_output, "stdout-probe") != NULL);
+        CHECK(strstr(captured.standard_output, "stderr-probe") == NULL);
+        CHECK(strstr(captured.standard_error, STATUS_ERROR) != NULL);
+        CHECK(strstr(captured.standard_error, "stderr-probe") != NULL);
+        CHECK(strstr(captured.standard_error, "stdout-probe") == NULL);
+
+        if (cases[i].color_stdout) {
+            CHECK(strstr(captured.standard_output,
+                         COLOR_GREEN STATUS_SUCCESS COLOR_RESET) != NULL);
+            CHECK(strstr(captured.standard_output,
+                         COLOR_GREEN "stdout-probe" COLOR_RESET) != NULL);
+        } else {
+            CHECK(memchr(captured.standard_output, 0x1b,
+                         captured.standard_output_length) == NULL);
+        }
+        if (cases[i].color_stderr) {
+            CHECK(strstr(captured.standard_error,
+                         COLOR_RED STATUS_ERROR COLOR_RESET) != NULL);
+            CHECK(strstr(captured.standard_error,
+                         COLOR_RED "stderr-probe" COLOR_RESET) != NULL);
+        } else {
+            CHECK(memchr(captured.standard_error, 0x1b,
+                         captured.standard_error_length) == NULL);
+        }
+        captured_output_free(&captured);
+    }
+
     CHECK_EQ_INT(restore_color_environment(&saved), 0);
 }
 
@@ -1123,6 +1371,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(explicit_color_flags_have_deterministic_precedence);
     RUN_TEST(environment_color_policy_precedence_and_values_are_exact);
     RUN_TEST(automatic_color_requires_tty_and_color_environment);
+    RUN_TEST(color_policy_tracks_each_actual_destination_stream);
     RUN_TEST(colorize_maps_exact_styles_resets_and_passthroughs);
     RUN_TEST(colorize_results_remain_valid_across_later_growth);
     RUN_TEST(status_levels_and_variadic_formatting_are_exact);
