@@ -788,6 +788,7 @@ check_manifest_contract()
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-release-contract.XXXXXX") ||
         fail "cannot create temporary release-contract directory"
     copy_pid=
+    copy_watchdog_pid=
     lock_dist_pid=
     lock_gate_pid=
     lock_contender_pid=
@@ -814,6 +815,7 @@ check_manifest_contract()
         stop_background "$lock_gate_pid"
         stop_background "$lock_contender_pid"
         stop_background "$lock_dist_pid"
+        stop_background "$copy_watchdog_pid"
         if [ -n "$copy_pid" ]; then
             kill "$copy_pid" 2>/dev/null || true
             wait "$copy_pid" 2>/dev/null || true
@@ -984,6 +986,109 @@ check_manifest_contract()
                 fail "stream publication did not retain exactly one private source"
             [ "$(cat "$1")" = stream-prefix-suffix ] ||
                 fail "retained stream source is incomplete"
+            rm -f "$1"
+            ;;
+    esac
+
+    # AR-11 M42: a known direct-producer failure outranks an inherited stdout
+    # descriptor that remains open in a descendant. The publisher must observe
+    # exit 23 while supervising the stream, tear down the producer group before
+    # the delayed marker, and retain only the already-captured partial bytes.
+    copy_status_ready=$tmp/copy-status-priority.ready
+    copy_status_release=$tmp/copy-status-priority.release
+    copy_status_delayed=$tmp/copy-status-priority.delayed
+    copy_status_deadline=$tmp/copy-status-priority.deadline
+    rm -f "$copy_status_ready" "$copy_status_release" \
+        "$copy_status_delayed" "$copy_status_deadline"
+    # The background descendant, not this parent shell, expands the marker.
+    # shellcheck disable=SC2016
+    AR11_COPY_STATUS_READY=$copy_status_ready \
+        AR11_COPY_STATUS_RELEASE=$copy_status_release \
+        AR11_COPY_STATUS_DELAYED=$copy_status_delayed \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c '
+            printf failed-stream
+            (
+                : >"$AR11_COPY_STATUS_READY"
+                attempt=0
+                while [ ! -e "$AR11_COPY_STATUS_RELEASE" ] &&
+                      [ "$attempt" -lt 300 ]; do
+                    sleep 0.1
+                    attempt=$((attempt + 1))
+                done
+                [ -e "$AR11_COPY_STATUS_RELEASE" ] || exit 0
+                : >"$AR11_COPY_STATUS_DELAYED"
+            ) &
+            descendant_pid=$!
+            attempt=0
+            while [ ! -e "$AR11_COPY_STATUS_READY" ] &&
+                  kill -0 "$descendant_pid" 2>/dev/null &&
+                  [ "$attempt" -lt 20 ]; do
+                sleep 0.1
+                attempt=$((attempt + 1))
+            done
+            if [ ! -e "$AR11_COPY_STATUS_READY" ]; then
+                kill "$descendant_pid" 2>/dev/null || :
+                wait "$descendant_pid" 2>/dev/null || :
+                exit 24
+            fi
+            exit 23
+        ' >"$out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while [ ! -e "$copy_status_ready" ] &&
+        kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    [ -e "$copy_status_ready" ] ||
+        fail "status-priority descendant did not reach its ready boundary"
+    (
+        sleep 3
+        if kill -0 "$copy_pid" 2>/dev/null; then
+            : >"$copy_status_deadline"
+            kill -TERM "$copy_pid" 2>/dev/null || :
+        fi
+    ) &
+    copy_watchdog_pid=$!
+    if wait "$copy_pid"; then
+        copy_pid=
+        stop_background "$copy_watchdog_pid"
+        copy_watchdog_pid=
+        fail "publisher accepted a failed producer with inherited stdout"
+    fi
+    copy_pid=
+    stop_background "$copy_watchdog_pid"
+    copy_watchdog_pid=
+    [ ! -e "$copy_status_deadline" ] ||
+        fail "publisher did not return promptly for a known producer failure"
+    grep -F 'archive command exited with status 23' "$out" >/dev/null ||
+        fail "inherited stdout hid the direct producer exit status"
+    if grep -F 'archive command timed out before output stream completion' \
+        "$out" >/dev/null; then
+        fail "known producer failure was also reported as a stream timeout"
+    fi
+    : >"$copy_status_release"
+    attempt=0
+    while [ ! -e "$copy_status_delayed" ] && [ "$attempt" -lt 20 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    [ ! -e "$copy_status_delayed" ] ||
+        fail "status-priority failure left a producer-group descendant alive"
+    { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+        fail "status-priority failure left a canonical artifact"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD status-priority failure did not retire its exact temporary"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "status-priority failure did not retain one private source"
+            [ "$(cat "$1")" = failed-stream ] ||
+                fail "status-priority failure changed captured producer bytes"
             rm -f "$1"
             ;;
     esac

@@ -704,58 +704,183 @@ static int write_all(int fd, const unsigned char *buffer, size_t size)
     return 0;
 }
 
-static int copy_producer_stream(int input_fd, int output_fd,
-                                int64_t deadline)
+/* Keep the direct child PID published until its terminal status has been
+ * retained. In particular, a successful direct child can become waitable
+ * while a descendant still owns the output pipe. */
+static volatile pid_t fatal_signal_producer = 0;
+
+typedef enum producer_status_result {
+    PRODUCER_STATUS_ERROR = -1,
+    PRODUCER_STATUS_RUNNING = 0,
+    PRODUCER_STATUS_SUCCESS = 1,
+    PRODUCER_STATUS_FAILURE = 2
+} producer_status_result_t;
+
+typedef enum producer_stream_result {
+    PRODUCER_STREAM_CAPTURE_ERROR = -1,
+    PRODUCER_STREAM_COMPLETE = 0,
+    PRODUCER_STREAM_FAILURE = 1,
+    PRODUCER_STREAM_WAIT_ERROR = 2
+} producer_stream_result_t;
+
+/* Observe without releasing the PID first. A failed producer's process group
+ * must be terminated while child still pins that numeric identity; only then
+ * may waitpid retain the exact status and make the PID reusable. A successful
+ * producer is left waitable when reap_success is false so inherited output can
+ * still be drained under the same owned lifetime boundary. */
+static producer_status_result_t observe_producer_status(pid_t child,
+                                                         bool reap_success,
+                                                         int *status)
+{
+    siginfo_t observed;
+    pid_t waited;
+    bool failed;
+    int waitid_rc;
+
+    do {
+        memset(&observed, 0, sizeof(observed));
+        waitid_rc = waitid(P_PID, (id_t)child, &observed,
+                           WEXITED | WNOHANG | WNOWAIT);
+    } while (waitid_rc != 0 && errno == EINTR);
+    if (waitid_rc != 0) {
+        return PRODUCER_STATUS_ERROR;
+    }
+    if (observed.si_pid == 0) {
+        return PRODUCER_STATUS_RUNNING;
+    }
+    if (observed.si_code == CLD_EXITED) {
+        failed = observed.si_status != 0;
+    } else if (observed.si_code == CLD_KILLED ||
+               observed.si_code == CLD_DUMPED) {
+        failed = true;
+    } else {
+        errno = EIO;
+        return PRODUCER_STATUS_ERROR;
+    }
+    if (!failed && !reap_success) {
+        return PRODUCER_STATUS_SUCCESS;
+    }
+
+    if (failed) {
+        (void)kill(-child, SIGKILL);
+    }
+    do {
+        waited = waitpid(child, status, WNOHANG);
+    } while (waited < 0 && errno == EINTR);
+    if (waited == 0) {
+        errno = EAGAIN;
+        return PRODUCER_STATUS_ERROR;
+    }
+    if (waited < 0) {
+        return PRODUCER_STATUS_ERROR;
+    }
+    fatal_signal_producer = 0;
+    return failed ? PRODUCER_STATUS_FAILURE : PRODUCER_STATUS_SUCCESS;
+}
+
+static int supervise_producer_status(pid_t child, bool *producer_succeeded,
+                                     int *status)
+{
+    producer_status_result_t result;
+
+    if (*producer_succeeded) {
+        return 0;
+    }
+    result = observe_producer_status(child, false, status);
+    if (result == PRODUCER_STATUS_ERROR) {
+        return -1;
+    }
+    if (result == PRODUCER_STATUS_FAILURE) {
+        return 1;
+    }
+    if (result == PRODUCER_STATUS_SUCCESS) {
+        *producer_succeeded = true;
+    }
+    return 0;
+}
+
+static producer_stream_result_t copy_producer_stream(int input_fd,
+                                                      int output_fd,
+                                                      pid_t child,
+                                                      int64_t deadline,
+                                                      int *status)
 {
     unsigned char buffer[64U * 1024U];
     struct pollfd input;
+    bool producer_succeeded = false;
 
     input.fd = input_fd;
     input.events = POLLIN;
-    input.revents = 0;
     for (;;) {
         int remaining;
         int remaining_rc = deadline_remaining(deadline, &remaining);
+        int producer_rc;
         int poll_rc;
+        int poll_timeout;
         ssize_t count;
 
         if (remaining_rc <= 0) {
+            producer_rc = supervise_producer_status(
+                child, &producer_succeeded, status);
+            if (producer_rc < 0) {
+                return PRODUCER_STREAM_WAIT_ERROR;
+            }
+            if (producer_rc > 0) {
+                return PRODUCER_STREAM_FAILURE;
+            }
             if (remaining_rc == 0) {
                 errno = ETIMEDOUT;
             }
-            return -1;
+            return PRODUCER_STREAM_CAPTURE_ERROR;
         }
+        poll_timeout = producer_succeeded || remaining <= 50 ? remaining : 50;
         input.revents = 0;
-        poll_rc = poll(&input, 1, remaining);
+        poll_rc = poll(&input, 1, poll_timeout);
         if (poll_rc < 0) {
             if (errno == EINTR) {
                 continue;
             }
-            return -1;
+            return PRODUCER_STREAM_CAPTURE_ERROR;
         }
         if (poll_rc == 0) {
-            errno = ETIMEDOUT;
-            return -1;
+            producer_rc = supervise_producer_status(
+                child, &producer_succeeded, status);
+            if (producer_rc < 0) {
+                return PRODUCER_STREAM_WAIT_ERROR;
+            }
+            if (producer_rc > 0) {
+                return PRODUCER_STREAM_FAILURE;
+            }
+            continue;
         }
         if ((input.revents & POLLNVAL) != 0) {
             errno = EBADF;
-            return -1;
+            return PRODUCER_STREAM_CAPTURE_ERROR;
         }
         if ((input.revents & (POLLIN | POLLHUP | POLLERR)) == 0) {
             errno = EIO;
-            return -1;
+            return PRODUCER_STREAM_CAPTURE_ERROR;
         }
         do {
             count = read(input_fd, buffer, sizeof(buffer));
         } while (count < 0 && errno == EINTR);
         if (count < 0) {
-            return -1;
+            return PRODUCER_STREAM_CAPTURE_ERROR;
+        }
+        if (count > 0 &&
+            write_all(output_fd, buffer, (size_t)count) != 0) {
+            return PRODUCER_STREAM_CAPTURE_ERROR;
+        }
+        producer_rc = supervise_producer_status(
+            child, &producer_succeeded, status);
+        if (producer_rc < 0) {
+            return PRODUCER_STREAM_WAIT_ERROR;
+        }
+        if (producer_rc > 0) {
+            return PRODUCER_STREAM_FAILURE;
         }
         if (count == 0) {
-            return 0;
-        }
-        if (write_all(output_fd, buffer, (size_t)count) != 0) {
-            return -1;
+            return PRODUCER_STREAM_COMPLETE;
         }
     }
 }
@@ -767,7 +892,6 @@ static int copy_producer_stream(int input_fd, int output_fd,
  * The handler makes the boundary hold: kill the group, then die by the same
  * signal with default disposition so the caller observes a truthful
  * signal-death status. kill/signal/raise are all async-signal-safe. */
-static volatile pid_t fatal_signal_producer = 0;
 
 static void forward_fatal_signal(int signal_number)
 {
@@ -811,15 +935,14 @@ static int install_fatal_signal_forwarding(void)
 static int wait_for_producer(pid_t child, int64_t deadline, int *status)
 {
     for (;;) {
-        pid_t waited = waitpid(child, status, WNOHANG);
+        producer_status_result_t result =
+            observe_producer_status(child, true, status);
 
-        if (waited == child) {
+        if (result == PRODUCER_STATUS_SUCCESS ||
+            result == PRODUCER_STATUS_FAILURE) {
             return 0;
         }
-        if (waited < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+        if (result == PRODUCER_STATUS_ERROR) {
             return -1;
         }
         {
@@ -864,6 +987,19 @@ static void terminate_producer(pid_t child)
     errno = saved_errno;
 }
 
+static void report_producer_failure(int status)
+{
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "ERROR: archive command exited with status %d\n",
+                WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "ERROR: archive command terminated by signal %d\n",
+                WTERMSIG(status));
+    } else {
+        fprintf(stderr, "ERROR: archive command did not exit normally\n");
+    }
+}
+
 static int run_to_descriptor(int output_fd, char *const command[])
 {
     int pipe_fds[2];
@@ -872,6 +1008,7 @@ static int run_to_descriptor(int output_fd, char *const command[])
     int64_t deadline;
     int64_t started;
     pid_t child;
+    producer_stream_result_t stream_result;
 
     if (create_producer_pipe(pipe_fds) != 0) {
         return -1;
@@ -934,10 +1071,20 @@ static int run_to_descriptor(int output_fd, char *const command[])
         return -1;
     }
     deadline = started + (int64_t)GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS;
-    if (copy_producer_stream(pipe_fds[0], output_fd, deadline) != 0) {
+    stream_result = copy_producer_stream(pipe_fds[0], output_fd, child,
+                                         deadline, &status);
+    if (stream_result != PRODUCER_STREAM_COMPLETE) {
         saved_errno = errno;
         (void)close(pipe_fds[0]);
-        if (saved_errno == ETIMEDOUT) {
+        if (stream_result == PRODUCER_STREAM_FAILURE) {
+            report_producer_failure(status);
+            errno = EIO;
+            return -1;
+        }
+        if (stream_result == PRODUCER_STREAM_WAIT_ERROR) {
+            fprintf(stderr, "ERROR: cannot wait for archive command: %s\n",
+                    strerror(saved_errno));
+        } else if (saved_errno == ETIMEDOUT) {
             fprintf(stderr,
                     "ERROR: archive command timed out before output stream completion\n");
         } else {
@@ -966,15 +1113,7 @@ static int run_to_descriptor(int output_fd, char *const command[])
      * the direct producer pid is no longer this process's to kill. */
     fatal_signal_producer = 0;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        if (WIFEXITED(status)) {
-            fprintf(stderr, "ERROR: archive command exited with status %d\n",
-                    WEXITSTATUS(status));
-        } else if (WIFSIGNALED(status)) {
-            fprintf(stderr, "ERROR: archive command terminated by signal %d\n",
-                    WTERMSIG(status));
-        } else {
-            fprintf(stderr, "ERROR: archive command did not exit normally\n");
-        }
+        report_producer_failure(status);
         errno = EIO;
         return -1;
     }
