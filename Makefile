@@ -962,6 +962,8 @@ test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@echo "Running tests..."
 	@GITSWITCH_BIN="$(abspath $(BINDIR)/$(TARGET))"; \
 	export GITSWITCH_BIN; \
+	GITSWITCH_SOURCE_ROOT="$(CURDIR)"; \
+	export GITSWITCH_SOURCE_ROOT; \
 	for test in $(TEST_TARGETS); do \
 		echo "Running $$test..."; \
 		"$$test" || exit 1; \

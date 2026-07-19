@@ -313,6 +313,75 @@ static const char *slurp(const char *path, char *buf, size_t size) {
     return buf;
 }
 
+static int extract_unique_line(const char *text, const char *prefix,
+                               char *line, size_t line_size) {
+    const char *cursor = text;
+    size_t prefix_length = strlen(prefix);
+    bool found = false;
+
+    if (!text || !prefix || !line || line_size == 0) return -1;
+    line[0] = '\0';
+    while (*cursor) {
+        const char *newline = strchr(cursor, '\n');
+        size_t length = newline ? (size_t)(newline - cursor) : strlen(cursor);
+
+        if (length >= prefix_length &&
+            memcmp(cursor, prefix, prefix_length) == 0) {
+            if (found || length + 2U > line_size) return -1;
+            memcpy(line, cursor, length);
+            line[length] = '\n';
+            line[length + 1U] = '\0';
+            found = true;
+        }
+        if (!newline) break;
+        cursor = newline + 1;
+    }
+    return found ? 0 : -1;
+}
+
+static int extract_unique_section(const char *text, const char *heading,
+                                  char *section, size_t section_size) {
+    const char *start;
+    const char *end;
+    size_t heading_length;
+    size_t length;
+
+    if (!text || !heading || !section || section_size == 0) return -1;
+    section[0] = '\0';
+    heading_length = strlen(heading);
+    start = strstr(text, heading);
+    if (!start || strstr(start + heading_length, heading)) return -1;
+    end = strstr(start, "\n\n");
+    if (!end) return -1;
+    length = (size_t)(end - start) + 1U;
+    if (length + 1U > section_size) return -1;
+    memcpy(section, start, length);
+    section[length] = '\0';
+    return 0;
+}
+
+static int extract_parenthesized_value(const char *line, const char *prefix,
+                                       char *value, size_t value_size) {
+    const char *open;
+    const char *close;
+    size_t length;
+
+    if (!line || !prefix || !value || value_size == 0) return -1;
+    value[0] = '\0';
+    if (strncmp(line, prefix, strlen(prefix)) != 0) return -1;
+    open = strchr(line, '(');
+    close = open ? strchr(open + 1, ')') : NULL;
+    if (!open || !close || close[1] != '\n' || close[2] != '\0' ||
+        strchr(open + 1, '(') || strchr(close + 1, ')')) {
+        return -1;
+    }
+    length = (size_t)(close - (open + 1));
+    if (length + 1U > value_size) return -1;
+    memcpy(value, open + 1, length);
+    value[length] = '\0';
+    return 0;
+}
+
 typedef struct {
     struct stat home;
     struct stat config_parent;
@@ -706,13 +775,26 @@ TEST(option_order_is_independent_of_posixly_correct) {
     }
 }
 
-TEST(help_names_every_yes_confirmation_bypass) {
-    static const char expected[] =
-        "  --yes, -y            Assume 'yes' to confirmation prompts "
-        "(add/edit/remove/reset)\n";
+TEST(readme_and_help_name_every_yes_confirmation_bypass) {
+    static const char expected_commands[] = "add/edit/remove/reset";
     const char *argv[] = {"gitswitch", "--help", NULL};
+    const char *source_root = getenv("GITSWITCH_SOURCE_ROOT");
     char home[128], runtime[128], output_path[128], output[8192];
+    char readme_path[4096], readme[16384], readme_line[256], help_line[256];
+    char readme_options[2048], help_options[2048], yes_commands[128];
+    int path_length;
     int rc;
+
+    if (!source_root || !*source_root) source_root = ".";
+    path_length = snprintf(readme_path, sizeof(readme_path), "%s/README.md",
+                           source_root);
+    CHECK(path_length > 0 && (size_t)path_length < sizeof(readme_path));
+    if (path_length <= 0 || (size_t)path_length >= sizeof(readme_path)) return;
+    slurp(readme_path, readme, sizeof(readme));
+    CHECK_EQ_INT(extract_unique_line(readme, "  --yes, -y", readme_line,
+                                     sizeof(readme_line)), 0);
+    CHECK_EQ_INT(extract_unique_section(readme, "Options:\n", readme_options,
+                                        sizeof(readme_options)), 0);
 
     CHECK_EQ_INT(make_private_dir(home, sizeof(home),
                                   "gitswitch-ar09-home"), 0);
@@ -721,7 +803,16 @@ TEST(help_names_every_yes_confirmation_bypass) {
     rc = run_cli(home, runtime, argv, output_path, sizeof(output_path));
     CHECK_EQ_INT(rc, 0);
     slurp(output_path, output, sizeof(output));
-    CHECK(strstr(output, expected) != NULL);
+    CHECK_EQ_INT(extract_unique_line(output, "  --yes, -y", help_line,
+                                     sizeof(help_line)), 0);
+    CHECK_EQ_INT(extract_unique_section(output, "Options:\n", help_options,
+                                        sizeof(help_options)), 0);
+    CHECK_STR_EQ(readme_options, help_options);
+    CHECK_STR_EQ(readme_line, help_line);
+    CHECK_EQ_INT(extract_parenthesized_value(
+                     help_line, "  --yes, -y", yes_commands,
+                     sizeof(yes_commands)), 0);
+    CHECK_STR_EQ(yes_commands, expected_commands);
     CHECK(directory_empty(home));
     CHECK(directory_empty(runtime));
     unlink(output_path);
@@ -1663,7 +1754,7 @@ TEST_MAIN_BEGIN()
         return 1;
     }
     RUN_TEST(option_order_is_independent_of_posixly_correct);
-    RUN_TEST(help_names_every_yes_confirmation_bypass);
+    RUN_TEST(readme_and_help_name_every_yes_confirmation_bypass);
     RUN_TEST(config_command_reports_exact_owner_only_mode);
     RUN_TEST(doctor_reports_the_bound_gpg_path_and_keeps_absence_optional);
     RUN_TEST(informational_output_bytes_are_stable);

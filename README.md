@@ -25,7 +25,7 @@ Options:
   --global, -g         Use global git scope
   --local, -l          Use local git scope (default)
   --dry-run, -n        Show what would be done without executing
-  --yes, -y            Assume 'yes' to confirmation prompts (remove/reset)
+  --yes, -y            Assume 'yes' to confirmation prompts (add/edit/remove/reset)
   --names              With 'list': print only account names (one per line)
   --verbose, -V        Enable verbose output
   --debug, -d          Enable debug logging
