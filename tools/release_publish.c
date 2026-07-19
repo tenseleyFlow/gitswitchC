@@ -711,6 +711,13 @@ static volatile pid_t fatal_signal_producer = 0;
 static const int forwarded_fatal_signals[] = {
     SIGINT, SIGTERM, SIGHUP, SIGQUIT
 };
+#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
+static volatile sig_atomic_t test_reap_transition_active = 0;
+static int test_reap_transition_signal = 0;
+static int test_reap_transition_report_fd = -1;
+static bool test_reap_transition_enabled = false;
+static bool test_reap_transition_used = false;
+#endif
 
 typedef enum producer_status_result {
     PRODUCER_STATUS_ERROR = -1,
@@ -727,6 +734,120 @@ typedef enum producer_stream_result {
     PRODUCER_STREAM_WAIT_ERROR = 2
 } producer_stream_result_t;
 
+typedef struct producer_reap_result {
+    pid_t waited;
+    int wait_errno;
+    int mask_errno;
+} producer_reap_result_t;
+
+static int build_forwarded_fatal_signal_set(sigset_t *fatal_set)
+{
+    size_t index;
+
+    if (sigemptyset(fatal_set) != 0) {
+        return -1;
+    }
+    for (index = 0;
+         index < sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0]);
+         index++) {
+        if (sigaddset(fatal_set, forwarded_fatal_signals[index]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
+/* Named-helper-only one-shot checkpoint. The independent oracle ensures a
+ * missing production-set member is reported as 'U' rather than hidden by a
+ * collusive test mask. The selected signal is raised only after waitpid has
+ * released the PID and before handler-visible ownership is retired. */
+static void run_reap_transition_test_hook(void)
+{
+    static const int expected_fatal_signals[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT
+    };
+    sigset_t current;
+    char proof = 'B';
+    size_t index;
+
+    if (!test_reap_transition_enabled || test_reap_transition_used) {
+        return;
+    }
+    test_reap_transition_used = true;
+    if (sigprocmask(SIG_SETMASK, NULL, &current) != 0) {
+        proof = 'U';
+    } else {
+        for (index = 0;
+             index < sizeof(expected_fatal_signals) /
+                         sizeof(expected_fatal_signals[0]);
+             index++) {
+            if (sigismember(&current, expected_fatal_signals[index]) != 1) {
+                proof = 'U';
+                break;
+            }
+        }
+    }
+    (void)write(test_reap_transition_report_fd, &proof, sizeof(proof));
+    test_reap_transition_active = 1;
+    if (raise(test_reap_transition_signal) != 0) {
+        static const char raise_failure = 'R';
+
+        (void)write(test_reap_transition_report_fd, &raise_failure,
+                    sizeof(raise_failure));
+    }
+}
+#endif
+
+/* Reaping releases a numeric PID for reuse. Keep every signal whose handler
+ * can consult fatal_signal_producer blocked across that release and the
+ * matching publication retirement, then restore the exact entry mask. Wait
+ * and mask outcomes remain separate so callers never retry a kill merely
+ * because restoration failed after a successful reap. ECHILD likewise proves
+ * that this process no longer owns the published numeric identity. */
+static producer_reap_result_t reap_and_retire_producer(pid_t child,
+                                                        int *status,
+                                                        int options)
+{
+    producer_reap_result_t result = {
+        .waited = -1,
+        .wait_errno = 0,
+        .mask_errno = 0
+    };
+    sigset_t fatal_set;
+    sigset_t saved_mask;
+
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0) {
+        result.mask_errno = errno;
+        return result;
+    }
+    if (sigprocmask(SIG_BLOCK, &fatal_set, &saved_mask) != 0) {
+        result.mask_errno = errno;
+        return result;
+    }
+    do {
+        result.waited = waitpid(child, status, options);
+    } while (result.waited < 0 && errno == EINTR);
+    if (result.waited < 0) {
+        result.wait_errno = errno;
+    }
+#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
+    if (result.waited == child) {
+        run_reap_transition_test_hook();
+    }
+#endif
+    if ((result.waited == child ||
+         (result.waited < 0 && result.wait_errno == ECHILD)) &&
+        fatal_signal_producer == child) {
+        fatal_signal_producer = 0;
+    }
+    if (sigprocmask(SIG_SETMASK, &saved_mask, NULL) != 0) {
+        result.mask_errno = errno;
+    }
+    return result;
+}
+
 /* Observe without releasing the PID first. A terminal producer's process
  * group must receive group-directed SIGKILL while child still pins that
  * numeric identity: immediately on failure, or after the complete inherited
@@ -739,7 +860,7 @@ static producer_status_result_t observe_producer_status(pid_t child,
                                                          int *status)
 {
     siginfo_t observed;
-    pid_t waited;
+    producer_reap_result_t reap_result;
     bool failed;
     int waitid_rc;
 
@@ -749,6 +870,15 @@ static producer_status_result_t observe_producer_status(pid_t child,
                            WEXITED | WNOHANG | WNOWAIT);
     } while (waitid_rc != 0 && errno == EINTR);
     if (waitid_rc != 0) {
+        int waitid_errno = errno;
+
+        if (waitid_errno == ECHILD) {
+            /* An inherited or external reaper has already released the
+             * numeric identity. Retire the matching publication under the
+             * same fatal-signal guard before cleanup can consider a kill. */
+            (void)reap_and_retire_producer(child, status, WNOHANG);
+        }
+        errno = waitid_errno;
         return PRODUCER_STATUS_ERROR;
     }
     if (observed.si_pid == 0) {
@@ -774,17 +904,28 @@ static producer_status_result_t observe_producer_status(pid_t child,
             return PRODUCER_STATUS_GROUP_ERROR;
         }
     }
-    do {
-        waited = waitpid(child, status, WNOHANG);
-    } while (waited < 0 && errno == EINTR);
-    if (waited == 0) {
+    reap_result = reap_and_retire_producer(child, status, WNOHANG);
+    if (reap_result.waited == 0) {
+        if (reap_result.mask_errno != 0) {
+            errno = reap_result.mask_errno;
+            return PRODUCER_STATUS_ERROR;
+        }
         errno = EAGAIN;
         return PRODUCER_STATUS_ERROR;
     }
-    if (waited < 0) {
+    if (reap_result.waited < 0) {
+        errno = reap_result.wait_errno != 0 ? reap_result.wait_errno
+                                            : reap_result.mask_errno;
         return PRODUCER_STATUS_ERROR;
     }
-    fatal_signal_producer = 0;
+    if (reap_result.waited != child) {
+        errno = ECHILD;
+        return PRODUCER_STATUS_ERROR;
+    }
+    if (reap_result.mask_errno != 0) {
+        errno = reap_result.mask_errno;
+        return PRODUCER_STATUS_ERROR;
+    }
     return failed ? PRODUCER_STATUS_FAILURE : PRODUCER_STATUS_SUCCESS;
 }
 
@@ -908,6 +1049,17 @@ static void forward_fatal_signal(int signal_number)
     pid_t child = fatal_signal_producer;
 
     if (child > 0) {
+#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
+        if (test_reap_transition_active != 0) {
+            static const char stale_ownership = 'S';
+
+            (void)write(test_reap_transition_report_fd, &stale_ownership,
+                        sizeof(stale_ownership));
+            /* Never let the deliberate test mutant signal a numeric identity
+             * after waitpid has made it reusable. */
+            _exit(90);
+        }
+#endif
         (void)kill(-child, SIGKILL);
         (void)kill(child, SIGKILL);
     }
@@ -950,6 +1102,76 @@ static int reset_fatal_signals_for_test(void)
     return sigprocmask(SIG_UNBLOCK, &fatal_set, NULL);
 }
 #endif
+
+#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
+static int configure_reap_transition_test(void)
+{
+    const char *signal_name =
+        getenv("GITSWITCH_RELEASE_TEST_REAP_SIGNAL"); /* Flawfinder: ignore — named-fixture-only exact signal selector, compiled out of production */
+    const char *report_fd =
+        getenv("GITSWITCH_RELEASE_TEST_REAP_REPORT_FD"); /* Flawfinder: ignore — named-fixture-only exact descriptor selector, compiled out of production */
+    const char *preblocked =
+        getenv("GITSWITCH_RELEASE_TEST_REAP_PREBLOCKED"); /* Flawfinder: ignore — named-fixture-only boolean mask control, compiled out of production */
+    sigset_t selected;
+    int descriptor_flags;
+    int selected_signal;
+
+    if (signal_name == NULL && report_fd == NULL && preblocked == NULL) {
+        return 0;
+    }
+    if (signal_name == NULL || report_fd == NULL ||
+        strcmp(report_fd, "9") != 0 ||
+        (preblocked != NULL && strcmp(preblocked, "1") != 0)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strcmp(signal_name, "HUP") == 0) {
+        selected_signal = SIGHUP;
+    } else if (strcmp(signal_name, "INT") == 0) {
+        selected_signal = SIGINT;
+    } else if (strcmp(signal_name, "QUIT") == 0) {
+        selected_signal = SIGQUIT;
+    } else if (strcmp(signal_name, "TERM") == 0) {
+        selected_signal = SIGTERM;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+    descriptor_flags = fcntl(9, F_GETFD);
+    if (descriptor_flags < 0 ||
+        fcntl(9, F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
+        return -1;
+    }
+    if (preblocked != NULL) {
+        if (sigemptyset(&selected) != 0 ||
+            sigaddset(&selected, selected_signal) != 0 ||
+            sigprocmask(SIG_BLOCK, &selected, NULL) != 0) {
+            return -1;
+        }
+    }
+    test_reap_transition_signal = selected_signal;
+    test_reap_transition_report_fd = 9;
+    test_reap_transition_enabled = true;
+    return 0;
+}
+#endif
+
+/* exec preserves SIG_IGN, and some inherited SIGCHLD policies auto-reap a
+ * producer before waitid/waitpid can pin its numeric identity. This dedicated
+ * helper owns and must diagnose its one producer, so establish ordinary
+ * waitable-child semantics before any fork. A zeroed action also clears
+ * SA_NOCLDWAIT where supported. */
+static int establish_producer_wait_ownership(void)
+{
+    struct sigaction waitable;
+
+    memset(&waitable, 0, sizeof(waitable));
+    waitable.sa_handler = SIG_DFL;
+    if (sigemptyset(&waitable.sa_mask) != 0) {
+        return -1;
+    }
+    return sigaction(SIGCHLD, &waitable, NULL);
+}
 
 /* Preserve an inherited SIG_IGN (nohup semantics); otherwise forward. */
 static int install_fatal_signal_forwarding(void)
@@ -1023,18 +1245,50 @@ static int wait_for_producer(pid_t child, int64_t deadline, int *status)
 static void terminate_producer(pid_t child)
 {
     int saved_errno = errno;
+    producer_reap_result_t reap_result;
+    siginfo_t observed;
     int status;
-    pid_t waited;
+    int waitid_errno = 0;
+    int waitid_rc;
+
+    if (fatal_signal_producer != child) {
+        errno = saved_errno;
+        return;
+    }
+
+    /* Refuse to signal through a publication already proven unowned. The
+     * normal SIGCHLD contract keeps a live or waitable child pinned; ECHILD is
+     * therefore the only result that makes the numeric identity unsafe. */
+    do {
+        memset(&observed, 0, sizeof(observed));
+        waitid_rc = waitid(P_PID, (id_t)child, &observed,
+                           WEXITED | WNOHANG | WNOWAIT);
+    } while (waitid_rc != 0 && errno == EINTR);
+    if (waitid_rc != 0 && errno == ECHILD) {
+        (void)reap_and_retire_producer(child, &status, WNOHANG);
+        errno = saved_errno;
+        return;
+    }
 
     /* The child creates this process group before it can exec or write output,
      * so ordinary descendants remain inside the lifetime boundary. Killing the
      * direct PID as well covers an early setpgid failure. */
     (void)kill(-child, SIGKILL);
     (void)kill(child, SIGKILL);
+    /* Keep the blocking wait interruptible. WNOWAIT first pins the terminal
+     * identity; only the following guarded WNOHANG reap blocks fatal signals. */
     do {
-        waited = waitpid(child, &status, 0);
-    } while (waited < 0 && errno == EINTR);
-    fatal_signal_producer = 0;
+        memset(&observed, 0, sizeof(observed));
+        waitid_rc = waitid(P_PID, (id_t)child, &observed,
+                           WEXITED | WNOWAIT);
+    } while (waitid_rc != 0 && errno == EINTR);
+    if (waitid_rc != 0) {
+        waitid_errno = errno;
+    }
+    if (waitid_rc == 0 || waitid_errno == ECHILD) {
+        reap_result = reap_and_retire_producer(child, &status, WNOHANG);
+        (void)reap_result;
+    }
     errno = saved_errno;
 }
 
@@ -1166,9 +1420,9 @@ static int run_to_descriptor(int output_fd, char *const command[])
         terminate_producer(child);
         return -1;
     }
-    /* The complete inherited stream is captured and group-directed SIGKILL
-     * was issued while the direct PID still pinned the owned group identity. */
-    fatal_signal_producer = 0;
+    /* The complete inherited stream is captured, group-directed SIGKILL was
+     * issued while the direct PID still pinned the owned group identity, and
+     * the guarded reap retired handler ownership before making it reusable. */
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         report_producer_failure(status);
         errno = EIO;
@@ -1552,6 +1806,13 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 #endif
+#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
+    if (configure_reap_transition_test() != 0) {
+        fprintf(stderr, "ERROR: cannot configure reap-transition test: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+#endif
     if (install_fatal_signal_forwarding() != 0) {
         fprintf(stderr, "ERROR: cannot install signal forwarding: %s\n",
                 strerror(errno));
@@ -1568,6 +1829,11 @@ int main(int argc, char **argv)
     if (final_name[0] == '\0' || strcmp(final_name, ".") == 0 ||
         strcmp(final_name, "..") == 0 || strchr(final_name, '/') != NULL) {
         fprintf(stderr, "ERROR: final archive name is not a single component\n");
+        return EXIT_FAILURE;
+    }
+    if (establish_producer_wait_ownership() != 0) {
+        fprintf(stderr, "ERROR: cannot establish archive-child ownership: %s\n",
+                strerror(errno));
         return EXIT_FAILURE;
     }
 

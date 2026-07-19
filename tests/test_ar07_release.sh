@@ -1506,6 +1506,205 @@ check_manifest_contract()
     [ -z "$copy_group_violations" ] ||
         fail "successful publication left producer descendants:$copy_group_violations"
 
+    # AR-11 M45: waitpid makes the producer PID reusable, so every fatal
+    # handler must remain blocked until handler-visible ownership is retired.
+    # The named-only checkpoint writes B after independently observing all
+    # four signals blocked, raises the selected signal immediately after reap,
+    # and safely exits 90 before any kill if a stale positive PID is visible.
+    copy_reap_expected=$tmp/copy-reap.expected
+    copy_reap_report_expected=$tmp/copy-reap-report.expected
+    printf '%s' reap-transition-payload >"$copy_reap_expected" ||
+        fail "cannot create reap-transition expected payload"
+    printf '%s' B >"$copy_reap_report_expected" ||
+        fail "cannot create reap-transition expected report"
+    copy_reap_violations=
+    for copy_reap_signal in HUP INT QUIT TERM; do
+        copy_reap_report=$tmp/copy-reap-$copy_reap_signal.report
+        rm -f "$copy_reap_report" "$copy_archive" \
+            "$copy_dir"/.archive.tar.gz.tmp.*
+        copy_reap_status=0
+        if GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+            GITSWITCH_RELEASE_TEST_REAP_SIGNAL=$copy_reap_signal \
+            GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9 \
+            "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+                archive.tar.gz -- /bin/sh -c \
+                'printf reap-transition-payload' \
+                9>"$copy_reap_report" >"$out" 2>&1; then
+            copy_reap_status=0
+        else
+            copy_reap_status=$?
+        fi
+        if [ "$copy_reap_status" -le 128 ]; then
+            copy_reap_violations="$copy_reap_violations $copy_reap_signal-status-$copy_reap_status"
+        else
+            copy_reap_observed=$(kill -l "$copy_reap_status" 2>/dev/null || :)
+            case $copy_reap_observed in
+                "$copy_reap_signal"|"SIG$copy_reap_signal") ;;
+                *)
+                    copy_reap_violations="$copy_reap_violations $copy_reap_signal-status-$copy_reap_status"
+                    ;;
+            esac
+        fi
+        cmp -s "$copy_reap_report_expected" "$copy_reap_report" ||
+            copy_reap_violations="$copy_reap_violations $copy_reap_signal-guard"
+        { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+            copy_reap_violations="$copy_reap_violations $copy_reap_signal-published"
+        set -- "$copy_dir"/.archive.tar.gz.tmp.*
+        if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-shape"
+        else
+            cmp -s "$copy_reap_expected" "$1" ||
+                copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-bytes"
+            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-mode"
+        fi
+        rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+        set -- "$copy_dir"/.archive.tar.gz.tmp.*
+        { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+            copy_reap_violations="$copy_reap_violations $copy_reap_signal-temp-residue"
+    done
+    [ -z "$copy_reap_violations" ] ||
+        fail "guarded producer-reap violations:$copy_reap_violations"
+
+    # An ignored SIGCHLD disposition survives exec on supported POSIX hosts
+    # and may auto-reap children. The publisher must establish its own wait
+    # ownership before fork so the same guarded retirement proof still runs.
+    copy_reap_chld_report=$tmp/copy-reap-sigchld.report
+    rm -f "$copy_reap_chld_report" "$copy_archive" \
+        "$copy_dir"/.archive.tar.gz.tmp.*
+    copy_reap_status=0
+    if (
+        trap '' CHLD
+        GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1
+        GITSWITCH_RELEASE_TEST_REAP_SIGNAL=TERM
+        GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9
+        export GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS
+        export GITSWITCH_RELEASE_TEST_REAP_SIGNAL
+        export GITSWITCH_RELEASE_TEST_REAP_REPORT_FD
+        exec "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            archive.tar.gz -- /bin/sh -c 'printf reap-transition-payload' \
+            9>"$copy_reap_chld_report" >"$out" 2>&1
+    ); then
+        copy_reap_status=0
+    else
+        copy_reap_status=$?
+    fi
+    [ "$copy_reap_status" -gt 128 ] ||
+        fail "inherited-SIGCHLD publisher did not die by its deferred signal"
+    copy_reap_observed=$(kill -l "$copy_reap_status" 2>/dev/null || :)
+    case $copy_reap_observed in
+        TERM|SIGTERM) ;;
+        *)
+            fail "inherited-SIGCHLD publisher died with status $copy_reap_status"
+            ;;
+    esac
+    cmp -s "$copy_reap_report_expected" "$copy_reap_chld_report" ||
+        fail "inherited SIGCHLD bypassed guarded producer retirement"
+    { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+        fail "inherited-SIGCHLD transition left a canonical artifact"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+        fail "inherited-SIGCHLD transition did not retain one private temporary"
+    cmp -s "$copy_reap_expected" "$1" ||
+        fail "inherited-SIGCHLD transition changed captured bytes"
+    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+        fail "inherited-SIGCHLD transition left a non-private temporary"
+    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+
+    # Restoring the exact entry mask matters: a signal blocked by the caller
+    # must remain pending and blocked after retirement, not be unconditionally
+    # released by the helper. The checkpoint report proves it actually ran.
+    copy_reap_preblocked_report=$tmp/copy-reap-preblocked.report
+    rm -f "$copy_reap_preblocked_report" "$copy_archive" \
+        "$copy_dir"/.archive.tar.gz.tmp.*
+    if ! GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+        GITSWITCH_RELEASE_TEST_REAP_SIGNAL=TERM \
+        GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9 \
+        GITSWITCH_RELEASE_TEST_REAP_PREBLOCKED=1 \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            archive.tar.gz -- /bin/sh -c 'printf reap-transition-payload' \
+            9>"$copy_reap_preblocked_report" >"$out" 2>&1; then
+        fail "publisher released an inherited blocked fatal signal"
+    fi
+    cmp -s "$copy_reap_report_expected" "$copy_reap_preblocked_report" ||
+        fail "preblocked reap transition did not run under the complete guard"
+    cmp -s "$copy_reap_expected" "$copy_archive" ||
+        fail "preblocked reap transition changed the published bytes"
+    [ "$(find "$copy_archive" -prune -type f -perm 0444 -print)" = \
+        "$copy_archive" ] ||
+        fail "preblocked reap transition did not publish read-only bytes"
+    rm -f "$copy_archive"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD preblocked reap transition did not retire its exact temporary"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "preblocked reap transition did not retain one private source"
+            cmp -s "$copy_reap_expected" "$1" ||
+                fail "preblocked reap transition changed its retained source"
+            [ "$(find "$1" -prune -type f -perm 0444 -print)" = "$1" ] ||
+                fail "preblocked reap transition retained a writable source"
+            rm -f "$1"
+            ;;
+    esac
+
+    # Exercise the second reap owner as well. Closing stdout while the direct
+    # producer remains alive drives the bounded wait into terminate_producer;
+    # that cleanup must use the same atomic retirement primitive.
+    copy_reap_terminate_expected=$tmp/copy-reap-terminate.expected
+    copy_reap_terminate_report=$tmp/copy-reap-terminate.report
+    copy_reap_terminate_delayed=$tmp/copy-reap-terminate.delayed
+    printf '%s' reap-terminate-payload >"$copy_reap_terminate_expected" ||
+        fail "cannot create terminate-reap expected payload"
+    rm -f "$copy_reap_terminate_report" \
+        "$copy_reap_terminate_delayed" "$copy_archive" \
+        "$copy_dir"/.archive.tar.gz.tmp.*
+    copy_reap_status=0
+    # The producer, not this parent shell, expands the fixture variables.
+    # shellcheck disable=SC2016
+    if AR11_COPY_REAP_DELAYED=$copy_reap_terminate_delayed \
+        GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+        GITSWITCH_RELEASE_TEST_REAP_SIGNAL=TERM \
+        GITSWITCH_RELEASE_TEST_REAP_REPORT_FD=9 \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            archive.tar.gz -- /bin/sh -c '
+                printf reap-terminate-payload
+                exec 1>&-
+                sleep 30
+                : >"$AR11_COPY_REAP_DELAYED"
+            ' 9>"$copy_reap_terminate_report" >"$out" 2>&1; then
+        copy_reap_status=0
+    else
+        copy_reap_status=$?
+    fi
+    [ "$copy_reap_status" -gt 128 ] ||
+        fail "terminate-reap publisher did not die by its deferred signal"
+    copy_reap_observed=$(kill -l "$copy_reap_status" 2>/dev/null || :)
+    case $copy_reap_observed in
+        TERM|SIGTERM) ;;
+        *) fail "terminate-reap publisher died with status $copy_reap_status" ;;
+    esac
+    cmp -s "$copy_reap_report_expected" "$copy_reap_terminate_report" ||
+        fail "terminate-reap transition exposed stale producer ownership"
+    [ ! -e "$copy_reap_terminate_delayed" ] ||
+        fail "terminate-reap producer survived group teardown"
+    { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+        fail "terminate-reap transition left a canonical artifact"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+        fail "terminate-reap transition did not retain one private temporary"
+    cmp -s "$copy_reap_terminate_expected" "$1" ||
+        fail "terminate-reap transition changed captured bytes"
+    [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+        fail "terminate-reap transition left a non-private temporary"
+    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "terminate-reap transition left temporary residue"
+
     # A descendant that never closes the inherited stream must not hang the
     # release indefinitely or leave a canonical artifact. The named test
     # helper uses a five-second build-time deadline; production retains a much
