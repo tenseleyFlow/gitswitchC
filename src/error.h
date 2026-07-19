@@ -272,6 +272,19 @@ void get_timestamp(char *buffer, size_t buffer_size);
  * Safe string functions that set error context on failure
  */
 int safe_strncpy(char *dest, const char *src, size_t dest_size);
+
+/**
+ * Attempt to append a complete NUL-terminated source to a destination buffer.
+ * dest_size is the destination's total readable and writable capacity;
+ * success requires dest to contain a NUL within that bound. src must remain
+ * readable through its first NUL or the remaining destination capacity,
+ * whichever comes first; success requires that NUL to occur before the bound.
+ * Rejection performs no append copy, although publishing the global error
+ * context remains an observable side effect. Invalid arguments, missing
+ * terminators, insufficient capacity, and overlap between the source span and
+ * append-write span are rejected. Disjoint spans may share one backing
+ * allocation.
+ */
 int safe_strncat(char *dest, const char *src, size_t dest_size);
 int safe_snprintf(char *buffer, size_t buffer_size, const char *fmt, ...) GS_PRINTF_FMT(3, 4);
 

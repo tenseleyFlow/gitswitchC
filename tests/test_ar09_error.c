@@ -628,6 +628,138 @@ TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures) {
     CHECK(strstr(g_last_error.details, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
 }
 
+TEST(safe_strncat_accepts_empty_and_exact_fit_without_replacing_error) {
+    char empty[1] = "";
+    char exact[5] = "ab";
+    error_context_t saved;
+    uint64_t saved_generation;
+
+    set_error(ERR_ACCOUNT_INVALID, "retained concatenation diagnostic");
+    saved = *get_last_error();
+    saved_generation = error_report_generation();
+
+    CHECK_EQ_INT(safe_strncat(empty, "", sizeof(empty)), 0);
+    CHECK_STR_EQ(empty, "");
+    CHECK_EQ_INT(safe_strncat(exact, "cd", sizeof(exact)), 0);
+    CHECK_STR_EQ(exact, "abcd");
+    CHECK(memcmp(get_last_error(), &saved, sizeof(saved)) == 0);
+    CHECK(error_report_generation() == saved_generation);
+}
+
+TEST(safe_strncat_rejects_invalid_and_short_capacities_atomically) {
+    char short_dest[4] = "ab";
+    char short_before[sizeof(short_dest)];
+    char one_byte[1] = "";
+    char full[5] = "abcd";
+    char full_before[sizeof(full)];
+
+    memcpy(short_before, short_dest, sizeof(short_before));
+    CHECK_EQ_INT(safe_strncat(NULL, "x", sizeof(short_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(safe_strncat(short_dest, NULL, sizeof(short_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(safe_strncat(short_dest, "x", 0), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(short_dest, short_before, sizeof(short_dest)) == 0);
+
+    CHECK_EQ_INT(safe_strncat(short_dest, "cd", sizeof(short_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(short_dest, short_before, sizeof(short_dest)) == 0);
+
+    CHECK_EQ_INT(safe_strncat(one_byte, "x", sizeof(one_byte)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_STR_EQ(one_byte, "");
+
+    memcpy(full_before, full, sizeof(full_before));
+    CHECK_EQ_INT(safe_strncat(full, "", sizeof(full)), 0);
+    CHECK(memcmp(full, full_before, sizeof(full)) == 0);
+    CHECK_EQ_INT(safe_strncat(full, "x", sizeof(full)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(full, full_before, sizeof(full)) == 0);
+}
+
+TEST(safe_strncat_bounds_unterminated_destination_and_source_scans) {
+    char *unterminated_dest = malloc(4U);
+    char *unterminated_src = malloc(4U);
+    char dest_before[4];
+    char source_dest[5] = "a";
+    char source_dest_before[sizeof(source_dest)];
+
+    CHECK(unterminated_dest != NULL);
+    CHECK(unterminated_src != NULL);
+    if (!unterminated_dest || !unterminated_src) {
+        free(unterminated_dest);
+        free(unterminated_src);
+        return;
+    }
+
+    memset(unterminated_dest, 'd', 4U);
+    memcpy(dest_before, unterminated_dest, sizeof(dest_before));
+    CHECK_EQ_INT(safe_strncat(unterminated_dest, "x", 4U), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(unterminated_dest, dest_before, sizeof(dest_before)) == 0);
+
+    memset(unterminated_src, 's', 4U);
+    memcpy(source_dest_before, source_dest, sizeof(source_dest_before));
+    CHECK_EQ_INT(safe_strncat(source_dest, unterminated_src,
+                             sizeof(source_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(source_dest, source_dest_before, sizeof(source_dest)) == 0);
+
+    free(unterminated_dest);
+    free(unterminated_src);
+}
+
+TEST(safe_strncat_rejects_copy_overlap_without_mutation) {
+    char self[8] = "ab";
+    char self_before[sizeof(self)];
+    char interior[8] = "abc";
+    char interior_before[sizeof(interior)];
+    char destination_inside_source[16] = "abc";
+    char destination_inside_before[sizeof(destination_inside_source)];
+    char tail_source[16] = {'a', 'b', '\0', 'c', 'd', '\0'};
+    char tail_source_before[sizeof(tail_source)];
+
+    memcpy(self_before, self, sizeof(self_before));
+    CHECK_EQ_INT(safe_strncat(self, self, sizeof(self)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(self, self_before, sizeof(self)) == 0);
+
+    memcpy(interior_before, interior, sizeof(interior_before));
+    CHECK_EQ_INT(safe_strncat(interior, interior + 1, sizeof(interior)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(interior, interior_before, sizeof(interior)) == 0);
+
+    memcpy(destination_inside_before, destination_inside_source,
+           sizeof(destination_inside_before));
+    CHECK_EQ_INT(safe_strncat(destination_inside_source + 1,
+                             destination_inside_source,
+                             sizeof(destination_inside_source) - 1U),
+                 -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(destination_inside_source, destination_inside_before,
+                 sizeof(destination_inside_source)) == 0);
+
+    memcpy(tail_source_before, tail_source, sizeof(tail_source_before));
+    CHECK_EQ_INT(safe_strncat(tail_source, tail_source + 3,
+                             sizeof(tail_source)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(tail_source, tail_source_before, sizeof(tail_source)) == 0);
+}
+
+TEST(safe_strncat_accepts_adjacent_nonoverlapping_ranges) {
+    struct {
+        char dest[4];
+        char src[4];
+    } adjacent = {{'a', '\0'}, {'b', 'c', '\0'}};
+
+    CHECK_EQ_INT(safe_strncat(adjacent.dest, adjacent.src,
+                             sizeof(adjacent.dest)),
+                 0);
+    CHECK_STR_EQ(adjacent.dest, "abc");
+    CHECK_STR_EQ(adjacent.src, "bc");
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
     RUN_TEST(observational_scope_restores_context_generation_and_errno);
@@ -652,4 +784,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(error_accumulator_retains_first_context_without_global_side_effects);
     RUN_TEST(error_accumulator_appends_in_order_and_publishes_first_cause);
     RUN_TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures);
+    RUN_TEST(safe_strncat_accepts_empty_and_exact_fit_without_replacing_error);
+    RUN_TEST(safe_strncat_rejects_invalid_and_short_capacities_atomically);
+    RUN_TEST(safe_strncat_bounds_unterminated_destination_and_source_scans);
+    RUN_TEST(safe_strncat_rejects_copy_overlap_without_mutation);
+    RUN_TEST(safe_strncat_accepts_adjacent_nonoverlapping_ranges);
 TEST_MAIN_END()

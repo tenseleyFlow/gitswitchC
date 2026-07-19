@@ -778,22 +778,64 @@ int safe_strncpy(char *dest, const char *src, size_t dest_size) {
     return 0;
 }
 
+/* Pointer equality is defined even for unrelated objects; ordering and
+ * subtraction are not. Two overlapping contiguous spans must contain at
+ * least one another's start, so equality-only walks keep this ISO C portable
+ * without forming or comparing one-past pointers. */
+static bool byte_range_contains(const unsigned char *range, size_t range_size,
+                                const unsigned char *candidate) {
+    size_t index;
+
+    for (index = 0; index < range_size; index++) {
+        if (range + index == candidate) return true;
+    }
+    return false;
+}
+
+static bool byte_ranges_overlap(const void *first, size_t first_size,
+                                const void *second, size_t second_size) {
+    const unsigned char *first_bytes = first;
+    const unsigned char *second_bytes = second;
+
+    if (first_size == 0 || second_size == 0) return false;
+    return byte_range_contains(first_bytes, first_size, second_bytes) ||
+           byte_range_contains(second_bytes, second_size, first_bytes);
+}
+
 /* Safe string concatenation with error context */
 int safe_strncat(char *dest, const char *src, size_t dest_size) {
+    size_t dest_len;
+    size_t remaining;
+    size_t src_len;
+    size_t copy_size;
+
     if (!dest || !src || dest_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to safe_strncat");
         return -1;
     }
-    
-    size_t dest_len = strlen(dest);
-    size_t src_len = strlen(src);
-    
-    if (dest_len + src_len >= dest_size) {
+
+    dest_len = strnlen(dest, dest_size);
+    if (dest_len == dest_size) {
+        set_error(ERR_INVALID_ARGS,
+                  "Destination string is not terminated within buffer");
+        return -1;
+    }
+
+    remaining = dest_size - dest_len;
+    src_len = strnlen(src, remaining);
+    if (src_len == remaining) {
         set_error(ERR_INVALID_ARGS, "String concatenation would overflow buffer");
         return -1;
     }
-    
-    strncat(dest, src, dest_size - dest_len - 1);
+
+    copy_size = src_len + 1U;
+    if (byte_ranges_overlap(src, copy_size, dest + dest_len, copy_size)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Source and destination append ranges overlap");
+        return -1;
+    }
+
+    memcpy(dest + dest_len, src, copy_size);
     return 0;
 }
 
