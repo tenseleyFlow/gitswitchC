@@ -415,27 +415,154 @@ TEST(display_format_rejects_unterminated_context_fields_truthfully) {
     CHECK(strstr(formatted, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
 }
 
-/* AR-10 L9: a failed re-init must keep the previous sink and level live —
- * the old order closed the working stream and committed the level before the
- * fopen could fail. Observable contract: the failed call returns -1 and a
- * subsequent log line still lands in the ORIGINAL log file. */
-TEST(failed_error_init_retains_previous_log_sink) {
+/* AR-10 L9 / AR-11 L19: a failed re-init must keep the previous sink and
+ * level live while publishing the exact fopen errno. The old order closed
+ * the working stream before failure; the later diagnostic path retained the
+ * stream but erased the causal errno by using the non-system setter. */
+TEST(failed_error_init_retains_previous_log_sink_and_errno) {
     char dir[64];
     char good[128];
-    char bad[128];
-    char content[512];
+    char missing_parent[160];
+    char not_directory[128];
+    char not_directory_child[160];
+    char errno_fragment[32];
+    char content[1024];
+    FILE *saved_sink;
     FILE *stream;
+    struct stat saved_stat = {0};
+    struct stat current_stat = {0};
+    log_level_t saved_level;
+    bool saved_stderr_policy;
+    int saved_fd;
+    int expected_free_fd;
+    int probe_fd;
+    int result;
     size_t got;
 
     snprintf(dir, sizeof(dir), "/tmp/gswar10err_XXXXXX");
     CHECK(ts_mkdtemp(dir) != NULL);
     snprintf(good, sizeof(good), "%s/good.log", dir);
-    /* Unopenable: path through a nonexistent directory. */
-    snprintf(bad, sizeof(bad), "%s/missing-dir/bad.log", dir);
+    snprintf(missing_parent, sizeof(missing_parent),
+             "%s/missing-dir/bad.log", dir);
+    snprintf(not_directory, sizeof(not_directory), "%s/not-a-dir", dir);
+    snprintf(not_directory_child, sizeof(not_directory_child),
+             "%s/not-a-dir/bad.log", dir);
 
-    CHECK_EQ_INT(error_init(LOG_LEVEL_INFO, good), 0);
-    CHECK_EQ_INT(error_init(LOG_LEVEL_INFO, bad), -1);
-    log_info("post-failure line lands in the original sink");
+    stream = fopen(not_directory, "w");
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(fclose(stream), 0);
+
+    result = error_init(LOG_LEVEL_INFO, good);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) {
+        (void)error_init(LOG_LEVEL_CRITICAL, NULL);
+        return;
+    }
+
+    saved_sink = g_log_file;
+    saved_level = g_log_level;
+    saved_stderr_policy = g_log_to_stderr;
+    saved_fd = fileno(saved_sink);
+    CHECK(saved_fd >= 0);
+    if (saved_fd < 0) {
+        (void)error_init(LOG_LEVEL_CRITICAL, NULL);
+        return;
+    }
+    result = fstat(saved_fd, &saved_stat);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    probe_fd = dup(saved_fd);
+    CHECK(probe_fd >= 0);
+    if (probe_fd < 0) {
+        (void)error_init(LOG_LEVEL_CRITICAL, NULL);
+        return;
+    }
+    expected_free_fd = probe_fd;
+    CHECK_EQ_INT(close(probe_fd), 0);
+
+    errno = 0;
+    CHECK_EQ_INT(error_init(LOG_LEVEL_CRITICAL, missing_parent), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ENOENT);
+    CHECK(snprintf(errno_fragment, sizeof(errno_fragment), "errno=%d", ENOENT) >
+          0);
+    CHECK(strstr(get_last_error()->details, errno_fragment) != NULL);
+    result = fcntl(saved_fd, F_GETFD);
+    CHECK(result >= 0);
+    if (result < 0) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    result = fstat(saved_fd, &current_stat);
+    CHECK_EQ_INT(result, 0);
+    if (result == 0) CHECK(ts_same_identity(&saved_stat, &current_stat));
+    if (result != 0 || !ts_same_identity(&saved_stat, &current_stat)) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    CHECK(g_log_file == saved_sink);
+    CHECK_EQ_INT(g_log_level, saved_level);
+    CHECK_EQ_INT(g_log_to_stderr, saved_stderr_policy);
+    if (g_log_file != saved_sink) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    probe_fd = dup(saved_fd);
+    CHECK_EQ_INT(probe_fd, expected_free_fd);
+    if (probe_fd >= 0) CHECK_EQ_INT(close(probe_fd), 0);
+
+    errno = 0;
+    CHECK_EQ_INT(error_init(LOG_LEVEL_DEBUG, not_directory_child), -1);
+    CHECK_EQ_INT(errno, ENOTDIR);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ENOTDIR);
+    CHECK(snprintf(errno_fragment, sizeof(errno_fragment), "errno=%d", ENOTDIR) >
+          0);
+    CHECK(strstr(get_last_error()->details, errno_fragment) != NULL);
+    result = fcntl(saved_fd, F_GETFD);
+    CHECK(result >= 0);
+    if (result < 0) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    result = fstat(saved_fd, &current_stat);
+    CHECK_EQ_INT(result, 0);
+    if (result == 0) CHECK(ts_same_identity(&saved_stat, &current_stat));
+    if (result != 0 || !ts_same_identity(&saved_stat, &current_stat)) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    CHECK(g_log_file == saved_sink);
+    CHECK_EQ_INT(g_log_level, saved_level);
+    CHECK_EQ_INT(g_log_to_stderr, saved_stderr_policy);
+    if (g_log_file != saved_sink) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    probe_fd = dup(saved_fd);
+    CHECK_EQ_INT(probe_fd, expected_free_fd);
+    if (probe_fd >= 0) CHECK_EQ_INT(close(probe_fd), 0);
+
+    log_info("post-failure line lands in the original sink at original level");
 
     stream = fopen(good, "r");
     CHECK(stream != NULL);
@@ -444,11 +571,15 @@ TEST(failed_error_init_retains_previous_log_sink) {
         content[got] = '\0';
         fclose(stream);
         CHECK(strstr(content,
-                     "post-failure line lands in the original sink") != NULL);
+                     "post-failure line lands in the original sink at original level") !=
+              NULL);
     }
 
-    /* Restore the suite's quiet logging configuration. */
+    /* Restore through the logging subsystem so it remains the sole owner. */
     CHECK_EQ_INT(error_init(LOG_LEVEL_CRITICAL, NULL), 0);
+    errno = 0;
+    CHECK(fcntl(saved_fd, F_GETFD) < 0);
+    CHECK_EQ_INT(errno, EBADF);
 }
 
 TEST(error_accumulator_retains_first_context_without_global_side_effects) {
@@ -780,7 +911,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(very_large_message_and_saved_context_keep_truncation_state);
     RUN_TEST(display_format_marks_its_own_bounded_truncation);
     RUN_TEST(display_format_rejects_unterminated_context_fields_truthfully);
-    RUN_TEST(failed_error_init_retains_previous_log_sink);
+    RUN_TEST(failed_error_init_retains_previous_log_sink_and_errno);
     RUN_TEST(error_accumulator_retains_first_context_without_global_side_effects);
     RUN_TEST(error_accumulator_appends_in_order_and_publishes_first_cause);
     RUN_TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures);

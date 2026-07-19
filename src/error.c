@@ -245,9 +245,14 @@ int error_init(log_level_t level, const char *log_file_path) {
     if (log_file_path) {
         replacement = fopen(log_file_path, "a");
         if (!replacement) {
+            int saved_errno = errno;
+
             /* First-ever init still needs a usable sink for the diagnostic. */
             if (!g_log_file) g_log_file = stderr;
-            set_error(ERR_FILE_IO, "Failed to open log file: %s", log_file_path);
+            errno = saved_errno;
+            (void)set_system_error(ERR_FILE_IO, "Failed to open log file: %s",
+                                   log_file_path);
+            errno = saved_errno;
             return -1;
         }
         /* Set log file to line buffered for immediate output */
