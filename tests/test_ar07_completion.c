@@ -1106,14 +1106,17 @@ TEST(zsh_completion_queries_accounts_only_for_account_operands) {
     written = snprintf(
         stub_source, sizeof(stub_source),
         "#!/bin/sh\n"
+        "if [ \"$#\" -ne 2 ] || [ \"$1\" != --names ] || "
+        "[ \"$2\" != list ]; then\n"
+        "    printf 'INVALID\\n' >'%s'\n"
+        "    exit 64\n"
+        "fi\n"
         "count=0\n"
         "if [ -r '%s' ]; then IFS= read -r count <'%s'; fi\n"
         "count=$((count + 1))\n"
         "printf '%%s\\n' \"$count\" >'%s'\n"
-        "[ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
-        "[ \"$2\" = list ] || exit 64\n"
         "printf '%%s\\n' Alpha 'Colon:Name' 'Space Name'\n",
-        count_path, count_path, count_path);
+        count_path, count_path, count_path, count_path);
     CHECK(written >= 0 && (size_t)written < sizeof(stub_source));
     if (written < 0 || (size_t)written >= sizeof(stub_source)) return;
     CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
@@ -1249,6 +1252,119 @@ TEST(fish_completion_executes_getopt_style_operand_state) {
                  "P\nACCOUNT\nE\n"
                  "P\nE\n"
                  "P\nE\n");
+}
+
+TEST(fish_completion_queries_accounts_only_for_account_operands) {
+    const char *fish = find_shell("fish");
+    char root[PATH_MAX], stub[PATH_MAX], count_path[PATH_MAX];
+    char stub_source[2048], script[16384], output[16384];
+    int written;
+
+    if (!fish) {
+        TS_SKIP("fish", "fish shell is unavailable");
+    }
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar11-fish-completion.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(stub, sizeof(stub), root, "gitswitch"), 0);
+    CHECK_EQ_INT(path_join(count_path, sizeof(count_path), root, "calls"), 0);
+    written = snprintf(
+        stub_source, sizeof(stub_source),
+        "#!/bin/sh\n"
+        "if [ \"$#\" -ne 2 ] || [ \"$1\" != --names ] || "
+        "[ \"$2\" != list ]; then\n"
+        "    printf 'INVALID\\n' >'%s'\n"
+        "    exit 64\n"
+        "fi\n"
+        "count=0\n"
+        "if [ -r '%s' ]; then IFS= read -r count <'%s'; fi\n"
+        "count=$((count + 1))\n"
+        "printf '%%s\\n' \"$count\" >'%s'\n"
+        "printf '%%s\\n' Alpha 'Colon:Name' 'Space Name'\n",
+        count_path, count_path, count_path, count_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(stub_source));
+    if (written < 0 || (size_t)written >= sizeof(stub_source)) return;
+    CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
+    CHECK_EQ_INT(write_text(count_path, "0\n", 0600), 0);
+
+    written = snprintf(
+        script, sizeof(script),
+        "set -gx PATH '%s' $PATH; set -g count_file '%s'; "
+        "complete -c gitswitch -e; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.fish\"; "
+        "printf 'C:source:'; command cat $count_file; "
+        "function probe --argument-names label line; "
+        "printf '0\\n' >$count_file; "
+        "complete -C \"$line\" >/dev/null; "
+        "printf 'C:%%s:' $label; command cat $count_file; end; "
+        "probe option-only 'gitswitch --v'; "
+        "probe option-after-command 'gitswitch edit --v'; "
+        "probe short-option-only 'gitswitch -v'; "
+        "probe short-option-after-command 'gitswitch edit -y'; "
+        "probe escaped-option-only 'gitswitch \\--v'; "
+        "probe escaped-option-after-command 'gitswitch edit \\--v'; "
+        "probe quoted-option-only 'gitswitch \"--v\"'; "
+        "probe quoted-option-after-command 'gitswitch edit \"--v\"'; "
+        "probe open-quote-option 'gitswitch \"--v'; "
+        "probe trailing-escape-option 'gitswitch --v\\\\'; "
+        "probe trailing-escape-after-command 'gitswitch edit --v\\\\'; "
+        "probe delimiter-token 'gitswitch --'; "
+        "probe init-shell 'gitswitch init '; "
+        "probe list-no-operand 'gitswitch list '; "
+        "probe consumed-account 'gitswitch edit Alpha '; "
+        "probe bare-account 'gitswitch '; "
+        "probe bare-prefix 'gitswitch A'; "
+        "probe edit-prefix 'gitswitch edit A'; "
+        "for cmd in edit remove rm delete reset switch; "
+        "probe account-$cmd \"gitswitch $cmd \"; end; "
+        "probe option-before-bare 'gitswitch -g '; "
+        "probe option-after-edit 'gitswitch edit -gn '; "
+        "probe delimited-bare 'gitswitch -- --v'; "
+        "probe delimited-edit 'gitswitch edit -- --v'; "
+        "probe delimited-escaped 'gitswitch edit -- \\--v'; "
+        "probe delimited-quoted 'gitswitch edit -- \"--v\"'; "
+        "probe delimited-trailing-escape 'gitswitch edit -- --v\\\\'; "
+        "probe lone-dash 'gitswitch -'",
+        root, count_path);
+    CHECK(written >= 0 && (size_t)written < sizeof(script));
+    if (written < 0 || (size_t)written >= sizeof(script)) return;
+
+    CHECK_EQ_INT(run_script(fish, true, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(
+        output,
+        "C:source:0\n"
+        "C:option-only:0\n"
+        "C:option-after-command:0\n"
+        "C:short-option-only:0\n"
+        "C:short-option-after-command:0\n"
+        "C:escaped-option-only:0\n"
+        "C:escaped-option-after-command:0\n"
+        "C:quoted-option-only:0\n"
+        "C:quoted-option-after-command:0\n"
+        "C:open-quote-option:0\n"
+        "C:trailing-escape-option:0\n"
+        "C:trailing-escape-after-command:0\n"
+        "C:delimiter-token:0\n"
+        "C:init-shell:0\n"
+        "C:list-no-operand:0\n"
+        "C:consumed-account:0\n"
+        "C:bare-account:1\n"
+        "C:bare-prefix:1\n"
+        "C:edit-prefix:1\n"
+        "C:account-edit:1\n"
+        "C:account-remove:1\n"
+        "C:account-rm:1\n"
+        "C:account-delete:1\n"
+        "C:account-reset:1\n"
+        "C:account-switch:1\n"
+        "C:option-before-bare:1\n"
+        "C:option-after-edit:1\n"
+        "C:delimited-bare:1\n"
+        "C:delimited-edit:1\n"
+        "C:delimited-escaped:1\n"
+        "C:delimited-quoted:1\n"
+        "C:delimited-trailing-escape:1\n"
+        "C:lone-dash:0\n");
 }
 
 TEST(names_loader_preserves_account_admission_without_runtime_work) {
@@ -1502,6 +1618,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(zsh_empty_names_produce_no_blank_candidate);
     RUN_TEST(zsh_completion_queries_accounts_only_for_account_operands);
     RUN_TEST(fish_completion_executes_getopt_style_operand_state);
+    RUN_TEST(fish_completion_queries_accounts_only_for_account_operands);
     RUN_TEST(names_loader_preserves_account_admission_without_runtime_work);
     RUN_TEST(names_loader_validates_toml_but_ignores_external_active_artifact);
     RUN_TEST(cli_names_grammar_is_noncreating_nonrepairing_and_runtime_free);

@@ -47,6 +47,23 @@ function __gitswitch_state --argument-names wanted
         case command
             test -z "$seen_command"
         case account
+            # Fish evaluates dynamic arguments before filtering them against
+            # the active token. Do not run the names command for an option
+            # still being typed; preserve post-'--' positional semantics.
+            set -l current_token (commandline -ct)
+            if test $options_enabled -eq 1
+                switch "$current_token"
+                    case '-*'
+                        return 1
+                end
+                # Decode Fish quoting without evaluation. Keep the raw check
+                # above because an incomplete trailing escape cannot decode.
+                set current_token (string unescape -- "$current_token")
+                switch "$current_token"
+                    case '-*'
+                        return 1
+                end
+            end
             if test -z "$seen_command"
                 return 0
             end
