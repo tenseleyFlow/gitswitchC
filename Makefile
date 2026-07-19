@@ -49,6 +49,7 @@ override RELEASE_STATE_GOALS := release-publish-helpers \
 	_release-publish-helpers-locked release-symbol-contract-test \
 	_release-symbol-contract-test-locked clean _clean-release-locked \
 	distclean dev dist _dist-release-locked distcheck \
+	_distcheck-release-locked \
 	release-contract-test _release-contract-test-locked rpm \
 	_rpm-release-locked \
 	build/tools/release-publish \
@@ -700,10 +701,12 @@ override DIST_PUBLISH_NAMED_DEFINES := \
 	-DGITSWITCH_RELEASE_TEST_PUBLICATION_RACE=1 \
 	-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 \
 	-DGITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT=1 \
+	-DGITSWITCH_RELEASE_TEST_FORK_TRANSITION=1 \
 	-DGITSWITCH_RELEASE_TEST_REAP_TRANSITION=1 \
 	-DGITSWITCH_RELEASE_TEST_DIGEST=1 \
 	-DGITSWITCH_RELEASE_TEST_DURABILITY=1 \
-	-DGITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS=5000
+	-DGITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS=5000 \
+	-DGITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS=5000
 override GITSWITCH_DIST_PUBLISH_POLICY_VERSION := $(DIST_PUBLISH_POLICY_VERSION)
 override GITSWITCH_DIST_PUBLISH_COMMON_FLAGS := $(DIST_PUBLISH_COMMON_FLAGS)
 override GITSWITCH_DIST_PUBLISH_PRODUCTION_DEFINES := $(DIST_PUBLISH_PRODUCTION_DEFINES)
@@ -2111,7 +2114,7 @@ override PACKAGE := gitswitcher
 # goal that consumes release metadata; ordinary builds otherwise paid for two
 # unrelated Git processes on every Make invocation (AR-07 L25).
 RELEASE_METADATA_GOALS = release-manifest-check dist distcheck \
-	release-contract-test _dist-release-locked \
+	release-contract-test _dist-release-locked _distcheck-release-locked \
 	_release-contract-test-locked rpm _rpm-release-locked
 ifneq ($(strip $(filter $(RELEASE_METADATA_GOALS),$(MAKECMDGOALS))),)
     override RELEASE_COMMIT := $(shell git rev-parse --verify HEAD^{commit} 2>/dev/null)
@@ -2143,6 +2146,7 @@ export GITSWITCH_DIST_ROOT
 override DIST_MANIFEST := src tests tools completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
 .PHONY: release-manifest-check dist _dist-release-locked distcheck \
+	_distcheck-release-locked \
 	release-contract-test _release-contract-test-locked \
 	freebsd-platform-contract-test release-artifact-test qa-contract-test \
 	sig-repro-test rpm _rpm-release-locked
@@ -2211,10 +2215,47 @@ _dist-release-locked: release-manifest-check \
 		--internal-release-archive-v1 "$$root_physical" \
 		"$(RELEASE_COMMIT)" "$$GITSWITCH_DIST_ROOT" -- $(DIST_MANIFEST)
 
-distcheck: dist
-	@sh tests/test_dist.sh "$$GITSWITCH_DIST_ARCHIVE_PATH" \
-		"$$GITSWITCH_DIST_ROOT" \
-		"$(PREFIX)" "$(MAKE_COMMAND)" -- $(DIST_MANIFEST)
+distcheck: tools/release_publish_lock.sh
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory _distcheck-release-locked
+
+# Distcheck never publishes its transient archive into the canonical namespace.
+# The descriptor-pinned publisher generates it privately, gives the validator
+# the pinned descriptor, and closes that exact inode after the validator has
+# snapshotted and closed it. Named fallback platforms retire only through
+# descriptor-conditioned unlink or safely retain the private random name; no
+# caller-controlled pathname is deleted (AR-11 L42).
+_distcheck-release-locked: release-manifest-check \
+		_release-publish-helpers-locked
+	@set -e; \
+	root_physical=`CDPATH='' cd "$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" && pwd -P`; \
+	request="$$GITSWITCH_DIST_ARCHIVE_REQUEST"; \
+	expected_rel="$(DIST_ARTIFACT_DIR)/$$GITSWITCH_DIST_ARCHIVE_NAME"; \
+	expected_abs="$$root_physical/$$expected_rel"; \
+	case "$(RELEASE_VERSION)" in \
+		''|*[!A-Za-z0-9._+-]*) \
+			echo 'ERROR: committed release VERSION is not path-safe' >&2; exit 1 ;; \
+	esac; \
+	case "$$request" in \
+		"$$expected_rel"|"$$expected_abs") ;; \
+		*) echo "ERROR: DIST_ARCHIVE must be exactly $$expected_rel" >&2; exit 1 ;; \
+	esac; \
+	if git ls-files --error-unmatch -- "$$expected_rel" >/dev/null 2>&1; then \
+		echo 'ERROR: distribution output aliases a tracked path' >&2; exit 1; \
+	fi; \
+	if ! git check-ignore -q -- "$$expected_rel"; then \
+		echo 'ERROR: distribution output directory is not ignored' >&2; exit 1; \
+	fi; \
+	echo "Validating private distribution archive: $$expected_rel"; \
+	"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH" \
+		--internal-release-tree-consume-v1 "$$root_physical" build dist \
+		"$$GITSWITCH_DIST_ARCHIVE_NAME" -- \
+		--internal-release-archive-v1 "$$root_physical" \
+		"$(RELEASE_COMMIT)" "$$GITSWITCH_DIST_ROOT" -- $(DIST_MANIFEST) \
+		--internal-consumer-v1 \
+		sh tests/test_dist.sh '@GITSWITCH_PRIVATE_ARCHIVE_FD@' \
+		"$$GITSWITCH_DIST_ROOT" "$(PREFIX)" "$(MAKE_COMMAND)" -- \
+		$(DIST_MANIFEST)
 
 # Keep the declared FreeBSD floor tied to both its required headers and the
 # exact hosted release that executes publication/reset behavior.

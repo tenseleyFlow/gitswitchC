@@ -60,8 +60,16 @@ extern char **environ;
 #define GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS 300000
 #endif
 
+#ifndef GITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS
+#define GITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS 3600000
+#endif
+
 #if GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS <= 0
 #error "GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS must be positive"
+#endif
+
+#if GITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS <= 0
+#error "GITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS must be positive"
 #endif
 
 /* AR-10 M2: main() opens its working descriptors immediately, so when the
@@ -92,8 +100,9 @@ static void usage(const char *program)
     fprintf(stderr,
             "usage: %s OUTPUT_DIRECTORY CANONICAL_DIRECTORY FINAL_NAME -- COMMAND [ARG ...]\n"
             "       %s --internal-release-tree-v1 ROOT BUILD_COMPONENT DIST_COMPONENT FINAL_NAME -- COMMAND [ARG ...]\n"
+            "       %s --internal-release-tree-consume-v1 ROOT BUILD_COMPONENT DIST_COMPONENT PRIVATE_NAME -- PRODUCER [ARG ...] --internal-consumer-v1 CONSUMER [ARG ...]\n"
             "       %s --internal-retire-tree-v1 HOME PRIVATE_NAME EXPECTED_DEV EXPECTED_INO\n",
-            program, program, program);
+            program, program, program, program);
 }
 
 static bool same_identity(const struct stat *left, const struct stat *right)
@@ -113,6 +122,8 @@ static bool same_directory_identity(const struct stat *left,
 #define PRIVATE_RPM_SUFFIX_SIZE 6U
 #define RETIRE_TREE_MAX_DEPTH 256U
 #define RETIRE_TREE_RETAINED_STATUS 2
+#define PRIVATE_ARCHIVE_ARGUMENT "@GITSWITCH_PRIVATE_ARCHIVE_FD@"
+#define PRIVATE_CONSUMER_SEPARATOR "--internal-consumer-v1"
 
 static int run_cleanup_race_hook(void);
 
@@ -2741,7 +2752,9 @@ cleanup:
 /* Keep the direct child PID published until its terminal status has been
  * retained. In particular, a successful direct child can become waitable
  * while a descendant still owns the output pipe. */
-static volatile pid_t fatal_signal_producer = 0;
+static volatile sig_atomic_t fatal_signal_producer = 0;
+_Static_assert(sizeof(sig_atomic_t) >= sizeof(pid_t),
+               "pid_t must fit in sig_atomic_t for release-child publication");
 static const int forwarded_fatal_signals[] = {
     SIGINT, SIGTERM, SIGHUP, SIGQUIT
 };
@@ -2751,6 +2764,19 @@ static int test_reap_transition_signal = 0;
 static int test_reap_transition_report_fd = -1;
 static bool test_reap_transition_enabled = false;
 static bool test_reap_transition_used = false;
+#endif
+#if defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
+typedef enum fork_transition_target {
+    FORK_TRANSITION_PRODUCER = 1,
+    FORK_TRANSITION_CONSUMER = 2
+} fork_transition_target_t;
+
+static int test_fork_transition_signal = 0;
+static int test_fork_transition_report_fd = -1;
+static fork_transition_target_t test_fork_transition_target =
+    FORK_TRANSITION_PRODUCER;
+static bool test_fork_transition_enabled = false;
+static bool test_fork_transition_used = false;
 #endif
 
 typedef enum producer_status_result {
@@ -2791,6 +2817,74 @@ static int build_forwarded_fatal_signal_set(sigset_t *fatal_set)
     }
     return 0;
 }
+
+/* Fork and handler-visible PID publication are one ownership transition.
+ * Keep every signal that can consult fatal_signal_producer blocked until both
+ * the child process group and the matching publication exist, then restore
+ * the caller's exact entry mask in each process. */
+static int begin_fatal_fork_guard(sigset_t *saved_mask)
+{
+    sigset_t fatal_set;
+
+    if (build_forwarded_fatal_signal_set(&fatal_set) != 0) {
+        return -1;
+    }
+    return sigprocmask(SIG_BLOCK, &fatal_set, saved_mask);
+}
+
+static int restore_fatal_fork_guard(const sigset_t *saved_mask)
+{
+    return sigprocmask(SIG_SETMASK, saved_mask, NULL);
+}
+
+#if defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
+/* Named-helper-only checkpoint inside the fork-to-publication critical
+ * section. The independent signal list makes an incomplete production guard
+ * visible as U. Raising while the selected signal is blocked makes it pending;
+ * correct code publishes the child before exact-mask restoration delivers it. */
+static int run_fork_transition_test_hook(pid_t child,
+                                         fork_transition_target_t target)
+{
+    static const int expected_fatal_signals[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT
+    };
+    char report[64];
+    char proof = 'B';
+    int length;
+    sigset_t current;
+    size_t index;
+
+    if (!test_fork_transition_enabled || test_fork_transition_used ||
+        target != test_fork_transition_target) {
+        return 0;
+    }
+    test_fork_transition_used = true;
+    if (sigprocmask(SIG_SETMASK, NULL, &current) != 0) {
+        proof = 'U';
+    } else {
+        for (index = 0;
+             index < sizeof(expected_fatal_signals) /
+                         sizeof(expected_fatal_signals[0]);
+             index++) {
+            if (sigismember(&current, expected_fatal_signals[index]) != 1) {
+                proof = 'U';
+                break;
+            }
+        }
+    }
+    length = snprintf(report, sizeof(report), "%c %jd\n", proof,
+                      (intmax_t)child);
+    if (length < 0 || (size_t)length >= sizeof(report)) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (write_all(test_fork_transition_report_fd,
+                  (const unsigned char *)report, (size_t)length) != 0) {
+        return -1;
+    }
+    return raise(test_fork_transition_signal);
+}
+#endif
 
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
 /* Named-helper-only one-shot checkpoint. The independent oracle ensures a
@@ -2873,7 +2967,7 @@ static producer_reap_result_t reap_and_retire_producer(pid_t child,
 #endif
     if ((result.waited == child ||
          (result.waited < 0 && result.wait_errno == ECHILD)) &&
-        fatal_signal_producer == child) {
+        (pid_t)fatal_signal_producer == child) {
         fatal_signal_producer = 0;
     }
     if (sigprocmask(SIG_SETMASK, &saved_mask, NULL) != 0) {
@@ -3080,7 +3174,7 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
 
 static void forward_fatal_signal(int signal_number)
 {
-    pid_t child = fatal_signal_producer;
+    pid_t child = (pid_t)fatal_signal_producer;
 
     if (child > 0) {
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
@@ -3137,6 +3231,67 @@ static int reset_fatal_signals_for_test(void)
 }
 #endif
 
+#if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION) || \
+    defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
+static int parse_fatal_test_signal(const char *signal_name,
+                                   int *selected_signal)
+{
+    if (strcmp(signal_name, "HUP") == 0) {
+        *selected_signal = SIGHUP;
+    } else if (strcmp(signal_name, "INT") == 0) {
+        *selected_signal = SIGINT;
+    } else if (strcmp(signal_name, "QUIT") == 0) {
+        *selected_signal = SIGQUIT;
+    } else if (strcmp(signal_name, "TERM") == 0) {
+        *selected_signal = SIGTERM;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+#if defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
+static int configure_fork_transition_test(void)
+{
+    const char *signal_name =
+        getenv("GITSWITCH_RELEASE_TEST_FORK_SIGNAL"); /* Flawfinder: ignore — named-fixture-only exact signal selector, compiled out of production */
+    const char *report_fd =
+        getenv("GITSWITCH_RELEASE_TEST_FORK_REPORT_FD"); /* Flawfinder: ignore — named-fixture-only exact descriptor selector, compiled out of production */
+    const char *target =
+        getenv("GITSWITCH_RELEASE_TEST_FORK_TARGET"); /* Flawfinder: ignore — named-fixture-only exact transition selector, compiled out of production */
+    int descriptor_flags;
+
+    if (signal_name == NULL && report_fd == NULL && target == NULL) {
+        return 0;
+    }
+    if (signal_name == NULL || report_fd == NULL || target == NULL ||
+        strcmp(report_fd, "9") != 0 ||
+        parse_fatal_test_signal(signal_name,
+                                &test_fork_transition_signal) != 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strcmp(target, "producer") == 0) {
+        test_fork_transition_target = FORK_TRANSITION_PRODUCER;
+    } else if (strcmp(target, "consumer") == 0) {
+        test_fork_transition_target = FORK_TRANSITION_CONSUMER;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+    descriptor_flags = fcntl(9, F_GETFD);
+    if (descriptor_flags < 0 ||
+        fcntl(9, F_SETFD, descriptor_flags | FD_CLOEXEC) != 0) {
+        return -1;
+    }
+    test_fork_transition_report_fd = 9;
+    test_fork_transition_enabled = true;
+    return 0;
+}
+#endif
+
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
 static int configure_reap_transition_test(void)
 {
@@ -3159,16 +3314,7 @@ static int configure_reap_transition_test(void)
         errno = EINVAL;
         return -1;
     }
-    if (strcmp(signal_name, "HUP") == 0) {
-        selected_signal = SIGHUP;
-    } else if (strcmp(signal_name, "INT") == 0) {
-        selected_signal = SIGINT;
-    } else if (strcmp(signal_name, "QUIT") == 0) {
-        selected_signal = SIGQUIT;
-    } else if (strcmp(signal_name, "TERM") == 0) {
-        selected_signal = SIGTERM;
-    } else {
-        errno = EINVAL;
+    if (parse_fatal_test_signal(signal_name, &selected_signal) != 0) {
         return -1;
     }
     descriptor_flags = fcntl(9, F_GETFD);
@@ -3285,7 +3431,7 @@ static void terminate_producer(pid_t child)
     int waitid_errno = 0;
     int waitid_rc;
 
-    if (fatal_signal_producer != child) {
+    if ((pid_t)fatal_signal_producer != child) {
         errno = saved_errno;
         return;
     }
@@ -3340,7 +3486,7 @@ static void report_producer_failure(int status)
 }
 
 static int run_to_descriptor(int output_fd, int directory_fd,
-                             char *const command[])
+                             char *const command[], int timeout_ms)
 {
     int pipe_fds[2];
     int status;
@@ -3350,17 +3496,30 @@ static int run_to_descriptor(int output_fd, int directory_fd,
     int wait_result;
     pid_t child;
     producer_stream_result_t stream_result;
+    sigset_t saved_mask;
 
     if (create_producer_pipe(pipe_fds) != 0) {
+        return -1;
+    }
+    if (begin_fatal_fork_guard(&saved_mask) != 0) {
+        saved_errno = errno;
+        (void)close(pipe_fds[0]);
+        (void)close(pipe_fds[1]);
+        errno = saved_errno;
         return -1;
     }
     child = fork();
 
     if (child < 0) {
+        int restore_errno = 0;
+
         saved_errno = errno;
         (void)close(pipe_fds[0]);
         (void)close(pipe_fds[1]);
-        errno = saved_errno;
+        if (restore_fatal_fork_guard(&saved_mask) != 0) {
+            restore_errno = errno;
+        }
+        errno = restore_errno != 0 ? restore_errno : saved_errno;
         return -1;
     }
     if (child == 0) {
@@ -3389,20 +3548,42 @@ static int run_to_descriptor(int output_fd, int directory_fd,
         if (directory_fd > STDERR_FILENO) {
             (void)close(directory_fd);
         }
+        if (restore_fatal_fork_guard(&saved_mask) != 0) {
+            _exit(126);
+        }
         if (strcmp(command[0], ARCHIVE_INTERNAL_TOKEN) == 0) {
             _exit(run_internal_release_archive(command));
         }
         execvp(command[0], command); /* Flawfinder: ignore — argv-vector exec of the operator's archive command; no shell, vector from the Makefile recipe */
         _exit(errno == ENOENT ? 127 : 126);
     }
-    /* Publish the producer to the fatal-signal forwarder before anything in
-     * this parent can fail or block. */
-    fatal_signal_producer = child;
+#if defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
+    if (run_fork_transition_test_hook(child,
+                                      FORK_TRANSITION_PRODUCER) != 0) {
+        saved_errno = errno;
+    } else {
+        saved_errno = 0;
+    }
+#else
+    saved_errno = 0;
+#endif
+    /* Publish the producer while every forwarding signal remains blocked.
+     * Exact-mask restoration below is the first point that can deliver one. */
+    fatal_signal_producer = (sig_atomic_t)child;
     (void)close(pipe_fds[1]);
     /* Close the fork/setpgid race from the parent side as well. EACCES/ESRCH
      * only mean the child already crossed that boundary or exited; the child
      * itself cannot exec until its own setpgid succeeds. */
     (void)setpgid(child, child);
+    if (restore_fatal_fork_guard(&saved_mask) != 0 && saved_errno == 0) {
+        saved_errno = errno;
+    }
+    if (saved_errno != 0) {
+        (void)close(pipe_fds[0]);
+        errno = saved_errno;
+        terminate_producer(child);
+        return -1;
+    }
     if (monotonic_milliseconds(&started) != 0) {
         saved_errno = errno;
         (void)close(pipe_fds[0]);
@@ -3410,14 +3591,13 @@ static int run_to_descriptor(int output_fd, int directory_fd,
         terminate_producer(child);
         return -1;
     }
-    if (started > INT64_MAX -
-                      (int64_t)GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS) {
+    if (started > INT64_MAX - (int64_t)timeout_ms) {
         (void)close(pipe_fds[0]);
         errno = EOVERFLOW;
         terminate_producer(child);
         return -1;
     }
-    deadline = started + (int64_t)GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS;
+    deadline = started + (int64_t)timeout_ms;
     stream_result = copy_producer_stream(pipe_fds[0], output_fd, child,
                                          deadline, &status);
     if (stream_result != PRODUCER_STREAM_COMPLETE) {
@@ -3887,6 +4067,154 @@ static int publish_output(int source_fd, int directory_fd,
 #endif
 }
 
+static int validate_private_consumer_arguments(char *const arguments[])
+{
+    size_t matches = 0U;
+    size_t index;
+
+    for (index = 0U; arguments[index] != NULL; index++) {
+        if (strcmp(arguments[index], PRIVATE_ARCHIVE_ARGUMENT) == 0) {
+            matches++;
+        }
+    }
+    if (matches != 1U) {
+        errno = EINVAL;
+        return -1;
+    }
+    return 0;
+}
+
+/* Run the distcheck consumer with the exact private output on descriptor 3.
+ * The committed shell validator snapshots fd 3 once and closes it before any
+ * build descendant is launched. The descriptor is still O_RDWR internally
+ * because portable anonymous-file reopening is unavailable; the post-consumer
+ * digest makes any persistent mutation fatal, while no pathname ever becomes
+ * public. */
+static int run_private_consumer(int archive_fd, int directory_fd,
+                                char *const command[])
+{
+    int status;
+    int saved_errno;
+    int64_t deadline;
+    int64_t started;
+    int wait_result;
+    pid_t child;
+    sigset_t saved_mask;
+
+    if (lseek(archive_fd, 0, SEEK_SET) != 0) {
+        return -1;
+    }
+    if (begin_fatal_fork_guard(&saved_mask) != 0) {
+        return -1;
+    }
+    child = fork();
+    if (child < 0) {
+        int restore_errno = 0;
+
+        saved_errno = errno;
+        if (restore_fatal_fork_guard(&saved_mask) != 0) {
+            restore_errno = errno;
+        }
+        errno = restore_errno != 0 ? restore_errno : saved_errno;
+        return -1;
+    }
+    if (child == 0) {
+        int descriptor_flags;
+
+        if (setpgid(0, 0) != 0) {
+            _exit(126);
+        }
+        if (archive_fd == 3) {
+            descriptor_flags = fcntl(3, F_GETFD);
+            if (descriptor_flags < 0 ||
+                fcntl(3, F_SETFD,
+                      descriptor_flags & ~FD_CLOEXEC) != 0) {
+                _exit(126);
+            }
+        } else if (dup2(archive_fd, 3) < 0) {
+            _exit(126);
+        }
+        if (archive_fd != 3) {
+            (void)close(archive_fd);
+        }
+        if (directory_fd > STDERR_FILENO && directory_fd != 3) {
+            (void)close(directory_fd);
+        }
+        if (restore_fatal_fork_guard(&saved_mask) != 0) {
+            _exit(126);
+        }
+        execvp(command[0], command); /* Flawfinder: ignore -- exact internal distcheck argv from the Makefile */
+        _exit(errno == ENOENT ? 127 : 126);
+    }
+#if defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
+    if (run_fork_transition_test_hook(child,
+                                      FORK_TRANSITION_CONSUMER) != 0) {
+        saved_errno = errno;
+    } else {
+        saved_errno = 0;
+    }
+#else
+    saved_errno = 0;
+#endif
+    fatal_signal_producer = (sig_atomic_t)child;
+    (void)setpgid(child, child);
+    if (restore_fatal_fork_guard(&saved_mask) != 0 && saved_errno == 0) {
+        saved_errno = errno;
+    }
+    if (saved_errno != 0) {
+        errno = saved_errno;
+        terminate_producer(child);
+        return -1;
+    }
+    if (monotonic_milliseconds(&started) != 0) {
+        saved_errno = errno;
+        errno = saved_errno;
+        terminate_producer(child);
+        return -1;
+    }
+    if (started > INT64_MAX -
+                      (int64_t)GITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS) {
+        errno = EOVERFLOW;
+        terminate_producer(child);
+        return -1;
+    }
+    deadline = started + (int64_t)GITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS;
+    wait_result = wait_for_producer(child, deadline, &status);
+    if (wait_result != 0) {
+        saved_errno = errno;
+        if (wait_result > 0) {
+            fprintf(stderr,
+                    "ERROR: cannot terminate distcheck consumer process group: %s\n",
+                    strerror(saved_errno));
+        } else if (saved_errno == ETIMEDOUT) {
+            fprintf(stderr, "ERROR: distcheck consumer timed out\n");
+        } else {
+            fprintf(stderr, "ERROR: cannot wait for distcheck consumer: %s\n",
+                    strerror(saved_errno));
+        }
+        errno = saved_errno;
+        terminate_producer(child);
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (WIFEXITED(status)) {
+            fprintf(stderr,
+                    "ERROR: distcheck consumer exited with status %d\n",
+                    WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            fprintf(stderr,
+                    "ERROR: distcheck consumer terminated by signal %d\n",
+                    WTERMSIG(status));
+        } else {
+            fprintf(stderr,
+                    "ERROR: distcheck consumer did not exit normally\n");
+        }
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     char temp_name[NAME_MAX + 1U];
@@ -3897,6 +4225,7 @@ int main(int argc, char **argv)
     const char *dist_component = NULL;
     const char *final_name = NULL;
     int command_index = -1;
+    int consumer_index = -1;
     int root_fd = -1;
     int build_fd = -1;
     int directory_fd = -1;
@@ -3910,6 +4239,7 @@ int main(int argc, char **argv)
     struct stat existing;
     struct stat output_stat;
     int result = EXIT_FAILURE;
+    bool consume_mode = false;
     bool tree_mode = false;
 #if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
     const char *test_signal_defaults;
@@ -3956,6 +4286,13 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 #endif
+#if defined(GITSWITCH_RELEASE_TEST_FORK_TRANSITION)
+    if (configure_fork_transition_test() != 0) {
+        fprintf(stderr, "ERROR: cannot configure fork-transition test: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
+    }
+#endif
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
     if (configure_reap_transition_test() != 0) {
         fprintf(stderr, "ERROR: cannot configure reap-transition test: %s\n",
@@ -3969,7 +4306,34 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (argc >= 8 &&
+    if (argc >= 11 &&
+        strcmp(argv[1], "--internal-release-tree-consume-v1") == 0 &&
+        strcmp(argv[6], "--") == 0) {
+        int index;
+
+        consume_mode = true;
+        tree_mode = true;
+        root_path = argv[2];
+        build_component = argv[3];
+        dist_component = argv[4];
+        final_name = argv[5];
+        command_index = 7;
+        for (index = command_index + 1; index < argc; index++) {
+            if (strcmp(argv[index], PRIVATE_CONSUMER_SEPARATOR) == 0) {
+                if (consumer_index >= 0 || index == command_index ||
+                    index + 1 >= argc) {
+                    usage(argv[0]);
+                    return EXIT_FAILURE;
+                }
+                consumer_index = index + 1;
+                argv[index] = NULL;
+            }
+        }
+        if (consumer_index < 0) {
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    } else if (argc >= 8 &&
         strcmp(argv[1], "--internal-release-tree-v1") == 0 &&
         strcmp(argv[6], "--") == 0) {
         tree_mode = true;
@@ -4057,16 +4421,18 @@ int main(int argc, char **argv)
             goto cleanup;
         }
     }
-    if (fstatat(directory_fd, final_name, &existing,
-                AT_SYMLINK_NOFOLLOW) == 0) {
-        fprintf(stderr,
-                "ERROR: distribution archive already exists; refusing to replace it\n");
-        goto cleanup;
-    }
-    if (errno != ENOENT) {
-        fprintf(stderr, "ERROR: cannot inspect distribution output: %s\n",
-                strerror(errno));
-        goto cleanup;
+    if (!consume_mode) {
+        if (fstatat(directory_fd, final_name, &existing,
+                    AT_SYMLINK_NOFOLLOW) == 0) {
+            fprintf(stderr,
+                    "ERROR: distribution archive already exists; refusing to replace it\n");
+            goto cleanup;
+        }
+        if (errno != ENOENT) {
+            fprintf(stderr, "ERROR: cannot inspect distribution output: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
     }
 
     output_fd = create_temp(directory_fd, final_name, temp_name,
@@ -4077,7 +4443,8 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     if (run_to_descriptor(output_fd, directory_fd,
-                          &argv[command_index]) != 0) {
+                          &argv[command_index],
+                          GITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS) != 0) {
         goto cleanup;
     }
     if (fstat(output_fd, &output_stat) != 0 ||
@@ -4107,6 +4474,37 @@ int main(int argc, char **argv)
         has_name = false;
         fprintf(stderr,
                 "ERROR: distribution temporary output changed before publication; replacement retained\n");
+        goto cleanup;
+    }
+    if (consume_mode) {
+        if (validate_private_consumer_arguments(
+                &argv[consumer_index]) != 0) {
+            fprintf(stderr,
+                    "ERROR: private distcheck consumer requires exactly one archive-fd sentinel: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        if (run_private_consumer(output_fd, directory_fd,
+                                 &argv[consumer_index]) != 0) {
+            goto cleanup;
+        }
+        if (digest_read_only_regular_descriptor(output_fd,
+                                                output_stat.st_size,
+                                                published_digest) != 0 ||
+            memcmp(expected_digest, published_digest,
+                   sizeof(expected_digest)) != 0) {
+            fprintf(stderr,
+                    "ERROR: private distcheck archive changed during validation; applying safe private cleanup policy\n");
+            goto cleanup;
+        }
+        if (has_name &&
+            verify_named_temp_identity(directory_fd, temp_name,
+                                       output_fd) != 0) {
+            fprintf(stderr,
+                    "ERROR: private distcheck archive name changed during validation; replacement retained\n");
+            goto cleanup;
+        }
+        result = EXIT_SUCCESS;
         goto cleanup;
     }
     publish_rc = publish_output(output_fd, directory_fd,
@@ -4261,13 +4659,27 @@ cleanup:
     if (has_name && output_fd >= 0) {
         retire_rc = retire_named_temp(directory_fd, temp_name, output_fd);
         if (retire_rc < 0) {
-            fprintf(stderr,
-                    "ERROR: distribution staging name changed; replacement retained\n");
+            if (consume_mode) {
+                fprintf(stderr,
+                        "ERROR: private distcheck archive cleanup lost ownership; replacement retained\n");
+            } else {
+                fprintf(stderr,
+                        "ERROR: distribution staging name changed; replacement retained\n");
+            }
+            result = EXIT_FAILURE;
         } else if (retire_rc > 0) {
-            fprintf(stderr,
-                    "WARNING: failed publication retained its private staging name\n");
+            if (consume_mode) {
+                fprintf(stderr,
+                        "WARNING: platform lacks descriptor-conditioned unlink; private distcheck archive safely retained\n");
+            } else {
+                fprintf(stderr,
+                        "WARNING: failed publication retained its private staging name\n");
+            }
         }
-        result = EXIT_FAILURE;
+        if (!consume_mode) {
+            result = EXIT_FAILURE;
+        }
+        has_name = false;
     }
     if (published_fd >= 0 && published_fd != output_fd &&
         close(published_fd) != 0) {

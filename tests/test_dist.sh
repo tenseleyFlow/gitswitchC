@@ -28,21 +28,17 @@ archive_members_within_root()
     '
 }
 
-# `make distcheck` creates the archive before entering this script. Install the
-# exit trap before validating any caller-supplied value so every success and
-# failure path removes that generated artifact. `tmp` remains empty until
-# mktemp succeeds, making the same cleanup safe for early validation failures.
-archive=${1-}
+# A direct archive pathname is caller-owned input. In particular, a malformed
+# invocation must never turn its first unvalidated argument into a cleanup
+# target. Make's internal mode supplies an already-pinned archive on fd 3 and
+# never publishes a canonical path. This trap owns only the private build tree.
 tmp=
 cleanup()
 {
     status=$?
     trap - 0 1 2 3 15
     if [ -n "$tmp" ]; then
-        rm -rf "$tmp"
-    fi
-    if [ -n "$archive" ]; then
-        rm -f "$archive"
+        rm -rf "$tmp" 3<&-
     fi
     exit "$status"
 }
@@ -53,24 +49,27 @@ if [ "$#" -lt 6 ] || [ "$5" != -- ]; then
     fail "usage: $0 ARCHIVE DIST_ROOT PREFIX MAKE -- MANIFEST_PATH [PATH ...]"
 fi
 
+archive_input=$1
+archive_from_fd=false
+case $archive_input in
+    @GITSWITCH_PRIVATE_ARCHIVE_FD@)
+        : <&3 || fail "private archive descriptor 3 is unavailable"
+        archive_from_fd=true
+        ;;
+    *)
+        [ -f "$archive_input" ] ||
+            fail "archive not found: $archive_input"
+        ;;
+esac
 dist_root=$2
 prefix=$3
 make_cmd=$4
 shift 5
 
-[ -f "$archive" ] || fail "archive not found: $archive"
 case $prefix in
     /*) ;;
     *) fail "PREFIX must be absolute: $prefix" ;;
 esac
-
-# Count COMMITTED tests via git ls-files, not the live filesystem: dist now
-# archives HEAD (AR-05 L5), so an untracked stray under tests/ must neither
-# ship nor skew this baseline — with a filesystem count, the same dirty tree
-# was counted on both sides and contamination was undetectable.
-git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checkout"
-checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
-[ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
 # The executable-trust boundary rejects every helper below sticky /tmp even
 # when a deeper mktemp leaf is 0700.  Distcheck builds and runs every test
@@ -83,8 +82,31 @@ case ${HOME-} in
     *) fail "distcheck requires an absolute HOME for its trusted build root" ;;
 esac
 [ -d "$HOME" ] || fail "HOME is not a directory: $HOME"
-tmp=$(mktemp -d "$HOME/.gitswitch-distcheck.XXXXXX")
-chmod 0700 "$tmp" || fail "cannot make distcheck build root private"
+tmp=$(mktemp -d "$HOME/.gitswitch-distcheck.XXXXXX" 3<&-)
+chmod 0700 "$tmp" 3<&- || fail "cannot make distcheck build root private"
+
+# Snapshot borrowed input exactly once. The internal fd is closed immediately,
+# before any Git, compiler, test, or package descendant can inherit it. The two
+# unavoidable setup helpers above receive descriptor 3 explicitly closed. Every
+# later validator consumes only this invocation-private regular file (AR-11 L42).
+archive=$tmp/source-archive.tar.gz
+if [ "$archive_from_fd" = true ]; then
+    cat <&3 >"$archive" ||
+        fail "cannot snapshot private archive descriptor"
+else
+    cp "$archive_input" "$archive" 3<&- ||
+        fail "cannot snapshot caller-owned archive for validation"
+fi
+exec 3<&-
+[ -f "$archive" ] || fail "archive snapshot is not a regular file"
+
+# Count COMMITTED tests via git ls-files, not the live filesystem: dist now
+# archives HEAD (AR-05 L5), so an untracked stray under tests/ must neither
+# ship nor skew this baseline — with a filesystem count, the same dirty tree
+# was counted on both sides and contamination was undetectable.
+git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checkout"
+checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
+[ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
 members=$tmp/archive-members.txt
 gzip -t "$archive" || fail "archive is not a complete gzip stream"
@@ -151,6 +173,9 @@ done
 
 expected_version=$(sed -n '1p' "$source_root/VERSION")
 [ -n "$expected_version" ] || fail "VERSION is empty"
+case $expected_version in
+    *[!A-Za-z0-9._+-]*) fail "VERSION is not path-safe" ;;
+esac
 [ "$dist_root" = "gitswitcher-$expected_version" ] ||
     fail "archive root $dist_root disagrees with VERSION $expected_version"
 spec_version=$(sed -n 's/^Version:[[:space:]]*//p' \
@@ -223,7 +248,10 @@ if command -v rpmbuild >/dev/null 2>&1; then
     rpmtop=$tmp/rpmbuild
     mkdir -p "$rpmtop/BUILD" "$rpmtop/RPMS" "$rpmtop/SOURCES" \
         "$rpmtop/SPECS" "$rpmtop/SRPMS"
-    cp "$archive" "$rpmtop/SOURCES/"
+    # The invocation-private snapshot deliberately has a generic name. RPM's
+    # Source0 contract still resolves the canonical release basename, so copy
+    # the same pinned bytes under that name inside this private build tree.
+    cp "$archive" "$rpmtop/SOURCES/$dist_root.tar.gz"
     cp "$source_root/gitswitcher.spec" "$rpmtop/SPECS/"
     if ! rpmbuild --define "_topdir $rpmtop" --nodeps -ba \
         "$rpmtop/SPECS/gitswitcher.spec" >"$tmp/rpmbuild.log" 2>&1; then

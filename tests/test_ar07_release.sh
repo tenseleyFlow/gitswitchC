@@ -1109,6 +1109,8 @@ check_literal_archive_root_contract()
             sed -n '1,120p' "$m48_dist_out" >&2
             fail "M48 $m48_reject_label dist mutant missed its exact gate"
         }
+        cmp -s "$m48_reject_archive" "$m48_dist_archive" ||
+            fail "M48 $m48_reject_label failure changed caller-owned archive"
     }
 
     git clone --quiet "$m48_source" "$m48_repo" ||
@@ -1165,6 +1167,47 @@ EOF
     }
     grep -Fx M48_ARCHIVE_VALIDATION_COMPLETE "$m48_out" >/dev/null ||
         fail "M48 distcheck did not complete literal archive validation"
+    cmp -s "$m48_archive" "$m48_dist_archive" ||
+        fail "M48 build-boundary failure changed caller-owned archive"
+
+    # Drive the validator's TERM trap only after a valid archive has crossed
+    # every metadata gate and reached the extracted build boundary. The child
+    # make shim signals its direct test_dist.sh parent; trapped status 1 is
+    # distinct from the shim's fallback 79 if TERM is lost or ignored.
+    m48_signal_make=$m48_work/m48-signal-make
+    m48_signal_marker=$m48_work/m48-signal.marker
+    cat >"$m48_signal_make" <<'EOF'
+#!/bin/sh
+set -eu
+: "${GITSWITCH_L42_SIGNAL_MARKER:?}"
+printf '%s\n' ready >"$GITSWITCH_L42_SIGNAL_MARKER"
+kill -TERM "$PPID" || exit 78
+exit 79
+EOF
+    chmod 0755 "$m48_signal_make" ||
+        fail "cannot activate M48 distcheck signal shim"
+    m48_signal_archive=$m48_work/m48-signal-dist.tar.gz
+    cp "$m48_archive" "$m48_signal_archive" ||
+        fail "cannot copy M48 signal archive fixture"
+    m48_signal_status=0
+    (CDPATH='' cd "$m48_repo" && HOME="$m48_home" \
+        GITSWITCH_L42_SIGNAL_MARKER="$m48_signal_marker" \
+        sh "$m48_source/tests/test_dist.sh" "$m48_signal_archive" \
+            "$m48_dist_root" /usr/local "$m48_signal_make" -- \
+            src tests tools completions VERSION LICENSE README.md Makefile \
+            gitswitcher.spec) >"$m48_out" 2>&1 || m48_signal_status=$?
+    [ "$m48_signal_status" -eq 1 ] || {
+        sed -n '1,160p' "$m48_out" >&2
+        fail "M48 TERM did not reach the validator cleanup trap"
+    }
+    [ "$(sed -n '1p' "$m48_signal_marker")" = ready ] ||
+        fail "M48 signal shim did not reach the build boundary"
+    cmp -s "$m48_archive" "$m48_signal_archive" ||
+        fail "M48 TERM changed caller-owned archive bytes"
+    set -- "$m48_home"/.gitswitch-distcheck.*
+    if [ "$#" -ne 1 ] || [ -e "$1" ] || [ -L "$1" ]; then
+        fail "M48 TERM retained a private distcheck build tree"
+    fi
 
     m48_prefix_archive=$m48_work/m48-prefix.tar.gz
     m48_make_mutant prefix "$m48_prefix_archive"
@@ -1324,6 +1367,8 @@ check_manifest_contract()
     copy_group_release=
     copy_group_finish=
     copy_signal_producer_pid=
+    private_fork_pid=
+    private_child_pid=
     durability_swap_pid=
     lock_dist_pid=
     lock_gate_pid=
@@ -1384,6 +1429,14 @@ check_manifest_contract()
         stop_background "$copy_status_descendant_pid"
         stop_background "$copy_group_descendant_pid"
         stop_background "$copy_signal_producer_pid"
+        if [ -n "$private_fork_pid" ]; then
+            kill -KILL "-$private_fork_pid" 2>/dev/null || :
+            stop_background "$private_fork_pid"
+        fi
+        if [ -n "$private_child_pid" ]; then
+            kill -KILL "-$private_child_pid" 2>/dev/null || :
+            stop_background "$private_child_pid"
+        fi
         stop_background "$durability_swap_pid"
         rm -rf "$tmp"
         exit "$status"
@@ -1678,6 +1731,496 @@ EOF
         fail "release publisher SHA-256 known-answer vectors failed"
     copy_platform=$(uname -s) ||
         fail "cannot identify release publisher test platform"
+
+    # AR-11 L42: distcheck consumes a descriptor-pinned private archive and
+    # never publishes the canonical name. Force the named fallback on every
+    # host to prove normal retirement/retention, post-validation substitution,
+    # fixed-fd closure, and fatal-signal retention independently of O_TMPFILE.
+    private_consume_root=$tmp/private-consume
+    private_consumer=$tmp/private-consumer.sh
+    private_capture=$tmp/private-consumer.capture
+    private_marker=$tmp/private-consumer.marker
+    private_release=$tmp/private-consumer.release
+    private_out=$tmp/private-consumer.out
+    private_original=$tmp/private-consumer.original
+    mkdir "$private_consume_root" ||
+        fail "cannot create private-consumer root"
+    cat >"$private_consumer" <<'EOF'
+#!/bin/sh
+set -eu
+[ "${1-}" = @GITSWITCH_PRIVATE_ARCHIVE_FD@ ] || exit 91
+: "${AR11_PRIVATE_CAPTURE:?}"
+private_mode=${AR11_PRIVATE_MODE-success}
+case $private_mode in
+    preclose)
+        while :; do sleep 1; done
+        ;;
+    timeout)
+        : "${AR11_PRIVATE_MARKER:?}"
+        printf '%s\n' "$$" >"$AR11_PRIVATE_MARKER" || exit 96
+        while :; do sleep 1; done
+        ;;
+esac
+cat <&3 >"$AR11_PRIVATE_CAPTURE" || exit 92
+if [ "$private_mode" = mutate ]; then
+    printf '%s' '-mutated' >&3 || exit 98
+    exec 3<&-
+    exit 0
+fi
+exec 3<&-
+if /bin/sh -c ': <&3' 2>/dev/null; then
+    exit 93
+fi
+case $private_mode in
+    success) exit 0 ;;
+    replace)
+        : "${AR11_PRIVATE_MARKER:?}" "${AR11_PRIVATE_RELEASE:?}"
+        printf '%s\n' ready >"$AR11_PRIVATE_MARKER" || exit 94
+        attempt=0
+        while [ ! -s "$AR11_PRIVATE_RELEASE" ]; do
+            attempt=$((attempt + 1))
+            [ "$attempt" -lt 80 ] || exit 95
+            sleep 0.05
+        done
+        ;;
+    signal)
+        : "${AR11_PRIVATE_MARKER:?}"
+        printf '%s\n' "$$" >"$AR11_PRIVATE_MARKER" || exit 96
+        while :; do sleep 1; done
+        ;;
+    *) exit 97 ;;
+esac
+EOF
+    chmod 0700 "$private_consumer" ||
+        fail "cannot activate private-consumer fixture"
+
+    # Consume-mode grammar is an ownership boundary too: malformed separators
+    # must fail before creating a source, while zero or multiple descriptor
+    # sentinels may clean only the exact private source just generated.
+    private_parser_sentinel=$private_consume_root/parser-sibling.sentinel
+    private_parser_before=$tmp/private-parser-sibling.before
+    printf '%s\n' parser-sibling >"$private_parser_sentinel" ||
+        fail "cannot create private-parser sibling"
+    cp "$private_parser_sentinel" "$private_parser_before" ||
+        fail "cannot preserve private-parser sibling"
+    if "$named_publish_helper" --internal-release-tree-consume-v1 \
+        "$private_consume_root" build dist archive.tar.gz -- /bin/true \
+        >"$private_out" 2>&1; then
+        fail "private consume parser accepted a missing separator"
+    fi
+    grep -F 'usage:' "$private_out" >/dev/null ||
+        fail "missing private-consumer separator lacked usage diagnostics"
+    set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ] ||
+        fail "missing private-consumer separator created a private source"
+
+    if "$named_publish_helper" --internal-release-tree-consume-v1 \
+        "$private_consume_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf private-consume-payload' \
+        --internal-consumer-v1 /bin/true \
+        @GITSWITCH_PRIVATE_ARCHIVE_FD@ \
+        --internal-consumer-v1 /bin/true >"$private_out" 2>&1; then
+        fail "private consume parser accepted duplicate separators"
+    fi
+    grep -F 'usage:' "$private_out" >/dev/null ||
+        fail "duplicate private-consumer separator lacked usage diagnostics"
+    set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ] ||
+        fail "duplicate private-consumer separator created a private source"
+
+    for private_parser_shape in zero multiple; do
+        case $private_parser_shape in
+            zero)
+                if "$named_publish_helper" \
+                    --internal-release-tree-consume-v1 \
+                    "$private_consume_root" build dist archive.tar.gz -- \
+                    /bin/sh -c 'printf private-consume-payload' \
+                    --internal-consumer-v1 /bin/true \
+                    >"$private_out" 2>&1; then
+                    fail "private consumer accepted zero archive sentinels"
+                fi
+                ;;
+            multiple)
+                if "$named_publish_helper" \
+                    --internal-release-tree-consume-v1 \
+                    "$private_consume_root" build dist archive.tar.gz -- \
+                    /bin/sh -c 'printf private-consume-payload' \
+                    --internal-consumer-v1 /bin/true \
+                    @GITSWITCH_PRIVATE_ARCHIVE_FD@ \
+                    @GITSWITCH_PRIVATE_ARCHIVE_FD@ \
+                    >"$private_out" 2>&1; then
+                    fail "private consumer accepted multiple archive sentinels"
+                fi
+                ;;
+        esac
+        grep -F 'requires exactly one archive-fd sentinel' \
+            "$private_out" >/dev/null ||
+            fail "$private_parser_shape-sentinel rejection lacked its exact diagnostic"
+        [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
+        [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
+            fail "$private_parser_shape-sentinel rejection published a canonical name"
+        set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+        case $copy_platform in
+            FreeBSD)
+                [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ] ||
+                    fail "FreeBSD retained a $private_parser_shape-sentinel source"
+                ;;
+            Linux|Darwin)
+                { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                    fail "$copy_platform did not retain one $private_parser_shape-sentinel source"
+                [ "$(cat "$1")" = private-consume-payload ] ||
+                    fail "$copy_platform retained wrong $private_parser_shape-sentinel bytes"
+                grep -F 'private distcheck archive safely retained' \
+                    "$private_out" >/dev/null ||
+                    fail "$copy_platform $private_parser_shape-sentinel retention lacked a warning"
+                rm -f "$1" ||
+                    fail "cannot retire $private_parser_shape-sentinel fixture source"
+                ;;
+            *) fail "unsupported private-parser platform: $copy_platform" ;;
+        esac
+    done
+    cmp -s "$private_parser_before" "$private_parser_sentinel" ||
+        fail "private consume parser changed an unrelated sibling"
+
+    AR11_PRIVATE_CAPTURE=$private_capture \
+        "$named_publish_helper" --internal-release-tree-consume-v1 \
+        "$private_consume_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf private-consume-payload' \
+        --internal-consumer-v1 "$private_consumer" \
+        @GITSWITCH_PRIVATE_ARCHIVE_FD@ >"$private_out" 2>&1 || {
+        sed -n '1,160p' "$private_out" >&2
+        fail "private archive consumer success fixture failed"
+    }
+    [ "$(cat "$private_capture")" = private-consume-payload ] ||
+        fail "private archive consumer received wrong or empty bytes"
+    [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
+    [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
+        fail "private archive consumer published a canonical name"
+    set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ] ||
+                fail "FreeBSD private consumer retained a normally retired source"
+            ;;
+        Linux|Darwin)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "$copy_platform private consumer did not safely retain one named source"
+            [ "$(cat "$1")" = private-consume-payload ] ||
+                fail "$copy_platform retained private source changed bytes"
+            grep -F 'private distcheck archive safely retained' \
+                "$private_out" >/dev/null ||
+                fail "$copy_platform private retention lacked a warning"
+            rm -f "$1" || fail "cannot retire private-consumer fixture source"
+            ;;
+        *) fail "unsupported private-consumer platform: $copy_platform" ;;
+    esac
+
+    # The portable handoff descriptor is internally O_RDWR. A consumer that
+    # writes through fd 3 and exits successfully must still fail the helper's
+    # post-consumer byte proof without publishing or deleting foreign state.
+    rm -f "$private_capture" "$private_marker" "$private_release"
+    if AR11_PRIVATE_MODE=mutate AR11_PRIVATE_CAPTURE=$private_capture \
+        "$named_publish_helper" --internal-release-tree-consume-v1 \
+        "$private_consume_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf private-consume-payload' \
+        --internal-consumer-v1 "$private_consumer" \
+        @GITSWITCH_PRIVATE_ARCHIVE_FD@ >"$private_out" 2>&1; then
+        fail "private consumer mutation escaped the post-validation digest"
+    fi
+    [ "$(cat "$private_capture")" = private-consume-payload ] ||
+        fail "private mutation consumer received wrong source bytes"
+    [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
+    [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
+        fail "private mutation consumer published a canonical name"
+    grep -F 'private distcheck archive changed during validation' \
+        "$private_out" >/dev/null ||
+        fail "private consumer mutation lacked a digest diagnostic"
+    set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ] ||
+                fail "FreeBSD retained a privately mutated source"
+            ;;
+        Linux|Darwin)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "$copy_platform did not safely retain the privately mutated source"
+            [ "$(cat "$1")" = private-consume-payload-mutated ] ||
+                fail "$copy_platform retained wrong private mutation bytes"
+            grep -F 'private distcheck archive safely retained' \
+                "$private_out" >/dev/null ||
+                fail "$copy_platform private mutation retention lacked a warning"
+            rm -f "$1" || fail "cannot retire private mutation fixture source"
+            ;;
+        *) fail "unsupported private mutation platform: $copy_platform" ;;
+    esac
+
+    # Fork, process-group creation, and handler-visible PID publication are a
+    # single fatal-signal ownership transition for both supervised children.
+    # The named-only hook raises each forwarded signal while independently
+    # proving the full set is blocked, before the selected PID is published.
+    # Exact-mask restoration must deliver it only after publication, killing
+    # either the blocked producer or the pre-close consumer that still owns
+    # fd 3. Omitting either guard leaves the reported PID alive and is causal.
+    private_fork_violations=
+    for private_fork_target in producer consumer; do
+        for private_fork_signal in HUP INT QUIT TERM; do
+            private_fork_label=$private_fork_target-$private_fork_signal
+            private_fork_report=$tmp/private-fork-$private_fork_label.report
+            rm -f "$private_capture" "$private_marker" "$private_release" \
+                "$private_fork_report" \
+                "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+            private_fork_status=0
+            # The selected producer child, not this test shell, expands its
+            # mode after the guarded fork boundary.
+            # shellcheck disable=SC2016
+            if AR11_PRIVATE_MODE=preclose \
+                AR11_PRIVATE_CAPTURE=$private_capture \
+                AR11_PRIVATE_PRODUCER_MODE=$private_fork_target \
+                GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+                GITSWITCH_RELEASE_TEST_FORK_SIGNAL=$private_fork_signal \
+                GITSWITCH_RELEASE_TEST_FORK_REPORT_FD=9 \
+                GITSWITCH_RELEASE_TEST_FORK_TARGET=$private_fork_target \
+                "$named_publish_helper" --internal-release-tree-consume-v1 \
+                "$private_consume_root" build dist archive.tar.gz -- \
+                /bin/sh -c '
+                    if [ "$AR11_PRIVATE_PRODUCER_MODE" = producer ]; then
+                        while :; do sleep 1; done
+                    fi
+                    printf private-consume-payload
+                ' \
+                --internal-consumer-v1 "$private_consumer" \
+                @GITSWITCH_PRIVATE_ARCHIVE_FD@ \
+                9>"$private_fork_report" >"$private_out" 2>&1; then
+                private_fork_status=0
+            else
+                private_fork_status=$?
+            fi
+            if [ "$private_fork_status" -le 128 ]; then
+                private_fork_violations="$private_fork_violations $private_fork_label-status-$private_fork_status"
+            else
+                private_fork_observed=$(kill -l "$private_fork_status" 2>/dev/null || :)
+                case $private_fork_observed in
+                    "$private_fork_signal"|"SIG$private_fork_signal") ;;
+                    *)
+                        private_fork_violations="$private_fork_violations $private_fork_label-status-$private_fork_status"
+                        ;;
+                esac
+            fi
+            private_fork_proof=
+            private_fork_pid=
+            if [ -f "$private_fork_report" ]; then
+                IFS=' ' read -r private_fork_proof private_fork_pid \
+                    <"$private_fork_report" || :
+            fi
+            case $private_fork_pid in
+                ''|*[!0-9]*) private_fork_pid= ;;
+            esac
+            if [ "$private_fork_proof" != B ] ||
+               [ -z "$private_fork_pid" ]; then
+                private_fork_violations="$private_fork_violations $private_fork_label-guard"
+            fi
+            if [ -n "$private_fork_pid" ]; then
+                attempt=0
+                while kill -0 "$private_fork_pid" 2>/dev/null &&
+                      [ "$attempt" -lt 80 ]; do
+                    sleep 0.05
+                    attempt=$((attempt + 1))
+                done
+                if kill -0 "$private_fork_pid" 2>/dev/null; then
+                    private_fork_violations="$private_fork_violations $private_fork_label-live-$private_fork_pid"
+                    kill -KILL "-$private_fork_pid" 2>/dev/null || :
+                    stop_background "$private_fork_pid"
+                fi
+                private_fork_pid=
+            fi
+            [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
+            [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
+                private_fork_violations="$private_fork_violations $private_fork_label-published"
+            set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+            if [ "$#" -ne 1 ] || [ ! -f "$1" ] || [ -L "$1" ]; then
+                private_fork_violations="$private_fork_violations $private_fork_label-temp-shape"
+            else
+                if [ "$private_fork_target" = consumer ] &&
+                   [ "$(cat "$1")" != private-consume-payload ]; then
+                    private_fork_violations="$private_fork_violations $private_fork_label-temp-bytes"
+                fi
+                rm -f "$1" ||
+                    private_fork_violations="$private_fork_violations $private_fork_label-temp-cleanup"
+            fi
+        done
+    done
+    [ -z "$private_fork_violations" ] ||
+        fail "guarded release-child fork violations:$private_fork_violations"
+
+    # Consumer supervision has a distinct production budget from archive
+    # generation. The named helper's five-second budget makes the timeout path
+    # causal: the blocking consumer must be group-killed, its exact status must
+    # fail closed, and cleanup follows the same platform ownership policy.
+    rm -f "$private_capture" "$private_marker" "$private_release" \
+        "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    private_timeout_status=0
+    if AR11_PRIVATE_MODE=timeout AR11_PRIVATE_CAPTURE=$private_capture \
+        AR11_PRIVATE_MARKER=$private_marker \
+        "$named_publish_helper" --internal-release-tree-consume-v1 \
+        "$private_consume_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf private-consume-payload' \
+        --internal-consumer-v1 "$private_consumer" \
+        @GITSWITCH_PRIVATE_ARCHIVE_FD@ >"$private_out" 2>&1; then
+        private_timeout_status=0
+    else
+        private_timeout_status=$?
+    fi
+    [ "$private_timeout_status" -ne 0 ] ||
+        fail "timed-out private consumer unexpectedly succeeded"
+    grep -F 'distcheck consumer timed out' "$private_out" >/dev/null ||
+        fail "private consumer timeout lacked its exact diagnostic"
+    private_child_pid=$(sed -n '1p' "$private_marker")
+    case $private_child_pid in
+        ''|*[!0-9]*)
+            private_child_pid=
+            fail "private timeout consumer reported an invalid PID"
+            ;;
+    esac
+    attempt=0
+    while kill -0 "$private_child_pid" 2>/dev/null &&
+          [ "$attempt" -lt 80 ]; do
+        sleep 0.05
+        attempt=$((attempt + 1))
+    done
+    if kill -0 "$private_child_pid" 2>/dev/null; then
+        kill -KILL "-$private_child_pid" 2>/dev/null || :
+        stop_background "$private_child_pid"
+        private_child_pid=
+        fail "timed-out private consumer survived group teardown"
+    fi
+    private_child_pid=
+    [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
+    [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
+        fail "timed-out private consumer published a canonical name"
+    set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ] ||
+                fail "FreeBSD retained a timed-out private source"
+            ;;
+        Linux|Darwin)
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "$copy_platform did not safely retain the timed-out private source"
+            [ "$(cat "$1")" = private-consume-payload ] ||
+                fail "$copy_platform retained wrong private-timeout bytes"
+            grep -F 'private distcheck archive safely retained' \
+                "$private_out" >/dev/null ||
+                fail "$copy_platform private timeout retention lacked a warning"
+            rm -f "$1" || fail "cannot retire private timeout fixture source"
+            ;;
+        *) fail "unsupported private timeout platform: $copy_platform" ;;
+    esac
+
+    rm -f "$private_capture" "$private_marker" "$private_release"
+    AR11_PRIVATE_MODE=replace AR11_PRIVATE_CAPTURE=$private_capture \
+    AR11_PRIVATE_MARKER=$private_marker \
+    AR11_PRIVATE_RELEASE=$private_release \
+        "$named_publish_helper" --internal-release-tree-consume-v1 \
+        "$private_consume_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf private-consume-payload' \
+        --internal-consumer-v1 "$private_consumer" \
+        @GITSWITCH_PRIVATE_ARCHIVE_FD@ >"$private_out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while [ ! -s "$private_marker" ] && kill -0 "$copy_pid" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 80 ] ||
+            fail "private consumer did not reach replacement boundary"
+        sleep 0.05
+    done
+    [ -s "$private_marker" ] ||
+        fail "private consumer exited before replacement boundary"
+    set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+        fail "private consumer did not expose one pinned named source"
+    private_temp=$1
+    mv "$private_temp" "$private_original" ||
+        fail "cannot preserve pinned private-consumer source"
+    printf 'foreign-private-replacement' >"$private_temp" ||
+        fail "cannot install private-consumer replacement"
+    printf '%s\n' release >"$private_release" ||
+        fail "cannot release private-consumer replacement fixture"
+    if wait "$copy_pid"; then
+        copy_pid=
+        fail "private consumer accepted a replaced staging name"
+    fi
+    copy_pid=
+    [ "$(cat "$private_capture")" = private-consume-payload ] &&
+    [ "$(cat "$private_original")" = private-consume-payload ] ||
+        fail "private staging substitution changed the pinned source"
+    [ "$(cat "$private_temp")" = foreign-private-replacement ] ||
+        fail "private staging substitution changed the replacement"
+    [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
+    [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
+        fail "private staging substitution published a canonical name"
+    grep -F 'private distcheck archive name changed during validation' \
+        "$private_out" >/dev/null ||
+        fail "private staging substitution lacked an ownership diagnostic"
+    rm -f "$private_temp" "$private_original"
+
+    rm -f "$private_capture" "$private_marker" "$private_release"
+    AR11_PRIVATE_MODE=signal AR11_PRIVATE_CAPTURE=$private_capture \
+    AR11_PRIVATE_MARKER=$private_marker \
+        "$named_publish_helper" --internal-release-tree-consume-v1 \
+        "$private_consume_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf private-consume-payload' \
+        --internal-consumer-v1 "$private_consumer" \
+        @GITSWITCH_PRIVATE_ARCHIVE_FD@ >"$private_out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while [ ! -s "$private_marker" ] && kill -0 "$copy_pid" 2>/dev/null; do
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 80 ] ||
+            fail "private consumer did not reach signal boundary"
+        sleep 0.05
+    done
+    [ -s "$private_marker" ] ||
+        fail "private consumer exited before signal boundary"
+    private_child_pid=$(sed -n '1p' "$private_marker")
+    case $private_child_pid in
+        ''|*[!0-9]*)
+            private_child_pid=
+            fail "private consumer reported an invalid signal-boundary PID"
+            ;;
+    esac
+    kill -TERM "$copy_pid" || fail "cannot signal private archive helper"
+    if wait "$copy_pid"; then
+        private_signal_status=0
+    else
+        private_signal_status=$?
+    fi
+    copy_pid=
+    attempt=0
+    while kill -0 "$private_child_pid" 2>/dev/null &&
+          [ "$attempt" -lt 80 ]; do
+        attempt=$((attempt + 1))
+        sleep 0.05
+    done
+    if kill -0 "$private_child_pid" 2>/dev/null; then
+        kill -KILL "-$private_child_pid" 2>/dev/null || :
+        stop_background "$private_child_pid"
+        private_child_pid=
+        fail "private archive helper left its consumer alive after TERM"
+    fi
+    private_child_pid=
+    [ "$private_signal_status" -eq 143 ] ||
+        fail "private archive helper did not preserve TERM status"
+    [ "$(cat "$private_capture")" = private-consume-payload ] ||
+        fail "signalled private consumer received wrong archive bytes"
+    set -- "$private_consume_root/build/dist"/.archive.tar.gz.tmp.*
+    { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+        fail "signalled named private archive was not safely retained"
+    [ "$(cat "$1")" = private-consume-payload ] ||
+        fail "signalled named private archive changed bytes"
+    [ ! -e "$private_consume_root/build/dist/archive.tar.gz" ] &&
+    [ ! -L "$private_consume_root/build/dist/archive.tar.gz" ] ||
+        fail "signalled private consumer published a canonical name"
+    rm -f "$1" || fail "cannot retire signalled private archive fixture"
 
     # AR-11 M46: the publisher owns the fixed repository -> build -> dist
     # hierarchy.  A fresh root proves both components are created through the
