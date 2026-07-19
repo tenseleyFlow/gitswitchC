@@ -22,12 +22,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #if defined(__APPLE__)
+#include <crt_externs.h>
 #include <sys/attr.h>
 #include <sys/clonefile.h>
 #include <sys/random.h>
 #if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
 #include <sys/resource.h>
 #endif
+#endif
+
+#if defined(__APPLE__)
+#define archive_process_environ (*_NSGetEnviron())
+#else
+extern char **environ;
+#define archive_process_environ environ
 #endif
 
 #ifndef O_CLOEXEC
@@ -704,6 +712,1411 @@ static int write_all(int fd, const unsigned char *buffer, size_t size)
     return 0;
 }
 
+/* AR-11 M40: release archive bytes must not cross a mutable pathname between
+ * generation and validation. The publisher's internal archive mode therefore
+ * uses anonymous pipes for both independent Git/gzip streams and every
+ * validator. Only byte-equal spans reach the publisher's still-private output
+ * descriptor; the outer publisher cannot create the canonical name until this
+ * mode has reaped every child and returned success. */
+#define ARCHIVE_STREAM_BUFFER_SIZE (64U * 1024U)
+#define ARCHIVE_MANIFEST_MISMATCH_EXIT 42
+#define ARCHIVE_MANIFEST_ERROR_EXIT 43
+#define ARCHIVE_INTERNAL_TOKEN "--internal-release-archive-v1"
+
+typedef struct archive_byte_buffer {
+    unsigned char *bytes;
+    size_t size;
+    size_t capacity;
+} archive_byte_buffer_t;
+
+typedef struct archive_string_list {
+    char **items;
+    size_t count;
+    size_t capacity;
+} archive_string_list_t;
+
+typedef struct archive_workspace {
+    char root[PATH_MAX];
+    char home[PATH_MAX];
+    char xdg[PATH_MAX];
+    char git[PATH_MAX];
+    char git_objects[PATH_MAX];
+    char source_objects[PATH_MAX];
+    bool active;
+    bool home_created;
+    bool xdg_created;
+    bool git_created;
+    bool git_objects_created;
+    bool refs_created;
+    bool head_created;
+    bool config_created;
+} archive_workspace_t;
+
+typedef enum archive_object_format {
+    ARCHIVE_OBJECT_FORMAT_SHA1 = 0,
+    ARCHIVE_OBJECT_FORMAT_SHA256
+} archive_object_format_t;
+
+typedef struct archive_child {
+    pid_t pid;
+    const char *label;
+    bool manifest_validator;
+} archive_child_t;
+
+static int archive_buffer_append(archive_byte_buffer_t *buffer,
+                                 const unsigned char *bytes, size_t size)
+{
+    size_t required;
+
+    if (size > SIZE_MAX - buffer->size - 1U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    required = buffer->size + size + 1U;
+    if (required > buffer->capacity) {
+        size_t capacity = buffer->capacity == 0U ? 4096U : buffer->capacity;
+        unsigned char *replacement;
+
+        while (capacity < required) {
+            if (capacity > SIZE_MAX / 2U) {
+                capacity = required;
+                break;
+            }
+            capacity *= 2U;
+        }
+        replacement = realloc(buffer->bytes, capacity);
+        if (replacement == NULL) {
+            return -1;
+        }
+        buffer->bytes = replacement;
+        buffer->capacity = capacity;
+    }
+    if (size != 0U) {
+        memcpy(buffer->bytes + buffer->size, bytes, size);
+    }
+    buffer->size += size;
+    buffer->bytes[buffer->size] = '\0';
+    return 0;
+}
+
+static void archive_buffer_free(archive_byte_buffer_t *buffer)
+{
+    free(buffer->bytes);
+    memset(buffer, 0, sizeof(*buffer));
+}
+
+static int archive_list_add(archive_string_list_t *list, const char *value,
+                            size_t length)
+{
+    char *copy;
+
+    if (length == SIZE_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (list->count == list->capacity) {
+        size_t capacity = list->capacity == 0U ? 64U : list->capacity * 2U;
+        char **replacement;
+
+        if (capacity < list->capacity ||
+            capacity > SIZE_MAX / sizeof(*replacement)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        replacement = realloc(list->items,
+                              capacity * sizeof(*replacement));
+        if (replacement == NULL) {
+            return -1;
+        }
+        list->items = replacement;
+        list->capacity = capacity;
+    }
+    copy = malloc(length + 1U);
+    if (copy == NULL) {
+        return -1;
+    }
+    memcpy(copy, value, length);
+    copy[length] = '\0';
+    list->items[list->count++] = copy;
+    return 0;
+}
+
+static void archive_list_free(archive_string_list_t *list)
+{
+    size_t index;
+
+    for (index = 0U; index < list->count; index++) {
+        free(list->items[index]);
+    }
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+static int archive_string_compare(const void *left, const void *right)
+{
+    const char *const *left_string = left;
+    const char *const *right_string = right;
+
+    return strcmp(*left_string, *right_string);
+}
+
+static void archive_list_sort(archive_string_list_t *list)
+{
+    qsort(list->items, list->count, sizeof(*list->items),
+          archive_string_compare);
+}
+
+static void archive_list_deduplicate(archive_string_list_t *list)
+{
+    size_t read_index;
+    size_t write_index = 0U;
+
+    for (read_index = 0U; read_index < list->count; read_index++) {
+        if (write_index != 0U &&
+            strcmp(list->items[write_index - 1U],
+                   list->items[read_index]) == 0) {
+            free(list->items[read_index]);
+            continue;
+        }
+        list->items[write_index++] = list->items[read_index];
+    }
+    list->count = write_index;
+}
+
+static bool archive_path_byte_is_portable(unsigned char byte)
+{
+    return byte != '\0' &&
+           ((byte >= (unsigned char)'A' && byte <= (unsigned char)'Z') ||
+           (byte >= (unsigned char)'a' && byte <= (unsigned char)'z') ||
+           (byte >= (unsigned char)'0' && byte <= (unsigned char)'9') ||
+           strchr("._/+@%:=,-", (int)byte) != NULL);
+}
+
+static bool archive_tree_path_is_portable(const unsigned char *path,
+                                          size_t length)
+{
+    size_t component_start = 0U;
+    size_t index;
+
+    if (length == 0U || path[0] == (unsigned char)'/' ||
+        path[length - 1U] == (unsigned char)'/') {
+        return false;
+    }
+    for (index = 0U; index <= length; index++) {
+        if (index < length && !archive_path_byte_is_portable(path[index])) {
+            return false;
+        }
+        if (index == length || path[index] == (unsigned char)'/') {
+            size_t component_length = index - component_start;
+
+            if (component_length == 0U ||
+                (component_length == 1U && path[component_start] == '.') ||
+                (component_length == 2U && path[component_start] == '.' &&
+                 path[component_start + 1U] == '.')) {
+                return false;
+            }
+            component_start = index + 1U;
+        }
+    }
+    return true;
+}
+
+static int archive_add_prefixed_path(archive_string_list_t *list,
+                                     const char *root,
+                                     const unsigned char *path,
+                                     size_t path_length)
+{
+    size_t root_length = strlen(root);
+    size_t total;
+    char *combined;
+    int result;
+
+    if (root_length > SIZE_MAX - path_length - 2U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    total = root_length + 1U + path_length;
+    combined = malloc(total + 1U);
+    if (combined == NULL) {
+        return -1;
+    }
+    memcpy(combined, root, root_length);
+    combined[root_length] = '/';
+    memcpy(combined + root_length + 1U, path, path_length);
+    combined[total] = '\0';
+    result = archive_list_add(list, combined, total);
+    free(combined);
+    return result;
+}
+
+static int archive_build_expected_members(
+    const archive_byte_buffer_t *tree_paths, const char *dist_root,
+    archive_string_list_t *expected)
+{
+    size_t offset = 0U;
+    size_t root_length = strlen(dist_root);
+    char *root_entry;
+
+    if (tree_paths->size == 0U ||
+        tree_paths->bytes[tree_paths->size - 1U] != '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    root_entry = malloc(root_length + 2U);
+    if (root_entry == NULL) {
+        return -1;
+    }
+    memcpy(root_entry, dist_root, root_length);
+    root_entry[root_length] = '/';
+    root_entry[root_length + 1U] = '\0';
+    if (archive_list_add(expected, root_entry, root_length + 1U) != 0) {
+        free(root_entry);
+        return -1;
+    }
+    free(root_entry);
+
+    while (offset < tree_paths->size) {
+        size_t end = offset;
+        size_t index;
+
+        while (end < tree_paths->size && tree_paths->bytes[end] != '\0') {
+            end++;
+        }
+        if (end == tree_paths->size ||
+            !archive_tree_path_is_portable(tree_paths->bytes + offset,
+                                           end - offset)) {
+            errno = EINVAL;
+            return -1;
+        }
+        for (index = offset; index < end; index++) {
+            if (tree_paths->bytes[index] == (unsigned char)'/' &&
+                archive_add_prefixed_path(expected, dist_root,
+                    tree_paths->bytes + offset, index - offset + 1U) != 0) {
+                return -1;
+            }
+        }
+        if (archive_add_prefixed_path(expected, dist_root,
+                                      tree_paths->bytes + offset,
+                                      end - offset) != 0) {
+            return -1;
+        }
+        offset = end + 1U;
+    }
+    archive_list_sort(expected);
+    archive_list_deduplicate(expected);
+    return 0;
+}
+
+static int archive_compare_member_listing(
+    const archive_string_list_t *expected)
+{
+    archive_byte_buffer_t listing = {0};
+    archive_string_list_t actual = {0};
+    unsigned char buffer[8192];
+    size_t offset = 0U;
+    ssize_t count;
+    int result = ARCHIVE_MANIFEST_ERROR_EXIT;
+
+    do {
+        count = read(STDIN_FILENO, buffer, sizeof(buffer));
+    } while (count < 0 && errno == EINTR);
+    while (count > 0) {
+        if (archive_buffer_append(&listing, buffer, (size_t)count) != 0) {
+            goto cleanup;
+        }
+        do {
+            count = read(STDIN_FILENO, buffer, sizeof(buffer));
+        } while (count < 0 && errno == EINTR);
+    }
+    if (count < 0 || listing.size == 0U ||
+        listing.bytes[listing.size - 1U] != (unsigned char)'\n') {
+        goto cleanup;
+    }
+    while (offset < listing.size) {
+        size_t end = offset;
+        size_t index;
+
+        while (end < listing.size && listing.bytes[end] != '\n') {
+            end++;
+        }
+        if (end == offset || end == listing.size) {
+            goto cleanup;
+        }
+        for (index = offset; index < end; index++) {
+            if (!archive_path_byte_is_portable(listing.bytes[index])) {
+                goto cleanup;
+            }
+        }
+        if (archive_list_add(&actual, (const char *)listing.bytes + offset,
+                             end - offset) != 0) {
+            goto cleanup;
+        }
+        offset = end + 1U;
+    }
+    archive_list_sort(&actual);
+    if (actual.count != expected->count) {
+        result = ARCHIVE_MANIFEST_MISMATCH_EXIT;
+        goto cleanup;
+    }
+    for (offset = 0U; offset < actual.count; offset++) {
+        if (strcmp(actual.items[offset], expected->items[offset]) != 0) {
+            result = ARCHIVE_MANIFEST_MISMATCH_EXIT;
+            goto cleanup;
+        }
+    }
+    result = EXIT_SUCCESS;
+
+cleanup:
+    archive_list_free(&actual);
+    archive_buffer_free(&listing);
+    return result;
+}
+
+static int archive_join_path(char destination[PATH_MAX], const char *left,
+                             const char *right)
+{
+    int length = snprintf(destination, PATH_MAX, "%s/%s", left, right);
+
+    if (length < 0 || length >= PATH_MAX) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int archive_workspace_create(archive_workspace_t *workspace,
+                                    const char *tmp_parent)
+{
+    char template_path[PATH_MAX];
+    int head_fd = -1;
+    int length;
+    static const unsigned char head_contents[] =
+        "ref: refs/heads/unused\n";
+
+    length = snprintf(template_path, sizeof(template_path),
+                      "%s/gitswitch-release-archive.XXXXXX", tmp_parent);
+    if (length < 0 || (size_t)length >= sizeof(template_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (mkdtemp(template_path) == NULL) {
+        return -1;
+    }
+    length = snprintf(workspace->root, sizeof(workspace->root), "%s",
+                      template_path);
+    if (length < 0 || (size_t)length >= sizeof(workspace->root)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    workspace->active = true;
+    /* mkdtemp(3) creates the private workspace with mode 0700.  Do not
+     * re-address that freshly created directory by pathname just to restate
+     * the same mode: doing so would add a needless pathname race. */
+    if (archive_join_path(workspace->home, workspace->root, "home") != 0 ||
+        archive_join_path(workspace->xdg, workspace->root, "xdg") != 0 ||
+        archive_join_path(workspace->git, workspace->root, "git") != 0 ||
+        archive_join_path(workspace->git_objects, workspace->git, "objects") !=
+            0) {
+        return -1;
+    }
+    if (mkdir(workspace->home, S_IRWXU) != 0) {
+        return -1;
+    }
+    workspace->home_created = true;
+    if (mkdir(workspace->xdg, S_IRWXU) != 0) {
+        return -1;
+    }
+    workspace->xdg_created = true;
+    if (mkdir(workspace->git, S_IRWXU) != 0) {
+        return -1;
+    }
+    workspace->git_created = true;
+    if (mkdir(workspace->git_objects, S_IRWXU) != 0) {
+        return -1;
+    }
+    workspace->git_objects_created = true;
+    {
+        char refs[PATH_MAX];
+        char head[PATH_MAX];
+
+        if (archive_join_path(refs, workspace->git, "refs") != 0 ||
+            mkdir(refs, S_IRWXU) != 0) {
+            return -1;
+        }
+        workspace->refs_created = true;
+        if (archive_join_path(head, workspace->git, "HEAD") != 0) {
+            return -1;
+        }
+        head_fd = open(head, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW |
+                            O_CLOEXEC,
+                       S_IRUSR | S_IWUSR);
+        if (head_fd < 0) {
+            return -1;
+        }
+        workspace->head_created = true;
+        if (write_all(head_fd, head_contents,
+                      sizeof(head_contents) - 1U) != 0 ||
+            close(head_fd) != 0) {
+            int saved_errno = errno;
+
+            if (head_fd >= 0) {
+                (void)close(head_fd);
+            }
+            errno = saved_errno;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int archive_workspace_cleanup(archive_workspace_t *workspace)
+{
+    char path[PATH_MAX];
+    int first_errno = 0;
+
+    if (!workspace->active) {
+        return 0;
+    }
+#define ARCHIVE_CLEANUP_OPERATION(operation) \
+    do { \
+        if ((operation) != 0 && errno != ENOENT && first_errno == 0) { \
+            first_errno = errno; \
+        } \
+    } while (0)
+    if (workspace->config_created && workspace->git[0] != '\0') {
+        if (archive_join_path(path, workspace->git, "config") == 0) {
+            ARCHIVE_CLEANUP_OPERATION(unlink(path));
+        } else if (first_errno == 0) {
+            first_errno = errno;
+        }
+    }
+    if (workspace->head_created && workspace->git[0] != '\0') {
+        if (archive_join_path(path, workspace->git, "HEAD") == 0) {
+            ARCHIVE_CLEANUP_OPERATION(unlink(path));
+        } else if (first_errno == 0) {
+            first_errno = errno;
+        }
+    }
+    if (workspace->refs_created && workspace->git[0] != '\0') {
+        if (archive_join_path(path, workspace->git, "refs") == 0) {
+            ARCHIVE_CLEANUP_OPERATION(rmdir(path));
+        } else if (first_errno == 0) {
+            first_errno = errno;
+        }
+    }
+    if (workspace->git_objects_created && workspace->git_objects[0] != '\0') {
+        ARCHIVE_CLEANUP_OPERATION(rmdir(workspace->git_objects));
+    }
+    if (workspace->git_created && workspace->git[0] != '\0') {
+        ARCHIVE_CLEANUP_OPERATION(rmdir(workspace->git));
+    }
+    if (workspace->home_created && workspace->home[0] != '\0') {
+        ARCHIVE_CLEANUP_OPERATION(rmdir(workspace->home));
+    }
+    if (workspace->xdg_created && workspace->xdg[0] != '\0') {
+        ARCHIVE_CLEANUP_OPERATION(rmdir(workspace->xdg));
+    }
+    if (workspace->root[0] != '\0') {
+        ARCHIVE_CLEANUP_OPERATION(rmdir(workspace->root));
+    }
+#undef ARCHIVE_CLEANUP_OPERATION
+    workspace->active = false;
+    if (first_errno != 0) {
+        errno = first_errno;
+        return -1;
+    }
+    return 0;
+}
+
+static int archive_write_minimal_git_config(
+    const archive_workspace_t *workspace, archive_object_format_t format)
+{
+    static const unsigned char sha1_config[] =
+        "[core]\n"
+        "\trepositoryFormatVersion = 0\n";
+    static const unsigned char sha256_config[] =
+        "[core]\n"
+        "\trepositoryFormatVersion = 1\n"
+        "[extensions]\n"
+        "\tobjectFormat = sha256\n";
+    const unsigned char *contents;
+    size_t contents_size;
+    char temporary[PATH_MAX];
+    char destination[PATH_MAX];
+    int config_fd = -1;
+    int saved_errno;
+    int result = -1;
+
+    if (format == ARCHIVE_OBJECT_FORMAT_SHA1) {
+        contents = sha1_config;
+        contents_size = sizeof(sha1_config) - 1U;
+    } else if (format == ARCHIVE_OBJECT_FORMAT_SHA256) {
+        contents = sha256_config;
+        contents_size = sizeof(sha256_config) - 1U;
+    } else {
+        errno = EINVAL;
+        return -1;
+    }
+    if (archive_join_path(temporary, workspace->git, "config.tmp") != 0 ||
+        archive_join_path(destination, workspace->git, "config") != 0) {
+        return -1;
+    }
+    config_fd = open(temporary,
+                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                     S_IRUSR | S_IWUSR);
+    if (config_fd < 0) {
+        return -1;
+    }
+    if (write_all(config_fd, contents, contents_size) != 0) {
+        goto cleanup;
+    }
+    if (close(config_fd) != 0) {
+        config_fd = -1;
+        goto cleanup;
+    }
+    config_fd = -1;
+    if (rename(temporary, destination) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    saved_errno = errno;
+    if (config_fd >= 0) {
+        (void)close(config_fd);
+    }
+    if (result != 0) {
+        (void)unlink(temporary);
+    }
+    errno = saved_errno;
+    return result;
+}
+
+static int archive_set_clean_environment(const char *path,
+                                         const archive_workspace_t *workspace)
+{
+    archive_process_environ = NULL;
+    if (setenv("PATH", path, 1) != 0 || setenv("LC_ALL", "C", 1) != 0 ||
+        setenv("TZ", "UTC", 1) != 0 ||
+        setenv("HOME", workspace->home, 1) != 0 ||
+        setenv("XDG_CONFIG_HOME", workspace->xdg, 1) != 0 ||
+        setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+        setenv("GIT_CONFIG_SYSTEM", "/dev/null", 1) != 0 ||
+        setenv("GIT_CONFIG_GLOBAL", "/dev/null", 1) != 0 ||
+        setenv("GIT_ATTR_NOSYSTEM", "1", 1) != 0 ||
+        setenv("GIT_NO_REPLACE_OBJECTS", "1", 1) != 0 ||
+        setenv("GIT_LITERAL_PATHSPECS", "1", 1) != 0 ||
+        setenv("GIT_OPTIONAL_LOCKS", "0", 1) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int archive_reset_exec_signal_state(void)
+{
+    static const int reset_signals[] = {
+        SIGPIPE, SIGCHLD, SIGINT, SIGTERM, SIGHUP, SIGQUIT
+    };
+    struct sigaction default_action;
+    sigset_t empty_mask;
+    size_t index;
+
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigemptyset(&empty_mask) != 0) {
+        return -1;
+    }
+    for (index = 0U;
+         index < sizeof(reset_signals) / sizeof(reset_signals[0]);
+         index++) {
+        struct sigaction current;
+
+        if (sigaction(reset_signals[index], NULL, &current) != 0) {
+            return -1;
+        }
+        if (reset_signals[index] != SIGPIPE &&
+            current.sa_handler == SIG_IGN) {
+            continue;
+        }
+        if (sigaction(reset_signals[index], &default_action, NULL) != 0) {
+            return -1;
+        }
+    }
+    return sigprocmask(SIG_SETMASK, &empty_mask, NULL);
+}
+
+static pid_t archive_spawn_exec(char *const arguments[], int input_fd,
+                                int output_fd, const int *all_fds,
+                                size_t fd_count)
+{
+    pid_t child = fork();
+
+    if (child != 0) {
+        return child;
+    }
+    if ((input_fd >= 0 && input_fd != STDIN_FILENO &&
+         dup2(input_fd, STDIN_FILENO) < 0) ||
+        (output_fd >= 0 && output_fd != STDOUT_FILENO &&
+         dup2(output_fd, STDOUT_FILENO) < 0)) {
+        _exit(126);
+    }
+    {
+        size_t index;
+
+        for (index = 0U; index < fd_count; index++) {
+            if (all_fds[index] > STDERR_FILENO) {
+                (void)close(all_fds[index]);
+            }
+        }
+    }
+    if (archive_reset_exec_signal_state() != 0) {
+        _exit(126);
+    }
+    execvp(arguments[0], arguments); /* Flawfinder: ignore — fixed release-tool argv under a scrubbed environment; PATH is the caller's explicit toolchain selector */
+    _exit(errno == ENOENT ? 127 : 126);
+}
+
+static void archive_report_child_status(const char *label, int status)
+{
+    if (WIFEXITED(status)) {
+        fprintf(stderr, "release-archive: ERROR: %s exited with status %d\n",
+                label, WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr,
+                "release-archive: ERROR: %s terminated by signal %d\n",
+                label, WTERMSIG(status));
+    } else {
+        fprintf(stderr,
+                "release-archive: ERROR: %s did not exit normally\n",
+                label);
+    }
+}
+
+static int archive_wait_exact_child(pid_t child, const char *label)
+{
+    int status;
+    pid_t waited;
+
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child) {
+        fprintf(stderr, "release-archive: ERROR: cannot wait for %s: %s\n",
+                label, strerror(errno));
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        archive_report_child_status(label, status);
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+static int archive_capture_command(char *const arguments[], const char *label,
+                                   archive_byte_buffer_t *output)
+{
+    int pipe_fds[2];
+    int all_fds[2];
+    unsigned char buffer[8192];
+    pid_t child;
+    ssize_t count;
+    int result = -1;
+    int saved_errno = 0;
+
+    if (create_producer_pipe(pipe_fds) != 0) {
+        return -1;
+    }
+    all_fds[0] = pipe_fds[0];
+    all_fds[1] = pipe_fds[1];
+    child = archive_spawn_exec(arguments, -1, pipe_fds[1], all_fds, 2U);
+    if (child < 0) {
+        saved_errno = errno;
+        (void)close(pipe_fds[0]);
+        (void)close(pipe_fds[1]);
+        errno = saved_errno;
+        return -1;
+    }
+    (void)close(pipe_fds[1]);
+    do {
+        count = read(pipe_fds[0], buffer, sizeof(buffer));
+    } while (count < 0 && errno == EINTR);
+    while (count > 0) {
+        if (archive_buffer_append(output, buffer, (size_t)count) != 0) {
+            saved_errno = errno;
+            (void)kill(child, SIGKILL);
+            (void)close(pipe_fds[0]);
+            (void)archive_wait_exact_child(child, label);
+            errno = saved_errno;
+            return -1;
+        }
+        do {
+            count = read(pipe_fds[0], buffer, sizeof(buffer));
+        } while (count < 0 && errno == EINTR);
+    }
+    saved_errno = errno;
+    if (close(pipe_fds[0]) != 0 && count >= 0) {
+        count = -1;
+        saved_errno = errno;
+    }
+    if (count < 0) {
+        (void)kill(child, SIGKILL);
+    }
+    if (archive_wait_exact_child(child, label) == 0 && count >= 0) {
+        result = 0;
+    }
+    if (result != 0 && saved_errno != 0) {
+        errno = saved_errno;
+    }
+    return result;
+}
+
+static pid_t archive_spawn_manifest_validator(
+    int input_fd, const int *all_fds, size_t fd_count,
+    const archive_string_list_t *expected)
+{
+    pid_t child = fork();
+
+    if (child != 0) {
+        return child;
+    }
+    if (input_fd != STDIN_FILENO && dup2(input_fd, STDIN_FILENO) < 0) {
+        _exit(ARCHIVE_MANIFEST_ERROR_EXIT);
+    }
+    {
+        size_t index;
+
+        for (index = 0U; index < fd_count; index++) {
+            if (all_fds[index] > STDERR_FILENO) {
+                (void)close(all_fds[index]);
+            }
+        }
+    }
+    if (archive_reset_exec_signal_state() != 0) {
+        _exit(ARCHIVE_MANIFEST_ERROR_EXIT);
+    }
+    _exit(archive_compare_member_listing(expected));
+}
+
+static void archive_terminate_children(archive_child_t *children,
+                                       size_t child_count)
+{
+    size_t index;
+
+    for (index = 0U; index < child_count; index++) {
+        if (children[index].pid > 0) {
+            (void)kill(children[index].pid, SIGKILL);
+        }
+    }
+}
+
+static int archive_wait_children(archive_child_t *children,
+                                 size_t child_count)
+{
+    size_t index;
+    int failed = 0;
+
+    for (index = 0U; index < child_count; index++) {
+        int status;
+        pid_t waited;
+
+        if (children[index].pid <= 0) {
+            continue;
+        }
+        do {
+            waited = waitpid(children[index].pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited != children[index].pid) {
+            fprintf(stderr,
+                    "release-archive: ERROR: cannot wait for %s: %s\n",
+                    children[index].label, strerror(errno));
+            failed = 1;
+            continue;
+        }
+        children[index].pid = -1;
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+            continue;
+        }
+        if (children[index].manifest_validator && WIFEXITED(status) &&
+            WEXITSTATUS(status) == ARCHIVE_MANIFEST_MISMATCH_EXIT) {
+            fprintf(stderr,
+                    "release-archive: ERROR: completed archive differs from the exact committed release manifest\n");
+        } else {
+            archive_report_child_status(children[index].label, status);
+        }
+        failed = 1;
+    }
+    return failed == 0 ? 0 : -1;
+}
+
+static int archive_stream_equal_bytes(int first_fd, int second_fd,
+                                      int integrity_fd, int decoder_fd,
+                                      bool *repeat_mismatch)
+{
+    unsigned char first_buffer[ARCHIVE_STREAM_BUFFER_SIZE];
+    unsigned char second_buffer[ARCHIVE_STREAM_BUFFER_SIZE];
+    size_t first_offset = 0U;
+    size_t first_size = 0U;
+    size_t second_offset = 0U;
+    size_t second_size = 0U;
+    bool first_eof = false;
+    bool second_eof = false;
+
+    *repeat_mismatch = false;
+    for (;;) {
+        if (first_offset == first_size && !first_eof) {
+            ssize_t count;
+
+            do {
+                count = read(first_fd, first_buffer, sizeof(first_buffer));
+            } while (count < 0 && errno == EINTR);
+            if (count < 0) {
+                return -1;
+            }
+            first_offset = 0U;
+            first_size = (size_t)count;
+            first_eof = count == 0;
+        }
+        if (second_offset == second_size && !second_eof) {
+            ssize_t count;
+
+            do {
+                count = read(second_fd, second_buffer,
+                             sizeof(second_buffer));
+            } while (count < 0 && errno == EINTR);
+            if (count < 0) {
+                return -1;
+            }
+            second_offset = 0U;
+            second_size = (size_t)count;
+            second_eof = count == 0;
+        }
+        if (first_offset == first_size && second_offset == second_size &&
+            first_eof && second_eof) {
+            return 0;
+        }
+        if ((first_eof && first_offset == first_size) !=
+            (second_eof && second_offset == second_size)) {
+            *repeat_mismatch = true;
+            errno = EIO;
+            return -1;
+        }
+        if (first_offset < first_size && second_offset < second_size) {
+            size_t first_remaining = first_size - first_offset;
+            size_t second_remaining = second_size - second_offset;
+            size_t matched = first_remaining < second_remaining ?
+                                 first_remaining : second_remaining;
+
+            if (memcmp(first_buffer + first_offset,
+                       second_buffer + second_offset, matched) != 0) {
+                *repeat_mismatch = true;
+                errno = EIO;
+                return -1;
+            }
+            if (write_all(STDOUT_FILENO, first_buffer + first_offset,
+                          matched) != 0 ||
+                write_all(integrity_fd, first_buffer + first_offset,
+                          matched) != 0 ||
+                write_all(decoder_fd, first_buffer + first_offset,
+                          matched) != 0) {
+                return -1;
+            }
+            first_offset += matched;
+            second_offset += matched;
+        }
+    }
+}
+
+enum archive_pipe_index {
+    ARCHIVE_PIPE_RAW_A = 0,
+    ARCHIVE_PIPE_RAW_B,
+    ARCHIVE_PIPE_GZIP_A,
+    ARCHIVE_PIPE_GZIP_B,
+    ARCHIVE_PIPE_INTEGRITY,
+    ARCHIVE_PIPE_DECODER,
+    ARCHIVE_PIPE_TAR,
+    ARCHIVE_PIPE_LISTING,
+    ARCHIVE_PIPE_COUNT
+};
+
+static void archive_close_graph_pipes(int pipes[ARCHIVE_PIPE_COUNT][2])
+{
+    size_t pipe_index;
+
+    for (pipe_index = 0U; pipe_index < ARCHIVE_PIPE_COUNT; pipe_index++) {
+        size_t endpoint;
+
+        for (endpoint = 0U; endpoint < 2U; endpoint++) {
+            if (pipes[pipe_index][endpoint] >= 0) {
+                (void)close(pipes[pipe_index][endpoint]);
+                pipes[pipe_index][endpoint] = -1;
+            }
+        }
+    }
+}
+
+static int archive_create_graph_pipes(int pipes[ARCHIVE_PIPE_COUNT][2],
+                                      int all_fds[ARCHIVE_PIPE_COUNT * 2U])
+{
+    size_t pipe_index;
+
+    for (pipe_index = 0U; pipe_index < ARCHIVE_PIPE_COUNT; pipe_index++) {
+        pipes[pipe_index][0] = -1;
+        pipes[pipe_index][1] = -1;
+    }
+    for (pipe_index = 0U; pipe_index < ARCHIVE_PIPE_COUNT; pipe_index++) {
+        if (create_producer_pipe(pipes[pipe_index]) != 0) {
+            archive_close_graph_pipes(pipes);
+            return -1;
+        }
+        all_fds[pipe_index * 2U] = pipes[pipe_index][0];
+        all_fds[(pipe_index * 2U) + 1U] = pipes[pipe_index][1];
+    }
+    return 0;
+}
+
+static bool archive_component_is_safe(const char *component)
+{
+    size_t index;
+    size_t length = strlen(component);
+
+    if (length == 0U || strcmp(component, ".") == 0 ||
+        strcmp(component, "..") == 0) {
+        return false;
+    }
+    for (index = 0U; index < length; index++) {
+        if (component[index] == '/' ||
+            !archive_path_byte_is_portable((unsigned char)component[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool archive_commit_is_hexadecimal(const char *commit)
+{
+    size_t index;
+    size_t length = strlen(commit);
+
+    if (length != 40U && length != 64U) {
+        return false;
+    }
+    for (index = 0U; index < length; index++) {
+        char byte = commit[index];
+
+        if (!((byte >= '0' && byte <= '9') ||
+              (byte >= 'A' && byte <= 'F') ||
+              (byte >= 'a' && byte <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int archive_resolve_object_database(const char *project_root,
+                                           archive_workspace_t *workspace)
+{
+    archive_byte_buffer_t common_output = {0};
+    archive_byte_buffer_t format_output = {0};
+    char common_candidate[PATH_MAX];
+    char common_resolved[PATH_MAX];
+    char objects_candidate[PATH_MAX];
+    char *rev_parse_arguments[] = {
+        "git", "-C", (char *)project_root, "rev-parse",
+        "--git-common-dir", NULL
+    };
+    char *format_arguments[] = {
+        "git", "-C", (char *)project_root, "rev-parse",
+        "--show-object-format=storage", NULL
+    };
+    archive_object_format_t object_format;
+    size_t length;
+    struct stat object_stat;
+    int result = -1;
+
+    if (archive_capture_command(format_arguments,
+                                "project Git object format query",
+                                &format_output) != 0 ||
+        format_output.size == 0U) {
+        goto cleanup;
+    }
+    length = format_output.size;
+    if (format_output.bytes[length - 1U] == (unsigned char)'\n') {
+        length--;
+    }
+    if (length != 0U &&
+        format_output.bytes[length - 1U] == (unsigned char)'\r') {
+        length--;
+    }
+    if (length == 4U && memcmp(format_output.bytes, "sha1", 4U) == 0) {
+        object_format = ARCHIVE_OBJECT_FORMAT_SHA1;
+    } else if (length == 6U &&
+               memcmp(format_output.bytes, "sha256", 6U) == 0) {
+        object_format = ARCHIVE_OBJECT_FORMAT_SHA256;
+    } else {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    if (archive_capture_command(rev_parse_arguments,
+                                "project Git metadata query",
+                                &common_output) != 0 ||
+        common_output.size == 0U) {
+        goto cleanup;
+    }
+    length = common_output.size;
+    if (common_output.bytes[length - 1U] == (unsigned char)'\n') {
+        length--;
+    }
+    if (length != 0U &&
+        common_output.bytes[length - 1U] == (unsigned char)'\r') {
+        length--;
+    }
+    if (length == 0U || length >= PATH_MAX ||
+        memchr(common_output.bytes, '\0', length) != NULL ||
+        memchr(common_output.bytes, '\n', length) != NULL) {
+        errno = EINVAL;
+        goto cleanup;
+    }
+    memcpy(common_candidate, common_output.bytes, length);
+    common_candidate[length] = '\0';
+    if (common_candidate[0] != '/') {
+        char relative[PATH_MAX];
+
+        memcpy(relative, common_candidate, length + 1U);
+        if (archive_join_path(common_candidate, project_root, relative) != 0) {
+            goto cleanup;
+        }
+    }
+    if (realpath(common_candidate, common_resolved) == NULL ||
+        archive_join_path(objects_candidate, common_resolved, "objects") !=
+            0 ||
+        realpath(objects_candidate, workspace->source_objects) == NULL ||
+        stat(workspace->source_objects, &object_stat) != 0 ||
+        !S_ISDIR(object_stat.st_mode)) {
+        goto cleanup;
+    }
+    if (archive_write_minimal_git_config(workspace, object_format) != 0) {
+        goto cleanup;
+    }
+    workspace->config_created = true;
+    if (setenv("GIT_DIR", workspace->git, 1) != 0 ||
+        setenv("GIT_OBJECT_DIRECTORY", workspace->source_objects, 1) != 0) {
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    archive_buffer_free(&common_output);
+    archive_buffer_free(&format_output);
+    return result;
+}
+
+static int archive_run_stream_graph(char *const archive_arguments[],
+                                    const archive_string_list_t *expected)
+{
+    int pipes[ARCHIVE_PIPE_COUNT][2];
+    int all_fds[ARCHIVE_PIPE_COUNT * 2U];
+    archive_child_t children[8] = {
+        {-1, "first sanitized Git archive", false},
+        {-1, "second sanitized Git archive", false},
+        {-1, "first fixed gzip compressor", false},
+        {-1, "second fixed gzip compressor", false},
+        {-1, "completed gzip integrity check", false},
+        {-1, "completed gzip tar decoder", false},
+        {-1, "completed tar member check", false},
+        {-1, "completed archive member comparison", true}
+    };
+    char *gzip_compress_arguments[] = {"gzip", "-n", "-9", NULL};
+    char *gzip_integrity_arguments[] = {"gzip", "-t", NULL};
+    char *gzip_decoder_arguments[] = {"gzip", "-dc", NULL};
+    char *tar_arguments[] = {"tar", "-tf", "-", NULL};
+    struct sigaction ignored_pipe;
+    bool repeat_mismatch = false;
+    int stream_result;
+    int stream_errno = 0;
+    int child_result;
+    size_t child_count = sizeof(children) / sizeof(children[0]);
+    size_t index;
+
+    if (archive_create_graph_pipes(pipes, all_fds) != 0) {
+        return -1;
+    }
+    children[7].pid = archive_spawn_manifest_validator(
+        pipes[ARCHIVE_PIPE_LISTING][0], all_fds,
+        ARCHIVE_PIPE_COUNT * 2U, expected);
+    if (children[7].pid < 0) {
+        goto spawn_failure;
+    }
+    children[6].pid = archive_spawn_exec(
+        tar_arguments, pipes[ARCHIVE_PIPE_TAR][0],
+        pipes[ARCHIVE_PIPE_LISTING][1], all_fds,
+        ARCHIVE_PIPE_COUNT * 2U);
+    if (children[6].pid < 0) {
+        goto spawn_failure;
+    }
+    children[5].pid = archive_spawn_exec(
+        gzip_decoder_arguments, pipes[ARCHIVE_PIPE_DECODER][0],
+        pipes[ARCHIVE_PIPE_TAR][1], all_fds, ARCHIVE_PIPE_COUNT * 2U);
+    if (children[5].pid < 0) {
+        goto spawn_failure;
+    }
+    children[4].pid = archive_spawn_exec(
+        gzip_integrity_arguments, pipes[ARCHIVE_PIPE_INTEGRITY][0],
+        STDERR_FILENO, all_fds, ARCHIVE_PIPE_COUNT * 2U);
+    if (children[4].pid < 0) {
+        goto spawn_failure;
+    }
+    children[2].pid = archive_spawn_exec(
+        gzip_compress_arguments, pipes[ARCHIVE_PIPE_RAW_A][0],
+        pipes[ARCHIVE_PIPE_GZIP_A][1], all_fds,
+        ARCHIVE_PIPE_COUNT * 2U);
+    if (children[2].pid < 0) {
+        goto spawn_failure;
+    }
+    children[3].pid = archive_spawn_exec(
+        gzip_compress_arguments, pipes[ARCHIVE_PIPE_RAW_B][0],
+        pipes[ARCHIVE_PIPE_GZIP_B][1], all_fds,
+        ARCHIVE_PIPE_COUNT * 2U);
+    if (children[3].pid < 0) {
+        goto spawn_failure;
+    }
+    children[0].pid = archive_spawn_exec(
+        archive_arguments, -1, pipes[ARCHIVE_PIPE_RAW_A][1], all_fds,
+        ARCHIVE_PIPE_COUNT * 2U);
+    if (children[0].pid < 0) {
+        goto spawn_failure;
+    }
+    children[1].pid = archive_spawn_exec(
+        archive_arguments, -1, pipes[ARCHIVE_PIPE_RAW_B][1], all_fds,
+        ARCHIVE_PIPE_COUNT * 2U);
+    if (children[1].pid < 0) {
+        goto spawn_failure;
+    }
+
+    for (index = 0U; index < ARCHIVE_PIPE_COUNT; index++) {
+        size_t endpoint;
+
+        for (endpoint = 0U; endpoint < 2U; endpoint++) {
+            bool keep =
+                (index == ARCHIVE_PIPE_GZIP_A && endpoint == 0U) ||
+                (index == ARCHIVE_PIPE_GZIP_B && endpoint == 0U) ||
+                (index == ARCHIVE_PIPE_INTEGRITY && endpoint == 1U) ||
+                (index == ARCHIVE_PIPE_DECODER && endpoint == 1U);
+
+            if (!keep && pipes[index][endpoint] >= 0) {
+                (void)close(pipes[index][endpoint]);
+                pipes[index][endpoint] = -1;
+            }
+        }
+    }
+
+    memset(&ignored_pipe, 0, sizeof(ignored_pipe));
+    ignored_pipe.sa_handler = SIG_IGN;
+    if (sigemptyset(&ignored_pipe.sa_mask) != 0 ||
+        sigaction(SIGPIPE, &ignored_pipe, NULL) != 0) {
+        stream_errno = errno;
+        stream_result = -1;
+    } else {
+        stream_result = archive_stream_equal_bytes(
+            pipes[ARCHIVE_PIPE_GZIP_A][0],
+            pipes[ARCHIVE_PIPE_GZIP_B][0],
+            pipes[ARCHIVE_PIPE_INTEGRITY][1],
+            pipes[ARCHIVE_PIPE_DECODER][1], &repeat_mismatch);
+        stream_errno = errno;
+    }
+    archive_close_graph_pipes(pipes);
+    if (stream_result != 0) {
+        if (repeat_mismatch) {
+            fprintf(stderr,
+                    "release-archive: ERROR: repeated archive byte check exited with status 1\n");
+        } else {
+            fprintf(stderr,
+                    "release-archive: ERROR: cannot fan out validated archive bytes: %s\n",
+                    strerror(stream_errno));
+        }
+        archive_terminate_children(children, child_count);
+    }
+    child_result = archive_wait_children(children, child_count);
+    if (stream_result != 0 || child_result != 0) {
+        errno = stream_result != 0 ? stream_errno : EIO;
+        return -1;
+    }
+    return 0;
+
+spawn_failure:
+    stream_errno = errno;
+    archive_close_graph_pipes(pipes);
+    archive_terminate_children(children, child_count);
+    (void)archive_wait_children(children, child_count);
+    errno = stream_errno;
+    return -1;
+}
+
+static int run_internal_release_archive(char *const arguments[])
+{
+    archive_workspace_t workspace;
+    archive_byte_buffer_t tree_paths = {0};
+    archive_string_list_t expected = {0};
+    char resolved_root[PATH_MAX];
+    char prefix_argument[PATH_MAX];
+    char *path_copy = NULL;
+    char *tmp_copy = NULL;
+    char **tree_arguments = NULL;
+    char **archive_arguments = NULL;
+    const char *project_root;
+    const char *commit;
+    const char *dist_root;
+    const char *path;
+    const char *tmp_parent;
+    size_t manifest_count = 0U;
+    size_t index;
+    int prefix_length;
+    int result = EXIT_FAILURE;
+    int cleanup_result;
+
+    memset(&workspace, 0, sizeof(workspace));
+    if (arguments[0] == NULL ||
+        strcmp(arguments[0], ARCHIVE_INTERNAL_TOKEN) != 0 ||
+        arguments[1] == NULL || arguments[2] == NULL ||
+        arguments[3] == NULL || arguments[4] == NULL ||
+        strcmp(arguments[4], "--") != 0 || arguments[5] == NULL) {
+        fprintf(stderr,
+                "release-archive: ERROR: invalid internal archive invocation\n");
+        goto cleanup;
+    }
+    project_root = arguments[1];
+    commit = arguments[2];
+    dist_root = arguments[3];
+    for (index = 5U; arguments[index] != NULL; index++) {
+        const unsigned char *manifest_path =
+            (const unsigned char *)arguments[index];
+
+        if (!archive_tree_path_is_portable(manifest_path,
+                                            strlen(arguments[index]))) {
+            fprintf(stderr,
+                    "release-archive: ERROR: release manifest operand is not portable: %s\n",
+                    arguments[index]);
+            goto cleanup;
+        }
+        manifest_count++;
+    }
+    if (project_root[0] != '/' ||
+        realpath(project_root, resolved_root) == NULL ||
+        !archive_commit_is_hexadecimal(commit) ||
+        !archive_component_is_safe(dist_root)) {
+        fprintf(stderr,
+                "release-archive: ERROR: invalid archive root, commit, or distribution name\n");
+        goto cleanup;
+    }
+    path = getenv("PATH"); /* Flawfinder: ignore — snapshotted explicit release toolchain path; all other inherited state is cleared below */
+    tmp_parent = getenv("TMPDIR"); /* Flawfinder: ignore — validated absolute parent for a private mkdtemp workspace */
+    if (path == NULL || path[0] == '\0') {
+        fprintf(stderr,
+                "release-archive: ERROR: PATH is required to resolve archive tools\n");
+        goto cleanup;
+    }
+    if (tmp_parent == NULL || tmp_parent[0] == '\0') {
+        tmp_parent = "/tmp";
+    }
+    if (tmp_parent[0] != '/') {
+        fprintf(stderr,
+                "release-archive: ERROR: TMPDIR must be absolute\n");
+        goto cleanup;
+    }
+    path_copy = strdup(path);
+    tmp_copy = strdup(tmp_parent);
+    if (path_copy == NULL || tmp_copy == NULL) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot snapshot archive environment\n");
+        goto cleanup;
+    }
+    (void)umask(S_IRWXG | S_IRWXO);
+    if (archive_workspace_create(&workspace, tmp_copy) != 0) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot create private archive workspace: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (archive_set_clean_environment(path_copy, &workspace) != 0 ||
+        archive_resolve_object_database(resolved_root, &workspace) != 0) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot establish sanitized Git metadata: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    prefix_length = snprintf(prefix_argument, sizeof(prefix_argument),
+                             "--prefix=%s/", dist_root);
+    if (prefix_length < 0 ||
+        (size_t)prefix_length >= sizeof(prefix_argument)) {
+        fprintf(stderr,
+                "release-archive: ERROR: distribution prefix is too long\n");
+        goto cleanup;
+    }
+    if (manifest_count > (SIZE_MAX / sizeof(*tree_arguments)) - 8U) {
+        fprintf(stderr,
+                "release-archive: ERROR: release manifest is too large\n");
+        goto cleanup;
+    }
+    tree_arguments = calloc(manifest_count + 7U,
+                            sizeof(*tree_arguments));
+    archive_arguments = calloc(manifest_count + 7U,
+                               sizeof(*archive_arguments));
+    if (tree_arguments == NULL || archive_arguments == NULL) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot allocate archive arguments\n");
+        goto cleanup;
+    }
+    tree_arguments[0] = "git";
+    tree_arguments[1] = "ls-tree";
+    tree_arguments[2] = "-rz";
+    tree_arguments[3] = "--name-only";
+    tree_arguments[4] = (char *)commit;
+    tree_arguments[5] = "--";
+    archive_arguments[0] = "git";
+    archive_arguments[1] = "archive";
+    archive_arguments[2] = "--format=tar";
+    archive_arguments[3] = prefix_argument;
+    archive_arguments[4] = (char *)commit;
+    archive_arguments[5] = "--";
+    for (index = 0U; index < manifest_count; index++) {
+        tree_arguments[index + 6U] = arguments[index + 5U];
+        archive_arguments[index + 6U] = arguments[index + 5U];
+    }
+    if (archive_capture_command(tree_arguments,
+                                "exact committed manifest query",
+                                &tree_paths) != 0 ||
+        archive_build_expected_members(&tree_paths, dist_root, &expected) !=
+            0) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot derive an exact portable committed release manifest: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (archive_run_stream_graph(archive_arguments, &expected) != 0) {
+        fprintf(stderr,
+                "release-archive: ERROR: archive generation or validation failed\n");
+        goto cleanup;
+    }
+    result = EXIT_SUCCESS;
+
+cleanup:
+    archive_list_free(&expected);
+    archive_buffer_free(&tree_paths);
+    free(tree_arguments);
+    free(archive_arguments);
+    free(path_copy);
+    free(tmp_copy);
+    cleanup_result = archive_workspace_cleanup(&workspace);
+    if (cleanup_result != 0) {
+        fprintf(stderr,
+                "release-archive: ERROR: cannot remove private archive workspace: %s\n",
+                strerror(errno));
+        result = EXIT_FAILURE;
+    }
+    return result;
+}
+
 /* Keep the direct child PID published until its terminal status has been
  * retained. In particular, a successful direct child can become waitable
  * while a descendant still owns the output pipe. */
@@ -1305,7 +2718,8 @@ static void report_producer_failure(int status)
     }
 }
 
-static int run_to_descriptor(int output_fd, char *const command[])
+static int run_to_descriptor(int output_fd, int directory_fd,
+                             char *const command[])
 {
     int pipe_fds[2];
     int status;
@@ -1350,6 +2764,12 @@ static int run_to_descriptor(int output_fd, char *const command[])
         }
         if (output_fd != STDOUT_FILENO) {
             (void)close(output_fd);
+        }
+        if (directory_fd > STDERR_FILENO) {
+            (void)close(directory_fd);
+        }
+        if (strcmp(command[0], ARCHIVE_INTERNAL_TOKEN) == 0) {
+            _exit(run_internal_release_archive(command));
         }
         execvp(command[0], command); /* Flawfinder: ignore — argv-vector exec of the operator's archive command; no shell, vector from the Makefile recipe */
         _exit(errno == ENOENT ? 127 : 126);
@@ -1867,7 +3287,7 @@ int main(int argc, char **argv)
                 strerror(errno));
         goto cleanup;
     }
-    if (run_to_descriptor(output_fd, &argv[5]) != 0) {
+    if (run_to_descriptor(output_fd, directory_fd, &argv[5]) != 0) {
         goto cleanup;
     }
     if (fstat(output_fd, &output_stat) != 0 ||

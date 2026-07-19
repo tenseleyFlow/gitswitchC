@@ -25,7 +25,7 @@ for tool in shellcheck bash zsh fish dash ksh awk; do
 done
 [ "$missing" -eq 0 ] || exit 1
 
-set -- "$root"/tests/*.sh "$root/tools/release_publish_lock.sh"
+set -- "$root"/tests/*.sh "$root"/tools/*.sh
 [ -e "$1" ] || fail "no POSIX test scripts discovered under $root/tests"
 script_count=$#
 

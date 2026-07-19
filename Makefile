@@ -2005,8 +2005,9 @@ release-manifest-check:
 # the manifest directories shipped any stray file nested inside src/, tests/,
 # or completions/ (editor backups, experiment files, test-run droppings), so
 # release tarballs were not reproducible from a tag and could leak unreviewed
-# content (AR-05 L5). git archive draws from HEAD, which also inherently
-# excludes VCS state, build products, cores, logs, and prior archives.
+# content (AR-05 L5). The producer archives the selected commit twice through
+# clean Git metadata and fixed gzip, validates both completed streams and exact
+# membership, then emits only the byte-identical candidate to the publisher.
 dist: tools/release_publish_lock.sh
 	+@sh tools/release_publish_lock.sh "$(DIST_PUBLISH_LOCK)" \
 		"$(MAKE_COMMAND)" --no-print-directory _dist-release-locked
@@ -2053,14 +2054,13 @@ _dist-release-locked: release-manifest-check \
 	echo "Creating distribution tarball: $$expected_rel"; \
 	"$$root_physical/$(DIST_PUBLISH_HELPER)" . "$$actual_dir" \
 		"$$GITSWITCH_DIST_ARCHIVE_NAME" -- \
-		git -C "$$root_physical" archive --format=tar.gz \
-		--prefix="$$GITSWITCH_DIST_ROOT/" \
-		"$(RELEASE_COMMIT)" -- $(DIST_MANIFEST)
+		--internal-release-archive-v1 "$$root_physical" \
+		"$(RELEASE_COMMIT)" "$$GITSWITCH_DIST_ROOT" -- $(DIST_MANIFEST)
 
 distcheck: dist
 	@sh tests/test_dist.sh "$$GITSWITCH_DIST_ARCHIVE_PATH" \
 		"$$GITSWITCH_DIST_ROOT" \
-		"$(PREFIX)" "$(MAKE_COMMAND)"
+		"$(PREFIX)" "$(MAKE_COMMAND)" -- $(DIST_MANIFEST)
 
 # Keep the declared FreeBSD floor tied to both its required headers and the
 # exact hosted release that executes publication/reset behavior.

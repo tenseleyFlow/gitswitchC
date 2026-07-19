@@ -968,6 +968,7 @@ assert_archive_metadata()
     version=$3
 
     [ -f "$archive" ] || fail "release archive not produced: $archive"
+    gzip -t "$archive" || fail "release archive is not a complete gzip stream"
     members=$(tar -tzf "$archive") || fail "cannot list release archive"
     root_entries=$(printf '%s\n' "$members" |
         grep -Ec "^${dist_root}/?$" || true)
@@ -1035,6 +1036,56 @@ inspect_dist_residue()
     # without funlinkat. This isolated contract owns the directory after the
     # helper exits, so it can remove the inspected residue between cases.
     rm -f "$1"
+}
+
+inspect_failed_dist_residue()
+{
+    residue_archive=$1
+    residue_platform=$2
+    residue_archive_dir=${residue_archive%/*}
+    residue_archive_name=${residue_archive##*/}
+
+    { [ ! -e "$residue_archive" ] && [ ! -L "$residue_archive" ]; } ||
+        fail "failed archive validation published a canonical artifact"
+
+    set -- "$residue_archive_dir/.$residue_archive_name.tmp."*
+    if [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then
+        [ "$residue_platform" != Darwin ] ||
+            fail "Darwin archive rejection did not retain its private source"
+        return
+    fi
+    { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+        fail "failed archive validation left an unexpected staging namespace"
+    [ "$residue_platform" != FreeBSD ] ||
+        fail "FreeBSD archive rejection retained a temporary despite funlinkat"
+
+    # Platforms without descriptor-conditioned unlink deliberately retain the
+    # failed private source. This isolated fixture owns the directory and can
+    # remove that inspected diagnostic residue before the next case.
+    rm -f "$1"
+}
+
+expect_archive_validation_rejected()
+{
+    label=$1
+    expected=$2
+    repo=$3
+    make_cmd=$4
+    archive=$5
+    out=$6
+    shim_dir=$7
+    platform=$8
+
+    rm -f "$archive"
+    if PATH="$shim_dir:$PATH" \
+        "$make_cmd" -C "$repo" dist >"$out" 2>&1; then
+        fail "$label archive validation unexpectedly succeeded"
+    fi
+    grep -F "$expected" "$out" >/dev/null || {
+        sed -n '1,200p' "$out" >&2
+        fail "$label rejection did not identify the failed validation gate"
+    }
+    inspect_failed_dist_residue "$archive" "$platform"
 }
 
 expect_dirty_rejected()
@@ -2323,6 +2374,291 @@ check_manifest_contract()
     assert_archive_metadata "$archive" "$dist_root" "$version"
     inspect_dist_residue "$archive" "$copy_platform"
 
+    # AR-11 M40: repository-private attributes and archive-format commands are
+    # operator state, not release inputs. A clean archive is the byte oracle;
+    # each independently poisoned rerun must remain identical to it. The Git
+    # wrapper also proves one publication performs the two generations needed
+    # for the producer's pre-publication byte-repeat check.
+    cp "$archive" "$tmp/hermetic-archive.baseline" ||
+        fail "cannot preserve hermetic archive baseline"
+    clean_git_dir=$(git -C "$clean_repo" rev-parse --absolute-git-dir) ||
+        fail "cannot resolve cloned Git directory"
+    printf '%s\n' 'README.md export-ignore' >"$clean_git_dir/info/attributes" ||
+        fail "cannot install repository-private attribute fixture"
+    rm -f "$archive"
+    "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 || {
+        sed -n '1,200p' "$out" >&2
+        fail "repository-private attributes changed release generation"
+    }
+    assert_archive_metadata "$archive" "$dist_root" "$version"
+    cmp -s "$archive" "$tmp/hermetic-archive.baseline" ||
+        fail "repository-private attributes changed release bytes"
+    rm -f "$archive" "$clean_git_dir/info/attributes"
+
+    # A workspace root can be created successfully while its first child path
+    # exceeds PATH_MAX. Cleanup must then remove only the root it actually
+    # created; uninitialized derived fields may never become root-relative
+    # /config, /HEAD, or /refs removal attempts.
+    path_max=$(getconf PATH_MAX "$tmp" 2>/dev/null) ||
+        fail "cannot resolve PATH_MAX for archive workspace fixture"
+    name_max=$(getconf NAME_MAX "$tmp" 2>/dev/null) ||
+        fail "cannot resolve NAME_MAX for archive workspace fixture"
+    case $path_max:$name_max in
+        *[!0-9:]*|:*|*:) fail "invalid archive workspace path limits" ;;
+    esac
+    archive_workspace_suffix=/gitswitch-release-archive.XXXXXX
+    long_tmp_target=$((path_max - ${#archive_workspace_suffix} - 2))
+    long_tmp=$tmp
+    [ "$long_tmp_target" -gt $((${#long_tmp} + 2)) ] ||
+        fail "PATH_MAX is too small for archive workspace fixture"
+    component_limit=$name_max
+    [ "$component_limit" -le 128 ] || component_limit=128
+    while [ "${#long_tmp}" -lt "$long_tmp_target" ]; do
+        component_length=$((long_tmp_target - ${#long_tmp} - 1))
+        [ "$component_length" -gt 0 ] ||
+            fail "cannot extend archive workspace fixture path"
+        [ "$component_length" -le "$component_limit" ] ||
+            component_length=$component_limit
+        long_component=$(awk -v count="$component_length" '
+            BEGIN { for (position = 0; position < count; position++) printf "w" }
+        ') || fail "cannot generate archive workspace path component"
+        [ "${#long_component}" -eq "$component_length" ] ||
+            fail "archive workspace path component was truncated"
+        long_tmp=$long_tmp/$long_component
+        mkdir "$long_tmp" || fail "cannot create long archive workspace path"
+    done
+    [ $((${#long_tmp} + ${#archive_workspace_suffix})) -lt "$path_max" ] &&
+        [ $((${#long_tmp} + ${#archive_workspace_suffix} + 5)) -ge "$path_max" ] ||
+        fail "archive workspace fixture does not straddle PATH_MAX"
+    printf '%s\n' caller-owned >"$long_tmp/caller-sentinel" ||
+        fail "cannot create archive workspace ownership sentinel"
+    if TMPDIR="$long_tmp" \
+        "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1; then
+        fail "overlong archive workspace child unexpectedly succeeded"
+    fi
+    grep -F 'cannot create private archive workspace' "$out" >/dev/null || {
+        sed -n '1,200p' "$out" >&2
+        fail "overlong archive workspace failure was not diagnosed"
+    }
+    [ "$(cat "$long_tmp/caller-sentinel")" = caller-owned ] ||
+        fail "archive workspace cleanup changed its caller-owned TMPDIR"
+    set -- "$long_tmp"/gitswitch-release-archive.*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "failed archive workspace creation left a private root"
+    inspect_failed_dist_residue "$archive" "$copy_platform"
+
+    hermetic_shims=$tmp/hermetic-git-shims
+    mkdir "$hermetic_shims" || fail "cannot create hermetic Git shim directory"
+    real_git=$(command -v git) || fail "git is unavailable for hermetic fixture"
+    real_gzip=$(command -v gzip) ||
+        fail "gzip is unavailable for hermetic fixture"
+    printf '%s\n' "$real_git" >"$hermetic_shims/real-git" ||
+        fail "cannot record hermetic fixture Git path"
+    printf '%s\n' "$real_gzip" >"$hermetic_shims/real-gzip" ||
+        fail "cannot record hermetic fixture gzip path"
+    cat >"$hermetic_shims/git" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r real_git <"$shim_dir/real-git" || exit 91
+is_archive=false
+is_ls_tree=false
+for argument do
+    case $argument in
+        archive) is_archive=true ;;
+        ls-tree) is_ls_tree=true ;;
+    esac
+done
+if [ "$is_archive" = true ]; then
+    printf '%s\n' archive >>"$shim_dir/archive-calls" || exit 92
+fi
+mode=
+if [ -f "$shim_dir/git-mode" ]; then
+    IFS= read -r mode <"$shim_dir/git-mode" || exit 93
+fi
+if [ "$mode" = manifest-missing-actual ] && [ "$is_ls_tree" = true ]; then
+    "$real_git" "$@" || exit $?
+    printf '%s\000' tests/.ar11-m40-unexpected
+    exit 0
+fi
+if [ "$mode" = manifest-unexpected-actual ] && [ "$is_ls_tree" = true ]; then
+    # Keep both archive streams unchanged while removing one committed member
+    # from the independent manifest oracle. Query each other manifest operand
+    # separately; the validator sorts and deduplicates the resulting NUL list.
+    [ "$#" -ge 6 ] && [ "$1" = ls-tree ] && [ "$5" = -- ] || exit 94
+    tree_command=$1
+    tree_recursive=$2
+    tree_names=$3
+    tree_commit=$4
+    shift 5
+    for tree_path do
+        [ "$tree_path" = README.md ] && continue
+        "$real_git" "$tree_command" "$tree_recursive" "$tree_names" \
+            "$tree_commit" -- "$tree_path" || exit $?
+    done
+    exit 0
+fi
+exec "$real_git" "$@"
+EOF
+    cat >"$hermetic_shims/gzip" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r real_gzip <"$shim_dir/real-gzip" || exit 94
+mode=
+if [ -f "$shim_dir/gzip-mode" ]; then
+    IFS= read -r mode <"$shim_dir/gzip-mode" || exit 95
+fi
+if [ "$#" -eq 2 ] && [ "$1" = -n ] && [ "$2" = -9 ]; then
+    printf '%s\n' 'compress:-n:-9' >>"$shim_dir/gzip-calls" || exit 96
+    if [ "$mode" = repeat-diverge ]; then
+        if mkdir "$shim_dir/first-compression" 2>/dev/null; then
+            exec "$real_gzip" -n -9
+        else
+            # Keep the stream valid and exactly the same length while changing
+            # only gzip's informational OS header byte. Length-only or
+            # decompressed-payload comparisons therefore cannot satisfy the
+            # repeated-byte gate.
+            "$real_gzip" -n -9 | {
+                dd bs=1 count=9 2>/dev/null
+                dd bs=1 count=1 of=/dev/null 2>/dev/null
+                printf '\377'
+                cat
+            }
+            exit $?
+        fi
+    fi
+elif [ "$#" -eq 1 ] && [ "$1" = -t ]; then
+    printf '%s\n' 'integrity:-t' >>"$shim_dir/gzip-calls" || exit 97
+    [ "$mode" != integrity-fail ] || exit 73
+fi
+exec "$real_gzip" "$@"
+EOF
+    real_tar=$(command -v tar) || fail "tar is unavailable for hermetic fixture"
+    printf '%s\n' "$real_tar" >"$hermetic_shims/real-tar" ||
+        fail "cannot record hermetic fixture tar path"
+    cat >"$hermetic_shims/tar" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r real_tar <"$shim_dir/real-tar" || exit 98
+mode=
+if [ -f "$shim_dir/tar-mode" ]; then
+    IFS= read -r mode <"$shim_dir/tar-mode" || exit 99
+fi
+if [ "$#" -eq 2 ] && [ "$1" = -tf ] && [ "$2" = - ]; then
+    printf '%s\n' 'list:-tf:-' >>"$shim_dir/tar-calls" || exit 100
+    "$real_tar" "$@" || exit $?
+    [ "$mode" != status-fail ] || exit 74
+    exit 0
+fi
+exec "$real_tar" "$@"
+EOF
+    cat >"$hermetic_shims/configured-compressor" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+printf '%s\n' invoked >"$shim_dir/compressor-invoked" || exit 93
+printf '%s\n' locally-configured-encoding
+EOF
+    chmod 0700 "$hermetic_shims/git" "$hermetic_shims/gzip" \
+        "$hermetic_shims/tar" \
+        "$hermetic_shims/configured-compressor" ||
+        fail "cannot make hermetic fixture shims executable"
+    git -C "$clean_repo" config --local tar.tar.gz.command \
+        "$hermetic_shims/configured-compressor" ||
+        fail "cannot install repository-local compressor fixture"
+    git -C "$clean_repo" config --local tar.umask 077 ||
+        fail "cannot install repository-local tar umask fixture"
+    PATH="$hermetic_shims:$PATH" \
+        "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 || {
+        sed -n '1,200p' "$out" >&2
+        fail "repository-local archive configuration changed release generation"
+    }
+    git -C "$clean_repo" config --local --unset-all tar.tar.gz.command ||
+        fail "cannot remove repository-local compressor fixture"
+    git -C "$clean_repo" config --local --unset-all tar.umask ||
+        fail "cannot remove repository-local tar umask fixture"
+    [ ! -e "$hermetic_shims/compressor-invoked" ] ||
+        fail "release invoked the repository-local archive compressor"
+    [ "$(wc -l <"$hermetic_shims/archive-calls")" -eq 2 ] ||
+        fail "release did not compare two independently generated archives"
+    [ "$(grep -Fxc 'compress:-n:-9' \
+        "$hermetic_shims/gzip-calls" || true)" -eq 2 ] ||
+        fail "release did not use fixed gzip -n -9 for both archive streams"
+    [ "$(grep -Fxc 'integrity:-t' \
+        "$hermetic_shims/gzip-calls" || true)" -eq 1 ] ||
+        fail "release did not integrity-check its completed gzip stream"
+    assert_archive_metadata "$archive" "$dist_root" "$version"
+    cmp -s "$archive" "$tmp/hermetic-archive.baseline" ||
+        fail "repository-local archive configuration changed release bytes"
+
+    # Each validation gate gets a causal failure mode. The compressor shim
+    # makes two valid but byte-distinct gzip streams, the Git shim perturbs only
+    # the manifest oracle after both archives are complete, and the integrity
+    # mode fails only gzip -t, and the tar shim emits a full valid listing
+    # before failing its terminal status. None may create the canonical name.
+    rm -f "$hermetic_shims/gzip-calls"
+    rmdir "$hermetic_shims/first-compression" 2>/dev/null || :
+    printf '%s\n' repeat-diverge >"$hermetic_shims/gzip-mode" ||
+        fail "cannot arm repeated-byte divergence fixture"
+    expect_archive_validation_rejected \
+        "repeated-byte" \
+        "repeated archive byte check exited with status 1" \
+        "$clean_repo" "$make_cmd" "$archive" "$out" \
+        "$hermetic_shims" "$copy_platform"
+    [ "$(grep -Fxc 'compress:-n:-9' \
+        "$hermetic_shims/gzip-calls" || true)" -eq 2 ] ||
+        fail "repeated-byte fixture did not exercise both fixed compressors"
+
+    rm -f "$hermetic_shims/gzip-mode" "$hermetic_shims/gzip-calls" \
+        "$hermetic_shims/archive-calls"
+    rmdir "$hermetic_shims/first-compression" 2>/dev/null || :
+    printf '%s\n' manifest-missing-actual >"$hermetic_shims/git-mode" ||
+        fail "cannot arm missing-actual manifest fixture"
+    expect_archive_validation_rejected \
+        "missing-actual manifest" \
+        "completed archive differs from the exact committed release manifest" \
+        "$clean_repo" "$make_cmd" "$archive" "$out" \
+        "$hermetic_shims" "$copy_platform"
+    [ "$(wc -l <"$hermetic_shims/archive-calls")" -eq 2 ] ||
+        fail "missing-actual manifest fixture did not complete both archive streams"
+
+    rm -f "$hermetic_shims/git-mode" "$hermetic_shims/gzip-calls" \
+        "$hermetic_shims/archive-calls"
+    printf '%s\n' manifest-unexpected-actual >"$hermetic_shims/git-mode" ||
+        fail "cannot arm unexpected-actual manifest fixture"
+    expect_archive_validation_rejected \
+        "unexpected-actual manifest" \
+        "completed archive differs from the exact committed release manifest" \
+        "$clean_repo" "$make_cmd" "$archive" "$out" \
+        "$hermetic_shims" "$copy_platform"
+    [ "$(wc -l <"$hermetic_shims/archive-calls")" -eq 2 ] ||
+        fail "unexpected-actual manifest fixture did not complete both archive streams"
+
+    rm -f "$hermetic_shims/git-mode" "$hermetic_shims/gzip-calls" \
+        "$hermetic_shims/archive-calls"
+    printf '%s\n' integrity-fail >"$hermetic_shims/gzip-mode" ||
+        fail "cannot arm gzip-integrity failure fixture"
+    expect_archive_validation_rejected \
+        "gzip-integrity" \
+        "completed gzip integrity check exited with status 73" \
+        "$clean_repo" "$make_cmd" "$archive" "$out" \
+        "$hermetic_shims" "$copy_platform"
+    [ "$(grep -Fxc 'integrity:-t' \
+        "$hermetic_shims/gzip-calls" || true)" -eq 1 ] ||
+        fail "gzip-integrity fixture did not exercise the completed-stream check"
+    rm -f "$hermetic_shims/gzip-mode" "$hermetic_shims/gzip-calls" \
+        "$hermetic_shims/tar-calls"
+
+    printf '%s\n' status-fail >"$hermetic_shims/tar-mode" ||
+        fail "cannot arm completed-tar status fixture"
+    expect_archive_validation_rejected \
+        "completed-tar status" \
+        "completed tar member check exited with status 74" \
+        "$clean_repo" "$make_cmd" "$archive" "$out" \
+        "$hermetic_shims" "$copy_platform"
+    [ "$(grep -Fxc 'list:-tf:-' \
+        "$hermetic_shims/tar-calls" || true)" -eq 1 ] ||
+        fail "completed-tar fixture did not exercise the listing child"
+    rm -f "$hermetic_shims/tar-mode" "$hermetic_shims/tar-calls"
+
     # The root-local mutex must cover the verified helper's use, not merely
     # generation. Gate A inside `git archive`, then prove an independent Make
     # process with a different HOSTCC cannot compile or replace the shared
@@ -2339,25 +2675,33 @@ check_manifest_contract()
     real_hostcc=$(command -v cc 2>/dev/null ||
         command -v gcc 2>/dev/null || command -v clang 2>/dev/null) ||
         fail "a host C compiler is unavailable for lock fixture"
+    printf '%s\n' "$real_git" >"$lock_shims/real-git"
+    printf '%s\n' "$lock_ready" >"$lock_shims/ready"
+    printf '%s\n' "$lock_release" >"$lock_shims/release"
     cat >"$lock_shims/git" <<'EOF'
 #!/bin/sh
-: "${AR11_LOCK_REAL_GIT:?}"
-: "${AR11_LOCK_REPO:?}"
-: "${AR11_LOCK_READY:?}"
-: "${AR11_LOCK_RELEASE:?}"
-if [ "${1-}" = -C ] && [ "${2-}" = "$AR11_LOCK_REPO" ] &&
-   [ "${3-}" = archive ]; then
-    ready_tmp=$AR11_LOCK_READY.tmp.$$
+shim_dir=${0%/*}
+IFS= read -r real_git <"$shim_dir/real-git" || exit 90
+IFS= read -r ready <"$shim_dir/ready" || exit 91
+IFS= read -r release <"$shim_dir/release" || exit 92
+is_archive=false
+for argument do
+    if [ "$argument" = archive ]; then
+        is_archive=true
+    fi
+done
+if [ "$is_archive" = true ]; then
+    ready_tmp=$ready.tmp.$$
     printf '%s\n' "$$" >"$ready_tmp" || exit 91
-    mv -f "$ready_tmp" "$AR11_LOCK_READY" || exit 92
+    mv -f "$ready_tmp" "$ready" || exit 93
     gate_tries=0
-    while [ ! -s "$AR11_LOCK_RELEASE" ]; do
+    while [ ! -s "$release" ]; do
         gate_tries=$((gate_tries + 1))
-        [ "$gate_tries" -lt 300 ] || exit 93
+        [ "$gate_tries" -lt 300 ] || exit 94
         sleep 0.1
     done
 fi
-exec "$AR11_LOCK_REAL_GIT" "$@"
+exec "$real_git" "$@"
 EOF
     cat >"$lock_shims/hostcc-b" <<'EOF'
 #!/bin/sh
@@ -2378,10 +2722,6 @@ EOF
     (
         lock_a_status=0
         PATH="$lock_shims:$PATH" \
-            AR11_LOCK_REAL_GIT="$real_git" \
-            AR11_LOCK_REPO="$clean_repo" \
-            AR11_LOCK_READY="$lock_ready" \
-            AR11_LOCK_RELEASE="$lock_release" \
             "$make_cmd" -C "$clean_repo" dist >"$lock_a_out" 2>&1 ||
             lock_a_status=$?
         status_tmp=$lock_status.tmp.$$
@@ -2617,9 +2957,15 @@ EOF
     race_marker=$tmp/dist-race.marker
     mkdir "$race_shims"
     real_git=$(command -v git) || fail "git is unavailable for dist race"
+    printf '%s\n' "$real_git" >"$race_shims/real-git"
+    printf '%s\n' "$race_marker" >"$race_shims/marker"
+    printf '%s\n' "$race_repo/VERSION" >"$race_shims/target"
     cat >"$race_shims/git" <<'EOF'
 #!/bin/sh
-: "${AR08_REAL_GIT:?}"
+shim_dir=${0%/*}
+IFS= read -r real_git <"$shim_dir/real-git" || exit 90
+IFS= read -r marker <"$shim_dir/marker" || exit 91
+IFS= read -r target <"$shim_dir/target" || exit 92
 output=
 previous=
 is_archive=false
@@ -2634,26 +2980,29 @@ for arg do
     previous=$arg
 done
 if [ "$is_archive" = true ]; then
-    printf '%s\n' invoked >>"$AR08_DIST_RACE_MARKER"
-    if [ -n "${AR08_DIST_SWAP_DIR-}" ]; then
-        mv "$AR08_DIST_SWAP_DIR" "$AR08_DIST_SWAP_DIR.pinned"
-        mkdir "$AR08_DIST_SWAP_DIR"
+    printf '%s\n' invoked >>"$marker"
+    swap_dir=
+    if [ -f "$shim_dir/swap-dir" ]; then
+        IFS= read -r swap_dir <"$shim_dir/swap-dir" || exit 93
+    fi
+    if [ -n "$swap_dir" ]; then
+        mv "$swap_dir" "$swap_dir.pinned"
+        mkdir "$swap_dir"
+        rm -f "$shim_dir/swap-dir"
     fi
     if [ -n "$output" ]; then
         rm -f "$output"
-        ln -s "$AR08_DIST_RACE_TARGET" "$output"
+        ln -s "$target" "$output"
     fi
 fi
-exec "$AR08_REAL_GIT" "$@"
+exec "$real_git" "$@"
 EOF
     chmod 0700 "$race_shims/git"
     cp "$race_repo/VERSION" "$tmp/race.VERSION.before"
     cp "$race_repo/README.md" "$tmp/race.README.before"
     race_version=$(cat "$race_repo/VERSION")
     race_archive=$race_repo/build/dist/gitswitcher-$race_version.tar.gz
-    PATH="$race_shims:$PATH" AR08_REAL_GIT="$real_git" \
-        AR08_DIST_RACE_MARKER="$race_marker" \
-        AR08_DIST_RACE_TARGET="$race_repo/VERSION" \
+    PATH="$race_shims:$PATH" \
         "$make_cmd" -C "$race_repo" dist >"$out" 2>&1 || {
         sed -n '1,200p' "$out" >&2
         fail "descriptor-pinned distribution race fixture failed"
@@ -2668,10 +3017,9 @@ EOF
     inspect_dist_residue "$race_archive" "$copy_platform"
     rm -f "$race_archive"
     : >"$race_marker"
-    if PATH="$race_shims:$PATH" AR08_REAL_GIT="$real_git" \
-        AR08_DIST_RACE_MARKER="$race_marker" \
-        AR08_DIST_RACE_TARGET="$race_repo/VERSION" \
-        AR08_DIST_SWAP_DIR="$race_repo/build/dist" \
+    printf '%s\n' "$race_repo/build/dist" >"$race_shims/swap-dir" ||
+        fail "cannot arm distribution-directory substitution fixture"
+    if PATH="$race_shims:$PATH" \
         "$make_cmd" -C "$race_repo" dist >"$out" 2>&1; then
         fail "distribution succeeded after its canonical directory was replaced"
     fi

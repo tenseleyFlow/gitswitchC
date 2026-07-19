@@ -30,13 +30,14 @@ cleanup()
 trap cleanup 0
 trap 'exit 1' 1 2 3 15
 
-if [ "$#" -ne 4 ]; then
-    fail "usage: $0 ARCHIVE DIST_ROOT PREFIX MAKE"
+if [ "$#" -lt 6 ] || [ "$5" != -- ]; then
+    fail "usage: $0 ARCHIVE DIST_ROOT PREFIX MAKE -- MANIFEST_PATH [PATH ...]"
 fi
 
 dist_root=$2
 prefix=$3
 make_cmd=$4
+shift 5
 
 [ -f "$archive" ] || fail "archive not found: $archive"
 case $prefix in
@@ -67,7 +68,8 @@ tmp=$(mktemp -d "$HOME/.gitswitch-distcheck.XXXXXX")
 chmod 0700 "$tmp" || fail "cannot make distcheck build root private"
 
 members=$tmp/archive-members.txt
-tar -tzf "$archive" >"$members"
+gzip -t "$archive" || fail "archive is not a complete gzip stream"
+tar -tzf "$archive" >"$members" || fail "cannot list archive members"
 
 root_entries=$(grep -Ec "^${dist_root}/?$" "$members" || true)
 [ "$root_entries" -eq 1 ] || fail "archive must contain exactly one top-level $dist_root directory"
@@ -80,6 +82,28 @@ fi
 if grep -E '(^|/)(\.git|\.omx)(/|$)|(^|/)build(/|$)|\.(o|core|tar\.gz)$|(^|/)valgrind[^/]*\.log$' "$members" >/dev/null; then
     fail "archive contains excluded build, VCS, OMX, core, log, or archive content"
 fi
+
+# AR-11 M40: membership must equal the selected commit manifest exactly, not
+# merely contain a short required subset. Directory headers are archive
+# structure; every non-directory member must correspond one-for-one to a blob
+# or symlink selected from the immutable release commit.
+expected_members=$tmp/expected-members.txt
+expected_paths=$tmp/expected-paths.txt
+expected_prefixed=$tmp/expected-prefixed.txt
+actual_members=$tmp/actual-members.txt
+actual_unsorted=$tmp/actual-members-unsorted.txt
+git ls-tree -r --name-only HEAD -- "$@" >"$expected_paths" ||
+    fail "cannot derive exact committed release manifest"
+sed "s#^#${dist_root}/#" <"$expected_paths" >"$expected_prefixed" ||
+    fail "cannot prefix exact committed release manifest"
+LC_ALL=C sort "$expected_prefixed" >"$expected_members" ||
+    fail "cannot sort exact committed release manifest"
+grep -v '/$' "$members" >"$actual_unsorted" ||
+    fail "cannot normalize archive member manifest"
+LC_ALL=C sort "$actual_unsorted" >"$actual_members" ||
+    fail "cannot sort archive member manifest"
+cmp -s "$expected_members" "$actual_members" ||
+    fail "archive members differ from the exact committed release manifest"
 
 tar -xzf "$archive" -C "$tmp"
 source_root=$tmp/$dist_root
