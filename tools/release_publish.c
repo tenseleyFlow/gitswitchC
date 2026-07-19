@@ -90,6 +90,329 @@ static bool same_identity(const struct stat *left, const struct stat *right)
            S_ISREG(left->st_mode) && S_ISREG(right->st_mode);
 }
 
+#define SHA256_BLOCK_SIZE 64U
+#define SHA256_DIGEST_SIZE 32U
+
+typedef struct sha256_context {
+    uint32_t state[8];
+    uint64_t total_size;
+    unsigned char block[SHA256_BLOCK_SIZE];
+    size_t block_size;
+} sha256_context_t;
+
+static uint32_t rotate_right(uint32_t value, unsigned int count)
+{
+    return (value >> count) | (value << (32U - count));
+}
+
+static uint32_t load_big_endian_32(const unsigned char *bytes)
+{
+    return ((uint32_t)bytes[0] << 24U) |
+           ((uint32_t)bytes[1] << 16U) |
+           ((uint32_t)bytes[2] << 8U) | (uint32_t)bytes[3];
+}
+
+static void store_big_endian_32(unsigned char *bytes, uint32_t value)
+{
+    bytes[0] = (unsigned char)(value >> 24U);
+    bytes[1] = (unsigned char)(value >> 16U);
+    bytes[2] = (unsigned char)(value >> 8U);
+    bytes[3] = (unsigned char)value;
+}
+
+static void sha256_transform(sha256_context_t *context,
+                             const unsigned char block[SHA256_BLOCK_SIZE])
+{
+    static const uint32_t constants[64] = {
+        0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
+        0x3956c25bU, 0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U,
+        0xd807aa98U, 0x12835b01U, 0x243185beU, 0x550c7dc3U,
+        0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U, 0xc19bf174U,
+        0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+        0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU,
+        0x983e5152U, 0xa831c66dU, 0xb00327c8U, 0xbf597fc7U,
+        0xc6e00bf3U, 0xd5a79147U, 0x06ca6351U, 0x14292967U,
+        0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU, 0x53380d13U,
+        0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+        0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U,
+        0xd192e819U, 0xd6990624U, 0xf40e3585U, 0x106aa070U,
+        0x19a4c116U, 0x1e376c08U, 0x2748774cU, 0x34b0bcb5U,
+        0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU, 0x682e6ff3U,
+        0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+        0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U
+    };
+    uint32_t words[64];
+    uint32_t a;
+    uint32_t b;
+    uint32_t c;
+    uint32_t d;
+    uint32_t e;
+    uint32_t f;
+    uint32_t g;
+    uint32_t h;
+    size_t index;
+
+    for (index = 0; index < 16U; index++) {
+        words[index] = load_big_endian_32(block + (index * 4U));
+    }
+    for (; index < 64U; index++) {
+        uint32_t left = words[index - 15U];
+        uint32_t right = words[index - 2U];
+        uint32_t sigma_zero = rotate_right(left, 7U) ^
+                              rotate_right(left, 18U) ^ (left >> 3U);
+        uint32_t sigma_one = rotate_right(right, 17U) ^
+                             rotate_right(right, 19U) ^ (right >> 10U);
+
+        words[index] = words[index - 16U] + sigma_zero +
+                       words[index - 7U] + sigma_one;
+    }
+
+    a = context->state[0];
+    b = context->state[1];
+    c = context->state[2];
+    d = context->state[3];
+    e = context->state[4];
+    f = context->state[5];
+    g = context->state[6];
+    h = context->state[7];
+
+    for (index = 0; index < 64U; index++) {
+        uint32_t choice = (e & f) ^ ((~e) & g);
+        uint32_t majority = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t sum_zero = rotate_right(a, 2U) ^ rotate_right(a, 13U) ^
+                            rotate_right(a, 22U);
+        uint32_t sum_one = rotate_right(e, 6U) ^ rotate_right(e, 11U) ^
+                           rotate_right(e, 25U);
+        uint32_t first = h + sum_one + choice + constants[index] +
+                         words[index];
+        uint32_t second = sum_zero + majority;
+
+        h = g;
+        g = f;
+        f = e;
+        e = d + first;
+        d = c;
+        c = b;
+        b = a;
+        a = first + second;
+    }
+
+    context->state[0] += a;
+    context->state[1] += b;
+    context->state[2] += c;
+    context->state[3] += d;
+    context->state[4] += e;
+    context->state[5] += f;
+    context->state[6] += g;
+    context->state[7] += h;
+}
+
+static void sha256_init(sha256_context_t *context)
+{
+    static const uint32_t initial_state[8] = {
+        0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
+        0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U
+    };
+
+    memcpy(context->state, initial_state, sizeof(initial_state));
+    context->total_size = 0U;
+    context->block_size = 0U;
+}
+
+static int sha256_update(sha256_context_t *context,
+                         const unsigned char *bytes, size_t size)
+{
+    if ((uint64_t)size > UINT64_MAX - context->total_size) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    context->total_size += (uint64_t)size;
+    while (size > 0U) {
+        size_t available = SHA256_BLOCK_SIZE - context->block_size;
+        size_t count = size < available ? size : available;
+
+        memcpy(context->block + context->block_size, bytes, count);
+        context->block_size += count;
+        bytes += count;
+        size -= count;
+        if (context->block_size == SHA256_BLOCK_SIZE) {
+            sha256_transform(context, context->block);
+            context->block_size = 0U;
+        }
+    }
+    return 0;
+}
+
+static int sha256_final(sha256_context_t *context,
+                        unsigned char digest[SHA256_DIGEST_SIZE])
+{
+    uint64_t bit_size;
+    size_t index;
+
+    if (context->total_size > UINT64_MAX / 8U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    bit_size = context->total_size * 8U;
+    context->block[context->block_size++] = 0x80U;
+    if (context->block_size > 56U) {
+        memset(context->block + context->block_size, 0,
+               SHA256_BLOCK_SIZE - context->block_size);
+        sha256_transform(context, context->block);
+        context->block_size = 0U;
+    }
+    memset(context->block + context->block_size, 0,
+           56U - context->block_size);
+    for (index = 0; index < 8U; index++) {
+        context->block[63U - index] =
+            (unsigned char)(bit_size >> (index * 8U));
+    }
+    sha256_transform(context, context->block);
+    for (index = 0; index < 8U; index++) {
+        store_big_endian_32(digest + (index * 4U), context->state[index]);
+    }
+    return 0;
+}
+
+static int digest_read_only_regular_descriptor(
+    int fd, off_t expected_size, unsigned char digest[SHA256_DIGEST_SIZE])
+{
+    unsigned char buffer[64U * 1024U];
+    sha256_context_t context;
+    struct stat before;
+    struct stat after;
+    off_t offset = 0;
+
+    if (expected_size < 0 ||
+        (uintmax_t)expected_size > UINT64_MAX / 8U) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (fstat(fd, &before) != 0) {
+        return -1;
+    }
+    if (!S_ISREG(before.st_mode) || before.st_size != expected_size ||
+        (before.st_mode & 07777) !=
+            (S_IRUSR | S_IRGRP | S_IROTH)) {
+        errno = ESTALE;
+        return -1;
+    }
+
+    sha256_init(&context);
+    while (offset < expected_size) {
+        off_t remaining = expected_size - offset;
+        size_t wanted = sizeof(buffer);
+        ssize_t count;
+
+        if (remaining < (off_t)wanted) {
+            wanted = (size_t)remaining;
+        }
+        do {
+            count = pread(fd, buffer, wanted, offset);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0) {
+            if (count == 0) {
+                errno = ESTALE;
+            }
+            return -1;
+        }
+        if (sha256_update(&context, buffer, (size_t)count) != 0) {
+            return -1;
+        }
+        offset += count;
+    }
+    if (fstat(fd, &after) != 0) {
+        return -1;
+    }
+    if (!same_identity(&before, &after) || after.st_size != expected_size ||
+        (after.st_mode & 07777) !=
+            (S_IRUSR | S_IRGRP | S_IROTH)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return sha256_final(&context, digest);
+}
+
+#if defined(GITSWITCH_RELEASE_TEST_DIGEST)
+static bool digest_matches_hex(
+    const unsigned char digest[SHA256_DIGEST_SIZE], const char *expected)
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t index;
+
+    for (index = 0U; index < SHA256_DIGEST_SIZE; index++) {
+        if (expected[index * 2U] != hex[digest[index] >> 4U] ||
+            expected[(index * 2U) + 1U] !=
+                hex[digest[index] & 0x0fU]) {
+            return false;
+        }
+    }
+    return expected[SHA256_DIGEST_SIZE * 2U] == '\0';
+}
+
+static bool sha256_matches_vector(const unsigned char *bytes, size_t size,
+                                  size_t chunk_size, const char *expected)
+{
+    sha256_context_t context;
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    size_t offset = 0U;
+
+    sha256_init(&context);
+    while (offset < size) {
+        size_t count = size - offset;
+
+        if (count > chunk_size) {
+            count = chunk_size;
+        }
+        if (sha256_update(&context, bytes + offset, count) != 0) {
+            return false;
+        }
+        offset += count;
+    }
+    return sha256_final(&context, digest) == 0 &&
+           digest_matches_hex(digest, expected);
+}
+
+static int run_sha256_known_answer_tests(void)
+{
+    static const unsigned char abc[] = "abc";
+    static const unsigned char padding_boundary[] =
+        "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    unsigned char thousand_a[1000];
+    sha256_context_t context;
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    size_t index;
+
+    if (!sha256_matches_vector((const unsigned char *)"", 0U, 1U,
+                               "e3b0c44298fc1c149afbf4c8996fb924"
+                               "27ae41e4649b934ca495991b7852b855") ||
+        !sha256_matches_vector(abc, sizeof(abc) - 1U, 2U,
+                               "ba7816bf8f01cfea414140de5dae2223"
+                               "b00361a396177a9cb410ff61f20015ad") ||
+        !sha256_matches_vector(padding_boundary,
+                               sizeof(padding_boundary) - 1U, 7U,
+                               "248d6a61d20638b8e5c026930c3e6039"
+                               "a33ce45964ff2167f6ecedd419db06c1")) {
+        return -1;
+    }
+
+    memset(thousand_a, 'a', sizeof(thousand_a));
+    sha256_init(&context);
+    for (index = 0U; index < 1000U; index++) {
+        if (sha256_update(&context, thousand_a, sizeof(thousand_a)) != 0) {
+            return -1;
+        }
+    }
+    if (sha256_final(&context, digest) != 0 ||
+        !digest_matches_hex(digest,
+                            "cdc76e5c9914fb9281a1c7e284d73e67"
+                            "f1809a48a497200e046d39ccc7112cd0")) {
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static int read_random(void *buffer, size_t size)
 {
     unsigned char *cursor = buffer;
@@ -927,7 +1250,7 @@ static int publish_descriptor_clone(int source_fd, int directory_fd,
     }
     do {
         destination_fd = openat(directory_fd, final_name,
-                                O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+                                O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     } while (destination_fd < 0 && errno == EINTR);
 #if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
     saved_errno = errno;
@@ -999,6 +1322,8 @@ int main(int argc, char **argv)
     int publish_rc;
     int retire_rc;
     bool has_name = false;
+    unsigned char expected_digest[SHA256_DIGEST_SIZE];
+    unsigned char published_digest[SHA256_DIGEST_SIZE];
     struct stat existing;
     struct stat output_stat;
     int result = EXIT_FAILURE;
@@ -1008,6 +1333,15 @@ int main(int argc, char **argv)
     if (reserve_standard_descriptors() != 0) {
         return EXIT_FAILURE;
     }
+#if defined(GITSWITCH_RELEASE_TEST_DIGEST)
+    if (argc == 2 && strcmp(argv[1], "--test-sha256") == 0) {
+        if (run_sha256_known_answer_tests() != 0) {
+            fprintf(stderr, "ERROR: internal SHA-256 known-answer test failed\n");
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
+#endif
     if (install_fatal_signal_forwarding() != 0) {
         fprintf(stderr, "ERROR: cannot install signal forwarding: %s\n",
                 strerror(errno));
@@ -1065,10 +1399,19 @@ int main(int argc, char **argv)
         fprintf(stderr, "ERROR: archive command produced no regular output\n");
         goto cleanup;
     }
-    if (fchmod(output_fd,
-               S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH) != 0 ||
+    /* Make the completed bytes read-only before any public name can select
+     * them. The open descriptor remains usable for sync and descriptor-bound
+     * verification without reopening a writable pathname. */
+    if (fchmod(output_fd, S_IRUSR | S_IRGRP | S_IROTH) != 0 ||
         fsync(output_fd) != 0) {
         fprintf(stderr, "ERROR: cannot sync completed distribution output: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (digest_read_only_regular_descriptor(output_fd, output_stat.st_size,
+                                            expected_digest) != 0) {
+        fprintf(stderr,
+                "ERROR: cannot prove completed distribution output bytes: %s\n",
                 strerror(errno));
         goto cleanup;
     }
@@ -1132,6 +1475,30 @@ int main(int argc, char **argv)
                 "ERROR: canonical distribution directory changed during publication; artifact retained\n");
         goto cleanup;
     }
+    if (verify_published_identity(published_fd, directory_fd,
+                                  final_name) != 0) {
+        fprintf(stderr,
+                "ERROR: published distribution output changed before completion; artifact retained\n");
+        goto cleanup;
+    }
+    if (digest_read_only_regular_descriptor(published_fd,
+                                            output_stat.st_size,
+                                            published_digest) != 0) {
+        fprintf(stderr,
+                "ERROR: cannot prove published distribution output bytes before completion; artifact retained: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (memcmp(expected_digest, published_digest,
+               sizeof(expected_digest)) != 0) {
+        errno = ESTALE;
+        fprintf(stderr,
+                "ERROR: published distribution output changed content before completion; artifact retained\n");
+        goto cleanup;
+    }
+    /* Close a replacement race during the descriptor digest: this is the
+     * final publication proof before provisional success. Descriptor closes
+     * below remain checked and can still turn the overall result into failure. */
     if (verify_published_identity(published_fd, directory_fd,
                                   final_name) != 0) {
         fprintf(stderr,

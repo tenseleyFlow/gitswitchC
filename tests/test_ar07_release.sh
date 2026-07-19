@@ -850,6 +850,8 @@ check_manifest_contract()
     # fclonefileat.
     [ -x "$named_publish_helper" ] ||
         fail "named-publish helper is unavailable: $named_publish_helper"
+    "$named_publish_helper" --test-sha256 ||
+        fail "release publisher SHA-256 known-answer vectors failed"
     copy_dir=$tmp/copy-publish
     mkdir "$copy_dir"
     copy_canonical=$(cd "$copy_dir" && pwd -P) ||
@@ -860,6 +862,9 @@ check_manifest_contract()
         fail "descriptor-bound publication failed"
     [ "$(cat "$copy_archive")" = original-payload ] ||
         fail "descriptor-bound publication changed payload"
+    [ "$(find "$copy_archive" -prune -type f -perm 0444 -print)" = \
+        "$copy_archive" ] ||
+        fail "descriptor-bound publication did not publish read-only bytes"
     copy_platform=$(uname -s)
     copy_retained_temp=
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
@@ -874,6 +879,9 @@ check_manifest_contract()
             copy_retained_temp=$1
             [ "$(cat "$copy_retained_temp")" = original-payload ] ||
                 fail "Darwin retained clone source changed payload"
+            [ "$(find "$copy_retained_temp" -prune -type f -perm 0444 -print)" = \
+                "$copy_retained_temp" ] ||
+                fail "Darwin retained clone source is not read-only"
             ;;
         *)
             { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
@@ -881,6 +889,9 @@ check_manifest_contract()
             copy_retained_temp=$1
             [ "$(cat "$copy_retained_temp")" = original-payload ] ||
                 fail "retained named source changed payload"
+            [ "$(find "$copy_retained_temp" -prune -type f -perm 0444 -print)" = \
+                "$copy_retained_temp" ] ||
+                fail "retained named source is not read-only"
             ;;
     esac
     if "$named_publish_helper" "$copy_dir" "$copy_canonical" archive.tar.gz \
@@ -1212,6 +1223,57 @@ check_manifest_contract()
     [ "$(cat "$tmp/original-cleanup-temp")" = original-payload ] ||
         fail "failed copy cleanup changed the pinned source"
     rm -f "$copy_archive" "$copy_temp" "$tmp/original-cleanup-temp"
+
+    # AR-11 M41: the final identity check must bind the bytes, not only the
+    # device/inode/type tuple. Pause after publication, retain a write-capable
+    # descriptor, restore the intended read-only mode, and replace the payload
+    # with equal-length bytes through that descriptor. Path identity, size,
+    # and final mode all remain unchanged; only a descriptor digest can reject
+    # the late mutation before the publisher reports success.
+    copy_content_marker=$tmp/copy-content.marker
+    copy_content_release=$tmp/copy-content.release
+    GITSWITCH_RELEASE_TEST_CLEANUP_MARKER=$copy_content_marker \
+        GITSWITCH_RELEASE_TEST_CLEANUP_RELEASE=$copy_content_release \
+        "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+        archive.tar.gz -- /bin/sh -c 'printf original-payload' \
+        >"$out" 2>&1 &
+    copy_pid=$!
+    attempt=0
+    while [ ! -e "$copy_content_marker" ] && \
+        kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    [ -e "$copy_content_marker" ] ||
+        fail "copy publication did not reach its content-proof boundary"
+    [ "$(cat "$copy_archive")" = original-payload ] ||
+        fail "content-proof boundary did not publish the complete artifact"
+    [ "$(find "$copy_archive" -prune -type f -perm 0444 -print)" = \
+        "$copy_archive" ] ||
+        fail "content-proof boundary exposed writable artifact mode"
+    chmod 0644 "$copy_archive" ||
+        fail "cannot prepare the content-change fixture"
+    exec 9<>"$copy_archive" ||
+        fail "cannot pin a write-capable content-change descriptor"
+    chmod 0444 "$copy_archive" ||
+        fail "cannot restore the content-change fixture mode"
+    printf '%s' 'mutated-payload!' >&9 ||
+        fail "cannot apply the equal-length content change"
+    exec 9>&-
+    [ "$(cat "$copy_archive")" = 'mutated-payload!' ] ||
+        fail "content-change fixture did not replace the published bytes"
+    : >"$copy_content_release"
+    if wait "$copy_pid"; then
+        copy_pid=
+        fail "publisher accepted same-inode equal-length content change"
+    fi
+    copy_pid=
+    grep -F 'published distribution output changed content before completion' \
+        "$out" >/dev/null ||
+        fail "content change did not report the failed final byte proof"
+    [ "$(cat "$copy_archive")" = 'mutated-payload!' ] ||
+        fail "content-change rejection altered the retained artifact"
+    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
 
     if "$named_publish_helper" "$copy_dir" "$copy_canonical" archive.tar.gz \
         -- /bin/sh -c 'printf partial; exit 9' >"$out" 2>&1; then
