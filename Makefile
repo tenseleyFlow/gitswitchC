@@ -1230,34 +1230,57 @@ ifeq ($(BUILD_TYPE),release)
 install: release-policy-check
 endif
 install:
-	@if [ ! -x "$(BINDIR)/$(TARGET)" ]; then \
-		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
+	@set -e; \
+	source_binary="$(BINDIR)/$(TARGET)"; \
+	destination_dir="$(DESTDIR)$(PREFIX)/bin"; \
+	destination_binary="$$destination_dir/$(TARGET)"; \
+	if [ ! -x "$$source_binary" ]; then \
+		echo "Error: $$source_binary not built. Run 'make release' (or 'make') first." >&2; \
 		exit 1; \
-	fi
-	@bt=`sed -n '1s/|.*//p' $(BUILDTYPE_STAMP) 2>/dev/null`; \
+	fi; \
+	echo "Installing $(TARGET)..."; \
+	install -d "$$destination_dir"; \
+	staged_binary=`mktemp "$$destination_dir/.$(TARGET).install.XXXXXX"`; \
+	cleanup_staged_install() { \
+		cleanup_status=$$1; \
+		trap - 0 1 2 3 15; \
+		rm -f "$$staged_binary"; \
+		exit "$$cleanup_status"; \
+	}; \
+	trap 'cleanup_staged_install $$?' 0; \
+	trap 'cleanup_staged_install 129' 1; \
+	trap 'cleanup_staged_install 130' 2; \
+	trap 'cleanup_staged_install 131' 3; \
+	trap 'cleanup_staged_install 143' 15; \
+	install -m 755 "$$source_binary" "$$staged_binary"; \
+	bt=`sed -n '1s/|.*//p' "$(BUILDTYPE_STAMP)" 2>/dev/null`; \
 	if [ "$$bt" != "release" ]; then \
+		sh tests/test_ar07_release.sh copy-publish \
+			"$$source_binary" "$$staged_binary" "$$destination_binary" || { \
+			echo 'ERROR: refusing to install an unverified staged binary' >&2; exit 1; \
+		}; \
 		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
 	else \
-		built_os=`sed -n 's/^platform_os=//p' $(BUILDTYPE_STAMP)`; \
+		built_os=`sed -n 's/^platform_os=//p' "$(BUILDTYPE_STAMP)"`; \
 		case "$$built_os" in Linux|Darwin|FreeBSD) ;; \
-			*) built_ack=`sed -n 's/^unsupported_release_ack=//p' $(BUILDTYPE_STAMP)`; \
-			   built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
+			*) built_ack=`sed -n 's/^unsupported_release_ack=//p' "$(BUILDTYPE_STAMP)"`; \
+			   built_format=`sed -n 's/^release_artifact_format=//p' "$(BUILDTYPE_STAMP)"`; \
 			   test "$$built_ack" = I_ACKNOWLEDGE_UNSUPPORTED_RELEASE && \
 			   { test "$$built_format" = elf || test "$$built_format" = macho; } || { \
 				echo 'ERROR: refusing release install without a recorded supported/acknowledged inspection policy' >&2; exit 1; \
 			   } ;; \
-			esac; \
-		built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
-		built_triple=`sed -n 's/^target_triple=//p' $(BUILDTYPE_STAMP)`; \
+		esac; \
+		built_format=`sed -n 's/^release_artifact_format=//p' "$(BUILDTYPE_STAMP)"`; \
+		built_triple=`sed -n 's/^target_triple=//p' "$(BUILDTYPE_STAMP)"`; \
 		GITSWITCH_RELEASE_FORMAT="$$built_format" \
-			sh tests/test_ar07_release.sh artifact \
-			"$(BINDIR)/$(TARGET)" "$(BINDIR)/$(TARGET)" "$$built_triple" || { \
+			sh tests/test_ar07_release.sh artifact-publish \
+			"$$source_binary" "$$staged_binary" \
+			"$$destination_binary" "$$built_triple" || { \
 			echo 'ERROR: refusing to install an unverified release artifact' >&2; exit 1; \
 		}; \
-	fi
-	@echo "Installing $(TARGET)..."
-	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(BINDIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	fi; \
+	rm -f "$$staged_binary"; \
+	trap - 0 1 2 3 15
 	@echo "Installing shell completions..."
 	install -d $(DESTDIR)$(PREFIX)/share/bash-completion/completions
 	install -m 644 completions/gitswitch.bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(TARGET)
@@ -2093,6 +2116,9 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
 		"$$stage$(PREFIX)/bin/$(TARGET)" "$(TARGET_TRIPLE)"; \
+	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
+	sh tests/test_ar07_release.sh install "$(CURDIR)" "$(MAKE_COMMAND)" \
+		"$(BINDIR)/$(TARGET)" "$(BUILDDIR)" "$(PREFIX)"; \
 	# Exercise the compiler-argv contract even when CC itself is one word. \
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh neuter \

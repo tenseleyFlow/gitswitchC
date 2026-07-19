@@ -184,6 +184,8 @@ check_artifact_pair()
     staged=$2
     expected_triple=${3-}
 
+    [ "$built" != "$staged" ] ||
+        fail "built and staged release paths must be distinct"
     [ -x "$built" ] || fail "built release binary is missing: $built"
     [ -x "$staged" ] || fail "staged release binary is missing: $staged"
     cmp -s "$built" "$staged" ||
@@ -218,6 +220,299 @@ check_artifact_pair()
 
     printf 'ar07-release: PASS (%s built and staged artifacts verified)\n' \
         "$format"
+}
+
+check_install_publication_paths()
+{
+    [ "$#" -eq 3 ] ||
+        fail "internal install publication path contract"
+    install_publish_built=$1
+    install_publish_staged=$2
+    install_publish_final=$3
+
+    [ "$install_publish_built" != "$install_publish_staged" ] &&
+        [ "$install_publish_built" != "$install_publish_final" ] &&
+        [ "$install_publish_staged" != "$install_publish_final" ] ||
+        fail "install publication paths must be distinct"
+    install_publish_staged_parent=${install_publish_staged%/*}
+    install_publish_final_parent=${install_publish_final%/*}
+    [ -n "$install_publish_staged_parent" ] &&
+        [ "$install_publish_staged_parent" = "$install_publish_final_parent" ] ||
+        fail "staged and final install paths must share one directory"
+    [ -f "$install_publish_staged" ] && [ ! -L "$install_publish_staged" ] ||
+        fail "staged install artifact is not a regular private file"
+}
+
+publish_install_copy()
+{
+    [ "$#" -eq 3 ] ||
+        fail "usage: $0 copy-publish BUILT STAGED FINAL"
+    install_publish_built=$1
+    install_publish_staged=$2
+    install_publish_final=$3
+
+    check_install_publication_paths "$install_publish_built" \
+        "$install_publish_staged" "$install_publish_final"
+    [ -x "$install_publish_built" ] ||
+        fail "built install binary is missing: $install_publish_built"
+    [ -x "$install_publish_staged" ] ||
+        fail "staged install binary is missing: $install_publish_staged"
+    cmp -s "$install_publish_built" "$install_publish_staged" ||
+        fail "staged install binary is not byte-identical to selected build"
+    mv -f "$install_publish_staged" "$install_publish_final" ||
+        fail "cannot atomically publish staged install binary"
+}
+
+publish_release_artifact()
+{
+    [ "$#" -eq 4 ] ||
+        fail "usage: $0 artifact-publish BUILT STAGED FINAL TRIPLE"
+    install_publish_built=$1
+    install_publish_staged=$2
+    install_publish_final=$3
+    install_publish_triple=$4
+
+    check_install_publication_paths "$install_publish_built" \
+        "$install_publish_staged" "$install_publish_final"
+    check_artifact_pair "$install_publish_built" \
+        "$install_publish_staged" "$install_publish_triple"
+    mv -f "$install_publish_staged" "$install_publish_final" ||
+        fail "cannot atomically publish validated release artifact"
+}
+
+# AR-11 M39: the install recipe must publish the exact private copy inspected
+# by the release validator, not reopen the mutable build pathname afterward.
+# A PATH-local `sh` wrapper lets the real validator finish and then atomically
+# replaces its built-path argument and, if still named, its staged argument.
+# Correct install logic has already published and retired the staged name in
+# the validator operation; split validate-then-publish logic installs the
+# replacement instead.
+check_install_staging_contract()
+{
+    [ "$#" -eq 5 ] ||
+        fail "usage: $0 install ROOT MAKE BUILT_BINARY BUILDDIR PREFIX"
+    install_root=$1
+    install_make=$2
+    install_seed_built=$3
+    install_seed_builddir=$4
+    install_prefix=$5
+
+    case $install_seed_built in
+        /*) ;;
+        *) install_seed_built=$install_root/$install_seed_built ;;
+    esac
+    case $install_seed_builddir in
+        /*) ;;
+        *) install_seed_builddir=$install_root/$install_seed_builddir ;;
+    esac
+    install_target=${install_seed_built##*/}
+    [ -x "$install_seed_built" ] ||
+        fail "install-race built binary is missing: $install_seed_built"
+    [ -f "$install_seed_builddir/obj/.buildconfig" ] ||
+        fail "install-race release build stamp is missing"
+
+    install_real_sh=$(command -v sh) || fail "install-race sh is unavailable"
+    install_real_cp=$(command -v cp) || fail "install-race cp is unavailable"
+    install_real_chmod=$(command -v chmod) ||
+        fail "install-race chmod is unavailable"
+    install_real_mv=$(command -v mv) || fail "install-race mv is unavailable"
+    install_tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-install-contract.XXXXXX") ||
+        fail "cannot create install-race temporary directory"
+    install_builddir=$install_tmp/build
+    install_built=$install_builddir/bin/$install_target
+    install_expected=$install_tmp/built.expected
+    install_replacement=$install_tmp/built.replacement
+    install_sentinel=$install_tmp/installed.sentinel
+    install_reject_stage=$install_tmp/reject-stage
+    install_swap_stage=$install_tmp/swap-stage
+    install_shims=$install_tmp/shims
+    install_report=$install_tmp/validator.args
+    install_stage_state=$install_tmp/validator.stage-state
+    install_out=$install_tmp/install.out
+    mkdir -p "$install_builddir/bin" "$install_builddir/obj" ||
+        fail "cannot create private install-race build"
+    "$install_real_cp" "$install_seed_built" "$install_built" ||
+        fail "cannot seed private install-race binary"
+    "$install_real_cp" "$install_seed_built" "$install_expected" ||
+        fail "cannot preserve expected install-race bytes"
+    "$install_real_cp" "$install_seed_builddir/obj/.buildconfig" \
+        "$install_builddir/obj/.buildconfig" ||
+        fail "cannot seed private install-race build stamp"
+    printf '%s\n' '#!/bin/sh' 'exit 97' >"$install_replacement" ||
+        fail "cannot create install-race replacement"
+    "$install_real_chmod" 0755 "$install_replacement" ||
+        fail "cannot make install-race replacement executable"
+    printf '%s\n' '#!/bin/sh' 'exit 96' >"$install_sentinel" ||
+        fail "cannot create install-race destination sentinel"
+    "$install_real_chmod" 0755 "$install_sentinel" ||
+        fail "cannot make install-race destination sentinel executable"
+    mkdir "$install_shims" || fail "cannot create install-race shim directory"
+
+    install_contract_cleanup()
+    {
+        install_cleanup_status=$?
+        trap - 0 1 2 3 15
+        rm -rf "$install_tmp"
+        exit "$install_cleanup_status"
+    }
+    trap install_contract_cleanup 0
+    trap 'exit 1' 1 2 3 15
+
+cat >"$install_shims/sh" <<'EOF'
+#!/bin/sh
+case ${2-} in
+    artifact|artifact-publish) install_validator=true ;;
+    *) install_validator=false ;;
+esac
+if [ "${1-}" = tests/test_ar07_release.sh ] &&
+   [ "$install_validator" = true ] &&
+   [ ! -e "$AR11_INSTALL_SWAP_REPORT" ]; then
+    printf '%s\n%s\n' "$3" "$4" >"$AR11_INSTALL_SWAP_REPORT" ||
+        exit 98
+    if [ "$AR11_INSTALL_SWAP_MODE" = corrupt-staged ] &&
+       [ "$3" != "$4" ]; then
+        "$AR11_INSTALL_REAL_CP" "$AR11_INSTALL_SWAP_BINARY" "$4" ||
+            exit 98
+        "$AR11_INSTALL_REAL_CHMOD" 0755 "$4" || exit 98
+        exec "$AR11_INSTALL_REAL_SH" "$@"
+    fi
+fi
+"$AR11_INSTALL_REAL_SH" "$@"
+status=$?
+if [ "$status" -eq 0 ] &&
+   [ "${1-}" = tests/test_ar07_release.sh ] &&
+   [ "$install_validator" = true ] &&
+   [ "$AR11_INSTALL_SWAP_MODE" = swap-after-validation ]; then
+    swap_tmp=$3.ar11-install-swap.$$
+    "$AR11_INSTALL_REAL_CP" "$AR11_INSTALL_SWAP_BINARY" "$swap_tmp" ||
+        exit 98
+    "$AR11_INSTALL_REAL_CHMOD" 0755 "$swap_tmp" || exit 98
+    "$AR11_INSTALL_REAL_MV" -f "$swap_tmp" "$3" || exit 98
+    swap_tmp=$4.ar11-install-swap.$$
+    "$AR11_INSTALL_REAL_CP" "$AR11_INSTALL_SWAP_BINARY" "$swap_tmp" ||
+        exit 98
+    "$AR11_INSTALL_REAL_CHMOD" 0755 "$swap_tmp" || exit 98
+    "$AR11_INSTALL_REAL_MV" -f "$swap_tmp" "$4" || exit 98
+    printf '%s\n' replaced >"$AR11_INSTALL_STAGE_STATE" || exit 98
+fi
+exit "$status"
+EOF
+    chmod 0755 "$install_shims/sh" || fail "cannot activate install-race shim"
+
+    # Corrupt only the validator's distinct staged argument. The fixed recipe
+    # must reject it before atomic publication, preserve a pre-existing final
+    # binary, and remove the private temporary. The old self-comparison never
+    # exposes a distinct staged argument and proceeds to overwrite the final.
+    install_reject_bin=$install_reject_stage$install_prefix/bin
+    mkdir -p "$install_reject_bin" ||
+        fail "cannot create rejecting install destination"
+    "$install_real_cp" "$install_sentinel" \
+        "$install_reject_bin/$install_target" ||
+        fail "cannot seed rejecting install sentinel"
+    "$install_real_chmod" 0755 "$install_reject_bin/$install_target" ||
+        fail "cannot set rejecting install sentinel mode"
+    "$install_real_cp" "$install_sentinel" \
+        "$install_tmp/reject.expected" ||
+        fail "cannot preserve rejecting install sentinel"
+    if PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_SH="$install_real_sh" \
+        AR11_INSTALL_REAL_CP="$install_real_cp" \
+        AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_SWAP_BINARY="$install_replacement" \
+        AR11_INSTALL_SWAP_REPORT="$install_report" \
+        AR11_INSTALL_STAGE_STATE="$install_stage_state" \
+        AR11_INSTALL_SWAP_MODE=corrupt-staged \
+        GITSWITCH_RELEASE_FORMAT="${GITSWITCH_RELEASE_FORMAT-}" \
+        "$install_make" -C "$install_root" BUILD_TYPE=release \
+            BUILDDIR="$install_builddir" TARGET="$install_target" \
+            install DESTDIR="$install_reject_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        fail "install accepted a corrupted private staged binary"
+    fi
+    [ -s "$install_report" ] ||
+        fail "install recipe did not execute the artifact validator"
+    install_built_arg=$(sed -n '1p' "$install_report")
+    install_staged_arg=$(sed -n '2p' "$install_report")
+    [ "$install_built_arg" = "$install_built" ] ||
+        fail "install validator inspected an unexpected build path"
+    [ -n "$install_staged_arg" ] &&
+        [ "$install_staged_arg" != "$install_built_arg" ] ||
+        fail "install validator arguments are not distinct"
+    case $install_staged_arg in
+        "$install_reject_bin/.${install_target}.install."*) ;;
+        *) fail "install validator did not inspect a private destination temporary" ;;
+    esac
+    grep -F 'staged binary is not byte-identical' "$install_out" >/dev/null || {
+        sed -n '1,200p' "$install_out" >&2
+        fail "corrupted staged install failed for an unrelated reason"
+    }
+    cmp -s "$install_tmp/reject.expected" \
+        "$install_reject_bin/$install_target" ||
+        fail "failed staged validation replaced the prior installed binary"
+    reject_mode=$(find "$install_reject_bin/$install_target" -prune \
+        -type f -perm 0755 -print 2>/dev/null) ||
+        fail "cannot inspect preserved install destination mode"
+    [ "$reject_mode" = "$install_reject_bin/$install_target" ] ||
+        fail "failed staged validation changed the prior installed binary mode"
+    set -- "$install_reject_bin/.${install_target}.install."*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "failed install left a private binary temporary"
+    [ ! -e "$install_reject_stage$install_prefix/share" ] ||
+        fail "failed binary validation installed completion assets"
+
+    # Then let the real validator succeed and replace the private source plus
+    # any still-named staged path afterward. Publication must already have
+    # atomically consumed the validated temporary before control returns.
+    rm -f "$install_report" "$install_stage_state"
+    if ! PATH="$install_shims:$PATH" \
+        AR11_INSTALL_REAL_SH="$install_real_sh" \
+        AR11_INSTALL_REAL_CP="$install_real_cp" \
+        AR11_INSTALL_REAL_CHMOD="$install_real_chmod" \
+        AR11_INSTALL_REAL_MV="$install_real_mv" \
+        AR11_INSTALL_SWAP_BINARY="$install_replacement" \
+        AR11_INSTALL_SWAP_REPORT="$install_report" \
+        AR11_INSTALL_STAGE_STATE="$install_stage_state" \
+        AR11_INSTALL_SWAP_MODE=swap-after-validation \
+        GITSWITCH_RELEASE_FORMAT="${GITSWITCH_RELEASE_FORMAT-}" \
+        "$install_make" -C "$install_root" BUILD_TYPE=release \
+            BUILDDIR="$install_builddir" TARGET="$install_target" \
+            install DESTDIR="$install_swap_stage" PREFIX="$install_prefix" \
+            >"$install_out" 2>&1; then
+        sed -n '1,200p' "$install_out" >&2
+        fail "staged install failed during the post-validation source swap"
+    fi
+    [ -s "$install_report" ] ||
+        fail "source-swap install did not execute the artifact validator"
+    install_built_arg=$(sed -n '1p' "$install_report")
+    install_staged_arg=$(sed -n '2p' "$install_report")
+    [ "$install_built_arg" = "$install_built" ] ||
+        fail "source-swap validator inspected an unexpected build path"
+    [ -n "$install_staged_arg" ] &&
+        [ "$install_staged_arg" != "$install_built_arg" ] ||
+        fail "source-swap validator arguments are not distinct"
+    case $install_staged_arg in
+        "$install_swap_stage$install_prefix/bin/.${install_target}.install."*) ;;
+        *) fail "source-swap validator missed its private destination temporary" ;;
+    esac
+    install_final=$install_swap_stage$install_prefix/bin/$install_target
+    cmp -s "$install_expected" "$install_final" ||
+        fail "install published bytes replaced after validation"
+    cmp -s "$install_replacement" "$install_built" ||
+        fail "install-race wrapper did not replace the validated source"
+    [ "$(sed -n '1p' "$install_stage_state")" = replaced ] ||
+        fail "install-race wrapper did not replace the retired staged pathname"
+    install_mode=$(find "$install_final" -prune -type f -perm 0755 \
+        -print 2>/dev/null) || fail "cannot inspect installed binary mode"
+    [ "$install_mode" = "$install_final" ] ||
+        fail "installed binary is not a regular file with exact mode 0755"
+    set -- "$install_swap_stage$install_prefix/bin/.${install_target}.install."*
+    { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+        fail "successful install left a private binary temporary"
+
+    trap - 0 1 2 3 15
+    rm -rf "$install_tmp"
+    printf 'ar07-release: PASS (staged install rejects corruption and seals publication)\n'
 }
 
 expect_artifact_rejection()
@@ -2421,12 +2716,16 @@ EOF
     printf 'ar07-release: PASS (commit-pinned metadata and dirty-input refusal)\n'
 }
 
-[ "$#" -ge 1 ] || fail "usage: $0 {manifest|artifact|neuter} ..."
+[ "$#" -ge 1 ] ||
+    fail "usage: $0 {manifest|artifact|artifact-publish|copy-publish|install|neuter} ..."
 mode=$1
 shift
 case $mode in
     manifest) check_manifest_contract "$@" ;;
     artifact) check_artifact_pair "$@" ;;
+    artifact-publish) publish_release_artifact "$@" ;;
+    copy-publish) publish_install_copy "$@" ;;
+    install) check_install_staging_contract "$@" ;;
     neuter) check_neuter_contract "$@" ;;
-    *) fail "unknown mode '$mode' (expected manifest, artifact, or neuter)" ;;
+    *) fail "unknown mode '$mode'" ;;
 esac

@@ -135,6 +135,13 @@ case $version_output in
     *) fail "binary version '$version_output' does not contain VERSION '$expected_version'" ;;
 esac
 
+# AR-11 M39: exercise the same atomic staged-install boundary from the
+# extracted, commit-pinned source tree consumed by RPM %install. The focused
+# mode rejects a corrupted private copy and proves a post-validation source
+# replacement cannot change the bytes ultimately published.
+sh "$source_root/tests/test_ar07_release.sh" install "$source_root" \
+    "$make_cmd" "$release_bin" "$source_root/build" "$prefix"
+
 stage=$tmp/stage
 "$make_cmd" -C "$source_root" BUILD_TYPE=release install DESTDIR="$stage" PREFIX="$prefix"
 
