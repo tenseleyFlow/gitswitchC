@@ -185,6 +185,31 @@ case ${1-} in
             fail 'cannot create token residue'
         exit 0
         ;;
+    --catch-signal)
+        [ "$#" -eq 3 ] || fail 'invalid signal-catch fixture invocation'
+        fixture_signal=$2
+        fixture_status=$3
+        case $fixture_signal:$fixture_status in
+            INT:42|QUIT:43) ;;
+            *) fail 'invalid signal-catch fixture values' ;;
+        esac
+        trap 'exit "$fixture_status"' "$fixture_signal"
+        kill -"$fixture_signal" "$$" ||
+            fail 'signal-catch fixture cannot signal itself'
+        exit 99
+        ;;
+    --expect-ignored-signal)
+        [ "$#" -eq 2 ] || fail 'invalid ignored-signal fixture invocation'
+        fixture_signal=$2
+        case $fixture_signal in
+            INT|QUIT) ;;
+            *) fail 'invalid ignored-signal fixture value' ;;
+        esac
+        trap 'exit 98' "$fixture_signal"
+        kill -"$fixture_signal" "$$" ||
+            fail 'ignored-signal fixture cannot signal itself'
+        exit 0
+        ;;
 esac
 
 [ "$#" -eq 1 ] || fail "usage: $0 PROJECT_ROOT"
@@ -283,6 +308,53 @@ else
 fi
 expect_status 'normal lock cleanup' 0 "$normal_status" "$normal_log"
 assert_absent "$normal_lock" 'normal cleanup'
+
+# POSIX shells may add SIGINT/SIGQUIT ignores when launching an asynchronous
+# list. The supervisor itself needs a background child so it can forward
+# signals, but those shell-added ignores must not prevent the exec'd command
+# from installing its own handlers. Each child self-signals after installing a
+# distinct handler; a leaked ignore would instead fall through to status 99.
+for signal_case in INT:42 QUIT:43; do
+    signal_name=${signal_case%:*}
+    expected_status=${signal_case#*:}
+    disposition_lock=$tmp/disposition-$signal_name.lock
+    disposition_log=$tmp/disposition-$signal_name.err
+    if sh "$lock_script" "$disposition_lock" sh "$self" \
+        --catch-signal "$signal_name" "$expected_status" \
+        >"$tmp/disposition-$signal_name.out" 2>"$disposition_log"; then
+        disposition_status=0
+    else
+        disposition_status=$?
+    fi
+    expect_status "$signal_name child disposition" "$expected_status" \
+        "$disposition_status" "$disposition_log"
+    assert_absent "$disposition_lock" "$signal_name disposition cleanup"
+done
+
+# Conversely, an ignore policy that predates this supervisor is authoritative.
+# Enter the supervisor through a shell that explicitly ignores one signal;
+# POSIX shells keep such an inherited ignore unchangeable. The child attempts
+# to replace it with a handler and self-signals: status 0 proves the signal
+# remained ignored, while status 98 would expose an accidental resurrection.
+for signal_name in INT QUIT; do
+    inherited_lock=$tmp/inherited-$signal_name.lock
+    inherited_log=$tmp/inherited-$signal_name.err
+    if sh -c '
+        inherited_signal=$1
+        shift
+        trap "" "$inherited_signal"
+        exec "$@"
+    ' sh "$signal_name" sh "$lock_script" "$inherited_lock" \
+        sh "$self" --expect-ignored-signal "$signal_name" \
+        >"$tmp/inherited-$signal_name.out" 2>"$inherited_log"; then
+        inherited_status=0
+    else
+        inherited_status=$?
+    fi
+    expect_status "inherited $signal_name ignore" 0 "$inherited_status" \
+        "$inherited_log"
+    assert_absent "$inherited_lock" "$signal_name inherited-ignore cleanup"
+done
 
 # Contender B receives EEXIST while A owns the root and pauses before returning
 # that result. A then exits and removes the root. B must recognize that the

@@ -413,7 +413,16 @@ GITSWITCH_RELEASE_LOCK_LEASE_FD=9
 export GITSWITCH_RELEASE_LOCK_TOKEN
 export GITSWITCH_RELEASE_LOCK_LEASE_FD
 
-"$@" 9>"$lease_path" &
+# A non-job-control shell makes SIGINT and SIGQUIT ignored for an asynchronous
+# list. Reset those shell-added dispositions in a short-lived subshell before
+# exec so the owned command can install its own handlers. POSIX shells keep a
+# signal that was already ignored when this supervisor started unchangeable,
+# preserving an outer nohup/supervisor policy. exec retains the child PID that
+# this script publishes and forwards signals to below.
+(
+    trap - INT QUIT
+    exec "$@" 9>"$lease_path"
+) &
 child_pid=$!
 command_launched=1
 trap 'forward_signal HUP 129' 1

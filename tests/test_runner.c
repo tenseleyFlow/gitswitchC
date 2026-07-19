@@ -178,6 +178,8 @@ static int exercise_post_fork_signal_publication(void) {
     sigset_t original_mask;
     sigset_t configured_mask;
     sigset_t after_mask;
+    struct sigaction default_action;
+    struct sigaction ignored_action;
     int run_rc;
 
     if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 10;
@@ -187,7 +189,22 @@ static int exercise_post_fork_signal_publication(void) {
     sigdelset(&configured_mask, SIGHUP);
     sigaddset(&configured_mask, SIGUSR1);
     if (sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) return 11;
-    if (signal(SIGHUP, SIG_IGN) == SIG_ERR) return 12;
+    /* The runner deliberately preserves inherited SIG_IGN dispositions, but
+     * this fixture asserts one exact guard shape. Normalize its private worker
+     * so INT/TERM/QUIT are installed while inherited HUP ignore is preserved;
+     * the release-lock contract independently checks supervisor inheritance. */
+    memset(&default_action, 0, sizeof(default_action));
+    memset(&ignored_action, 0, sizeof(ignored_action));
+    default_action.sa_handler = SIG_DFL;
+    ignored_action.sa_handler = SIG_IGN;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigemptyset(&ignored_action.sa_mask) != 0 ||
+        sigaction(SIGINT, &default_action, NULL) != 0 ||
+        sigaction(SIGTERM, &default_action, NULL) != 0 ||
+        sigaction(SIGQUIT, &default_action, NULL) != 0 ||
+        sigaction(SIGHUP, &ignored_action, NULL) != 0) {
+        return 12;
+    }
     if (signals_guard_begin() != 0) return 13;
     if (raise(SIGTERM) != 0 || !signals_pending()) return 14;
     signals_rollback_begin();
