@@ -1146,6 +1146,9 @@ check_manifest_contract()
     lock_dist_pid=
     lock_gate_pid=
     lock_contender_pid=
+    rpm_alpha_pid=
+    rpm_beta_pid=
+    rpm_retire_pid=
     stop_background()
     {
         background_pid=$1
@@ -1179,6 +1182,9 @@ check_manifest_contract()
         stop_background "$lock_gate_pid"
         stop_background "$lock_contender_pid"
         stop_background "$lock_dist_pid"
+        stop_background "$rpm_alpha_pid"
+        stop_background "$rpm_beta_pid"
+        stop_background "$rpm_retire_pid"
         if [ -n "$copy_status_release" ]; then
             : >"$copy_status_release" 2>/dev/null || :
         fi
@@ -3773,22 +3779,1218 @@ EOF
     [ ! -e "$clean_repo/build/dist/gitswitcher-9.9.9-uncommitted.tar.gz" ] ||
         fail "VERSION/DIST_ROOT override renamed committed release payload"
 
-    # The RPM target must consume the spec embedded in that same archive.
-    rm -f "$archive"
-    shim_dir=$tmp/shims
-    rpm_home=$tmp/rpm-home
-    mkdir -p "$shim_dir" "$rpm_home"
-    printf '%s\n' '#!/bin/sh' 'exit 0' >"$shim_dir/rpmbuild"
-    chmod 0700 "$shim_dir/rpmbuild"
-    HOME="$rpm_home" PATH="$shim_dir:$PATH" \
-        "$make_cmd" -C "$clean_repo" rpm >"$out" 2>&1 ||
-        fail "RPM source/spec consistency fixture failed"
-    tar -xOf "$archive" "$dist_root/gitswitcher.spec" >"$tmp/archived.spec" ||
-        fail "cannot extract archive spec for RPM comparison"
-    cmp -s "$tmp/archived.spec" \
-        "$rpm_home/rpmbuild/SPECS/gitswitcher.spec" ||
-        fail "RPM target did not consume the archive-embedded spec"
-    inspect_dist_residue "$archive" "$copy_platform"
+    # AR-11 M47: two same-version RPM builds must overlap without sharing any
+    # rpmbuild input, output, or scratch pathname.  Each clone commits a
+    # distinct source/spec marker while retaining the same VERSION.  The shim
+    # uses a two-phase barrier: both private topdirs and their exact inputs must
+    # coexist before either invocation is allowed to produce an RPM.  This is
+    # causal concurrency evidence, rather than a scheduler-dependent timing
+    # assertion.
+    rpm_fixture=$tmp/rpm-isolation
+    rpm_shims=$rpm_fixture/shims
+    rpm_state=$rpm_fixture/state
+    rpm_home=$rpm_fixture/"home \$shared"
+    rpm_alpha_repo=$rpm_fixture/"alpha \$checkout"
+    rpm_beta_repo=$rpm_fixture/"beta \$checkout"
+    mkdir -p "$rpm_shims" "$rpm_state" "$rpm_home" ||
+        fail "cannot create RPM isolation fixture"
+    rpm_home=$(CDPATH='' cd "$rpm_home" && pwd -P) ||
+        fail "cannot resolve physical RPM fixture HOME"
+    [ -d "$rpm_home" ] && [ ! -L "$rpm_home" ] ||
+        fail "RPM fixture HOME is not a physical directory"
+    mkdir "$rpm_home/rpmbuild" ||
+        fail "cannot create shared-rpmbuild sentinel directory"
+    printf '%s\n' 'caller-owned HOME/rpmbuild sentinel' \
+        >"$rpm_home/rpmbuild/sentinel" ||
+        fail "cannot create shared-rpmbuild sentinel"
+    cp "$rpm_home/rpmbuild/sentinel" "$rpm_fixture/rpmbuild.expected" ||
+        fail "cannot preserve shared-rpmbuild sentinel"
+    rpm_poison=$rpm_state/macro-poison
+    {
+        printf '%%_topdir %s\n' "$rpm_poison/top"
+        printf '%%_builddir %s\n' "$rpm_poison/build"
+        printf '%%_buildrootdir %s\n' "$rpm_poison/buildroot"
+        printf '%%_rpmdir %s\n' "$rpm_poison/rpms"
+        printf '%%_sourcedir %s\n' "$rpm_poison/sources"
+        printf '%%_specdir %s\n' "$rpm_poison/specs"
+        printf '%%_srcrpmdir %s\n' "$rpm_poison/srpms"
+        printf '%%_tmppath %s\n' "$rpm_poison/tmp"
+        printf '%%_rpmfilename poison/%%{NAME}.rpm\n'
+    } >"$rpm_home/.rpmmacros" ||
+        fail "cannot create hostile user RPM macro fixture"
+    cp "$rpm_home/.rpmmacros" "$rpm_fixture/rpmmacros.expected" ||
+        fail "cannot preserve hostile user RPM macros"
+    rpm_real_cmp=$(command -v cmp) || fail "cmp is unavailable for RPM fixture"
+    printf '%s\n' "$rpm_real_cmp" >"$rpm_shims/real-cmp" ||
+        fail "cannot record real cmp for RPM fixture"
+    cat >"$rpm_shims/cmp" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r real_cmp <"$shim_dir/real-cmp" || exit 96
+"$real_cmp" "$@"
+cmp_status=$?
+if [ "$cmp_status" -eq 0 ] &&
+   [ "${AR11_RPM_MODE-}" = symlink-srpms ] &&
+   [ "$#" -eq 3 ] && [ "$1" = -s ]; then
+    cmp_canonical=false
+    cmp_private=false
+    case $2 in
+        "$AR11_RPM_REPO_ROOT/build/dist/"*.tar.gz) cmp_canonical=true ;;
+    esac
+    case $3 in
+        "$AR11_RPM_HOME/.gitswitch-rpmbuild."??????/SOURCES/*.tar.gz)
+            cmp_private=true ;;
+    esac
+    if [ "$cmp_canonical" = true ] && [ "$cmp_private" = true ] &&
+       [ ! -e "$AR11_RPM_STATE/archive-swap.marker" ]; then
+        cp "$2" "$AR11_RPM_STATE/archive-swap.original" || exit 95
+        chmod 0600 "$2" || exit 94
+        printf '%s\n' 'canonical archive replaced after private-copy proof' \
+            >"$2" || exit 93
+        : >"$AR11_RPM_STATE/archive-swap.marker" || exit 92
+    fi
+fi
+exit "$cmp_status"
+EOF
+    chmod 0700 "$rpm_shims/cmp" ||
+        fail "cannot activate canonical-archive swap shim"
+
+    git clone --quiet "$root" "$rpm_alpha_repo" ||
+        fail "cannot clone alpha RPM fixture"
+    git clone --quiet "$root" "$rpm_beta_repo" ||
+        fail "cannot clone beta RPM fixture"
+    for rpm_lane in alpha beta; do
+        case $rpm_lane in
+            alpha) rpm_lane_repo=$rpm_alpha_repo ;;
+            beta) rpm_lane_repo=$rpm_beta_repo ;;
+        esac
+        printf '\n# AR11_RPM_LANE: %s\n' "$rpm_lane" \
+            >>"$rpm_lane_repo/gitswitcher.spec" ||
+            fail "cannot mark $rpm_lane RPM spec"
+        printf '\nAR11_RPM_SOURCE: %s\n' "$rpm_lane" \
+            >>"$rpm_lane_repo/README.md" ||
+            fail "cannot mark $rpm_lane RPM source"
+        git -C "$rpm_lane_repo" add -- gitswitcher.spec README.md ||
+            fail "cannot stage $rpm_lane RPM fixture"
+        git -C "$rpm_lane_repo" \
+            -c user.name='AR-11 RPM fixture' \
+            -c user.email='ar11-rpm@example.invalid' \
+            -c commit.gpgsign=false commit --quiet --no-gpg-sign \
+            -m "AR-11 RPM $rpm_lane fixture" ||
+            fail "cannot commit $rpm_lane RPM fixture"
+    done
+    rpm_alpha_root=$(CDPATH='' cd "$rpm_alpha_repo" && pwd -P) ||
+        fail "cannot resolve alpha RPM fixture root"
+    rpm_beta_root=$(CDPATH='' cd "$rpm_beta_repo" && pwd -P) ||
+        fail "cannot resolve beta RPM fixture root"
+    rpm_fixture_version=$(git -C "$rpm_alpha_repo" show HEAD:VERSION) ||
+        fail "cannot read alpha RPM fixture version"
+    [ "$rpm_fixture_version" = \
+        "$(git -C "$rpm_beta_repo" show HEAD:VERSION)" ] ||
+        fail "concurrent RPM fixtures do not retain one package version"
+    rpm_alpha_spec_hash=$(git hash-object \
+        "$rpm_alpha_repo/gitswitcher.spec") ||
+        fail "cannot hash alpha RPM spec"
+    rpm_beta_spec_hash=$(git hash-object \
+        "$rpm_beta_repo/gitswitcher.spec") ||
+        fail "cannot hash beta RPM spec"
+    [ "$rpm_alpha_spec_hash" != "$rpm_beta_spec_hash" ] ||
+        fail "concurrent RPM fixture specs are not byte-distinct"
+
+    cat >"$rpm_shims/rpmbuild" <<'EOF'
+#!/bin/sh
+set -eu
+
+rpm_die()
+{
+    printf 'ar11-rpmbuild-shim: ERROR: %s\n' "$*" >&2
+    exit 97
+}
+
+: "${AR11_RPM_STATE:?}"
+: "${AR11_RPM_MODE:?}"
+: "${AR11_RPM_REPO_ROOT:?}"
+: "${AR11_RPM_HOME:?}"
+[ "$HOME" = "$AR11_RPM_HOME" ] || rpm_die "fixture HOME changed in transit"
+[ -f "$HOME/.rpmmacros" ] && [ ! -L "$HOME/.rpmmacros" ] ||
+    rpm_die "hostile user RPM macros were not installed"
+
+rpm_topdir=
+rpm_builddir=
+rpm_buildrootdir=
+rpm_rpmdir=
+rpm_sourcedir=
+rpm_specdir=
+rpm_srcrpmdir=
+rpm_tmppath=
+rpm_filename_macro=
+rpm_spec=
+rpm_define_count=0
+rpm_ba_count=0
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --define)
+            [ "$#" -ge 2 ] || rpm_die "--define lacks its value"
+            shift
+            case $1 in
+                "_topdir "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_topdir" ] || rpm_die "duplicate _topdir"
+                    rpm_topdir=${1#"_topdir "}
+                    ;;
+                "_builddir "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_builddir" ] || rpm_die "duplicate _builddir"
+                    rpm_builddir=${1#"_builddir "}
+                    ;;
+                "_buildrootdir "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_buildrootdir" ] || rpm_die "duplicate _buildrootdir"
+                    rpm_buildrootdir=${1#"_buildrootdir "}
+                    ;;
+                "_rpmdir "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_rpmdir" ] || rpm_die "duplicate _rpmdir"
+                    rpm_rpmdir=${1#"_rpmdir "}
+                    ;;
+                "_sourcedir "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_sourcedir" ] || rpm_die "duplicate _sourcedir"
+                    rpm_sourcedir=${1#"_sourcedir "}
+                    ;;
+                "_specdir "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_specdir" ] || rpm_die "duplicate _specdir"
+                    rpm_specdir=${1#"_specdir "}
+                    ;;
+                "_srcrpmdir "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_srcrpmdir" ] || rpm_die "duplicate _srcrpmdir"
+                    rpm_srcrpmdir=${1#"_srcrpmdir "}
+                    ;;
+                "_tmppath "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_tmppath" ] || rpm_die "duplicate _tmppath"
+                    rpm_tmppath=${1#"_tmppath "}
+                    ;;
+                "_rpmfilename "*)
+                    rpm_define_count=$((rpm_define_count + 1))
+                    [ -z "$rpm_filename_macro" ] ||
+                        rpm_die "duplicate _rpmfilename"
+                    rpm_filename_macro=${1#"_rpmfilename "}
+                    ;;
+            esac
+            ;;
+        -ba)
+            [ "$#" -ge 2 ] || rpm_die "-ba lacks its spec path"
+            rpm_ba_count=$((rpm_ba_count + 1))
+            shift
+            rpm_spec=$1
+            ;;
+    esac
+    shift
+done
+[ "$rpm_define_count" -eq 9 ] ||
+    rpm_die "expected nine explicit private RPM macro definitions"
+[ "$rpm_ba_count" -eq 1 ] || rpm_die "expected one -ba spec argument"
+[ -n "$rpm_topdir" ] || rpm_die "private _topdir is empty"
+case $rpm_topdir in
+    "$AR11_RPM_HOME/.gitswitch-rpmbuild."??????) ;;
+    *) rpm_die "_topdir is outside the physical private HOME namespace" ;;
+esac
+[ "$rpm_builddir" = "$rpm_topdir/BUILD" ] &&
+[ "$rpm_buildrootdir" = "$rpm_topdir/BUILDROOT" ] &&
+[ "$rpm_rpmdir" = "$rpm_topdir/RPMS" ] &&
+[ "$rpm_sourcedir" = "$rpm_topdir/SOURCES" ] &&
+[ "$rpm_specdir" = "$rpm_topdir/SPECS" ] &&
+[ "$rpm_srcrpmdir" = "$rpm_topdir/SRPMS" ] &&
+[ "$rpm_tmppath" = "$rpm_topdir/TMP" ] ||
+    rpm_die "subordinate RPM macros escaped the private _topdir"
+[ "$rpm_filename_macro" = \
+    '%{ARCH}/%{NAME}-%{VERSION}-%{RELEASE}.%{ARCH}.rpm' ] ||
+    rpm_die "RPM output filename layout was not pinned"
+[ -d "$rpm_topdir" ] && [ ! -L "$rpm_topdir" ] ||
+    rpm_die "_topdir is not a private directory"
+[ "$(find "$rpm_topdir" -prune -type d -perm 0700 -print 2>/dev/null)" = \
+    "$rpm_topdir" ] || rpm_die "_topdir is not mode 0700"
+for rpm_component in BUILD BUILDROOT PUBLISH RPMS SOURCES SPECS SRPMS TMP; do
+    rpm_component_path=$rpm_topdir/$rpm_component
+    [ -d "$rpm_component_path" ] && [ ! -L "$rpm_component_path" ] ||
+        rpm_die "missing private $rpm_component directory"
+    [ "$(find "$rpm_component_path" -prune -type d -perm 0700 \
+        -print 2>/dev/null)" = "$rpm_component_path" ] ||
+        rpm_die "private $rpm_component directory is not mode 0700"
+done
+[ "$rpm_spec" = "$rpm_topdir/SPECS/gitswitcher.spec" ] ||
+    rpm_die "-ba did not receive the private spec"
+[ -f "$rpm_spec" ] && [ ! -L "$rpm_spec" ] ||
+    rpm_die "private spec is not a regular file"
+
+rpm_lane=$(sed -n 's/^# AR11_RPM_LANE: //p' "$rpm_spec" | sed -n '1p')
+case $rpm_lane in
+    alpha|beta) ;;
+    *) rpm_die "private spec lacks its lane identity" ;;
+esac
+rpm_package=$(sed -n 's/^Name:[[:space:]]*//p' "$rpm_spec" | sed -n '1p')
+rpm_version=$(sed -n 's/^Version:[[:space:]]*//p' "$rpm_spec" | sed -n '1p')
+[ "$rpm_package" = gitswitcher ] && [ -n "$rpm_version" ] ||
+    rpm_die "private spec metadata is invalid"
+rpm_source=$rpm_topdir/SOURCES/$rpm_package-$rpm_version.tar.gz
+rpm_canonical_source=$AR11_RPM_REPO_ROOT/build/dist/$rpm_package-$rpm_version.tar.gz
+[ -f "$rpm_source" ] && [ ! -L "$rpm_source" ] ||
+    rpm_die "private Source0 is not a regular file"
+rpm_source_oracle=$rpm_canonical_source
+if [ "$AR11_RPM_MODE" = symlink-srpms ] &&
+   [ -f "$AR11_RPM_STATE/archive-swap.marker" ]; then
+    rpm_source_oracle=$AR11_RPM_STATE/archive-swap.original
+    if cmp -s "$rpm_canonical_source" "$rpm_source"; then
+        rpm_die "canonical archive swap did not separate the private source"
+    fi
+fi
+cmp -s "$rpm_source_oracle" "$rpm_source" ||
+    rpm_die "private Source0 differs from this checkout's archive"
+cmp -s "$AR11_RPM_REPO_ROOT/$rpm_package.spec" "$rpm_spec" ||
+    rpm_die "private spec differs from this checkout's committed spec"
+rpm_archived_spec=$AR11_RPM_STATE/.archived-spec.$AR11_RPM_MODE.$rpm_lane.$$
+rpm_archived_readme=$AR11_RPM_STATE/.archived-readme.$AR11_RPM_MODE.$rpm_lane.$$
+tar -xOf "$rpm_source" \
+    "$rpm_package-$rpm_version/$rpm_package.spec" >"$rpm_archived_spec" ||
+    rpm_die "cannot extract the private archive spec"
+tar -xOf "$rpm_source" \
+    "$rpm_package-$rpm_version/README.md" >"$rpm_archived_readme" ||
+    rpm_die "cannot extract the private archive source marker"
+cmp -s "$rpm_archived_spec" "$rpm_spec" ||
+    rpm_die "rpmbuild spec is not the archive-embedded spec"
+grep -Fx "AR11_RPM_SOURCE: $rpm_lane" "$rpm_archived_readme" >/dev/null ||
+    rpm_die "private Source0 belongs to the other build"
+rm -f "$rpm_archived_spec" "$rpm_archived_readme"
+if [ "$AR11_RPM_MODE" = symlink-srpms ]; then
+    cp "$AR11_RPM_STATE/archive-swap.original" "$rpm_canonical_source" ||
+        rpm_die "cannot restore canonical archive after private extraction"
+    chmod 0444 "$rpm_canonical_source" ||
+        rpm_die "cannot restore canonical archive mode"
+    cmp -s "$AR11_RPM_STATE/archive-swap.original" "$rpm_canonical_source" ||
+        rpm_die "restored canonical archive changed bytes"
+    : >"$AR11_RPM_STATE/archive-swap.restored" ||
+        rpm_die "cannot record private archive extraction proof"
+fi
+
+rpm_source_hash=$(git hash-object "$rpm_source") ||
+    rpm_die "cannot hash private Source0"
+rpm_spec_hash=$(git hash-object "$rpm_spec") ||
+    rpm_die "cannot hash private spec"
+rpm_report=$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.observed
+rpm_report_tmp=$rpm_report.tmp.$$
+printf '%s\n%s\n%s\n%s\n%s\n' \
+    "$rpm_topdir" "$rpm_source_hash" "$rpm_spec_hash" \
+    "$rpm_source" "$rpm_spec" >"$rpm_report_tmp" ||
+    rpm_die "cannot record private RPM inputs"
+mv "$rpm_report_tmp" "$rpm_report" ||
+    rpm_die "cannot publish private RPM input report"
+
+rpm_wait_for_pair()
+{
+    rpm_barrier_suffix=$1
+    rpm_barrier_tries=0
+    while { [ ! -f "$AR11_RPM_STATE/alpha.$rpm_barrier_suffix" ] ||
+            [ ! -f "$AR11_RPM_STATE/beta.$rpm_barrier_suffix" ]; } &&
+          [ "$rpm_barrier_tries" -lt 300 ]; do
+        sleep 0.1
+        rpm_barrier_tries=$((rpm_barrier_tries + 1))
+    done
+    [ -f "$AR11_RPM_STATE/alpha.$rpm_barrier_suffix" ] &&
+    [ -f "$AR11_RPM_STATE/beta.$rpm_barrier_suffix" ] ||
+        rpm_die "timed out at concurrent $rpm_barrier_suffix barrier"
+}
+
+if [ "$AR11_RPM_MODE" = concurrent ]; then
+    : >"$AR11_RPM_STATE/$rpm_lane.ready" ||
+        rpm_die "cannot enter concurrent ready barrier"
+    rpm_wait_for_pair ready
+    case $rpm_lane in
+        alpha) rpm_other_lane=beta ;;
+        beta) rpm_other_lane=alpha ;;
+    esac
+    IFS= read -r rpm_other_topdir \
+        <"$AR11_RPM_STATE/concurrent.$rpm_other_lane.observed" ||
+        rpm_die "cannot read the other build's private topdir"
+    [ "$rpm_other_topdir" != "$rpm_topdir" ] ||
+        rpm_die "concurrent builds received the same _topdir"
+    [ -d "$rpm_other_topdir" ] && [ ! -L "$rpm_other_topdir" ] ||
+        rpm_die "other private topdir did not coexist at the barrier"
+    printf '%s\n' "$rpm_other_topdir" \
+        >"$AR11_RPM_STATE/$rpm_lane.checked" ||
+        rpm_die "cannot enter concurrent identity barrier"
+    rpm_wait_for_pair checked
+fi
+
+rpm_binary_dir=$rpm_topdir/RPMS/noarch
+mkdir -m 0700 "$rpm_binary_dir" || rpm_die "cannot create binary RPM directory"
+rpm_binary_name=$rpm_package-$rpm_version-1.noarch.rpm
+rpm_binary=$rpm_binary_dir/$rpm_binary_name
+printf 'kind=binary\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
+    "$rpm_lane" "$AR11_RPM_MODE" "$rpm_source_hash" "$rpm_spec_hash" \
+    >"$rpm_binary" || rpm_die "cannot create causal binary RPM"
+cp "$rpm_binary" \
+    "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.binary.expected" ||
+    rpm_die "cannot preserve expected binary RPM"
+
+if [ "$AR11_RPM_MODE" = symlink-srpms ]; then
+    rpm_escape_dir=$AR11_RPM_STATE/symlink-srpms.$rpm_lane.escape
+    mkdir -m 0700 "$rpm_escape_dir" ||
+        rpm_die "cannot create escaped SRPM directory"
+    rm -rf "$rpm_topdir/SRPMS" || rpm_die "cannot replace private SRPMS"
+    ln -s "$rpm_escape_dir" "$rpm_topdir/SRPMS" ||
+        rpm_die "cannot substitute private SRPMS with a symlink"
+fi
+rpm_source_name=$rpm_package-$rpm_version-1.src.rpm
+rpm_built_source=$rpm_topdir/SRPMS/$rpm_source_name
+printf 'kind=source\nlane=%s\nmode=%s\nsource=%s\nspec=%s\n' \
+    "$rpm_lane" "$AR11_RPM_MODE" "$rpm_source_hash" "$rpm_spec_hash" \
+    >"$rpm_built_source" || rpm_die "cannot create causal source RPM"
+cp "$rpm_built_source" \
+    "$AR11_RPM_STATE/$AR11_RPM_MODE.$rpm_lane.source.expected" ||
+    rpm_die "cannot preserve expected source RPM"
+printf '%s\n' 'must not be published' >"$rpm_topdir/RPMS/ignored.txt" ||
+    rpm_die "cannot create non-RPM output decoy"
+EOF
+    chmod 0700 "$rpm_shims/rpmbuild" ||
+        fail "cannot activate private-rpmbuild shim"
+
+    rpm_assert_private_retirement()
+    {
+        rpm_retirement_path=$1
+        rpm_retirement_out=$2
+        case $copy_platform in
+            FreeBSD)
+                [ ! -e "$rpm_retirement_path" ] &&
+                [ ! -L "$rpm_retirement_path" ] ||
+                    fail "FreeBSD RPM target retained a descriptor-retirable namespace"
+                if grep -F 'private RPM namespace safely retained:' \
+                    "$rpm_retirement_out" >/dev/null 2>&1; then
+                    fail "FreeBSD RPM target reported unsupported retirement"
+                fi
+                ;;
+            Linux|Darwin)
+                [ -d "$rpm_retirement_path" ] &&
+                [ ! -L "$rpm_retirement_path" ] ||
+                    fail "RPM target lost its safely retained private namespace"
+                [ "${rpm_retirement_path%/*}" = "$rpm_home" ] ||
+                    fail "RPM target retained a namespace outside fixture HOME"
+                rpm_retirement_name=${rpm_retirement_path##*/}
+                case $rpm_retirement_name in
+                    .gitswitch-rpmbuild.??????) ;;
+                    *) fail "RPM target retained an unbounded namespace name" ;;
+                esac
+                rpm_retirement_suffix=${rpm_retirement_name#.gitswitch-rpmbuild.}
+                case $rpm_retirement_suffix in
+                    *[!A-Za-z0-9]*)
+                        fail "RPM target retained an unsafe namespace suffix"
+                        ;;
+                esac
+                [ "$(CDPATH='' cd "$rpm_retirement_path" && pwd -P)" = \
+                    "$rpm_retirement_path" ] ||
+                    fail "RPM target retained a nonphysical namespace"
+                [ "$(find "$rpm_retirement_path" -prune -type d -perm 0700 \
+                    -print 2>/dev/null)" = "$rpm_retirement_path" ] ||
+                    fail "RPM target retained a namespace without exact mode 0700"
+                grep -F 'private RPM namespace safely retained:' \
+                    "$rpm_retirement_out" >/dev/null ||
+                    fail "RPM target silently retained its private namespace"
+                grep -F 'release-rpm: WARNING: private namespace safely retained' \
+                    "$rpm_retirement_out" >/dev/null ||
+                    fail "RPM workflow hid its retained-namespace disposition"
+                # Linux and Darwin cannot condition removal on the open vnode.
+                # The isolated test owns this exact HOME and removes the
+                # already-validated residue only after the workflow returns.
+                rm -rf "$rpm_retirement_path" ||
+                    fail "cannot retire fixture-owned private RPM namespace"
+                ;;
+            *) fail "unsupported RPM retirement fixture platform" ;;
+        esac
+    }
+
+    rpm_assert_no_private_residue()
+    {
+        rpm_residue_repo=$1
+        for rpm_residue in \
+            "$rpm_home"/.gitswitch-rpmbuild.* \
+            "$rpm_residue_repo/build"/.rpmbuild.* \
+            "$rpm_residue_repo/build"/.rpm-publish.*; do
+            [ ! -e "$rpm_residue" ] && [ ! -L "$rpm_residue" ] ||
+                fail "RPM target retained private residue: $rpm_residue"
+        done
+    }
+
+    rpm_inspect_leaf_residue()
+    {
+        rpm_residue_final=$1
+        rpm_residue_expected=$2
+        rpm_residue_dir=${rpm_residue_final%/*}
+        rpm_residue_name=${rpm_residue_final##*/}
+        set -- "$rpm_residue_dir/.$rpm_residue_name.tmp."*
+        if [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; then
+            return
+        fi
+        [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ] ||
+            fail "RPM publisher left an unexpected private leaf residue"
+        cmp -s "$rpm_residue_expected" "$1" ||
+            fail "retained RPM publisher residue changed bytes"
+        # Descriptor retirement is preferred.  A platform that cannot unlink
+        # the still-open private name may retain this one byte-identical source;
+        # the isolated fixture owns the directory and retires it after proof.
+        rm -f "$1" || fail "cannot retire inspected RPM publisher residue"
+    }
+
+    rpm_assert_publication()
+    {
+        rpm_assert_repo=$1
+        rpm_assert_lane=$2
+        rpm_assert_mode=$3
+        rpm_assert_output=$rpm_assert_repo/build/dist
+        rpm_assert_binary=gitswitcher-$rpm_fixture_version-1.noarch.rpm
+        rpm_assert_source=gitswitcher-$rpm_fixture_version-1.src.rpm
+        [ -d "$rpm_assert_output" ] && [ ! -L "$rpm_assert_output" ] ||
+            fail "$rpm_assert_lane RPM publication is not a real directory"
+        set -- "$rpm_assert_output"/*.rpm
+        [ "$#" -eq 2 ] ||
+            fail "$rpm_assert_lane RPM publication did not contain exactly two outputs"
+        for rpm_assert_file do
+            [ -f "$rpm_assert_file" ] && [ ! -L "$rpm_assert_file" ] ||
+                fail "$rpm_assert_lane RPM publication contains a non-regular output"
+            [ "$(find "$rpm_assert_file" -prune -type f -perm 0444 \
+                -print 2>/dev/null)" = "$rpm_assert_file" ] ||
+                fail "$rpm_assert_lane published an RPM without mode 0444"
+        done
+        cmp -s "$rpm_assert_output/$rpm_assert_binary" \
+            "$rpm_state/$rpm_assert_mode.$rpm_assert_lane.binary.expected" ||
+            fail "$rpm_assert_lane published another build's binary RPM"
+        cmp -s "$rpm_assert_output/$rpm_assert_source" \
+            "$rpm_state/$rpm_assert_mode.$rpm_assert_lane.source.expected" ||
+            fail "$rpm_assert_lane published another build's source RPM"
+        rpm_inspect_leaf_residue "$rpm_assert_output/$rpm_assert_binary" \
+            "$rpm_state/$rpm_assert_mode.$rpm_assert_lane.binary.expected"
+        rpm_inspect_leaf_residue "$rpm_assert_output/$rpm_assert_source" \
+            "$rpm_state/$rpm_assert_mode.$rpm_assert_lane.source.expected"
+        [ ! -e "$rpm_assert_repo/build/rpm" ] &&
+        [ ! -L "$rpm_assert_repo/build/rpm" ] ||
+            fail "$rpm_assert_lane escaped the canonical build/dist namespace"
+    }
+
+    rpm_alpha_out=$rpm_fixture/alpha.out
+    rpm_beta_out=$rpm_fixture/beta.out
+    (
+        HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=concurrent \
+        AR11_RPM_HOME="$rpm_home" \
+        AR11_RPM_REPO_ROOT="$rpm_alpha_root" \
+            "$make_cmd" -C "$rpm_alpha_repo" rpm \
+            >"$rpm_alpha_out" 2>&1
+    ) &
+    rpm_alpha_pid=$!
+    (
+        HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=concurrent \
+        AR11_RPM_HOME="$rpm_home" \
+        AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+            "$make_cmd" -C "$rpm_beta_repo" rpm \
+            >"$rpm_beta_out" 2>&1
+    ) &
+    rpm_beta_pid=$!
+    rpm_alpha_status=0
+    wait "$rpm_alpha_pid" || rpm_alpha_status=$?
+    rpm_alpha_pid=
+    if [ "$rpm_alpha_status" -ne 0 ]; then
+        sed -n '1,240p' "$rpm_alpha_out" >&2
+        sed -n '1,240p' "$rpm_beta_out" >&2
+        fail "alpha concurrent RPM build failed"
+    fi
+    rpm_beta_status=0
+    wait "$rpm_beta_pid" || rpm_beta_status=$?
+    rpm_beta_pid=
+    if [ "$rpm_beta_status" -ne 0 ]; then
+        sed -n '1,240p' "$rpm_alpha_out" >&2
+        sed -n '1,240p' "$rpm_beta_out" >&2
+        fail "beta concurrent RPM build failed"
+    fi
+
+    for rpm_barrier_lane in alpha beta; do
+        [ -f "$rpm_state/$rpm_barrier_lane.ready" ] &&
+        [ -f "$rpm_state/$rpm_barrier_lane.checked" ] ||
+            fail "$rpm_barrier_lane build did not cross both concurrency barriers"
+    done
+    rpm_alpha_report=$rpm_state/concurrent.alpha.observed
+    rpm_beta_report=$rpm_state/concurrent.beta.observed
+    rpm_alpha_topdir=$(sed -n '1p' "$rpm_alpha_report")
+    rpm_beta_topdir=$(sed -n '1p' "$rpm_beta_report")
+    [ -n "$rpm_alpha_topdir" ] && [ -n "$rpm_beta_topdir" ] &&
+    [ "$rpm_alpha_topdir" != "$rpm_beta_topdir" ] ||
+        fail "concurrent RPM builds did not record distinct private topdirs"
+    rpm_assert_private_retirement "$rpm_alpha_topdir" "$rpm_alpha_out"
+    rpm_assert_private_retirement "$rpm_beta_topdir" "$rpm_beta_out"
+    rpm_alpha_archive=$rpm_alpha_repo/build/dist/gitswitcher-$rpm_fixture_version.tar.gz
+    rpm_beta_archive=$rpm_beta_repo/build/dist/gitswitcher-$rpm_fixture_version.tar.gz
+    rpm_alpha_source_hash=$(sed -n '2p' "$rpm_alpha_report")
+    rpm_beta_source_hash=$(sed -n '2p' "$rpm_beta_report")
+    [ "$rpm_alpha_source_hash" = "$(git hash-object "$rpm_alpha_archive")" ] &&
+    [ "$rpm_beta_source_hash" = "$(git hash-object "$rpm_beta_archive")" ] ||
+        fail "private RPM Source0 hash did not match its checkout archive"
+    [ "$rpm_alpha_source_hash" != "$rpm_beta_source_hash" ] ||
+        fail "concurrent RPM fixture source archives are not byte-distinct"
+    [ "$(sed -n '3p' "$rpm_alpha_report")" = "$rpm_alpha_spec_hash" ] &&
+    [ "$(sed -n '3p' "$rpm_beta_report")" = "$rpm_beta_spec_hash" ] ||
+        fail "private RPM spec hash did not match its checkout spec"
+    rpm_assert_publication "$rpm_alpha_repo" alpha concurrent
+    rpm_assert_publication "$rpm_beta_repo" beta concurrent
+    rpm_assert_no_private_residue "$rpm_alpha_repo"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+    cmp -s "$rpm_alpha_repo/build/dist/gitswitcher-$rpm_fixture_version-1.noarch.rpm" \
+        "$rpm_beta_repo/build/dist/gitswitcher-$rpm_fixture_version-1.noarch.rpm" &&
+        fail "concurrent RPM publications lost their causal input identity"
+    inspect_dist_residue "$rpm_alpha_archive" "$copy_platform"
+    inspect_dist_residue "$rpm_beta_archive" "$copy_platform"
+
+    rpm_beta_git_dir=$(git -C "$rpm_beta_repo" rev-parse \
+        --absolute-git-dir) ||
+        fail "cannot resolve beta RPM fixture Git directory"
+    rpm_beta_publisher=$rpm_beta_git_dir/gitswitch-release-tools/release-publish
+    [ -x "$rpm_beta_publisher" ] && [ -f "$rpm_beta_publisher" ] &&
+    [ ! -L "$rpm_beta_publisher" ] ||
+        fail "beta RPM fixture lacks its production release publisher"
+    rpm_beta_named_publisher=$rpm_beta_git_dir/gitswitch-release-tools/release-publish-named-test
+    [ -x "$rpm_beta_named_publisher" ] &&
+    [ -f "$rpm_beta_named_publisher" ] &&
+    [ ! -L "$rpm_beta_named_publisher" ] ||
+        fail "beta RPM fixture lacks its named-test release publisher"
+    rpm_helper=$rpm_beta_repo/tools/release_rpm.sh
+    [ -f "$rpm_helper" ] && [ ! -L "$rpm_helper" ] ||
+        fail "RPM release helper is unavailable to direct fixtures"
+    rpm_archive_name=gitswitcher-$rpm_fixture_version.tar.gz
+    rpm_fixture_dist_root=gitswitcher-$rpm_fixture_version
+    rpm_binary_name=gitswitcher-$rpm_fixture_version-1.noarch.rpm
+    rpm_source_name=gitswitcher-$rpm_fixture_version-1.src.rpm
+
+    # A wrong generation must not begin a partial walk. FreeBSD can condition
+    # recursive removal on an open vnode; Linux and Darwin deliberately retain
+    # the complete tree because pathname unlink cannot reject a post-proof
+    # same-UID substitution.
+    rpm_retire_tree=$rpm_home/.gitswitch-rpmbuild.Ret123
+    rpm_retire_nested=$rpm_retire_tree/nested
+    rpm_retire_external=$rpm_state/retire-external.sentinel
+    rpm_retire_wrong_out=$rpm_fixture/retire-wrong.out
+    rpm_retire_exact_out=$rpm_fixture/retire-exact.out
+    mkdir -m 0700 "$rpm_retire_tree" ||
+        fail "cannot create private RPM retirement fixture"
+    mkdir -m 0700 "$rpm_retire_nested" ||
+        fail "cannot create nested RPM retirement fixture"
+    printf '%s\n' 'private nested retirement data' \
+        >"$rpm_retire_nested/data" ||
+        fail "cannot create nested RPM retirement data"
+    cp "$rpm_retire_nested/data" "$rpm_fixture/retire-data.expected" ||
+        fail "cannot preserve nested RPM retirement data"
+    printf '%s\n' 'external retirement sentinel' >"$rpm_retire_external" ||
+        fail "cannot create external RPM retirement sentinel"
+    cp "$rpm_retire_external" "$rpm_fixture/retire-external.expected" ||
+        fail "cannot preserve external RPM retirement sentinel"
+    ln -s "$rpm_retire_external" "$rpm_retire_nested/external-link" ||
+        fail "cannot link private RPM tree to external sentinel"
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_retire_identity=$(stat -f '%d:%i' "$rpm_retire_tree") ||
+                fail "cannot identify private RPM retirement fixture"
+            ;;
+        *)
+            rpm_retire_identity=$(stat -c '%d:%i' "$rpm_retire_tree") ||
+                fail "cannot identify private RPM retirement fixture"
+            ;;
+    esac
+    rpm_retire_device=${rpm_retire_identity%%:*}
+    rpm_retire_inode=${rpm_retire_identity#*:}
+    if [ "$rpm_retire_inode" -gt 0 ]; then
+        rpm_retire_wrong_inode=$((rpm_retire_inode - 1))
+    else
+        rpm_retire_wrong_inode=1
+    fi
+    if "$rpm_beta_publisher" --internal-retire-tree-v1 \
+        "$rpm_home" "${rpm_retire_tree##*/}" \
+        "$rpm_retire_device" "$rpm_retire_wrong_inode" \
+        >"$rpm_retire_wrong_out" 2>&1; then
+        fail "RPM retirement accepted the wrong directory generation"
+    fi
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_retire_after=$(stat -f '%d:%i' "$rpm_retire_tree") ||
+                fail "wrong-generation retirement removed its directory"
+            ;;
+        *)
+            rpm_retire_after=$(stat -c '%d:%i' "$rpm_retire_tree") ||
+                fail "wrong-generation retirement removed its directory"
+            ;;
+    esac
+    [ "$rpm_retire_after" = "$rpm_retire_identity" ] ||
+        fail "wrong-generation retirement replaced the private directory"
+    cmp -s "$rpm_retire_nested/data" "$rpm_fixture/retire-data.expected" ||
+        fail "wrong-generation retirement changed nested private data"
+    [ -L "$rpm_retire_nested/external-link" ] &&
+    [ "$(readlink "$rpm_retire_nested/external-link")" = \
+        "$rpm_retire_external" ] ||
+        fail "wrong-generation retirement changed the external symlink"
+    cmp -s "$rpm_retire_external" "$rpm_fixture/retire-external.expected" ||
+        fail "wrong-generation retirement changed the external target"
+    if "$rpm_beta_publisher" --internal-retire-tree-v1 \
+        "$rpm_home" "${rpm_retire_tree##*/}" \
+        "$rpm_retire_device" "$rpm_retire_inode" \
+        >"$rpm_retire_exact_out" 2>&1; then
+        rpm_retire_status=0
+    else
+        rpm_retire_status=$?
+    fi
+    case $copy_platform in
+        FreeBSD)
+            [ "$rpm_retire_status" -eq 0 ] || {
+                sed -n '1,160p' "$rpm_retire_exact_out" >&2
+                fail "FreeBSD matching-generation RPM retirement failed"
+            }
+            [ ! -e "$rpm_retire_tree" ] && [ ! -L "$rpm_retire_tree" ] ||
+                fail "FreeBSD matching-generation retirement retained its namespace"
+            ;;
+        Linux|Darwin)
+            [ "$rpm_retire_status" -eq 2 ] || {
+                sed -n '1,160p' "$rpm_retire_exact_out" >&2
+                fail "unsupported descriptor retirement lacked retained status"
+            }
+            [ -d "$rpm_retire_tree" ] && [ ! -L "$rpm_retire_tree" ] ||
+                fail "unsupported descriptor retirement removed its namespace"
+            case $copy_platform in
+                Darwin)
+                    rpm_retire_after=$(stat -f '%d:%i' "$rpm_retire_tree") ||
+                        fail "cannot re-identify retained RPM namespace"
+                    ;;
+                *)
+                    rpm_retire_after=$(stat -c '%d:%i' "$rpm_retire_tree") ||
+                        fail "cannot re-identify retained RPM namespace"
+                    ;;
+            esac
+            [ "$rpm_retire_after" = "$rpm_retire_identity" ] ||
+                fail "unsupported retirement replaced the private namespace"
+            cmp -s "$rpm_retire_nested/data" \
+                "$rpm_fixture/retire-data.expected" ||
+                fail "unsupported retirement partially removed nested data"
+            [ -L "$rpm_retire_nested/external-link" ] ||
+                fail "unsupported retirement partially removed a symlink"
+            grep -F 'private RPM namespace safely retained:' \
+                "$rpm_retire_exact_out" >/dev/null ||
+                fail "unsupported retirement silently retained its namespace"
+            rm -rf "$rpm_retire_tree" ||
+                fail "cannot remove fixture-owned retained RPM namespace"
+            ;;
+    esac
+    cmp -s "$rpm_retire_external" "$rpm_fixture/retire-external.expected" ||
+        fail "matching-generation RPM retirement followed the external symlink"
+
+    # Pause at the helper's final retirement boundary. A same-UID writer then
+    # swaps in an empty replacement that the old pathname-only rmdir deleted.
+    # The supported outcomes are descriptor-conditioned refusal on FreeBSD and
+    # pre-mutation safe retention on Linux/Darwin; neither may delete the
+    # replacement.
+    rpm_retire_race_tree=$rpm_home/.gitswitch-rpmbuild.Rac123
+    rpm_retire_race_original=$rpm_home/.gitswitch-rpmbuild.Rac123.original
+    rpm_retire_race_nested=$rpm_retire_race_tree/nested
+    rpm_retire_race_marker=$rpm_fixture/retire-race.marker
+    rpm_retire_race_release=$rpm_fixture/retire-race.release
+    rpm_retire_race_out=$rpm_fixture/retire-race.out
+    mkdir -m 0700 "$rpm_retire_race_tree" \
+        "$rpm_retire_race_nested" ||
+        fail "cannot create RPM retirement-race fixture"
+    printf '%s\n' 'retirement race private data' \
+        >"$rpm_retire_race_nested/data" ||
+        fail "cannot seed RPM retirement-race fixture"
+    cp "$rpm_retire_race_nested/data" \
+        "$rpm_fixture/retire-race.expected" ||
+        fail "cannot preserve RPM retirement-race data"
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_retire_race_identity=$(stat -f '%d:%i' \
+                "$rpm_retire_race_tree") ||
+                fail "cannot identify RPM retirement-race fixture"
+            ;;
+        *)
+            rpm_retire_race_identity=$(stat -c '%d:%i' \
+                "$rpm_retire_race_tree") ||
+                fail "cannot identify RPM retirement-race fixture"
+            ;;
+    esac
+    rpm_retire_race_device=${rpm_retire_race_identity%%:*}
+    rpm_retire_race_inode=${rpm_retire_race_identity#*:}
+    GITSWITCH_RELEASE_TEST_CLEANUP_MARKER=$rpm_retire_race_marker \
+    GITSWITCH_RELEASE_TEST_CLEANUP_RELEASE=$rpm_retire_race_release \
+        "$rpm_beta_named_publisher" --internal-retire-tree-v1 \
+        "$rpm_home" "${rpm_retire_race_tree##*/}" \
+        "$rpm_retire_race_device" "$rpm_retire_race_inode" \
+        >"$rpm_retire_race_out" 2>&1 &
+    rpm_retire_pid=$!
+    rpm_retire_wait=0
+    while [ ! -e "$rpm_retire_race_marker" ] &&
+          kill -0 "$rpm_retire_pid" 2>/dev/null &&
+          [ "$rpm_retire_wait" -lt 100 ]; do
+        sleep 0.1
+        rpm_retire_wait=$((rpm_retire_wait + 1))
+    done
+    [ -f "$rpm_retire_race_marker" ] || {
+        sed -n '1,160p' "$rpm_retire_race_out" >&2
+        fail "RPM retirement-race helper missed its final boundary"
+    }
+    case $copy_platform in
+        FreeBSD)
+            [ ! -e "$rpm_retire_race_nested" ] &&
+            [ ! -L "$rpm_retire_race_nested" ] ||
+                fail "FreeBSD retirement race paused before recursive removal"
+            ;;
+        Linux|Darwin)
+            cmp -s "$rpm_retire_race_nested/data" \
+                "$rpm_fixture/retire-race.expected" ||
+                fail "unsupported retirement mutated before safe retention"
+            ;;
+    esac
+    mv "$rpm_retire_race_tree" "$rpm_retire_race_original" ||
+        fail "cannot move the pinned RPM namespace generation"
+    mkdir -m 0700 "$rpm_retire_race_tree" ||
+        fail "cannot install replacement RPM namespace"
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_retire_replacement_identity=$(stat -f '%d:%i' \
+                "$rpm_retire_race_tree") ||
+                fail "cannot identify replacement RPM namespace"
+            ;;
+        *)
+            rpm_retire_replacement_identity=$(stat -c '%d:%i' \
+                "$rpm_retire_race_tree") ||
+                fail "cannot identify replacement RPM namespace"
+            ;;
+    esac
+    [ "$rpm_retire_replacement_identity" != "$rpm_retire_race_identity" ] ||
+        fail "RPM retirement race reused the pinned generation"
+    : >"$rpm_retire_race_release" ||
+        fail "cannot release RPM retirement-race helper"
+    if wait "$rpm_retire_pid"; then
+        rpm_retire_race_status=0
+    else
+        rpm_retire_race_status=$?
+    fi
+    rpm_retire_pid=
+    [ "$rpm_retire_race_status" -ne 0 ] ||
+        fail "RPM retirement accepted a post-proof replacement"
+    grep -F 'final retirement boundary' "$rpm_retire_race_out" >/dev/null || {
+        sed -n '1,160p' "$rpm_retire_race_out" >&2
+        fail "RPM retirement race lacked a causal final-boundary diagnostic"
+    }
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_retire_replacement_after=$(stat -f '%d:%i' \
+                "$rpm_retire_race_tree") ||
+                fail "RPM retirement deleted its replacement"
+            rpm_retire_original_after=$(stat -f '%d:%i' \
+                "$rpm_retire_race_original") ||
+                fail "RPM retirement deleted its pinned generation"
+            ;;
+        *)
+            rpm_retire_replacement_after=$(stat -c '%d:%i' \
+                "$rpm_retire_race_tree") ||
+                fail "RPM retirement deleted its replacement"
+            rpm_retire_original_after=$(stat -c '%d:%i' \
+                "$rpm_retire_race_original") ||
+                fail "RPM retirement deleted its pinned generation"
+            ;;
+    esac
+    [ "$rpm_retire_replacement_after" = \
+        "$rpm_retire_replacement_identity" ] ||
+        fail "RPM retirement replaced the post-proof substitution"
+    [ "$rpm_retire_original_after" = "$rpm_retire_race_identity" ] ||
+        fail "RPM retirement changed the pinned generation identity"
+    [ -z "$(find "$rpm_retire_race_tree" -mindepth 1 -print -quit)" ] ||
+        fail "replacement RPM namespace was not the empty race object"
+    case $copy_platform in
+        FreeBSD)
+            [ -z "$(find "$rpm_retire_race_original" -mindepth 1 \
+                -print -quit)" ] ||
+                fail "FreeBSD pinned namespace was not recursively retired"
+            rmdir "$rpm_retire_race_original" ||
+                fail "cannot remove fixture-owned retired namespace"
+            ;;
+        Linux|Darwin)
+            cmp -s "$rpm_retire_race_original/nested/data" \
+                "$rpm_fixture/retire-race.expected" ||
+                fail "unsupported retirement partially changed pinned data"
+            rm -rf "$rpm_retire_race_original" ||
+                fail "cannot remove fixture-owned retained generation"
+            ;;
+    esac
+    rmdir "$rpm_retire_race_tree" ||
+        fail "cannot remove fixture-owned replacement namespace"
+
+    # HOME is transported as data into mktemp and then into RPM macro values.
+    # An otherwise exact physical HOME containing RPM expansion syntax must be
+    # rejected before mktemp or rpmbuild can interpret it.  A dedicated command
+    # marker and exact directory-shape proof distinguish that boundary from a
+    # later build failure.
+    rpm_invalid_home=$rpm_fixture/"literal %{_tmppath} \$home"
+    rpm_invalid_shims=$rpm_fixture/invalid-home-shims
+    rpm_invalid_marker=$rpm_fixture/invalid-home-rpmbuild.marker
+    rpm_invalid_mktemp_marker=$rpm_fixture/invalid-home-mktemp.marker
+    rpm_invalid_out=$rpm_fixture/invalid-home.out
+    mkdir -p "$rpm_invalid_home" "$rpm_invalid_shims" ||
+        fail "cannot create literal-macro HOME fixture"
+    rpm_invalid_home=$(CDPATH='' cd "$rpm_invalid_home" && pwd -P) ||
+        fail "cannot resolve literal-macro HOME fixture"
+    printf '%s\n' 'literal-macro HOME sentinel' \
+        >"$rpm_invalid_home/sentinel" ||
+        fail "cannot seed literal-macro HOME fixture"
+    printf '%s\n' "$rpm_invalid_marker" \
+        >"$rpm_invalid_shims/marker-path" ||
+        fail "cannot record invalid-HOME rpmbuild marker"
+    printf '%s\n' "$rpm_invalid_mktemp_marker" \
+        >"$rpm_invalid_shims/mktemp-marker-path" ||
+        fail "cannot record invalid-HOME mktemp marker"
+    cat >"$rpm_invalid_shims/rpmbuild" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r marker <"$shim_dir/marker-path" || exit 96
+: >"$marker" || exit 95
+exit 94
+EOF
+    chmod 0700 "$rpm_invalid_shims/rpmbuild" ||
+        fail "cannot activate invalid-HOME rpmbuild marker"
+    cat >"$rpm_invalid_shims/mktemp" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r marker <"$shim_dir/mktemp-marker-path" || exit 96
+: >"$marker" || exit 95
+exit 93
+EOF
+    chmod 0700 "$rpm_invalid_shims/mktemp" ||
+        fail "cannot activate invalid-HOME mktemp marker"
+    if HOME="$rpm_invalid_home" PATH="$rpm_invalid_shims:$PATH" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_invalid_out" 2>&1; then
+        fail "RPM helper accepted HOME containing literal RPM macro syntax"
+    fi
+    grep -E 'HOME.*(RPM|macro)' "$rpm_invalid_out" >/dev/null || {
+        sed -n '1,160p' "$rpm_invalid_out" >&2
+        fail "literal-macro HOME rejection lacked a causal diagnostic"
+    }
+    [ ! -e "$rpm_invalid_marker" ] && [ ! -L "$rpm_invalid_marker" ] ||
+        fail "literal-macro HOME reached rpmbuild"
+    [ ! -e "$rpm_invalid_mktemp_marker" ] &&
+    [ ! -L "$rpm_invalid_mktemp_marker" ] ||
+        fail "literal-macro HOME reached mktemp"
+    for rpm_invalid_residue in \
+        "$rpm_invalid_home"/.gitswitch-rpmbuild.*; do
+        [ ! -e "$rpm_invalid_residue" ] && [ ! -L "$rpm_invalid_residue" ] ||
+            fail "literal-macro HOME created a private RPM namespace"
+    done
+    set -- "$rpm_invalid_home"/*
+    [ "$#" -eq 1 ] && [ "$1" = "$rpm_invalid_home/sentinel" ] ||
+        fail "literal-macro HOME rejection left unexpected residue"
+
+    rpm_assert_incomplete_set()
+    {
+        rpm_incomplete_log=$1
+        if ! grep -F 'RPM set publication is incomplete' \
+            "$rpm_incomplete_log" >/dev/null; then
+            sed -n '1,200p' "$rpm_incomplete_log" >&2
+            fail "partial RPM publication lacked explicit recovery guidance"
+        fi
+        if ! grep -E 'inspect and remove only .*exact no-replace outputs' \
+            "$rpm_incomplete_log" >/dev/null; then
+            sed -n '1,200p' "$rpm_incomplete_log" >&2
+            fail "partial RPM publication lacked exact cleanup guidance"
+        fi
+        for rpm_incomplete_name in "$rpm_binary_name" "$rpm_source_name"; do
+            grep -F "build/dist/$rpm_incomplete_name" \
+                "$rpm_incomplete_log" >/dev/null || {
+                sed -n '1,200p' "$rpm_incomplete_log" >&2
+                fail "partial RPM diagnostic omitted $rpm_incomplete_name"
+            }
+        done
+    }
+
+    # The publisher may report failure only after an earlier leaf has become
+    # canonical, so automatic replacement/resume is unsafe.  Fail the wrapper
+    # before its second call: the helper must enumerate the complete intended
+    # set, retain the byte-exact first leaf, reject an immediate retry without
+    # changing its inode, and succeed only after this isolated owner removes
+    # both explicitly named leaves.
+    rpm_beta_binary=$rpm_beta_repo/build/dist/$rpm_binary_name
+    rpm_beta_source=$rpm_beta_repo/build/dist/$rpm_source_name
+    rm -f "$rpm_beta_binary" "$rpm_beta_source" ||
+        fail "cannot reset beta RPM leaves for partial-publication fixture"
+    rpm_partial_publisher=$rpm_shims/partial-publisher
+    rpm_partial_calls=$rpm_state/partial-publisher.calls
+    rpm_partial_count=$rpm_state/partial-publisher.count
+    cat >"$rpm_partial_publisher" <<'EOF'
+#!/bin/sh
+set -u
+: "${AR11_RPM_REAL_PUBLISHER:?}"
+: "${AR11_RPM_PUBLISH_CALLS:?}"
+: "${AR11_RPM_PUBLISH_COUNT:?}"
+if [ "${1-}" = --internal-retire-tree-v1 ]; then
+    exec "$AR11_RPM_REAL_PUBLISHER" "$@"
+fi
+[ "${1-}" = --internal-release-tree-v1 ] || exit 93
+partial_count=0
+if [ -f "$AR11_RPM_PUBLISH_COUNT" ]; then
+    IFS= read -r partial_count <"$AR11_RPM_PUBLISH_COUNT" || exit 96
+fi
+partial_count=$((partial_count + 1))
+printf '%s\n' "$partial_count" >"$AR11_RPM_PUBLISH_COUNT" || exit 95
+printf '%s\n' "${5-}" >>"$AR11_RPM_PUBLISH_CALLS" || exit 94
+if [ "$partial_count" -eq 2 ]; then
+    printf '%s\n' 'injected second RPM publication failure' >&2
+    exit 75
+fi
+exec "$AR11_RPM_REAL_PUBLISHER" "$@"
+EOF
+    chmod 0700 "$rpm_partial_publisher" ||
+        fail "cannot activate partial RPM publisher"
+    rpm_partial_out=$rpm_fixture/partial-publication.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=partial \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        AR11_RPM_REAL_PUBLISHER="$rpm_beta_publisher" \
+        AR11_RPM_PUBLISH_CALLS="$rpm_partial_calls" \
+        AR11_RPM_PUBLISH_COUNT="$rpm_partial_count" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_partial_publisher" >"$rpm_partial_out" 2>&1; then
+        fail "injected second-leaf RPM publication failure returned success"
+    fi
+    rpm_assert_incomplete_set "$rpm_partial_out"
+    [ "$(sed -n '1p' "$rpm_partial_calls")" = "$rpm_binary_name" ] &&
+    [ "$(sed -n '2p' "$rpm_partial_calls")" = "$rpm_source_name" ] &&
+    [ "$(sed -n '3p' "$rpm_partial_calls")" = '' ] ||
+        fail "partial publisher did not receive the exact ordered RPM set"
+    cmp -s "$rpm_beta_binary" "$rpm_state/partial.beta.binary.expected" ||
+        fail "partial publication did not retain the exact first RPM leaf"
+    [ ! -e "$rpm_beta_source" ] && [ ! -L "$rpm_beta_source" ] ||
+        fail "failed second publication exposed the second RPM leaf"
+    [ "$(find "$rpm_beta_binary" -prune -type f -perm 0444 \
+        -print 2>/dev/null)" = "$rpm_beta_binary" ] ||
+        fail "retained first RPM leaf is not sealed mode 0444"
+    rpm_partial_topdir=$(sed -n '1p' "$rpm_state/partial.beta.observed")
+    [ -n "$rpm_partial_topdir" ] ||
+        fail "partial RPM publication omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_partial_topdir" "$rpm_partial_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+    rpm_inspect_leaf_residue "$rpm_beta_binary" \
+        "$rpm_state/partial.beta.binary.expected"
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_partial_identity=$(stat -f '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot identify retained first RPM leaf"
+            ;;
+        *)
+            rpm_partial_identity=$(stat -c '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot identify retained first RPM leaf"
+            ;;
+    esac
+
+    rpm_blocked_retry_out=$rpm_fixture/partial-retry-blocked.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=partial-retry \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_blocked_retry_out" 2>&1; then
+        fail "RPM helper auto-resumed an incomplete publication set"
+    fi
+    rpm_assert_incomplete_set "$rpm_blocked_retry_out"
+    cmp -s "$rpm_beta_binary" "$rpm_state/partial.beta.binary.expected" ||
+        fail "blocked RPM retry replaced the retained first leaf"
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_blocked_identity=$(stat -f '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot re-identify retained first RPM leaf"
+            ;;
+        *)
+            rpm_blocked_identity=$(stat -c '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot re-identify retained first RPM leaf"
+            ;;
+    esac
+    [ "$rpm_blocked_identity" = "$rpm_partial_identity" ] ||
+        fail "blocked RPM retry replaced the retained leaf inode"
+    [ ! -e "$rpm_beta_source" ] && [ ! -L "$rpm_beta_source" ] ||
+        fail "blocked RPM retry published the missing second leaf"
+    rpm_blocked_topdir=$(sed -n '1p' \
+        "$rpm_state/partial-retry.beta.observed")
+    [ -n "$rpm_blocked_topdir" ] ||
+        fail "blocked RPM retry omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_blocked_topdir" \
+        "$rpm_blocked_retry_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    rm -f "$rpm_beta_binary" ||
+        fail "cannot replace retained RPM with mismatch sentinel"
+    printf '%s\n' 'foreign mismatched RPM leaf' >"$rpm_beta_binary" ||
+        fail "cannot create mismatched RPM sentinel"
+    chmod 0444 "$rpm_beta_binary" ||
+        fail "cannot seal mismatched RPM sentinel"
+    cp "$rpm_beta_binary" "$rpm_fixture/mismatched-rpm.expected" ||
+        fail "cannot preserve mismatched RPM sentinel"
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_mismatch_identity=$(stat -f '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot identify mismatched RPM sentinel"
+            ;;
+        *)
+            rpm_mismatch_identity=$(stat -c '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot identify mismatched RPM sentinel"
+            ;;
+    esac
+    rpm_mismatch_out=$rpm_fixture/partial-retry-mismatch.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=partial-mismatch \
+        AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_mismatch_out" 2>&1; then
+        fail "RPM helper replaced a mismatched incomplete-set leaf"
+    fi
+    rpm_assert_incomplete_set "$rpm_mismatch_out"
+    cmp -s "$rpm_beta_binary" "$rpm_fixture/mismatched-rpm.expected" ||
+        fail "mismatched RPM retry changed foreign bytes"
+    case $copy_platform in
+        Darwin|FreeBSD)
+            rpm_mismatch_after=$(stat -f '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot re-identify mismatched RPM sentinel"
+            ;;
+        *)
+            rpm_mismatch_after=$(stat -c '%d:%i' "$rpm_beta_binary") ||
+                fail "cannot re-identify mismatched RPM sentinel"
+            ;;
+    esac
+    [ "$rpm_mismatch_after" = "$rpm_mismatch_identity" ] ||
+        fail "mismatched RPM retry replaced the foreign inode"
+    [ ! -e "$rpm_beta_source" ] && [ ! -L "$rpm_beta_source" ] ||
+        fail "mismatched RPM retry published the missing second leaf"
+    rpm_mismatch_topdir=$(sed -n '1p' \
+        "$rpm_state/partial-mismatch.beta.observed")
+    [ -n "$rpm_mismatch_topdir" ] ||
+        fail "mismatched RPM retry omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_mismatch_topdir" "$rpm_mismatch_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    rm -f "$rpm_beta_binary" "$rpm_beta_source" ||
+        fail "cannot perform explicit incomplete-set RPM cleanup"
+    rpm_partial_final_out=$rpm_fixture/partial-retry-final.out
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+    AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=partial-final \
+    AR11_RPM_HOME="$rpm_home" AR11_RPM_REPO_ROOT="$rpm_beta_root" \
+        sh "$rpm_helper" "$rpm_beta_root" "$rpm_beta_archive" \
+        "$rpm_archive_name" "$rpm_fixture_dist_root" gitswitcher \
+        "$rpm_beta_publisher" >"$rpm_partial_final_out" 2>&1 || {
+        sed -n '1,240p' "$rpm_partial_final_out" >&2
+        fail "explicitly cleaned RPM publication set did not retry"
+    }
+    rpm_assert_publication "$rpm_beta_repo" beta partial-final
+    rpm_partial_final_topdir=$(sed -n '1p' \
+        "$rpm_state/partial-final.beta.observed")
+    [ -n "$rpm_partial_final_topdir" ] ||
+        fail "completed partial-publication retry omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_partial_final_topdir" \
+        "$rpm_partial_final_out"
+    rpm_assert_no_private_residue "$rpm_beta_repo"
+
+    # A hostile rpmbuild replaces SRPMS with a symlink after the recipe creates
+    # and validates the private directory tree.  The binary is otherwise ready
+    # to enter private PUBLISH staging, so the intermediate-directory identity
+    # check must reject the build without exposing either output.  Cleanup and
+    # retry must then use a fresh topdir and publish a complete set.
+    rpm_binary_name=gitswitcher-$rpm_fixture_version-1.noarch.rpm
+    rpm_source_name=gitswitcher-$rpm_fixture_version-1.src.rpm
+    rm -f "$rpm_alpha_repo/build/dist/$rpm_binary_name" \
+        "$rpm_alpha_repo/build/dist/$rpm_source_name" ||
+        fail "cannot reset alpha public RPM outputs"
+    rm -f "$rpm_alpha_archive" || fail "cannot reset alpha RPM archive"
+    rpm_symlink_out=$rpm_fixture/symlink-srpms.out
+    if HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+        AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=symlink-srpms \
+        AR11_RPM_HOME="$rpm_home" \
+        AR11_RPM_REPO_ROOT="$rpm_alpha_root" \
+        "$make_cmd" -C "$rpm_alpha_repo" rpm \
+        >"$rpm_symlink_out" 2>&1; then
+        fail "RPM target accepted a substituted private SRPMS directory"
+    fi
+    rpm_symlink_report=$rpm_state/symlink-srpms.alpha.observed
+    [ -s "$rpm_symlink_report" ] || {
+        sed -n '1,240p' "$rpm_symlink_out" >&2
+        fail "SRPMS substitution fixture failed before rpmbuild"
+    }
+    [ -f "$rpm_state/archive-swap.marker" ] &&
+    [ -f "$rpm_state/archive-swap.original" ] &&
+    [ -f "$rpm_state/archive-swap.restored" ] ||
+        fail "private-source fixture did not replace the canonical archive"
+    cmp -s "$rpm_state/archive-swap.original" "$rpm_alpha_archive" ||
+        fail "private-source fixture did not restore the canonical archive"
+    rpm_symlink_topdir=$(sed -n '1p' "$rpm_symlink_report")
+    [ -n "$rpm_symlink_topdir" ] ||
+        fail "failed RPM build omitted its private topdir"
+    rpm_assert_private_retirement "$rpm_symlink_topdir" "$rpm_symlink_out"
+    [ ! -e "$rpm_alpha_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -L "$rpm_alpha_repo/build/dist/$rpm_binary_name" ] &&
+    [ ! -e "$rpm_alpha_repo/build/dist/$rpm_source_name" ] &&
+    [ ! -L "$rpm_alpha_repo/build/dist/$rpm_source_name" ] ||
+        fail "failed RPM build exposed a partial public RPM"
+    rpm_escaped_source=$rpm_state/symlink-srpms.alpha.escape/$rpm_source_name
+    cmp -s "$rpm_escaped_source" \
+        "$rpm_state/symlink-srpms.alpha.source.expected" ||
+        fail "failed RPM cleanup changed the escaped SRPM sentinel"
+    rpm_assert_no_private_residue "$rpm_alpha_repo"
+    inspect_dist_residue "$rpm_alpha_archive" "$copy_platform"
+
+    mkdir -m 0700 "$rpm_symlink_topdir" ||
+        fail "cannot reserve failed RPM topdir identity for retry"
+    printf '%s\n' 'failed topdir identity sentinel' \
+        >"$rpm_symlink_topdir/sentinel" ||
+        fail "cannot mark failed RPM topdir identity"
+    cp "$rpm_symlink_topdir/sentinel" \
+        "$rpm_fixture/failed-topdir.expected" ||
+        fail "cannot preserve failed-topdir sentinel"
+    rm -f "$rpm_alpha_archive" || fail "cannot reset retry RPM archive"
+    rpm_retry_out=$rpm_fixture/retry.out
+    HOME="$rpm_home" PATH="$rpm_shims:$PATH" \
+    AR11_RPM_STATE="$rpm_state" AR11_RPM_MODE=retry \
+    AR11_RPM_HOME="$rpm_home" \
+    AR11_RPM_REPO_ROOT="$rpm_alpha_root" \
+        "$make_cmd" -C "$rpm_alpha_repo" rpm \
+        >"$rpm_retry_out" 2>&1 || {
+        sed -n '1,240p' "$rpm_retry_out" >&2
+        fail "RPM retry after private validation failure failed"
+    }
+    rpm_retry_topdir=$(sed -n '1p' "$rpm_state/retry.alpha.observed")
+    [ -n "$rpm_retry_topdir" ] &&
+    [ "$rpm_retry_topdir" != "$rpm_symlink_topdir" ] ||
+        fail "RPM retry reused the failed private topdir identity"
+    cmp -s "$rpm_symlink_topdir/sentinel" \
+        "$rpm_fixture/failed-topdir.expected" ||
+        fail "RPM retry changed a caller-reserved old topdir identity"
+    rpm_assert_private_retirement "$rpm_retry_topdir" "$rpm_retry_out"
+    rm -rf "$rpm_symlink_topdir" ||
+        fail "cannot remove failed-topdir retry sentinel"
+    rpm_assert_publication "$rpm_alpha_repo" alpha retry
+    rpm_assert_no_private_residue "$rpm_alpha_repo"
+    inspect_dist_residue "$rpm_alpha_archive" "$copy_platform"
+    cmp -s "$rpm_home/rpmbuild/sentinel" "$rpm_fixture/rpmbuild.expected" ||
+        fail "RPM builds touched the caller's shared HOME/rpmbuild path"
+    [ -d "$rpm_home/rpmbuild" ] && [ ! -L "$rpm_home/rpmbuild" ] ||
+        fail "RPM builds replaced the caller's shared HOME/rpmbuild directory"
+    set -- "$rpm_home/rpmbuild"/*
+    [ "$#" -eq 1 ] && [ "$1" = "$rpm_home/rpmbuild/sentinel" ] ||
+        fail "RPM builds populated the caller's shared HOME/rpmbuild directory"
+    cmp -s "$rpm_home/.rpmmacros" "$rpm_fixture/rpmmacros.expected" ||
+        fail "RPM builds changed the caller's hostile user macro file"
+    [ ! -e "$rpm_poison" ] && [ ! -L "$rpm_poison" ] ||
+        fail "user RPM macros redirected output outside the private topdir"
 
     # The archive producer must never receive a reopenable temporary path.
     # This wrapper reproduces the original same-uid substitution: when it sees

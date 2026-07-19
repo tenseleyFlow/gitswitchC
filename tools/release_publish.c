@@ -6,6 +6,7 @@
 
 #include "../src/freebsd_compat.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -90,8 +91,9 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "usage: %s OUTPUT_DIRECTORY CANONICAL_DIRECTORY FINAL_NAME -- COMMAND [ARG ...]\n"
-            "       %s --internal-release-tree-v1 ROOT BUILD_COMPONENT DIST_COMPONENT FINAL_NAME -- COMMAND [ARG ...]\n",
-            program, program);
+            "       %s --internal-release-tree-v1 ROOT BUILD_COMPONENT DIST_COMPONENT FINAL_NAME -- COMMAND [ARG ...]\n"
+            "       %s --internal-retire-tree-v1 HOME PRIVATE_NAME EXPECTED_DEV EXPECTED_INO\n",
+            program, program, program);
 }
 
 static bool same_identity(const struct stat *left, const struct stat *right)
@@ -105,6 +107,507 @@ static bool same_directory_identity(const struct stat *left,
 {
     return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
            S_ISDIR(left->st_mode) && S_ISDIR(right->st_mode);
+}
+
+#define PRIVATE_RPM_PREFIX ".gitswitch-rpmbuild."
+#define PRIVATE_RPM_SUFFIX_SIZE 6U
+#define RETIRE_TREE_MAX_DEPTH 256U
+#define RETIRE_TREE_RETAINED_STATUS 2
+
+static int run_cleanup_race_hook(void);
+
+static bool private_rpm_name_is_valid(const char *name)
+{
+    const size_t prefix_size = sizeof(PRIVATE_RPM_PREFIX) - 1U;
+    size_t index;
+
+    if (strncmp(name, PRIVATE_RPM_PREFIX, prefix_size) != 0 ||
+        strlen(name) != prefix_size + PRIVATE_RPM_SUFFIX_SIZE) {
+        return false;
+    }
+    for (index = prefix_size;
+         index < prefix_size + PRIVATE_RPM_SUFFIX_SIZE; index++) {
+        unsigned char byte = (unsigned char)name[index];
+
+        if (!((byte >= (unsigned char)'A' && byte <= (unsigned char)'Z') ||
+              (byte >= (unsigned char)'a' && byte <= (unsigned char)'z') ||
+              (byte >= (unsigned char)'0' && byte <= (unsigned char)'9'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int parse_decimal_identity(const char *text, uintmax_t *identity)
+{
+    const unsigned char *cursor = (const unsigned char *)text;
+    char *end = NULL;
+    uintmax_t value;
+
+    if (*cursor == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    while (*cursor != '\0') {
+        if (*cursor < (unsigned char)'0' ||
+            *cursor > (unsigned char)'9') {
+            errno = EINVAL;
+            return -1;
+        }
+        cursor++;
+    }
+    errno = 0;
+    value = strtoumax(text, &end, 10);
+    if (errno != 0 || end == NULL || *end != '\0') {
+        if (errno == 0) {
+            errno = EINVAL;
+        }
+        return -1;
+    }
+    *identity = value;
+    return 0;
+}
+
+/* Pin an absolute lexical-canonical directory without following a symlink in
+ * any component. Empty, dot, and dot-dot components would make the supplied
+ * spelling differ from the descriptor walk, so reject them. */
+static int open_canonical_absolute_directory(const char *path)
+{
+    const char *cursor;
+    int directory_fd;
+
+    if (path[0] != '/') {
+        errno = EINVAL;
+        return -1;
+    }
+    do {
+        directory_fd =
+            open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (directory_fd < 0 && errno == EINTR);
+    if (directory_fd < 0) {
+        return -1;
+    }
+    cursor = path + 1;
+    if (*cursor == '\0') {
+        return directory_fd;
+    }
+    for (;;) {
+        const char *separator = strchr(cursor, '/');
+        size_t component_size = separator == NULL
+                                    ? strlen(cursor)
+                                    : (size_t)(separator - cursor);
+        char *component;
+        int child_fd;
+        int saved_errno;
+
+        if (component_size == 0U ||
+            (component_size == 1U && cursor[0] == '.') ||
+            (component_size == 2U && cursor[0] == '.' &&
+             cursor[1] == '.')) {
+            (void)close(directory_fd);
+            errno = EINVAL;
+            return -1;
+        }
+        if (component_size > SIZE_MAX - 1U) {
+            (void)close(directory_fd);
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        component = malloc(component_size + 1U);
+        if (component == NULL) {
+            saved_errno = errno;
+            (void)close(directory_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        memcpy(component, cursor, component_size);
+        component[component_size] = '\0';
+        do {
+            child_fd = openat(directory_fd, component,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        } while (child_fd < 0 && errno == EINTR);
+        saved_errno = errno;
+        free(component);
+        if (child_fd < 0) {
+            (void)close(directory_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        if (close(directory_fd) != 0) {
+            saved_errno = errno;
+            (void)close(child_fd);
+            errno = saved_errno;
+            return -1;
+        }
+        directory_fd = child_fd;
+        if (separator == NULL) {
+            return directory_fd;
+        }
+        cursor = separator + 1;
+    }
+}
+
+static int revalidate_canonical_directory_path(const char *path,
+                                               const struct stat *expected)
+{
+    struct stat current;
+    int directory_fd = open_canonical_absolute_directory(path);
+    int saved_errno;
+
+    if (directory_fd < 0) {
+        return -1;
+    }
+    if (fstat(directory_fd, &current) != 0) {
+        saved_errno = errno;
+        (void)close(directory_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (!same_directory_identity(expected, &current)) {
+        (void)close(directory_fd);
+        errno = ESTALE;
+        return -1;
+    }
+    return close(directory_fd);
+}
+
+#if defined(__FreeBSD__)
+static int duplicate_cloexec(int fd)
+{
+#if defined(F_DUPFD_CLOEXEC)
+    int duplicate;
+
+    do {
+        duplicate = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+    } while (duplicate < 0 && errno == EINTR);
+    return duplicate;
+#else
+    int duplicate;
+    int flags;
+    int saved_errno;
+
+    do {
+        duplicate = dup(fd);
+    } while (duplicate < 0 && errno == EINTR);
+    if (duplicate < 0) {
+        return -1;
+    }
+    flags = fcntl(duplicate, F_GETFD);
+    if (flags < 0 ||
+        fcntl(duplicate, F_SETFD, flags | FD_CLOEXEC) != 0) {
+        saved_errno = errno;
+        (void)close(duplicate);
+        errno = saved_errno;
+        return -1;
+    }
+    return duplicate;
+#endif
+}
+#endif
+
+static int revalidate_directory_entry(int parent_fd, const char *name,
+                                      int child_fd,
+                                      const struct stat *expected)
+{
+    struct stat descriptor_stat;
+    struct stat path_stat;
+
+    if (fstat(child_fd, &descriptor_stat) != 0) {
+        return -1;
+    }
+    if (!same_directory_identity(expected, &descriptor_stat)) {
+        errno = ESTALE;
+        return -1;
+    }
+    if (fstatat(parent_fd, name, &path_stat, AT_SYMLINK_NOFOLLOW) != 0) {
+        return -1;
+    }
+    if (!same_directory_identity(&descriptor_stat, &path_stat)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+#if defined(__FreeBSD__)
+static int retire_directory_contents(int directory_fd, dev_t tree_device,
+                                     unsigned int depth)
+{
+    DIR *stream;
+    int stream_fd;
+    int result = 0;
+
+    if (depth >= RETIRE_TREE_MAX_DEPTH) {
+        errno = ELOOP;
+        return -1;
+    }
+    stream_fd = duplicate_cloexec(directory_fd);
+    if (stream_fd < 0) {
+        return -1;
+    }
+    stream = fdopendir(stream_fd);
+    if (stream == NULL) {
+        int saved_errno = errno;
+
+        (void)close(stream_fd);
+        errno = saved_errno;
+        return -1;
+    }
+
+    for (;;) {
+        struct dirent *entry;
+        struct stat before;
+        struct stat pinned;
+        int entry_fd = -1;
+        int saved_errno;
+
+        errno = 0;
+        entry = readdir(stream);
+        if (entry == NULL) {
+            if (errno != 0) {
+                result = -1;
+            }
+            break;
+        }
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (fstatat(directory_fd, entry->d_name, &before,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            result = -1;
+            break;
+        }
+        if (before.st_dev != tree_device) {
+            errno = EXDEV;
+            result = -1;
+            break;
+        }
+        do {
+            entry_fd = openat(directory_fd, entry->d_name,
+                              O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        } while (entry_fd < 0 && errno == EINTR);
+        if (entry_fd < 0 || fstat(entry_fd, &pinned) != 0) {
+            saved_errno = errno;
+            if (entry_fd >= 0) {
+                (void)close(entry_fd);
+            }
+            errno = saved_errno;
+            result = -1;
+            break;
+        }
+        if (pinned.st_dev != before.st_dev ||
+            pinned.st_ino != before.st_ino ||
+            (pinned.st_mode & S_IFMT) != (before.st_mode & S_IFMT)) {
+            (void)close(entry_fd);
+            errno = ESTALE;
+            result = -1;
+            break;
+        }
+        if (S_ISDIR(pinned.st_mode)) {
+            int child_fd = -1;
+
+            do {
+                child_fd = openat(directory_fd, entry->d_name,
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                      O_CLOEXEC);
+            } while (child_fd < 0 && errno == EINTR);
+            if (child_fd < 0 ||
+                revalidate_directory_entry(directory_fd, entry->d_name,
+                                           child_fd, &pinned) != 0 ||
+                retire_directory_contents(child_fd, tree_device,
+                                          depth + 1U) != 0) {
+                saved_errno = errno;
+                if (child_fd >= 0) {
+                    (void)close(child_fd);
+                }
+                (void)close(entry_fd);
+                errno = saved_errno;
+                result = -1;
+                break;
+            }
+            if (funlinkat(directory_fd, entry->d_name, entry_fd,
+                          AT_REMOVEDIR) != 0) {
+                saved_errno = errno;
+                (void)close(child_fd);
+                (void)close(entry_fd);
+                errno = saved_errno;
+                result = -1;
+                break;
+            }
+            saved_errno = 0;
+            if (close(child_fd) != 0) {
+                saved_errno = errno;
+            }
+            if (close(entry_fd) != 0 && saved_errno == 0) {
+                saved_errno = errno;
+            }
+            if (saved_errno != 0) {
+                errno = saved_errno;
+                result = -1;
+                break;
+            }
+        } else {
+            if (funlinkat(directory_fd, entry->d_name, entry_fd, 0) != 0) {
+                saved_errno = errno;
+                (void)close(entry_fd);
+                errno = saved_errno;
+                result = -1;
+                break;
+            }
+            if (close(entry_fd) != 0) {
+                result = -1;
+                break;
+            }
+        }
+    }
+    {
+        int saved_errno = errno;
+
+        if (closedir(stream) != 0 && result == 0) {
+            return -1;
+        }
+        errno = saved_errno;
+    }
+    return result;
+}
+#endif
+
+static int run_internal_retire_tree(const char *home_path,
+                                    const char *private_name,
+                                    const char *expected_device_text,
+                                    const char *expected_inode_text)
+{
+    uintmax_t expected_device;
+    uintmax_t expected_inode;
+    struct stat home_stat;
+    struct stat private_stat;
+    int home_fd = -1;
+    int private_fd = -1;
+    int result = EXIT_FAILURE;
+#if defined(__FreeBSD__)
+    struct stat current_private_stat;
+#endif
+
+    if (!private_rpm_name_is_valid(private_name)) {
+        fprintf(stderr, "ERROR: private RPM namespace name is invalid\n");
+        return EXIT_FAILURE;
+    }
+    if (parse_decimal_identity(expected_device_text, &expected_device) != 0 ||
+        parse_decimal_identity(expected_inode_text, &expected_inode) != 0) {
+        fprintf(stderr, "ERROR: private RPM namespace identity is invalid\n");
+        return EXIT_FAILURE;
+    }
+    home_fd = open_canonical_absolute_directory(home_path);
+    if (home_fd < 0 || fstat(home_fd, &home_stat) != 0) {
+        fprintf(stderr, "ERROR: cannot pin canonical HOME directory: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    do {
+        private_fd = openat(home_fd, private_name,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (private_fd < 0 && errno == EINTR);
+    if (private_fd < 0 || fstat(private_fd, &private_stat) != 0) {
+        fprintf(stderr, "ERROR: cannot pin private RPM namespace: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (!S_ISDIR(private_stat.st_mode) ||
+        (uintmax_t)private_stat.st_dev != expected_device ||
+        (uintmax_t)private_stat.st_ino != expected_inode ||
+        private_stat.st_uid != geteuid() ||
+        (private_stat.st_mode & 07777) != 0700) {
+        errno = ESTALE;
+        fprintf(stderr,
+                "ERROR: private RPM namespace identity or permissions changed\n");
+        goto cleanup;
+    }
+    if (revalidate_directory_entry(home_fd, private_name, private_fd,
+                                   &private_stat) != 0) {
+        fprintf(stderr,
+                "ERROR: private RPM namespace changed before retirement\n");
+        goto cleanup;
+    }
+    if (revalidate_canonical_directory_path(home_path, &home_stat) != 0) {
+        fprintf(stderr,
+                "ERROR: canonical HOME changed before retirement: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+#if !defined(__FreeBSD__)
+    /* These systems cannot make unlink conditional on private_fd still
+     * naming this directory. Return a distinct non-success status before the
+     * first content mutation; the caller may report the safe retention
+     * without converting an otherwise successful package build to failure. */
+    if (run_cleanup_race_hook() != 0 ||
+        revalidate_directory_entry(home_fd, private_name, private_fd,
+                                   &private_stat) != 0 ||
+        revalidate_canonical_directory_path(home_path, &home_stat) != 0) {
+        fprintf(stderr,
+                "ERROR: private RPM namespace changed at final retirement boundary; replacement retained\n");
+        goto cleanup;
+    }
+    fprintf(stderr,
+            "WARNING: descriptor-conditioned directory removal is unavailable; private RPM namespace safely retained: %s/%s\n",
+            home_path, private_name);
+    result = RETIRE_TREE_RETAINED_STATUS;
+    goto cleanup;
+#else
+    if (retire_directory_contents(private_fd, private_stat.st_dev, 0U) != 0) {
+        fprintf(stderr,
+                "ERROR: cannot retire private RPM namespace contents: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (fstat(private_fd, &current_private_stat) != 0) {
+        fprintf(stderr,
+                "ERROR: cannot inspect private RPM namespace during retirement: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (!same_directory_identity(&private_stat, &current_private_stat) ||
+        current_private_stat.st_uid != geteuid() ||
+        (current_private_stat.st_mode & 07777) != 0700) {
+        errno = ESTALE;
+        fprintf(stderr,
+                "ERROR: private RPM namespace changed during retirement\n");
+        goto cleanup;
+    }
+    if (revalidate_directory_entry(home_fd, private_name, private_fd,
+                                   &private_stat) != 0) {
+        fprintf(stderr,
+                "ERROR: private RPM namespace changed during retirement\n");
+        goto cleanup;
+    }
+    if (revalidate_canonical_directory_path(home_path, &home_stat) != 0) {
+        fprintf(stderr, "ERROR: canonical HOME changed during retirement: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (run_cleanup_race_hook() != 0 ||
+        funlinkat(home_fd, private_name, private_fd, AT_REMOVEDIR) != 0) {
+        fprintf(stderr,
+                "ERROR: private RPM namespace was not removed at final retirement boundary; current name retained: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (fsync(home_fd) != 0) {
+        fprintf(stderr, "ERROR: cannot sync HOME after RPM retirement: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    result = EXIT_SUCCESS;
+#endif
+
+cleanup:
+    if (private_fd >= 0 && close(private_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
+    if (home_fd >= 0 && close(home_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
+    return result;
 }
 
 #if defined(GITSWITCH_RELEASE_TEST_DURABILITY)
@@ -3416,6 +3919,14 @@ int main(int argc, char **argv)
      * failure there is no guaranteed-safe stderr to report on. */
     if (reserve_standard_descriptors() != 0) {
         return EXIT_FAILURE;
+    }
+    if (argc >= 2 &&
+        strcmp(argv[1], "--internal-retire-tree-v1") == 0) {
+        if (argc != 6) {
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        return run_internal_retire_tree(argv[2], argv[3], argv[4], argv[5]);
     }
 #if defined(GITSWITCH_RELEASE_TEST_DIGEST)
     if (argc == 2 && strcmp(argv[1], "--test-sha256") == 0) {

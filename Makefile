@@ -50,6 +50,7 @@ override RELEASE_STATE_GOALS := release-publish-helpers \
 	_release-symbol-contract-test-locked clean _clean-release-locked \
 	distclean dev dist _dist-release-locked distcheck \
 	release-contract-test _release-contract-test-locked rpm \
+	_rpm-release-locked \
 	build/tools/release-publish \
 	build/tools/release-publish-named-test
 override RELEASE_GIT_DIR_PROBE_FAILURE := __GITSWITCH_RELEASE_GIT_DIR_FAILURE__
@@ -2111,7 +2112,7 @@ override PACKAGE := gitswitcher
 # unrelated Git processes on every Make invocation (AR-07 L25).
 RELEASE_METADATA_GOALS = release-manifest-check dist distcheck \
 	release-contract-test _dist-release-locked \
-	_release-contract-test-locked rpm
+	_release-contract-test-locked rpm _rpm-release-locked
 ifneq ($(strip $(filter $(RELEASE_METADATA_GOALS),$(MAKECMDGOALS))),)
     override RELEASE_COMMIT := $(shell git rev-parse --verify HEAD^{commit} 2>/dev/null)
     override RELEASE_VERSION := $(shell git show $(RELEASE_COMMIT):VERSION 2>/dev/null)
@@ -2144,7 +2145,7 @@ override DIST_MANIFEST := src tests tools completions VERSION LICENSE README.md 
 .PHONY: release-manifest-check dist _dist-release-locked distcheck \
 	release-contract-test _release-contract-test-locked \
 	freebsd-platform-contract-test release-artifact-test qa-contract-test \
-	sig-repro-test rpm
+	sig-repro-test rpm _rpm-release-locked
 # Fail closed before producing an artifact when any tracked or untracked
 # release-manifest path differs from the exact commit selected above. Besides
 # preventing a live VERSION from naming committed payload, this makes the spec
@@ -2311,19 +2312,32 @@ sig-repro-test: $(BINDIR)/$(TARGET)
 		esac; \
 	fi
 
-rpm: dist
-	@echo "Building RPM package..."
-	@command -v rpmbuild >/dev/null 2>&1 || (echo "rpmbuild not available - install rpm-build package" && exit 1)
-	mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES \
-		~/rpmbuild/SPECS ~/rpmbuild/SRPMS
-	cp "$$GITSWITCH_DIST_ARCHIVE_PATH" ~/rpmbuild/SOURCES/
-	# Consume the review-identical spec embedded in the commit-pinned archive,
-	# never a second live-checkout input.
-	tar -xOf "$$GITSWITCH_DIST_ARCHIVE_PATH" \
-		"$$GITSWITCH_DIST_ROOT/$(PACKAGE).spec" > \
-		~/rpmbuild/SPECS/$(PACKAGE).spec
-	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
-	@echo "RPM packages created in ~/rpmbuild/RPMS/"
+rpm: tools/release_publish_lock.sh tools/release_rpm.sh
+	@command -v rpmbuild >/dev/null 2>&1 || { \
+		echo 'rpmbuild not available - install the RPM build tools' >&2; \
+		exit 1; \
+	}
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory _rpm-release-locked
+
+_rpm-release-locked: _dist-release-locked tools/release_rpm.sh
+	@set -e; \
+	lock_token=$${GITSWITCH_RELEASE_LOCK_TOKEN-}; \
+	test -n "$$lock_token" && test -d "$$lock_token" && \
+	test ! -L "$$lock_token" && \
+	test -d "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	test ! -L "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	IFS= read -r lock_owner <"$$GITSWITCH_DIST_PUBLISH_LOCK_PATH/owner" && \
+	test "$$lock_owner" = "$$lock_token" || { \
+		echo 'ERROR: RPM build requires ownership of the release-publisher lock' >&2; \
+		exit 1; \
+	}; \
+	sh tools/release_rpm.sh \
+		"$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" \
+		"$$GITSWITCH_DIST_ARCHIVE_PATH" \
+		"$$GITSWITCH_DIST_ARCHIVE_NAME" \
+		"$$GITSWITCH_DIST_ROOT" "$(PACKAGE)" \
+		"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH"
 
 # Prevent make from removing intermediate files
 .SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(PUBLIC_API_PRODUCTION_OBJECT) \
