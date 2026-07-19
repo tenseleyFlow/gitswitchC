@@ -120,10 +120,19 @@ spec_version=$(sed -n 's/^Version:[[:space:]]*//p' \
 built_test_count=0
 for binary in "$source_root"/build/bin/test_*; do
     [ -x "$binary" ] || continue
+    # test_public_api.c deliberately links twice: once with the testing API
+    # surface and once against the production-only surface. Count the latter
+    # independently so the one-source/one-primary-binary manifest invariant
+    # remains exact without rejecting that required second link profile.
+    case ${binary##*/} in
+        test_public_api_production) continue ;;
+    esac
     built_test_count=$((built_test_count + 1))
 done
 [ "$built_test_count" -eq "$checkout_test_count" ] ||
     fail "built test count $built_test_count differs from checkout count $checkout_test_count"
+[ -x "$source_root/build/bin/test_public_api_production" ] ||
+    fail "production public-API link test was not built"
 
 "$make_cmd" -C "$source_root" clean
 "$make_cmd" -C "$source_root" BUILD_TYPE=release all
