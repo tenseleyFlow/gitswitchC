@@ -2275,14 +2275,14 @@ static const char *detect_shell_from_env(void) {
     return slash ? slash + 1 : shell;
 }
 
-/* Finish a shell-snippet emit: the output of `gitswitch init` is consumed by
- * `eval "$(gitswitch init bash)"`, so a short write (EPIPE, ENOSPC, closed fd)
- * that truncates the snippet mid-construct — an `if` with no `fi`, or an
- * SSH_AUTH_SOCK assignment whose existence guard got cut off — would still be
- * eval'd as-is by the shell. stdio latches every write failure in the stream
- * error flag, so flush and check it here and fail the whole command instead of
- * returning success for half a script. Nothing further is written to stdout
- * after this check, so a detected failure never appends a partial line (SIPW-1). */
+/* Finish a shell-snippet emit. Status-checking loaders capture this output and
+ * evaluate it only when `gitswitch init` succeeds, so a short write (EPIPE,
+ * ENOSPC, closed fd) that truncates the snippet mid-construct — an `if` with no
+ * `fi`, or an SSH_AUTH_SOCK assignment whose existence guard got cut off —
+ * must make the generator fail. stdio latches every write failure in the
+ * stream error flag, so flush and check it here instead of returning success
+ * for half a script. Nothing further is written to stdout after this check, so
+ * a detected failure never appends a partial line (SIPW-1). */
 static int finish_snippet_emit(void) {
     if (fflush(stdout) != 0 || ferror(stdout)) {
         fprintf(stderr, "gitswitch: failed to write shell integration snippet: %s\n",
@@ -2557,10 +2557,10 @@ static int handle_init_command(const char *shell) {
 
     if (!shell || !*shell) {
         fprintf(stderr,
-                "gitswitch: could not detect shell; pass one explicitly:\n"
-                "  gitswitch init fish | source\n"
-                "  eval \"$(gitswitch init bash)\"\n"
-                "  eval \"$(gitswitch init zsh)\"\n");
+                "gitswitch: could not detect shell; pass one explicitly "
+                "(bash|zsh|fish|sh|dash|ksh)\n"
+                "and evaluate/source its output only after init succeeds "
+                "(see README: shell integration)\n");
         return EXIT_FAILURE;
     }
     if (!shell_is_supported(shell)) {
@@ -2582,8 +2582,9 @@ static int handle_init_command(const char *shell) {
      * wiring rather than failing the whole init. The _quiet variant is
      * mandatory here: the plain one prints a not-memory-backed [WARN] to STDOUT
      * on any host with XDG_RUNTIME_DIR unset and a disk-backed /tmp (stock
-     * macOS), and this stdout is eval'd by the shell — the warning would become
-     * `bash: [WARN]: command not found` at every prompt (AR-06 F08). */
+     * macOS). This stdout is captured as a shell program and evaluated after a
+     * successful init, so the warning would become `bash: [WARN]: command not
+     * found` at every prompt (AR-06 F08). */
     char gpg_home[MAX_PATH_LEN];
     bool have_gpg_home = (gpg_manager_get_home_path_quiet(gpg_home, sizeof(gpg_home)) == 0);
 

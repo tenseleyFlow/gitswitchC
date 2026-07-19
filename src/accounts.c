@@ -1052,8 +1052,8 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
 
     if (ssh_ok || gpg_ok) {
         printf("\n  Tip: wire your shell once so every switch takes effect transparently:\n");
-        printf("    bash/zsh/sh/dash/ksh: eval \"$(gitswitch init sh)\"\n");
-        printf("    fish:                  gitswitch init fish | source\n");
+        printf("    capture `gitswitch init <shell>` first, then evaluate/source it only\n");
+        printf("    when generation succeeds (see README: shell integration).\n");
         if (gpg_ok) {
             printf("  Note: this scopes GNUPGHOME to a per-account keyring, so gpg in that\n");
             printf("        shell sees only '%s'. Use a shell without the integration for\n",
