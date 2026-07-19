@@ -9,6 +9,25 @@ fail()
     exit 1
 }
 
+# VERSION permits ERE metacharacters such as '+' and '.', so archive roots
+# must be compared as literal path components rather than interpolated into a
+# regular expression (AR-11 M48).
+archive_root_entry_count()
+{
+    LC_ALL=C awk -v root="$1" '
+        $0 == root || $0 == root "/" { count++ }
+        END { print count + 0 }
+    '
+}
+
+archive_members_within_root()
+{
+    LC_ALL=C awk -v root="$1" '
+        $0 != root && index($0, root "/") != 1 { outside = 1; exit }
+        END { exit outside ? 1 : 0 }
+    '
+}
+
 # `make distcheck` creates the archive before entering this script. Install the
 # exit trap before validating any caller-supplied value so every success and
 # failure path removes that generated artifact. `tmp` remains empty until
@@ -71,9 +90,9 @@ members=$tmp/archive-members.txt
 gzip -t "$archive" || fail "archive is not a complete gzip stream"
 tar -tzf "$archive" >"$members" || fail "cannot list archive members"
 
-root_entries=$(grep -Ec "^${dist_root}/?$" "$members" || true)
+root_entries=$(archive_root_entry_count "$dist_root" <"$members")
 [ "$root_entries" -eq 1 ] || fail "archive must contain exactly one top-level $dist_root directory"
-if grep -Ev "^${dist_root}(/|$)" "$members" >/dev/null; then
+if ! archive_members_within_root "$dist_root" <"$members"; then
     fail "archive contains a member outside $dist_root"
 fi
 if LC_ALL=C sort "$members" | uniq -d | grep . >/dev/null; then

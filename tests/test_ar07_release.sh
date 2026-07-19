@@ -9,6 +9,25 @@ fail()
     exit 1
 }
 
+# VERSION permits ERE metacharacters such as '+' and '.', so archive roots
+# must be compared as literal path components rather than interpolated into a
+# regular expression (AR-11 M48).
+archive_root_entry_count()
+{
+    LC_ALL=C awk -v root="$1" '
+        $0 == root || $0 == root "/" { count++ }
+        END { print count + 0 }
+    '
+}
+
+archive_members_within_root()
+{
+    LC_ALL=C awk -v root="$1" '
+        $0 != root && index($0, root "/") != 1 { outside = 1; exit }
+        END { exit outside ? 1 : 0 }
+    '
+}
+
 elf_has_immediate_binding()
 {
     # Accept DT_BIND_NOW itself, or an exact NOW/BIND_NOW flag token carried
@@ -971,10 +990,11 @@ assert_archive_metadata()
     gzip -t "$archive" || fail "release archive is not a complete gzip stream"
     members=$(tar -tzf "$archive") || fail "cannot list release archive"
     root_entries=$(printf '%s\n' "$members" |
-        grep -Ec "^${dist_root}/?$" || true)
+        archive_root_entry_count "$dist_root")
     [ "$root_entries" -eq 1 ] ||
         fail "archive does not contain exactly one $dist_root root entry"
-    if printf '%s\n' "$members" | grep -Ev "^${dist_root}(/|$)" >/dev/null; then
+    if ! printf '%s\n' "$members" |
+        archive_members_within_root "$dist_root"; then
         fail "archive contains a path outside $dist_root"
     fi
 
@@ -1002,6 +1022,168 @@ assert_archive_metadata()
         grep -E '^make .*BUILD_TYPE=release .*READLINE=1' >/dev/null ||
         fail "archived RPM spec does not force Readline in its release build"
 }
+
+check_literal_archive_root_contract()
+(
+    m48_work=$1
+    m48_source=$2
+    m48_make=$3
+    m48_version=1.8.0+meta
+    m48_dist_root=gitswitcher-$m48_version
+    m48_regex_alias=gitswitcher-1x8y00meta
+    m48_repo=$m48_work/m48-literal-version
+    m48_out=$m48_work/m48-literal.out
+    m48_home=$m48_work/m48-home
+    m48_stop_make=$m48_work/m48-stop-make
+
+    m48_make_mutant()
+    {
+        m48_mutant_label=$1
+        m48_mutant_archive=$2
+        m48_mutant_tree=$m48_work/m48-mutant-$m48_mutant_label
+
+        rm -rf "$m48_mutant_tree"
+        mkdir -p "$m48_mutant_tree" ||
+            fail "cannot create M48 $m48_mutant_label fixture"
+        case $m48_mutant_label in
+            prefix)
+                mkdir -p "$m48_mutant_tree/$m48_dist_root" \
+                    "$m48_mutant_tree/$m48_dist_root-prefix" ||
+                    fail "cannot create M48 prefix fixture roots"
+                : >"$m48_mutant_tree/$m48_dist_root-prefix/marker"
+                tar -czf "$m48_mutant_archive" -C "$m48_mutant_tree" \
+                    "$m48_dist_root" "$m48_dist_root-prefix" ||
+                    fail "cannot create M48 prefix archive"
+                ;;
+            regex-alias)
+                mkdir -p "$m48_mutant_tree/$m48_regex_alias" ||
+                    fail "cannot create M48 regex-alias fixture root"
+                : >"$m48_mutant_tree/$m48_regex_alias/marker"
+                tar -czf "$m48_mutant_archive" -C "$m48_mutant_tree" \
+                    "$m48_regex_alias" ||
+                    fail "cannot create M48 regex-alias archive"
+                ;;
+            outside)
+                mkdir -p "$m48_mutant_tree/$m48_dist_root" \
+                    "$m48_mutant_tree/outside-root" ||
+                    fail "cannot create M48 outside-root fixture roots"
+                : >"$m48_mutant_tree/outside-root/marker"
+                tar -czf "$m48_mutant_archive" -C "$m48_mutant_tree" \
+                    "$m48_dist_root" outside-root ||
+                    fail "cannot create M48 outside-root archive"
+                ;;
+            *) fail "unknown M48 archive mutant: $m48_mutant_label" ;;
+        esac
+    }
+
+    m48_expect_rejected()
+    {
+        m48_reject_label=$1
+        m48_reject_archive=$2
+        m48_metadata_message=$3
+        m48_dist_message=$4
+        m48_metadata_out=$m48_work/m48-$m48_reject_label-metadata.out
+        m48_dist_out=$m48_work/m48-$m48_reject_label-dist.out
+        m48_dist_archive=$m48_work/m48-$m48_reject_label-dist.tar.gz
+
+        if (assert_archive_metadata "$m48_reject_archive" \
+            "$m48_dist_root" "$m48_version") >"$m48_metadata_out" 2>&1; then
+            fail "M48 $m48_reject_label metadata mutant unexpectedly passed"
+        fi
+        grep -F "$m48_metadata_message" "$m48_metadata_out" >/dev/null || {
+            sed -n '1,120p' "$m48_metadata_out" >&2
+            fail "M48 $m48_reject_label metadata mutant missed its exact gate"
+        }
+
+        cp "$m48_reject_archive" "$m48_dist_archive" ||
+            fail "cannot copy M48 $m48_reject_label dist fixture"
+        m48_dist_status=0
+        (CDPATH='' cd "$m48_repo" && HOME="$m48_home" \
+            sh "$m48_source/tests/test_dist.sh" "$m48_dist_archive" \
+                "$m48_dist_root" \
+                /usr/local "$m48_stop_make" -- VERSION gitswitcher.spec) \
+                >"$m48_dist_out" 2>&1 || m48_dist_status=$?
+        [ "$m48_dist_status" -ne 0 ] ||
+            fail "M48 $m48_reject_label dist mutant unexpectedly passed"
+        grep -F "$m48_dist_message" "$m48_dist_out" >/dev/null || {
+            sed -n '1,120p' "$m48_dist_out" >&2
+            fail "M48 $m48_reject_label dist mutant missed its exact gate"
+        }
+    }
+
+    git clone --quiet "$m48_source" "$m48_repo" ||
+        fail "cannot clone M48 literal-version fixture"
+    printf '%s\n' "$m48_version" >"$m48_repo/VERSION" ||
+        fail "cannot write M48 literal VERSION"
+    awk -v version="$m48_version" '
+        !changed && /^Version:[[:space:]]*/ {
+            print "Version:        " version
+            changed = 1
+            next
+        }
+        { print }
+        END { if (!changed) exit 1 }
+    ' "$m48_repo/gitswitcher.spec" >"$m48_repo/gitswitcher.spec.updated" ||
+        fail "cannot rewrite M48 literal spec version"
+    mv "$m48_repo/gitswitcher.spec.updated" "$m48_repo/gitswitcher.spec" ||
+        fail "cannot install M48 literal spec version"
+    git -C "$m48_repo" add VERSION gitswitcher.spec ||
+        fail "cannot stage M48 literal-version fixture"
+    git -C "$m48_repo" -c user.name='AR-11 M48' \
+        -c user.email='ar11-m48@example.invalid' -c commit.gpgsign=false \
+        commit --quiet -m 'M48 literal version fixture' ||
+        fail "cannot commit M48 literal-version fixture"
+
+    "$m48_make" -C "$m48_repo" dist >"$m48_out" 2>&1 || {
+        sed -n '1,160p' "$m48_out" >&2
+        fail "M48 literal-version distribution failed"
+    }
+    m48_archive=$m48_repo/build/dist/$m48_dist_root.tar.gz
+    assert_archive_metadata "$m48_archive" "$m48_dist_root" "$m48_version"
+
+    mkdir -p "$m48_home" || fail "cannot create M48 private HOME"
+    chmod 0700 "$m48_home" || fail "cannot protect M48 private HOME"
+    cat >"$m48_stop_make" <<'EOF'
+#!/bin/sh
+printf '%s\n' M48_ARCHIVE_VALIDATION_COMPLETE
+exit 79
+EOF
+    chmod 0755 "$m48_stop_make" || fail "cannot make M48 stop shim executable"
+    m48_dist_archive=$m48_work/m48-valid-dist.tar.gz
+    cp "$m48_archive" "$m48_dist_archive" ||
+        fail "cannot copy M48 valid dist fixture"
+    m48_dist_status=0
+    (CDPATH='' cd "$m48_repo" && HOME="$m48_home" \
+        sh "$m48_source/tests/test_dist.sh" "$m48_dist_archive" \
+            "$m48_dist_root" \
+            /usr/local "$m48_stop_make" -- src tests tools completions \
+            VERSION LICENSE README.md Makefile gitswitcher.spec) \
+            >"$m48_out" 2>&1 || m48_dist_status=$?
+    [ "$m48_dist_status" -eq 79 ] || {
+        sed -n '1,160p' "$m48_out" >&2
+        fail "M48 literal root did not reach the distcheck build boundary"
+    }
+    grep -Fx M48_ARCHIVE_VALIDATION_COMPLETE "$m48_out" >/dev/null ||
+        fail "M48 distcheck did not complete literal archive validation"
+
+    m48_prefix_archive=$m48_work/m48-prefix.tar.gz
+    m48_make_mutant prefix "$m48_prefix_archive"
+    m48_expect_rejected prefix "$m48_prefix_archive" \
+        'archive contains a path outside' \
+        'archive contains a member outside'
+
+    m48_alias_archive=$m48_work/m48-regex-alias.tar.gz
+    m48_make_mutant regex-alias "$m48_alias_archive"
+    m48_expect_rejected regex-alias "$m48_alias_archive" \
+        'archive does not contain exactly one' \
+        'archive must contain exactly one top-level'
+
+    m48_outside_archive=$m48_work/m48-outside.tar.gz
+    m48_make_mutant outside "$m48_outside_archive"
+    m48_expect_rejected outside "$m48_outside_archive" \
+        'archive contains a path outside' \
+        'archive contains a member outside'
+)
 
 inspect_dist_residue()
 {
@@ -1228,6 +1410,11 @@ check_manifest_contract()
     cp "$clean_repo/VERSION" "$tmp/VERSION.before"
     cp "$clean_repo/README.md" "$tmp/README.before"
     cp "$clean_repo/src/main.c" "$tmp/main.before"
+
+    # AR-11 M48: the committed VERSION grammar includes ERE metacharacters.
+    # Prove both archive validators accept the literal '+' root and reject a
+    # shared-prefix component, an old-ERE alias, and an unrelated top level.
+    check_literal_archive_root_contract "$tmp" "$root" "$make_cmd"
 
     # Git-backed state must follow the current worktree's real Git directory,
     # including gitfile worktrees and paths containing spaces and literal dollar
