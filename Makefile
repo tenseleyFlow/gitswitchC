@@ -315,9 +315,10 @@ INCLUDES = -I$(SRCDIR)
 # libssl/libcrypto DT_NEEDED entries in every shipped binary (AR-05 M2).
 LIBS =
 
-# Optional GNU readline: gives the interactive add/edit prompts line editing
-# and TAB path completion. Auto-detected; build still works without it (the
-# prompt module falls back to fgets). Override with READLINE=0 to force off.
+# Optional GNU readline: gives terminal-to-terminal add/edit prompts line
+# editing and TAB path completion. Auto-detected; build still works without it
+# (the prompt module uses its bounded byte-wise stdio reader). Override with
+# READLINE=0 to force off.
 #
 # GNU readline isn't on the default search path everywhere: on macOS it's a
 # keg-only Homebrew formula, and on the BSDs it lives under /usr/local. Probe

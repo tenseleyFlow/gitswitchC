@@ -1,4 +1,5 @@
-/* AR-08 L19: prompt input must be atomic across readline and fgets builds. */
+/* AR-08 L19: prompt input must be atomic across readline and bounded-stdio
+ * paths. */
 #ifdef __linux__
 #define _GNU_SOURCE
 #endif

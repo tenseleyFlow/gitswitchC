@@ -192,9 +192,9 @@ int prompt_line(const char *prompt, char *buf, size_t size, bool path_completion
         return saved_errno == 0 ? PROMPT_LINE_EOF : PROMPT_LINE_ERROR;
     }
 
-    /* Apply the limit to the physical input, before trimming, so readline and
-     * fgets builds accept exactly the same lines. A prefix is never a valid
-     * answer: the caller can distinguish this result and ask again. */
+    /* Apply the limit before trimming so the readline path uses the same
+     * size boundary as bounded stdio. An overlong physical line is rejected
+     * instead of exposing a prefix as a valid answer. */
     if (strlen(line) >= size) {
         free(line);
         clear_error();

@@ -46,9 +46,10 @@ Examples:
   gitswitch doctor                 # Check local configuration/key readiness
 ```
 
-When built against GNU readline (auto-detected by the Makefile), the interactive
-`add`/`edit` prompts get line editing, and the SSH key path prompt gets TAB
-filename completion. Without readline the prompts fall back to plain input.
+When built against GNU readline (auto-detected by the Makefile), terminal-to-
+terminal `add`/`edit` prompts get line editing, and the SSH key path prompt gets
+TAB filename completion. Redirected prompts and builds without readline use
+bounded plain stdio input.
 
 ### command-line completion
 

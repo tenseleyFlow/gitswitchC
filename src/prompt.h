@@ -1,10 +1,11 @@
 /* Interactive line prompt with optional GNU readline support.
  *
- * When built with -DHAVE_READLINE (the Makefile auto-detects libreadline), the
- * prompts get line editing, history-free recall, and TAB completion; the SSH
- * key path prompt gets filename completion. Without readline it degrades
- * cleanly to fgets. Either way the returned line is newline-stripped and
- * whitespace-trimmed on both ends, and buf is always NUL-terminated.
+ * On builds with -DHAVE_READLINE (the Makefile auto-detects libreadline),
+ * terminal-to-terminal prompt_line calls get line editing and optional TAB
+ * filename completion. All other calls use a bounded byte-wise stdio reader.
+ * A successful line excludes its newline and is whitespace-trimmed on both
+ * ends. For every valid nonempty destination, buf is NUL-terminated on every
+ * result.
  */
 
 #ifndef PROMPT_H
@@ -21,9 +22,12 @@ typedef enum {
 } prompt_result_t;
 
 /* Read one line after printing `prompt`. If path_completion is true, TAB
- * completes filesystem paths (readline builds only). At most size - 1 input
- * bytes are accepted; an overlong physical line is consumed but never exposed
- * as a successful prefix. Every non-success result leaves buf empty. */
+ * completes filesystem paths on Readline-enabled terminal-to-terminal calls.
+ * At most size - 1 bytes are returned. An overlong physical line is consumed
+ * and returns PROMPT_LINE_TRUNCATED rather than exposing a prefix. On the
+ * bounded-stdio path, a physical line containing an embedded NUL is likewise
+ * consumed and returns PROMPT_LINE_TRUNCATED. For a valid buf with size > 0,
+ * every non-success result leaves buf empty. */
 int prompt_line(const char *prompt, char *buf, size_t size, bool path_completion);
 
 /* Checked destructive-confirmation variant. The complete prompt is flushed

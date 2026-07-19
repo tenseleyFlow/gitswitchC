@@ -1,8 +1,8 @@
 /* PTY-driven end-to-end tests for the interactive flows (add/edit/remove/
  * reset). The prompt paths behave differently on a real terminal — readline
  * builds go raw, TAB completion is armed only for the SSH key path prompt,
- * and Ctrl-D must cancel via the readline-NULL / fgets-EOF paths — so these
- * tests give the binary an actual PTY, not a pipe.
+ * and Ctrl-D must cancel via the readline-NULL / bounded-stdio EOF paths — so
+ * these tests give the binary an actual PTY, not a pipe.
  *
  * Dependency-free expect-style driver (no pexpect/expect): pty_spawn() forks
  * the built binary onto a fresh PTY slave inside a throwaway HOME +
@@ -977,9 +977,9 @@ TEST(duplicate_name_rejected_and_config_unchanged) {
 }
 
 /* 5. Ctrl-D at a prompt cancels cleanly on both input paths: the prompt_line
- *    path (readline NULL in readline builds, fgets EOF otherwise) via the add
- *    name prompt, and the always-fgets path via the remove confirmation. The
- *    config must be untouched either way. */
+ *    path (readline NULL in interactive readline builds, bounded-stdio EOF
+ *    otherwise) via the add name prompt, and the always-bounded-stdio path via
+ *    the remove confirmation. The config must be untouched either way. */
 TEST(eof_ctrl_d_cancels_cleanly) {
     sandbox_t sb;
     char before[16384], after[16384];
@@ -999,7 +999,7 @@ TEST(eof_ctrl_d_cancels_cleanly) {
     CHECK(pty_wait_exit(&g_p) != 0);
     pty_close(&g_p);
 
-    /* fgets path: EOF at the remove typed-'yes' confirmation. */
+    /* Bounded-stdio path: EOF at the remove typed-'yes' confirmation. */
     if (pty_spawn(&g_p, rm_argv, &sb) != 0) { CHECK(!"pty_spawn failed"); sandbox_teardown(&sb); return; }
     CHECK_EQ_INT(expect_send(&g_p, "Are you sure? (type 'yes' to confirm):", "\x04"), 0);
     CHECK_EQ_INT(pty_expect(&g_p, "Failed to read confirmation"), 0);
