@@ -713,7 +713,8 @@ typedef enum producer_status_result {
     PRODUCER_STATUS_ERROR = -1,
     PRODUCER_STATUS_RUNNING = 0,
     PRODUCER_STATUS_SUCCESS = 1,
-    PRODUCER_STATUS_FAILURE = 2
+    PRODUCER_STATUS_FAILURE = 2,
+    PRODUCER_STATUS_GROUP_ERROR = 3
 } producer_status_result_t;
 
 typedef enum producer_stream_result {
@@ -723,13 +724,15 @@ typedef enum producer_stream_result {
     PRODUCER_STREAM_WAIT_ERROR = 2
 } producer_stream_result_t;
 
-/* Observe without releasing the PID first. A failed producer's process group
- * must be terminated while child still pins that numeric identity; only then
- * may waitpid retain the exact status and make the PID reusable. A successful
- * producer is left waitable when reap_success is false so inherited output can
- * still be drained under the same owned lifetime boundary. */
+/* Observe without releasing the PID first. A terminal producer's process
+ * group must receive group-directed SIGKILL while child still pins that
+ * numeric identity: immediately on failure, or after the complete inherited
+ * stream on success. Only then may waitpid retain the exact status and make
+ * the PID reusable. A successful producer is left waitable when
+ * finish_success is false so inherited output can still drain under the same
+ * owned lifetime boundary. */
 static producer_status_result_t observe_producer_status(pid_t child,
-                                                         bool reap_success,
+                                                         bool finish_success,
                                                          int *status)
 {
     siginfo_t observed;
@@ -757,12 +760,16 @@ static producer_status_result_t observe_producer_status(pid_t child,
         errno = EIO;
         return PRODUCER_STATUS_ERROR;
     }
-    if (!failed && !reap_success) {
+    if (!failed && !finish_success) {
         return PRODUCER_STATUS_SUCCESS;
     }
 
-    if (failed) {
-        (void)kill(-child, SIGKILL);
+    if (failed || finish_success) {
+        if (kill(-child, SIGKILL) != 0 && errno != ESRCH && !failed) {
+            /* Keep the waitable direct child and published identity intact so
+             * the caller's failure cleanup can retry before reaping it. */
+            return PRODUCER_STATUS_GROUP_ERROR;
+        }
     }
     do {
         waited = waitpid(child, status, WNOHANG);
@@ -945,6 +952,9 @@ static int wait_for_producer(pid_t child, int64_t deadline, int *status)
         if (result == PRODUCER_STATUS_ERROR) {
             return -1;
         }
+        if (result == PRODUCER_STATUS_GROUP_ERROR) {
+            return 1;
+        }
         {
             int remaining;
             int remaining_rc = deadline_remaining(deadline, &remaining);
@@ -1007,6 +1017,7 @@ static int run_to_descriptor(int output_fd, char *const command[])
     int saved_errno;
     int64_t deadline;
     int64_t started;
+    int wait_result;
     pid_t child;
     producer_stream_result_t stream_result;
 
@@ -1096,9 +1107,14 @@ static int run_to_descriptor(int output_fd, char *const command[])
         return -1;
     }
     (void)close(pipe_fds[0]);
-    if (wait_for_producer(child, deadline, &status) != 0) {
+    wait_result = wait_for_producer(child, deadline, &status);
+    if (wait_result != 0) {
         saved_errno = errno;
-        if (saved_errno == ETIMEDOUT) {
+        if (wait_result > 0) {
+            fprintf(stderr,
+                    "ERROR: cannot terminate archive command process group: %s\n",
+                    strerror(saved_errno));
+        } else if (saved_errno == ETIMEDOUT) {
             fprintf(stderr,
                     "ERROR: archive command timed out before output stream completion\n");
         } else {
@@ -1109,8 +1125,8 @@ static int run_to_descriptor(int output_fd, char *const command[])
         terminate_producer(child);
         return -1;
     }
-    /* Reaped: the group may still hold inherited-descriptor descendants, but
-     * the direct producer pid is no longer this process's to kill. */
+    /* The complete inherited stream is captured and group-directed SIGKILL
+     * was issued while the direct PID still pinned the owned group identity. */
     fatal_signal_producer = 0;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         report_producer_failure(status);

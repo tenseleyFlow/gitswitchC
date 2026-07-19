@@ -789,6 +789,12 @@ check_manifest_contract()
         fail "cannot create temporary release-contract directory"
     copy_pid=
     copy_watchdog_pid=
+    copy_watchdog_cancel=
+    copy_status_descendant_pid=
+    copy_status_release=
+    copy_group_descendant_pid=
+    copy_group_release=
+    copy_group_finish=
     lock_dist_pid=
     lock_gate_pid=
     lock_contender_pid=
@@ -808,6 +814,16 @@ check_manifest_contract()
         fi
         wait "$background_pid" 2>/dev/null || :
     }
+    cancel_watchdog()
+    {
+        watchdog_pid=$1
+        watchdog_cancel=$2
+        [ -n "$watchdog_pid" ] || return 0
+        if [ -n "$watchdog_cancel" ]; then
+            : >"$watchdog_cancel" 2>/dev/null || :
+        fi
+        wait "$watchdog_pid" 2>/dev/null || :
+    }
     cleanup()
     {
         status=$?
@@ -815,11 +831,22 @@ check_manifest_contract()
         stop_background "$lock_gate_pid"
         stop_background "$lock_contender_pid"
         stop_background "$lock_dist_pid"
-        stop_background "$copy_watchdog_pid"
+        if [ -n "$copy_status_release" ]; then
+            : >"$copy_status_release" 2>/dev/null || :
+        fi
+        if [ -n "$copy_group_release" ]; then
+            : >"$copy_group_release" 2>/dev/null || :
+        fi
+        if [ -n "$copy_group_finish" ]; then
+            : >"$copy_group_finish" 2>/dev/null || :
+        fi
+        cancel_watchdog "$copy_watchdog_pid" "$copy_watchdog_cancel"
         if [ -n "$copy_pid" ]; then
             kill "$copy_pid" 2>/dev/null || true
             wait "$copy_pid" 2>/dev/null || true
         fi
+        stop_background "$copy_status_descendant_pid"
+        stop_background "$copy_group_descendant_pid"
         rm -rf "$tmp"
         exit "$status"
     }
@@ -995,14 +1022,19 @@ check_manifest_contract()
     # exit 23 while supervising the stream, tear down the producer group before
     # the delayed marker, and retain only the already-captured partial bytes.
     copy_status_ready=$tmp/copy-status-priority.ready
+    copy_status_pid_file=$tmp/copy-status-priority.pid
     copy_status_release=$tmp/copy-status-priority.release
     copy_status_delayed=$tmp/copy-status-priority.delayed
     copy_status_deadline=$tmp/copy-status-priority.deadline
-    rm -f "$copy_status_ready" "$copy_status_release" \
-        "$copy_status_delayed" "$copy_status_deadline"
+    copy_watchdog_cancel=$tmp/copy-status-priority.watchdog-cancel
+    rm -f "$copy_status_ready" "$copy_status_pid_file" \
+        "$copy_status_release" \
+        "$copy_status_delayed" "$copy_status_deadline" \
+        "$copy_watchdog_cancel"
     # The background descendant, not this parent shell, expands the marker.
     # shellcheck disable=SC2016
     AR11_COPY_STATUS_READY=$copy_status_ready \
+        AR11_COPY_STATUS_PID=$copy_status_pid_file \
         AR11_COPY_STATUS_RELEASE=$copy_status_release \
         AR11_COPY_STATUS_DELAYED=$copy_status_delayed \
         "$named_publish_helper" "$copy_dir" "$copy_canonical" \
@@ -1020,6 +1052,7 @@ check_manifest_contract()
                 : >"$AR11_COPY_STATUS_DELAYED"
             ) &
             descendant_pid=$!
+            printf "%s\n" "$descendant_pid" >"$AR11_COPY_STATUS_PID"
             attempt=0
             while [ ! -e "$AR11_COPY_STATUS_READY" ] &&
                   kill -0 "$descendant_pid" 2>/dev/null &&
@@ -1036,16 +1069,31 @@ check_manifest_contract()
         ' >"$out" 2>&1 &
     copy_pid=$!
     attempt=0
-    while [ ! -e "$copy_status_ready" ] &&
+    while { [ ! -e "$copy_status_ready" ] ||
+            [ ! -s "$copy_status_pid_file" ]; } &&
         kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
         sleep 0.1
         attempt=$((attempt + 1))
     done
-    [ -e "$copy_status_ready" ] ||
+    [ -e "$copy_status_ready" ] && [ -s "$copy_status_pid_file" ] ||
         fail "status-priority descendant did not reach its ready boundary"
+    IFS= read -r copy_status_descendant_pid <"$copy_status_pid_file" ||
+        fail "cannot read the status-priority descendant PID"
+    case $copy_status_descendant_pid in
+        ''|0|*[!0-9]*)
+            fail "status-priority fixture published an invalid descendant PID"
+            ;;
+    esac
     (
-        sleep 3
-        if kill -0 "$copy_pid" 2>/dev/null; then
+        watchdog_attempt=0
+        while [ ! -e "$copy_watchdog_cancel" ] &&
+              kill -0 "$copy_pid" 2>/dev/null &&
+              [ "$watchdog_attempt" -lt 30 ]; do
+            sleep 0.1
+            watchdog_attempt=$((watchdog_attempt + 1))
+        done
+        if [ ! -e "$copy_watchdog_cancel" ] &&
+           kill -0 "$copy_pid" 2>/dev/null; then
             : >"$copy_status_deadline"
             kill -TERM "$copy_pid" 2>/dev/null || :
         fi
@@ -1053,13 +1101,19 @@ check_manifest_contract()
     copy_watchdog_pid=$!
     if wait "$copy_pid"; then
         copy_pid=
-        stop_background "$copy_watchdog_pid"
+        cancel_watchdog "$copy_watchdog_pid" "$copy_watchdog_cancel"
         copy_watchdog_pid=
+        copy_watchdog_cancel=
+        : >"$copy_status_release"
+        stop_background "$copy_status_descendant_pid"
+        copy_status_descendant_pid=
+        copy_status_release=
         fail "publisher accepted a failed producer with inherited stdout"
     fi
     copy_pid=
-    stop_background "$copy_watchdog_pid"
+    cancel_watchdog "$copy_watchdog_pid" "$copy_watchdog_cancel"
     copy_watchdog_pid=
+    copy_watchdog_cancel=
     [ ! -e "$copy_status_deadline" ] ||
         fail "publisher did not return promptly for a known producer failure"
     grep -F 'archive command exited with status 23' "$out" >/dev/null ||
@@ -1076,6 +1130,18 @@ check_manifest_contract()
     done
     [ ! -e "$copy_status_delayed" ] ||
         fail "status-priority failure left a producer-group descendant alive"
+    attempt=0
+    while kill -0 "$copy_status_descendant_pid" 2>/dev/null &&
+          [ "$attempt" -lt 20 ]; do
+        sleep 0.1
+        attempt=$((attempt + 1))
+    done
+    if kill -0 "$copy_status_descendant_pid" 2>/dev/null; then
+        stop_background "$copy_status_descendant_pid"
+        fail "status-priority fixture could not retire its descendant"
+    fi
+    copy_status_descendant_pid=
+    copy_status_release=
     { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
         fail "status-priority failure left a canonical artifact"
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
@@ -1092,6 +1158,224 @@ check_manifest_contract()
             rm -f "$1"
             ;;
     esac
+
+    # AR-11 M43: after complete output, successful publication issues
+    # uncatchable in-group teardown before releasing the direct PID. Cover a
+    # descendant that contributes inherited output before closing stdout and
+    # one that detaches stdout immediately; neither may continue useful work
+    # after the publisher returns.
+    copy_group_violations=
+    for copy_group_shape in holding detached; do
+        copy_group_ready=$tmp/copy-group-$copy_group_shape.ready
+        copy_group_pid_file=$tmp/copy-group-$copy_group_shape.pid
+        copy_group_release=$tmp/copy-group-$copy_group_shape.release
+        copy_group_delayed=$tmp/copy-group-$copy_group_shape.delayed
+        copy_group_finish=$tmp/copy-group-$copy_group_shape.finish
+        copy_group_deadline=$tmp/copy-group-$copy_group_shape.deadline
+        copy_group_expected=$tmp/copy-group-$copy_group_shape.expected
+        copy_watchdog_cancel=$tmp/copy-group-$copy_group_shape.watchdog-cancel
+        copy_group_descendant_pid=
+        rm -f "$copy_group_ready" "$copy_group_pid_file" \
+            "$copy_group_release" "$copy_group_delayed" \
+            "$copy_group_finish" "$copy_group_deadline" \
+            "$copy_group_expected" "$copy_watchdog_cancel"
+        case $copy_group_shape in
+            holding)
+                copy_group_payload=group-prefix-suffix
+                printf '%s' "$copy_group_payload" >"$copy_group_expected" ||
+                    fail "cannot create holding expected payload"
+                # The background descendant, not this parent shell, expands
+                # the fixture paths.
+                # shellcheck disable=SC2016
+                AR11_COPY_GROUP_READY=$copy_group_ready \
+                    AR11_COPY_GROUP_PID=$copy_group_pid_file \
+                    AR11_COPY_GROUP_RELEASE=$copy_group_release \
+                    AR11_COPY_GROUP_DELAYED=$copy_group_delayed \
+                    AR11_COPY_GROUP_FINISH=$copy_group_finish \
+                    "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+                    archive.tar.gz -- /bin/sh -c '
+                        printf group-prefix
+                        (
+                            printf -- "-suffix"
+                            exec 1>&-
+                            : >"$AR11_COPY_GROUP_READY"
+                            attempt=0
+                            while [ ! -e "$AR11_COPY_GROUP_RELEASE" ] &&
+                                  [ "$attempt" -lt 300 ]; do
+                                sleep 0.1
+                                attempt=$((attempt + 1))
+                            done
+                            [ -e "$AR11_COPY_GROUP_RELEASE" ] || exit 0
+                            : >"$AR11_COPY_GROUP_DELAYED"
+                            attempt=0
+                            while [ ! -e "$AR11_COPY_GROUP_FINISH" ] &&
+                                  [ "$attempt" -lt 300 ]; do
+                                sleep 0.1
+                                attempt=$((attempt + 1))
+                            done
+                        ) &
+                        descendant_pid=$!
+                        printf "%s\n" "$descendant_pid" >"$AR11_COPY_GROUP_PID"
+                        attempt=0
+                        while [ ! -e "$AR11_COPY_GROUP_READY" ] &&
+                              kill -0 "$descendant_pid" 2>/dev/null &&
+                              [ "$attempt" -lt 20 ]; do
+                            sleep 0.1
+                            attempt=$((attempt + 1))
+                        done
+                        [ -e "$AR11_COPY_GROUP_READY" ] || exit 24
+                    ' >"$out" 2>&1 &
+                ;;
+            detached)
+                copy_group_payload=detached-payload
+                printf '%s' "$copy_group_payload" >"$copy_group_expected" ||
+                    fail "cannot create detached expected payload"
+                # The background descendant, not this parent shell, expands
+                # the fixture paths.
+                # shellcheck disable=SC2016
+                AR11_COPY_GROUP_READY=$copy_group_ready \
+                    AR11_COPY_GROUP_PID=$copy_group_pid_file \
+                    AR11_COPY_GROUP_RELEASE=$copy_group_release \
+                    AR11_COPY_GROUP_DELAYED=$copy_group_delayed \
+                    AR11_COPY_GROUP_FINISH=$copy_group_finish \
+                    "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+                    archive.tar.gz -- /bin/sh -c '
+                        printf detached-payload
+                        (
+                            : >"$AR11_COPY_GROUP_READY"
+                            attempt=0
+                            while [ ! -e "$AR11_COPY_GROUP_RELEASE" ] &&
+                                  [ "$attempt" -lt 300 ]; do
+                                sleep 0.1
+                                attempt=$((attempt + 1))
+                            done
+                            [ -e "$AR11_COPY_GROUP_RELEASE" ] || exit 0
+                            : >"$AR11_COPY_GROUP_DELAYED"
+                            attempt=0
+                            while [ ! -e "$AR11_COPY_GROUP_FINISH" ] &&
+                                  [ "$attempt" -lt 300 ]; do
+                                sleep 0.1
+                                attempt=$((attempt + 1))
+                            done
+                        ) </dev/null >/dev/null 2>&1 &
+                        descendant_pid=$!
+                        printf "%s\n" "$descendant_pid" >"$AR11_COPY_GROUP_PID"
+                        attempt=0
+                        while [ ! -e "$AR11_COPY_GROUP_READY" ] &&
+                              kill -0 "$descendant_pid" 2>/dev/null &&
+                              [ "$attempt" -lt 20 ]; do
+                            sleep 0.1
+                            attempt=$((attempt + 1))
+                        done
+                        [ -e "$AR11_COPY_GROUP_READY" ] || exit 24
+                    ' >"$out" 2>&1 &
+                ;;
+        esac
+        copy_pid=$!
+        attempt=0
+        while { [ ! -e "$copy_group_ready" ] ||
+                [ ! -s "$copy_group_pid_file" ]; } &&
+            kill -0 "$copy_pid" 2>/dev/null && [ "$attempt" -lt 100 ]; do
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        if [ ! -e "$copy_group_ready" ] || [ ! -s "$copy_group_pid_file" ]; then
+            fail "$copy_group_shape descendant did not reach its ready boundary"
+        fi
+        IFS= read -r copy_group_descendant_pid <"$copy_group_pid_file" ||
+            fail "cannot read the $copy_group_shape descendant PID"
+        case $copy_group_descendant_pid in
+            ''|0|*[!0-9]*)
+                fail "$copy_group_shape fixture published an invalid descendant PID"
+                ;;
+        esac
+        (
+            watchdog_attempt=0
+            while [ ! -e "$copy_watchdog_cancel" ] &&
+                  kill -0 "$copy_pid" 2>/dev/null &&
+                  [ "$watchdog_attempt" -lt 30 ]; do
+                sleep 0.1
+                watchdog_attempt=$((watchdog_attempt + 1))
+            done
+            if [ ! -e "$copy_watchdog_cancel" ] &&
+               kill -0 "$copy_pid" 2>/dev/null; then
+                : >"$copy_group_deadline"
+                kill -TERM "$copy_pid" 2>/dev/null || :
+            fi
+        ) &
+        copy_watchdog_pid=$!
+        if ! wait "$copy_pid"; then
+            copy_pid=
+            cancel_watchdog "$copy_watchdog_pid" "$copy_watchdog_cancel"
+            copy_watchdog_pid=
+            copy_watchdog_cancel=
+            fail "publisher rejected the $copy_group_shape descendant fixture"
+        fi
+        copy_pid=
+        cancel_watchdog "$copy_watchdog_pid" "$copy_watchdog_cancel"
+        copy_watchdog_pid=
+        copy_watchdog_cancel=
+        [ ! -e "$copy_group_deadline" ] ||
+            fail "publisher did not finish the $copy_group_shape group promptly"
+        cmp -s "$copy_group_expected" "$copy_archive" ||
+            fail "$copy_group_shape descendant publication changed captured bytes"
+        [ "$(find "$copy_archive" -prune -type f -perm 0444 -print)" = \
+            "$copy_archive" ] ||
+            fail "$copy_group_shape descendant publication was not read-only"
+
+        # Open the work gate immediately after the publication proof. A killed
+        # orphan may remain visible to kill -0 as a zombie, but it cannot write
+        # the delayed marker; a merely deferred teardown is exposed at once.
+        : >"$copy_group_release"
+        attempt=0
+        while [ ! -e "$copy_group_delayed" ] &&
+              kill -0 "$copy_group_descendant_pid" 2>/dev/null &&
+              [ "$attempt" -lt 20 ]; do
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        if [ -e "$copy_group_delayed" ]; then
+            copy_group_violations="$copy_group_violations $copy_group_shape-delayed"
+        fi
+        if kill -0 "$copy_group_descendant_pid" 2>/dev/null; then
+            copy_group_violations="$copy_group_violations $copy_group_shape-live"
+        fi
+        : >"$copy_group_finish"
+        attempt=0
+        while kill -0 "$copy_group_descendant_pid" 2>/dev/null &&
+              [ "$attempt" -lt 20 ]; do
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        if kill -0 "$copy_group_descendant_pid" 2>/dev/null; then
+            stop_background "$copy_group_descendant_pid"
+        fi
+        if kill -0 "$copy_group_descendant_pid" 2>/dev/null; then
+            fail "$copy_group_shape fixture could not retire its descendant"
+        fi
+        copy_group_descendant_pid=
+        copy_group_release=
+        copy_group_finish=
+        rm -f "$copy_archive"
+        set -- "$copy_dir"/.archive.tar.gz.tmp.*
+        case $copy_platform in
+            FreeBSD)
+                { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                    fail "FreeBSD $copy_group_shape publication did not retire its exact temporary"
+                ;;
+            *)
+                { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                    fail "$copy_group_shape publication did not retain one private source"
+                cmp -s "$copy_group_expected" "$1" ||
+                    fail "$copy_group_shape retained source changed captured bytes"
+                [ "$(find "$1" -prune -type f -perm 0444 -print)" = "$1" ] ||
+                    fail "$copy_group_shape retained source was not read-only"
+                rm -f "$1"
+                ;;
+        esac
+    done
+    [ -z "$copy_group_violations" ] ||
+        fail "successful publication left producer descendants:$copy_group_violations"
 
     # A descendant that never closes the inherited stream must not hang the
     # release indefinitely or leave a canonical artifact. The named test
