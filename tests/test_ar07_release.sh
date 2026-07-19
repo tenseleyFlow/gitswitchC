@@ -795,6 +795,7 @@ check_manifest_contract()
     copy_group_descendant_pid=
     copy_group_release=
     copy_group_finish=
+    copy_signal_producer_pid=
     lock_dist_pid=
     lock_gate_pid=
     lock_contender_pid=
@@ -847,6 +848,7 @@ check_manifest_contract()
         fi
         stop_background "$copy_status_descendant_pid"
         stop_background "$copy_group_descendant_pid"
+        stop_background "$copy_signal_producer_pid"
         rm -rf "$tmp"
         exit "$status"
     }
@@ -954,30 +956,157 @@ check_manifest_contract()
         fail "fully closed-descriptor publication corrupted the published artifact"
     rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
 
-    # AR-10 L30: the producer's own process group is the helper's lifetime
-    # boundary, but it also removes the producer from the terminal foreground
-    # group — a SIGTERM/SIGINT to the helper used to kill only the helper and
-    # abandon the still-running producer group (which then wrote the marker).
-    # The forwarding handler must take the group down with the helper.
-    orphan_marker=$tmp/orphan.marker
-    rm -f "$orphan_marker"
-    # The spawned producer, not this parent shell, expands the marker.
+    # AR-10 L30 / AR-11 M44: the producer's own process group is the helper's
+    # lifetime boundary, but it also removes the producer from the terminal
+    # foreground group. Every fatal signal handled by the publisher must tear
+    # down that group before the publisher truthfully dies by the same signal.
+    # Keep the publisher in the foreground: POSIX shells may start asynchronous
+    # jobs with SIGINT or SIGQUIT ignored, which would invalidate this fixture.
+    copy_signal_violations=
+    copy_signal_expected=$tmp/copy-signal.expected
+    printf '%s' partial >"$copy_signal_expected" ||
+        fail "cannot create fatal-signal expected payload"
+    # shellcheck disable=SC3045
+    ulimit -c 0 2>/dev/null ||
+        fail "cannot disable core files for the fatal-signal fixture"
+    # The spawned producer, not this parent shell, expands these variables.
     # shellcheck disable=SC2016
-    AR10_ORPHAN_MARKER=$orphan_marker \
-        "$named_publish_helper" "$copy_dir" "$copy_canonical" archive.tar.gz \
-        -- /bin/sh -c 'printf partial; sleep 3; : >"$AR10_ORPHAN_MARKER"' \
-        >"$out" 2>&1 &
-    orphan_publisher=$!
-    sleep 1
-    kill -TERM "$orphan_publisher" 2>/dev/null || :
-    orphan_status=0
-    wait "$orphan_publisher" 2>/dev/null || orphan_status=$?
-    [ "$orphan_status" -ge 128 ] ||
-        fail "signalled publisher did not die by its forwarded signal"
-    sleep 3
-    [ ! -e "$orphan_marker" ] ||
-        fail "signalled publisher abandoned its producer process group"
-    rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+    copy_signal_command='
+        printf partial
+        printf "%s\n" "$$" >"$AR11_COPY_SIGNAL_PID"
+        attempt=0
+        while [ "$attempt" -lt 50 ]; do
+            set -- "$AR11_COPY_SIGNAL_DIR"/.archive.tar.gz.tmp.*
+            if [ "$#" -eq 1 ] && [ -f "$1" ] &&
+               cmp -s "$AR11_COPY_SIGNAL_EXPECTED" "$1"; then
+                break
+            fi
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        [ "$attempt" -lt 50 ] || exit 24
+        kill -s "$AR11_COPY_SIGNAL" "$PPID"
+        sleep 1
+        : >"$AR11_COPY_SIGNAL_DELAYED"
+    '
+    for copy_signal in HUP INT QUIT TERM; do
+        copy_signal_pid_file=$tmp/copy-signal-$copy_signal.pid
+        copy_signal_delayed=$tmp/copy-signal-$copy_signal.delayed
+        copy_signal_producer_pid=
+        rm -f "$copy_signal_pid_file" "$copy_signal_delayed" \
+            "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+        copy_signal_status=0
+        if AR11_COPY_SIGNAL=$copy_signal \
+            AR11_COPY_SIGNAL_PID=$copy_signal_pid_file \
+            AR11_COPY_SIGNAL_DELAYED=$copy_signal_delayed \
+            AR11_COPY_SIGNAL_DIR=$copy_dir \
+            AR11_COPY_SIGNAL_EXPECTED=$copy_signal_expected \
+            GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS=1 \
+            "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+                archive.tar.gz -- /bin/sh -c "$copy_signal_command" \
+                >"$out" 2>&1; then
+            copy_signal_status=0
+        else
+            copy_signal_status=$?
+        fi
+        if [ ! -s "$copy_signal_pid_file" ]; then
+            copy_signal_violations="$copy_signal_violations $copy_signal-no-pid"
+        else
+            IFS= read -r copy_signal_producer_pid <"$copy_signal_pid_file" ||
+                fail "cannot read the $copy_signal producer PID"
+            case $copy_signal_producer_pid in
+                ''|0|*[!0-9]*)
+                    fail "$copy_signal fixture published an invalid producer PID"
+                    ;;
+            esac
+        fi
+        if [ "$copy_signal_status" -le 128 ]; then
+            copy_signal_violations="$copy_signal_violations $copy_signal-status-$copy_signal_status"
+        else
+            copy_signal_observed=$(kill -l "$copy_signal_status" 2>/dev/null || :)
+            case $copy_signal_observed in
+                "$copy_signal"|"SIG$copy_signal") ;;
+                *)
+                    copy_signal_violations="$copy_signal_violations $copy_signal-status-$copy_signal_status"
+                    ;;
+            esac
+        fi
+        attempt=0
+        while [ ! -e "$copy_signal_delayed" ] &&
+              [ -n "$copy_signal_producer_pid" ] &&
+              kill -0 "$copy_signal_producer_pid" 2>/dev/null &&
+              [ "$attempt" -lt 30 ]; do
+            sleep 0.1
+            attempt=$((attempt + 1))
+        done
+        if [ -e "$copy_signal_delayed" ]; then
+            copy_signal_violations="$copy_signal_violations $copy_signal-delayed"
+        fi
+        if [ -n "$copy_signal_producer_pid" ] &&
+           kill -0 "$copy_signal_producer_pid" 2>/dev/null; then
+            copy_signal_violations="$copy_signal_violations $copy_signal-live"
+            stop_background "$copy_signal_producer_pid"
+        fi
+        copy_signal_producer_pid=
+        { [ ! -e "$copy_archive" ] && [ ! -L "$copy_archive" ]; } ||
+            copy_signal_violations="$copy_signal_violations $copy_signal-published"
+        set -- "$copy_dir"/.archive.tar.gz.tmp.*
+        if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            copy_signal_violations="$copy_signal_violations $copy_signal-temp-shape"
+        else
+            cmp -s "$copy_signal_expected" "$1" ||
+                copy_signal_violations="$copy_signal_violations $copy_signal-temp-bytes"
+            [ "$(find "$1" -prune -type f -perm 0600 -print)" = "$1" ] ||
+                copy_signal_violations="$copy_signal_violations $copy_signal-temp-mode"
+        fi
+        rm -f "$copy_archive" "$copy_dir"/.archive.tar.gz.tmp.*
+        set -- "$copy_dir"/.archive.tar.gz.tmp.*
+        { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+            copy_signal_violations="$copy_signal_violations $copy_signal-temp-residue"
+    done
+    [ -z "$copy_signal_violations" ] ||
+        fail "fatal-signal forwarding violations:$copy_signal_violations"
+
+    # An ignored disposition is an intentional caller policy (for example,
+    # nohup), not a request for the publisher to install a forwarding handler.
+    copy_quit_expected=$tmp/copy-quit-ignored.expected
+    printf '%s' quit-ignored-payload >"$copy_quit_expected" ||
+        fail "cannot create ignored-SIGQUIT expected payload"
+    if ! (
+        trap '' QUIT
+        unset GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS
+        # The spawned producer, not this parent shell, expands PPID.
+        # shellcheck disable=SC2016
+        exec "$named_publish_helper" "$copy_dir" "$copy_canonical" \
+            archive.tar.gz -- /bin/sh -c '
+                kill -s QUIT "$PPID" || exit 25
+                printf quit-ignored-payload
+            '
+    ) >"$out" 2>&1; then
+        fail "publisher replaced an inherited ignored SIGQUIT disposition"
+    fi
+    cmp -s "$copy_quit_expected" "$copy_archive" ||
+        fail "ignored-SIGQUIT publication changed captured bytes"
+    [ "$(find "$copy_archive" -prune -type f -perm 0444 -print)" = \
+        "$copy_archive" ] ||
+        fail "ignored-SIGQUIT publication was not read-only"
+    rm -f "$copy_archive"
+    set -- "$copy_dir"/.archive.tar.gz.tmp.*
+    case $copy_platform in
+        FreeBSD)
+            { [ "$#" -eq 1 ] && [ ! -e "$1" ] && [ ! -L "$1" ]; } ||
+                fail "FreeBSD ignored-SIGQUIT publication did not retire its exact temporary"
+            ;;
+        *)
+            { [ "$#" -eq 1 ] && [ -f "$1" ]; } ||
+                fail "ignored-SIGQUIT publication did not retain one private source"
+            cmp -s "$copy_quit_expected" "$1" ||
+                fail "ignored-SIGQUIT retained source changed captured bytes"
+            [ "$(find "$1" -prune -type f -perm 0444 -print)" = "$1" ] ||
+                fail "ignored-SIGQUIT retained source was not read-only"
+            rm -f "$1"
+            ;;
+    esac
 
     # The direct producer may exit while a background descendant still owns
     # its stdout. Success is not complete until that inherited stream reaches

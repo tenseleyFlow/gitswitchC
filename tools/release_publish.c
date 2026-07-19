@@ -708,6 +708,9 @@ static int write_all(int fd, const unsigned char *buffer, size_t size)
  * retained. In particular, a successful direct child can become waitable
  * while a descendant still owns the output pipe. */
 static volatile pid_t fatal_signal_producer = 0;
+static const int forwarded_fatal_signals[] = {
+    SIGINT, SIGTERM, SIGHUP, SIGQUIT
+};
 
 typedef enum producer_status_result {
     PRODUCER_STATUS_ERROR = -1,
@@ -894,9 +897,9 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
 
 /* AR-10 L30: the producer runs in its own process group as the helper's
  * lifetime boundary — which also removes it from the terminal's foreground
- * group, so a Ctrl-C (or any SIGINT/SIGTERM/SIGHUP delivered to the helper)
- * used to kill only the helper and abandon the still-running producer group.
- * The handler makes the boundary hold: kill the group, then die by the same
+ * group, so a fatal signal delivered to the helper used to kill only the
+ * helper and abandon the still-running producer group. The handler covers
+ * SIGINT, SIGTERM, SIGHUP, and SIGQUIT: kill the group, then die by the same
  * signal with default disposition so the caller observes a truthful
  * signal-death status. kill/signal/raise are all async-signal-safe. */
 
@@ -912,18 +915,55 @@ static void forward_fatal_signal(int signal_number)
     (void)raise(signal_number);
 }
 
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+/* A shell cannot restore a signal that was ignored when the shell started.
+ * The named-temp test helper uses this opt-in seam to give the fatal-signal
+ * contract a deterministic default, unblocked starting state in every CI
+ * launcher. Production builds compile the seam out. */
+static int reset_fatal_signals_for_test(void)
+{
+    /* This oracle stays independent of the forwarding table so a missing
+     * production entry cannot also weaken the fixture's starting state. */
+    static const int expected_fatal_signals[] = {
+        SIGINT, SIGTERM, SIGHUP, SIGQUIT
+    };
+    struct sigaction default_action;
+    sigset_t fatal_set;
+    size_t index;
+
+    memset(&default_action, 0, sizeof(default_action));
+    default_action.sa_handler = SIG_DFL;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigemptyset(&fatal_set) != 0) {
+        return -1;
+    }
+    for (index = 0;
+         index < sizeof(expected_fatal_signals) /
+                     sizeof(expected_fatal_signals[0]);
+         index++) {
+        if (sigaction(expected_fatal_signals[index], &default_action, NULL) !=
+                0 ||
+            sigaddset(&fatal_set, expected_fatal_signals[index]) != 0) {
+            return -1;
+        }
+    }
+    return sigprocmask(SIG_UNBLOCK, &fatal_set, NULL);
+}
+#endif
+
 /* Preserve an inherited SIG_IGN (nohup semantics); otherwise forward. */
 static int install_fatal_signal_forwarding(void)
 {
-    static const int fatal_signals[] = { SIGINT, SIGTERM, SIGHUP };
     size_t index;
 
     for (index = 0;
-         index < sizeof(fatal_signals) / sizeof(fatal_signals[0]); index++) {
+         index < sizeof(forwarded_fatal_signals) /
+                     sizeof(forwarded_fatal_signals[0]);
+         index++) {
         struct sigaction current;
         struct sigaction forwarding;
 
-        if (sigaction(fatal_signals[index], NULL, &current) != 0) {
+        if (sigaction(forwarded_fatal_signals[index], NULL, &current) != 0) {
             return -1;
         }
         if (current.sa_handler == SIG_IGN) {
@@ -932,7 +972,8 @@ static int install_fatal_signal_forwarding(void)
         memset(&forwarding, 0, sizeof(forwarding));
         forwarding.sa_handler = forward_fatal_signal;
         if (sigemptyset(&forwarding.sa_mask) != 0 ||
-            sigaction(fatal_signals[index], &forwarding, NULL) != 0) {
+            sigaction(forwarded_fatal_signals[index], &forwarding, NULL) !=
+                0) {
             return -1;
         }
     }
@@ -1482,6 +1523,9 @@ int main(int argc, char **argv)
     struct stat existing;
     struct stat output_stat;
     int result = EXIT_FAILURE;
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+    const char *test_signal_defaults;
+#endif
 
     /* Must precede every other descriptor acquisition; see the helper. On
      * failure there is no guaranteed-safe stderr to report on. */
@@ -1495,6 +1539,17 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         return EXIT_SUCCESS;
+    }
+#endif
+#if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
+    test_signal_defaults =
+        getenv("GITSWITCH_RELEASE_TEST_FATAL_DEFAULTS"); /* Flawfinder: ignore — named-fixture-only boolean test control, compiled out of production */
+    if (test_signal_defaults != NULL &&
+        strcmp(test_signal_defaults, "1") == 0 &&
+        reset_fatal_signals_for_test() != 0) {
+        fprintf(stderr, "ERROR: cannot reset test signal state: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
     }
 #endif
     if (install_fatal_signal_forwarding() != 0) {
