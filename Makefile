@@ -39,9 +39,70 @@ override BUILD_ROOT_MARKER_NAME := .gitswitch-build-root
 override GITSWITCH_BUILD_ROOT := $(BUILDDIR)
 export GITSWITCH_BUILD_ROOT
 # Release publication is a security boundary, not a caller-selected build
-# output. Keep its host helper in one untracked namespace even when ordinary
-# build directories are redirected by a packager.
-override TOOLBUILDDIR := build/tools
+# output.  In a Git checkout, keep its mutex and provenance-bound host helpers
+# under that checkout's physical Git directory.  They therefore exist before
+# the artifact tree and are outside the repository namespace whose durability
+# the publisher commits.  Exported source trees retain the historical
+# build/tools location for non-release helper/test use; `dist` already requires
+# Git metadata and cannot take that fallback.
+override RELEASE_STATE_GOALS := release-publish-helpers \
+	_release-publish-helpers-locked release-symbol-contract-test \
+	_release-symbol-contract-test-locked clean _clean-release-locked \
+	distclean dev dist _dist-release-locked distcheck \
+	release-contract-test _release-contract-test-locked rpm \
+	build/tools/release-publish \
+	build/tools/release-publish-named-test
+override RELEASE_GIT_DIR_PROBE_FAILURE := __GITSWITCH_RELEASE_GIT_DIR_FAILURE__
+ifneq ($(strip $(filter $(RELEASE_STATE_GOALS),$(MAKECMDGOALS))),)
+    override RELEASE_GIT_DIR := $(shell fail_git_dir() { \
+	printf '%s' '$(RELEASE_GIT_DIR_PROBE_FAILURE)'; exit 0; \
+    }; \
+    root=`pwd -P` || fail_git_dir; \
+	local_git_marker=0; \
+	if test -e .git || test -L .git; then local_git_marker=1; fi; \
+	if ! top=`git rev-parse --show-toplevel 2>/dev/null`; then \
+		test "$$local_git_marker" -eq 0 || fail_git_dir; \
+		exit 0; \
+	fi; \
+    top_physical=`CDPATH='' cd "$$top" 2>/dev/null && pwd -P` || \
+	fail_git_dir; \
+	if test "$$root" != "$$top_physical"; then \
+		test "$$local_git_marker" -eq 0 || fail_git_dir; \
+		exit 0; \
+	fi; \
+    git_dir=`git rev-parse --absolute-git-dir 2>/dev/null` || \
+	fail_git_dir; \
+    test -n "$$git_dir" || fail_git_dir; \
+    git_dir_physical=`CDPATH='' cd "$$git_dir" 2>/dev/null && pwd -P` || \
+	fail_git_dir; \
+    test -n "$$git_dir_physical" || fail_git_dir; \
+    printf '%s' "$$git_dir_physical")
+else
+    override RELEASE_GIT_DIR :=
+endif
+ifeq ($(RELEASE_GIT_DIR),$(RELEASE_GIT_DIR_PROBE_FAILURE))
+    $(error cannot resolve the physical Git directory for release state)
+endif
+ifneq ($(strip $(RELEASE_GIT_DIR)),)
+    override RELEASE_GIT_DIR_AVAILABLE := 1
+    override TOOLBUILDDIR := $(RELEASE_GIT_DIR)/gitswitch-release-tools
+    override DIST_PUBLISH_LOCK := $(RELEASE_GIT_DIR)/gitswitch-release-publish.lock
+    override GITSWITCH_RELEASE_TOOLS_EXTERNAL := 1
+else
+    override RELEASE_GIT_DIR_AVAILABLE := 0
+    override TOOLBUILDDIR := build/tools
+    override DIST_PUBLISH_LOCK := .gitswitch-release-publish.lock
+    override GITSWITCH_RELEASE_TOOLS_EXTERNAL := 0
+endif
+override GITSWITCH_RELEASE_PROJECT_ROOT_PATH := $(CURDIR)
+override GITSWITCH_RELEASE_GIT_DIR_PATH := $(RELEASE_GIT_DIR)
+override GITSWITCH_RELEASE_TOOLBUILDDIR_PATH := $(TOOLBUILDDIR)
+override GITSWITCH_DIST_PUBLISH_LOCK_PATH := $(DIST_PUBLISH_LOCK)
+export GITSWITCH_RELEASE_TOOLS_EXTERNAL
+export GITSWITCH_RELEASE_PROJECT_ROOT_PATH
+export GITSWITCH_RELEASE_GIT_DIR_PATH
+export GITSWITCH_RELEASE_TOOLBUILDDIR_PATH
+export GITSWITCH_DIST_PUBLISH_LOCK_PATH
 TESTDIR = tests
 DOCDIR = docs
 HOSTCC ?= cc
@@ -606,7 +667,26 @@ $(BINDIR): | prepare-build-root
 override DIST_PUBLISH_HELPER := build/tools/release-publish
 override DIST_PUBLISH_NAMED_TEST_HELPER := build/tools/release-publish-named-test
 override DIST_PUBLISH_PROVENANCE := build/tools/.release-publish.provenance
-override DIST_PUBLISH_LOCK := .gitswitch-release-publish.lock
+ifeq ($(GITSWITCH_RELEASE_TOOLS_EXTERNAL),1)
+    override DIST_PUBLISH_HELPER := $(TOOLBUILDDIR)/release-publish
+    override DIST_PUBLISH_NAMED_TEST_HELPER := $(TOOLBUILDDIR)/release-publish-named-test
+    override DIST_PUBLISH_PROVENANCE := $(TOOLBUILDDIR)/.release-publish.provenance
+    override DIST_PUBLISH_HELPER_EXEC := $(DIST_PUBLISH_HELPER)
+    override DIST_PUBLISH_NAMED_TEST_HELPER_EXEC := $(DIST_PUBLISH_NAMED_TEST_HELPER)
+else
+    override DIST_PUBLISH_HELPER_EXEC := $(CURDIR)/$(DIST_PUBLISH_HELPER)
+    override DIST_PUBLISH_NAMED_TEST_HELPER_EXEC := $(CURDIR)/$(DIST_PUBLISH_NAMED_TEST_HELPER)
+endif
+override GITSWITCH_DIST_PUBLISH_HELPER_PATH := $(DIST_PUBLISH_HELPER)
+override GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH := $(DIST_PUBLISH_NAMED_TEST_HELPER)
+override GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH := $(DIST_PUBLISH_PROVENANCE)
+override GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH := $(DIST_PUBLISH_HELPER_EXEC)
+override GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_EXEC_PATH := $(DIST_PUBLISH_NAMED_TEST_HELPER_EXEC)
+export GITSWITCH_DIST_PUBLISH_HELPER_PATH
+export GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH
+export GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH
+export GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH
+export GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_EXEC_PATH
 override DIST_PUBLISH_POLICY_VERSION := host-tool-v1
 override DIST_PUBLISH_COMMON_FLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
 override DIST_PUBLISH_PRODUCTION_DEFINES :=
@@ -621,6 +701,7 @@ override DIST_PUBLISH_NAMED_DEFINES := \
 	-DGITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT=1 \
 	-DGITSWITCH_RELEASE_TEST_REAP_TRANSITION=1 \
 	-DGITSWITCH_RELEASE_TEST_DIGEST=1 \
+	-DGITSWITCH_RELEASE_TEST_DURABILITY=1 \
 	-DGITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS=5000
 override GITSWITCH_DIST_PUBLISH_POLICY_VERSION := $(DIST_PUBLISH_POLICY_VERSION)
 override GITSWITCH_DIST_PUBLISH_COMMON_FLAGS := $(DIST_PUBLISH_COMMON_FLAGS)
@@ -631,8 +712,9 @@ export GITSWITCH_DIST_PUBLISH_COMMON_FLAGS
 export GITSWITCH_DIST_PUBLISH_PRODUCTION_DEFINES
 export GITSWITCH_DIST_PUBLISH_NAMED_DEFINES
 
-# One controller owns both publisher profiles and one receipt. A root-local
-# cooperative mutex stays outside every cleaned build tree, so independent
+# One controller owns both publisher profiles and one receipt. A Git-private
+# cooperative mutex stays outside both the published repository namespace and
+# every cleaned build tree, so independent
 # Make processes cannot interleave generation, release use, or cleanup. The
 # public target enters through the signal-forwarding lock supervisor; the
 # private target refuses direct calls without the supervisor's unique token.
@@ -647,7 +729,7 @@ export GITSWITCH_DIST_PUBLISH_NAMED_DEFINES
 # than blessing a partial generation.
 .PHONY: release-publish-helpers _release-publish-helpers-locked
 release-publish-helpers: tools/release_publish_lock.sh
-	+@sh tools/release_publish_lock.sh "$(DIST_PUBLISH_LOCK)" \
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
 		"$(MAKE_COMMAND)" --no-print-directory \
 		_release-publish-helpers-locked
 
@@ -661,9 +743,9 @@ _release-publish-helpers-locked: tools/release_publish.c \
 		echo 'ERROR: release-helper controller requires a live lock token' >&2; \
 		exit 1; \
 	}; \
-	test -d "$(DIST_PUBLISH_LOCK)" && \
-	test ! -L "$(DIST_PUBLISH_LOCK)" && \
-	IFS= read -r lock_owner <"$(DIST_PUBLISH_LOCK)/owner" && \
+	test -d "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	test ! -L "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	IFS= read -r lock_owner <"$$GITSWITCH_DIST_PUBLISH_LOCK_PATH/owner" && \
 	test "$$lock_owner" = "$$lock_token" || { \
 		echo 'ERROR: release-helper controller does not own the shared lock' >&2; \
 		exit 1; \
@@ -744,11 +826,14 @@ _release-publish-helpers-locked: tools/release_publish.c \
 				return 1 ;; \
 		esac; \
 	}; \
-	for namespace_component in build "$(TOOLBUILDDIR)"; do \
-		case "$$namespace_component" in \
-			build) namespace_create_mode=0755 ;; \
-			*) namespace_create_mode=0700 ;; \
-		esac; \
+	if test "$$GITSWITCH_RELEASE_TOOLS_EXTERNAL" -eq 1; then \
+		test -n "$$GITSWITCH_RELEASE_GIT_DIR_PATH" && \
+		test -d "$$GITSWITCH_RELEASE_GIT_DIR_PATH" && \
+		test ! -L "$$GITSWITCH_RELEASE_GIT_DIR_PATH" || { \
+			echo 'ERROR: physical Git directory is unavailable for release helpers' >&2; \
+			exit 1; \
+		}; \
+		namespace_component="$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; \
 		if test -L "$$namespace_component"; then \
 			echo "ERROR: release-helper namespace is a symlink: $$namespace_component" >&2; \
 			exit 1; \
@@ -759,7 +844,7 @@ _release-publish-helpers-locked: tools/release_publish.c \
 			exit 1; \
 		fi; \
 		test -d "$$namespace_component" || \
-			mkdir -m "$$namespace_create_mode" "$$namespace_component" || { \
+			mkdir -m 0700 "$$namespace_component" || { \
 			echo "ERROR: cannot create release-helper namespace: $$namespace_component" >&2; \
 			exit 1; \
 		}; \
@@ -768,28 +853,78 @@ _release-publish-helpers-locked: tools/release_publish.c \
 			exit 1; \
 		}; \
 		normalize_namespace_acl "$$namespace_component" || exit 1; \
-		case "$$namespace_component" in \
-			build) \
-				chmod go-w "$$namespace_component" || { \
-					echo 'ERROR: cannot make build namespace non-writable by peers' >&2; \
-					exit 1; \
-				} ;; \
-			*) \
-				chmod 0700 "$$namespace_component" || { \
-					echo 'ERROR: cannot secure release-helper namespace' >&2; \
-					exit 1; \
-				} ;; \
-		esac; \
-	done; \
-	tools_physical=`CDPATH='' cd "$(TOOLBUILDDIR)" && pwd -P` || { \
+		chmod 0700 "$$namespace_component" || { \
+			echo 'ERROR: cannot secure release-helper namespace' >&2; \
+			exit 1; \
+		}; \
+	else \
+		for namespace_component in build "$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; do \
+			case "$$namespace_component" in \
+				build) namespace_create_mode=0755 ;; \
+				*) namespace_create_mode=0700 ;; \
+			esac; \
+			if test -L "$$namespace_component"; then \
+				echo "ERROR: release-helper namespace is a symlink: $$namespace_component" >&2; \
+				exit 1; \
+			fi; \
+			if test -e "$$namespace_component" && \
+			   ! test -d "$$namespace_component"; then \
+				echo "ERROR: release-helper namespace is not a directory: $$namespace_component" >&2; \
+				exit 1; \
+			fi; \
+			test -d "$$namespace_component" || \
+				mkdir -m "$$namespace_create_mode" "$$namespace_component" || { \
+				echo "ERROR: cannot create release-helper namespace: $$namespace_component" >&2; \
+				exit 1; \
+			}; \
+			test -d "$$namespace_component" && test ! -L "$$namespace_component" || { \
+				echo "ERROR: release-helper namespace changed during creation: $$namespace_component" >&2; \
+				exit 1; \
+			}; \
+			normalize_namespace_acl "$$namespace_component" || exit 1; \
+			case "$$namespace_component" in \
+				build) \
+					chmod go-w "$$namespace_component" || { \
+						echo 'ERROR: cannot make build namespace non-writable by peers' >&2; \
+						exit 1; \
+					} ;; \
+				*) \
+					chmod 0700 "$$namespace_component" || { \
+						echo 'ERROR: cannot secure release-helper namespace' >&2; \
+						exit 1; \
+					} ;; \
+			esac; \
+		done; \
+	fi; \
+	tools_physical=`CDPATH='' cd "$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH" && pwd -P` || { \
 		echo 'ERROR: cannot resolve release-helper namespace' >&2; \
 		exit 1; \
 	}; \
-	test "$$tools_physical" = "$$root_physical/$(TOOLBUILDDIR)" || { \
-		echo 'ERROR: release-helper namespace resolves outside the project' >&2; \
+	if test "$$GITSWITCH_RELEASE_TOOLS_EXTERNAL" -eq 1; then \
+		expected_tools="$$GITSWITCH_RELEASE_GIT_DIR_PATH/gitswitch-release-tools"; \
+	else \
+		expected_tools="$$root_physical/$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; \
+	fi; \
+	test "$$tools_physical" = "$$expected_tools" || { \
+		echo 'ERROR: release-helper namespace resolves outside its approved state root' >&2; \
 		exit 1; \
 	}; \
-	tmpdir=`mktemp -d "$(TOOLBUILDDIR)/release-publish.tmp.XXXXXX"` || { \
+	for stale_tmp in "$$tools_physical"/release-publish.tmp.*; do \
+		test -e "$$stale_tmp" || test -L "$$stale_tmp" || continue; \
+		stale_name=$${stale_tmp##*/}; \
+		case "$$stale_name" in \
+			release-publish.tmp.??????) ;; \
+			*) continue ;; \
+		esac; \
+		if test -L "$$stale_tmp"; then \
+			rm -f "$$stale_tmp"; \
+		elif test -d "$$stale_tmp"; then \
+			rm -rf "$$stale_tmp"; \
+		else \
+			rm -f "$$stale_tmp"; \
+		fi; \
+	done; \
+	tmpdir=`mktemp -d "$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH/release-publish.tmp.XXXXXX"` || { \
 		echo 'ERROR: cannot create private release-helper build directory' >&2; \
 		exit 1; \
 	}; \
@@ -917,20 +1052,20 @@ _release-publish-helpers-locked: tools/release_publish.c \
 	} >"$$expected"; \
 	force_rebuild=$(if $(findstring B,$(firstword $(MAKEFLAGS))),1,0); \
 	if test "$$force_rebuild" -eq 0 && \
-	   file_mode_matches "$(DIST_PUBLISH_HELPER)" 0755 && \
-	   test -x "$(DIST_PUBLISH_HELPER)" && \
-	   file_mode_matches "$(DIST_PUBLISH_NAMED_TEST_HELPER)" 0755 && \
-	   test -x "$(DIST_PUBLISH_NAMED_TEST_HELPER)" && \
-	   file_mode_matches "$(DIST_PUBLISH_PROVENANCE)" 0644; then \
-		production_digest=`digest_file "$(DIST_PUBLISH_HELPER)"` || production_digest=; \
-		named_digest=`digest_file "$(DIST_PUBLISH_NAMED_TEST_HELPER)"` || named_digest=; \
+	   file_mode_matches "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" 0755 && \
+	   test -x "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" && \
+	   file_mode_matches "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" 0755 && \
+	   test -x "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" && \
+	   file_mode_matches "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" 0644; then \
+		production_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH"` || production_digest=; \
+		named_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH"` || named_digest=; \
 		if test -n "$$production_digest" && test -n "$$named_digest"; then \
 			{ \
 				cat "$$expected"; \
 				printf 'production_helper_sha256=%s\n' "$$production_digest"; \
 				printf 'named_helper_sha256=%s\n' "$$named_digest"; \
 			} >"$$tmpdir/current"; \
-			if cmp -s "$$tmpdir/current" "$(DIST_PUBLISH_PROVENANCE)" && \
+			if cmp -s "$$tmpdir/current" "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" && \
 			   verify_host_inputs; then \
 				exit 0; \
 			fi; \
@@ -958,14 +1093,14 @@ _release-publish-helpers-locked: tools/release_publish.c \
 		echo 'ERROR: release-helper inputs changed during compilation' >&2; \
 		exit 1; \
 	}; \
-	mv -f "$$production_tmp" "$(DIST_PUBLISH_HELPER)"; \
-	mv -f "$$named_tmp" "$(DIST_PUBLISH_NAMED_TEST_HELPER)"; \
-	mv -f "$$new_receipt" "$(DIST_PUBLISH_PROVENANCE)"; \
-	file_mode_matches "$(DIST_PUBLISH_HELPER)" 0755 && \
-	test -x "$(DIST_PUBLISH_HELPER)" && \
-	file_mode_matches "$(DIST_PUBLISH_NAMED_TEST_HELPER)" 0755 && \
-	test -x "$(DIST_PUBLISH_NAMED_TEST_HELPER)" && \
-	file_mode_matches "$(DIST_PUBLISH_PROVENANCE)" 0644 || { \
+	mv -f "$$production_tmp" "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH"; \
+	mv -f "$$named_tmp" "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH"; \
+	mv -f "$$new_receipt" "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH"; \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" 0644 || { \
 		echo 'ERROR: release-helper publication produced an invalid file shape' >&2; \
 		exit 1; \
 	}; \
@@ -973,22 +1108,22 @@ _release-publish-helpers-locked: tools/release_publish.c \
 		echo 'ERROR: release-helper inputs changed during publication' >&2; \
 		exit 1; \
 	}; \
-	published_production_digest=`digest_file "$(DIST_PUBLISH_HELPER)"` || exit 1; \
-	published_named_digest=`digest_file "$(DIST_PUBLISH_NAMED_TEST_HELPER)"` || exit 1; \
+	published_production_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH"` || exit 1; \
+	published_named_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH"` || exit 1; \
 	{ \
 		cat "$$expected"; \
 		printf 'production_helper_sha256=%s\n' "$$published_production_digest"; \
 		printf 'named_helper_sha256=%s\n' "$$published_named_digest"; \
 	} >"$$tmpdir/published"; \
-	cmp -s "$$tmpdir/published" "$(DIST_PUBLISH_PROVENANCE)" || { \
+	cmp -s "$$tmpdir/published" "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" || { \
 		echo 'ERROR: release-helper provenance changed during publication' >&2; \
 		exit 1; \
 	}; \
-	file_mode_matches "$(DIST_PUBLISH_HELPER)" 0755 && \
-	test -x "$(DIST_PUBLISH_HELPER)" && \
-	file_mode_matches "$(DIST_PUBLISH_NAMED_TEST_HELPER)" 0755 && \
-	test -x "$(DIST_PUBLISH_NAMED_TEST_HELPER)" && \
-	file_mode_matches "$(DIST_PUBLISH_PROVENANCE)" 0644 || { \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" 0644 || { \
 		echo 'ERROR: release-helper metadata changed during finalization' >&2; \
 		exit 1; \
 	}; \
@@ -997,12 +1132,19 @@ _release-publish-helpers-locked: tools/release_publish.c \
 		exit 1; \
 	}
 
+ifeq ($(GITSWITCH_RELEASE_TOOLS_EXTERNAL),1)
+.PHONY: build/tools/release-publish build/tools/release-publish-named-test
+build/tools/release-publish build/tools/release-publish-named-test:
+	@echo 'ERROR: release helpers in Git checkouts are private state; use release-publish-helpers' >&2
+	@exit 1
+else
 $(DIST_PUBLISH_HELPER) $(DIST_PUBLISH_NAMED_TEST_HELPER): | release-publish-helpers
 	@mode_match=`find "$@" -prune -type f -perm 0755 -print 2>/dev/null`; \
 	test "$$mode_match" = "$@" && test -x "$@" || { \
 		echo "ERROR: verified release helper is unavailable: $@" >&2; \
 		exit 1; \
 	}
+endif
 
 # The CI symbol consumer shares the same cross-process critical section as
 # helper generation. Keeping both operations in one supervised invocation
@@ -1010,14 +1152,14 @@ $(DIST_PUBLISH_HELPER) $(DIST_PUBLISH_NAMED_TEST_HELPER): | release-publish-help
 # provenance validation and inspection.
 .PHONY: release-symbol-contract-test _release-symbol-contract-test-locked
 release-symbol-contract-test: tools/release_publish_lock.sh
-	+@sh tools/release_publish_lock.sh "$(DIST_PUBLISH_LOCK)" \
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
 		"$(MAKE_COMMAND)" --no-print-directory \
 		_release-symbol-contract-test-locked
 
 _release-symbol-contract-test-locked: _release-publish-helpers-locked \
 		tests/test_ci_symbols.sh
 	@/bin/sh tests/test_ci_symbols.sh "$(BINDIR)/$(TARGET)" \
-		"$(DIST_PUBLISH_HELPER)"
+		"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH"
 
 # Build-config stamp: objects/tests share build/obj and build/bin across every
 # configuration. Record every effective compile/link input, not just the build
@@ -1705,16 +1847,16 @@ override GITSWITCH_CLEAN_BUILDDIR := $(BUILDDIR)
 export GITSWITCH_CLEAN_BUILDDIR
 .PHONY: clean _clean-release-locked
 clean: tools/release_publish_lock.sh
-	+@sh tools/release_publish_lock.sh "$(DIST_PUBLISH_LOCK)" \
-		"$(MAKE_COMMAND)" --no-print-directory _clean-release-locked
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+			"$(MAKE_COMMAND)" --no-print-directory _clean-release-locked
 
 _clean-release-locked:
 	@lock_token=$${GITSWITCH_RELEASE_LOCK_TOKEN-}; \
 	test -n "$$lock_token" && test -d "$$lock_token" && \
 	test ! -L "$$lock_token" && \
-	test -d "$(DIST_PUBLISH_LOCK)" && \
-	test ! -L "$(DIST_PUBLISH_LOCK)" && \
-	IFS= read -r lock_owner <"$(DIST_PUBLISH_LOCK)/owner" && \
+	test -d "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	test ! -L "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	IFS= read -r lock_owner <"$$GITSWITCH_DIST_PUBLISH_LOCK_PATH/owner" && \
 	test "$$lock_owner" = "$$lock_token" || { \
 		echo 'ERROR: clean requires ownership of the release-publisher lock' >&2; \
 		exit 1; \
@@ -1822,19 +1964,47 @@ _clean-release-locked:
 		rm -f "$$clean_component_path"; \
 	fi
 	@set -e; \
-	if test -L build; then \
-		rm -f build; \
-	elif test -d build; then \
-		if test -L "$(TOOLBUILDDIR)"; then \
-			rm -f "$(TOOLBUILDDIR)"; \
-		elif test -d "$(TOOLBUILDDIR)"; then \
-			rm -rf "$(TOOLBUILDDIR)"; \
-		elif test -e "$(TOOLBUILDDIR)"; then \
-			rm -f "$(TOOLBUILDDIR)"; \
+	if test "$$GITSWITCH_RELEASE_TOOLS_EXTERNAL" -eq 1; then \
+		release_tools_path="$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; \
+		if test -L "$$release_tools_path"; then \
+			echo 'ERROR: refusing symlinked Git-private release-helper cache' >&2; \
+			exit 1; \
+		elif test -d "$$release_tools_path"; then \
+			release_tools_physical=`CDPATH='' cd "$$release_tools_path" && pwd -P` || exit 1; \
+			test "$$release_tools_physical" = \
+			     "$$GITSWITCH_RELEASE_GIT_DIR_PATH/gitswitch-release-tools" || { \
+				echo 'ERROR: refusing release-helper cleanup outside the Git-private cache' >&2; \
+				exit 1; \
+			}; \
+			for stale_tmp in "$$release_tools_physical"/release-publish.tmp.*; do \
+				test -e "$$stale_tmp" || test -L "$$stale_tmp" || continue; \
+				stale_name=$${stale_tmp##*/}; \
+				case "$$stale_name" in \
+					release-publish.tmp.??????) ;; \
+					*) continue ;; \
+				esac; \
+				if test -L "$$stale_tmp"; then \
+					rm -f "$$stale_tmp"; \
+				elif test -d "$$stale_tmp"; then \
+					rm -rf "$$stale_tmp"; \
+				else \
+					rm -f "$$stale_tmp"; \
+				fi; \
+			done; \
+		elif test -e "$$release_tools_path"; then \
+			echo 'ERROR: refusing non-directory Git-private release-helper cache' >&2; \
+			exit 1; \
 		fi; \
-	elif test -e build; then \
-		rm -f build; \
-	fi
+	fi; \
+	for release_tools_path in build/tools; do \
+		if test -L "$$release_tools_path"; then \
+			rm -f "$$release_tools_path"; \
+		elif test -d "$$release_tools_path"; then \
+			rm -rf "$$release_tools_path"; \
+		elif test -e "$$release_tools_path"; then \
+			rm -f "$$release_tools_path"; \
+		fi; \
+	done
 	rm -f valgrind*.log
 	rm -f *.core core.*
 
@@ -1905,7 +2075,7 @@ help:
 	@echo "  install      Install to system"
 	@echo "  uninstall    Remove from system"
 	@echo "  clean        Remove build files"
-	@echo "  distclean    Remove all generated files"
+	@echo "  distclean    Remove generated worktree files (preserves Git-private release cache)"
 	@echo "  format       Format source code"
 	@echo "  analyze      Run static analysis"
 	@echo "  security-scan Run security scan"
@@ -2009,13 +2179,13 @@ release-manifest-check:
 # clean Git metadata and fixed gzip, validates both completed streams and exact
 # membership, then emits only the byte-identical candidate to the publisher.
 dist: tools/release_publish_lock.sh
-	+@sh tools/release_publish_lock.sh "$(DIST_PUBLISH_LOCK)" \
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
 		"$(MAKE_COMMAND)" --no-print-directory _dist-release-locked
 
 _dist-release-locked: release-manifest-check \
 		_release-publish-helpers-locked
 	@set -e; \
-	root_physical=`CDPATH='' cd "$(CURDIR)" && pwd -P`; \
+	root_physical=`CDPATH='' cd "$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" && pwd -P`; \
 	request="$$GITSWITCH_DIST_ARCHIVE_REQUEST"; \
 	expected_rel="$(DIST_ARTIFACT_DIR)/$$GITSWITCH_DIST_ARCHIVE_NAME"; \
 	expected_abs="$$root_physical/$$expected_rel"; \
@@ -2033,26 +2203,9 @@ _dist-release-locked: release-manifest-check \
 	if ! git check-ignore -q -- "$$expected_rel"; then \
 		echo 'ERROR: distribution output directory is not ignored' >&2; exit 1; \
 	fi; \
-	for component in build "$(DIST_ARTIFACT_DIR)"; do \
-		if test -L "$$component"; then \
-			echo "ERROR: distribution directory is a symlink: $$component" >&2; exit 1; \
-		fi; \
-		if test -e "$$component" && ! test -d "$$component"; then \
-			echo "ERROR: distribution directory is not a directory: $$component" >&2; exit 1; \
-		fi; \
-		test -d "$$component" || mkdir "$$component"; \
-	done; \
-	cd "$(DIST_ARTIFACT_DIR)"; \
-	actual_dir=`pwd -P`; \
-	if test "$$actual_dir" != "$$root_physical/$(DIST_ARTIFACT_DIR)"; then \
-		echo 'ERROR: distribution directory resolved outside its dedicated namespace' >&2; exit 1; \
-	fi; \
-	if test -e "$$GITSWITCH_DIST_ARCHIVE_NAME" || \
-	   test -L "$$GITSWITCH_DIST_ARCHIVE_NAME"; then \
-		echo 'ERROR: distribution archive already exists; refusing to replace it' >&2; exit 1; \
-	fi; \
 	echo "Creating distribution tarball: $$expected_rel"; \
-	"$$root_physical/$(DIST_PUBLISH_HELPER)" . "$$actual_dir" \
+	"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH" \
+		--internal-release-tree-v1 "$$root_physical" build dist \
 		"$$GITSWITCH_DIST_ARCHIVE_NAME" -- \
 		--internal-release-archive-v1 "$$root_physical" \
 		"$(RELEASE_COMMIT)" "$$GITSWITCH_DIST_ROOT" -- $(DIST_MANIFEST)
@@ -2065,20 +2218,21 @@ distcheck: dist
 # Keep the declared FreeBSD floor tied to both its required headers and the
 # exact hosted release that executes publication/reset behavior.
 freebsd-platform-contract-test:
-	@FREEBSD_CONTRACT_CC="$(CC)" \
-		sh tests/test_ar11_freebsd_floor.sh "$(CURDIR)"
+	@FREEBSD_CONTRACT_CC="$(CC)" sh tests/test_ar11_freebsd_floor.sh \
+		"$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH"
 
 # Negative release-input checks run in isolated local clones, so they can dirty
 # VERSION/spec/manifest fixtures without touching the operator's checkout.
 release-contract-test: tools/release_publish_lock.sh
-	+@sh tools/release_publish_lock.sh "$(DIST_PUBLISH_LOCK)" \
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
 		"$(MAKE_COMMAND)" --no-print-directory \
 		_release-contract-test-locked
 
 _release-contract-test-locked: freebsd-platform-contract-test \
 		_release-publish-helpers-locked
-	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)" \
-		"$(CURDIR)/$(DIST_PUBLISH_NAMED_TEST_HELPER)"
+	@sh tests/test_ar07_release.sh manifest \
+		"$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" "$(MAKE_COMMAND)" \
+		"$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_EXEC_PATH"
 
 # Inspect the exact release binary and byte-identical staged-install copy with
 # native ELF or Mach-O tooling. The shell test owns its temporary stage.

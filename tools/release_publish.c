@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -88,14 +89,117 @@ static int reserve_standard_descriptors(void)
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "usage: %s OUTPUT_DIRECTORY CANONICAL_DIRECTORY FINAL_NAME -- COMMAND [ARG ...]\n",
-            program);
+            "usage: %s OUTPUT_DIRECTORY CANONICAL_DIRECTORY FINAL_NAME -- COMMAND [ARG ...]\n"
+            "       %s --internal-release-tree-v1 ROOT BUILD_COMPONENT DIST_COMPONENT FINAL_NAME -- COMMAND [ARG ...]\n",
+            program, program);
 }
 
 static bool same_identity(const struct stat *left, const struct stat *right)
 {
     return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
            S_ISREG(left->st_mode) && S_ISREG(right->st_mode);
+}
+
+static bool same_directory_identity(const struct stat *left,
+                                    const struct stat *right)
+{
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
+           S_ISDIR(left->st_mode) && S_ISDIR(right->st_mode);
+}
+
+#if defined(GITSWITCH_RELEASE_TEST_DURABILITY)
+static int durability_report_fd = -1;
+static char durability_fail_stage;
+
+static int configure_durability_test(void)
+{
+    const char *report_text =
+        getenv("GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD"); /* Flawfinder: ignore -- named-fixture-only descriptor number, compiled out of production */
+    const char *fail_text =
+        getenv("GITSWITCH_RELEASE_TEST_SYNC_FAIL_STAGE"); /* Flawfinder: ignore -- named-fixture-only one-byte fault selector, compiled out of production */
+
+    if (report_text != NULL) {
+        char *end = NULL;
+        long value;
+        int flags;
+
+        errno = 0;
+        value = strtol(report_text, &end, 10);
+        if (errno != 0 || end == report_text || *end != '\0' ||
+            value < 3L || value > (long)INT_MAX) {
+            errno = EINVAL;
+            return -1;
+        }
+        flags = fcntl((int)value, F_GETFD);
+        if (flags < 0 || fcntl((int)value, F_SETFD, flags | FD_CLOEXEC) != 0) {
+            return -1;
+        }
+        durability_report_fd = (int)value;
+    }
+    if (fail_text != NULL) {
+        if (fail_text[0] == '\0' || fail_text[1] != '\0' ||
+            strchr("FADBR", fail_text[0]) == NULL) {
+            errno = EINVAL;
+            return -1;
+        }
+        durability_fail_stage = fail_text[0];
+    }
+    return 0;
+}
+
+static int write_durability_report(const char *buffer, size_t length)
+{
+    size_t offset = 0U;
+
+    while (offset < length) {
+        ssize_t count;
+
+        do {
+            count = write(durability_report_fd, buffer + offset,
+                          length - offset);
+        } while (count < 0 && errno == EINTR);
+        if (count <= 0) {
+            if (count == 0) {
+                errno = EIO;
+            }
+            return -1;
+        }
+        offset += (size_t)count;
+    }
+    return 0;
+}
+#endif
+
+static int durability_sync(int fd, char stage)
+{
+#if defined(GITSWITCH_RELEASE_TEST_DURABILITY)
+    if (durability_report_fd >= 0) {
+        struct stat identity;
+        char report[128];
+        int length;
+
+        if (fstat(fd, &identity) != 0) {
+            return -1;
+        }
+        length = snprintf(report, sizeof(report), "%c %" PRIuMAX ":%" PRIuMAX
+                          "\n", stage, (uintmax_t)identity.st_dev,
+                          (uintmax_t)identity.st_ino);
+        if (length < 0 || (size_t)length >= sizeof(report)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        if (write_durability_report(report, (size_t)length) != 0) {
+            return -1;
+        }
+    }
+    if (durability_fail_stage == stage) {
+        errno = EIO;
+        return -1;
+    }
+#else
+    (void)stage;
+#endif
+    return fsync(fd);
 }
 
 #define SHA256_BLOCK_SIZE 64U
@@ -526,6 +630,7 @@ static int verify_named_temp_identity(int directory_fd, const char *temp_name,
 
 #if defined(GITSWITCH_RELEASE_TEST_CLEANUP_RACE) || \
     defined(GITSWITCH_RELEASE_TEST_ADOPTION_RACE) || \
+    defined(GITSWITCH_RELEASE_TEST_DURABILITY) || \
     (defined(__FreeBSD__) && \
      defined(GITSWITCH_RELEASE_TEST_PUBLICATION_RACE))
 static int run_test_race_hook(const char *marker_variable,
@@ -580,6 +685,19 @@ static int run_cleanup_race_hook(void)
 
     return run_test_race_hook("GITSWITCH_RELEASE_TEST_CLEANUP_MARKER",
                               "GITSWITCH_RELEASE_TEST_CLEANUP_RELEASE",
+                              &hook_used);
+#else
+    return 0;
+#endif
+}
+
+static int run_final_tree_race_hook(void)
+{
+#if defined(GITSWITCH_RELEASE_TEST_DURABILITY)
+    static bool hook_used;
+
+    return run_test_race_hook("GITSWITCH_RELEASE_TEST_FINAL_TREE_MARKER",
+                              "GITSWITCH_RELEASE_TEST_FINAL_TREE_RELEASE",
                               &hook_used);
 #else
     return 0;
@@ -2958,6 +3076,92 @@ static int verify_canonical_directory(int directory_fd,
     return 0;
 }
 
+static bool valid_directory_component(const char *component)
+{
+    size_t length;
+
+    if (component == NULL || component[0] == '\0' ||
+        strcmp(component, ".") == 0 || strcmp(component, "..") == 0 ||
+        strchr(component, '/') != NULL) {
+        return false;
+    }
+    length = strlen(component);
+    return length <= (size_t)NAME_MAX;
+}
+
+static int verify_directory_entry(int parent_fd, const char *component,
+                                  int child_fd)
+{
+    struct stat child_stat;
+    struct stat entry_stat;
+
+    if (fstat(child_fd, &child_stat) != 0 ||
+        fstatat(parent_fd, component, &entry_stat,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        return -1;
+    }
+    if (!same_directory_identity(&child_stat, &entry_stat)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+static int open_directory_component(int parent_fd, const char *component,
+                                    mode_t create_mode)
+{
+    int child_fd;
+    int saved_errno;
+
+    if (!valid_directory_component(component)) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (;;) {
+        int mkdir_result;
+
+        do {
+            child_fd = openat(parent_fd, component,
+                              O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+        } while (child_fd < 0 && errno == EINTR);
+        if (child_fd >= 0) {
+            break;
+        }
+        if (errno != ENOENT) {
+            return -1;
+        }
+        do {
+            mkdir_result = mkdirat(parent_fd, component, create_mode);
+        } while (mkdir_result != 0 && errno == EINTR);
+        if (mkdir_result == 0) {
+            continue;
+        }
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+    if (verify_directory_entry(parent_fd, component, child_fd) != 0) {
+        saved_errno = errno;
+        (void)close(child_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return child_fd;
+}
+
+static int verify_release_tree(int root_fd, const char *root_path,
+                               int build_fd, const char *build_component,
+                               int dist_fd, const char *dist_component)
+{
+    if (verify_canonical_directory(root_fd, root_path) != 0 ||
+        verify_directory_entry(root_fd, build_component, build_fd) != 0 ||
+        verify_directory_entry(build_fd, dist_component, dist_fd) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
 #if defined(__APPLE__)
 static int clone_id_for_descriptor(int fd, uint64_t *clone_id)
 {
@@ -3183,9 +3387,15 @@ static int publish_output(int source_fd, int directory_fd,
 int main(int argc, char **argv)
 {
     char temp_name[NAME_MAX + 1U];
-    const char *directory_path;
-    const char *canonical_directory;
-    const char *final_name;
+    const char *directory_path = NULL;
+    const char *canonical_directory = NULL;
+    const char *root_path = NULL;
+    const char *build_component = NULL;
+    const char *dist_component = NULL;
+    const char *final_name = NULL;
+    int command_index = -1;
+    int root_fd = -1;
+    int build_fd = -1;
     int directory_fd = -1;
     int output_fd = -1;
     int published_fd = -1;
@@ -3197,6 +3407,7 @@ int main(int argc, char **argv)
     struct stat existing;
     struct stat output_stat;
     int result = EXIT_FAILURE;
+    bool tree_mode = false;
 #if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
     const char *test_signal_defaults;
 #endif
@@ -3213,6 +3424,14 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
         return EXIT_SUCCESS;
+    }
+#endif
+#if defined(GITSWITCH_RELEASE_TEST_DURABILITY)
+    if (configure_durability_test() != 0) {
+        fprintf(stderr,
+                "ERROR: cannot configure release durability fixture: %s\n",
+                strerror(errno));
+        return EXIT_FAILURE;
     }
 #endif
 #if defined(GITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT)
@@ -3239,13 +3458,24 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if (argc < 6 || strcmp(argv[4], "--") != 0) {
+    if (argc >= 8 &&
+        strcmp(argv[1], "--internal-release-tree-v1") == 0 &&
+        strcmp(argv[6], "--") == 0) {
+        tree_mode = true;
+        root_path = argv[2];
+        build_component = argv[3];
+        dist_component = argv[4];
+        final_name = argv[5];
+        command_index = 7;
+    } else if (argc >= 6 && strcmp(argv[4], "--") == 0) {
+        directory_path = argv[1];
+        canonical_directory = argv[2];
+        final_name = argv[3];
+        command_index = 5;
+    } else {
         usage(argv[0]);
         return EXIT_FAILURE;
     }
-    directory_path = argv[1];
-    canonical_directory = argv[2];
-    final_name = argv[3];
     if (final_name[0] == '\0' || strcmp(final_name, ".") == 0 ||
         strcmp(final_name, "..") == 0 || strchr(final_name, '/') != NULL) {
         fprintf(stderr, "ERROR: final archive name is not a single component\n");
@@ -3257,16 +3487,64 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    directory_fd = open(directory_path,
-                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    if (directory_fd < 0) {
-        fprintf(stderr, "ERROR: cannot open distribution directory: %s\n",
-                strerror(errno));
-        goto cleanup;
-    }
-    if (verify_canonical_directory(directory_fd, canonical_directory) != 0) {
-        fprintf(stderr, "ERROR: canonical distribution directory changed identity\n");
-        goto cleanup;
+    if (tree_mode) {
+        if (root_path == NULL || root_path[0] != '/' ||
+            !valid_directory_component(build_component) ||
+            !valid_directory_component(dist_component)) {
+            fprintf(stderr,
+                    "ERROR: release root must be absolute and directory names must be single components\n");
+            goto cleanup;
+        }
+        do {
+            root_fd = open(root_path,
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        } while (root_fd < 0 && errno == EINTR);
+        if (root_fd < 0 ||
+            verify_canonical_directory(root_fd, root_path) != 0) {
+            fprintf(stderr, "ERROR: cannot pin canonical release root: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        /* Release output is private while it is being constructed.  Request
+         * the same owner-only upper bound for both fresh namespace components;
+         * a stricter caller umask may remove permissions but cannot add them.
+         * Existing directories retain their established mode. */
+        build_fd = open_directory_component(root_fd, build_component, 0700);
+        if (build_fd < 0) {
+            fprintf(stderr,
+                    "ERROR: cannot open or create pinned build directory: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        directory_fd = open_directory_component(build_fd, dist_component,
+                                                0700);
+        if (directory_fd < 0) {
+            fprintf(stderr,
+                    "ERROR: cannot open or create pinned distribution directory: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        if (verify_release_tree(root_fd, root_path, build_fd,
+                                build_component, directory_fd,
+                                dist_component) != 0) {
+            fprintf(stderr,
+                    "ERROR: pinned release directory chain changed identity\n");
+            goto cleanup;
+        }
+    } else {
+        directory_fd = open(directory_path,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (directory_fd < 0) {
+            fprintf(stderr, "ERROR: cannot open distribution directory: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        if (verify_canonical_directory(directory_fd,
+                                       canonical_directory) != 0) {
+            fprintf(stderr,
+                    "ERROR: canonical distribution directory changed identity\n");
+            goto cleanup;
+        }
     }
     if (fstatat(directory_fd, final_name, &existing,
                 AT_SYMLINK_NOFOLLOW) == 0) {
@@ -3287,7 +3565,8 @@ int main(int argc, char **argv)
                 strerror(errno));
         goto cleanup;
     }
-    if (run_to_descriptor(output_fd, directory_fd, &argv[5]) != 0) {
+    if (run_to_descriptor(output_fd, directory_fd,
+                          &argv[command_index]) != 0) {
         goto cleanup;
     }
     if (fstat(output_fd, &output_stat) != 0 ||
@@ -3299,8 +3578,9 @@ int main(int argc, char **argv)
      * them. The open descriptor remains usable for sync and descriptor-bound
      * verification without reopening a writable pathname. */
     if (fchmod(output_fd, S_IRUSR | S_IRGRP | S_IROTH) != 0 ||
-        fsync(output_fd) != 0) {
-        fprintf(stderr, "ERROR: cannot sync completed distribution output: %s\n",
+        durability_sync(output_fd, 'F') != 0) {
+        fprintf(stderr,
+                "ERROR: cannot sync completed distribution output durability stage F: %s\n",
                 strerror(errno));
         goto cleanup;
     }
@@ -3340,10 +3620,11 @@ int main(int argc, char **argv)
                 "ERROR: published distribution output changed identity; artifact and private source retained\n");
         goto cleanup;
     }
-    if (published_fd != output_fd && fsync(published_fd) != 0) {
+    if (published_fd != output_fd &&
+        durability_sync(published_fd, 'A') != 0) {
         has_name = false;
         fprintf(stderr,
-                "ERROR: cannot sync adopted distribution output; artifact and private source retained: %s\n",
+                "ERROR: cannot sync adopted distribution output durability stage A; artifact and private source retained: %s\n",
                 strerror(errno));
         goto cleanup;
     }
@@ -3360,13 +3641,61 @@ int main(int argc, char **argv)
                 "WARNING: platform lacks descriptor-conditioned unlink; private distribution staging name retained\n");
     }
     has_name = false;
-    if (fsync(directory_fd) != 0) {
+    if (tree_mode &&
+        verify_release_tree(root_fd, root_path, build_fd, build_component,
+                            directory_fd, dist_component) != 0) {
         fprintf(stderr,
-                "ERROR: cannot sync distribution directory; published artifact retained: %s\n",
+                "ERROR: pinned release directory chain changed before durability barriers; artifact retained\n");
+        goto cleanup;
+    }
+    if (durability_sync(directory_fd, 'D') != 0) {
+        fprintf(stderr,
+                "ERROR: cannot sync distribution directory durability stage D; published artifact retained: %s\n",
                 strerror(errno));
         goto cleanup;
     }
-    if (verify_canonical_directory(directory_fd, canonical_directory) != 0) {
+    if (tree_mode) {
+        if (verify_release_tree(root_fd, root_path, build_fd,
+                                build_component, directory_fd,
+                                dist_component) != 0) {
+            fprintf(stderr,
+                    "ERROR: pinned release directory chain changed before build durability; artifact retained\n");
+            goto cleanup;
+        }
+        if (durability_sync(build_fd, 'B') != 0) {
+            fprintf(stderr,
+                    "ERROR: cannot sync build directory durability stage B; published artifact retained: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        if (verify_release_tree(root_fd, root_path, build_fd,
+                                build_component, directory_fd,
+                                dist_component) != 0) {
+            fprintf(stderr,
+                    "ERROR: pinned release directory chain changed before repository durability; artifact retained\n");
+            goto cleanup;
+        }
+        if (durability_sync(root_fd, 'R') != 0) {
+            fprintf(stderr,
+                    "ERROR: cannot sync repository directory durability stage R; published artifact retained: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        if (verify_release_tree(root_fd, root_path, build_fd,
+                                build_component, directory_fd,
+                                dist_component) != 0) {
+            fprintf(stderr,
+                    "ERROR: pinned release directory chain changed during publication; artifact retained\n");
+            goto cleanup;
+        }
+        if (run_final_tree_race_hook() != 0) {
+            fprintf(stderr,
+                    "ERROR: cannot complete final release-tree test boundary: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+    } else if (verify_canonical_directory(directory_fd,
+                                          canonical_directory) != 0) {
         fprintf(stderr,
                 "ERROR: canonical distribution directory changed during publication; artifact retained\n");
         goto cleanup;
@@ -3401,6 +3730,20 @@ int main(int argc, char **argv)
                 "ERROR: published distribution output changed before completion; artifact retained\n");
         goto cleanup;
     }
+    if (tree_mode) {
+        if (verify_release_tree(root_fd, root_path, build_fd,
+                                build_component, directory_fd,
+                                dist_component) != 0) {
+            fprintf(stderr,
+                    "ERROR: pinned release directory chain changed before completion; artifact retained\n");
+            goto cleanup;
+        }
+    } else if (verify_canonical_directory(directory_fd,
+                                          canonical_directory) != 0) {
+        fprintf(stderr,
+                "ERROR: canonical distribution directory changed before completion; artifact retained\n");
+        goto cleanup;
+    }
     result = EXIT_SUCCESS;
 
 cleanup:
@@ -3423,6 +3766,12 @@ cleanup:
         result = EXIT_FAILURE;
     }
     if (directory_fd >= 0 && close(directory_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
+    if (build_fd >= 0 && close(build_fd) != 0) {
+        result = EXIT_FAILURE;
+    }
+    if (root_fd >= 0 && close(root_fd) != 0) {
         result = EXIT_FAILURE;
     }
     return result;

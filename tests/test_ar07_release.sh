@@ -1142,6 +1142,7 @@ check_manifest_contract()
     copy_group_release=
     copy_group_finish=
     copy_signal_producer_pid=
+    durability_swap_pid=
     lock_dist_pid=
     lock_gate_pid=
     lock_contender_pid=
@@ -1195,6 +1196,7 @@ check_manifest_contract()
         stop_background "$copy_status_descendant_pid"
         stop_background "$copy_group_descendant_pid"
         stop_background "$copy_signal_producer_pid"
+        stop_background "$durability_swap_pid"
         rm -rf "$tmp"
         exit "$status"
     }
@@ -1203,6 +1205,12 @@ check_manifest_contract()
 
     clean_repo=$tmp/clean
     git clone --quiet "$root" "$clean_repo" || fail "cannot clone clean HEAD"
+    clean_git_dir=$(git -C "$clean_repo" rev-parse --absolute-git-dir) ||
+        fail "cannot resolve cloned Git directory"
+    clean_tools_dir=$clean_git_dir/gitswitch-release-tools
+    clean_publish_helper=$clean_tools_dir/release-publish
+    clean_publish_receipt=$clean_tools_dir/.release-publish.provenance
+    clean_publish_lock=$clean_git_dir/gitswitch-release-publish.lock
     commit=$(git -C "$clean_repo" rev-parse --verify 'HEAD^{commit}') ||
         fail "cannot resolve cloned HEAD"
     version=$(git -C "$clean_repo" show "$commit:VERSION") ||
@@ -1214,6 +1222,252 @@ check_manifest_contract()
     cp "$clean_repo/VERSION" "$tmp/VERSION.before"
     cp "$clean_repo/README.md" "$tmp/README.before"
     cp "$clean_repo/src/main.c" "$tmp/main.before"
+
+    # Git-backed state must follow the current worktree's real Git directory,
+    # including gitfile worktrees and paths containing spaces and literal dollar
+    # signs.  The persistent verified cache survives clean, while the transient
+    # lock and artifact tree do not.  A source export nested in another
+    # repository must not select that outer repository's state root.
+    linked_bare=$tmp/"linked \$base.git"
+    linked_checkout=$tmp/"linked \$checkout"
+    git clone --bare --quiet "$root" "$linked_bare" ||
+        fail "cannot create linked-worktree release fixture"
+    git --git-dir="$linked_bare" worktree add --quiet --detach \
+        "$linked_checkout" "$commit" ||
+        fail "cannot create linked checkout with spaces"
+    linked_git_dir=$(git -C "$linked_checkout" rev-parse \
+        --absolute-git-dir) || fail "cannot resolve linked-checkout Git dir"
+    linked_common_git_dir=$(git -C "$linked_checkout" rev-parse \
+        --git-common-dir) || fail "cannot resolve linked-checkout common Git dir"
+    linked_common_git_dir=$(CDPATH='' cd "$linked_common_git_dir" && pwd -P) ||
+        fail "cannot resolve physical linked-checkout common Git dir"
+    linked_bare_physical=$(CDPATH='' cd "$linked_bare" && pwd -P) ||
+        fail "cannot resolve physical linked bare repository"
+    [ "$linked_common_git_dir" = "$linked_bare_physical" ] ||
+        fail "linked checkout selected the wrong common Git directory"
+    grep -Fx "gitdir: $linked_git_dir" "$linked_checkout/.git" >/dev/null ||
+        fail "linked checkout gitfile did not retain its exact Git directory"
+    for linked_dollar_path in "$linked_checkout" "$linked_common_git_dir" \
+        "$linked_git_dir"; do
+        case $linked_dollar_path in
+            *'$'*) ;;
+            *) fail "linked Git fixture lost its literal dollar sign: $linked_dollar_path" ;;
+        esac
+    done
+    case $linked_git_dir in
+        "$linked_bare"/worktrees/*) ;;
+        *) fail "linked checkout selected the wrong Git-private state root" ;;
+    esac
+    linked_tools=$linked_git_dir/gitswitch-release-tools
+    linked_lock=$linked_git_dir/gitswitch-release-publish.lock
+    linked_archive=$linked_checkout/build/dist/$dist_root.tar.gz
+
+    # A root-local .git directory or gitfile proves that this is a checkout even
+    # when the first Git command fails.  Both the initial top-level probe and
+    # the later absolute-Git-dir probe must therefore fail closed rather than
+    # redirecting the mutex/helpers to the exported-source fallback.
+    gitdir_probe_shims=$tmp/gitdir-probe-shims
+    mkdir "$gitdir_probe_shims" ||
+        fail "cannot create Git-directory probe shim"
+    probe_real_git=$(command -v git) ||
+        fail "git is unavailable for Git-directory probe fixture"
+    printf '%s\n' "$probe_real_git" >"$gitdir_probe_shims/real-git" ||
+        fail "cannot record Git-directory probe executable"
+    printf '%s\n' "$gitdir_probe_shims/probe-mode" \
+        >"$gitdir_probe_shims/probe-mode-path" ||
+        fail "cannot record Git-directory probe mode path"
+    cat >"$gitdir_probe_shims/git" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r real_git <"$shim_dir/real-git" || exit 97
+IFS= read -r probe_mode_path <"$shim_dir/probe-mode-path" || exit 96
+IFS= read -r probe_mode <"$probe_mode_path" || exit 95
+if [ "$#" -eq 2 ] && [ "$1" = rev-parse ]; then
+    case $probe_mode:$2 in
+        show-toplevel:--show-toplevel|
+        absolute-git-dir:--absolute-git-dir) exit 75 ;;
+    esac
+fi
+exec "$real_git" "$@"
+EOF
+    chmod 0700 "$gitdir_probe_shims/git" ||
+        fail "cannot make Git-directory probe shim executable"
+    expect_release_git_probe_rejected()
+    {
+        probe_repo=$1
+        probe_tools=$2
+        probe_lock=$3
+        probe_label=$4
+        probe_out=$tmp/gitdir-probe-$probe_label.out
+
+        if PATH="$gitdir_probe_shims:$PATH" \
+            "$make_cmd" -C "$probe_repo" release-publish-helpers \
+            >"$probe_out" 2>&1; then
+            fail "$probe_label accepted an unresolved Git directory"
+        fi
+        grep -F 'cannot resolve the physical Git directory for release state' \
+            "$probe_out" >/dev/null || {
+            sed -n '1,120p' "$probe_out" >&2
+            fail "$probe_label lacked the exact fail-closed diagnostic"
+        }
+        [ ! -e "$probe_tools" ] && [ ! -L "$probe_tools" ] &&
+        [ ! -e "$probe_lock" ] && [ ! -L "$probe_lock" ] &&
+        [ ! -e "$probe_repo/build" ] && [ ! -L "$probe_repo/build" ] &&
+        [ ! -e "$probe_repo/.gitswitch-release-publish.lock" ] &&
+        [ ! -L "$probe_repo/.gitswitch-release-publish.lock" ] ||
+            fail "$probe_label created fallback or Git-private release state"
+    }
+
+    [ -d "$clean_repo/.git" ] && [ ! -L "$clean_repo/.git" ] ||
+        fail "ordinary checkout lacks its real .git directory"
+    [ -f "$linked_checkout/.git" ] && [ ! -L "$linked_checkout/.git" ] ||
+        fail "linked checkout lacks its real .git gitfile"
+    printf '%s\n' show-toplevel >"$gitdir_probe_shims/probe-mode" ||
+        fail "cannot arm initial Git-probe failure"
+    expect_release_git_probe_rejected "$clean_repo" "$clean_tools_dir" \
+        "$clean_publish_lock" ordinary-show-toplevel
+    expect_release_git_probe_rejected "$linked_checkout" "$linked_tools" \
+        "$linked_lock" linked-show-toplevel
+    printf '%s\n' absolute-git-dir >"$gitdir_probe_shims/probe-mode" ||
+        fail "cannot arm absolute Git-dir probe failure"
+    expect_release_git_probe_rejected "$linked_checkout" "$linked_tools" \
+        "$linked_lock" linked-absolute-git-dir
+
+    # The historical file targets would otherwise bypass goal-sensitive Git
+    # discovery and recreate the helper inside build/. Reject them explicitly
+    # in checkouts; exported source trees retain that compatibility surface.
+    for obsolete_helper_goal in build/tools/release-publish \
+        build/tools/release-publish-named-test; do
+        if "$make_cmd" -C "$linked_checkout" "$obsolete_helper_goal" \
+            >"$tmp/obsolete-helper.out" 2>&1; then
+            fail "Git checkout accepted obsolete helper goal: $obsolete_helper_goal"
+        fi
+        grep -F 'release helpers in Git checkouts are private state' \
+            "$tmp/obsolete-helper.out" >/dev/null || {
+            sed -n '1,120p' "$tmp/obsolete-helper.out" >&2
+            fail "obsolete helper goal lacked its migration diagnostic"
+        }
+    done
+    [ ! -e "$linked_checkout/build" ] &&
+    [ ! -L "$linked_checkout/build" ] ||
+        fail "obsolete helper goal created an in-tree helper namespace"
+
+    "$make_cmd" -C "$linked_checkout" dist >"$tmp/linked-dist.out" 2>&1 || {
+        sed -n '1,200p' "$tmp/linked-dist.out" >&2
+        fail "linked checkout release failed"
+    }
+    (assert_archive_metadata "$linked_archive" "$dist_root" "$version")
+    [ -x "$linked_tools/release-publish" ] &&
+    [ -x "$linked_tools/release-publish-named-test" ] &&
+    [ -f "$linked_tools/.release-publish.provenance" ] ||
+        fail "linked checkout did not publish Git-private verified helpers"
+    [ ! -e "$linked_lock" ] && [ ! -L "$linked_lock" ] ||
+        fail "linked checkout retained its Git-private mutex"
+    cp "$linked_tools/release-publish" "$tmp/linked-helper.before" ||
+        fail "cannot preserve linked helper before stale-cache cleanup"
+    cp "$linked_tools/release-publish-named-test" \
+        "$tmp/linked-named-helper.before" ||
+        fail "cannot preserve linked named helper before stale-cache cleanup"
+    cp "$linked_tools/.release-publish.provenance" \
+        "$tmp/linked-receipt.before" ||
+        fail "cannot preserve linked receipt before stale-cache cleanup"
+
+    # A killed compiler can strand only mktemp's exact six-character directory
+    # shape.  The next lock owner retires that stale private tree, but similarly
+    # prefixed foreign names and the verified canonical generation are not its
+    # cleanup authority.
+    linked_stale_tmp=$linked_tools/release-publish.tmp.A1b2C3
+    linked_short_sentinel=$linked_tools/release-publish.tmp.A1b2C
+    linked_long_sentinel=$linked_tools/release-publish.tmp.A1b2C34
+    mkdir "$linked_stale_tmp" ||
+        fail "cannot create stale release-helper temporary directory"
+    chmod 0700 "$linked_stale_tmp" ||
+        fail "cannot secure stale release-helper temporary directory"
+    printf '%s\n' stale >"$linked_stale_tmp/residue" ||
+        fail "cannot populate stale release-helper temporary directory"
+    printf '%s\n' preserve-short >"$linked_short_sentinel" ||
+        fail "cannot create short release-helper prefix sentinel"
+    printf '%s\n' preserve-long >"$linked_long_sentinel" ||
+        fail "cannot create long release-helper prefix sentinel"
+    "$make_cmd" -C "$linked_checkout" release-publish-helpers \
+        >"$tmp/linked-stale-cleanup.out" 2>&1 || {
+        sed -n '1,200p' "$tmp/linked-stale-cleanup.out" >&2
+        fail "linked checkout could not retire stale helper state"
+    }
+    [ ! -e "$linked_stale_tmp" ] && [ ! -L "$linked_stale_tmp" ] ||
+        fail "verified helper bootstrap retained exact-shape stale state"
+    [ "$(cat "$linked_short_sentinel")" = preserve-short ] &&
+    [ "$(cat "$linked_long_sentinel")" = preserve-long ] ||
+        fail "stale helper cleanup changed similarly prefixed foreign state"
+    if ! cmp -s "$linked_tools/release-publish" \
+            "$tmp/linked-helper.before" ||
+       ! cmp -s "$linked_tools/release-publish-named-test" \
+            "$tmp/linked-named-helper.before" ||
+       ! cmp -s "$linked_tools/.release-publish.provenance" \
+            "$tmp/linked-receipt.before"; then
+        fail "stale helper cleanup changed the verified canonical generation"
+    fi
+    [ ! -e "$linked_lock" ] && [ ! -L "$linked_lock" ] ||
+        fail "stale helper cleanup retained its Git-private mutex"
+
+    linked_clean_stale_tmp=$linked_tools/release-publish.tmp.D4e5F6
+    mkdir "$linked_clean_stale_tmp" ||
+        fail "cannot create clean-path stale helper temporary directory"
+    chmod 0700 "$linked_clean_stale_tmp" ||
+        fail "cannot secure clean-path stale helper temporary directory"
+    printf '%s\n' stale-clean >"$linked_clean_stale_tmp/residue" ||
+        fail "cannot populate clean-path stale helper temporary directory"
+    "$make_cmd" -C "$linked_checkout" clean >"$tmp/linked-clean.out" 2>&1 || {
+        sed -n '1,200p' "$tmp/linked-clean.out" >&2
+        fail "linked checkout clean failed"
+    }
+    [ ! -e "$linked_checkout/build" ] &&
+    [ ! -L "$linked_checkout/build" ] ||
+        fail "linked checkout clean retained the artifact tree"
+    [ ! -e "$linked_clean_stale_tmp" ] &&
+    [ ! -L "$linked_clean_stale_tmp" ] ||
+        fail "linked checkout clean retained exact-shape stale helper state"
+    [ "$(cat "$linked_short_sentinel")" = preserve-short ] &&
+    [ "$(cat "$linked_long_sentinel")" = preserve-long ] ||
+        fail "linked checkout clean changed similarly prefixed foreign state"
+    if ! cmp -s "$linked_tools/release-publish" \
+            "$tmp/linked-helper.before" ||
+       ! cmp -s "$linked_tools/release-publish-named-test" \
+            "$tmp/linked-named-helper.before" ||
+       ! cmp -s "$linked_tools/.release-publish.provenance" \
+            "$tmp/linked-receipt.before"; then
+        fail "linked checkout clean removed or changed persistent helpers"
+    fi
+    [ ! -e "$linked_lock" ] && [ ! -L "$linked_lock" ] ||
+        fail "linked checkout clean retained its Git-private mutex"
+    [ -z "$(git -C "$linked_checkout" status --porcelain=v1 \
+        --untracked-files=all)" ] ||
+        fail "linked checkout release state leaked into worktree status"
+    nested_export=$linked_checkout/'nested export'
+    mkdir -p "$nested_export/src" "$nested_export/tools" ||
+        fail "cannot create nested source-export fixture"
+    cp "$root/Makefile" "$root/VERSION" "$nested_export/" ||
+        fail "cannot copy nested source-export metadata"
+    cp "$root/src/freebsd_compat.h" "$nested_export/src/" ||
+        fail "cannot copy nested source-export header"
+    cp "$root/tools/release_publish.c" \
+        "$root/tools/release_publish_lock.sh" "$nested_export/tools/" ||
+        fail "cannot copy nested source-export helpers"
+    "$make_cmd" -C "$nested_export" release-publish-helpers \
+        >"$tmp/nested-export.out" 2>&1 || {
+        sed -n '1,200p' "$tmp/nested-export.out" >&2
+        fail "nested source export helper build failed"
+    }
+    [ -x "$nested_export/build/tools/release-publish" ] &&
+    [ -f "$nested_export/build/tools/.release-publish.provenance" ] ||
+        fail "nested source export did not use its local fallback state"
+    [ ! -e "$nested_export/.gitswitch-release-publish.lock" ] &&
+    [ ! -L "$nested_export/.gitswitch-release-publish.lock" ] ||
+        fail "nested source export retained its local mutex"
+    rm -rf "$nested_export" || fail "cannot retire nested source export"
+    [ -z "$(git -C "$linked_checkout" status --porcelain=v1 \
+        --untracked-files=all)" ] ||
+        fail "nested source export leaked into linked checkout status"
 
     # Exercise publication from a named temporary on every host: success,
     # occupied-output refusal, producer failure, and cleanup must preserve
@@ -1229,6 +1483,408 @@ check_manifest_contract()
         fail "named-publish helper is unavailable: $named_publish_helper"
     "$named_publish_helper" --test-sha256 ||
         fail "release publisher SHA-256 known-answer vectors failed"
+    copy_platform=$(uname -s) ||
+        fail "cannot identify release publisher test platform"
+
+    # AR-11 M46: the publisher owns the fixed repository -> build -> dist
+    # hierarchy.  A fresh root proves both components are created through the
+    # pinned descriptor chain, while the trace proves each durability barrier
+    # targets the intended inode in strict leaf-to-root order.  Every injected
+    # barrier failure is causal: omitting or ignoring that fsync makes the
+    # corresponding case falsely succeed.
+    durability_root=$tmp/durability-tree
+    durability_trace=$tmp/durability.trace
+    durability_out=$tmp/durability.out
+    mkdir "$durability_root" ||
+        fail "cannot create release durability fixture root"
+    printf '%s\n' unrelated >"$durability_root/sentinel" ||
+        fail "cannot create release durability sentinel"
+    (
+        # Exact private modes are publisher policy, not ambient-umask output.
+        umask 000
+        GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD=9 \
+            "$named_publish_helper" --internal-release-tree-v1 \
+            "$durability_root" build dist archive.tar.gz -- \
+            /bin/sh -c 'printf durability-payload' \
+            9>"$durability_trace" >"$durability_out" 2>&1
+    ) || {
+        sed -n '1,160p' "$durability_out" >&2
+        fail "fresh-tree descriptor-bound publication failed"
+    }
+    [ "$(find "$durability_root/build" -prune -type d \
+        -perm 0700 -print 2>/dev/null)" = "$durability_root/build" ] ||
+        fail "fresh publisher build directory mode is not exactly 0700"
+    [ "$(find "$durability_root/build/dist" -prune -type d \
+        -perm 0700 -print 2>/dev/null)" = "$durability_root/build/dist" ] ||
+        fail "fresh publisher dist directory mode is not exactly 0700"
+    case $copy_platform in
+        Darwin) durability_expected=FADBR ;;
+        *) durability_expected=FDBR ;;
+    esac
+    durability_actual=$(awk '{ printf "%s", $1 }' "$durability_trace") ||
+        fail "cannot inspect release durability trace"
+    [ "$durability_actual" = "$durability_expected" ] || {
+        sed -n '1,160p' "$durability_trace" >&2
+        fail "release durability order was $durability_actual; expected $durability_expected"
+    }
+    case $copy_platform in
+        Darwin|FreeBSD)
+            durability_archive_identity=$(stat -f '%d:%i' \
+                "$durability_root/build/dist/archive.tar.gz") ||
+                fail "cannot identify durability archive"
+            durability_dist_identity=$(stat -f '%d:%i' \
+                "$durability_root/build/dist") ||
+                fail "cannot identify durability dist directory"
+            durability_build_identity=$(stat -f '%d:%i' \
+                "$durability_root/build") ||
+                fail "cannot identify durability build directory"
+            durability_root_identity=$(stat -f '%d:%i' \
+                "$durability_root") ||
+                fail "cannot identify durability repository root"
+            ;;
+        *)
+            durability_archive_identity=$(stat -c '%d:%i' \
+                "$durability_root/build/dist/archive.tar.gz") ||
+                fail "cannot identify durability archive"
+            durability_dist_identity=$(stat -c '%d:%i' \
+                "$durability_root/build/dist") ||
+                fail "cannot identify durability dist directory"
+            durability_build_identity=$(stat -c '%d:%i' \
+                "$durability_root/build") ||
+                fail "cannot identify durability build directory"
+            durability_root_identity=$(stat -c '%d:%i' \
+                "$durability_root") ||
+                fail "cannot identify durability repository root"
+            ;;
+    esac
+    [ "$(awk '$1 == "D" { print $2 }' "$durability_trace")" = \
+        "$durability_dist_identity" ] ||
+        fail "dist durability barrier targeted the wrong descriptor"
+    [ "$(awk '$1 == "B" { print $2 }' "$durability_trace")" = \
+        "$durability_build_identity" ] ||
+        fail "build durability barrier targeted the wrong descriptor"
+    [ "$(awk '$1 == "R" { print $2 }' "$durability_trace")" = \
+        "$durability_root_identity" ] ||
+        fail "repository durability barrier targeted the wrong descriptor"
+    case $copy_platform in
+        Darwin)
+            [ "$(awk '$1 == "A" { print $2 }' "$durability_trace")" = \
+                "$durability_archive_identity" ] ||
+                fail "adopted-file barrier targeted the wrong descriptor"
+            set -- "$durability_root/build/dist"/.archive.tar.gz.tmp.*
+            { [ "$#" -eq 1 ] && [ -f "$1" ] && [ ! -L "$1" ]; } ||
+                fail "Darwin durability fixture lost its retained source"
+            durability_source_identity=$(stat -f '%d:%i' "$1") ||
+                fail "cannot identify Darwin durability source"
+            [ "$(awk '$1 == "F" { print $2 }' "$durability_trace")" = \
+                "$durability_source_identity" ] ||
+                fail "file barrier targeted the wrong Darwin source descriptor"
+            ;;
+        *)
+            [ "$(awk '$1 == "F" { print $2 }' "$durability_trace")" = \
+                "$durability_archive_identity" ] ||
+                fail "file barrier targeted the wrong published inode"
+            ;;
+    esac
+    [ "$(cat "$durability_root/build/dist/archive.tar.gz")" = \
+        durability-payload ] ||
+        fail "fresh-tree durability publication changed payload"
+    [ "$(cat "$durability_root/sentinel")" = unrelated ] ||
+        fail "fresh-tree durability publication changed unrelated state"
+
+    durability_fail_stages='F D B R'
+    [ "$copy_platform" != Darwin ] || durability_fail_stages='F A D B R'
+    for durability_fail_stage in $durability_fail_stages; do
+        durability_case_root=$tmp/durability-fail-$durability_fail_stage
+        durability_case_trace=$tmp/durability-fail-$durability_fail_stage.trace
+        mkdir "$durability_case_root" ||
+            fail "cannot create durability failure fixture root"
+        printf '%s\n' unrelated >"$durability_case_root/sentinel" ||
+            fail "cannot create durability failure sentinel"
+        if GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD=9 \
+           GITSWITCH_RELEASE_TEST_SYNC_FAIL_STAGE=$durability_fail_stage \
+            "$named_publish_helper" --internal-release-tree-v1 \
+            "$durability_case_root" build dist archive.tar.gz -- \
+            /bin/sh -c 'printf durability-payload' \
+            9>"$durability_case_trace" >"$durability_out" 2>&1; then
+            fail "durability barrier $durability_fail_stage failure was accepted"
+        fi
+        case $copy_platform:$durability_fail_stage in
+            Darwin:F) durability_prefix=F ;;
+            Darwin:A) durability_prefix=FA ;;
+            Darwin:D) durability_prefix=FAD ;;
+            Darwin:B) durability_prefix=FADB ;;
+            Darwin:R) durability_prefix=FADBR ;;
+            *:F) durability_prefix=F ;;
+            *:D) durability_prefix=FD ;;
+            *:B) durability_prefix=FDB ;;
+            *:R) durability_prefix=FDBR ;;
+            *) fail "invalid durability failure stage: $durability_fail_stage" ;;
+        esac
+        durability_actual=$(awk '{ printf "%s", $1 }' \
+            "$durability_case_trace") ||
+            fail "cannot inspect durability failure trace"
+        [ "$durability_actual" = "$durability_prefix" ] || {
+            sed -n '1,160p' "$durability_case_trace" >&2
+            fail "durability failure trace was $durability_actual; expected $durability_prefix"
+        }
+        case $durability_fail_stage in
+            F)
+                [ ! -e "$durability_case_root/build/dist/archive.tar.gz" ] &&
+                [ ! -L "$durability_case_root/build/dist/archive.tar.gz" ] ||
+                    fail "pre-publication sync failure left a canonical artifact"
+                ;;
+            *)
+                [ "$(cat "$durability_case_root/build/dist/archive.tar.gz")" = \
+                    durability-payload ] ||
+                    fail "post-publication sync failure did not retain complete bytes"
+                ;;
+        esac
+        [ "$(cat "$durability_case_root/sentinel")" = unrelated ] ||
+            fail "durability failure changed unrelated state"
+        grep -F "durability stage $durability_fail_stage" \
+            "$durability_out" >/dev/null || {
+            sed -n '1,160p' "$durability_out" >&2
+            fail "durability failure lacked its stage diagnostic"
+        }
+    done
+
+    # A failed file barrier may leave only private staging residue and the
+    # newly created directory chain.  Retrying in that exact tree must still
+    # execute every ancestor barrier rather than treating existence as proof
+    # that the parent entry is already durable.
+    durability_retry_root=$tmp/durability-fail-F
+    GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD=9 \
+        "$named_publish_helper" --internal-release-tree-v1 \
+        "$durability_retry_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf durability-payload' \
+        9>"$durability_trace" >"$durability_out" 2>&1 || {
+        sed -n '1,160p' "$durability_out" >&2
+        fail "release durability retry failed"
+    }
+    durability_actual=$(awk '{ printf "%s", $1 }' "$durability_trace") ||
+        fail "cannot inspect release durability retry trace"
+    [ "$durability_actual" = "$durability_expected" ] ||
+        fail "release durability retry skipped an ancestor barrier"
+
+    # Invalid names and hostile directory shapes must fail before the producer
+    # can publish through an escape, symlink, or non-directory component.
+    durability_shape_root=$tmp/durability-shapes
+    durability_outside=$tmp/durability-outside
+    mkdir "$durability_shape_root" "$durability_outside" ||
+        fail "cannot create durability shape fixtures"
+    if "$named_publish_helper" --internal-release-tree-v1 \
+        "$durability_shape_root" ../escape dist archive.tar.gz -- \
+        /bin/sh -c 'printf escaped' >"$durability_out" 2>&1; then
+        fail "release tree accepted a multi-component build name"
+    fi
+    [ ! -e "$tmp/escape" ] && [ ! -L "$tmp/escape" ] ||
+        fail "invalid release component escaped its root"
+
+    ln -s "$durability_outside" "$durability_shape_root/build" ||
+        fail "cannot install symlinked build fixture"
+    if "$named_publish_helper" --internal-release-tree-v1 \
+        "$durability_shape_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf escaped' >"$durability_out" 2>&1; then
+        fail "release tree accepted a symlinked build directory"
+    fi
+    [ ! -e "$durability_outside/dist" ] &&
+    [ ! -L "$durability_outside/dist" ] ||
+        fail "symlinked build fixture changed its target"
+    rm -f "$durability_shape_root/build"
+    printf '%s\n' not-a-directory >"$durability_shape_root/build" ||
+        fail "cannot install non-directory build fixture"
+    if "$named_publish_helper" --internal-release-tree-v1 \
+        "$durability_shape_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf escaped' >"$durability_out" 2>&1; then
+        fail "release tree accepted a non-directory build component"
+    fi
+    rm -f "$durability_shape_root/build"
+    mkdir "$durability_shape_root/build" ||
+        fail "cannot restore durability build fixture"
+    ln -s "$durability_outside" "$durability_shape_root/build/dist" ||
+        fail "cannot install symlinked dist fixture"
+    if "$named_publish_helper" --internal-release-tree-v1 \
+        "$durability_shape_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf escaped' >"$durability_out" 2>&1; then
+        fail "release tree accepted a symlinked dist directory"
+    fi
+    rm -f "$durability_shape_root/build/dist"
+    printf '%s\n' not-a-directory >"$durability_shape_root/build/dist" ||
+        fail "cannot install non-directory dist fixture"
+    if "$named_publish_helper" --internal-release-tree-v1 \
+        "$durability_shape_root" build dist archive.tar.gz -- \
+        /bin/sh -c 'printf escaped' >"$durability_out" 2>&1; then
+        fail "release tree accepted a non-directory dist component"
+    fi
+
+    # Replace the public build component while the producer is paused.  The
+    # publisher may finish only inside its pinned old tree; it must reject the
+    # chain before D/B/R and never publish into the replacement namespace.
+    durability_swap_root=$tmp/durability-build-swap
+    durability_swap_ready=$tmp/durability-build-swap.ready
+    durability_swap_release=$tmp/durability-build-swap.release
+    durability_swap_trace=$tmp/durability-build-swap.trace
+    mkdir "$durability_swap_root" ||
+        fail "cannot create durability build-swap root"
+    # The spawned producer, not this parent shell, expands the gate variables.
+    # shellcheck disable=SC2016
+    AR11_DURABILITY_SWAP_READY=$durability_swap_ready \
+    AR11_DURABILITY_SWAP_RELEASE=$durability_swap_release \
+    GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD=8 \
+        "$named_publish_helper" --internal-release-tree-v1 \
+        "$durability_swap_root" build dist archive.tar.gz -- \
+        /bin/sh -c '
+            printf durability-swap-payload
+            : >"$AR11_DURABILITY_SWAP_READY"
+            attempt=0
+            while [ ! -s "$AR11_DURABILITY_SWAP_RELEASE" ]; do
+                attempt=$((attempt + 1))
+                [ "$attempt" -lt 100 ] || exit 90
+                sleep 0.1
+            done
+        ' 8>"$durability_swap_trace" >"$durability_out" 2>&1 &
+    durability_swap_pid=$!
+    durability_swap_tries=0
+    while [ ! -e "$durability_swap_ready" ]; do
+        durability_swap_tries=$((durability_swap_tries + 1))
+        [ "$durability_swap_tries" -lt 100 ] ||
+            fail "timed out waiting for build-swap producer"
+        sleep 0.1
+    done
+    mv "$durability_swap_root/build" "$durability_swap_root/build.pinned" ||
+        fail "cannot move pinned durability build directory"
+    mkdir "$durability_swap_root/build" \
+        "$durability_swap_root/build/dist" ||
+        fail "cannot install replacement durability build directory"
+    printf '%s\n' replacement >"$durability_swap_root/build/sentinel" ||
+        fail "cannot create replacement build sentinel"
+    printf '%s\n' release >"$durability_swap_release" ||
+        fail "cannot release build-swap producer"
+    if wait "$durability_swap_pid"; then
+        durability_swap_status=0
+    else
+        durability_swap_status=$?
+    fi
+    durability_swap_pid=
+    [ "$durability_swap_status" -ne 0 ] ||
+        fail "publisher accepted a replaced build component"
+    case $copy_platform in
+        Darwin) durability_swap_expected=FA ;;
+        *) durability_swap_expected=F ;;
+    esac
+    durability_actual=$(awk '{ printf "%s", $1 }' \
+        "$durability_swap_trace") ||
+        fail "cannot inspect build-swap durability trace"
+    [ "$durability_actual" = "$durability_swap_expected" ] ||
+        fail "build replacement reached an ancestor durability barrier"
+    [ ! -e "$durability_swap_root/build/dist/archive.tar.gz" ] &&
+    [ ! -L "$durability_swap_root/build/dist/archive.tar.gz" ] ||
+        fail "publisher wrote through the replacement build component"
+    [ "$(cat "$durability_swap_root/build/sentinel")" = replacement ] ||
+        fail "publisher changed replacement build state"
+    [ "$(cat "$durability_swap_root/build.pinned/dist/archive.tar.gz")" = \
+        durability-swap-payload ] ||
+        fail "build replacement did not retain complete pinned artifact"
+    grep -F 'chain changed before durability barriers' \
+        "$durability_out" >/dev/null || {
+        sed -n '1,160p' "$durability_out" >&2
+        fail "build replacement lacked a precise chain diagnostic"
+    }
+
+    # The post-R check is not the end of publication: the final content digest
+    # can be long-running.  Replace each independently verified component after
+    # that check so deleting any one of the final root/build/dist proofs makes
+    # its exact matrix case falsely succeed.
+    for durability_final_component in root build dist; do
+        durability_final_root=$tmp/durability-final-$durability_final_component
+        durability_final_marker=$tmp/durability-final-$durability_final_component.marker
+        durability_final_release=$tmp/durability-final-$durability_final_component.release
+        durability_final_trace=$tmp/durability-final-$durability_final_component.trace
+        durability_final_out=$tmp/durability-final-$durability_final_component.out
+        mkdir "$durability_final_root" ||
+            fail "cannot create final-$durability_final_component durability root"
+        GITSWITCH_RELEASE_TEST_FINAL_TREE_MARKER=$durability_final_marker \
+        GITSWITCH_RELEASE_TEST_FINAL_TREE_RELEASE=$durability_final_release \
+        GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD=8 \
+            "$named_publish_helper" --internal-release-tree-v1 \
+            "$durability_final_root" build dist archive.tar.gz -- \
+            /bin/sh -c 'printf durability-final-tree-payload' \
+            8>"$durability_final_trace" >"$durability_final_out" 2>&1 &
+        durability_swap_pid=$!
+        durability_swap_tries=0
+        while [ ! -e "$durability_final_marker" ]; do
+            kill -0 "$durability_swap_pid" 2>/dev/null || {
+                sed -n '1,160p' "$durability_final_out" >&2
+                fail "final-$durability_final_component publisher exited before its race boundary"
+            }
+            durability_swap_tries=$((durability_swap_tries + 1))
+            [ "$durability_swap_tries" -lt 100 ] ||
+                fail "final-$durability_final_component publisher did not reach its race boundary"
+            sleep 0.1
+        done
+        case $durability_final_component in
+            root)
+                durability_final_pinned_root=$durability_final_root.pinned
+                mv "$durability_final_root" "$durability_final_pinned_root" ||
+                    fail "cannot move final pinned root directory"
+                mkdir "$durability_final_root" ||
+                    fail "cannot install final replacement root directory"
+                durability_final_sentinel=$durability_final_root/sentinel
+                durability_final_replacement_archive=$durability_final_root/build/dist/archive.tar.gz
+                durability_final_pinned_archive=$durability_final_pinned_root/build/dist/archive.tar.gz
+                ;;
+            build)
+                mv "$durability_final_root/build" \
+                    "$durability_final_root/build.pinned" ||
+                    fail "cannot move final pinned build directory"
+                mkdir "$durability_final_root/build" \
+                    "$durability_final_root/build/dist" ||
+                    fail "cannot install final replacement build directory"
+                durability_final_sentinel=$durability_final_root/build/sentinel
+                durability_final_replacement_archive=$durability_final_root/build/dist/archive.tar.gz
+                durability_final_pinned_archive=$durability_final_root/build.pinned/dist/archive.tar.gz
+                ;;
+            dist)
+                mv "$durability_final_root/build/dist" \
+                    "$durability_final_root/build/dist.pinned" ||
+                    fail "cannot move final pinned dist directory"
+                mkdir "$durability_final_root/build/dist" ||
+                    fail "cannot install final replacement dist directory"
+                durability_final_sentinel=$durability_final_root/build/dist/sentinel
+                durability_final_replacement_archive=$durability_final_root/build/dist/archive.tar.gz
+                durability_final_pinned_archive=$durability_final_root/build/dist.pinned/archive.tar.gz
+                ;;
+        esac
+        printf '%s\n' replacement >"$durability_final_sentinel" ||
+            fail "cannot create final-$durability_final_component replacement sentinel"
+        printf '%s\n' release >"$durability_final_release" ||
+            fail "cannot release final-$durability_final_component race boundary"
+        if wait "$durability_swap_pid"; then
+            durability_swap_pid=
+            fail "publisher accepted a post-R $durability_final_component replacement"
+        fi
+        durability_swap_pid=
+        durability_actual=$(awk '{ printf "%s", $1 }' \
+            "$durability_final_trace") ||
+            fail "cannot inspect final-$durability_final_component durability trace"
+        [ "$durability_actual" = "$durability_expected" ] ||
+            fail "final-$durability_final_component replacement skipped a durability barrier"
+        [ ! -e "$durability_final_replacement_archive" ] &&
+        [ ! -L "$durability_final_replacement_archive" ] ||
+            fail "final-$durability_final_component replacement received the pinned artifact"
+        [ "$(cat "$durability_final_sentinel")" = replacement ] ||
+            fail "final-$durability_final_component replacement state changed"
+        [ "$(cat "$durability_final_pinned_archive")" = \
+            durability-final-tree-payload ] ||
+            fail "final-$durability_final_component rejection changed the pinned artifact"
+        grep -F 'chain changed before completion' "$durability_final_out" \
+            >/dev/null || {
+            sed -n '1,160p' "$durability_final_out" >&2
+            fail "final-$durability_final_component replacement lacked its completion diagnostic"
+        }
+    done
+
     copy_dir=$tmp/copy-publish
     mkdir "$copy_dir"
     copy_canonical=$(cd "$copy_dir" && pwd -P) ||
@@ -1242,7 +1898,6 @@ check_manifest_contract()
     [ "$(find "$copy_archive" -prune -type f -perm 0444 -print)" = \
         "$copy_archive" ] ||
         fail "descriptor-bound publication did not publish read-only bytes"
-    copy_platform=$(uname -s)
     copy_retained_temp=
     set -- "$copy_dir"/.archive.tar.gz.tmp.*
     case $copy_platform in
@@ -2381,8 +3036,186 @@ check_manifest_contract()
     # for the producer's pre-publication byte-repeat check.
     cp "$archive" "$tmp/hermetic-archive.baseline" ||
         fail "cannot preserve hermetic archive baseline"
-    clean_git_dir=$(git -C "$clean_repo" rev-parse --absolute-git-dir) ||
-        fail "cannot resolve cloned Git directory"
+
+    # The complete Make flow must delegate both artifact-directory components
+    # to mkdirat in the publisher.  Its provenance-bound helpers live under the
+    # clone's Git directory, so a genuinely absent build tree needs no shell
+    # namespace bootstrap inside the repository.
+    mkdir_shims=$tmp/m46-mkdir-shims
+    mkdir_marker=$tmp/m46-pathname-mkdir
+    mkdir "$mkdir_shims" || fail "cannot create M46 mkdir shim directory"
+    real_mkdir=$(command -v mkdir) || fail "mkdir is unavailable"
+    printf '%s\n' "$real_mkdir" >"$mkdir_shims/real-mkdir" ||
+        fail "cannot record real mkdir for M46 fixture"
+    printf '%s\n' "$mkdir_marker" >"$mkdir_shims/marker" ||
+        fail "cannot record M46 mkdir marker"
+    cat >"$mkdir_shims/mkdir" <<'EOF'
+#!/bin/sh
+shim_dir=${0%/*}
+IFS= read -r real_mkdir <"$shim_dir/real-mkdir" || exit 95
+IFS= read -r marker <"$shim_dir/marker" || exit 96
+for argument do
+    if [ "$argument" = build ] || [ "$argument" = build/dist ]; then
+        printf '%s\n' "$argument" >"$marker" || exit 97
+        exit 98
+    fi
+done
+exec "$real_mkdir" "$@"
+EOF
+    chmod 0700 "$mkdir_shims/mkdir" ||
+        fail "cannot make M46 mkdir shim executable"
+    real_hostcc=$(command -v cc 2>/dev/null ||
+        command -v gcc 2>/dev/null || command -v clang 2>/dev/null) ||
+        fail "a host C compiler is unavailable for M46"
+    cat >"$mkdir_shims/hostcc" <<'EOF'
+#!/bin/sh
+: "${AR11_M46_REAL_HOSTCC:?}"
+case ${1-} in
+    --version) exec "$AR11_M46_REAL_HOSTCC" "$@" ;;
+esac
+exec "$AR11_M46_REAL_HOSTCC" \
+    -DGITSWITCH_RELEASE_TEST_DURABILITY=1 "$@"
+EOF
+    chmod 0700 "$mkdir_shims/hostcc" ||
+        fail "cannot make M46 HOSTCC wrapper executable"
+    durability_make_hostcc=$mkdir_shims/hostcc
+    durability_make_trace=$tmp/m46-make.trace
+    rm -f "$archive"
+    rm -rf "$clean_tools_dir" "$clean_repo/build" ||
+        fail "cannot reset first-use release state for M46 fixture"
+    if PATH="$mkdir_shims:$PATH" \
+        "$make_cmd" -C "$clean_repo" HOSTCC=false dist \
+        >"$out" 2>&1; then
+        fail "first-use publisher bootstrap accepted an invalid compiler"
+    fi
+    [ ! -e "$clean_repo/build" ] && [ ! -L "$clean_repo/build" ] ||
+        fail "failed publisher bootstrap created the artifact tree"
+    [ ! -e "$clean_publish_lock" ] && [ ! -L "$clean_publish_lock" ] ||
+        fail "failed publisher bootstrap retained its Git-private mutex"
+    rm -rf "$clean_repo/build" ||
+        fail "cannot reset the fresh artifact tree for M46 fixture"
+    AR11_M46_REAL_HOSTCC=$real_hostcc \
+    GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD=8 \
+    PATH="$mkdir_shims:$PATH" \
+        "$make_cmd" -C "$clean_repo" HOSTCC="$durability_make_hostcc" \
+        dist 8>"$durability_make_trace" >"$out" 2>&1 || {
+        sed -n '1,200p' "$out" >&2
+        fail "descriptor-relative distribution creation failed"
+    }
+    [ ! -e "$mkdir_marker" ] ||
+        fail "Make still pathname-created an artifact-directory component"
+    [ "$(find "$clean_repo/build" -prune -type d -perm 0700 \
+        -print 2>/dev/null)" = "$clean_repo/build" ] ||
+        fail "real Make publisher build directory mode is not exactly 0700"
+    [ "$(find "$clean_repo/build/dist" -prune -type d -perm 0700 \
+        -print 2>/dev/null)" = "$clean_repo/build/dist" ] ||
+        fail "real Make publisher dist directory mode is not exactly 0700"
+    cmp -s "$archive" "$tmp/hermetic-archive.baseline" ||
+        fail "descriptor-relative directory creation changed release bytes"
+    durability_make_actual=$(awk '{ printf "%s", $1 }' \
+        "$durability_make_trace") ||
+        fail "cannot inspect real Make durability trace"
+    [ "$durability_make_actual" = "$durability_expected" ] || {
+        sed -n '1,160p' "$durability_make_trace" >&2
+        fail "real Make durability order was $durability_make_actual; expected $durability_expected"
+    }
+    case $copy_platform in
+        Darwin|FreeBSD)
+            durability_make_dist_identity=$(stat -f '%d:%i' \
+                "$clean_repo/build/dist") ||
+                fail "cannot identify real Make dist directory"
+            durability_make_build_identity=$(stat -f '%d:%i' \
+                "$clean_repo/build") ||
+                fail "cannot identify real Make build directory"
+            durability_make_root_identity=$(stat -f '%d:%i' \
+                "$clean_repo") || fail "cannot identify real Make root"
+            ;;
+        *)
+            durability_make_dist_identity=$(stat -c '%d:%i' \
+                "$clean_repo/build/dist") ||
+                fail "cannot identify real Make dist directory"
+            durability_make_build_identity=$(stat -c '%d:%i' \
+                "$clean_repo/build") ||
+                fail "cannot identify real Make build directory"
+            durability_make_root_identity=$(stat -c '%d:%i' \
+                "$clean_repo") || fail "cannot identify real Make root"
+            ;;
+    esac
+    [ "$(awk '$1 == "D" { print $2 }' "$durability_make_trace")" = \
+        "$durability_make_dist_identity" ] ||
+        fail "real Make dist barrier targeted the wrong descriptor"
+    [ "$(awk '$1 == "B" { print $2 }' "$durability_make_trace")" = \
+        "$durability_make_build_identity" ] ||
+        fail "real Make build barrier targeted the wrong descriptor"
+    [ "$(awk '$1 == "R" { print $2 }' "$durability_make_trace")" = \
+        "$durability_make_root_identity" ] ||
+        fail "real Make root barrier targeted the wrong descriptor"
+    [ ! -e "$clean_publish_lock" ] && [ ! -L "$clean_publish_lock" ] ||
+        fail "real Make durability flow retained its Git-private mutex"
+    real_nm=$(command -v nm 2>/dev/null) ||
+        fail "nm is required to prove production fsync imports"
+    for durability_helper in "$clean_publish_helper" \
+        "$clean_tools_dir/release-publish-named-test"; do
+        "$real_nm" -u "$durability_helper" >"$tmp/m46-nm.out" 2>&1 || {
+            sed -n '1,160p' "$tmp/m46-nm.out" >&2
+            fail "cannot inspect publisher imports: $durability_helper"
+        }
+        grep -E '(^|[[:space:]])_?fsync(@[^[:space:]]*)?([[:space:]]|$)' \
+            "$tmp/m46-nm.out" >/dev/null || {
+            sed -n '1,160p' "$tmp/m46-nm.out" >&2
+            fail "publisher does not import fsync: $durability_helper"
+        }
+    done
+    inspect_dist_residue "$archive" "$copy_platform"
+    rm -f "$archive"
+
+    # Exercise the production Make path, not only the direct named fixture, at
+    # every required barrier.  Each injected fault must reach its exact prefix,
+    # fail the wrapper, and still release the Git-private mutex for the retry.
+    for durability_make_fail_stage in F D B R; do
+        : >"$durability_make_trace"
+        if AR11_M46_REAL_HOSTCC=$real_hostcc \
+           GITSWITCH_RELEASE_TEST_SYNC_REPORT_FD=8 \
+           GITSWITCH_RELEASE_TEST_SYNC_FAIL_STAGE=$durability_make_fail_stage \
+            "$make_cmd" -C "$clean_repo" \
+            HOSTCC="$durability_make_hostcc" dist \
+            8>"$durability_make_trace" >"$out" 2>&1; then
+            fail "real Make accepted durability stage $durability_make_fail_stage failure"
+        fi
+        case $copy_platform:$durability_make_fail_stage in
+            Darwin:F) durability_make_prefix=F ;;
+            Darwin:D) durability_make_prefix=FAD ;;
+            Darwin:B) durability_make_prefix=FADB ;;
+            Darwin:R) durability_make_prefix=FADBR ;;
+            *:F) durability_make_prefix=F ;;
+            *:D) durability_make_prefix=FD ;;
+            *:B) durability_make_prefix=FDB ;;
+            *:R) durability_make_prefix=FDBR ;;
+        esac
+        durability_make_actual=$(awk '{ printf "%s", $1 }' \
+            "$durability_make_trace") ||
+            fail "cannot inspect failed real Make durability trace"
+        [ "$durability_make_actual" = "$durability_make_prefix" ] || {
+            sed -n '1,160p' "$durability_make_trace" >&2
+            fail "failed real Make durability order was $durability_make_actual; expected $durability_make_prefix"
+        }
+        grep -F "durability stage $durability_make_fail_stage" "$out" \
+            >/dev/null || {
+            sed -n '1,200p' "$out" >&2
+            fail "real Make failure lacked durability stage $durability_make_fail_stage"
+        }
+        [ ! -e "$clean_publish_lock" ] && [ ! -L "$clean_publish_lock" ] ||
+            fail "failed real Make durability flow retained its mutex"
+        case $durability_make_fail_stage in
+            F) inspect_failed_dist_residue "$archive" "$copy_platform" ;;
+            *)
+                assert_archive_metadata "$archive" "$dist_root" "$version"
+                inspect_dist_residue "$archive" "$copy_platform"
+                rm -f "$archive"
+                ;;
+        esac
+    done
+
     printf '%s\n' 'README.md export-ignore' >"$clean_git_dir/info/attributes" ||
         fail "cannot install repository-private attribute fixture"
     rm -f "$archive"
@@ -2659,7 +3492,7 @@ EOF
         fail "completed-tar fixture did not exercise the listing child"
     rm -f "$hermetic_shims/tar-mode" "$hermetic_shims/tar-calls"
 
-    # The root-local mutex must cover the verified helper's use, not merely
+    # The Git-private mutex must cover the verified helper's use, not merely
     # generation. Gate A inside `git archive`, then prove an independent Make
     # process with a different HOSTCC cannot compile or replace the shared
     # helper generation until A finishes consuming it.
@@ -2715,7 +3548,7 @@ exec "$AR11_LOCK_REAL_HOSTCC" "$@"
 EOF
     chmod 0700 "$lock_shims/git" "$lock_shims/hostcc-b"
     lock_hostcc=$(CDPATH='' cd "$lock_shims" && pwd -P)/hostcc-b
-    cp "$clean_repo/build/tools/.release-publish.provenance" \
+    cp "$clean_publish_receipt" \
         "$tmp/release-lock.receipt.before"
     rm -f "$archive" "$lock_ready" "$lock_release" "$lock_status" \
         "$lock_hostcc_log"
@@ -2747,7 +3580,7 @@ EOF
     esac
     kill -0 "$lock_gate_pid" 2>/dev/null ||
         fail "archive gate exited before contention"
-    [ -s "$clean_repo/.gitswitch-release-publish.lock/owner" ] ||
+    [ -s "$clean_publish_lock/owner" ] ||
         fail "first release process reached use without owning the mutex"
 
     : >"$lock_hostcc_log"
@@ -2763,10 +3596,10 @@ EOF
         fail "contending helper generation lacked a precise busy result"
     [ ! -s "$lock_hostcc_log" ] ||
         fail "contending helper generation invoked its compiler"
-    cmp -s "$clean_repo/build/tools/.release-publish.provenance" \
+    cmp -s "$clean_publish_receipt" \
         "$tmp/release-lock.receipt.before" ||
         fail "contending helper generation changed shared provenance"
-    [ -d "$clean_repo/.gitswitch-release-publish.lock" ] ||
+    [ -d "$clean_publish_lock" ] ||
         fail "contender removed the first release process mutex"
 
     lock_release_tmp=$lock_release.tmp.$$
@@ -2792,8 +3625,8 @@ EOF
     wait "$lock_dist_pid" || fail "first release process returned failure"
     lock_dist_pid=
     lock_gate_pid=
-    [ ! -e "$clean_repo/.gitswitch-release-publish.lock" ] &&
-        [ ! -L "$clean_repo/.gitswitch-release-publish.lock" ] ||
+    [ ! -e "$clean_publish_lock" ] &&
+        [ ! -L "$clean_publish_lock" ] ||
         fail "successful release retained its mutex"
     assert_archive_metadata "$archive" "$dist_root" "$version"
     inspect_dist_residue "$archive" "$copy_platform"
@@ -2809,10 +3642,10 @@ EOF
     [ "$(wc -l <"$lock_hostcc_log")" -eq 2 ] ||
         fail "post-release helper generation did not compile both profiles"
     grep -F "hostcc_resolved=$lock_hostcc" \
-        "$clean_repo/build/tools/.release-publish.provenance" >/dev/null ||
+        "$clean_publish_receipt" >/dev/null ||
         fail "post-release provenance did not bind the contending HOSTCC"
-    [ ! -e "$clean_repo/.gitswitch-release-publish.lock" ] &&
-        [ ! -L "$clean_repo/.gitswitch-release-publish.lock" ] ||
+    [ ! -e "$clean_publish_lock" ] &&
+        [ ! -L "$clean_publish_lock" ] ||
         fail "post-release helper generation retained its mutex"
 
     # The helper target is a release-use provenance gate, not a timestamp
@@ -2829,10 +3662,9 @@ EOF
     [ -n "$foreign_publish_helper" ] ||
         fail "cannot find a regular true executable for helper provenance"
     rm -f "$archive"
-    cp "$foreign_publish_helper" \
-        "$clean_repo/build/tools/release-publish" ||
+    cp "$foreign_publish_helper" "$clean_publish_helper" ||
         fail "cannot install foreign publisher fixture"
-    touch -t 203501010000 "$clean_repo/build/tools/release-publish" ||
+    touch -t 203501010000 "$clean_publish_helper" ||
         fail "cannot future-date foreign publisher fixture"
     "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 || {
         sed -n '1,200p' "$out" >&2
@@ -2841,14 +3673,21 @@ EOF
     assert_archive_metadata "$archive" "$dist_root" "$version"
     inspect_dist_residue "$archive" "$copy_platform"
 
-    # The helper target itself is fixed inside the ignored build namespace.
+    # The helper target itself is fixed inside the Git-private state namespace.
     # Before that boundary was override-protected, `-B
     # DIST_PUBLISH_HELPER=VERSION` compiled the helper over tracked VERSION and
     # still returned success. Exercise both primary documentation inputs and
-    # the helper-directory variable while forcing a rebuild.
+    # the helper-directory and Git-state discovery variables while forcing a
+    # rebuild.
+    hostile_release_state=$tmp/hostile-release-state
+    mkdir "$hostile_release_state" ||
+        fail "cannot create hostile release-state fixture"
+    printf '%s\n' preserve >"$hostile_release_state/sentinel" ||
+        fail "cannot create hostile release-state sentinel"
     rm -f "$archive"
     "$make_cmd" -B -C "$clean_repo" DIST_PUBLISH_HELPER=VERSION \
-        TOOLBUILDDIR=. dist >"$out" 2>&1 ||
+        TOOLBUILDDIR=. RELEASE_GIT_DIR_AVAILABLE=0 \
+        RELEASE_GIT_DIR="$hostile_release_state" dist >"$out" 2>&1 ||
         fail "fixed publisher target rejected a hostile VERSION override"
     cmp -s "$clean_repo/VERSION" "$tmp/VERSION.before" ||
         fail "publisher target override changed tracked VERSION"
@@ -2856,12 +3695,18 @@ EOF
     inspect_dist_residue "$archive" "$copy_platform"
     rm -f "$archive"
     "$make_cmd" -B -C "$clean_repo" DIST_PUBLISH_HELPER=README.md \
-        TOOLBUILDDIR=src dist >"$out" 2>&1 ||
+        TOOLBUILDDIR=src RELEASE_GIT_DIR_AVAILABLE=1 \
+        RELEASE_GIT_DIR="$hostile_release_state" dist >"$out" 2>&1 ||
         fail "fixed publisher target rejected a hostile README override"
     cmp -s "$clean_repo/README.md" "$tmp/README.before" ||
         fail "publisher target override changed tracked README"
     assert_archive_metadata "$archive" "$dist_root" "$version"
     inspect_dist_residue "$archive" "$copy_platform"
+    [ "$(cat "$hostile_release_state/sentinel")" = preserve ] ||
+        fail "hostile Git-state override changed its target"
+    [ ! -e "$clean_repo/build/tools" ] &&
+    [ ! -L "$clean_repo/build/tools" ] ||
+        fail "hostile release-state override restored in-tree helper bootstrap"
 
     # An existing artifact is never replaced, even by a byte-identical rerun.
     cp "$archive" "$tmp/archive.before"
@@ -3023,7 +3868,8 @@ EOF
         "$make_cmd" -C "$race_repo" dist >"$out" 2>&1; then
         fail "distribution succeeded after its canonical directory was replaced"
     fi
-    grep -F 'canonical distribution directory changed' "$out" >/dev/null ||
+    grep -F 'pinned release directory chain changed before durability barriers' \
+        "$out" >/dev/null ||
         fail "distribution directory-race rejection was not precise"
     cmp -s "$race_repo/VERSION" "$tmp/race.VERSION.before" ||
         fail "distribution directory substitution changed tracked VERSION"
