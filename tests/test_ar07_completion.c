@@ -766,10 +766,12 @@ TEST(completion_source_reader_covers_the_legacy_boundary) {
 
 TEST(bash_completion_executes_getopt_style_operand_state) {
     const char *bash = find_shell("bash");
-    char output[16384];
+    char root[PATH_MAX], tilde_fixture[PATH_MAX], output[16384];
+    int rc;
     /* AR-10 L26: no _init_completion stub — its absence exercises the real
      * fallback branch; a `return 1` stub now means "already handled". */
-    const char *script =
+    const char *script_body =
+        "unset -f _init_completion 2>/dev/null || :; "
         "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
         "_gitswitch_complete_accounts(){ COMPREPLY+=(ACCOUNT); }; "
         "probe(){ COMP_WORDS=(\"$@\"); COMP_CWORD=$((${#COMP_WORDS[@]}-1)); "
@@ -780,17 +782,68 @@ TEST(bash_completion_executes_getopt_style_operand_state) {
         "probe gitswitch \"$cmd\" Alpha -y ''; done; "
         "probe gitswitch -- edit ''; "
         "probe gitswitch edit -- ''; probe gitswitch edit -- Alpha ''; "
-        "probe gitswitch -- -g ''";
+        "probe gitswitch -- -g ''; "
+        "probe gitswitch '' ''; "
+        "line_probe(){ COMP_LINE=$1; COMP_POINT=${#COMP_LINE}; COMPREPLY=(); "
+        "_gitswitch; printf '<%s>\\n' \"${COMPREPLY[*]}\"; "
+        "unset COMP_LINE COMP_POINT; }; "
+        "line_probe 'gitswitch > /tmp/m35-out edit A'; "
+        "line_probe 'gitswitch edit>/tmp/m35-out A'; "
+        "line_probe 'gitswitch 2>> /tmp/m35-out edit A'; "
+        "line_probe 'gitswitch &>>/tmp/m35-out edit A'; "
+        "line_probe 'gitswitch <(:) edit A'; "
+        "line_probe 'gitswitch 2<(:) edit A'; "
+        "line_probe 'gitswitch 2>(:) edit A'; "
+        "named_probe(){ COMP_LINE=$1; COMP_POINT=${#COMP_LINE}; COMPREPLY=(); "
+        "_gitswitch; if ((BASH_VERSINFO[0] > 4 || "
+        "(BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 1))); then "
+        "[[ ${COMPREPLY[*]} == ACCOUNT ]] || exit 71; "
+        "else ((${#COMPREPLY[@]} == 0)) || exit 72; fi; "
+        "printf '<NAMED-FD-OK>\\n'; unset COMP_LINE COMP_POINT; }; "
+        "named_probe 'gitswitch {fd}>/tmp/m35-out edit A'; "
+        "named_probe 'gitswitch {fd}>&- edit A'; "
+        "line_probe \"gitswitch edit \\$'Apost\\\\'rophe \\$sa\"; "
+        "line_probe \"gitswitch '>/tmp/m35-out' edit A\"; "
+        "line_probe 'gitswitch \\>/tmp/m35-out edit A'; "
+        "retry_probe(){ local line=$1 fixture_candidate=$2 expected=$3; "
+        "COMP_LINE=\"gitswitch edit > $line\"; COMP_POINT=${#COMP_LINE}; "
+        "COMP_WORDS=(gitswitch edit '>' split : suffix); COMP_CWORD=5; "
+        "compgen(){ [[ $3 == \"$line\" ]] && "
+        "printf '%s\\n' \"$fixture_candidate\"; }; "
+        "COMPREPLY=(); _gitswitch_filename_retry; unset -f compgen; "
+        "[[ ${COMPREPLY[*]} == \"$expected\" ]] || exit 73; "
+        "printf '<RETRY-OK>\\n'; unset COMP_LINE COMP_POINT; }; "
+        "retry_probe 'm35:redirect-ou' 'm35:redirect-output' "
+        "'redirect-output'; "
+        "retry_probe 'm35=redirect-ou' 'm35=redirect-output' "
+        "'redirect-output'; "
+        "retry_probe 'm35@redirect-ou' 'm35@redirect-output' "
+        "'@redirect-output'; "
+        "HOME=\"$GS_M35_REDIRECT_HOME\"; export HOME; COMPREPLY=(); "
+        "_gitswitch_complete_redirect_files '~/m35-tilde-fi'; "
+        "printf '<%s>\\n' \"${COMPREPLY[*]}\"";
 
     CHECK(bash != NULL);
     if (!bash) return;
-    CHECK_EQ_INT(run_script(bash, false, script, output, sizeof(output)), 0);
+    snprintf(root, sizeof(root), "/tmp/gitswitch-m35-redirect.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(tilde_fixture, sizeof(tilde_fixture), root,
+                           "m35-tilde-file"), 0);
+    CHECK_EQ_INT(write_text(tilde_fixture, "fixture\n", 0600), 0);
+    CHECK_EQ_INT(setenv("GS_M35_REDIRECT_HOME", root, 1), 0);
+    rc = run_script(bash, false, script_body, output, sizeof(output));
+    CHECK_EQ_INT(unsetenv("GS_M35_REDIRECT_HOME"), 0);
+    CHECK_EQ_INT(rc, 0);
     CHECK_STR_EQ(output,
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n"
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n"
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n"
                  "<ACCOUNT>\n<ACCOUNT>\n<>\n"
-                 "<ACCOUNT>\n<ACCOUNT>\n<>\n<>\n");
+                 "<ACCOUNT>\n<ACCOUNT>\n<>\n<>\n"
+                 "<>\n<ACCOUNT>\n<ACCOUNT>\n<ACCOUNT>\n"
+                 "<ACCOUNT>\n<>\n<>\n<>\n<NAMED-FD-OK>\n<NAMED-FD-OK>\n"
+                 "<ACCOUNT>\n<>\n<>\n<RETRY-OK>\n<RETRY-OK>\n<RETRY-OK>\n"
+                 "<~/m35-tilde-file>\n");
 }
 
 TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
@@ -822,6 +875,7 @@ TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
     written = snprintf(
         script, sizeof(script),
         "export LC_ALL=C; PATH='%s':$PATH; "
+        "unset histchars; unset -f _init_completion 2>/dev/null || :; "
         "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
         "dump(){ printf '<%%s>\\n' \"${COMPREPLY[@]}\"; }; "
         "probe(){ COMPREPLY=(); _gitswitch_complete_accounts \"$1\"; dump; }; "
@@ -831,7 +885,7 @@ TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
         "probe 'Double\\\"N'; printf '%%s\\n' DOUBLE-END; "
         "probe 'Back\\\\S'; printf '%%s\\n' BACKSLASH-END; "
         "probe 'Paren\\ \\(W'; printf '%%s\\n' PAREN-END; "
-        /* AR-10 L24: user-opened quotes must match and yield RAW names. */
+        /* AR-10 L24/M35: user-opened quotes match and yield context encoding. */
         "probe \"'Café\"; printf '%%s\\n' SQUOTE-END; "
         "probe '\"Café'; printf '%%s\\n' DQUOTE-END; "
         /* AR-10 L23: colon/equals names must prefix-match at this layer. */
@@ -860,8 +914,118 @@ TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale) {
         "<Paren\\ \\(Work\\)>\nPAREN-END\n"
         "<Café One>\n<Café Two>\nSQUOTE-END\n"
         "<Café One>\n<Café Two>\nDQUOTE-END\n"
-        "<Colon:Name>\nCOLON-END\n"
-        "<Equal=Name>\nEQUAL-END\n");
+        "<Name>\nCOLON-END\n"
+        "<Name>\nEQUAL-END\n");
+}
+
+/* AR-11 M35: COMPREPLY is shell syntax relative to the quote context that
+ * remains open at the cursor, not an already-literal argv value. Keep this
+ * sourced-script layer separate from the native Readline PTY witness: it pins
+ * the exact encoder/decoder contract, especially the canonical quote splices
+ * that a later TAB feeds back as the next raw prefix. */
+TEST(bash_completion_encodes_and_redecodes_active_quote_contexts) {
+    const char *bash = find_shell("bash");
+    char root[PATH_MAX], stub[PATH_MAX], script[32768], output[32768];
+    const char *stub_source =
+        "#!/bin/sh\n"
+        "[ \"$#\" -eq 2 ] && [ \"$1\" = --names ] && "
+        "[ \"$2\" = list ] || exit 64\n"
+        "cat <<'NAMES'\n"
+        "Apost'rophe $safe\n"
+        "Double$Cash`Tick`\\Slash\"Quote'Apost!Bang\n"
+        "Bang!Quote\"End\n"
+        "Path\\q End\n"
+        "Mixed Prefix$Cash\n"
+        "Colon:Double$Cash\n"
+        "Equal=Double$Cash\n"
+        "At@Double$Cash\n"
+        "Ambig Space\n"
+        "Ambig!Bang\n"
+        "Caret^History\n"
+        "NAMES\n";
+    int written;
+
+    CHECK(bash != NULL);
+    if (!bash) return;
+    snprintf(root, sizeof(root),
+             "/tmp/gitswitch-ar11-bash-quote.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(path_join(stub, sizeof(stub), root, "gitswitch"), 0);
+    CHECK_EQ_INT(write_text(stub, stub_source, 0700), 0);
+
+    written = snprintf(
+        script, sizeof(script),
+        "export LC_ALL=C; PATH='%s':$PATH; "
+        "unset histchars; unset -f _init_completion 2>/dev/null || :; "
+        "source \"$GS_T16_ROOT/completions/gitswitch.bash\"; "
+        "dump(){ printf '<%%s>\\n' \"${COMPREPLY[@]}\"; }; "
+        "probe(){ local label=$1 current=$2; COMPREPLY=(); "
+        "_gitswitch_complete_accounts \"$current\"; "
+        "printf '%%s:%%s\\n' \"$label\" \"${#COMPREPLY[@]}\"; dump; }; "
+        "routeprobe(){ local label=$1; shift; COMP_WORDS=(\"$@\"); "
+        "COMP_CWORD=$((${#COMP_WORDS[@]} - 1)); COMPREPLY=(); "
+        "unset COMP_LINE COMP_POINT; _gitswitch; "
+        "printf '%%s:%%s\\n' \"$label\" \"${#COMPREPLY[@]}\"; dump; }; "
+        "probe SINGLE \"'Apost\"; "
+        "probe DOUBLE '\"Double'; "
+        "probe REPEAT-SINGLE \"'Apost'\\\\''ro\"; "
+        "probe REPEAT-DOUBLE '\"Bang\"\\!\"Q'; "
+        "probe DOUBLE-BACKSLASH '\"Path\\q'; "
+        "probe MID-DOUBLE 'Mixed\" Pre'; "
+        "probe COLON 'Colon:Dou'; "
+        "probe EQUAL 'Equal=Dou'; "
+        "probe AT 'At@Dou'; "
+        "probe QUOTED-COLON '\"Colon:Dou'; "
+        "probe QUOTED-EQUAL '\"Equal=Dou'; "
+        "probe MID-QUOTED-COLON 'Colon:\"Dou'; "
+        "probe AMBIG 'Ambig\\'; "
+        "routeprobe FIXED-SUBCOMMAND gitswitch 'e\"di'; "
+        "routeprobe FIXED-OPTION gitswitch '--\"gl'; "
+        "routeprobe FIXED-INIT gitswitch init 'b\"as'; "
+        "routeprobe ANSI-SUBCOMMAND gitswitch \"\\$'ed\"; "
+        "routeprobe ANSI-HEX gitswitch \"\\$'\\\\x65d\"; "
+        "routeprobe ANSI-OCTAL gitswitch \"\\$'\\\\145d\"; "
+        "routeprobe LOCALE-SUBCOMMAND gitswitch \"\\$\\\"ed\"; "
+        "probe ANSI-ACCOUNT \"\\$'Apost\"; "
+        "probe ANSI-REPEAT \"\\$'Apost\\\\'ro\"; "
+        "histchars=''; probe EMPTY-HIST-DOUBLE '\"Double'; "
+        "histchars='^!#'; "
+        "probe CUSTOM-DOUBLE '\"Caret'; "
+        "probe CUSTOM-BARE 'Caret'",
+        root);
+    CHECK(written >= 0 && (size_t)written < sizeof(script));
+    if (written < 0 || (size_t)written >= sizeof(script)) return;
+
+    CHECK_EQ_INT(run_script(bash, false, script, output, sizeof(output)), 0);
+    CHECK_STR_EQ(
+        output,
+        "SINGLE:1\n<Apost'\\''rophe $safe>\n"
+        "DOUBLE:1\n"
+        "<Double\\$Cash\\`Tick\\`\\\\Slash\\\"Quote'Apost\"\\!\"Bang>\n"
+        "REPEAT-SINGLE:1\n<rophe $safe>\n"
+        "REPEAT-DOUBLE:1\n<Quote\\\"End>\n"
+        "DOUBLE-BACKSLASH:1\n<Path\\\\q End>\n"
+        "MID-DOUBLE:1\n< Prefix\\$Cash>\n"
+        "COLON:1\n<Double\\$Cash>\n"
+        "EQUAL:1\n<Double\\$Cash>\n"
+        "AT:1\n<@Double\\$Cash>\n"
+        "QUOTED-COLON:1\n<Colon:Double\\$Cash>\n"
+        "QUOTED-EQUAL:1\n<Equal=Double\\$Cash>\n"
+        "MID-QUOTED-COLON:1\n<Double\\$Cash>\n"
+        "AMBIG:2\n<Ambig\\ Space>\n<Ambig\\!Bang>\n"
+        "FIXED-SUBCOMMAND:1\n<dit>\n"
+        "FIXED-OPTION:1\n<global>\n"
+        "FIXED-INIT:1\n<ash>\n"
+        "ANSI-SUBCOMMAND:1\n<edit>\n"
+        "ANSI-HEX:1\n<edit>\n"
+        "ANSI-OCTAL:1\n<edit>\n"
+        "LOCALE-SUBCOMMAND:0\n<>\n"
+        "ANSI-ACCOUNT:1\n<Apost\\'rophe $safe>\n"
+        "ANSI-REPEAT:1\n<Apost\\'rophe $safe>\n"
+        "EMPTY-HIST-DOUBLE:1\n"
+        "<Double\\$Cash\\`Tick\\`\\\\Slash\\\"Quote'Apost!Bang>\n"
+        "CUSTOM-DOUBLE:1\n<Caret\"\\^\"History>\n"
+        "CUSTOM-BARE:1\n<Caret\\^History>\n");
 }
 
 /* AR-10 L22/L26: a nonzero return from an EXISTING _init_completion means
@@ -1332,6 +1496,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(completion_surfaces_are_exact_and_hidden_options_stay_hidden);
     RUN_TEST(bash_completion_executes_getopt_style_operand_state);
     RUN_TEST(bash_completion_round_trips_quoted_utf8_prefixes_in_c_locale);
+    RUN_TEST(bash_completion_encodes_and_redecodes_active_quote_contexts);
     RUN_TEST(bash_handled_init_completion_preserves_stock_candidates);
     RUN_TEST(zsh_completion_executes_runtime_expansion_and_state_scanner);
     RUN_TEST(zsh_empty_names_produce_no_blank_candidate);
