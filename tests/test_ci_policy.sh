@@ -525,10 +525,8 @@ check_policy()
                         gate = "linux-gcc-test"
                     else if (command == "/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
                         gate = "linux-gcc-artifact"
-                    else if (command == "/usr/bin/make -B build/tools/release-publish")
-                        gate = "linux-publisher-build"
-                    else if (command == "/bin/sh tests/test_ci_symbols.sh build/bin/gitswitch build/tools/release-publish")
-                        gate = "linux-symbol-inspection"
+                    else if (command == "/usr/bin/make -B release-symbol-contract-test")
+                        gate = "linux-symbol-contract"
                     else if (command == "/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test")
                         gate = "linux-clang-test"
                     else if (command == "/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
@@ -1328,8 +1326,7 @@ check_policy()
             require_release_gate("linux-gcc-clean")
             require_release_gate("linux-gcc-test")
             require_release_gate("linux-gcc-artifact")
-            require_release_gate("linux-publisher-build")
-            require_release_gate("linux-symbol-inspection")
+            require_release_gate("linux-symbol-contract")
             require_release_gate("linux-contract")
             require_release_gate("linux-clang-clean")
             require_release_gate("linux-clang-test")
@@ -1379,8 +1376,7 @@ check_policy()
                 reject("Linux coverage upload must follow its build gate before cleanup")
             if (release_gate_step_serial["linux-gcc-clean"] + 1 != release_gate_step_serial["linux-gcc-test"] ||
                 release_gate_step_serial["linux-gcc-test"] + 1 != release_gate_step_serial["linux-gcc-artifact"] ||
-                release_gate_step_serial["linux-gcc-artifact"] + 1 != release_gate_step_serial["linux-publisher-build"] ||
-                release_gate_step_serial["linux-publisher-build"] + 1 != release_gate_step_serial["linux-symbol-inspection"])
+                release_gate_step_serial["linux-gcc-artifact"] + 1 != release_gate_step_serial["linux-symbol-contract"])
                 reject("Linux GCC release provenance gates must remain adjacent")
             if (release_gate_step_serial["linux-clang-clean"] + 1 != release_gate_step_serial["linux-clang-test"] ||
                 release_gate_step_serial["linux-clang-test"] + 1 != release_gate_step_serial["linux-clang-artifact"])
@@ -1391,9 +1387,8 @@ check_policy()
             require_release_order("linux-coverage-provenance", "linux-gcc-clean")
             require_release_order("linux-gcc-clean", "linux-gcc-test")
             require_release_order("linux-gcc-test", "linux-gcc-artifact")
-            require_release_order("linux-gcc-artifact", "linux-publisher-build")
-            require_release_order("linux-publisher-build", "linux-symbol-inspection")
-            require_release_order("linux-symbol-inspection", "linux-contract")
+            require_release_order("linux-gcc-artifact", "linux-symbol-contract")
+            require_release_order("linux-symbol-contract", "linux-contract")
             require_release_order("linux-contract", "linux-clang-clean")
             require_release_order("linux-clang-clean", "linux-clang-test")
             require_release_order("linux-clang-test", "linux-clang-artifact")
@@ -2241,8 +2236,7 @@ linux|linux-policy|/bin/sh tests/test_ci_policy.sh .
 linux|linux-coverage|/usr/bin/make coverage
 linux|linux-gcc-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
 linux|linux-gcc-artifact|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
-linux|linux-publisher-build|/usr/bin/make -B build/tools/release-publish
-linux|linux-symbol-inspection|/bin/sh tests/test_ci_symbols.sh build/bin/gitswitch build/tools/release-publish
+linux|linux-symbol-contract|/usr/bin/make -B release-symbol-contract-test
 linux|linux-contract|/usr/bin/make release-contract-test
 linux|linux-clang-test|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
 linux|linux-clang-artifact|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
@@ -2447,29 +2441,29 @@ expect_structural_rejected_for "Linux clang stale artifact insertion" \
     "$tmp/linux-clang-stale-artifact.yml" "$today" \
     "Linux clang release provenance gates must remain adjacent"
 
-# Both exact consumers must inspect the GCC artifact and publisher immediately
-# after their production. Replacing either file after the producer used to
-# leave the symbol step as merely optional positional evidence.
+# The locked symbol contract must immediately consume the GCC artifact. A
+# replacement step inserted between those gates would otherwise inspect a
+# different application binary even though helper production/use is locked.
 awk '
     { print }
-    !changed && $0 == "        run: /usr/bin/make -B build/tools/release-publish" {
-        print "      - name: Post-publisher replacement fixture"
+    !changed && $0 == "        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test" {
+        print "      - name: Pre-symbol replacement fixture"
         print "        run: |"
         print "          cp /bin/true build/bin/gitswitch"
         print "          cp /bin/true build/tools/release-publish"
         changed = 1
     }
     END { if (!changed) exit 1 }
-' "$workflow" >"$tmp/linux-post-publisher-replacement.yml"
-expect_structural_rejected_for "Linux post-publisher replacement" \
-    "$tmp/linux-post-publisher-replacement.yml" "$today" \
+' "$workflow" >"$tmp/linux-pre-symbol-replacement.yml"
+expect_structural_rejected_for "Linux pre-symbol replacement" \
+    "$tmp/linux-pre-symbol-replacement.yml" "$today" \
     "Linux GCC release provenance gates must remain adjacent"
 
 add_release_step_field linux \
-    "/bin/sh tests/test_ci_symbols.sh build/bin/gitswitch build/tools/release-publish" \
-    "if: false" "$tmp/conditional-symbol-inspection.yml"
-expect_structural_rejected_for "conditional Linux symbol inspection" \
-    "$tmp/conditional-symbol-inspection.yml" "$today" \
+    "/usr/bin/make -B release-symbol-contract-test" \
+    "if: false" "$tmp/conditional-symbol-contract.yml"
+expect_structural_rejected_for "conditional Linux symbol contract" \
+    "$tmp/conditional-symbol-contract.yml" "$today" \
     "required release gate step must be unconditional"
 
 # AR-11 M37: the policy checker is itself one exact hosted gate. Conditions,

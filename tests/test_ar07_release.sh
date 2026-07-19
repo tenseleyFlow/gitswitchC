@@ -788,10 +788,32 @@ check_manifest_contract()
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-release-contract.XXXXXX") ||
         fail "cannot create temporary release-contract directory"
     copy_pid=
+    lock_dist_pid=
+    lock_gate_pid=
+    lock_contender_pid=
+    stop_background()
+    {
+        background_pid=$1
+        [ -n "$background_pid" ] || return 0
+        kill -TERM "$background_pid" 2>/dev/null || :
+        background_tries=0
+        while kill -0 "$background_pid" 2>/dev/null &&
+              [ "$background_tries" -lt 50 ]; do
+            sleep 0.1
+            background_tries=$((background_tries + 1))
+        done
+        if kill -0 "$background_pid" 2>/dev/null; then
+            kill -KILL "$background_pid" 2>/dev/null || :
+        fi
+        wait "$background_pid" 2>/dev/null || :
+    }
     cleanup()
     {
         status=$?
         trap - 0 1 2 3 15
+        stop_background "$lock_gate_pid"
+        stop_background "$lock_contender_pid"
+        stop_background "$lock_dist_pid"
         if [ -n "$copy_pid" ]; then
             kill "$copy_pid" 2>/dev/null || true
             wait "$copy_pid" 2>/dev/null || true
@@ -1224,6 +1246,184 @@ check_manifest_contract()
 
     "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 ||
         fail "clean committed release failed"
+    assert_archive_metadata "$archive" "$dist_root" "$version"
+    inspect_dist_residue "$archive" "$copy_platform"
+
+    # The root-local mutex must cover the verified helper's use, not merely
+    # generation. Gate A inside `git archive`, then prove an independent Make
+    # process with a different HOSTCC cannot compile or replace the shared
+    # helper generation until A finishes consuming it.
+    lock_shims=$tmp/release-lock-shims
+    lock_ready=$tmp/release-lock.ready
+    lock_release=$tmp/release-lock.release
+    lock_status=$tmp/release-lock.status
+    lock_a_out=$tmp/release-lock-a.out
+    lock_b_out=$tmp/release-lock-b.out
+    lock_hostcc_log=$tmp/release-lock-hostcc.log
+    mkdir "$lock_shims"
+    real_git=$(command -v git) || fail "git is unavailable for lock fixture"
+    real_hostcc=$(command -v cc 2>/dev/null ||
+        command -v gcc 2>/dev/null || command -v clang 2>/dev/null) ||
+        fail "a host C compiler is unavailable for lock fixture"
+    cat >"$lock_shims/git" <<'EOF'
+#!/bin/sh
+: "${AR11_LOCK_REAL_GIT:?}"
+: "${AR11_LOCK_REPO:?}"
+: "${AR11_LOCK_READY:?}"
+: "${AR11_LOCK_RELEASE:?}"
+if [ "${1-}" = -C ] && [ "${2-}" = "$AR11_LOCK_REPO" ] &&
+   [ "${3-}" = archive ]; then
+    ready_tmp=$AR11_LOCK_READY.tmp.$$
+    printf '%s\n' "$$" >"$ready_tmp" || exit 91
+    mv -f "$ready_tmp" "$AR11_LOCK_READY" || exit 92
+    gate_tries=0
+    while [ ! -s "$AR11_LOCK_RELEASE" ]; do
+        gate_tries=$((gate_tries + 1))
+        [ "$gate_tries" -lt 300 ] || exit 93
+        sleep 0.1
+    done
+fi
+exec "$AR11_LOCK_REAL_GIT" "$@"
+EOF
+    cat >"$lock_shims/hostcc-b" <<'EOF'
+#!/bin/sh
+: "${AR11_LOCK_REAL_HOSTCC:?}"
+: "${AR11_LOCK_HOSTCC_LOG:?}"
+if [ "${1-}" = --version ]; then
+    exec "$AR11_LOCK_REAL_HOSTCC" "$@"
+fi
+printf '%s\n' compile >>"$AR11_LOCK_HOSTCC_LOG" || exit 94
+exec "$AR11_LOCK_REAL_HOSTCC" "$@"
+EOF
+    chmod 0700 "$lock_shims/git" "$lock_shims/hostcc-b"
+    lock_hostcc=$(CDPATH='' cd "$lock_shims" && pwd -P)/hostcc-b
+    cp "$clean_repo/build/tools/.release-publish.provenance" \
+        "$tmp/release-lock.receipt.before"
+    rm -f "$archive" "$lock_ready" "$lock_release" "$lock_status" \
+        "$lock_hostcc_log"
+    (
+        lock_a_status=0
+        PATH="$lock_shims:$PATH" \
+            AR11_LOCK_REAL_GIT="$real_git" \
+            AR11_LOCK_REPO="$clean_repo" \
+            AR11_LOCK_READY="$lock_ready" \
+            AR11_LOCK_RELEASE="$lock_release" \
+            "$make_cmd" -C "$clean_repo" dist >"$lock_a_out" 2>&1 ||
+            lock_a_status=$?
+        status_tmp=$lock_status.tmp.$$
+        printf '%s\n' "$lock_a_status" >"$status_tmp" || exit 95
+        mv -f "$status_tmp" "$lock_status" || exit 96
+        exit "$lock_a_status"
+    ) &
+    lock_dist_pid=$!
+    lock_wait_tries=0
+    while [ ! -s "$lock_ready" ]; do
+        if ! kill -0 "$lock_dist_pid" 2>/dev/null; then
+            sed -n '1,200p' "$lock_a_out" >&2
+            fail "first release process exited before its archive gate"
+        fi
+        lock_wait_tries=$((lock_wait_tries + 1))
+        [ "$lock_wait_tries" -lt 300 ] ||
+            fail "first release process did not reach its archive gate"
+        sleep 0.1
+    done
+    lock_gate_pid=$(sed -n '1p' "$lock_ready")
+    case $lock_gate_pid in
+        ''|*[!0-9]*) fail "archive gate did not publish a valid PID" ;;
+    esac
+    kill -0 "$lock_gate_pid" 2>/dev/null ||
+        fail "archive gate exited before contention"
+    [ -s "$clean_repo/.gitswitch-release-publish.lock/owner" ] ||
+        fail "first release process reached use without owning the mutex"
+
+    : >"$lock_hostcc_log"
+    if GITSWITCH_RELEASE_LOCK_ATTEMPTS=1 \
+        AR11_LOCK_REAL_HOSTCC="$real_hostcc" \
+        AR11_LOCK_HOSTCC_LOG="$lock_hostcc_log" \
+        "$make_cmd" -C "$clean_repo" HOSTCC="$lock_hostcc" \
+        release-publish-helpers >"$lock_b_out" 2>&1; then
+        fail "contending helper generation bypassed active release use"
+    fi
+    grep -F 'release publisher is busy or its lock is stale' \
+        "$lock_b_out" >/dev/null ||
+        fail "contending helper generation lacked a precise busy result"
+    [ ! -s "$lock_hostcc_log" ] ||
+        fail "contending helper generation invoked its compiler"
+    cmp -s "$clean_repo/build/tools/.release-publish.provenance" \
+        "$tmp/release-lock.receipt.before" ||
+        fail "contending helper generation changed shared provenance"
+    [ -d "$clean_repo/.gitswitch-release-publish.lock" ] ||
+        fail "contender removed the first release process mutex"
+
+    lock_release_tmp=$lock_release.tmp.$$
+    printf '%s\n' release >"$lock_release_tmp" ||
+        fail "cannot publish archive-gate release"
+    mv -f "$lock_release_tmp" "$lock_release" ||
+        fail "cannot release archive gate"
+    lock_wait_tries=0
+    while [ ! -s "$lock_status" ]; do
+        if ! kill -0 "$lock_dist_pid" 2>/dev/null; then
+            sed -n '1,200p' "$lock_a_out" >&2
+            fail "first release process exited without a completion status"
+        fi
+        lock_wait_tries=$((lock_wait_tries + 1))
+        [ "$lock_wait_tries" -lt 300 ] ||
+            fail "first release process did not finish after gate release"
+        sleep 0.1
+    done
+    [ "$(cat "$lock_status")" -eq 0 ] || {
+        sed -n '1,200p' "$lock_a_out" >&2
+        fail "first release process failed after gate release"
+    }
+    wait "$lock_dist_pid" || fail "first release process returned failure"
+    lock_dist_pid=
+    lock_gate_pid=
+    [ ! -e "$clean_repo/.gitswitch-release-publish.lock" ] &&
+        [ ! -L "$clean_repo/.gitswitch-release-publish.lock" ] ||
+        fail "successful release retained its mutex"
+    assert_archive_metadata "$archive" "$dist_root" "$version"
+    inspect_dist_residue "$archive" "$copy_platform"
+
+    : >"$lock_hostcc_log"
+    AR11_LOCK_REAL_HOSTCC="$real_hostcc" \
+        AR11_LOCK_HOSTCC_LOG="$lock_hostcc_log" \
+        "$make_cmd" -C "$clean_repo" HOSTCC="$lock_hostcc" \
+        release-publish-helpers >"$lock_b_out" 2>&1 || {
+        sed -n '1,200p' "$lock_b_out" >&2
+        fail "helper generation did not recover after mutex release"
+    }
+    [ "$(wc -l <"$lock_hostcc_log")" -eq 2 ] ||
+        fail "post-release helper generation did not compile both profiles"
+    grep -F "hostcc_resolved=$lock_hostcc" \
+        "$clean_repo/build/tools/.release-publish.provenance" >/dev/null ||
+        fail "post-release provenance did not bind the contending HOSTCC"
+    [ ! -e "$clean_repo/.gitswitch-release-publish.lock" ] &&
+        [ ! -L "$clean_repo/.gitswitch-release-publish.lock" ] ||
+        fail "post-release helper generation retained its mutex"
+
+    # The helper target is a release-use provenance gate, not a timestamp
+    # hint. A future-dated foreign executable must be rebuilt before dist
+    # invokes it; otherwise /usr/bin/true lets Make report success without
+    # producing any archive.
+    foreign_publish_helper=
+    for candidate in /usr/bin/true /bin/true; do
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            foreign_publish_helper=$candidate
+            break
+        fi
+    done
+    [ -n "$foreign_publish_helper" ] ||
+        fail "cannot find a regular true executable for helper provenance"
+    rm -f "$archive"
+    cp "$foreign_publish_helper" \
+        "$clean_repo/build/tools/release-publish" ||
+        fail "cannot install foreign publisher fixture"
+    touch -t 203501010000 "$clean_repo/build/tools/release-publish" ||
+        fail "cannot future-date foreign publisher fixture"
+    "$make_cmd" -C "$clean_repo" dist >"$out" 2>&1 || {
+        sed -n '1,200p' "$out" >&2
+        fail "dist did not recover a future-dated foreign publisher"
+    }
     assert_archive_metadata "$archive" "$dist_root" "$version"
     inspect_dist_residue "$archive" "$copy_platform"
 

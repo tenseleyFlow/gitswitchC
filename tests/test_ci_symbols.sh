@@ -1,6 +1,7 @@
 #!/bin/sh
 # Verify the exact Linux release consumers before later QA work can mutate the
-# build tree. The workflow policy pins this invocation and its adjacency.
+# build tree. The workflow pins the enclosing Make target and its adjacency;
+# that target holds the publisher mutex through this complete inspection.
 
 set -eu
 

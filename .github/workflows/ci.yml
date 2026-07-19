@@ -87,15 +87,11 @@ jobs:
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace
       - name: Release artifact hardening (built + staged)
         run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
-      # The preceding required clean removes any pre-existing publisher. Keep
-      # its build as a separately recognized gate, before symbol inspection.
-      - name: Build release publisher from the reviewed source
-        run: /usr/bin/make -B build/tools/release-publish
-      # AR-05 L8: symbol-level no-shell gate. Keep the exact consumer adjacent
-      # to the separately rebuilt publisher so neither inspected file can be
-      # replaced between production and inspection.
-      - name: No-shell gate (binary symbols)
-        run: /bin/sh tests/test_ci_symbols.sh build/bin/gitswitch build/tools/release-publish
+      # AR-05 L8 / AR-11 M38: force a publisher rebuild and inspect its symbols
+      # inside one cross-process lock, so concurrent clean/rebuild operations
+      # cannot replace the helper between provenance validation and use.
+      - name: No-shell gate (locked publisher build + binary symbols)
+        run: /usr/bin/make -B release-symbol-contract-test
       # AR-05 L3: run REAL Valgrind against the release binaries. The
       # qa-contract-test below only proves the recipe's failure plumbing via
       # a shim; without this step no actual memory checking ever executed in
