@@ -174,20 +174,22 @@ int prompt_line(const char *prompt, char *buf, size_t size, bool path_completion
      * elsewhere a stray TAB should not spew the working directory. */
     rl_inhibit_completion = path_completion ? 0 : 1;
 
-    errno = 0;
-    char *line = readline(prompt ? prompt : "");
-    if (!line) {
-        /* AR-10 L34: readline reads through its own read(2) and never sets
-         * stdio's error flag, so ferror(stdin) was structurally false here
-         * and a hard tty error was misclassified as a polite EOF. readline
-         * leaves the failing read's errno in place; classify the specific
-         * hard-error values and keep everything else as EOF (Ctrl-D). */
-        int saved_errno = errno;
-        if (ferror(stdin) || saved_errno == EIO || saved_errno == EBADF ||
-            saved_errno == ENXIO) {
-            return PROMPT_LINE_ERROR;
-        }
-        return PROMPT_LINE_EOF;
+    char *line;
+
+    for (;;) {
+        int saved_errno;
+
+        /* Readline reports both an empty Ctrl-D and an input failure as NULL.
+         * Its input callback leaves the causal read errno in place, so reset
+         * ambient state for every attempt and capture it immediately. */
+        errno = 0;
+        line = readline(prompt ? prompt : "");
+        saved_errno = errno;
+        if (line) break;
+        if (saved_errno == EINTR) continue;
+
+        errno = saved_errno;
+        return saved_errno == 0 ? PROMPT_LINE_EOF : PROMPT_LINE_ERROR;
     }
 
     /* Apply the limit to the physical input, before trimming, so readline and

@@ -22,6 +22,7 @@
 #endif
 
 #include "test.h"
+#include "prompt.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -35,6 +36,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef HAVE_READLINE
+#include <readline/readline.h>
+#endif
 
 /* Generous-but-bounded deadlines: normal turnaround is milliseconds, but the
  * debug build runs under ASan/UBSan on possibly loaded CI machines. */
@@ -370,6 +375,213 @@ static void pty_close(pty_proc_t *p) {
         p->master = -1;
     }
 }
+
+#ifdef HAVE_READLINE
+/* AR-11 L20: drive prompt_line() through Readline's public input callback so
+ * NULL outcomes carry a causal errno instead of depending on host TTY races.
+ * Each case runs in a fresh PTY child because Readline's streams, hooks, and
+ * terminal state are process-global. */
+typedef enum {
+    READLINE_CASE_EINTR_THEN_LINE,
+    READLINE_CASE_EINTR_THEN_EOF,
+    READLINE_CASE_EIO,
+    READLINE_CASE_EAGAIN,
+    READLINE_CASE_CLEAN_EOF,
+    READLINE_CASE_STALE_STDIO_EOF
+} readline_case_t;
+
+typedef struct {
+    int result;
+    int saved_errno;
+    int startup_calls;
+    int injected_eintr;
+    int stdio_error_before;
+    int stdio_error_after;
+    char buffer[16];
+} readline_case_result_t;
+
+static readline_case_t g_readline_case;
+static int g_readline_script_offset;
+static int g_readline_startup_calls;
+static int g_readline_injected_eintr;
+
+static int scripted_readline_startup(void) {
+    g_readline_startup_calls++;
+    return 0;
+}
+
+static int scripted_readline_getc(FILE *stream) {
+    static const char successful_line[] = "ok\n";
+
+    (void)stream;
+    switch (g_readline_case) {
+        case READLINE_CASE_EINTR_THEN_LINE:
+        case READLINE_CASE_EINTR_THEN_EOF:
+            if (!g_readline_injected_eintr) {
+                g_readline_injected_eintr = 1;
+                errno = EINTR;
+                return READERR;
+            }
+            if (g_readline_case == READLINE_CASE_EINTR_THEN_EOF) {
+                errno = 0;
+                return EOF;
+            }
+            if (g_readline_script_offset >=
+                (int)(sizeof(successful_line) - 1U)) {
+                errno = EIO;
+                return READERR;
+            }
+            errno = 0;
+            return (unsigned char)successful_line[g_readline_script_offset++];
+        case READLINE_CASE_EIO:
+            errno = EIO;
+            return READERR;
+        case READLINE_CASE_EAGAIN:
+            errno = EAGAIN;
+            return READERR;
+        case READLINE_CASE_CLEAN_EOF:
+        case READLINE_CASE_STALE_STDIO_EOF:
+            errno = 0;
+            return EOF;
+        default:
+            errno = EINVAL;
+            return READERR;
+    }
+}
+
+static int write_readline_result(int fd,
+                                 const readline_case_result_t *result) {
+    size_t written = 0;
+
+    while (written < sizeof(*result)) {
+        ssize_t count = write(fd, (const char *)result + written,
+                              sizeof(*result) - written);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) return -1;
+        written += (size_t)count;
+    }
+    return 0;
+}
+
+static int run_readline_case(readline_case_t test_case,
+                             readline_case_result_t *result) {
+    pty_proc_t proc;
+    const char *pts;
+    char slave_name[256];
+    int result_pipe[2] = {-1, -1};
+    size_t used = 0;
+    int child_rc;
+
+    memset(&proc, 0, sizeof(proc));
+    proc.master = -1;
+    memset(result, 0, sizeof(*result));
+
+    proc.master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (proc.master < 0 || grantpt(proc.master) != 0 ||
+        unlockpt(proc.master) != 0 ||
+        (pts = ptsname(proc.master)) == NULL) {
+        if (proc.master >= 0) close(proc.master);
+        return -1;
+    }
+    snprintf(slave_name, sizeof(slave_name), "%s", pts);
+    if (pipe(result_pipe) != 0) {
+        close(proc.master);
+        return -1;
+    }
+    if (fflush(NULL) != 0) {
+        close(result_pipe[0]);
+        close(result_pipe[1]);
+        close(proc.master);
+        return -1;
+    }
+
+    proc.pid = fork();
+    if (proc.pid < 0) {
+        close(result_pipe[0]);
+        close(result_pipe[1]);
+        close(proc.master);
+        return -1;
+    }
+    if (proc.pid == 0) {
+        readline_case_result_t child_result;
+        int slave_fd;
+
+        close(result_pipe[0]);
+        if (setsid() < 0) _exit(2);
+        slave_fd = open(slave_name, O_RDWR);
+        if (slave_fd < 0 || dup2(slave_fd, STDIN_FILENO) < 0 ||
+            dup2(slave_fd, STDOUT_FILENO) < 0 ||
+            dup2(slave_fd, STDERR_FILENO) < 0) {
+            _exit(2);
+        }
+        if (slave_fd > STDERR_FILENO) close(slave_fd);
+        close(proc.master);
+
+        setenv("TERM", "dumb", 1);
+        setenv("INPUTRC", "/dev/null", 1);
+        memset(&child_result, 0, sizeof(child_result));
+        memset(child_result.buffer, 'X', sizeof(child_result.buffer));
+        child_result.buffer[sizeof(child_result.buffer) - 1] = '\0';
+
+        rl_instream = stdin;
+        rl_outstream = stdout;
+        rl_catch_signals = 0;
+        rl_catch_sigwinch = 0;
+        rl_initialize();
+        g_readline_case = test_case;
+        g_readline_script_offset = 0;
+        g_readline_startup_calls = 0;
+        g_readline_injected_eintr = 0;
+        rl_startup_hook = scripted_readline_startup;
+        rl_getc_function = scripted_readline_getc;
+
+        if (test_case == READLINE_CASE_STALE_STDIO_EOF) {
+            int saved_stdin = dup(STDIN_FILENO);
+
+            if (saved_stdin < 0 || close(STDIN_FILENO) != 0) _exit(2);
+            errno = 0;
+            (void)fgetc(stdin);
+            if (!ferror(stdin) || dup2(saved_stdin, STDIN_FILENO) < 0) {
+                _exit(2);
+            }
+            close(saved_stdin);
+        }
+        child_result.stdio_error_before = ferror(stdin) != 0;
+
+        errno = 0;
+        child_result.result = prompt_line(
+            "scripted> ", child_result.buffer,
+            sizeof(child_result.buffer), false);
+        child_result.saved_errno = errno;
+        child_result.startup_calls = g_readline_startup_calls;
+        child_result.injected_eintr = g_readline_injected_eintr;
+        child_result.stdio_error_after = ferror(stdin) != 0;
+
+        if (write_readline_result(result_pipe[1], &child_result) != 0) {
+            _exit(3);
+        }
+        close(result_pipe[1]);
+        _exit(0);
+    }
+
+    close(result_pipe[1]);
+    result_pipe[1] = -1;
+    child_rc = pty_wait_exit(&proc);
+    if (child_rc == 0) {
+        while (used < sizeof(*result)) {
+            ssize_t count = read(result_pipe[0], (char *)result + used,
+                                 sizeof(*result) - used);
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) break;
+            used += (size_t)count;
+        }
+    }
+
+    close(result_pipe[0]);
+    pty_close(&proc);
+    return child_rc == 0 && used == sizeof(*result) ? 0 : -1;
+}
+#endif
 
 static int sandbox_publish_account(sandbox_t *sb, const char *account) {
     const char *switch_argv[] = {
@@ -798,6 +1010,65 @@ TEST(eof_ctrl_d_cancels_cleanly) {
     CHECK(after_len == before_len && memcmp(before, after, before_len) == 0);
 
     sandbox_teardown(&sb);
+}
+
+/* L20: a Readline NULL is clean EOF only when its causal errno is zero.
+ * Interrupted reads restart from a fresh Readline attempt; every other error
+ * remains observable by the caller. A stale stdio error flag is deliberately
+ * unrelated because Readline consumes input through its own callback. */
+TEST(readline_null_distinguishes_interrupt_error_and_eof) {
+#ifndef HAVE_READLINE
+    TS_SKIP("readline", "binary was built without readline support");
+#else
+    readline_case_result_t result;
+
+    SKIP_IF_NO_PTY();
+
+    CHECK_EQ_INT(run_readline_case(READLINE_CASE_EINTR_THEN_LINE, &result), 0);
+    CHECK_EQ_INT(result.result, PROMPT_LINE_OK);
+    CHECK_STR_EQ(result.buffer, "ok");
+    CHECK_EQ_INT(result.saved_errno, 0);
+    CHECK_EQ_INT(result.injected_eintr, 1);
+    CHECK_EQ_INT(result.startup_calls, 2);
+    CHECK_EQ_INT(result.stdio_error_after, 0);
+
+    CHECK_EQ_INT(run_readline_case(READLINE_CASE_EINTR_THEN_EOF, &result), 0);
+    CHECK_EQ_INT(result.result, PROMPT_LINE_EOF);
+    CHECK_STR_EQ(result.buffer, "");
+    CHECK_EQ_INT(result.saved_errno, 0);
+    CHECK_EQ_INT(result.injected_eintr, 1);
+    CHECK_EQ_INT(result.startup_calls, 2);
+    CHECK_EQ_INT(result.stdio_error_after, 0);
+
+    CHECK_EQ_INT(run_readline_case(READLINE_CASE_EIO, &result), 0);
+    CHECK_EQ_INT(result.result, PROMPT_LINE_ERROR);
+    CHECK_STR_EQ(result.buffer, "");
+    CHECK_EQ_INT(result.saved_errno, EIO);
+    CHECK_EQ_INT(result.startup_calls, 1);
+    CHECK_EQ_INT(result.stdio_error_after, 0);
+
+    CHECK_EQ_INT(run_readline_case(READLINE_CASE_EAGAIN, &result), 0);
+    CHECK_EQ_INT(result.result, PROMPT_LINE_ERROR);
+    CHECK_STR_EQ(result.buffer, "");
+    CHECK_EQ_INT(result.saved_errno, EAGAIN);
+    CHECK_EQ_INT(result.startup_calls, 1);
+    CHECK_EQ_INT(result.stdio_error_after, 0);
+
+    CHECK_EQ_INT(run_readline_case(READLINE_CASE_CLEAN_EOF, &result), 0);
+    CHECK_EQ_INT(result.result, PROMPT_LINE_EOF);
+    CHECK_STR_EQ(result.buffer, "");
+    CHECK_EQ_INT(result.saved_errno, 0);
+    CHECK_EQ_INT(result.startup_calls, 1);
+    CHECK_EQ_INT(result.stdio_error_after, 0);
+
+    CHECK_EQ_INT(run_readline_case(READLINE_CASE_STALE_STDIO_EOF, &result), 0);
+    CHECK_EQ_INT(result.stdio_error_before, 1);
+    CHECK_EQ_INT(result.result, PROMPT_LINE_EOF);
+    CHECK_STR_EQ(result.buffer, "");
+    CHECK_EQ_INT(result.saved_errno, 0);
+    CHECK_EQ_INT(result.startup_calls, 1);
+    CHECK_EQ_INT(result.stdio_error_after, 1);
+#endif
 }
 
 /* 6. TAB completes filenames only at the SSH key path prompt; at other
@@ -1521,6 +1792,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(yes_flag_skips_confirmation);
     RUN_TEST(duplicate_name_rejected_and_config_unchanged);
     RUN_TEST(eof_ctrl_d_cancels_cleanly);
+    RUN_TEST(readline_null_distinguishes_interrupt_error_and_eof);
     RUN_TEST(ssh_key_path_tab_completion_and_inhibition);
     RUN_TEST(reset_typed_yes_confirmation_semantics);
     RUN_TEST(remove_typed_yes_confirmation_semantics);
