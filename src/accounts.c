@@ -3,12 +3,16 @@
  */
 
 /* Enable POSIX extensions for setenv/unsetenv and related process APIs.
- * Darwin needs its extension namespace restored before system headers. */
+ * Darwin needs its extension namespace restored before system headers.
+ * FreeBSD must retain its default BSD namespace because project headers
+ * require O_PATH for descriptor-conditioned retirement. */
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE 1
 #endif
+#if !defined(__FreeBSD__)
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>

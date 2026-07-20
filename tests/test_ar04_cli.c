@@ -166,6 +166,7 @@ static int seed_account_publication(const char *home, uint32_t account_id,
         "[fixture]\n"
         "\tgeneration = ar04-cli\n";
     static const char state_header[] = "none\nactive=work\n";
+    char canonical_home[PATH_MAX];
     char git_path[PATH_MAX];
     char state_path[PATH_MAX];
     publication_ledger_t ledger;
@@ -177,11 +178,15 @@ static int seed_account_publication(const char *home, uint32_t account_id,
     int result = -1;
 
     if (!home ||
-        snprintf(git_path, sizeof(git_path), "%s/.gitconfig", home) < 0 ||
+        canonical_existing_path(home, canonical_home,
+                                sizeof(canonical_home)) != 0 ||
+        snprintf(git_path, sizeof(git_path), "%s/.gitconfig",
+                 canonical_home) < 0 ||
         snprintf(state_path, sizeof(state_path),
                  "%s/.config/gitswitch/.resume-hint", home) < 0 ||
         write_text(git_path, git_body, 0600) != 0 ||
-        stat(home, &parent_st) != 0 || stat(git_path, &config_st) != 0) {
+        stat(canonical_home, &parent_st) != 0 ||
+        stat(git_path, &config_st) != 0) {
         return -1;
     }
 
@@ -463,24 +468,28 @@ TEST(reset_reports_both_subsystem_failures_once) {
 }
 
 TEST(targeted_reset_metadata_matches_active_account_scope) {
-    char home[PATH_MAX], runtime[PATH_MAX], config[PATH_MAX];
+    char home[PATH_MAX], aliased_home[PATH_MAX], runtime[PATH_MAX];
+    char config[PATH_MAX];
     char hint[PATH_MAX], output[PATH_MAX], contents[8192];
     int reset_rc;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
+    CHECK_EQ_INT(join_path(aliased_home, sizeof(aliased_home), runtime,
+                           "/home-alias"), 0);
+    CHECK_EQ_INT(symlink(home, aliased_home), 0);
     CHECK_EQ_INT(write_two_account_active_config(
-                     home, 1U, AR04_CLI_WORK_INCARNATION), 0);
-    CHECK_EQ_INT(join_path(config, sizeof(config), home,
+                     aliased_home, 1U, AR04_CLI_WORK_INCARNATION), 0);
+    CHECK_EQ_INT(join_path(config, sizeof(config), aliased_home,
                            "/.config/gitswitch/accounts.toml"), 0);
-    CHECK_EQ_INT(join_path(hint, sizeof(hint), home,
+    CHECK_EQ_INT(join_path(hint, sizeof(hint), aliased_home,
                            "/.config/gitswitch/.resume-hint"), 0);
     CHECK_EQ_INT(join_path(output, sizeof(output), runtime, "/reset.out"), 0);
 
     /* Resetting the active account installs an authoritative inactive
      * tombstone; the legacy settings key may remain byte-identical but cannot
      * be resurrected on reload. Both account records remain. */
-    reset_rc = run_targeted_reset(home, runtime, "work", output);
+    reset_rc = run_targeted_reset(aliased_home, runtime, "work", output);
     CHECK_EQ_INT(reset_rc, 0);
     slurp(config, contents, sizeof(contents));
     CHECK(strstr(contents, "active_account = \"work\"") != NULL);
@@ -494,8 +503,8 @@ TEST(targeted_reset_metadata_matches_active_account_scope) {
     /* Resetting an inactive account must not rewrite the active marker or its
      * exact retry hint. Recreate the starting document to exercise that arm. */
     CHECK_EQ_INT(write_two_account_active_config(
-                     home, 2U, AR04_CLI_OTHER_INCARNATION), 0);
-    reset_rc = run_targeted_reset(home, runtime, "other", output);
+                     aliased_home, 2U, AR04_CLI_OTHER_INCARNATION), 0);
+    reset_rc = run_targeted_reset(aliased_home, runtime, "other", output);
     CHECK_EQ_INT(reset_rc, 0);
     slurp(config, contents, sizeof(contents));
     CHECK(strstr(contents, "active_account = \"work\"") != NULL);

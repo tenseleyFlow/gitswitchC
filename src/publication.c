@@ -3,8 +3,11 @@
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE 1
 #endif
+/* FreeBSD exposes O_PATH only in its default BSD namespace. */
+#if !defined(__FreeBSD__)
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#endif
 
 #include "publication.h"
 

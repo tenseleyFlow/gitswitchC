@@ -687,9 +687,13 @@ TEST(identityfile_quoting_and_hostname_match_openssh_oracle) {
     CHECK(output_has_value(output, "identityfile", key));
 }
 
-TEST(openssh_include_rejects_group_or_other_writable_config) {
+TEST(openssh_include_rejects_other_writable_config) {
     static const mode_t accepted_modes[] = {0600, 0644};
-    static const mode_t rejected_modes[] = {0620, 0602, 0666};
+    /* Debian and Ubuntu intentionally accept group-write when the owning
+     * group contains only the file owner. Other-write remains an invariant
+     * across their policy and upstream OpenSSH. The application's stricter
+     * no-group/no-other-write policy has a separate causal mode matrix. */
+    static const mode_t rejected_modes[] = {0602, 0666};
     static const char included_text[] =
         "Host l36-probe\n"
         "  HostName l36.example.test\n"
@@ -2337,7 +2341,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(historical_host_port_block_can_be_repaired_after_upgrade);
     RUN_TEST(historical_host_port_block_can_be_removed_after_upgrade);
     RUN_TEST(identityfile_quoting_and_hostname_match_openssh_oracle);
-    RUN_TEST(openssh_include_rejects_group_or_other_writable_config);
+    RUN_TEST(openssh_include_rejects_other_writable_config);
     RUN_TEST(openssh_percent_and_environment_expansions_are_safe);
     RUN_TEST(embedded_nul_at_every_region_fails_without_mutation);
     RUN_TEST(exact_marker_parser_preserves_incidental_substrings);

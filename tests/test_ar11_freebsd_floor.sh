@@ -74,7 +74,10 @@ make_headers()
             >"$destination/sys/param.h"
     fi
     if [ "$opath" = present ]; then
-        printf '%s\n' '#define O_PATH 0x00400000' >"$destination/fcntl.h"
+        printf '%s\n' \
+            '#if !defined(_POSIX_C_SOURCE) && !defined(_XOPEN_SOURCE)' \
+            '#define O_PATH 0x00400000' \
+            '#endif' >"$destination/fcntl.h"
     else
         printf '%s\n' '/* deliberately missing O_PATH */' \
             >"$destination/fcntl.h"
@@ -83,15 +86,21 @@ make_headers()
 
 compile_probe()
 {
-    headers=$1
-    output=$2
-    log=$3
+    compile_source "$probe" "$@"
+}
+
+compile_source()
+{
+    source=$1
+    headers=$2
+    output=$3
+    log=$4
     set -f
     # FREEBSD_CONTRACT_CC deliberately follows Make's compiler selection.
     # Word splitting permits the same launcher-plus-compiler form as CC.
     # shellcheck disable=SC2086
     $cc_command -std=c11 -Wall -Wextra -Werror -D__FreeBSD__ \
-        -I"$headers" -I"$root/src" "$probe" -o "$output" \
+        -I"$headers" -I"$root/src" "$source" -o "$output" \
         >"$log.stdout" 2>"$log.stderr"
 }
 
@@ -131,6 +140,25 @@ if ! compile_probe "$newer_headers" "$tmp/newer.bin" "$tmp/newer"; then
     fail "newer supported headers do not compile"
 fi
 "$tmp/newer.bin" || fail "newer supported probe failed"
+
+# Reproduce the real application prologues rather than testing only the
+# compatibility header in isolation. FreeBSD's O_PATH is in the default BSD
+# namespace, so a source that selects strict POSIX/XSI before project headers
+# would hide the required API even on the declared release floor.
+for production_source in "$root/src/accounts.c" "$root/src/publication.c"; do
+    source_name=${production_source##*/}
+    source_probe=$tmp/$source_name.probe.c
+    sed '/^#include /,$d' "$production_source" >"$source_probe" ||
+        fail "cannot extract $source_name feature-selection prologue"
+    printf '%s\n' '#include "freebsd_compat.h"' \
+        'int main(void) { return 0; }' >>"$source_probe"
+    if ! compile_source "$source_probe" "$minimum_headers" \
+        "$tmp/$source_name.bin" "$tmp/$source_name"; then
+        cat "$tmp/$source_name.stderr" >&2
+        fail "$source_name hides required FreeBSD APIs"
+    fi
+    "$tmp/$source_name.bin" || fail "$source_name feature probe failed"
+done
 
 expect_rejected "$old_headers" old-release \
     "gitswitch requires FreeBSD $min_release or newer"
