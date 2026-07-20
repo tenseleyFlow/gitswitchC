@@ -259,6 +259,8 @@ static int m10_fixture_init_internal(m10_fixture_t *fixture,
              ? !ts_mkdtemp_trusted(root_template, sizeof(root_template),
                                    "gsw-ar11-m10")
              : !ts_mkdtemp(root_template)) ||
+        ts_canonicalize_dir_path(root_template,
+                                 sizeof(root_template)) != 0 ||
         safe_strncpy(fixture->root, root_template,
                      sizeof(fixture->root)) != 0 ||
         safe_snprintf(fixture->state_dir, sizeof(fixture->state_dir),
