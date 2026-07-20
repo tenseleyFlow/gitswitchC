@@ -29,6 +29,51 @@ esac
     fail "lock parent is not a real directory: $lock_parent"
 
 host_os=$(uname -s 2>/dev/null) || fail "cannot identify host platform"
+
+# Determine caller policy before this supervisor installs its own handlers.
+# A non-interactive shell cannot replace a disposition that was ignored when
+# it started: the foreground probe therefore exits 0 only for a genuinely
+# inherited ignore, while a resettable signal reaches the temporary handler.
+# This distinction lets the asynchronous command repair shell-added ignores
+# without resurrecting a signal intentionally suppressed by nohup/supervision.
+signal_is_ignored_on_entry()
+{
+    probe_signal_name=$1
+    if sh -c '
+        trap "exit 91" "$1"
+        kill -"$1" "$$" || exit 92
+        exit 0
+    ' sh "$probe_signal_name"; then
+        return 0
+    else
+        probe_signal_status=$?
+    fi
+    [ "$probe_signal_status" -eq 91 ] ||
+        fail "cannot classify inherited $probe_signal_name disposition"
+    return 1
+}
+
+reset_command_int=1
+reset_command_quit=1
+if signal_is_ignored_on_entry INT; then
+    reset_command_int=0
+fi
+if signal_is_ignored_on_entry QUIT; then
+    reset_command_quit=0
+fi
+
+# Ubuntu 24.04 dash keeps the ignores it adds for an asynchronous list even
+# after `trap -`. GNU env can reset selected dispositions immediately before
+# exec, after dash has added them. Detect that extension rather than imposing
+# it on macOS/FreeBSD or other shells where the POSIX trap fallback works.
+command_signal_env=0
+if [ "$reset_command_int" -eq 1 ] || [ "$reset_command_quit" -eq 1 ]; then
+    if env --default-signal=INT --default-signal=QUIT true \
+        >/dev/null 2>&1; then
+        command_signal_env=1
+    fi
+fi
+
 normalize_private_acl()
 {
     private_path=$1
@@ -418,14 +463,30 @@ export GITSWITCH_RELEASE_LOCK_TOKEN
 export GITSWITCH_RELEASE_LOCK_LEASE_FD
 
 # A non-job-control shell makes SIGINT and SIGQUIT ignored for an asynchronous
-# list. Reset those shell-added dispositions in a short-lived subshell before
-# exec so the owned command can install its own handlers. POSIX shells keep a
-# signal that was already ignored when this supervisor started unchangeable,
-# preserving an outer nohup/supervisor policy. exec retains the child PID that
-# this script publishes and forwards signals to below.
-(
+# list. Reset only dispositions that were not ignored on entry so the owned
+# command can install its handlers without overriding outer nohup/supervisor
+# policy. exec retains the child PID published and signalled by this script.
+launch_owned_command()
+{
+    if [ "$command_signal_env" -eq 1 ]; then
+        case $reset_command_int:$reset_command_quit in
+            1:1)
+                exec env --default-signal=INT --default-signal=QUIT \
+                    "$@" 9>"$lease_path"
+                ;;
+            1:0)
+                exec env --default-signal=INT "$@" 9>"$lease_path"
+                ;;
+            0:1)
+                exec env --default-signal=QUIT "$@" 9>"$lease_path"
+                ;;
+        esac
+    fi
     trap - INT QUIT
     exec "$@" 9>"$lease_path"
+}
+(
+    launch_owned_command "$@"
 ) &
 child_pid=$!
 command_launched=1

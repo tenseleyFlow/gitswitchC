@@ -110,7 +110,11 @@ static bool fixture_init(real_fixture_t *fixture) {
     FILE *key;
     memset(fixture, 0, sizeof(*fixture));
     snprintf(fixture->base, sizeof(fixture->base), "/tmp/gsw_ar07_git_XXXXXX");
-    if (!ts_mkdtemp(fixture->base)) return false;
+    if (!ts_mkdtemp(fixture->base) ||
+        ts_canonicalize_dir_path(fixture->base,
+                                 sizeof(fixture->base)) != 0) {
+        return false;
+    }
     snprintf(fixture->home, sizeof(fixture->home), "%s/home", fixture->base);
     snprintf(fixture->xdg, sizeof(fixture->xdg), "%s/xdg", fixture->base);
     snprintf(fixture->repo, sizeof(fixture->repo), "%s/repo", fixture->base);

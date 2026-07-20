@@ -190,6 +190,13 @@ static int write_legacy_two_account_config(const char *home,
                          config_dir) >= sizeof(path)) {
         return -1;
     }
+    /* Give the command a freshly materialized pre-load generation. Rewriting
+     * the seed inode in place can leave a delayed ctime update on FreeBSD UFS,
+     * which correctly looks like a concurrent change to the publication
+     * guard after the CLI has loaded the file. */
+    if (unlink(path) != 0 && errno != ENOENT) {
+        return -1;
+    }
     return write_text_mode(path, legacy_two_accounts, 0600);
 }
 
