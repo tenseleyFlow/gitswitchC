@@ -202,7 +202,9 @@ static int fixture_setup(reset_fixture_t *fixture) {
     memset(fixture, 0, sizeof(*fixture));
     if ((size_t)snprintf(fixture->root, sizeof(fixture->root),
                          "/tmp/gitswitch-ar07-reset.XXXXXX") >=
-        sizeof(fixture->root) || !ts_mkdtemp(fixture->root)) {
+        sizeof(fixture->root) || !ts_mkdtemp(fixture->root) ||
+        ts_canonicalize_dir_path(fixture->root,
+                                 sizeof(fixture->root)) != 0) {
         return -1;
     }
     if ((size_t)snprintf(fixture->home, sizeof(fixture->home), "%s/home",
