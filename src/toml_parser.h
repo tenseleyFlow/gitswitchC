@@ -22,7 +22,7 @@
  * relationship is pinned by a _Static_assert in toml_parser.c. */
 #define TOML_MAX_SECTIONS 65
 #define TOML_MAX_KEYS_PER_SECTION 16
-#define TOML_MAX_FILE_SIZE (64 * 1024)  /* 64KB max config file */
+#define TOML_MAX_FILE_SIZE CONFIG_DOCUMENT_MAX_SIZE  /* 64KB max config file */
 
 /* TOML value types */
 typedef enum {

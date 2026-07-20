@@ -50,7 +50,15 @@ typedef enum {
     /* Read-side consistency checkpoint. A test callback may mutate the
      * descriptor's backing file and return false; production leaves the
      * callback NULL. */
-    CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ
+    CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ,
+    /* Read-side close checkpoint. A test callback may expose a ctime-only
+     * close-time metadata step and return false; the loader must bind the
+     * generation observed after close. */
+    CONFIG_IO_DOCUMENT_AFTER_CLOSE,
+    /* Exact-byte reproof checkpoint immediately before its final descriptor
+     * generation observation. A test callback may expose a ctime-only step
+     * and return false. */
+    CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES
 } config_io_boundary_t;
 
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);

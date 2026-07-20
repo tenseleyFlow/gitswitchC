@@ -6462,6 +6462,7 @@ typedef struct {
     bool prepared;
     bool published;
     bool restored;
+    bool restored_witness_ready;
     bool settled;
 } git_retirement_group_t;
 
@@ -7104,6 +7105,7 @@ static void git_retirement_transaction_release(
     git_retirement_transaction_t *transaction) {
     if (!transaction) return;
     for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_scope_lock_close(&transaction->groups[i].lock);
         git_scope_snapshot_clear(&transaction->groups[i].snapshot);
     }
     if (transaction->items) {
@@ -7633,12 +7635,15 @@ int git_retirement_transaction_abort(
 
 static bool git_retirement_group_is_abort_reconciled(
     const git_retirement_group_t *group) {
-    if (!group || !group->prepared || !group->lock_ready ||
-        group->settled) {
+    bool restored;
+
+    if (!group || !group->prepared) {
         return false;
     }
-    if (group->published) return group->restored;
-    return group->planned == 0U;
+    restored = group->published ? group->restored : group->planned == 0U;
+    return restored &&
+           (group->restored_witness_ready ||
+            (group->lock_ready && !group->settled));
 }
 
 size_t git_retirement_transaction_restored_destination_count(
@@ -7658,8 +7663,146 @@ size_t git_retirement_transaction_restored_destination_count(
     return count;
 }
 
+/* Prove exact bytes through a descriptor, flush any delayed inode metadata,
+ * close that descriptor, and require the named observation to stabilize. The
+ * ctime-only retry is authorized solely by the complete byte proof. */
+static bool git_file_at_matches_witness_after_close(
+    int parent_fd, const char *leaf, const struct stat *baseline,
+    const unsigned char *data, size_t length, struct stat *current) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        struct stat opened;
+        struct stat named_after;
+        int fd = openat(parent_fd, leaf,
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+
+        if (fd < 0 || fsync(fd) != 0 ||
+            !git_file_at_matches_witness(
+                parent_fd, leaf, fd, baseline, data, length, &opened)) {
+            int saved_errno = errno ? errno : EAGAIN;
+
+            if (fd >= 0) (void)close(fd);
+            errno = saved_errno;
+            return false;
+        }
+        if (close(fd) != 0) return false;
+        if (fstatat(parent_fd, leaf, &named_after,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !git_same_pinned_file_generation(baseline, &named_after)) {
+            return false;
+        }
+        if (git_same_file_observation(&opened, &named_after)) {
+            if (current) *current = named_after;
+            return true;
+        }
+        if (attempt != 0 ||
+            !git_metadata_ctime_only_change(&opened, &named_after)) {
+            errno = EAGAIN;
+            return false;
+        }
+    }
+    errno = EAGAIN;
+    return false;
+}
+
+static int git_retirement_group_finalize_restored_witness(
+    git_retirement_group_t *group, struct stat *current_stat) {
+    unsigned char *retained_data = NULL;
+    size_t retained_length;
+    struct stat reopened_parent;
+    struct stat refreshed;
+
+    if (!group || !current_stat || !group->prepared) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (group->restored_witness_ready) {
+        if (!git_file_at_matches_witness_after_close(
+                group->lock.dir_fd, group->lock.leaf,
+                &group->lock.original_stat, group->lock.original_data,
+                group->lock.original_length, &refreshed)) {
+            errno = errno ? errno : EAGAIN;
+            return -1;
+        }
+        if (!git_same_file_observation(
+                &group->lock.original_stat, &refreshed)) {
+            if (!git_metadata_ctime_only_change(
+                    &group->lock.original_stat, &refreshed)) {
+                errno = EAGAIN;
+                return -1;
+            }
+            group->lock.original_stat = refreshed;
+        }
+        *current_stat = refreshed;
+        return 0;
+    }
+    if (!group->lock_ready || group->settled ||
+        !group->lock.original_present ||
+        !group->lock.original_witness_valid ||
+        group->lock.original_fd < 0 || group->lock.dir_fd < 0 ||
+        !git_file_at_matches_witness(
+            group->lock.dir_fd, group->lock.leaf,
+            group->lock.original_fd, &group->lock.original_stat,
+            group->lock.original_data, group->lock.original_length,
+            NULL)) {
+        errno = errno ? errno : EAGAIN;
+        return -1;
+    }
+    retained_length = group->lock.original_length;
+    if (retained_length != 0U) {
+        retained_data = malloc(retained_length);
+        if (!retained_data) {
+            errno = ENOMEM;
+            return -1;
+        }
+        memcpy(retained_data, group->lock.original_data, retained_length);
+    }
+
+    /* Checked cleanup removes and syncs every transaction-owned name before
+     * the generation is sealed. FreeBSD UFS may materialize the fallback
+     * link/rename ctime only at this sync; recording earlier leaves a stale
+     * ledger even though the restored inode and bytes are exact. */
+    if (git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        if (retained_data) {
+            secure_zero_memory(retained_data, retained_length);
+            free(retained_data);
+        }
+        group->lock_ready = false;
+        group->settled = true;
+        errno = saved_errno;
+        return -1;
+    }
+    group->lock_ready = false;
+    group->settled = true;
+    group->lock.original_data = retained_data;
+    group->lock.original_length = retained_length;
+    group->lock.original_present = true;
+    group->lock.original_witness_valid = true;
+    group->lock.dir_fd = open(group->lock.parent,
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                  O_NOFOLLOW);
+    if (group->lock.dir_fd < 0 ||
+        fstat(group->lock.dir_fd, &reopened_parent) != 0 ||
+        !S_ISDIR(reopened_parent.st_mode) ||
+        !git_same_object_identity(
+            &group->lock.parent_stat, &reopened_parent) ||
+        !git_file_at_matches_witness_after_close(
+            group->lock.dir_fd, group->lock.leaf,
+            &group->lock.original_stat, group->lock.original_data,
+            group->lock.original_length, &refreshed)) {
+        errno = errno ? errno : EAGAIN;
+        return -1;
+    }
+    group->lock.parent_stat = reopened_parent;
+    group->lock.original_stat = refreshed;
+    group->restored_witness_ready = true;
+    *current_stat = refreshed;
+    return 0;
+}
+
 int git_retirement_transaction_restored_destination(
-    const git_retirement_transaction_t *transaction, size_t index,
+    git_retirement_transaction_t *transaction, size_t index,
     char *config_path, size_t path_size,
     publication_identity_t *post_config) {
     size_t position = 0U;
@@ -7672,7 +7815,7 @@ int git_retirement_transaction_restored_destination(
         return -1;
     }
     for (size_t i = 0U; i < transaction->group_count; i++) {
-        const git_retirement_group_t *group = &transaction->groups[i];
+        git_retirement_group_t *group = &transaction->groups[i];
         struct stat current_stat;
 
         if (!git_retirement_group_is_abort_reconciled(group)) continue;
@@ -7684,14 +7827,11 @@ int git_retirement_transaction_restored_destination(
             return -1;
         }
         /* A changed group was re-proved by abort while an unchanged group
-         * never passed through the reverse-exchange path.  Re-prove both at
-         * the query boundary so a no-op destination cannot lend stale ledger
-         * authority to a pathname replaced by an uncooperative writer. */
-        if (!git_file_at_matches_witness(
-                group->lock.dir_fd, group->lock.leaf,
-                group->lock.original_fd, &group->lock.original_stat,
-                group->lock.original_data, group->lock.original_length,
-                &current_stat)) {
+         * never passed through the reverse-exchange path. Checked-clean both
+         * transaction namespaces before sealing their post-cleanup identity,
+         * then retain exact bytes for the post-ledger commit reproof. */
+        if (git_retirement_group_finalize_restored_witness(
+                group, &current_stat) != 0) {
             errno = errno ? errno : EAGAIN;
             set_system_error(
                 ERR_GIT_CONFIG_FAILED,
@@ -7719,6 +7859,31 @@ int git_retirement_transaction_commit(
     for (size_t i = 0U; i < transaction->group_count; i++) {
         git_retirement_group_t *group = &transaction->groups[i];
         char label[96];
+
+        if (group->restored_witness_ready) {
+            struct stat refreshed;
+
+            if (!git_file_at_matches_witness_after_close(
+                    group->lock.dir_fd, group->lock.leaf,
+                    &group->lock.original_stat,
+                    group->lock.original_data,
+                    group->lock.original_length, &refreshed) ||
+                !git_same_file_observation(
+                    &group->lock.original_stat, &refreshed)) {
+                errno = errno ? errno : EAGAIN;
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Restored Git destination changed during publication-ledger reconciliation");
+                (void)snprintf(
+                    label, sizeof(label),
+                    "destination %zu post-refresh verification (%s)",
+                    group->representative + 1U,
+                    git_scope_diagnostic_label(group->scope));
+                (void)error_accumulator_add_last(&failures, label);
+                result = -1;
+            }
+            continue;
+        }
 
         if (!group->lock_ready || group->settled) continue;
         if (git_scope_lock_discard_checked(&group->lock, true) != 0) {

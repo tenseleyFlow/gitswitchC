@@ -295,12 +295,16 @@ size_t git_retirement_transaction_restored_destination_count(
 
 /**
  * Return one reconciled canonical path and its freshly re-proved exact file
- * identity. `index` addresses changed-and-restored and unchanged/no-op
- * destinations exactly once per physical configuration namespace. The
- * transaction must remain uncommitted and fully aborted.
+ * identity. The query checked-cleans and syncs that destination's transaction
+ * artifacts before sealing the generation, then retains its exact bytes for
+ * commit to re-prove after the caller refreshes the publication ledger. This
+ * prevents delayed filesystem metadata from making the new ledger stale while
+ * still detecting an external Git writer. `index` addresses changed-and-
+ * restored and unchanged/no-op destinations exactly once per physical config
+ * namespace. The transaction must remain uncommitted and fully aborted.
  */
 int git_retirement_transaction_restored_destination(
-    const git_retirement_transaction_t *transaction, size_t index,
+    git_retirement_transaction_t *transaction, size_t index,
     char *config_path, size_t path_size,
     publication_identity_t *post_config);
 

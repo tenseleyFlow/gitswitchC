@@ -46,6 +46,7 @@
 #define ACCOUNT_INCARNATION_HEX_LEN 64U
 #define ACCOUNT_INCARNATION_LEN (ACCOUNT_INCARNATION_HEX_LEN + 1U)
 #define MAX_ACCOUNTS 64
+#define CONFIG_DOCUMENT_MAX_SIZE (64U * 1024U)
 
 /* Default configuration paths */
 #define DEFAULT_CONFIG_DIR ".config/gitswitch"
@@ -106,6 +107,18 @@ typedef struct {
      * source so a stale context cannot describe a replaced account model. */
     bool source_generation_valid;
     struct stat source_generation;
+    /* Exact bytes retained after this context durably publishes a full
+     * document. Some filesystems expose a delayed ctime-only step after that
+     * publication; later writes may admit it only after re-proving the
+     * complete file against this bounded witness. */
+    bool source_witness_valid;
+    /* A completed stable load retains the same exact bytes under distinct
+     * authority. This covers reader-induced ctime materialization without
+     * misclassifying the document as self-published; any byte, inode, mtime,
+     * ownership, mode, size, or link-count change still fails closed. */
+    bool source_read_witness_valid;
+    size_t source_witness_length;
+    unsigned char source_witness[CONFIG_DOCUMENT_MAX_SIZE];
     char active_account[MAX_NAME_LEN];  /* Last-switched account, persisted for boot resume */
     bool verbose;
     bool dry_run;

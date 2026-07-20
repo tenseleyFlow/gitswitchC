@@ -246,6 +246,9 @@ static bool config_metadata_snapshot_same(const struct stat *a,
 static bool config_is_namespace_change_errno(int error);
 static int config_require_loaded_source_generation(
     const gitswitch_ctx_t *ctx, const char *config_path);
+static int config_reprove_loaded_source(
+    const char *config_path, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length);
 static int config_admit_full_save_generation(const gitswitch_ctx_t *ctx,
                                              const char *config_path);
 static int config_require_full_save_generation_snapshot(
@@ -490,12 +493,24 @@ static void config_document_free(toml_document_t *doc) {
 static int config_read_document_expected(const char *config_path,
                                          toml_document_t *doc,
                                          const struct stat *expected_identity,
-                                         struct stat *loaded_identity) {
+                                         struct stat *loaded_identity,
+                                         unsigned char *loaded_bytes,
+                                         size_t loaded_capacity,
+                                         size_t *loaded_length) {
     char *buffer = NULL;
     struct stat before, after, path_after;
     size_t file_size, total = 0;
     int parse_result;
     int fd;
+
+    if ((loaded_bytes && !loaded_length) ||
+        (!loaded_bytes && loaded_length)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid configuration read-witness arguments");
+        return -1;
+    }
+    if (loaded_length) *loaded_length = 0U;
 
     fd = open_config_validated(config_path);
     if (fd < 0) {
@@ -640,13 +655,59 @@ static int config_read_document_expected(const char *config_path,
             goto fail_buffer;
         }
     }
-    close(fd);
+    if (close(fd) != 0) {
+        fd = -1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close config after complete read: %s",
+                         config_path);
+        goto fail_buffer;
+    }
+    fd = -1;
+    if (config_io_fault(CONFIG_IO_DOCUMENT_AFTER_CLOSE,
+                        "config document close checkpoint")) {
+        goto fail_buffer;
+    }
+
+    /* FreeBSD UFS may expose a reader-induced ctime step only when the
+     * descriptor closes. The complete bytes, EOF, descriptor generation, and
+     * installed inode were proved immediately above, so admit only that
+     * ctime-only transition and bind callers to the post-close generation.
+     * Any later ctime-only transition still requires a caller-retained exact
+     * byte witness and a fresh descriptor proof. */
+    errno = 0;
+    if (lstat(config_path, &path_after) != 0 ||
+        (!config_metadata_snapshot_same(&after, &path_after) &&
+         !config_metadata_ctime_only_change(&after, &path_after))) {
+        int close_observation_errno = errno ? errno : ESTALE;
+
+        errno = config_is_namespace_change_errno(close_observation_errno)
+                    ? ESTALE
+                    : close_observation_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Configuration changed while its completed read was closing: %s",
+            config_path);
+        goto fail_buffer;
+    }
+    after = path_after;
     if (parse_result != 0) {
         goto fail_buffer;
     }
 
     if (loaded_identity) {
         *loaded_identity = after;
+    }
+    if (loaded_bytes) {
+        if (file_size > loaded_capacity) {
+            errno = EOVERFLOW;
+            set_system_error(
+                ERR_CONFIG_INVALID,
+                "Configuration exceeds read-witness capacity: %s",
+                config_path);
+            goto fail_buffer;
+        }
+        if (file_size != 0U) memcpy(loaded_bytes, buffer, file_size);
+        *loaded_length = file_size;
     }
 
     /* Config content can reference key material paths; don't leave a stray
@@ -661,10 +722,13 @@ fail_buffer:
     return -1;
 }
 
-static int config_read_document(const char *config_path, toml_document_t *doc,
-                                struct stat *loaded_identity) {
+static int config_read_document(
+    const char *config_path, toml_document_t *doc,
+    struct stat *loaded_identity, unsigned char *loaded_bytes,
+    size_t loaded_capacity, size_t *loaded_length) {
     return config_read_document_expected(config_path, doc, NULL,
-                                         loaded_identity);
+                                         loaded_identity, loaded_bytes,
+                                         loaded_capacity, loaded_length);
 }
 
 static bool config_state_needs_valid(const char *line, size_t length) {
@@ -1042,6 +1106,7 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
     toml_document_t *toml_doc;
     config_active_state_t active_state;
     struct stat loaded_identity;
+    size_t loaded_length = 0U;
     char legacy_active[MAX_NAME_LEN] = "";
     char scope_str[32];
 
@@ -1055,7 +1120,15 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
         return -1;
     }
 
-    if (config_read_document(config_path, toml_doc, &loaded_identity) != 0) {
+    secure_zero_memory(ctx->config.source_witness,
+                       sizeof(ctx->config.source_witness));
+    ctx->config.source_witness_length = 0U;
+    ctx->config.source_witness_valid = false;
+    ctx->config.source_read_witness_valid = false;
+    if (config_read_document(
+            config_path, toml_doc, &loaded_identity,
+            ctx->config.source_witness,
+            sizeof(ctx->config.source_witness), &loaded_length) != 0) {
         config_document_free(toml_doc);
         return -1;
     }
@@ -1128,6 +1201,9 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
     ctx->config.source_generation = loaded_identity;
     ctx->config.source_generation_valid = true;
+    ctx->config.source_witness_valid = false;
+    ctx->config.source_read_witness_valid = true;
+    ctx->config.source_witness_length = loaded_length;
 
     config_document_free(toml_doc);
 
@@ -1308,7 +1384,29 @@ static int config_require_loaded_source_generation(
     if (!config_metadata_file_is_safe(&current, true) ||
         !config_metadata_snapshot_same(&ctx->config.source_generation,
                                        &current)) {
-        errno = ESTALE;
+        lookup_errno = ESTALE;
+        if (config_metadata_file_is_safe(&current, true) &&
+            config_metadata_ctime_only_change(
+                &ctx->config.source_generation, &current) &&
+            (ctx->config.source_witness_valid ||
+             ctx->config.source_read_witness_valid) &&
+            ctx->config.source_generation.st_size >= 0 &&
+            ctx->config.source_witness_length <=
+                sizeof(ctx->config.source_witness) &&
+            (uintmax_t)ctx->config.source_generation.st_size ==
+                ctx->config.source_witness_length) {
+            errno = 0;
+            if (config_reprove_loaded_source(
+                    config_path, &ctx->config.source_generation,
+                    ctx->config.source_witness,
+                    ctx->config.source_witness_length) == 0) {
+                return 0;
+            }
+            lookup_errno = errno ? errno : ESTALE;
+        }
+        errno = config_is_namespace_change_errno(lookup_errno)
+                    ? ESTALE
+                    : lookup_errno;
         set_system_error(
             ERR_FILE_IO,
             "Configuration changed since it was loaded; refusing active-state publication: %s",
@@ -1343,7 +1441,35 @@ static int config_require_full_save_generation_snapshot(
             !config_metadata_file_is_safe(destination, true) ||
             !config_metadata_snapshot_same(&ctx->config.source_generation,
                                            destination)) {
-            errno = ESTALE;
+            int proof_errno = ESTALE;
+
+            /* A completed stable load or preceding successful full save may
+             * leave FreeBSD UFS with a reader-induced ctime update that
+             * materializes only after the captured generation. Admit it for
+             * a later full save only after re-proving every retained byte. */
+            if (destination_existed &&
+                config_metadata_file_is_safe(destination, true) &&
+                config_metadata_ctime_only_change(
+                    &ctx->config.source_generation, destination) &&
+                (ctx->config.source_witness_valid ||
+                 ctx->config.source_read_witness_valid) &&
+                ctx->config.source_generation.st_size >= 0 &&
+                ctx->config.source_witness_length <=
+                    sizeof(ctx->config.source_witness) &&
+                (uintmax_t)ctx->config.source_generation.st_size ==
+                    ctx->config.source_witness_length) {
+                errno = 0;
+                if (config_reprove_loaded_source(
+                        config_path, &ctx->config.source_generation,
+                        ctx->config.source_witness,
+                        ctx->config.source_witness_length) == 0) {
+                    return 0;
+                }
+                proof_errno = errno ? errno : ESTALE;
+            }
+            errno = config_is_namespace_change_errno(proof_errno)
+                        ? ESTALE
+                        : proof_errno;
             set_system_error(
                 ERR_FILE_IO,
                 "Configuration changed since it was loaded; refusing full-document save: %s",
@@ -1569,30 +1695,138 @@ static int config_reprove_published_file_at(
         goto proof_fail;
     }
 
+    if (config_io_fault(CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES,
+                        "config document exact-byte reproof")) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+
     errno = 0;
-    if (fstat(fd, &descriptor_after) != 0 ||
-        fstatat(dir_fd, name, &named_after, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (fstat(fd, &descriptor_after) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, true) ||
+        (!config_metadata_snapshot_same(&opened, &descriptor_after) &&
+         !config_metadata_ctime_only_change(&opened,
+                                            &descriptor_after))) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    fd = -1;
+
+    /* FreeBSD UFS can defer the reader-induced ctime materialization until
+     * the proof descriptor closes. Snapshot the pathname only after that
+     * close, admitting solely this ctime-only step because the complete bytes
+     * and all other metadata were just proved on the same inode. */
+    errno = 0;
+    if (fstatat(dir_fd, name, &named_after, AT_SYMLINK_NOFOLLOW) != 0) {
         failure_errno = config_is_namespace_change_errno(errno)
                             ? ESTALE
                             : (errno ? errno : EIO);
         goto proof_fail;
     }
-    if (!config_metadata_file_is_safe(&descriptor_after, true) ||
-        !config_metadata_file_is_safe(&named_after, true) ||
-        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
-        !config_metadata_snapshot_same(&opened, &named_after)) {
+    if (!config_metadata_file_is_safe(&named_after, true) ||
+        (!config_metadata_snapshot_same(&descriptor_after, &named_after) &&
+         !config_metadata_ctime_only_change(&descriptor_after,
+                                            &named_after))) {
         failure_errno = ESTALE;
         goto proof_fail;
     }
 
     *current_generation = named_after;
-    close(fd);
     secure_zero_memory(observed, sizeof(observed));
     return 0;
 
 proof_fail:
     if (fd >= 0) close(fd);
     secure_zero_memory(observed, sizeof(observed));
+    errno = failure_errno;
+    return -1;
+}
+
+/* Re-prove a stable loaded or self-published source through a pinned, private
+ * parent directory. Callers must carry the exact bounded document witness. */
+static int config_reprove_loaded_source(
+    const char *config_path, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length) {
+    char dir_path[MAX_PATH_LEN];
+    const char *slash;
+    const char *target_name;
+    struct stat pinned_dir;
+    struct stat current_generation;
+    size_t dir_length;
+    int dir_fd = -1;
+    int failure_errno = ESTALE;
+
+    if (!config_path || !config_path[0] || !expected ||
+        (!expected_data && expected_length != 0U)) {
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(config_path, '/');
+    target_name = slash ? slash + 1 : config_path;
+    if (target_name[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!slash) {
+        if (safe_strncpy(dir_path, ".", sizeof(dir_path)) != 0) {
+            return -1;
+        }
+    } else {
+        dir_length = (size_t)(slash - config_path);
+        if (dir_length == 0U) dir_length = 1U;
+        if (dir_length >= sizeof(dir_path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(dir_path, config_path, dir_length);
+        dir_path[dir_length] = '\0';
+    }
+
+    errno = 0;
+    dir_fd = open(dir_path,
+                  O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto reproof_fail;
+    }
+    if (fstat(dir_fd, &pinned_dir) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto reproof_fail;
+    }
+    if (!config_metadata_dir_is_safe(&pinned_dir) ||
+        !config_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_errno = ESTALE;
+        goto reproof_fail;
+    }
+    if (config_reprove_published_file_at(
+            dir_fd, target_name, expected, expected_data, expected_length,
+            &current_generation) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto reproof_fail;
+    }
+    if (!config_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_errno = ESTALE;
+        goto reproof_fail;
+    }
+    if (close(dir_fd) != 0) {
+        dir_fd = -1;
+        errno = errno ? errno : EIO;
+        return -1;
+    }
+    return 0;
+
+reproof_fail:
+    if (dir_fd >= 0) close(dir_fd);
     errno = failure_errno;
     return -1;
 }
@@ -1645,7 +1879,9 @@ static int config_require_active_state_generation(
         goto generation_mismatch;
     }
     if (!config_metadata_file_is_safe(&named_before, false) ||
-        !config_metadata_snapshot_same(&expected->metadata, &named_before)) {
+        (!config_metadata_snapshot_same(&expected->metadata, &named_before) &&
+         !config_metadata_ctime_only_change(&expected->metadata,
+                                            &named_before))) {
         failure_errno = ESTALE;
         goto generation_mismatch;
     }
@@ -1663,7 +1899,10 @@ static int config_require_active_state_generation(
         goto generation_mismatch;
     }
     if (!config_metadata_file_is_safe(&opened, false) ||
-        !config_metadata_snapshot_same(&expected->metadata, &opened) ||
+        (!config_metadata_snapshot_same(&named_before, &opened) &&
+         !config_metadata_ctime_only_change(&named_before, &opened)) ||
+        (!config_metadata_snapshot_same(&expected->metadata, &opened) &&
+         !config_metadata_ctime_only_change(&expected->metadata, &opened)) ||
         opened.st_size < 0 ||
         (uintmax_t)opened.st_size != expected->length) {
         failure_errno = ESTALE;
@@ -1700,6 +1939,18 @@ static int config_require_active_state_generation(
         failure_errno = errno ? errno : EIO;
         goto generation_mismatch;
     }
+    if (!config_metadata_file_is_safe(&descriptor_after, false) ||
+        (!config_metadata_snapshot_same(&opened, &descriptor_after) &&
+         !config_metadata_ctime_only_change(&opened, &descriptor_after))) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    fd = -1;
     errno = 0;
     if (lstat(hint, &named_after) != 0) {
         failure_errno = config_is_namespace_change_errno(errno)
@@ -1707,16 +1958,14 @@ static int config_require_active_state_generation(
                             : (errno ? errno : EIO);
         goto generation_mismatch;
     }
-    if (!config_metadata_file_is_safe(&descriptor_after, false) ||
-        !config_metadata_file_is_safe(&named_after, false) ||
-        !config_metadata_snapshot_same(&expected->metadata,
-                                       &descriptor_after) ||
-        !config_metadata_snapshot_same(&expected->metadata, &named_after)) {
+    if (!config_metadata_file_is_safe(&named_after, false) ||
+        (!config_metadata_snapshot_same(&descriptor_after, &named_after) &&
+         !config_metadata_ctime_only_change(&descriptor_after,
+                                            &named_after))) {
         failure_errno = ESTALE;
         goto generation_mismatch;
     }
 
-    close(fd);
     secure_zero_memory(observed, sizeof(observed));
     return 0;
 
@@ -4657,7 +4906,7 @@ state_cleanup:
 /* Shared atomic-write tail for config_save and config_save_active_account:
  * validate the destination, back up the existing file, write doc to a fresh
  * 0600 temp, rename it into place, refresh the resume hint. */
-static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
+static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                                         const toml_document_t *doc,
                                         const char *config_path,
                                         bool make_backup,
@@ -5013,9 +5262,6 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
             config_path);
         goto document_fail;
     }
-    free(document_bytes);
-    document_bytes = NULL;
-
     if (update_hint &&
         config_update_resume_hint(ctx, config_path, NULL,
                                   CONFIG_SOURCE_GENERATION_UNBOUND,
@@ -5025,6 +5271,17 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     if (committed_generation) {
         *committed_generation = destination_now;
     }
+    secure_zero_memory(ctx->config.source_witness,
+                       sizeof(ctx->config.source_witness));
+    if (document_length != 0U) {
+        memcpy(ctx->config.source_witness, document_bytes, document_length);
+    }
+    ctx->config.source_witness_length = document_length;
+    ctx->config.source_witness_valid = true;
+    ctx->config.source_read_witness_valid = false;
+    secure_zero_memory(document_bytes, document_length);
+    free(document_bytes);
+    document_bytes = NULL;
     close(dir_fd);
     log_info("Configuration document committed to: %s", config_path);
     return 0;
@@ -5059,7 +5316,10 @@ document_fail:
             signals_scratch_unregister(temp_path);
         }
         if (dir_fd >= 0) close(dir_fd);
-        free(document_bytes);
+        if (document_bytes) {
+            secure_zero_memory(document_bytes, document_length);
+            free(document_bytes);
+        }
         errno = saved_errno;
     }
     return -1;
@@ -7015,7 +7275,8 @@ static int config_backup_internal(const char *config_path,
     verify_doc = config_document_alloc();
     if (!verify_doc ||
         config_read_document_expected(backup_path, verify_doc,
-                                      &backup_identity, NULL) != 0) {
+                                      &backup_identity, NULL,
+                                      NULL, 0U, NULL) != 0) {
         if (!verify_doc && get_last_error()->code == ERR_SUCCESS) {
             set_error(ERR_MEMORY_ALLOCATION,
                       "Cannot allocate config backup verification document");

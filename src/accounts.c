@@ -4539,6 +4539,7 @@ static int pending_retirement_finalize(
     bool created;
     bool refresh_installed = false;
     bool settlement_ok = true;
+    bool refresh_witnesses_stable = false;
     size_t destination_count = 0U;
 
     if (!ctx || !retirement || !retirement->git || !retirement->guard ||
@@ -4601,24 +4602,79 @@ static int pending_retirement_finalize(
                     settlement_ok = false;
                 }
             }
+            /* A FreeBSD UFS ctime from the restored Git link/rename may be
+             * exposed by the unrelated state-file sync below. Re-prove the
+             * retained exact Git bytes after each ledger install and reseal
+             * only that ctime when necessary. A bounded non-converging cycle
+             * keeps the retirement guard instead of publishing ambiguity. */
+            for (unsigned attempt = 0U;
+                 settlement_ok && destination_count != 0U &&
+                 attempt < 3U; attempt++) {
+                if (config_refresh_retirement_publications_transactional(
+                        ctx, ctx->config.config_path, retirement->owners,
+                        retirement->owner_count, destinations,
+                        destination_count, &refresh_installed) != 0) {
+                    (void)error_accumulator_add_last(
+                        &failures,
+                        refresh_installed
+                            ? "installed retirement-ledger reconciliation"
+                            : "retirement-ledger reconciliation");
+                    settlement_ok = false;
+                    break;
+                }
+                refresh_witnesses_stable = true;
+                for (size_t i = 0U; i < destination_count; i++) {
+                    config_retirement_destination_t observed;
+
+                    memset(&observed, 0, sizeof(observed));
+                    if (git_retirement_transaction_restored_destination(
+                            retirement->git, i, observed.config_path,
+                            sizeof(observed.config_path),
+                            &observed.post_config) != 0 ||
+                        strcmp(observed.config_path,
+                               destinations[i].config_path) != 0) {
+                        if (get_last_error()->code == ERR_SUCCESS) {
+                            errno = ESTALE;
+                            set_error(
+                                ERR_GIT_CONFIG_FAILED,
+                                "Git retirement destination order changed during ledger reconciliation");
+                        }
+                        (void)error_accumulator_add_last(
+                            &failures,
+                            "post-refresh Git destination witness");
+                        settlement_ok = false;
+                        secure_zero_memory(&observed, sizeof(observed));
+                        break;
+                    }
+                    if (!publication_identity_equal(
+                            &destinations[i].post_config,
+                            &observed.post_config)) {
+                        destinations[i].post_config =
+                            observed.post_config;
+                        refresh_witnesses_stable = false;
+                    }
+                    secure_zero_memory(&observed, sizeof(observed));
+                }
+                if (settlement_ok && refresh_witnesses_stable) break;
+            }
             if (settlement_ok && destination_count != 0U &&
-                config_refresh_retirement_publications_transactional(
-                    ctx, ctx->config.config_path, retirement->owners,
-                    retirement->owner_count, destinations,
-                    destination_count, &refresh_installed) != 0) {
+                !refresh_witnesses_stable) {
+                errno = EAGAIN;
+                set_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Restored Git generation did not stabilize across publication-ledger reconciliation");
                 (void)error_accumulator_add_last(
                     &failures,
-                    refresh_installed
-                        ? "installed retirement-ledger reconciliation"
-                        : "retirement-ledger reconciliation");
+                    "retirement-ledger generation stabilization");
                 settlement_ok = false;
             }
         }
     }
 
-    /* Locks remain held through any ledger refresh above.  Consume them
-     * before clearing the cross-process blocker, regardless of whether the
-     * current durable state had to be accepted or restored. */
+    /* A rollback query has already checked-cleaned its Git artifacts and
+     * retained exact bytes; commit re-proves those destinations after the
+     * ledger refresh. Durable and uncertain outcomes still consume their
+     * held locks here before the cross-process blocker can be cleared. */
     if (git_retirement_transaction_commit(&retirement->git) != 0) {
         (void)error_accumulator_add_last(
             &failures, "Git retirement transaction cleanup");

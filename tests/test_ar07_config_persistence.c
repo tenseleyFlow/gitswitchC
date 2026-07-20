@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/wait.h>
+#include <time.h>
 
 static const char one_account[] =
     "[settings]\n"
@@ -95,6 +96,78 @@ static bool same_identity(const struct stat *left, const struct stat *right) {
            left->st_size == right->st_size && same_mtime(left, right);
 }
 
+static bool same_ctime(const struct stat *left, const struct stat *right) {
+#ifdef __APPLE__
+    return left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
+static bool same_without_ctime(const struct stat *left,
+                               const struct stat *right) {
+    return same_identity(left, right) && left->st_uid == right->st_uid &&
+           left->st_gid == right->st_gid && left->st_mode == right->st_mode &&
+           left->st_nlink == right->st_nlink;
+}
+
+static int force_ctime_only_drift(const char *path,
+                                  const struct stat *expected,
+                                  struct stat *current) {
+    const struct timespec retry = { .tv_sec = 0, .tv_nsec = 1000000L };
+
+    for (size_t attempt = 0; attempt < 128U; attempt++) {
+        if (lstat(path, current) != 0 ||
+            !same_without_ctime(expected, current)) {
+            errno = ESTALE;
+            return -1;
+        }
+        if (!same_ctime(expected, current)) return 0;
+        if (chmod(path, 0400) != 0 || chmod(path, 0600) != 0) return -1;
+        (void)nanosleep(&retry, NULL);
+    }
+    errno = ETIMEDOUT;
+    return -1;
+}
+
+static int restore_file_times(const char *path,
+                              const struct stat *expected) {
+    struct timespec times[2];
+
+#ifdef __APPLE__
+    times[0] = expected->st_atimespec;
+    times[1] = expected->st_mtimespec;
+#else
+    times[0] = expected->st_atim;
+    times[1] = expected->st_mtim;
+#endif
+    return utimensat(AT_FDCWD, path, times, 0);
+}
+
+static int rewrite_first_byte_preserving_mtime(
+    const char *path, const struct stat *expected, unsigned char replacement,
+    unsigned char *previous) {
+    unsigned char observed;
+    int fd;
+    int saved_errno;
+
+    fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    if (pread(fd, &observed, 1U, 0) != 1 ||
+        pwrite(fd, &replacement, 1U, 0) != 1 || fsync(fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(fd) != 0) return -1;
+    if (restore_file_times(path, expected) != 0) return -1;
+    if (previous) *previous = observed;
+    return 0;
+}
+
 static int count_prefix(const char *dir, const char *prefix) {
     DIR *stream = opendir(dir);
     struct dirent *entry;
@@ -133,6 +206,14 @@ static size_t generation_io_boundary_calls;
 static char state_rewrite_hint[256];
 static char state_rewrite_content[64];
 static int state_rewrite_error;
+static bool state_rewrite_restore_times;
+static struct stat state_rewrite_expected;
+static char state_ctime_drift_hint[256];
+static int state_ctime_drift_error;
+static char document_close_ctime_path[256];
+static int document_close_ctime_error;
+static char document_reproof_ctime_path[256];
+static int document_reproof_ctime_error;
 static char document_rewrite_path[256];
 static const char *document_rewrite_content;
 static struct stat document_rewrite_before;
@@ -175,10 +256,65 @@ static bool rewrite_state_before_publication(
     if (boundary == CONFIG_IO_STATE_BEFORE_RENAME &&
         state_rewrite_hint[0] != '\0') {
         if (rewrite_private_in_place(state_rewrite_hint,
-                                     state_rewrite_content) != 0) {
+                                     state_rewrite_content) != 0 ||
+            (state_rewrite_restore_times &&
+             restore_file_times(state_rewrite_hint,
+                                &state_rewrite_expected) != 0)) {
             state_rewrite_error = errno ? errno : EIO;
         }
         state_rewrite_hint[0] = '\0';
+        state_rewrite_restore_times = false;
+    }
+    return false;
+}
+
+static bool drift_state_ctime_before_publication(
+    config_io_boundary_t boundary) {
+    struct stat before;
+    struct stat after;
+
+    if (boundary == CONFIG_IO_STATE_BEFORE_RENAME &&
+        state_ctime_drift_hint[0] != '\0') {
+        if (lstat(state_ctime_drift_hint, &before) != 0 ||
+            force_ctime_only_drift(state_ctime_drift_hint, &before,
+                                   &after) != 0) {
+            state_ctime_drift_error = errno ? errno : EIO;
+        }
+        state_ctime_drift_hint[0] = '\0';
+    }
+    return false;
+}
+
+static bool drift_document_ctime_after_close(
+    config_io_boundary_t boundary) {
+    struct stat before;
+    struct stat after;
+
+    if (boundary == CONFIG_IO_DOCUMENT_AFTER_CLOSE &&
+        document_close_ctime_path[0] != '\0') {
+        if (lstat(document_close_ctime_path, &before) != 0 ||
+            force_ctime_only_drift(document_close_ctime_path, &before,
+                                   &after) != 0) {
+            document_close_ctime_error = errno ? errno : EIO;
+        }
+        document_close_ctime_path[0] = '\0';
+    }
+    return false;
+}
+
+static bool drift_document_ctime_during_reproof(
+    config_io_boundary_t boundary) {
+    struct stat before;
+    struct stat after;
+
+    if (boundary == CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES &&
+        document_reproof_ctime_path[0] != '\0') {
+        if (lstat(document_reproof_ctime_path, &before) != 0 ||
+            force_ctime_only_drift(document_reproof_ctime_path, &before,
+                                   &after) != 0) {
+            document_reproof_ctime_error = errno ? errno : EIO;
+        }
+        document_reproof_ctime_path[0] = '\0';
     }
     return false;
 }
@@ -710,6 +846,138 @@ TEST(full_save_binds_and_refreshes_the_exact_source_generation) {
     CHECK_EQ_INT(count_prefix(uncertain_dir, "accounts.toml.tmp."), 0);
 }
 
+TEST(self_published_witness_admits_only_exact_ctime_drift) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char text[128];
+    struct stat drifted;
+    unsigned char original_first = 0U;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.config.default_scope = GIT_SCOPE_LOCAL;
+    ctx.account_count = 1U;
+    ctx.accounts[0].id = 1U;
+    ctx.accounts[0].preferred_scope = GIT_SCOPE_LOCAL;
+    snprintf(ctx.accounts[0].name, sizeof(ctx.accounts[0].name),
+             "%s", "alice");
+    snprintf(ctx.accounts[0].email, sizeof(ctx.accounts[0].email),
+             "%s", "alice@example.com");
+    snprintf(ctx.config.active_account, sizeof(ctx.config.active_account),
+             "%s", "alice");
+
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(ctx.config.source_generation_valid);
+    CHECK(ctx.config.source_witness_valid);
+    CHECK(ctx.config.source_witness_length ==
+          (size_t)ctx.config.source_generation.st_size);
+    CHECK(ctx.config.source_witness_length <=
+          sizeof(ctx.config.source_witness));
+
+    /* FreeBSD UFS can expose this exact transition after a durable rename.
+     * A full-byte reproof against our self-publication witness admits it. */
+    CHECK_EQ_INT(force_ctime_only_drift(
+                     path, &ctx.config.source_generation, &drifted), 0);
+    snprintf(document_reproof_ctime_path,
+             sizeof(document_reproof_ctime_path), "%s", path);
+    document_reproof_ctime_error = 0;
+    config_set_io_fault_fn(drift_document_ctime_during_reproof);
+    installed = false;
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    config_set_io_fault_fn(NULL);
+    CHECK_EQ_INT(document_reproof_ctime_error, 0);
+    CHECK(!installed); /* the already-current hint is intentionally idempotent */
+    CHECK(read_text(hint, text, sizeof(text)) > 0U);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+
+    /* The same witness also authorizes a later full-model replacement. This
+     * is a distinct admission path and runs again after state publication. */
+    ctx.config.default_scope = GIT_SCOPE_GLOBAL;
+    installed = false;
+    CHECK_EQ_INT(config_save_transactional(&ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(ctx.config.source_witness_valid);
+    CHECK_EQ_INT(lstat(path, &drifted), 0);
+    CHECK(same_identity(&ctx.config.source_generation, &drifted));
+
+    /* Metadata alone is insufficient: overwrite one byte on the same inode,
+     * restore the original mtime, and retain the same size/mode. The exact
+     * witness must reject the otherwise ctime-only source transition. */
+    CHECK_EQ_INT(rewrite_first_byte_preserving_mtime(
+                     path, &ctx.config.source_generation, (unsigned char)'{',
+                     &original_first), 0);
+    CHECK_EQ_INT(force_ctime_only_drift(
+                     path, &ctx.config.source_generation, &drifted), 0);
+    installed = true;
+    clear_error();
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), -1);
+    CHECK(!installed);
+    CHECK(strstr(get_last_error()->message,
+                 "changed since it was loaded") != NULL);
+    CHECK(read_text(hint, text, sizeof(text)) > 0U);
+    CHECK_STR_EQ(text, "none\nactive=alice\n");
+
+    /* Ordinary loads retain distinct exact-read authority, not
+     * self-publication authority. */
+    CHECK_EQ_INT(rewrite_first_byte_preserving_mtime(
+                     path, &drifted, original_first, NULL), 0);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK(!ctx.config.source_witness_valid);
+    CHECK(ctx.config.source_read_witness_valid);
+    CHECK(ctx.config.source_witness_length ==
+          (size_t)ctx.config.source_generation.st_size);
+}
+
+TEST(load_binds_the_post_close_source_generation) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char text[128];
+    struct stat current;
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    CHECK_EQ_INT(write_private(hint, "none\nactive=alice\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+
+    snprintf(document_close_ctime_path,
+             sizeof(document_close_ctime_path), "%s", path);
+    document_close_ctime_error = 0;
+    config_set_io_fault_fn(drift_document_ctime_after_close);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    config_set_io_fault_fn(NULL);
+
+    CHECK_EQ_INT(document_close_ctime_error, 0);
+    CHECK(ctx.config.source_generation_valid);
+    CHECK(!ctx.config.source_witness_valid);
+    CHECK(ctx.config.source_read_witness_valid);
+    CHECK_EQ_INT(lstat(path, &current), 0);
+    CHECK(same_identity(&ctx.config.source_generation, &current));
+
+    /* A later UFS directory sync may expose one more reader-induced ctime
+     * step. The distinct read witness admits only its exact loaded bytes. */
+    CHECK_EQ_INT(force_ctime_only_drift(
+                     path, &ctx.config.source_generation, &current), 0);
+    ctx.config.active_account[0] = '\0';
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0U);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+}
+
 TEST(full_save_rejects_stale_absent_and_generationless_sources_early) {
     char dir[128];
     char path[256];
@@ -1193,6 +1461,8 @@ TEST(active_state_publish_reproves_exact_before_image_after_hook) {
     snprintf(state_rewrite_content, sizeof(state_rewrite_content), "%s",
              "none\nactive=ALICE\n");
     state_rewrite_error = 0;
+    state_rewrite_expected = before;
+    state_rewrite_restore_times = true;
     config_set_io_fault_fn(rewrite_state_before_publication);
     clear_error();
     CHECK_EQ_INT(config_save_active_account_transactional(
@@ -1209,6 +1479,7 @@ TEST(active_state_publish_reproves_exact_before_image_after_hook) {
     CHECK_EQ_INT(lstat(hint, &after), 0);
     CHECK(before.st_dev == after.st_dev && before.st_ino == after.st_ino);
     CHECK_EQ_INT(before.st_size, after.st_size);
+    CHECK(same_mtime(&before, &after));
     CHECK(read_text(hint, text, sizeof(text)) > 0);
     CHECK_STR_EQ(text, "none\nactive=ALICE\n");
     CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
@@ -1221,6 +1492,38 @@ TEST(active_state_publish_reproves_exact_before_image_after_hook) {
                      &ctx, path, &installed), 0);
     CHECK(installed);
     CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "none\ninactive=v1\n");
+    CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
+}
+
+TEST(active_state_exact_witness_admits_ctime_only_drift) {
+    char dir[128];
+    char path[256];
+    char hint[256];
+    char text[128];
+    gitswitch_ctx_t ctx;
+    bool installed = false;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(hint, sizeof(hint), "%s/.resume-hint", dir);
+    CHECK_EQ_INT(write_private(path, one_account), 0);
+    CHECK_EQ_INT(write_private(hint, "none\nactive=alice\n"), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    ctx.config.active_account[0] = '\0';
+
+    snprintf(state_ctime_drift_hint, sizeof(state_ctime_drift_hint),
+             "%s", hint);
+    state_ctime_drift_error = 0;
+    config_set_io_fault_fn(drift_state_ctime_before_publication);
+    CHECK_EQ_INT(config_save_active_account_transactional(
+                     &ctx, path, &installed), 0);
+    config_set_io_fault_fn(NULL);
+
+    CHECK_EQ_INT(state_ctime_drift_error, 0);
+    CHECK(installed);
+    CHECK(read_text(hint, text, sizeof(text)) > 0U);
     CHECK_STR_EQ(text, "none\ninactive=v1\n");
     CHECK_EQ_INT(count_prefix(dir, ".resume-hint.tmp."), 0);
 }
@@ -1418,6 +1721,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(backup_faults_abort_and_full_save_rolls_state_back);
     RUN_TEST(full_save_rollback_preserves_a_later_state_generation);
     RUN_TEST(full_save_binds_and_refreshes_the_exact_source_generation);
+    RUN_TEST(self_published_witness_admits_only_exact_ctime_drift);
+    RUN_TEST(load_binds_the_post_close_source_generation);
     RUN_TEST(full_save_rejects_stale_absent_and_generationless_sources_early);
     RUN_TEST(full_save_rechecks_loaded_generation_across_state_publication);
     RUN_TEST(full_save_rechecks_absence_across_state_publication);
@@ -1426,6 +1731,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(active_state_case_variants_normalize_and_publish_canonical_name);
     RUN_TEST(active_state_save_is_bound_to_loaded_config_generation);
     RUN_TEST(active_state_publish_reproves_exact_before_image_after_hook);
+    RUN_TEST(active_state_exact_witness_admits_ctime_only_drift);
     RUN_TEST(historical_active_state_migrates_without_reset_resurrection);
     RUN_TEST(active_state_rejects_corruption_and_crash_mismatches);
     RUN_TEST(active_state_faults_report_install_boundary_and_do_not_leak_fds);
