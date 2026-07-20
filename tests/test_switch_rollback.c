@@ -234,13 +234,13 @@ static int setup_gpg_source_home(void) {
     return setenv("GNUPGHOME", g_gpg_source_home, 1);
 }
 
-/* These cases fake every GPG child invocation, but gpg_manager_init still
- * performs production's descriptor-pinned availability check. Homebrew's
- * shared, group-writable prefix is intentionally rejected by that resolver,
- * even though the installed gpg is a valid CI dependency. First execute the
- * host command solely as a test-capability preflight; when it is runnable,
- * prepend a private trusted script that command_exists can validate. The
- * script is a tripwire: the fake runner must intercept it before execution. */
+/* These cases fake every GPG child invocation, but gpg_manager_init and the
+ * isolated-home activation still perform production's descriptor-pinned gpg
+ * and gpgconf resolution. Homebrew's shared, group-writable prefix is
+ * intentionally rejected by that resolver, even though the installed gpg is
+ * a valid CI dependency. First execute the host gpg solely as a test-capability
+ * preflight; when it is runnable, prepend private trusted tripwire scripts for
+ * every command the fake runner intercepts. */
 static int host_gpg_preflight(void) {
     int status;
     pid_t waited;
@@ -282,7 +282,9 @@ static int restore_gpg_command_fixture(void) {
 static int setup_gpg_command_fixture(void) {
     static const char script[] = "#!/bin/sh\nexit 125\n";
     const char *path = getenv("PATH");
-    char command_path[MAX_PATH_LEN];
+    char gpg_path[MAX_PATH_LEN];
+    char gpgconf_path[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
     char *saved_path = NULL;
     char *fixture_path = NULL;
     size_t dir_len;
@@ -296,9 +298,12 @@ static int setup_gpg_command_fixture(void) {
     }
     if (!ts_mkdtemp_trusted(g_gpg_command_dir,
                             sizeof(g_gpg_command_dir), "gsw-gpg-bin") ||
-        safe_snprintf(command_path, sizeof(command_path), "%s/gpg",
+        safe_snprintf(gpg_path, sizeof(gpg_path), "%s/gpg",
                       g_gpg_command_dir) != 0 ||
-        write_string_to_file(command_path, script, 0700) != 0) {
+        safe_snprintf(gpgconf_path, sizeof(gpgconf_path), "%s/gpgconf",
+                      g_gpg_command_dir) != 0 ||
+        write_string_to_file(gpg_path, script, 0700) != 0 ||
+        write_string_to_file(gpgconf_path, script, 0700) != 0) {
         free(saved_path);
         return -1;
     }
@@ -333,7 +338,10 @@ static int setup_gpg_command_fixture(void) {
     g_gpg_saved_path = saved_path;
     g_gpg_saved_path_present = path != NULL;
     g_gpg_command_fixture_active = true;
-    if (!command_exists("gpg")) {
+    if (find_command_path("gpg", resolved, sizeof(resolved)) != 0 ||
+        strcmp(resolved, gpg_path) != 0 ||
+        find_command_path("gpgconf", resolved, sizeof(resolved)) != 0 ||
+        strcmp(resolved, gpgconf_path) != 0) {
         int saved_errno = errno;
         (void)restore_gpg_command_fixture();
         errno = saved_errno ? saved_errno : ENOENT;
