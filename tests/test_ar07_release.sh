@@ -1,5 +1,7 @@
 #!/bin/sh
 # AR-07 T18 release-input and native artifact contracts.
+# ShellCheck 0.9 misclassifies deliberate fail-closed assertion chains.
+# shellcheck disable=SC2015
 
 set -eu
 

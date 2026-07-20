@@ -1,6 +1,8 @@
 #!/bin/sh
 # AR-11: deterministic cross-process and signal regressions for the portable
 # release-publisher lock supervisor.
+# ShellCheck 0.9 misclassifies deliberate fail-closed assertion chains.
+# shellcheck disable=SC2015
 
 set -u
 

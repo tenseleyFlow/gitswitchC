@@ -207,20 +207,27 @@ static int sigpipe_pending_worker(sigpipe_pending_case_t test_case) {
 
     sigemptyset(&pipe_set);
     sigaddset(&pipe_set, SIGPIPE);
+    int drain_error = 0;
+    int drained_signal = 0;
     if (remains_pending) {
-        struct timespec zero = {0, 0};
-        (void)sigtimedwait(&pipe_set, NULL, &zero);
+        do {
+            drain_error = sigwait(&pipe_set, &drained_signal);
+        } while (drain_error == EINTR);
     }
     int action_restore = sigaction(SIGPIPE, &original_action, NULL);
     int mask_restore = sigprocmask(SIG_SETMASK, &original_mask, NULL);
-    if (action_restore != 0 || mask_restore != 0) return 24;
+    if (drain_error != 0 ||
+        (remains_pending && drained_signal != SIGPIPE) ||
+        action_restore != 0 || mask_restore != 0) {
+        return 24;
+    }
     if (!result.spawned || !exact_action || !exact_mask) return 25;
     if (initially_pending != remains_pending) return 26;
     if (g_sigpipe_witness_calls != 0) return 27;
     if (with_input && run_rc != -1) return 28;
     if (!with_input && (run_rc != 0 || result.exit_code != 0)) return 29;
-    /* A successful zero-time drain reports EAGAIN internally when no new
-     * instance remains; that bookkeeping errno must never escape the runner. */
+    /* Pending-set inspection and synchronous draining are internal
+     * bookkeeping; their transient errno must never escape the runner. */
     if (with_input && returned_errno == EAGAIN) return 30;
     return 0;
 }

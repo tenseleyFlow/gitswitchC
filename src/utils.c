@@ -3122,12 +3122,32 @@ static int run_sigpipe_end(run_sigpipe_state_t *state) {
 
     if (!state->active) return 0;
     if (state->saw_epipe && !state->initially_pending) {
-        struct timespec zero = {0, 0};
-        int consumed;
-        do {
-            consumed = sigtimedwait(&state->set, NULL, &zero);
-        } while (consumed < 0 && errno == EINTR);
-        if (consumed < 0 && errno != EAGAIN) consume_errno = errno;
+        sigset_t pending;
+
+        /* macOS has sigwait() but no sigtimedwait(). Check the blocked set
+         * first so the portable wait cannot block when an ignored SIGPIPE was
+         * discarded instead of becoming pending. */
+        if (sigpending(&pending) != 0) {
+            consume_errno = errno;
+        } else {
+            int pending_member = sigismember(&pending, SIGPIPE);
+
+            if (pending_member < 0) {
+                consume_errno = errno;
+            } else if (pending_member == 1) {
+                int consumed_signal = 0;
+                int wait_error;
+
+                do {
+                    wait_error = sigwait(&state->set, &consumed_signal);
+                } while (wait_error == EINTR);
+                if (wait_error != 0) {
+                    consume_errno = wait_error;
+                } else if (consumed_signal != SIGPIPE) {
+                    consume_errno = EIO;
+                }
+            }
+        }
     }
     if (sigprocmask(SIG_SETMASK, &state->saved_mask, NULL) != 0) {
         int restore_errno = errno;

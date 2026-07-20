@@ -1,5 +1,7 @@
 #!/bin/sh
 # Serialize release-publisher generation, use, and cleanup across Make processes.
+# ShellCheck 0.9 misclassifies deliberate fail-closed assertion chains.
+# shellcheck disable=SC2015
 
 set -u
 umask 077

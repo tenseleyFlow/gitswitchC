@@ -1,5 +1,7 @@
 #!/bin/sh
 # Negative-path contracts for Make QA and distribution recipes.
+# ShellCheck 0.9 misclassifies deliberate fail-closed assertion chains.
+# shellcheck disable=SC2015
 
 set -eu
 

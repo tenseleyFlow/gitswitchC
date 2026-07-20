@@ -1,5 +1,7 @@
 #!/bin/sh
 # AR-07 T19 / AR-11 M38: application and release-helper provenance gates.
+# ShellCheck 0.9 misclassifies deliberate fail-closed assertion chains.
+# shellcheck disable=SC2015
 
 set -eu
 

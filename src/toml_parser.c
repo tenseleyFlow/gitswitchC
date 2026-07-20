@@ -2,6 +2,8 @@
  * Built specifically for gitswitch-c with comprehensive input validation
  */
 
+#include <sys/types.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdio.h>

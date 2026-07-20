@@ -1,6 +1,8 @@
 #!/bin/sh
 # Build RPMs inside one invocation-private namespace, then publish only the
 # validated package leaves through the descriptor-pinned release publisher.
+# ShellCheck 0.9 misclassifies deliberate fail-closed assertion chains.
+# shellcheck disable=SC2015
 
 set -u
 umask 077
