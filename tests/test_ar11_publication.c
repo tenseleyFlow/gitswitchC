@@ -180,6 +180,7 @@ static int make_private_config_home(char *home, size_t home_size,
     if ((size_t)snprintf(home, home_size,
                          "/tmp/gsw-ar11-publication.XXXXXX") >= home_size ||
         !ts_mkdtemp(home) ||
+        ts_canonicalize_dir_path(home, home_size) != 0 ||
         (size_t)snprintf(config_parent, sizeof(config_parent), "%s/.config",
                          home) >= sizeof(config_parent) ||
         mkdir(config_parent, 0700) != 0 ||
