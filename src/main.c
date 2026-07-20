@@ -165,6 +165,13 @@ typedef struct {
     char subject[MAX_NAME_LEN];
 } command_result_t;
 
+/* Mutating commands are mutually exclusive. Dispatch them through one call
+ * site so debug sanitizers need one structure-return slot rather than one for
+ * every syntactic branch; those redundant slots pushed Clang's debug-sanitized
+ * CLI frame beyond the supported 128 KiB budget on macOS. */
+typedef command_result_t (*mutation_handler_t)(gitswitch_ctx_t *ctx,
+                                               const char *identifier);
+
 /* An account transaction can retain the caller context after a failed final
  * release. A renamed in-process CLI entry used by tests can return without
  * terminating the process, so exact recovery metadata must keep that storage
@@ -686,7 +693,8 @@ static void remove_test_checkpoint(int stage) {
 static command_result_t command_result(int status);
 static void emit_command_success(const gitswitch_ctx_t *ctx,
                                  const command_result_t *result);
-static command_result_t handle_add_command(gitswitch_ctx_t *ctx);
+static command_result_t handle_add_command(gitswitch_ctx_t *ctx,
+                                           const char *identifier);
 static command_result_t handle_edit_command(gitswitch_ctx_t *ctx,
                                             const char *identifier);
 static int handle_list_command(gitswitch_ctx_t *ctx);
@@ -875,6 +883,8 @@ static void emit_command_success(const gitswitch_ctx_t *ctx,
 int main(int argc, char *argv[]) {
     gitswitch_ctx_t *ctx = NULL;
     command_result_t mutation = command_result(EXIT_SUCCESS);
+    mutation_handler_t mutation_handler = NULL;
+    const char *mutation_argument = NULL;
     bool has_mutation_result = false;
     bool signal_guard_cleanup_failed = false;
     bool retained_account_context = false;
@@ -1258,21 +1268,17 @@ int main(int argc, char *argv[]) {
             exit_code = handle_list_command(ctx);
         }
     } else if (strcmp(command, "add") == 0) {
-        mutation = handle_add_command(ctx);
-        has_mutation_result = true;
-        exit_code = mutation.status;
+        mutation_handler = handle_add_command;
     } else if (strcmp(command, "edit") == 0) {
-        mutation = handle_edit_command(ctx, arg1);
-        has_mutation_result = true;
-        exit_code = mutation.status;
+        mutation_handler = handle_edit_command;
+        mutation_argument = arg1;
     } else if (strcmp(command, "list") == 0 || strcmp(command, "ls") == 0) {
         /* `list --names` is a plumbing mode: one account name per line, no
          * decoration, for shell-completion scripts to consume. */
         exit_code = names_only ? handle_list_names(ctx) : handle_list_command(ctx);
     } else if (strcmp(command, "remove") == 0 || strcmp(command, "rm") == 0 || strcmp(command, "delete") == 0) {
-        mutation = handle_remove_command(ctx, arg1);
-        has_mutation_result = true;
-        exit_code = mutation.status;
+        mutation_handler = handle_remove_command;
+        mutation_argument = arg1;
     } else if (strcmp(command, "status") == 0) {
         exit_code = handle_status_command(ctx);
     } else if (strcmp(command, "doctor") == 0 || strcmp(command, "health") == 0) {
@@ -1282,16 +1288,19 @@ int main(int argc, char *argv[]) {
     } else if (strcmp(command, "resume") == 0) {
         exit_code = handle_resume_command(ctx);
     } else if (strcmp(command, "reset") == 0) {
-        mutation = handle_reset_command(ctx, arg1);
-        has_mutation_result = true;
-        exit_code = mutation.status;
+        mutation_handler = handle_reset_command;
+        mutation_argument = arg1;
     } else if (strcmp(command, "switch") == 0) {
-        mutation = handle_switch_command(ctx, arg1);
-        has_mutation_result = true;
-        exit_code = mutation.status;
+        mutation_handler = handle_switch_command;
+        mutation_argument = arg1;
     } else {
         /* Assume it's an account identifier for switching */
-        mutation = handle_switch_command(ctx, command);
+        mutation_handler = handle_switch_command;
+        mutation_argument = command;
+    }
+
+    if (mutation_handler) {
+        mutation = mutation_handler(ctx, mutation_argument);
         has_mutation_result = true;
         exit_code = mutation.status;
     }
@@ -1887,8 +1896,11 @@ cleanup:
 
 /* Command handler implementations */
 
-static command_result_t handle_add_command(gitswitch_ctx_t *ctx) {
+static command_result_t handle_add_command(gitswitch_ctx_t *ctx,
+                                           const char *identifier) {
     command_result_t result = command_result(EXIT_FAILURE);
+
+    (void)identifier;
 
     if (!ctx) return result;
 

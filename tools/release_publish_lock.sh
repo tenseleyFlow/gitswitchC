@@ -304,7 +304,9 @@ forward_signal()
 # During setup and child launch, record signals instead of exiting between an
 # atomic resource creation and the shell assignment that records ownership.
 # The next boundary observes the pending signal with enough state to clean up.
-# shellcheck disable=SC2329
+# ShellCheck 0.9 reports trap-only callbacks as SC2317; 0.11 renamed the same
+# false positive to SC2329. CI deliberately supports both analyzer versions.
+# shellcheck disable=SC2317,SC2329
 record_signal()
 {
     pending_signal_name=$1
