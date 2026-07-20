@@ -147,6 +147,8 @@ static int m12_fixture_init(m12_fixture_t *fixture) {
     if (!ts_mkdtemp(root_template) ||
         safe_strncpy(fixture->root, root_template,
                      sizeof(fixture->root)) != 0 ||
+        ts_canonicalize_dir_path(fixture->root,
+                                 sizeof(fixture->root)) != 0 ||
         safe_snprintf(fixture->config_a, sizeof(fixture->config_a),
                       "%s/config-a", fixture->root) != 0 ||
         safe_snprintf(fixture->config_b, sizeof(fixture->config_b),
