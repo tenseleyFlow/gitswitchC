@@ -75,6 +75,12 @@ static int g_sync_file_calls;
 static int g_sync_directory_calls;
 static int g_fail_file_sync_at;
 static int g_fail_directory_sync_at;
+typedef enum {
+    M20_RELOAD_MUTATION_NONE = 0,
+    M20_RELOAD_MUTATION_EXACT_CTIME,
+    M20_RELOAD_MUTATION_DIFFERENT_BYTES
+} m20_reload_mutation_t;
+static m20_reload_mutation_t g_reload_mutation;
 
 static m20_saved_env_t m20_save_env(const char *name) {
     const char *value = getenv(name);
@@ -164,6 +170,60 @@ static bool m20_reload_shape_is_exact(const char *const argv[]) {
            strcmp(argv[2], "gpg-agent") == 0;
 }
 
+static bool m20_same_ctime(const struct stat *left,
+                           const struct stat *right) {
+#ifdef __APPLE__
+    return left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
+static int m20_mutate_config_during_reload(m20_reload_mutation_t mutation) {
+    char path[MAX_PATH_LEN];
+    struct stat before;
+    struct stat after;
+    struct timespec times[2];
+    unsigned char byte;
+    int fd;
+
+    if (mutation == M20_RELOAD_MUTATION_NONE ||
+        safe_snprintf(path, sizeof(path), "%s/gpg-agent.conf",
+                      g_expected_home) != 0) {
+        return -1;
+    }
+    fd = open(path, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &before) != 0 ||
+        pread(fd, &byte, 1, 0) != 1) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+#ifdef __APPLE__
+    times[0] = before.st_atimespec;
+    times[1] = before.st_mtimespec;
+#else
+    times[0] = before.st_atim;
+    times[1] = before.st_mtim;
+#endif
+    if (mutation == M20_RELOAD_MUTATION_DIFFERENT_BYTES) byte ^= 1U;
+    if (pwrite(fd, &byte, 1, 0) != 1 ||
+        fchmod(fd, 0400) != 0 || fchmod(fd, 0600) != 0 ||
+        futimens(fd, times) != 0 || fsync(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (close(fd) != 0) return -1;
+    if (stat(path, &after) != 0 || before.st_dev != after.st_dev ||
+        before.st_ino != after.st_ino || before.st_size != after.st_size ||
+        !S_ISREG(after.st_mode) || (after.st_mode & 0777) != 0600 ||
+        m20_same_ctime(&before, &after)) {
+        return -1;
+    }
+    return 0;
+}
+
 static int m20_runner(const char *const argv[], const run_opts_t *opts,
                       run_result_t *result) {
     if (result) {
@@ -200,6 +260,15 @@ static int m20_runner(const char *const argv[], const run_opts_t *opts,
             g_reload_protocol_errors++;
             if (result) result->exit_code = 8;
             return -1;
+        }
+        if (g_reload_mutation != M20_RELOAD_MUTATION_NONE) {
+            m20_reload_mutation_t mutation = g_reload_mutation;
+            g_reload_mutation = M20_RELOAD_MUTATION_NONE;
+            if (m20_mutate_config_during_reload(mutation) != 0) {
+                g_reload_protocol_errors++;
+                if (result) result->exit_code = 8;
+                return -1;
+            }
         }
         if (g_fail_reload) {
             if (result) result->exit_code = 9;
@@ -335,6 +404,7 @@ static void m20_reset_observation(const m20_fixture_t *fixture,
     g_reload_protocol_errors = 0;
     g_gpg_listing_calls = 0;
     g_fail_reload = fail_reload;
+    g_reload_mutation = M20_RELOAD_MUTATION_NONE;
 }
 
 static int m20_install_private_tools(m20_fixture_t *fixture) {
@@ -954,6 +1024,92 @@ TEST(stale_clean_state_after_identical_config_replacement_forces_reload) {
     CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
 }
 
+TEST(exact_ctime_drift_during_reload_is_byte_proved_once) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    gpg_agent_conf_precommit_fn old_commit;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    int first_rc;
+    int second_rc;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    g_reload_mutation = M20_RELOAD_MUTATION_EXACT_CTIME;
+    old_commit = gpg_manager_set_agent_conf_precommit_fn(
+        m20_count_config_commit);
+    old_runner = run_set_runner(m20_runner);
+    first_rc = gpg_create_isolated_home(&config, &fixture.account);
+
+    CHECK_EQ_INT(first_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 1);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+
+    m20_reset_observation(&fixture, m20_config_a, false);
+    second_rc = gpg_create_isolated_home(&config, &fixture.account);
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_precommit_fn(old_commit);
+
+    CHECK_EQ_INT(second_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 1);
+    CHECK_EQ_INT(g_reload_calls, 0);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
+TEST(changed_bytes_with_restored_mtime_fail_then_retry) {
+    m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
+    m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
+    m20_saved_env_t gnupg = m20_save_env("GNUPGHOME");
+    m20_saved_env_t path = m20_save_env("PATH");
+    m20_fixture_t fixture;
+    gpg_agent_conf_precommit_fn old_commit;
+    command_runner_fn old_runner;
+    gpg_config_t config;
+    int first_rc;
+    int retry_rc;
+
+    CHECK_EQ_INT(m20_make_fixture(&fixture, m20_config_a, true), 0);
+    m20_prepare_config(&config);
+    g_config_commits = 0;
+    m20_reset_observation(&fixture, m20_config_a, false);
+    g_reload_mutation = M20_RELOAD_MUTATION_DIFFERENT_BYTES;
+    old_commit = gpg_manager_set_agent_conf_precommit_fn(
+        m20_count_config_commit);
+    old_runner = run_set_runner(m20_runner);
+    first_rc = gpg_create_isolated_home(&config, &fixture.account);
+
+    CHECK_EQ_INT(first_rc, -1);
+    CHECK_EQ_INT(g_config_commits, 1);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK(strstr(get_last_error()->message,
+                 "changed during GPG agent activation") != NULL);
+
+    m20_reset_observation(&fixture, m20_config_a, false);
+    retry_rc = gpg_create_isolated_home(&config, &fixture.account);
+    run_set_runner(old_runner);
+    gpg_manager_set_agent_conf_precommit_fn(old_commit);
+
+    CHECK_EQ_INT(retry_rc, 0);
+    CHECK_EQ_INT(g_config_commits, 2);
+    CHECK_EQ_INT(g_reload_calls, 1);
+    CHECK_EQ_INT(g_reload_protocol_errors, 0);
+    CHECK_EQ_INT(m20_restore_env("PATH", &path), 0);
+    CHECK_EQ_INT(m20_restore_env("GNUPGHOME", &gnupg), 0);
+    CHECK_EQ_INT(m20_restore_env("GITSWITCH_ALLOW_TMP_GPG", &optin), 0);
+    CHECK_EQ_INT(m20_restore_env("XDG_RUNTIME_DIR", &runtime), 0);
+}
+
 TEST(changed_config_is_observed_by_the_retained_live_agent) {
     m20_saved_env_t runtime = m20_save_env("XDG_RUNTIME_DIR");
     m20_saved_env_t optin = m20_save_env("GITSWITCH_ALLOW_TMP_GPG");
@@ -1029,6 +1185,8 @@ int main(int argc, char **argv) {
     RUN_TEST(missing_reload_state_for_matching_config_forces_one_migration_reload);
     RUN_TEST(corrupt_clean_state_for_matching_config_forces_one_reload);
     RUN_TEST(stale_clean_state_after_identical_config_replacement_forces_reload);
+    RUN_TEST(exact_ctime_drift_during_reload_is_byte_proved_once);
+    RUN_TEST(changed_bytes_with_restored_mtime_fail_then_retry);
     RUN_TEST(changed_config_is_observed_by_the_retained_live_agent);
     return ts_test_finish();
 }

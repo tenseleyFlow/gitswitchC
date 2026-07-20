@@ -2295,7 +2295,13 @@ int copy_file(const char *src_path, const char *dst_path) {
     if (dst_fd < 0) {
         int saved_errno = errno;
         errno = saved_errno;
-        if (saved_errno == ELOOP) {
+        if (saved_errno == ELOOP
+#if defined(__FreeBSD__)
+            /* FreeBSD deliberately reports EMLINK for a final symlink rejected
+             * by O_NOFOLLOW; POSIX and the other supported hosts use ELOOP. */
+            || saved_errno == EMLINK
+#endif
+        ) {
             set_error(ERR_INVALID_ARGS,
                       "Refusing symlink destination: %s", dst_path);
         } else {
@@ -3082,9 +3088,12 @@ static int g_test_exec_acl_failure_errno;
 
 /* A pipe write has no portable per-call "do not generate SIGPIPE" flag.
  * Follow the POSIX thread-mask pattern instead: block only for actual stdin
- * writes, remember whether the caller already owned a pending instance, and
- * synchronously consume the generated instance only after write reports
- * EPIPE. The process-wide disposition is never changed. */
+ * writes, temporarily consume any caller-owned pending instance, consume the
+ * runner-generated instance after EPIPE, then re-raise the caller's instance
+ * while it is still blocked. The explicit remove/restore is necessary on
+ * kernels which retain the two standard-signal instances separately; merely
+ * remembering that SIGPIPE was already pending can leak the generated instance
+ * back to the caller. The process-wide disposition is never changed. */
 typedef struct {
     bool active;
     bool initially_pending;
@@ -3095,6 +3104,8 @@ typedef struct {
 
 static int run_sigpipe_begin(run_sigpipe_state_t *state) {
     sigset_t pending;
+    int consumed_signal = 0;
+    int wait_error;
 
     memset(state, 0, sizeof(*state));
     if (sigemptyset(&state->set) != 0 ||
@@ -3113,15 +3124,28 @@ static int run_sigpipe_begin(run_sigpipe_state_t *state) {
         return -1;
     }
     state->initially_pending = sigismember(&pending, SIGPIPE) == 1;
+    if (state->initially_pending) {
+        do {
+            wait_error = sigwait(&state->set, &consumed_signal);
+        } while (wait_error == EINTR);
+        if (wait_error != 0 || consumed_signal != SIGPIPE) {
+            int consume_errno = wait_error != 0 ? wait_error : EIO;
+            (void)sigprocmask(SIG_SETMASK, &state->saved_mask, NULL);
+            state->active = false;
+            errno = consume_errno;
+            return -1;
+        }
+    }
     return 0;
 }
 
 static int run_sigpipe_end(run_sigpipe_state_t *state) {
     int entry_errno = errno;
     int consume_errno = 0;
+    int restore_pending_errno = 0;
 
     if (!state->active) return 0;
-    if (state->saw_epipe && !state->initially_pending) {
+    if (state->saw_epipe) {
         sigset_t pending;
 
         /* macOS has sigwait() but no sigtimedwait(). Check the blocked set
@@ -3149,6 +3173,20 @@ static int run_sigpipe_end(run_sigpipe_state_t *state) {
             }
         }
     }
+    if (state->initially_pending) {
+        sigset_t pending;
+
+        if (raise(SIGPIPE) != 0) {
+            restore_pending_errno = errno;
+        } else if (sigpending(&pending) != 0) {
+            restore_pending_errno = errno;
+        } else {
+            int pending_member = sigismember(&pending, SIGPIPE);
+            if (pending_member != 1) {
+                restore_pending_errno = pending_member < 0 ? errno : EIO;
+            }
+        }
+    }
     if (sigprocmask(SIG_SETMASK, &state->saved_mask, NULL) != 0) {
         int restore_errno = errno;
         state->active = false;
@@ -3158,6 +3196,10 @@ static int run_sigpipe_end(run_sigpipe_state_t *state) {
     state->active = false;
     if (consume_errno != 0) {
         errno = consume_errno;
+        return -1;
+    }
+    if (restore_pending_errno != 0) {
+        errno = restore_pending_errno;
         return -1;
     }
     errno = entry_errno;

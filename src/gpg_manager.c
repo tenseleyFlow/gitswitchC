@@ -75,6 +75,8 @@ typedef struct {
     bool reload_required;
     int config_fd;
     struct stat config_identity;
+    unsigned char *config_witness;
+    size_t config_witness_length;
     int marker_fd;
     struct stat marker_identity;
     char gpgconf_path[MAX_PATH_LEN];
@@ -183,6 +185,11 @@ static int gpg_agent_config_update_close(gpg_agent_config_update_t *update) {
     if (update->marker_fd >= 0 && close(update->marker_fd) != 0 &&
         saved_errno == 0) {
         saved_errno = errno;
+    }
+    if (update->config_witness) {
+        secure_zero_memory(update->config_witness,
+                           update->config_witness_length);
+        free(update->config_witness);
     }
     gpg_agent_config_update_init(update);
     if (saved_errno != 0) {
@@ -5790,6 +5797,136 @@ static int gpg_validate_agent_update_entry(
     return 0;
 }
 
+/* FreeBSD/UFS may expose the ctime caused by our own atomic publication only
+ * after a later descriptor operation. This predicate is intentionally narrow:
+ * callers may admit it only while holding an exact byte witness captured
+ * before that publication. */
+static bool gpg_file_ctime_only_change(const struct stat *before,
+                                       const struct stat *after) {
+    bool same_without_ctime;
+    bool same_mtime;
+    bool same_ctime;
+
+    if (!before || !after) return false;
+    same_without_ctime = gpg_same_reset_entry(before, after) &&
+                         before->st_nlink == after->st_nlink &&
+                         before->st_size == after->st_size;
+#ifdef __APPLE__
+    same_mtime =
+        before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+        before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec;
+    same_ctime =
+        before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+        before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+    same_mtime = before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+                 before->st_mtim.tv_nsec == after->st_mtim.tv_nsec;
+    same_ctime = before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+                 before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+    return same_without_ctime && same_mtime && !same_ctime;
+}
+
+static int gpg_config_witness_matches_fd(
+    int fd, const unsigned char *witness, size_t witness_length) {
+    unsigned char observed[4096];
+    unsigned char trailing;
+    size_t offset = 0;
+    ssize_t count = 0;
+
+    if (fd < 0 || (!witness && witness_length != 0U)) {
+        errno = EINVAL;
+        return -1;
+    }
+    while (offset < witness_length) {
+        size_t wanted = witness_length - offset;
+        size_t received = 0;
+        if (wanted > sizeof(observed)) wanted = sizeof(observed);
+        while (received < wanted) {
+            do {
+                count = pread(fd, observed + received, wanted - received,
+                              (off_t)(offset + received));
+            } while (count < 0 && errno == EINTR);
+            if (count <= 0) break;
+            received += (size_t)count;
+        }
+        if (received != wanted ||
+            memcmp(observed, witness + offset, wanted) != 0) {
+            secure_zero_memory(observed, sizeof(observed));
+            if (count >= 0) errno = ESTALE;
+            return -1;
+        }
+        offset += wanted;
+    }
+    do {
+        count = pread(fd, &trailing, 1, (off_t)witness_length);
+    } while (count < 0 && errno == EINTR);
+    secure_zero_memory(observed, sizeof(observed));
+    if (count != 0) {
+        if (count > 0) errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+/* Validate the retained config descriptor normally. If only ctime advanced
+ * since this invocation published the file, re-prove every byte and refresh
+ * the in-memory identity. This does not weaken cross-invocation clean-state
+ * matching: a later same-inode rewrite still changes the persisted generation
+ * and therefore forces another agent reload. */
+static int gpg_validate_agent_config_update(
+    int home_fd, gpg_agent_config_update_t *update) {
+    struct stat opened_before;
+    struct stat named_before;
+    struct stat opened_after;
+    struct stat named_after;
+    bool opened_admissible;
+    bool named_admissible;
+
+    if (home_fd < 0 || !update || update->config_fd < 0 ||
+        (!update->config_witness && update->config_witness_length != 0U) ||
+        update->config_identity.st_size < 0 ||
+        (uintmax_t)update->config_identity.st_size !=
+            update->config_witness_length ||
+        fstat(update->config_fd, &opened_before) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        set_error(ERR_FILE_IO,
+                  "Installed gpg-agent.conf changed during GPG agent activation");
+        return -1;
+    }
+    if (!S_ISREG(opened_before.st_mode) ||
+        opened_before.st_uid != getuid() || opened_before.st_nlink != 1 ||
+        (opened_before.st_mode & 0777) != 0600 ||
+        !gpg_same_file_version(&opened_before, &named_before)) {
+        set_error(ERR_FILE_IO,
+                  "Installed gpg-agent.conf changed during GPG agent activation");
+        return -1;
+    }
+    if (gpg_same_file_version(&update->config_identity, &opened_before)) {
+        return 0;
+    }
+    opened_admissible = gpg_file_ctime_only_change(
+        &update->config_identity, &opened_before);
+    named_admissible = gpg_file_ctime_only_change(
+        &update->config_identity, &named_before);
+    if (!opened_admissible || !named_admissible ||
+        gpg_config_witness_matches_fd(
+            update->config_fd, update->config_witness,
+            update->config_witness_length) != 0 ||
+        fstat(update->config_fd, &opened_after) != 0 ||
+        fstatat(home_fd, "gpg-agent.conf", &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !gpg_same_file_version(&opened_before, &opened_after) ||
+        !gpg_same_file_version(&opened_after, &named_after)) {
+        set_error(ERR_FILE_IO,
+                  "Installed gpg-agent.conf changed during GPG agent activation");
+        return -1;
+    }
+    update->config_identity = opened_after;
+    return 0;
+}
+
 /* Persist the obligation before publishing changed config bytes. Existing
  * pending state is adopted after a failed attempt; clean state is changed in
  * place through its retained descriptor. */
@@ -5971,10 +6108,7 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
         return -1;
     }
     if (gpg_validate_pinned_home(home) != 0 ||
-        gpg_validate_agent_update_entry(
-            home->home_fd, "gpg-agent.conf", update->config_fd,
-            &update->config_identity, update->config_identity.st_size,
-            "Installed gpg-agent.conf") != 0 ||
+        gpg_validate_agent_config_update(home->home_fd, update) != 0 ||
         gpg_validate_agent_update_entry(
             home->home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
             &update->marker_identity, 0, "GPG agent reload state") != 0) {
@@ -6001,18 +6135,12 @@ static int gpg_reload_agent_config(const gpg_pinned_home_t *home,
         return -1;
     }
     if (gpg_validate_pinned_home(home) != 0 ||
-        gpg_validate_agent_update_entry(
-            home->home_fd, "gpg-agent.conf", update->config_fd,
-            &update->config_identity, update->config_identity.st_size,
-            "Installed gpg-agent.conf") != 0 ||
+        gpg_validate_agent_config_update(home->home_fd, update) != 0 ||
         gpg_validate_agent_update_entry(
             home->home_fd, GPG_AGENT_RELOAD_STATE, update->marker_fd,
             &update->marker_identity, 0, "GPG agent reload state") != 0 ||
         gpg_set_agent_reload_clean(home->home_fd, update) != 0 ||
-        gpg_validate_agent_update_entry(
-            home->home_fd, "gpg-agent.conf", update->config_fd,
-            &update->config_identity, update->config_identity.st_size,
-            "Installed gpg-agent.conf") != 0 ||
+        gpg_validate_agent_config_update(home->home_fd, update) != 0 ||
         gpg_validate_pinned_home(home) != 0) {
         return -1;
     }
@@ -7441,7 +7569,9 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
         if (gpg_set_agent_reload_pending(home_fd, update) != 0) {
             goto fail;
         }
-        free(desired);
+        update->config_witness = desired;
+        update->config_witness_length = desired_len;
+        desired = NULL;
         log_debug("Reused pending GPG agent configuration: %s",
                   gpg_agent_conf_path);
         return 0;
@@ -7565,12 +7695,36 @@ static int setup_gpg_agent_config(int home_fd, const char *gnupg_home,
                   "Installed gpg-agent.conf changed after synchronization");
         goto fail;
     }
-    update->config_fd = fd;
-    update->config_identity = fd_now;
-    update->reload_required = true;
+    /* FreeBSD/UFS can materialize the final ctime only when the writable
+     * descriptor is closed. Retaining it made a later, otherwise read-only
+     * activation proof observe a false generation change. Close it now, then
+     * re-open and byte-prove the published inode from the pinned directory
+     * before handing a read-only proof descriptor to the reload phase. */
+    if (close(fd) != 0) {
+        fd = -1;
+        set_system_error(ERR_FILE_IO,
+                         "Failed to close installed gpg-agent.conf");
+        goto fail;
+    }
     fd = -1;
+    match = gpg_agent_conf_matches(home_fd, desired, desired_len,
+                                   &matched_fd, &matched_identity);
+    if (match != 1 || matched_identity.st_dev != created.st_dev ||
+        matched_identity.st_ino != created.st_ino) {
+        if (match >= 0) {
+            set_error(ERR_FILE_IO,
+                      "Installed gpg-agent.conf changed after publication");
+        }
+        goto fail;
+    }
+    update->config_fd = matched_fd;
+    update->config_identity = matched_identity;
+    matched_fd = -1;
+    update->reload_required = true;
+    update->config_witness = desired;
+    update->config_witness_length = desired_len;
+    desired = NULL;
 
-    free(desired);
     log_debug("Created GPG agent configuration: %s", gpg_agent_conf_path);
     return 0;
 
