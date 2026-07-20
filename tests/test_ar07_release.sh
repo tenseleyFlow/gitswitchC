@@ -4893,8 +4893,9 @@ EOF
     {
         rpm_retirement_path=$1
         rpm_retirement_out=$2
-        case $copy_platform in
-            FreeBSD)
+        rpm_retirement_expected=${3:-removed}
+        case $copy_platform:$rpm_retirement_expected in
+            FreeBSD:removed)
                 [ ! -e "$rpm_retirement_path" ] &&
                 [ ! -L "$rpm_retirement_path" ] ||
                     fail "FreeBSD RPM target retained a descriptor-retirable namespace"
@@ -4903,7 +4904,7 @@ EOF
                     fail "FreeBSD RPM target reported unsupported retirement"
                 fi
                 ;;
-            Linux|Darwin)
+            Linux:*|Darwin:*|FreeBSD:retained)
                 [ -d "$rpm_retirement_path" ] &&
                 [ ! -L "$rpm_retirement_path" ] ||
                     fail "RPM target lost its safely retained private namespace"
@@ -4938,7 +4939,7 @@ EOF
                 rm -rf "$rpm_retirement_path" ||
                     fail "cannot retire fixture-owned private RPM namespace"
                 ;;
-            *) fail "unsupported RPM retirement fixture platform" ;;
+            *) fail "unsupported RPM retirement fixture disposition" ;;
         esac
     }
 
@@ -5102,10 +5103,10 @@ EOF
     rpm_binary_name=gitswitcher-$rpm_fixture_version-1.noarch.rpm
     rpm_source_name=gitswitcher-$rpm_fixture_version-1.src.rpm
 
-    # A wrong generation must not begin a partial walk. FreeBSD can condition
-    # recursive removal on an open vnode; Linux and Darwin deliberately retain
-    # the complete tree because pathname unlink cannot reject a post-proof
-    # same-UID substitution.
+    # A wrong generation must not begin a partial walk. This fixture also
+    # contains an external symlink: FreeBSD 14.4 can bind its removal to an
+    # O_PATH witness without following the link, while Linux and Darwin must
+    # retain the complete tree rather than risk pathname-race deletion.
     rpm_retire_tree=$rpm_home/.gitswitch-rpmbuild.Ret123
     rpm_retire_nested=$rpm_retire_tree/nested
     rpm_retire_external=$rpm_state/retire-external.sentinel
@@ -5178,23 +5179,15 @@ EOF
         rpm_retire_status=$?
     fi
     case $copy_platform in
-        FreeBSD)
-            [ "$rpm_retire_status" -eq 0 ] || {
-                sed -n '1,160p' "$rpm_retire_exact_out" >&2
-                fail "FreeBSD matching-generation RPM retirement failed"
-            }
-            [ ! -e "$rpm_retire_tree" ] && [ ! -L "$rpm_retire_tree" ] ||
-                fail "FreeBSD matching-generation retirement retained its namespace"
-            ;;
         Linux|Darwin)
             [ "$rpm_retire_status" -eq 2 ] || {
                 sed -n '1,160p' "$rpm_retire_exact_out" >&2
-                fail "unsupported descriptor retirement lacked retained status"
+                fail "symlink-bearing descriptor retirement lacked retained status"
             }
             [ -d "$rpm_retire_tree" ] && [ ! -L "$rpm_retire_tree" ] ||
-                fail "unsupported descriptor retirement removed its namespace"
+                fail "symlink-bearing descriptor retirement removed its namespace"
             case $copy_platform in
-                Darwin)
+                Darwin|FreeBSD)
                     rpm_retire_after=$(stat -f '%d:%i' "$rpm_retire_tree") ||
                         fail "cannot re-identify retained RPM namespace"
                     ;;
@@ -5204,17 +5197,25 @@ EOF
                     ;;
             esac
             [ "$rpm_retire_after" = "$rpm_retire_identity" ] ||
-                fail "unsupported retirement replaced the private namespace"
+                fail "retained retirement replaced the private namespace"
             cmp -s "$rpm_retire_nested/data" \
                 "$rpm_fixture/retire-data.expected" ||
-                fail "unsupported retirement partially removed nested data"
+                fail "retained retirement partially removed nested data"
             [ -L "$rpm_retire_nested/external-link" ] ||
-                fail "unsupported retirement partially removed a symlink"
+                fail "retained retirement partially removed a symlink"
             grep -F 'private RPM namespace safely retained:' \
                 "$rpm_retire_exact_out" >/dev/null ||
-                fail "unsupported retirement silently retained its namespace"
+                fail "retirement silently retained its namespace"
             rm -rf "$rpm_retire_tree" ||
                 fail "cannot remove fixture-owned retained RPM namespace"
+            ;;
+        FreeBSD)
+            [ "$rpm_retire_status" -eq 0 ] || {
+                sed -n '1,160p' "$rpm_retire_exact_out" >&2
+                fail "FreeBSD symlink-bearing RPM retirement failed"
+            }
+            [ ! -e "$rpm_retire_tree" ] && [ ! -L "$rpm_retire_tree" ] ||
+                fail "FreeBSD symlink-bearing retirement retained its namespace"
             ;;
     esac
     cmp -s "$rpm_retire_external" "$rpm_fixture/retire-external.expected" ||
@@ -5667,7 +5668,16 @@ EOF
     rpm_symlink_topdir=$(sed -n '1p' "$rpm_symlink_report")
     [ -n "$rpm_symlink_topdir" ] ||
         fail "failed RPM build omitted its private topdir"
-    rpm_assert_private_retirement "$rpm_symlink_topdir" "$rpm_symlink_out"
+    case $copy_platform in
+        FreeBSD)
+            rpm_assert_private_retirement \
+                "$rpm_symlink_topdir" "$rpm_symlink_out"
+            ;;
+        Linux|Darwin)
+            rpm_assert_private_retirement \
+                "$rpm_symlink_topdir" "$rpm_symlink_out" retained
+            ;;
+    esac
     [ ! -e "$rpm_alpha_repo/build/dist/$rpm_binary_name" ] &&
     [ ! -L "$rpm_alpha_repo/build/dist/$rpm_binary_name" ] &&
     [ ! -e "$rpm_alpha_repo/build/dist/$rpm_source_name" ] &&

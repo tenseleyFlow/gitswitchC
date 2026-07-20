@@ -282,40 +282,6 @@ static int revalidate_canonical_directory_path(const char *path,
     return close(directory_fd);
 }
 
-#if defined(__FreeBSD__)
-static int duplicate_cloexec(int fd)
-{
-#if defined(F_DUPFD_CLOEXEC)
-    int duplicate;
-
-    do {
-        duplicate = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
-    } while (duplicate < 0 && errno == EINTR);
-    return duplicate;
-#else
-    int duplicate;
-    int flags;
-    int saved_errno;
-
-    do {
-        duplicate = dup(fd);
-    } while (duplicate < 0 && errno == EINTR);
-    if (duplicate < 0) {
-        return -1;
-    }
-    flags = fcntl(duplicate, F_GETFD);
-    if (flags < 0 ||
-        fcntl(duplicate, F_SETFD, flags | FD_CLOEXEC) != 0) {
-        saved_errno = errno;
-        (void)close(duplicate);
-        errno = saved_errno;
-        return -1;
-    }
-    return duplicate;
-#endif
-}
-#endif
-
 static int revalidate_directory_entry(int parent_fd, const char *name,
                                       int child_fd,
                                       const struct stat *expected)
@@ -341,8 +307,8 @@ static int revalidate_directory_entry(int parent_fd, const char *name,
 }
 
 #if defined(__FreeBSD__)
-static int retire_directory_contents(int directory_fd, dev_t tree_device,
-                                     unsigned int depth)
+static int visit_retirement_tree(int directory_fd, dev_t tree_device,
+                                 unsigned int depth, bool remove_entries)
 {
     DIR *stream;
     int stream_fd;
@@ -352,10 +318,11 @@ static int retire_directory_contents(int directory_fd, dev_t tree_device,
         errno = ELOOP;
         return -1;
     }
-    stream_fd = duplicate_cloexec(directory_fd);
-    if (stream_fd < 0) {
-        return -1;
-    }
+    do {
+        stream_fd = openat(directory_fd, ".",
+                           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (stream_fd < 0 && errno == EINTR);
+    if (stream_fd < 0) return -1;
     stream = fdopendir(stream_fd);
     if (stream == NULL) {
         int saved_errno = errno;
@@ -369,7 +336,6 @@ static int retire_directory_contents(int directory_fd, dev_t tree_device,
         struct dirent *entry;
         struct stat before;
         struct stat pinned;
-        int entry_fd = -1;
         int saved_errno;
 
         errno = 0;
@@ -394,28 +360,7 @@ static int retire_directory_contents(int directory_fd, dev_t tree_device,
             result = -1;
             break;
         }
-        do {
-            entry_fd = openat(directory_fd, entry->d_name,
-                              O_PATH | O_NOFOLLOW | O_CLOEXEC);
-        } while (entry_fd < 0 && errno == EINTR);
-        if (entry_fd < 0 || fstat(entry_fd, &pinned) != 0) {
-            saved_errno = errno;
-            if (entry_fd >= 0) {
-                (void)close(entry_fd);
-            }
-            errno = saved_errno;
-            result = -1;
-            break;
-        }
-        if (pinned.st_dev != before.st_dev ||
-            pinned.st_ino != before.st_ino ||
-            (pinned.st_mode & S_IFMT) != (before.st_mode & S_IFMT)) {
-            (void)close(entry_fd);
-            errno = ESTALE;
-            result = -1;
-            break;
-        }
-        if (S_ISDIR(pinned.st_mode)) {
+        if (S_ISDIR(before.st_mode)) {
             int child_fd = -1;
 
             do {
@@ -423,25 +368,28 @@ static int retire_directory_contents(int directory_fd, dev_t tree_device,
                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                       O_CLOEXEC);
             } while (child_fd < 0 && errno == EINTR);
-            if (child_fd < 0 ||
+            if (child_fd < 0 || fstat(child_fd, &pinned) != 0 ||
+                pinned.st_dev != before.st_dev ||
+                pinned.st_ino != before.st_ino ||
+                !S_ISDIR(pinned.st_mode) ||
                 revalidate_directory_entry(directory_fd, entry->d_name,
                                            child_fd, &pinned) != 0 ||
-                retire_directory_contents(child_fd, tree_device,
-                                          depth + 1U) != 0) {
+                visit_retirement_tree(child_fd, tree_device, depth + 1U,
+                                      remove_entries) != 0) {
                 saved_errno = errno;
+                if (saved_errno == 0) saved_errno = ESTALE;
                 if (child_fd >= 0) {
                     (void)close(child_fd);
                 }
-                (void)close(entry_fd);
                 errno = saved_errno;
                 result = -1;
                 break;
             }
-            if (funlinkat(directory_fd, entry->d_name, entry_fd,
+            if (remove_entries &&
+                funlinkat(directory_fd, entry->d_name, child_fd,
                           AT_REMOVEDIR) != 0) {
                 saved_errno = errno;
                 (void)close(child_fd);
-                (void)close(entry_fd);
                 errno = saved_errno;
                 result = -1;
                 break;
@@ -450,16 +398,34 @@ static int retire_directory_contents(int directory_fd, dev_t tree_device,
             if (close(child_fd) != 0) {
                 saved_errno = errno;
             }
-            if (close(entry_fd) != 0 && saved_errno == 0) {
-                saved_errno = errno;
-            }
             if (saved_errno != 0) {
                 errno = saved_errno;
                 result = -1;
                 break;
             }
-        } else {
-            if (funlinkat(directory_fd, entry->d_name, entry_fd, 0) != 0) {
+        } else if (S_ISREG(before.st_mode)) {
+            int entry_fd = -1;
+
+            /* Use a normally operable descriptor for regular leaves. Keeping
+             * the open nonblocking means a raced FIFO/device cannot stall;
+             * fstat plus funlinkat then bind deletion to that exact vnode. */
+            do {
+                entry_fd = openat(directory_fd, entry->d_name,
+                                  O_RDONLY | O_NONBLOCK | O_NOFOLLOW |
+                                      O_CLOEXEC);
+            } while (entry_fd < 0 && errno == EINTR);
+            if (entry_fd < 0 || fstat(entry_fd, &pinned) != 0 ||
+                pinned.st_dev != before.st_dev ||
+                pinned.st_ino != before.st_ino ||
+                !S_ISREG(pinned.st_mode)) {
+                saved_errno = errno;
+                if (entry_fd >= 0) (void)close(entry_fd);
+                errno = saved_errno != 0 ? saved_errno : ESTALE;
+                result = -1;
+                break;
+            }
+            if (remove_entries &&
+                funlinkat(directory_fd, entry->d_name, entry_fd, 0) != 0) {
                 saved_errno = errno;
                 (void)close(entry_fd);
                 errno = saved_errno;
@@ -470,6 +436,46 @@ static int retire_directory_contents(int directory_fd, dev_t tree_device,
                 result = -1;
                 break;
             }
+        } else if (S_ISLNK(before.st_mode)) {
+            int entry_fd = -1;
+
+            /* A FreeBSD 14.4 O_PATH descriptor is accepted by funlinkat(2)
+             * for a symlink even though the same descriptor kind is rejected
+             * for a directory. O_NOFOLLOW pins the link itself, never its
+             * external target. */
+            do {
+                entry_fd = openat(directory_fd, entry->d_name,
+                                  O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            } while (entry_fd < 0 && errno == EINTR);
+            if (entry_fd < 0 || fstat(entry_fd, &pinned) != 0 ||
+                pinned.st_dev != before.st_dev ||
+                pinned.st_ino != before.st_ino ||
+                !S_ISLNK(pinned.st_mode)) {
+                saved_errno = errno;
+                if (entry_fd >= 0) (void)close(entry_fd);
+                errno = saved_errno != 0 ? saved_errno : ESTALE;
+                result = -1;
+                break;
+            }
+            if (remove_entries &&
+                funlinkat(directory_fd, entry->d_name, entry_fd, 0) != 0) {
+                saved_errno = errno;
+                (void)close(entry_fd);
+                errno = saved_errno;
+                result = -1;
+                break;
+            }
+            if (close(entry_fd) != 0) {
+                result = -1;
+                break;
+            }
+        } else {
+            /* Preserve a tree containing unexpected special files rather
+             * than opening a FIFO/device or degrading to pathname unlink.
+             * The validation pass reaches this branch before any mutation. */
+            errno = EOPNOTSUPP;
+            result = -1;
+            break;
         }
     }
     {
@@ -565,7 +571,22 @@ static int run_internal_retire_tree(const char *home_path,
     result = RETIRE_TREE_RETAINED_STATUS;
     goto cleanup;
 #else
-    if (retire_directory_contents(private_fd, private_stat.st_dev, 0U) != 0) {
+    if (visit_retirement_tree(private_fd, private_stat.st_dev, 0U, false) !=
+        0) {
+        if (errno == EOPNOTSUPP) {
+            fprintf(stderr,
+                    "WARNING: private RPM namespace safely retained: %s/%s\n",
+                    home_path, private_name);
+            result = RETIRE_TREE_RETAINED_STATUS;
+            goto cleanup;
+        }
+        fprintf(stderr,
+                "ERROR: cannot validate private RPM namespace contents before retirement: %s\n",
+                strerror(errno));
+        goto cleanup;
+    }
+    if (visit_retirement_tree(private_fd, private_stat.st_dev, 0U, true) !=
+        0) {
         fprintf(stderr,
                 "ERROR: cannot retire private RPM namespace contents: %s\n",
                 strerror(errno));

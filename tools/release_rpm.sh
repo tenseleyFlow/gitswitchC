@@ -117,8 +117,7 @@ rpm_cleanup()
                     fi
                     ;;
                 2)
-                    if [ "$rpm_host_os" != FreeBSD ] &&
-                       rpm_directory_is_exact "$rpm_topdir" &&
+                    if rpm_directory_is_exact "$rpm_topdir" &&
                        [ "$(rpm_path_identity "$rpm_topdir")" = \
                            "$rpm_topdir_identity" ]; then
                         printf 'release-rpm: WARNING: private namespace safely retained because this platform lacks descriptor-conditioned directory removal: %s\n' \
