@@ -28,6 +28,7 @@
 #include <sys/attr.h>
 #include <sys/clonefile.h>
 #include <sys/random.h>
+#include <sys/sysctl.h>
 #if defined(GITSWITCH_RELEASE_TEST_FD_PRESSURE)
 #include <sys/resource.h>
 #endif
@@ -3071,6 +3072,109 @@ static producer_reap_result_t reap_and_retire_producer(pid_t child,
     return result;
 }
 
+#if defined(__APPLE__)
+/* XNU's explicit-process-group kill path excludes zombies from its group
+ * iteration and returns EPERM, rather than ESRCH, when no signalable live
+ * member remains.  Do not broadly forgive EPERM: inspect the still-pinned
+ * group through KERN_PROC_PGRP and accept it only when every member is already
+ * a zombie and the direct child remains the group leader. */
+static int darwin_producer_group_is_zombie_only(pid_t child)
+{
+    int mib[4];
+    struct kinfo_proc *members = NULL;
+    size_t member_bytes = 0U;
+    size_t member_count;
+    size_t index;
+    unsigned int attempt;
+    bool leader_seen = false;
+
+    if (child <= 0 || (uintmax_t)child > (uintmax_t)INT_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    mib[0] = CTL_KERN;
+    mib[1] = KERN_PROC;
+    mib[2] = KERN_PROC_PGRP;
+    mib[3] = (int)child;
+
+    for (attempt = 0U; attempt < 4U; attempt++) {
+        size_t capacity = 0U;
+
+        if (sysctl(mib, 4U, NULL, &capacity, NULL, 0U) != 0) {
+            return -1;
+        }
+        if (capacity == 0U || capacity > SIZE_MAX - sizeof(*members)) {
+            errno = capacity == 0U ? ESRCH : EOVERFLOW;
+            return -1;
+        }
+        members = malloc(capacity);
+        if (members == NULL) {
+            return -1;
+        }
+        member_bytes = capacity;
+        if (sysctl(mib, 4U, members, &member_bytes, NULL, 0U) == 0) {
+            break;
+        }
+        {
+            int snapshot_errno = errno;
+
+            free(members);
+            members = NULL;
+            if (snapshot_errno != ENOMEM) {
+                errno = snapshot_errno;
+                return -1;
+            }
+        }
+    }
+    if (members == NULL) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (member_bytes == 0U ||
+        member_bytes % sizeof(*members) != 0U) {
+        free(members);
+        errno = EIO;
+        return -1;
+    }
+    member_count = member_bytes / sizeof(*members);
+    for (index = 0U; index < member_count; index++) {
+        if (members[index].kp_eproc.e_pgid != child) {
+            free(members);
+            errno = EIO;
+            return -1;
+        }
+        if (members[index].kp_proc.p_pid == child) {
+            leader_seen = true;
+        }
+        if (members[index].kp_proc.p_stat != SZOMB) {
+            free(members);
+            errno = EBUSY;
+            return -1;
+        }
+    }
+    free(members);
+    if (!leader_seen) {
+        errno = ESRCH;
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+static int validate_completed_group_kill_failure(pid_t child,
+                                                  int group_errno)
+{
+#if defined(__APPLE__)
+    if (group_errno == EPERM) {
+        return darwin_producer_group_is_zombie_only(child);
+    }
+#else
+    (void)child;
+#endif
+    errno = group_errno;
+    return -1;
+}
+
 /* Observe without releasing the PID first. A terminal producer's process
  * group must receive group-directed SIGKILL while child still pins that
  * numeric identity: immediately on failure, or after the complete inherited
@@ -3122,9 +3226,14 @@ static producer_status_result_t observe_producer_status(pid_t child,
 
     if (failed || finish_success) {
         if (kill(-child, SIGKILL) != 0 && errno != ESRCH && !failed) {
+            int group_errno = errno;
+
             /* Keep the waitable direct child and published identity intact so
              * the caller's failure cleanup can retry before reaping it. */
-            return PRODUCER_STATUS_GROUP_ERROR;
+            if (validate_completed_group_kill_failure(child, group_errno) !=
+                0) {
+                return PRODUCER_STATUS_GROUP_ERROR;
+            }
         }
     }
     reap_result = reap_and_retire_producer(child, status, WNOHANG);
