@@ -508,6 +508,7 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     char link_target[1024];
     struct stat ssh_before, ssh_after, gpg_before, gpg_after;
     ssize_t link_len;
+    int edit_result;
     int listener = -1;
     static const char inactive_config[] =
         "[settings]\n"
@@ -628,8 +629,13 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     CHECK(strstr(contents, "email = \"new@example.com\"") != NULL);
 
     CHECK_EQ_INT(prepare_home(home, inactive_config), 0);
-    CHECK_EQ_INT(run_edit(home, runtime, shims,
-                          "renamed\nnew@example.com\n\n\n\n\n", output), 0);
+    edit_result = run_edit(home, runtime, shims,
+                           "renamed\nnew@example.com\n\n\n\n\n", output);
+    if (edit_result != 0) {
+        slurp(output, contents, sizeof(contents));
+        fprintf(stderr, "  inactive edit output:\n%s\n", contents);
+    }
+    CHECK_EQ_INT(edit_result, 0);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"renamed\"") != NULL);
@@ -971,6 +977,7 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     char home[256], runtime[256], shims[512], path[1024], target[1024];
     char output[1024], contents[8192];
     struct stat link_st;
+    int listener = -1;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
@@ -1011,10 +1018,12 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
     CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
                                          "none", "work", NULL), 0);
-    snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
-    CHECK_EQ_INT(mkdir_private(path), 0);
-    snprintf(target, sizeof(target), "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
-    CHECK_EQ_INT(write_text(target, "socket fixture\n", 0600), 0);
+    listener = install_live_current_socket(runtime, "work");
+    CHECK(listener >= 0);
+    if (listener >= 0) {
+        CHECK_EQ_INT(close(listener), 0);
+        listener = -1;
+    }
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg/.lock", runtime);
@@ -1022,6 +1031,10 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     snprintf(output, sizeof(output), "%s/remove.out", runtime);
     CHECK(run_remove(home, runtime, shims, "work", output) != 0);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
+    if (access(path, F_OK) == 0) {
+        slurp(output, contents, sizeof(contents));
+        fprintf(stderr, "  partial cleanup output:\n%s\n", contents);
+    }
     CHECK(access(path, F_OK) != 0);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));

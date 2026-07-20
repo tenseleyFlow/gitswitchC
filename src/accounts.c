@@ -2513,15 +2513,17 @@ static bool account_ssh_routing_equal(const account_t *a,
 
 static bool account_ssh_runtime_identity_equal(const account_t *a,
                                                const account_t *b) {
-    return a && b && strcmp(a->name, b->name) == 0 &&
-           a->ssh_enabled == b->ssh_enabled &&
+    if (!a || !b || a->ssh_enabled != b->ssh_enabled) return false;
+    if (!a->ssh_enabled) return true;
+    return strcmp(a->name, b->name) == 0 &&
            strcmp(a->ssh_key_path, b->ssh_key_path) == 0;
 }
 
 static bool account_gpg_runtime_identity_equal(const account_t *a,
                                                const account_t *b) {
-    return a && b && strcmp(a->name, b->name) == 0 &&
-           a->gpg_enabled == b->gpg_enabled &&
+    if (!a || !b || a->gpg_enabled != b->gpg_enabled) return false;
+    if (!a->gpg_enabled) return true;
+    return strcmp(a->name, b->name) == 0 &&
            strcmp(a->gpg_key_id, b->gpg_key_id) == 0;
 }
 

@@ -31,6 +31,11 @@ static const char private_key_text[] =
 static const char public_key_text[] =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFixture test@example\n";
 
+static char g_gpg_command_dir[MAX_PATH_LEN];
+static char *g_saved_path;
+static bool g_saved_path_present;
+static bool g_gpg_command_fixture_active;
+
 static config_io_boundary_t g_fault_boundary;
 
 static bool fail_config_at(config_io_boundary_t boundary) {
@@ -314,6 +319,97 @@ static int write_mode(const char *path, const char *text, mode_t mode) {
     return chmod(path, mode);
 }
 
+static int restore_gpg_command_fixture(void) {
+    int result;
+
+    if (!g_gpg_command_fixture_active) return 0;
+    result = g_saved_path_present ? setenv("PATH", g_saved_path, 1)
+                                  : unsetenv("PATH");
+    free(g_saved_path);
+    g_saved_path = NULL;
+    g_saved_path_present = false;
+    g_gpg_command_fixture_active = false;
+    return result;
+}
+
+/* These tests replace GPG execution with deterministic runners, but the
+ * production path correctly resolves and pins a trusted executable before it
+ * calls a runner. Homebrew's operator-writable prefix is intentionally outside
+ * that trust policy. Supply a private tripwire executable so this suite tests
+ * runner semantics without depending on the host package layout. */
+static int setup_gpg_command_fixture(void) {
+    static const char script[] = "#!/bin/sh\nexit 125\n";
+    const char *path = getenv("PATH");
+    char command_path[MAX_PATH_LEN];
+    char *fixture_path;
+    size_t dir_length;
+    size_t path_length = path ? strlen(path) : 0U;
+    size_t fixture_length;
+
+    if (g_gpg_command_fixture_active) {
+        errno = EALREADY;
+        return -1;
+    }
+    if (path) {
+        g_saved_path = strdup(path);
+        if (!g_saved_path) return -1;
+        g_saved_path_present = true;
+    }
+    if (!ts_mkdtemp_trusted(g_gpg_command_dir,
+                            sizeof(g_gpg_command_dir),
+                            "gsw-ar07-gpg-bin") ||
+        safe_snprintf(command_path, sizeof(command_path), "%s/gpg",
+                      g_gpg_command_dir) != 0 ||
+        write_mode(command_path, script, 0700) != 0) {
+        free(g_saved_path);
+        g_saved_path = NULL;
+        g_saved_path_present = false;
+        return -1;
+    }
+
+    dir_length = strlen(g_gpg_command_dir);
+    if (path_length > SIZE_MAX - dir_length - 2U) {
+        free(g_saved_path);
+        g_saved_path = NULL;
+        g_saved_path_present = false;
+        errno = EOVERFLOW;
+        return -1;
+    }
+    fixture_length = dir_length + (path_length > 0U ? path_length + 1U : 0U) +
+                     1U;
+    fixture_path = malloc(fixture_length);
+    if (!fixture_path) {
+        free(g_saved_path);
+        g_saved_path = NULL;
+        g_saved_path_present = false;
+        return -1;
+    }
+    memcpy(fixture_path, g_gpg_command_dir, dir_length);
+    if (path_length > 0U) {
+        fixture_path[dir_length] = ':';
+        memcpy(fixture_path + dir_length + 1U, path, path_length + 1U);
+    } else {
+        fixture_path[dir_length] = '\0';
+    }
+    if (setenv("PATH", fixture_path, 1) != 0) {
+        free(fixture_path);
+        free(g_saved_path);
+        g_saved_path = NULL;
+        g_saved_path_present = false;
+        return -1;
+    }
+    free(fixture_path);
+    g_gpg_command_fixture_active = true;
+    if (!command_exists("gpg")) {
+        int saved_errno = errno;
+
+        (void)restore_gpg_command_fixture();
+        errno = saved_errno ? saved_errno : ENOENT;
+        return -1;
+    }
+    return 0;
+}
+
 static int write_all_fd(int fd, const void *data, size_t length) {
     const unsigned char *cursor = data;
     size_t total = 0U;
@@ -341,6 +437,8 @@ static int seed_credentialless_publication(const char *root,
     static const char state_header[] = "none\ninactive=v1\n";
     char config_path[512];
     char git_path[512];
+    char canonical_root[MAX_PATH_LEN];
+    char canonical_git_path[MAX_PATH_LEN];
     char state_path[512];
     char config_body[2048];
     publication_record_t record;
@@ -379,6 +477,13 @@ static int seed_credentialless_publication(const char *root,
                      sizeof(ctx->config.config_path)) != 0) {
         return -1;
     }
+    if (safe_strncpy(canonical_root, root, sizeof(canonical_root)) != 0 ||
+        ts_canonicalize_dir_path(canonical_root,
+                                 sizeof(canonical_root)) != 0 ||
+        safe_snprintf(canonical_git_path, sizeof(canonical_git_path),
+                      "%s/.gitconfig", canonical_root) != 0) {
+        return -1;
+    }
 
     publication_record_init(&record);
     record.account_id = account->id;
@@ -388,7 +493,7 @@ static int seed_credentialless_publication(const char *root,
                           PUBLICATION_CAP_POST_GENERATION;
     if (safe_strncpy(record.account_incarnation, account->incarnation,
                      sizeof(record.account_incarnation)) != 0 ||
-        safe_strncpy(record.config_path, git_path,
+        safe_strncpy(record.config_path, canonical_git_path,
                      sizeof(record.config_path)) != 0 ||
         stat(root, &st) != 0) {
         return -1;
@@ -584,6 +689,33 @@ TEST(edit_guard_failure_restores_candidate_before_image) {
     }
     end_edit_guard();
     signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+}
+
+/* A disabled manager has no runtime identity to retire. Renaming a fully
+ * credentialless inactive account must remain a config-only edit even when the
+ * shared runtime namespace is deliberately unusable. */
+TEST(credentialless_rename_skips_runtime_retirement) {
+    char root[256], key_one[512], key_two[512], lock_dir[512];
+    gitswitch_ctx_t ctx;
+    account_t original, changed;
+
+    CHECK_EQ_INT(make_sandbox(root, sizeof(root), key_one, sizeof(key_one),
+                              key_two, sizeof(key_two)), 0);
+    CHECK((size_t)snprintf(lock_dir, sizeof(lock_dir),
+                           "%s/runtime/gitswitch-runtime", root) <
+          sizeof(lock_dir));
+    CHECK_EQ_INT(write_mode(lock_dir, "not a directory\n", 0600), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&original, 1, "one", "one@example.com", NULL, NULL);
+    CHECK_EQ_INT(config_add_account(&ctx, &original), 0);
+    changed = ctx.accounts[0];
+    snprintf(changed.name, sizeof(changed.name), "%s", "renamed");
+
+    CHECK_EQ_INT(accounts_edit_candidate_prepare(&ctx, &changed), 0);
+    CHECK_STR_EQ(ctx.accounts[0].name, "renamed");
+    CHECK_EQ_INT(accounts_edit_commit(&ctx), 0);
+    end_edit_guard();
 }
 
 TEST(duplicate_email_is_ambiguous_for_every_account_selector) {
@@ -1251,7 +1383,12 @@ TEST(health_uses_retained_gpg_home_before_source_recovery) {
 }
 
 TEST_MAIN_BEGIN()
+    if (setup_gpg_command_fixture() != 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot prepare trusted GPG fixture\n");
+        return 1;
+    }
     RUN_TEST(edit_guard_failure_restores_candidate_before_image);
+    RUN_TEST(credentialless_rename_skips_runtime_retirement);
     RUN_TEST(duplicate_email_is_ambiguous_for_every_account_selector);
     RUN_TEST(alias_collisions_are_rejected_on_add_update_and_load);
     RUN_TEST(case_varied_alias_blocks_reconcile_and_shared_remove_is_non_destructive);
@@ -1265,4 +1402,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_signing_only_edit_preserves_the_isolated_home);
     RUN_TEST(health_reports_only_the_local_capabilities_it_proves);
     RUN_TEST(health_uses_retained_gpg_home_before_source_recovery);
-TEST_MAIN_END()
+    if (restore_gpg_command_fixture() != 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot restore PATH after GPG tests\n");
+        return 1;
+    }
+    return ts_test_finish();
+}

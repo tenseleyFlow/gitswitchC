@@ -703,6 +703,12 @@ _gitswitch_filename_retry() {
     retained_prefix=$_gitswitch_decode_retained
     wordbreak_prefix=$_gitswitch_decode_wordbreak
     [[ $quote_context == "\$\"" ]] && return
+    if [[ -n $quote_context ]]; then
+        # The candidate is encoded against the live quote below. Bash 5.2's
+        # filename mode quotes that shell source a second time, producing a
+        # different pathname containing literal backslashes.
+        compopt +o filenames 2>/dev/null || :
+    fi
     while IFS= read -r candidate; do
         if [[ -d $candidate ]] ||
            [[ $candidate == \~/* && -d ${HOME-}${candidate:1} ]]; then
