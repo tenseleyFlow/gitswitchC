@@ -1945,11 +1945,74 @@ cleanup:
     return result;
 }
 
+/* Rebuild the producer environment through libc's supported mutation API.
+ * Assigning NULL to environ happens to be accepted by glibc's setenv(), but
+ * Darwin's setenv() immediately iterates *_NSGetEnviron() and dereferences the
+ * null vector.  Remove each inherited name instead, with the entry count as a
+ * progress bound, so malformed input fails closed rather than looping. */
+static int archive_clear_environment(void)
+{
+    char **environment = archive_process_environ;
+    size_t remaining = 0U;
+
+    if (environment == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (;;) {
+        if (remaining > (size_t)PTRDIFF_MAX / sizeof(*environment)) {
+            errno = EOVERFLOW;
+            return -1;
+        }
+        if (environment[remaining] == NULL) {
+            break;
+        }
+        remaining++;
+    }
+    while ((environment = archive_process_environ) != NULL &&
+           environment[0] != NULL) {
+        const char *entry = environment[0];
+        const char *separator = strchr(entry, '=');
+        char *name;
+        size_t name_length;
+        int saved_errno;
+
+        if (remaining == 0U) {
+            errno = EIO;
+            return -1;
+        }
+        if (separator == NULL || separator == entry) {
+            errno = EINVAL;
+            return -1;
+        }
+        name_length = (size_t)(separator - entry);
+        name = malloc(name_length + 1U);
+        if (name == NULL) {
+            return -1;
+        }
+        memcpy(name, entry, name_length);
+        name[name_length] = '\0';
+        if (unsetenv(name) != 0) {
+            saved_errno = errno;
+            free(name);
+            errno = saved_errno;
+            return -1;
+        }
+        free(name);
+        remaining--;
+    }
+    if (archive_process_environ == NULL) {
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
 static int archive_set_clean_environment(const char *path,
                                          const archive_workspace_t *workspace)
 {
-    archive_process_environ = NULL;
-    if (setenv("PATH", path, 1) != 0 || setenv("LC_ALL", "C", 1) != 0 ||
+    if (archive_clear_environment() != 0 ||
+        setenv("PATH", path, 1) != 0 || setenv("LC_ALL", "C", 1) != 0 ||
         setenv("TZ", "UTC", 1) != 0 ||
         setenv("HOME", workspace->home, 1) != 0 ||
         setenv("XDG_CONFIG_HOME", workspace->xdg, 1) != 0 ||
