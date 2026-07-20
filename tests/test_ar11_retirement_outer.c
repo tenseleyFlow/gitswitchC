@@ -15,6 +15,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <sys/wait.h>
+#include <time.h>
 
 #define M18_INCARNATION \
     "1818181818181818181818181818181818181818181818181818181818181818"
@@ -23,6 +24,25 @@
 
 int gitswitch_cli_main(int argc, char **argv);
 int gitswitch_test_context_allocations(void);
+
+typedef enum {
+    GIT_RETIREMENT_TEST_LOCKED_READ = 1,
+    GIT_RETIREMENT_TEST_BEFORE_REMOVE,
+    GIT_RETIREMENT_TEST_BEFORE_PUBLISH,
+    GIT_RETIREMENT_TEST_BEFORE_EXCHANGE,
+    GIT_RETIREMENT_TEST_BEFORE_DIRECTORY_SYNC,
+    GIT_RETIREMENT_TEST_BEFORE_CLEANUP,
+    GIT_RETIREMENT_TEST_FORCE_EXCHANGE_FALLBACK,
+    GIT_RETIREMENT_TEST_CLEANUP_UNLINK,
+    GIT_RETIREMENT_TEST_AFTER_EXCHANGE,
+    GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
+    GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE
+} git_retirement_test_stage_t;
+typedef bool (*git_retirement_test_hook_fn)(
+    git_retirement_test_stage_t stage, const char *path,
+    const char *key, const char *value);
+git_retirement_test_hook_fn git_ops_test_set_retirement_hook(
+    git_retirement_test_hook_fn fn);
 
 typedef enum {
     M18_COMMAND_REMOVE = 0,
@@ -72,6 +92,8 @@ static config_io_boundary_t m18_fault_boundary;
 static bool m18_fault_observed;
 static size_t m18_faults_remaining;
 static size_t m18_fault_matches_to_skip;
+static size_t m18_witness_ctime_drifts_remaining;
+static int m18_witness_ctime_drift_error;
 
 static bool m18_config_fault(config_io_boundary_t boundary) {
     if (boundary != m18_fault_boundary) return false;
@@ -83,6 +105,80 @@ static bool m18_config_fault(config_io_boundary_t boundary) {
     m18_fault_observed = true;
     if (m18_faults_remaining != SIZE_MAX) m18_faults_remaining--;
     return true;
+}
+
+static bool m18_same_ctime(const struct stat *left,
+                           const struct stat *right) {
+#if defined(__APPLE__)
+    return left->st_ctimespec.tv_sec == right->st_ctimespec.tv_sec &&
+           left->st_ctimespec.tv_nsec == right->st_ctimespec.tv_nsec;
+#else
+    return left->st_ctim.tv_sec == right->st_ctim.tv_sec &&
+           left->st_ctim.tv_nsec == right->st_ctim.tv_nsec;
+#endif
+}
+
+static bool m18_same_without_ctime(const struct stat *left,
+                                   const struct stat *right) {
+    if (left->st_dev != right->st_dev ||
+        left->st_ino != right->st_ino ||
+        left->st_mode != right->st_mode ||
+        left->st_uid != right->st_uid ||
+        left->st_gid != right->st_gid ||
+        left->st_nlink != right->st_nlink ||
+        left->st_size != right->st_size) {
+        return false;
+    }
+#if defined(__APPLE__)
+    return left->st_mtimespec.tv_sec == right->st_mtimespec.tv_sec &&
+           left->st_mtimespec.tv_nsec == right->st_mtimespec.tv_nsec;
+#else
+    return left->st_mtim.tv_sec == right->st_mtim.tv_sec &&
+           left->st_mtim.tv_nsec == right->st_mtim.tv_nsec;
+#endif
+}
+
+static int m18_force_ctime_only_drift(const char *path) {
+    const struct timespec retry = {.tv_sec = 0, .tv_nsec = 1000000L};
+    struct stat before;
+    struct stat after;
+    mode_t original_mode;
+    mode_t transient_mode;
+
+    if (!path || lstat(path, &before) != 0) return -1;
+    original_mode = before.st_mode & 07777;
+    transient_mode = original_mode ^ S_IXUSR;
+    for (size_t attempt = 0U; attempt < 128U; attempt++) {
+        if (chmod(path, transient_mode) != 0 ||
+            chmod(path, original_mode) != 0 ||
+            lstat(path, &after) != 0 ||
+            !m18_same_without_ctime(&before, &after)) {
+            errno = errno ? errno : ESTALE;
+            return -1;
+        }
+        if (!m18_same_ctime(&before, &after)) return 0;
+        (void)nanosleep(&retry, NULL);
+    }
+    errno = ETIMEDOUT;
+    return -1;
+}
+
+static bool m18_retirement_witness_hook(
+    git_retirement_test_stage_t stage, const char *path,
+    const char *key, const char *value) {
+    (void)key;
+    (void)value;
+    if (stage != GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE ||
+        m18_witness_ctime_drifts_remaining == 0U) {
+        return false;
+    }
+    if (m18_force_ctime_only_drift(path) != 0) {
+        m18_witness_ctime_drift_error = errno ? errno : EIO;
+        m18_witness_ctime_drifts_remaining = 0U;
+        return false;
+    }
+    m18_witness_ctime_drifts_remaining--;
+    return false;
 }
 
 static int m18_write_all(int fd, const void *data, size_t length) {
@@ -564,11 +660,24 @@ static int m18_run_cli_after_matches(
         m18_fault_observed = false;
         m18_faults_remaining = fault_limit;
         m18_fault_matches_to_skip = fault_matches_to_skip;
+        m18_witness_ctime_drift_error = 0;
         if (fault_limit != M18_FAULT_NONE) {
             (void)config_set_io_fault_fn(m18_config_fault);
         }
+        if (m18_witness_ctime_drifts_remaining != 0U) {
+            (void)git_ops_test_set_retirement_hook(
+                m18_retirement_witness_hook);
+        }
         optind = 1;
         rc = gitswitch_cli_main(argc, argv);
+        if (m18_witness_ctime_drift_error != 0 ||
+            m18_witness_ctime_drifts_remaining != 0U) {
+            fprintf(stderr,
+                    "[M18 restored-witness drift incomplete: remaining=%zu error=%d]\n",
+                    m18_witness_ctime_drifts_remaining,
+                    m18_witness_ctime_drift_error);
+            _exit(124);
+        }
         if (m18_fault_observed) observed = '1';
         if (write(observed_pipe[1], &observed, 1U) != 1) _exit(121);
         (void)close(observed_pipe[1]);
@@ -610,6 +719,19 @@ static int m18_run_cli(const m18_fixture_t *fixture,
                        bool *fault_observed) {
     return m18_run_cli_after_matches(
         fixture, command, fault_limit, boundary, 0U, fault_observed);
+}
+
+static int m18_run_cli_with_witness_ctime_drifts(
+    const m18_fixture_t *fixture, m18_command_t command,
+    size_t fault_limit, config_io_boundary_t boundary,
+    size_t witness_ctime_drifts, bool *fault_observed) {
+    int status;
+
+    m18_witness_ctime_drifts_remaining = witness_ctime_drifts;
+    status = m18_run_cli(fixture, command, fault_limit, boundary,
+                         fault_observed);
+    m18_witness_ctime_drifts_remaining = 0U;
+    return status;
 }
 
 typedef enum {
@@ -1205,6 +1327,46 @@ TEST(remove_backup_verification_fault_restores_exact_outer_state) {
         1U, true);
 }
 
+TEST(restored_witness_retries_multiple_delayed_ctime_steps) {
+    m18_fixture_t fixture;
+    m18_bytes_t accounts_before = {0};
+    m18_bytes_t git_before = {0};
+    m18_bytes_t output = {0};
+    bool observed = false;
+    int status;
+
+    CHECK_EQ_INT(m18_fixture_setup(&fixture), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.accounts_path,
+                                &accounts_before), 0);
+    CHECK_EQ_INT(m18_read_bytes(fixture.git_path, &git_before), 0);
+
+    /* Model several UFS ctime materializations after the restored descriptor
+     * closes. Every retry must re-prove the retained bytes, converge on the
+     * final named generation, refresh the ledger, and clear the guard. */
+    status = m18_run_cli_with_witness_ctime_drifts(
+        &fixture, M18_COMMAND_REMOVE, M18_FAULT_ONCE,
+        CONFIG_IO_STATE_AFTER_TEMP, 3U, &observed);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+    CHECK(observed);
+    CHECK(m18_file_equals(fixture.accounts_path, &accounts_before));
+    CHECK(m18_file_equals(fixture.git_path, &git_before));
+    CHECK(m18_git_has_command(&fixture));
+    CHECK(m18_state_has_active_work_header(&fixture));
+    CHECK(m18_ledger_matches_live_restored_git(&fixture));
+    CHECK(m18_guard_is_unblocked_and_bounded(&fixture));
+    CHECK_EQ_INT(m18_read_bytes(fixture.output_path, &output), 0);
+    CHECK(m18_output_contains(
+        &output, "active-state temp creation"));
+    CHECK(!m18_output_contains(
+        &output, "destination changed after abort"));
+
+    m18_bytes_clear(&accounts_before);
+    m18_bytes_clear(&git_before);
+    m18_bytes_clear(&output);
+    m18_fixture_cleanup(&fixture);
+}
+
 TEST(reset_state_boundary_matrix_preserves_outer_coherence) {
     static const config_io_boundary_t clean_boundaries[] = {
         CONFIG_IO_STATE_AFTER_TEMP,
@@ -1334,6 +1496,7 @@ TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(remove_save_boundary_matrix_preserves_outer_coherence);
     RUN_TEST(remove_backup_verification_fault_restores_exact_outer_state);
+    RUN_TEST(restored_witness_retries_multiple_delayed_ctime_steps);
     RUN_TEST(reset_state_boundary_matrix_preserves_outer_coherence);
     RUN_TEST(reset_persistent_preinstall_fault_retains_guard_and_blocks_switch);
     RUN_TEST(reset_all_clean_rollback_refreshes_shared_and_no_op_destinations);

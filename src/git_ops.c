@@ -121,6 +121,11 @@ static const char *const g_gpg_program_keys[] = {
  * driving unbounded allocation in this single-purpose CLI. */
 #define GIT_INSPECTION_INITIAL_BYTES (16U * 1024U)
 #define GIT_INSPECTION_MAX_BYTES (8U * 1024U * 1024U)
+/* A restored inode can expose more than one delayed ctime step while FreeBSD
+ * UFS closes funlinkat/link/rename witnesses. Every retry below re-proves the
+ * complete retained bytes and immutable inode fields; this bound prevents an
+ * uncooperative metadata writer from turning reconciliation into a spin. */
+#define GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS 8U
 static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]);
 
 typedef struct {
@@ -226,7 +231,8 @@ typedef enum {
     GIT_RETIREMENT_TEST_FORCE_EXCHANGE_FALLBACK,
     GIT_RETIREMENT_TEST_CLEANUP_UNLINK,
     GIT_RETIREMENT_TEST_AFTER_EXCHANGE,
-    GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH
+    GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
+    GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE
 } git_retirement_test_stage_t;
 typedef bool (*git_retirement_test_hook_fn)(
     git_retirement_test_stage_t stage, const char *path,
@@ -3961,7 +3967,11 @@ static int git_scope_lock_publish(git_scope_lock_t *lock,
         bool forced_mismatch =
             g_metadata_test_hook &&
             g_metadata_test_hook(GIT_METADATA_TEST_STAGE_REVALIDATE);
-        errno = 0;
+        /* The nested verifier assigns EAGAIN only to ctime-only churn. Seed
+         * every otherwise-unclassified witness mismatch as a hard stale
+         * generation so an external replacement can never enter this retry
+         * path merely because a comparison returned false. */
+        errno = ESTALE;
         if (forced_mismatch || !S_ISREG(opened_stage.st_mode) ||
             opened_stage.st_dev != named_stage.st_dev ||
             opened_stage.st_ino != named_stage.st_ino ||
@@ -7667,34 +7677,65 @@ size_t git_retirement_transaction_restored_destination_count(
  * close that descriptor, and require the named observation to stabilize. The
  * ctime-only retry is authorized solely by the complete byte proof. */
 static bool git_file_at_matches_witness_after_close(
-    int parent_fd, const char *leaf, const struct stat *baseline,
-    const unsigned char *data, size_t length, struct stat *current) {
-    for (int attempt = 0; attempt < 2; attempt++) {
+    int parent_fd, const char *path, const char *leaf,
+    const struct stat *baseline, const unsigned char *data, size_t length,
+    struct stat *current) {
+    for (unsigned attempt = 0U;
+         attempt < GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS;
+         attempt++) {
         struct stat opened;
         struct stat named_after;
         int fd = openat(parent_fd, leaf,
                         O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
 
-        if (fd < 0 || fsync(fd) != 0 ||
-            !git_file_at_matches_witness(
+        if (fd < 0) return false;
+        if (fsync(fd) != 0) {
+            int saved_errno = errno ? errno : EIO;
+
+            (void)close(fd);
+            errno = saved_errno;
+            return false;
+        }
+        errno = 0;
+        if (!git_file_at_matches_witness(
                 parent_fd, leaf, fd, baseline, data, length, &opened)) {
             int saved_errno = errno ? errno : EAGAIN;
 
-            if (fd >= 0) (void)close(fd);
+            if (close(fd) != 0) return false;
+            if (saved_errno == EAGAIN &&
+                attempt + 1U <
+                    GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS) {
+                continue;
+            }
             errno = saved_errno;
             return false;
         }
         if (close(fd) != 0) return false;
-        if (fstatat(parent_fd, leaf, &named_after,
-                    AT_SYMLINK_NOFOLLOW) != 0 ||
-            !git_same_pinned_file_generation(baseline, &named_after)) {
+        /* FreeBSD may not expose the last funlinkat/link/rename ctime until
+         * the retained descriptor closes. Sync the containing namespace only
+         * after that close, then require a stable named observation. */
+        if (g_retirement_test_hook &&
+            g_retirement_test_hook(
+                GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE,
+                path, NULL, NULL)) {
+            errno = EIO;
+            return false;
+        }
+        if (fsync(parent_fd) != 0 ||
+            fstatat(parent_fd, leaf, &named_after,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            return false;
+        }
+        if (!git_same_pinned_file_generation(baseline, &named_after)) {
+            errno = EAGAIN;
             return false;
         }
         if (git_same_file_observation(&opened, &named_after)) {
             if (current) *current = named_after;
             return true;
         }
-        if (attempt != 0 ||
+        if (attempt + 1U >=
+                GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS ||
             !git_metadata_ctime_only_change(&opened, &named_after)) {
             errno = EAGAIN;
             return false;
@@ -7717,7 +7758,7 @@ static int git_retirement_group_finalize_restored_witness(
     }
     if (group->restored_witness_ready) {
         if (!git_file_at_matches_witness_after_close(
-                group->lock.dir_fd, group->lock.leaf,
+                group->lock.dir_fd, group->lock.path, group->lock.leaf,
                 &group->lock.original_stat, group->lock.original_data,
                 group->lock.original_length, &refreshed)) {
             errno = errno ? errno : EAGAIN;
@@ -7788,7 +7829,7 @@ static int git_retirement_group_finalize_restored_witness(
         !git_same_object_identity(
             &group->lock.parent_stat, &reopened_parent) ||
         !git_file_at_matches_witness_after_close(
-            group->lock.dir_fd, group->lock.leaf,
+            group->lock.dir_fd, group->lock.path, group->lock.leaf,
             &group->lock.original_stat, group->lock.original_data,
             group->lock.original_length, &refreshed)) {
         errno = errno ? errno : EAGAIN;
@@ -7864,7 +7905,8 @@ int git_retirement_transaction_commit(
             struct stat refreshed;
 
             if (!git_file_at_matches_witness_after_close(
-                    group->lock.dir_fd, group->lock.leaf,
+                    group->lock.dir_fd, group->lock.path,
+                    group->lock.leaf,
                     &group->lock.original_stat,
                     group->lock.original_data,
                     group->lock.original_length, &refreshed) ||
