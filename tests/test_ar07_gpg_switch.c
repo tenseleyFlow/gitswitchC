@@ -11,6 +11,7 @@
 #include "gitswitch.h"
 #include "gpg_manager.h"
 #include "utils.h"
+#include "trusted_command_fixture.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -2747,7 +2748,18 @@ TEST(legacy_agent_environment_is_suppressed_and_restored) {
 }
 
 TEST_MAIN_BEGIN()
+    static const char *const trusted_commands[] = {
+        "gpg", "gpgconf", NULL
+    };
+    ts_trusted_command_fixture_t command_fixture = {0};
+
     error_init(LOG_LEVEL_ERROR, NULL);
+    if (ts_trusted_command_fixture_install(
+            &command_fixture, "gsw-ar11-gpg-switch", trusted_commands) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot install trusted GPG command fixtures\n");
+        return 1;
+    }
     RUN_TEST(strict_capability_parser_rejects_unusable_keys);
     RUN_TEST(selector_inventory_is_exact_and_canonical);
     RUN_TEST(secret_listing_result_matrix_is_causal_and_exact);
@@ -2777,4 +2789,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(environment_failures_are_fatal_and_retryable);
     RUN_TEST(legacy_agent_environment_failures_are_fatal_and_retryable);
     RUN_TEST(legacy_agent_environment_is_suppressed_and_restored);
+    if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot restore PATH after GPG switch tests\n");
+        return 1;
+    }
 TEST_MAIN_END()

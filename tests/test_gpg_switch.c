@@ -23,6 +23,7 @@
 #include "utils.h"
 #include "error.h"
 #include "signals.h"
+#include "trusted_command_fixture.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -1323,7 +1324,19 @@ TEST(truncated_idempotency_probe_is_not_signing_evidence) {
 }
 
 TEST_MAIN_BEGIN()
+    static const char *const trusted_commands[] = {
+        "gpg", "gpgconf", NULL
+    };
+    ts_trusted_command_fixture_t command_fixture = {0};
+
     error_init(LOG_LEVEL_ERROR, NULL);
+    if (ts_trusted_command_fixture_install(
+            &command_fixture, "gsw-ar11-gpg-switch-core",
+            trusted_commands) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot install trusted GPG command fixtures\n");
+        return 1;
+    }
     RUN_TEST(repeat_isolated_switch_spawns_gpg_once);
     RUN_TEST(isolated_switch_fails_when_current_cannot_be_retargeted);
     RUN_TEST(truncated_secret_key_export_is_never_imported);
@@ -1340,4 +1353,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_current_snapshot_and_conditional_restore_are_compare_and_swap);
     RUN_TEST(gpg_current_snapshot_blocks_on_base_lock);
     RUN_TEST(truncated_idempotency_probe_is_not_signing_evidence);
+    if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot restore PATH after GPG switch tests\n");
+        return 1;
+    }
 TEST_MAIN_END()

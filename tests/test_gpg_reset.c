@@ -24,6 +24,7 @@
 #include "gpg_manager.h"
 #include "utils.h"
 #include "error.h"
+#include "trusted_command_fixture.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -1082,7 +1083,16 @@ TEST(create_isolated_home_refuses_persistent_xdg_base) {
 }
 
 TEST_MAIN_BEGIN()
+    static const char *const trusted_commands[] = {"gpgconf", NULL};
+    ts_trusted_command_fixture_t command_fixture = {0};
+
     error_init(LOG_LEVEL_ERROR, NULL);
+    if (ts_trusted_command_fixture_install(
+            &command_fixture, "gsw-ar11-gpg-reset", trusted_commands) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot install trusted gpgconf fixture\n");
+        return 1;
+    }
     RUN_TEST(gpg_manager_reset_rejects_empty_selector_without_mutation);
     RUN_TEST(gpg_manager_reset_rejects_traversal);
     RUN_TEST(gpg_manager_reset_refuses_symlinked_base);
@@ -1103,4 +1113,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_reset_sync_failure_is_retryable);
     RUN_TEST(targeted_reset_restores_current_replaced_after_capture);
     RUN_TEST(create_isolated_home_refuses_persistent_xdg_base);
+    if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot restore PATH after GPG reset tests\n");
+        return 1;
+    }
 TEST_MAIN_END()
