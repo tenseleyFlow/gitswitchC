@@ -311,6 +311,11 @@ static int prepare_home(const char *home, const char *config_body) {
     snprintf(path, sizeof(path), "%s/.gnupg", home);
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
+    /* Each seed is a new pre-command generation. Reusing the inode through
+     * fopen("w") leaves FreeBSD UFS free to materialize the preceding ctime
+     * update after the child has loaded it, which correctly trips the
+     * production stale-generation guard. */
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
     if (write_text(path, config_body, 0600) != 0) return -1;
 
     /* Historical active-only files predate the consolidated artifact. Remove

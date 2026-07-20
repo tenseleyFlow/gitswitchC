@@ -68,7 +68,8 @@ static int make_private_dir(char *path, size_t size, const char *stem) {
     if ((size_t)snprintf(path, size, "/tmp/%s.XXXXXX", stem) >= size) {
         return -1;
     }
-    return ts_mkdtemp(path) ? 0 : -1;
+    if (!ts_mkdtemp(path)) return -1;
+    return ts_canonicalize_dir_path(path, size);
 }
 
 static int write_text_mode(const char *path, const char *text, mode_t mode) {

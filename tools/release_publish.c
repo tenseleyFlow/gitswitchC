@@ -2887,6 +2887,18 @@ static int run_fork_transition_test_hook(pid_t child,
 #endif
 
 #if defined(GITSWITCH_RELEASE_TEST_REAP_TRANSITION)
+/* This reporter is also called from the fatal-signal handler. Keep it to one
+ * async-signal-safe best-effort write: a failed report already makes the
+ * named fixture fail, while consuming the result keeps fortified WERROR
+ * builds honest. */
+static void report_reap_transition(char report)
+{
+    ssize_t write_result =
+        write(test_reap_transition_report_fd, &report, sizeof(report));
+
+    (void)write_result;
+}
+
 /* Named-helper-only one-shot checkpoint. The independent oracle ensures a
  * missing production-set member is reported as 'U' rather than hidden by a
  * collusive test mask. The selected signal is raised only after waitpid has
@@ -2917,13 +2929,12 @@ static void run_reap_transition_test_hook(void)
             }
         }
     }
-    (void)write(test_reap_transition_report_fd, &proof, sizeof(proof));
+    report_reap_transition(proof);
     test_reap_transition_active = 1;
     if (raise(test_reap_transition_signal) != 0) {
         static const char raise_failure = 'R';
 
-        (void)write(test_reap_transition_report_fd, &raise_failure,
-                    sizeof(raise_failure));
+        report_reap_transition(raise_failure);
     }
 }
 #endif
@@ -3181,8 +3192,7 @@ static void forward_fatal_signal(int signal_number)
         if (test_reap_transition_active != 0) {
             static const char stale_ownership = 'S';
 
-            (void)write(test_reap_transition_report_fd, &stale_ownership,
-                        sizeof(stale_ownership));
+            report_reap_transition(stale_ownership);
             /* Never let the deliberate test mutant signal a numeric identity
              * after waitpid has made it reusable. */
             _exit(90);
