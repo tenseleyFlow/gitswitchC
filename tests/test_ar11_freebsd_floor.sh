@@ -17,6 +17,10 @@ root=$(CDPATH='' cd -- "$1" && pwd -P) || fail "cannot enter repository root"
 contract=$root/src/freebsd_compat.h
 workflow=$root/.github/workflows/ci.yml
 cc_command=${FREEBSD_CONTRACT_CC:-cc}
+freebsd_cppflag=-D__FreeBSD__
+case $(uname -s) in
+    FreeBSD) freebsd_cppflag= ;;
+esac
 
 [ -f "$contract" ] || fail "missing FreeBSD compatibility contract"
 [ -f "$workflow" ] || fail "missing hosted CI workflow"
@@ -99,7 +103,7 @@ compile_source()
     # FREEBSD_CONTRACT_CC deliberately follows Make's compiler selection.
     # Word splitting permits the same launcher-plus-compiler form as CC.
     # shellcheck disable=SC2086
-    $cc_command -std=c11 -Wall -Wextra -Werror -D__FreeBSD__ \
+    $cc_command -std=c11 -Wall -Wextra -Werror $freebsd_cppflag \
         -I"$headers" -I"$root/src" "$source" -o "$output" \
         >"$log.stdout" 2>"$log.stderr"
 }

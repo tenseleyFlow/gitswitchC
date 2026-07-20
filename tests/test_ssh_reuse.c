@@ -72,6 +72,18 @@ static const char *runner_generation_fingerprint(
     } else if (opts && opts->use_stdin_fd && opts->stdin_fd >= 0) {
         ssize_t n = pread(opts->stdin_fd, data, sizeof(data) - 1, 0);
         if (n > 0) length = (size_t)n;
+    } else if (opts && opts->use_cwd_fd && opts->cwd_fd >= 0 && argv &&
+               argv[2]) {
+        int fd = openat(opts->cwd_fd, argv[2],
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd >= 0) {
+            ssize_t n;
+            do {
+                n = read(fd, data, sizeof(data) - 1);
+            } while (n < 0 && errno == EINTR);
+            if (n > 0) length = (size_t)n;
+            close(fd);
+        }
     } else if (argv && argv[2]) {
         FILE *stream = fopen(argv[2], "r");
         if (stream) {

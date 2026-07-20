@@ -302,9 +302,11 @@ static bool error_is_would_block(int error_number) {
     return false;
 }
 
-/* Drain a closed PTY peer without assuming whether the host reports the end
- * as EOF (macOS/FreeBSD) or EIO (Linux). The output under test is tiny; the
- * explicit bound also turns an accidental output loop into a test failure. */
+/* Drain a PTY after the synchronous emitter has flushed. FreeBSD can discard
+ * unread output when the last slave descriptor closes, so the caller keeps
+ * that peer open and a quiet nonblocking read ends the capture. Closed peers
+ * may still report EOF (macOS/FreeBSD) or EIO (Linux). The explicit bound also
+ * turns an accidental output loop into a test failure. */
 static int read_pty_capture(int master, char **text_out, size_t *length_out) {
     enum { CAPTURE_LIMIT = 4096, POLL_TIMEOUT_MS = 250 };
     struct pollfd descriptor;
@@ -343,11 +345,14 @@ static int read_pty_capture(int master, char **text_out, size_t *length_out) {
         if (count < 0 && error_is_would_block(errno)) {
             int ready;
 
+            if (length != 0U) break;
+
             descriptor.revents = 0;
             do {
                 ready = poll(&descriptor, 1, POLL_TIMEOUT_MS);
             } while (ready < 0 && errno == EINTR);
             if (ready > 0) continue;
+            if (ready == 0) break;
         }
         free(text);
         return -1;
@@ -423,8 +428,6 @@ static int capture_mixed_color_output(bool stdout_is_tty,
     stdout_redirected = false;
     if (dup2(saved_stderr, STDERR_FILENO) != STDERR_FILENO) goto cleanup;
     stderr_redirected = false;
-    close(slave);
-    slave = -1;
 
     if (read_capture(file_capture, &file_text, &file_length) != 0 ||
         read_pty_capture(master, &pty_text, &pty_length) != 0) {

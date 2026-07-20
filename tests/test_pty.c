@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -45,6 +46,7 @@
  * debug build runs under ASan/UBSan on possibly loaded CI machines. */
 #define EXPECT_TIMEOUT_MS 10000
 #define EXIT_TIMEOUT_MS   15000
+#define PTY_STARTUP_PROMPT "GITSWITCH-PTY-READY> "
 
 /* Absolute path to the binary under test (the child chdirs into the sandbox). */
 static char g_bin[4096];
@@ -187,6 +189,24 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* Opening a PTY slave after setsid() implicitly acquires it as the controlling
+ * terminal on Linux, but that side effect is not portable to FreeBSD.  Open
+ * without implicit acquisition, then request the controlling terminal
+ * explicitly so interactive shells have a valid foreground process group on
+ * every supported host. */
+static int open_controlling_pty_slave(const char *slave_name) {
+    int slave_fd;
+
+    if (setsid() < 0) return -1;
+    slave_fd = open(slave_name, O_RDWR | O_NOCTTY);
+    if (slave_fd < 0) return -1;
+    if (ioctl(slave_fd, TIOCSCTTY, 0) != 0) {
+        close(slave_fd);
+        return -1;
+    }
+    return slave_fd;
+}
+
 /* Pull whatever the child has written, waiting at most timeout_ms for the
  * first byte. Returns 1 if data arrived, 0 on timeout, -1 on EOF. Always
  * consumes (the child must never block on a full PTY buffer); if the capture
@@ -242,12 +262,14 @@ static int pty_spawn_exec(pty_proc_t *p, const char *executable,
     }
     if (p->pid == 0) {
         int sfd;
-        setsid();
-        sfd = open(slave_name, O_RDWR); /* becomes the controlling TTY */
+
+        sfd = open_controlling_pty_slave(slave_name);
         if (sfd < 0) _exit(126);
-        dup2(sfd, STDIN_FILENO);
-        dup2(sfd, STDOUT_FILENO);
-        dup2(sfd, STDERR_FILENO);
+        if (dup2(sfd, STDIN_FILENO) < 0 ||
+            dup2(sfd, STDOUT_FILENO) < 0 ||
+            dup2(sfd, STDERR_FILENO) < 0) {
+            _exit(126);
+        }
         if (sfd > STDERR_FILENO) close(sfd);
         close(p->master);
 
@@ -256,6 +278,7 @@ static int pty_spawn_exec(pty_proc_t *p, const char *executable,
         /* T6 pins helper resolution to trusted absolute PATH dirs. */
         setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
         setenv("TERM", "dumb", 1); /* keep readline's escape output minimal */
+        setenv("PS1", PTY_STARTUP_PROMPT, 1);
         /* No ambient state may leak into the sandboxed run. */
         unsetenv("XDG_CONFIG_HOME");
         unsetenv("GNUPGHOME");
@@ -507,8 +530,7 @@ static int run_readline_case(readline_case_t test_case,
         int slave_fd;
 
         close(result_pipe[0]);
-        if (setsid() < 0) _exit(2);
-        slave_fd = open(slave_name, O_RDWR);
+        slave_fd = open_controlling_pty_slave(slave_name);
         if (slave_fd < 0 || dup2(slave_fd, STDIN_FILENO) < 0 ||
             dup2(slave_fd, STDOUT_FILENO) < 0 ||
             dup2(slave_fd, STDERR_FILENO) < 0) {
@@ -588,11 +610,17 @@ static int sandbox_publish_account(sandbox_t *sb, const char *account) {
         "gitswitch", "--global", "--yes", account, NULL
     };
     pty_proc_t publish_proc;
+    int exit_code;
 
     if (pty_spawn(&publish_proc, switch_argv, sb) != 0) {
         return -1;
     }
-    if (pty_wait_exit(&publish_proc) != 0) {
+    exit_code = pty_wait_exit(&publish_proc);
+    if (exit_code != 0) {
+        fprintf(stderr,
+                "  failed to publish account '%s' (exit %d); output:\n"
+                "  ----\n%s\n  ----\n",
+                account, exit_code, publish_proc.out);
         pty_close(&publish_proc);
         return -1;
     }
@@ -1525,7 +1553,8 @@ TEST(bash_tab_completion_preserves_active_quote_argv) {
         CHECK(!"interactive Bash spawn failed");
         goto cleanup;
     }
-    if (pty_send(&bash_proc, fallback_setup) != 0 ||
+    if (pty_expect(&bash_proc, PTY_STARTUP_PROMPT) != 0 ||
+        pty_send(&bash_proc, fallback_setup) != 0 ||
         pty_expect(&bash_proc, "M35-READY") != 0 ||
         pty_expect(&bash_proc, "M35-PROMPT> ") != 0) {
         CHECK(!"interactive Bash setup failed");
@@ -1649,7 +1678,8 @@ TEST(bash_tab_completion_preserves_active_quote_argv) {
             CHECK(!"bash-completion PTY spawn failed");
             goto cleanup;
         }
-        if (pty_send(&bash_proc, installed_setup) != 0 ||
+        if (pty_expect(&bash_proc, PTY_STARTUP_PROMPT) != 0 ||
+            pty_send(&bash_proc, installed_setup) != 0 ||
             pty_expect(&bash_proc, "M35-BC-READY") != 0 ||
             pty_expect(&bash_proc, "M35-PROMPT> ") != 0) {
             CHECK(!"installed bash-completion setup failed");

@@ -44,6 +44,18 @@ static saved_env_t save_env(const char *name) {
     return saved;
 }
 
+static char trusted_gpg_dir[MAX_PATH_LEN];
+static char *saved_gpg_path;
+static bool saved_gpg_path_present;
+static bool trusted_gpg_active;
+
+static void remove_trusted_gpg_fixture(void) {
+    if (trusted_gpg_dir[0] != '\0') {
+        ts_rm_rf(trusted_gpg_dir);
+        trusted_gpg_dir[0] = '\0';
+    }
+}
+
 static void restore_env(const char *name, saved_env_t *saved) {
     if (saved->present && saved->value) {
         (void)setenv(name, saved->value, 1);
@@ -93,6 +105,119 @@ static int run_command(const char *const argv[], char *output,
     }
     opts.stderr_to_devnull = true;
     return run_argv(argv, &opts, result);
+}
+
+static int restore_trusted_gpg(void) {
+    int rc;
+
+    if (!trusted_gpg_active) return 0;
+    rc = saved_gpg_path_present ? setenv("PATH", saved_gpg_path, 1)
+                                : unsetenv("PATH");
+    free(saved_gpg_path);
+    saved_gpg_path = NULL;
+    saved_gpg_path_present = false;
+    trusted_gpg_active = false;
+    remove_trusted_gpg_fixture();
+    return rc;
+}
+
+/* The production resolver intentionally rejects Homebrew's group-writable
+ * prefix. These cases exercise status attribution rather than path trust, so
+ * run the already-provisioned GnuPG binary from a private trusted fixture.
+ * This preserves the real process and only changes its executable pathname. */
+static int activate_trusted_gpg_copy(const char *source_path) {
+    char destination[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    const char *path = getenv("PATH");
+    char *saved_path = NULL;
+    char *fixture_path = NULL;
+    size_t dir_len;
+    size_t path_len = path ? strlen(path) : 0;
+    size_t fixture_len;
+    const char *version_argv[] = { source_path, "--version", NULL };
+    run_result_t version_result;
+
+    if (!source_path || !*source_path || trusted_gpg_active) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&version_result, 0, sizeof(version_result));
+    if (run_command(version_argv, NULL, 0, &version_result) != 0) return 0;
+    if (path) {
+        saved_path = strdup(path);
+        if (!saved_path) return -1;
+    }
+    if (!ts_mkdtemp_trusted(trusted_gpg_dir, sizeof(trusted_gpg_dir),
+                            "gsw-ar11-gpg-bin") ||
+        safe_snprintf(destination, sizeof(destination), "%s/gpg",
+                      trusted_gpg_dir) != 0 ||
+        copy_file(source_path, destination) != 0 ||
+        chmod(destination, 0700) != 0) {
+        free(saved_path);
+        remove_trusted_gpg_fixture();
+        return -1;
+    }
+
+    dir_len = strlen(trusted_gpg_dir);
+    if (path_len > SIZE_MAX - dir_len - 2U) {
+        free(saved_path);
+        remove_trusted_gpg_fixture();
+        errno = EOVERFLOW;
+        return -1;
+    }
+    fixture_len = dir_len + (path_len > 0 ? path_len + 1U : 0U) + 1U;
+    fixture_path = malloc(fixture_len);
+    if (!fixture_path) {
+        free(saved_path);
+        remove_trusted_gpg_fixture();
+        return -1;
+    }
+    memcpy(fixture_path, trusted_gpg_dir, dir_len);
+    if (path_len > 0) {
+        fixture_path[dir_len] = ':';
+        memcpy(fixture_path + dir_len + 1U, path, path_len + 1U);
+    } else {
+        fixture_path[dir_len] = '\0';
+    }
+
+    if (setenv("PATH", fixture_path, 1) != 0) {
+        free(fixture_path);
+        free(saved_path);
+        remove_trusted_gpg_fixture();
+        return -1;
+    }
+    free(fixture_path);
+    saved_gpg_path = saved_path;
+    saved_gpg_path_present = path != NULL;
+    trusted_gpg_active = true;
+    if (gpg_manager_resolve_executable(resolved, sizeof(resolved)) != 0 ||
+        strcmp(resolved, destination) != 0) {
+        int saved_errno = errno;
+
+        (void)restore_trusted_gpg();
+        errno = saved_errno ? saved_errno : ENOEXEC;
+        return -1;
+    }
+    return 1;
+}
+
+static int prepare_real_gpg(void) {
+    static const char *const homebrew_candidates[] = {
+        "/opt/homebrew/bin/gpg",
+        "/usr/local/bin/gpg",
+        NULL
+    };
+    char resolved[MAX_PATH_LEN];
+
+    if (gpg_manager_resolve_executable(resolved, sizeof(resolved)) == 0) {
+        return 1;
+    }
+    for (size_t i = 0; homebrew_candidates[i]; i++) {
+        int rc = activate_trusted_gpg_copy(homebrew_candidates[i]);
+
+        if (rc != 0) return rc;
+    }
+    return 0;
 }
 
 static int fake_finish(run_result_t *result, int exit_code) {
@@ -2724,6 +2849,11 @@ cleanup:
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
+    int gpg_rc = prepare_real_gpg();
+    if (gpg_rc < 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot prepare trusted real GPG\n");
+        return 1;
+    }
     RUN_TEST(oversized_unrelated_config_is_captured_without_losing_identity);
     RUN_TEST(malformed_effective_listing_is_an_error_not_absence);
     RUN_TEST(status_escapes_and_bounds_every_external_value);
@@ -2754,4 +2884,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(git_boolean_grammar_matches_gits_canonical_oracle);
     RUN_TEST(persisted_absolute_ssh_ignores_later_writable_path_shadow);
     RUN_TEST(persisted_absolute_openpgp_ignores_later_writable_path_shadow);
+    if (restore_trusted_gpg() != 0) {
+        fprintf(stderr, "HARNESS FAIL: cannot restore PATH after GPG tests\n");
+        return 1;
+    }
 TEST_MAIN_END()

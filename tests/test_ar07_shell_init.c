@@ -1422,9 +1422,11 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
     CHECK_EQ_INT(write_text(git_config, git_config_body, 0600), 0);
     read_text(git_config, before, sizeof(before));
 
+    /* Match the production fallback PATH: FreeBSD packages Git and OpenSSH
+     * helpers under /usr/local/bin, while Linux/macOS commonly use /usr/bin. */
     snprintf(command, sizeof(command),
              "env -u SSH_AUTH_SOCK -u GNUPGHOME HOME='%s' "
-             "XDG_RUNTIME_DIR='%s' PATH='/usr/bin:/bin' "
+             "XDG_RUNTIME_DIR='%s' PATH='/usr/local/bin:/usr/bin:/bin' "
              "GIT_CONFIG_NOSYSTEM=1 '%s' -C resume >/dev/null 2>&1",
              home, runtime, g_bin);
     CHECK_EQ_INT(run_shell(command), 0);
@@ -1432,7 +1434,8 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
     CHECK_STR_EQ(after, before);
 
     snprintf(command, sizeof(command),
-             "env HOME='%s' XDG_RUNTIME_DIR='%s' PATH='/usr/bin:/bin' "
+             "env HOME='%s' XDG_RUNTIME_DIR='%s' "
+             "PATH='/usr/local/bin:/usr/bin:/bin' "
              "GIT_CONFIG_NOSYSTEM=1 '%s' -C -y reset >/dev/null 2>&1",
              home, runtime, g_bin);
     CHECK_EQ_INT(run_shell(command), 0);
