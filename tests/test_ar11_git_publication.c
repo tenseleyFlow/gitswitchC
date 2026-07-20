@@ -13,6 +13,7 @@
 #include "gpg_manager.h"
 #include "publication.h"
 #include "utils.h"
+#include "trusted_command_fixture.h"
 
 #include <stdint.h>
 
@@ -822,10 +823,25 @@ cleanup:
 }
 
 TEST_MAIN_BEGIN()
+    static const char *const trusted_commands[] = {"gpg", NULL};
+    ts_trusted_command_fixture_t command_fixture = {0};
+
     error_init(LOG_LEVEL_WARNING, NULL);
+    if (ts_trusted_command_fixture_install(
+            &command_fixture, "gsw-ar11-git-publication",
+            trusted_commands) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot install trusted GPG fixture\n");
+        return 1;
+    }
     RUN_TEST(bound_publication_rejects_other_accounts_and_raw_managed_writes);
     RUN_TEST(bound_publication_rejects_standalone_tracked_override_writers);
     RUN_TEST(default_runner_exports_exact_sealed_global_publication);
     RUN_TEST(default_runner_exports_exact_sealed_local_publication);
+    if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot restore PATH after Git publication tests\n");
+        return 1;
+    }
     error_cleanup();
 TEST_MAIN_END()
