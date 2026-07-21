@@ -890,11 +890,19 @@ static ssh_process_outcome_t pid_is_our_ssh_agent(
     while (offset < process_args_len && process_args[offset] == '\0') {
         offset++;
     }
-    matched = offset < process_args_len &&
-              counted_argv_is_our_ssh_agent(process_args + offset,
-                                             process_args_len - offset,
-                                             argc, expected_sock,
-                                             runtime_dir_fd);
+    /* AR-12 H5: never collapse ssh_process_outcome_t through a boolean
+     * expression — `&&` would map INDETERMINATE (3) to UNRELATED (1) and an
+     * exhausted argv region to OWNED (0), both inverting the fail-closed
+     * contract in ssh_manager.h. A truncated argument area is an
+     * indeterminate inspection, and the enum must flow through intact. */
+    if (offset >= process_args_len) {
+        free(process_args);
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    matched = counted_argv_is_our_ssh_agent(process_args + offset,
+                                            process_args_len - offset,
+                                            argc, expected_sock,
+                                            runtime_dir_fd);
     free(process_args);
     return matched;
 #elif defined(__FreeBSD__)
