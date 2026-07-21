@@ -439,7 +439,11 @@ TEST(failed_reload_preserves_complete_context) {
         "[settings]\ndefault_scope = \"local\"\n"
         "[accounts.1]\nname = \"alice\"\nemail = \"a@b.com\"\n";
     static const char malformed_state[] = "garbage\n";
-    static const char mismatched_state[] = "ssh\nactive=alice\n";
+    /* AR-12 M3 note: a stale-but-well-formed needs token now degrades to
+     * inactive instead of failing the load, so the late active-state
+     * validation boundary is exercised with an unsafe active name, which
+     * remains a hard failure. */
+    static const char mismatched_state[] = "none\nactive=bad/name\n";
     char dir[128], path[256], hint[256];
     gitswitch_ctx_t ctx;
     gitswitch_ctx_t *before;

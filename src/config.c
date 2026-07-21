@@ -1275,11 +1275,18 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
                    !active_state.legacy_needs_only &&
                    strcmp(active_state.needs,
                           config_account_runtime_needs(state_account)) != 0) {
-            set_error(ERR_CONFIG_INVALID,
-                      "Active-state runtime needs '%s' do not match account '%s' (expected '%s')",
-                      active_state.needs, ctx->config.active_account,
-                      config_account_runtime_needs(state_account));
-            return -1;
+            /* AR-12 M3: a stale needs token is repairable staleness, not
+             * corruption. Two supported producers exist: a hand edit that
+             * changed the active account's ssh/gpg features, and gitswitch's
+             * own crash window between state install and document rename.
+             * Hard-failing here bricked every command including the repair
+             * paths; degrade to inactive like the branches above and let the
+             * next serialized save rewrite the artifact. */
+            display_warning(
+                "Active-state runtime needs '%s' do not match account '%s' (expected '%s'); treating the session as inactive until the next switch",
+                active_state.needs, ctx->config.active_account,
+                config_account_runtime_needs(state_account));
+            ctx->config.active_account[0] = '\0';
         } else if (safe_strncpy(ctx->config.active_account,
                                 state_account->name,
                                 sizeof(ctx->config.active_account)) != 0) {
