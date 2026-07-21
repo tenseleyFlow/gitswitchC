@@ -1083,6 +1083,62 @@ vacuous_cleanup:
     }
 }
 
+/* AR-12 M4: a recorded destination whose config file was deleted (removed
+ * repository, deleted global config) carries none of the published values.
+ * Its retirement leg must settle vacuously — remove succeeds, the other
+ * live destination is really retired, and no durable .retirement-incomplete
+ * fence survives to brick every future command. */
+TEST(deleted_destination_retires_vacuously_and_clears_guard) {
+    m17_fixture_t *fixture = calloc(1U, sizeof(*fixture));
+    m17_bytes_t output = {0};
+    m17_bytes_t survivor = {0};
+    char marker[MAX_PATH_LEN];
+    int setup_result;
+    int status;
+
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+    setup_result = m17_fixture_setup(fixture, true, true);
+    CHECK_EQ_INT(setup_result, 0);
+    if (setup_result != 0) goto vacuous_guard_cleanup;
+    CHECK_EQ_INT(unlink(fixture->git_paths[0]), 0);
+    status = m17_run_cli(fixture, M17_COMMAND_REMOVE, M17_FAULT_NONE, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->output_path, &output), 0);
+    CHECK(strstr((const char *)output.data,
+                 m17_success_text(M17_COMMAND_REMOVE)) != NULL);
+    /* The guard is settled: an incomplete marker may remain on disk only
+     * when paired with its completion certificate, and no fence blocks the
+     * next mutating command. */
+    CHECK_EQ_INT(safe_snprintf(marker, sizeof(marker), "%s/%s",
+                               fixture->config_dir,
+                               ".retirement-incomplete"), 0);
+    if (access(marker, F_OK) == 0) {
+        CHECK_EQ_INT(safe_snprintf(marker, sizeof(marker), "%s/%s",
+                                   fixture->config_dir,
+                                   ".retirement-complete"), 0);
+        CHECK_EQ_INT(access(marker, F_OK), 0);
+    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->git_paths[1], &survivor), 0);
+    CHECK(strstr((const char *)survivor.data, "sshCommand") == NULL);
+    CHECK(strstr((const char *)survivor.data, "marker = keep") != NULL);
+    /* A follow-up mutating command must not be fenced. */
+    status = m17_run_cli(fixture, M17_COMMAND_RESET_ALL, M17_FAULT_NONE,
+                         NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+
+vacuous_guard_cleanup:
+    m17_bytes_clear(&output);
+    m17_bytes_clear(&survivor);
+    free(fixture);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(remove_retirement_failures_are_nonzero_and_retryable);
@@ -1091,4 +1147,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reset_all_continues_after_first_account_retirement_failure);
     RUN_TEST(reset_cleanup_failures_append_without_replacing_retirement_cause);
     RUN_TEST(credentialless_no_ledger_retires_vacuously);
+    RUN_TEST(deleted_destination_retires_vacuously_and_clears_guard);
 TEST_MAIN_END()

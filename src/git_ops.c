@@ -6433,6 +6433,20 @@ static bool git_retirement_directory_identity_matches(
                ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
 }
 
+/* AR-12 M4: a destination whose recorded config path is provably absent
+ * (every component resolves and the leaf is ENOENT, or a parent component is
+ * gone) cannot carry any published value. Only a definitive ENOENT counts;
+ * permission or loop errors stay indeterminate and fail closed. */
+static bool git_retirement_destination_provably_absent(
+    const publication_record_t *publication) {
+    struct stat st;
+
+    if (!publication || publication->config_path[0] != '/') return false;
+    errno = 0;
+    if (stat(publication->config_path, &st) == 0) return false;
+    return errno == ENOENT;
+}
+
 /* A completed atomic retirement necessarily changes the config generation.
  * For retry/idempotence, retain the durable namespace and repository proof
  * while allowing the caller to inspect whether every exact owned value is
@@ -7342,6 +7356,23 @@ static int git_retirement_transaction_prepare_internal(
         if (git_retirement_verify_live_namespace(
                 transaction->publication_refs[i]) == 0) {
             transaction->items[i].namespace_ready = true;
+            clear_error();
+            continue;
+        }
+        /* AR-12 M4: a recorded config file that provably no longer exists
+         * (deleted repository, removed global config) carries none of the
+         * published values, so this leg is vacuously retired: nothing
+         * attributable is live and no mutation is needed. Failing instead
+         * would strand the durable retirement guard forever — no retry can
+         * re-verify a namespace that is gone. Indeterminate probes (EACCES,
+         * ELOOP, changed identity) keep the fail-closed path. */
+        if (git_retirement_destination_provably_absent(
+                transaction->publication_refs[i])) {
+            log_warning(
+                "Recorded Git destination %s no longer exists; treating "
+                "account '%s' retirement leg as already retired",
+                transaction->publication_refs[i]->config_path,
+                transaction->items[i].account.name);
             clear_error();
             continue;
         }
