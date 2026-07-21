@@ -446,6 +446,51 @@ static int git_reject_ssh_command_override(void) {
     return 0;
 }
 
+/* AR-12 M5: Git's section and variable names are case-insensitive, but the
+ * SUBSECTION of a three-part key (gpg.openpgp.program, gpg.ssh.program,
+ * gpg.x509.program) is case-sensitive. `[gpg "OpenPGP"] program` is a
+ * distinct key Git never consults; folding it into the managed slot made
+ * verification and rollback adopt an inert foreign value. Compare the outer
+ * parts case-insensitively and the subsection byte-exactly. */
+static bool git_managed_key_equals_n(const char *key, size_t key_len,
+                                     const char *managed) {
+    size_t managed_len = strlen(managed);
+    const char *managed_first = strchr(managed, '.');
+    const char *managed_last = strrchr(managed, '.');
+    const char *key_first;
+    const char *key_last = NULL;
+    size_t section_len;
+    size_t subsection_len;
+    size_t variable_len;
+
+    if (key_len != managed_len) return false;
+    if (!managed_first || managed_first == managed_last) {
+        return strncasecmp(key, managed, key_len) == 0;
+    }
+    key_first = memchr(key, '.', key_len);
+    if (!key_first) return false;
+    for (const char *p = key + key_len; p > key;) {
+        p--;
+        if (*p == '.') {
+            key_last = p;
+            break;
+        }
+    }
+    if (!key_last || key_first == key_last) return false;
+    section_len = (size_t)(managed_first - managed);
+    subsection_len = (size_t)(managed_last - managed_first) - 1U;
+    variable_len = managed_len - (size_t)(managed_last - managed) - 1U;
+    if ((size_t)(key_first - key) != section_len ||
+        (size_t)(key_last - key_first) - 1U != subsection_len) {
+        return false;
+    }
+    return strncasecmp(key, managed, section_len) == 0 &&
+           strncmp(key_first + 1U, managed_first + 1U,
+                   subsection_len) == 0 &&
+           strncasecmp(key_last + 1U, managed_last + 1U,
+                       variable_len) == 0;
+}
+
 /* Parse `git config --show-origin --show-scope -z --list`. Git emits three
  * NUL-terminated fields per record: scope, origin, then "key\nvalue". Last
  * match wins, preserving Git's effective precedence including includes and
@@ -482,9 +527,8 @@ static int parse_effective_listing(const char *buf, size_t len,
         size_t key_len = newline ? (size_t)(newline - record) : record_len;
         int key_index = -1;
         for (int i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-            size_t managed_len = strlen(g_managed_keys[i]);
-            if (key_len == managed_len &&
-                strncasecmp(record, g_managed_keys[i], key_len) == 0) {
+            if (git_managed_key_equals_n(record, key_len,
+                                         g_managed_keys[i])) {
                 key_index = i;
                 break;
             }
@@ -765,9 +809,7 @@ static void git_snapshot_clear(git_config_snapshot_t *snapshot) {
 
 static int git_managed_key_index_n(const char *key, size_t key_len) {
     for (int i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        size_t managed_len = strlen(g_managed_keys[i]);
-        if (key_len == managed_len &&
-            strncasecmp(key, g_managed_keys[i], key_len) == 0) {
+        if (git_managed_key_equals_n(key, key_len, g_managed_keys[i])) {
             return i;
         }
     }

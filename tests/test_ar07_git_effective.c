@@ -457,6 +457,36 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
     CHECK(strstr(output, "global\nconfig") == NULL);
 }
 
+/* AR-12 M5: Git's section and variable names are case-insensitive, but a
+ * three-part key's SUBSECTION is case-sensitive: `[gpg "OpenPGP"] program`
+ * is a distinct key Git never consults. Folding it into the managed
+ * gpg.openpgp.program slot wedged switch verification and misdiagnosed
+ * rollback against an inert foreign value. */
+TEST(case_variant_gpg_subsection_is_not_folded_into_managed_slot) {
+    real_fixture_t fixture;
+    git_current_config_t current;
+
+    CHECK(fixture_init(&fixture));
+    CHECK_EQ_INT(set_git_value("--global", GIT_CONFIG_USER_NAME,
+                               "AR12 User"), 0);
+    CHECK_EQ_INT(set_git_value("--global", GIT_CONFIG_USER_EMAIL,
+                               "ar12@example.test"), 0);
+    CHECK_EQ_INT(set_git_value("--global", "gpg.OpenPGP.program",
+                               "/inert/gpg"), 0);
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_get_current_config(&current), 0);
+    CHECK(!current.gpg_openpgp_program.present);
+
+    /* Case variance on the OUTER parts stays managed — Git itself treats
+     * section and variable case-insensitively. */
+    CHECK_EQ_INT(set_git_value("--global", "GPG.openpgp.PROGRAM",
+                               "/real/gpg"), 0);
+    git_ops_test_reset_caches();
+    CHECK_EQ_INT(git_get_current_config(&current), 0);
+    CHECK(current.gpg_openpgp_program.present);
+    CHECK_STR_EQ(current.gpg_openpgp_program.value, "/real/gpg");
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(global_switch_stops_before_writes_when_any_local_clear_fails);
@@ -464,4 +494,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(worktree_values_are_cleared_and_restored_around_global_switch);
     RUN_TEST(unwritable_repo_config_stops_global_identity_write);
     RUN_TEST(status_attributes_stale_worktree_ssh_and_gpg_program);
+    RUN_TEST(case_variant_gpg_subsection_is_not_folded_into_managed_slot);
 TEST_MAIN_END()
