@@ -773,6 +773,204 @@ TEST(trusted_shebang_executes_from_the_verified_descriptor) {
     CHECK_EQ_INT(result.exit_code, 0);
 }
 
+static void check_fatal_path_candidate_errno(int injected_errno) {
+    char *saved_path = NULL;
+    bool had_path = false;
+    const char *argv[] = {"true", NULL};
+    run_result_t result;
+
+    save_environment("PATH", &saved_path, &had_path);
+    CHECK_EQ_INT(setenv("PATH", "/ar11-definitely-missing:/usr/bin:/bin", 1),
+                 0);
+    run_test_set_path_candidate_failure(1, injected_errno);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), -1);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(errno, injected_errno);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SYSTEM_CALL);
+    run_test_set_path_candidate_failure(0, 0);
+    restore_environment("PATH", saved_path, had_path);
+}
+
+TEST(path_candidate_operational_failures_are_fatal) {
+    check_fatal_path_candidate_errno(EIO);
+    check_fatal_path_candidate_errno(EMFILE);
+}
+
+TEST(inner_directory_open_failure_survives_successful_policy_probe) {
+    char root[MAX_PATH_LEN], bin[MAX_PATH_LEN], configured_path[MAX_PATH_LEN];
+    char *saved_path = NULL;
+    bool had_path = false;
+    const char *argv[] = {"true", NULL};
+    run_result_t result;
+
+    if (!make_safe_fixture(root, sizeof(root), bin, sizeof(bin))) {
+        CHECK(!"inner directory-open fixture creation failed");
+        return;
+    }
+    CHECK((size_t)snprintf(configured_path, sizeof(configured_path),
+                           "%s:/usr/bin:/bin", bin) <
+          sizeof(configured_path));
+    save_environment("PATH", &saved_path, &had_path);
+    CHECK_EQ_INT(setenv("PATH", configured_path, 1), 0);
+
+    /* #1 opens '/'; #2 opens the first real ancestor. Its injected EIO is
+     * followed by a successful no-follow stat of that same ancestor, proving
+     * the secondary policy probe cannot erase the operational failure and
+     * redirect execution to /usr/bin/true. */
+    run_test_set_directory_open_failure(2, EIO);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), -1);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+    run_test_set_directory_open_failure(0, 0);
+    restore_environment("PATH", saved_path, had_path);
+}
+
+static void check_acl_failure_stops_path_fallback(
+    run_test_exec_acl_target_t target, int injected_errno) {
+    char root[MAX_PATH_LEN], bin[MAX_PATH_LEN], helper[MAX_PATH_LEN];
+    char configured_path[MAX_PATH_LEN];
+    char *saved_path = NULL;
+    bool had_path = false;
+    const char *argv[] = {"true", NULL};
+    run_result_t result;
+
+    if (!make_safe_fixture(root, sizeof(root), bin, sizeof(bin))) {
+        CHECK(!"ACL failure fixture creation failed");
+        return;
+    }
+    CHECK((size_t)snprintf(helper, sizeof(helper), "%s/true", bin) <
+          sizeof(helper));
+    CHECK_EQ_INT(write_string_to_file(helper, "#!/bin/sh\nexit 97\n", 0755),
+                 0);
+    CHECK((size_t)snprintf(configured_path, sizeof(configured_path),
+                           "%s:/usr/bin:/bin", bin) <
+          sizeof(configured_path));
+    save_environment("PATH", &saved_path, &had_path);
+    CHECK_EQ_INT(setenv("PATH", configured_path, 1), 0);
+
+    run_test_set_exec_acl_failure(target, injected_errno);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), -1);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(errno, injected_errno);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(get_last_error()->system_errno, injected_errno);
+    run_test_set_exec_acl_failure(RUN_TEST_EXEC_ACL_NONE, 0);
+    restore_environment("PATH", saved_path, had_path);
+}
+
+TEST(exec_acl_operational_failures_stop_path_fallback) {
+    check_acl_failure_stops_path_fallback(RUN_TEST_EXEC_ACL_DIRECTORY, EIO);
+    check_acl_failure_stops_path_fallback(RUN_TEST_EXEC_ACL_LEAF, EMFILE);
+}
+
+static void check_acl_policy_rejection_is_skippable(
+    run_test_exec_acl_target_t target) {
+    char root[MAX_PATH_LEN], bin[MAX_PATH_LEN], helper[MAX_PATH_LEN];
+    char configured_path[MAX_PATH_LEN];
+    char *saved_path = NULL;
+    bool had_path = false;
+    const char *argv[] = {"true", NULL};
+    run_result_t result;
+
+    if (!make_safe_fixture(root, sizeof(root), bin, sizeof(bin))) {
+        CHECK(!"ACL policy fixture creation failed");
+        return;
+    }
+    CHECK((size_t)snprintf(helper, sizeof(helper), "%s/true", bin) <
+          sizeof(helper));
+    CHECK_EQ_INT(write_string_to_file(helper, "#!/bin/sh\nexit 97\n", 0755),
+                 0);
+    CHECK((size_t)snprintf(configured_path, sizeof(configured_path),
+                           "%s:/usr/bin:/bin", bin) <
+          sizeof(configured_path));
+    save_environment("PATH", &saved_path, &had_path);
+    CHECK_EQ_INT(setenv("PATH", configured_path, 1), 0);
+
+    run_test_set_exec_acl_failure(target, EACCES);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), 0);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+    run_test_set_exec_acl_failure(RUN_TEST_EXEC_ACL_NONE, 0);
+    restore_environment("PATH", saved_path, had_path);
+}
+
+TEST(exec_acl_policy_rejection_continues_path_search) {
+    check_acl_policy_rejection_is_skippable(RUN_TEST_EXEC_ACL_DIRECTORY);
+    check_acl_policy_rejection_is_skippable(RUN_TEST_EXEC_ACL_LEAF);
+}
+
+TEST(path_absence_and_policy_rejection_continue_deterministically) {
+    char *saved_path = NULL;
+    bool had_path = false;
+    const char *argv[] = {"true", NULL};
+    run_result_t result;
+
+    save_environment("PATH", &saved_path, &had_path);
+    /* Seed a fatal stale errno: the world-writable /tmp entry must replace it
+     * with deterministic EACCES and permit the trusted later entry. */
+    CHECK_EQ_INT(setenv("PATH", "/ar11-definitely-missing:/tmp:/usr/bin:/bin",
+                        1),
+                 0);
+    errno = EIO;
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), 0);
+    CHECK(result.spawned);
+    CHECK_EQ_INT(result.exit_code, 0);
+    restore_environment("PATH", saved_path, had_path);
+}
+
+TEST(interpreter_parser_io_failure_preserves_operational_truth) {
+    char root[MAX_PATH_LEN], bin[MAX_PATH_LEN], script[MAX_PATH_LEN];
+    char malformed[MAX_PATH_LEN];
+    const char *argv[2];
+    run_result_t result;
+
+    if (!make_safe_fixture(root, sizeof(root), bin, sizeof(bin))) {
+        CHECK(!"interpreter parser fixture creation failed");
+        return;
+    }
+    CHECK((size_t)snprintf(script, sizeof(script), "%s/ar11-script", bin) <
+          sizeof(script));
+    CHECK((size_t)snprintf(malformed, sizeof(malformed), "%s/ar11-malformed",
+                           bin) < sizeof(malformed));
+    CHECK_EQ_INT(write_string_to_file(script, "#!/bin/sh\nexit 0\n", 0755),
+                 0);
+    argv[0] = script;
+    argv[1] = NULL;
+
+    run_test_set_exec_parse_failure(2, EIO);
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), -1);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(errno, EIO);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+    CHECK(strstr(get_last_error()->message, "inspect executable format") !=
+          NULL);
+    run_test_set_exec_parse_failure(0, 0);
+
+    CHECK_EQ_INT(write_string_to_file(malformed, "not a binary or script\n",
+                                      0755),
+                 0);
+    argv[0] = malformed;
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(run_argv(argv, NULL, &result), -1);
+    CHECK(!result.spawned);
+    CHECK_EQ_INT(errno, ENOEXEC);
+    CHECK_EQ_INT(get_last_error()->code, ERR_PERMISSION_DENIED);
+}
+
 TEST(runtime_root_is_absolute_private_and_cwd_independent) {
     char root[MAX_PATH_LEN], bin[MAX_PATH_LEN], runtime[MAX_PATH_LEN];
     char link_path[MAX_PATH_LEN], missing[MAX_PATH_LEN];
@@ -832,7 +1030,9 @@ TEST(runtime_root_is_absolute_private_and_cwd_independent) {
     if (fd >= 0) close(fd);
 
     CHECK_EQ_INT(chmod(runtime, 0000), 0);
+    clear_error();
     CHECK_EQ_INT(open_runtime_parent(observed, sizeof(observed)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
     CHECK_EQ_INT(chmod(runtime, 0700), 0);
     CHECK_EQ_INT(symlink(runtime, link_path), 0);
 
@@ -849,12 +1049,19 @@ TEST(runtime_root_is_absolute_private_and_cwd_independent) {
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", variant, 1), 0);
     CHECK_EQ_INT(open_runtime_parent(rejected, sizeof(rejected)), -1);
 
-    /* A missing configured directory takes the documented absolute fallback;
-     * it must never leave the relative/missing spelling in emitted state. */
+    /* A configured nonempty root is authoritative: absence must fail closed,
+     * while creating that exact directory makes the same configuration usable. */
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", missing, 1), 0);
+    clear_error();
+    fd = open_runtime_parent(observed, sizeof(observed));
+    CHECK_EQ_INT(fd, -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(mkdir(missing, 0700), 0);
+    clear_error();
     fd = open_runtime_parent(observed, sizeof(observed));
     CHECK(fd >= 0);
-    CHECK_STR_EQ(observed, fallback);
+    CHECK_STR_EQ(observed, missing);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SUCCESS);
     if (fd >= 0) close(fd);
 
     restore_environment("XDG_RUNTIME_DIR", saved_xdg, had_xdg);
@@ -891,6 +1098,12 @@ int main(int argc, char **argv) {
     RUN_TEST(execute_only_policy_is_explicit);
 #endif
     RUN_TEST(trusted_shebang_executes_from_the_verified_descriptor);
+    RUN_TEST(path_candidate_operational_failures_are_fatal);
+    RUN_TEST(inner_directory_open_failure_survives_successful_policy_probe);
+    RUN_TEST(exec_acl_operational_failures_stop_path_fallback);
+    RUN_TEST(exec_acl_policy_rejection_continues_path_search);
+    RUN_TEST(path_absence_and_policy_rejection_continue_deterministically);
+    RUN_TEST(interpreter_parser_io_failure_preserves_operational_truth);
     RUN_TEST(runtime_root_is_absolute_private_and_cwd_independent);
     return ts_test_finish();
 }

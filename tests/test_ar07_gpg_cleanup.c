@@ -81,6 +81,110 @@ static int make_file(const char *path, const char *content) {
     return write_string_to_file(path, content ? content : "x\n", 0600);
 }
 
+static char g_gpgconf_fixture_dir[MAX_PATH_LEN];
+static char *g_gpgconf_saved_path;
+static bool g_gpgconf_saved_path_present;
+static bool g_gpgconf_fixture_active;
+
+static void remove_gpgconf_fixture(void) {
+    if (g_gpgconf_fixture_dir[0] != '\0') {
+        ts_rm_rf(g_gpgconf_fixture_dir);
+        g_gpgconf_fixture_dir[0] = '\0';
+    }
+}
+
+static int restore_gpgconf_fixture(void) {
+    int rc = 0;
+
+    if (g_gpgconf_fixture_active) {
+        rc = g_gpgconf_saved_path_present
+                 ? setenv("PATH", g_gpgconf_saved_path, 1)
+                 : unsetenv("PATH");
+    }
+    free(g_gpgconf_saved_path);
+    g_gpgconf_saved_path = NULL;
+    g_gpgconf_saved_path_present = false;
+    g_gpgconf_fixture_active = false;
+    remove_gpgconf_fixture();
+    return rc;
+}
+
+/* These tests inject command results but intentionally exercise production's
+ * trusted gpgconf resolution and reload bookkeeping. Homebrew's prefix is not
+ * a production-trusted executable location, so give every host the same
+ * private, runnable gpgconf fixture instead of depending on its package
+ * manager layout. */
+static int install_gpgconf_fixture(void) {
+    static const char program[] = "#!/bin/sh\nexit 0\n";
+    char executable[MAX_PATH_LEN];
+    char resolved[MAX_PATH_LEN];
+    const char *path = getenv("PATH");
+    char *saved_path = path ? strdup(path) : NULL;
+    char *fixture_path = NULL;
+    size_t dir_len;
+    size_t path_len = path ? strlen(path) : 0;
+    size_t fixture_len;
+
+    if (g_gpgconf_fixture_active || (path && !saved_path)) {
+        free(saved_path);
+        errno = g_gpgconf_fixture_active ? EALREADY : ENOMEM;
+        return -1;
+    }
+    if (!ts_mkdtemp_trusted(g_gpgconf_fixture_dir,
+                            sizeof(g_gpgconf_fixture_dir),
+                            "gsw-ar11-gpgconf") ||
+        safe_snprintf(executable, sizeof(executable), "%s/gpgconf",
+                      g_gpgconf_fixture_dir) != 0 ||
+        write_string_to_file(executable, program, 0700) != 0 ||
+        chmod(executable, 0700) != 0) {
+        free(saved_path);
+        remove_gpgconf_fixture();
+        return -1;
+    }
+
+    dir_len = strlen(g_gpgconf_fixture_dir);
+    if (path_len > SIZE_MAX - dir_len - 2U) {
+        free(saved_path);
+        remove_gpgconf_fixture();
+        errno = EOVERFLOW;
+        return -1;
+    }
+    fixture_len = dir_len + (path_len > 0 ? path_len + 1U : 0U) + 1U;
+    fixture_path = malloc(fixture_len);
+    if (!fixture_path) {
+        free(saved_path);
+        remove_gpgconf_fixture();
+        return -1;
+    }
+    memcpy(fixture_path, g_gpgconf_fixture_dir, dir_len);
+    if (path_len > 0) {
+        fixture_path[dir_len] = ':';
+        memcpy(fixture_path + dir_len + 1U, path, path_len + 1U);
+    } else {
+        fixture_path[dir_len] = '\0';
+    }
+
+    if (setenv("PATH", fixture_path, 1) != 0) {
+        free(fixture_path);
+        free(saved_path);
+        remove_gpgconf_fixture();
+        return -1;
+    }
+    free(fixture_path);
+    g_gpgconf_saved_path = saved_path;
+    g_gpgconf_saved_path_present = path != NULL;
+    g_gpgconf_fixture_active = true;
+    if (find_command_path("gpgconf", resolved, sizeof(resolved)) != 0 ||
+        strcmp(resolved, executable) != 0) {
+        int saved_errno = errno;
+
+        (void)restore_gpgconf_fixture();
+        errno = saved_errno ? saved_errno : ENOEXEC;
+        return -1;
+    }
+    return 0;
+}
+
 static int make_home(char *xdg, size_t xdg_size,
                      char *base, size_t base_size,
                      char *home, size_t home_size,
@@ -601,8 +705,9 @@ TEST(byte_identical_agent_config_performs_no_commit) {
     CHECK_EQ_INT(gpg_create_isolated_home(&config, &account), 0);
     CHECK_EQ_INT(stat(installed, &first), 0);
     CHECK_EQ_INT(g_precommit_calls, 1);
-    CHECK_EQ_INT(g_file_syncs, 1);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    /* Config temp, durable reload obligation, then completed-reload state. */
+    CHECK_EQ_INT(g_file_syncs, 3);
+    CHECK_EQ_INT(g_directory_syncs, 2);
 
     g_file_syncs = 0;
     g_directory_syncs = 0;
@@ -626,8 +731,8 @@ TEST(byte_identical_agent_config_performs_no_commit) {
                  (int)(sizeof(changed) - 1));
     CHECK_STR_EQ(content, changed);
     CHECK(!has_agent_conf_scratch(config.gnupg_home));
-    CHECK_EQ_INT(g_file_syncs, 1);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    CHECK_EQ_INT(g_file_syncs, 3);
+    CHECK_EQ_INT(g_directory_syncs, 2);
     gpg_manager_set_agent_conf_precommit_fn(old_hook);
     gpg_manager_set_agent_conf_sync_fn(old_sync);
 
@@ -680,27 +785,29 @@ TEST(agent_config_sync_failures_return_nonzero) {
     g_directory_syncs = 0;
     g_fail_file_sync = false;
     CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
-    CHECK_EQ_INT(g_file_syncs, 1);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    /* The focused writer publishes a durable pending obligation; only the
+     * production prepare path may run gpgconf and mark it complete. */
+    CHECK_EQ_INT(g_file_syncs, 2);
+    CHECK_EQ_INT(g_directory_syncs, 2);
     CHECK_EQ_INT(make_file(source_conf, changed), 0);
 
     g_file_syncs = 0;
     g_directory_syncs = 0;
     g_fail_directory_sync = true;
     CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
-    CHECK_EQ_INT(g_file_syncs, 1);
+    CHECK_EQ_INT(g_file_syncs, 2);
     CHECK_EQ_INT(g_directory_syncs, 1);
     CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
-                 (int)(sizeof(changed) - 1));
-    CHECK_STR_EQ(content, changed);
+                 (int)(sizeof(original) - 1));
+    CHECK_STR_EQ(content, original);
     CHECK(!has_agent_conf_scratch(home));
 
     g_fail_directory_sync = false;
     g_file_syncs = 0;
     g_directory_syncs = 0;
     CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), 0);
-    CHECK_EQ_INT(g_file_syncs, 0);
-    CHECK_EQ_INT(g_directory_syncs, 1);
+    CHECK_EQ_INT(g_file_syncs, 2);
+    CHECK_EQ_INT(g_directory_syncs, 2);
     CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
                  (int)(sizeof(changed) - 1));
     CHECK_STR_EQ(content, changed);
@@ -796,6 +903,63 @@ TEST(agent_config_defaults_require_confirmed_source_absence) {
     run_set_runner(previous);
 }
 
+TEST(managed_descendant_agent_config_is_rejected_without_mutation) {
+    static const char retained[] =
+        "# existing isolated policy\n"
+        "default-cache-ttl 17\n";
+    static const char managed_source[] =
+        "# must never be inherited from managed state\n"
+        "default-cache-ttl 999\n";
+    char xdg[128], base[256], home[320], nested[384];
+    char source_conf[448], installed[384], content[512];
+    const char *inherited_gnupghome = getenv("GNUPGHOME");
+    bool had_gnupghome = inherited_gnupghome != NULL;
+    char *saved_gnupghome = had_gnupghome
+                                ? strdup(inherited_gnupghome)
+                                : NULL;
+    command_runner_fn previous;
+    int home_fd;
+
+    if (had_gnupghome && !saved_gnupghome) {
+        CHECK(!"failed to retain GNUPGHOME for managed-source fixture");
+        return;
+    }
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "ancestry"), 0);
+    CHECK_EQ_INT(safe_snprintf(nested, sizeof(nested), "%s/nested",
+                               home), 0);
+    CHECK_EQ_INT(safe_snprintf(source_conf, sizeof(source_conf),
+                               "%s/gpg-agent.conf", nested), 0);
+    CHECK_EQ_INT(safe_snprintf(installed, sizeof(installed),
+                               "%s/gpg-agent.conf", home), 0);
+    CHECK_EQ_INT(mkdir(nested, 0700), 0);
+    CHECK_EQ_INT(make_file(source_conf, managed_source), 0);
+    CHECK_EQ_INT(make_file(installed, retained), 0);
+    CHECK_EQ_INT(setenv("GNUPGHOME", nested, 1), 0);
+    home_fd = open(home, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    CHECK(home_fd >= 0);
+
+    clear_error();
+    CHECK_EQ_INT(gpg_manager_setup_agent_config_for_test(home_fd, home), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "managed GPG descendant") != NULL);
+    CHECK_EQ_INT(read_file_to_string(installed, content, sizeof(content)),
+                 (int)(sizeof(retained) - 1));
+    CHECK_STR_EQ(content, retained);
+    CHECK(!has_agent_conf_scratch(home));
+
+    if (home_fd >= 0) CHECK_EQ_INT(close(home_fd), 0);
+    if (had_gnupghome) {
+        CHECK_EQ_INT(setenv("GNUPGHOME", saved_gnupghome, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("GNUPGHOME"), 0);
+    }
+    free(saved_gnupghome);
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset("ancestry"), 0);
+    run_set_runner(previous);
+}
+
 TEST(agent_config_registration_failure_is_atomic_and_retryable) {
     static const char source[] =
         "default-cache-ttl 31\n"
@@ -858,6 +1022,11 @@ TEST(agent_config_registration_failure_is_atomic_and_retryable) {
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
+    if (install_gpgconf_fixture() != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot install trusted gpgconf fixture\n");
+        return 1;
+    }
     RUN_TEST(ordinary_same_mount_recursion_still_cleans);
     RUN_TEST(same_device_different_mount_identity_is_rejected);
     RUN_TEST(preexisting_hardlink_blocks_before_agent_stop_or_deletion);
@@ -872,5 +1041,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(byte_identical_agent_config_performs_no_commit);
     RUN_TEST(agent_config_sync_failures_return_nonzero);
     RUN_TEST(agent_config_defaults_require_confirmed_source_absence);
+    RUN_TEST(managed_descendant_agent_config_is_rejected_without_mutation);
     RUN_TEST(agent_config_registration_failure_is_atomic_and_retryable);
+    if (restore_gpgconf_fixture() != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot restore PATH after gpgconf tests\n");
+        return 1;
+    }
 TEST_MAIN_END()

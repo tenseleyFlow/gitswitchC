@@ -9,6 +9,7 @@
 #include "test.h"
 #include "accounts.h"
 #include "error.h"
+#include "publication.h"
 #include "ssh_manager.h"
 #include "utils.h"
 
@@ -28,6 +29,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#define REAL_RESUME_INCARNATION \
+    "1111111111111111111111111111111111111111111111111111111111111111"
 
 typedef enum {
     SHELL_POSIX = 0,
@@ -119,6 +123,70 @@ static int write_bytes(const char *path, const void *bytes, size_t length,
     }
     if (fchmod(fd, mode) != 0) { close(fd); return -1; }
     return close(fd);
+}
+
+/* Model an earlier successful credentialless publication followed by an
+ * external replacement of ~/.gitconfig.  The stale generation remains exact
+ * enough for reset to reconcile non-destructively, but can never authorize a
+ * mutation of the external replacement. */
+static int seed_stale_global_publication(const char *home,
+                                         const char *hint,
+                                         const char *git_config) {
+    static const char published_body[] =
+        "[user]\n\tname = work\n\temail = work@example.test\n";
+    static const char state_header[] = "ssh\nactive=work\n";
+    publication_ledger_t ledger;
+    publication_record_t record;
+    unsigned char *tail = NULL;
+    unsigned char *state = NULL;
+    size_t tail_length = 0U;
+    size_t header_length = sizeof(state_header) - 1U;
+    struct stat parent_st;
+    struct stat config_st;
+    int result = -1;
+
+    publication_ledger_init(&ledger);
+    publication_record_init(&record);
+    if (write_text(git_config, published_body, 0600) != 0 ||
+        stat(home, &parent_st) != 0 || stat(git_config, &config_st) != 0) {
+        goto cleanup;
+    }
+    record.account_id = 1U;
+    record.scope = PUBLICATION_SCOPE_GLOBAL;
+    record.state = PUBLICATION_STATE_PUBLISHED;
+    record.capabilities = PUBLICATION_CAP_DESTINATION |
+                          PUBLICATION_CAP_POST_GENERATION;
+    if (safe_strncpy(record.account_incarnation, REAL_RESUME_INCARNATION,
+                     sizeof(record.account_incarnation)) != 0 ||
+        safe_strncpy(record.config_path, git_config,
+                     sizeof(record.config_path)) != 0) {
+        goto cleanup;
+    }
+    publication_identity_from_stat(&record.config_parent, &parent_st);
+    publication_identity_from_stat(&record.post_config, &config_st);
+    if (publication_record_validate(&record) != 0 ||
+        publication_ledger_upsert(&ledger, &record) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0 ||
+        tail_length > SIZE_MAX - header_length) {
+        goto cleanup;
+    }
+    state = malloc(header_length + tail_length);
+    if (!state) goto cleanup;
+    memcpy(state, state_header, header_length);
+    memcpy(state + header_length, tail, tail_length);
+    result = write_bytes(hint, state, header_length + tail_length, 0600);
+
+cleanup:
+    if (state) {
+        secure_zero_memory(state, header_length + tail_length);
+        free(state);
+    }
+    if (tail) {
+        secure_zero_memory(tail, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
 }
 
 static const char *read_text(const char *path, char *text, size_t size) {
@@ -469,7 +537,9 @@ static int run_wrapper_script(bool fish, const char *script,
     if (strcmp(kind, "unset") == 0) {
         written = snprintf(
             command, sizeof(command),
-            "env -u SSH_AUTH_SOCK -u GNUPGHOME HOME='%s' "
+            "env -u SSH_AUTH_SOCK -u GNUPGHOME "
+            "GPG_AGENT_INFO='/foreign/S.gpg-agent:4242:1' "
+            "GS_AGENT_INFO='/foreign/S.gpg-agent:4242:1' HOME='%s' "
             "XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' ENV=/dev/null "
             "GS_KIND=unset GS_SNIPPET='%s' GS_HELPER='%s' GS_SOCK='%s' "
             "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' "
@@ -482,7 +552,9 @@ static int run_wrapper_script(bool fish, const char *script,
         const char *value = strcmp(kind, "empty") == 0 ? "" : "/foreign/value";
         written = snprintf(
             command, sizeof(command),
-            "env SSH_AUTH_SOCK='%s' GNUPGHOME='%s' HOME='%s' "
+            "env SSH_AUTH_SOCK='%s' GNUPGHOME='%s' "
+            "GPG_AGENT_INFO='/foreign/S.gpg-agent:4242:1' "
+            "GS_AGENT_INFO='/foreign/S.gpg-agent:4242:1' HOME='%s' "
             "XDG_RUNTIME_DIR='%s' PATH='%s:/usr/bin:/bin' ENV=/dev/null "
             "GS_KIND='%s' GS_SNIPPET='%s' GS_HELPER='%s' GS_SOCK='%s' "
             "GS_GPG='%s' GS_RESUME_LOG='%s' GS_ARGV_LOG='%s' "
@@ -533,18 +605,34 @@ static int generate_key(const char *path) {
     return run_external(argv, NULL, output, sizeof(output));
 }
 
-static int agent_command(const char *socket_path, const char *arg) {
+static int agent_run(const char *socket_path,
+                     const char *first_arg,
+                     const char *second_arg,
+                     const char *third_arg,
+                     char *output,
+                     size_t output_size) {
     char environment[PATH_MAX + 32];
     const char *env[] = {environment, NULL};
-    const char *argv[] = {"ssh-add", arg, NULL};
-    char output[2048];
+    const char *argv[] = {
+        "ssh-add", first_arg, second_arg, third_arg, NULL
+    };
+    char discarded_output[2048];
 
-    if ((size_t)snprintf(environment, sizeof(environment),
+    if (!first_arg ||
+        (size_t)snprintf(environment, sizeof(environment),
                          "SSH_AUTH_SOCK=%s", socket_path) >=
         sizeof(environment)) {
         return -1;
     }
-    return run_external(argv, env, output, sizeof(output));
+    if (!output || output_size == 0U) {
+        output = discarded_output;
+        output_size = sizeof(discarded_output);
+    }
+    return run_external(argv, env, output, output_size);
+}
+
+static int agent_command(const char *socket_path, const char *arg) {
+    return agent_run(socket_path, arg, NULL, NULL, NULL, 0U);
 }
 
 TEST(help_and_init_share_the_exact_six_shell_matrix) {
@@ -565,6 +653,61 @@ TEST(help_and_init_share_the_exact_six_shell_matrix) {
         read_text(g_fixture.snippets[i], contents, sizeof(contents));
         CHECK(contents[0] != '\0');
         CHECK(strstr(contents, g_shells[i].name) != NULL);
+    }
+}
+
+TEST(shell_generators_fail_closed_for_missing_configured_runtime_root) {
+    char missing[PATH_MAX];
+    char output_path[PATH_MAX];
+    char output[32768];
+    char command[PATH_MAX * 5];
+
+    CHECK_EQ_INT(join_path(missing, sizeof(missing), g_fixture.root,
+                           "/missing-runtime"), 0);
+    CHECK_EQ_INT(join_path(output_path, sizeof(output_path), g_fixture.root,
+                           "/missing-runtime.out"), 0);
+    for (size_t i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
+        int written = snprintf(
+            command, sizeof(command),
+            "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, missing, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written < 0 || (size_t)written >= sizeof(command)) continue;
+        CHECK(run_shell(command) != 0);
+        CHECK_STR_EQ(read_text(output_path, output, sizeof(output)), "");
+
+        written = snprintf(
+            command, sizeof(command),
+            "env -u XDG_RUNTIME_DIR HOME='%s' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written >= 0 && (size_t)written < sizeof(command)) {
+            CHECK_EQ_INT(run_shell(command), 0);
+            CHECK(read_text(output_path, output, sizeof(output))[0] != '\0');
+        }
+
+        written = snprintf(
+            command, sizeof(command),
+            "HOME='%s' XDG_RUNTIME_DIR='' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written >= 0 && (size_t)written < sizeof(command)) {
+            CHECK_EQ_INT(run_shell(command), 0);
+            CHECK(read_text(output_path, output, sizeof(output))[0] != '\0');
+        }
+    }
+
+    CHECK_EQ_INT(mkdir_private(missing), 0);
+    for (size_t i = 0; i < sizeof(g_shells) / sizeof(g_shells[0]); i++) {
+        int written = snprintf(
+            command, sizeof(command),
+            "HOME='%s' XDG_RUNTIME_DIR='%s' '%s' init '%s' >'%s' 2>/dev/null",
+            g_fixture.home, missing, g_bin, g_shells[i].name, output_path);
+        CHECK(written >= 0 && (size_t)written < sizeof(command));
+        if (written >= 0 && (size_t)written < sizeof(command)) {
+            CHECK_EQ_INT(run_shell(command), 0);
+            CHECK(read_text(output_path, output, sizeof(output))[0] != '\0');
+        }
     }
 }
 
@@ -866,6 +1009,7 @@ TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership) {
     char script[PATH_MAX];
     static const char body[] =
         ". \"$GS_SNIPPET\" || exit 10\n"
+        "[ \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\" ] || exit 21\n"
         "case $GS_KIND in\n"
         "unset) [ \"${SSH_AUTH_SOCK+x}\" != x ] && [ \"${GNUPGHOME+x}\" != x ] || exit 11 ;;\n"
         "empty) [ \"${SSH_AUTH_SOCK+x}:$SSH_AUTH_SOCK\" = x: ] && [ \"${GNUPGHOME+x}:$GNUPGHOME\" = x: ] || exit 12 ;;\n"
@@ -874,12 +1018,21 @@ TEST(posix_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "gitswitch switch work || exit 14\n"
         "[ \"$SSH_AUTH_SOCK\" = \"$GS_SOCK\" ] || exit 15\n"
         "[ \"$GNUPGHOME\" = \"$GS_GPG\" ] || exit 16\n"
+        "[ \"${GPG_AGENT_INFO+x}\" != x ] || exit 22\n"
         "gitswitch reset || exit 17\n"
         "case $GS_KIND in\n"
         "unset) [ \"${SSH_AUTH_SOCK+x}\" != x ] && [ \"${GNUPGHOME+x}\" != x ] || exit 18 ;;\n"
         "empty) [ \"${SSH_AUTH_SOCK+x}:$SSH_AUTH_SOCK\" = x: ] && [ \"${GNUPGHOME+x}:$GNUPGHOME\" = x: ] || exit 19 ;;\n"
         "foreign) [ \"$SSH_AUTH_SOCK\" = /foreign/value ] && [ \"$GNUPGHOME\" = /foreign/value ] || exit 20 ;;\n"
-        "esac\n";
+        "esac\n"
+        "[ \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\" ] || exit 23\n"
+        "gitswitch switch work || exit 24\n"
+        "[ \"${GPG_AGENT_INFO+x}\" != x ] || exit 25\n"
+        "GPG_AGENT_INFO=/manual/S.gpg-agent:5252:1; export GPG_AGENT_INFO\n"
+        "gitswitch switch work || exit 26\n"
+        "[ \"${GPG_AGENT_INFO+x}\" != x ] || exit 27\n"
+        "gitswitch reset || exit 28\n"
+        "[ \"$GPG_AGENT_INFO\" = /manual/S.gpg-agent:5252:1 ] || exit 29\n";
 
     CHECK_EQ_INT(join_path(script, sizeof(script), g_fixture.root,
                            "/posix-transition.sh"), 0);
@@ -894,6 +1047,7 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
     char script[PATH_MAX];
     static const char body[] =
         "source \"$GS_SNIPPET\"; or exit 10\n"
+        "test \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\"; or exit 21\n"
         "switch $GS_KIND\n"
         "case unset\n"
         "    not set -q SSH_AUTH_SOCK; and not set -q GNUPGHOME; or exit 11\n"
@@ -905,6 +1059,7 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "gitswitch switch work; or exit 14\n"
         "test \"$SSH_AUTH_SOCK\" = \"$GS_SOCK\"; or exit 15\n"
         "test \"$GNUPGHOME\" = \"$GS_GPG\"; or exit 16\n"
+        "not set -q GPG_AGENT_INFO; or exit 22\n"
         "gitswitch reset; or exit 17\n"
         "switch $GS_KIND\n"
         "case unset\n"
@@ -913,7 +1068,15 @@ TEST(fish_source_before_runtime_refreshes_then_restores_prior_ownership) {
         "    set -q SSH_AUTH_SOCK; and test -z \"$SSH_AUTH_SOCK\"; and set -q GNUPGHOME; and test -z \"$GNUPGHOME\"; or exit 19\n"
         "case foreign\n"
         "    test \"$SSH_AUTH_SOCK\" = /foreign/value; and test \"$GNUPGHOME\" = /foreign/value; or exit 20\n"
-        "end\n";
+        "end\n"
+        "test \"$GPG_AGENT_INFO\" = \"$GS_AGENT_INFO\"; or exit 23\n"
+        "gitswitch switch work; or exit 24\n"
+        "not set -q GPG_AGENT_INFO; or exit 25\n"
+        "set -gx GPG_AGENT_INFO /manual/S.gpg-agent:5252:1\n"
+        "gitswitch switch work; or exit 26\n"
+        "not set -q GPG_AGENT_INFO; or exit 27\n"
+        "gitswitch reset; or exit 28\n"
+        "test \"$GPG_AGENT_INFO\" = /manual/S.gpg-agent:5252:1; or exit 29\n";
 
     if (resolve_executable("fish", fish_path, sizeof(fish_path)) != 0) {
         TS_SKIP("fish", "native fish executable is unavailable");
@@ -1005,14 +1168,23 @@ TEST(fish_wrapper_preserves_manual_overrides_status_argv_and_neuter_paths) {
 }
 
 TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
+    static const char certificate_suffix[] = "(ED25519-CERT)\n";
     char root[PATH_MAX] = "/tmp/gitswitch-ar07-live.XXXXXX";
     char runtime[PATH_MAX];
     char agent_dir[PATH_MAX];
     char agent_sock[PATH_MAX];
     char other_sock[PATH_MAX];
     char current[PATH_MAX];
+    char agent_lock[PATH_MAX];
     char expected_key[PATH_MAX];
+    char expected_pub[PATH_MAX];
+    char other_pub[PATH_MAX];
+    char ca_key[PATH_MAX];
     char other_key[PATH_MAX];
+    char expected_public_text[2048];
+    char other_public_text[2048];
+    char expected_fingerprint[256] = {0};
+    char agent_fingerprint[256] = {0};
     char output[4096];
     char *saved_runtime = NULL;
     const char *old_runtime = getenv("XDG_RUNTIME_DIR");
@@ -1037,9 +1209,15 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         join_path(other_sock, sizeof(other_sock), agent_dir,
                   "/ssh-agent.other.sock") != 0 ||
         join_path(current, sizeof(current), agent_dir, "/current.sock") != 0 ||
+        join_path(agent_lock, sizeof(agent_lock), agent_dir, "/.lock") != 0 ||
         join_path(expected_key, sizeof(expected_key), root, "/expected") != 0 ||
+        join_path(expected_pub, sizeof(expected_pub), root,
+                  "/expected.pub") != 0 ||
+        join_path(other_pub, sizeof(other_pub), root, "/other.pub") != 0 ||
+        join_path(ca_key, sizeof(ca_key), root, "/ca") != 0 ||
         join_path(other_key, sizeof(other_key), root, "/other") != 0 ||
         mkdir_private(runtime) != 0 || mkdir_private(agent_dir) != 0 ||
+        write_bytes(agent_lock, "", 0, 0600) != 0 ||
         setenv("XDG_RUNTIME_DIR", runtime, 1) != 0) {
         CHECK(!"real SSH liveness fixture setup failed");
         free(saved_runtime);
@@ -1047,6 +1225,7 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
         return;
     }
     CHECK_EQ_INT(generate_key(expected_key), 0);
+    CHECK_EQ_INT(generate_key(ca_key), 0);
     CHECK_EQ_INT(generate_key(other_key), 0);
     CHECK_EQ_INT(run_external(agent_argv, NULL, output, sizeof(output)), 0);
     agent_pid = parse_agent_pid(output);
@@ -1090,6 +1269,72 @@ TEST(real_ssh_liveness_requires_current_account_and_exactly_one_key) {
 
     CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
     CHECK_EQ_INT(agent_command(agent_sock, expected_key), 0);
+    live = false;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(live);
+
+    /* `ssh-keygen -lf <private>` prefers `<private>.pub` when it exists.
+     * Replace only that untrusted sibling with the other key: liveness must
+     * continue deriving identity from the descriptor-admitted private bytes,
+     * not accept whichever public file happens to sit beside the pathname. */
+    CHECK(read_text(expected_pub, expected_public_text,
+                    sizeof(expected_public_text))[0] != '\0');
+    CHECK(read_text(other_pub, other_public_text,
+                    sizeof(other_public_text))[0] != '\0');
+    CHECK_EQ_INT(write_text(expected_pub, other_public_text, 0600), 0);
+    live = false;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(live); /* private A still matches the agent's A */
+    CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
+    CHECK_EQ_INT(agent_command(agent_sock, other_key), 0);
+    live = true;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(!live); /* sibling B must not authorize agent B for private A */
+    CHECK_EQ_INT(write_text(expected_pub, expected_public_text, 0600), 0);
+
+    /* OpenSSH gives a certificate the same fingerprint as its raw public
+     * key. Loading a private key beside its sibling certificate adds both;
+     * deleting only the raw public identity leaves a deterministic
+     * certificate-only agent that must not satisfy raw-key liveness. */
+    {
+        const char *sign_argv[] = {
+            "ssh-keygen", "-q", "-s", ca_key, "-I", "ar11-m24",
+            "-n", "work", expected_pub, NULL
+        };
+        const char *fingerprint_argv[] = {
+            "ssh-keygen", "-lf", expected_pub, NULL
+        };
+        CHECK_EQ_INT(run_external(sign_argv, NULL, output, sizeof(output)), 0);
+        CHECK_EQ_INT(run_external(fingerprint_argv, NULL, output,
+                                  sizeof(output)), 0);
+        CHECK_EQ_INT(sscanf(output, "%*s %255s", expected_fingerprint), 1);
+    }
+    CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
+    CHECK_EQ_INT(agent_command(agent_sock, expected_key), 0);
+    live = true;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(!live); /* raw plus its same-fingerprint certificate is not exact */
+    CHECK_EQ_INT(agent_run(agent_sock, "-k", "-d", expected_pub,
+                           NULL, 0U), 0);
+    CHECK_EQ_INT(agent_run(agent_sock, "-l", NULL, NULL,
+                           output, sizeof(output)), 0);
+    CHECK(strlen(output) >= sizeof(certificate_suffix) - 1U &&
+          memcmp(output + strlen(output) - (sizeof(certificate_suffix) - 1U),
+                 certificate_suffix,
+                 sizeof(certificate_suffix) - 1U) == 0);
+    CHECK(strchr(output, '\n') != NULL &&
+          strchr(output, '\n')[1] == '\0');
+    CHECK_EQ_INT(sscanf(output, "%*s %255s", agent_fingerprint), 1);
+    CHECK_STR_EQ(agent_fingerprint, expected_fingerprint);
+    live = true;
+    CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
+    CHECK(!live);
+
+    /* The configured raw key alone remains a valid exact identity. `-k`
+     * prevents ssh-add from automatically loading the sibling certificate. */
+    CHECK_EQ_INT(agent_command(agent_sock, "-D"), 0);
+    CHECK_EQ_INT(agent_run(agent_sock, "-k", expected_key, NULL,
+                           NULL, 0U), 0);
     live = false;
     CHECK_EQ_INT(ssh_manager_current_is_live_for_account(&account, &live), 0);
     CHECK(live);
@@ -1164,19 +1409,24 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
              "default_scope = \"global\"\n"
              "active_account = \"work\"\n\n"
              "[accounts.1]\n"
+             "incarnation = \"" REAL_RESUME_INCARNATION "\"\n"
              "name = \"work\"\n"
              "email = \"work@example.test\"\n"
              "preferred_scope = \"global\"\n"
              "ssh_key = \"%s\"\n",
              key);
     CHECK_EQ_INT(write_text(config_path, config_body, 0600), 0);
-    CHECK_EQ_INT(write_text(hint, "ssh\nactive=work\n", 0600), 0);
+    CHECK_EQ_INT(seed_stale_global_publication(home, hint, git_config), 0);
+    /* Replacing the published generation is the external edit this test must
+     * preserve across both resume and the later retirement reconciliation. */
     CHECK_EQ_INT(write_text(git_config, git_config_body, 0600), 0);
     read_text(git_config, before, sizeof(before));
 
+    /* Match the production fallback PATH: FreeBSD packages Git and OpenSSH
+     * helpers under /usr/local/bin, while Linux/macOS commonly use /usr/bin. */
     snprintf(command, sizeof(command),
              "env -u SSH_AUTH_SOCK -u GNUPGHOME HOME='%s' "
-             "XDG_RUNTIME_DIR='%s' PATH='/usr/bin:/bin' "
+             "XDG_RUNTIME_DIR='%s' PATH='/usr/local/bin:/usr/bin:/bin' "
              "GIT_CONFIG_NOSYSTEM=1 '%s' -C resume >/dev/null 2>&1",
              home, runtime, g_bin);
     CHECK_EQ_INT(run_shell(command), 0);
@@ -1184,10 +1434,13 @@ TEST(real_resume_leaves_external_git_configuration_byte_identical) {
     CHECK_STR_EQ(after, before);
 
     snprintf(command, sizeof(command),
-             "env HOME='%s' XDG_RUNTIME_DIR='%s' PATH='/usr/bin:/bin' "
+             "env HOME='%s' XDG_RUNTIME_DIR='%s' "
+             "PATH='/usr/local/bin:/usr/bin:/bin' "
              "GIT_CONFIG_NOSYSTEM=1 '%s' -C -y reset >/dev/null 2>&1",
              home, runtime, g_bin);
     CHECK_EQ_INT(run_shell(command), 0);
+    read_text(git_config, after, sizeof(after));
+    CHECK_STR_EQ(after, before);
     ts_rm_rf(root);
 }
 
@@ -1209,6 +1462,7 @@ int main(int argc, char **argv) {
     }
 
     RUN_TEST(help_and_init_share_the_exact_six_shell_matrix);
+    RUN_TEST(shell_generators_fail_closed_for_missing_configured_runtime_root);
     RUN_TEST(generated_snippets_use_only_the_bounded_resume_hint_probe);
     RUN_TEST(resume_hint_probe_accepts_only_safe_exact_artifacts);
     RUN_TEST(resume_hint_probe_is_noncreating_and_rejects_other_grammar);

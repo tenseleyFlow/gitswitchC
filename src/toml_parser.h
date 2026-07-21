@@ -8,6 +8,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "gitswitch.h"
+
 /* Maximum limits for security */
 #define TOML_MAX_KEY_LEN 64
 #define TOML_MAX_VALUE_LEN 512
@@ -20,7 +22,7 @@
  * relationship is pinned by a _Static_assert in toml_parser.c. */
 #define TOML_MAX_SECTIONS 65
 #define TOML_MAX_KEYS_PER_SECTION 16
-#define TOML_MAX_FILE_SIZE (64 * 1024)  /* 64KB max config file */
+#define TOML_MAX_FILE_SIZE CONFIG_DOCUMENT_MAX_SIZE  /* 64KB max config file */
 
 /* TOML value types */
 typedef enum {
@@ -54,7 +56,9 @@ typedef struct {
 typedef struct {
     toml_section_t sections[TOML_MAX_SECTIONS];
     size_t section_count;
-    char file_path[512];
+    /* Retain the successfully opened source path for diagnostics without
+     * imposing a parser-only ceiling below the application's path contract. */
+    char file_path[MAX_PATH_LEN];
     bool is_valid; /* True only after a complete successful schema pass;
                     * every successful public setter clears it. */
 } toml_document_t;
@@ -79,10 +83,12 @@ typedef void (*toml_writer_test_hook_fn)(toml_writer_test_stage_t stage,
 toml_writer_test_hook_fn toml_set_writer_test_hook_fn(
     toml_writer_test_hook_fn fn);
 
-/* Deterministic pure-metadata mismatch seam for descriptor revalidation.
- * Production leaves it NULL; tests restore the returned prior callback. */
+/* Deterministic internal-boundary seam for descriptor revalidation and model
+ * preflight operation counting. Production leaves it NULL; tests restore the
+ * returned prior callback. */
 typedef enum {
-    TOML_METADATA_TEST_FD_REVALIDATE = 1
+    TOML_METADATA_TEST_FD_REVALIDATE = 1,
+    TOML_METADATA_TEST_MODEL_PREFLIGHT = 2
 } toml_metadata_test_stage_t;
 typedef bool (*toml_metadata_test_hook_fn)(toml_metadata_test_stage_t stage);
 toml_metadata_test_hook_fn toml_set_metadata_test_hook_fn(
@@ -189,7 +195,9 @@ int toml_validate_gitswitch_schema(toml_document_t *doc);
 /**
  * Validate the two distinct SSH host fields used by the config schema.
  * `ssh_host` is a managed OpenSSH Host pattern and may contain '*'/'?'.
- * `ssh_hostname` is a literal canonical destination and never may.
+ * `ssh_hostname` is one host-only canonical destination: an ASCII name/IPv4
+ * value or an unbracketed IPv6 literal. Endpoint `host:port` syntax is not
+ * modeled and is rejected.
  */
 bool toml_validate_ssh_host_alias(const char *alias);
 bool toml_validate_ssh_hostname(const char *hostname);

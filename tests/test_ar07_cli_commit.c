@@ -4,6 +4,9 @@
  * tests execute the built CLI in isolated HOME/XDG_RUNTIME_DIR trees. */
 #include "test.h"
 #include "gitswitch.h"
+#include "publication.h"
+#include "toml_parser.h"
+#include "utils.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,7 +21,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#define CHECK_LOOKUP_STATUS(call, expected) do {                             \
+    publication_lookup_status_t lookup_status_ = (call);                    \
+    CHECK(lookup_status_ == (expected));                                     \
+} while (0)
+
+#define CLI_ACCOUNT_1_INCARNATION \
+    "1111111111111111111111111111111111111111111111111111111111111111"
+#define CLI_ACCOUNT_2_INCARNATION \
+    "2222222222222222222222222222222222222222222222222222222222222222"
+
 static char g_bin[4096];
+static const char *g_cli_path_override;
 
 typedef enum {
     POSIXLY_INHERIT = 0,
@@ -54,7 +68,8 @@ static int make_private_dir(char *path, size_t size, const char *stem) {
     if ((size_t)snprintf(path, size, "/tmp/%s.XXXXXX", stem) >= size) {
         return -1;
     }
-    return ts_mkdtemp(path) ? 0 : -1;
+    if (!ts_mkdtemp(path)) return -1;
+    return ts_canonicalize_dir_path(path, size);
 }
 
 static int write_text_mode(const char *path, const char *text, mode_t mode) {
@@ -78,6 +93,16 @@ static int write_text_mode(const char *path, const char *text, mode_t mode) {
     return chmod(path, mode);
 }
 
+static int install_cli_probe_program(const char *source,
+                                     const char *directory, const char *name,
+                                     char *path, size_t path_size) {
+    int written;
+
+    written = snprintf(path, path_size, "%s/%s", directory, name);
+    if (written < 0 || (size_t)written >= path_size) return -1;
+    return copy_file(source, path) == 0 && chmod(path, 0700) == 0 ? 0 : -1;
+}
+
 static int write_account_config(const char *home, bool include_second,
                                 char *config_dir, size_t dir_size) {
     char path[4096];
@@ -87,6 +112,7 @@ static int write_account_config(const char *home, bool include_second,
         "active_account = \"old\"\n"
         "\n"
         "[accounts.1]\n"
+        "incarnation = \"" CLI_ACCOUNT_1_INCARNATION "\"\n"
         "name = \"old\"\n"
         "email = \"old@example.com\"\n"
         "preferred_scope = \"global\"\n";
@@ -96,11 +122,13 @@ static int write_account_config(const char *home, bool include_second,
         "active_account = \"old\"\n"
         "\n"
         "[accounts.1]\n"
+        "incarnation = \"" CLI_ACCOUNT_1_INCARNATION "\"\n"
         "name = \"old\"\n"
         "email = \"old@example.com\"\n"
         "preferred_scope = \"global\"\n"
         "\n"
         "[accounts.2]\n"
+        "incarnation = \"" CLI_ACCOUNT_2_INCARNATION "\"\n"
         "name = \"new\"\n"
         "email = \"new@example.com\"\n"
         "preferred_scope = \"global\"\n";
@@ -138,6 +166,33 @@ static int write_account_config(const char *home, bool include_second,
     return 0;
 }
 
+static int write_legacy_two_account_config(const char *home,
+                                           char *config_dir,
+                                           size_t dir_size) {
+    char path[4096];
+    static const char legacy_two_accounts[] =
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "active_account = \"old\"\n"
+        "\n"
+        "[accounts.1]\n"
+        "name = \"old\"\n"
+        "email = \"old@example.com\"\n"
+        "preferred_scope = \"global\"\n"
+        "\n"
+        "[accounts.2]\n"
+        "name = \"new\"\n"
+        "email = \"new@example.com\"\n"
+        "preferred_scope = \"global\"\n";
+
+    if (write_account_config(home, true, config_dir, dir_size) != 0 ||
+        (size_t)snprintf(path, sizeof(path), "%s/accounts.toml",
+                         config_dir) >= sizeof(path)) {
+        return -1;
+    }
+    return write_text_mode(path, legacy_two_accounts, 0600);
+}
+
 static bool directory_empty(const char *path) {
     DIR *dir = opendir(path);
     struct dirent *entry;
@@ -156,6 +211,91 @@ static bool directory_empty(const char *path) {
     return true;
 }
 
+static bool directory_has_only_entry(const char *path,
+                                     const char *expected_name) {
+    DIR *dir = opendir(path);
+    struct dirent *entry;
+    bool found = false;
+    bool valid = true;
+
+    if (!dir) {
+        return false;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (found || strcmp(entry->d_name, expected_name) != 0) {
+            valid = false;
+        }
+        found = true;
+    }
+    if (closedir(dir) != 0) {
+        return false;
+    }
+    return valid && found;
+}
+
+static bool directory_has_exact_entries(const char *path,
+                                        const char *const expected[],
+                                        size_t expected_count) {
+    DIR *dir = opendir(path);
+    struct dirent *entry;
+    size_t found_count = 0;
+
+    if (!dir) {
+        return false;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        bool matched = false;
+
+        if (strcmp(entry->d_name, ".") == 0 ||
+            strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        for (size_t i = 0; i < expected_count; i++) {
+            if (strcmp(entry->d_name, expected[i]) == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            closedir(dir);
+            return false;
+        }
+        found_count++;
+    }
+    if (closedir(dir) != 0) {
+        return false;
+    }
+    return found_count == expected_count;
+}
+
+static bool modification_timestamp_equal(const struct stat *before,
+                                         const struct stat *after) {
+#ifdef __APPLE__
+    return before->st_mtimespec.tv_sec == after->st_mtimespec.tv_sec &&
+           before->st_mtimespec.tv_nsec == after->st_mtimespec.tv_nsec;
+#else
+    return before->st_mtim.tv_sec == after->st_mtim.tv_sec &&
+           before->st_mtim.tv_nsec == after->st_mtim.tv_nsec;
+#endif
+}
+
+static bool mutation_timestamps_equal(const struct stat *before,
+                                      const struct stat *after) {
+#ifdef __APPLE__
+    return modification_timestamp_equal(before, after) &&
+           before->st_ctimespec.tv_sec == after->st_ctimespec.tv_sec &&
+           before->st_ctimespec.tv_nsec == after->st_ctimespec.tv_nsec;
+#else
+    return modification_timestamp_equal(before, after) &&
+           before->st_ctim.tv_sec == after->st_ctim.tv_sec &&
+           before->st_ctim.tv_nsec == after->st_ctim.tv_nsec;
+#endif
+}
+
 static const char *slurp(const char *path, char *buf, size_t size) {
     FILE *file;
     size_t used;
@@ -172,6 +312,240 @@ static const char *slurp(const char *path, char *buf, size_t size) {
     buf[used] = '\0';
     fclose(file);
     return buf;
+}
+
+static int extract_unique_line(const char *text, const char *prefix,
+                               char *line, size_t line_size) {
+    const char *cursor = text;
+    size_t prefix_length = strlen(prefix);
+    bool found = false;
+
+    if (!text || !prefix || !line || line_size == 0) return -1;
+    line[0] = '\0';
+    while (*cursor) {
+        const char *newline = strchr(cursor, '\n');
+        size_t length = newline ? (size_t)(newline - cursor) : strlen(cursor);
+
+        if (length >= prefix_length &&
+            memcmp(cursor, prefix, prefix_length) == 0) {
+            if (found || length + 2U > line_size) return -1;
+            memcpy(line, cursor, length);
+            line[length] = '\n';
+            line[length + 1U] = '\0';
+            found = true;
+        }
+        if (!newline) break;
+        cursor = newline + 1;
+    }
+    return found ? 0 : -1;
+}
+
+static int extract_unique_section(const char *text, const char *heading,
+                                  char *section, size_t section_size) {
+    const char *start;
+    const char *end;
+    size_t heading_length;
+    size_t length;
+
+    if (!text || !heading || !section || section_size == 0) return -1;
+    section[0] = '\0';
+    heading_length = strlen(heading);
+    start = strstr(text, heading);
+    if (!start || strstr(start + heading_length, heading)) return -1;
+    end = strstr(start, "\n\n");
+    if (!end) return -1;
+    length = (size_t)(end - start) + 1U;
+    if (length + 1U > section_size) return -1;
+    memcpy(section, start, length);
+    section[length] = '\0';
+    return 0;
+}
+
+static int extract_parenthesized_value(const char *line, const char *prefix,
+                                       char *value, size_t value_size) {
+    const char *open;
+    const char *close;
+    size_t length;
+
+    if (!line || !prefix || !value || value_size == 0) return -1;
+    value[0] = '\0';
+    if (strncmp(line, prefix, strlen(prefix)) != 0) return -1;
+    open = strchr(line, '(');
+    close = open ? strchr(open + 1, ')') : NULL;
+    if (!open || !close || close[1] != '\n' || close[2] != '\0' ||
+        strchr(open + 1, '(') || strchr(close + 1, ')')) {
+        return -1;
+    }
+    length = (size_t)(close - (open + 1));
+    if (length + 1U > value_size) return -1;
+    memcpy(value, open + 1, length);
+    value[length] = '\0';
+    return 0;
+}
+
+typedef struct {
+    struct stat home;
+    struct stat config_parent;
+    struct stat config_dir;
+    struct stat accounts;
+    struct stat resume_hint;
+    struct stat config_lock;
+    struct stat git_config;
+    char accounts_contents[4096];
+    char resume_hint_contents[4096];
+    char config_lock_contents[128];
+    char git_config_contents[4096];
+} persisted_tree_snapshot_t;
+
+static bool preserved_metadata_equal(const struct stat *before,
+                                     const struct stat *after) {
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_mode == after->st_mode &&
+           before->st_nlink == after->st_nlink &&
+           before->st_uid == after->st_uid &&
+           before->st_gid == after->st_gid &&
+           before->st_size == after->st_size &&
+           mutation_timestamps_equal(before, after);
+}
+
+static bool preserved_file_identity_equal(const struct stat *before,
+                                          const struct stat *after) {
+    return before->st_dev == after->st_dev &&
+           before->st_ino == after->st_ino &&
+           before->st_mode == after->st_mode &&
+           before->st_nlink == after->st_nlink &&
+           before->st_uid == after->st_uid &&
+           before->st_gid == after->st_gid &&
+           before->st_size == after->st_size &&
+           modification_timestamp_equal(before, after);
+}
+
+static int snapshot_text_file(const char *path, struct stat *metadata,
+                              char *contents, size_t contents_size) {
+    if (lstat(path, metadata) != 0 || !S_ISREG(metadata->st_mode) ||
+        metadata->st_size < 0 ||
+        (uintmax_t)metadata->st_size >= (uintmax_t)contents_size) {
+        return -1;
+    }
+    slurp(path, contents, contents_size);
+    return strlen(contents) == (size_t)metadata->st_size ? 0 : -1;
+}
+
+static int snapshot_persisted_tree(const char *home, const char *config_dir,
+                                   persisted_tree_snapshot_t *snapshot) {
+    static const char *const home_entries[] = {".config", ".gitconfig"};
+    static const char *const config_parent_entries[] = {"gitswitch"};
+    static const char *const config_entries[] = {
+        "accounts.toml", ".resume-hint", ".config.lock"
+    };
+    char path[8192];
+
+    if (!home || !config_dir || !snapshot) return -1;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (!directory_has_exact_entries(
+            home, home_entries,
+            sizeof(home_entries) / sizeof(home_entries[0])) ||
+        lstat(home, &snapshot->home) != 0 ||
+        (size_t)snprintf(path, sizeof(path), "%s/.config", home) >=
+            sizeof(path) ||
+        !directory_has_exact_entries(
+            path, config_parent_entries,
+            sizeof(config_parent_entries) /
+                sizeof(config_parent_entries[0])) ||
+        lstat(path, &snapshot->config_parent) != 0 ||
+        !directory_has_exact_entries(
+            config_dir, config_entries,
+            sizeof(config_entries) / sizeof(config_entries[0])) ||
+        lstat(config_dir, &snapshot->config_dir) != 0) {
+        return -1;
+    }
+
+    if ((size_t)snprintf(path, sizeof(path), "%s/accounts.toml",
+                         config_dir) >= sizeof(path) ||
+        snapshot_text_file(path, &snapshot->accounts,
+                           snapshot->accounts_contents,
+                           sizeof(snapshot->accounts_contents)) != 0 ||
+        (size_t)snprintf(path, sizeof(path), "%s/.resume-hint",
+                         config_dir) >= sizeof(path) ||
+        snapshot_text_file(path, &snapshot->resume_hint,
+                           snapshot->resume_hint_contents,
+                           sizeof(snapshot->resume_hint_contents)) != 0 ||
+        (size_t)snprintf(path, sizeof(path), "%s/.config.lock",
+                         config_dir) >= sizeof(path) ||
+        snapshot_text_file(path, &snapshot->config_lock,
+                           snapshot->config_lock_contents,
+                           sizeof(snapshot->config_lock_contents)) != 0 ||
+        (size_t)snprintf(path, sizeof(path), "%s/.gitconfig", home) >=
+            sizeof(path) ||
+        snapshot_text_file(path, &snapshot->git_config,
+                           snapshot->git_config_contents,
+                           sizeof(snapshot->git_config_contents)) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static bool persisted_tree_unchanged(
+    const char *home, const char *config_dir,
+    const persisted_tree_snapshot_t *before) {
+    persisted_tree_snapshot_t after;
+
+    if (!before || snapshot_persisted_tree(home, config_dir, &after) != 0) {
+        return false;
+    }
+    return preserved_metadata_equal(&before->home, &after.home) &&
+           preserved_metadata_equal(&before->config_parent,
+                                    &after.config_parent) &&
+           preserved_metadata_equal(&before->config_dir,
+                                    &after.config_dir) &&
+           preserved_metadata_equal(&before->accounts, &after.accounts) &&
+           preserved_metadata_equal(&before->resume_hint,
+                                    &after.resume_hint) &&
+           preserved_metadata_equal(&before->config_lock,
+                                    &after.config_lock) &&
+           preserved_metadata_equal(&before->git_config,
+                                    &after.git_config) &&
+           strcmp(before->accounts_contents, after.accounts_contents) == 0 &&
+           strcmp(before->resume_hint_contents,
+                  after.resume_hint_contents) == 0 &&
+           strcmp(before->config_lock_contents,
+                  after.config_lock_contents) == 0 &&
+           strcmp(before->git_config_contents,
+                  after.git_config_contents) == 0;
+}
+
+/* Mutating command admission revalidates the persistent lock mode before
+ * dispatch and can therefore advance only that inode's ctime.  Authorization
+ * failure must retain its identity/ownership/mode/size/bytes and preserve all
+ * account authority files with exact metadata and contents. */
+static bool persisted_authority_unchanged(
+    const char *home, const char *config_dir,
+    const persisted_tree_snapshot_t *before) {
+    persisted_tree_snapshot_t after;
+
+    if (!before || snapshot_persisted_tree(home, config_dir, &after) != 0) {
+        return false;
+    }
+    return preserved_metadata_equal(&before->home, &after.home) &&
+           preserved_metadata_equal(&before->config_parent,
+                                    &after.config_parent) &&
+           preserved_metadata_equal(&before->config_dir,
+                                    &after.config_dir) &&
+           preserved_metadata_equal(&before->accounts, &after.accounts) &&
+           preserved_metadata_equal(&before->resume_hint,
+                                    &after.resume_hint) &&
+           preserved_file_identity_equal(&before->config_lock,
+                                         &after.config_lock) &&
+           preserved_metadata_equal(&before->git_config,
+                                    &after.git_config) &&
+           strcmp(before->accounts_contents, after.accounts_contents) == 0 &&
+           strcmp(before->resume_hint_contents,
+                  after.resume_hint_contents) == 0 &&
+           strcmp(before->config_lock_contents,
+                  after.config_lock_contents) == 0 &&
+           strcmp(before->git_config_contents,
+                  after.git_config_contents) == 0;
 }
 
 /* argv must include argv[0] and its terminating NULL. execv's historical API
@@ -259,6 +633,8 @@ static int run_cli_input_posixly(const char *home, const char *runtime,
             setenv("XDG_RUNTIME_DIR", runtime, 1) != 0 ||
             setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
             setenv("GIT_CONFIG_GLOBAL", git_config, 1) != 0 ||
+            (g_cli_path_override &&
+             setenv("PATH", g_cli_path_override, 1) != 0) ||
             posixly_rc != 0 || stdout_fault_rc != 0) {
             _exit(125);
         }
@@ -303,6 +679,19 @@ static int run_cli(const char *home, const char *runtime,
                    const char *const argv[],
                    char *output_path, size_t output_size) {
     return run_cli_input(home, runtime, NULL, argv, output_path, output_size);
+}
+
+static int run_cli_with_path(const char *home, const char *runtime,
+                             const char *path,
+                             const char *const argv[],
+                             char *output_path, size_t output_size) {
+    const char *previous_override = g_cli_path_override;
+    int rc;
+
+    g_cli_path_override = path;
+    rc = run_cli(home, runtime, argv, output_path, output_size);
+    g_cli_path_override = previous_override;
+    return rc;
 }
 
 static int run_cli_stdout_mode(const char *home, const char *runtime,
@@ -387,13 +776,26 @@ TEST(option_order_is_independent_of_posixly_correct) {
     }
 }
 
-TEST(help_names_every_yes_confirmation_bypass) {
-    static const char expected[] =
-        "  --yes, -y            Assume 'yes' to confirmation prompts "
-        "(add/edit/remove/reset)\n";
+TEST(readme_and_help_name_every_yes_confirmation_bypass) {
+    static const char expected_commands[] = "add/edit/remove/reset";
     const char *argv[] = {"gitswitch", "--help", NULL};
+    const char *source_root = getenv("GITSWITCH_SOURCE_ROOT");
     char home[128], runtime[128], output_path[128], output[8192];
+    char readme_path[4096], readme[16384], readme_line[256], help_line[256];
+    char readme_options[2048], help_options[2048], yes_commands[128];
+    int path_length;
     int rc;
+
+    if (!source_root || !*source_root) source_root = ".";
+    path_length = snprintf(readme_path, sizeof(readme_path), "%s/README.md",
+                           source_root);
+    CHECK(path_length > 0 && (size_t)path_length < sizeof(readme_path));
+    if (path_length <= 0 || (size_t)path_length >= sizeof(readme_path)) return;
+    slurp(readme_path, readme, sizeof(readme));
+    CHECK_EQ_INT(extract_unique_line(readme, "  --yes, -y", readme_line,
+                                     sizeof(readme_line)), 0);
+    CHECK_EQ_INT(extract_unique_section(readme, "Options:\n", readme_options,
+                                        sizeof(readme_options)), 0);
 
     CHECK_EQ_INT(make_private_dir(home, sizeof(home),
                                   "gitswitch-ar09-home"), 0);
@@ -402,7 +804,16 @@ TEST(help_names_every_yes_confirmation_bypass) {
     rc = run_cli(home, runtime, argv, output_path, sizeof(output_path));
     CHECK_EQ_INT(rc, 0);
     slurp(output_path, output, sizeof(output));
-    CHECK(strstr(output, expected) != NULL);
+    CHECK_EQ_INT(extract_unique_line(output, "  --yes, -y", help_line,
+                                     sizeof(help_line)), 0);
+    CHECK_EQ_INT(extract_unique_section(output, "Options:\n", help_options,
+                                        sizeof(help_options)), 0);
+    CHECK_STR_EQ(readme_options, help_options);
+    CHECK_STR_EQ(readme_line, help_line);
+    CHECK_EQ_INT(extract_parenthesized_value(
+                     help_line, "  --yes, -y", yes_commands,
+                     sizeof(yes_commands)), 0);
+    CHECK_STR_EQ(yes_commands, expected_commands);
     CHECK(directory_empty(home));
     CHECK(directory_empty(runtime));
     unlink(output_path);
@@ -453,6 +864,79 @@ TEST(config_command_reports_exact_owner_only_mode) {
         }
         CHECK_EQ_INT(rc, 0);
         CHECK_STR_EQ(report, expected);
+        unlink(output_path);
+    }
+}
+
+TEST(doctor_reports_the_bound_gpg_path_and_keeps_absence_optional) {
+    const char *argv[] = {"gitswitch", "--no-color", "doctor", NULL};
+    char trusted_root[4096], with_gpg[4096], without_gpg[4096];
+    char probe_source[4096];
+    char git_path[4096], ssh_agent_path[4096], gpg_path[4096];
+
+    CHECK_EQ_INT(find_command_path("true", probe_source,
+                                   sizeof(probe_source)), 0);
+    CHECK(ts_mkdtemp_trusted(trusted_root, sizeof(trusted_root),
+                             "gitswitch-ar11-doctor") != NULL);
+    CHECK((size_t)snprintf(with_gpg, sizeof(with_gpg), "%s/with-gpg",
+                           trusted_root) < sizeof(with_gpg));
+    CHECK((size_t)snprintf(without_gpg, sizeof(without_gpg), "%s/no-gpg",
+                           trusted_root) < sizeof(without_gpg));
+    CHECK_EQ_INT(mkdir(with_gpg, 0700), 0);
+    CHECK_EQ_INT(mkdir(without_gpg, 0700), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, with_gpg, "git",
+                                           git_path,
+                                           sizeof(git_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, with_gpg,
+                                           "ssh-agent",
+                                           ssh_agent_path,
+                                           sizeof(ssh_agent_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, with_gpg, "gpg",
+                                           gpg_path,
+                                           sizeof(gpg_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, without_gpg, "git",
+                                           git_path,
+                                           sizeof(git_path)), 0);
+    CHECK_EQ_INT(install_cli_probe_program(probe_source, without_gpg,
+                                           "ssh-agent",
+                                           ssh_agent_path,
+                                           sizeof(ssh_agent_path)), 0);
+
+    for (int gpg_present = 1; gpg_present >= 0; gpg_present--) {
+        char home[128], runtime[128], config_dir[4096];
+        char output_path[128], output[16384], expected[8192];
+        const char *selected_path = gpg_present ? with_gpg : without_gpg;
+        int rc;
+
+        CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                      "gitswitch-ar11-home"), 0);
+        CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                      "gitswitch-ar11-run"), 0);
+        CHECK_EQ_INT(write_account_config(home, false, config_dir,
+                                          sizeof(config_dir)), 0);
+        rc = run_cli_with_path(home, runtime, selected_path, argv,
+                               output_path, sizeof(output_path));
+        slurp(output_path, output, sizeof(output));
+        if (rc != 0) {
+            fprintf(stderr, "  doctor GPG-present=%d returned %d:\n%s\n",
+                    gpg_present, rc, output);
+        }
+        CHECK_EQ_INT(rc, 0);
+        if (gpg_present) {
+            CHECK((size_t)snprintf(expected, sizeof(expected),
+                                   "[OK] GPG found: %s", gpg_path) <
+                  sizeof(expected));
+            CHECK(strstr(output, expected) != NULL);
+            CHECK(strstr(output, "GPG not found") == NULL);
+        } else {
+            CHECK(strstr(output,
+                         "[WARN] GPG not found - GPG signing will not work") !=
+                  NULL);
+            CHECK(strstr(output, "GPG found:") == NULL);
+        }
+        CHECK(strstr(output,
+                     "All configured accounts passed the reported local checks") !=
+              NULL);
         unlink(output_path);
     }
 }
@@ -726,7 +1210,134 @@ TEST(dry_run_does_not_repair_existing_config_directory_permissions) {
     unlink(output_path);
 }
 
-TEST(save_failures_never_print_final_mutation_success) {
+TEST(read_only_commands_never_create_or_repair_runtime_manager_lock) {
+    cli_case_t cases[] = {
+        {"no command", {"gitswitch", NULL}},
+        {"list", {"gitswitch", "list", NULL}},
+        {"list alias", {"gitswitch", "ls", NULL}},
+        {"status", {"gitswitch", "status", NULL}},
+        {"doctor", {"gitswitch", "doctor", NULL}},
+        {"health", {"gitswitch", "health", NULL}},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char home[128], runtime[128], agent_dir[256], lock_path[320];
+        char config_dir[4096];
+        char output_path[128];
+        persisted_tree_snapshot_t persisted_before;
+        struct stat manager_before = {0};
+        struct stat manager_after = {0};
+        struct stat lock_observed = {0};
+        int rc;
+
+        CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                      "gitswitch-ar07-home"), 0);
+        CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                      "gitswitch-ar07-run"), 0);
+        CHECK_EQ_INT(write_account_config(home, false, config_dir,
+                                          sizeof(config_dir)), 0);
+        CHECK_EQ_INT(snapshot_persisted_tree(home, config_dir,
+                                             &persisted_before), 0);
+        CHECK((size_t)snprintf(agent_dir, sizeof(agent_dir),
+                               "%s/gitswitch-ssh", runtime) <
+              sizeof(agent_dir));
+        CHECK_EQ_INT(mkdir(agent_dir, 0700), 0);
+        CHECK(directory_empty(agent_dir));
+        CHECK_EQ_INT(stat(agent_dir, &manager_before), 0);
+        CHECK((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock",
+                               agent_dir) < sizeof(lock_path));
+        errno = 0;
+        CHECK(lstat(lock_path, &lock_observed) != 0 && errno == ENOENT);
+
+        rc = run_cli(home, runtime, cases[i].argv,
+                     output_path, sizeof(output_path));
+        if (rc < 0 || rc >= 126) {
+            fprintf(stderr, "  read-only case '%s' returned %d\n",
+                    cases[i].label, rc);
+        }
+        CHECK(rc >= 0 && rc < 126);
+        CHECK_EQ_INT(stat(agent_dir, &manager_after), 0);
+        CHECK(preserved_metadata_equal(&manager_before, &manager_after));
+        CHECK(directory_empty(agent_dir));
+        errno = 0;
+        CHECK(lstat(lock_path, &lock_observed) != 0 && errno == ENOENT);
+        CHECK(persisted_tree_unchanged(home, config_dir,
+                                       &persisted_before));
+        unlink(output_path);
+    }
+}
+
+TEST(read_only_commands_never_repair_or_replace_wrong_mode_manager_lock) {
+    cli_case_t cases[] = {
+        {"no command", {"gitswitch", NULL}},
+        {"list", {"gitswitch", "list", NULL}},
+        {"list alias", {"gitswitch", "ls", NULL}},
+        {"status", {"gitswitch", "status", NULL}},
+        {"doctor", {"gitswitch", "doctor", NULL}},
+        {"health", {"gitswitch", "health", NULL}},
+    };
+    static const char lock_sentinel[] = "wrong-mode-lock-sentinel\n";
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char home[128], runtime[128], agent_dir[256], lock_path[320];
+        char config_dir[4096];
+        char output_path[128], lock_contents[128];
+        persisted_tree_snapshot_t persisted_before;
+        struct stat manager_before = {0}, manager_after = {0};
+        struct stat lock_before = {0}, lock_after = {0};
+        int rc;
+
+        CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                      "gitswitch-ar07-home"), 0);
+        CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                      "gitswitch-ar07-run"), 0);
+        CHECK_EQ_INT(write_account_config(home, false, config_dir,
+                                          sizeof(config_dir)), 0);
+        CHECK_EQ_INT(snapshot_persisted_tree(home, config_dir,
+                                             &persisted_before), 0);
+        CHECK((size_t)snprintf(agent_dir, sizeof(agent_dir),
+                               "%s/gitswitch-ssh", runtime) <
+              sizeof(agent_dir));
+        CHECK_EQ_INT(mkdir(agent_dir, 0700), 0);
+        CHECK((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock",
+                               agent_dir) < sizeof(lock_path));
+        CHECK_EQ_INT(write_text_mode(lock_path, lock_sentinel, 0644), 0);
+        CHECK(directory_has_only_entry(agent_dir, ".lock"));
+        CHECK_STR_EQ(slurp(lock_path, lock_contents, sizeof(lock_contents)),
+                     lock_sentinel);
+        CHECK_EQ_INT(stat(agent_dir, &manager_before), 0);
+        CHECK_EQ_INT(lstat(lock_path, &lock_before), 0);
+
+        rc = run_cli(home, runtime, cases[i].argv,
+                     output_path, sizeof(output_path));
+        if (rc < 0 || rc >= 126) {
+            fprintf(stderr, "  wrong-mode read-only case '%s' returned %d\n",
+                    cases[i].label, rc);
+        }
+        CHECK(rc >= 0 && rc < 126);
+        CHECK_EQ_INT(stat(agent_dir, &manager_after), 0);
+        CHECK_EQ_INT(lstat(lock_path, &lock_after), 0);
+
+        CHECK(persisted_tree_unchanged(home, config_dir,
+                                       &persisted_before));
+        CHECK(preserved_metadata_equal(&manager_before, &manager_after));
+        CHECK(directory_has_only_entry(agent_dir, ".lock"));
+
+        CHECK(preserved_metadata_equal(&lock_before, &lock_after));
+        CHECK_EQ_INT(lock_before.st_mode & 0777, 0644);
+        CHECK_EQ_INT(lock_after.st_mode & 0777, 0644);
+        CHECK_STR_EQ(slurp(lock_path, lock_contents, sizeof(lock_contents)),
+                     lock_sentinel);
+
+        unlink(lock_path);
+        unlink(output_path);
+    }
+}
+
+TEST(mutation_failures_never_print_final_mutation_success) {
+    static const char *const publish_old[] = {
+        "gitswitch", "--global", "--yes", "switch", "old", NULL
+    };
     cli_case_t cases[] = {
         {"add", {"gitswitch", "--yes", "add", NULL}},
         {"edit", {"gitswitch", "--yes", "edit", "old", NULL}},
@@ -745,6 +1356,13 @@ TEST(save_failures_never_print_final_mutation_success) {
         "Account removed successfully",
         "Reset all gitswitch SSH/GPG state",
     };
+    const char *failure_context[] = {
+        "Failed to save configuration changes",
+        "Failed to save configuration changes",
+        "Failed to remove account: Cannot acquire the retirement lifecycle lock",
+        ("reset failed; account and active-state metadata were preserved for retry: "
+         "Cannot acquire the retirement lifecycle lock"),
+    };
 
     if (getuid() == 0) {
         TS_SKIP("unprivileged",
@@ -762,6 +1380,25 @@ TEST(save_failures_never_print_final_mutation_success) {
                                       "gitswitch-ar07-run"), 0);
         CHECK_EQ_INT(write_account_config(home, false, config_dir,
                                           sizeof(config_dir)), 0);
+
+        /* Remove/reset install their retirement guard before any runtime
+         * cleanup or config mutation. The deliberately unwritable directory
+         * therefore exercises that fail-closed admission boundary rather than
+         * the later save reached by add/edit. Seed publication authority while
+         * the fixture is writable so ownership admission is not the failure. */
+        if (i >= 2U) {
+            rc = run_cli(home, runtime, publish_old,
+                         output_path, sizeof(output_path));
+            if (rc != 0) {
+                slurp(output_path, output, sizeof(output));
+                fprintf(stderr,
+                        "  publication setup for save-failure case '%s' "
+                        "returned %d:\n%s\n",
+                        cases[i].label, rc, output);
+            }
+            CHECK_EQ_INT(rc, 0);
+            unlink(output_path);
+        }
         input_path[0] = '\0';
         if (input[i]) {
             snprintf(input_path, sizeof(input_path), "%s/input", runtime);
@@ -778,11 +1415,102 @@ TEST(save_failures_never_print_final_mutation_success) {
             fprintf(stderr, "  save-failure case '%s' returned %d:\n%s\n",
                     cases[i].label, rc, output);
         }
+        if (strstr(output, failure_context[i]) == NULL) {
+            fprintf(stderr,
+                    "  save-failure case '%s' omitted expected context '%s':\n%s\n",
+                    cases[i].label, failure_context[i], output);
+        }
         CHECK(rc > 0 && rc < 126);
-        CHECK(strstr(output, "Failed to save configuration changes") != NULL);
+        CHECK(strstr(output, failure_context[i]) != NULL);
         CHECK(strstr(output, banner[i]) == NULL);
 
         CHECK_EQ_INT(chmod(config_dir, 0700), 0);
+        unlink(output_path);
+    }
+}
+
+TEST(destructive_prompt_output_failure_blocks_authorization) {
+    static const char *const publish_old[] = {
+        "gitswitch", "--global", "--yes", "switch", "old", NULL
+    };
+    cli_case_t cases[] = {
+        {"remove", {"gitswitch", "remove", "old", NULL}},
+        {"reset", {"gitswitch", "reset", NULL}},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char home[128], publish_runtime[128], runtime[128];
+        char config_dir[4096], output_path[128];
+        char input_path[] = "/tmp/gitswitch-ar11-prompt-input.XXXXXX";
+        persisted_tree_snapshot_t persisted_before;
+        struct stat runtime_before = {0}, runtime_after = {0};
+        bool durable_unchanged;
+        int input_fd;
+        int rc;
+
+        CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                      "gitswitch-ar11-home"), 0);
+        CHECK_EQ_INT(make_private_dir(publish_runtime,
+                                      sizeof(publish_runtime),
+                                      "gitswitch-ar11-publish-run"), 0);
+        CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                      "gitswitch-ar11-run"), 0);
+        CHECK_EQ_INT(write_account_config(home, false, config_dir,
+                                          sizeof(config_dir)), 0);
+
+        /* Successful remove/reset now requires exact durable publication
+         * authority. Seed that authority through the real switch path, but use
+         * a separate runtime root so the authorization-failure assertion starts
+         * from an exactly empty runtime tree. */
+        rc = run_cli(home, publish_runtime, publish_old,
+                     output_path, sizeof(output_path));
+        if (rc != 0) {
+            char output[16384];
+
+            fprintf(stderr,
+                    "  publication setup for prompt-output case '%s' "
+                    "returned %d:\n%s\n",
+                    cases[i].label, rc,
+                    slurp(output_path, output, sizeof(output)));
+        }
+        CHECK_EQ_INT(rc, EXIT_SUCCESS);
+        unlink(output_path);
+
+        CHECK_EQ_INT(snapshot_persisted_tree(home, config_dir,
+                                             &persisted_before), 0);
+        CHECK(directory_empty(runtime));
+        CHECK_EQ_INT(stat(runtime, &runtime_before), 0);
+
+        input_fd = mkstemp(input_path);
+        CHECK(input_fd >= 0);
+        if (input_fd >= 0) {
+            CHECK_EQ_INT(close(input_fd), 0);
+            CHECK_EQ_INT(write_text_mode(input_path, "yes\n", 0600), 0);
+        }
+
+        rc = run_cli_input_posixly(home, runtime, input_path,
+                                   cases[i].argv, POSIXLY_INHERIT,
+                                   CLI_STDOUT_READ_ONLY, output_path,
+                                   sizeof(output_path));
+        if (rc != EXIT_FAILURE) {
+            fprintf(stderr,
+                    "  prompt-output case '%s' returned %d, expected %d\n",
+                    cases[i].label, rc, EXIT_FAILURE);
+        }
+        CHECK_EQ_INT(rc, EXIT_FAILURE);
+        durable_unchanged = persisted_authority_unchanged(
+            home, config_dir, &persisted_before);
+        if (!durable_unchanged) {
+            fprintf(stderr,
+                    "  prompt-output case '%s' changed durable authority\n",
+                    cases[i].label);
+        }
+        CHECK(durable_unchanged);
+        CHECK_EQ_INT(stat(runtime, &runtime_after), 0);
+        CHECK(preserved_metadata_equal(&runtime_before, &runtime_after));
+        CHECK(directory_empty(runtime));
+
+        unlink(input_path);
         unlink(output_path);
     }
 }
@@ -833,9 +1561,116 @@ TEST(switch_save_failure_restores_git_config_active_and_exact_hint) {
     unlink(output_path);
 }
 
+TEST(valid_legacy_switch_migrates_before_publication) {
+    char home[128], runtime[128], config_dir[4096];
+    char output_path[128], output[16384], config_path[8192];
+    char state_path[8192], state[16384], git_config_path[8192];
+    char config_contents[16384];
+    char old_incarnation[ACCOUNT_INCARNATION_LEN] = "";
+    char new_incarnation[ACCOUNT_INCARNATION_LEN] = "";
+    static const char active_prefix[] = "none\nactive=new\n";
+    toml_document_t *document = NULL;
+    publication_ledger_t ledger;
+    const publication_record_t *record = NULL;
+    size_t state_length;
+    const char *argv[] = {"gitswitch", "--yes", "new", NULL};
+    int rc;
+
+    publication_ledger_init(&ledger);
+    CHECK_EQ_INT(make_private_dir(home, sizeof(home),
+                                  "gitswitch-ar11-home"), 0);
+    CHECK_EQ_INT(make_private_dir(runtime, sizeof(runtime),
+                                  "gitswitch-ar11-run"), 0);
+    CHECK_EQ_INT(write_legacy_two_account_config(
+                     home, config_dir, sizeof(config_dir)), 0);
+
+    rc = run_cli(home, runtime, argv, output_path, sizeof(output_path));
+    slurp(output_path, output, sizeof(output));
+    if (rc != 0) {
+        fprintf(stderr, "  valid legacy switch returned %d:\n%s\n", rc,
+                output);
+    }
+    CHECK_EQ_INT(rc, 0);
+    CHECK(strstr(output, "Switched to: new") != NULL);
+
+    CHECK((size_t)snprintf(config_path, sizeof(config_path),
+                           "%s/accounts.toml", config_dir) <
+          sizeof(config_path));
+    document = malloc(sizeof(*document));
+    CHECK(document != NULL);
+    if (document) {
+        CHECK_EQ_INT(toml_parse_file(config_path, document), 0);
+        if (document->is_valid) {
+            CHECK_EQ_INT(toml_get_string(document, "accounts.1",
+                                         "incarnation", old_incarnation,
+                                         sizeof(old_incarnation)), 0);
+            CHECK_EQ_INT(toml_get_string(document, "accounts.2",
+                                         "incarnation", new_incarnation,
+                                         sizeof(new_incarnation)), 0);
+        }
+        toml_cleanup_document(document);
+        free(document);
+    }
+    CHECK(account_incarnation_is_valid(old_incarnation));
+    CHECK(account_incarnation_is_valid(new_incarnation));
+    CHECK(strcmp(old_incarnation, new_incarnation) != 0);
+    slurp(config_path, config_contents, sizeof(config_contents));
+    CHECK(strstr(config_contents, "active_account") == NULL);
+
+    CHECK((size_t)snprintf(state_path, sizeof(state_path),
+                           "%s/.resume-hint", config_dir) <
+          sizeof(state_path));
+    slurp(state_path, state, sizeof(state));
+    state_length = strlen(state);
+    CHECK(state_length > sizeof(active_prefix) - 1U);
+    if (state_length >= sizeof(active_prefix) - 1U &&
+        memcmp(state, active_prefix, sizeof(active_prefix) - 1U) == 0) {
+        CHECK_EQ_INT(publication_ledger_parse(
+                         (const unsigned char *)state +
+                             sizeof(active_prefix) - 1U,
+                         state_length - (sizeof(active_prefix) - 1U),
+                         &ledger),
+                     0);
+    }
+    CHECK(ledger.present);
+    CHECK_EQ_INT((int)ledger.version, (int)PUBLICATION_LEDGER_VERSION);
+    CHECK_EQ_INT((int)ledger.count, 1);
+    CHECK((size_t)snprintf(git_config_path, sizeof(git_config_path),
+                           "%s/.gitconfig", home) <
+          sizeof(git_config_path));
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                            &ledger, UINT32_C(2), new_incarnation,
+                            PUBLICATION_SCOPE_GLOBAL, git_config_path, "",
+                            &record),
+                        PUBLICATION_LOOKUP_FOUND);
+    CHECK(record != NULL);
+    if (record) {
+        CHECK_EQ_INT(publication_record_validate(record), 0);
+        CHECK_STR_EQ(record->account_incarnation, new_incarnation);
+        CHECK_EQ_INT((int)record->state,
+                     (int)PUBLICATION_STATE_PUBLISHED);
+        CHECK_EQ_INT((int)record->capabilities,
+                     (int)(PUBLICATION_CAP_DESTINATION |
+                           PUBLICATION_CAP_POST_GENERATION));
+        CHECK_STR_EQ(record->config_path, git_config_path);
+        CHECK_STR_EQ(record->repository_path, "");
+    }
+    slurp(git_config_path, config_contents, sizeof(config_contents));
+    CHECK(strstr(config_contents, "old@example.com") == NULL);
+    CHECK(strstr(config_contents, "new@example.com") != NULL);
+
+    publication_ledger_clear(&ledger);
+    unlink(output_path);
+}
+
 TEST(production_ignores_inherited_test_fault_environment) {
     char home[128], runtime[128], config_dir[4096];
     char output_path[128], output[16384], path[8192], contents[16384];
+    char git_config_path[8192];
+    static const char active_prefix[] = "none\nactive=new\n";
+    publication_ledger_t ledger;
+    const publication_record_t *record = NULL;
+    size_t contents_length;
     const char *argv[] = {"gitswitch", "--yes", "new", NULL};
     int rc;
 
@@ -863,7 +1698,50 @@ TEST(production_ignores_inherited_test_fault_environment) {
     CHECK(strstr(contents, "active_account = \"new\"") == NULL);
     snprintf(path, sizeof(path), "%s/.resume-hint", config_dir);
     slurp(path, contents, sizeof(contents));
-    CHECK_STR_EQ(contents, "none\nactive=new\n");
+    contents_length = strlen(contents);
+    CHECK(contents_length > sizeof(active_prefix) - 1U);
+    CHECK(contents_length >= sizeof(active_prefix) - 1U &&
+          memcmp(contents, active_prefix,
+                 sizeof(active_prefix) - 1U) == 0);
+
+    /* The first two lines remain the shell-integration contract. A normal
+     * prepared switch now appends its exact sealed Git destination instead of
+     * discarding that provenance after commit. Parse the complete tail through
+     * the production grammar so an arbitrary suffix cannot satisfy the test. */
+    publication_ledger_init(&ledger);
+    if (contents_length >= sizeof(active_prefix) - 1U &&
+        memcmp(contents, active_prefix, sizeof(active_prefix) - 1U) == 0) {
+        CHECK_EQ_INT(publication_ledger_parse(
+                         (const unsigned char *)contents +
+                             sizeof(active_prefix) - 1U,
+                         contents_length - (sizeof(active_prefix) - 1U),
+                         &ledger),
+                     0);
+    }
+    CHECK(ledger.present);
+    CHECK_EQ_INT((int)ledger.version, (int)PUBLICATION_LEDGER_VERSION);
+    CHECK_EQ_INT((int)ledger.count, 1);
+    CHECK((size_t)snprintf(git_config_path, sizeof(git_config_path),
+                           "%s/.gitconfig", home) <
+          sizeof(git_config_path));
+    CHECK_LOOKUP_STATUS(publication_ledger_find(
+                     &ledger, UINT32_C(2), CLI_ACCOUNT_2_INCARNATION,
+                     PUBLICATION_SCOPE_GLOBAL, git_config_path, "", &record),
+                 PUBLICATION_LOOKUP_FOUND);
+    CHECK(record != NULL);
+    if (record) {
+        CHECK_EQ_INT(publication_record_validate(record), 0);
+        CHECK_STR_EQ(record->account_incarnation,
+                     CLI_ACCOUNT_2_INCARNATION);
+        CHECK_EQ_INT((int)record->state,
+                     (int)PUBLICATION_STATE_PUBLISHED);
+        CHECK_EQ_INT((int)record->capabilities,
+                     (int)(PUBLICATION_CAP_DESTINATION |
+                           PUBLICATION_CAP_POST_GENERATION));
+        CHECK_STR_EQ(record->config_path, git_config_path);
+        CHECK_STR_EQ(record->repository_path, "");
+    }
+    publication_ledger_clear(&ledger);
     snprintf(path, sizeof(path), "%s/.gitconfig", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "old@example.com") == NULL);
@@ -877,8 +1755,9 @@ TEST_MAIN_BEGIN()
         return 1;
     }
     RUN_TEST(option_order_is_independent_of_posixly_correct);
-    RUN_TEST(help_names_every_yes_confirmation_bypass);
+    RUN_TEST(readme_and_help_name_every_yes_confirmation_bypass);
     RUN_TEST(config_command_reports_exact_owner_only_mode);
+    RUN_TEST(doctor_reports_the_bound_gpg_path_and_keeps_absence_optional);
     RUN_TEST(informational_output_bytes_are_stable);
     RUN_TEST(informational_output_failures_return_nonzero);
     RUN_TEST(exact_arity_rejects_invalid_forms_before_state_creation);
@@ -886,7 +1765,11 @@ TEST_MAIN_BEGIN()
     RUN_TEST(legacy_init_alias_rejects_operands_without_creating_state);
     RUN_TEST(valid_dry_run_grammar_is_noncreating_for_every_command_shape);
     RUN_TEST(dry_run_does_not_repair_existing_config_directory_permissions);
-    RUN_TEST(save_failures_never_print_final_mutation_success);
+    RUN_TEST(read_only_commands_never_create_or_repair_runtime_manager_lock);
+    RUN_TEST(read_only_commands_never_repair_or_replace_wrong_mode_manager_lock);
+    RUN_TEST(mutation_failures_never_print_final_mutation_success);
+    RUN_TEST(destructive_prompt_output_failure_blocks_authorization);
     RUN_TEST(switch_save_failure_restores_git_config_active_and_exact_hint);
+    RUN_TEST(valid_legacy_switch_migrates_before_publication);
     RUN_TEST(production_ignores_inherited_test_fault_environment);
 TEST_MAIN_END()

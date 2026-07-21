@@ -126,13 +126,29 @@ static int make_xdg_agent_dir(char *dir_out, size_t size) {
     return mkdir(dir_out, 0700);
 }
 
-static void make_account(account_t *a, const char *key_basename) {
+static int make_account(account_t *a, const char *key_basename) {
+    static const char private_prefix[] =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n";
+    static const char private_suffix[] =
+        "\n-----END OPENSSH PRIVATE KEY-----\n";
+    const char *generation = strstr(key_basename, "keyB")
+                                 ? "generation-b"
+                                 : "generation-a";
+    char key_data[256];
+
     memset(a, 0, sizeof(*a));
     a->id = 1;
-    safe_strncpy(a->name, "work", sizeof(a->name));
-    safe_strncpy(a->email, "w@x.com", sizeof(a->email));
+    if (safe_strncpy(a->name, "work", sizeof(a->name)) != 0 ||
+        safe_strncpy(a->email, "w@x.com", sizeof(a->email)) != 0 ||
+        (size_t)snprintf(a->ssh_key_path, sizeof(a->ssh_key_path), "%s/%s",
+                         g_xdg, key_basename) >= sizeof(a->ssh_key_path) ||
+        (size_t)snprintf(key_data, sizeof(key_data), "%s%s%s",
+                         private_prefix, generation, private_suffix) >=
+            sizeof(key_data)) {
+        return -1;
+    }
     a->ssh_enabled = true;
-    snprintf(a->ssh_key_path, sizeof(a->ssh_key_path), "%s/%s", g_xdg, key_basename);
+    return write_string_to_file(a->ssh_key_path, key_data, 0600);
 }
 
 static int count_substr(const char *hay, const char *needle) {
@@ -218,7 +234,7 @@ TEST(agent_spawn_pins_bourne_format_and_reaps_on_parse_failure) {
 
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -277,7 +293,7 @@ TEST(socket_validation_failure_reaps_spawned_agent) {
 
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -343,7 +359,7 @@ TEST(reuse_refuses_contaminated_agent) {
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
     CHECK_EQ_INT(bind_sock(sock, 0600), 0);
-    make_account(&acct, "keyA"); /* the agent DOES hold FP_A — but not alone */
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0); /* agent holds FP_A, not alone */
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -408,7 +424,7 @@ TEST(reuse_requires_exact_fingerprint_token) {
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
     CHECK_EQ_INT(bind_sock(sock, 0600), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -471,7 +487,7 @@ TEST(agent_probe_precedes_fingerprint_computation) {
     CHECK_EQ_INT(make_xdg_agent_dir(dir, sizeof(dir)), 0);
     snprintf(sock, sizeof(sock), "%s/ssh-agent.work.sock", dir);
     CHECK_EQ_INT(bind_sock(sock, 0600), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -484,6 +500,7 @@ TEST(agent_probe_precedes_fingerprint_computation) {
 
     CHECK_EQ_INT(rc, 0);
     CHECK(cfg.key_already_loaded); /* single exact match: adopted */
+    CHECK(cfg.reused_existing_agent);
     /* L18: the cheap liveness probe must come first — a stale socket (dead
      * agent, the common miss) must not cost an ssh-keygen fork+exec. */
     CHECK_STR_EQ(g_first_probe, "ssh-add");

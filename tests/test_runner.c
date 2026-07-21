@@ -34,13 +34,134 @@ static bool signal_masks_equal(const sigset_t *left, const sigset_t *right) {
     return true;
 }
 
+static bool signal_actions_equal(const struct sigaction *left,
+                                 const struct sigaction *right) {
+    if (left->sa_handler != right->sa_handler ||
+        left->sa_flags != right->sa_flags) {
+        return false;
+    }
+    return signal_masks_equal(&left->sa_mask, &right->sa_mask);
+}
+
+static void sigchld_reaping_handler(int signal_number) {
+    int saved_errno = errno;
+    int status;
+    (void)signal_number;
+    while (waitpid(-1, &status, WNOHANG) > 0) {}
+    errno = saved_errno;
+}
+
+typedef enum {
+    SIGCHLD_POLICY_IGNORE = 0,
+    SIGCHLD_POLICY_NOCLDWAIT,
+    SIGCHLD_POLICY_REAPER
+} sigchld_policy_t;
+
+static int exercise_rejected_sigchld_policy(sigchld_policy_t policy) {
+    char marker[] = "/tmp/gitswitch-ar11-sigchld.XXXXXX";
+    char command[MAX_PATH_LEN + 32];
+    const char *argv[] = {"sh", "-c", command, NULL};
+    struct sigaction original_action;
+    struct sigaction installed;
+    struct sigaction after_action;
+    sigset_t original_mask;
+    sigset_t configured_mask;
+    sigset_t after_mask;
+    run_result_t result;
+    int marker_fd = mkstemp(marker);
+
+    if (marker_fd < 0) return 20;
+    close(marker_fd);
+    if (unlink(marker) != 0) return 21;
+    if ((size_t)snprintf(command, sizeof(command), ": > '%s'", marker) >=
+        sizeof(command)) {
+        return 22;
+    }
+    if (sigaction(SIGCHLD, NULL, &original_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) {
+        return 23;
+    }
+    configured_mask = original_mask;
+    if (sigaddset(&configured_mask, SIGUSR1) != 0 ||
+        sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) {
+        return 24;
+    }
+
+    memset(&installed, 0, sizeof(installed));
+    if (sigemptyset(&installed.sa_mask) != 0 ||
+        sigaddset(&installed.sa_mask, SIGUSR2) != 0) {
+        return 25;
+    }
+    switch (policy) {
+        case SIGCHLD_POLICY_IGNORE:
+            installed.sa_handler = SIG_IGN;
+            break;
+        case SIGCHLD_POLICY_NOCLDWAIT:
+            installed.sa_handler = SIG_DFL;
+            installed.sa_flags = SA_NOCLDWAIT;
+            break;
+        case SIGCHLD_POLICY_REAPER:
+            installed.sa_handler = sigchld_reaping_handler;
+            installed.sa_flags = SA_RESTART;
+            break;
+        default:
+            return 26;
+    }
+    if (sigaction(SIGCHLD, &installed, NULL) != 0 ||
+        sigaction(SIGCHLD, NULL, &installed) != 0) {
+        return 27;
+    }
+
+    clear_error();
+    errno = 0;
+    int rc = run_argv(argv, NULL, &result);
+    int returned_errno = errno;
+    bool marker_absent = access(marker, F_OK) != 0 && errno == ENOENT;
+    if (sigaction(SIGCHLD, NULL, &after_action) != 0 ||
+        sigprocmask(SIG_SETMASK, NULL, &after_mask) != 0) {
+        return 28;
+    }
+    int action_restore = sigaction(SIGCHLD, &original_action, NULL);
+    int mask_restore = sigprocmask(SIG_SETMASK, &original_mask, NULL);
+    (void)unlink(marker);
+
+    if (action_restore != 0 || mask_restore != 0) return 29;
+    if (rc != -1 || result.spawned || returned_errno != EBUSY) return 30;
+    if (!marker_absent) return 31;
+    if (!signal_actions_equal(&installed, &after_action)) return 32;
+    if (!signal_masks_equal(&configured_mask, &after_mask)) return 33;
+    return 0;
+}
+
+static bool sigchld_policy_is_rejected(sigchld_policy_t policy) {
+    int status = 0;
+    pid_t worker = fork();
+    if (worker < 0) return false;
+    if (worker == 0) _exit(exercise_rejected_sigchld_policy(policy));
+    return waitpid(worker, &status, 0) == worker && WIFEXITED(status) &&
+           WEXITSTATUS(status) == 0;
+}
+
+TEST(run_rejects_ignored_sigchld_before_spawn) {
+    CHECK(sigchld_policy_is_rejected(SIGCHLD_POLICY_IGNORE));
+}
+
+TEST(run_rejects_nocldwait_sigchld_before_spawn) {
+    CHECK(sigchld_policy_is_rejected(SIGCHLD_POLICY_NOCLDWAIT));
+}
+
+TEST(run_rejects_foreign_sigchld_reaper_before_spawn) {
+    CHECK(sigchld_policy_is_rejected(SIGCHLD_POLICY_REAPER));
+}
+
 static void raise_second_rollback_signal_before_pid_publication(void) {
     sigset_t current;
     sigset_t expected = g_expected_parent_mask;
 
-    /* The spawn window blocks every guard-INSTALLED signal: SIGINT, SIGTERM,
-     * and (AR-10 L16) SIGQUIT; SIGHUP is SIG_IGN in this fixture, so the
-     * guard deliberately skipped it. */
+    /* The ownership window keeps SIGCHLD blocked, and the spawn window adds
+     * every guard-INSTALLED signal: SIGINT, SIGTERM, and (AR-10 L16)
+     * SIGQUIT. SIGHUP is SIG_IGN here, so the guard deliberately skipped it. */
+    sigaddset(&expected, SIGCHLD);
     sigaddset(&expected, SIGINT);
     sigaddset(&expected, SIGTERM);
     sigaddset(&expected, SIGQUIT);
@@ -57,6 +178,8 @@ static int exercise_post_fork_signal_publication(void) {
     sigset_t original_mask;
     sigset_t configured_mask;
     sigset_t after_mask;
+    struct sigaction default_action;
+    struct sigaction ignored_action;
     int run_rc;
 
     if (sigprocmask(SIG_SETMASK, NULL, &original_mask) != 0) return 10;
@@ -66,7 +189,22 @@ static int exercise_post_fork_signal_publication(void) {
     sigdelset(&configured_mask, SIGHUP);
     sigaddset(&configured_mask, SIGUSR1);
     if (sigprocmask(SIG_SETMASK, &configured_mask, NULL) != 0) return 11;
-    if (signal(SIGHUP, SIG_IGN) == SIG_ERR) return 12;
+    /* The runner deliberately preserves inherited SIG_IGN dispositions, but
+     * this fixture asserts one exact guard shape. Normalize its private worker
+     * so INT/TERM/QUIT are installed while inherited HUP ignore is preserved;
+     * the release-lock contract independently checks supervisor inheritance. */
+    memset(&default_action, 0, sizeof(default_action));
+    memset(&ignored_action, 0, sizeof(ignored_action));
+    default_action.sa_handler = SIG_DFL;
+    ignored_action.sa_handler = SIG_IGN;
+    if (sigemptyset(&default_action.sa_mask) != 0 ||
+        sigemptyset(&ignored_action.sa_mask) != 0 ||
+        sigaction(SIGINT, &default_action, NULL) != 0 ||
+        sigaction(SIGTERM, &default_action, NULL) != 0 ||
+        sigaction(SIGQUIT, &default_action, NULL) != 0 ||
+        sigaction(SIGHUP, &ignored_action, NULL) != 0) {
+        return 12;
+    }
     if (signals_guard_begin() != 0) return 13;
     if (raise(SIGTERM) != 0 || !signals_pending()) return 14;
     signals_rollback_begin();
@@ -317,6 +455,48 @@ TEST(run_passes_extra_env) {
     CHECK_STR_EQ(out, "hello_env\n");
 }
 
+TEST(run_unsets_environment_before_applying_additions) {
+    const char *name = "GITSWITCH_TEST_UNSET_VAR";
+    const char *argv[] = {"printenv", "GITSWITCH_TEST_UNSET_VAR", NULL};
+    const char *unset_env[] = {"GITSWITCH_TEST_UNSET_VAR", NULL};
+    const char *extra_env[] = {"GITSWITCH_TEST_UNSET_VAR=child", NULL};
+    const char *inherited = getenv(name);
+    char *saved = inherited ? strdup(inherited) : NULL;
+    char out[64];
+    run_opts_t opts;
+    run_result_t res;
+
+    CHECK(!inherited || saved != NULL);
+    if (inherited && !saved) return;
+    CHECK_EQ_INT(setenv(name, "parent", 1), 0);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&res, 0, sizeof(res));
+    opts.out = out;
+    opts.out_size = sizeof(out);
+    opts.unset_env = unset_env;
+    CHECK_EQ_INT(run_argv(argv, &opts, &res), -1);
+    CHECK(res.spawned);
+    CHECK_EQ_INT(res.exit_code, 1);
+    CHECK_STR_EQ(out, "");
+    CHECK_STR_EQ(getenv(name), "parent");
+
+    memset(&res, 0, sizeof(res));
+    opts.extra_env = extra_env;
+    CHECK_EQ_INT(run_argv(argv, &opts, &res), 0);
+    CHECK(res.spawned);
+    CHECK_EQ_INT(res.exit_code, 0);
+    CHECK_STR_EQ(out, "child\n");
+    CHECK_STR_EQ(getenv(name), "parent");
+
+    if (saved) {
+        CHECK_EQ_INT(setenv(name, saved, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv(name), 0);
+    }
+    free(saved);
+}
+
 TEST(run_uses_pinned_child_working_directory) {
     char dir[] = "/tmp/gswrunpwd_XXXXXX";
     /* PATH_MAX: glibc's fortified realpath (__realpath_chk) aborts the whole
@@ -463,11 +643,15 @@ TEST_MAIN_BEGIN()
     RUN_TEST(run_feeds_binary_stdin_at_exact_length);
     RUN_TEST(run_null_input_retains_devnull_eof);
     RUN_TEST(run_passes_extra_env);
+    RUN_TEST(run_unsets_environment_before_applying_additions);
     RUN_TEST(run_uses_pinned_child_working_directory);
     RUN_TEST(run_preserves_pinned_cwd_when_it_collides_with_closed_stdio);
     RUN_TEST(run_empty_argv_fails);
     RUN_TEST(run_reports_output_truncation);
     RUN_TEST(run_reports_death_by_signal);
+    RUN_TEST(run_rejects_ignored_sigchld_before_spawn);
+    RUN_TEST(run_rejects_nocldwait_sigchld_before_spawn);
+    RUN_TEST(run_rejects_foreign_sigchld_reaper_before_spawn);
     RUN_TEST(run_publishes_child_before_releasing_blocked_rollback_signal);
     RUN_TEST(run_restores_exact_mask_and_errno_when_fork_fails);
 TEST_MAIN_END()

@@ -12,8 +12,8 @@
  * 64 KiB and failed the whole switch for any account with an alias when the
  * user's config was larger. The buffers are now heap-sized to the file; this
  * ceiling only guards against a pathological/hostile giant file and is set well
- * beyond any realistic ssh config. Shared by the writer (ssh_manager.c) and the
- * switch preflight (accounts.c) so the two never disagree. */
+ * beyond any realistic ssh config. Shared by the writer and its read-only
+ * structural preflight in ssh_manager.c so the two never disagree. */
 #define GITSWITCH_SSH_CONFIG_MAX_BYTES (8u * 1024u * 1024u)
 
 /* SSH agent management modes */
@@ -35,6 +35,8 @@ typedef struct {
     bool agent_owned;      /* Whether we started this agent */
     bool key_already_loaded; /* The isolated agent already holds the account key;
                               * reuse avoids a passphrase re-prompt. */
+    bool reused_existing_agent; /* This activation adopted an already-live,
+                                  * matching isolated agent. */
 } ssh_config_t;
 
 /* One truthful process-state vocabulary for identity, liveness, and reap.
@@ -76,20 +78,24 @@ typedef int (*ssh_current_publish_hook_fn)(int dir_fd);
 typedef int (*ssh_quarantine_hook_fn)(int dir_fd, const char *name);
 typedef enum {
     SSH_METADATA_TEST_RUNTIME_PIN = 1,
-    SSH_METADATA_TEST_RESET_QUARANTINE
+    SSH_METADATA_TEST_RESET_QUARANTINE,
+    SSH_METADATA_TEST_CONFIG_HOME_CREATE,
+    SSH_METADATA_TEST_CONFIG_UNCHANGED_RECHECK,
+    SSH_METADATA_TEST_CONFIG_UNCHANGED_FINAL_RECHECK
 } ssh_metadata_test_stage_t;
 typedef bool (*ssh_metadata_test_hook_fn)(ssh_metadata_test_stage_t stage);
 typedef int (*ssh_key_open_fn)(const char *path, int flags);
 typedef void (*ssh_key_snapshot_clear_hook_fn)(const void *data, size_t length,
                                                int retained_fd);
+typedef int (*ssh_socket_probe_fn)(const char *path, bool *reachable);
 typedef int64_t (*ssh_probe_clock_fn)(void);
 typedef int (*ssh_probe_poll_fn)(int fd, int timeout_ms);
 
 /* Public-state result for one ~/.ssh/config alias publication.  Failure is
  * transactionally reversible only while PREINSTALL_FAILED remains current.
- * The two uncertain states mean renameat() already made the new bytes public;
- * callers must retain the matching account transaction instead of rolling its
- * Git/runtime/config state back around an installed alias. */
+ * The two uncertain states mean renameat() already made the replacement
+ * public; callers must retain the matching account transaction instead of
+ * rolling its Git/runtime/config state back around an installed alias. */
 typedef enum {
     SSH_CONFIG_PUBLICATION_PREINSTALL_FAILED,
     SSH_CONFIG_PUBLICATION_UNCHANGED,
@@ -136,8 +142,9 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account);
 /**
  * Start isolated SSH agent for account
  * Returns socket path and PID for cleanup
- * This low-level legacy entry point does not validate the key pathname. Use
- * ssh_switch_account() for the descriptor-admitted validation/use contract.
+ * This low-level legacy entry point now admits one descriptor-backed private
+ * key generation for reuse verification and loading. Use ssh_switch_account()
+ * for the complete account-switch transaction and rollback contract.
  */
 int ssh_start_isolated_agent(ssh_config_t *ssh_config, const account_t *account);
 
@@ -192,6 +199,10 @@ ssh_key_open_fn ssh_manager_set_key_open_fn(ssh_key_open_fn fn);
  * a deterministic test seam; NULL restores the production no-op. */
 ssh_key_snapshot_clear_hook_fn ssh_manager_set_key_snapshot_clear_hook_fn(
     ssh_key_snapshot_clear_hook_fn fn);
+/* Test-only probe seam. Install/restore it only when no concurrent SSH
+ * manager operation is running. A failing callback must publish a structured
+ * error (for example with set_system_error()) before returning -1. */
+ssh_socket_probe_fn ssh_manager_set_socket_probe_fn(ssh_socket_probe_fn fn);
 ssh_probe_clock_fn ssh_manager_set_probe_clock_fn(ssh_probe_clock_fn fn);
 ssh_probe_poll_fn ssh_manager_set_probe_poll_fn(ssh_probe_poll_fn fn);
 
@@ -203,7 +214,9 @@ int ssh_stop_agent(ssh_config_t *ssh_config);
 /**
  * Explicitly clear all keys from the selected SSH agent. This primitive is
  * destructive and nontransactional; cleared private identities cannot be
- * exported or restored. Account switching never calls it.
+ * exported or restored. key_already_loaded is cleared whenever a completed
+ * ssh-add child is known to have exited zero, even if later parent-side runner
+ * cleanup makes this function report failure. Account switching never calls it.
  */
 int ssh_clear_agent_keys(ssh_config_t *ssh_config);
 
@@ -278,8 +291,10 @@ int ssh_test_connection(const account_t *account, const char *host);
 
 /**
  * Write the stable SSH_AUTH_SOCK symlink path to buf.
- * Uses $XDG_RUNTIME_DIR/gitswitch-ssh/current.sock when XDG_RUNTIME_DIR is set,
- * otherwise /tmp/gitswitch-ssh-<uid>/current.sock. Shared by runtime switch
+ * Uses $XDG_RUNTIME_DIR/gitswitch-ssh/current.sock when XDG_RUNTIME_DIR is
+ * nonempty and valid, otherwise /tmp/gitswitch-ssh-<uid>/current.sock only
+ * when XDG_RUNTIME_DIR is unset or empty. A configured invalid/missing root is
+ * an error. Shared by runtime switch
  * logic and the `init` shell-integration command so both agree on the path.
  * Returns 0 on success, -1 if the computed path would overflow buf.
  */
@@ -290,6 +305,10 @@ int ssh_manager_get_auth_sock_path(char *buf, size_t buf_size);
  * The private SSH runtime directory is inspected under the manager lock, and
  * current.sock must be a stable symlink to an exact same-directory
  * ssh-agent.<name>.sock entry backed by a live, user-owned 0600 socket.
+ * Discovery acquires only an already-existing self-owned 0600 manager lock;
+ * it never creates or repairs runtime state. A missing manager lock means no
+ * manager-owned generation can be proven and returns success with
+ * `*present == false` without inspecting current.sock.
  *
  * Returns 0 with `*present == false` when the managed directory or current.sock
  * is absent. Returns 0 with `*present == true` and a NUL-terminated name for a

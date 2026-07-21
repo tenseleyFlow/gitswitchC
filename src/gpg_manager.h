@@ -48,6 +48,9 @@ typedef struct {
 /* GPG configuration structure */
 typedef struct {
     gpg_mode_t mode;
+    /* Canonical absolute OpenPGP executable selected by the hardened resolver.
+     * One manager transaction keeps this binding even if PATH changes. */
+    char executable_path[MAX_PATH_LEN];
     char gnupg_home[MAX_PATH_LEN];    /* GNUPGHOME path */
     char current_key_id[GPG_FINGERPRINT_BUFSIZE];
     bool signing_enabled;
@@ -58,6 +61,10 @@ typedef struct {
      * retryable rather than erasing evidence of a partially committed switch. */
     char previous_gnupg_home[MAX_PATH_LEN];
     bool previous_gnupg_home_present;
+    char previous_gpg_agent_info[MAX_PATH_LEN];
+    bool previous_gpg_agent_info_present;
+    bool gnupg_home_environment_installed;
+    bool gpg_agent_info_suppressed;
     bool environment_installed;
     gpg_link_identity_t published_link;
     bool published_link_valid;
@@ -97,6 +104,17 @@ typedef int (*gpg_reset_final_hook_fn)(int base_fd);
  * that pathname into a private quarantine. Tests use this boundary to prove
  * that a same-uid writer replacing `current` is restored, never unlinked. */
 typedef int (*gpg_reset_current_hook_fn)(int base_fd);
+typedef enum {
+    GPG_RESET_QUARANTINE_HOOK_AFTER_RENAME,
+    GPG_RESET_QUARANTINE_HOOK_BEFORE_REVALIDATE,
+    GPG_RESET_QUARANTINE_HOOK_BEFORE_UNLINK
+} gpg_reset_quarantine_hook_stage_t;
+/* Deterministic post-publication failure seam for reset's durable
+ * quarantine/witness pair. The named quarantine and its hard-link witness are
+ * synchronized before AFTER_RENAME runs; failures retain both for retry. */
+typedef int (*gpg_reset_quarantine_hook_fn)(
+    int base_fd, gpg_reset_quarantine_hook_stage_t stage,
+    const char *quarantine);
 /* Deterministic mount-identity and managed-writer durability seams. NULL
  * restores the native statx/fsid and fsync implementations. */
 typedef int (*gpg_mount_identity_probe_fn)(int fd, uint64_t *identity);
@@ -123,14 +141,16 @@ gpg_reset_final_hook_fn
 gpg_manager_set_reset_final_hook_fn(gpg_reset_final_hook_fn fn);
 gpg_reset_current_hook_fn
 gpg_manager_set_reset_current_hook_fn(gpg_reset_current_hook_fn fn);
+gpg_reset_quarantine_hook_fn
+gpg_manager_set_reset_quarantine_hook_fn(gpg_reset_quarantine_hook_fn fn);
 gpg_mount_identity_probe_fn
 gpg_manager_set_mount_identity_probe_fn(gpg_mount_identity_probe_fn fn);
 gpg_agent_conf_sync_fn
 gpg_manager_set_agent_conf_sync_fn(gpg_agent_conf_sync_fn fn);
 
 /* Focused verification entry point for the otherwise-internal managed writer.
- * It preserves the switch's existing best-effort policy while allowing tests
- * to assert the writer's own sync-error return contract directly. */
+ * It stages a durable reload obligation but never launches gpgconf; production
+ * prepare owns applying and completing that obligation before activation. */
 int gpg_manager_setup_agent_config_for_test(int home_fd,
                                             const char *gnupg_home);
 
@@ -140,6 +160,11 @@ int gpg_manager_setup_agent_config_for_test(int home_fd,
  * Initialize GPG manager with specified mode
  */
 int gpg_manager_init(gpg_config_t *gpg_config, gpg_mode_t mode);
+
+/** Resolve the manager's supported OpenPGP executable names through the same
+ * hardened path policy used for launch. `gpg` has deterministic priority over
+ * `gpg2`. Returns one canonical absolute path or -1 with a GPG diagnostic. */
+int gpg_manager_resolve_executable(char *path, size_t path_size);
 
 /** Restore manager-owned environment/runtime retry state, then clear the
  * transaction configuration. Persistent per-account homes are deliberately
@@ -172,7 +197,8 @@ int gpg_create_isolated_home(gpg_config_t *gpg_config, const account_t *account)
  * Configure git GPG signing
  * - Sets user.signingkey
  * - Enables/disables commit.gpgsign
- * - Sets gpg.program if needed
+ * - Publishes the manager's exact bound path as gpg.openpgp.program
+ * - Verifies the complete effective Git/GPG post-image before returning
  */
 int gpg_configure_git_signing(gpg_config_t *gpg_config, const account_t *account, 
                               git_scope_t scope);
@@ -190,12 +216,13 @@ int gpg_set_environment(gpg_config_t *gpg_config);
  * that must be restored before the transaction can be forgotten. */
 bool gpg_manager_runtime_restore_pending(const gpg_config_t *gpg_config);
 
-/** Strict parser used by the switch and exposed for mutation-sensitive colon
- * record tests. Accepts GnuPG's fixed colon-format secret records, including
- * the documented pre-2.1 form whose validity field is empty, while requiring
- * independent expiry, capability, and secret-material evidence. Resolves
- * exactly one usable primary secret key, writes its canonical fingerprint,
- * and optionally requires a usable signing record. */
+/** Strict detached-listing parser exposed for mutation-sensitive colon-record
+ * tests. It accepts the documented pre-2.1 empty validity field, but requires
+ * explicit modern secret-material evidence because a detached capture cannot
+ * prove which helper produced it. The production resolver separately binds
+ * an empty field 15 to the same retained executable's verified GnuPG 2.0
+ * version contract. Resolves exactly one usable primary secret key, writes its
+ * canonical fingerprint, and optionally requires a usable signing record. */
 int gpg_manager_resolve_secret_key_listing(const char *listing,
                                            bool require_signing,
                                            char *fingerprint,
@@ -214,11 +241,38 @@ int gpg_manager_resolve_system_key(const char *selector,
                                    char *fingerprint,
                                    size_t fingerprint_size);
 
+typedef enum {
+    GPG_SOURCE_RECOVERY_UNKNOWN = 0,
+    GPG_SOURCE_RECOVERY_AVAILABLE,
+    GPG_SOURCE_RECOVERY_MISSING,
+    GPG_SOURCE_RECOVERY_MISMATCH,
+    GPG_SOURCE_RECOVERY_ERROR
+} gpg_source_recovery_t;
+
+typedef struct {
+    bool retained_home_usable;
+    gpg_source_recovery_t source_recovery;
+} gpg_account_key_readiness_t;
+
+/** Check an account key without creating, importing, retargeting, or changing
+ * process environment. Mirrors isolated activation order: a safe retained
+ * account home is authoritative; only an ordinary key miss falls back to the
+ * real source keyring, while malformed/unusable/operational retained-home
+ * evidence fails closed. When the retained home succeeds, the source is
+ * probed separately and must resolve the same canonical fingerprint and
+ * configured capability to be considered recoverable. Returns 0 when the
+ * account can be activated from either source and fills `readiness`; returns
+ * -1 when neither activation path is currently usable. */
+int gpg_manager_check_account_key(
+    const account_t *account, gpg_account_key_readiness_t *readiness);
+
 /**
  * Compute the stable GNUPGHOME path (a `current` symlink under the isolated
  * GPG base directory) that `gitswitch init` exports into the shell and that
  * each switch retargets to the active account's home. Uses
- * $XDG_RUNTIME_DIR/gitswitch-gpg/current, else /tmp/gitswitch-gpg-<uid>/current.
+ * $XDG_RUNTIME_DIR/gitswitch-gpg/current when a nonempty configured root is
+ * valid, else /tmp/gitswitch-gpg-<uid>/current only when XDG_RUNTIME_DIR is
+ * unset or empty. A configured invalid/missing root is an error.
  * Shared by the runtime switch logic and the `init` command so both agree.
  * Returns 0 on success, -1 if the computed path would overflow buf.
  */
@@ -227,7 +281,8 @@ int gpg_manager_get_home_path(char *buf, size_t size);
 /**
  * As gpg_manager_get_home_path, but suppresses the "not memory-backed" warning
  * that would otherwise print to stdout. Used by `gitswitch init`, whose stdout
- * is eval'd by the shell (AR-06 F08). Returns 0 on success, -1 on overflow.
+ * is captured and evaluated as a shell program only after successful
+ * generation (AR-06 F08). Returns 0 on success, -1 on overflow.
  */
 int gpg_manager_get_home_path_quiet(char *buf, size_t size);
 

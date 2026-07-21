@@ -80,6 +80,24 @@ typedef struct {
     int system_errno;
 } error_context_t;
 
+/* Bounded first-error aggregation for multi-stage cleanup paths. The first
+ * context remains byte-identical in first_error; accumulated_details is the
+ * publication copy that may gain later causal entries. */
+typedef struct {
+    bool active;
+    error_context_t first_error;
+    int first_errno;
+    size_t failure_count;
+    size_t rendered_count;
+    bool chain_truncated;
+    char accumulated_details[sizeof(((error_context_t *)0)->details)];
+} error_accumulator_t;
+
+/* Synchronous best-effort work can use this callback shape when its
+ * diagnostics must remain observational rather than becoming the caller's
+ * causal error report. */
+typedef int (*error_observation_fn)(void *context);
+
 /* Global error context */
 extern error_context_t g_last_error;
 
@@ -147,9 +165,61 @@ int set_system_error_context(error_code_t code, const char *file, int line,
 const error_context_t *get_last_error(void);
 
 /**
+ * Return the generation of committed caller-visible causal reports published
+ * through set_error_context() or set_system_error_context(). Ordinary reports
+ * advance monotonically. A report published inside error_run_observational()
+ * is provisional, and the scope restores its entry generation on return.
+ * Clearing or restoring a retained context does not manufacture a new report.
+ */
+uint64_t error_report_generation(void);
+
+/**
+ * Run one synchronous observational operation while preserving the complete
+ * caller-visible error state: context bytes, causal report generation, and
+ * ambient errno. Callback diagnostics, generation advances, clears, and errno
+ * changes are provisional and discarded on normal return; the callback's
+ * integer result is returned unchanged. Other callback side effects are not
+ * rolled back. A NULL callback is API misuse and publishes ERR_INVALID_ARGS
+ * with errno EINVAL before returning -1.
+ *
+ * The callback must return normally and must not overlap concurrent access to
+ * the process-global error subsystem.
+ */
+int error_run_observational(error_observation_fn operation, void *context);
+
+/**
  * Clear last error
  */
 void clear_error(void);
+
+/**
+ * Initialize a bounded first-error accumulator.
+ */
+void error_accumulator_init(error_accumulator_t *accumulator);
+
+/**
+ * Retain an error without changing the global error context or errno. The
+ * first context and ambient errno are captured exactly. Later failures are
+ * appended as "; [label] message" followed by their existing detail chain
+ * while space permits. Returns false for an invalid call or when the new
+ * entry cannot be rendered completely.
+ */
+bool error_accumulator_add(error_accumulator_t *accumulator,
+                           const char *label,
+                           const error_context_t *error);
+
+/**
+ * Add the current global error context under label without changing it.
+ */
+bool error_accumulator_add_last(error_accumulator_t *accumulator,
+                                const char *label);
+
+/**
+ * Publish the accumulated context with one global assignment and restore the
+ * ambient errno captured with the first failure. Returns false when no first
+ * failure has been captured.
+ */
+bool error_accumulator_publish(const error_accumulator_t *accumulator);
 
 /**
  * Convert error code to human-readable string
@@ -202,6 +272,19 @@ void get_timestamp(char *buffer, size_t buffer_size);
  * Safe string functions that set error context on failure
  */
 int safe_strncpy(char *dest, const char *src, size_t dest_size);
+
+/**
+ * Attempt to append a complete NUL-terminated source to a destination buffer.
+ * dest_size is the destination's total readable and writable capacity;
+ * success requires dest to contain a NUL within that bound. src must remain
+ * readable through its first NUL or the remaining destination capacity,
+ * whichever comes first; success requires that NUL to occur before the bound.
+ * Rejection performs no append copy, although publishing the global error
+ * context remains an observable side effect. Invalid arguments, missing
+ * terminators, insufficient capacity, and overlap between the source span and
+ * append-write span are rejected. Disjoint spans may share one backing
+ * allocation.
+ */
 int safe_strncat(char *dest, const char *src, size_t dest_size);
 int safe_snprintf(char *buffer, size_t buffer_size, const char *fmt, ...) GS_PRINTF_FMT(3, 4);
 

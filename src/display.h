@@ -29,7 +29,8 @@
 /**
  * Initialize display system
  * - Detect terminal capabilities
- * - Set up color output based on TTY and preferences
+ * - Resolve disabled, forced, or automatic color policy
+ * - In automatic mode, inspect each destination stream when emitting output
  */
 int display_init(bool force_color, bool no_color);
 
@@ -66,6 +67,10 @@ void display_info(const char *message, ...) GS_PRINTF_FMT(1, 2);
 /**
  * Format and colorize text based on content type.
  *
+ * The public colorizer uses stdout as its destination when evaluating
+ * automatic mode. Display functions that write elsewhere evaluate their own
+ * destination internally.
+ *
  * Returns a newly allocated string for every non-NULL text input, including
  * when color is disabled or the type is unknown. The caller must free it.
  * Returns NULL for NULL text or when the result cannot be allocated.
@@ -73,7 +78,7 @@ void display_info(const char *message, ...) GS_PRINTF_FMT(1, 2);
 char *display_colorize(const char *text, const char *type);
 
 /**
- * Check if terminal supports color output
+ * Check whether the current policy enables color for stdout
  */
 bool display_supports_color(void);
 

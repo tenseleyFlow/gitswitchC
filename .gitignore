@@ -1,5 +1,6 @@
 build/*
 build-*/
+.gitswitch-release-publish.lock/
 CLAUDE.md
 .fackr/
 .docs/

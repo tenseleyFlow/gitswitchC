@@ -25,7 +25,7 @@ Options:
   --global, -g         Use global git scope
   --local, -l          Use local git scope (default)
   --dry-run, -n        Show what would be done without executing
-  --yes, -y            Assume 'yes' to confirmation prompts (remove/reset)
+  --yes, -y            Assume 'yes' to confirmation prompts (add/edit/remove/reset)
   --names              With 'list': print only account names (one per line)
   --verbose, -V        Enable verbose output
   --debug, -d          Enable debug logging
@@ -46,9 +46,10 @@ Examples:
   gitswitch doctor                 # Check local configuration/key readiness
 ```
 
-When built against GNU readline (auto-detected by the Makefile), the interactive
-`add`/`edit` prompts get line editing, and the SSH key path prompt gets TAB
-filename completion. Without readline the prompts fall back to plain input.
+When built against GNU readline (auto-detected by the Makefile), terminal-to-
+terminal `add`/`edit` prompts get line editing, and the SSH key path prompt gets
+TAB filename completion. Redirected prompts and builds without readline use
+bounded plain stdio input.
 
 ### command-line completion
 
@@ -62,27 +63,60 @@ filename completion. Without readline the prompts fall back to plain input.
 gitswitch maintains stable paths at fixed locations — an SSH agent socket and,
 for accounts with GPG signing, a per-account `GNUPGHOME` — so your shell can
 point `SSH_AUTH_SOCK` and `GNUPGHOME` at them once and have every `gitswitch
-<account>` switch transparently. Add the matching line to your shell rc:
+<account>` switch transparently. Add the matching block to your shell rc.
 
 The supported init targets are exactly `bash`, `zsh`, `fish`, `sh`, `dash`,
-and `ksh`. Fish uses `gitswitch init fish | source`; the other five use
-`eval "$(gitswitch init <shell>)"`. Completion scripts remain available for
-bash, zsh, and fish only.
-
-```fish
-# ~/.config/fish/config.fish
-gitswitch init fish | source
-```
+and `ksh`. Each loader captures the generated program and checks the generator
+status before evaluating it. A failed generator therefore returns nonzero and
+neither empty nor partial output is installed. Completion scripts remain
+available for bash, zsh, and fish only.
 
 ```bash
 # ~/.bashrc
-eval "$(gitswitch init bash)"
+__gitswitch_load() {
+    local __gitswitch_init_output
+    __gitswitch_init_output="$(command gitswitch init bash)" || return "$?"
+    eval "$__gitswitch_init_output"
+}
+__gitswitch_load
 ```
 
 ```zsh
 # ~/.zshrc
-eval "$(gitswitch init zsh)"
+__gitswitch_load() {
+    local __gitswitch_init_output
+    __gitswitch_init_output="$(command gitswitch init zsh)" || return "$?"
+    eval "$__gitswitch_init_output"
+}
+__gitswitch_load
 ```
+
+```fish
+# ~/.config/fish/config.fish
+function __gitswitch_load
+    set -l __gitswitch_init_output (command gitswitch init fish)
+    or return $status
+    string join \n -- $__gitswitch_init_output | source
+end
+__gitswitch_load
+```
+
+```sh
+# ~/.profile (sh, dash, or ksh)
+__gitswitch_load() {
+    __gitswitch_init_output="$(command gitswitch init sh)"
+    set -- "$?" "$__gitswitch_init_output"
+    unset __gitswitch_init_output
+    [ "$1" -eq 0 ] || return "$1"
+    eval "$2"
+}
+__gitswitch_load
+```
+
+The `sh` target emits the shared POSIX integration used by sh, dash, and ksh.
+The loader functions are intentionally reusable when a shell rc file is
+sourced again; their captured output is fresh and function-local (or cleared)
+on every call.
 
 The snippet guards optional paths, so an SSH or GPG runtime that is not
 configured—or has never been created—is omitted without an error. A saved

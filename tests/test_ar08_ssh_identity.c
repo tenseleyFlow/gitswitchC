@@ -144,6 +144,124 @@ static int run_quiet_real(const char *const argv[]) {
     return run_argv_real(argv, &opts, &result);
 }
 
+static int copy_file_bytes(const char *source, const char *destination) {
+    unsigned char buffer[4096];
+    int source_fd = -1;
+    int destination_fd = -1;
+    int rc = -1;
+
+    source_fd = open(source, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (source_fd < 0) goto done;
+    destination_fd = open(destination,
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                          0600);
+    if (destination_fd < 0) goto done;
+    for (;;) {
+        ssize_t count = read(source_fd, buffer, sizeof(buffer));
+        size_t offset = 0U;
+
+        if (count == 0) {
+            rc = 0;
+            break;
+        }
+        if (count < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        while (offset < (size_t)count) {
+            ssize_t written = write(destination_fd, buffer + offset,
+                                    (size_t)count - offset);
+            if (written > 0) {
+                offset += (size_t)written;
+            } else if (written < 0 && errno == EINTR) {
+                continue;
+            } else {
+                goto done;
+            }
+        }
+    }
+
+done:
+    if (destination_fd >= 0 && close(destination_fd) != 0) rc = -1;
+    if (source_fd >= 0 && close(source_fd) != 0) rc = -1;
+    return rc;
+}
+
+/* On Darwin/FreeBSD the admitted private bytes are staged in the locked
+ * runtime directory. OpenSSH always probes `<path>.pub` first, so the scratch
+ * component deliberately consumes the filesystem's complete NAME_MAX budget:
+ * the private path works, while the appended sibling is kernel-rejected. */
+TEST(real_name_max_private_component_blocks_pub_sibling_lookup) {
+    static const char prefix[] = ".key-fingerprint.";
+    char root[128] = "/tmp/gsw-ar11-ssh-namemax.XXXXXX";
+    char source[MAX_PATH_LEN];
+    char component[MAX_PATH_LEN];
+    char scratch[MAX_PATH_LEN];
+    char sidecar[MAX_PATH_LEN];
+    char source_listing[1024];
+    char scratch_listing[1024];
+    long name_max;
+    int sidecar_fd;
+    const char *keygen[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
+        "name-max", "-f", source, NULL
+    };
+    const char *source_fingerprint[] = {"ssh-keygen", "-lf", source, NULL};
+    const char *scratch_fingerprint[] = {"ssh-keygen", "-lf", scratch, NULL};
+    run_opts_t opts;
+    run_result_t result;
+
+    if (!command_exists("ssh-keygen")) {
+        TS_SKIP("openssh", "ssh-keygen unavailable");
+    }
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(chmod(root, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(source, sizeof(source), "%s/source", root), 0);
+    errno = 0;
+    name_max = pathconf(root, _PC_NAME_MAX);
+    CHECK(name_max >= (long)(sizeof(prefix) - 1U + 16U));
+    CHECK(name_max > 0 &&
+          (size_t)name_max < sizeof(component) &&
+          strlen(root) + 1U + (size_t)name_max + 1U < sizeof(scratch));
+    if (name_max <= 0 || (size_t)name_max >= sizeof(component) ||
+        strlen(root) + 1U + (size_t)name_max + 1U >= sizeof(scratch)) {
+        ts_rm_rf(root);
+        return;
+    }
+    memcpy(component, prefix, sizeof(prefix) - 1U);
+    memset(component + sizeof(prefix) - 1U, 'x',
+           (size_t)name_max - (sizeof(prefix) - 1U));
+    component[name_max] = '\0';
+    CHECK_EQ_INT(safe_snprintf(scratch, sizeof(scratch), "%s/%s", root,
+                               component), 0);
+    CHECK_EQ_INT(safe_snprintf(sidecar, sizeof(sidecar), "%s.pub", scratch),
+                 0);
+    CHECK_EQ_INT(run_quiet_real(keygen), 0);
+    CHECK_EQ_INT(copy_file_bytes(source, scratch), 0);
+
+    sidecar_fd = open(sidecar, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    CHECK(sidecar_fd < 0);
+    CHECK_EQ_INT(errno, ENAMETOOLONG);
+    if (sidecar_fd >= 0) close(sidecar_fd);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = source_listing;
+    opts.out_size = sizeof(source_listing);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv_real(source_fingerprint, &opts, &result), 0);
+    CHECK(!result.out_truncated);
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = scratch_listing;
+    opts.out_size = sizeof(scratch_listing);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv_real(scratch_fingerprint, &opts, &result), 0);
+    CHECK(!result.out_truncated);
+    CHECK_STR_EQ(scratch_listing, source_listing);
+    ts_rm_rf(root);
+}
+
 TEST(real_isolated_agent_does_not_autoload_a_sibling_certificate) {
     char root[128], key[MAX_PATH_LEN], key_pub[MAX_PATH_LEN];
     char key_cert[MAX_PATH_LEN], ca[MAX_PATH_LEN];
@@ -301,9 +419,101 @@ TEST(real_encrypted_snapshot_uses_askpass_exactly_once) {
     ts_rm_rf(root);
 }
 
+/* OpenSSH stores key-generation comments in a 1024-byte buffer, so 1023
+ * bytes is the largest comment its ordinary `ssh-keygen -C` path persists.
+ * The resulting `ssh-keygen -lf` record exceeds the former 1024-byte capture
+ * even though its fingerprint is valid. Verification must capture the whole
+ * bounded listing in one execution without relaxing the independent rule
+ * that an incomplete agent identity listing cannot prove exclusivity. */
+TEST(real_maximum_stored_comment_verifies_exact_fingerprint) {
+    char root[128], key[MAX_PATH_LEN], comment[1024];
+    char listing[1024];
+    char complete_listing[8192];
+    const char *fingerprint_field;
+    const char *comment_field;
+    const char *type_field;
+    const char *keygen[] = {
+        "ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", comment,
+        "-f", key, NULL
+    };
+    const char *fingerprint[] = {"ssh-keygen", "-lf", key, NULL};
+    run_opts_t opts;
+    run_result_t result;
+    account_t account;
+    ssh_config_t config;
+    int switch_rc;
+
+    if (!command_exists("ssh-keygen") || !command_exists("ssh-agent") ||
+        !command_exists("ssh-add")) {
+        TS_SKIP("openssh", "ssh-keygen/ssh-agent/ssh-add unavailable");
+    }
+    memset(comment, 'c', sizeof(comment) - 1U);
+    comment[sizeof(comment) - 1U] = '\0';
+    snprintf(root, sizeof(root), "/tmp/gsw-ar11-ssh-comment.XXXXXX");
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK_EQ_INT(chmod(root, 0700), 0);
+    CHECK_EQ_INT(safe_snprintf(key, sizeof(key), "%s/id_test", root), 0);
+    CHECK_EQ_INT(run_quiet_real(keygen), 0);
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = complete_listing;
+    opts.out_size = sizeof(complete_listing);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv_real(fingerprint, &opts, &result), 0);
+    CHECK(!result.out_truncated);
+    CHECK(result.out_len > sizeof(listing) - 1U);
+    CHECK(result.out_len < 2048U);
+    fingerprint_field = strstr(complete_listing, "SHA256:");
+    CHECK(fingerprint_field != NULL);
+    comment_field = fingerprint_field ? strchr(fingerprint_field, ' ') : NULL;
+    CHECK(comment_field != NULL);
+    if (comment_field) comment_field++;
+    type_field = comment_field ? strstr(comment_field, " (ED25519)\n") : NULL;
+    CHECK(type_field != NULL);
+    if (comment_field && type_field) {
+        CHECK_EQ_INT((long)(type_field - comment_field),
+                     (long)sizeof(comment) - 1L);
+        CHECK(memcmp(comment_field, comment, sizeof(comment) - 1U) == 0);
+    }
+
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = listing;
+    opts.out_size = sizeof(listing);
+    opts.stderr_to_devnull = true;
+    CHECK_EQ_INT(run_argv_real(fingerprint, &opts, &result), 0);
+    CHECK(result.out_truncated);
+    CHECK_EQ_INT((long)result.out_len, (long)sizeof(listing) - 1L);
+    CHECK(strstr(listing, "256 SHA256:") == listing);
+
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", root, 1), 0);
+    memset(&account, 0, sizeof(account));
+    account.id = 1;
+    account.ssh_enabled = true;
+    CHECK_EQ_INT(safe_strncpy(account.name, "long-comment",
+                              sizeof(account.name)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.email,
+                              "long-comment@example.test",
+                              sizeof(account.email)), 0);
+    CHECK_EQ_INT(safe_strncpy(account.ssh_key_path, key,
+                              sizeof(account.ssh_key_path)), 0);
+    CHECK_EQ_INT(ssh_manager_init(&config, SSH_AGENT_ISOLATED), 0);
+    switch_rc = ssh_switch_account(&config, &account);
+    CHECK_EQ_INT(switch_rc, 0);
+    CHECK_EQ_INT(ssh_manager_cleanup(&config), 0);
+
+    unsetenv("XDG_RUNTIME_DIR");
+    unsetenv("SSH_AUTH_SOCK");
+    unsetenv("SSH_AGENT_PID");
+    ts_rm_rf(root);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(snapshot_is_wiped_and_descriptor_closed_on_postcapture_exits);
+    RUN_TEST(real_name_max_private_component_blocks_pub_sibling_lookup);
     RUN_TEST(real_isolated_agent_does_not_autoload_a_sibling_certificate);
     RUN_TEST(real_encrypted_snapshot_uses_askpass_exactly_once);
+    RUN_TEST(real_maximum_stored_comment_verifies_exact_fingerprint);
 TEST_MAIN_END()

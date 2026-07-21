@@ -6,6 +6,122 @@
 #include <errno.h>
 #include <string.h>
 
+typedef struct {
+    uint64_t generation_before;
+    uint64_t generation_during;
+} observational_failure_t;
+
+typedef struct {
+    bool inner_result_preserved;
+    bool inner_context_restored;
+    bool inner_generation_restored;
+    bool inner_errno_restored;
+} nested_observation_t;
+
+static int publish_observational_failure(void *context) {
+    observational_failure_t *observation = context;
+
+    set_error(ERR_NETWORK_ERROR, "first observational failure");
+    errno = EIO;
+    set_system_error(ERR_SYSTEM_CALL, "second observational failure");
+    observation->generation_during = error_report_generation();
+    clear_error();
+    errno = ENOSPC;
+    return 73;
+}
+
+static int publish_nested_observational_failure(void *context) {
+    (void)context;
+    errno = ENOTTY;
+    set_system_error(ERR_FILE_IO, "nested observational failure");
+    errno = ECHILD;
+    return 19;
+}
+
+static int run_nested_observation(void *context) {
+    nested_observation_t *observation = context;
+    error_context_t outer_error;
+    uint64_t outer_generation;
+    int nested_result;
+
+    set_error(ERR_NETWORK_ERROR, "outer observational failure");
+    outer_error = *get_last_error();
+    outer_generation = error_report_generation();
+    errno = EPIPE;
+    nested_result = error_run_observational(
+        publish_nested_observational_failure, NULL);
+
+    observation->inner_result_preserved = nested_result == 19;
+    observation->inner_context_restored =
+        memcmp(get_last_error(), &outer_error, sizeof(outer_error)) == 0;
+    observation->inner_generation_restored =
+        error_report_generation() == outer_generation;
+    observation->inner_errno_restored = errno == EPIPE;
+    return 29;
+}
+
+TEST(observational_scope_restores_context_generation_and_errno) {
+    observational_failure_t observation = {0};
+    error_context_t saved;
+
+    set_error(ERR_ACCOUNT_INVALID, "retained causal diagnostic");
+    saved = *get_last_error();
+    errno = EAGAIN;
+    observation.generation_before = error_report_generation();
+
+    CHECK_EQ_INT(error_run_observational(publish_observational_failure,
+                                         &observation),
+                 73);
+    CHECK(observation.generation_during != observation.generation_before);
+    CHECK(error_report_generation() == observation.generation_before);
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK_EQ_INT(get_last_error()->code, saved.code);
+    CHECK_STR_EQ(get_last_error()->message, saved.message);
+    CHECK_STR_EQ(get_last_error()->details, saved.details);
+    CHECK_STR_EQ(get_last_error()->file, saved.file);
+    CHECK_STR_EQ(get_last_error()->function, saved.function);
+    CHECK_EQ_INT(get_last_error()->line, saved.line);
+    CHECK_EQ_INT(get_last_error()->system_errno, saved.system_errno);
+}
+
+TEST(nested_observational_scopes_restore_in_lifo_order) {
+    nested_observation_t observation = {0};
+    error_context_t saved;
+    uint64_t saved_generation;
+
+    set_error(ERR_ACCOUNT_INVALID, "nested retained diagnostic");
+    saved = *get_last_error();
+    saved_generation = error_report_generation();
+    errno = EAGAIN;
+
+    CHECK_EQ_INT(error_run_observational(run_nested_observation,
+                                         &observation),
+                 29);
+    CHECK(observation.inner_result_preserved);
+    CHECK(observation.inner_context_restored);
+    CHECK(observation.inner_generation_restored);
+    CHECK(observation.inner_errno_restored);
+    CHECK(memcmp(get_last_error(), &saved, sizeof(saved)) == 0);
+    CHECK(error_report_generation() == saved_generation);
+    CHECK_EQ_INT(errno, EAGAIN);
+}
+
+TEST(null_observational_callback_publishes_api_misuse) {
+    uint64_t saved_generation;
+
+    set_error(ERR_ACCOUNT_INVALID, "replaced diagnostic");
+    saved_generation = error_report_generation();
+    errno = 0;
+
+    CHECK_EQ_INT(error_run_observational(NULL, NULL), -1);
+    CHECK_EQ_INT(errno, EINVAL);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(get_last_error()->system_errno, EINVAL);
+    CHECK_STR_EQ(get_last_error()->message,
+                 "NULL observational error callback (Invalid argument)");
+    CHECK(error_report_generation() != saved_generation);
+}
+
 TEST(direct_error_context_copies_mutable_provenance) {
     char file[64] = "mutable-source.c";
     char function[64] = "mutable_function";
@@ -299,27 +415,154 @@ TEST(display_format_rejects_unterminated_context_fields_truthfully) {
     CHECK(strstr(formatted, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
 }
 
-/* AR-10 L9: a failed re-init must keep the previous sink and level live —
- * the old order closed the working stream and committed the level before the
- * fopen could fail. Observable contract: the failed call returns -1 and a
- * subsequent log line still lands in the ORIGINAL log file. */
-TEST(failed_error_init_retains_previous_log_sink) {
+/* AR-10 L9 / AR-11 L19: a failed re-init must keep the previous sink and
+ * level live while publishing the exact fopen errno. The old order closed
+ * the working stream before failure; the later diagnostic path retained the
+ * stream but erased the causal errno by using the non-system setter. */
+TEST(failed_error_init_retains_previous_log_sink_and_errno) {
     char dir[64];
     char good[128];
-    char bad[128];
-    char content[512];
+    char missing_parent[160];
+    char not_directory[128];
+    char not_directory_child[160];
+    char errno_fragment[32];
+    char content[1024];
+    FILE *saved_sink;
     FILE *stream;
+    struct stat saved_stat = {0};
+    struct stat current_stat = {0};
+    log_level_t saved_level;
+    bool saved_stderr_policy;
+    int saved_fd;
+    int expected_free_fd;
+    int probe_fd;
+    int result;
     size_t got;
 
     snprintf(dir, sizeof(dir), "/tmp/gswar10err_XXXXXX");
     CHECK(ts_mkdtemp(dir) != NULL);
     snprintf(good, sizeof(good), "%s/good.log", dir);
-    /* Unopenable: path through a nonexistent directory. */
-    snprintf(bad, sizeof(bad), "%s/missing-dir/bad.log", dir);
+    snprintf(missing_parent, sizeof(missing_parent),
+             "%s/missing-dir/bad.log", dir);
+    snprintf(not_directory, sizeof(not_directory), "%s/not-a-dir", dir);
+    snprintf(not_directory_child, sizeof(not_directory_child),
+             "%s/not-a-dir/bad.log", dir);
 
-    CHECK_EQ_INT(error_init(LOG_LEVEL_INFO, good), 0);
-    CHECK_EQ_INT(error_init(LOG_LEVEL_INFO, bad), -1);
-    log_info("post-failure line lands in the original sink");
+    stream = fopen(not_directory, "w");
+    CHECK(stream != NULL);
+    if (!stream) return;
+    CHECK_EQ_INT(fclose(stream), 0);
+
+    result = error_init(LOG_LEVEL_INFO, good);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) {
+        (void)error_init(LOG_LEVEL_CRITICAL, NULL);
+        return;
+    }
+
+    saved_sink = g_log_file;
+    saved_level = g_log_level;
+    saved_stderr_policy = g_log_to_stderr;
+    saved_fd = fileno(saved_sink);
+    CHECK(saved_fd >= 0);
+    if (saved_fd < 0) {
+        (void)error_init(LOG_LEVEL_CRITICAL, NULL);
+        return;
+    }
+    result = fstat(saved_fd, &saved_stat);
+    CHECK_EQ_INT(result, 0);
+    if (result != 0) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    probe_fd = dup(saved_fd);
+    CHECK(probe_fd >= 0);
+    if (probe_fd < 0) {
+        (void)error_init(LOG_LEVEL_CRITICAL, NULL);
+        return;
+    }
+    expected_free_fd = probe_fd;
+    CHECK_EQ_INT(close(probe_fd), 0);
+
+    errno = 0;
+    CHECK_EQ_INT(error_init(LOG_LEVEL_CRITICAL, missing_parent), -1);
+    CHECK_EQ_INT(errno, ENOENT);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ENOENT);
+    CHECK(snprintf(errno_fragment, sizeof(errno_fragment), "errno=%d", ENOENT) >
+          0);
+    CHECK(strstr(get_last_error()->details, errno_fragment) != NULL);
+    result = fcntl(saved_fd, F_GETFD);
+    CHECK(result >= 0);
+    if (result < 0) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    result = fstat(saved_fd, &current_stat);
+    CHECK_EQ_INT(result, 0);
+    if (result == 0) CHECK(ts_same_identity(&saved_stat, &current_stat));
+    if (result != 0 || !ts_same_identity(&saved_stat, &current_stat)) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    CHECK(g_log_file == saved_sink);
+    CHECK_EQ_INT(g_log_level, saved_level);
+    CHECK_EQ_INT(g_log_to_stderr, saved_stderr_policy);
+    if (g_log_file != saved_sink) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    probe_fd = dup(saved_fd);
+    CHECK_EQ_INT(probe_fd, expected_free_fd);
+    if (probe_fd >= 0) CHECK_EQ_INT(close(probe_fd), 0);
+
+    errno = 0;
+    CHECK_EQ_INT(error_init(LOG_LEVEL_DEBUG, not_directory_child), -1);
+    CHECK_EQ_INT(errno, ENOTDIR);
+    CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+    CHECK_EQ_INT(get_last_error()->system_errno, ENOTDIR);
+    CHECK(snprintf(errno_fragment, sizeof(errno_fragment), "errno=%d", ENOTDIR) >
+          0);
+    CHECK(strstr(get_last_error()->details, errno_fragment) != NULL);
+    result = fcntl(saved_fd, F_GETFD);
+    CHECK(result >= 0);
+    if (result < 0) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    result = fstat(saved_fd, &current_stat);
+    CHECK_EQ_INT(result, 0);
+    if (result == 0) CHECK(ts_same_identity(&saved_stat, &current_stat));
+    if (result != 0 || !ts_same_identity(&saved_stat, &current_stat)) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    CHECK(g_log_file == saved_sink);
+    CHECK_EQ_INT(g_log_level, saved_level);
+    CHECK_EQ_INT(g_log_to_stderr, saved_stderr_policy);
+    if (g_log_file != saved_sink) {
+        g_log_file = stderr;
+        g_log_level = LOG_LEVEL_CRITICAL;
+        g_log_to_stderr = saved_stderr_policy;
+        return;
+    }
+    probe_fd = dup(saved_fd);
+    CHECK_EQ_INT(probe_fd, expected_free_fd);
+    if (probe_fd >= 0) CHECK_EQ_INT(close(probe_fd), 0);
+
+    log_info("post-failure line lands in the original sink at original level");
 
     stream = fopen(good, "r");
     CHECK(stream != NULL);
@@ -328,15 +571,331 @@ TEST(failed_error_init_retains_previous_log_sink) {
         content[got] = '\0';
         fclose(stream);
         CHECK(strstr(content,
-                     "post-failure line lands in the original sink") != NULL);
+                     "post-failure line lands in the original sink at original level") !=
+              NULL);
     }
 
-    /* Restore the suite's quiet logging configuration. */
+    /* Restore through the logging subsystem so it remains the sole owner. */
     CHECK_EQ_INT(error_init(LOG_LEVEL_CRITICAL, NULL), 0);
+    errno = 0;
+    CHECK(fcntl(saved_fd, F_GETFD) < 0);
+    CHECK_EQ_INT(errno, EBADF);
+}
+
+TEST(error_accumulator_retains_first_context_without_global_side_effects) {
+    error_accumulator_t accumulator;
+    error_context_t first;
+    error_context_t first_bytes;
+    error_context_t global_before = {0};
+
+    memset(&first, 0xA5, sizeof(first));
+    first.code = ERR_CONFIG_WRITE_FAILED;
+    snprintf(first.message, sizeof(first.message), "%s", "first failure");
+    first.message_truncated = false;
+    snprintf(first.details, sizeof(first.details), "%s", "first details");
+    first.details_truncated = false;
+    snprintf(first.file, sizeof(first.file), "%s", "first-source.c");
+    first.line = 271;
+    snprintf(first.function, sizeof(first.function), "%s", "first_function");
+    first.system_errno = EIO;
+    memcpy(&first_bytes, &first, sizeof(first_bytes));
+
+    global_before.code = ERR_UNKNOWN;
+    snprintf(global_before.message, sizeof(global_before.message), "%s",
+             "unrelated global error");
+    memcpy(&g_last_error, &global_before, sizeof(g_last_error));
+
+    errno = EDOM;
+    error_accumulator_init(&accumulator);
+    CHECK_EQ_INT(errno, EDOM);
+    CHECK(!accumulator.active);
+
+    errno = EINTR;
+    CHECK(error_accumulator_add(&accumulator, "initial", &first));
+    CHECK_EQ_INT(errno, EINTR);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+    CHECK(accumulator.active);
+    CHECK_EQ_INT(accumulator.first_errno, EINTR);
+    CHECK_EQ_INT(accumulator.failure_count, 1);
+    CHECK_EQ_INT(accumulator.rendered_count, 1);
+    CHECK(!accumulator.chain_truncated);
+    CHECK_STR_EQ(accumulator.accumulated_details, "first details");
+}
+
+TEST(error_accumulator_appends_in_order_and_publishes_first_cause) {
+    error_accumulator_t accumulator;
+    error_context_t first = {0};
+    error_context_t first_bytes;
+    error_context_t later = {0};
+    error_context_t global_before;
+
+    first.code = ERR_FILE_IO;
+    snprintf(first.message, sizeof(first.message), "%s", "save failed");
+    snprintf(first.details, sizeof(first.details), "%s", "save errno detail");
+    snprintf(first.file, sizeof(first.file), "%s", "resume.c");
+    first.line = 41;
+    snprintf(first.function, sizeof(first.function), "%s", "restore_resume");
+    first.system_errno = ENOSPC;
+    memcpy(&first_bytes, &first, sizeof(first_bytes));
+
+    error_accumulator_init(&accumulator);
+    errno = EBUSY;
+    CHECK(error_accumulator_add(&accumulator, "save", &first));
+
+    set_error_context(ERR_CONFIG_WRITE_FAILED, "metadata.c", 52,
+                      "restore_metadata", "metadata restore failed");
+    memcpy(&global_before, &g_last_error, sizeof(global_before));
+    errno = EAGAIN;
+    CHECK(error_accumulator_add_last(&accumulator, "resume restore"));
+    CHECK_EQ_INT(errno, EAGAIN);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+
+    later.code = ERR_SYSTEM_CALL;
+    snprintf(later.message, sizeof(later.message), "%s", "abort failed");
+    snprintf(later.details, sizeof(later.details), "%s",
+             "; [nested cleanup] nested failure");
+    snprintf(later.file, sizeof(later.file), "%s", "accounts.c");
+    later.line = 63;
+    snprintf(later.function, sizeof(later.function), "%s", "abort_switch");
+    later.system_errno = EPERM;
+    errno = ENOTTY;
+    CHECK(error_accumulator_add(&accumulator, "account abort", &later));
+    CHECK_EQ_INT(errno, ENOTTY);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+
+    CHECK_EQ_INT(accumulator.failure_count, 3);
+    CHECK_EQ_INT(accumulator.rendered_count, 3);
+    CHECK(!accumulator.chain_truncated);
+    CHECK_STR_EQ(accumulator.accumulated_details,
+                 "save errno detail; [resume restore] metadata restore failed; "
+                 "[account abort] abort failed; [nested cleanup] nested failure");
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+
+    set_error_context(ERR_UNKNOWN, "sentinel.c", 99, "sentinel",
+                      "publish replaces this once");
+    errno = ERANGE;
+    CHECK(error_accumulator_publish(&accumulator));
+    CHECK_EQ_INT(errno, EBUSY);
+    CHECK_EQ_INT(g_last_error.code, ERR_FILE_IO);
+    CHECK_EQ_INT(g_last_error.system_errno, ENOSPC);
+    CHECK_STR_EQ(g_last_error.message, "save failed");
+    CHECK_STR_EQ(g_last_error.details,
+                 "save errno detail; [resume restore] metadata restore failed; "
+                 "[account abort] abort failed; [nested cleanup] nested failure");
+    CHECK_STR_EQ(g_last_error.file, "resume.c");
+    CHECK_EQ_INT(g_last_error.line, 41);
+    CHECK_STR_EQ(g_last_error.function, "restore_resume");
+    CHECK(!g_last_error.details_truncated);
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+}
+
+TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures) {
+    error_accumulator_t accumulator;
+    error_context_t first = {0};
+    error_context_t first_bytes;
+    error_context_t later = {0};
+    error_context_t global_before = {0};
+    char truncated_details[sizeof(accumulator.accumulated_details)];
+    size_t initial_length = sizeof(first.details) - 24U;
+
+    first.code = ERR_CONFIG_WRITE_FAILED;
+    snprintf(first.message, sizeof(first.message), "%s", "primary failure");
+    memset(first.details, 'd', initial_length);
+    first.details[initial_length] = '\0';
+    snprintf(first.file, sizeof(first.file), "%s", "primary.c");
+    first.line = 72;
+    snprintf(first.function, sizeof(first.function), "%s", "primary_stage");
+    first.system_errno = EROFS;
+    memcpy(&first_bytes, &first, sizeof(first_bytes));
+
+    memset(later.message, 'x', sizeof(later.message) - 1U);
+    later.message[sizeof(later.message) - 1U] = '\0';
+    later.code = ERR_SYSTEM_CALL;
+
+    global_before.code = ERR_ACCOUNT_INVALID;
+    snprintf(global_before.message, sizeof(global_before.message), "%s",
+             "global sentinel");
+    memcpy(&g_last_error, &global_before, sizeof(g_last_error));
+
+    error_accumulator_init(&accumulator);
+    errno = ECHILD;
+    CHECK(error_accumulator_add(&accumulator, "primary", &first));
+    errno = EPIPE;
+    CHECK(!error_accumulator_add(&accumulator, "secondary", &later));
+    CHECK_EQ_INT(errno, EPIPE);
+    CHECK(accumulator.chain_truncated);
+    CHECK_EQ_INT(accumulator.failure_count, 2);
+    CHECK_EQ_INT(accumulator.rendered_count, 1);
+    CHECK(strstr(accumulator.accumulated_details,
+                 ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
+    memcpy(truncated_details, accumulator.accumulated_details,
+           sizeof(truncated_details));
+
+    errno = ENFILE;
+    CHECK(!error_accumulator_add(&accumulator, "tertiary", &later));
+    CHECK_EQ_INT(errno, ENFILE);
+    CHECK_EQ_INT(accumulator.failure_count, 3);
+    CHECK_EQ_INT(accumulator.rendered_count, 1);
+    CHECK(memcmp(truncated_details, accumulator.accumulated_details,
+                 sizeof(truncated_details)) == 0);
+    CHECK(memcmp(&g_last_error, &global_before, sizeof(g_last_error)) == 0);
+    CHECK(memcmp(&accumulator.first_error, &first_bytes,
+                 sizeof(first_bytes)) == 0);
+
+    errno = ENOMSG;
+    CHECK(error_accumulator_publish(&accumulator));
+    CHECK_EQ_INT(errno, ECHILD);
+    CHECK_EQ_INT(g_last_error.code, ERR_CONFIG_WRITE_FAILED);
+    CHECK_EQ_INT(g_last_error.system_errno, EROFS);
+    CHECK_STR_EQ(g_last_error.message, "primary failure");
+    CHECK_STR_EQ(g_last_error.file, "primary.c");
+    CHECK_EQ_INT(g_last_error.line, 72);
+    CHECK_STR_EQ(g_last_error.function, "primary_stage");
+    CHECK(g_last_error.details_truncated);
+    CHECK(strstr(g_last_error.details, ERROR_MESSAGE_TRUNCATION_MARKER) != NULL);
+}
+
+TEST(safe_strncat_accepts_empty_and_exact_fit_without_replacing_error) {
+    char empty[1] = "";
+    char exact[5] = "ab";
+    error_context_t saved;
+    uint64_t saved_generation;
+
+    set_error(ERR_ACCOUNT_INVALID, "retained concatenation diagnostic");
+    saved = *get_last_error();
+    saved_generation = error_report_generation();
+
+    CHECK_EQ_INT(safe_strncat(empty, "", sizeof(empty)), 0);
+    CHECK_STR_EQ(empty, "");
+    CHECK_EQ_INT(safe_strncat(exact, "cd", sizeof(exact)), 0);
+    CHECK_STR_EQ(exact, "abcd");
+    CHECK(memcmp(get_last_error(), &saved, sizeof(saved)) == 0);
+    CHECK(error_report_generation() == saved_generation);
+}
+
+TEST(safe_strncat_rejects_invalid_and_short_capacities_atomically) {
+    char short_dest[4] = "ab";
+    char short_before[sizeof(short_dest)];
+    char one_byte[1] = "";
+    char full[5] = "abcd";
+    char full_before[sizeof(full)];
+
+    memcpy(short_before, short_dest, sizeof(short_before));
+    CHECK_EQ_INT(safe_strncat(NULL, "x", sizeof(short_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(safe_strncat(short_dest, NULL, sizeof(short_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_EQ_INT(safe_strncat(short_dest, "x", 0), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(short_dest, short_before, sizeof(short_dest)) == 0);
+
+    CHECK_EQ_INT(safe_strncat(short_dest, "cd", sizeof(short_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(short_dest, short_before, sizeof(short_dest)) == 0);
+
+    CHECK_EQ_INT(safe_strncat(one_byte, "x", sizeof(one_byte)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK_STR_EQ(one_byte, "");
+
+    memcpy(full_before, full, sizeof(full_before));
+    CHECK_EQ_INT(safe_strncat(full, "", sizeof(full)), 0);
+    CHECK(memcmp(full, full_before, sizeof(full)) == 0);
+    CHECK_EQ_INT(safe_strncat(full, "x", sizeof(full)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(full, full_before, sizeof(full)) == 0);
+}
+
+TEST(safe_strncat_bounds_unterminated_destination_and_source_scans) {
+    char *unterminated_dest = malloc(4U);
+    char *unterminated_src = malloc(4U);
+    char dest_before[4];
+    char source_dest[5] = "a";
+    char source_dest_before[sizeof(source_dest)];
+
+    CHECK(unterminated_dest != NULL);
+    CHECK(unterminated_src != NULL);
+    if (!unterminated_dest || !unterminated_src) {
+        free(unterminated_dest);
+        free(unterminated_src);
+        return;
+    }
+
+    memset(unterminated_dest, 'd', 4U);
+    memcpy(dest_before, unterminated_dest, sizeof(dest_before));
+    CHECK_EQ_INT(safe_strncat(unterminated_dest, "x", 4U), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(unterminated_dest, dest_before, sizeof(dest_before)) == 0);
+
+    memset(unterminated_src, 's', 4U);
+    memcpy(source_dest_before, source_dest, sizeof(source_dest_before));
+    CHECK_EQ_INT(safe_strncat(source_dest, unterminated_src,
+                             sizeof(source_dest)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(source_dest, source_dest_before, sizeof(source_dest)) == 0);
+
+    free(unterminated_dest);
+    free(unterminated_src);
+}
+
+TEST(safe_strncat_rejects_copy_overlap_without_mutation) {
+    char self[8] = "ab";
+    char self_before[sizeof(self)];
+    char interior[8] = "abc";
+    char interior_before[sizeof(interior)];
+    char destination_inside_source[16] = "abc";
+    char destination_inside_before[sizeof(destination_inside_source)];
+    char tail_source[16] = {'a', 'b', '\0', 'c', 'd', '\0'};
+    char tail_source_before[sizeof(tail_source)];
+
+    memcpy(self_before, self, sizeof(self_before));
+    CHECK_EQ_INT(safe_strncat(self, self, sizeof(self)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(self, self_before, sizeof(self)) == 0);
+
+    memcpy(interior_before, interior, sizeof(interior_before));
+    CHECK_EQ_INT(safe_strncat(interior, interior + 1, sizeof(interior)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(interior, interior_before, sizeof(interior)) == 0);
+
+    memcpy(destination_inside_before, destination_inside_source,
+           sizeof(destination_inside_before));
+    CHECK_EQ_INT(safe_strncat(destination_inside_source + 1,
+                             destination_inside_source,
+                             sizeof(destination_inside_source) - 1U),
+                 -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(destination_inside_source, destination_inside_before,
+                 sizeof(destination_inside_source)) == 0);
+
+    memcpy(tail_source_before, tail_source, sizeof(tail_source_before));
+    CHECK_EQ_INT(safe_strncat(tail_source, tail_source + 3,
+                             sizeof(tail_source)), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(memcmp(tail_source, tail_source_before, sizeof(tail_source)) == 0);
+}
+
+TEST(safe_strncat_accepts_adjacent_nonoverlapping_ranges) {
+    struct {
+        char dest[4];
+        char src[4];
+    } adjacent = {{'a', '\0'}, {'b', 'c', '\0'}};
+
+    CHECK_EQ_INT(safe_strncat(adjacent.dest, adjacent.src,
+                             sizeof(adjacent.dest)),
+                 0);
+    CHECK_STR_EQ(adjacent.dest, "abc");
+    CHECK_STR_EQ(adjacent.src, "bc");
 }
 
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_CRITICAL, NULL);
+    RUN_TEST(observational_scope_restores_context_generation_and_errno);
+    RUN_TEST(nested_observational_scopes_restore_in_lifo_order);
+    RUN_TEST(null_observational_callback_publishes_api_misuse);
     RUN_TEST(direct_error_context_copies_mutable_provenance);
     RUN_TEST(system_error_context_copies_mutable_provenance);
     RUN_TEST(error_context_value_copy_has_independent_provenance);
@@ -352,5 +911,13 @@ TEST_MAIN_BEGIN()
     RUN_TEST(very_large_message_and_saved_context_keep_truncation_state);
     RUN_TEST(display_format_marks_its_own_bounded_truncation);
     RUN_TEST(display_format_rejects_unterminated_context_fields_truthfully);
-    RUN_TEST(failed_error_init_retains_previous_log_sink);
+    RUN_TEST(failed_error_init_retains_previous_log_sink_and_errno);
+    RUN_TEST(error_accumulator_retains_first_context_without_global_side_effects);
+    RUN_TEST(error_accumulator_appends_in_order_and_publishes_first_cause);
+    RUN_TEST(error_accumulator_marks_bounded_chain_truncation_and_counts_failures);
+    RUN_TEST(safe_strncat_accepts_empty_and_exact_fit_without_replacing_error);
+    RUN_TEST(safe_strncat_rejects_invalid_and_short_capacities_atomically);
+    RUN_TEST(safe_strncat_bounds_unterminated_destination_and_source_scans);
+    RUN_TEST(safe_strncat_rejects_copy_overlap_without_mutation);
+    RUN_TEST(safe_strncat_accepts_adjacent_nonoverlapping_ranges);
 TEST_MAIN_END()

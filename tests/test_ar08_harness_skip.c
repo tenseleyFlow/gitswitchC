@@ -36,7 +36,9 @@ TEST(child_fails_then_requests_skip) {
 }
 
 static int run_child_scenario(const char *scenario) {
-    if (strcmp(scenario, "pass") == 0) {
+    if (strcmp(scenario, "empty") == 0) {
+        /* Deliberately execute no RUN_TEST invocation. */
+    } else if (strcmp(scenario, "pass") == 0) {
         RUN_TEST(child_passes);
     } else if (strcmp(scenario, "skip-fish") == 0) {
         RUN_TEST(child_skips_fish);
@@ -133,6 +135,19 @@ static int capture_scenario(const char *scenario, const char *required_caps,
 static bool output_contains(const child_result_t *result,
                             const char *expected) {
     return result && expected && strstr(result->output, expected) != NULL;
+}
+
+TEST(empty_suite_is_a_harness_failure) {
+    child_result_t result;
+    int captured = capture_scenario("empty", NULL, &result);
+    CHECK_EQ_INT(captured, 0);
+    if (captured != 0) return;
+
+    CHECK(result.exit_code != 0);
+    CHECK(output_contains(&result, "HARNESS FAIL: no tests executed"));
+    CHECK(output_contains(
+        &result,
+        "RESULT FAIL: 0 run, 0 passed, 0 failed, 0 skipped"));
 }
 
 TEST(optional_skip_is_visible_and_successful) {
@@ -245,6 +260,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    RUN_TEST(empty_suite_is_a_harness_failure);
     RUN_TEST(optional_skip_is_visible_and_successful);
     RUN_TEST(required_skip_fails_the_suite_without_double_counting);
     RUN_TEST(required_capabilities_use_exact_token_matching);

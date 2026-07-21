@@ -35,13 +35,103 @@ SRCDIR = src
 BUILDDIR = build
 OBJDIR = $(BUILDDIR)/obj
 BINDIR = $(BUILDDIR)/bin
+override BUILD_ROOT_MARKER_NAME := .gitswitch-build-root
+override GITSWITCH_BUILD_ROOT := $(BUILDDIR)
+export GITSWITCH_BUILD_ROOT
 # Release publication is a security boundary, not a caller-selected build
-# output. Keep its host helper in one untracked namespace even when ordinary
-# build directories are redirected by a packager.
-override TOOLBUILDDIR := build/tools
+# output.  In a Git checkout, keep its mutex and provenance-bound host helpers
+# under that checkout's physical Git directory.  They therefore exist before
+# the artifact tree and are outside the repository namespace whose durability
+# the publisher commits.  Exported source trees retain the historical
+# build/tools location for non-release helper/test use; `dist` already requires
+# Git metadata and cannot take that fallback.
+override RELEASE_STATE_GOALS := release-publish-helpers \
+	_release-publish-helpers-locked release-symbol-contract-test \
+	_release-symbol-contract-test-locked clean _clean-release-locked \
+	distclean dev dist _dist-release-locked distcheck \
+	_distcheck-release-locked \
+	release-contract-test _release-contract-test-locked rpm \
+	_rpm-release-locked \
+	build/tools/release-publish \
+	build/tools/release-publish-named-test
+override RELEASE_GIT_DIR_PROBE_FAILURE := __GITSWITCH_RELEASE_GIT_DIR_FAILURE__
+ifneq ($(strip $(filter $(RELEASE_STATE_GOALS),$(MAKECMDGOALS))),)
+    override RELEASE_GIT_DIR := $(shell fail_git_dir() { \
+	printf '%s' '$(RELEASE_GIT_DIR_PROBE_FAILURE)'; exit 0; \
+    }; \
+    root=`pwd -P` || fail_git_dir; \
+	local_git_marker=0; \
+	if test -e .git || test -L .git; then local_git_marker=1; fi; \
+	if ! top=`git rev-parse --show-toplevel 2>/dev/null`; then \
+		test "$$local_git_marker" -eq 0 || fail_git_dir; \
+		exit 0; \
+	fi; \
+    top_physical=`CDPATH='' cd "$$top" 2>/dev/null && pwd -P` || \
+	fail_git_dir; \
+	if test "$$root" != "$$top_physical"; then \
+		test "$$local_git_marker" -eq 0 || fail_git_dir; \
+		exit 0; \
+	fi; \
+    git_dir=`git rev-parse --absolute-git-dir 2>/dev/null` || \
+	fail_git_dir; \
+    test -n "$$git_dir" || fail_git_dir; \
+    git_dir_physical=`CDPATH='' cd "$$git_dir" 2>/dev/null && pwd -P` || \
+	fail_git_dir; \
+    test -n "$$git_dir_physical" || fail_git_dir; \
+    printf '%s' "$$git_dir_physical")
+else
+    override RELEASE_GIT_DIR :=
+endif
+ifeq ($(RELEASE_GIT_DIR),$(RELEASE_GIT_DIR_PROBE_FAILURE))
+    $(error cannot resolve the physical Git directory for release state)
+endif
+ifneq ($(strip $(RELEASE_GIT_DIR)),)
+    override RELEASE_GIT_DIR_AVAILABLE := 1
+    override TOOLBUILDDIR := $(RELEASE_GIT_DIR)/gitswitch-release-tools
+    override DIST_PUBLISH_LOCK := $(RELEASE_GIT_DIR)/gitswitch-release-publish.lock
+    override GITSWITCH_RELEASE_TOOLS_EXTERNAL := 1
+else
+    override RELEASE_GIT_DIR_AVAILABLE := 0
+    override TOOLBUILDDIR := build/tools
+    override DIST_PUBLISH_LOCK := .gitswitch-release-publish.lock
+    override GITSWITCH_RELEASE_TOOLS_EXTERNAL := 0
+endif
+override GITSWITCH_RELEASE_PROJECT_ROOT_PATH := $(CURDIR)
+override GITSWITCH_RELEASE_GIT_DIR_PATH := $(RELEASE_GIT_DIR)
+override GITSWITCH_RELEASE_TOOLBUILDDIR_PATH := $(TOOLBUILDDIR)
+override GITSWITCH_DIST_PUBLISH_LOCK_PATH := $(DIST_PUBLISH_LOCK)
+export GITSWITCH_RELEASE_TOOLS_EXTERNAL
+export GITSWITCH_RELEASE_PROJECT_ROOT_PATH
+export GITSWITCH_RELEASE_GIT_DIR_PATH
+export GITSWITCH_RELEASE_TOOLBUILDDIR_PATH
+export GITSWITCH_DIST_PUBLISH_LOCK_PATH
 TESTDIR = tests
 DOCDIR = docs
 HOSTCC ?= cc
+
+# Release-publisher helpers execute on the build host, so their compiler
+# identity is deliberately separate from the target compiler below. As with
+# CC, a multi-launcher HOSTCC command may provide the complete whitespace-free
+# identity-file list explicitly; the default binds the resolved first launcher
+# by content as well as by command spelling and version output.
+HOSTCC_LAUNCHER := $(firstword $(HOSTCC))
+HOSTCC_RESOLVED_DEFAULT := $(shell p=`command -v "$(HOSTCC_LAUNCHER)" 2>/dev/null` || exit 0; \
+	d=$${p%/*}; b=`printf '%s\n' "$$p" | sed 's,.*/,,'`; \
+	if test "$$d" = "$$p"; then d=.; b=$$p; fi; \
+	cd "$$d" 2>/dev/null && printf '%s/%s' "$$PWD" "$$b")
+HOSTCC_IDENTITY_FILE ?= $(HOSTCC_RESOLVED_DEFAULT)
+HOSTCC_IDENTITY_FILES ?= $(HOSTCC_IDENTITY_FILE)
+HOSTCC_VERSION_ID := $(shell $(HOSTCC) --version 2>/dev/null | sed -n '1p')
+override GITSWITCH_HOSTCC_COMMAND := $(HOSTCC)
+override GITSWITCH_HOSTCC_LAUNCHER := $(HOSTCC_LAUNCHER)
+override GITSWITCH_HOSTCC_RESOLVED := $(HOSTCC_RESOLVED_DEFAULT)
+override GITSWITCH_HOSTCC_IDENTITY_FILES := $(HOSTCC_IDENTITY_FILES)
+override GITSWITCH_HOSTCC_VERSION := $(HOSTCC_VERSION_ID)
+export GITSWITCH_HOSTCC_COMMAND
+export GITSWITCH_HOSTCC_LAUNCHER
+export GITSWITCH_HOSTCC_RESOLVED
+export GITSWITCH_HOSTCC_IDENTITY_FILES
+export GITSWITCH_HOSTCC_VERSION
 
 # Compiler identity and target policy. Hardening follows the compiler's target,
 # never the machine running Make. The launcher itself is content-fingerprinted
@@ -315,9 +405,10 @@ INCLUDES = -I$(SRCDIR)
 # libssl/libcrypto DT_NEEDED entries in every shipped binary (AR-05 M2).
 LIBS =
 
-# Optional GNU readline: gives the interactive add/edit prompts line editing
-# and TAB path completion. Auto-detected; build still works without it (the
-# prompt module falls back to fgets). Override with READLINE=0 to force off.
+# Optional GNU readline: gives terminal-to-terminal add/edit prompts line
+# editing and TAB path completion. Auto-detected; build still works without it
+# (the prompt module uses its bounded byte-wise stdio reader). Override with
+# READLINE=0 to force off.
 #
 # GNU readline isn't on the default search path everywhere: on macOS it's a
 # keg-only Homebrew formula, and on the BSDs it lives under /usr/local. Probe
@@ -352,7 +443,7 @@ endif
 # Source files (Phase 2 - Configuration Management)
 PHASE2_SOURCES = $(SRCDIR)/main.c $(SRCDIR)/error.c $(SRCDIR)/utils.c \
                  $(SRCDIR)/display.c $(SRCDIR)/toml_parser.c $(SRCDIR)/config.c \
-                 $(SRCDIR)/accounts.c $(SRCDIR)/prompt.c
+                 $(SRCDIR)/publication.c $(SRCDIR)/accounts.c $(SRCDIR)/prompt.c
 
 # Source files (Phase 3 - Git Operations)
 PHASE3_SOURCES = $(PHASE2_SOURCES) $(SRCDIR)/git_ops.c
@@ -375,6 +466,10 @@ HEADERS = $(wildcard $(SRCDIR)/*.h)
 TEST_SOURCES = $(wildcard $(TESTDIR)/test_*.c)
 TEST_OBJECTS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(OBJDIR)/test_%.o)
 TEST_TARGETS = $(TEST_SOURCES:$(TESTDIR)/test_%.c=$(BINDIR)/test_%)
+PUBLIC_API_PRODUCTION_OBJECT = $(OBJDIR)/test_public_api_production.o
+PUBLIC_API_PRODUCTION_TARGET = $(BINDIR)/test_public_api_production
+PUBLIC_API_COVERAGE_STAMP = $(OBJDIR)/.public-api-coverage
+TEST_TARGETS += $(PUBLIC_API_PRODUCTION_TARGET)
 CLI_E2E_TEST_TARGETS = \
 	$(BINDIR)/test_ar04_cli \
 	$(BINDIR)/test_ar04_lifecycle \
@@ -398,7 +493,8 @@ DEPFILES = $(OBJECTS:.o=.d) $(TEST_OBJECTS:.o=.d) \
            $(AR08_COPY_UTILS_OBJECT:.o=.d) \
            $(AR09_SECURITY_UTILS_OBJECT:.o=.d) \
            $(AR09_DISPATCH_SIGNALS_OBJECT:.o=.d) \
-           $(AR09_DISPATCH_TEST_OBJECT:.o=.d)
+           $(AR09_DISPATCH_TEST_OBJECT:.o=.d) \
+           $(PUBLIC_API_PRODUCTION_OBJECT:.o=.d)
 
 # Let each translation unit describe its real header graph. -MP keeps a stale
 # dependency file usable long enough to re-run the compiler after a header is
@@ -411,33 +507,663 @@ DEPFLAGS ?= -MMD -MP
 .PHONY: all
 all: $(BINDIR)/$(TARGET)
 
-# Create directories
-$(OBJDIR):
-	@mkdir -p $(OBJDIR)
+# Create application build directories only under a root this checkout owns.
+# The canonical project-local build directory is intrinsically ours for
+# compatibility with older trees and with the fixed release-helper namespace.
+# A redirected root is claimed only when this invocation atomically creates
+# its final component; existing redirected directories require the exact
+# private marker from an earlier invocation of this checkout.
+.PHONY: prepare-build-root
+prepare-build-root:
+	@set -e; \
+	umask 077; \
+	build_root=$$GITSWITCH_BUILD_ROOT; \
+	while test "$$build_root" != / && \
+	      test "$${build_root%/}" != "$$build_root"; do \
+		build_root=$${build_root%/}; \
+	done; \
+	case "$$build_root" in \
+		''|/|.|..|../*|*/..|*'/../'*) \
+			echo "ERROR: refusing unsafe application build root: $$build_root" >&2; \
+			exit 1 ;; \
+	esac; \
+	project_root=`CDPATH='' cd . && pwd -P` || exit 1; \
+	case "$$build_root" in \
+		"$$project_root") \
+			echo 'ERROR: application build root aliases the project root' >&2; \
+			exit 1 ;; \
+	esac; \
+	case "$$build_root" in \
+		/*) build_component_path=/; build_remaining=$${build_root#/} ;; \
+		*) build_component_path=.; build_remaining=$$build_root ;; \
+	esac; \
+	while test -n "$$build_remaining"; do \
+		case "$$build_remaining" in \
+			*/*) build_component=$${build_remaining%%/*}; \
+				build_remaining=$${build_remaining#*/} ;; \
+			*) build_component=$$build_remaining; build_remaining= ;; \
+		esac; \
+		case "$$build_component" in ''|.) continue ;; esac; \
+		if test "$$build_component_path" = /; then \
+			build_component_path=/$$build_component; \
+		else \
+			build_component_path=$$build_component_path/$$build_component; \
+		fi; \
+		if test -n "$$build_remaining" && \
+		   test -L "$$build_component_path"; then \
+			echo "ERROR: application build root has a symlinked component: $$build_component_path" >&2; \
+			exit 1; \
+		fi; \
+	done; \
+	if test -L "$$build_root"; then \
+		echo "ERROR: application build root is a symlink: $$build_root" >&2; \
+		exit 1; \
+	fi; \
+	if test -e "$$build_root" && ! test -d "$$build_root"; then \
+		echo "ERROR: application build root is not a directory: $$build_root" >&2; \
+		exit 1; \
+	fi; \
+	created_root=0; \
+	marker="$$build_root/$(BUILD_ROOT_MARKER_NAME)"; \
+	marker_tmp=; \
+	pending_build_root_signal=; \
+	cleanup_build_root_claim() { \
+		claim_status=$$1; \
+		trap - 0 1 2 3 15; \
+		if test -n "$$marker_tmp"; then \
+			rm -f "$$marker_tmp" 2>/dev/null || :; \
+		fi; \
+		if test "$$created_root" -eq 1 && \
+		   ! test -e "$$marker" && ! test -L "$$marker"; then \
+			rmdir "$$build_root" 2>/dev/null || :; \
+		fi; \
+		exit "$$claim_status"; \
+	}; \
+	record_build_root_signal() { \
+		pending_build_root_signal=$$1; \
+	}; \
+	abort_if_build_root_signalled() { \
+		if test -n "$$pending_build_root_signal"; then \
+			claim_signal_status=$$pending_build_root_signal; \
+			pending_build_root_signal=; \
+			cleanup_build_root_claim "$$claim_signal_status"; \
+		fi; \
+	}; \
+	trap 'cleanup_build_root_claim $$?' 0; \
+	trap 'record_build_root_signal 129' 1; \
+	trap 'record_build_root_signal 130' 2; \
+	trap 'record_build_root_signal 131' 3; \
+	trap 'record_build_root_signal 143' 15; \
+	if ! test -d "$$build_root"; then \
+		case "$$build_root" in \
+			*/*) build_parent=$${build_root%/*}; \
+				test -n "$$build_parent" || build_parent=/ ;; \
+			*) build_parent=. ;; \
+		esac; \
+		mkdir -p "$$build_parent" || exit 1; \
+		abort_if_build_root_signalled; \
+		if mkdir -m 0755 "$$build_root"; then \
+			created_root=1; \
+		else \
+			abort_if_build_root_signalled; \
+			echo "ERROR: cannot atomically claim application build root: $$build_root" >&2; \
+			exit 1; \
+		fi; \
+	fi; \
+	abort_if_build_root_signalled; \
+	trap 'cleanup_build_root_claim 129' 1; \
+	trap 'cleanup_build_root_claim 130' 2; \
+	trap 'cleanup_build_root_claim 131' 3; \
+	trap 'cleanup_build_root_claim 143' 15; \
+	abort_if_build_root_signalled; \
+	test -d "$$build_root" && test ! -L "$$build_root" || { \
+		echo "ERROR: application build root changed during preparation: $$build_root" >&2; \
+		exit 1; \
+	}; \
+	build_physical=`CDPATH='' cd "$$build_root" && pwd -P` || exit 1; \
+	case "$$build_physical" in \
+		/|"$$project_root") \
+			echo "ERROR: unsafe physical application build root: $$build_physical" >&2; \
+			exit 1 ;; \
+	esac; \
+	if test -e "$$marker" || test -L "$$marker"; then \
+		test -f "$$marker" && test ! -L "$$marker" || { \
+			echo "ERROR: application build-root marker is invalid: $$marker" >&2; \
+			exit 1; \
+		}; \
+		marker_mode=`find "$$marker" -prune -type f -perm 0600 \
+			-print 2>/dev/null`; \
+		test "$$marker_mode" = "$$marker" && \
+		{ \
+			printf '%s\n' 'schema=gitswitch-build-root-v1'; \
+			printf 'project=%s\n' "$$project_root"; \
+			printf 'build=%s\n' "$$build_physical"; \
+		} | cmp -s - "$$marker" || { \
+			echo "ERROR: application build-root marker is invalid: $$marker" >&2; \
+			exit 1; \
+		}; \
+	else \
+		if test "$$created_root" -ne 1 && \
+		   test "$$build_physical" != "$$project_root/build"; then \
+			echo "ERROR: refusing unowned existing application build root: $$build_root" >&2; \
+			exit 1; \
+		fi; \
+		marker_tmp="$$marker.tmp.$$$$"; \
+		{ \
+			printf '%s\n' 'schema=gitswitch-build-root-v1'; \
+			printf 'project=%s\n' "$$project_root"; \
+			printf 'build=%s\n' "$$build_physical"; \
+		} >"$$marker_tmp"; \
+		chmod 0600 "$$marker_tmp"; \
+		mv -f "$$marker_tmp" "$$marker"; \
+		marker_tmp=; \
+	fi; \
+	trap - 0 1 2 3 15
 
-$(BINDIR):
-	@mkdir -p $(BINDIR)
+$(OBJDIR): | prepare-build-root
+	@mkdir -p "$(OBJDIR)"
 
-$(TOOLBUILDDIR):
-	@mkdir -p $(TOOLBUILDDIR)
+$(BINDIR): | prepare-build-root
+	@mkdir -p "$(BINDIR)"
 
 override DIST_PUBLISH_HELPER := build/tools/release-publish
-$(DIST_PUBLISH_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
-	@echo "Building descriptor-pinned release publisher..."
-	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror $< -o $@
-
+override DIST_PUBLISH_NAMED_TEST_HELPER := build/tools/release-publish-named-test
+override DIST_PUBLISH_PROVENANCE := build/tools/.release-publish.provenance
+ifeq ($(GITSWITCH_RELEASE_TOOLS_EXTERNAL),1)
+    override DIST_PUBLISH_HELPER := $(TOOLBUILDDIR)/release-publish
+    override DIST_PUBLISH_NAMED_TEST_HELPER := $(TOOLBUILDDIR)/release-publish-named-test
+    override DIST_PUBLISH_PROVENANCE := $(TOOLBUILDDIR)/.release-publish.provenance
+    override DIST_PUBLISH_HELPER_EXEC := $(DIST_PUBLISH_HELPER)
+    override DIST_PUBLISH_NAMED_TEST_HELPER_EXEC := $(DIST_PUBLISH_NAMED_TEST_HELPER)
+else
+    override DIST_PUBLISH_HELPER_EXEC := $(CURDIR)/$(DIST_PUBLISH_HELPER)
+    override DIST_PUBLISH_NAMED_TEST_HELPER_EXEC := $(CURDIR)/$(DIST_PUBLISH_NAMED_TEST_HELPER)
+endif
+override GITSWITCH_DIST_PUBLISH_HELPER_PATH := $(DIST_PUBLISH_HELPER)
+override GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH := $(DIST_PUBLISH_NAMED_TEST_HELPER)
+override GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH := $(DIST_PUBLISH_PROVENANCE)
+override GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH := $(DIST_PUBLISH_HELPER_EXEC)
+override GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_EXEC_PATH := $(DIST_PUBLISH_NAMED_TEST_HELPER_EXEC)
+export GITSWITCH_DIST_PUBLISH_HELPER_PATH
+export GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH
+export GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH
+export GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH
+export GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_EXEC_PATH
+override DIST_PUBLISH_POLICY_VERSION := host-tool-v1
+override DIST_PUBLISH_COMMON_FLAGS := -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror
+override DIST_PUBLISH_PRODUCTION_DEFINES :=
 # Exercise descriptor-bound publication from a named temp on every QA host;
 # macOS CI exercises its exact fclonefileat implementation below this contract.
-override DIST_PUBLISH_NAMED_TEST_HELPER := build/tools/release-publish-named-test
-$(DIST_PUBLISH_NAMED_TEST_HELPER): tools/release_publish.c | $(TOOLBUILDDIR)
-	@echo "Building named-temp release publisher fixture..."
-	$(HOSTCC) -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror \
-		-DGITSWITCH_RELEASE_FORCE_NAMED_TEMP=1 \
-		-DGITSWITCH_RELEASE_TEST_FD_PRESSURE=1 \
-		-DGITSWITCH_RELEASE_TEST_ADOPTION_RACE=1 \
-		-DGITSWITCH_RELEASE_TEST_PUBLICATION_RACE=1 \
-		-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 \
-		-DGITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS=5000 $< -o $@
+override DIST_PUBLISH_NAMED_DEFINES := \
+	-DGITSWITCH_RELEASE_FORCE_NAMED_TEMP=1 \
+	-DGITSWITCH_RELEASE_TEST_FD_PRESSURE=1 \
+	-DGITSWITCH_RELEASE_TEST_ADOPTION_RACE=1 \
+	-DGITSWITCH_RELEASE_TEST_PUBLICATION_RACE=1 \
+	-DGITSWITCH_RELEASE_TEST_CLEANUP_RACE=1 \
+	-DGITSWITCH_RELEASE_TEST_SIGNAL_DEFAULT=1 \
+	-DGITSWITCH_RELEASE_TEST_FORK_TRANSITION=1 \
+	-DGITSWITCH_RELEASE_TEST_REAP_TRANSITION=1 \
+	-DGITSWITCH_RELEASE_TEST_DIGEST=1 \
+	-DGITSWITCH_RELEASE_TEST_DURABILITY=1 \
+	-DGITSWITCH_RELEASE_PRODUCER_TIMEOUT_MS=5000 \
+	-DGITSWITCH_RELEASE_CONSUMER_TIMEOUT_MS=5000
+override GITSWITCH_DIST_PUBLISH_POLICY_VERSION := $(DIST_PUBLISH_POLICY_VERSION)
+override GITSWITCH_DIST_PUBLISH_COMMON_FLAGS := $(DIST_PUBLISH_COMMON_FLAGS)
+override GITSWITCH_DIST_PUBLISH_PRODUCTION_DEFINES := $(DIST_PUBLISH_PRODUCTION_DEFINES)
+override GITSWITCH_DIST_PUBLISH_NAMED_DEFINES := $(DIST_PUBLISH_NAMED_DEFINES)
+export GITSWITCH_DIST_PUBLISH_POLICY_VERSION
+export GITSWITCH_DIST_PUBLISH_COMMON_FLAGS
+export GITSWITCH_DIST_PUBLISH_PRODUCTION_DEFINES
+export GITSWITCH_DIST_PUBLISH_NAMED_DEFINES
+
+# One controller owns both publisher profiles and one receipt. A Git-private
+# cooperative mutex stays outside both the published repository namespace and
+# every cleaned build tree, so independent
+# Make processes cannot interleave generation, release use, or cleanup. The
+# public target enters through the signal-forwarding lock supervisor; the
+# private target refuses direct calls without the supervisor's unique token.
+# It runs for every requested helper, independently of mtimes, and reuses the
+# pair only
+# when source/header bytes, HOSTCC identity, exact compile policy, and both
+# current helper digests match the receipt. This closes the future-mtime and
+# post-build replacement holes while preserving a true no-op incremental
+# build. GNU Make's -B remains the CI real-build gate and deliberately bypasses
+# reuse. All canonical files are published only after both private compiles
+# succeed; a failure or interrupted rename leaves a detectable mismatch rather
+# than blessing a partial generation.
+.PHONY: release-publish-helpers _release-publish-helpers-locked
+release-publish-helpers: tools/release_publish_lock.sh
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory \
+		_release-publish-helpers-locked
+
+_release-publish-helpers-locked: tools/release_publish.c \
+		src/freebsd_compat.h tools/release_publish_lock.sh
+	@set -e; \
+	umask 077; \
+	lock_token=$${GITSWITCH_RELEASE_LOCK_TOKEN-}; \
+	test -n "$$lock_token" && test -d "$$lock_token" && \
+	test ! -L "$$lock_token" || { \
+		echo 'ERROR: release-helper controller requires a live lock token' >&2; \
+		exit 1; \
+	}; \
+	test -d "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	test ! -L "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	IFS= read -r lock_owner <"$$GITSWITCH_DIST_PUBLISH_LOCK_PATH/owner" && \
+	test "$$lock_owner" = "$$lock_token" || { \
+		echo 'ERROR: release-helper controller does not own the shared lock' >&2; \
+		exit 1; \
+	}; \
+	digest_file() { \
+		digest_path=$$1; \
+		digest_value=; \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			digest_output=`sha256sum "$$digest_path"` || return 1; \
+			digest_value=$${digest_output%% *}; \
+		elif command -v shasum >/dev/null 2>&1; then \
+			digest_output=`shasum -a 256 "$$digest_path"` || return 1; \
+			digest_value=$${digest_output%% *}; \
+		elif command -v sha256 >/dev/null 2>&1; then \
+			digest_value=`sha256 -q "$$digest_path"` || return 1; \
+		else \
+			echo 'ERROR: SHA-256 tool required for release-helper provenance' >&2; \
+			return 1; \
+		fi; \
+		case "$$digest_value" in \
+			''|*[!0-9A-Fa-f]*) return 1 ;; \
+		esac; \
+		test "$${#digest_value}" -eq 64 || return 1; \
+		printf '%s' "$$digest_value"; \
+	}; \
+	file_mode_matches() { \
+		mode_path=$$1; \
+		mode_value=$$2; \
+		mode_match=`find "$$mode_path" -prune -type f \
+			-perm "$$mode_value" -print 2>/dev/null` || return 1; \
+		test "$$mode_match" = "$$mode_path"; \
+	}; \
+	root_physical=`CDPATH='' cd . && pwd -P` || { \
+		echo 'ERROR: cannot resolve release-helper project root' >&2; \
+		exit 1; \
+	}; \
+	host_os=`uname -s 2>/dev/null` || { \
+		echo 'ERROR: cannot identify release-helper host platform' >&2; \
+		exit 1; \
+	}; \
+	normalize_namespace_acl() { \
+		namespace_acl_path=$$1; \
+		case "$$host_os" in \
+			Linux) : ;; \
+			Darwin) \
+				chmod -N "$$namespace_acl_path" || { \
+					echo "ERROR: cannot clear release-helper ACL: $$namespace_acl_path" >&2; \
+					return 1; \
+				} ;; \
+			FreeBSD) \
+				namespace_acl_nfs4=`getconf ACL_NFS4 "$$namespace_acl_path" 2>/dev/null` || { \
+					echo "ERROR: cannot query release-helper NFSv4 ACL support: $$namespace_acl_path" >&2; \
+					return 1; \
+				}; \
+				namespace_acl_extended=`getconf ACL_EXTENDED "$$namespace_acl_path" 2>/dev/null` || { \
+					echo "ERROR: cannot query release-helper POSIX ACL support: $$namespace_acl_path" >&2; \
+					return 1; \
+				}; \
+				case "$$namespace_acl_nfs4:$$namespace_acl_extended" in \
+					1:0|1:1) \
+						setfacl -b "$$namespace_acl_path" || { \
+							echo "ERROR: cannot clear release-helper NFSv4 ACL: $$namespace_acl_path" >&2; \
+							return 1; \
+						} ;; \
+					0:1) \
+						setfacl -b "$$namespace_acl_path" && \
+						setfacl -k "$$namespace_acl_path" || { \
+							echo "ERROR: cannot clear release-helper POSIX ACL: $$namespace_acl_path" >&2; \
+							return 1; \
+						} ;; \
+					0:0) : ;; \
+					*) \
+						echo "ERROR: invalid release-helper ACL capability result: $$namespace_acl_path" >&2; \
+						return 1 ;; \
+				esac ;; \
+			*) \
+				echo "ERROR: unsupported release-helper ACL policy: $$host_os" >&2; \
+				return 1 ;; \
+		esac; \
+	}; \
+	if test "$$GITSWITCH_RELEASE_TOOLS_EXTERNAL" -eq 1; then \
+		test -n "$$GITSWITCH_RELEASE_GIT_DIR_PATH" && \
+		test -d "$$GITSWITCH_RELEASE_GIT_DIR_PATH" && \
+		test ! -L "$$GITSWITCH_RELEASE_GIT_DIR_PATH" || { \
+			echo 'ERROR: physical Git directory is unavailable for release helpers' >&2; \
+			exit 1; \
+		}; \
+		namespace_component="$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; \
+		if test -L "$$namespace_component"; then \
+			echo "ERROR: release-helper namespace is a symlink: $$namespace_component" >&2; \
+			exit 1; \
+		fi; \
+		if test -e "$$namespace_component" && \
+		   ! test -d "$$namespace_component"; then \
+			echo "ERROR: release-helper namespace is not a directory: $$namespace_component" >&2; \
+			exit 1; \
+		fi; \
+		test -d "$$namespace_component" || \
+			mkdir -m 0700 "$$namespace_component" || { \
+			echo "ERROR: cannot create release-helper namespace: $$namespace_component" >&2; \
+			exit 1; \
+		}; \
+		test -d "$$namespace_component" && test ! -L "$$namespace_component" || { \
+			echo "ERROR: release-helper namespace changed during creation: $$namespace_component" >&2; \
+			exit 1; \
+		}; \
+		normalize_namespace_acl "$$namespace_component" || exit 1; \
+		chmod 0700 "$$namespace_component" || { \
+			echo 'ERROR: cannot secure release-helper namespace' >&2; \
+			exit 1; \
+		}; \
+	else \
+		for namespace_component in build "$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; do \
+			case "$$namespace_component" in \
+				build) namespace_create_mode=0755 ;; \
+				*) namespace_create_mode=0700 ;; \
+			esac; \
+			if test -L "$$namespace_component"; then \
+				echo "ERROR: release-helper namespace is a symlink: $$namespace_component" >&2; \
+				exit 1; \
+			fi; \
+			if test -e "$$namespace_component" && \
+			   ! test -d "$$namespace_component"; then \
+				echo "ERROR: release-helper namespace is not a directory: $$namespace_component" >&2; \
+				exit 1; \
+			fi; \
+			test -d "$$namespace_component" || \
+				mkdir -m "$$namespace_create_mode" "$$namespace_component" || { \
+				echo "ERROR: cannot create release-helper namespace: $$namespace_component" >&2; \
+				exit 1; \
+			}; \
+			test -d "$$namespace_component" && test ! -L "$$namespace_component" || { \
+				echo "ERROR: release-helper namespace changed during creation: $$namespace_component" >&2; \
+				exit 1; \
+			}; \
+			normalize_namespace_acl "$$namespace_component" || exit 1; \
+			case "$$namespace_component" in \
+				build) \
+					chmod go-w "$$namespace_component" || { \
+						echo 'ERROR: cannot make build namespace non-writable by peers' >&2; \
+						exit 1; \
+					} ;; \
+				*) \
+					chmod 0700 "$$namespace_component" || { \
+						echo 'ERROR: cannot secure release-helper namespace' >&2; \
+						exit 1; \
+					} ;; \
+			esac; \
+		done; \
+	fi; \
+	tools_physical=`CDPATH='' cd "$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH" && pwd -P` || { \
+		echo 'ERROR: cannot resolve release-helper namespace' >&2; \
+		exit 1; \
+	}; \
+	if test "$$GITSWITCH_RELEASE_TOOLS_EXTERNAL" -eq 1; then \
+		expected_tools="$$GITSWITCH_RELEASE_GIT_DIR_PATH/gitswitch-release-tools"; \
+	else \
+		expected_tools="$$root_physical/$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; \
+	fi; \
+	test "$$tools_physical" = "$$expected_tools" || { \
+		echo 'ERROR: release-helper namespace resolves outside its approved state root' >&2; \
+		exit 1; \
+	}; \
+	for stale_tmp in "$$tools_physical"/release-publish.tmp.*; do \
+		test -e "$$stale_tmp" || test -L "$$stale_tmp" || continue; \
+		stale_name=$${stale_tmp##*/}; \
+		case "$$stale_name" in \
+			release-publish.tmp.??????) ;; \
+			*) continue ;; \
+		esac; \
+		if test -L "$$stale_tmp"; then \
+			rm -f "$$stale_tmp"; \
+		elif test -d "$$stale_tmp"; then \
+			rm -rf "$$stale_tmp"; \
+		else \
+			rm -f "$$stale_tmp"; \
+		fi; \
+	done; \
+	tmpdir=`mktemp -d "$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH/release-publish.tmp.XXXXXX"` || { \
+		echo 'ERROR: cannot create private release-helper build directory' >&2; \
+		exit 1; \
+	}; \
+	cleanup_host_tools() { \
+		cleanup_status=$$1; \
+		trap - 0 1 2 3 15; \
+		rm -rf "$$tmpdir"; \
+		exit "$$cleanup_status"; \
+	}; \
+	trap 'cleanup_host_tools $$?' 0; \
+	trap 'cleanup_host_tools 129' 1; \
+	trap 'cleanup_host_tools 130' 2; \
+	trap 'cleanup_host_tools 131' 3; \
+	trap 'cleanup_host_tools 143' 15; \
+	test -n "$$GITSWITCH_HOSTCC_COMMAND" && \
+	test -n "$$GITSWITCH_HOSTCC_LAUNCHER" && \
+	test -n "$$GITSWITCH_HOSTCC_RESOLVED" && \
+	test -n "$$GITSWITCH_HOSTCC_IDENTITY_FILES" && \
+	test -n "$$GITSWITCH_HOSTCC_VERSION" || { \
+		echo 'ERROR: complete HOSTCC command, path, version, and identity files are required' >&2; \
+		exit 1; \
+	}; \
+	test -f "$$GITSWITCH_HOSTCC_RESOLVED" && \
+	test -r "$$GITSWITCH_HOSTCC_RESOLVED" || { \
+		echo 'ERROR: resolved HOSTCC launcher is not a readable regular file' >&2; \
+		exit 1; \
+	}; \
+	hostcc_resolved_digest=`digest_file "$$GITSWITCH_HOSTCC_RESOLVED"` || { \
+		echo 'ERROR: cannot fingerprint resolved HOSTCC launcher' >&2; exit 1; \
+	}; \
+	mkdir "$$tmpdir/tools" "$$tmpdir/src" || { \
+		echo 'ERROR: cannot create private release-helper source tree' >&2; \
+		exit 1; \
+	}; \
+	cp tools/release_publish.c "$$tmpdir/tools/release_publish.c" || { \
+		echo 'ERROR: cannot snapshot release publisher source' >&2; exit 1; \
+	}; \
+	cp src/freebsd_compat.h "$$tmpdir/src/freebsd_compat.h" || { \
+		echo 'ERROR: cannot snapshot release publisher compatibility header' >&2; \
+		exit 1; \
+	}; \
+	chmod 0600 "$$tmpdir/tools/release_publish.c" \
+		"$$tmpdir/src/freebsd_compat.h" || exit 1; \
+	release_source_digest=`digest_file "$$tmpdir/tools/release_publish.c"` || { \
+		echo 'ERROR: cannot fingerprint release publisher snapshot' >&2; exit 1; \
+	}; \
+	compat_header_digest=`digest_file "$$tmpdir/src/freebsd_compat.h"` || { \
+		echo 'ERROR: cannot fingerprint release publisher header snapshot' >&2; \
+		exit 1; \
+	}; \
+	identity_manifest="$$tmpdir/identity"; \
+	: >"$$identity_manifest"; \
+	identity_count=0; \
+	for identity_file in $$GITSWITCH_HOSTCC_IDENTITY_FILES; do \
+		test -f "$$identity_file" && test -r "$$identity_file" || { \
+			echo "ERROR: HOSTCC identity file is not readable: $$identity_file" >&2; \
+			exit 1; \
+		}; \
+		identity_digest=`digest_file "$$identity_file"` || { \
+			echo "ERROR: cannot fingerprint HOSTCC identity file: $$identity_file" >&2; \
+			exit 1; \
+		}; \
+		printf 'hostcc_identity=%s:%s\n' "$$identity_file" "$$identity_digest" \
+			>>"$$identity_manifest"; \
+		identity_count=$$((identity_count + 1)); \
+	done; \
+	test "$$identity_count" -gt 0 || { \
+		echo 'ERROR: HOSTCC identity-file list is incomplete' >&2; exit 1; \
+	}; \
+	verify_host_inputs() { \
+		current_source_digest=`digest_file tools/release_publish.c` || return 1; \
+		current_header_digest=`digest_file src/freebsd_compat.h` || return 1; \
+		current_resolved_digest=`digest_file "$$GITSWITCH_HOSTCC_RESOLVED"` || \
+			return 1; \
+		current_hostcc_version=`$(HOSTCC) --version 2>/dev/null | sed -n '1p'`; \
+		test "$$current_source_digest" = "$$release_source_digest" || return 1; \
+		test "$$current_header_digest" = "$$compat_header_digest" || return 1; \
+		test "$$current_resolved_digest" = "$$hostcc_resolved_digest" || \
+			return 1; \
+		test "$$current_hostcc_version" = "$$GITSWITCH_HOSTCC_VERSION" || \
+			return 1; \
+		current_identity_manifest="$$tmpdir/identity.current"; \
+		: >"$$current_identity_manifest"; \
+		current_identity_count=0; \
+		for current_identity_file in $$GITSWITCH_HOSTCC_IDENTITY_FILES; do \
+			test -f "$$current_identity_file" && \
+			test -r "$$current_identity_file" || return 1; \
+			current_identity_digest=`digest_file "$$current_identity_file"` || \
+				return 1; \
+			printf 'hostcc_identity=%s:%s\n' "$$current_identity_file" \
+				"$$current_identity_digest" >>"$$current_identity_manifest"; \
+			current_identity_count=$$((current_identity_count + 1)); \
+		done; \
+		test "$$current_identity_count" = "$$identity_count" || return 1; \
+		cmp -s "$$current_identity_manifest" "$$identity_manifest"; \
+	}; \
+	verify_host_inputs || { \
+		echo 'ERROR: release-helper inputs changed while being snapshotted' >&2; \
+		exit 1; \
+	}; \
+	printf '%s' "$$GITSWITCH_HOSTCC_COMMAND" >"$$tmpdir/hostcc-command"; \
+	printf '%s' "$$GITSWITCH_HOSTCC_VERSION" >"$$tmpdir/hostcc-version"; \
+	printf '%s' "$$GITSWITCH_DIST_PUBLISH_COMMON_FLAGS" >"$$tmpdir/common-flags"; \
+	printf '%s' "$$GITSWITCH_DIST_PUBLISH_PRODUCTION_DEFINES" >"$$tmpdir/production-defines"; \
+	printf '%s' "$$GITSWITCH_DIST_PUBLISH_NAMED_DEFINES" >"$$tmpdir/named-defines"; \
+	hostcc_command_digest=`digest_file "$$tmpdir/hostcc-command"` || exit 1; \
+	hostcc_version_digest=`digest_file "$$tmpdir/hostcc-version"` || exit 1; \
+	common_flags_digest=`digest_file "$$tmpdir/common-flags"` || exit 1; \
+	production_defines_digest=`digest_file "$$tmpdir/production-defines"` || exit 1; \
+	named_defines_digest=`digest_file "$$tmpdir/named-defines"` || exit 1; \
+	expected="$$tmpdir/expected"; \
+	{ \
+		printf 'schema=%s\n' "$$GITSWITCH_DIST_PUBLISH_POLICY_VERSION"; \
+		printf 'source_release_publish_sha256=%s\n' "$$release_source_digest"; \
+		printf 'source_freebsd_compat_sha256=%s\n' "$$compat_header_digest"; \
+		printf 'hostcc_command_sha256=%s\n' "$$hostcc_command_digest"; \
+		printf 'hostcc_launcher=%s\n' "$$GITSWITCH_HOSTCC_LAUNCHER"; \
+		printf 'hostcc_resolved=%s\n' "$$GITSWITCH_HOSTCC_RESOLVED"; \
+		printf 'hostcc_resolved_sha256=%s\n' "$$hostcc_resolved_digest"; \
+		printf 'hostcc_version_sha256=%s\n' "$$hostcc_version_digest"; \
+		cat "$$identity_manifest"; \
+		printf 'common_flags_sha256=%s\n' "$$common_flags_digest"; \
+		printf 'production_defines_sha256=%s\n' "$$production_defines_digest"; \
+		printf 'named_defines_sha256=%s\n' "$$named_defines_digest"; \
+	} >"$$expected"; \
+	force_rebuild=$(if $(findstring B,$(firstword $(MAKEFLAGS))),1,0); \
+	if test "$$force_rebuild" -eq 0 && \
+	   file_mode_matches "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" 0755 && \
+	   test -x "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" && \
+	   file_mode_matches "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" 0755 && \
+	   test -x "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" && \
+	   file_mode_matches "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" 0644; then \
+		production_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH"` || production_digest=; \
+		named_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH"` || named_digest=; \
+		if test -n "$$production_digest" && test -n "$$named_digest"; then \
+			{ \
+				cat "$$expected"; \
+				printf 'production_helper_sha256=%s\n' "$$production_digest"; \
+				printf 'named_helper_sha256=%s\n' "$$named_digest"; \
+			} >"$$tmpdir/current"; \
+			if cmp -s "$$tmpdir/current" "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" && \
+			   verify_host_inputs; then \
+				exit 0; \
+			fi; \
+		fi; \
+	fi; \
+	production_tmp="$$tmpdir/release-publish"; \
+	named_tmp="$$tmpdir/release-publish-named-test"; \
+	echo "Building descriptor-pinned release publisher..."; \
+	$(HOSTCC) $(DIST_PUBLISH_COMMON_FLAGS) $(DIST_PUBLISH_PRODUCTION_DEFINES) \
+		"$$tmpdir/tools/release_publish.c" -o "$$production_tmp"; \
+	echo "Building named-temp release publisher fixture..."; \
+	$(HOSTCC) $(DIST_PUBLISH_COMMON_FLAGS) $(DIST_PUBLISH_NAMED_DEFINES) \
+		"$$tmpdir/tools/release_publish.c" -o "$$named_tmp"; \
+	chmod 0755 "$$production_tmp" "$$named_tmp"; \
+	production_digest=`digest_file "$$production_tmp"` || exit 1; \
+	named_digest=`digest_file "$$named_tmp"` || exit 1; \
+	new_receipt="$$tmpdir/provenance"; \
+	{ \
+		cat "$$expected"; \
+		printf 'production_helper_sha256=%s\n' "$$production_digest"; \
+		printf 'named_helper_sha256=%s\n' "$$named_digest"; \
+	} >"$$new_receipt"; \
+	chmod 0644 "$$new_receipt"; \
+	verify_host_inputs || { \
+		echo 'ERROR: release-helper inputs changed during compilation' >&2; \
+		exit 1; \
+	}; \
+	mv -f "$$production_tmp" "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH"; \
+	mv -f "$$named_tmp" "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH"; \
+	mv -f "$$new_receipt" "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH"; \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" 0644 || { \
+		echo 'ERROR: release-helper publication produced an invalid file shape' >&2; \
+		exit 1; \
+	}; \
+	verify_host_inputs || { \
+		echo 'ERROR: release-helper inputs changed during publication' >&2; \
+		exit 1; \
+	}; \
+	published_production_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH"` || exit 1; \
+	published_named_digest=`digest_file "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH"` || exit 1; \
+	{ \
+		cat "$$expected"; \
+		printf 'production_helper_sha256=%s\n' "$$published_production_digest"; \
+		printf 'named_helper_sha256=%s\n' "$$published_named_digest"; \
+	} >"$$tmpdir/published"; \
+	cmp -s "$$tmpdir/published" "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" || { \
+		echo 'ERROR: release-helper provenance changed during publication' >&2; \
+		exit 1; \
+	}; \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" 0755 && \
+	test -x "$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_PATH" && \
+	file_mode_matches "$$GITSWITCH_DIST_PUBLISH_PROVENANCE_PATH" 0644 || { \
+		echo 'ERROR: release-helper metadata changed during finalization' >&2; \
+		exit 1; \
+	}; \
+	verify_host_inputs || { \
+		echo 'ERROR: release-helper inputs changed during finalization' >&2; \
+		exit 1; \
+	}
+
+ifeq ($(GITSWITCH_RELEASE_TOOLS_EXTERNAL),1)
+.PHONY: build/tools/release-publish build/tools/release-publish-named-test
+build/tools/release-publish build/tools/release-publish-named-test:
+	@echo 'ERROR: release helpers in Git checkouts are private state; use release-publish-helpers' >&2
+	@exit 1
+else
+$(DIST_PUBLISH_HELPER) $(DIST_PUBLISH_NAMED_TEST_HELPER): | release-publish-helpers
+	@mode_match=`find "$@" -prune -type f -perm 0755 -print 2>/dev/null`; \
+	test "$$mode_match" = "$@" && test -x "$@" || { \
+		echo "ERROR: verified release helper is unavailable: $@" >&2; \
+		exit 1; \
+	}
+endif
+
+# The CI symbol consumer shares the same cross-process critical section as
+# helper generation. Keeping both operations in one supervised invocation
+# prevents a concurrent clean/rebuild from replacing the exact helper between
+# provenance validation and inspection.
+.PHONY: release-symbol-contract-test _release-symbol-contract-test-locked
+release-symbol-contract-test: tools/release_publish_lock.sh
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory \
+		_release-symbol-contract-test-locked
+
+_release-symbol-contract-test-locked: _release-publish-helpers-locked \
+		tests/test_ci_symbols.sh
+	@/bin/sh tests/test_ci_symbols.sh "$(BINDIR)/$(TARGET)" \
+		"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH"
 
 # Build-config stamp: objects/tests share build/obj and build/bin across every
 # configuration. Record every effective compile/link input, not just the build
@@ -650,34 +1376,57 @@ ifeq ($(BUILD_TYPE),release)
 install: release-policy-check
 endif
 install:
-	@if [ ! -x "$(BINDIR)/$(TARGET)" ]; then \
-		echo "Error: $(BINDIR)/$(TARGET) not built. Run 'make release' (or 'make') first." >&2; \
+	@set -e; \
+	source_binary="$(BINDIR)/$(TARGET)"; \
+	destination_dir="$(DESTDIR)$(PREFIX)/bin"; \
+	destination_binary="$$destination_dir/$(TARGET)"; \
+	if [ ! -x "$$source_binary" ]; then \
+		echo "Error: $$source_binary not built. Run 'make release' (or 'make') first." >&2; \
 		exit 1; \
-	fi
-	@bt=`sed -n '1s/|.*//p' $(BUILDTYPE_STAMP) 2>/dev/null`; \
+	fi; \
+	echo "Installing $(TARGET)..."; \
+	install -d "$$destination_dir"; \
+	staged_binary=`mktemp "$$destination_dir/.$(TARGET).install.XXXXXX"`; \
+	cleanup_staged_install() { \
+		cleanup_status=$$1; \
+		trap - 0 1 2 3 15; \
+		rm -f "$$staged_binary"; \
+		exit "$$cleanup_status"; \
+	}; \
+	trap 'cleanup_staged_install $$?' 0; \
+	trap 'cleanup_staged_install 129' 1; \
+	trap 'cleanup_staged_install 130' 2; \
+	trap 'cleanup_staged_install 131' 3; \
+	trap 'cleanup_staged_install 143' 15; \
+	install -m 755 "$$source_binary" "$$staged_binary"; \
+	bt=`sed -n '1s/|.*//p' "$(BUILDTYPE_STAMP)" 2>/dev/null`; \
 	if [ "$$bt" != "release" ]; then \
+		sh tests/test_ar07_release.sh copy-publish \
+			"$$source_binary" "$$staged_binary" "$$destination_binary" || { \
+			echo 'ERROR: refusing to install an unverified staged binary' >&2; exit 1; \
+		}; \
 		echo "Warning: installing a '$$bt' build (not 'release'); run 'make release' for a hardened, non-ASan binary." >&2; \
 	else \
-		built_os=`sed -n 's/^platform_os=//p' $(BUILDTYPE_STAMP)`; \
+		built_os=`sed -n 's/^platform_os=//p' "$(BUILDTYPE_STAMP)"`; \
 		case "$$built_os" in Linux|Darwin|FreeBSD) ;; \
-			*) built_ack=`sed -n 's/^unsupported_release_ack=//p' $(BUILDTYPE_STAMP)`; \
-			   built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
+			*) built_ack=`sed -n 's/^unsupported_release_ack=//p' "$(BUILDTYPE_STAMP)"`; \
+			   built_format=`sed -n 's/^release_artifact_format=//p' "$(BUILDTYPE_STAMP)"`; \
 			   test "$$built_ack" = I_ACKNOWLEDGE_UNSUPPORTED_RELEASE && \
 			   { test "$$built_format" = elf || test "$$built_format" = macho; } || { \
 				echo 'ERROR: refusing release install without a recorded supported/acknowledged inspection policy' >&2; exit 1; \
 			   } ;; \
-			esac; \
-		built_format=`sed -n 's/^release_artifact_format=//p' $(BUILDTYPE_STAMP)`; \
-		built_triple=`sed -n 's/^target_triple=//p' $(BUILDTYPE_STAMP)`; \
+		esac; \
+		built_format=`sed -n 's/^release_artifact_format=//p' "$(BUILDTYPE_STAMP)"`; \
+		built_triple=`sed -n 's/^target_triple=//p' "$(BUILDTYPE_STAMP)"`; \
 		GITSWITCH_RELEASE_FORMAT="$$built_format" \
-			sh tests/test_ar07_release.sh artifact \
-			"$(BINDIR)/$(TARGET)" "$(BINDIR)/$(TARGET)" "$$built_triple" || { \
+			sh tests/test_ar07_release.sh artifact-publish \
+			"$$source_binary" "$$staged_binary" \
+			"$$destination_binary" "$$built_triple" || { \
 			echo 'ERROR: refusing to install an unverified release artifact' >&2; exit 1; \
 		}; \
-	fi
-	@echo "Installing $(TARGET)..."
-	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(BINDIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
+	fi; \
+	rm -f "$$staged_binary"; \
+	trap - 0 1 2 3 15
 	@echo "Installing shell completions..."
 	install -d $(DESTDIR)$(PREFIX)/share/bash-completion/completions
 	install -m 644 completions/gitswitch.bash $(DESTDIR)$(PREFIX)/share/bash-completion/completions/$(TARGET)
@@ -700,10 +1449,27 @@ uninstall:
 # Test compilation
 # AR-10 L15: test objects see the GITSWITCH_TESTING declarations (the suites
 # link the testing signals object below); production objects never do.
+$(PUBLIC_API_COVERAGE_STAMP): $(TESTDIR)/test_public_api.c \
+		$(TESTDIR)/test_public_api_coverage.sh $(HEADERS) \
+		$(BUILDTYPE_STAMP) | $(OBJDIR)
+	@PUBLIC_API_CC="$(CC)" sh $(TESTDIR)/test_public_api_coverage.sh "$(CURDIR)"
+	@touch $@
+
+$(OBJDIR)/test_public_api.o: $(PUBLIC_API_COVERAGE_STAMP)
+
 $(OBJDIR)/test_%.o: $(TESTDIR)/test_%.c $(BUILDTYPE_STAMP) | $(OBJDIR)
 	@echo "Compiling test $<..."
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
 		-DGITSWITCH_TESTING \
+		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
+
+# Compile the same exhaustive registry without GITSWITCH_TESTING so an API
+# accidentally available only to test objects cannot satisfy the production
+# link contract (AR-11 L4).
+$(PUBLIC_API_PRODUCTION_OBJECT): $(TESTDIR)/test_public_api.c \
+		$(PUBLIC_API_COVERAGE_STAMP) $(BUILDTYPE_STAMP) | $(OBJDIR)
+	@echo "Compiling production public API profile..."
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -I$(TESTDIR) $(DEPFLAGS) \
 		$(RELEASE_ENFORCED_CFLAGS) $(TU_HARDENING_FLAGS) -c $< -o $@
 
 # The reset suite calls the real CLI entry point in isolated child processes
@@ -766,12 +1532,62 @@ $(AR09_DISPATCH_TEST_OBJECT): $(TESTDIR)/test_signals.c $(BUILDTYPE_STAMP) | $(O
 # Test executables (exclude main.o to avoid multiple main functions)
 # AR-10 L15: suites link the GITSWITCH_TESTING signals object — the sigaction
 # fault / guard-end sabotage seams no longer exist in the production object.
+# AR-11 M13-M15: keep the real-Git exact-retirement transaction suite visible
+# as an explicit focused target while retaining the common test link profile.
+$(BINDIR)/test_ar11_retirement_atomic: \
+		$(OBJDIR)/test_ar11_retirement_atomic.o
+
 $(BINDIR)/test_%: $(OBJDIR)/test_%.o $(AR09_DISPATCH_SIGNALS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
+$(PUBLIC_API_PRODUCTION_TARGET): $(PUBLIC_API_PRODUCTION_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking production public API profile..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# The lifecycle suite drives one remove through the real CLI entry with a
+# one-shot post-runtime persistence fault; the production executable remains
+# free of the renamed testing entry point.
+$(BINDIR)/test_ar04_lifecycle: $(OBJDIR)/test_ar04_lifecycle.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
 $(BINDIR)/test_ar07_reset: $(OBJDIR)/test_ar07_reset.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# AR-11 M17 drives remove, targeted reset, and all-account reset through the
+# real CLI entry while injecting only the existing private Git-retirement
+# checkpoints. The production entry point remains unchanged.
+$(BINDIR)/test_ar11_retirement_outcome: \
+		$(OBJDIR)/test_ar11_retirement_outcome.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# AR-11 M18 drives post-retirement config/state failures through the real CLI
+# entry and proves the outer transaction's restore-or-block-resume contract.
+$(BINDIR)/test_ar11_retirement_outer: \
+		$(OBJDIR)/test_ar11_retirement_outer.o \
+		$(AR07_RESET_MAIN_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# AR-11 M4 drives two consecutive invocations of the real CLI entry in one
+# process so a retained abort-only context cannot hide behind process exit.
+$(BINDIR)/test_ar11_cli_owner: $(OBJDIR)/test_ar11_cli_owner.o \
 		$(AR07_RESET_MAIN_OBJECT) \
 		$(AR09_DISPATCH_SIGNALS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
@@ -787,6 +1603,15 @@ $(BINDIR)/test_ar08_remove_signal: $(OBJDIR)/test_ar08_remove_signal.o \
 
 $(BINDIR)/test_ar08_resume_hint_race: \
 		$(OBJDIR)/test_ar08_resume_hint_race.o \
+		$(AR08_HINT_CONFIG_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# Deterministic retirement-guard namespace races use the same private config
+# checkpoint object. Broad config suites continue to link production config.o.
+$(BINDIR)/test_ar11_guard_clear: \
+		$(OBJDIR)/test_ar11_guard_clear.o \
 		$(AR08_HINT_CONFIG_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/config.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
@@ -810,6 +1635,33 @@ $(BINDIR)/test_ar07_runner: \
 		$(OBJDIR)/test_ar07_runner.o \
 		$(AR08_COPY_UTILS_OBJECT) \
 		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+# AR-11 trusted-exec fault seams are compiled only into these causal test
+# profiles; the production utils object and installed binary retain no fault
+# state or injection symbols.
+$(BINDIR)/test_ar07_exec_trust: \
+		$(OBJDIR)/test_ar07_exec_trust.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_ar11_gpg_program: \
+		$(OBJDIR)/test_ar11_gpg_program.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
+	@echo "Linking test $@..."
+	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
+
+$(BINDIR)/test_public_api: \
+		$(OBJDIR)/test_public_api.o \
+		$(AR08_COPY_UTILS_OBJECT) \
+		$(AR09_DISPATCH_SIGNALS_OBJECT) \
+		$(filter-out $(OBJDIR)/main.o $(OBJDIR)/utils.o $(OBJDIR)/signals.o,$(OBJECTS)) | $(BINDIR)
 	@echo "Linking test $@..."
 	$(CC) $(LDFLAGS) $^ -o $@ $(LIBS) $(RELEASE_ENFORCED_LDFLAGS)
 
@@ -853,6 +1705,8 @@ test: $(BINDIR)/$(TARGET) $(TEST_TARGETS)
 	@echo "Running tests..."
 	@GITSWITCH_BIN="$(abspath $(BINDIR)/$(TARGET))"; \
 	export GITSWITCH_BIN; \
+	GITSWITCH_SOURCE_ROOT="$(CURDIR)"; \
+	export GITSWITCH_SOURCE_ROOT; \
 	for test in $(TEST_TARGETS); do \
 		echo "Running $$test..."; \
 		"$$test" || exit 1; \
@@ -863,12 +1717,15 @@ endif
 # ShellCheck is intentionally a separate, fail-closed QA gate instead of an
 # ordinary `make test` prerequisite: builds remain package-independent while
 # CI and release reviewers can require every dialect parser explicitly.
-.PHONY: shell-static-test ci-policy-test
+.PHONY: shell-static-test ci-policy-test public-api-coverage-test
 shell-static-test:
 	@sh tests/test_shell_assets.sh "$(CURDIR)"
 
 ci-policy-test:
 	@sh tests/test_ci_policy.sh "$(CURDIR)"
+
+public-api-coverage-test:
+	@PUBLIC_API_CC="$(CC)" sh $(TESTDIR)/test_public_api_coverage.sh "$(CURDIR)"
 
 # The small contract fixture proves both threshold metrics are wired to gcovr's
 # documented nonzero exit bits; a no-op or report-only replacement cannot make
@@ -990,10 +1847,168 @@ endif
 # installed and false-succeeding (empty docs/) for everyone else (AR-05 L4).
 
 # Clean targets
-.PHONY: clean
-clean:
+override GITSWITCH_CLEAN_BUILDDIR := $(BUILDDIR)
+export GITSWITCH_CLEAN_BUILDDIR
+.PHONY: clean _clean-release-locked
+clean: tools/release_publish_lock.sh
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+			"$(MAKE_COMMAND)" --no-print-directory _clean-release-locked
+
+_clean-release-locked:
+	@lock_token=$${GITSWITCH_RELEASE_LOCK_TOKEN-}; \
+	test -n "$$lock_token" && test -d "$$lock_token" && \
+	test ! -L "$$lock_token" && \
+	test -d "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	test ! -L "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	IFS= read -r lock_owner <"$$GITSWITCH_DIST_PUBLISH_LOCK_PATH/owner" && \
+	test "$$lock_owner" = "$$lock_token" || { \
+		echo 'ERROR: clean requires ownership of the release-publisher lock' >&2; \
+		exit 1; \
+	}
 	@echo "Cleaning build files..."
-	rm -rf $(BUILDDIR)
+	@set -e; \
+	clean_path=$$GITSWITCH_CLEAN_BUILDDIR; \
+	while test "$$clean_path" != / && \
+	      test "$${clean_path%/}" != "$$clean_path"; do \
+		clean_path=$${clean_path%/}; \
+	done; \
+	case "$$clean_path" in \
+		''|/|.|..) \
+			echo "ERROR: refusing unsafe BUILDDIR cleanup: $$clean_path" >&2; \
+			exit 1 ;; \
+	esac; \
+	clean_project=`CDPATH='' cd . && pwd -P` || exit 1; \
+	case "$$clean_path" in \
+		"$$clean_project") \
+			echo 'ERROR: refusing to clean the project root' >&2; exit 1 ;; \
+		"$$clean_project"/*) \
+			clean_path=.$${clean_path#"$$clean_project"} ;; \
+		/*) clean_component_path=/ ;; \
+		*) clean_component_path=. ;; \
+	esac; \
+	case "$$clean_path" in \
+		/*) clean_remaining=$${clean_path#/} ;; \
+		*) clean_remaining=$$clean_path ;; \
+	esac; \
+	case "$$clean_path" in \
+		/*) : ;; \
+		*) clean_component_path=. ;; \
+	esac; \
+	if test -z "$${clean_component_path-}"; then \
+		clean_component_path=.; \
+	fi; \
+	while test -n "$$clean_remaining"; do \
+		case "$$clean_remaining" in \
+			*/*) \
+				clean_component=$${clean_remaining%%/*}; \
+				clean_remaining=$${clean_remaining#*/} ;; \
+			*) clean_component=$$clean_remaining; clean_remaining= ;; \
+		esac; \
+		case "$$clean_component" in \
+			''|.) continue ;; \
+			..) \
+				echo 'ERROR: refusing BUILDDIR cleanup containing ..' >&2; \
+				exit 1 ;; \
+		esac; \
+		if test "$$clean_component_path" = /; then \
+			clean_component_path=/$$clean_component; \
+		else \
+			clean_component_path=$$clean_component_path/$$clean_component; \
+		fi; \
+		if test -n "$$clean_remaining" && \
+		   test -L "$$clean_component_path"; then \
+			echo "ERROR: refusing BUILDDIR with symlinked component: $$clean_component_path" >&2; \
+			exit 1; \
+		fi; \
+	done; \
+	case "$$clean_component_path" in \
+		/|.) echo 'ERROR: refusing unsafe resolved BUILDDIR cleanup' >&2; exit 1 ;; \
+	esac; \
+	case "$$clean_component_path" in \
+		./build) clean_is_canonical=1 ;; \
+		*) clean_is_canonical=0 ;; \
+	esac; \
+	if test -L "$$clean_component_path"; then \
+		test "$$clean_is_canonical" -eq 1 || { \
+			echo "ERROR: refusing unowned redirected BUILDDIR symlink: $$clean_component_path" >&2; \
+			exit 1; \
+		}; \
+		rm -f "$$clean_component_path"; \
+	elif test -d "$$clean_component_path"; then \
+		clean_physical=`CDPATH='' cd "$$clean_component_path" && pwd -P` || exit 1; \
+		case "$$clean_physical" in \
+			/|"$$clean_project") \
+				echo "ERROR: refusing unsafe physical BUILDDIR cleanup: $$clean_physical" >&2; \
+				exit 1 ;; \
+		esac; \
+		if test "$$clean_is_canonical" -ne 1; then \
+			clean_marker="$$clean_component_path/$(BUILD_ROOT_MARKER_NAME)"; \
+			test -f "$$clean_marker" && test ! -L "$$clean_marker" || { \
+				echo "ERROR: refusing unowned redirected BUILDDIR cleanup: $$clean_component_path" >&2; \
+				exit 1; \
+			}; \
+			clean_marker_mode=`find "$$clean_marker" -prune -type f \
+				-perm 0600 -print 2>/dev/null`; \
+			test "$$clean_marker_mode" = "$$clean_marker" && \
+			{ \
+				printf '%s\n' 'schema=gitswitch-build-root-v1'; \
+				printf 'project=%s\n' "$$clean_project"; \
+				printf 'build=%s\n' "$$clean_physical"; \
+			} | cmp -s - "$$clean_marker" || { \
+				echo "ERROR: refusing unowned redirected BUILDDIR cleanup: $$clean_component_path" >&2; \
+				exit 1; \
+			}; \
+		fi; \
+		rm -rf "$$clean_component_path"; \
+	elif test -e "$$clean_component_path"; then \
+		test "$$clean_is_canonical" -eq 1 || { \
+			echo "ERROR: refusing unowned redirected BUILDDIR file: $$clean_component_path" >&2; \
+			exit 1; \
+		}; \
+		rm -f "$$clean_component_path"; \
+	fi
+	@set -e; \
+	if test "$$GITSWITCH_RELEASE_TOOLS_EXTERNAL" -eq 1; then \
+		release_tools_path="$$GITSWITCH_RELEASE_TOOLBUILDDIR_PATH"; \
+		if test -L "$$release_tools_path"; then \
+			echo 'ERROR: refusing symlinked Git-private release-helper cache' >&2; \
+			exit 1; \
+		elif test -d "$$release_tools_path"; then \
+			release_tools_physical=`CDPATH='' cd "$$release_tools_path" && pwd -P` || exit 1; \
+			test "$$release_tools_physical" = \
+			     "$$GITSWITCH_RELEASE_GIT_DIR_PATH/gitswitch-release-tools" || { \
+				echo 'ERROR: refusing release-helper cleanup outside the Git-private cache' >&2; \
+				exit 1; \
+			}; \
+			for stale_tmp in "$$release_tools_physical"/release-publish.tmp.*; do \
+				test -e "$$stale_tmp" || test -L "$$stale_tmp" || continue; \
+				stale_name=$${stale_tmp##*/}; \
+				case "$$stale_name" in \
+					release-publish.tmp.??????) ;; \
+					*) continue ;; \
+				esac; \
+				if test -L "$$stale_tmp"; then \
+					rm -f "$$stale_tmp"; \
+				elif test -d "$$stale_tmp"; then \
+					rm -rf "$$stale_tmp"; \
+				else \
+					rm -f "$$stale_tmp"; \
+				fi; \
+			done; \
+		elif test -e "$$release_tools_path"; then \
+			echo 'ERROR: refusing non-directory Git-private release-helper cache' >&2; \
+			exit 1; \
+		fi; \
+	fi; \
+	for release_tools_path in build/tools; do \
+		if test -L "$$release_tools_path"; then \
+			rm -f "$$release_tools_path"; \
+		elif test -d "$$release_tools_path"; then \
+			rm -rf "$$release_tools_path"; \
+		elif test -e "$$release_tools_path"; then \
+			rm -f "$$release_tools_path"; \
+		fi; \
+	done
 	rm -f valgrind*.log
 	rm -f *.core core.*
 
@@ -1064,7 +2079,7 @@ help:
 	@echo "  install      Install to system"
 	@echo "  uninstall    Remove from system"
 	@echo "  clean        Remove build files"
-	@echo "  distclean    Remove all generated files"
+	@echo "  distclean    Remove generated worktree files (preserves Git-private release cache)"
 	@echo "  format       Format source code"
 	@echo "  analyze      Run static analysis"
 	@echo "  security-scan Run security scan"
@@ -1099,7 +2114,8 @@ override PACKAGE := gitswitcher
 # goal that consumes release metadata; ordinary builds otherwise paid for two
 # unrelated Git processes on every Make invocation (AR-07 L25).
 RELEASE_METADATA_GOALS = release-manifest-check dist distcheck \
-	release-contract-test rpm
+	release-contract-test _dist-release-locked _distcheck-release-locked \
+	_release-contract-test-locked rpm _rpm-release-locked
 ifneq ($(strip $(filter $(RELEASE_METADATA_GOALS),$(MAKECMDGOALS))),)
     override RELEASE_COMMIT := $(shell git rev-parse --verify HEAD^{commit} 2>/dev/null)
     override RELEASE_VERSION := $(shell git show $(RELEASE_COMMIT):VERSION 2>/dev/null)
@@ -1129,8 +2145,11 @@ export GITSWITCH_DIST_ROOT
 # state, build products, cores, logs, and previously generated archives.
 override DIST_MANIFEST := src tests tools completions VERSION LICENSE README.md Makefile $(PACKAGE).spec
 
-.PHONY: release-manifest-check dist distcheck release-contract-test \
-	release-artifact-test qa-contract-test sig-repro-test rpm
+.PHONY: release-manifest-check dist _dist-release-locked distcheck \
+	_distcheck-release-locked \
+	release-contract-test _release-contract-test-locked \
+	freebsd-platform-contract-test release-artifact-test qa-contract-test \
+	sig-repro-test rpm _rpm-release-locked
 # Fail closed before producing an artifact when any tracked or untracked
 # release-manifest path differs from the exact commit selected above. Besides
 # preventing a live VERSION from naming committed payload, this makes the spec
@@ -1161,11 +2180,17 @@ release-manifest-check:
 # the manifest directories shipped any stray file nested inside src/, tests/,
 # or completions/ (editor backups, experiment files, test-run droppings), so
 # release tarballs were not reproducible from a tag and could leak unreviewed
-# content (AR-05 L5). git archive draws from HEAD, which also inherently
-# excludes VCS state, build products, cores, logs, and prior archives.
-dist: release-manifest-check $(DIST_PUBLISH_HELPER)
+# content (AR-05 L5). The producer archives the selected commit twice through
+# clean Git metadata and fixed gzip, validates both completed streams and exact
+# membership, then emits only the byte-identical candidate to the publisher.
+dist: tools/release_publish_lock.sh
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory _dist-release-locked
+
+_dist-release-locked: release-manifest-check \
+		_release-publish-helpers-locked
 	@set -e; \
-	root_physical=`CDPATH='' cd "$(CURDIR)" && pwd -P`; \
+	root_physical=`CDPATH='' cd "$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" && pwd -P`; \
 	request="$$GITSWITCH_DIST_ARCHIVE_REQUEST"; \
 	expected_rel="$(DIST_ARTIFACT_DIR)/$$GITSWITCH_DIST_ARCHIVE_NAME"; \
 	expected_abs="$$root_physical/$$expected_rel"; \
@@ -1183,41 +2208,73 @@ dist: release-manifest-check $(DIST_PUBLISH_HELPER)
 	if ! git check-ignore -q -- "$$expected_rel"; then \
 		echo 'ERROR: distribution output directory is not ignored' >&2; exit 1; \
 	fi; \
-	for component in build "$(DIST_ARTIFACT_DIR)"; do \
-		if test -L "$$component"; then \
-			echo "ERROR: distribution directory is a symlink: $$component" >&2; exit 1; \
-		fi; \
-		if test -e "$$component" && ! test -d "$$component"; then \
-			echo "ERROR: distribution directory is not a directory: $$component" >&2; exit 1; \
-		fi; \
-		test -d "$$component" || mkdir "$$component"; \
-	done; \
-	cd "$(DIST_ARTIFACT_DIR)"; \
-	actual_dir=`pwd -P`; \
-	if test "$$actual_dir" != "$$root_physical/$(DIST_ARTIFACT_DIR)"; then \
-		echo 'ERROR: distribution directory resolved outside its dedicated namespace' >&2; exit 1; \
-	fi; \
-	if test -e "$$GITSWITCH_DIST_ARCHIVE_NAME" || \
-	   test -L "$$GITSWITCH_DIST_ARCHIVE_NAME"; then \
-		echo 'ERROR: distribution archive already exists; refusing to replace it' >&2; exit 1; \
-	fi; \
 	echo "Creating distribution tarball: $$expected_rel"; \
-	"$$root_physical/$(DIST_PUBLISH_HELPER)" . "$$actual_dir" \
+	"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH" \
+		--internal-release-tree-v1 "$$root_physical" build dist \
 		"$$GITSWITCH_DIST_ARCHIVE_NAME" -- \
-		git -C "$$root_physical" archive --format=tar.gz \
-		--prefix="$$GITSWITCH_DIST_ROOT/" \
-		"$(RELEASE_COMMIT)" -- $(DIST_MANIFEST)
+		--internal-release-archive-v1 "$$root_physical" \
+		"$(RELEASE_COMMIT)" "$$GITSWITCH_DIST_ROOT" -- $(DIST_MANIFEST)
 
-distcheck: dist
-	@sh tests/test_dist.sh "$$GITSWITCH_DIST_ARCHIVE_PATH" \
-		"$$GITSWITCH_DIST_ROOT" \
-		"$(PREFIX)" "$(MAKE_COMMAND)"
+distcheck: tools/release_publish_lock.sh
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory _distcheck-release-locked
+
+# Distcheck never publishes its transient archive into the canonical namespace.
+# The descriptor-pinned publisher generates it privately, gives the validator
+# the pinned descriptor, and closes that exact inode after the validator has
+# snapshotted and closed it. Named fallback platforms retire only through
+# descriptor-conditioned unlink or safely retain the private random name; no
+# caller-controlled pathname is deleted (AR-11 L42).
+_distcheck-release-locked: release-manifest-check \
+		_release-publish-helpers-locked
+	@set -e; \
+	root_physical=`CDPATH='' cd "$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" && pwd -P`; \
+	request="$$GITSWITCH_DIST_ARCHIVE_REQUEST"; \
+	expected_rel="$(DIST_ARTIFACT_DIR)/$$GITSWITCH_DIST_ARCHIVE_NAME"; \
+	expected_abs="$$root_physical/$$expected_rel"; \
+	case "$(RELEASE_VERSION)" in \
+		''|*[!A-Za-z0-9._+-]*) \
+			echo 'ERROR: committed release VERSION is not path-safe' >&2; exit 1 ;; \
+	esac; \
+	case "$$request" in \
+		"$$expected_rel"|"$$expected_abs") ;; \
+		*) echo "ERROR: DIST_ARCHIVE must be exactly $$expected_rel" >&2; exit 1 ;; \
+	esac; \
+	if git ls-files --error-unmatch -- "$$expected_rel" >/dev/null 2>&1; then \
+		echo 'ERROR: distribution output aliases a tracked path' >&2; exit 1; \
+	fi; \
+	if ! git check-ignore -q -- "$$expected_rel"; then \
+		echo 'ERROR: distribution output directory is not ignored' >&2; exit 1; \
+	fi; \
+	echo "Validating private distribution archive: $$expected_rel"; \
+	"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH" \
+		--internal-release-tree-consume-v1 "$$root_physical" build dist \
+		"$$GITSWITCH_DIST_ARCHIVE_NAME" -- \
+		--internal-release-archive-v1 "$$root_physical" \
+		"$(RELEASE_COMMIT)" "$$GITSWITCH_DIST_ROOT" -- $(DIST_MANIFEST) \
+		--internal-consumer-v1 \
+		sh tests/test_dist.sh '@GITSWITCH_PRIVATE_ARCHIVE_FD@' \
+		"$$GITSWITCH_DIST_ROOT" "$(PREFIX)" "$(MAKE_COMMAND)" -- \
+		$(DIST_MANIFEST)
+
+# Keep the declared FreeBSD floor tied to both its required headers and the
+# exact hosted release that executes publication/reset behavior.
+freebsd-platform-contract-test:
+	@FREEBSD_CONTRACT_CC="$(CC)" sh tests/test_ar11_freebsd_floor.sh \
+		"$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH"
 
 # Negative release-input checks run in isolated local clones, so they can dirty
 # VERSION/spec/manifest fixtures without touching the operator's checkout.
-release-contract-test: $(DIST_PUBLISH_NAMED_TEST_HELPER)
-	@sh tests/test_ar07_release.sh manifest "$(CURDIR)" "$(MAKE_COMMAND)" \
-		"$(CURDIR)/$(DIST_PUBLISH_NAMED_TEST_HELPER)"
+release-contract-test: tools/release_publish_lock.sh
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory \
+		_release-contract-test-locked
+
+_release-contract-test-locked: freebsd-platform-contract-test \
+		_release-publish-helpers-locked
+	@sh tests/test_ar07_release.sh manifest \
+		"$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" "$(MAKE_COMMAND)" \
+		"$$GITSWITCH_DIST_PUBLISH_NAMED_TEST_HELPER_EXEC_PATH"
 
 # Inspect the exact release binary and byte-identical staged-install copy with
 # native ELF or Mach-O tooling. The shell test owns its temporary stage.
@@ -1255,6 +2312,9 @@ release-artifact-test: $(BINDIR)/$(TARGET)
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh artifact "$(BINDIR)/$(TARGET)" \
 		"$$stage$(PREFIX)/bin/$(TARGET)" "$(TARGET_TRIPLE)"; \
+	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
+	sh tests/test_ar07_release.sh install "$(CURDIR)" "$(MAKE_COMMAND)" \
+		"$(BINDIR)/$(TARGET)" "$(BUILDDIR)" "$(PREFIX)"; \
 	# Exercise the compiler-argv contract even when CC itself is one word. \
 	GITSWITCH_RELEASE_FORMAT="$(RELEASE_ARTIFACT_FORMAT)" \
 	sh tests/test_ar07_release.sh neuter \
@@ -1269,6 +2329,7 @@ endif
 
 qa-contract-test:
 	@sh tests/test_qa.sh "$(CURDIR)" "$(MAKE_COMMAND)"
+	@sh tests/test_release_publish_lock.sh "$(CURDIR)"
 	@sh tests/test_ar07_build.sh "$(CURDIR)" "$(MAKE_COMMAND)"
 	@sh tests/test_ci_policy.sh "$(CURDIR)"
 
@@ -1292,20 +2353,34 @@ sig-repro-test: $(BINDIR)/$(TARGET)
 		esac; \
 	fi
 
-rpm: dist
-	@echo "Building RPM package..."
-	@command -v rpmbuild >/dev/null 2>&1 || (echo "rpmbuild not available - install rpm-build package" && exit 1)
-	mkdir -p ~/rpmbuild/BUILD ~/rpmbuild/RPMS ~/rpmbuild/SOURCES \
-		~/rpmbuild/SPECS ~/rpmbuild/SRPMS
-	cp "$$GITSWITCH_DIST_ARCHIVE_PATH" ~/rpmbuild/SOURCES/
-	# Consume the review-identical spec embedded in the commit-pinned archive,
-	# never a second live-checkout input.
-	tar -xOf "$$GITSWITCH_DIST_ARCHIVE_PATH" \
-		"$$GITSWITCH_DIST_ROOT/$(PACKAGE).spec" > \
-		~/rpmbuild/SPECS/$(PACKAGE).spec
-	rpmbuild -ba ~/rpmbuild/SPECS/$(PACKAGE).spec
-	@echo "RPM packages created in ~/rpmbuild/RPMS/"
+rpm: tools/release_publish_lock.sh tools/release_rpm.sh
+	@command -v rpmbuild >/dev/null 2>&1 || { \
+		echo 'rpmbuild not available - install the RPM build tools' >&2; \
+		exit 1; \
+	}
+	+@sh tools/release_publish_lock.sh "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" \
+		"$(MAKE_COMMAND)" --no-print-directory _rpm-release-locked
+
+_rpm-release-locked: _dist-release-locked tools/release_rpm.sh
+	@set -e; \
+	lock_token=$${GITSWITCH_RELEASE_LOCK_TOKEN-}; \
+	test -n "$$lock_token" && test -d "$$lock_token" && \
+	test ! -L "$$lock_token" && \
+	test -d "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	test ! -L "$$GITSWITCH_DIST_PUBLISH_LOCK_PATH" && \
+	IFS= read -r lock_owner <"$$GITSWITCH_DIST_PUBLISH_LOCK_PATH/owner" && \
+	test "$$lock_owner" = "$$lock_token" || { \
+		echo 'ERROR: RPM build requires ownership of the release-publisher lock' >&2; \
+		exit 1; \
+	}; \
+	sh tools/release_rpm.sh \
+		"$$GITSWITCH_RELEASE_PROJECT_ROOT_PATH" \
+		"$$GITSWITCH_DIST_ARCHIVE_PATH" \
+		"$$GITSWITCH_DIST_ARCHIVE_NAME" \
+		"$$GITSWITCH_DIST_ROOT" "$(PACKAGE)" \
+		"$$GITSWITCH_DIST_PUBLISH_HELPER_EXEC_PATH"
 
 # Prevent make from removing intermediate files
-.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(AR07_RESET_MAIN_OBJECT) \
+.SECONDARY: $(OBJECTS) $(TEST_OBJECTS) $(PUBLIC_API_PRODUCTION_OBJECT) \
+	$(AR07_RESET_MAIN_OBJECT) \
 	$(AR08_REMOVE_ACCOUNTS_OBJECT) $(AR08_HINT_CONFIG_OBJECT)

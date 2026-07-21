@@ -7,15 +7,24 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <errno.h>
 #include <unistd.h>
 
 #include "display.h"
 #include "utils.h"
 #include "error.h"
 
-/* Global display state. (AR-10 L3: the old g_color_forced flag recorded the
- * forced-vs-auto distinction but nothing ever read it — removed.) */
-static bool g_color_enabled = false;
+typedef enum {
+    DISPLAY_COLOR_DISABLED,
+    DISPLAY_COLOR_FORCED,
+    DISPLAY_COLOR_AUTOMATIC
+} display_color_policy_t;
+
+/* Automatic mode combines process-wide terminal capability with the TTY
+ * state of the stream used for each emission. Keeping the policy distinct
+ * prevents a stdout decision from leaking into stderr diagnostics. */
+static display_color_policy_t g_color_policy = DISPLAY_COLOR_DISABLED;
+static bool g_auto_color_capable = false;
 static int g_terminal_width = 80;
 static int g_terminal_height = 24;
 
@@ -61,7 +70,7 @@ static bool detect_color_support(void) {
     const char *term = getenv("TERM");
     const char *colorterm = getenv("COLORTERM");
     
-    /* Force color if COLORTERM is set */
+    /* A non-empty COLORTERM identifies a color-capable environment. */
     if (colorterm && *colorterm) {
         return true;
     }
@@ -80,27 +89,60 @@ static bool detect_color_support(void) {
     return false;
 }
 
+static const char *display_color_policy_name(void) {
+    switch (g_color_policy) {
+        case DISPLAY_COLOR_DISABLED:
+            return "disabled";
+        case DISPLAY_COLOR_FORCED:
+            return "forced";
+        case DISPLAY_COLOR_AUTOMATIC:
+            return "automatic";
+        default:
+            return "unknown";
+    }
+}
+
+/* Terminal probing is advisory and must not overwrite a caller's errno.
+ * Forced and disabled policy remain global; only automatic mode inspects the
+ * descriptor currently backing the actual destination stream. */
+static bool display_stream_supports_color(FILE *stream) {
+    int saved_errno;
+    int descriptor;
+    bool supported;
+
+    if (g_color_policy == DISPLAY_COLOR_DISABLED) return false;
+    if (g_color_policy == DISPLAY_COLOR_FORCED) return true;
+    if (!stream || !g_auto_color_capable) return false;
+
+    saved_errno = errno;
+    descriptor = fileno(stream);
+    supported = descriptor >= 0 && is_terminal(descriptor);
+    errno = saved_errno;
+    return supported;
+}
+
 /* Initialize display system */
 int display_init(bool force_color, bool no_color) {
+    g_auto_color_capable = false;
     if (no_color) {
-        g_color_enabled = false;
+        g_color_policy = DISPLAY_COLOR_DISABLED;
     } else if (force_color) {
-        g_color_enabled = true;
+        g_color_policy = DISPLAY_COLOR_FORCED;
     } else {
         /* AR-10 L6: honor the ecosystem conventions between the explicit CLI
          * flags and auto-detection. NO_COLOR (any non-empty value) disables;
-         * CLICOLOR_FORCE (non-empty, not "0") forces color even when stdout
+         * CLICOLOR_FORCE (non-empty, not "0") forces color even when a stream
          * is not a terminal. https://no-color.org / https://bixense.com/clicolors */
         const char *no_color_env = getenv("NO_COLOR");
         const char *force_env = getenv("CLICOLOR_FORCE");
 
         if (no_color_env && *no_color_env) {
-            g_color_enabled = false;
+            g_color_policy = DISPLAY_COLOR_DISABLED;
         } else if (force_env && *force_env && strcmp(force_env, "0") != 0) {
-            g_color_enabled = true;
+            g_color_policy = DISPLAY_COLOR_FORCED;
         } else {
-            g_color_enabled = is_terminal(STDOUT_FILENO) &&
-                              detect_color_support();
+            g_color_policy = DISPLAY_COLOR_AUTOMATIC;
+            g_auto_color_capable = detect_color_support();
         }
     }
     
@@ -111,21 +153,23 @@ int display_init(bool force_color, bool no_color) {
         g_terminal_height = 24;
     }
     
-    log_debug("Display initialized: color=%s, size=%dx%d", 
-              g_color_enabled ? "enabled" : "disabled",
+    log_debug("Display initialized: color-policy=%s, auto-capable=%s, size=%dx%d",
+              display_color_policy_name(),
+              g_auto_color_capable ? "yes" : "no",
               g_terminal_width, g_terminal_height);
     
     return 0;
 }
 
-/* Check if terminal supports color output */
+/* Report the current policy result for the stdout-oriented public API. */
 bool display_supports_color(void) {
-    return g_color_enabled;
+    return display_stream_supports_color(stdout);
 }
 
 /* Format and colorize text based on content type. Each result has independent
  * caller-owned storage, so later calls cannot invalidate a retained pointer. */
-char *display_colorize(const char *text, const char *type) {
+static char *display_colorize_with_decision(const char *text, const char *type,
+                                            bool color_enabled) {
     char *result;
     const char *color_code = NULL;
     size_t code_len;
@@ -136,7 +180,7 @@ char *display_colorize(const char *text, const char *type) {
     if (!text) return NULL;
 
     /* Select color based on type */
-    if (!g_color_enabled || !type) {
+    if (!color_enabled || !type) {
         color_code = NULL;
     } else if (strcmp(type, "success") == 0) {
         color_code = COLOR_GREEN;
@@ -179,6 +223,11 @@ char *display_colorize(const char *text, const char *type) {
            reset_len + 1U);
 
     return result;
+}
+
+char *display_colorize(const char *text, const char *type) {
+    return display_colorize_with_decision(
+        text, type, display_stream_supports_color(stdout));
 }
 
 /* Print formatted header with decorative border. Widths are counted in BYTES,
@@ -293,10 +342,13 @@ void display_status(const char *level, const char *message, ...) {
      * the internal log already went to stderr. */
     {
         FILE *out = strcmp(level, "error") == 0 ? stderr : stdout;
+        bool color_enabled = display_stream_supports_color(out);
 
-        colored_icon = display_colorize(icon, color_type);
+        colored_icon = display_colorize_with_decision(icon, color_type,
+                                                       color_enabled);
         if (formatted_message[0] != '\0') {
-            colored_message = display_colorize(formatted_message, color_type);
+            colored_message = display_colorize_with_decision(
+                formatted_message, color_type, color_enabled);
             fprintf(out, "%s %s\n",
                     colored_icon ? colored_icon : icon,
                     colored_message ? colored_message : formatted_message);

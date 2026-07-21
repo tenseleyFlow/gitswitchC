@@ -832,6 +832,8 @@ TEST(descriptor_metadata_mismatch_uses_stable_estale_diagnostic) {
         return;
     }
     toml_init_document(&doc);
+    CHECK_EQ_INT(toml_set_string(&doc, "settings", "default_scope",
+                                 "local"), 0);
     CHECK_EQ_INT(toml_set_string(&doc, "settings", "active_account",
                                  "audit"), 0);
     fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);

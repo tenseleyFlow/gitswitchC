@@ -42,6 +42,7 @@
 #define FP_B "SHA256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
 static int g_agent_start_attempts; /* execs of ssh-agent (i.e. reuse REFUSED) */
+static bool g_agent_lists_certificate;
 static const char *g_pid_link_to_plant;
 static const char *g_pid_link_target;
 static bool g_replace_dir_on_key_probe;
@@ -55,6 +56,7 @@ static int g_generation_loads;
 static const char *g_generation_loaded_fp;
 static char g_generation_key_path[MAX_PATH_LEN];
 static char g_generation_replacement[MAX_PATH_LEN];
+static bool g_keygen_used_admitted_bytes;
 
 static const char *runner_generation_fingerprint(
     const char *const argv[], const run_opts_t *opts) {
@@ -70,6 +72,18 @@ static const char *runner_generation_fingerprint(
     } else if (opts && opts->use_stdin_fd && opts->stdin_fd >= 0) {
         ssize_t n = pread(opts->stdin_fd, data, sizeof(data) - 1, 0);
         if (n > 0) length = (size_t)n;
+    } else if (opts && opts->use_cwd_fd && opts->cwd_fd >= 0 && argv &&
+               argv[2]) {
+        int fd = openat(opts->cwd_fd, argv[2],
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (fd >= 0) {
+            ssize_t n;
+            do {
+                n = read(fd, data, sizeof(data) - 1);
+            } while (n < 0 && errno == EINTR);
+            if (n > 0) length = (size_t)n;
+            close(fd);
+        }
     } else if (argv && argv[2]) {
         FILE *stream = fopen(argv[2], "r");
         if (stream) {
@@ -102,6 +116,12 @@ static int replace_agent_dir_namespace(void) {
 static int replace_agent_dir_after_commit(int dir_fd) {
     (void)dir_fd;
     return replace_agent_dir_namespace();
+}
+
+static int fail_namespace_commit(int dir_fd) {
+    (void)dir_fd;
+    errno = EIO;
+    return -1;
 }
 
 static int with_runner_cwd(const run_opts_t *opts,
@@ -163,6 +183,11 @@ static ssh_process_outcome_t classify_agent_gone(pid_t pid,
 
 static int g_stop_dirsync_calls;
 static int g_stop_dirsync_fail_call;
+static int g_clear_agent_keys_calls;
+static int g_clear_agent_keys_runner_rc;
+static int g_clear_agent_keys_exit_code;
+static bool g_clear_agent_keys_exact_argv;
+static bool g_clear_agent_keys_saw_socket;
 
 static int stop_counting_dirsync(int dir_fd) {
     (void)dir_fd;
@@ -173,6 +198,44 @@ static int stop_counting_dirsync(int dir_fd) {
         return -1;
     }
     return 0;
+}
+
+static int clear_agent_keys_runner(const char *const argv[],
+                                   const run_opts_t *opts,
+                                   run_result_t *result) {
+    const char *auth_sock = getenv("SSH_AUTH_SOCK");
+    bool fail;
+
+    if (result) memset(result, 0, sizeof(*result));
+    g_clear_agent_keys_calls++;
+    g_clear_agent_keys_exact_argv = g_clear_agent_keys_exact_argv && argv &&
+        argv[0] && strcmp(argv[0], "ssh-add") == 0 && argv[1] &&
+        strcmp(argv[1], "-D") == 0 && argv[2] == NULL;
+    g_clear_agent_keys_saw_socket = g_clear_agent_keys_saw_socket && auth_sock &&
+        strcmp(auth_sock, "/tmp/l38-agent.sock") == 0;
+
+    fail = g_clear_agent_keys_runner_rc != 0;
+    if (opts && opts->out && opts->out_size > 0) {
+        int written = snprintf(opts->out, opts->out_size, "%s",
+                               fail ? "synthetic clear failure" : "");
+        if (result && written >= 0) {
+            result->out_len = (size_t)written < opts->out_size
+                                  ? (size_t)written
+                                  : opts->out_size - 1;
+        }
+    }
+    if (result) {
+        result->spawned = true;
+        result->exit_code = g_clear_agent_keys_exit_code;
+        result->term_signal = 0;
+    }
+    if (g_clear_agent_keys_runner_rc != 0 &&
+        g_clear_agent_keys_exit_code == 0) {
+        errno = EIO;
+        set_system_error(ERR_SYSTEM_CALL,
+                         "synthetic runner cleanup failure");
+    }
+    return g_clear_agent_keys_runner_rc;
 }
 
 static int swap_pid_temp_path(int dir_fd, const char *temp_name) {
@@ -202,7 +265,11 @@ static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
     /* ssh-keygen -lf <key>: fingerprint derives from the key file name. */
     if (strcmp(argv[0], "ssh-keygen") == 0 && argv[1] &&
         strcmp(argv[1], "-lf") == 0 && argv[2]) {
-        const char *fp = strstr(argv[2], "keyB") ? FP_B : FP_A;
+        const char *fp = runner_generation_fingerprint(argv, opts);
+        g_keygen_used_admitted_bytes =
+            opts && ((opts->use_stdin_fd && opts->stdin_fd >= 0) ||
+                     (opts->use_cwd_fd &&
+                      strstr(argv[2], ".key-fingerprint.") != NULL));
         if (opts && opts->out) {
             snprintf(opts->out, opts->out_size, "256 %s user@host (ED25519)\n", fp);
             if (result) result->out_len = strlen(opts->out);
@@ -210,14 +277,18 @@ static int fake_ssh_runner(const char *const argv[], const run_opts_t *opts,
         return 0;
     }
 
-    /* ssh-add -l (against the socket in opts->extra_env): agent holds keyA. */
+    /* ssh-add -l (against the socket in opts->extra_env): agent holds keyA.
+     * The certificate mode exposes the OpenSSH substitution case: a raw key
+     * and its certificate intentionally share one fingerprint. */
     if (strcmp(argv[0], "ssh-add") == 0 && argv[1] && strcmp(argv[1], "-l") == 0) {
         if (g_replace_dir_on_key_probe) {
             g_replace_dir_on_key_probe = false;
             if (replace_agent_dir_namespace() != 0) return -1;
         }
         if (opts && opts->out) {
-            snprintf(opts->out, opts->out_size, "256 %s agent-key (ED25519)\n", FP_A);
+            snprintf(opts->out, opts->out_size, "256 %s agent-key (%s)\n",
+                     FP_A,
+                     g_agent_lists_certificate ? "ED25519-CERT" : "ED25519");
             if (result) result->out_len = strlen(opts->out);
         }
         return 0;
@@ -273,13 +344,29 @@ static int setup_agent_socket(const char *account, char *sock_out, size_t size) 
     return chmod(sock_out, 0600);
 }
 
-static void make_account(account_t *a, const char *key_basename) {
+static int make_account(account_t *a, const char *key_basename) {
+    static const char private_prefix[] =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n";
+    static const char private_suffix[] =
+        "\n-----END OPENSSH PRIVATE KEY-----\n";
+    const char *generation = strstr(key_basename, "keyB")
+                                 ? "generation-b"
+                                 : "generation-a";
+    char key_data[256];
+
     memset(a, 0, sizeof(*a));
     a->id = 1;
-    safe_strncpy(a->name, "work", sizeof(a->name));
-    safe_strncpy(a->email, "w@x.com", sizeof(a->email));
+    if (safe_strncpy(a->name, "work", sizeof(a->name)) != 0 ||
+        safe_strncpy(a->email, "w@x.com", sizeof(a->email)) != 0 ||
+        (size_t)snprintf(a->ssh_key_path, sizeof(a->ssh_key_path), "%s/%s",
+                         g_xdg, key_basename) >= sizeof(a->ssh_key_path) ||
+        (size_t)snprintf(key_data, sizeof(key_data), "%s%s%s",
+                         private_prefix, generation, private_suffix) >=
+            sizeof(key_data)) {
+        return -1;
+    }
     a->ssh_enabled = true;
-    snprintf(a->ssh_key_path, sizeof(a->ssh_key_path), "%s/%s", g_xdg, key_basename);
+    return write_string_to_file(a->ssh_key_path, key_data, 0600);
 }
 
 /* Adoption control: agent holds the account's own key -> reused in place
@@ -293,30 +380,106 @@ TEST(ssh_fingerprint_reuse_adopts_matching_key) {
     int rc;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
-    make_account(&acct, "keyA"); /* matches the FP_A the fake agent reports */
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
     CHECK_EQ_INT(setenv("SSH_AGENT_PID", "99999", 1), 0);
 
     g_agent_start_attempts = 0;
+    g_keygen_used_admitted_bytes = false;
     prev = run_set_runner(fake_ssh_runner);
     rc = ssh_start_isolated_agent(&cfg, &acct);
     run_set_runner(prev);
 
     CHECK_EQ_INT(rc, 0);
     CHECK(cfg.key_already_loaded);       /* caller skips ssh_add_key */
+    CHECK(cfg.reused_existing_agent);    /* caller skips the network probe */
     CHECK(!cfg.agent_owned);             /* no verified PID => never claim ownership */
     CHECK_EQ_INT(cfg.agent_pid, -1);
     CHECK(getenv("SSH_AGENT_PID") == NULL);
     CHECK_EQ_INT(g_agent_start_attempts, 0); /* no restart, no re-prompt */
+    CHECK(g_keygen_used_admitted_bytes);
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK(path_exists(sock));            /* the live agent was not reaped */
+
+    /* This is a successful no-op, not a successful stop: an adopted agent is
+     * still live and still holds the exact key we just proved. */
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+    CHECK(cfg.key_already_loaded);
+    CHECK(path_exists(sock));
 
     /* current.sock points at the adopted agent's socket. */
     snprintf(cur, sizeof(cur), "%s/gitswitch-ssh/current.sock", g_xdg);
     CHECK_EQ_INT(lstat(cur, &st), 0);
     CHECK(S_ISLNK(st.st_mode));
+}
+
+TEST(precleanup_activation_failure_preserves_prior_key_truth) {
+    ssh_config_t cfg;
+    account_t acct;
+
+    CHECK_EQ_INT(make_xdg_runtime_dir(), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", g_xdg, 1), 0);
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
+    memset(acct.name, 'a', 160);
+    acct.name[160] = '\0';
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+    cfg.key_already_loaded = true;
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_path,
+                              "/tmp/prior-agent.sock",
+                              sizeof(cfg.agent_socket_path)), 0);
+
+    CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+    CHECK_EQ_INT(get_last_error()->code, ERR_INVALID_ARGS);
+    CHECK(strstr(get_last_error()->message, "socket") != NULL);
+    CHECK(cfg.key_already_loaded);
+    CHECK_STR_EQ(cfg.agent_socket_path, "/tmp/prior-agent.sock");
+
+    CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+    ts_rm_rf(g_xdg);
+}
+
+TEST(reuse_failure_preserves_only_reproven_target_key_truth) {
+    for (int prior_is_target = 0; prior_is_target <= 1; prior_is_target++) {
+        char sock[256];
+        ssh_config_t cfg;
+        account_t acct;
+        command_runner_fn previous_runner;
+        ssh_namespace_commit_hook_fn previous_hook;
+
+        CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+        CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.mode = SSH_AGENT_ISOLATED;
+        cfg.agent_pid = -1;
+        cfg.key_already_loaded = true;
+        CHECK_EQ_INT(safe_strncpy(
+                         cfg.agent_socket_path,
+                         prior_is_target ? sock : "/tmp/prior-agent.sock",
+                         sizeof(cfg.agent_socket_path)), 0);
+
+        g_agent_start_attempts = 0;
+        previous_hook = ssh_manager_set_namespace_commit_hook_fn(
+            fail_namespace_commit);
+        previous_runner = run_set_runner(fake_ssh_runner);
+        CHECK_EQ_INT(ssh_start_isolated_agent(&cfg, &acct), -1);
+        run_set_runner(previous_runner);
+        ssh_manager_set_namespace_commit_hook_fn(previous_hook);
+
+        CHECK_EQ_INT(get_last_error()->code, ERR_FILE_IO);
+        CHECK_EQ_INT(g_agent_start_attempts, 0);
+        CHECK_EQ_INT(cfg.key_already_loaded, prior_is_target);
+        CHECK(path_exists(sock));
+
+        CHECK_EQ_INT(unsetenv("SSH_AUTH_SOCK"), 0);
+        (void)unsetenv("SSH_AGENT_PID");
+        CHECK_EQ_INT(unsetenv("XDG_RUNTIME_DIR"), 0);
+        ts_rm_rf(g_xdg);
+    }
 }
 
 /* The guard itself: same live socket, but the account's key changed (edit) —
@@ -330,7 +493,7 @@ TEST(ssh_fingerprint_reuse_rejects_different_key) {
     int rc;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
-    make_account(&acct, "keyB"); /* FP_B: NOT what the fake agent holds */
+    CHECK_EQ_INT(make_account(&acct, "keyB"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -343,10 +506,42 @@ TEST(ssh_fingerprint_reuse_rejects_different_key) {
     /* Reuse refused: the code moved on to a fresh agent start... */
     CHECK_EQ_INT(g_agent_start_attempts, 1);
     CHECK(!cfg.key_already_loaded);
+    CHECK(!cfg.reused_existing_agent);
     /* ...whose (fake-injected) failure fails the switch instead of silently
      * keeping the wrong key active. */
     CHECK_EQ_INT(rc, -1);
     /* The stale wrong-key agent socket was reaped, not left adoptable. */
+    CHECK(!path_exists(sock));
+}
+
+/* A certificate and its underlying public key deliberately have the same
+ * fingerprint. Fingerprint equality alone therefore cannot prove that the
+ * configured raw identity is loaded: a certificate-only agent must be
+ * refused and replaced just like an agent holding a different key. */
+TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate) {
+    char sock[256];
+    ssh_config_t cfg;
+    account_t acct;
+    command_runner_fn prev;
+    int rc;
+
+    CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    cfg.agent_pid = -1;
+
+    g_agent_start_attempts = 0;
+    g_agent_lists_certificate = true;
+    prev = run_set_runner(fake_ssh_runner);
+    rc = ssh_start_isolated_agent(&cfg, &acct);
+    run_set_runner(prev);
+    g_agent_lists_certificate = false;
+
+    CHECK_EQ_INT(g_agent_start_attempts, 1);
+    CHECK(!cfg.key_already_loaded);
+    CHECK(!cfg.reused_existing_agent);
+    CHECK_EQ_INT(rc, -1);
     CHECK(!path_exists(sock));
 }
 
@@ -464,10 +659,13 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     setenv("XDG_RUNTIME_DIR", g_xdg, 1);
     snprintf(sock, sizeof(sock), "%s/gitswitch-ssh/ssh-agent.work.sock", g_xdg);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
+    /* A new activation owns this outcome. Prove it actively clears a stale
+     * marker retained in a caller-reused configuration object. */
+    cfg.reused_existing_agent = true;
 
     prev = run_set_runner(fake_quoting_agent_runner);
     rc = ssh_start_isolated_agent(&cfg, &acct);
@@ -477,6 +675,7 @@ TEST(agent_output_quoted_auth_sock_is_unwrapped) {
     CHECK(strchr(cfg.agent_socket_path, '"') == NULL); /* quotes stripped */
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK(g_key_load_used_pinned_socket);
+    CHECK(!cfg.reused_existing_agent);
 }
 
 /* A stale agent forces a fingerprint-before-fresh-load sequence. Replacing
@@ -498,7 +697,7 @@ TEST(isolated_switch_retains_generation_between_fingerprint_and_load) {
     command_runner_fn previous;
 
     CHECK_EQ_INT(setup_agent_socket("work", sock, sizeof(sock)), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     CHECK_EQ_INT(write_string_to_file(acct.ssh_key_path, generation_a, 0600),
                  0);
     CHECK_EQ_INT(safe_strncpy(g_generation_key_path, acct.ssh_key_path,
@@ -552,7 +751,7 @@ TEST(fresh_commit_revalidates_public_agent_directory) {
     snprintf(public_current, sizeof(public_current), "%s/current.sock",
              public_dir);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -591,7 +790,7 @@ TEST(ssh_reuse_refuses_symlinked_agent_socket) {
     snprintf(external, sizeof(external), "%s/external-agent.sock", g_xdg);
     CHECK_EQ_INT(rename(sock, external), 0);
     CHECK_EQ_INT(symlink(external, sock), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -623,7 +822,7 @@ TEST(ssh_reuse_refuses_symlinked_pid_sidecar) {
     snprintf(victim, sizeof(victim), "%s/precious", g_xdg);
     CHECK_EQ_INT(write_string_to_file(victim, "424242\n", 0600), 0);
     CHECK_EQ_INT(symlink(victim, pid_path), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -658,7 +857,7 @@ TEST(fresh_agent_sidecar_atomically_replaces_planted_symlink) {
     snprintf(victim, sizeof(victim), "%s/precious", g_xdg);
     CHECK_EQ_INT(write_string_to_file(victim, "keep\n", 0600), 0);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -694,7 +893,7 @@ TEST(reuse_aborts_on_agent_directory_namespace_replacement) {
 
     CHECK_EQ_INT(setup_agent_socket("work", public_sock,
                                     sizeof(public_sock)), 0);
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -735,7 +934,7 @@ TEST(fresh_start_aborts_and_cleans_on_namespace_replacement) {
     snprintf(public_sock, sizeof(public_sock),
              "%s/ssh-agent.work.sock", public_dir);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -780,7 +979,7 @@ TEST(pid_sidecar_rejects_temp_path_inode_swap) {
              "%s/.ssh-agent.work.pid.tmp.%d", dir, (int)getpid());
     snprintf(pid_path, sizeof(pid_path), "%s/ssh-agent.work.pid", dir);
 
-    make_account(&acct, "keyA");
+    CHECK_EQ_INT(make_account(&acct, "keyA"), 0);
     memset(&cfg, 0, sizeof(cfg));
     cfg.mode = SSH_AGENT_ISOLATED;
     cfg.agent_pid = -1;
@@ -817,6 +1016,8 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
                  sizeof(cfg.agent_socket_arg));
     cfg.agent_pid = 12345;
     cfg.agent_owned = true;
+    cfg.key_already_loaded = true;
+    cfg.reused_existing_agent = true;
     CHECK_EQ_INT(setenv("SSH_AUTH_SOCK", sock, 1), 0);
     CHECK_EQ_INT(setenv("SSH_AGENT_PID", "12345", 1), 0);
 
@@ -825,6 +1026,8 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
     ssh_manager_set_reap_fn(prev_reap);
 
     CHECK(cfg.agent_owned);
+    CHECK(cfg.key_already_loaded);
+    CHECK(cfg.reused_existing_agent);
     CHECK_EQ_INT(cfg.agent_pid, 12345);
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK_STR_EQ(cfg.agent_socket_arg, "ssh-agent.work.sock");
@@ -836,8 +1039,12 @@ TEST(stop_agent_reap_failure_preserves_retry_handle) {
     prev_reap = ssh_manager_set_reap_fn(classify_agent_gone);
     CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
     ssh_manager_set_reap_fn(prev_reap);
+    CHECK(!cfg.key_already_loaded);
+    CHECK(!cfg.reused_existing_agent);
     CHECK(!path_exists(sock));
     CHECK(!path_exists(pid_path));
+    CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
+    CHECK(!cfg.key_already_loaded);
 }
 
 TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
@@ -861,6 +1068,7 @@ TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
                               sizeof(cfg.agent_socket_arg)), 0);
     cfg.agent_pid = 12345;
     cfg.agent_owned = true;
+    cfg.key_already_loaded = true;
 
     g_stop_dirsync_calls = 0;
     g_stop_dirsync_fail_call = 1;
@@ -876,6 +1084,7 @@ TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
     CHECK(strstr(get_last_error()->message,
                  "stopped agent socket cleanup") != NULL);
     CHECK(cfg.agent_owned);
+    CHECK(!cfg.key_already_loaded);
     CHECK_EQ_INT(cfg.agent_pid, 12345);
     CHECK_STR_EQ(cfg.agent_socket_path, sock);
     CHECK(!path_exists(sock));
@@ -886,6 +1095,7 @@ TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry) {
     CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
     CHECK(g_stop_dirsync_calls >= 1);
     CHECK(!cfg.agent_owned);
+    CHECK(!cfg.key_already_loaded);
     CHECK_EQ_INT(cfg.agent_pid, -1);
     CHECK(cfg.agent_socket_path[0] == '\0');
     CHECK(!path_exists(sock));
@@ -918,6 +1128,7 @@ TEST(stop_agent_already_gone_artifacts_are_durably_confirmed) {
                               sizeof(cfg.agent_socket_arg)), 0);
     cfg.agent_pid = 12345;
     cfg.agent_owned = true;
+    cfg.key_already_loaded = true;
 
     g_stop_dirsync_calls = 0;
     g_stop_dirsync_fail_call = 0;
@@ -926,6 +1137,7 @@ TEST(stop_agent_already_gone_artifacts_are_durably_confirmed) {
     CHECK_EQ_INT(ssh_stop_agent(&cfg), 0);
     CHECK_EQ_INT(g_stop_dirsync_calls, 1);
     CHECK(!cfg.agent_owned);
+    CHECK(!cfg.key_already_loaded);
     CHECK_EQ_INT(cfg.agent_pid, -1);
     CHECK(!path_exists(sock));
     CHECK(!path_exists(pid_path));
@@ -954,15 +1166,87 @@ TEST(stop_agent_preserves_a_replacement_pid_sidecar) {
                               sizeof(cfg.agent_socket_arg)), 0);
     cfg.agent_pid = 12345;
     cfg.agent_owned = true;
+    cfg.key_already_loaded = true;
 
     previous_reap = ssh_manager_set_reap_fn(classify_agent_gone);
     CHECK_EQ_INT(ssh_stop_agent(&cfg), -1);
     CHECK(cfg.agent_owned);
+    CHECK(!cfg.key_already_loaded);
     CHECK_EQ_INT(cfg.agent_pid, 12345);
     CHECK(path_exists(sock));
     CHECK(path_exists(pid_path));
     CHECK(strstr(get_last_error()->message, "replacement retained") != NULL);
     ssh_manager_set_reap_fn(previous_reap);
+}
+
+TEST(clear_agent_keys_tracks_the_destructive_child_result) {
+    ssh_config_t cfg;
+    command_runner_fn previous_runner;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.mode = SSH_AGENT_ISOLATED;
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_path,
+                              "/tmp/l38-agent.sock",
+                              sizeof(cfg.agent_socket_path)), 0);
+    CHECK_EQ_INT(safe_strncpy(cfg.agent_socket_arg,
+                              "ssh-agent.work.sock",
+                              sizeof(cfg.agent_socket_arg)), 0);
+    cfg.agent_pid = 4321;
+    cfg.agent_owned = true;
+    cfg.key_already_loaded = true;
+    cfg.reused_existing_agent = true;
+
+    g_clear_agent_keys_calls = 0;
+    g_clear_agent_keys_runner_rc = -1;
+    g_clear_agent_keys_exit_code = 1;
+    g_clear_agent_keys_exact_argv = true;
+    g_clear_agent_keys_saw_socket = true;
+    previous_runner = run_set_runner(clear_agent_keys_runner);
+
+    CHECK_EQ_INT(ssh_clear_agent_keys(&cfg), -1);
+    CHECK(cfg.key_already_loaded);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SSH_KEY_LOAD_FAILED);
+    CHECK(strstr(get_last_error()->message, "synthetic clear failure") != NULL);
+    CHECK_EQ_INT(cfg.agent_pid, 4321);
+    CHECK(cfg.agent_owned);
+    CHECK(cfg.reused_existing_agent);
+    CHECK_STR_EQ(cfg.agent_socket_path, "/tmp/l38-agent.sock");
+    CHECK_STR_EQ(cfg.agent_socket_arg, "ssh-agent.work.sock");
+
+    g_clear_agent_keys_runner_rc = 0;
+    g_clear_agent_keys_exit_code = 0;
+    CHECK_EQ_INT(ssh_clear_agent_keys(&cfg), 0);
+    CHECK(!cfg.key_already_loaded);
+    CHECK_EQ_INT(cfg.agent_pid, 4321);
+    CHECK(cfg.agent_owned);
+    CHECK(cfg.reused_existing_agent);
+    CHECK_STR_EQ(cfg.agent_socket_path, "/tmp/l38-agent.sock");
+    CHECK_STR_EQ(cfg.agent_socket_arg, "ssh-agent.work.sock");
+
+    /* The command can complete before runner pipe/signal cleanup fails. The
+     * API still reports that parent-side failure, but key state follows the
+     * destructive child's known-zero exit rather than the wrapper status. */
+    cfg.key_already_loaded = true;
+    g_clear_agent_keys_runner_rc = -1;
+    g_clear_agent_keys_exit_code = 0;
+    clear_error();
+    CHECK_EQ_INT(ssh_clear_agent_keys(&cfg), -1);
+    CHECK(!cfg.key_already_loaded);
+    CHECK_EQ_INT(get_last_error()->code, ERR_SYSTEM_CALL);
+    CHECK_EQ_INT(get_last_error()->system_errno, EIO);
+    CHECK(strstr(get_last_error()->message,
+                 "synthetic runner cleanup failure") != NULL);
+
+    g_clear_agent_keys_runner_rc = 0;
+    CHECK_EQ_INT(ssh_clear_agent_keys(&cfg), 0);
+    CHECK(!cfg.key_already_loaded);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(g_clear_agent_keys_calls, 4);
+    CHECK(g_clear_agent_keys_exact_argv);
+    CHECK(g_clear_agent_keys_saw_socket);
+    CHECK_EQ_INT(unsetenv("SSH_AUTH_SOCK"), 0);
+    CHECK_EQ_INT(unsetenv("SSH_AGENT_PID"), 0);
 }
 
 /* AR-02 #10: ssh_configure_host_alias writes "IdentityFile <path>" into
@@ -1210,7 +1494,10 @@ TEST(reset_never_signals_bystander_pid_in_sidecar) {
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_ERROR, NULL);
     RUN_TEST(ssh_fingerprint_reuse_adopts_matching_key);
+    RUN_TEST(precleanup_activation_failure_preserves_prior_key_truth);
+    RUN_TEST(reuse_failure_preserves_only_reproven_target_key_truth);
     RUN_TEST(ssh_fingerprint_reuse_rejects_different_key);
+    RUN_TEST(ssh_fingerprint_reuse_rejects_same_fingerprint_certificate);
     RUN_TEST(agent_output_quoted_auth_sock_is_unwrapped);
     RUN_TEST(isolated_switch_retains_generation_between_fingerprint_and_load);
     RUN_TEST(fresh_commit_revalidates_public_agent_directory);
@@ -1224,6 +1511,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(stop_agent_cleanup_failure_retains_sidecar_until_durable_retry);
     RUN_TEST(stop_agent_already_gone_artifacts_are_durably_confirmed);
     RUN_TEST(stop_agent_preserves_a_replacement_pid_sidecar);
+    RUN_TEST(clear_agent_keys_tracks_the_destructive_child_result);
     RUN_TEST(host_alias_write_rejects_newline_key_path);
     RUN_TEST(host_alias_removal_excises_only_named_block);
     RUN_TEST(host_alias_handles_config_larger_than_64k);

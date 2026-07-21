@@ -44,6 +44,10 @@ int join_path(char *result, size_t result_size, const char *base, const char *co
 bool path_exists(const char *path);
 bool is_directory(const char *path);
 bool is_regular_file(const char *path);
+/* Create every absent component descriptor-relatively and validate every
+ * existing component as a directory. Intermediate symlinks to directories
+ * remain supported; the final component must be a real directory. The final
+ * public path is re-opened and matched to the pinned inode before success. */
 int create_directory_recursive(const char *path, mode_t mode);
 int get_file_permissions(const char *path, mode_t *mode);
 
@@ -71,7 +75,9 @@ int ensure_private_dir(const char *path);
  * descriptor names the validated inode even if its pathname is subsequently
  * renamed.  When XDG_RUNTIME_DIR is absent or empty, the system /tmp target is
  * opened and the absolute /tmp spelling is returned for the uid-specific
- * fallback directories.
+ * fallback directories. A configured nonempty XDG_RUNTIME_DIR is
+ * authoritative: if it is missing or inaccessible, this fails closed rather
+ * than silently selecting /tmp.
  */
 int open_runtime_parent(char *path, size_t path_size);
 
@@ -87,13 +93,27 @@ int open_private_subdir_at(int parent_fd, const char *name, bool create,
 
 /**
  * Acquire the replace-resistant private lock domain for dir_fd.  The returned
- * descriptor is an opaque token, not the legacy lock-file descriptor; release
+ * descriptor is an anonymous opaque token, never an alias of the legacy
+ * lock-file descriptor; release
  * it with unlock_private_file().  Acquisition retains locks on the pinned
  * parent directory, the leaf directory, and the validated legacy lock file so
  * replacing either named entry cannot create a concurrent lock domain.
  */
 int lock_private_file_at(int dir_fd, const char *name);
 int try_lock_private_file_at(int dir_fd, const char *name);
+/**
+ * Non-blockingly acquire an already-existing exact private lock file without
+ * creating it or repairing its metadata. The entry must be a self-owned 0600
+ * regular file with one link. An absent entry returns -1 with errno=ENOENT.
+ */
+int try_lock_existing_private_file_at(int dir_fd, const char *name);
+/**
+ * Prove that a live opaque token still owns the exact private lock file named
+ * in the pinned directory. Returns 0 only while both the token registration
+ * and the directory-entry identity still match the acquisition; otherwise
+ * returns -1 with errno set to ESTALE (or EINVAL for invalid arguments).
+ */
+int verify_private_lock_file_at(int token_fd, int dir_fd, const char *name);
 void unlock_private_file(int token_fd);
 
 /**
@@ -135,6 +155,9 @@ int atomic_symlink_at(int dir_fd, const char *target, const char *link_name);
  */
 int read_file_to_string(const char *file_path, char *buffer, size_t buffer_size);
 int write_string_to_file(const char *file_path, const char *content, mode_t mode);
+/* Copy into a regular, non-symlink destination leaf relative to a pinned
+ * parent. Success additionally proves that the public parent/leaf still name
+ * the descriptors used for the copy. */
 int copy_file(const char *src_path, const char *dst_path);
 int backup_file(const char *file_path, const char *backup_suffix);
 bool file_is_readable(const char *file_path);
@@ -171,6 +194,7 @@ typedef struct {
     bool        use_stdin_fd;       /* duplicate current offset to child fd 0; mutually exclusive with input */
     bool        merge_stderr;       /* true => child stderr merged into captured stdout (2>&1) */
     bool        stderr_to_devnull;  /* when !merge_stderr: silence child stderr */
+    const char *const *unset_env;   /* NULL-terminated variable names removed from the child first */
     const char *const *extra_env;   /* NULL-terminated "KEY=VALUE" entries set in the child (e.g. GNUPGHOME) */
     int         cwd_fd;             /* pinned directory inherited across fork; ignored unless use_cwd_fd */
     bool        use_cwd_fd;         /* fchdir(cwd_fd) in the child before closing inherited descriptors */
@@ -267,6 +291,27 @@ void run_test_set_post_fork_pre_publish_hook(
  * restored without replacing the primary system errno. Zero disables it. */
 void run_test_set_fork_failure(int system_errno);
 
+#ifdef GITSWITCH_TESTING
+typedef enum {
+    RUN_TEST_EXEC_ACL_NONE = 0,
+    RUN_TEST_EXEC_ACL_DIRECTORY,
+    RUN_TEST_EXEC_ACL_LEAF
+} run_test_exec_acl_target_t;
+
+/* One-shot parser fault on the Nth executable-format read (1-based). */
+void run_test_set_exec_parse_failure(unsigned int parse_ordinal,
+                                     int system_errno);
+/* One-shot PATH candidate fault on the Nth absolute nonempty entry (1-based). */
+void run_test_set_path_candidate_failure(unsigned int candidate_ordinal,
+                                         int system_errno);
+/* One-shot directory-open fault on the Nth lexical/canonical walk open. */
+void run_test_set_directory_open_failure(unsigned int open_ordinal,
+                                         int system_errno);
+/* One-shot ACL inspection result for an executable directory or leaf. */
+void run_test_set_exec_acl_failure(run_test_exec_acl_target_t target,
+                                   int system_errno);
+#endif
+
 /* True if `command` is currently eligible for the default runner; does not
  * execute it. */
 bool command_exists(const char *command);
@@ -360,6 +405,9 @@ bool text_is_tty_safe(const char *text);
  */
 void secure_zero_memory(void *ptr, size_t size);
 int generate_random_string(char *buffer, size_t buffer_size, const char *charset);
+/* Exact immutable-account identity grammar shared by the TOML and durable
+ * publication trust boundaries: 64 uppercase hexadecimal digits plus NUL. */
+bool account_incarnation_is_valid(const char *incarnation);
 bool check_file_permissions_safe(const char *file_path, mode_t expected_mode);
 
 /**

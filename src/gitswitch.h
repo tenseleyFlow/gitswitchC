@@ -3,6 +3,8 @@
 #ifndef GITSWITCH_H
 #define GITSWITCH_H
 
+#include "freebsd_compat.h"
+
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,7 +43,10 @@
  * fingerprint contract: 64 hexadecimal digits plus NUL. */
 #define MAX_GPG_SELECTOR_LEN 67
 #define MAX_GPG_FINGERPRINT_LEN 65
+#define ACCOUNT_INCARNATION_HEX_LEN 64U
+#define ACCOUNT_INCARNATION_LEN (ACCOUNT_INCARNATION_HEX_LEN + 1U)
 #define MAX_ACCOUNTS 64
+#define CONFIG_DOCUMENT_MAX_SIZE (64U * 1024U)
 
 /* Default configuration paths */
 #define DEFAULT_CONFIG_DIR ".config/gitswitch"
@@ -67,6 +72,14 @@ typedef enum {
 /* Account structure */
 typedef struct {
     uint32_t id;
+    /* Immutable account ownership identity. Numeric IDs remain human-facing
+     * selectors and can be hand-edited; durable publication authority is
+     * always bound to this independently generated 256-bit value as well.
+     * Legacy account documents remain empty during every read-only load; an
+     * explicit mutating migration generates a candidate and sets the runtime-
+     * only persisted bit only after a full transactional save. */
+    char incarnation[ACCOUNT_INCARNATION_LEN];
+    bool incarnation_persisted;
     char name[MAX_NAME_LEN];
     char email[MAX_EMAIL_LEN];
     char description[MAX_DESC_LEN];
@@ -94,6 +107,18 @@ typedef struct {
      * source so a stale context cannot describe a replaced account model. */
     bool source_generation_valid;
     struct stat source_generation;
+    /* Exact bytes retained after this context durably publishes a full
+     * document. Some filesystems expose a delayed ctime-only step after that
+     * publication; later writes may admit it only after re-proving the
+     * complete file against this bounded witness. */
+    bool source_witness_valid;
+    /* A completed stable load retains the same exact bytes under distinct
+     * authority. This covers reader-induced ctime materialization without
+     * misclassifying the document as self-published; any byte, inode, mtime,
+     * ownership, mode, size, or link-count change still fails closed. */
+    bool source_read_witness_valid;
+    size_t source_witness_length;
+    unsigned char source_witness[CONFIG_DOCUMENT_MAX_SIZE];
     char active_account[MAX_NAME_LEN];  /* Last-switched account, persisted for boot resume */
     bool verbose;
     bool dry_run;

@@ -71,6 +71,66 @@ resume_hint_test_hook_fn gitswitch_test_set_resume_hint_hook(
 #define RESUME_HINT_TEST_CHECKPOINT(stage) ((void)(stage))
 #endif
 
+#ifdef GITSWITCH_TESTING
+typedef enum {
+    RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE = 0,
+    RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_CLEAR_BEFORE_FILE_SYNC,
+    RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
+    RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+} retirement_guard_clear_test_stage_t;
+typedef int (*retirement_guard_clear_test_hook_fn)(
+    retirement_guard_clear_test_stage_t stage, int directory_fd,
+    const char *marker_name);
+retirement_guard_clear_test_hook_fn
+gitswitch_test_set_retirement_guard_clear_hook(
+    retirement_guard_clear_test_hook_fn hook);
+static retirement_guard_clear_test_hook_fn
+    g_retirement_guard_clear_test_hook;
+
+retirement_guard_clear_test_hook_fn
+gitswitch_test_set_retirement_guard_clear_hook(
+    retirement_guard_clear_test_hook_fn hook) {
+    retirement_guard_clear_test_hook_fn previous =
+        g_retirement_guard_clear_test_hook;
+    g_retirement_guard_clear_test_hook = hook;
+    return previous;
+}
+
+static int config_retirement_guard_clear_test_checkpoint(
+    retirement_guard_clear_test_stage_t stage, int directory_fd,
+    const char *marker_name) {
+    if (!g_retirement_guard_clear_test_hook) return 0;
+    if (g_retirement_guard_clear_test_hook(
+            stage, directory_fd, marker_name) == 0) {
+        return 0;
+    }
+    if (errno == 0) errno = EIO;
+    return -1;
+}
+
+#define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
+    config_retirement_guard_clear_test_checkpoint((stage), (fd), (name))
+#else
+enum {
+    RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE = 0,
+    RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
+    RETIREMENT_GUARD_CLEAR_BEFORE_FILE_SYNC,
+    RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH,
+    RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+    RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
+    RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+    RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC
+};
+#define RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(stage, fd, name)             \
+    ((void)(stage), (void)(fd), (void)(name), 0)
+#endif
+
 /* Default configuration template with security-focused defaults */
 const char *default_config_template = 
 "# gitswitch-c Configuration File\n"
@@ -101,7 +161,8 @@ const char *default_config_template =
 "#ssh_key = \"~/.ssh/id_rsa_work\"\n"
 "#gpg_key = \"ABCDEF1234567890\"\n"
 "#gpg_signing_enabled = true\n"
-"# ssh_host is the alias used in Git remotes; ssh_hostname is its real destination\n"
+"# ssh_host is the Git remote alias; ssh_hostname is its host-only destination\n"
+"# Use unbracketed IPv6 when needed; appended ports are not supported\n"
 "#ssh_host = \"github.com-work\"\n"
 "#ssh_hostname = \"github.com\"\n"
 "\n"
@@ -131,6 +192,15 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
 static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static void count_unknown_keys(gitswitch_ctx_t *ctx, const toml_document_t *doc);
 static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *doc);
+static int config_materialize_missing_incarnations(
+    gitswitch_ctx_t *ctx, const publication_ledger_t *publications);
+static int config_validate_live_publication_bindings(
+    const gitswitch_ctx_t *ctx,
+    const publication_ledger_t *publications);
+static int config_generate_incarnation(
+    const gitswitch_ctx_t *ctx, const publication_ledger_t *publications,
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN],
+    size_t generated_count, char out[ACCOUNT_INCARNATION_LEN]);
 static int parse_account_id_from_section(const char *section_name, uint32_t *account_id);
 static int validate_account_security(const account_t *account);
 static int normalize_account_model_for_admission(account_t *account);
@@ -144,11 +214,28 @@ static void config_rebind_current_id(gitswitch_ctx_t *ctx,
 static int validate_account_uniqueness(const gitswitch_ctx_t *ctx,
                                        const account_t *account,
                                        size_t ignore_index);
+typedef enum {
+    CONFIG_SOURCE_GENERATION_UNBOUND = 0,
+    CONFIG_SOURCE_GENERATION_REQUIRE_LOADED,
+    CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE
+} config_source_generation_requirement_t;
+
+typedef struct {
+    const config_retirement_owner_t *owners;
+    size_t owner_count;
+    const config_retirement_destination_t *destinations;
+    size_t destination_count;
+} config_retirement_refresh_request_t;
+
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed,
-                                     bool require_loaded_source,
-                                     config_resume_hint_snapshot_t *rollback_snapshot);
+                                     config_source_generation_requirement_t
+                                         generation_requirement,
+                                     config_resume_hint_snapshot_t *rollback_snapshot,
+                                     const publication_record_t *publication,
+                                     const config_retirement_refresh_request_t
+                                         *retirement_refresh);
 static bool config_metadata_same_file(const struct stat *a,
                                       const struct stat *b);
 static void config_unlink_created_temp(const char *path,
@@ -156,8 +243,17 @@ static void config_unlink_created_temp(const char *path,
                                        bool have_created_identity);
 static bool config_metadata_snapshot_same(const struct stat *a,
                                           const struct stat *b);
+static bool config_is_namespace_change_errno(int error);
 static int config_require_loaded_source_generation(
     const gitswitch_ctx_t *ctx, const char *config_path);
+static int config_reprove_loaded_source(
+    const char *config_path, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length);
+static int config_admit_full_save_generation(const gitswitch_ctx_t *ctx,
+                                             const char *config_path);
+static int config_require_full_save_generation_snapshot(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool destination_existed, const struct stat *destination);
 static bool config_metadata_ctime_only_change(const struct stat *before,
                                               const struct stat *after);
 static bool config_refresh_publication_identity(
@@ -183,13 +279,35 @@ typedef struct {
     char active_account[MAX_NAME_LEN];
 } config_active_state_t;
 
+#define CONFIG_ACTIVE_STATE_HEADER_MAX (MAX_NAME_LEN + 64U)
+#define CONFIG_ACTIVE_STATE_MAX \
+    (PUBLICATION_LEDGER_MAX_BYTES + CONFIG_ACTIVE_STATE_HEADER_MAX)
+/* Hex encoding can double every bounded string. Two complete record structs
+ * plus fixed grammar/identity overhead is therefore a conservative upper
+ * bound for one additional canonical record. */
+#define CONFIG_PUBLICATION_RECORD_RESERVE \
+    (sizeof(publication_record_t) * 2U + 8192U)
+
+typedef struct {
+    bool existed;
+    struct stat metadata;
+    unsigned char *data;
+    size_t length;
+} config_active_state_generation_t;
+
+static void config_active_state_generation_clear(
+    config_active_state_generation_t *generation);
+
 static int config_read_active_state(const char *config_path,
                                     config_active_state_t *state,
-                                    bool require_private_mode);
+                                    bool require_private_mode,
+                                    config_active_state_generation_t *generation,
+                                    publication_ledger_t *publications);
 
 typedef enum {
     CONFIG_INIT_NORMAL = 0,
     CONFIG_INIT_READONLY,
+    CONFIG_INIT_RUNTIME_READONLY,
     CONFIG_INIT_NAMES
 } config_init_kind_t;
 
@@ -240,7 +358,8 @@ static int config_init_mode(gitswitch_ctx_t *ctx, config_init_kind_t kind) {
         log_info("Loading configuration from: %s", config_path);
         return config_load_mode(ctx, config_path,
                                 kind != CONFIG_INIT_NAMES,
-                                kind == CONFIG_INIT_NORMAL);
+                                kind == CONFIG_INIT_NORMAL ||
+                                    kind == CONFIG_INIT_RUNTIME_READONLY);
     } else {
         log_info("Configuration file not found: %s", config_path);
         /* File creation remains deferred to a command that actually needs it. */
@@ -261,6 +380,14 @@ int config_init_readonly(gitswitch_ctx_t *ctx) {
     return config_init_mode(ctx, CONFIG_INIT_READONLY);
 }
 
+/* Read-only commands still need truthful live-account attribution. Inspect the
+ * existing runtime namespace without creating or repairing the configuration
+ * directory; unlike preview mode, this deliberately takes the SSH manager's
+ * read-side lock and probes an existing current.sock target. */
+int config_init_runtime_readonly(gitswitch_ctx_t *ctx) {
+    return config_init_mode(ctx, CONFIG_INIT_RUNTIME_READONLY);
+}
+
 /* Load only the account document needed by `list --names`. It still validates
  * the legacy field in that document for schema compatibility, but deliberately
  * does not apply legacy/versioned active-account state and never reaches
@@ -275,6 +402,7 @@ static config_io_fault_fn g_config_io_fault;
 static config_metadata_test_hook_fn g_config_metadata_test_hook;
 static config_backup_clock_fn g_config_backup_clock;
 static config_backup_readdir_fn g_config_backup_readdir = readdir;
+static config_incarnation_generate_fn g_config_incarnation_generate;
 
 config_document_malloc_fn config_set_document_malloc_fn(
     config_document_malloc_fn fn) {
@@ -307,6 +435,14 @@ config_backup_readdir_fn config_set_backup_readdir_fn(
     config_backup_readdir_fn fn) {
     config_backup_readdir_fn previous = g_config_backup_readdir;
     g_config_backup_readdir = fn ? fn : readdir;
+    return previous;
+}
+
+config_incarnation_generate_fn config_set_incarnation_generate_fn(
+    config_incarnation_generate_fn fn) {
+    config_incarnation_generate_fn previous =
+        g_config_incarnation_generate;
+    g_config_incarnation_generate = fn;
     return previous;
 }
 
@@ -357,12 +493,24 @@ static void config_document_free(toml_document_t *doc) {
 static int config_read_document_expected(const char *config_path,
                                          toml_document_t *doc,
                                          const struct stat *expected_identity,
-                                         struct stat *loaded_identity) {
+                                         struct stat *loaded_identity,
+                                         unsigned char *loaded_bytes,
+                                         size_t loaded_capacity,
+                                         size_t *loaded_length) {
     char *buffer = NULL;
     struct stat before, after, path_after;
     size_t file_size, total = 0;
     int parse_result;
     int fd;
+
+    if ((loaded_bytes && !loaded_length) ||
+        (!loaded_bytes && loaded_length)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid configuration read-witness arguments");
+        return -1;
+    }
+    if (loaded_length) *loaded_length = 0U;
 
     fd = open_config_validated(config_path);
     if (fd < 0) {
@@ -507,13 +655,59 @@ static int config_read_document_expected(const char *config_path,
             goto fail_buffer;
         }
     }
-    close(fd);
+    if (close(fd) != 0) {
+        fd = -1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close config after complete read: %s",
+                         config_path);
+        goto fail_buffer;
+    }
+    fd = -1;
+    if (config_io_fault(CONFIG_IO_DOCUMENT_AFTER_CLOSE,
+                        "config document close checkpoint")) {
+        goto fail_buffer;
+    }
+
+    /* FreeBSD UFS may expose a reader-induced ctime step only when the
+     * descriptor closes. The complete bytes, EOF, descriptor generation, and
+     * installed inode were proved immediately above, so admit only that
+     * ctime-only transition and bind callers to the post-close generation.
+     * Any later ctime-only transition still requires a caller-retained exact
+     * byte witness and a fresh descriptor proof. */
+    errno = 0;
+    if (lstat(config_path, &path_after) != 0 ||
+        (!config_metadata_snapshot_same(&after, &path_after) &&
+         !config_metadata_ctime_only_change(&after, &path_after))) {
+        int close_observation_errno = errno ? errno : ESTALE;
+
+        errno = config_is_namespace_change_errno(close_observation_errno)
+                    ? ESTALE
+                    : close_observation_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Configuration changed while its completed read was closing: %s",
+            config_path);
+        goto fail_buffer;
+    }
+    after = path_after;
     if (parse_result != 0) {
         goto fail_buffer;
     }
 
     if (loaded_identity) {
         *loaded_identity = after;
+    }
+    if (loaded_bytes) {
+        if (file_size > loaded_capacity) {
+            errno = EOVERFLOW;
+            set_system_error(
+                ERR_CONFIG_INVALID,
+                "Configuration exceeds read-witness capacity: %s",
+                config_path);
+            goto fail_buffer;
+        }
+        if (file_size != 0U) memcpy(loaded_bytes, buffer, file_size);
+        *loaded_length = file_size;
     }
 
     /* Config content can reference key material paths; don't leave a stray
@@ -528,13 +722,14 @@ fail_buffer:
     return -1;
 }
 
-static int config_read_document(const char *config_path, toml_document_t *doc,
-                                struct stat *loaded_identity) {
+static int config_read_document(
+    const char *config_path, toml_document_t *doc,
+    struct stat *loaded_identity, unsigned char *loaded_bytes,
+    size_t loaded_capacity, size_t *loaded_length) {
     return config_read_document_expected(config_path, doc, NULL,
-                                         loaded_identity);
+                                         loaded_identity, loaded_bytes,
+                                         loaded_capacity, loaded_length);
 }
-
-#define CONFIG_ACTIVE_STATE_MAX 1024U
 
 static bool config_state_needs_valid(const char *line, size_t length) {
     return (length == 3 && memcmp(line, "ssh", 3) == 0) ||
@@ -585,20 +780,38 @@ static int config_state_path_for_config(const char *config_path,
     return 0;
 }
 
+static void config_active_state_generation_clear(
+    config_active_state_generation_t *generation) {
+    if (!generation) return;
+    if (generation->data) {
+        secure_zero_memory(generation->data, generation->length);
+        free(generation->data);
+    }
+    memset(generation, 0, sizeof(*generation));
+}
+
 static int config_read_active_state(const char *config_path,
                                     config_active_state_t *state,
-                                    bool require_private_mode) {
+                                    bool require_private_mode,
+                                    config_active_state_generation_t *generation,
+                                    publication_ledger_t *publications) {
     char hint[MAX_PATH_LEN];
     char dir[MAX_PATH_LEN];
-    char buffer[CONFIG_ACTIVE_STATE_MAX + 1];
+    unsigned char *buffer = NULL;
     struct stat before;
     struct stat opened;
     struct stat after;
-    const char *first_newline;
-    const char *active;
+    const unsigned char *first_newline;
+    const unsigned char *second_newline;
+    const unsigned char *second;
+    const unsigned char *active;
+    publication_ledger_t parsed_publications;
     size_t first_length;
+    size_t second_length;
     size_t active_length;
+    size_t tail_offset;
     size_t total = 0;
+    int result = -1;
     int fd = -1;
 
     if (!state) {
@@ -606,24 +819,30 @@ static int config_read_active_state(const char *config_path,
         return -1;
     }
     memset(state, 0, sizeof(*state));
+    publication_ledger_init(&parsed_publications);
+    if (publications) publication_ledger_clear(publications);
+    if (generation) {
+        config_active_state_generation_clear(generation);
+    }
     if (config_state_path_for_config(config_path, hint, sizeof(hint)) != 0) {
-        return -1;
+        goto cleanup;
     }
     if (lstat(hint, &before) != 0) {
         if (errno == ENOENT) {
-            return 0;
+            result = 0;
+            goto cleanup;
         }
         set_system_error(ERR_FILE_IO,
                          "Cannot inspect active-state artifact: %s", hint);
-        return -1;
+        goto cleanup;
     }
 
     if (safe_strncpy(dir, hint, sizeof(dir)) != 0) {
-        return -1;
+        goto cleanup;
     }
     char *slash = strrchr(dir, '/');
     if (!slash) {
-        if (safe_strncpy(dir, ".", sizeof(dir)) != 0) return -1;
+        if (safe_strncpy(dir, ".", sizeof(dir)) != 0) goto cleanup;
     } else if (slash == dir) {
         slash[1] = '\0';
     } else {
@@ -633,7 +852,7 @@ static int config_read_active_state(const char *config_path,
         set_error(ERR_PERMISSION_DENIED,
                   "Active-state parent is not a private owned directory: %s",
                   dir);
-        return -1;
+        goto cleanup;
     }
     if (!config_metadata_file_is_safe(&before, require_private_mode) ||
         before.st_size < 0 ||
@@ -641,7 +860,14 @@ static int config_read_active_state(const char *config_path,
         set_error(ERR_PERMISSION_DENIED,
                   "Active-state artifact is not a small stable owned file: %s",
                   hint);
-        return -1;
+        goto cleanup;
+    }
+
+    buffer = malloc((size_t)before.st_size + 1U);
+    if (!buffer) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate active-state bundle");
+        goto cleanup;
     }
 
     RESUME_HINT_TEST_CHECKPOINT(1);
@@ -656,7 +882,8 @@ static int config_read_active_state(const char *config_path,
         errno = saved_errno;
         set_system_error(ERR_FILE_IO,
                          "Cannot open stable active-state artifact: %s", hint);
-        return -1;
+        fd = -1;
+        goto cleanup;
     }
     while (total < (size_t)opened.st_size) {
         ssize_t n = read(fd, buffer + total, (size_t)opened.st_size - total);
@@ -667,8 +894,7 @@ static int config_read_active_state(const char *config_path,
         } else {
             set_error(ERR_FILE_IO,
                       "Cannot read complete active-state artifact: %s", hint);
-            close(fd);
-            return -1;
+            goto cleanup;
         }
     }
     RESUME_HINT_TEST_CHECKPOINT(2);
@@ -678,19 +904,32 @@ static int config_read_active_state(const char *config_path,
         lstat(hint, &after) != 0 ||
         !config_metadata_file_is_safe(&after, require_private_mode) ||
         !config_metadata_snapshot_same(&opened, &after)) {
-        close(fd);
         set_error(ERR_FILE_IO,
                   "Active-state artifact changed while being read: %s", hint);
-        return -1;
+        goto cleanup;
     }
     close(fd);
+    fd = -1;
     buffer[total] = '\0';
+
+    if (generation) {
+        generation->data = malloc(total == 0U ? 1U : total);
+        if (!generation->data) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot allocate active-state generation witness");
+            goto cleanup;
+        }
+        generation->existed = true;
+        generation->metadata = opened;
+        memcpy(generation->data, buffer, total);
+        generation->length = total;
+    }
 
     if (memchr(buffer, '\0', total) != NULL) {
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: embedded NUL byte",
                   hint);
-        return -1;
+        goto cleanup;
     }
 
     /* The first resume-hint implementation wrote a zero-byte marker. It still
@@ -700,7 +939,8 @@ static int config_read_active_state(const char *config_path,
     if (total == 0) {
         state->exists = true;
         state->legacy_needs_only = true;
-        return 0;
+        result = 0;
+        goto publish;
     }
 
     first_newline = memchr(buffer, '\n', total);
@@ -708,65 +948,96 @@ static int config_read_active_state(const char *config_path,
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: missing first newline",
                   hint);
-        return -1;
+        goto cleanup;
     }
     first_length = (size_t)(first_newline - buffer);
-    if (!config_state_needs_valid(buffer, first_length)) {
+    if (!config_state_needs_valid((const char *)buffer, first_length)) {
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: invalid runtime-needs token",
                   hint);
-        return -1;
+        goto cleanup;
     }
     memcpy(state->needs, buffer, first_length);
     state->needs[first_length] = '\0';
     state->exists = true;
     if ((size_t)(first_newline - buffer) + 1 == total) {
         state->legacy_needs_only = true;
-        return 0;
+        result = 0;
+        goto publish;
     }
+
+    second = first_newline + 1;
+    second_newline = memchr(second, '\n', total - (size_t)(second - buffer));
+    if (!second_newline) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Malformed active-state artifact %s: missing second newline",
+                  hint);
+        goto cleanup;
+    }
+    second_length = (size_t)(second_newline - second);
+    tail_offset = (size_t)(second_newline - buffer) + 1U;
 
     /* Versioned inactive tombstone. Keeping the first line as "none" makes
      * every already-generated shell snippet take its no-op arm, while the
      * second line disambiguates a deliberate reset from a pre-state-artifact
      * configuration whose legacy active_account must still migrate. */
-    if (first_length == 4 && memcmp(buffer, "none", 4) == 0 &&
-        total - ((size_t)(first_newline - buffer) + 1) ==
-            sizeof("inactive=v1\n") - 1 &&
-        memcmp(first_newline + 1, "inactive=v1\n",
-               sizeof("inactive=v1\n") - 1) == 0) {
+    if (first_length == 4U && memcmp(buffer, "none", 4U) == 0 &&
+        second_length == sizeof("inactive=v1") - 1U &&
+        memcmp(second, "inactive=v1", second_length) == 0) {
         state->inactive_tombstone = true;
-        return 0;
-    }
-
-    active = first_newline + 1;
-    if ((size_t)(active - buffer) + 7 > total ||
-        memcmp(active, "active=", 7) != 0 || buffer[total - 1] != '\n') {
+    } else if (second_length < sizeof("active=") - 1U ||
+               memcmp(second, "active=", sizeof("active=") - 1U) != 0) {
         set_error(ERR_CONFIG_INVALID,
                   "Malformed active-state artifact %s: expected active=<name>",
                   hint);
-        return -1;
+        goto cleanup;
+    } else {
+        active = second + sizeof("active=") - 1U;
+        active_length = second_length - (sizeof("active=") - 1U);
+        if (active_length == 0U ||
+            active_length >= sizeof(state->active_account) ||
+            memchr(active, '\r', active_length) != NULL) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Malformed active-state artifact %s: invalid active name length",
+                      hint);
+            goto cleanup;
+        }
+        memcpy(state->active_account, active, active_length);
+        state->active_account[active_length] = '\0';
+        if (!validate_name(state->active_account) ||
+            !text_is_tty_safe(state->active_account)) {
+            memset(state->active_account, 0,
+                   sizeof(state->active_account));
+            set_error(ERR_CONFIG_INVALID,
+                      "Malformed active-state artifact %s: unsafe active account name",
+                      hint);
+            goto cleanup;
+        }
     }
-    active += 7;
-    active_length = total - (size_t)(active - buffer) - 1;
-    if (active_length == 0 || active_length >= sizeof(state->active_account) ||
-        memchr(active, '\n', active_length) != NULL ||
-        memchr(active, '\r', active_length) != NULL) {
-        set_error(ERR_CONFIG_INVALID,
-                  "Malformed active-state artifact %s: invalid active name length",
-                  hint);
-        return -1;
+    if (publication_ledger_parse(buffer + tail_offset,
+                                 total - tail_offset,
+                                 &parsed_publications) != 0) {
+        goto cleanup;
     }
-    memcpy(state->active_account, active, active_length);
-    state->active_account[active_length] = '\0';
-    if (!validate_name(state->active_account) ||
-        !text_is_tty_safe(state->active_account)) {
-        memset(state->active_account, 0, sizeof(state->active_account));
-        set_error(ERR_CONFIG_INVALID,
-                  "Malformed active-state artifact %s: unsafe active account name",
-                  hint);
-        return -1;
+    result = 0;
+
+publish:
+    if (result == 0 && publications) {
+        *publications = parsed_publications;
+        publication_ledger_init(&parsed_publications);
     }
-    return 0;
+
+cleanup:
+    if (fd >= 0) close(fd);
+    if (buffer) {
+        secure_zero_memory(buffer, (size_t)before.st_size + 1U);
+        free(buffer);
+    }
+    publication_ledger_clear(&parsed_publications);
+    if (result != 0 && generation) {
+        config_active_state_generation_clear(generation);
+    }
+    return result;
 }
 
 static const char *config_account_runtime_needs(const account_t *account) {
@@ -835,6 +1106,7 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
     toml_document_t *toml_doc;
     config_active_state_t active_state;
     struct stat loaded_identity;
+    size_t loaded_length = 0U;
     char legacy_active[MAX_NAME_LEN] = "";
     char scope_str[32];
 
@@ -848,7 +1120,15 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
         return -1;
     }
 
-    if (config_read_document(config_path, toml_doc, &loaded_identity) != 0) {
+    secure_zero_memory(ctx->config.source_witness,
+                       sizeof(ctx->config.source_witness));
+    ctx->config.source_witness_length = 0U;
+    ctx->config.source_witness_valid = false;
+    ctx->config.source_read_witness_valid = false;
+    if (config_read_document(
+            config_path, toml_doc, &loaded_identity,
+            ctx->config.source_witness,
+            sizeof(ctx->config.source_witness), &loaded_length) != 0) {
         config_document_free(toml_doc);
         return -1;
     }
@@ -921,6 +1201,9 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
     safe_strncpy(ctx->config.config_path, config_path, sizeof(ctx->config.config_path));
     ctx->config.source_generation = loaded_identity;
     ctx->config.source_generation_valid = true;
+    ctx->config.source_witness_valid = false;
+    ctx->config.source_read_witness_valid = true;
+    ctx->config.source_witness_length = loaded_length;
 
     config_document_free(toml_doc);
 
@@ -936,7 +1219,8 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
      * runtime-needs marker) migrates from settings.active_account. Reset writes
      * the tombstone atomically, so absence can safely retain its pre-T12 meaning
      * without resurrecting a post-T12 reset. */
-    if (config_read_active_state(config_path, &active_state, false) != 0) {
+    if (config_read_active_state(config_path, &active_state, false, NULL,
+                                 NULL) != 0) {
         return -1;
     }
     if (active_state.exists && active_state.inactive_tombstone) {
@@ -986,6 +1270,10 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
                       "Active-state runtime needs '%s' do not match account '%s' (expected '%s')",
                       active_state.needs, ctx->config.active_account,
                       config_account_runtime_needs(state_account));
+            return -1;
+        } else if (safe_strncpy(ctx->config.active_account,
+                                state_account->name,
+                                sizeof(ctx->config.active_account)) != 0) {
             return -1;
         }
     }
@@ -1073,6 +1361,7 @@ static bool config_metadata_snapshot_same(const struct stat *a,
 static int config_require_loaded_source_generation(
     const gitswitch_ctx_t *ctx, const char *config_path) {
     struct stat current;
+    int lookup_errno;
 
     if (!ctx || !config_path || !ctx->config.source_generation_valid ||
         strcmp(ctx->config.config_path, config_path) != 0) {
@@ -1081,11 +1370,43 @@ static int config_require_loaded_source_generation(
         return -1;
     }
     errno = 0;
-    if (lstat(config_path, &current) != 0 ||
-        !config_metadata_file_is_safe(&current, true) ||
+    if (lstat(config_path, &current) != 0) {
+        lookup_errno = errno ? errno : EIO;
+        errno = config_is_namespace_change_errno(lookup_errno)
+                    ? ESTALE
+                    : lookup_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Configuration changed since it was loaded; refusing active-state publication: %s",
+            config_path);
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&current, true) ||
         !config_metadata_snapshot_same(&ctx->config.source_generation,
                                        &current)) {
-        errno = errno ? errno : ESTALE;
+        lookup_errno = ESTALE;
+        if (config_metadata_file_is_safe(&current, true) &&
+            config_metadata_ctime_only_change(
+                &ctx->config.source_generation, &current) &&
+            (ctx->config.source_witness_valid ||
+             ctx->config.source_read_witness_valid) &&
+            ctx->config.source_generation.st_size >= 0 &&
+            ctx->config.source_witness_length <=
+                sizeof(ctx->config.source_witness) &&
+            (uintmax_t)ctx->config.source_generation.st_size ==
+                ctx->config.source_witness_length) {
+            errno = 0;
+            if (config_reprove_loaded_source(
+                    config_path, &ctx->config.source_generation,
+                    ctx->config.source_witness,
+                    ctx->config.source_witness_length) == 0) {
+                return 0;
+            }
+            lookup_errno = errno ? errno : ESTALE;
+        }
+        errno = config_is_namespace_change_errno(lookup_errno)
+                    ? ESTALE
+                    : lookup_errno;
         set_system_error(
             ERR_FILE_IO,
             "Configuration changed since it was loaded; refusing active-state publication: %s",
@@ -1093,6 +1414,112 @@ static int config_require_loaded_source_generation(
         return -1;
     }
     return 0;
+}
+
+static int config_require_full_save_generation_snapshot(
+    const gitswitch_ctx_t *ctx, const char *config_path,
+    bool destination_existed, const struct stat *destination) {
+    if (!ctx || !config_path || (destination_existed && !destination)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid full-save generation proof arguments");
+        return -1;
+    }
+    if (strnlen(config_path, sizeof(ctx->config.config_path)) >=
+        sizeof(ctx->config.config_path)) {
+        set_error(ERR_INVALID_PATH, "Config path is too long");
+        return -1;
+    }
+
+    if (ctx->config.source_generation_valid) {
+        if (strcmp(ctx->config.config_path, config_path) != 0) {
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Full save requires the exact path from the loaded configuration generation");
+            return -1;
+        }
+        if (!destination_existed ||
+            !config_metadata_file_is_safe(destination, true) ||
+            !config_metadata_snapshot_same(&ctx->config.source_generation,
+                                           destination)) {
+            int proof_errno = ESTALE;
+
+            /* A completed stable load or preceding successful full save may
+             * leave FreeBSD UFS with a reader-induced ctime update that
+             * materializes only after the captured generation. Admit it for
+             * a later full save only after re-proving every retained byte. */
+            if (destination_existed &&
+                config_metadata_file_is_safe(destination, true) &&
+                config_metadata_ctime_only_change(
+                    &ctx->config.source_generation, destination) &&
+                (ctx->config.source_witness_valid ||
+                 ctx->config.source_read_witness_valid) &&
+                ctx->config.source_generation.st_size >= 0 &&
+                ctx->config.source_witness_length <=
+                    sizeof(ctx->config.source_witness) &&
+                (uintmax_t)ctx->config.source_generation.st_size ==
+                    ctx->config.source_witness_length) {
+                errno = 0;
+                if (config_reprove_loaded_source(
+                        config_path, &ctx->config.source_generation,
+                        ctx->config.source_witness,
+                        ctx->config.source_witness_length) == 0) {
+                    return 0;
+                }
+                proof_errno = errno ? errno : ESTALE;
+            }
+            errno = config_is_namespace_change_errno(proof_errno)
+                        ? ESTALE
+                        : proof_errno;
+            set_system_error(
+                ERR_FILE_IO,
+                "Configuration changed since it was loaded; refusing full-document save: %s",
+                config_path);
+            return -1;
+        }
+        return 0;
+    }
+
+    if (destination_existed) {
+        errno = ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Refusing generationless overwrite of existing configuration; load it before saving: %s",
+            config_path);
+        return -1;
+    }
+    return 0;
+}
+
+/* A full rebuild is allowed to create a genuinely absent first document, but
+ * it may replace an existing document only when the caller presents the exact
+ * generation admitted by config_load or by its own last durable full save.
+ * Run this immediately after taking the destination lock, before allocating or
+ * mutating the serialized model, capturing resume state, or creating backups. */
+static int config_admit_full_save_generation(const gitswitch_ctx_t *ctx,
+                                             const char *config_path) {
+    struct stat current;
+    bool existed = false;
+
+    if (!ctx || !config_path) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid full-save generation admission arguments");
+        return -1;
+    }
+    errno = 0;
+    if (lstat(config_path, &current) == 0) {
+        existed = true;
+    } else if (errno == ENOENT ||
+               (ctx->config.source_generation_valid &&
+                config_is_namespace_change_errno(errno))) {
+        existed = false;
+    } else {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot establish configuration generation: %s",
+                         config_path);
+        return -1;
+    }
+    return config_require_full_save_generation_snapshot(
+        ctx, config_path, existed, existed ? &current : NULL);
 }
 
 /* FreeBSD UFS may materialize a ctime update only when a related directory is
@@ -1161,6 +1588,398 @@ static bool config_pread_full(int fd, unsigned char *buffer, size_t length,
         }
     }
     return true;
+}
+
+/* A no-follow lookup reports namespace replacement differently across the
+ * supported platforms: Linux/macOS commonly use ELOOP or ENOTDIR, while
+ * FreeBSD may report EMLINK for the terminal symlink. These all mean that the
+ * expected pathname generation disappeared; unrelated syscall failures retain
+ * their original errno. */
+static bool config_is_namespace_change_errno(int error) {
+    if (error == ENOENT || error == ELOOP || error == ENOTDIR) return true;
+#ifdef EMLINK
+    if (error == EMLINK) return true;
+#endif
+    return false;
+}
+
+/* Re-prove a published regular-file generation against both strict metadata
+ * and an independent byte snapshot captured before publication. FreeBSD may
+ * materialize only ctime when the containing directory is synced; admit that
+ * narrow metadata transition only when the complete bytes still match. */
+static int config_reprove_published_file_at(
+    int dir_fd, const char *name, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length,
+    struct stat *current_generation) {
+    unsigned char observed[4096];
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    unsigned char trailing;
+    ssize_t trailing_count;
+    off_t offset = 0;
+    int fd = -1;
+    int failure_errno = ESTALE;
+
+    if (dir_fd < 0 || !name || !expected ||
+        (!expected_data && expected_length != 0) || !current_generation) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    errno = 0;
+    if (fstatat(dir_fd, name, &named_before, AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_before, true) ||
+        named_before.st_size < 0 ||
+        (uintmax_t)named_before.st_size != expected_length ||
+        (!config_metadata_snapshot_same(expected, &named_before) &&
+         !config_metadata_ctime_only_change(expected, &named_before))) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    errno = 0;
+    fd = openat(dir_fd, name,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto proof_fail;
+    }
+    if (fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&opened, true) ||
+        opened.st_size < 0 ||
+        (uintmax_t)opened.st_size != expected_length ||
+        (!config_metadata_snapshot_same(expected, &opened) &&
+         !config_metadata_ctime_only_change(expected, &opened))) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    while ((size_t)offset < expected_length) {
+        size_t remaining = expected_length - (size_t)offset;
+        size_t chunk = remaining < sizeof(observed)
+                           ? remaining
+                           : sizeof(observed);
+        errno = 0;
+        if (!config_pread_full(fd, observed, chunk, offset)) {
+            failure_errno = errno ? errno : EIO;
+            goto proof_fail;
+        }
+        if (memcmp(observed, expected_data + (size_t)offset, chunk) != 0) {
+            failure_errno = ESTALE;
+            goto proof_fail;
+        }
+        offset += (off_t)chunk;
+    }
+    errno = 0;
+    do {
+        trailing_count = pread(fd, &trailing, 1, (off_t)expected_length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count < 0) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    if (trailing_count != 0) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    if (config_io_fault(CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES,
+                        "config document exact-byte reproof")) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+
+    errno = 0;
+    if (fstat(fd, &descriptor_after) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, true) ||
+        (!config_metadata_snapshot_same(&opened, &descriptor_after) &&
+         !config_metadata_ctime_only_change(&opened,
+                                            &descriptor_after))) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto proof_fail;
+    }
+    fd = -1;
+
+    /* FreeBSD UFS can defer the reader-induced ctime materialization until
+     * the proof descriptor closes. Snapshot the pathname only after that
+     * close, admitting solely this ctime-only step because the complete bytes
+     * and all other metadata were just proved on the same inode. */
+    errno = 0;
+    if (fstatat(dir_fd, name, &named_after, AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto proof_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_after, true) ||
+        (!config_metadata_snapshot_same(&descriptor_after, &named_after) &&
+         !config_metadata_ctime_only_change(&descriptor_after,
+                                            &named_after))) {
+        failure_errno = ESTALE;
+        goto proof_fail;
+    }
+
+    *current_generation = named_after;
+    secure_zero_memory(observed, sizeof(observed));
+    return 0;
+
+proof_fail:
+    if (fd >= 0) close(fd);
+    secure_zero_memory(observed, sizeof(observed));
+    errno = failure_errno;
+    return -1;
+}
+
+/* Re-prove a stable loaded or self-published source through a pinned, private
+ * parent directory. Callers must carry the exact bounded document witness. */
+static int config_reprove_loaded_source(
+    const char *config_path, const struct stat *expected,
+    const unsigned char *expected_data, size_t expected_length) {
+    char dir_path[MAX_PATH_LEN];
+    const char *slash;
+    const char *target_name;
+    struct stat pinned_dir;
+    struct stat current_generation;
+    size_t dir_length;
+    int dir_fd = -1;
+    int failure_errno = ESTALE;
+
+    if (!config_path || !config_path[0] || !expected ||
+        (!expected_data && expected_length != 0U)) {
+        errno = EINVAL;
+        return -1;
+    }
+    slash = strrchr(config_path, '/');
+    target_name = slash ? slash + 1 : config_path;
+    if (target_name[0] == '\0') {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!slash) {
+        if (safe_strncpy(dir_path, ".", sizeof(dir_path)) != 0) {
+            return -1;
+        }
+    } else {
+        dir_length = (size_t)(slash - config_path);
+        if (dir_length == 0U) dir_length = 1U;
+        if (dir_length >= sizeof(dir_path)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        memcpy(dir_path, config_path, dir_length);
+        dir_path[dir_length] = '\0';
+    }
+
+    errno = 0;
+    dir_fd = open(dir_path,
+                  O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto reproof_fail;
+    }
+    if (fstat(dir_fd, &pinned_dir) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto reproof_fail;
+    }
+    if (!config_metadata_dir_is_safe(&pinned_dir) ||
+        !config_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_errno = ESTALE;
+        goto reproof_fail;
+    }
+    if (config_reprove_published_file_at(
+            dir_fd, target_name, expected, expected_data, expected_length,
+            &current_generation) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto reproof_fail;
+    }
+    if (!config_named_directory_matches(dir_path, &pinned_dir)) {
+        failure_errno = ESTALE;
+        goto reproof_fail;
+    }
+    if (close(dir_fd) != 0) {
+        dir_fd = -1;
+        errno = errno ? errno : EIO;
+        return -1;
+    }
+    return 0;
+
+reproof_fail:
+    if (dir_fd >= 0) close(dir_fd);
+    errno = failure_errno;
+    return -1;
+}
+
+/* Re-prove the exact bounded active-state before-image immediately before its
+ * replacement. Strict metadata catches ordinary edits, while the byte proof
+ * also rejects an in-place same-length rewrite even if timestamp evidence is
+ * unavailable or has been restored. */
+static int config_require_active_state_generation(
+    const char *hint, const config_active_state_generation_t *expected) {
+    unsigned char observed[4096];
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    unsigned char trailing;
+    ssize_t trailing_count;
+    int fd = -1;
+    int failure_errno = ESTALE;
+    size_t offset = 0;
+
+    if (!hint || !expected || expected->length > CONFIG_ACTIVE_STATE_MAX ||
+        (expected->length != 0U && !expected->data)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid active-state generation proof arguments");
+        return -1;
+    }
+
+    if (!expected->existed) {
+        errno = 0;
+        if (lstat(hint, &named_before) != 0) {
+            if (errno == ENOENT) return 0;
+            failure_errno = config_is_namespace_change_errno(errno)
+                                ? ESTALE
+                                : (errno ? errno : EIO);
+        }
+        errno = failure_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Resume hint changed before update; refusing replacement: %s",
+            hint);
+        return -1;
+    }
+
+    errno = 0;
+    if (lstat(hint, &named_before) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto generation_mismatch;
+    }
+    if (!config_metadata_file_is_safe(&named_before, false) ||
+        (!config_metadata_snapshot_same(&expected->metadata, &named_before) &&
+         !config_metadata_ctime_only_change(&expected->metadata,
+                                            &named_before))) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    errno = 0;
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto generation_mismatch;
+    }
+    errno = 0;
+    if (fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    if (!config_metadata_file_is_safe(&opened, false) ||
+        (!config_metadata_snapshot_same(&named_before, &opened) &&
+         !config_metadata_ctime_only_change(&named_before, &opened)) ||
+        (!config_metadata_snapshot_same(&expected->metadata, &opened) &&
+         !config_metadata_ctime_only_change(&expected->metadata, &opened)) ||
+        opened.st_size < 0 ||
+        (uintmax_t)opened.st_size != expected->length) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    while (offset < expected->length) {
+        size_t wanted = expected->length - offset;
+        if (wanted > sizeof(observed)) wanted = sizeof(observed);
+        errno = 0;
+        if (!config_pread_full(fd, observed, wanted, (off_t)offset)) {
+            failure_errno = errno ? errno : EIO;
+            goto generation_mismatch;
+        }
+        if (memcmp(observed, expected->data + offset, wanted) != 0) {
+            failure_errno = ESTALE;
+            goto generation_mismatch;
+        }
+        offset += wanted;
+    }
+    errno = 0;
+    do {
+        trailing_count = pread(fd, &trailing, 1, (off_t)expected->length);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count < 0) {
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    if (trailing_count != 0) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    errno = 0;
+    if (fstat(fd, &descriptor_after) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, false) ||
+        (!config_metadata_snapshot_same(&opened, &descriptor_after) &&
+         !config_metadata_ctime_only_change(&opened, &descriptor_after))) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+    if (close(fd) != 0) {
+        fd = -1;
+        failure_errno = errno ? errno : EIO;
+        goto generation_mismatch;
+    }
+    fd = -1;
+    errno = 0;
+    if (lstat(hint, &named_after) != 0) {
+        failure_errno = config_is_namespace_change_errno(errno)
+                            ? ESTALE
+                            : (errno ? errno : EIO);
+        goto generation_mismatch;
+    }
+    if (!config_metadata_file_is_safe(&named_after, false) ||
+        (!config_metadata_snapshot_same(&descriptor_after, &named_after) &&
+         !config_metadata_ctime_only_change(&descriptor_after,
+                                            &named_after))) {
+        failure_errno = ESTALE;
+        goto generation_mismatch;
+    }
+
+    secure_zero_memory(observed, sizeof(observed));
+    return 0;
+
+generation_mismatch:
+    {
+        if (fd >= 0) close(fd);
+        secure_zero_memory(observed, sizeof(observed));
+        errno = failure_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Resume hint changed before update; refusing replacement: %s",
+            hint);
+    }
+    return -1;
 }
 
 /* Refresh a publication baseline only when the new durable backup proves the
@@ -1401,6 +2220,1454 @@ static int config_directory_for_path(const char *config_path, char *dir,
     return 0;
 }
 
+#define CONFIG_RETIREMENT_GUARD_NAME ".retirement-incomplete"
+#define CONFIG_RETIREMENT_COMPLETE_NAME ".retirement-complete"
+#define CONFIG_RETIREMENT_STAGE_NAME ".retirement-transition"
+#define CONFIG_RETIREMENT_LOCK_NAME ".retirement.lock"
+#define CONFIG_RETIREMENT_GUARD_HEADER \
+    "gitswitch-retirement-incomplete-v1"
+#define CONFIG_RETIREMENT_GUARD_MAX_BYTES 8192U
+
+typedef struct {
+    config_retirement_kind_t kind;
+    config_retirement_owner_t owners[MAX_ACCOUNTS];
+    size_t owner_count;
+    char token[ACCOUNT_INCARNATION_LEN];
+} config_retirement_guard_model_t;
+
+struct config_retirement_guard {
+    int directory_fd;
+    int lock_fd;
+    char directory[MAX_PATH_LEN];
+    struct stat directory_identity;
+    struct stat marker_identity;
+    unsigned char *marker_data;
+    size_t marker_length;
+    char token[ACCOUNT_INCARNATION_LEN];
+    bool created;
+};
+
+/* The application is single-threaded and owns at most one outer retirement
+ * transaction. The filesystem lock serializes independent processes; this
+ * process-local owner closes its intentionally re-entrant lock helper's
+ * second-handle loophole and also rejects a fork child that inherited an
+ * unfinished parent transaction. */
+static pid_t g_retirement_guard_owner_pid;
+
+static const char *config_retirement_kind_name(
+    config_retirement_kind_t kind) {
+    switch (kind) {
+        case CONFIG_RETIREMENT_REMOVE:
+            return "remove";
+        case CONFIG_RETIREMENT_RESET:
+            return "reset";
+        default:
+            return NULL;
+    }
+}
+
+static int config_retirement_owner_compare(const void *left,
+                                           const void *right) {
+    const config_retirement_owner_t *a = left;
+    const config_retirement_owner_t *b = right;
+
+    if (a->account_id < b->account_id) return -1;
+    if (a->account_id > b->account_id) return 1;
+    return strcmp(a->account_incarnation, b->account_incarnation);
+}
+
+static int config_retirement_canonicalize_owners(
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_owner_t canonical[MAX_ACCOUNTS]) {
+    if (!owners || owner_count == 0U || owner_count > MAX_ACCOUNTS ||
+        !canonical) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "A retirement guard requires one bounded owner set");
+        return -1;
+    }
+    for (size_t i = 0; i < owner_count; i++) {
+        if (!config_account_id_is_valid(owners[i].account_id) ||
+            !account_incarnation_is_valid(
+                owners[i].account_incarnation)) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "Retirement guard owner %zu is not an exact account incarnation",
+                      i);
+            return -1;
+        }
+        canonical[i] = owners[i];
+    }
+    qsort(canonical, owner_count, sizeof(canonical[0]),
+          config_retirement_owner_compare);
+    for (size_t i = 1; i < owner_count; i++) {
+        if (config_retirement_owner_compare(&canonical[i - 1],
+                                            &canonical[i]) == 0) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "Retirement guard owner set contains a duplicate");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static bool config_retirement_next_line(const unsigned char **cursor,
+                                        const unsigned char *end,
+                                        const unsigned char **line,
+                                        size_t *line_length) {
+    const unsigned char *newline;
+
+    if (!cursor || !*cursor || !end || !line || !line_length ||
+        *cursor >= end) {
+        return false;
+    }
+    newline = memchr(*cursor, '\n', (size_t)(end - *cursor));
+    if (!newline) return false;
+    *line = *cursor;
+    *line_length = (size_t)(newline - *cursor);
+    *cursor = newline + 1;
+    return true;
+}
+
+static bool config_retirement_line_equals(const unsigned char *line,
+                                          size_t line_length,
+                                          const char *expected) {
+    size_t expected_length = strlen(expected);
+    return line_length == expected_length &&
+           memcmp(line, expected, expected_length) == 0;
+}
+
+static bool config_retirement_parse_uint(const unsigned char *value,
+                                         size_t length,
+                                         uint32_t *parsed) {
+    uint32_t result = 0;
+
+    if (!value || length == 0U || !parsed ||
+        (length > 1U && value[0] == (unsigned char)'0')) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        uint32_t digit;
+        if (value[i] < (unsigned char)'0' ||
+            value[i] > (unsigned char)'9') {
+            return false;
+        }
+        digit = (uint32_t)(value[i] - (unsigned char)'0');
+        if (result > (UINT32_MAX - digit) / 10U) return false;
+        result = result * 10U + digit;
+    }
+    if (!config_account_id_is_valid(result)) return false;
+    *parsed = result;
+    return true;
+}
+
+static bool config_retirement_parse_count(const unsigned char *value,
+                                          size_t length,
+                                          size_t *parsed) {
+    size_t result = 0;
+
+    if (!value || length == 0U || !parsed ||
+        (length > 1U && value[0] == (unsigned char)'0')) {
+        return false;
+    }
+    for (size_t i = 0; i < length; i++) {
+        size_t digit;
+        if (value[i] < (unsigned char)'0' ||
+            value[i] > (unsigned char)'9') {
+            return false;
+        }
+        digit = (size_t)(value[i] - (unsigned char)'0');
+        if (result > (SIZE_MAX - digit) / 10U) return false;
+        result = result * 10U + digit;
+    }
+    if (result == 0U || result > MAX_ACCOUNTS) return false;
+    *parsed = result;
+    return true;
+}
+
+static int config_retirement_guard_parse(
+    const unsigned char *data, size_t length,
+    config_retirement_guard_model_t *model) {
+    static const char token_prefix[] = "token=";
+    static const char operation_prefix[] = "operation=";
+    static const char owners_prefix[] = "owners=";
+    static const char owner_prefix[] = "owner=";
+    const unsigned char *cursor = data;
+    const unsigned char *end;
+    const unsigned char *line;
+    size_t line_length;
+
+    if (!data || length == 0U ||
+        length > CONFIG_RETIREMENT_GUARD_MAX_BYTES || !model) {
+        goto malformed;
+    }
+    memset(model, 0, sizeof(*model));
+    end = data + length;
+
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        !config_retirement_line_equals(
+            line, line_length, CONFIG_RETIREMENT_GUARD_HEADER)) {
+        goto malformed;
+    }
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        line_length != sizeof(token_prefix) - 1U +
+                           ACCOUNT_INCARNATION_HEX_LEN ||
+        memcmp(line, token_prefix, sizeof(token_prefix) - 1U) != 0) {
+        goto malformed;
+    }
+    memcpy(model->token, line + sizeof(token_prefix) - 1U,
+           ACCOUNT_INCARNATION_HEX_LEN);
+    model->token[ACCOUNT_INCARNATION_HEX_LEN] = '\0';
+    if (!account_incarnation_is_valid(model->token)) goto malformed;
+
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        line_length <= sizeof(operation_prefix) - 1U ||
+        memcmp(line, operation_prefix,
+               sizeof(operation_prefix) - 1U) != 0) {
+        goto malformed;
+    }
+    line += sizeof(operation_prefix) - 1U;
+    line_length -= sizeof(operation_prefix) - 1U;
+    if (config_retirement_line_equals(line, line_length, "remove")) {
+        model->kind = CONFIG_RETIREMENT_REMOVE;
+    } else if (config_retirement_line_equals(line, line_length, "reset")) {
+        model->kind = CONFIG_RETIREMENT_RESET;
+    } else {
+        goto malformed;
+    }
+
+    if (!config_retirement_next_line(&cursor, end, &line, &line_length) ||
+        line_length <= sizeof(owners_prefix) - 1U ||
+        memcmp(line, owners_prefix, sizeof(owners_prefix) - 1U) != 0 ||
+        !config_retirement_parse_count(
+            line + sizeof(owners_prefix) - 1U,
+            line_length - (sizeof(owners_prefix) - 1U),
+            &model->owner_count)) {
+        goto malformed;
+    }
+
+    for (size_t i = 0; i < model->owner_count; i++) {
+        const unsigned char *colon;
+        size_t id_length;
+        const unsigned char *incarnation;
+
+        if (!config_retirement_next_line(&cursor, end, &line,
+                                         &line_length) ||
+            line_length <= sizeof(owner_prefix) - 1U ||
+            memcmp(line, owner_prefix, sizeof(owner_prefix) - 1U) != 0) {
+            goto malformed;
+        }
+        line += sizeof(owner_prefix) - 1U;
+        line_length -= sizeof(owner_prefix) - 1U;
+        colon = memchr(line, ':', line_length);
+        if (!colon) goto malformed;
+        id_length = (size_t)(colon - line);
+        incarnation = colon + 1;
+        if (!config_retirement_parse_uint(
+                line, id_length, &model->owners[i].account_id) ||
+            (size_t)((line + line_length) - incarnation) !=
+                ACCOUNT_INCARNATION_HEX_LEN) {
+            goto malformed;
+        }
+        memcpy(model->owners[i].account_incarnation, incarnation,
+               ACCOUNT_INCARNATION_HEX_LEN);
+        model->owners[i]
+            .account_incarnation[ACCOUNT_INCARNATION_HEX_LEN] = '\0';
+        if (!account_incarnation_is_valid(
+                model->owners[i].account_incarnation) ||
+            (i > 0U &&
+             config_retirement_owner_compare(&model->owners[i - 1],
+                                             &model->owners[i]) >= 0)) {
+            goto malformed;
+        }
+    }
+    if (cursor != end) goto malformed;
+    return 0;
+
+malformed:
+    if (model) secure_zero_memory(model, sizeof(*model));
+    errno = EINVAL;
+    set_error(ERR_CONFIG_INVALID,
+              "Retirement-incomplete marker is malformed");
+    return -1;
+}
+
+static int config_retirement_guard_serialize(
+    config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const char token[ACCOUNT_INCARNATION_LEN],
+    unsigned char **serialized, size_t *serialized_length) {
+    unsigned char *data;
+    size_t used = 0;
+    const char *kind_name = config_retirement_kind_name(kind);
+    int written;
+
+    if (!kind_name || !owners || owner_count == 0U ||
+        owner_count > MAX_ACCOUNTS ||
+        !account_incarnation_is_valid(token) || !serialized ||
+        !serialized_length) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard serialization arguments");
+        return -1;
+    }
+    *serialized = NULL;
+    *serialized_length = 0;
+    data = malloc(CONFIG_RETIREMENT_GUARD_MAX_BYTES);
+    if (!data) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate retirement guard marker");
+        return -1;
+    }
+#define CONFIG_RETIREMENT_ACCEPT_WRITE()                                   \
+    do {                                                                   \
+        if (written < 0 ||                                                 \
+            (size_t)written >=                                             \
+                CONFIG_RETIREMENT_GUARD_MAX_BYTES - used) {                \
+            secure_zero_memory(data, CONFIG_RETIREMENT_GUARD_MAX_BYTES);   \
+            free(data);                                                    \
+            errno = EOVERFLOW;                                             \
+            set_error(ERR_CONFIG_INVALID,                                  \
+                      "Retirement guard marker exceeds its byte limit");  \
+            return -1;                                                     \
+        }                                                                  \
+        used += (size_t)written;                                           \
+    } while (0)
+
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "%s\n", CONFIG_RETIREMENT_GUARD_HEADER);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "token=%s\n", token);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "operation=%s\n", kind_name);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    written = snprintf((char *)data + used,
+                       CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                       "owners=%zu\n", owner_count);
+    CONFIG_RETIREMENT_ACCEPT_WRITE();
+    for (size_t i = 0; i < owner_count; i++) {
+        written = snprintf((char *)data + used,
+                           CONFIG_RETIREMENT_GUARD_MAX_BYTES - used,
+                           "owner=%u:%s\n",
+                           (unsigned int)owners[i].account_id,
+                           owners[i].account_incarnation);
+        CONFIG_RETIREMENT_ACCEPT_WRITE();
+    }
+#undef CONFIG_RETIREMENT_ACCEPT_WRITE
+    *serialized = data;
+    *serialized_length = used;
+    return 0;
+}
+
+/* Open only an already-existing private config directory. Probe uses the
+ * `allow_absent` result to report a cleanly absent marker without creating or
+ * repairing any namespace object. */
+static int config_retirement_open_directory(
+    const char *config_path, bool allow_absent, char directory[MAX_PATH_LEN],
+    struct stat *directory_identity, int *directory_fd) {
+    struct stat opened;
+    int fd;
+
+    if (!config_path || !directory || !directory_identity || !directory_fd) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard directory arguments");
+        return -1;
+    }
+    *directory_fd = -1;
+    if (config_directory_for_path(config_path, directory, MAX_PATH_LEN) != 0) {
+        return -1;
+    }
+    errno = 0;
+    if (lstat(directory, directory_identity) != 0) {
+        if (allow_absent && errno == ENOENT) return 1;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect retirement guard directory: %s",
+                         directory);
+        return -1;
+    }
+    if (!config_metadata_dir_is_safe(directory_identity)) {
+        errno = EACCES;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Retirement guard directory is not private and self-owned: %s",
+                  directory);
+        return -1;
+    }
+    fd = open(directory,
+              O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_dir_is_safe(&opened) ||
+        !config_metadata_same_file(directory_identity, &opened) ||
+        !config_named_directory_matches(directory, directory_identity)) {
+        int saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot pin retirement guard directory: %s",
+                         directory);
+        return -1;
+    }
+    *directory_fd = fd;
+    return 0;
+}
+
+static int config_retirement_guard_read_named_at(
+    int directory_fd, const char *name, bool *absent, unsigned char **data,
+    size_t *length, struct stat *identity,
+    config_retirement_guard_model_t *model) {
+    struct stat named_before;
+    struct stat opened;
+    struct stat descriptor_after;
+    struct stat named_after;
+    unsigned char *buffer = NULL;
+    unsigned char extra;
+    ssize_t extra_count;
+    int fd = -1;
+    int failure_errno = EIO;
+
+    if (directory_fd < 0 || !name || name[0] == '\0' || !absent || !data ||
+        !length || !identity || !model) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard read arguments");
+        return -1;
+    }
+    *absent = false;
+    *data = NULL;
+    *length = 0;
+    memset(identity, 0, sizeof(*identity));
+    memset(model, 0, sizeof(*model));
+
+    errno = 0;
+    if (fstatat(directory_fd, name, &named_before,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *absent = true;
+            return 0;
+        }
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&named_before, true) ||
+        named_before.st_size <= 0 ||
+        (uintmax_t)named_before.st_size >
+            CONFIG_RETIREMENT_GUARD_MAX_BYTES) {
+        failure_errno = EACCES;
+        goto read_fail;
+    }
+    fd = openat(directory_fd, name,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(&named_before, &opened) ||
+        opened.st_size <= 0 ||
+        (uintmax_t)opened.st_size > CONFIG_RETIREMENT_GUARD_MAX_BYTES) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    *length = (size_t)opened.st_size;
+    buffer = malloc(*length);
+    if (!buffer) {
+        failure_errno = ENOMEM;
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate retirement guard read buffer");
+        goto read_fail_preserve_error;
+    }
+    if (!config_pread_full(fd, buffer, *length, 0)) {
+        failure_errno = errno ? errno : EIO;
+        goto read_fail;
+    }
+    do {
+        errno = 0;
+        extra_count = pread(fd, &extra, 1, (off_t)*length);
+    } while (extra_count < 0 && errno == EINTR);
+    if (extra_count != 0 || fstat(fd, &descriptor_after) != 0 ||
+        fstatat(directory_fd, name, &named_after,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        failure_errno = errno ? errno : ESTALE;
+        goto read_fail;
+    }
+    if (!config_metadata_file_is_safe(&descriptor_after, true) ||
+        !config_metadata_file_is_safe(&named_after, true) ||
+        !config_metadata_snapshot_same(&opened, &descriptor_after) ||
+        !config_metadata_snapshot_same(&opened, &named_after)) {
+        failure_errno = ESTALE;
+        goto read_fail;
+    }
+    if (config_retirement_guard_parse(buffer, *length, model) != 0) {
+        failure_errno = errno ? errno : EINVAL;
+        goto read_fail_preserve_error;
+    }
+
+    close(fd);
+    *identity = named_after;
+    *data = buffer;
+    return 0;
+
+read_fail:
+    errno = failure_errno;
+    set_system_error(ERR_FILE_IO,
+                     "Cannot read a stable private retirement-incomplete marker");
+read_fail_preserve_error:
+    if (fd >= 0) close(fd);
+    if (buffer) {
+        secure_zero_memory(buffer, *length);
+        free(buffer);
+    }
+    *data = NULL;
+    *length = 0;
+    secure_zero_memory(model, sizeof(*model));
+    errno = failure_errno;
+    return -1;
+}
+
+/* Earlier M18 builds could retain random clear witnesses. They are never
+ * silently reclaimed: any such residue remains a fail-closed compatibility
+ * blocker until an operator inspects it. New transitions use one fixed stage
+ * name and therefore cannot grow this namespace. */
+static int config_retirement_guard_legacy_residue_present_at(
+    int directory_fd, bool *present) {
+    static const char prefix[] = CONFIG_RETIREMENT_GUARD_NAME ".clear.";
+    DIR *stream;
+    struct dirent *entry;
+    int scan_fd;
+    int scan_errno;
+    int close_result;
+
+    if (directory_fd < 0 || !present) {
+        errno = EINVAL;
+        return -1;
+    }
+    *present = true;
+    scan_fd = openat(directory_fd, ".",
+                     O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+    if (scan_fd < 0) return -1;
+    stream = fdopendir(scan_fd);
+    if (!stream) {
+        int saved_errno = errno ? errno : EIO;
+        close(scan_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    *present = false;
+    errno = 0;
+    while ((entry = readdir(stream)) != NULL) {
+        if (strncmp(entry->d_name, prefix, sizeof(prefix) - 1U) == 0 &&
+            entry->d_name[sizeof(prefix) - 1U] != '\0') {
+            *present = true;
+            break;
+        }
+    }
+    scan_errno = errno;
+    close_result = closedir(stream);
+    if (scan_errno != 0 || close_result != 0) {
+        errno = scan_errno != 0 ? scan_errno : (errno ? errno : EIO);
+        *present = true;
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    bool marker_absent;
+    bool completion_absent;
+    bool stage_present;
+    unsigned char *marker_data;
+    size_t marker_length;
+    struct stat marker_identity;
+    config_retirement_guard_model_t marker_model;
+    unsigned char *completion_data;
+    size_t completion_length;
+    struct stat completion_identity;
+    config_retirement_guard_model_t completion_model;
+} config_retirement_guard_pair_t;
+
+static void config_retirement_guard_pair_clear(
+    config_retirement_guard_pair_t *pair) {
+    if (!pair) return;
+    if (pair->marker_data) {
+        secure_zero_memory(pair->marker_data, pair->marker_length);
+        free(pair->marker_data);
+    }
+    if (pair->completion_data) {
+        secure_zero_memory(pair->completion_data,
+                           pair->completion_length);
+        free(pair->completion_data);
+    }
+    secure_zero_memory(pair, sizeof(*pair));
+}
+
+static int config_retirement_guard_stage_state_at(
+    int directory_fd, bool *present, struct stat *identity) {
+    struct stat named;
+
+    if (directory_fd < 0 || !present) {
+        errno = EINVAL;
+        return -1;
+    }
+    *present = true;
+    if (identity) memset(identity, 0, sizeof(*identity));
+    errno = 0;
+    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+            *present = false;
+            return 0;
+        }
+        return -1;
+    }
+    if (!config_metadata_file_is_safe(&named, true) ||
+        named.st_size < 0 ||
+        (uintmax_t)named.st_size > CONFIG_RETIREMENT_GUARD_MAX_BYTES) {
+        errno = EACCES;
+        return -1;
+    }
+    if (identity) *identity = named;
+    return 0;
+}
+
+static int config_retirement_guard_name_stable_at(
+    int directory_fd, const char *name, bool absent,
+    const struct stat *expected) {
+    struct stat named;
+
+    errno = 0;
+    if (fstatat(directory_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (absent && errno == ENOENT) return 0;
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    if (absent || !expected ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_snapshot_same(expected, &named)) {
+        errno = ESTALE;
+        return -1;
+    }
+    return 0;
+}
+
+/* Read C and S as one generation. Each individual reader pins and re-proves
+ * its descriptor; the final name reproof closes the mixed-generation window
+ * across the two reads. A transition stage is part of the snapshot and always
+ * blocks probe, even if C/S otherwise form an exact completed pair. */
+static int config_retirement_guard_pair_read_at(
+    int directory_fd, config_retirement_guard_pair_t *pair) {
+    struct stat stage_before;
+    struct stat stage_after;
+    bool stage_after_present = false;
+
+    if (directory_fd < 0 || !pair) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(pair, 0, sizeof(*pair));
+    if (config_retirement_guard_stage_state_at(
+            directory_fd, &pair->stage_present, &stage_before) != 0 ||
+        config_retirement_guard_read_named_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            &pair->marker_absent, &pair->marker_data,
+            &pair->marker_length, &pair->marker_identity,
+            &pair->marker_model) != 0) {
+        goto pair_fail;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_PAIR_AFTER_MARKER_READ,
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
+        config_retirement_guard_read_named_at(
+            directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            &pair->completion_absent, &pair->completion_data,
+            &pair->completion_length, &pair->completion_identity,
+            &pair->completion_model) != 0 ||
+        config_retirement_guard_name_stable_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            pair->marker_absent, &pair->marker_identity) != 0 ||
+        config_retirement_guard_name_stable_at(
+            directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            pair->completion_absent, &pair->completion_identity) != 0 ||
+        config_retirement_guard_stage_state_at(
+            directory_fd, &stage_after_present, &stage_after) != 0) {
+        goto pair_fail;
+    }
+    if (pair->stage_present != stage_after_present ||
+        (pair->stage_present &&
+         !config_metadata_snapshot_same(&stage_before, &stage_after))) {
+        errno = ESTALE;
+        goto pair_fail;
+    }
+    return 0;
+
+pair_fail:
+    config_retirement_guard_pair_clear(pair);
+    return -1;
+}
+
+static bool config_retirement_guard_pair_exact(
+    const config_retirement_guard_pair_t *pair) {
+    return pair && !pair->marker_absent && !pair->completion_absent &&
+           !pair->stage_present &&
+           pair->marker_length == pair->completion_length &&
+           memcmp(pair->marker_data, pair->completion_data,
+                  pair->marker_length) == 0;
+}
+
+static bool config_retirement_owner_sets_equal(
+    const config_retirement_guard_model_t *model,
+    config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count) {
+    if (!model || model->kind != kind ||
+        model->owner_count != owner_count) {
+        return false;
+    }
+    for (size_t i = 0; i < owner_count; i++) {
+        if (model->owners[i].account_id != owners[i].account_id ||
+            strcmp(model->owners[i].account_incarnation,
+                   owners[i].account_incarnation) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int config_retirement_guard_stage_remove_at(int directory_fd) {
+    struct stat before;
+    struct stat opened;
+    struct stat named;
+    bool present = false;
+    int fd = -1;
+    int saved_errno;
+
+    if (config_retirement_guard_stage_state_at(
+            directory_fd, &present, &before) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect retirement transition stage");
+        return -1;
+    }
+    if (!present) return 0;
+    fd = openat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true) ||
+        !config_metadata_snapshot_same(&before, &opened) ||
+        fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_snapshot_same(&opened, &named)) {
+        saved_errno = errno ? errno : ESTALE;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement transition stage changed during recovery");
+        return -1;
+    }
+    if (unlinkat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, 0) != 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot remove retained retirement transition stage");
+        return -1;
+    }
+    if (close(fd) != 0 || fsync(directory_fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot durably remove retirement transition stage");
+        return -1;
+    }
+    return 0;
+}
+
+static int config_retirement_guard_stage_write_at(
+    int directory_fd, const unsigned char *data, size_t length,
+    bool clear_transition, struct stat *stage_identity) {
+    struct stat opened;
+    struct stat named;
+    size_t total = 0U;
+    int fd = -1;
+    int saved_errno;
+
+    if (directory_fd < 0 || !data || length == 0U ||
+        length > CONFIG_RETIREMENT_GUARD_MAX_BYTES || !stage_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (clear_transition &&
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_STAGE_CREATE,
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME) != 0) {
+        set_system_error(ERR_FILE_IO,
+                         "Retirement completion failed before stage creation");
+        return -1;
+    }
+    fd = openat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                PERM_USER_RW);
+    if (fd < 0 || fchmod(fd, PERM_USER_RW) != 0 ||
+        fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true)) {
+        saved_errno = errno ? errno : EIO;
+        if (fd >= 0) close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot create private retirement transition stage");
+        return -1;
+    }
+    while (total < length) {
+        ssize_t count = write(fd, data + total, length - total);
+
+        if (count > 0) {
+            total += (size_t)count;
+        } else if (count < 0 && errno == EINTR) {
+            continue;
+        } else {
+            saved_errno = errno ? errno : EIO;
+            close(fd);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot write retirement transition stage");
+            return -1;
+        }
+    }
+    if (clear_transition &&
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_AFTER_STAGE_WRITE,
+            directory_fd, CONFIG_RETIREMENT_STAGE_NAME) != 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement completion failed after stage write");
+        return -1;
+    }
+    if (clear_transition &&
+        RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_FILE_SYNC,
+            fd, CONFIG_RETIREMENT_STAGE_NAME) != 0) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement completion stage sync was interrupted");
+        return -1;
+    }
+    if (fsync(fd) != 0 || fstat(fd, &opened) != 0 ||
+        !config_metadata_file_is_safe(&opened, true) ||
+        opened.st_size < 0 || (uintmax_t)opened.st_size != length) {
+        saved_errno = errno ? errno : EIO;
+        close(fd);
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot sync retirement transition stage");
+        return -1;
+    }
+    if (close(fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(ERR_FILE_IO,
+                         "Cannot close retirement transition stage");
+        return -1;
+    }
+    if (fstatat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_snapshot_same(&opened, &named)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(ERR_FILE_IO,
+                         "Retirement transition stage changed before publication");
+        return -1;
+    }
+    *stage_identity = named;
+    return 0;
+}
+
+static int config_retirement_guard_stage_publish_at(
+    int directory_fd, const char *destination,
+    const struct stat *stage_identity, struct stat *published_identity) {
+    struct stat named;
+
+    if (directory_fd < 0 || !destination || !stage_identity ||
+        !published_identity) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (renameat(directory_fd, CONFIG_RETIREMENT_STAGE_NAME,
+                 directory_fd, destination) != 0 ||
+        fstatat(directory_fd, destination, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        !config_metadata_file_is_safe(&named, true) ||
+        !config_metadata_same_file(stage_identity, &named)) {
+        errno = errno ? errno : ESTALE;
+        return -1;
+    }
+    *published_identity = named;
+    return 0;
+}
+
+static void config_retirement_guard_free(
+    config_retirement_guard_t *guard) {
+    if (!guard) return;
+    if (g_retirement_guard_owner_pid == getpid()) {
+        g_retirement_guard_owner_pid = 0;
+    }
+    if (guard->lock_fd >= 0) unlock_private_file(guard->lock_fd);
+    if (guard->directory_fd >= 0) close(guard->directory_fd);
+    if (guard->marker_data) {
+        secure_zero_memory(guard->marker_data, guard->marker_length);
+        free(guard->marker_data);
+    }
+    secure_zero_memory(guard, sizeof(*guard));
+    free(guard);
+}
+
+static int config_retirement_guard_make_handle(
+    int directory_fd, int lock_fd, const char *directory,
+    const struct stat *directory_identity, const struct stat *marker_identity,
+    unsigned char *marker_data, size_t marker_length,
+    const char token[ACCOUNT_INCARNATION_LEN], bool created,
+    config_retirement_guard_t **out) {
+    config_retirement_guard_t *guard = calloc(1, sizeof(*guard));
+
+    if (!guard) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate retirement guard handle");
+        return -1;
+    }
+    guard->directory_fd = directory_fd;
+    guard->lock_fd = lock_fd;
+    guard->directory_identity = *directory_identity;
+    guard->marker_identity = *marker_identity;
+    guard->marker_data = marker_data;
+    guard->marker_length = marker_length;
+    memcpy(guard->token, token, sizeof(guard->token));
+    guard->created = created;
+    if (safe_strncpy(guard->directory, directory,
+                     sizeof(guard->directory)) != 0) {
+        /* Ownership of fd/data transfers only after the handle is complete. */
+        guard->directory_fd = -1;
+        guard->lock_fd = -1;
+        guard->marker_data = NULL;
+        free(guard);
+        return -1;
+    }
+    g_retirement_guard_owner_pid = getpid();
+    *out = guard;
+    return 0;
+}
+
+int config_retirement_guard_install_or_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard) {
+    static const char hexadecimal[] = "0123456789ABCDEF";
+    config_retirement_owner_t canonical[MAX_ACCOUNTS];
+    config_retirement_guard_pair_t pair;
+    config_retirement_guard_pair_t revalidated_pair;
+    char directory[MAX_PATH_LEN];
+    char token[ACCOUNT_INCARNATION_LEN];
+    struct stat directory_identity;
+    struct stat published_identity;
+    struct stat stage_identity;
+    unsigned char *marker_data = NULL;
+    size_t marker_length = 0U;
+    int directory_fd = -1;
+    int lock_fd = -1;
+    int result = -1;
+    int saved_errno = EIO;
+    bool legacy_residue = false;
+
+    if (!guard || *guard || !config_path ||
+        !config_retirement_kind_name(kind)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard installation arguments");
+        return -1;
+    }
+    if (g_retirement_guard_owner_pid != 0) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "This process already owns a retirement lifecycle transaction");
+        return -1;
+    }
+    memset(canonical, 0, sizeof(canonical));
+    memset(&pair, 0, sizeof(pair));
+    memset(&revalidated_pair, 0, sizeof(revalidated_pair));
+    memset(token, 0, sizeof(token));
+    if (config_retirement_canonicalize_owners(
+            owners, owner_count, canonical) != 0) {
+        goto install_done;
+    }
+    result = config_retirement_open_directory(
+        config_path, false, directory, &directory_identity, &directory_fd);
+    if (result != 0) goto install_done;
+    /* From here onward only the two handle-publication paths may report
+     * success. Keep every validation, lock, sync, and reproof failure at -1
+     * instead of leaking the directory-open success code with a NULL handle. */
+    result = -1;
+
+    lock_fd = try_lock_private_file_at(
+        directory_fd, CONFIG_RETIREMENT_LOCK_NAME);
+    if (lock_fd < 0) {
+        saved_errno = errno ? errno : EIO;
+        errno = saved_errno;
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot acquire the retirement lifecycle lock");
+        goto install_done;
+    }
+    if (config_retirement_guard_legacy_residue_present_at(
+            directory_fd, &legacy_residue) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot inspect legacy retirement guard residue");
+        goto install_done;
+    }
+    if (legacy_residue) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "A retained retirement guard clear witness blocks configuration mutation");
+        goto install_done;
+    }
+    if (config_retirement_guard_stage_remove_at(directory_fd) != 0 ||
+        config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+
+    if (!pair.marker_absent &&
+        !config_retirement_guard_pair_exact(&pair)) {
+        if (!config_retirement_owner_sets_equal(
+                &pair.marker_model, kind, canonical, owner_count)) {
+            errno = EBUSY;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "A different retirement-incomplete operation already blocks configuration mutation");
+            goto install_done;
+        }
+        if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+                RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+                directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
+            fsync(directory_fd) != 0) {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot prove the retained retirement guard generation durable");
+            goto install_done;
+        }
+        if (config_retirement_guard_pair_read_at(
+                directory_fd, &revalidated_pair) != 0 ||
+            revalidated_pair.marker_absent ||
+            revalidated_pair.stage_present ||
+            config_retirement_guard_pair_exact(&revalidated_pair) ||
+            !config_metadata_snapshot_same(
+                &pair.marker_identity,
+                &revalidated_pair.marker_identity) ||
+            pair.marker_length != revalidated_pair.marker_length ||
+            memcmp(pair.marker_data, revalidated_pair.marker_data,
+                   pair.marker_length) != 0 ||
+            strcmp(pair.marker_model.token,
+                   revalidated_pair.marker_model.token) != 0 ||
+            !config_retirement_owner_sets_equal(
+                &revalidated_pair.marker_model, kind,
+                canonical, owner_count) ||
+            !config_named_directory_matches(
+                directory, &directory_identity)) {
+            errno = errno ? errno : ESTALE;
+            set_system_error(
+                ERR_FILE_IO,
+                "Retained retirement guard changed during durability proof");
+            goto install_done;
+        }
+        memcpy(token, revalidated_pair.marker_model.token, sizeof(token));
+        if (config_retirement_guard_make_handle(
+                directory_fd, lock_fd, directory, &directory_identity,
+                &revalidated_pair.marker_identity,
+                revalidated_pair.marker_data,
+                revalidated_pair.marker_length,
+                token, false, guard) != 0) {
+            goto install_done;
+        }
+        revalidated_pair.marker_data = NULL;
+        revalidated_pair.marker_length = 0U;
+        directory_fd = -1;
+        lock_fd = -1;
+        result = 0;
+        goto install_done;
+    }
+    if (pair.marker_absent && !pair.completion_absent) {
+        errno = EBUSY;
+        set_error(
+            ERR_CONFIG_INVALID,
+            "A lone retirement completion certificate blocks configuration mutation");
+        goto install_done;
+    }
+
+    for (unsigned int attempt = 0U; attempt < 16U; attempt++) {
+        if (generate_random_string(
+                token, sizeof(token), hexadecimal) != 0 ||
+            !account_incarnation_is_valid(token) ||
+            config_retirement_guard_serialize(
+                kind, canonical, owner_count, token, &marker_data,
+                &marker_length) != 0) {
+            goto install_done;
+        }
+        if (pair.completion_absent ||
+            marker_length != pair.completion_length ||
+            memcmp(marker_data, pair.completion_data,
+                   marker_length) != 0) {
+            break;
+        }
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+        marker_data = NULL;
+        marker_length = 0U;
+        secure_zero_memory(token, sizeof(token));
+    }
+    if (!marker_data) {
+        errno = EEXIST;
+        set_error(
+            ERR_FILE_IO,
+            "Cannot generate a fresh retirement guard generation");
+        goto install_done;
+    }
+    if (config_retirement_guard_stage_write_at(
+            directory_fd, marker_data, marker_length, false,
+            &stage_identity) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        goto install_done;
+    }
+    if (config_retirement_guard_stage_publish_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            &stage_identity, &published_identity) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot publish the fresh retirement guard generation");
+        goto install_done;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_INSTALL_BEFORE_DIR_SYNC,
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME) != 0 ||
+        fsync(directory_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot durably publish the fresh retirement guard generation");
+        goto install_done;
+    }
+    if (config_reprove_published_file_at(
+            directory_fd, CONFIG_RETIREMENT_GUARD_NAME,
+            &published_identity, marker_data, marker_length,
+            &published_identity) != 0) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Fresh retirement guard changed during commit");
+        goto install_done;
+    }
+
+    config_retirement_guard_pair_clear(&pair);
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        pair.marker_absent || pair.stage_present ||
+        !config_metadata_same_file(
+            &published_identity, &pair.marker_identity) ||
+        pair.marker_length != marker_length ||
+        memcmp(pair.marker_data, marker_data, marker_length) != 0 ||
+        config_retirement_guard_pair_exact(&pair) ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Fresh retirement guard is not a stable blocking generation");
+        goto install_done;
+    }
+    if (config_retirement_guard_make_handle(
+            directory_fd, lock_fd, directory, &directory_identity,
+            &pair.marker_identity, marker_data, marker_length,
+            token, true, guard) != 0) {
+        goto install_done;
+    }
+    marker_data = NULL;
+    marker_length = 0U;
+    directory_fd = -1;
+    lock_fd = -1;
+    result = 0;
+
+install_done:
+    if (result != 0) saved_errno = errno ? errno : EIO;
+    if (lock_fd >= 0) unlock_private_file(lock_fd);
+    if (directory_fd >= 0) close(directory_fd);
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_pair_clear(&revalidated_pair);
+    if (marker_data) {
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+    }
+    secure_zero_memory(canonical, sizeof(canonical));
+    secure_zero_memory(token, sizeof(token));
+    if (result != 0) errno = saved_errno;
+    return result;
+}
+int config_retirement_guard_probe(
+    const char *config_path, bool *blocked) {
+    config_retirement_guard_pair_t pair;
+    char directory[MAX_PATH_LEN];
+    struct stat directory_identity;
+    int directory_fd = -1;
+    int result;
+    bool legacy_residue = false;
+
+    if (!config_path || !blocked) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard probe arguments");
+        return -1;
+    }
+    *blocked = true;
+    memset(&pair, 0, sizeof(pair));
+    result = config_retirement_open_directory(
+        config_path, true, directory, &directory_identity, &directory_fd);
+    if (result == 1) {
+        *blocked = false;
+        return 0;
+    }
+    if (result != 0) return -1;
+
+    if (config_retirement_guard_pair_read_at(
+            directory_fd, &pair) != 0 ||
+        config_retirement_guard_legacy_residue_present_at(
+            directory_fd, &legacy_residue) != 0 ||
+        !config_named_directory_matches(
+            directory, &directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        result = -1;
+        goto probe_done;
+    }
+    if (!pair.stage_present && !legacy_residue &&
+        ((pair.marker_absent && pair.completion_absent) ||
+         config_retirement_guard_pair_exact(&pair))) {
+        *blocked = false;
+    }
+    result = 0;
+
+probe_done:
+    config_retirement_guard_pair_clear(&pair);
+    close(directory_fd);
+    return result;
+}
+bool config_retirement_guard_was_created(
+    const config_retirement_guard_t *guard) {
+    return guard && guard->created;
+}
+
+/* Bind completion to the exact canonical blocker generation held by this
+ * handle.  Both inode identity and complete serialized bytes must still match;
+ * a replaced, rewritten, or mixed-generation marker cannot be certified. */
+static bool config_retirement_guard_pair_matches_handle(
+    const config_retirement_guard_t *guard,
+    const config_retirement_guard_pair_t *pair) {
+    return guard && pair && !pair->marker_absent &&
+           config_metadata_same_file(
+               &guard->marker_identity, &pair->marker_identity) &&
+           guard->marker_length == pair->marker_length &&
+           memcmp(guard->marker_data, pair->marker_data,
+                  guard->marker_length) == 0 &&
+           strcmp(guard->token, pair->marker_model.token) == 0;
+}
+
+int config_retirement_guard_clear(
+    config_retirement_guard_t **guard_ptr) {
+    config_retirement_guard_t *guard;
+    config_retirement_guard_pair_t pair;
+    struct stat published_identity;
+    struct stat stage_identity;
+    error_context_t primary_error;
+    int primary_errno = 0;
+    bool have_primary = false;
+    bool publication_attempted = false;
+
+    if (!guard_ptr || !*guard_ptr) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement guard clear handle");
+        return -1;
+    }
+    guard = *guard_ptr;
+    memset(&pair, 0, sizeof(pair));
+    memset(&primary_error, 0, sizeof(primary_error));
+
+    if (!config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement guard directory changed before completion");
+        goto clear_fail;
+    }
+
+    if (config_retirement_guard_stage_remove_at(
+            guard->directory_fd) != 0) {
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) != 0 ||
+        !config_retirement_guard_pair_matches_handle(
+            guard, &pair) ||
+        !config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        if (errno == 0) errno = ESTALE;
+        if (get_last_error()->message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Retirement guard generation changed before completion");
+        }
+        goto clear_fail;
+    }
+    if (config_retirement_guard_pair_exact(&pair)) {
+        goto clear_success;
+    }
+    config_retirement_guard_pair_clear(&pair);
+
+    if (config_retirement_guard_stage_write_at(
+            guard->directory_fd, guard->marker_data,
+            guard->marker_length, true, &stage_identity) != 0) {
+        goto clear_fail;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_PUBLISH,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion failed before certificate publication");
+        goto clear_fail;
+    }
+
+    publication_attempted = true;
+    if (config_retirement_guard_stage_publish_at(
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME,
+            &stage_identity, &published_identity) != 0) {
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        if (primary_error.message[0] == '\0') {
+            set_system_error(
+                ERR_FILE_IO,
+                "Cannot publish retirement completion certificate");
+            primary_error = *get_last_error();
+        }
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_AFTER_PUBLISH,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion acknowledgement failed after publication");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_BEFORE_DIR_SYNC,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion directory sync was interrupted");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (fsync(guard->directory_fd) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Cannot sync retirement completion certificate");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+        goto classify_commit;
+    }
+    if (RETIREMENT_GUARD_CLEAR_TEST_CHECKPOINT(
+            RETIREMENT_GUARD_CLEAR_AFTER_DIR_SYNC,
+            guard->directory_fd, CONFIG_RETIREMENT_COMPLETE_NAME) != 0) {
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion directory sync acknowledgement was lost");
+        primary_error = *get_last_error();
+        primary_errno = errno ? errno : EIO;
+        have_primary = true;
+    }
+
+classify_commit:
+    config_retirement_guard_pair_clear(&pair);
+    if (config_retirement_guard_pair_read_at(
+            guard->directory_fd, &pair) == 0 &&
+        config_retirement_guard_pair_matches_handle(
+            guard, &pair) &&
+        config_retirement_guard_pair_exact(&pair) &&
+        config_named_directory_matches(
+            guard->directory, &guard->directory_identity)) {
+        if (have_primary || publication_attempted) {
+            if (have_primary) {
+                log_warning(
+                    "Retirement completion is exact despite a lost filesystem acknowledgement: %s",
+                    primary_error.message[0]
+                        ? primary_error.message
+                        : "unknown completion acknowledgement");
+            }
+        }
+        goto clear_success;
+    }
+    if (have_primary) {
+        g_last_error = primary_error;
+        errno = primary_errno;
+    } else {
+        errno = errno ? errno : ESTALE;
+        set_system_error(
+            ERR_FILE_IO,
+            "Retirement completion certificate is not an exact stable pair");
+    }
+    goto clear_fail;
+
+clear_success:
+    config_retirement_guard_pair_clear(&pair);
+    config_retirement_guard_free(guard);
+    *guard_ptr = NULL;
+    clear_error();
+    errno = 0;
+    return 0;
+
+clear_fail:
+    config_retirement_guard_pair_clear(&pair);
+    return -1;
+}
+
+void config_retirement_guard_abandon(
+    config_retirement_guard_t **guard) {
+    if (!guard || !*guard) return;
+    /* clear() never removes or renames the canonical blocker. A failed
+     * transition may retain the one fixed stage, which probe also classifies
+     * as blocked; releasing the lifecycle lock cannot reopen mutation. */
+    config_retirement_guard_free(*guard);
+    *guard = NULL;
+}
 static int config_write_lock_directory(const char *dir) {
     char lockpath[MAX_PATH_LEN];
     struct stat dir_identity;
@@ -1521,7 +3788,7 @@ int config_resume_hint_probe(char *needs, size_t size) {
     }
     needs[0] = '\0';
     if (config_get_path(config_path, sizeof(config_path)) != 0 ||
-        config_read_active_state(config_path, &state, true) != 0) {
+        config_read_active_state(config_path, &state, true, NULL, NULL) != 0) {
         return -1;
     }
     if (!state.exists) {
@@ -1537,7 +3804,7 @@ int config_resume_hint_probe(char *needs, size_t size) {
     return safe_strncpy(needs, normalized, size);
 }
 
-#define CONFIG_RESUME_HINT_SNAPSHOT_MAX 4096U
+#define CONFIG_RESUME_HINT_SNAPSHOT_MAX CONFIG_ACTIVE_STATE_MAX
 
 void config_resume_hint_snapshot_clear(
     config_resume_hint_snapshot_t *snapshot) {
@@ -1547,6 +3814,11 @@ void config_resume_hint_snapshot_clear(
     if (snapshot->data) {
         secure_zero_memory(snapshot->data, snapshot->length);
         free(snapshot->data);
+    }
+    if (snapshot->post_image_data) {
+        secure_zero_memory(snapshot->post_image_data,
+                           snapshot->post_image_length);
+        free(snapshot->post_image_data);
     }
     memset(snapshot, 0, sizeof(*snapshot));
 }
@@ -1650,6 +3922,8 @@ static int config_resume_hint_snapshot_capture_at(
 
     snapshot->data = data;
     snapshot->mode = (unsigned int)(opened.st_mode & 0777);
+    snapshot->before_image = opened;
+    snapshot->before_image_valid = true;
     snapshot->existed = true;
     snapshot->valid = true;
     return 0;
@@ -1678,10 +3952,65 @@ static int config_resume_hint_snapshot_bind_post_image(
     snapshot->post_image_installed = false;
     snapshot->post_image_valid = false;
     memset(&snapshot->post_image, 0, sizeof(snapshot->post_image));
-    secure_zero_memory(snapshot->post_image_data,
-                       sizeof(snapshot->post_image_data));
+    if (snapshot->post_image_data) {
+        secure_zero_memory(snapshot->post_image_data,
+                           snapshot->post_image_length);
+        free(snapshot->post_image_data);
+        snapshot->post_image_data = NULL;
+    }
     snapshot->post_image_length = 0;
     return 0;
+}
+
+/* A guarded transaction starts from a before-image captured before its
+ * surrounding mutation. Re-read the state only after entering the
+ * destination's write lock, then prove that no cooperating state writer
+ * committed in the gap.
+ * The complete bytes distinguish same-inode rewrites; the captured metadata
+ * distinguishes atomic replacement even when a later writer restored the
+ * same bytes. FreeBSD may materialize ctime during a directory sync, so admit
+ * only that narrow metadata drift when the independent byte witness matches. */
+static int config_resume_hint_snapshot_require_before_image(
+    const char *hint, const config_resume_hint_snapshot_t *snapshot,
+    const config_active_state_generation_t *current) {
+    bool content_same;
+    bool metadata_same;
+
+    if (!hint || !snapshot || !snapshot->valid || !current ||
+        snapshot->length > CONFIG_ACTIVE_STATE_MAX ||
+        (snapshot->length != 0U && !snapshot->data)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid active-state rollback before-image proof");
+        return -1;
+    }
+    if (snapshot->existed != current->existed) {
+        goto conflict;
+    }
+    if (!snapshot->existed) {
+        return 0;
+    }
+    if (!snapshot->before_image_valid || !current->data ||
+        snapshot->length != current->length) {
+        goto conflict;
+    }
+    content_same = snapshot->length == 0U ||
+                   memcmp(snapshot->data, current->data,
+                          snapshot->length) == 0;
+    metadata_same =
+        config_metadata_snapshot_same(&snapshot->before_image,
+                                      &current->metadata) ||
+        config_metadata_ctime_only_change(&snapshot->before_image,
+                                          &current->metadata);
+    if (!content_same || !metadata_same) {
+        goto conflict;
+    }
+    return 0;
+
+conflict:
+    set_error(ERR_FILE_IO,
+              "Active-state before-image changed after rollback snapshot capture; refusing publication: %s",
+              hint);
+    return -1;
 }
 
 static bool config_resume_hint_post_image_content_same(
@@ -1690,32 +4019,42 @@ static bool config_resume_hint_post_image_content_same(
     struct stat opened;
     struct stat after;
     struct stat named;
-    unsigned char data[MAX_NAME_LEN + 32U];
+    unsigned char data[4096];
     unsigned char extra;
     ssize_t extra_count;
+    size_t offset = 0;
     int fd = -1;
     bool matches = false;
 
     if (!hint || !snapshot || !current || !snapshot->post_image_valid ||
-        snapshot->post_image_length > sizeof(data) || current->st_size < 0 ||
+        (snapshot->post_image_length != 0U &&
+         !snapshot->post_image_data) ||
+        snapshot->post_image_length > CONFIG_ACTIVE_STATE_MAX ||
+        current->st_size < 0 ||
         (uintmax_t)current->st_size != snapshot->post_image_length) {
         return false;
     }
     fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0 || fstat(fd, &opened) != 0 ||
         !config_metadata_file_is_safe(&opened, true) ||
-        !config_metadata_snapshot_same(current, &opened) ||
-        !config_pread_full(fd, data, snapshot->post_image_length, 0)) {
+        !config_metadata_snapshot_same(current, &opened)) {
         goto cleanup;
+    }
+    while (offset < snapshot->post_image_length) {
+        size_t wanted = snapshot->post_image_length - offset;
+        if (wanted > sizeof(data)) wanted = sizeof(data);
+        if (!config_pread_full(fd, data, wanted, (off_t)offset) ||
+            memcmp(data, snapshot->post_image_data + offset, wanted) != 0) {
+            goto cleanup;
+        }
+        offset += wanted;
     }
     do {
         extra_count = pread(fd, &extra, 1,
                             (off_t)snapshot->post_image_length);
     } while (extra_count < 0 && errno == EINTR);
-    if (extra_count == 0 &&
-        memcmp(data, snapshot->post_image_data,
-               snapshot->post_image_length) == 0 &&
-        fstat(fd, &after) == 0 && lstat(hint, &named) == 0 &&
+    if (extra_count == 0 && fstat(fd, &after) == 0 &&
+        lstat(hint, &named) == 0 &&
         config_metadata_file_is_safe(&after, true) &&
         config_metadata_file_is_safe(&named, true) &&
         config_metadata_snapshot_same(&opened, &after) &&
@@ -2029,6 +4368,110 @@ int config_resume_hint_snapshot_restore(
     return result;
 }
 
+static bool config_retirement_refresh_owns_record(
+    const config_retirement_refresh_request_t *request,
+    const publication_record_t *record) {
+    for (size_t i = 0; i < request->owner_count; i++) {
+        if (request->owners[i].account_id == record->account_id &&
+            strcmp(request->owners[i].account_incarnation,
+                   record->account_incarnation) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A reverse retirement publish can restore the exact prior Git bytes through
+ * a newly materialized inode generation. Refresh only that generation field;
+ * the owner/destination witnesses and every unrelated record remain intact.
+ * Inputs are treated as an exact set so a truncated caller result cannot make
+ * a partially refreshed ledger look complete. */
+static int config_apply_retirement_publication_refresh(
+    publication_ledger_t *publications,
+    const config_retirement_refresh_request_t *request) {
+    bool destination_used[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    size_t matching_records = 0;
+
+    if (!publications || !request || !request->owners ||
+        request->owner_count == 0U ||
+        request->owner_count > MAX_ACCOUNTS || !request->destinations ||
+        request->destination_count == 0U ||
+        request->destination_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retirement publication refresh set");
+        return -1;
+    }
+    for (size_t i = 0; i < request->destination_count; i++) {
+        size_t path_length = strnlen(request->destinations[i].config_path,
+                                    MAX_PATH_LEN);
+        if (path_length == 0U || path_length >= MAX_PATH_LEN) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "Retirement publication destination %zu has an invalid config path",
+                      i);
+            return -1;
+        }
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(request->destinations[i].config_path,
+                       request->destinations[j].config_path) == 0) {
+                errno = EINVAL;
+                set_error(ERR_INVALID_ARGS,
+                          "Retirement publication refresh contains duplicate config path %s",
+                          request->destinations[i].config_path);
+                return -1;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < publications->count; i++) {
+        publication_record_t *record = &publications->records[i];
+        size_t destination_index = request->destination_count;
+
+        if (record->state != PUBLICATION_STATE_PUBLISHED ||
+            !config_retirement_refresh_owns_record(request, record)) {
+            continue;
+        }
+        for (size_t j = 0; j < request->destination_count; j++) {
+            if (strcmp(record->config_path,
+                       request->destinations[j].config_path) == 0) {
+                destination_index = j;
+                break;
+            }
+        }
+        if (destination_index == request->destination_count) {
+            errno = ESTALE;
+            set_error(ERR_CONFIG_INVALID,
+                      "Retirement publication refresh is missing Git config destination %s",
+                      record->config_path);
+            return -1;
+        }
+        record->post_config =
+            request->destinations[destination_index].post_config;
+        if (publication_record_validate(record) != 0) {
+            return -1;
+        }
+        destination_used[destination_index] = true;
+        matching_records++;
+    }
+    if (matching_records == 0U) {
+        errno = ESTALE;
+        set_error(ERR_CONFIG_INVALID,
+                  "Retirement publication refresh found no matching PUBLISHED owner records");
+        return -1;
+    }
+    for (size_t i = 0; i < request->destination_count; i++) {
+        if (!destination_used[i]) {
+            errno = ESTALE;
+            set_error(ERR_CONFIG_INVALID,
+                      "Retirement publication refresh destination is not owned by the requested records: %s",
+                      request->destinations[i].config_path);
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /* Atomically replace the consolidated active-state artifact. Its first line
  * keeps the exact legacy runtime-needs contract consumed by generated shell
  * code; its second line records either active=<name> or the versioned inactive
@@ -2036,23 +4479,34 @@ int config_resume_hint_snapshot_restore(
 static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                                      const char *config_path,
                                      bool *state_installed,
-                                     bool require_loaded_source,
-                                     config_resume_hint_snapshot_t *rollback_snapshot) {
+                                     config_source_generation_requirement_t
+                                         generation_requirement,
+                                     config_resume_hint_snapshot_t *rollback_snapshot,
+                                     const publication_record_t *publication,
+                                     const config_retirement_refresh_request_t
+                                         *retirement_refresh) {
     config_active_state_t existing_state;
+    config_active_state_generation_t state_before = {0};
+    publication_ledger_t publications;
     const account_t *active_account = NULL;
     const char *needs;
-    char content[MAX_NAME_LEN + 32];
+    char header[MAX_NAME_LEN + 32U];
+    unsigned char *ledger_bytes = NULL;
+    size_t ledger_length = 0U;
+    unsigned char *content = NULL;
+    size_t length = 0U;
     char dir[MAX_PATH_LEN];
     char hint[MAX_PATH_LEN];
     char temp[MAX_PATH_LEN];
     struct stat dir_identity;
-    struct stat before;
     struct stat temp_identity;
     struct stat after;
-    bool existed = false;
     bool have_temp_identity = false;
     bool temp_registered = false;
+    int result = -1;
     int fd = -1;
+
+    publication_ledger_init(&publications);
 
     if (state_installed) {
         *state_installed = false;
@@ -2067,8 +4521,18 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             config_path, rollback_snapshot) != 0) {
         return -1;
     }
-    if (require_loaded_source &&
-        config_require_loaded_source_generation(ctx, config_path) != 0) {
+    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
+        if (config_require_loaded_source_generation(ctx, config_path) != 0) {
+            return -1;
+        }
+    } else if (generation_requirement ==
+               CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE) {
+        if (config_admit_full_save_generation(ctx, config_path) != 0) {
+            return -1;
+        }
+    } else if (generation_requirement != CONFIG_SOURCE_GENERATION_UNBOUND) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid source-generation requirement for active-state commit");
         return -1;
     }
 
@@ -2103,16 +4567,82 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                   "Cannot safely update the resume hint: config directory is unavailable");
         return -1;
     }
-    if (config_read_active_state(config_path, &existing_state, false) != 0) {
-        return -1;
+    if (config_read_active_state(config_path, &existing_state, false,
+                                 &state_before, &publications) != 0) {
+        goto state_cleanup;
     }
-    if (ctx->config.active_account[0] == '\0') {
-        if (safe_strncpy(content, "none\ninactive=v1\n",
-                         sizeof(content)) != 0) {
-            return -1;
+    if (rollback_snapshot &&
+        config_resume_hint_snapshot_require_before_image(
+            hint, rollback_snapshot, &state_before) != 0) {
+        goto state_cleanup;
+    }
+
+    /* A full account-model save is the causal boundary that makes deletion
+     * durable. Preserve every deleted account's record as a non-authorizing
+     * tombstone instead of leaving it published under a reusable integer. The
+     * state file is installed first and restored from its exact before-image
+     * when accounts.toml does not install, so this transition commits or rolls
+     * back with the deletion. A load that skipped account sections is not a
+     * complete ownership view and therefore cannot classify any record as
+     * orphaned. */
+    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE &&
+        ctx->accounts_skipped_on_load == 0U) {
+        for (size_t i = 0; i < publications.count; i++) {
+            bool account_present = false;
+            for (size_t j = 0; j < ctx->account_count; j++) {
+                if (ctx->accounts[j].incarnation_persisted &&
+                    ctx->accounts[j].id ==
+                        publications.records[i].account_id &&
+                    strcmp(ctx->accounts[j].incarnation,
+                           publications.records[i].account_incarnation) == 0) {
+                    account_present = true;
+                    break;
+                }
+            }
+            if (!account_present) {
+                publications.records[i].state = PUBLICATION_STATE_RETIRING;
+            }
         }
-        if (existing_state.exists && existing_state.inactive_tombstone) {
-            return 0;
+    }
+    if (retirement_refresh &&
+        config_apply_retirement_publication_refresh(
+            &publications, retirement_refresh) != 0) {
+        goto state_cleanup;
+    }
+    if (retirement_refresh) {
+        /* Git rollback reconciliation runs after the caller has already
+         * mutated its in-memory remove/reset model.  Rebuilding this header
+         * from `ctx` would therefore publish that uncommitted model even
+         * though the outer save failed before installation.  Preserve the
+         * stable on-disk header semantically and change only the matching
+         * publication generations below. */
+        if (!existing_state.exists || existing_state.legacy_needs_only) {
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Retirement publication refresh requires a versioned active-state header");
+            goto state_cleanup;
+        }
+        if (existing_state.inactive_tombstone) {
+            if (safe_strncpy(header, "none\ninactive=v1\n",
+                             sizeof(header)) != 0) {
+                goto state_cleanup;
+            }
+        } else if (existing_state.active_account[0] == '\0' ||
+                   (size_t)snprintf(header, sizeof(header),
+                                    "%s\nactive=%s\n",
+                                    existing_state.needs,
+                                    existing_state.active_account) >=
+                       sizeof(header)) {
+            errno = ESTALE;
+            set_error(ERR_CONFIG_INVALID,
+                      "Retirement publication refresh found an invalid active-state header");
+            goto state_cleanup;
+        }
+    } else if (ctx->config.active_account[0] == '\0') {
+        if (safe_strncpy(header, "none\ninactive=v1\n",
+                         sizeof(header)) != 0) {
+            goto state_cleanup;
         }
     } else {
 
@@ -2132,13 +4662,13 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             !text_is_tty_safe(ctx->config.active_account)) {
             set_error(ERR_CONFIG_INVALID,
                       "Refusing to persist unsafe active account name");
-            return -1;
+            goto state_cleanup;
         }
         if (!active_account) {
             set_error(ERR_CONFIG_INVALID,
                       "Refusing to persist missing active account '%s'",
                       ctx->config.active_account);
-            return -1;
+            goto state_cleanup;
         }
         bool wants_ssh = active_account->ssh_enabled &&
                          active_account->ssh_key_path[0] != '\0';
@@ -2148,45 +4678,71 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         else if (wants_ssh)              needs = "ssh";
         else if (wants_gpg)              needs = "gpg";
         else                             needs = "none";
-        if ((size_t)snprintf(content, sizeof(content), "%s\nactive=%s\n",
-                             needs, ctx->config.active_account) >= sizeof(content)) {
+        if ((size_t)snprintf(header, sizeof(header), "%s\nactive=%s\n",
+                             needs, active_account->name) >= sizeof(header)) {
             set_error(ERR_CONFIG_INVALID, "Active-state content is too long");
-            return -1;
-        }
-        if (existing_state.exists && !existing_state.legacy_needs_only &&
-            !existing_state.inactive_tombstone &&
-            strcmp(existing_state.needs, needs) == 0 &&
-            strcmp(existing_state.active_account,
-                   ctx->config.active_account) == 0) {
-            return 0;
+            goto state_cleanup;
         }
     }
 
-    /* Never open the destination for writing. Capture its exact identity (or
-     * absence), build a fresh 0600 inode beside it, then verify that neither
-     * the destination nor its private directory changed before rename. */
-    if (lstat(hint, &before) == 0) {
-        existed = true;
-        if (!config_metadata_file_is_safe(&before, false)) {
-            set_error(ERR_PERMISSION_DENIED,
-                      "Refusing to replace unsafe resume hint metadata: %s", hint);
-            return -1;
-        }
-    } else if (errno != ENOENT) {
-        set_system_error(ERR_FILE_IO,
-                         "Cannot inspect resume hint before update: %s", hint);
-        return -1;
+    if (publication &&
+        publication_ledger_upsert(&publications, publication) != 0) {
+        goto state_cleanup;
     }
+    if (publication_ledger_serialize(&publications, &ledger_bytes,
+                                     &ledger_length) != 0) {
+        goto state_cleanup;
+    }
+    if (strlen(header) > CONFIG_ACTIVE_STATE_MAX ||
+        ledger_length > CONFIG_ACTIVE_STATE_MAX - strlen(header)) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Active-state publication bundle exceeds byte limit");
+        goto state_cleanup;
+    }
+    length = strlen(header) + ledger_length;
+    content = malloc(length == 0U ? 1U : length);
+    if (!content) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Cannot allocate active-state publication bundle");
+        goto state_cleanup;
+    }
+    memcpy(content, header, strlen(header));
+    if (ledger_length != 0U) {
+        memcpy(content + strlen(header), ledger_bytes, ledger_length);
+    }
+    if (state_before.existed && state_before.length == length &&
+        memcmp(state_before.data, content, length) == 0) {
+        result = 0;
+        goto state_cleanup;
+    }
+    /* Reserve the exact post-image before entering the mutation phase. A
+     * post-rename allocation failure would otherwise leave an installed state
+     * that the guarded rollback snapshot could not identify safely. */
+    if (rollback_snapshot) {
+        rollback_snapshot->post_image_data = malloc(length == 0U ? 1U : length);
+        if (!rollback_snapshot->post_image_data) {
+            set_error(ERR_MEMORY_ALLOCATION,
+                      "Cannot allocate active-state post-image witness");
+            goto state_cleanup;
+        }
+        memcpy(rollback_snapshot->post_image_data, content, length);
+        rollback_snapshot->post_image_length = length;
+    }
+
+    /* Never open the destination for writing. The validated reader above
+     * retained strict metadata plus every bounded before-image byte. Build a
+     * fresh inode beside it, then re-prove that exact generation after the
+     * public pre-rename checkpoint. */
     if ((size_t)snprintf(temp, sizeof(temp), "%s.tmp.XXXXXX", hint) >= sizeof(temp)) {
         set_error(ERR_INVALID_PATH, "Resume hint temporary path is too long");
-        return -1;
+        goto state_cleanup;
     }
 
     fd = mkstemp(temp);
     if (fd < 0) {
         set_system_error(ERR_FILE_IO,
                          "Cannot create temporary resume hint: %s", hint);
-        return -1;
+        goto state_cleanup;
     }
     if (fchmod(fd, PERM_USER_RW) != 0 ||
         fstat(fd, &temp_identity) != 0 ||
@@ -2208,7 +4764,6 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     }
 
     size_t total = 0;
-    size_t length = strlen(content);
     while (total < length) {
         ssize_t n = write(fd, content + total, length - total);
         if (n > 0) {
@@ -2252,29 +4807,22 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
                   "Resume hint metadata changed before installation: %s", hint);
         goto hint_fail;
     }
-    if (lstat(hint, &after) == 0) {
-        if (!existed || !config_metadata_file_is_safe(&after, false) ||
-            !config_metadata_same_file(&before, &after)) {
-            set_error(ERR_FILE_IO,
-                      "Resume hint changed before update; refusing replacement: %s",
-                      hint);
-            goto hint_fail;
-        }
-    } else if (existed || errno != ENOENT) {
-        set_error(ERR_FILE_IO,
-                  "Resume hint changed before update; refusing replacement: %s",
-                  hint);
-        goto hint_fail;
-    }
-
     if (config_io_fault(CONFIG_IO_STATE_BEFORE_RENAME,
                         "active-state rename")) {
         set_system_error(ERR_FILE_IO,
                          "Cannot install resume hint atomically: %s", hint);
         goto hint_fail;
     }
-    if (require_loaded_source &&
-        config_require_loaded_source_generation(ctx, config_path) != 0) {
+    if (generation_requirement == CONFIG_SOURCE_GENERATION_REQUIRE_LOADED) {
+        if (config_require_loaded_source_generation(ctx, config_path) != 0) {
+            goto hint_fail;
+        }
+    } else if (generation_requirement ==
+                   CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE &&
+               config_admit_full_save_generation(ctx, config_path) != 0) {
+        goto hint_fail;
+    }
+    if (config_require_active_state_generation(hint, &state_before) != 0) {
         goto hint_fail;
     }
     /* Every public config/state save holds the destination's internal lock
@@ -2302,17 +4850,10 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         !config_metadata_same_file(&temp_identity, &after)) {
         set_error(ERR_FILE_IO,
                   "Cannot verify installed resume hint: %s", hint);
-        return -1;
+        goto state_cleanup;
     }
     if (rollback_snapshot) {
-        if (length > sizeof(rollback_snapshot->post_image_data)) {
-            set_error(ERR_CONFIG_INVALID,
-                      "Installed resume-hint post-image is too long");
-            return -1;
-        }
         rollback_snapshot->post_image = after;
-        memcpy(rollback_snapshot->post_image_data, content, length);
-        rollback_snapshot->post_image_length = length;
         rollback_snapshot->post_image_valid = true;
     }
     {
@@ -2327,7 +4868,7 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             errno = saved_errno;
             set_system_error(ERR_FILE_IO,
                              "Cannot durably commit resume hint: %s", hint);
-            return -1;
+            goto state_cleanup;
         }
         close(dir_fd);
     }
@@ -2337,27 +4878,41 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
             set_error(ERR_FILE_IO,
                       "Installed resume-hint generation changed during durability commit: %s",
                       hint);
-            return -1;
+            goto state_cleanup;
         }
     }
-    return 0;
+    result = 0;
+    goto state_cleanup;
 
 hint_fail:
     if (fd >= 0) close(fd);
     config_unlink_created_temp(temp, &temp_identity, have_temp_identity);
     if (temp_registered) signals_scratch_unregister(temp);
-    return -1;
+
+state_cleanup:
+    if (content) {
+        secure_zero_memory(content, length);
+        free(content);
+    }
+    if (ledger_bytes) {
+        secure_zero_memory(ledger_bytes, ledger_length);
+        free(ledger_bytes);
+    }
+    publication_ledger_clear(&publications);
+    config_active_state_generation_clear(&state_before);
+    return result;
 }
 
 /* Shared atomic-write tail for config_save and config_save_active_account:
  * validate the destination, back up the existing file, write doc to a fresh
  * 0600 temp, rename it into place, refresh the resume hint. */
-static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
+static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                                         const toml_document_t *doc,
                                         const char *config_path,
                                         bool make_backup,
                                         bool update_hint,
-                                        bool *config_installed) {
+                                        bool *config_installed,
+                                        struct stat *committed_generation) {
     char dir_path[MAX_PATH_LEN];
     char temp_path[MAX_PATH_LEN];
     char temp_name[MAX_PATH_LEN];
@@ -2366,8 +4921,12 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     struct stat pinned_dir;
     struct stat destination_before;
     struct stat destination_now;
+    struct stat installed_generation;
     struct stat temp_identity;
+    struct stat temp_generation;
     struct stat temp_now;
+    unsigned char *document_bytes = NULL;
+    size_t document_length = 0;
     bool destination_existed = false;
     bool temp_exists = false;
     bool temp_registered = false;
@@ -2377,6 +4936,9 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
 
     if (config_installed) {
         *config_installed = false;
+    }
+    if (committed_generation) {
+        memset(committed_generation, 0, sizeof(*committed_generation));
     }
 
     /* Refuse to write through or next to a symlink (cfg-symlink-01). rename()
@@ -2436,16 +4998,26 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
     if (fstatat(dir_fd, target_name, &destination_before,
                 AT_SYMLINK_NOFOLLOW) == 0) {
         destination_existed = true;
-        if (!config_metadata_file_is_safe(&destination_before, false)) {
-            errno = EPERM;
-            set_error(ERR_PERMISSION_DENIED,
-                      "Config destination is not a safe owned regular file: %s",
-                      config_path);
-            goto document_fail;
-        }
     } else if (errno != ENOENT) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Cannot identify config destination: %s", config_path);
+        goto document_fail;
+    }
+    /* The state publisher may have run callbacks and a directory sync since
+     * full-save admission. Tie this first pinned-directory destination snapshot
+     * back to the caller's loaded generation (or proven first-save absence)
+     * before backups or document temporaries create any side effects. */
+    if (config_require_full_save_generation_snapshot(
+            ctx, config_path, destination_existed,
+            destination_existed ? &destination_before : NULL) != 0) {
+        goto document_fail;
+    }
+    if (destination_existed &&
+        !config_metadata_file_is_safe(&destination_before, false)) {
+        errno = EPERM;
+        set_error(ERR_PERMISSION_DENIED,
+                  "Config destination is not a safe owned regular file: %s",
+                  config_path);
         goto document_fail;
     }
 
@@ -2493,7 +5065,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
     temp_fd = openat(dir_fd, temp_name,
-                     O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                     O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                      PERM_USER_RW);
     if (temp_fd < 0) {
         set_system_error(ERR_CONFIG_WRITE_FAILED,
@@ -2530,17 +5102,57 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
     errno = 0;
-    if (fstat(temp_fd, &temp_now) != 0 ||
-        !config_metadata_file_is_safe(&temp_now, true) ||
-        !config_metadata_same_file(&temp_identity, &temp_now) ||
+    if (fstat(temp_fd, &temp_generation) != 0 ||
+        !config_metadata_file_is_safe(&temp_generation, true) ||
+        !config_metadata_same_file(&temp_identity, &temp_generation) ||
         fstatat(dir_fd, temp_name, &temp_now, AT_SYMLINK_NOFOLLOW) != 0 ||
         !config_metadata_file_is_safe(&temp_now, true) ||
-        !config_metadata_same_file(&temp_identity, &temp_now)) {
+        !config_metadata_snapshot_same(&temp_generation, &temp_now) ||
+        temp_generation.st_size < 0 ||
+        temp_generation.st_size > (off_t)TOML_MAX_FILE_SIZE) {
         errno = errno ? errno : ESTALE;
         set_system_error(ERR_CONFIG_WRITE_FAILED,
                          "Temporary config changed before publication: %s",
                          temp_path);
         goto document_fail;
+    }
+    document_length = (size_t)temp_generation.st_size;
+    document_bytes = malloc(document_length ? document_length : 1U);
+    if (!document_bytes) {
+        errno = ENOMEM;
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot snapshot temporary config before publication: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    if (!config_pread_full(temp_fd, document_bytes, document_length, 0)) {
+        set_system_error(ERR_CONFIG_WRITE_FAILED,
+                         "Cannot snapshot temporary config before publication: %s",
+                         temp_path);
+        goto document_fail;
+    }
+    {
+        unsigned char trailing;
+        ssize_t trailing_count;
+
+        errno = 0;
+        do {
+            trailing_count = pread(temp_fd, &trailing, 1,
+                                   (off_t)document_length);
+        } while (trailing_count < 0 && errno == EINTR);
+        if (trailing_count != 0 ||
+            fstat(temp_fd, &temp_now) != 0 ||
+            !config_metadata_snapshot_same(&temp_generation, &temp_now) ||
+            fstatat(dir_fd, temp_name, &temp_now,
+                    AT_SYMLINK_NOFOLLOW) != 0 ||
+            !config_metadata_snapshot_same(&temp_generation, &temp_now)) {
+            errno = errno ? errno : ESTALE;
+            set_system_error(
+                ERR_CONFIG_WRITE_FAILED,
+                "Temporary config changed while snapshotting publication bytes: %s",
+                temp_path);
+            goto document_fail;
+        }
     }
     if (close(temp_fd) != 0) {
         temp_fd = -1;
@@ -2614,6 +5226,7 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
                          config_path);
         goto document_fail;
     }
+    installed_generation = destination_now;
 
     /* AR-05 L11: per POSIX a rename() is only durable once the directory
      * holding the new entry is itself fsynced. toml_write_fd already fsyncs
@@ -2633,10 +5246,42 @@ static int config_write_document_atomic(const gitswitch_ctx_t *ctx,
         goto document_fail;
     }
 
-    if (update_hint &&
-        config_update_resume_hint(ctx, config_path, NULL, false, NULL) != 0) {
+    /* Capture the context's next admission generation only after the payload
+     * and directory entry are both durable. A post-rename failure remains an
+     * installed-but-uncertain result and deliberately leaves the caller bound
+     * to its old generation until it reloads. */
+    errno = 0;
+    if (config_reprove_published_file_at(
+            dir_fd, target_name, &installed_generation, document_bytes,
+            document_length, &destination_now) != 0) {
+        int proof_errno = errno ? errno : EIO;
+        errno = proof_errno;
+        set_system_error(
+            proof_errno == ESTALE ? ERR_FILE_IO : ERR_CONFIG_WRITE_FAILED,
+            "Durable config generation changed before context refresh: %s",
+            config_path);
         goto document_fail;
     }
+    if (update_hint &&
+        config_update_resume_hint(ctx, config_path, NULL,
+                                  CONFIG_SOURCE_GENERATION_UNBOUND,
+                                  NULL, NULL, NULL) != 0) {
+        goto document_fail;
+    }
+    if (committed_generation) {
+        *committed_generation = destination_now;
+    }
+    secure_zero_memory(ctx->config.source_witness,
+                       sizeof(ctx->config.source_witness));
+    if (document_length != 0U) {
+        memcpy(ctx->config.source_witness, document_bytes, document_length);
+    }
+    ctx->config.source_witness_length = document_length;
+    ctx->config.source_witness_valid = true;
+    ctx->config.source_read_witness_valid = false;
+    secure_zero_memory(document_bytes, document_length);
+    free(document_bytes);
+    document_bytes = NULL;
     close(dir_fd);
     log_info("Configuration document committed to: %s", config_path);
     return 0;
@@ -2671,6 +5316,10 @@ document_fail:
             signals_scratch_unregister(temp_path);
         }
         if (dir_fd >= 0) close(dir_fd);
+        if (document_bytes) {
+            secure_zero_memory(document_bytes, document_length);
+            free(document_bytes);
+        }
         errno = saved_errno;
     }
     return -1;
@@ -2736,30 +5385,56 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx) {
 }
 
 /* Save configuration to TOML file */
-static int config_save_mode(const gitswitch_ctx_t *ctx,
+static int config_save_mode(gitswitch_ctx_t *ctx,
                             const char *config_path,
                             bool update_hint,
                             bool *config_installed,
-                            config_resume_hint_snapshot_t *rollback_snapshot) {
+                            config_resume_hint_snapshot_t *rollback_snapshot,
+                            const publication_record_t *publication) {
     config_resume_hint_snapshot_t local_state_before = {0};
     config_resume_hint_snapshot_t *state_before = rollback_snapshot
         ? rollback_snapshot : &local_state_before;
     toml_document_t *toml_doc = NULL;
+    publication_ledger_t incarnation_reservations;
+    char incarnation_before[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN] = {{0}};
+    bool incarnation_persisted_before[MAX_ACCOUNTS] = {false};
+    size_t incarnation_before_count = 0U;
+    bool incarnation_before_valid = false;
     bool document_installed = false;
     bool state_installed = false;
+    struct stat committed_generation;
     int write_lock_fd = -1;
     int result = -1;
+
+    publication_ledger_init(&incarnation_reservations);
 
     if (!ctx || !config_path) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_save");
         return -1;
     }
+    if (ctx->account_count > MAX_ACCOUNTS) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Account model exceeds the supported account limit");
+        return -1;
+    }
+    incarnation_before_count = ctx->account_count;
+    for (size_t i = 0; i < incarnation_before_count; i++) {
+        memcpy(incarnation_before[i], ctx->accounts[i].incarnation,
+               ACCOUNT_INCARNATION_LEN);
+        incarnation_persisted_before[i] =
+            ctx->accounts[i].incarnation_persisted;
+    }
+    incarnation_before_valid = true;
     if (config_installed) {
         *config_installed = false;
     }
     write_lock_fd = config_write_lock_path(config_path);
     if (write_lock_fd < 0) {
         return -1;
+    }
+
+    if (config_admit_full_save_generation(ctx, config_path) != 0) {
+        goto cleanup;
     }
 
     /* GIT_SCOPE_SYSTEM remains part of the public observation model because
@@ -2798,6 +5473,21 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
      * way to detect the silent drop. */
     if (config_check_rewritable(ctx) != 0) {
         display_warning("Not saving config: %s", get_last_error()->message);
+        goto cleanup;
+    }
+
+    /* Full account-model publication is the only point that materializes a
+     * legacy token. Run every model/rewrite admission first, reserve every
+     * incarnation already named by durable Git provenance, and generate all
+     * missing candidates off-model before installing the complete set. The
+     * cleanup path restores this function's exact in-memory before-image when
+     * the account document never installs. */
+    if (config_load_publication_ledger(
+            config_path, &incarnation_reservations) != 0 ||
+        config_validate_live_publication_bindings(
+            ctx, &incarnation_reservations) != 0 ||
+        config_materialize_missing_incarnations(
+            ctx, &incarnation_reservations) != 0) {
         goto cleanup;
     }
 
@@ -2840,8 +5530,9 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
             goto cleanup;
         }
         if (config_update_resume_hint(ctx, config_path,
-                                      &state_installed, false,
-                                      state_before) != 0) {
+                                      &state_installed,
+                                      CONFIG_SOURCE_GENERATION_REQUIRE_FULL_SAVE,
+                                      state_before, publication, NULL) != 0) {
             if (state_installed) {
                 error_context_t state_error = *get_last_error();
                 if (config_resume_hint_snapshot_restore_at(config_path,
@@ -2860,7 +5551,8 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
         }
     }
     result = config_write_document_atomic(ctx, toml_doc, config_path, true,
-                                          false, &document_installed);
+                                          false, &document_installed,
+                                          &committed_generation);
     if (config_installed) {
         *config_installed = document_installed;
     }
@@ -2879,23 +5571,42 @@ static int config_save_mode(const gitswitch_ctx_t *ctx,
             g_last_error = write_error;
         }
     }
+    if (result == 0) {
+        memmove(ctx->config.config_path, config_path,
+                strlen(config_path) + 1U);
+        ctx->config.source_generation = committed_generation;
+        ctx->config.source_generation_valid = true;
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            ctx->accounts[i].incarnation_persisted = true;
+        }
+    }
 
 cleanup:
+    if (result != 0 && !document_installed && incarnation_before_valid) {
+        for (size_t i = 0; i < incarnation_before_count; i++) {
+            memcpy(ctx->accounts[i].incarnation, incarnation_before[i],
+                   ACCOUNT_INCARNATION_LEN);
+            ctx->accounts[i].incarnation_persisted =
+                incarnation_persisted_before[i];
+        }
+    }
+    secure_zero_memory(incarnation_before, sizeof(incarnation_before));
     if (!rollback_snapshot) {
         config_resume_hint_snapshot_clear(&local_state_before);
     }
     config_document_free(toml_doc);
+    publication_ledger_clear(&incarnation_reservations);
     if (write_lock_fd >= 0) {
         config_write_unlock(write_lock_fd);
     }
     return result;
 }
 
-int config_save(const gitswitch_ctx_t *ctx, const char *config_path) {
-    return config_save_mode(ctx, config_path, true, NULL, NULL);
+int config_save(gitswitch_ctx_t *ctx, const char *config_path) {
+    return config_save_mode(ctx, config_path, true, NULL, NULL, NULL);
 }
 
-int config_save_transactional(const gitswitch_ctx_t *ctx,
+int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed) {
     if (!config_installed) {
@@ -2904,17 +5615,46 @@ int config_save_transactional(const gitswitch_ctx_t *ctx,
         return -1;
     }
     *config_installed = false;
-    return config_save_mode(ctx, config_path, true, config_installed, NULL);
+    return config_save_mode(ctx, config_path, true, config_installed, NULL,
+                            NULL);
+}
+
+int config_migrate_account_incarnations(gitswitch_ctx_t *ctx,
+                                        const char *config_path,
+                                        bool *config_installed) {
+    bool migration_required = false;
+
+    if (config_installed) *config_installed = false;
+    if (!ctx || !config_path || !config_installed) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account incarnation migration request");
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        if (!ctx->accounts[i].incarnation_persisted) {
+            migration_required = true;
+            continue;
+        }
+        if (!account_incarnation_is_valid(ctx->accounts[i].incarnation)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account %u has invalid persisted incarnation state",
+                      ctx->accounts[i].id);
+            return -1;
+        }
+    }
+    if (!migration_required) return 0;
+    return config_save_transactional(ctx, config_path, config_installed);
 }
 
 /* Persist only the consolidated state artifact. This intentionally does not
  * parse or replace accounts.toml: switch/reset state is orthogonal to the
  * account schema and remains writable even when a healthy subset was loaded
  * from a non-reconstructable config. */
-static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
+static int config_save_active_account_mode(gitswitch_ctx_t *ctx,
                                            const char *config_path,
                                            bool *config_installed,
-                                           config_resume_hint_snapshot_t *rollback_snapshot) {
+                                           config_resume_hint_snapshot_t *rollback_snapshot,
+                                           const publication_record_t *publication) {
     int write_lock_fd;
     int result;
 
@@ -2934,21 +5674,25 @@ static int config_save_active_account_mode(const gitswitch_ctx_t *ctx,
      * to edit — the full rebuild is both safe and required to create one. */
     if (!path_exists(config_path)) {
         result = config_save_mode(ctx, config_path, true,
-                                  config_installed, rollback_snapshot);
+                                  config_installed, rollback_snapshot,
+                                  publication);
     } else {
         result = config_update_resume_hint(ctx, config_path, config_installed,
-                                           true, rollback_snapshot);
+                                           CONFIG_SOURCE_GENERATION_REQUIRE_LOADED,
+                                           rollback_snapshot, publication,
+                                           NULL);
     }
     config_write_unlock(write_lock_fd);
     return result;
 }
 
-int config_save_active_account(const gitswitch_ctx_t *ctx,
+int config_save_active_account(gitswitch_ctx_t *ctx,
                                const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL,
+                                           NULL);
 }
 
-int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
+int config_save_active_account_transactional(gitswitch_ctx_t *ctx,
                                              const char *config_path,
                                              bool *config_installed) {
     if (!config_installed) {
@@ -2958,11 +5702,57 @@ int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
     }
     *config_installed = false;
     return config_save_active_account_mode(ctx, config_path,
-                                           config_installed, NULL);
+                                           config_installed, NULL, NULL);
+}
+
+int config_refresh_retirement_publications_transactional(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_destination_t *destinations,
+    size_t destination_count, bool *state_installed) {
+    config_retirement_owner_t canonical[MAX_ACCOUNTS];
+    config_retirement_refresh_request_t request;
+    int write_lock_fd;
+    int result;
+    int saved_errno;
+
+    if (state_installed) *state_installed = false;
+    if (!ctx || !config_path || !state_installed || !destinations ||
+        destination_count == 0U ||
+        destination_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid transactional retirement publication refresh");
+        return -1;
+    }
+    memset(canonical, 0, sizeof(canonical));
+    if (config_retirement_canonicalize_owners(
+            owners, owner_count, canonical) != 0) {
+        secure_zero_memory(canonical, sizeof(canonical));
+        return -1;
+    }
+    request.owners = canonical;
+    request.owner_count = owner_count;
+    request.destinations = destinations;
+    request.destination_count = destination_count;
+
+    write_lock_fd = config_write_lock_path(config_path);
+    if (write_lock_fd < 0) {
+        secure_zero_memory(canonical, sizeof(canonical));
+        return -1;
+    }
+    result = config_update_resume_hint(
+        ctx, config_path, state_installed,
+        CONFIG_SOURCE_GENERATION_REQUIRE_LOADED, NULL, NULL, &request);
+    saved_errno = result == 0 ? 0 : (errno ? errno : EIO);
+    config_write_unlock(write_lock_fd);
+    secure_zero_memory(canonical, sizeof(canonical));
+    if (result != 0) errno = saved_errno;
+    return result;
 }
 
 int config_save_active_account_transactional_guarded(
-    const gitswitch_ctx_t *ctx, const char *config_path,
+    gitswitch_ctx_t *ctx, const char *config_path,
     bool *config_installed,
     config_resume_hint_snapshot_t *rollback_snapshot) {
     if (!config_installed || !rollback_snapshot ||
@@ -2974,12 +5764,134 @@ int config_save_active_account_transactional_guarded(
     *config_installed = false;
     return config_save_active_account_mode(ctx, config_path,
                                            config_installed,
-                                           rollback_snapshot);
+                                           rollback_snapshot, NULL);
 }
 
-int config_restore_active_account(const gitswitch_ctx_t *ctx,
+/* A durable publication record may be installed only for the exact live
+ * account selected by the prepared switch. Validate pointer provenance before
+ * dereferencing current_account, then bind both the numeric ID and immutable
+ * incarnation. This prevents a caller from relabelling a sealed Git post-image
+ * as another account or as a later account that reused the same numeric ID. */
+static int config_validate_publication_owner(
+    const gitswitch_ctx_t *ctx, const publication_record_t *publication) {
+    const account_t *owner = NULL;
+    size_t pair_matches = 0U;
+
+    if (!ctx || !publication || !ctx->current_account ||
+        ctx->account_count > MAX_ACCOUNTS) {
+        errno = ESTALE;
+        set_error(ERR_CONFIG_INVALID,
+                  "Publication save has no live current account owner");
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        const account_t *candidate = &ctx->accounts[i];
+
+        if (ctx->current_account == candidate) owner = candidate;
+        if (candidate->id == publication->account_id &&
+            account_incarnation_is_valid(candidate->incarnation) &&
+            strcmp(candidate->incarnation,
+                   publication->account_incarnation) == 0) {
+            pair_matches++;
+        }
+    }
+    if (!owner || pair_matches != 1U || !owner->incarnation_persisted ||
+        !account_incarnation_is_valid(owner->incarnation) ||
+        owner->id != publication->account_id ||
+        strcmp(owner->incarnation,
+               publication->account_incarnation) != 0 ||
+        ctx->config.active_account[0] == '\0' ||
+        strcmp(ctx->config.active_account, owner->name) != 0 ||
+        publication->state != PUBLICATION_STATE_PUBLISHED) {
+        errno = ESTALE;
+        set_error(ERR_CONFIG_INVALID,
+                  "Publication record does not belong to the exact live active account incarnation");
+        return -1;
+    }
+    return 0;
+}
+
+int config_save_active_account_publication_transactional_guarded(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const publication_record_t *publication, bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot) {
+    if (config_installed) {
+        *config_installed = false;
+    }
+    if (!publication || !config_installed || !rollback_snapshot ||
+        !rollback_snapshot->valid) {
+        set_error(
+            ERR_INVALID_ARGS,
+            "Guarded publication save requires a record, install state, and valid rollback snapshot");
+        return -1;
+    }
+    if (publication_record_validate(publication) != 0) {
+        return -1;
+    }
+    if (config_validate_publication_owner(ctx, publication) != 0) {
+        return -1;
+    }
+    return config_save_active_account_mode(ctx, config_path,
+                                           config_installed,
+                                           rollback_snapshot, publication);
+}
+
+int config_load_publication_ledger(const char *config_path,
+                                   publication_ledger_t *ledger) {
+    config_active_state_t state;
+
+    if (!config_path || !ledger) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid publication-ledger load arguments");
+        return -1;
+    }
+    return config_read_active_state(config_path, &state, false, NULL,
+                                    ledger);
+}
+
+int config_publication_preflight(const char *config_path) {
+    config_active_state_t state;
+    publication_ledger_t ledger;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+    int result = -1;
+
+    if (!config_path) {
+        set_error(ERR_INVALID_ARGS,
+                  "NULL config path for publication capacity preflight");
+        return -1;
+    }
+    publication_ledger_init(&ledger);
+    if (config_read_active_state(config_path, &state, false, NULL,
+                                 &ledger) != 0 ||
+        publication_ledger_serialize(&ledger, &serialized,
+                                     &serialized_length) != 0) {
+        goto cleanup;
+    }
+    if (ledger.count >= PUBLICATION_LEDGER_MAX_RECORDS ||
+        CONFIG_PUBLICATION_RECORD_RESERVE > PUBLICATION_LEDGER_MAX_BYTES ||
+        serialized_length >
+            PUBLICATION_LEDGER_MAX_BYTES - CONFIG_PUBLICATION_RECORD_RESERVE) {
+        errno = ENOSPC;
+        set_error(ERR_CONFIG_INVALID,
+                  "Publication ledger has no capacity for another worst-case record");
+        goto cleanup;
+    }
+    result = 0;
+
+cleanup:
+    if (serialized) {
+        secure_zero_memory(serialized, serialized_length);
+        free(serialized);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
+int config_restore_active_account(gitswitch_ctx_t *ctx,
                                   const char *config_path) {
-    return config_save_active_account_mode(ctx, config_path, NULL, NULL);
+    return config_save_active_account_mode(ctx, config_path, NULL, NULL,
+                                           NULL);
 }
 
 /* Create default configuration file */
@@ -3337,12 +6249,25 @@ int config_get_path(char *path_buffer, size_t buffer_size) {
     return join_path(path_buffer, buffer_size, config_dir, DEFAULT_CONFIG_FILE);
 }
 
-/* Add new account to configuration */
-int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
+/* Add new account to configuration. The shared implementation admits either
+ * a globally idle public call or the exact ADD owner capability. */
+static int config_add_account_impl(gitswitch_ctx_t *ctx,
+                                   const account_t *account,
+                                   bool operation_owned,
+                                   uint64_t transaction_token) {
     account_t candidate;
+    publication_ledger_t publications;
     uint32_t current_id = 0;
     bool had_current;
+    bool publication_reserved = false;
 
+    if (accounts_transaction_authorize_model_mutation(
+            ctx,
+            operation_owned ? ACCOUNTS_TRANSACTION_ADD
+                            : ACCOUNTS_TRANSACTION_NONE,
+            operation_owned ? transaction_token : 0) != 0) {
+        return -1;
+    }
     if (!ctx || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_add_account");
         return -1;
@@ -3353,6 +6278,9 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
         return -1;
     }
     candidate = *account;
+    secure_zero_memory(candidate.incarnation,
+                       sizeof(candidate.incarnation));
+    candidate.incarnation_persisted = false;
     if (normalize_account_model_for_admission(&candidate) != 0) return -1;
     
     /* Validate account security */
@@ -3361,6 +6289,40 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
     }
     
     if (validate_account_uniqueness(ctx, &candidate, SIZE_MAX) != 0) return -1;
+
+    /* Account IDs are publication ownership identities, not merely current
+     * array keys. A record survives failed retirement so a later retry can
+     * still describe the residue; recycling its integer would let an unrelated
+     * account inherit that authority. Empty/unbound contexts have no durable
+     * namespace, while a bound context must read the ledger exactly or fail
+     * before model mutation. */
+    publication_ledger_init(&publications);
+    if (ctx->config.config_path[0] != '\0' &&
+        config_load_publication_ledger(ctx->config.config_path,
+                                       &publications) != 0) {
+        publication_ledger_clear(&publications);
+        return -1;
+    }
+    for (size_t i = 0; i < publications.count; i++) {
+        if (publications.records[i].account_id == candidate.id) {
+            publication_reserved = true;
+            break;
+        }
+    }
+    if (publication_reserved) {
+        publication_ledger_clear(&publications);
+        set_error(
+            ERR_ACCOUNT_EXISTS,
+            "Account ID %u is reserved by durable Git publication provenance",
+            candidate.id);
+        return -1;
+    }
+    if (config_generate_incarnation(ctx, &publications, NULL, 0U,
+                                    candidate.incarnation) != 0) {
+        publication_ledger_clear(&publications);
+        return -1;
+    }
+    publication_ledger_clear(&publications);
 
     had_current = config_capture_current_id(ctx, &current_id);
 
@@ -3374,12 +6336,31 @@ int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
     return 0;
 }
 
+int config_add_account(gitswitch_ctx_t *ctx, const account_t *account) {
+    return config_add_account_impl(ctx, account, false, 0);
+}
+
+int config_add_account_owned(gitswitch_ctx_t *ctx, const account_t *account,
+                             uint64_t transaction_token) {
+    return config_add_account_impl(ctx, account, true, transaction_token);
+}
+
 /* Remove account from configuration */
-int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
+static int config_remove_account_impl(gitswitch_ctx_t *ctx,
+                                      uint32_t account_id,
+                                      bool operation_owned,
+                                      uint64_t transaction_token) {
     size_t found_index = SIZE_MAX;
     uint32_t current_id = 0;
     bool had_current;
     
+    if (accounts_transaction_authorize_model_mutation(
+            ctx,
+            operation_owned ? ACCOUNTS_TRANSACTION_REMOVE
+                            : ACCOUNTS_TRANSACTION_NONE,
+            operation_owned ? transaction_token : 0) != 0) {
+        return -1;
+    }
     if (!ctx) {
         set_error(ERR_INVALID_ARGS, "NULL context to config_remove_account");
         return -1;
@@ -3418,14 +6399,34 @@ int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
     return 0;
 }
 
+int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id) {
+    return config_remove_account_impl(ctx, account_id, false, 0);
+}
+
+int config_remove_account_owned(gitswitch_ctx_t *ctx, uint32_t account_id,
+                                uint64_t transaction_token) {
+    return config_remove_account_impl(ctx, account_id, true,
+                                      transaction_token);
+}
+
 /* Update existing account */
-int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
+static int config_update_account_impl(gitswitch_ctx_t *ctx,
+                                      const account_t *account,
+                                      bool operation_owned,
+                                      uint64_t transaction_token) {
     account_t *existing_account = NULL;
     account_t replacement;
     size_t existing_index = SIZE_MAX;
     uint32_t current_id = 0;
     bool had_current;
     
+    if (accounts_transaction_authorize_model_mutation(
+            ctx,
+            operation_owned ? ACCOUNTS_TRANSACTION_EDIT
+                            : ACCOUNTS_TRANSACTION_NONE,
+            operation_owned ? transaction_token : 0) != 0) {
+        return -1;
+    }
     if (!ctx || !account) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to config_update_account");
         return -1;
@@ -3451,6 +6452,36 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
         set_error(ERR_ACCOUNT_NOT_FOUND, "Account with ID %u not found", account->id);
         return -1;
     }
+
+    /* Incarnation is immutable account authority, not an editable field.
+     * Empty means an older/source-compatible caller omitted the field and
+     * inherits it. A nonempty value must name the exact current incarnation;
+     * silently accepting a different token would mask a stale or misbound
+     * edit request. Durability state always comes from the live model. */
+    if (existing_account->incarnation[0] != '\0' &&
+        !account_incarnation_is_valid(existing_account->incarnation)) {
+        errno = ESTALE;
+        set_error(
+            ERR_ACCOUNT_INVALID,
+            "Account %u has a corrupted immutable incarnation",
+            account->id);
+        return -1;
+    }
+    if (replacement.incarnation[0] != '\0' &&
+        (!account_incarnation_is_valid(replacement.incarnation) ||
+         strcmp(replacement.incarnation,
+                existing_account->incarnation) != 0)) {
+        errno = ESTALE;
+        set_error(
+            ERR_ACCOUNT_INVALID,
+            "Account %u edit attempted to replace its immutable incarnation",
+            account->id);
+        return -1;
+    }
+    memcpy(replacement.incarnation, existing_account->incarnation,
+           sizeof(replacement.incarnation));
+    replacement.incarnation_persisted =
+        existing_account->incarnation_persisted;
     
     /* Validate new account data */
     if (validate_account_security(&replacement) != 0) {
@@ -3472,6 +6503,16 @@ int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
     log_info("Updated account: %s (%s)", replacement.name,
              replacement.description);
     return 0;
+}
+
+int config_update_account(gitswitch_ctx_t *ctx, const account_t *account) {
+    return config_update_account_impl(ctx, account, false, 0);
+}
+
+int config_update_account_owned(gitswitch_ctx_t *ctx,
+                                const account_t *account,
+                                uint64_t transaction_token) {
+    return config_update_account_impl(ctx, account, true, transaction_token);
 }
 
 /* Find account by identifier, exact matches first to avoid selecting the wrong
@@ -3718,6 +6759,171 @@ static bool config_scope_is_persistable(git_scope_t scope) {
 
 static bool config_account_id_is_valid(uint32_t account_id) {
     return account_id != 0;
+}
+
+static bool config_incarnation_reserved(
+    const gitswitch_ctx_t *ctx, const publication_ledger_t *publications,
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN],
+    size_t generated_count, const char *candidate) {
+    for (size_t i = 0; ctx && i < ctx->account_count; i++) {
+        if (account_incarnation_is_valid(ctx->accounts[i].incarnation) &&
+            strcmp(ctx->accounts[i].incarnation, candidate) == 0) {
+            return true;
+        }
+    }
+    for (size_t i = 0; i < generated_count; i++) {
+        if (generated[i][0] != '\0' &&
+            strcmp(generated[i], candidate) == 0) {
+            return true;
+        }
+    }
+    for (size_t i = 0; publications && i < publications->count; i++) {
+        if (strcmp(publications->records[i].account_incarnation,
+                   candidate) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* An integer mentioned by durable Git provenance is already an ownership
+ * namespace. A full save may remove its exact account (the state phase then
+ * tombstones the record), but it may not install a different live account at
+ * the same integer. Reject before entropy generation or any state write so a
+ * hand-edited legacy/mismatched document cannot be normalized into a binding
+ * that every later switch must reject. */
+static int config_validate_live_publication_bindings(
+    const gitswitch_ctx_t *ctx,
+    const publication_ledger_t *publications) {
+    if (!ctx || !publications) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account publication binding model");
+        return -1;
+    }
+    for (size_t i = 0; i < ctx->account_count; i++) {
+        const account_t *account = &ctx->accounts[i];
+
+        for (size_t j = 0; j < publications->count; j++) {
+            const publication_record_t *record = &publications->records[j];
+
+            if (record->account_id != account->id) continue;
+            if (account->incarnation_persisted &&
+                account_incarnation_is_valid(account->incarnation) &&
+                strcmp(account->incarnation,
+                       record->account_incarnation) == 0) {
+                continue;
+            }
+            errno = ESTALE;
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Account ID %u is bound to a different durable incarnation",
+                account->id);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int config_generate_incarnation(
+    const gitswitch_ctx_t *ctx, const publication_ledger_t *publications,
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN],
+    size_t generated_count, char out[ACCOUNT_INCARNATION_LEN]) {
+    static const char hexadecimal[] = "0123456789ABCDEF";
+
+    if (!out) {
+        set_error(ERR_INVALID_ARGS, "NULL account incarnation output");
+        return -1;
+    }
+    out[0] = '\0';
+    for (size_t attempt = 0; attempt < 128U; attempt++) {
+        int result = g_config_incarnation_generate
+            ? g_config_incarnation_generate(out)
+            : generate_random_string(out, ACCOUNT_INCARNATION_LEN,
+                                     hexadecimal);
+        if (result != 0) {
+            secure_zero_memory(out, ACCOUNT_INCARNATION_LEN);
+            return -1;
+        }
+        if (!account_incarnation_is_valid(out)) {
+            secure_zero_memory(out, ACCOUNT_INCARNATION_LEN);
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Account incarnation generator returned a noncanonical token");
+            return -1;
+        }
+        if (!config_incarnation_reserved(ctx, publications, generated,
+                                         generated_count, out)) {
+            return 0;
+        }
+        secure_zero_memory(out, ACCOUNT_INCARNATION_LEN);
+    }
+    set_error(ERR_CONFIG_INVALID,
+              "Cannot allocate a unique account incarnation");
+    return -1;
+}
+
+/* Generate every missing token off-model first. Entropy failure at any point
+ * therefore leaves the complete in-memory account array unchanged; only once
+ * the full candidate set is valid and collision-free are values installed. */
+static int config_materialize_missing_incarnations(
+    gitswitch_ctx_t *ctx, const publication_ledger_t *publications) {
+    char generated[MAX_ACCOUNTS][ACCOUNT_INCARNATION_LEN] = {{0}};
+    size_t count;
+
+    if (!ctx || ctx->account_count > MAX_ACCOUNTS) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid account incarnation migration model");
+        return -1;
+    }
+    count = ctx->account_count;
+    for (size_t i = 0; i < count; i++) {
+        const char *incarnation = ctx->accounts[i].incarnation;
+
+        if (incarnation[0] != '\0') {
+            if (!account_incarnation_is_valid(incarnation)) {
+                set_error(
+                    ERR_ACCOUNT_INVALID,
+                    "Account %u has a noncanonical incarnation",
+                    ctx->accounts[i].id);
+                goto fail;
+            }
+            for (size_t j = 0; j < i; j++) {
+                const char *prior = generated[j][0] != '\0'
+                    ? generated[j] : ctx->accounts[j].incarnation;
+                if (strcmp(prior, incarnation) == 0) {
+                    set_error(
+                        ERR_ACCOUNT_INVALID,
+                        "Accounts %u and %u share one incarnation",
+                        ctx->accounts[j].id, ctx->accounts[i].id);
+                    goto fail;
+                }
+            }
+            continue;
+        }
+        if (ctx->accounts[i].incarnation_persisted ||
+            config_generate_incarnation(ctx, publications, generated, i,
+                                        generated[i]) != 0) {
+            if (ctx->accounts[i].incarnation_persisted) {
+                set_error(ERR_ACCOUNT_INVALID,
+                          "Account %u has no persisted incarnation",
+                          ctx->accounts[i].id);
+            }
+            goto fail;
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (generated[i][0] != '\0') {
+            memcpy(ctx->accounts[i].incarnation, generated[i],
+                   ACCOUNT_INCARNATION_LEN);
+            ctx->accounts[i].incarnation_persisted = false;
+        }
+    }
+    secure_zero_memory(generated, sizeof(generated));
+    return 0;
+
+fail:
+    secure_zero_memory(generated, sizeof(generated));
+    return -1;
 }
 
 typedef struct {
@@ -4069,7 +7275,8 @@ static int config_backup_internal(const char *config_path,
     verify_doc = config_document_alloc();
     if (!verify_doc ||
         config_read_document_expected(backup_path, verify_doc,
-                                      &backup_identity, NULL) != 0) {
+                                      &backup_identity, NULL,
+                                      NULL, 0U, NULL) != 0) {
         if (!verify_doc && get_last_error()->code == ERR_SUCCESS) {
             set_error(ERR_MEMORY_ALLOCATION,
                       "Cannot allocate config backup verification document");
@@ -4796,7 +8003,7 @@ static bool config_key_is_modeled(const char *section, const char *key) {
     }
     /* An [accounts.<id>] section. */
     static const char *const account_keys[] = {
-        "name", "email", "description", "preferred_scope",
+        "incarnation", "name", "email", "description", "preferred_scope",
         "ssh_key", "ssh_host", "ssh_hostname", "gpg_key",
         "gpg_signing_enabled", NULL
     };
@@ -4873,6 +8080,21 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             memset(&account, 0, sizeof(account));
             account.id = account_id;
             account.preferred_scope = GIT_SCOPE_LOCAL; /* Default */
+
+            /* Optional only for pre-incarnation account documents. Never
+             * generate entropy during load: readonly/names/status must remain
+             * observational. A real mutation materializes every missing token
+             * together before its full transactional save. */
+            fs = get_account_field(
+                doc, sections[i], "incarnation", account.incarnation,
+                sizeof(account.incarnation));
+            if (fs == FIELD_UNLOADABLE) {
+                ctx->accounts_skipped_on_load++;
+                display_warning("Account section [%s] was skipped: %s",
+                                sections[i], get_last_error()->message);
+                continue;
+            }
+            account.incarnation_persisted = fs == FIELD_LOADED;
 
             /* Load required fields. Skipped, not dropped: whether the field
              * is MISSING or present-but-refused by the getter (a name over
@@ -5071,6 +8293,9 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             bool dup = false;
             for (size_t j = 0; j < ctx->account_count; j++) {
                 if (ctx->accounts[j].id == account.id ||
+                    (account.incarnation[0] != '\0' &&
+                     strcmp(ctx->accounts[j].incarnation,
+                            account.incarnation) == 0) ||
                     strcasecmp(ctx->accounts[j].name, account.name) == 0 ||
                     (ctx->accounts[j].ssh_host_alias[0] != '\0' &&
                      account.ssh_host_alias[0] != '\0' &&
@@ -5123,6 +8348,23 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                             "understands [settings] and [accounts.<id>]). It is preserved, "
                             "but account changes are blocked until you fix or remove it.",
                             sections[i]);
+        }
+    }
+
+    /* The writer emits incarnations for every account in one generation.
+     * A mixture of present and absent tokens cannot be its output: treat that
+     * shape as a manual same-ID replacement/partial rewrite, not as legacy.
+     * Pure legacy documents (all absent) remain readable and unmaterialized. */
+    {
+        size_t persisted = 0U;
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            if (ctx->accounts[i].incarnation_persisted) persisted++;
+        }
+        if (persisted != 0U && persisted != ctx->account_count) {
+            set_error(
+                ERR_CONFIG_INVALID,
+                "Account document mixes legacy accounts without incarnations and incarnation-bound accounts");
+            return -1;
         }
     }
 
@@ -5350,8 +8592,8 @@ static int validate_account_security(const account_t *account) {
     if (account->ssh_hostname[0] != '\0' &&
         !toml_validate_ssh_hostname(account->ssh_hostname)) {
         set_error(ERR_ACCOUNT_INVALID,
-                  "Invalid SSH canonical hostname (ASCII letters, digits, "
-                  "'.', '-', '_', and ':' only): %s",
+                  "Invalid SSH canonical hostname (host-only ASCII name/IPv4 "
+                  "or unbracketed IPv6; embedded ports are unsupported): %s",
                   account->ssh_hostname);
         return -1;
     }
@@ -5470,6 +8712,12 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
                       "Account ID must be in 1..%u", UINT32_MAX);
             return -1;
         }
+        if (!account_incarnation_is_valid(account->incarnation)) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "Account %u has no canonical incarnation",
+                      account->id);
+            return -1;
+        }
         if (!config_scope_is_persistable(account->preferred_scope)) {
             set_error(ERR_ACCOUNT_INVALID,
                       "Account %u preferred scope must be local or global",
@@ -5489,6 +8737,13 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
         log_debug("Creating/updating section: %s", section_name);
         
         /* Save required fields */
+        if (toml_set_string(doc, section_name, "incarnation",
+                            account->incarnation) != 0) {
+            set_error(ERR_CONFIG_INVALID,
+                      "Failed to save account incarnation");
+            return -1;
+        }
+
         if (toml_set_string(doc, section_name, "name", account->name) != 0) {
             set_error(ERR_CONFIG_INVALID, "Failed to save account name");
             return -1;

@@ -9,48 +9,67 @@ fail()
     exit 1
 }
 
-# `make distcheck` creates the archive before entering this script. Install the
-# exit trap before validating any caller-supplied value so every success and
-# failure path removes that generated artifact. `tmp` remains empty until
-# mktemp succeeds, making the same cleanup safe for early validation failures.
-archive=${1-}
+# VERSION permits ERE metacharacters such as '+' and '.', so archive roots
+# must be compared as literal path components rather than interpolated into a
+# regular expression (AR-11 M48).
+archive_root_entry_count()
+{
+    LC_ALL=C awk -v root="$1" '
+        $0 == root || $0 == root "/" { count++ }
+        END { print count + 0 }
+    '
+}
+
+archive_members_within_root()
+{
+    LC_ALL=C awk -v root="$1" '
+        $0 != root && index($0, root "/") != 1 { outside = 1; exit }
+        END { exit outside ? 1 : 0 }
+    '
+}
+
+# A direct archive pathname is caller-owned input. In particular, a malformed
+# invocation must never turn its first unvalidated argument into a cleanup
+# target. Make's internal mode supplies an already-pinned archive on fd 3 and
+# never publishes a canonical path. This trap owns only the private build tree.
 tmp=
 cleanup()
 {
     status=$?
     trap - 0 1 2 3 15
     if [ -n "$tmp" ]; then
-        rm -rf "$tmp"
-    fi
-    if [ -n "$archive" ]; then
-        rm -f "$archive"
+        rm -rf "$tmp" 3<&-
     fi
     exit "$status"
 }
 trap cleanup 0
 trap 'exit 1' 1 2 3 15
 
-if [ "$#" -ne 4 ]; then
-    fail "usage: $0 ARCHIVE DIST_ROOT PREFIX MAKE"
+if [ "$#" -lt 6 ] || [ "$5" != -- ]; then
+    fail "usage: $0 ARCHIVE DIST_ROOT PREFIX MAKE -- MANIFEST_PATH [PATH ...]"
 fi
 
+archive_input=$1
+archive_from_fd=false
+case $archive_input in
+    @GITSWITCH_PRIVATE_ARCHIVE_FD@)
+        : <&3 || fail "private archive descriptor 3 is unavailable"
+        archive_from_fd=true
+        ;;
+    *)
+        [ -f "$archive_input" ] ||
+            fail "archive not found: $archive_input"
+        ;;
+esac
 dist_root=$2
 prefix=$3
 make_cmd=$4
+shift 5
 
-[ -f "$archive" ] || fail "archive not found: $archive"
 case $prefix in
     /*) ;;
     *) fail "PREFIX must be absolute: $prefix" ;;
 esac
-
-# Count COMMITTED tests via git ls-files, not the live filesystem: dist now
-# archives HEAD (AR-05 L5), so an untracked stray under tests/ must neither
-# ship nor skew this baseline — with a filesystem count, the same dirty tree
-# was counted on both sides and contamination was undetectable.
-git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checkout"
-checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
-[ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
 # The executable-trust boundary rejects every helper below sticky /tmp even
 # when a deeper mktemp leaf is 0700.  Distcheck builds and runs every test
@@ -63,15 +82,39 @@ case ${HOME-} in
     *) fail "distcheck requires an absolute HOME for its trusted build root" ;;
 esac
 [ -d "$HOME" ] || fail "HOME is not a directory: $HOME"
-tmp=$(mktemp -d "$HOME/.gitswitch-distcheck.XXXXXX")
-chmod 0700 "$tmp" || fail "cannot make distcheck build root private"
+tmp=$(mktemp -d "$HOME/.gitswitch-distcheck.XXXXXX" 3<&-)
+chmod 0700 "$tmp" 3<&- || fail "cannot make distcheck build root private"
+
+# Snapshot borrowed input exactly once. The internal fd is closed immediately,
+# before any Git, compiler, test, or package descendant can inherit it. The two
+# unavoidable setup helpers above receive descriptor 3 explicitly closed. Every
+# later validator consumes only this invocation-private regular file (AR-11 L42).
+archive=$tmp/source-archive.tar.gz
+if [ "$archive_from_fd" = true ]; then
+    cat <&3 >"$archive" ||
+        fail "cannot snapshot private archive descriptor"
+else
+    cp "$archive_input" "$archive" 3<&- ||
+        fail "cannot snapshot caller-owned archive for validation"
+fi
+exec 3<&-
+[ -f "$archive" ] || fail "archive snapshot is not a regular file"
+
+# Count COMMITTED tests via git ls-files, not the live filesystem: dist now
+# archives HEAD (AR-05 L5), so an untracked stray under tests/ must neither
+# ship nor skew this baseline — with a filesystem count, the same dirty tree
+# was counted on both sides and contamination was undetectable.
+git rev-parse --git-dir >/dev/null 2>&1 || fail "distcheck requires a git checkout"
+checkout_test_count=$(git ls-files 'tests/test_*.c' | wc -l)
+[ "$checkout_test_count" -gt 0 ] || fail "no committed C tests discovered"
 
 members=$tmp/archive-members.txt
-tar -tzf "$archive" >"$members"
+gzip -t "$archive" || fail "archive is not a complete gzip stream"
+tar -tzf "$archive" >"$members" || fail "cannot list archive members"
 
-root_entries=$(grep -Ec "^${dist_root}/?$" "$members" || true)
+root_entries=$(archive_root_entry_count "$dist_root" <"$members")
 [ "$root_entries" -eq 1 ] || fail "archive must contain exactly one top-level $dist_root directory"
-if grep -Ev "^${dist_root}(/|$)" "$members" >/dev/null; then
+if ! archive_members_within_root "$dist_root" <"$members"; then
     fail "archive contains a member outside $dist_root"
 fi
 if LC_ALL=C sort "$members" | uniq -d | grep . >/dev/null; then
@@ -80,6 +123,28 @@ fi
 if grep -E '(^|/)(\.git|\.omx)(/|$)|(^|/)build(/|$)|\.(o|core|tar\.gz)$|(^|/)valgrind[^/]*\.log$' "$members" >/dev/null; then
     fail "archive contains excluded build, VCS, OMX, core, log, or archive content"
 fi
+
+# AR-11 M40: membership must equal the selected commit manifest exactly, not
+# merely contain a short required subset. Directory headers are archive
+# structure; every non-directory member must correspond one-for-one to a blob
+# or symlink selected from the immutable release commit.
+expected_members=$tmp/expected-members.txt
+expected_paths=$tmp/expected-paths.txt
+expected_prefixed=$tmp/expected-prefixed.txt
+actual_members=$tmp/actual-members.txt
+actual_unsorted=$tmp/actual-members-unsorted.txt
+git ls-tree -r --name-only HEAD -- "$@" >"$expected_paths" ||
+    fail "cannot derive exact committed release manifest"
+sed "s#^#${dist_root}/#" <"$expected_paths" >"$expected_prefixed" ||
+    fail "cannot prefix exact committed release manifest"
+LC_ALL=C sort "$expected_prefixed" >"$expected_members" ||
+    fail "cannot sort exact committed release manifest"
+grep -v '/$' "$members" >"$actual_unsorted" ||
+    fail "cannot normalize archive member manifest"
+LC_ALL=C sort "$actual_unsorted" >"$actual_members" ||
+    fail "cannot sort archive member manifest"
+cmp -s "$expected_members" "$actual_members" ||
+    fail "archive members differ from the exact committed release manifest"
 
 tar -xzf "$archive" -C "$tmp"
 source_root=$tmp/$dist_root
@@ -108,6 +173,9 @@ done
 
 expected_version=$(sed -n '1p' "$source_root/VERSION")
 [ -n "$expected_version" ] || fail "VERSION is empty"
+case $expected_version in
+    *[!A-Za-z0-9._+-]*) fail "VERSION is not path-safe" ;;
+esac
 [ "$dist_root" = "gitswitcher-$expected_version" ] ||
     fail "archive root $dist_root disagrees with VERSION $expected_version"
 spec_version=$(sed -n 's/^Version:[[:space:]]*//p' \
@@ -120,10 +188,19 @@ spec_version=$(sed -n 's/^Version:[[:space:]]*//p' \
 built_test_count=0
 for binary in "$source_root"/build/bin/test_*; do
     [ -x "$binary" ] || continue
+    # test_public_api.c deliberately links twice: once with the testing API
+    # surface and once against the production-only surface. Count the latter
+    # independently so the one-source/one-primary-binary manifest invariant
+    # remains exact without rejecting that required second link profile.
+    case ${binary##*/} in
+        test_public_api_production) continue ;;
+    esac
     built_test_count=$((built_test_count + 1))
 done
 [ "$built_test_count" -eq "$checkout_test_count" ] ||
     fail "built test count $built_test_count differs from checkout count $checkout_test_count"
+[ -x "$source_root/build/bin/test_public_api_production" ] ||
+    fail "production public-API link test was not built"
 
 "$make_cmd" -C "$source_root" clean
 "$make_cmd" -C "$source_root" BUILD_TYPE=release all
@@ -134,6 +211,13 @@ case $version_output in
     *" $expected_version ("*) ;;
     *) fail "binary version '$version_output' does not contain VERSION '$expected_version'" ;;
 esac
+
+# AR-11 M39: exercise the same atomic staged-install boundary from the
+# extracted, commit-pinned source tree consumed by RPM %install. The focused
+# mode rejects a corrupted private copy and proves a post-validation source
+# replacement cannot change the bytes ultimately published.
+sh "$source_root/tests/test_ar07_release.sh" install "$source_root" \
+    "$make_cmd" "$release_bin" "$source_root/build" "$prefix"
 
 stage=$tmp/stage
 "$make_cmd" -C "$source_root" BUILD_TYPE=release install DESTDIR="$stage" PREFIX="$prefix"
@@ -164,7 +248,10 @@ if command -v rpmbuild >/dev/null 2>&1; then
     rpmtop=$tmp/rpmbuild
     mkdir -p "$rpmtop/BUILD" "$rpmtop/RPMS" "$rpmtop/SOURCES" \
         "$rpmtop/SPECS" "$rpmtop/SRPMS"
-    cp "$archive" "$rpmtop/SOURCES/"
+    # The invocation-private snapshot deliberately has a generic name. RPM's
+    # Source0 contract still resolves the canonical release basename, so copy
+    # the same pinned bytes under that name inside this private build tree.
+    cp "$archive" "$rpmtop/SOURCES/$dist_root.tar.gz"
     cp "$source_root/gitswitcher.spec" "$rpmtop/SPECS/"
     if ! rpmbuild --define "_topdir $rpmtop" --nodeps -ba \
         "$rpmtop/SPECS/gitswitcher.spec" >"$tmp/rpmbuild.log" 2>&1; then

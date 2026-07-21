@@ -3,6 +3,7 @@
 #include "accounts.h"
 #include "error.h"
 #include "git_ops.h"
+#include "publication.h"
 #include "utils.h"
 
 #include <fcntl.h>
@@ -109,7 +110,11 @@ static bool fixture_init(real_fixture_t *fixture) {
     FILE *key;
     memset(fixture, 0, sizeof(*fixture));
     snprintf(fixture->base, sizeof(fixture->base), "/tmp/gsw_ar07_git_XXXXXX");
-    if (!ts_mkdtemp(fixture->base)) return false;
+    if (!ts_mkdtemp(fixture->base) ||
+        ts_canonicalize_dir_path(fixture->base,
+                                 sizeof(fixture->base)) != 0) {
+        return false;
+    }
     snprintf(fixture->home, sizeof(fixture->home), "%s/home", fixture->base);
     snprintf(fixture->xdg, sizeof(fixture->xdg), "%s/xdg", fixture->base);
     snprintf(fixture->repo, sizeof(fixture->repo), "%s/repo", fixture->base);
@@ -153,6 +158,83 @@ static int get_git_value(const char *scope, const char *key,
     if (result.out_len > 0 && value[result.out_len - 1] == '\n')
         value[result.out_len - 1] = '\0';
     return 0;
+}
+
+static int install_global_ssh_publication(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const char *config_parent, const char *ssh_command,
+    const char *ssh_program) {
+    char state_path[MAX_PATH_LEN];
+    publication_record_t publication;
+    publication_ledger_t ledger;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0U;
+    struct stat st;
+    FILE *state = NULL;
+    int result = -1;
+
+    publication_record_init(&publication);
+    publication_ledger_init(&ledger);
+    if (!ctx || !ctx->current_account || !config_path || !config_parent ||
+        !ssh_command || !ssh_program ||
+        safe_strncpy(ctx->config.config_path, config_path,
+                     sizeof(ctx->config.config_path)) != 0 ||
+        safe_snprintf(state_path, sizeof(state_path), "%s/.resume-hint",
+                      config_parent) != 0 ||
+        stat(config_parent, &st) != 0) {
+        goto cleanup;
+    }
+
+    publication.account_id = ctx->current_account->id;
+    if (safe_strncpy(publication.account_incarnation,
+                     ctx->current_account->incarnation,
+                     sizeof(publication.account_incarnation)) != 0 ||
+        safe_strncpy(publication.config_path, config_path,
+                     sizeof(publication.config_path)) != 0 ||
+        safe_strncpy(publication.ssh_command, ssh_command,
+                     sizeof(publication.ssh_command)) != 0 ||
+        safe_strncpy(publication.ssh_program, ssh_program,
+                     sizeof(publication.ssh_program)) != 0) {
+        goto cleanup;
+    }
+    publication.scope = PUBLICATION_SCOPE_GLOBAL;
+    publication_identity_from_stat(&publication.config_parent, &st);
+    if (stat(config_path, &st) != 0) goto cleanup;
+    publication_identity_from_stat(&publication.post_config, &st);
+    if (stat(ssh_program, &st) != 0 || !S_ISREG(st.st_mode)) goto cleanup;
+    publication_identity_from_stat(&publication.ssh_program_identity, &st);
+    publication.capabilities = PUBLICATION_CAP_DESTINATION |
+                               PUBLICATION_CAP_POST_GENERATION |
+                               PUBLICATION_CAP_SSH_COMMAND |
+                               PUBLICATION_CAP_SSH_PROGRAM;
+    publication.state = PUBLICATION_STATE_PUBLISHED;
+    if (publication_record_validate(&publication) != 0 ||
+        publication_ledger_upsert(&ledger, &publication) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0) {
+        goto cleanup;
+    }
+
+    state = fopen(state_path, "wb");
+    if (!state || fputs("ssh\nactive=AR07 User\n", state) == EOF ||
+        fwrite(tail, 1U, tail_length, state) != tail_length) {
+        goto cleanup;
+    }
+    if (fclose(state) != 0) {
+        state = NULL;
+        goto cleanup;
+    }
+    state = NULL;
+    if (chmod(state_path, 0600) != 0) goto cleanup;
+    result = 0;
+
+cleanup:
+    if (state) (void)fclose(state);
+    if (tail) {
+        secure_zero_memory(tail, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
 }
 
 TEST(worktree_values_are_cleared_and_restored_around_global_switch) {
@@ -286,6 +368,8 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
     size_t captured;
     int saved_stdout;
     char global_config[192];
+    char published_ssh_command[GIT_CONFIG_VALUE_MAX];
+    char ssh_program[MAX_PATH_LEN];
 
     CHECK(fixture_init(&fixture));
     snprintf(global_config, sizeof(global_config), "%s/global\nconfig",
@@ -299,6 +383,9 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
                                "ssh -i /stale/key"), 0);
     CHECK_EQ_INT(set_git_value("--worktree", GIT_CONFIG_GPG_PROGRAM,
                                "/stale/gpg"), 0);
+    CHECK_EQ_INT(set_git_value("--worktree",
+                               GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                               "/stale/gpg"), 0);
 
     CHECK_EQ_INT(git_get_current_config(&current), 0);
     CHECK(current.ssh_command.present);
@@ -306,14 +393,39 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
     CHECK(strstr(current.ssh_command.origin, "config.worktree") != NULL);
     CHECK(current.gpg_program.present);
     CHECK_EQ_INT(current.gpg_program.scope, GIT_CONFIG_ORIGIN_WORKTREE);
+    /* Selector identity is data: the same bytes under legacy gpg.program do
+     * not become an OpenPGP binding, and neither field may overwrite the
+     * other while effective configuration is captured. */
+    CHECK(current.gpg_openpgp_program.present);
+    CHECK_EQ_INT(current.gpg_openpgp_program.scope,
+                 GIT_CONFIG_ORIGIN_WORKTREE);
+    CHECK_STR_EQ(current.gpg_program.value, "/stale/gpg");
+    CHECK_STR_EQ(current.gpg_openpgp_program.value, "/stale/gpg");
+    CHECK(!current.gpg_x509_program.present);
+    CHECK(!current.gpg_ssh_program.present);
 
     memset(&ctx, 0, sizeof(ctx));
     ctx.account_count = 1;
     ctx.accounts[0] = basic_account();
+    ctx.accounts[0].id = 7U;
+    snprintf(ctx.accounts[0].incarnation,
+             sizeof(ctx.accounts[0].incarnation),
+             "ABCDEF0123456789ABCDEF0123456789"
+             "ABCDEF0123456789ABCDEF0123456789");
+    ctx.accounts[0].incarnation_persisted = true;
     ctx.accounts[0].ssh_enabled = true;
     snprintf(ctx.accounts[0].ssh_key_path,
              sizeof(ctx.accounts[0].ssh_key_path), "%s", fixture.key);
     ctx.current_account = &ctx.accounts[0];
+    CHECK_EQ_INT(git_expected_ssh_command(
+                     ctx.current_account, published_ssh_command,
+                     sizeof(published_ssh_command)), 0);
+    CHECK_EQ_INT(publication_extract_ssh_program(
+                     published_ssh_command, ssh_program,
+                     sizeof(ssh_program)), 0);
+    CHECK_EQ_INT(install_global_ssh_publication(
+                     &ctx, global_config, fixture.base,
+                     published_ssh_command, ssh_program), 0);
 
     capture = tmpfile();
     CHECK(capture != NULL);
@@ -335,7 +447,12 @@ TEST(status_attributes_stale_worktree_ssh_and_gpg_program) {
 
     CHECK(strstr(output, "Match Status: [WARN]") != NULL);
     CHECK(strstr(output, "Effective SSH Command: [MISMATCH] (worktree scope") != NULL);
-    CHECK(strstr(output, "Effective GPG Program: [MISMATCH] (worktree scope") != NULL);
+    CHECK(strstr(output,
+                 "Effective OpenPGP Program: [MISMATCH] (worktree scope") !=
+          NULL);
+    CHECK(strstr(output,
+                 "Effective Legacy GPG Program: [FOREIGN] (worktree scope") !=
+          NULL);
     CHECK(strstr(output, "global\\x0Aconfig") != NULL);
     CHECK(strstr(output, "global\nconfig") == NULL);
 }

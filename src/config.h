@@ -4,6 +4,7 @@
 #define CONFIG_H
 
 #include "gitswitch.h"
+#include "publication.h"
 #include <dirent.h>
 
 /* Configuration file format version */
@@ -49,7 +50,15 @@ typedef enum {
     /* Read-side consistency checkpoint. A test callback may mutate the
      * descriptor's backing file and return false; production leaves the
      * callback NULL. */
-    CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ
+    CONFIG_IO_DOCUMENT_AFTER_PREFIX_READ,
+    /* Read-side close checkpoint. A test callback may expose a ctime-only
+     * close-time metadata step and return false; the loader must bind the
+     * generation observed after close. */
+    CONFIG_IO_DOCUMENT_AFTER_CLOSE,
+    /* Exact-byte reproof checkpoint immediately before its final descriptor
+     * generation observation. A test callback may expose a ctime-only step
+     * and return false. */
+    CONFIG_IO_DOCUMENT_REPROOF_AFTER_BYTES
 } config_io_boundary_t;
 
 typedef bool (*config_io_fault_fn)(config_io_boundary_t boundary);
@@ -83,13 +92,22 @@ typedef struct dirent *(*config_backup_readdir_fn)(DIR *dir);
 config_backup_readdir_fn config_set_backup_readdir_fn(
     config_backup_readdir_fn fn);
 
+/* Focused single-threaded entropy seam for incarnation allocation tests.
+ * Production leaves NULL installed and uses generate_random_string(). A test
+ * generator must emit one exact ACCOUNT_INCARNATION_LEN token or fail. */
+typedef int (*config_incarnation_generate_fn)(
+    char incarnation[ACCOUNT_INCARNATION_LEN]);
+config_incarnation_generate_fn config_set_incarnation_generate_fn(
+    config_incarnation_generate_fn fn);
+
 /* Function prototypes */
 
 /**
  * Initialize configuration system
- * - Locates configuration file
- * - Creates default config if none exists
- * - Validates configuration format
+ * - Resolves and stores the normal configuration path
+ * - Creates or secures the private configuration directory
+ * - Loads and validates accounts.toml when it already exists
+ * - Leaves first-file creation to the first successful save
  */
 int config_init(gitswitch_ctx_t *ctx);
 
@@ -99,6 +117,14 @@ int config_init(gitswitch_ctx_t *ctx);
  * config directory or lock metadata.
  */
 int config_init_readonly(gitswitch_ctx_t *ctx);
+
+/**
+ * Initialize configuration for a read-only command that reports live runtime
+ * state. Like config_init_readonly(), this never creates or chmods the config
+ * directory or lock metadata, but it may take the existing SSH runtime lock
+ * and probe current.sock to attribute the active account.
+ */
+int config_init_runtime_readonly(gitswitch_ctx_t *ctx);
 
 /**
  * Load the complete account document for `list --names` without creating or
@@ -135,13 +161,23 @@ int config_load(gitswitch_ctx_t *ctx, const char *config_path);
  * changes through the final pre-rename checkpoint, so the unsupported race is
  * explicitly bounded to the last check-to-rename interval.
  */
-int config_save(const gitswitch_ctx_t *ctx, const char *config_path);
+int config_save(gitswitch_ctx_t *ctx, const char *config_path);
 /* Full-document transactional save. `config_installed` becomes true once the
  * new accounts.toml inode is renamed into place, including a later directory-
- * sync failure whose visible result must be treated as installed/uncertain. */
-int config_save_transactional(const gitswitch_ctx_t *ctx,
+ * sync failure whose visible result must be treated as installed/uncertain.
+ * On complete durable success, the mutable context is rebound to the exact
+ * installed source generation so another save from that context is admitted. */
+int config_save_transactional(gitswitch_ctx_t *ctx,
                               const char *config_path,
                               bool *config_installed);
+
+/* Materialize and durably persist every legacy account incarnation in one
+ * full transaction. A no-op when every account came from a persisted token.
+ * The CLI invokes this under its outer config lock before switch prepare, so
+ * entropy or persistence failure precedes all runtime and Git mutation. */
+int config_migrate_account_incarnations(gitswitch_ctx_t *ctx,
+                                        const char *config_path,
+                                        bool *config_installed);
 
 /**
  * Fail-closed gate shared by config_save and the mutating-command handlers
@@ -161,9 +197,11 @@ int config_check_rewritable(const gitswitch_ctx_t *ctx);
  * either the exact active account or a versioned inactive tombstone. Falls back
  * to config_save when no config exists. For an existing config, the context
  * must come from a successful load of that exact path and the source generation
- * must still be installed; otherwise the save fails closed.
+ * must still be installed; otherwise the save fails closed. If accounts.toml
+ * is absent, this entry point performs the required full first save and then
+ * binds the mutable context to that newly installed source generation.
  */
-int config_save_active_account(const gitswitch_ctx_t *ctx, const char *config_path);
+int config_save_active_account(gitswitch_ctx_t *ctx, const char *config_path);
 
 /**
  * Write the path of the consolidated active-state/resume-hint file into buf.
@@ -179,6 +217,94 @@ int config_resume_hint_path(char *buf, size_t size);
  * fails with no output value. */
 int config_resume_hint_probe(char *needs, size_t size);
 
+/* Durable fail-closed witness for an outer remove/reset transaction whose Git
+ * retirement may no longer agree with the account/active-state document. The
+ * marker is a versioned 0600 sibling of accounts.toml and binds one operation
+ * kind to an exact canonical owner set. Its handle is intentionally opaque:
+ * callers may clear only the exact marker generation they installed/adopted.
+ */
+typedef enum {
+    CONFIG_RETIREMENT_REMOVE = 1,
+    CONFIG_RETIREMENT_RESET
+} config_retirement_kind_t;
+
+typedef struct {
+    uint32_t account_id;
+    char account_incarnation[ACCOUNT_INCARNATION_LEN];
+} config_retirement_owner_t;
+
+typedef struct {
+    char config_path[MAX_PATH_LEN];
+    publication_identity_t post_config;
+} config_retirement_destination_t;
+
+typedef struct config_retirement_guard config_retirement_guard_t;
+
+/* Under an internally owned retirement lifecycle lock, install a fresh
+ * incomplete generation or adopt an active generation only when its kind and
+ * sorted owner set match exactly. Adoption first syncs the pinned directory,
+ * then jointly re-reads the same blocking generation, so an earlier
+ * rename-without-directory-sync failure cannot authorize Git mutation. A
+ * stable exact marker/certificate pair is a completed prior operation and is
+ * rotated to a fresh token; its stale certificate then keeps the new
+ * generation blocked until clear(). Unsafe, malformed, unstable, or
+ * mismatched state fails closed. `owners` may be in any order; duplicate
+ * tuples are refused. The returned handle owns the lock and must be passed to
+ * clear() or abandon().
+ */
+int config_retirement_guard_install_or_adopt(
+    const char *config_path, config_retirement_kind_t kind,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    config_retirement_guard_t **guard);
+
+/* Read-only retirement gate. On return 0, `blocked` is false only when both
+ * fixed records are absent or one jointly revalidated canonical marker and
+ * byte-identical `.retirement-complete` certificate form an exact pair. A
+ * lone record, stale/mismatched pair, fixed transition stage, or retained
+ * legacy clear witness returns blocked. Unsafe, malformed, unreadable, or
+ * unstable state returns -1 with `blocked` still true. The two names are
+ * re-statted after both descriptor reads so mixed-generation snapshots cannot
+ * unblock. This probe never creates, chmods, or repairs a path.
+ */
+int config_retirement_guard_probe(const char *config_path, bool *blocked);
+
+/* True only when this invocation installed the marker. A matching retry that
+ * adopted a prior marker returns false, allowing pre-install rollback to
+ * preserve the older incomplete witness.
+ */
+bool config_retirement_guard_was_created(
+    const config_retirement_guard_t *guard);
+
+/* Complete only the exact owned marker generation (inode, complete bytes, and
+ * embedded token) by atomically replacing the fixed completion certificate;
+ * the canonical blocker is never renamed or deleted. Before certificate
+ * publication every failure retains a blocking marker and the handle. Once a
+ * jointly revalidated exact pair is observable, publication is the no-fail
+ * logical commit point: a later file/directory sync acknowledgement failure is
+ * reported as success because a crash can yield only the exact completed pair
+ * or the older blocking state. Success frees and NULLs the lock-owning handle.
+ */
+int config_retirement_guard_clear(config_retirement_guard_t **guard);
+
+/* Release the lifecycle lock and free/NULL the handle without namespace
+ * repair. clear() never removes the canonical marker; a failed transition may
+ * retain the one fixed stage, and both states remain probe-blocking. */
+void config_retirement_guard_abandon(config_retirement_guard_t **guard);
+
+/* Refresh only the Git post-config generation witnesses for PUBLISHED ledger
+ * records owned by `owners`. Every matching record must find exactly one
+ * destination with the same Git config path; duplicate, missing, or unused
+ * destination inputs fail before publication. The active header and all other
+ * records are preserved semantically through the ordinary atomic active-state
+ * writer. `state_installed` follows the same rename/dir-sync classification as
+ * config_save_active_account_transactional().
+ */
+int config_refresh_retirement_publications_transactional(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const config_retirement_owner_t *owners, size_t owner_count,
+    const config_retirement_destination_t *destinations,
+    size_t destination_count, bool *state_installed);
+
 /* Exact before-image for the consolidated active-state/resume-hint file. A CLI
  * switch captures it before runtime/Git mutation so a failed active-state
  * commit can restore the previous bytes (or previous absence) exactly.
@@ -192,12 +318,14 @@ typedef struct {
     unsigned char *data;
     size_t length;
     unsigned int mode;
+    bool before_image_valid;
+    struct stat before_image;
     char config_path[MAX_PATH_LEN];
     bool post_image_bound;
     bool post_image_installed;
     bool post_image_valid;
     struct stat post_image;
-    unsigned char post_image_data[MAX_NAME_LEN + 32U];
+    unsigned char *post_image_data;
     size_t post_image_length;
 } config_resume_hint_snapshot_t;
 
@@ -214,7 +342,7 @@ void config_resume_hint_snapshot_clear(config_resume_hint_snapshot_t *snapshot);
  * new state-artifact inode has been renamed into place, even if its subsequent
  * directory sync fails. Use the guarded variant when later transaction phases
  * may need to restore an exact snapshot. */
-int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
+int config_save_active_account_transactional(gitswitch_ctx_t *ctx,
                                              const char *config_path,
                                              bool *config_installed);
 /* Switch-transaction variant: rollback_snapshot must be a valid before-image
@@ -222,10 +350,31 @@ int config_save_active_account_transactional(const gitswitch_ctx_t *ctx,
  * that snapshot so config_resume_hint_snapshot_restore can perform a guarded
  * compare-before-restore instead of overwriting a later writer. */
 int config_save_active_account_transactional_guarded(
-    const gitswitch_ctx_t *ctx, const char *config_path,
+    gitswitch_ctx_t *ctx, const char *config_path,
     bool *config_installed,
     config_resume_hint_snapshot_t *rollback_snapshot);
-int config_restore_active_account(const gitswitch_ctx_t *ctx,
+/* Merge one required, valid sealed Git publication into the same atomic
+ * active-state bundle. The exact destination replaces its prior owner; other
+ * repositories/scopes remain recorded. Use the ordinary guarded save above
+ * when no publication is being merged and the current ledger must be
+ * preserved. */
+int config_save_active_account_publication_transactional_guarded(
+    gitswitch_ctx_t *ctx, const char *config_path,
+    const publication_record_t *publication,
+    bool *config_installed,
+    config_resume_hint_snapshot_t *rollback_snapshot);
+/* Read the optional publication ledger from a stable active-state bundle.
+ * Historical state returns a successful ledger-absent model. Before its first
+ * load, `ledger` must be initialized with publication_ledger_init(); the load
+ * clears its prior contents before reading, including on failure. Clear the
+ * final model with publication_ledger_clear(). */
+int config_load_publication_ledger(const char *config_path,
+                                   publication_ledger_t *ledger);
+/* Fail-before-mutation capacity gate for one worst-case new publication.
+ * This deliberately remains conservative when a later upsert may replace an
+ * existing record. */
+int config_publication_preflight(const char *config_path);
+int config_restore_active_account(gitswitch_ctx_t *ctx,
                                   const char *config_path);
 
 /**
@@ -260,9 +409,10 @@ int config_validate_account_model(const account_t *account);
 
 /**
  * Get the configuration file path (<config dir>/accounts.toml).
- * Builds the path only — it does NOT read environment variables and does NOT
- * create any directory (AR-06 F53: the old doc claimed both). Directory
- * creation is config_init/config_create_default's job.
+ * Resolves the home directory from HOME when it is set, otherwise from the
+ * current user's password-database entry, and builds the path only. This query
+ * does not create, chmod, or otherwise modify any filesystem object; directory
+ * creation and security repair belong to config_init/config_create_default.
  */
 int config_get_path(char *path_buffer, size_t buffer_size);
 
@@ -271,15 +421,26 @@ int config_get_path(char *path_buffer, size_t buffer_size);
  */
 int config_add_account(gitswitch_ctx_t *ctx, const account_t *account);
 
+/* Account-operation capability variants. The token is accepted only for the
+ * exact ADD/EDIT/REMOVE owner and context while that transaction is entering;
+ * callers cannot query a live token. */
+int config_add_account_owned(gitswitch_ctx_t *ctx, const account_t *account,
+                             uint64_t transaction_token);
+
 /**
  * Remove account from configuration
  */
 int config_remove_account(gitswitch_ctx_t *ctx, uint32_t account_id);
+int config_remove_account_owned(gitswitch_ctx_t *ctx, uint32_t account_id,
+                                uint64_t transaction_token);
 
 /**
  * Update existing account in configuration
  */
 int config_update_account(gitswitch_ctx_t *ctx, const account_t *account);
+int config_update_account_owned(gitswitch_ctx_t *ctx,
+                                const account_t *account,
+                                uint64_t transaction_token);
 
 /**
  * Find account by ID or name/description

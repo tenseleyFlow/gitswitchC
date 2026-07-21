@@ -2,15 +2,17 @@
  * Implements safe git configuration management for gitswitch-c
  */
 
-/* Darwin hides O_NOFOLLOW and its timespec-valued struct stat members when a
- * strict POSIX namespace is selected. Keep POSIX.1-2008 visibility while
- * explicitly restoring those Darwin extensions used by the descriptor-pinned
- * rollback path. */
+/* Select the native namespace needed by descriptor-pinned publication:
+ * Darwin's renameatx_np, Linux's renameat2 syscall, and FreeBSD's funlinkat.
+ * Strict POSIX feature macros hide the relevant BSD extensions. */
 #if defined(__APPLE__)
 #define _DARWIN_C_SOURCE 1
-#endif
+#elif defined(__linux__)
+#define _GNU_SOURCE 1
+#elif !defined(__FreeBSD__)
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#endif
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,13 +20,20 @@
 #include <strings.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 
 #include "git_ops.h"
+#define GITSWITCH_INTERNAL_API
+#include "git_status_internal.h"
+#undef GITSWITCH_INTERNAL_API
 #include "gpg_manager.h"
 #include "error.h"
 #include "utils.h"
@@ -43,8 +52,17 @@ static int git_get_config_value_ex(const char *key, char *value,
                                    size_t value_size, git_scope_t scope,
                                    bool *value_too_long);
 static int git_detect_managed_worktree_scope(bool *present);
-static int git_verify_merged_account(const account_t *account);
+static int git_verify_merged_account(const account_t *account,
+                                     const char *expected_gpg_program);
 static int git_reject_ssh_command_override(void);
+static int git_set_config_impl(const account_t *account, git_scope_t scope);
+static int git_configure_ssh_impl(const account_t *account,
+                                  git_scope_t scope);
+static int git_configure_gpg_impl(const account_t *account,
+                                  git_scope_t scope);
+static int build_expected_ssh_command_with_program(
+    const account_t *account, const char *ssh_path, char *command,
+    size_t command_size, char *expanded_path, size_t expanded_path_size);
 
 /* Snapshot/restore of gitswitch-managed git config keys, for switch rollback. */
 
@@ -103,6 +121,11 @@ static const char *const g_gpg_program_keys[] = {
  * driving unbounded allocation in this single-purpose CLI. */
 #define GIT_INSPECTION_INITIAL_BYTES (16U * 1024U)
 #define GIT_INSPECTION_MAX_BYTES (8U * 1024U * 1024U)
+/* A restored inode can expose more than one delayed ctime step while FreeBSD
+ * UFS closes funlinkat/link/rename witnesses. Every retry below re-proves the
+ * complete retained bytes and immutable inode fields; this bound prevents an
+ * uncooperative metadata writer from turning reconciliation into a spin. */
+#define GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS 8U
 static void git_init_kv(git_kv_t out[GIT_MANAGED_KEY_COUNT]);
 
 typedef struct {
@@ -161,12 +184,18 @@ typedef struct {
     git_scope_generation_t primary_generation;
     git_scope_generation_t local_generation;
     git_scope_generation_t worktree_generation;
+    uint32_t publication_account_id;
+    char publication_account_incarnation[ACCOUNT_INCARNATION_LEN];
+    bool publication_owner_bound;
+    bool publication_owner_tainted;
+    bool publication_full_image_written;
     bool postimage_sealed;
     bool valid;
     bool restore_incomplete;
 } git_config_snapshot_t;
 
 static git_config_snapshot_t g_git_snapshot;
+static unsigned int g_git_account_write_depth;
 static void git_snapshot_clear(git_config_snapshot_t *snapshot);
 static int git_scope_generation_capture(git_scope_t scope,
                                         git_scope_generation_t *generation);
@@ -192,6 +221,24 @@ typedef enum {
 typedef bool (*git_metadata_test_hook_fn)(git_metadata_test_stage_t stage);
 static git_metadata_test_hook_fn g_metadata_test_hook;
 
+typedef enum {
+    GIT_RETIREMENT_TEST_LOCKED_READ = 1,
+    GIT_RETIREMENT_TEST_BEFORE_REMOVE,
+    GIT_RETIREMENT_TEST_BEFORE_PUBLISH,
+    GIT_RETIREMENT_TEST_BEFORE_EXCHANGE,
+    GIT_RETIREMENT_TEST_BEFORE_DIRECTORY_SYNC,
+    GIT_RETIREMENT_TEST_BEFORE_CLEANUP,
+    GIT_RETIREMENT_TEST_FORCE_EXCHANGE_FALLBACK,
+    GIT_RETIREMENT_TEST_CLEANUP_UNLINK,
+    GIT_RETIREMENT_TEST_AFTER_EXCHANGE,
+    GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
+    GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE
+} git_retirement_test_stage_t;
+typedef bool (*git_retirement_test_hook_fn)(
+    git_retirement_test_stage_t stage, const char *path,
+    const char *key, const char *value);
+static git_retirement_test_hook_fn g_retirement_test_hook;
+
 /* Test seams for deterministic real-Git race coverage. They are deliberately
  * absent from the installed API; tests declare the prototypes locally. */
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn);
@@ -199,6 +246,8 @@ void git_ops_test_set_restore_locked_hook(git_restore_test_hook_fn fn);
 void git_ops_test_set_restore_postpublish_hook(git_restore_test_hook_fn fn);
 git_metadata_test_hook_fn git_ops_test_set_metadata_hook(
     git_metadata_test_hook_fn fn);
+git_retirement_test_hook_fn git_ops_test_set_retirement_hook(
+    git_retirement_test_hook_fn fn);
 git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     git_snapshot_value_malloc_fn fn);
 void git_ops_test_set_restore_prelock_hook(git_restore_test_hook_fn fn) {
@@ -220,6 +269,13 @@ git_snapshot_value_malloc_fn git_ops_test_set_snapshot_value_malloc_fn(
     git_snapshot_value_malloc_fn fn) {
     git_snapshot_value_malloc_fn previous = g_git_snapshot_value_malloc;
     g_git_snapshot_value_malloc = fn ? fn : malloc;
+    return previous;
+}
+
+git_retirement_test_hook_fn git_ops_test_set_retirement_hook(
+    git_retirement_test_hook_fn fn) {
+    git_retirement_test_hook_fn previous = g_retirement_test_hook;
+    g_retirement_test_hook = fn;
     return previous;
 }
 
@@ -317,6 +373,7 @@ static void cfg_cache_store(int s, int k, cfg_state_t state, bool present,
 void git_ops_test_reset_caches(void);
 void git_ops_test_reset_caches(void) {
     git_snapshot_clear(&g_git_snapshot);
+    g_git_account_write_depth = 0U;
     memset(g_cfg_cache, 0, sizeof(g_cfg_cache));
     memset(&g_repo_cache, 0, sizeof(g_repo_cache));
     g_git_validated = false;
@@ -326,6 +383,12 @@ void git_ops_test_reset_caches(void) {
     g_metadata_test_hook = NULL;
     g_git_snapshot_value_malloc = malloc;
 }
+
+typedef enum {
+    GIT_STAGE_WITNESS_CAPTURED = 0,
+    GIT_STAGE_WITNESS_ORIGINAL,
+    GIT_STAGE_WITNESS_PUBLISHED
+} git_stage_witness_kind_t;
 
 typedef struct {
     git_kv_t keys[GIT_MANAGED_KEY_COUNT];
@@ -758,12 +821,46 @@ static int git_scope_snapshot_clone(const git_scope_snapshot_t *source,
     return 0;
 }
 
-/* Parse a complete `git config <scope> --list -z` result. A managed implicit
- * boolean has no key/value separator, so its file spelling cannot be recreated
- * through `git config --add`; refuse it before any mutation instead of
- * guessing. Every record, including the final one, must be NUL terminated. */
+static size_t git_snapshot_key_exact_count(const git_snapshot_key_t *key,
+                                           const char *value) {
+    size_t count = 0U;
+
+    if (!key || !value) return 0U;
+    for (size_t i = 0U; i < key->count; i++) {
+        if (strcmp(key->values[i], value) == 0) count++;
+    }
+    return count;
+}
+
+static int git_snapshot_key_remove_exact_once(git_snapshot_key_t *key,
+                                              const char *value) {
+    size_t match = SIZE_MAX;
+
+    if (!key || !value) return -1;
+    for (size_t i = 0U; i < key->count; i++) {
+        if (strcmp(key->values[i], value) != 0) continue;
+        if (match != SIZE_MAX) return -1;
+        match = i;
+    }
+    if (match == SIZE_MAX) return -1;
+    free(key->values[match]);
+    if (match + 1U < key->count) {
+        memmove(&key->values[match], &key->values[match + 1U],
+                (key->count - match - 1U) * sizeof(*key->values));
+    }
+    key->count--;
+    return 0;
+}
+
+/* Parse a complete `git config <scope> --list -z` result. Rollback cannot
+ * recreate the spelling of a managed implicit Boolean and therefore rejects
+ * it. Retirement edits a copied file in place, so it may retain the occurrence
+ * as semantic `true`; that also makes an implicit foreign true conflict with
+ * an attributed explicit true before `--fixed-value` could remove both.
+ * Every record, including the final one, must be NUL terminated. */
 static int git_parse_snapshot_listing(const char *buf, size_t len,
-                                      git_scope_snapshot_t *out) {
+                                      git_scope_snapshot_t *out,
+                                      bool retain_implicit) {
     size_t pos = 0;
 
     while (pos < len) {
@@ -784,10 +881,16 @@ static int git_parse_snapshot_listing(const char *buf, size_t len,
         if (!newline) {
             key_index = git_managed_key_index_n(record, record_len);
             if (key_index >= 0) {
-                set_error(ERR_GIT_CONFIG_FAILED,
-                          "Cannot exactly snapshot implicit Git value %s",
-                          g_managed_keys[key_index]);
-                return -1;
+                if (!retain_implicit) {
+                    set_error(ERR_GIT_CONFIG_FAILED,
+                              "Cannot exactly snapshot implicit Git value %s",
+                              g_managed_keys[key_index]);
+                    return -1;
+                }
+                if (git_snapshot_key_append(&out->keys[key_index],
+                                            "true", 4U) != 0) {
+                    return -1;
+                }
             }
             continue;
         }
@@ -962,10 +1065,12 @@ static int git_capture_scope_snapshot(git_scope_t scope,
     memset(&direct, 0, sizeof(direct));
     memset(&expanded, 0, sizeof(expanded));
     if (git_read_snapshot_listing(scope, false, &direct_buf, &direct_len) != 0 ||
-        git_parse_snapshot_listing(direct_buf, direct_len, &direct) != 0 ||
+        git_parse_snapshot_listing(direct_buf, direct_len, &direct,
+                                   false) != 0 ||
         git_read_snapshot_listing(scope, true, &expanded_buf,
                                   &expanded_len) != 0 ||
-        git_parse_snapshot_listing(expanded_buf, expanded_len, &expanded) != 0) {
+        git_parse_snapshot_listing(expanded_buf, expanded_len, &expanded,
+                                   false) != 0) {
         goto done;
     }
     if (!git_scope_snapshot_equal(&direct, &expanded)) {
@@ -1144,12 +1249,18 @@ typedef struct {
     char stage_leaf[96];
     char stage_path[MAX_PATH_LEN];
     int dir_fd;
+    int lock_fd;
+    int stage_fd;
     int original_fd;
     int published_fd;
     struct stat parent_stat;
     struct stat logical_stat;
+    struct stat lock_stat;
+    struct stat stage_stat;
     struct stat original_stat;
     struct stat published_stat;
+    unsigned char *stage_data;
+    size_t stage_length;
     unsigned char *original_data;
     size_t original_length;
     unsigned char *published_data;
@@ -1161,6 +1272,9 @@ typedef struct {
     bool logical_final_symlink;
     bool original_present;
     bool original_witness_valid;
+    bool lock_witness_valid;
+    bool stage_witness_valid;
+    git_stage_witness_kind_t stage_witness_kind;
     bool lock_created;
     bool stage_created;
     bool published;
@@ -1442,9 +1556,9 @@ static bool git_fd_matches_bytes(int fd, const unsigned char *expected,
     }
 }
 
-static int git_capture_fd_bytes_exact(int fd, unsigned char **data,
-                                      size_t *length,
-                                      struct stat *identity) {
+static int git_capture_fd_bytes_exact_bounded(
+    int fd, unsigned char **data, size_t *length,
+    struct stat *identity, uintmax_t max_bytes) {
     unsigned char *captured = NULL;
 
     if (!data || !length || !identity) {
@@ -1464,7 +1578,7 @@ static int git_capture_fd_bytes_exact(int fd, unsigned char **data,
             return -1;
         }
         if (before.st_size < 0 ||
-            (uintmax_t)before.st_size > GIT_SNAPSHOT_MAX_BYTES) {
+            (uintmax_t)before.st_size > max_bytes) {
             errno = EFBIG;
             return -1;
         }
@@ -1500,6 +1614,13 @@ static int git_capture_fd_bytes_exact(int fd, unsigned char **data,
     }
     errno = EAGAIN;
     return -1;
+}
+
+static int git_capture_fd_bytes_exact(int fd, unsigned char **data,
+                                      size_t *length,
+                                      struct stat *identity) {
+    return git_capture_fd_bytes_exact_bounded(
+        fd, data, length, identity, GIT_SNAPSHOT_MAX_BYTES);
 }
 
 static bool git_fd_matches_witness_stable(
@@ -1665,6 +1786,66 @@ static int git_scope_lock_resolve_paths(git_scope_t scope,
             sizeof(lock->lock_path)) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Git configuration lock path is too long");
+        return -1;
+    }
+    return 0;
+}
+
+/* Retirement authority names an already-canonical physical configuration
+ * path. Resolve no scope, repository, HOME, or GIT_* state here: doing so
+ * could lock a different file from the durable publication destination. */
+static int git_scope_lock_resolve_exact_path(const char *path,
+                                             git_scope_lock_t *lock) {
+    char canonical[MAX_PATH_LEN];
+    char *slash;
+
+    if (!path || path[0] != '/' || !lock ||
+        safe_strncpy(lock->logical_path, path,
+                     sizeof(lock->logical_path)) != 0 ||
+        safe_strncpy(lock->path, path, sizeof(lock->path)) != 0 ||
+        lstat(path, &lock->logical_stat) != 0 ||
+        !S_ISREG(lock->logical_stat.st_mode) ||
+        realpath(path, canonical) == NULL || strcmp(canonical, path) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Recorded Git configuration path is no longer canonical: %s",
+                  path ? path : "(null)");
+        return -1;
+    }
+    lock->logical_present = true;
+    lock->logical_final_symlink = false;
+    slash = strrchr(lock->path, '/');
+    if (!slash || !slash[1] || strlen(slash + 1U) > NAME_MAX) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Invalid recorded Git configuration path: %s", path);
+        return -1;
+    }
+    if (slash == lock->path) {
+        if (safe_strncpy(lock->parent, "/", sizeof(lock->parent)) != 0 ||
+            safe_strncpy(lock->logical_parent, "/",
+                         sizeof(lock->logical_parent)) != 0) {
+            return -1;
+        }
+    } else {
+        size_t parent_length = (size_t)(slash - lock->path);
+
+        if (parent_length >= sizeof(lock->parent)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Recorded Git configuration parent path is too long");
+            return -1;
+        }
+        memcpy(lock->parent, lock->path, parent_length);
+        lock->parent[parent_length] = '\0';
+        memcpy(lock->logical_parent, lock->path, parent_length);
+        lock->logical_parent[parent_length] = '\0';
+    }
+    if (safe_strncpy(lock->leaf, slash + 1U, sizeof(lock->leaf)) != 0 ||
+        (size_t)snprintf(lock->lock_leaf, sizeof(lock->lock_leaf), "%s.lock",
+                         lock->leaf) >= sizeof(lock->lock_leaf) ||
+        (size_t)snprintf(lock->lock_path, sizeof(lock->lock_path), "%s/%s",
+                         lock->parent, lock->lock_leaf) >=
+            sizeof(lock->lock_path)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Recorded Git configuration lock path is too long");
         return -1;
     }
     return 0;
@@ -2039,14 +2220,972 @@ static int git_scope_generation_verify_post_config(
     return 0;
 }
 
+static void git_scope_lock_clear_stage_witness(git_scope_lock_t *lock) {
+    if (!lock) return;
+    if (lock->stage_fd >= 0) (void)close(lock->stage_fd);
+    lock->stage_fd = -1;
+    if (lock->stage_data) {
+        secure_zero_memory(lock->stage_data, lock->stage_length);
+        free(lock->stage_data);
+    }
+    lock->stage_data = NULL;
+    lock->stage_length = 0U;
+    lock->stage_witness_valid = false;
+    lock->stage_witness_kind = GIT_STAGE_WITNESS_CAPTURED;
+    memset(&lock->stage_stat, 0, sizeof(lock->stage_stat));
+}
+
+static int git_scope_lock_capture_stage_witness(git_scope_lock_t *lock) {
+    int stage_fd;
+    struct stat named;
+    struct stat captured;
+    unsigned char *data = NULL;
+    size_t length = 0U;
+
+    if (!lock || !lock->stage_created || lock->dir_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    stage_fd = openat(lock->dir_fd, lock->stage_leaf,
+                      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (stage_fd < 0 ||
+        fstatat(lock->dir_fd, lock->stage_leaf, &named,
+                AT_SYMLINK_NOFOLLOW) != 0 ||
+        git_capture_fd_bytes_exact(stage_fd, &data, &length,
+                                   &captured) != 0 ||
+        !S_ISREG(captured.st_mode) || captured.st_nlink != 1 ||
+        !git_same_file_observation(&named, &captured)) {
+        int saved_errno = errno ? errno : EAGAIN;
+
+        if (stage_fd >= 0) (void)close(stage_fd);
+        if (data) {
+            secure_zero_memory(data, length);
+            free(data);
+        }
+        errno = saved_errno;
+        return -1;
+    }
+    git_scope_lock_clear_stage_witness(lock);
+    lock->stage_fd = stage_fd;
+    lock->stage_stat = captured;
+    lock->stage_data = data;
+    lock->stage_length = length;
+    lock->stage_witness_valid = true;
+    lock->stage_witness_kind = GIT_STAGE_WITNESS_CAPTURED;
+    return 0;
+}
+
+typedef struct {
+    int fd;
+    const struct stat *stat;
+    const unsigned char *data;
+    size_t length;
+    bool valid;
+} git_cleanup_witness_t;
+
+typedef enum {
+    GIT_CLEANUP_RETRY = -1,
+    GIT_CLEANUP_REMOVED = 0,
+    GIT_CLEANUP_FOREIGN = 1
+} git_cleanup_result_t;
+
+#define GIT_RECOVERY_MARKER_MAGIC "gitswitch-recovery-v1"
+#define GIT_RECOVERY_HEADER_MAX 512U
+#define GIT_RECOVERY_MARKER_MAX_BYTES \
+    (GIT_SNAPSHOT_MAX_BYTES + GIT_RECOVERY_HEADER_MAX)
+
+typedef struct {
+    bool stage_present;
+    char stage_leaf[sizeof(((git_scope_lock_t *)0)->stage_leaf)];
+    struct stat stage_stat;
+    const unsigned char *stage_data;
+    size_t stage_length;
+} git_recovery_marker_t;
+
+static int git_scope_lock_claim_fd(int fd) {
+    struct flock claim;
+
+    memset(&claim, 0, sizeof(claim));
+    claim.l_type = F_WRLCK;
+    claim.l_whence = SEEK_SET;
+    claim.l_start = 0;
+    claim.l_len = 0;
+    return fcntl(fd, F_SETLK, &claim);
+}
+
+static intmax_t git_stat_mtime_seconds(const struct stat *st) {
+#if defined(__APPLE__)
+    return (intmax_t)st->st_mtimespec.tv_sec;
+#else
+    return (intmax_t)st->st_mtim.tv_sec;
+#endif
+}
+
+static long git_stat_mtime_nanoseconds(const struct stat *st) {
+#if defined(__APPLE__)
+    return st->st_mtimespec.tv_nsec;
+#else
+    return st->st_mtim.tv_nsec;
+#endif
+}
+
+static void git_stat_set_mtime(struct stat *st, intmax_t seconds,
+                               long nanoseconds) {
+#if defined(__APPLE__)
+    st->st_mtimespec.tv_sec = (time_t)seconds;
+    st->st_mtimespec.tv_nsec = nanoseconds;
+#else
+    st->st_mtim.tv_sec = (time_t)seconds;
+    st->st_mtim.tv_nsec = nanoseconds;
+#endif
+}
+
+static bool git_recovery_stage_leaf_valid(const char *leaf) {
+    static const char prefix[] = ".gitswitch-config-";
+    const unsigned char *cursor;
+
+    if (!leaf || strncmp(leaf, prefix, sizeof(prefix) - 1U) != 0 ||
+        strlen(leaf) >= sizeof(((git_scope_lock_t *)0)->stage_leaf)) {
+        return false;
+    }
+    cursor = (const unsigned char *)leaf + sizeof(prefix) - 1U;
+    if (!isdigit(*cursor)) return false;
+    while (isdigit(*cursor)) cursor++;
+    if (*cursor++ != '-' || !isdigit(*cursor)) return false;
+    while (isdigit(*cursor)) cursor++;
+    return *cursor == '\0';
+}
+
+static int git_recovery_format_header(char *header, size_t header_size,
+                                      const char *stage_leaf,
+                                      const struct stat *stage_stat,
+                                      size_t stage_length) {
+    int written;
+
+    if (!header || header_size == 0U || !stage_leaf || !stage_stat) {
+        errno = EINVAL;
+        return -1;
+    }
+    written = snprintf( /* Flawfinder: ignore — bounded destination and a
+                         * compile-time literal assembled from PRI macros. */
+        header, header_size,
+        GIT_RECOVERY_MARKER_MAGIC
+        " %s %" PRIuMAX " %" PRIuMAX " %" PRIuMAX " %" PRIuMAX
+        " %" PRIuMAX " %" PRIuMAX " %" PRIuMAX " %" PRIdMAX
+        " %ld %" PRIuMAX,
+        stage_leaf, (uintmax_t)stage_stat->st_dev,
+        (uintmax_t)stage_stat->st_ino, (uintmax_t)stage_stat->st_mode,
+        (uintmax_t)stage_stat->st_uid, (uintmax_t)stage_stat->st_gid,
+        (uintmax_t)stage_stat->st_size, (uintmax_t)stage_stat->st_nlink,
+        git_stat_mtime_seconds(stage_stat),
+        git_stat_mtime_nanoseconds(stage_stat), (uintmax_t)stage_length);
+    if (written < 0 || (size_t)written >= header_size) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return written;
+}
+
+static bool git_recovery_next_token(const char **cursor, const char *end,
+                                    const char **token,
+                                    size_t *token_length) {
+    const char *start;
+    const char *separator;
+
+    if (!cursor || !*cursor || !end || !token || !token_length ||
+        *cursor >= end || **cursor == ' ') {
+        return false;
+    }
+    start = *cursor;
+    separator = memchr(start, ' ', (size_t)(end - start));
+    if (!separator) {
+        *token = start;
+        *token_length = (size_t)(end - start);
+        *cursor = end;
+        return *token_length != 0U;
+    }
+    if (separator == start || separator + 1 >= end || separator[1] == ' ') {
+        return false;
+    }
+    *token = start;
+    *token_length = (size_t)(separator - start);
+    *cursor = separator + 1;
+    return true;
+}
+
+static bool git_recovery_parse_uintmax_token(const char *token,
+                                             size_t token_length,
+                                             uintmax_t *value) {
+    uintmax_t parsed = 0U;
+
+    if (!token || token_length == 0U || !value) return false;
+    for (size_t i = 0U; i < token_length; i++) {
+        unsigned char byte = (unsigned char)token[i];
+        uintmax_t digit;
+
+        if (byte < (unsigned char)'0' || byte > (unsigned char)'9') {
+            return false;
+        }
+        digit = (uintmax_t)(byte - (unsigned char)'0');
+        if (parsed > (UINTMAX_MAX - digit) / 10U) return false;
+        parsed = parsed * 10U + digit;
+    }
+    *value = parsed;
+    return true;
+}
+
+static bool git_recovery_parse_intmax_token(const char *token,
+                                            size_t token_length,
+                                            intmax_t *value) {
+    bool negative;
+    uintmax_t magnitude = 0U;
+    uintmax_t limit;
+    size_t offset;
+
+    if (!token || token_length == 0U || !value) return false;
+    negative = token[0] == '-';
+    offset = negative ? 1U : 0U;
+    if (offset == token_length) return false;
+    limit = negative ? (uintmax_t)INTMAX_MAX + 1U
+                     : (uintmax_t)INTMAX_MAX;
+    for (size_t i = offset; i < token_length; i++) {
+        unsigned char byte = (unsigned char)token[i];
+        uintmax_t digit;
+
+        if (byte < (unsigned char)'0' || byte > (unsigned char)'9') {
+            return false;
+        }
+        digit = (uintmax_t)(byte - (unsigned char)'0');
+        if (magnitude > (limit - digit) / 10U) return false;
+        magnitude = magnitude * 10U + digit;
+    }
+    if (negative) {
+        *value = magnitude == (uintmax_t)INTMAX_MAX + 1U
+                     ? INTMAX_MIN
+                     : -(intmax_t)magnitude;
+    } else {
+        *value = (intmax_t)magnitude;
+    }
+    return true;
+}
+
+static bool git_recovery_marker_parse(const unsigned char *data,
+                                      size_t length,
+                                      git_recovery_marker_t *marker) {
+    const unsigned char *newline;
+    char header[GIT_RECOVERY_HEADER_MAX];
+    char canonical[GIT_RECOVERY_HEADER_MAX];
+    char stage_leaf[sizeof(marker->stage_leaf)];
+    uintmax_t device;
+    uintmax_t inode;
+    uintmax_t mode;
+    uintmax_t uid;
+    uintmax_t gid;
+    uintmax_t size;
+    uintmax_t links;
+    intmax_t mtime_seconds;
+    uintmax_t mtime_nanoseconds_value;
+    long mtime_nanoseconds;
+    uintmax_t data_length;
+    size_t header_length;
+    size_t data_offset;
+    const char *cursor;
+    const char *end;
+    const char *token;
+    size_t token_length;
+    size_t magic_length = sizeof(GIT_RECOVERY_MARKER_MAGIC) - 1U;
+    struct stat parsed;
+
+    if (!data || !marker || length == 0U ||
+        length > GIT_RECOVERY_MARKER_MAX_BYTES) {
+        return false;
+    }
+    newline = memchr(data, '\n', length);
+    if (!newline) return false;
+    header_length = (size_t)(newline - data);
+    data_offset = header_length + 1U;
+    if (header_length == 0U || header_length >= sizeof(header) ||
+        memchr(data, '\0', header_length) != NULL) {
+        return false;
+    }
+    memcpy(header, data, header_length);
+    header[header_length] = '\0';
+    if (header_length <= magic_length ||
+        memcmp(header, GIT_RECOVERY_MARKER_MAGIC, magic_length) != 0 ||
+        header[magic_length] != ' ') {
+        return false;
+    }
+    cursor = header + magic_length + 1U;
+    end = header + header_length;
+    if (!git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        token_length >= sizeof(stage_leaf)) {
+        return false;
+    }
+    memcpy(stage_leaf, token, token_length);
+    stage_leaf[token_length] = '\0';
+    if (!git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length, &device) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length, &inode) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length, &mode) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length, &uid) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length, &gid) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length, &size) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length, &links) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_intmax_token(token, token_length,
+                                         &mtime_seconds) ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(
+            token, token_length, &mtime_nanoseconds_value) ||
+        mtime_nanoseconds_value > (uintmax_t)LONG_MAX ||
+        !git_recovery_next_token(&cursor, end, &token, &token_length) ||
+        !git_recovery_parse_uintmax_token(token, token_length,
+                                          &data_length) ||
+        cursor != end || data_length > GIT_SNAPSHOT_MAX_BYTES ||
+        data_length > SIZE_MAX ||
+        (size_t)data_length != length - data_offset) {
+        return false;
+    }
+    mtime_nanoseconds = (long)mtime_nanoseconds_value;
+    /* Reject target-type overflow before populating the parsed stat witness.
+     * Integer casts themselves are defined or implementation-defined; the
+     * exact round trips make every unsupported representation fail closed. */
+    if ((uintmax_t)(dev_t)device != device ||
+        (uintmax_t)(ino_t)inode != inode ||
+        (uintmax_t)(mode_t)mode != mode ||
+        (uintmax_t)(uid_t)uid != uid ||
+        (uintmax_t)(gid_t)gid != gid ||
+        (off_t)size < 0 || (uintmax_t)(off_t)size != size ||
+        (uintmax_t)(nlink_t)links != links ||
+        (intmax_t)(time_t)mtime_seconds != mtime_seconds ||
+        mtime_nanoseconds > 999999999L) {
+        return false;
+    }
+    memset(&parsed, 0, sizeof(parsed));
+    parsed.st_dev = (dev_t)device;
+    parsed.st_ino = (ino_t)inode;
+    parsed.st_mode = (mode_t)mode;
+    parsed.st_uid = (uid_t)uid;
+    parsed.st_gid = (gid_t)gid;
+    parsed.st_size = (off_t)size;
+    parsed.st_nlink = (nlink_t)links;
+    git_stat_set_mtime(&parsed, mtime_seconds, mtime_nanoseconds);
+    if ((uintmax_t)parsed.st_dev != device ||
+        (uintmax_t)parsed.st_ino != inode ||
+        (uintmax_t)parsed.st_mode != mode ||
+        (uintmax_t)parsed.st_uid != uid ||
+        (uintmax_t)parsed.st_gid != gid || parsed.st_size < 0 ||
+        (uintmax_t)parsed.st_size != size ||
+        (uintmax_t)parsed.st_nlink != links ||
+        git_stat_mtime_seconds(&parsed) != mtime_seconds ||
+        git_stat_mtime_nanoseconds(&parsed) != mtime_nanoseconds ||
+        mtime_nanoseconds < 0 || mtime_nanoseconds > 999999999L ||
+        git_recovery_format_header(canonical, sizeof(canonical), stage_leaf,
+                                   &parsed, (size_t)data_length) < 0 ||
+        strcmp(header, canonical) != 0) {
+        return false;
+    }
+    if (strcmp(stage_leaf, "-") == 0) {
+        if (device != 0U || inode != 0U || mode != 0U || uid != 0U ||
+            gid != 0U || size != 0U || links != 0U || mtime_seconds != 0 ||
+            mtime_nanoseconds != 0L || data_length != 0U) {
+            return false;
+        }
+        memset(marker, 0, sizeof(*marker));
+        return true;
+    }
+    if (!git_recovery_stage_leaf_valid(stage_leaf) ||
+        !S_ISREG(parsed.st_mode) || parsed.st_nlink != 1 ||
+        parsed.st_size != (off_t)data_length) {
+        return false;
+    }
+    memset(marker, 0, sizeof(*marker));
+    marker->stage_present = true;
+    memcpy(marker->stage_leaf, stage_leaf, strlen(stage_leaf) + 1U);
+    marker->stage_stat = parsed;
+    marker->stage_data = data + data_offset;
+    marker->stage_length = (size_t)data_length;
+    return true;
+}
+
+static bool git_fd_matches_recovery_marker(
+    int fd, const char *header, size_t header_length,
+    const unsigned char *stage_data, size_t stage_length) {
+    unsigned char buffer[4096];
+    size_t offset = 0U;
+    size_t marker_length = header_length + 1U + stage_length;
+    struct stat before;
+    struct stat after;
+
+    if (fd < 0 || !header || (stage_length != 0U && !stage_data) ||
+        marker_length < stage_length || fstat(fd, &before) != 0 ||
+        before.st_size < 0 || (uintmax_t)before.st_size != marker_length) {
+        return false;
+    }
+    while (offset < marker_length) {
+        const unsigned char *expected;
+        size_t expected_length;
+        size_t wanted;
+        ssize_t got;
+
+        if (offset < header_length) {
+            expected = (const unsigned char *)header + offset;
+            expected_length = header_length - offset;
+        } else if (offset == header_length) {
+            static const unsigned char newline = '\n';
+            expected = &newline;
+            expected_length = 1U;
+        } else {
+            size_t data_offset = offset - header_length - 1U;
+            expected = stage_data + data_offset;
+            expected_length = stage_length - data_offset;
+        }
+        wanted = expected_length < sizeof(buffer) ? expected_length
+                                                   : sizeof(buffer);
+        do {
+            got = pread(fd, buffer, wanted, (off_t)offset);
+        } while (got < 0 && errno == EINTR);
+        if (got <= 0 || (size_t)got > expected_length ||
+            memcmp(buffer, expected, (size_t)got) != 0) {
+            if (got >= 0) errno = EAGAIN;
+            return false;
+        }
+        offset += (size_t)got;
+    }
+    return fstat(fd, &after) == 0 &&
+           git_same_file_observation(&before, &after);
+}
+
+static int git_scope_lock_capture_empty_lock_witness(
+    git_scope_lock_t *lock) {
+    unsigned char *data = NULL;
+    size_t length = 0U;
+    struct stat captured;
+    int result = -1;
+
+    if (!lock || lock->dir_fd < 0 || lock->lock_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (git_capture_fd_bytes_exact(lock->lock_fd, &data, &length,
+                                   &captured) == 0 &&
+        length == 0U && S_ISREG(captured.st_mode) &&
+        captured.st_nlink == 1 &&
+        git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd, &captured,
+            NULL, 0U, &lock->lock_stat)) {
+        lock->lock_witness_valid = true;
+        result = 0;
+    }
+    if (data) {
+        secure_zero_memory(data, length);
+        free(data);
+    }
+    return result;
+}
+
+static git_cleanup_witness_t git_scope_lock_stage_witness(
+    const git_scope_lock_t *lock) {
+    git_cleanup_witness_t witness = {-1, NULL, NULL, 0U, false};
+
+    if (!lock) return witness;
+    switch (lock->stage_witness_kind) {
+        case GIT_STAGE_WITNESS_CAPTURED:
+            witness.fd = lock->stage_fd;
+            witness.stat = &lock->stage_stat;
+            witness.data = lock->stage_data;
+            witness.length = lock->stage_length;
+            witness.valid = lock->stage_witness_valid;
+            break;
+        case GIT_STAGE_WITNESS_ORIGINAL:
+            witness.fd = lock->original_fd;
+            witness.stat = &lock->original_stat;
+            witness.data = lock->original_data;
+            witness.length = lock->original_length;
+            witness.valid = lock->original_witness_valid;
+            break;
+        case GIT_STAGE_WITNESS_PUBLISHED:
+            witness.fd = lock->published_fd;
+            witness.stat = &lock->published_stat;
+            witness.data = lock->published_data;
+            witness.length = lock->published_length;
+            witness.valid = lock->published_witness_valid;
+            break;
+        default:
+            break;
+    }
+    return witness;
+}
+
+static git_cleanup_result_t git_scope_lock_cleanup_name_once(
+    git_scope_lock_t *lock, const char *leaf, const char *description,
+    int witness_fd, const struct stat *witness_stat,
+    const unsigned char *witness_data, size_t witness_length,
+    bool witness_valid, bool retirement_hook) {
+    struct stat named;
+    struct stat pinned;
+    struct stat remaining;
+    int saved_errno;
+
+    if (!lock || !leaf || lock->dir_fd < 0 || witness_fd < 0 ||
+        !witness_stat || !witness_valid) {
+        errno = EINVAL;
+        return GIT_CLEANUP_RETRY;
+    }
+    errno = 0;
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, leaf, witness_fd, witness_stat,
+            witness_data, witness_length, NULL)) {
+        saved_errno = errno ? errno : EAGAIN;
+        if (fstatat(lock->dir_fd, leaf, &named,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) return GIT_CLEANUP_REMOVED;
+            return GIT_CLEANUP_RETRY;
+        }
+        if (fstat(witness_fd, &pinned) != 0) {
+            return GIT_CLEANUP_RETRY;
+        }
+        if (named.st_dev != pinned.st_dev || named.st_ino != pinned.st_ino ||
+            !git_same_pinned_file_generation(witness_stat, &named) ||
+            !git_same_pinned_file_generation(witness_stat, &pinned)) {
+            errno = saved_errno;
+            return GIT_CLEANUP_FOREIGN;
+        }
+        errno = saved_errno;
+        return GIT_CLEANUP_RETRY;
+    }
+    if (retirement_hook && g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_CLEANUP_UNLINK,
+                               lock->path, leaf, description)) {
+        errno = EIO;
+        return GIT_CLEANUP_RETRY;
+    }
+#if defined(__FreeBSD__)
+    if (funlinkat(lock->dir_fd, leaf, witness_fd, 0) != 0) {
+#else
+    if (unlinkat(lock->dir_fd, leaf, 0) != 0) {
+#endif
+        return GIT_CLEANUP_RETRY;
+    }
+    errno = 0;
+    if (fstatat(lock->dir_fd, leaf, &remaining,
+                AT_SYMLINK_NOFOLLOW) == 0) {
+        return GIT_CLEANUP_FOREIGN;
+    }
+    return errno == ENOENT ? GIT_CLEANUP_REMOVED : GIT_CLEANUP_RETRY;
+}
+
+static git_cleanup_result_t git_scope_lock_cleanup_name(
+    git_scope_lock_t *lock, const char *leaf, const char *description,
+    int witness_fd, const struct stat *witness_stat,
+    const unsigned char *witness_data, size_t witness_length,
+    bool witness_valid, bool retirement_hook) {
+    git_cleanup_result_t result = GIT_CLEANUP_RETRY;
+    int saved_errno = EAGAIN;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        result = git_scope_lock_cleanup_name_once(
+            lock, leaf, description, witness_fd, witness_stat,
+            witness_data, witness_length, witness_valid, retirement_hook);
+        if (result != GIT_CLEANUP_RETRY) break;
+        saved_errno = errno ? errno : EAGAIN;
+    }
+    if (result == GIT_CLEANUP_FOREIGN) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git transaction %s changed; preserving the foreign path",
+                  description ? description : "artifact");
+    } else if (result == GIT_CLEANUP_RETRY) {
+        errno = saved_errno;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot remove owned Git transaction %s",
+                         description ? description : "artifact");
+    }
+    return result;
+}
+
+static int git_scope_lock_persist_recovery_marker(git_scope_lock_t *lock) {
+    static unsigned long marker_nonce;
+    static const unsigned char newline = '\n';
+    git_cleanup_witness_t stage_witness = {-1, NULL, NULL, 0U, false};
+    git_recovery_marker_t parsed_marker;
+    const unsigned char *stage_data = NULL;
+    unsigned char *marker_data = NULL;
+    size_t stage_length = 0U;
+    size_t marker_length = 0U;
+    size_t expected_length;
+    struct stat stage_stat;
+    struct stat lock_current;
+    struct stat marker_stat;
+    struct stat installed_stat;
+    char header[GIT_RECOVERY_HEADER_MAX];
+    char marker_leaf[96];
+    const char *stage_leaf = "-";
+    error_accumulator_t failures;
+    int header_length;
+    int marker_fd = -1;
+    int primary_errno = EIO;
+    int result = -1;
+    bool marker_created = false;
+    bool marker_witness_valid = false;
+
+    memset(&stage_stat, 0, sizeof(stage_stat));
+    memset(&parsed_marker, 0, sizeof(parsed_marker));
+    memset(&marker_stat, 0, sizeof(marker_stat));
+    error_accumulator_init(&failures);
+    if (!lock || lock->dir_fd < 0 || !lock->lock_created ||
+        lock->lock_fd < 0 || !lock->lock_witness_valid) {
+        errno = EINVAL;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot retain Git transaction cleanup authority");
+        return -1;
+    }
+    if (lock->stage_created) {
+        stage_witness = git_scope_lock_stage_witness(lock);
+        if (!stage_witness.valid || stage_witness.fd < 0 ||
+            !git_file_at_matches_witness(
+                lock->dir_fd, lock->stage_leaf, stage_witness.fd,
+                stage_witness.stat, stage_witness.data,
+                stage_witness.length, &stage_stat)) {
+            errno = errno ? errno : EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Cannot retain exact Git staging cleanup authority");
+            return -1;
+        }
+        stage_leaf = lock->stage_leaf;
+        stage_data = stage_witness.data;
+        stage_length = stage_witness.length;
+    }
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd,
+            &lock->lock_stat, NULL, 0U, &lock_current)) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot retain exact Git lock cleanup authority");
+        return -1;
+    }
+    header_length = git_recovery_format_header(
+        header, sizeof(header), stage_leaf, &stage_stat, stage_length);
+    if (header_length < 0 ||
+        stage_length > SIZE_MAX - (size_t)header_length - 1U) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot format Git transaction recovery marker");
+        goto fail;
+    }
+    expected_length = (size_t)header_length + 1U + stage_length;
+    for (unsigned attempt = 0U; attempt < 100U; attempt++) {
+        unsigned long nonce = ++marker_nonce;
+
+        if ((size_t)snprintf(marker_leaf, sizeof(marker_leaf),
+                             ".gitswitch-recovery-%ld-%lu",
+                             (long)getpid(), nonce) >= sizeof(marker_leaf)) {
+            errno = ENAMETOOLONG;
+            set_system_error(ERR_GIT_CONFIG_FAILED,
+                             "Git recovery marker path is too long");
+            goto fail;
+        }
+        marker_fd = openat(lock->dir_fd, marker_leaf,
+                           O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (marker_fd >= 0) {
+            marker_created = true;
+            break;
+        }
+        if (errno != EEXIST) {
+            set_system_error(ERR_GIT_CONFIG_FAILED,
+                             "Cannot create private Git recovery marker");
+            goto fail;
+        }
+    }
+    if (marker_fd < 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot allocate a unique private Git recovery marker");
+        goto fail;
+    }
+    if (git_scope_lock_claim_fd(marker_fd) != 0 ||
+        fchmod(marker_fd, 0600) != 0 ||
+        git_write_all(marker_fd, (const unsigned char *)header,
+                      (size_t)header_length) != 0 ||
+        git_write_all(marker_fd, &newline, 1U) != 0 ||
+        (stage_length != 0U &&
+         git_write_all(marker_fd, stage_data, stage_length) != 0) ||
+        fsync(marker_fd) != 0) {
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot prepare private Git recovery marker");
+        goto fail;
+    }
+    if (git_capture_fd_bytes_exact_bounded(
+            marker_fd, &marker_data, &marker_length, &marker_stat,
+            GIT_RECOVERY_MARKER_MAX_BYTES) != 0 ||
+        marker_length != expected_length ||
+        !S_ISREG(marker_stat.st_mode) || marker_stat.st_nlink != 1 ||
+        marker_stat.st_uid != geteuid() ||
+        (marker_stat.st_mode & 07777) != 0600 ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, marker_leaf, marker_fd, &marker_stat,
+            marker_data, marker_length, NULL) ||
+        !git_fd_matches_recovery_marker(
+            marker_fd, header, (size_t)header_length,
+            stage_data, stage_length) ||
+        !git_recovery_marker_parse(marker_data, marker_length,
+                                   &parsed_marker)) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot validate private Git recovery marker");
+        goto fail;
+    }
+    marker_witness_valid = true;
+
+    /* Reprove both cleanup authorities immediately before the only namespace
+     * mutation. The canonical lock stays byte-empty until renameat() replaces
+     * it with a complete, fsynced, strictly parsed marker inode. */
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd,
+            &lock->lock_stat, NULL, 0U, &lock_current) ||
+        (lock->stage_created &&
+         (!stage_witness.valid || stage_witness.fd < 0 ||
+          !git_file_at_matches_witness(
+              lock->dir_fd, lock->stage_leaf, stage_witness.fd,
+              stage_witness.stat, stage_witness.data,
+              stage_witness.length, NULL)))) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Git transaction cleanup authority changed before recovery publication");
+        goto fail;
+    }
+    if (g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_MARKER_PUBLISH,
+                               lock->path, marker_leaf,
+                               "private recovery marker")) {
+        errno = EIO;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Injected Git recovery marker publication failure");
+        goto fail;
+    }
+    if (renameat(lock->dir_fd, marker_leaf,
+                 lock->dir_fd, lock->lock_leaf) != 0) {
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot publish complete Git recovery marker");
+        goto fail;
+    }
+    marker_created = false;
+    (void)close(lock->lock_fd);
+    lock->lock_fd = marker_fd;
+    marker_fd = -1;
+    lock->lock_stat = marker_stat;
+    lock->lock_witness_valid = false;
+    /* Exact cleanup authority is now durable in the canonical lock itself.
+     * Resource close must not attempt another pathname mutation. */
+    lock->stage_created = false;
+    lock->lock_created = false;
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd,
+            &marker_stat, marker_data, marker_length, &installed_stat) ||
+        fsync(lock->dir_fd) != 0 ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd,
+            &installed_stat, marker_data, marker_length, &lock->lock_stat)) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Complete Git recovery marker was installed but not durably verified");
+        goto fail;
+    }
+    result = 0;
+
+fail:
+    if (result != 0) {
+        error_context_t primary_error = *get_last_error();
+
+        primary_errno = errno ? errno : EIO;
+        errno = primary_errno;
+        (void)error_accumulator_add(
+            &failures, "Git recovery marker publication", &primary_error);
+        if (marker_created && marker_fd >= 0) {
+            if (!marker_witness_valid) {
+                if (marker_data) {
+                    secure_zero_memory(marker_data, marker_length);
+                    free(marker_data);
+                    marker_data = NULL;
+                    marker_length = 0U;
+                }
+                if (git_capture_fd_bytes_exact_bounded(
+                        marker_fd, &marker_data, &marker_length,
+                        &marker_stat, GIT_RECOVERY_MARKER_MAX_BYTES) == 0 &&
+                    S_ISREG(marker_stat.st_mode) &&
+                    marker_stat.st_nlink == 1 &&
+                    marker_stat.st_uid == geteuid()) {
+                    marker_witness_valid = true;
+                } else {
+                    set_system_error(
+                        ERR_GIT_CONFIG_FAILED,
+                        "Cannot pin failed private Git recovery marker for cleanup");
+                    (void)error_accumulator_add_last(
+                        &failures, "private recovery marker witness");
+                }
+            }
+            if (marker_witness_valid &&
+                git_scope_lock_cleanup_name(
+                    lock, marker_leaf, "private recovery marker",
+                    marker_fd, &marker_stat, marker_data, marker_length,
+                    true, false) != GIT_CLEANUP_REMOVED) {
+                (void)error_accumulator_add_last(
+                    &failures, "private recovery marker cleanup");
+            }
+        }
+    }
+    if (marker_fd >= 0) (void)close(marker_fd);
+    if (marker_data) {
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+    }
+    if (failures.active) {
+        (void)error_accumulator_publish(&failures);
+        errno = failures.first_errno;
+    }
+    return result;
+}
+
+static int git_scope_lock_recover_marker(git_scope_lock_t *lock) {
+    git_recovery_marker_t marker;
+    git_cleanup_result_t cleanup;
+    unsigned char *marker_data = NULL;
+    size_t marker_length = 0U;
+    struct stat marker_stat;
+    int marker_fd = -1;
+    int stage_fd = -1;
+    int result = -1;
+    int saved_errno = EEXIST;
+
+    memset(&marker, 0, sizeof(marker));
+    if (!lock || lock->dir_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    marker_fd = openat(lock->dir_fd, lock->lock_leaf,
+                       O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (marker_fd < 0 || git_scope_lock_claim_fd(marker_fd) != 0 ||
+        git_capture_fd_bytes_exact_bounded(
+            marker_fd, &marker_data, &marker_length, &marker_stat,
+            GIT_RECOVERY_MARKER_MAX_BYTES) != 0 ||
+        !S_ISREG(marker_stat.st_mode) || marker_stat.st_nlink != 1 ||
+        marker_stat.st_uid != geteuid() ||
+        (marker_stat.st_mode & 07777) != 0600 ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, marker_fd, &marker_stat,
+            marker_data, marker_length, NULL) ||
+        !git_recovery_marker_parse(marker_data, marker_length, &marker)) {
+        saved_errno = errno ? errno : EEXIST;
+        goto done;
+    }
+    if (marker.stage_present) {
+        stage_fd = openat(lock->dir_fd, marker.stage_leaf,
+                          O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (stage_fd < 0) {
+            if (errno != ENOENT) {
+                saved_errno = errno;
+                goto done;
+            }
+        } else {
+            cleanup = git_scope_lock_cleanup_name_once(
+                lock, marker.stage_leaf, "recovery staging file", stage_fd,
+                &marker.stage_stat, marker.stage_data, marker.stage_length,
+                true, false);
+            if (cleanup != GIT_CLEANUP_REMOVED) {
+                saved_errno = errno ? errno : EAGAIN;
+                goto done;
+            }
+        }
+        /* Make stage absence durable while the claimed marker still blocks
+         * every cooperative writer. A crash can then leave the marker, never
+         * lose the only recovery authority while resurrecting the stage. */
+        if (fsync(lock->dir_fd) != 0) {
+            saved_errno = errno ? errno : EIO;
+            goto done;
+        }
+    }
+    cleanup = git_scope_lock_cleanup_name_once(
+        lock, lock->lock_leaf, "recovery marker", marker_fd, &marker_stat,
+        marker_data, marker_length, true, false);
+    if (cleanup != GIT_CLEANUP_REMOVED) {
+        saved_errno = errno ? errno : EAGAIN;
+        goto done;
+    }
+    if (fsync(lock->dir_fd) != 0) {
+        saved_errno = errno ? errno : EIO;
+        goto done;
+    }
+    result = 0;
+
+done:
+    if (stage_fd >= 0) (void)close(stage_fd);
+    if (marker_fd >= 0) (void)close(marker_fd);
+    if (marker_data) {
+        secure_zero_memory(marker_data, marker_length);
+        free(marker_data);
+    }
+    errno = result == 0 ? 0 : saved_errno;
+    return result;
+}
+
+/* Remove only exact transaction-owned names. A transient failure retains the
+ * ownership bit for the checked retry above; a proven replacement is disowned
+ * and preserved. Resource disposal never changes the filesystem. */
+static int git_scope_lock_cleanup_owned(git_scope_lock_t *lock,
+                                        bool retirement_hook) {
+    git_cleanup_witness_t stage_witness;
+    git_cleanup_result_t cleanup;
+    bool stage_retry = false;
+    int result = 0;
+
+    if (!lock) return 0;
+    if (retirement_hook && g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_CLEANUP,
+                               lock->path, NULL, NULL)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Injected Git retirement cleanup ownership conflict");
+        result = -1;
+    }
+    if (lock->stage_created && lock->dir_fd >= 0) {
+        stage_witness = git_scope_lock_stage_witness(lock);
+        cleanup = git_scope_lock_cleanup_name(
+            lock, lock->stage_leaf, "staging file",
+            stage_witness.fd, stage_witness.stat, stage_witness.data,
+            stage_witness.length, stage_witness.valid, retirement_hook);
+        if (cleanup != GIT_CLEANUP_REMOVED) {
+            result = -1;
+        }
+        if (cleanup != GIT_CLEANUP_RETRY) {
+            lock->stage_created = false;
+        } else {
+            stage_retry = true;
+        }
+    }
+    if (!stage_retry && lock->lock_created && lock->dir_fd >= 0) {
+        cleanup = git_scope_lock_cleanup_name(
+            lock, lock->lock_leaf, "canonical lock", lock->lock_fd,
+            &lock->lock_stat, NULL, 0U, lock->lock_witness_valid,
+            retirement_hook);
+        if (cleanup != GIT_CLEANUP_REMOVED) {
+            result = -1;
+        }
+        if (cleanup != GIT_CLEANUP_RETRY) {
+            lock->lock_created = false;
+        }
+    }
+    return result;
+}
+
 static void git_scope_lock_close(git_scope_lock_t *lock) {
     if (!lock) return;
-    if (lock->stage_created && lock->dir_fd >= 0) {
-        (void)unlinkat(lock->dir_fd, lock->stage_leaf, 0);
-    }
-    if (lock->lock_created && !lock->published && lock->dir_fd >= 0) {
-        (void)unlinkat(lock->dir_fd, lock->lock_leaf, 0);
-    }
+    if (lock->lock_fd >= 0) close(lock->lock_fd);
+    lock->lock_fd = -1;
+    git_scope_lock_clear_stage_witness(lock);
     if (lock->original_fd >= 0) close(lock->original_fd);
     lock->original_fd = -1;
     if (lock->published_fd >= 0) close(lock->published_fd);
@@ -2067,10 +3206,48 @@ static void git_scope_lock_close(git_scope_lock_t *lock) {
     lock->dir_fd = -1;
 }
 
+static int git_scope_lock_discard_checked(git_scope_lock_t *lock,
+                                          bool retirement_hook) {
+    error_accumulator_t failures;
+    bool owned_names;
+    int entry_errno = errno;
+    int result = 0;
+
+    if (!lock) return 0;
+    error_accumulator_init(&failures);
+    owned_names = lock->stage_created || lock->lock_created;
+    if (git_scope_lock_cleanup_owned(lock, retirement_hook) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "Git transaction artifact cleanup");
+        result = -1;
+    }
+    if ((lock->stage_created || lock->lock_created) &&
+        git_scope_lock_persist_recovery_marker(lock) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "Git transaction recovery marker");
+        result = -1;
+    }
+    if (owned_names && lock->dir_fd >= 0 && fsync(lock->dir_fd) != 0) {
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot durably clean Git transaction artifacts");
+        (void)error_accumulator_add_last(
+            &failures, "Git transaction artifact directory sync");
+        result = -1;
+    }
+    git_scope_lock_close(lock);
+    if (failures.active) {
+        (void)error_accumulator_publish(&failures);
+        errno = failures.first_errno;
+    } else {
+        errno = entry_errno;
+    }
+    return result;
+}
+
 /* Acquire exactly the lock name used by Git for this config file, then copy
  * the full current file into it. The in-lock copy is the merge base, so every
  * unmanaged edit that completed before lock acquisition survives publication. */
-static int git_scope_lock_acquire(git_scope_t scope,
+static int git_scope_lock_acquire(git_scope_t scope, const char *exact_path,
                                   git_scope_lock_t *lock,
                                   const git_scope_generation_t *generation) {
     static unsigned long stage_nonce;
@@ -2085,9 +3262,13 @@ static int git_scope_lock_acquire(git_scope_t scope,
 
     memset(lock, 0, sizeof(*lock));
     lock->dir_fd = -1;
+    lock->lock_fd = -1;
+    lock->stage_fd = -1;
     lock->original_fd = -1;
     lock->published_fd = -1;
-    if (git_scope_lock_resolve_paths(scope, lock) != 0) {
+    if ((exact_path
+             ? git_scope_lock_resolve_exact_path(exact_path, lock)
+             : git_scope_lock_resolve_paths(scope, lock)) != 0) {
         if (generation && generation->valid) {
             lock->generation_conflict = true;
             set_error(ERR_GIT_CONFIG_FAILED,
@@ -2126,7 +3307,12 @@ static int git_scope_lock_acquire(git_scope_t scope,
     }
     if (g_restore_prelock_hook) g_restore_prelock_hook(scope);
     lock_fd = openat(lock->dir_fd, lock->lock_leaf,
-                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+                     O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    if (lock_fd < 0 && errno == EEXIST &&
+        git_scope_lock_recover_marker(lock) == 0) {
+        lock_fd = openat(lock->dir_fd, lock->lock_leaf,
+                         O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+    }
     if (lock_fd < 0) {
         set_system_error(ERR_GIT_CONFIG_FAILED,
                          "Cannot acquire Git configuration lock: %s",
@@ -2135,6 +3321,18 @@ static int git_scope_lock_acquire(git_scope_t scope,
         return -1;
     }
     lock->lock_created = true;
+    lock->lock_fd = lock_fd;
+    lock_fd = -1;
+    if (git_scope_lock_claim_fd(lock->lock_fd) != 0 ||
+        fstat(lock->lock_fd, &lock->lock_stat) != 0 ||
+        !S_ISREG(lock->lock_stat.st_mode) ||
+        lock->lock_stat.st_nlink != 1) {
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot pin Git configuration lock: %s",
+                         lock->lock_path);
+        goto fail;
+    }
+    lock->lock_witness_valid = true;
 
     for (unsigned attempt = 0; attempt < 100U; attempt++) {
         unsigned long nonce = ++stage_nonce;
@@ -2149,7 +3347,7 @@ static int git_scope_lock_acquire(git_scope_t scope,
             goto fail;
         }
         stage_fd = openat(lock->dir_fd, lock->stage_leaf,
-                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+                          O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
         if (stage_fd >= 0) {
             lock->stage_created = true;
             break;
@@ -2165,14 +3363,6 @@ static int git_scope_lock_acquire(git_scope_t scope,
                   "Cannot allocate a unique Git rollback staging file");
         goto fail;
     }
-    if (close(lock_fd) != 0) {
-        lock_fd = -1;
-        set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Cannot close Git configuration lock");
-        goto fail;
-    }
-    lock_fd = -1;
-
     if (fstatat(lock->dir_fd, lock->leaf, &named,
                 AT_SYMLINK_NOFOLLOW) == 0) {
         lock->original_present = true;
@@ -2283,21 +3473,58 @@ static int git_scope_lock_acquire(git_scope_t scope,
         goto fail;
     }
     stage_fd = -1;
+    if (git_scope_lock_capture_stage_witness(lock) != 0) {
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot pin Git rollback staging file: %s",
+                         lock->stage_path);
+        goto fail;
+    }
     return 0;
 
 fail:
-    if (source_fd >= 0) close(source_fd);
-    if (lock_fd >= 0) close(lock_fd);
-    if (stage_fd >= 0) close(stage_fd);
-    git_scope_lock_close(lock);
+    {
+        error_context_t primary_error = *get_last_error();
+        error_accumulator_t failures;
+        int primary_errno = errno;
+        int cleanup_result;
+
+        error_accumulator_init(&failures);
+        errno = primary_errno;
+        (void)error_accumulator_add(
+            &failures, "Git configuration lock acquisition", &primary_error);
+        if (source_fd >= 0) close(source_fd);
+        if (lock_fd >= 0) close(lock_fd);
+        if (stage_fd >= 0) close(stage_fd);
+        if (lock->lock_created && !lock->lock_witness_valid) {
+            (void)git_scope_lock_capture_empty_lock_witness(lock);
+        }
+        if (lock->stage_created && !lock->stage_witness_valid) {
+            (void)git_scope_lock_capture_stage_witness(lock);
+        }
+        cleanup_result = git_scope_lock_discard_checked(lock, false);
+        if (cleanup_result != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "Git configuration lock acquisition cleanup");
+        }
+        errno = primary_errno;
+        (void)error_accumulator_publish(&failures);
+        errno = primary_errno;
+    }
     return -1;
 }
 
-static int git_config_file_unset(const char *path, const char *key) {
+static int git_config_file_unset(const char *path, const char *key,
+                                 bool no_includes,
+                                 const char *diagnostic_context) {
     char output[256] = "";
-    const char *const argv[] = {
+    const char *const ordinary_argv[] = {
         "git", "config", "--file", path, "--unset-all", key, NULL
     };
+    const char *const exact_argv[] = {
+        "git", "config", "--file", path, "--no-includes", "--unset-all",
+        key, NULL
+    };
+    const char *const *argv = no_includes ? exact_argv : ordinary_argv;
     run_opts_t opts;
     run_result_t result;
 
@@ -2312,8 +3539,52 @@ static int git_config_file_unset(const char *path, const char *key) {
         return 0;
     }
     set_error(ERR_GIT_CONFIG_FAILED,
-              "Failed to clear Git config %s in rollback lock: %s", key,
+              "Failed to clear Git config %s in %s: %s", key,
+              diagnostic_context ? diagnostic_context : "exact file",
               output[0] ? output : "unknown Git error");
+    return -1;
+}
+
+/* Remove the one exact occurrence whose uniqueness was proven from the
+ * immutable retirement vector. `--fixed-value` keeps regex metacharacters
+ * literal. Exit 5 is a conflict here: the planned occurrence disappeared
+ * between verification and the staged command. */
+static int git_config_file_unset_exact(const char *path, const char *key,
+                                       const char *value,
+                                       const char *diagnostic_context) {
+    char output[256] = "";
+    const char *const argv[] = {
+        "git", "config", "--file", path, "--no-includes",
+        "--fixed-value", "--unset-all", key, value, NULL
+    };
+    run_opts_t opts;
+    run_result_t result;
+    uint64_t prior_error_generation;
+    int run_rc;
+
+    if (!path || !key || !value) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid exact Git configuration removal request");
+        return -1;
+    }
+    memset(&opts, 0, sizeof(opts));
+    memset(&result, 0, sizeof(result));
+    opts.out = output;
+    opts.out_size = sizeof(output);
+    opts.merge_stderr = true;
+    prior_error_generation = error_report_generation();
+    run_rc = run_argv(argv, &opts, &result);
+    if (run_rc == 0 && result.spawned &&
+        result.term_signal == 0 && result.exit_code == 0 &&
+        !result.out_truncated) {
+        return 0;
+    }
+    if (error_report_generation() != prior_error_generation) return -1;
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Failed to remove exact Git config %s value in %s: %s",
+              key,
+              diagnostic_context ? diagnostic_context : "staged file",
+              output[0] ? output : "Git did not remove the planned value");
     return -1;
 }
 
@@ -2338,15 +3609,53 @@ static int git_config_file_add(const char *path, const char *key,
     return -1;
 }
 
-static int git_capture_file_snapshot(const char *path,
+static void git_set_file_snapshot_run_error(const char *context,
+                                            const run_result_t *result) {
+    const char *operation = context ? context :
+        "Could not read exact Git configuration snapshot";
+
+    if (!result || !result->spawned) {
+        set_error(ERR_GIT_CONFIG_FAILED, "%s: Git could not be started",
+                  operation);
+    } else if (result->term_signal != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "%s: Git was killed by signal %d",
+                  operation, result->term_signal);
+    } else if (result->exit_code != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "%s: Git exited with status %d",
+                  operation, result->exit_code);
+    } else {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "%s: Git output capture failed after successful exit",
+                  operation);
+    }
+}
+
+/* Capture every managed vector from one exact physical configuration file.
+ * Binary stdout stays isolated from diagnostics: stderr text can otherwise be
+ * interleaved with valid NUL records and turn a failed read into a plausible
+ * partial snapshot. Each truncated attempt is discarded and retried with a
+ * larger buffer. The caller receives state only after the complete listing
+ * parses successfully; missing files and every operational failure are errors,
+ * while a successful zero-length listing is the exact all-absent vector. */
+static int git_capture_file_snapshot(const char *path, const char *context,
                                      git_scope_snapshot_t *out) {
     size_t capacity = GIT_SNAPSHOT_INITIAL_BYTES;
-    char *buffer = malloc(capacity);
-    int rc = -1;
+    char *buffer;
+    git_scope_snapshot_t next;
+    const char *const diagnostic_env[] = {
+        "LC_ALL=C", "LANG=C", NULL
+    };
 
+    if (!path || path[0] != '/' || !out) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid exact-file Git configuration snapshot request");
+        return -1;
+    }
+    memset(&next, 0, sizeof(next));
+    buffer = malloc(capacity);
     if (!buffer) {
         set_error(ERR_MEMORY_ALLOCATION,
-                  "Out of memory verifying Git rollback lock");
+                  "Out of memory reading exact Git configuration snapshot");
         return -1;
     }
     for (;;) {
@@ -2356,17 +3665,50 @@ static int git_capture_file_snapshot(const char *path,
         };
         run_opts_t opts;
         run_result_t result;
+        uint64_t prior_error_generation;
+        int run_rc;
+
         memset(&opts, 0, sizeof(opts));
         memset(&result, 0, sizeof(result));
         opts.out = buffer;
         opts.out_size = capacity;
-        opts.merge_stderr = true;
-        if (run_argv(argv, &opts, &result) != 0) break;
-        if (!result.out_truncated) {
-            rc = git_parse_snapshot_listing(buffer, result.out_len, out);
-            break;
+        opts.stderr_to_devnull = true;
+        opts.extra_env = diagnostic_env;
+        /* A runner reports a precise resolver/I/O failure through the global
+         * context. Its report generation distinguishes an identical new
+         * diagnostic from stale state without erasing an earlier preflight
+         * failure that the caller has retained for final aggregation. */
+        prior_error_generation = error_report_generation();
+        run_rc = run_argv(argv, &opts, &result);
+        if (run_rc != 0) {
+            /* The production runner can already provide a path-trust or I/O
+             * diagnostic more precise than child status. Recording fakes
+             * generally publish nothing, so synthesize their causal status. */
+            if (error_report_generation() == prior_error_generation) {
+                git_set_file_snapshot_run_error(context, &result);
+            }
+            goto fail;
         }
-        if (capacity >= GIT_SNAPSHOT_MAX_BYTES) break;
+        if (!result.out_truncated) {
+            if (result.out_len >= capacity) {
+                set_error(ERR_GIT_CONFIG_FAILED,
+                          "Invalid exact Git configuration snapshot length");
+                goto fail;
+            }
+            if (git_parse_snapshot_listing(buffer, result.out_len,
+                                           &next, true) != 0) {
+                goto fail;
+            }
+            free(buffer);
+            *out = next;
+            return 0;
+        }
+        if (capacity >= GIT_SNAPSHOT_MAX_BYTES) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Exact Git configuration snapshot exceeds %u bytes",
+                      (unsigned)GIT_SNAPSHOT_MAX_BYTES);
+            goto fail;
+        }
         {
             size_t grown_size = capacity * 2U;
             char *grown;
@@ -2374,31 +3716,239 @@ static int git_capture_file_snapshot(const char *path,
                 grown_size = GIT_SNAPSHOT_MAX_BYTES;
             }
             grown = realloc(buffer, grown_size);
-            if (!grown) break;
+            if (!grown) {
+                set_error(ERR_MEMORY_ALLOCATION,
+                          "Out of memory growing exact Git configuration snapshot");
+                goto fail;
+            }
             buffer = grown;
             capacity = grown_size;
         }
     }
+
+fail:
     free(buffer);
-    if (rc != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Failed to verify prepared Git rollback lock");
-    }
-    return rc;
+    git_scope_snapshot_clear(&next);
+    return -1;
 }
 
-static int git_scope_lock_publish(git_scope_lock_t *lock) {
+typedef enum {
+    GIT_EXCHANGE_ERROR = -1,
+    GIT_EXCHANGE_OK = 0,
+    GIT_EXCHANGE_UNSUPPORTED = 1
+} git_exchange_result_t;
+
+static git_exchange_result_t git_exchange_names_at(
+    int dir_fd, const char *left, const char *right) {
+    int result = -1;
+
+#if defined(__linux__) && defined(SYS_renameat2)
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1U << 1)
+#endif
+    result = (int)syscall(SYS_renameat2, dir_fd, left, dir_fd, right,
+                          RENAME_EXCHANGE);
+#elif defined(__APPLE__) && defined(RENAME_SWAP)
+    result = renameatx_np(dir_fd, left, dir_fd, right, RENAME_SWAP);
+#else
+    (void)dir_fd;
+    (void)left;
+    (void)right;
+    errno = ENOTSUP;
+    return GIT_EXCHANGE_UNSUPPORTED;
+#endif
+    if (result == 0) return GIT_EXCHANGE_OK;
+    if (errno == ENOSYS || errno == EINVAL || errno == ENOTSUP ||
+        errno == EOPNOTSUPP) {
+        return GIT_EXCHANGE_UNSUPPORTED;
+    }
+    return GIT_EXCHANGE_ERROR;
+}
+
+static int git_scope_lock_publish_retirement_exchange(
+    git_scope_lock_t *lock, const struct stat *captured_stage) {
+    git_exchange_result_t exchanged;
+    bool canonical_prepared;
+    bool displaced_original;
+    bool stage_prepared;
+    bool after_exchange_failure;
+    bool force_fallback;
+
+    if (!lock || !captured_stage || !lock->original_present ||
+        !lock->original_witness_valid || lock->original_fd < 0 ||
+        !lock->published_witness_valid || lock->published_fd < 0 ||
+        (lock->published_length != 0U && !lock->published_data)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Invalid exact Git retirement publication state");
+        return -1;
+    }
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, lock->stage_leaf, lock->published_fd,
+            captured_stage, lock->published_data,
+            lock->published_length, &lock->published_stat)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Prepared Git retirement image changed before exchange");
+        return -1;
+    }
+    if (g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_EXCHANGE,
+                               lock->path, NULL, NULL)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Injected Git retirement exchange failure");
+        return -1;
+    }
+    force_fallback = g_retirement_test_hook &&
+                     g_retirement_test_hook(
+                         GIT_RETIREMENT_TEST_FORCE_EXCHANGE_FALLBACK,
+                         lock->path, NULL, NULL);
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, lock->leaf, lock->original_fd,
+            &lock->original_stat, lock->original_data,
+            lock->original_length, NULL) ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd,
+            &lock->lock_stat, NULL, 0U, NULL)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git retirement destination or canonical lock changed at the publication boundary");
+        return -1;
+    }
+    exchanged = force_fallback
+                    ? GIT_EXCHANGE_UNSUPPORTED
+                    : git_exchange_names_at(lock->dir_fd, lock->stage_leaf,
+                                            lock->leaf);
+    if (exchanged != GIT_EXCHANGE_OK) {
+        if (exchanged == GIT_EXCHANGE_UNSUPPORTED) {
+            return 1;
+        }
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot atomically exchange the Git retirement image");
+        return -1;
+    }
+    /* From this point onward, classification is allocation-free and never
+     * mutates either published name. A failed observation can disown a
+     * foreign pathname, but cannot authorize swapping it into canonical. */
+    lock->stage_witness_kind = GIT_STAGE_WITNESS_ORIGINAL;
+    after_exchange_failure =
+        g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_AFTER_EXCHANGE,
+                               lock->path, lock->stage_path, NULL);
+    canonical_prepared = git_file_at_matches_witness(
+        lock->dir_fd, lock->leaf, lock->published_fd,
+        &lock->published_stat, lock->published_data,
+        lock->published_length, NULL);
+    displaced_original = git_file_at_matches_witness(
+        lock->dir_fd, lock->stage_leaf, lock->original_fd,
+        &lock->original_stat, lock->original_data,
+        lock->original_length, NULL);
+    stage_prepared = git_file_at_matches_witness(
+        lock->dir_fd, lock->stage_leaf, lock->published_fd,
+        &lock->published_stat, lock->published_data,
+        lock->published_length, NULL);
+    if (after_exchange_failure || !canonical_prepared ||
+        !displaced_original) {
+        lock->published = canonical_prepared;
+        if (displaced_original) {
+            lock->stage_witness_kind = GIT_STAGE_WITNESS_ORIGINAL;
+        } else if (stage_prepared) {
+            lock->stage_witness_kind = GIT_STAGE_WITNESS_PUBLISHED;
+        } else {
+            /* No retained witness authorizes this stage pathname. Preserve
+             * it as foreign and let checked cleanup remove only our lock. */
+            lock->stage_created = false;
+        }
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            after_exchange_failure
+                ? "Injected Git retirement post-exchange ownership failure"
+                : "Git retirement destination changed at the publication boundary");
+        return -1;
+    }
+    lock->published = true;
+    if (g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_DIRECTORY_SYNC,
+                               lock->path, NULL, NULL)) {
+        errno = EIO;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Git retirement was installed but its directory sync failed: %s",
+                         lock->path);
+        return -1;
+    }
+    if (fsync(lock->dir_fd) != 0) {
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Git retirement was installed but its directory sync failed: %s",
+                         lock->path);
+        return -1;
+    }
+    return 0;
+}
+
+/* On filesystems without a native name exchange, retain the original inode
+ * under a private checked name before the prepared stage replaces canonical.
+ * The extra link is reduced back to one by the replacement rename, leaving an
+ * exact original-generation rollback source under the continuously held Git
+ * lock. */
+static int git_scope_lock_preserve_fallback_original(
+    git_scope_lock_t *lock, char backup_leaf[96],
+    struct stat *linked_original) {
+    static unsigned long backup_nonce;
+
+    if (!lock || !backup_leaf || !linked_original ||
+        !lock->original_present || !lock->original_witness_valid ||
+        lock->original_fd < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (unsigned attempt = 0U; attempt < 100U; attempt++) {
+        unsigned long nonce = ++backup_nonce;
+
+        if ((size_t)snprintf(backup_leaf, 96U,
+                             ".gitswitch-config-%ld-%lu",
+                             (long)getpid(), nonce) >= 96U) {
+            errno = ENAMETOOLONG;
+            break;
+        }
+        if (linkat(lock->dir_fd, lock->leaf,
+                   lock->dir_fd, backup_leaf, 0) == 0) {
+            if (fstat(lock->original_fd, linked_original) == 0 &&
+                linked_original->st_nlink == 2 &&
+                git_file_at_matches_witness(
+                    lock->dir_fd, lock->leaf, lock->original_fd,
+                    linked_original, lock->original_data,
+                    lock->original_length, NULL) &&
+                git_file_at_matches_witness(
+                    lock->dir_fd, backup_leaf, lock->original_fd,
+                    linked_original, lock->original_data,
+                    lock->original_length, NULL)) {
+                return 0;
+            }
+            {
+                int saved_errno = errno ? errno : EAGAIN;
+                (void)unlinkat(lock->dir_fd, backup_leaf, 0);
+                errno = saved_errno;
+            }
+            break;
+        }
+        if (errno != EEXIST) break;
+    }
+    set_system_error(ERR_GIT_CONFIG_FAILED,
+                     "Cannot preserve the original Git retirement generation for fallback rollback");
+    return -1;
+}
+
+static int git_scope_lock_publish(git_scope_lock_t *lock,
+                                  bool retirement_exact) {
     char resolved[MAX_PATH_LEN];
     struct stat named_parent;
     struct stat named_original;
     struct stat named_stage;
     struct stat opened_stage;
     struct stat captured_stage;
-    struct stat named_lock;
-    struct stat opened_lock;
     struct stat logical_now;
     int verify_fd;
+    int exchange_result;
     bool original_unchanged;
+    char fallback_original_leaf[96] = "";
+    struct stat linked_original;
 
     verify_fd = openat(lock->dir_fd, lock->stage_leaf,
                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
@@ -2417,7 +3967,11 @@ static int git_scope_lock_publish(git_scope_lock_t *lock) {
         bool forced_mismatch =
             g_metadata_test_hook &&
             g_metadata_test_hook(GIT_METADATA_TEST_STAGE_REVALIDATE);
-        errno = 0;
+        /* The nested verifier assigns EAGAIN only to ctime-only churn. Seed
+         * every otherwise-unclassified witness mismatch as a hard stale
+         * generation so an external replacement can never enter this retry
+         * path merely because a comparison returned false. */
+        errno = ESTALE;
         if (forced_mismatch || !S_ISREG(opened_stage.st_mode) ||
             opened_stage.st_dev != named_stage.st_dev ||
             opened_stage.st_ino != named_stage.st_ino ||
@@ -2449,11 +4003,10 @@ static int git_scope_lock_publish(git_scope_lock_t *lock) {
         return -1;
     }
     lock->published_witness_valid = true;
-    if (close(verify_fd) != 0) {
-        set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Cannot close prepared Git rollback lock");
-        return -1;
-    }
+    lock->published_fd = verify_fd;
+    lock->published_stat = captured_stage;
+    lock->stage_witness_kind = GIT_STAGE_WITNESS_PUBLISHED;
+    verify_fd = -1;
     if (lstat(lock->parent, &named_parent) != 0 ||
         named_parent.st_dev != lock->parent_stat.st_dev ||
         named_parent.st_ino != lock->parent_stat.st_ino ||
@@ -2514,52 +4067,102 @@ static int git_scope_lock_publish(git_scope_lock_t *lock) {
                   lock->path);
         return -1;
     }
-    /* Replace the continuously-held canonical Git lock with the fully edited
-     * short staging artifact. renameat is atomic, so an external `git config`
-     * never observes the canonical lock name absent. */
-    if (renameat(lock->dir_fd, lock->stage_leaf,
-                 lock->dir_fd, lock->lock_leaf) != 0) {
-        set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Cannot install prepared Git rollback lock: %s",
-                         lock->lock_path);
-        return -1;
+    if (retirement_exact) {
+        exchange_result = git_scope_lock_publish_retirement_exchange(
+            lock, &captured_stage);
+        if (exchange_result <= 0) return exchange_result;
     }
-    lock->stage_created = false;
-    verify_fd = openat(lock->dir_fd, lock->lock_leaf,
-                       O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (verify_fd < 0 || fstat(verify_fd, &opened_lock) != 0 ||
-        fstatat(lock->dir_fd, lock->lock_leaf, &named_lock,
-                AT_SYMLINK_NOFOLLOW) != 0 ||
-        !git_same_pinned_file_generation(&captured_stage, &opened_lock) ||
-        !git_same_pinned_file_generation(&captured_stage, &named_lock) ||
-        fsync(verify_fd) != 0 ||
+    /* Native exchange is unavailable on some supported systems/filesystems.
+     * Keep Git's exact empty canonical lock continuously held and atomically
+     * publish the already-pinned private stage directly over the destination.
+     * The lock is removed only by checked cleanup after the directory sync. */
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, lock->stage_leaf, lock->published_fd,
+            &lock->published_stat, lock->published_data,
+            lock->published_length, NULL) ||
         !git_file_at_matches_witness(
-            lock->dir_fd, lock->lock_leaf, verify_fd, &captured_stage,
-            lock->published_data, lock->published_length, &opened_lock)) {
-        int saved_errno = errno ? errno : EAGAIN;
-        if (verify_fd >= 0) close(verify_fd);
-        errno = saved_errno;
-        set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Installed Git rollback lock could not be revalidated: %s",
-                         lock->lock_path);
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd,
+            &lock->lock_stat, NULL, 0U, NULL) ||
+        (lock->original_present
+             ? !git_file_at_matches_witness(
+                   lock->dir_fd, lock->leaf, lock->original_fd,
+                   &lock->original_stat, lock->original_data,
+                   lock->original_length, NULL)
+             : (fstatat(lock->dir_fd, lock->leaf, &named_original,
+                        AT_SYMLINK_NOFOLLOW) == 0 || errno != ENOENT))) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git rollback destination or canonical lock changed immediately before publication");
         return -1;
     }
-    /* Keep the already-verified descriptor across the publishing rename.
-     * Reopening the pathname afterward can fail or race with the next writer,
-     * leaving retry ownership stuck on the pre-restore inode. */
-    lock->published_fd = verify_fd;
-    lock->published_stat = opened_lock;
-    verify_fd = -1;
-    if (renameat(lock->dir_fd, lock->lock_leaf,
-                 lock->dir_fd, lock->leaf) != 0) {
-        set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Cannot publish Git rollback: %s", lock->path);
+    if (retirement_exact &&
+        git_scope_lock_preserve_fallback_original(
+            lock, fallback_original_leaf, &linked_original) != 0) {
         return -1;
+    }
+    if (renameat(lock->dir_fd, lock->stage_leaf,
+                 lock->dir_fd, lock->leaf) != 0) {
+        int rename_errno = errno;
+
+        if (fallback_original_leaf[0] != '\0') {
+            (void)git_scope_lock_cleanup_name(
+                lock, fallback_original_leaf,
+                "fallback original backup", lock->original_fd,
+                &linked_original, lock->original_data,
+                lock->original_length, true, false);
+        }
+        errno = rename_errno;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Cannot publish prepared Git rollback image: %s",
+                         lock->path);
+        return -1;
+    }
+    if (fallback_original_leaf[0] != '\0') {
+        struct stat refreshed_original;
+
+        if (!git_file_at_matches_witness(
+                lock->dir_fd, fallback_original_leaf, lock->original_fd,
+                &lock->original_stat, lock->original_data,
+                lock->original_length, &refreshed_original)) {
+            lock->stage_created = false;
+            lock->published = git_file_at_matches_witness(
+                lock->dir_fd, lock->leaf, lock->published_fd,
+                &lock->published_stat, lock->published_data,
+                lock->published_length, NULL);
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git retirement fallback lost its exact original rollback witness");
+            return -1;
+        }
+        git_scope_lock_clear_stage_witness(lock);
+        lock->original_stat = refreshed_original;
+        (void)safe_strncpy(lock->stage_leaf, fallback_original_leaf,
+                           sizeof(lock->stage_leaf));
+        if ((size_t)snprintf(lock->stage_path, sizeof(lock->stage_path),
+                             "%s/%s", lock->parent,
+                             lock->stage_leaf) >= sizeof(lock->stage_path)) {
+            lock->stage_created = false;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git retirement fallback rollback path is too long");
+            return -1;
+        }
+        lock->stage_created = true;
+        lock->stage_witness_kind = GIT_STAGE_WITNESS_ORIGINAL;
+    } else {
+        lock->stage_created = false;
     }
     lock->published = true;
+    if (retirement_exact && g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_DIRECTORY_SYNC,
+                               lock->path, NULL, NULL)) {
+        errno = EIO;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Git retirement was installed but its directory sync failed: %s",
+                         lock->path);
+        return -1;
+    }
     if (fsync(lock->dir_fd) != 0) {
         set_system_error(ERR_GIT_CONFIG_FAILED,
-                         "Git rollback was installed but its directory sync failed: %s",
+                         "%s was installed but its directory sync failed: %s",
+                         retirement_exact ? "Git retirement" : "Git rollback",
                          lock->path);
         return -1;
     }
@@ -2626,7 +4229,7 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
     memset(&expected, 0, sizeof(expected));
     memset(&observed, 0, sizeof(observed));
     if (git_scope_snapshot_restore_complete(before)) return result;
-    if (git_scope_lock_acquire(scope, &lock, generation) != 0) {
+    if (git_scope_lock_acquire(scope, NULL, &lock, generation) != 0) {
         if (lock.generation_conflict) {
             result.generation_conflicts++;
         } else {
@@ -2685,7 +4288,15 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
 
     for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
         if (!restore_key[i]) continue;
-        if (git_config_file_unset(lock.stage_path, g_managed_keys[i]) != 0) {
+        if (git_config_file_unset(lock.stage_path, g_managed_keys[i], false,
+                                  "rollback lock") != 0) {
+            result.write_failures++;
+            goto done;
+        }
+        if (git_scope_lock_capture_stage_witness(&lock) != 0) {
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Could not retain the edited Git rollback staging generation");
             result.write_failures++;
             goto done;
         }
@@ -2695,16 +4306,28 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
                 result.write_failures++;
                 goto done;
             }
+            if (git_scope_lock_capture_stage_witness(&lock) != 0) {
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Could not retain the edited Git rollback staging generation");
+                result.write_failures++;
+                goto done;
+            }
         }
     }
-    if (git_capture_file_snapshot(lock.stage_path, &observed) != 0 ||
-        !git_scope_snapshot_equal(&expected, &observed)) {
+    if (git_capture_file_snapshot(
+            lock.stage_path, "Could not verify prepared Git rollback lock",
+            &observed) != 0) {
+        result.write_failures++;
+        goto done;
+    }
+    if (!git_scope_snapshot_equal(&expected, &observed)) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Prepared Git rollback does not match its exact target vectors");
         result.write_failures++;
         goto done;
     }
-    if (git_scope_lock_publish(&lock) != 0) {
+    if (git_scope_lock_publish(&lock, false) != 0) {
         /* renameat() may already have installed the exact target. Record only
          * prefix ownership, never completion, until the parent directory sync
          * succeeds on a later checked retry. */
@@ -2756,10 +4379,37 @@ static git_restore_result_t git_restore_scope_snapshot_atomic(
     }
 
 done:
-    git_scope_snapshot_clear(&current);
-    git_scope_snapshot_clear(&expected);
-    git_scope_snapshot_clear(&observed);
-    git_scope_lock_close(&lock);
+    {
+        error_accumulator_t failures;
+        error_context_t primary_error;
+        bool primary_failure = result.write_failures != 0U ||
+                               result.generation_conflicts != 0U;
+        int primary_errno = errno;
+
+        error_accumulator_init(&failures);
+        if (primary_failure) {
+            primary_error = *get_last_error();
+            if (primary_error.code == ERR_SUCCESS) {
+                errno = primary_errno ? primary_errno : EIO;
+                set_system_error(ERR_GIT_CONFIG_FAILED,
+                                 "Git rollback transaction failed");
+                primary_error = *get_last_error();
+                primary_errno = errno;
+            }
+            errno = primary_errno;
+            (void)error_accumulator_add(
+                &failures, "Git rollback transaction", &primary_error);
+        }
+        git_scope_snapshot_clear(&current);
+        git_scope_snapshot_clear(&expected);
+        git_scope_snapshot_clear(&observed);
+        if (git_scope_lock_discard_checked(&lock, false) != 0) {
+            (void)error_accumulator_add_last(
+                &failures, "Git rollback artifact cleanup");
+            result.write_failures++;
+        }
+        if (failures.active) (void)error_accumulator_publish(&failures);
+    }
     return result;
 }
 
@@ -2890,7 +4540,13 @@ static git_scope_snapshot_t *git_transaction_post_scope(git_scope_t scope) {
 
 static int git_transaction_require_write_allowed(git_scope_t scope,
                                                  const char *key) {
-    if (cfg_key_index(key) < 0 || !git_transaction_post_scope(scope)) return 0;
+    if (cfg_key_index(key) < 0 || !g_git_snapshot.valid) return 0;
+    if (!git_transaction_post_scope(scope)) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot write a managed key outside the active Git transaction scopes");
+        return -1;
+    }
     if (g_git_snapshot.restore_incomplete) {
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Cannot modify a Git transaction with incomplete rollback");
@@ -2902,6 +4558,118 @@ static int git_transaction_require_write_allowed(git_scope_t scope,
         return -1;
     }
     return 0;
+}
+
+/* Bind durable publication ownership to the account that supplied the
+ * transaction's managed Git identity. The optional incarnation fields remain
+ * backward compatible for direct low-level git_set_config() callers, but a
+ * transaction without a canonical persisted owner can never be exported as
+ * durable account provenance. Once bound, another account cannot reuse the
+ * same snapshot slot to manufacture a post-image attributed to the first. */
+static int git_snapshot_bind_publication_owner(const account_t *account,
+                                               git_scope_t scope) {
+    if (!g_git_snapshot.valid) return 0;
+    if (!account) {
+        set_error(ERR_INVALID_ARGS,
+                  "Cannot bind a NULL Git publication owner");
+        return -1;
+    }
+    /* Account-owned boundaries are always primary-scope operations while a
+     * transaction is active. git_set_config_impl() normalizes tracked local
+     * and worktree overrides through raw managed-key operations under its
+     * authorization depth; it never needs a second account-owned boundary.
+     * Reject every other scope before considering whether that store was
+     * captured, because an untracked write is outside both rollback and the
+     * durable publication destination. */
+    if (scope != g_git_snapshot.scope) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot write an account outside the active Git transaction's primary scope");
+        return -1;
+    }
+    if (!git_transaction_post_scope(scope)) return 0;
+    if (g_git_snapshot.publication_owner_bound) {
+        if (account->id == 0U || !account->incarnation_persisted ||
+            !account_incarnation_is_valid(account->incarnation) ||
+            g_git_snapshot.publication_account_id != account->id ||
+            strcmp(g_git_snapshot.publication_account_incarnation,
+                   account->incarnation) != 0) {
+            errno = ESTALE;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git transaction is already bound to another account incarnation");
+            return -1;
+        }
+        return 0;
+    }
+    if (scope != g_git_snapshot.scope) return 0;
+    if (!account->incarnation_persisted && account->incarnation[0] == '\0') {
+        return 0;
+    }
+    if (account->id == 0U || !account->incarnation_persisted ||
+        !account_incarnation_is_valid(account->incarnation)) {
+        set_error(ERR_ACCOUNT_INVALID,
+                  "Git publication owner has no canonical persisted incarnation");
+        return -1;
+    }
+    g_git_snapshot.publication_account_id = account->id;
+    memcpy(g_git_snapshot.publication_account_incarnation,
+           account->incarnation, ACCOUNT_INCARNATION_LEN);
+    g_git_snapshot.publication_owner_bound = true;
+    return 0;
+}
+
+static bool git_snapshot_publication_owner_matches(
+    const account_t *account) {
+    return account && g_git_snapshot.publication_owner_bound &&
+           account->id != 0U && account->incarnation_persisted &&
+           account_incarnation_is_valid(account->incarnation) &&
+           g_git_snapshot.publication_account_id == account->id &&
+           strcmp(g_git_snapshot.publication_account_incarnation,
+                  account->incarnation) == 0;
+}
+
+static bool git_snapshot_publication_is_complete_for(
+    const account_t *account, git_scope_t scope) {
+    return g_git_snapshot.valid && scope == g_git_snapshot.scope &&
+           git_snapshot_publication_owner_matches(account) &&
+           !g_git_snapshot.publication_owner_tainted &&
+           g_git_snapshot.publication_full_image_written;
+}
+
+static int git_account_write_begin(const account_t *account,
+                                   git_scope_t scope) {
+    if (g_git_account_write_depth == UINT_MAX) {
+        errno = EOVERFLOW;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git account-write authorization depth overflow");
+        return -1;
+    }
+    if (git_snapshot_bind_publication_owner(account, scope) != 0) return -1;
+    /* Completeness describes the current post-image, not a historical success.
+     * Invalidate it before every standalone account-owned mutation. A failed
+     * repeated full write or partial writer may already have changed one key;
+     * only the successful full writer, or its exact canonical OpenPGP
+     * completion, is allowed to restore publication eligibility. */
+    if (g_git_account_write_depth == 0U && g_git_snapshot.valid &&
+        scope == g_git_snapshot.scope &&
+        g_git_snapshot.publication_owner_bound) {
+        g_git_snapshot.publication_full_image_written = false;
+    }
+    g_git_account_write_depth++;
+    return 0;
+}
+
+static void git_account_write_end(void) {
+    if (g_git_account_write_depth > 0U) g_git_account_write_depth--;
+}
+
+static void git_taint_publication_after_raw_write(git_scope_t scope,
+                                                  const char *key) {
+    if (g_git_account_write_depth != 0U || !key ||
+        cfg_key_index(key) < 0 || !git_transaction_post_scope(scope)) {
+        return;
+    }
+    g_git_snapshot.publication_owner_tainted = true;
 }
 
 typedef struct {
@@ -3036,6 +4804,20 @@ int git_config_seal(void) {
         set_error(ERR_INVALID_ARGS, "No Git snapshot to seal");
         return -1;
     }
+    if (g_git_snapshot.publication_owner_bound &&
+        g_git_snapshot.publication_owner_tainted) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git publication ownership was invalidated by an unowned managed-key write");
+        return -1;
+    }
+    if (g_git_snapshot.publication_owner_bound &&
+        !g_git_snapshot.publication_full_image_written) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git publication owner has no complete account post-image");
+        return -1;
+    }
     if (g_git_snapshot.postimage_sealed) return 0;
     if (git_snapshot_verify_generations(&g_git_snapshot, false) != 0 ||
         git_snapshot_pin_post_configs(&g_git_snapshot) != 0 ||
@@ -3069,6 +4851,296 @@ int git_config_seal(void) {
         return -1;
     }
     g_git_snapshot.postimage_sealed = true;
+    return 0;
+}
+
+static int git_publication_scope_from_git(git_scope_t scope,
+                                          publication_scope_t *publication) {
+    if (!publication) return -1;
+    if (scope == GIT_SCOPE_WORKTREE_INTERNAL) {
+        *publication = PUBLICATION_SCOPE_WORKTREE;
+        return 0;
+    }
+    switch (scope) {
+        case GIT_SCOPE_LOCAL:
+            *publication = PUBLICATION_SCOPE_LOCAL;
+            return 0;
+        case GIT_SCOPE_GLOBAL:
+            *publication = PUBLICATION_SCOPE_GLOBAL;
+            return 0;
+        case GIT_SCOPE_SYSTEM:
+        default:
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Cannot persist provenance for an unsupported Git publication scope");
+            return -1;
+    }
+}
+
+/* Copy one exact scalar from the sealed primary post-image. Switch writes
+ * replace every credential vector, so repetition here is a provenance error,
+ * not a value from which the exporter may choose a convenient element. */
+static int git_publication_copy_post_value(const char *key, char *out,
+                                           size_t out_size, bool *present) {
+    const git_snapshot_key_t *post;
+    int key_index;
+
+    if (!key || !out || out_size == 0 || !present) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid sealed Git publication value request");
+        return -1;
+    }
+    out[0] = '\0';
+    *present = false;
+    key_index = cfg_key_index(key);
+    if (key_index < 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication requested an unmanaged key");
+        return -1;
+    }
+    post = &g_git_snapshot.post_primary.keys[key_index];
+    if (post->count == 0) return 0;
+    if (post->count != 1 || !post->values || !post->values[0]) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication contains a repeated %s vector",
+                  key);
+        return -1;
+    }
+    if (safe_strncpy(out, post->values[0], out_size) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication %s value exceeds durable storage",
+                  key);
+        return -1;
+    }
+    *present = true;
+    return 0;
+}
+
+/* Re-run the complete executable trust walk against the absolute program
+ * stored in Git, and bind the durable identity only while the named object is
+ * unchanged across that proof. find_command_path() returns the canonical path
+ * but intentionally closes its launch descriptor; the before/after witness
+ * prevents a replacement in that gap from inheriting the proof. */
+static int git_publication_capture_program_identity(
+    const char *program, publication_identity_t *identity,
+    const char *diagnostic_name) {
+    char canonical[MAX_PATH_LEN];
+    struct stat before;
+    struct stat after;
+
+    if (!program || program[0] != '/' || !identity ||
+        lstat(program, &before) != 0 ||
+        find_command_path(program, canonical, sizeof(canonical)) != 0 ||
+        strcmp(canonical, program) != 0 || lstat(program, &after) != 0 ||
+        !git_same_file_version(&before, &after) ||
+        !S_ISREG(after.st_mode)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Cannot bind the sealed %s executable identity",
+                  diagnostic_name ? diagnostic_name : "Git helper");
+        return -1;
+    }
+    publication_identity_from_stat(identity, &after);
+    return 0;
+}
+
+int git_publication_verify_program_identity(
+    const char *program, const publication_identity_t *expected,
+    const char *diagnostic_name) {
+    publication_identity_t observed;
+
+    if (!program || !expected || !expected->present) {
+        set_error(ERR_INVALID_ARGS,
+                  "Missing persisted %s executable identity",
+                  diagnostic_name ? diagnostic_name : "Git helper");
+        return -1;
+    }
+    memset(&observed, 0, sizeof(observed));
+    if (git_publication_capture_program_identity(
+            program, &observed, diagnostic_name) != 0) {
+        return -1;
+    }
+    if (!publication_identity_equal(expected, &observed)) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Recorded %s executable generation changed",
+                  diagnostic_name ? diagnostic_name : "Git helper");
+        return -1;
+    }
+    return 0;
+}
+
+int git_config_export_sealed_publication(publication_record_t *out,
+                                         const char *gpg_selector) {
+    publication_record_t record;
+    const git_scope_generation_t *generation;
+    char gpg_format[sizeof(GIT_GPG_FORMAT_OPENPGP)];
+    char signing_state[sizeof("false")];
+    char legacy_program[MAX_PATH_LEN];
+    bool fingerprint_present = false;
+    bool gpg_program_present = false;
+    bool ssh_command_present = false;
+    bool gpg_format_present = false;
+    bool signing_state_present = false;
+    bool legacy_program_present = false;
+
+    if (!out) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid sealed Git publication export request");
+        return -1;
+    }
+    if (!g_git_snapshot.valid || !g_git_snapshot.postimage_sealed) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "No sealed Git publication is available to export");
+        return -1;
+    }
+    if (!g_git_snapshot.publication_owner_bound ||
+        g_git_snapshot.publication_owner_tainted ||
+        !g_git_snapshot.publication_full_image_written ||
+        g_git_snapshot.publication_account_id == 0U ||
+        !account_incarnation_is_valid(
+            g_git_snapshot.publication_account_incarnation)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication has no transaction-bound account owner");
+        return -1;
+    }
+    if (git_snapshot_verify_generations(&g_git_snapshot, true) != 0) {
+        return -1;
+    }
+    generation = &g_git_snapshot.primary_generation;
+    if (!generation->valid || !generation->post_config_identity_valid ||
+        !generation->post_config_present) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication has no durable post-config generation");
+        return -1;
+    }
+
+    publication_record_init(&record);
+    record.account_id = g_git_snapshot.publication_account_id;
+    memcpy(record.account_incarnation,
+           g_git_snapshot.publication_account_incarnation,
+           ACCOUNT_INCARNATION_LEN);
+    record.state = PUBLICATION_STATE_PUBLISHED;
+    if (git_publication_scope_from_git(g_git_snapshot.scope,
+                                       &record.scope) != 0 ||
+        safe_strncpy(record.config_path, generation->path,
+                     sizeof(record.config_path)) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication destination exceeds durable storage");
+        return -1;
+    }
+    publication_identity_from_stat(&record.config_parent,
+                                   &generation->parent_stat);
+    publication_identity_from_stat(&record.post_config,
+                                   &generation->post_config_stat);
+    record.capabilities = PUBLICATION_CAP_DESTINATION |
+                          PUBLICATION_CAP_POST_GENERATION;
+    if (generation->repository_present) {
+        if (safe_strncpy(record.repository_path,
+                         generation->repository_path,
+                         sizeof(record.repository_path)) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed Git repository path exceeds durable storage");
+            return -1;
+        }
+        publication_identity_from_stat(&record.repository,
+                                       &generation->repository_stat);
+    }
+
+    if (git_publication_copy_post_value(
+            GIT_CONFIG_USER_SIGNINGKEY, record.gpg_fingerprint,
+            sizeof(record.gpg_fingerprint), &fingerprint_present) != 0 ||
+        git_publication_copy_post_value(
+            GIT_CONFIG_GPG_OPENPGP_PROGRAM, record.gpg_program,
+            sizeof(record.gpg_program), &gpg_program_present) != 0 ||
+        git_publication_copy_post_value(
+            GIT_CONFIG_CORE_SSHCOMMAND, record.ssh_command,
+            sizeof(record.ssh_command), &ssh_command_present) != 0 ||
+        git_publication_copy_post_value(
+            GIT_CONFIG_GPG_FORMAT, gpg_format, sizeof(gpg_format),
+            &gpg_format_present) != 0 ||
+        git_publication_copy_post_value(
+            GIT_CONFIG_COMMIT_GPGSIGN, signing_state,
+            sizeof(signing_state), &signing_state_present) != 0) {
+        return -1;
+    }
+    if (!gpg_format_present || strcmp(gpg_format,
+                                      GIT_GPG_FORMAT_OPENPGP) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication is not in the managed OpenPGP format");
+        return -1;
+    }
+    for (size_t i = 0;
+         i < sizeof(g_gpg_program_keys) / sizeof(g_gpg_program_keys[0]); i++) {
+        if (strcmp(g_gpg_program_keys[i],
+                   GIT_CONFIG_GPG_OPENPGP_PROGRAM) == 0) {
+            continue;
+        }
+        if (git_publication_copy_post_value(
+                g_gpg_program_keys[i], legacy_program,
+                sizeof(legacy_program), &legacy_program_present) != 0) {
+            return -1;
+        }
+        if (legacy_program_present) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed Git publication retains a foreign %s selector",
+                      g_gpg_program_keys[i]);
+            return -1;
+        }
+    }
+    if (fingerprint_present != gpg_program_present ||
+        (fingerprint_present && !signing_state_present) ||
+        (fingerprint_present &&
+         !git_signing_key_matches_fingerprint(record.gpg_fingerprint,
+                                              record.gpg_fingerprint)) ||
+        (signing_state_present &&
+         strcmp(signing_state, "true") != 0 &&
+         strcmp(signing_state, "false") != 0)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication lacks a complete canonical OpenPGP identity");
+        return -1;
+    }
+    if (fingerprint_present) {
+        if (publication_normalize_gpg_selector(
+                gpg_selector, record.gpg_selector) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed Git publication lacks its original account GPG selector");
+            return -1;
+        }
+        for (char *digit = record.gpg_fingerprint; *digit; digit++) {
+            *digit = (char)toupper((unsigned char)*digit);
+        }
+        if (git_publication_capture_program_identity(
+                record.gpg_program, &record.gpg_program_identity,
+                "OpenPGP") != 0) {
+            return -1;
+        }
+        record.capabilities |= PUBLICATION_CAP_GPG_FINGERPRINT |
+                               PUBLICATION_CAP_GPG_PROGRAM |
+                               PUBLICATION_CAP_GPG_SELECTOR |
+                               PUBLICATION_CAP_GPG_SIGNING_STATE;
+        record.gpg_signing_enabled = strcmp(signing_state, "true") == 0;
+    } else if (gpg_selector && gpg_selector[0] != '\0') {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Sealed Git publication received a selector without a GPG post-image");
+        return -1;
+    }
+    if (ssh_command_present) {
+        if (publication_extract_ssh_program(
+                record.ssh_command, record.ssh_program,
+                sizeof(record.ssh_program)) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Sealed core.sshCommand has invalid executable provenance");
+            return -1;
+        }
+        if (git_publication_capture_program_identity(
+                record.ssh_program, &record.ssh_program_identity,
+                "SSH") != 0) {
+            return -1;
+        }
+        record.capabilities |= PUBLICATION_CAP_SSH_COMMAND |
+                               PUBLICATION_CAP_SSH_PROGRAM;
+    }
+    if (publication_record_validate(&record) != 0) return -1;
+    *out = record;
     return 0;
 }
 
@@ -3307,11 +5379,15 @@ static int git_verify_effective_account(const account_t *account,
                                              GIT_SCOPE_LOCAL) != 0)
                 return -1;
     }
-    return git_verify_merged_account(account);
+    /* The manager publishes its retained executable after this staged Git
+     * image succeeds. At this boundary every program selector must therefore
+     * still be absent; gpg_configure_git_signing() performs the exact final
+     * verification before the transaction can be sealed. */
+    return git_verify_merged_account(account, NULL);
 }
 
 /* Set git configuration for account */
-int git_set_config(const account_t *account, git_scope_t scope) {
+static int git_set_config_impl(const account_t *account, git_scope_t scope) {
     const char *scope_flag;
     bool manage_worktree = false;
     
@@ -3344,7 +5420,6 @@ int git_set_config(const account_t *account, git_scope_t scope) {
         set_error(ERR_GIT_NOT_REPOSITORY, "Not in a git repository, cannot set local config");
         return -1;
     }
-    
     /* The caller (accounts_switch) snapshots managed keys via
      * git_config_snapshot() before this point and restores them on failure, so
      * the whole switch is rolled back atomically rather than left half-applied. */
@@ -3467,6 +5542,24 @@ int git_set_config(const account_t *account, git_scope_t scope) {
     
     log_info("Git configuration set successfully for %s", account->name);
     return 0;
+}
+
+int git_set_config(const account_t *account, git_scope_t scope) {
+    int result;
+
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    result = git_set_config_impl(account, scope);
+    if (result == 0 && g_git_snapshot.valid &&
+        g_git_snapshot.scope == scope &&
+        git_snapshot_publication_owner_matches(account)) {
+        /* This full account writer normalizes every managed key in the
+         * primary and discovered override scopes, so it supersedes any raw
+         * pre-binding write observed earlier in the same snapshot. */
+        g_git_snapshot.publication_owner_tainted = false;
+        g_git_snapshot.publication_full_image_written = true;
+    }
+    git_account_write_end();
+    return result;
 }
 
 /* Preserve a useful Git diagnostic without ever feeding its arbitrary control
@@ -3722,7 +5815,8 @@ static int effective_key_matches(const git_effective_listing_t *listing,
     return strcmp(listing->keys[index].value, expected) == 0 ? 0 : -1;
 }
 
-static int git_verify_merged_account(const account_t *account) {
+static int git_verify_merged_account(const account_t *account,
+                                     const char *expected_gpg_program) {
     git_effective_listing_t *effective;
     char expected_ssh[GIT_CFG_VALUE_MAX];
     bool ssh_present = account->ssh_enabled && account->ssh_key_path[0] != '\0';
@@ -3755,14 +5849,18 @@ static int git_verify_merged_account(const account_t *account) {
                   "Effective merged Git configuration does not match the selected account");
         return -1;
     }
-    for (size_t i = 0;
-         i < sizeof(g_gpg_program_keys) / sizeof(g_gpg_program_keys[0]); i++) {
-        if (effective_key_matches(effective, g_gpg_program_keys[i], NULL,
-                                  false) != 0) {
-            set_error(ERR_GIT_CONFIG_FAILED,
-                      "Effective merged Git GPG program configuration does not match the selected account");
-            return -1;
-        }
+    if (effective_key_matches(effective, GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                              expected_gpg_program,
+                              expected_gpg_program != NULL) != 0 ||
+        effective_key_matches(effective, GIT_CONFIG_GPG_PROGRAM, NULL,
+                              false) != 0 ||
+        effective_key_matches(effective, GIT_CONFIG_GPG_X509_PROGRAM, NULL,
+                              false) != 0 ||
+        effective_key_matches(effective, GIT_CONFIG_GPG_SSH_PROGRAM, NULL,
+                              false) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective merged Git GPG program configuration does not match the selected account");
+        return -1;
     }
     return 0;
 }
@@ -3782,8 +5880,9 @@ static void copy_effective_value(git_config_effective_value_t *dest,
     }
 }
 
-int git_get_current_config(git_current_config_t *config) {
+int git_status_snapshot_read(git_status_snapshot_t **snapshot) {
     git_effective_listing_t *effective;
+    git_status_snapshot_t *captured;
     const int k_name = cfg_key_index(GIT_CONFIG_USER_NAME);
     const int k_email = cfg_key_index(GIT_CONFIG_USER_EMAIL);
     const int k_signkey = cfg_key_index(GIT_CONFIG_USER_SIGNINGKEY);
@@ -3794,18 +5893,13 @@ int git_get_current_config(git_current_config_t *config) {
     const int k_gpgx509 = cfg_key_index(GIT_CONFIG_GPG_X509_PROGRAM);
     const int k_gpgssh = cfg_key_index(GIT_CONFIG_GPG_SSH_PROGRAM);
     const int k_sshcommand = cfg_key_index(GIT_CONFIG_CORE_SSHCOMMAND);
-    const int gpg_program_indices[] = {
-        k_gpgprogram, k_gpgopenpgp, k_gpgx509, k_gpgssh
-    };
 
-    if (!config) {
-        set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
+    if (!snapshot) {
+        set_error(ERR_INVALID_ARGS, "NULL Git status snapshot output");
         return -1;
     }
+    *snapshot = NULL;
 
-    /* Initialize structure */
-    memset(config, 0, sizeof(git_current_config_t));
-    config->valid = false;
     if (git_reject_ssh_command_override() != 0) return -1;
 
     if (k_name < 0 || k_email < 0 || k_signkey < 0 || k_gpgsign < 0 ||
@@ -3815,6 +5909,32 @@ int git_get_current_config(git_current_config_t *config) {
         return -1;
     }
     if (git_read_effective_keys(&effective) != 0) return -1;
+
+    captured = calloc(1, sizeof(*captured));
+    if (!captured) {
+        set_error(ERR_MEMORY_ALLOCATION,
+                  "Out of memory projecting effective Git status");
+        return -1;
+    }
+    *snapshot = captured;
+
+    copy_effective_value(&captured->user_name, effective, k_name);
+    copy_effective_value(&captured->user_email, effective, k_email);
+    copy_effective_value(&captured->user_signing_key, effective, k_signkey);
+    copy_effective_value(&captured->commit_gpgsign, effective, k_gpgsign);
+    copy_effective_value(&captured->gpg_format, effective, k_gpgformat);
+    copy_effective_value(&captured->ssh_command, effective, k_sshcommand);
+    copy_effective_value(&captured->gpg_program, effective, k_gpgprogram);
+    copy_effective_value(&captured->gpg_openpgp_program, effective,
+                         k_gpgopenpgp);
+    copy_effective_value(&captured->gpg_x509_program, effective, k_gpgx509);
+    copy_effective_value(&captured->gpg_ssh_program, effective, k_gpgssh);
+    for (size_t i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (effective->keys[i].present) {
+            captured->any_present = true;
+            break;
+        }
+    }
 
     /* Validate every present managed value before classifying a missing
      * identity. Otherwise an absent user.name can hide an invalid Boolean or
@@ -3843,71 +5963,105 @@ int git_get_current_config(git_current_config_t *config) {
         (effective->keys[k_gpgformat].implicit ||
          strcmp(effective->keys[k_gpgformat].value,
                 GIT_GPG_FORMAT_OPENPGP) != 0)) {
+        captured->gpg_format_invalid = true;
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Effective gpg.format is not openpgp");
-        return -1;
-    }
-
-    if ((effective->keys[k_name].present &&
-         safe_strncpy(config->name, effective->keys[k_name].value,
-                      sizeof(config->name)) != 0) ||
-        (effective->keys[k_email].present &&
-         safe_strncpy(config->email, effective->keys[k_email].value,
-                      sizeof(config->email)) != 0)) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Effective Git identity exceeds supported field length");
-        return -1;
-    }
-    if (effective->keys[k_signkey].present &&
-        safe_strncpy(config->signing_key,
-                     effective->keys[k_signkey].value,
-                     sizeof(config->signing_key)) != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Effective Git signing key exceeds supported field length");
         return -1;
     }
     if (effective->keys[k_gpgsign].present &&
         git_parse_effective_bool(&effective->keys[k_gpgsign],
                                  GIT_CONFIG_COMMIT_GPGSIGN,
-                                 &config->gpg_signing_enabled) != 0) {
-        return -1;
-    }
-    if (!effective->keys[k_name].present) {
-        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.name configured");
-        return -1;
-    }
-    if (!effective->keys[k_email].present) {
-        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
+                                 &captured->gpg_signing_enabled) != 0) {
+        captured->commit_gpgsign_invalid = true;
         return -1;
     }
 
-    config->effective_name_scope = effective->scopes[k_name];
-    snprintf(config->effective_name_origin,
-             sizeof(config->effective_name_origin), "%s",
-             effective->origins[k_name]);
-    switch (config->effective_name_scope) {
-        case GIT_CONFIG_ORIGIN_GLOBAL: config->scope = GIT_SCOPE_GLOBAL; break;
-        case GIT_CONFIG_ORIGIN_SYSTEM: config->scope = GIT_SCOPE_SYSTEM; break;
+    captured->valid = true;
+    return 0;
+}
+
+void git_status_snapshot_free(git_status_snapshot_t *snapshot) {
+    if (!snapshot) return;
+    secure_zero_memory(snapshot, sizeof(*snapshot));
+    free(snapshot);
+}
+
+int git_status_snapshot_to_current(const git_status_snapshot_t *snapshot,
+                                   git_current_config_t *current) {
+    if (!snapshot || !current || !snapshot->valid) {
+        set_error(ERR_INVALID_ARGS, "Invalid effective Git status projection");
+        return -1;
+    }
+    memset(current, 0, sizeof(*current));
+    if ((snapshot->user_name.present &&
+         safe_strncpy(current->name, snapshot->user_name.value,
+                      sizeof(current->name)) != 0) ||
+        (snapshot->user_email.present &&
+         safe_strncpy(current->email, snapshot->user_email.value,
+                      sizeof(current->email)) != 0)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective Git identity exceeds supported field length");
+        return -1;
+    }
+    if (snapshot->user_signing_key.present &&
+        safe_strncpy(current->signing_key,
+                     snapshot->user_signing_key.value,
+                     sizeof(current->signing_key)) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Effective Git signing key exceeds supported field length");
+        return -1;
+    }
+    current->gpg_signing_enabled = snapshot->gpg_signing_enabled;
+    if (!snapshot->user_name.present) {
+        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.name configured");
+        return -1;
+    }
+    if (!snapshot->user_email.present) {
+        set_error(ERR_GIT_CONFIG_NOT_FOUND, "No git user.email configured");
+        return -1;
+    }
+    current->effective_name_scope = snapshot->user_name.scope;
+    snprintf(current->effective_name_origin,
+             sizeof(current->effective_name_origin), "%s",
+             snapshot->user_name.origin);
+    current->effective_signing_key_scope = snapshot->user_signing_key.scope;
+    snprintf(current->effective_signing_key_origin,
+             sizeof(current->effective_signing_key_origin), "%s",
+             snapshot->user_signing_key.origin);
+    switch (current->effective_name_scope) {
+        case GIT_CONFIG_ORIGIN_GLOBAL: current->scope = GIT_SCOPE_GLOBAL; break;
+        case GIT_CONFIG_ORIGIN_SYSTEM: current->scope = GIT_SCOPE_SYSTEM; break;
         case GIT_CONFIG_ORIGIN_LOCAL:
         case GIT_CONFIG_ORIGIN_WORKTREE:
         case GIT_CONFIG_ORIGIN_COMMAND:
         case GIT_CONFIG_ORIGIN_UNKNOWN:
-        default: config->scope = GIT_SCOPE_LOCAL; break;
+        default: current->scope = GIT_SCOPE_LOCAL; break;
     }
-
-    copy_effective_value(&config->ssh_command, effective, k_sshcommand);
-    memset(&config->gpg_program, 0, sizeof(config->gpg_program));
-    for (size_t i = 0;
-         i < sizeof(gpg_program_indices) / sizeof(gpg_program_indices[0]); i++) {
-        int index = gpg_program_indices[i];
-        if (effective->keys[index].present) {
-            copy_effective_value(&config->gpg_program, effective, index);
-            break;
-        }
-    }
-
-    config->valid = true;
+    current->ssh_command = snapshot->ssh_command;
+    current->gpg_program = snapshot->gpg_program;
+    current->gpg_openpgp_program = snapshot->gpg_openpgp_program;
+    current->gpg_x509_program = snapshot->gpg_x509_program;
+    current->gpg_ssh_program = snapshot->gpg_ssh_program;
+    current->valid = true;
     return 0;
+}
+
+int git_get_current_config(git_current_config_t *config) {
+    git_status_snapshot_t *snapshot = NULL;
+    int result;
+
+    if (!config) {
+        set_error(ERR_INVALID_ARGS, "NULL config to git_get_current_config");
+        return -1;
+    }
+    memset(config, 0, sizeof(*config));
+    if (git_status_snapshot_read(&snapshot) != 0) {
+        git_status_snapshot_free(snapshot);
+        return -1;
+    }
+    result = git_status_snapshot_to_current(snapshot, config);
+    git_status_snapshot_free(snapshot);
+    return result;
 }
 
 /* Clear git configuration */
@@ -3948,148 +6102,1893 @@ int git_clear_config(git_scope_t scope) {
     return 0;
 }
 
-/* See git_ops.h. The suffix rule mirrors GnuPG's own selector semantics: any
- * hex selector the user saved (short id, long id, or full fingerprint)
- * selects exactly the keys whose fingerprint it is a suffix of. */
-bool git_signing_key_selects_account(const account_t *account,
-                                     const char *configured) {
-    const char *selector;
-    size_t selector_len;
+/* See git_ops.h. Selector resolution belongs to activation; ownership checks
+ * accept only complete canonical fingerprints. */
+bool git_signing_key_matches_fingerprint(const char *fingerprint,
+                                         const char *configured) {
+    size_t fingerprint_len;
     size_t configured_len;
     size_t i;
 
-    if (!account || !configured) return false;
-    if (!account->gpg_enabled || account->gpg_key_id[0] == '\0') return false;
-
-    selector = account->gpg_key_id;
-    if (selector[0] == '0' && (selector[1] == 'x' || selector[1] == 'X')) {
-        selector += 2;
-    }
-    selector_len = strlen(selector);
+    if (!fingerprint || !configured) return false;
+    fingerprint_len = strlen(fingerprint);
     configured_len = strlen(configured);
-    if (selector_len == 0 ||
-        (configured_len != 40 && configured_len != 64) ||
-        selector_len > configured_len) {
+    if ((fingerprint_len != 40 && fingerprint_len != 64) ||
+        configured_len != fingerprint_len) {
         return false;
     }
-    for (i = 0; i < configured_len; i++) {
-        if (!isxdigit((unsigned char)configured[i])) return false;
-    }
-    return strncasecmp(configured + configured_len - selector_len,
-                       selector, selector_len) == 0;
-}
-
-/* Unset one attributed credential key for git_retire_account_identity,
- * preserving the first diagnostic and counting only keys that were present.
- * first_error must be larger than an error message plus the "scope key: "
- * prefix (see the caller) so the diagnostic never truncates. */
-static void git_retire_unset(const char *key, git_scope_t scope,
-                             size_t *removed, int *failures,
-                             char *first_error, size_t first_error_size) {
-    if (git_unset_config_value(key, scope) != 0) {
-        if (*failures == 0) {
-            snprintf(first_error, first_error_size, "%s %s: %s",
-                     git_scope_diagnostic_label(scope), key,
-                     get_last_error()->message);
+    for (i = 0; i < fingerprint_len; i++) {
+        if (!isxdigit((unsigned char)fingerprint[i]) ||
+            !isxdigit((unsigned char)configured[i])) {
+            return false;
         }
-        (*failures)++;
-        return;
     }
-    (*removed)++;
+    return strcasecmp(configured, fingerprint) == 0;
 }
 
-/* See git_ops.h (AR-10 M1). */
-int git_retire_account_identity(const account_t *account, size_t *cleared) {
-    git_scope_t scopes[3];
-    size_t scope_count = 0;
-    char expected_ssh[GIT_CFG_VALUE_MAX] = "";
-    bool expected_ssh_known = false;
-    char value[GIT_CFG_VALUE_MAX];
-    /* Wide enough for a full error message plus the "scope key: " prefix
-     * git_retire_unset prepends (gcc's -Wformat-truncation checks this). */
-    char first_error[sizeof(g_last_error.message) + 64] = "";
-    int failures = 0;
-    size_t removed = 0;
+bool git_signing_key_selects_account(const account_t *account,
+                                     const char *configured) {
+    if (!account || !account->gpg_enabled) return false;
+    return git_signing_key_matches_fingerprint(account->gpg_key_id,
+                                               configured);
+}
 
+static bool git_publication_scope_matches_origin(
+    publication_scope_t publication_scope,
+    git_config_origin_scope_t origin_scope) {
+    switch (publication_scope) {
+        case PUBLICATION_SCOPE_LOCAL:
+            return origin_scope == GIT_CONFIG_ORIGIN_LOCAL;
+        case PUBLICATION_SCOPE_GLOBAL:
+            return origin_scope == GIT_CONFIG_ORIGIN_GLOBAL;
+        case PUBLICATION_SCOPE_WORKTREE:
+            return origin_scope == GIT_CONFIG_ORIGIN_WORKTREE;
+        default:
+            return false;
+    }
+}
+
+static bool git_publication_origin_matches_path(
+    const char *origin_path, const publication_record_t *publication) {
+    char canonical[MAX_PATH_LEN];
+    char repository_relative[MAX_PATH_LEN];
+    const char *candidate = origin_path;
+    int written;
+
+    if (!origin_path || !publication || publication->config_path[0] != '/') {
+        return false;
+    }
+    if (strcmp(origin_path, publication->config_path) == 0) return true;
+    /* Git may report a logical symlink spelling or a repository-relative
+     * local origin. Relative local/worktree origins are rooted at Git's
+     * canonical repository top level, not at the process's current
+     * subdirectory. Global relative origins and resolution failure are
+     * unknown provenance, never a match. */
+    if (origin_path[0] != '/') {
+        if ((publication->scope != PUBLICATION_SCOPE_LOCAL &&
+             publication->scope != PUBLICATION_SCOPE_WORKTREE) ||
+            publication->repository_path[0] != '/') {
+            return false;
+        }
+        written = snprintf(repository_relative,
+                           sizeof(repository_relative), "%s/%s",
+                           publication->repository_path, origin_path);
+        if (written < 0 || (size_t)written >= sizeof(repository_relative)) {
+            return false;
+        }
+        candidate = repository_relative;
+    }
+    return realpath(candidate, canonical) != NULL &&
+           strcmp(canonical, publication->config_path) == 0;
+}
+
+git_signing_publication_result_t git_signing_key_matches_publication(
+    const account_t *account, const publication_record_t *publication,
+    const git_current_config_t *current) {
+    static const char file_origin_prefix[] = "file:";
+    char normalized_selector[MAX_GPG_SELECTOR_LEN];
+    const char *origin_path;
+
+    if (!account || !publication || !current || !account->gpg_enabled ||
+        !account->incarnation_persisted ||
+        publication->account_id != account->id ||
+        strcmp(publication->account_incarnation,
+               account->incarnation) != 0 ||
+        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        (publication->capabilities &
+         (PUBLICATION_CAP_DESTINATION |
+          PUBLICATION_CAP_POST_GENERATION |
+          PUBLICATION_CAP_GPG_FINGERPRINT |
+          PUBLICATION_CAP_GPG_PROGRAM |
+          PUBLICATION_CAP_GPG_SELECTOR)) !=
+            (PUBLICATION_CAP_DESTINATION |
+             PUBLICATION_CAP_POST_GENERATION |
+             PUBLICATION_CAP_GPG_FINGERPRINT |
+             PUBLICATION_CAP_GPG_PROGRAM |
+             PUBLICATION_CAP_GPG_SELECTOR)) {
+        return GIT_SIGNING_PUBLICATION_MISMATCH;
+    }
+
+    /* Once a complete publication tuple is established for this account,
+     * malformed current account input is an operational ERROR regardless of
+     * any additional destination or fingerprint mismatch. Otherwise the same
+     * invalid selector could be reported as WARN or ERROR merely according to
+     * which unrelated comparison happened to run first. */
+    if (publication_normalize_gpg_selector(
+            account->gpg_key_id, normalized_selector) != 0) {
+        return GIT_SIGNING_PUBLICATION_ERROR;
+    }
+    if (
+        !git_publication_scope_matches_origin(
+            publication->scope, current->effective_signing_key_scope) ||
+        strncmp(current->effective_signing_key_origin, file_origin_prefix,
+                sizeof(file_origin_prefix) - 1U) != 0) {
+        return GIT_SIGNING_PUBLICATION_MISMATCH;
+    }
+    origin_path = current->effective_signing_key_origin +
+                  sizeof(file_origin_prefix) - 1U;
+    if (!git_publication_origin_matches_path(origin_path, publication) ||
+        !git_signing_key_matches_fingerprint(
+            publication->gpg_fingerprint, current->signing_key)) {
+        return GIT_SIGNING_PUBLICATION_MISMATCH;
+    }
+
+    /* The switch-time selector is part of the durable tuple precisely so
+     * status remains observational when a valid isolated key outlives its
+     * source keyring. Only representation-neutral case/0x normalization is
+     * allowed; selector length and every digit remain significant. */
+    return strcmp(publication->gpg_selector, normalized_selector) == 0
+               ? GIT_SIGNING_PUBLICATION_MATCH
+               : GIT_SIGNING_PUBLICATION_MISMATCH;
+}
+
+git_ssh_publication_result_t git_ssh_command_matches_publication(
+    const account_t *account, const publication_record_t *publication,
+    const git_current_config_t *current) {
+    static const char file_origin_prefix[] = "file:";
+    char current_account_command[GIT_CFG_VALUE_MAX];
+    char expanded_path[MAX_PATH_LEN];
+    const char *origin_path;
+    const uint32_t required_capabilities =
+        PUBLICATION_CAP_DESTINATION |
+        PUBLICATION_CAP_POST_GENERATION |
+        PUBLICATION_CAP_SSH_COMMAND |
+        PUBLICATION_CAP_SSH_PROGRAM;
+
+    if (!account || !publication || !current || !account->ssh_enabled ||
+        account->ssh_key_path[0] == '\0' ||
+        !account->incarnation_persisted ||
+        publication->account_id != account->id ||
+        strcmp(publication->account_incarnation,
+               account->incarnation) != 0 ||
+        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        (publication->capabilities & required_capabilities) !=
+            required_capabilities) {
+        errno = ESTALE;
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Complete SSH publication provenance is unavailable");
+        return GIT_SSH_PUBLICATION_ERROR;
+    }
+    if (publication_record_validate(publication) != 0) {
+        return GIT_SSH_PUBLICATION_ERROR;
+    }
+
+    if (build_expected_ssh_command_with_program(
+            account, publication->ssh_program, current_account_command,
+            sizeof(current_account_command), expanded_path,
+            sizeof(expanded_path)) != 0 ||
+        git_publication_verify_program_identity(
+            publication->ssh_program, &publication->ssh_program_identity,
+            "SSH") != 0) {
+        return GIT_SSH_PUBLICATION_ERROR;
+    }
+
+    if (strcmp(current_account_command, publication->ssh_command) != 0 ||
+        !current->ssh_command.present ||
+        current->ssh_command.value_unknown ||
+        strcmp(current->ssh_command.value, publication->ssh_command) != 0 ||
+        !git_publication_scope_matches_origin(
+            publication->scope, current->ssh_command.scope) ||
+        strncmp(current->ssh_command.origin, file_origin_prefix,
+                sizeof(file_origin_prefix) - 1U) != 0) {
+        return GIT_SSH_PUBLICATION_MISMATCH;
+    }
+    origin_path = current->ssh_command.origin +
+                  sizeof(file_origin_prefix) - 1U;
+    return git_publication_origin_matches_path(origin_path, publication)
+               ? GIT_SSH_PUBLICATION_MATCH
+               : GIT_SSH_PUBLICATION_MISMATCH;
+}
+
+/* See git_ops.h. No credential mutation is attributable without the sealed
+ * command/fingerprint, exact destination, and publication generation. */
+int git_retire_account_identity(const account_t *account, size_t *cleared) {
     if (cleared) *cleared = 0;
     if (!account) {
+        errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "NULL account to git_retire_account_identity");
         return -1;
     }
+    errno = ESTALE;
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Durable Git publication provenance is required for retirement");
+    return -1;
+}
 
-    /* Rebuild the exact core.sshCommand a switch to this account would have
-     * published. When the trusted rebuild is impossible (e.g. the ssh binary
-     * disappeared), an existing value cannot be attributed to this account,
-     * so it is left in place; the no-active-account status view renders the
-     * residue instead of hiding it. */
-    if (account->ssh_enabled && account->ssh_key_path[0] != '\0') {
-        if (git_expected_ssh_command(account, expected_ssh,
-                                     sizeof(expected_ssh)) == 0) {
-            expected_ssh_known = true;
+static int git_scope_from_publication(publication_scope_t publication_scope,
+                                      git_scope_t *scope) {
+    if (!scope) return -1;
+    switch (publication_scope) {
+        case PUBLICATION_SCOPE_LOCAL:
+            *scope = GIT_SCOPE_LOCAL;
+            return 0;
+        case PUBLICATION_SCOPE_GLOBAL:
+            *scope = GIT_SCOPE_GLOBAL;
+            return 0;
+        case PUBLICATION_SCOPE_WORKTREE:
+            *scope = GIT_SCOPE_WORKTREE_INTERNAL;
+            return 0;
+        default:
+            return -1;
+    }
+}
+
+static bool git_retirement_directory_identity_matches(
+    const publication_identity_t *identity, const struct stat *st) {
+    return identity && identity->present && st &&
+           identity->device == (uintmax_t)st->st_dev &&
+           identity->inode == (uintmax_t)st->st_ino &&
+           (identity->mode & (uintmax_t)S_IFMT) ==
+               ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
+}
+
+/* A completed atomic retirement necessarily changes the config generation.
+ * For retry/idempotence, retain the durable namespace and repository proof
+ * while allowing the caller to inspect whether every exact owned value is
+ * already absent. This never authorizes mutation of a stale generation. */
+static int git_retirement_verify_live_namespace(
+    const publication_record_t *publication) {
+    char canonical[MAX_PATH_LEN];
+    char parent[MAX_PATH_LEN];
+    char repository[MAX_PATH_LEN];
+    const char *slash;
+    const char *leaf;
+    struct stat parent_stat;
+    struct stat config_stat;
+    struct stat repository_stat;
+    int parent_fd = -1;
+    int config_fd = -1;
+    int repository_fd = -1;
+    int result = -1;
+
+    if (!publication || publication_record_validate(publication) != 0) {
+        return -1;
+    }
+    slash = strrchr(publication->config_path, '/');
+    if (!slash || !slash[1] ||
+        realpath(publication->config_path, canonical) == NULL ||
+        strcmp(canonical, publication->config_path) != 0) {
+        goto mismatch;
+    }
+    leaf = slash + 1U;
+    if (slash == publication->config_path) {
+        if (safe_strncpy(parent, "/", sizeof(parent)) != 0) goto mismatch;
+    } else {
+        size_t length = (size_t)(slash - publication->config_path);
+
+        if (length >= sizeof(parent)) goto mismatch;
+        memcpy(parent, publication->config_path, length);
+        parent[length] = '\0';
+    }
+    parent_fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (parent_fd < 0 || fstat(parent_fd, &parent_stat) != 0 ||
+        !git_retirement_directory_identity_matches(
+            &publication->config_parent, &parent_stat)) {
+        goto mismatch;
+    }
+    config_fd = openat(parent_fd, leaf, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (config_fd < 0 || fstat(config_fd, &config_stat) != 0 ||
+        !S_ISREG(config_stat.st_mode)) {
+        goto mismatch;
+    }
+    if (publication->scope != PUBLICATION_SCOPE_GLOBAL) {
+        if (realpath(publication->repository_path, repository) == NULL ||
+            strcmp(repository, publication->repository_path) != 0) {
+            goto mismatch;
+        }
+        repository_fd = open(publication->repository_path,
+                             O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                 O_NOFOLLOW);
+        if (repository_fd < 0 ||
+            fstat(repository_fd, &repository_stat) != 0 ||
+            !git_retirement_directory_identity_matches(
+                &publication->repository, &repository_stat)) {
+            goto mismatch;
+        }
+    }
+    result = 0;
+    goto cleanup;
+
+mismatch:
+    errno = ESTALE;
+    set_error(ERR_GIT_CONFIG_FAILED,
+              "Recorded Git retirement namespace is inaccessible or changed");
+cleanup:
+    if (repository_fd >= 0) (void)close(repository_fd);
+    if (config_fd >= 0) (void)close(config_fd);
+    if (parent_fd >= 0) (void)close(parent_fd);
+    return result;
+}
+
+static int git_retire_validate_publication(
+    const account_t *account, const publication_record_t *publication,
+    git_scope_t *scope) {
+    if (!account || !publication || !scope ||
+        !account->incarnation_persisted) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Account has no exact durable Git publication provenance");
+        return -1;
+    }
+    if (publication_record_validate(publication) != 0) return -1;
+    if (publication->account_id != account->id ||
+        strcmp(publication->account_incarnation,
+               account->incarnation) != 0 ||
+        (publication->capabilities &
+         (PUBLICATION_CAP_DESTINATION |
+          PUBLICATION_CAP_POST_GENERATION)) !=
+            (PUBLICATION_CAP_DESTINATION |
+             PUBLICATION_CAP_POST_GENERATION) ||
+        publication->state != PUBLICATION_STATE_PUBLISHED ||
+        git_scope_from_publication(publication->scope, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Account has no exact durable Git publication provenance");
+        return -1;
+    }
+    if ((publication->capabilities &
+         PUBLICATION_CAP_GPG_FINGERPRINT) != 0U &&
+        !git_signing_key_matches_fingerprint(
+            publication->gpg_fingerprint,
+            publication->gpg_fingerprint)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Publication record has no canonical signing fingerprint");
+        return -1;
+    }
+    return 0;
+}
+
+typedef struct {
+    size_t representative;
+    git_scope_t scope;
+    const publication_record_t *live_generation;
+    git_scope_snapshot_t snapshot;
+    bool snapshot_ready;
+    bool stale_generation;
+    bool attribution_conflict;
+    const char *remove_value[GIT_MANAGED_KEY_COUNT];
+    git_scope_lock_t lock;
+    size_t planned;
+    bool lock_ready;
+    bool prepared;
+    bool published;
+    bool restored;
+    bool restored_witness_ready;
+    bool settled;
+} git_retirement_group_t;
+
+typedef struct {
+    account_t account;
+    publication_record_t publication;
+    bool ready;
+    bool namespace_ready;
+} git_retirement_item_t;
+
+typedef enum {
+    GIT_RETIREMENT_TRANSACTION_PREPARED = 0,
+    GIT_RETIREMENT_TRANSACTION_PUBLISHED,
+    GIT_RETIREMENT_TRANSACTION_ABORTED,
+    GIT_RETIREMENT_TRANSACTION_PUBLISH_FAILED
+} git_retirement_transaction_state_t;
+
+struct git_retirement_transaction {
+    git_retirement_item_t *items;
+    const publication_record_t **publication_refs;
+    git_retirement_group_t *groups;
+    size_t item_count;
+    size_t group_count;
+    size_t failure_count;
+    size_t published_cleared;
+    error_accumulator_t failures;
+    git_retirement_transaction_state_t state;
+    bool snapshot_indeterminate;
+    bool command_runner;
+};
+
+static const git_snapshot_key_t *git_snapshot_key_by_name(
+    const git_scope_snapshot_t *snapshot, const char *name) {
+    int index;
+
+    if (!snapshot || !name) return NULL;
+    index = git_managed_key_index_n(name, strlen(name));
+    return index >= 0 ? &snapshot->keys[index] : NULL;
+}
+
+static int git_retirement_schedule_exact(git_retirement_group_t *group,
+                                         const char *name,
+                                         const char *value) {
+    const git_snapshot_key_t *key;
+    const char *observed = NULL;
+    size_t matches;
+    int index;
+
+    if (!group || !name || !value) return -1;
+    index = git_managed_key_index_n(name, strlen(name));
+    if (index < 0) return -1;
+    key = &group->snapshot.keys[index];
+    matches = git_snapshot_key_exact_count(key, value);
+    if (matches == 0U) return 0;
+    if (matches != 1U) {
+        group->attribution_conflict = true;
+        return -1;
+    }
+    for (size_t i = 0U; i < key->count; i++) {
+        if (strcmp(key->values[i], value) == 0) {
+            observed = key->values[i];
+            break;
+        }
+    }
+    if (!observed ||
+        (group->remove_value[index] &&
+         strcmp(group->remove_value[index], observed) != 0)) {
+        group->attribution_conflict = true;
+        return -1;
+    }
+    group->remove_value[index] = observed;
+    return 0;
+}
+
+static const char *git_retirement_unique_fingerprint_value(
+    const git_snapshot_key_t *key, const char *fingerprint,
+    bool *ambiguous) {
+    const char *match = NULL;
+    size_t matches = 0U;
+
+    if (ambiguous) *ambiguous = false;
+    if (!key || !fingerprint) return NULL;
+    for (size_t i = 0U; i < key->count; i++) {
+        if (!git_signing_key_matches_fingerprint(
+                fingerprint, key->values[i])) {
+            continue;
+        }
+        match = key->values[i];
+        matches++;
+    }
+    if (matches > 1U && ambiguous) *ambiguous = true;
+    return matches == 1U ? match : NULL;
+}
+
+/* Derive exact occurrence removals from the one immutable preflight image.
+ * Only a record whose own post-image equals the selected live generation may
+ * authorize credentials; linked-worktree membership records from older
+ * generations cannot lend stale values to the current file. */
+static void git_retirement_plan_group(
+    git_retirement_group_t *group,
+    const publication_record_t *const publications[],
+    const bool ready[], size_t publication_count) {
+    const publication_record_t *representative;
+    const git_snapshot_key_t *signing_key;
+    const git_snapshot_key_t *signing_enabled;
+    const git_snapshot_key_t *gpg_format;
+    const git_snapshot_key_t *openpgp_program;
+
+    if (!group || !group->snapshot_ready || !publications || !ready ||
+        !group->live_generation ||
+        group->representative >= publication_count) {
+        return;
+    }
+    representative = publications[group->representative];
+    signing_key = git_snapshot_key_by_name(
+        &group->snapshot, GIT_CONFIG_USER_SIGNINGKEY);
+    signing_enabled = git_snapshot_key_by_name(
+        &group->snapshot, GIT_CONFIG_COMMIT_GPGSIGN);
+    gpg_format = git_snapshot_key_by_name(
+        &group->snapshot, GIT_CONFIG_GPG_FORMAT);
+    openpgp_program = git_snapshot_key_by_name(
+        &group->snapshot, GIT_CONFIG_GPG_OPENPGP_PROGRAM);
+
+    for (size_t i = 0U; i < publication_count; i++) {
+        const publication_record_t *publication = publications[i];
+        const char *anchor;
+        const char *signing_state = NULL;
+        bool ambiguous_anchor = false;
+
+        if (!ready[i] ||
+            !publication_record_same_config_destination(
+                representative, publication) ||
+            !publication_identity_equal(
+                &publication->post_config,
+                &group->live_generation->post_config)) {
+            continue;
+        }
+        if ((publication->capabilities & PUBLICATION_CAP_SSH_COMMAND) != 0U) {
+            (void)git_retirement_schedule_exact(
+                group, GIT_CONFIG_CORE_SSHCOMMAND,
+                publication->ssh_command);
+        }
+        if ((publication->capabilities &
+             PUBLICATION_CAP_GPG_FINGERPRINT) == 0U ||
+            !signing_key) {
+            continue;
+        }
+        anchor = git_retirement_unique_fingerprint_value(
+            signing_key, publication->gpg_fingerprint,
+            &ambiguous_anchor);
+        if (ambiguous_anchor) {
+            group->attribution_conflict = true;
+            continue;
+        }
+        if (!anchor) {
+            bool signing_residue;
+
+            if ((publication->capabilities &
+                 PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U) {
+                const char *expected = publication->gpg_signing_enabled
+                                           ? "true" : "false";
+                signing_residue = signing_enabled &&
+                    git_snapshot_key_exact_count(signing_enabled,
+                                                 expected) != 0U;
+            } else {
+                signing_residue = signing_enabled &&
+                                  signing_enabled->count != 0U;
+            }
+            if (signing_residue ||
+                (gpg_format &&
+                 git_snapshot_key_exact_count(
+                     gpg_format, GIT_GPG_FORMAT_OPENPGP) != 0U) ||
+                (openpgp_program &&
+                 git_snapshot_key_exact_count(
+                     openpgp_program, publication->gpg_program) != 0U)) {
+                /* The signing key is the attribution anchor. Never declare
+                 * success while an exact companion survives without it. */
+                group->attribution_conflict = true;
+            }
+            continue;
+        }
+
+        if ((publication->capabilities &
+             PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U) {
+            signing_state = publication->gpg_signing_enabled
+                                ? "true" : "false";
+        } else if (signing_enabled && signing_enabled->count == 1U &&
+                   (strcmp(signing_enabled->values[0], "true") == 0 ||
+                    strcmp(signing_enabled->values[0], "false") == 0)) {
+            /* Legacy internal-v1 records predate the exact bool witness. A
+             * scalar canonical bool in the sealed live generation is the
+             * only backward-compatible case with unambiguous ownership. */
+            signing_state = signing_enabled->values[0];
         } else {
-            log_warning("Cannot rebuild expected core.sshCommand for '%s'; "
-                        "leaving any persisted value in place: %s",
-                        account->name, get_last_error()->message);
+            group->attribution_conflict = true;
         }
+        if (signing_state) {
+            (void)git_retirement_schedule_exact(
+                group, GIT_CONFIG_COMMIT_GPGSIGN, signing_state);
+        }
+        if (gpg_format) {
+            (void)git_retirement_schedule_exact(
+                group, GIT_CONFIG_GPG_FORMAT,
+                GIT_GPG_FORMAT_OPENPGP);
+        }
+        if (openpgp_program) {
+            (void)git_retirement_schedule_exact(
+                group, GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                publication->gpg_program);
+        }
+        (void)git_retirement_schedule_exact(
+            group, GIT_CONFIG_USER_SIGNINGKEY, anchor);
     }
+}
 
-    scopes[scope_count++] = GIT_SCOPE_GLOBAL;
-    if (git_is_repository()) {
-        bool worktree_present = false;
-        scopes[scope_count++] = GIT_SCOPE_LOCAL;
-        if (git_detect_managed_worktree_scope(&worktree_present) == 0 &&
-            worktree_present) {
-            scopes[scope_count++] = GIT_SCOPE_WORKTREE_INTERNAL;
-        }
+static bool git_retirement_stale_snapshot_is_clean(
+    const git_retirement_group_t *group,
+    const git_scope_snapshot_t *snapshot,
+    const publication_record_t *const publications[],
+    size_t publication_count) {
+    const publication_record_t *representative;
+    const git_snapshot_key_t *ssh_command;
+    const git_snapshot_key_t *signing_key;
+    const git_snapshot_key_t *signing_enabled;
+    const git_snapshot_key_t *gpg_format;
+    const git_snapshot_key_t *openpgp_program;
+
+    if (!group || !snapshot || !publications ||
+        group->representative >= publication_count) {
+        return false;
     }
+    representative = publications[group->representative];
+    ssh_command = git_snapshot_key_by_name(
+        snapshot, GIT_CONFIG_CORE_SSHCOMMAND);
+    signing_key = git_snapshot_key_by_name(
+        snapshot, GIT_CONFIG_USER_SIGNINGKEY);
+    signing_enabled = git_snapshot_key_by_name(
+        snapshot, GIT_CONFIG_COMMIT_GPGSIGN);
+    gpg_format = git_snapshot_key_by_name(
+        snapshot, GIT_CONFIG_GPG_FORMAT);
+    openpgp_program = git_snapshot_key_by_name(
+        snapshot, GIT_CONFIG_GPG_OPENPGP_PROGRAM);
 
-    for (size_t s = 0; s < scope_count; s++) {
-        git_scope_t scope = scopes[s];
+    for (size_t i = 0U; i < publication_count; i++) {
+        const publication_record_t *publication = publications[i];
 
-        if (expected_ssh_known &&
-            git_get_config_value(GIT_CONFIG_CORE_SSHCOMMAND, value,
-                                 sizeof(value), scope) == 0 &&
-            strcmp(value, expected_ssh) == 0) {
-            git_retire_unset(GIT_CONFIG_CORE_SSHCOMMAND, scope, &removed,
-                             &failures, first_error, sizeof(first_error));
+        if (!publication_record_same_config_destination(
+                representative, publication)) {
+            continue;
         }
-
-        /* The signing key attributes the whole signing leg: its enable flag
-         * and the format normalization a switch wrote alongside it belong to
-         * the same retired identity, so retire them at the same scope. A
-         * foreign or noncanonical value attributes nothing. */
-        if (git_get_config_value(GIT_CONFIG_USER_SIGNINGKEY, value,
-                                 sizeof(value), scope) == 0 &&
-            git_signing_key_selects_account(account, value)) {
-            git_retire_unset(GIT_CONFIG_USER_SIGNINGKEY, scope, &removed,
-                             &failures, first_error, sizeof(first_error));
-            if (git_get_config_value(GIT_CONFIG_COMMIT_GPGSIGN, value,
-                                     sizeof(value), scope) == 0) {
-                git_retire_unset(GIT_CONFIG_COMMIT_GPGSIGN, scope, &removed,
-                                 &failures, first_error, sizeof(first_error));
+        if ((publication->capabilities & PUBLICATION_CAP_SSH_COMMAND) != 0U &&
+            ssh_command &&
+            git_snapshot_key_exact_count(
+                ssh_command, publication->ssh_command) != 0U) {
+            return false;
+        }
+        if ((publication->capabilities &
+             PUBLICATION_CAP_GPG_FINGERPRINT) == 0U) {
+            continue;
+        }
+        if (signing_key) {
+            for (size_t j = 0U; j < signing_key->count; j++) {
+                if (git_signing_key_matches_fingerprint(
+                        publication->gpg_fingerprint,
+                        signing_key->values[j])) {
+                    return false;
+                }
             }
-            if (git_get_config_value(GIT_CONFIG_GPG_FORMAT, value,
-                                     sizeof(value), scope) == 0) {
-                git_retire_unset(GIT_CONFIG_GPG_FORMAT, scope, &removed,
-                                 &failures, first_error, sizeof(first_error));
+        }
+        if ((publication->capabilities &
+             PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U) {
+            const char *expected = publication->gpg_signing_enabled
+                                       ? "true" : "false";
+            if (signing_enabled &&
+                git_snapshot_key_exact_count(signing_enabled,
+                                             expected) != 0U) {
+                return false;
             }
+        } else if (signing_enabled && signing_enabled->count != 0U) {
+            return false;
+        }
+        if (gpg_format &&
+            git_snapshot_key_exact_count(
+                gpg_format, GIT_GPG_FORMAT_OPENPGP) != 0U) {
+            return false;
+        }
+        if (openpgp_program &&
+            git_snapshot_key_exact_count(
+                openpgp_program, publication->gpg_program) != 0U) {
+            return false;
         }
     }
+    return true;
+}
 
+/* A post-rename directory-sync failure leaves the canonical target installed
+ * but the publication record naming its old source generation. Prepare an
+ * already-clean target under the canonical lock and retain that lock through
+ * the outer retirement decision so attributed values cannot reappear between
+ * reconciliation and ledger publication. */
+static int git_retirement_prepare_stale_group_atomic(
+    const publication_record_t *const publications[],
+    size_t publication_count, git_retirement_group_t *group) {
+    git_scope_snapshot_t locked;
+    const publication_record_t *representative;
+    error_accumulator_t failures;
+    int result = -1;
+
+    if (!publications || !group ||
+        group->representative >= publication_count) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid stale Git retirement reconciliation");
+        return -1;
+    }
+    representative = publications[group->representative];
+    memset(&group->lock, 0, sizeof(group->lock));
+    group->lock.dir_fd = -1;
+    group->lock.lock_fd = -1;
+    group->lock.stage_fd = -1;
+    group->lock.original_fd = -1;
+    group->lock.published_fd = -1;
+    memset(&locked, 0, sizeof(locked));
+    error_accumulator_init(&failures);
+    if (git_scope_lock_acquire(group->scope, representative->config_path,
+                               &group->lock, NULL) != 0) {
+        goto done;
+    }
+    group->lock_ready = true;
+    if (!git_retirement_directory_identity_matches(
+            &representative->config_parent, &group->lock.parent_stat)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Stale Git retirement destination parent changed");
+        goto done;
+    }
+    if (git_capture_file_snapshot(
+            group->lock.stage_path,
+            "Could not re-read stale Git retirement destination",
+            &locked) != 0) {
+        goto done;
+    }
+    if (!git_retirement_stale_snapshot_is_clean(
+            group, &locked, publications, publication_count)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Stale Git retirement destination still contains attributed values");
+        goto done;
+    }
+    for (size_t i = 0U; i < publication_count; i++) {
+        if (publication_record_same_config_destination(
+                representative, publications[i]) &&
+            git_retirement_verify_live_namespace(publications[i]) != 0) {
+            goto done;
+        }
+    }
+    if (!git_file_at_matches_witness(
+            group->lock.dir_fd, group->lock.leaf,
+            group->lock.original_fd, &group->lock.original_stat,
+            group->lock.original_data, group->lock.original_length,
+            NULL) ||
+        fsync(group->lock.dir_fd) != 0 ||
+        !git_file_at_matches_witness(
+            group->lock.dir_fd, group->lock.leaf,
+            group->lock.original_fd, &group->lock.original_stat,
+            group->lock.original_data, group->lock.original_length,
+            NULL)) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Could not durably reconcile clean Git retirement destination: %s",
+                         representative->config_path);
+        goto done;
+    }
+    result = 0;
+
+done:
+    git_scope_snapshot_clear(&locked);
+    if (result != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "stale retirement reconciliation");
+    }
+    if (result != 0 && group->lock.dir_fd >= 0 &&
+        git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "stale retirement artifact cleanup");
+        result = -1;
+    }
+    if (result != 0) group->lock_ready = false;
+    if (failures.active) (void)error_accumulator_publish(&failures);
+    if (result == 0) {
+        group->prepared = true;
+        group->planned = 0U;
+    }
+    return result;
+}
+
+static size_t git_retirement_planned_count(
+    const git_retirement_group_t *group) {
+    size_t count = 0U;
+
+    for (size_t i = 0U; group && i < GIT_MANAGED_KEY_COUNT; i++) {
+        if (group->remove_value[i]) count++;
+    }
+    return count;
+}
+
+static int git_retirement_execute_group_command(
+    const account_t *account,
+    const publication_record_t *const publications[],
+    git_retirement_group_t *group, size_t *cleared) {
+    static const char *const order[] = {
+        GIT_CONFIG_CORE_SSHCOMMAND,
+        GIT_CONFIG_COMMIT_GPGSIGN,
+        GIT_CONFIG_GPG_FORMAT,
+        GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+        GIT_CONFIG_USER_SIGNINGKEY
+    };
+    const char *config_path =
+        publications[group->representative]->config_path;
+    size_t removed = 0U;
+
+    for (size_t i = 0U; i < sizeof(order) / sizeof(order[0]); i++) {
+        int index = git_managed_key_index_n(order[i], strlen(order[i]));
+        const char *value = index >= 0 ? group->remove_value[index] : NULL;
+
+        if (!value) continue;
+        if (g_retirement_test_hook &&
+            g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_REMOVE,
+                                   config_path, order[i], value)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Injected Git retirement removal failure");
+            if (cleared) *cleared = removed;
+            return -1;
+        }
+        if (git_config_file_unset_exact(
+                config_path, order[i], value,
+                "recorded publication destination") != 0) {
+            if (cleared) *cleared = removed;
+            return -1;
+        }
+        removed++;
+    }
     if (cleared) *cleared = removed;
-    if (removed > 0) {
+    if (removed != 0U) {
         log_info("Retired %zu durable Git identity key(s) selecting '%s'",
                  removed, account->name);
     }
-    if (failures != 0) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Failed to retire %d durable Git identity key(s) for "
-                  "'%s': %s",
-                  failures, account->name,
-                  first_error[0] ? first_error : "unknown Git error");
+    return 0;
+}
+
+static int git_retirement_prepare_group_atomic(
+    const publication_record_t *const publications[],
+    const bool ready[], size_t publication_count,
+    git_retirement_group_t *group) {
+    git_scope_snapshot_t locked;
+    git_scope_snapshot_t expected;
+    git_scope_snapshot_t observed;
+    publication_identity_t original_identity;
+    static const char *const order[] = {
+        GIT_CONFIG_CORE_SSHCOMMAND,
+        GIT_CONFIG_COMMIT_GPGSIGN,
+        GIT_CONFIG_GPG_FORMAT,
+        GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+        GIT_CONFIG_USER_SIGNINGKEY
+    };
+    const char *config_path;
+    error_accumulator_t failures;
+    int result = -1;
+
+    if (!publications || !ready || !group ||
+        !group->snapshot_ready || !group->live_generation) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid exact Git retirement group preparation");
         return -1;
     }
+    memset(&group->lock, 0, sizeof(group->lock));
+    group->lock.dir_fd = -1;
+    group->lock.lock_fd = -1;
+    group->lock.stage_fd = -1;
+    group->lock.original_fd = -1;
+    group->lock.published_fd = -1;
+    memset(&locked, 0, sizeof(locked));
+    memset(&expected, 0, sizeof(expected));
+    memset(&observed, 0, sizeof(observed));
+    error_accumulator_init(&failures);
+    config_path = publications[group->representative]->config_path;
+    group->planned = git_retirement_planned_count(group);
+    if (git_scope_lock_acquire(group->scope, config_path, &group->lock,
+                               NULL) != 0) {
+        return -1;
+    }
+    group->lock_ready = true;
+    if (group->lock.original_stat.st_nlink != 1 ||
+        !git_retirement_directory_identity_matches(
+            &publications[group->representative]->config_parent,
+            &group->lock.parent_stat)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Recorded Git retirement destination no longer has one canonical file generation");
+        goto done;
+    }
+    publication_identity_from_stat(&original_identity,
+                                   &group->lock.original_stat);
+    if (!publication_identity_equal(
+            &original_identity, &group->live_generation->post_config)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git retirement destination changed before its canonical lock was acquired");
+        goto done;
+    }
+    if (git_capture_file_snapshot(
+            group->lock.stage_path,
+            "Could not read locked Git retirement source", &locked) != 0) {
+        goto done;
+    }
+    if (!git_scope_snapshot_equal(&group->snapshot, &locked)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git retirement vector changed before its canonical lock was acquired");
+        goto done;
+    }
+    if (group->planned == 0U) {
+        result = 0;
+        goto done;
+    }
+    if (g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_LOCKED_READ,
+                               config_path, NULL, NULL)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Injected Git retirement locked-read failure");
+        goto done;
+    }
+    if (git_scope_snapshot_clone(&locked, &expected) != 0) goto done;
+    for (size_t i = 0U; i < sizeof(order) / sizeof(order[0]); i++) {
+        int index = git_managed_key_index_n(order[i], strlen(order[i]));
+        const char *value = index >= 0 ? group->remove_value[index] : NULL;
+
+        if (!value) continue;
+        if (g_retirement_test_hook &&
+            g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_REMOVE,
+                                   config_path, order[i], value)) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Injected Git retirement staged-removal failure");
+            goto done;
+        }
+        if (git_config_file_unset_exact(
+                group->lock.stage_path, order[i], value,
+                "locked retirement staging file") != 0) {
+            goto done;
+        }
+        if (git_scope_lock_capture_stage_witness(&group->lock) != 0) {
+            set_system_error(ERR_GIT_CONFIG_FAILED,
+                             "Could not retain the edited Git retirement staging generation");
+            goto done;
+        }
+        if (git_snapshot_key_remove_exact_once(
+                &expected.keys[index], value) != 0) {
+            goto done;
+        }
+    }
+    if (git_capture_file_snapshot(
+            group->lock.stage_path,
+            "Could not verify prepared Git retirement staging file",
+            &observed) != 0) {
+        goto done;
+    }
+    if (!git_scope_snapshot_equal(&expected, &observed)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Prepared Git retirement vectors do not match the exact survivor plan");
+        goto done;
+    }
+    for (size_t i = 0U; i < publication_count; i++) {
+        if (ready[i] &&
+            publication_record_same_config_destination(
+                publications[group->representative], publications[i]) &&
+            git_retirement_verify_live_namespace(publications[i]) != 0) {
+            goto done;
+        }
+    }
+    result = 0;
+
+done:
+    git_scope_snapshot_clear(&locked);
+    git_scope_snapshot_clear(&expected);
+    git_scope_snapshot_clear(&observed);
+    if (result != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "exact Git retirement preparation");
+    }
+    if (result != 0 && group->lock.dir_fd >= 0 &&
+        git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        (void)error_accumulator_add_last(
+            &failures, "failed Git retirement preparation cleanup");
+        result = -1;
+    }
+    if (result != 0) group->lock_ready = false;
+    if (failures.active) (void)error_accumulator_publish(&failures);
+    if (result == 0) group->prepared = true;
+    return result;
+}
+
+static int git_retirement_publish_group_atomic(
+    const account_t *account,
+    const publication_record_t *const publications[],
+    const bool ready[], size_t publication_count,
+    git_retirement_group_t *group, size_t *cleared) {
+    const char *config_path;
+
+    if (cleared) *cleared = 0U;
+    if (!account || !publications || !ready || !group ||
+        !group->prepared || !group->lock_ready ||
+        group->lock.dir_fd < 0) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid prepared Git retirement publication");
+        return -1;
+    }
+    config_path = publications[group->representative]->config_path;
+    for (size_t i = 0U; i < publication_count; i++) {
+        if (ready[i] &&
+            publication_record_same_config_destination(
+                publications[group->representative], publications[i]) &&
+            git_retirement_verify_live_namespace(publications[i]) != 0) {
+            return -1;
+        }
+    }
+    if (group->planned == 0U) return 0;
+    if (g_retirement_test_hook &&
+        g_retirement_test_hook(GIT_RETIREMENT_TEST_BEFORE_PUBLISH,
+                               config_path, NULL, NULL)) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Injected Git retirement publication failure");
+        return -1;
+    }
+    if (git_scope_lock_publish(&group->lock, true) != 0) {
+        group->published = group->lock.published;
+        return -1;
+    }
+    group->published = group->lock.published;
+    if (cleared) *cleared = group->planned;
+    log_info("Retired %zu durable Git identity key(s) selecting '%s'",
+             group->planned, account->name);
+    return 0;
+}
+
+static void git_retirement_transaction_release(
+    git_retirement_transaction_t *transaction) {
+    if (!transaction) return;
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_scope_lock_close(&transaction->groups[i].lock);
+        git_scope_snapshot_clear(&transaction->groups[i].snapshot);
+    }
+    if (transaction->items) {
+        secure_zero_memory(transaction->items,
+                           transaction->item_count *
+                               sizeof(*transaction->items));
+        free(transaction->items);
+    }
+    free(transaction->publication_refs);
+    free(transaction->groups);
+    secure_zero_memory(transaction, sizeof(*transaction));
+    free(transaction);
+}
+
+static void git_retirement_transaction_add_failure(
+    git_retirement_transaction_t *transaction, const char *label) {
+    error_context_t contextual;
+    int saved_errno;
+    int written;
+
+    if (!transaction) return;
+    if (get_last_error()->code == ERR_SUCCESS) {
+        errno = errno ? errno : EIO;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Git retirement operation failed");
+    }
+    saved_errno = errno ? errno : EIO;
+    if (!transaction->failures.active && label && label[0] != '\0') {
+        char original[sizeof(contextual.message)];
+
+        contextual = *get_last_error();
+        memcpy(original, contextual.message, sizeof(original));
+        original[sizeof(original) - 1U] = '\0';
+        written = snprintf(contextual.message, sizeof(contextual.message),
+                           "%s: %s", label,
+                           original[0] != '\0'
+                               ? original
+                               : "Git retirement operation failed");
+        if (written < 0 ||
+            (size_t)written >= sizeof(contextual.message)) {
+            contextual.message[sizeof(contextual.message) - 1U] = '\0';
+            contextual.message_truncated = true;
+        }
+        errno = saved_errno;
+        (void)error_accumulator_add(&transaction->failures, label,
+                                    &contextual);
+    } else {
+        errno = saved_errno;
+        (void)error_accumulator_add_last(&transaction->failures, label);
+    }
+    errno = saved_errno;
+    transaction->failure_count++;
+}
+
+static int git_retirement_transaction_prepare_internal(
+    const account_t *const accounts[],
+    const publication_record_t *const publications[], size_t item_count,
+    bool allow_command_runner,
+    git_retirement_transaction_t **out) {
+    git_retirement_transaction_t *transaction = NULL;
+    bool ready[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    bool processed[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    const publication_record_t *
+        live_generations[PUBLICATION_LEDGER_MAX_RECORDS] = {NULL};
+
+    if (out) *out = NULL;
+    if (!out || !accounts || !publications || item_count == 0U ||
+        item_count > PUBLICATION_LEDGER_MAX_RECORDS ||
+        (!allow_command_runner && !run_uses_default_runner())) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid outer Git retirement transaction request");
+        return -1;
+    }
+    transaction = calloc(1U, sizeof(*transaction));
+    if (!transaction) goto allocation_failed;
+    transaction->items = calloc(item_count, sizeof(*transaction->items));
+    transaction->publication_refs =
+        calloc(item_count, sizeof(*transaction->publication_refs));
+    transaction->groups = calloc(item_count, sizeof(*transaction->groups));
+    if (!transaction->items || !transaction->publication_refs ||
+        !transaction->groups) {
+        goto allocation_failed;
+    }
+    transaction->item_count = item_count;
+    transaction->command_runner = !run_uses_default_runner();
+    transaction->state = GIT_RETIREMENT_TRANSACTION_PREPARED;
+    error_accumulator_init(&transaction->failures);
+
+    /* Reject every malformed, tombstoned, or differently owned record before
+     * any filesystem probe or Git subprocess can mutate a destination. */
+    for (size_t i = 0U; i < item_count; i++) {
+        git_scope_t ignored_scope;
+
+        if (!accounts[i] || !publications[i]) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "NULL item in outer Git retirement transaction");
+            goto fail;
+        }
+        transaction->items[i].account = *accounts[i];
+        transaction->items[i].publication = *publications[i];
+        transaction->publication_refs[i] =
+            &transaction->items[i].publication;
+        if (git_retire_validate_publication(
+                &transaction->items[i].account,
+                transaction->publication_refs[i], &ignored_scope) != 0) {
+            goto fail;
+        }
+    }
+
+    /* Preflight every repository witness before the first Git subprocess. A
+     * linked-worktree record may use the current generation sealed by another
+     * record for the same stable physical config namespace. */
+    for (size_t i = 0U; i < item_count; i++) {
+        git_scope_t scope = GIT_SCOPE_GLOBAL;
+        char label[MAX_NAME_LEN + 96U];
+
+        (void)git_scope_from_publication(
+            transaction->publication_refs[i]->scope, &scope);
+        if (publication_record_verify_live_destination(
+                transaction->publication_refs[i],
+                transaction->publication_refs, item_count,
+                &live_generations[i]) == 0) {
+            ready[i] = true;
+            transaction->items[i].ready = true;
+            transaction->items[i].namespace_ready = true;
+            continue;
+        }
+        /* The canonical atomic target has a different generation after a
+         * successful rename. Keep enough namespace proof to recognize an
+         * already-clean retry, but never use a stale generation to authorize
+         * another mutation. */
+        if (git_retirement_verify_live_namespace(
+                transaction->publication_refs[i]) == 0) {
+            transaction->items[i].namespace_ready = true;
+            clear_error();
+            continue;
+        }
+        (void)snprintf(label, sizeof(label),
+                       "account '%s' destination %zu (%s)",
+                       transaction->items[i].account.name, i + 1U,
+                       git_scope_diagnostic_label(scope));
+        git_retirement_transaction_add_failure(transaction, label);
+    }
+
+    /* Form stable physical groups, then capture every readable group before
+     * the first unset. Any indeterminate read blocks the complete mutation
+     * phase: no destination may be changed from a partial preflight image. */
+    for (size_t i = 0U; i < item_count; i++) {
+        size_t representative = SIZE_MAX;
+        git_retirement_group_t *group;
+
+        if (processed[i]) continue;
+        for (size_t j = 0U; j < item_count; j++) {
+            if (publication_record_same_config_destination(
+                    transaction->publication_refs[i],
+                    transaction->publication_refs[j])) {
+                processed[j] = true;
+                if (transaction->items[j].namespace_ready &&
+                    representative == SIZE_MAX) {
+                    representative = j;
+                }
+            }
+        }
+        if (representative == SIZE_MAX) continue;
+        group = &transaction->groups[transaction->group_count++];
+        group->lock.dir_fd = -1;
+        group->lock.lock_fd = -1;
+        group->lock.stage_fd = -1;
+        group->lock.original_fd = -1;
+        group->lock.published_fd = -1;
+        group->representative = representative;
+        (void)git_scope_from_publication(
+            transaction->publication_refs[representative]->scope,
+            &group->scope);
+        for (size_t j = 0U; j < item_count; j++) {
+            if (!ready[j] ||
+                !publication_record_same_config_destination(
+                    transaction->publication_refs[representative],
+                    transaction->publication_refs[j])) {
+                continue;
+            }
+            if (!group->live_generation) {
+                group->live_generation = live_generations[j];
+            } else if (!live_generations[j] ||
+                       !publication_identity_equal(
+                           &group->live_generation->post_config,
+                           &live_generations[j]->post_config)) {
+                group->attribution_conflict = true;
+            }
+        }
+        group->stale_generation = group->live_generation == NULL;
+    }
+
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_retirement_group_t *group = &transaction->groups[i];
+        const publication_record_t *publication =
+            transaction->publication_refs[group->representative];
+        char context[128];
+        char label[MAX_NAME_LEN + 96U];
+
+        (void)snprintf(context, sizeof(context),
+                       "Could not read recorded destination %zu Git configuration",
+                       group->representative + 1U);
+        if (git_capture_file_snapshot(publication->config_path, context,
+                                      &group->snapshot) != 0) {
+            (void)snprintf(label, sizeof(label),
+                           "account '%s' destination %zu snapshot (%s)",
+                           transaction->items[
+                               group->representative].account.name,
+                           group->representative + 1U,
+                           git_scope_diagnostic_label(group->scope));
+            git_retirement_transaction_add_failure(transaction, label);
+            transaction->snapshot_indeterminate = true;
+            continue;
+        }
+        group->snapshot_ready = true;
+        if (!group->stale_generation) {
+            git_retirement_plan_group(
+                group, transaction->publication_refs, ready, item_count);
+        }
+    }
+
+    /* All attribution above came from immutable original snapshots. Only a
+     * complete preflight may enter destructive work. Stale destination
+     * witnesses and later mutation failures retain M10's independent-group
+     * continuation; snapshot indeterminacy authorizes no mutation anywhere. */
+    if (!transaction->snapshot_indeterminate) {
+        for (size_t i = 0U; i < transaction->group_count; i++) {
+            git_retirement_group_t *group = &transaction->groups[i];
+            char label[MAX_NAME_LEN + 96U];
+            int prepare_result;
+
+            if (!group->snapshot_ready) continue;
+            if (group->attribution_conflict) {
+                set_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Git retirement found ambiguous repeated attributed values");
+                prepare_result = -1;
+            } else if (transaction->command_runner &&
+                       !group->stale_generation) {
+                group->planned = git_retirement_planned_count(group);
+                group->prepared = true;
+                prepare_result = 0;
+            } else if (group->stale_generation) {
+                prepare_result = git_retirement_prepare_stale_group_atomic(
+                    transaction->publication_refs, item_count, group);
+            } else {
+                prepare_result = git_retirement_prepare_group_atomic(
+                    transaction->publication_refs, ready, item_count, group);
+            }
+            if (prepare_result != 0) {
+                (void)snprintf(label, sizeof(label),
+                               "account '%s' destination %zu preparation (%s)",
+                               transaction->items[
+                                   group->representative].account.name,
+                               group->representative + 1U,
+                               git_scope_diagnostic_label(group->scope));
+                git_retirement_transaction_add_failure(transaction, label);
+            }
+        }
+    }
+
+    clear_error();
+    *out = transaction;
+    return 0;
+
+allocation_failed:
+    errno = ENOMEM;
+    set_error(ERR_MEMORY_ALLOCATION,
+              "Out of memory preparing outer Git retirement transaction");
+fail:
+    git_retirement_transaction_release(transaction);
+    return -1;
+}
+
+int git_retirement_transaction_prepare(
+    const account_t *const accounts[],
+    const publication_record_t *const publications[], size_t item_count,
+    git_retirement_transaction_t **transaction) {
+    return git_retirement_transaction_prepare_internal(
+        accounts, publications, item_count, false, transaction);
+}
+
+int git_retirement_transaction_publish(
+    git_retirement_transaction_t *transaction, size_t *cleared) {
+    bool ready[PUBLICATION_LEDGER_MAX_RECORDS] = {false};
+    size_t total_cleared = 0U;
+
+    if (cleared) *cleared = 0U;
+    if (!transaction ||
+        transaction->state != GIT_RETIREMENT_TRANSACTION_PREPARED) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid prepared Git retirement transaction");
+        return -1;
+    }
+    for (size_t i = 0U; i < transaction->item_count; i++) {
+        ready[i] = transaction->items[i].ready;
+    }
+    if (!transaction->snapshot_indeterminate) {
+        for (size_t i = 0U; i < transaction->group_count; i++) {
+            git_retirement_group_t *group = &transaction->groups[i];
+            const account_t *account =
+                &transaction->items[group->representative].account;
+            size_t group_cleared = 0U;
+            char label[MAX_NAME_LEN + 96U];
+            int publish_result;
+
+            if (!group->prepared) continue;
+            if (transaction->command_runner &&
+                !group->stale_generation) {
+                publish_result = git_retirement_execute_group_command(
+                    account, transaction->publication_refs, group,
+                    &group_cleared);
+            } else {
+                publish_result = git_retirement_publish_group_atomic(
+                    account, transaction->publication_refs, ready,
+                    transaction->item_count, group, &group_cleared);
+            }
+            if (publish_result != 0) {
+                (void)snprintf(label, sizeof(label),
+                               "account '%s' destination %zu publication (%s)",
+                               account->name,
+                               group->representative + 1U,
+                               git_scope_diagnostic_label(group->scope));
+                git_retirement_transaction_add_failure(transaction, label);
+            }
+            total_cleared += group_cleared;
+        }
+    }
+    transaction->published_cleared = total_cleared;
+    if (cleared) *cleared = total_cleared;
+    if (transaction->failure_count == 0U) {
+        transaction->state = GIT_RETIREMENT_TRANSACTION_PUBLISHED;
+        clear_error();
+        return 0;
+    }
+
+    /* A partial publication is the historical M17 outcome, not an outer
+     * rollback transaction. Accept successful canonical changes and settle
+     * every held lock before reporting the aggregate failure. */
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_retirement_group_t *group = &transaction->groups[i];
+        char label[MAX_NAME_LEN + 96U];
+
+        if (!group->lock_ready || group->settled) continue;
+        if (git_scope_lock_discard_checked(&group->lock, true) != 0) {
+            (void)snprintf(label, sizeof(label),
+                           "account '%s' destination %zu cleanup (%s)",
+                           transaction->items[
+                               group->representative].account.name,
+                           group->representative + 1U,
+                           git_scope_diagnostic_label(group->scope));
+            git_retirement_transaction_add_failure(transaction, label);
+        }
+        group->lock_ready = false;
+        group->settled = true;
+    }
+    transaction->state = GIT_RETIREMENT_TRANSACTION_PUBLISH_FAILED;
+    {
+        error_context_t summary;
+
+        set_error(
+            ERR_GIT_CONFIG_FAILED,
+            "Git retirement batch cleared %zu key(s), but %zu operation(s) across %zu recorded destination(s) failed",
+            total_cleared, transaction->failure_count,
+            transaction->item_count);
+        summary = *get_last_error();
+        (void)error_accumulator_add(&transaction->failures,
+                                    "retirement summary", &summary);
+        (void)error_accumulator_publish(&transaction->failures);
+    }
+    return -1;
+}
+
+static int git_scope_lock_reverse_retirement(git_scope_lock_t *lock) {
+    git_exchange_result_t exchanged;
+    struct stat refreshed_original;
+    struct stat refreshed_published;
+    bool canonical_original;
+
+    if (!lock || lock->dir_fd < 0 || !lock->lock_created ||
+        !lock->lock_witness_valid || !lock->original_present ||
+        !lock->original_witness_valid || !lock->published_witness_valid) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid retained Git retirement rollback state");
+        return -1;
+    }
+    if (!git_file_at_matches_witness(
+            lock->dir_fd, lock->lock_leaf, lock->lock_fd,
+            &lock->lock_stat, NULL, 0U, NULL)) {
+        errno = errno ? errno : EAGAIN;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Git retirement lock changed before outer rollback");
+        return -1;
+    }
+
+    /* A prior attempt may have restored the canonical inode before its
+     * directory sync failed. Reprove and finish that same operation instead
+     * of requiring the retired post-image to reappear. */
+    canonical_original = git_file_at_matches_witness(
+        lock->dir_fd, lock->leaf, lock->original_fd,
+        &lock->original_stat, lock->original_data,
+        lock->original_length, &refreshed_original);
+    if (!canonical_original) {
+        if (!git_file_at_matches_witness(
+                lock->dir_fd, lock->leaf, lock->published_fd,
+                &lock->published_stat, lock->published_data,
+                lock->published_length, NULL) ||
+            !lock->stage_created ||
+            !git_file_at_matches_witness(
+                lock->dir_fd, lock->stage_leaf, lock->original_fd,
+                &lock->original_stat, lock->original_data,
+                lock->original_length, NULL)) {
+            errno = errno ? errno : EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Git retirement destination changed before outer rollback");
+            return -1;
+        }
+        exchanged = git_exchange_names_at(
+            lock->dir_fd, lock->stage_leaf, lock->leaf);
+        if (exchanged == GIT_EXCHANGE_OK) {
+            lock->stage_witness_kind = GIT_STAGE_WITNESS_PUBLISHED;
+            if (!git_file_at_matches_witness(
+                    lock->dir_fd, lock->leaf, lock->original_fd,
+                    &lock->original_stat, lock->original_data,
+                    lock->original_length, &refreshed_original) ||
+                !git_file_at_matches_witness(
+                    lock->dir_fd, lock->stage_leaf, lock->published_fd,
+                    &lock->published_stat, lock->published_data,
+                    lock->published_length, &refreshed_published)) {
+                errno = errno ? errno : EAGAIN;
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Git retirement rollback could not classify exchanged generations");
+                return -1;
+            }
+            lock->published_stat = refreshed_published;
+        } else if (exchanged == GIT_EXCHANGE_UNSUPPORTED) {
+            if (renameat(lock->dir_fd, lock->stage_leaf,
+                         lock->dir_fd, lock->leaf) != 0 ||
+                !git_file_at_matches_witness(
+                    lock->dir_fd, lock->leaf, lock->original_fd,
+                    &lock->original_stat, lock->original_data,
+                    lock->original_length, &refreshed_original)) {
+                errno = errno ? errno : EAGAIN;
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Cannot restore the exact original Git retirement generation");
+                return -1;
+            }
+            lock->stage_created = false;
+        } else {
+            set_system_error(ERR_GIT_CONFIG_FAILED,
+                             "Cannot exchange the original Git retirement generation back into place");
+            return -1;
+        }
+    }
+    lock->original_stat = refreshed_original;
+    lock->published = false;
+    if (fsync(lock->dir_fd) != 0 ||
+        !git_file_at_matches_witness(
+            lock->dir_fd, lock->leaf, lock->original_fd,
+            &lock->original_stat, lock->original_data,
+            lock->original_length, &refreshed_original)) {
+        errno = errno ? errno : EIO;
+        set_system_error(ERR_GIT_CONFIG_FAILED,
+                         "Restored Git retirement generation was not durably verified");
+        return -1;
+    }
+    lock->original_stat = refreshed_original;
+    return 0;
+}
+
+int git_retirement_transaction_abort(
+    git_retirement_transaction_t *transaction) {
+    error_accumulator_t failures;
+    size_t failure_count = 0U;
+
+    if (!transaction || transaction->command_runner ||
+        (transaction->state != GIT_RETIREMENT_TRANSACTION_PUBLISHED &&
+         transaction->state != GIT_RETIREMENT_TRANSACTION_ABORTED)) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Git retirement transaction is not abortable");
+        return -1;
+    }
+    if (transaction->state == GIT_RETIREMENT_TRANSACTION_ABORTED) return 0;
+    error_accumulator_init(&failures);
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_retirement_group_t *group = &transaction->groups[i];
+        char label[96];
+
+        if (!group->published || group->restored) continue;
+        if (!group->lock_ready ||
+            git_scope_lock_reverse_retirement(&group->lock) != 0) {
+            (void)snprintf(label, sizeof(label),
+                           "destination %zu outer rollback (%s)",
+                           group->representative + 1U,
+                           git_scope_diagnostic_label(group->scope));
+            (void)error_accumulator_add_last(&failures, label);
+            failure_count++;
+            continue;
+        }
+        group->restored = true;
+    }
+    if (failure_count != 0U) {
+        error_context_t summary;
+
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git retirement outer rollback left %zu destination(s) unsettled",
+                  failure_count);
+        summary = *get_last_error();
+        (void)error_accumulator_add(&failures, "rollback summary",
+                                    &summary);
+        (void)error_accumulator_publish(&failures);
+        return -1;
+    }
+    transaction->state = GIT_RETIREMENT_TRANSACTION_ABORTED;
+    clear_error();
+    return 0;
+}
+
+static bool git_retirement_group_is_abort_reconciled(
+    const git_retirement_group_t *group) {
+    bool restored;
+
+    if (!group || !group->prepared) {
+        return false;
+    }
+    restored = group->published ? group->restored : group->planned == 0U;
+    return restored &&
+           (group->restored_witness_ready ||
+            (group->lock_ready && !group->settled));
+}
+
+size_t git_retirement_transaction_restored_destination_count(
+    const git_retirement_transaction_t *transaction) {
+    size_t count = 0U;
+
+    if (!transaction ||
+        transaction->state != GIT_RETIREMENT_TRANSACTION_ABORTED) {
+        return 0U;
+    }
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        if (git_retirement_group_is_abort_reconciled(
+                &transaction->groups[i])) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Prove exact bytes through a descriptor, flush any delayed inode metadata,
+ * close that descriptor, and require the named observation to stabilize. The
+ * ctime-only retry is authorized solely by the complete byte proof. */
+static bool git_file_at_matches_witness_after_close(
+    int parent_fd, const char *path, const char *leaf,
+    const struct stat *baseline, const unsigned char *data, size_t length,
+    struct stat *current) {
+    for (unsigned attempt = 0U;
+         attempt < GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS;
+         attempt++) {
+        struct stat opened;
+        struct stat named_after;
+        int fd = openat(parent_fd, leaf,
+                        O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+
+        if (fd < 0) return false;
+        if (fsync(fd) != 0) {
+            int saved_errno = errno ? errno : EIO;
+
+            (void)close(fd);
+            errno = saved_errno;
+            return false;
+        }
+        errno = 0;
+        if (!git_file_at_matches_witness(
+                parent_fd, leaf, fd, baseline, data, length, &opened)) {
+            int saved_errno = errno ? errno : EAGAIN;
+
+            if (close(fd) != 0) return false;
+            if (saved_errno == EAGAIN &&
+                attempt + 1U <
+                    GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS) {
+                continue;
+            }
+            errno = saved_errno;
+            return false;
+        }
+        if (close(fd) != 0) return false;
+        /* FreeBSD may not expose the last funlinkat/link/rename ctime until
+         * the retained descriptor closes. Sync the containing namespace only
+         * after that close, then require a stable named observation. */
+        if (g_retirement_test_hook &&
+            g_retirement_test_hook(
+                GIT_RETIREMENT_TEST_RESTORED_WITNESS_AFTER_CLOSE,
+                path, NULL, NULL)) {
+            errno = EIO;
+            return false;
+        }
+        if (fsync(parent_fd) != 0 ||
+            fstatat(parent_fd, leaf, &named_after,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            return false;
+        }
+        if (!git_same_pinned_file_generation(baseline, &named_after)) {
+            errno = EAGAIN;
+            return false;
+        }
+        if (git_same_file_observation(&opened, &named_after)) {
+            if (current) *current = named_after;
+            return true;
+        }
+        if (attempt + 1U >=
+                GIT_RESTORED_WITNESS_STABILIZATION_ATTEMPTS ||
+            !git_metadata_ctime_only_change(&opened, &named_after)) {
+            errno = EAGAIN;
+            return false;
+        }
+    }
+    errno = EAGAIN;
+    return false;
+}
+
+static int git_retirement_group_finalize_restored_witness(
+    git_retirement_group_t *group, struct stat *current_stat) {
+    unsigned char *retained_data = NULL;
+    size_t retained_length;
+    struct stat reopened_parent;
+    struct stat refreshed;
+
+    if (!group || !current_stat || !group->prepared) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (group->restored_witness_ready) {
+        if (!git_file_at_matches_witness_after_close(
+                group->lock.dir_fd, group->lock.path, group->lock.leaf,
+                &group->lock.original_stat, group->lock.original_data,
+                group->lock.original_length, &refreshed)) {
+            errno = errno ? errno : EAGAIN;
+            return -1;
+        }
+        if (!git_same_file_observation(
+                &group->lock.original_stat, &refreshed)) {
+            if (!git_metadata_ctime_only_change(
+                    &group->lock.original_stat, &refreshed)) {
+                errno = EAGAIN;
+                return -1;
+            }
+            group->lock.original_stat = refreshed;
+        }
+        *current_stat = refreshed;
+        return 0;
+    }
+    if (!group->lock_ready || group->settled ||
+        !group->lock.original_present ||
+        !group->lock.original_witness_valid ||
+        group->lock.original_fd < 0 || group->lock.dir_fd < 0 ||
+        !git_file_at_matches_witness(
+            group->lock.dir_fd, group->lock.leaf,
+            group->lock.original_fd, &group->lock.original_stat,
+            group->lock.original_data, group->lock.original_length,
+            NULL)) {
+        errno = errno ? errno : EAGAIN;
+        return -1;
+    }
+    retained_length = group->lock.original_length;
+    if (retained_length != 0U) {
+        retained_data = malloc(retained_length);
+        if (!retained_data) {
+            errno = ENOMEM;
+            return -1;
+        }
+        memcpy(retained_data, group->lock.original_data, retained_length);
+    }
+
+    /* Checked cleanup removes and syncs every transaction-owned name before
+     * the generation is sealed. FreeBSD UFS may materialize the fallback
+     * link/rename ctime only at this sync; recording earlier leaves a stale
+     * ledger even though the restored inode and bytes are exact. */
+    if (git_scope_lock_discard_checked(&group->lock, true) != 0) {
+        int saved_errno = errno ? errno : EIO;
+
+        if (retained_data) {
+            secure_zero_memory(retained_data, retained_length);
+            free(retained_data);
+        }
+        group->lock_ready = false;
+        group->settled = true;
+        errno = saved_errno;
+        return -1;
+    }
+    group->lock_ready = false;
+    group->settled = true;
+    group->lock.original_data = retained_data;
+    group->lock.original_length = retained_length;
+    group->lock.original_present = true;
+    group->lock.original_witness_valid = true;
+    group->lock.dir_fd = open(group->lock.parent,
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC |
+                                  O_NOFOLLOW);
+    if (group->lock.dir_fd < 0 ||
+        fstat(group->lock.dir_fd, &reopened_parent) != 0 ||
+        !S_ISDIR(reopened_parent.st_mode) ||
+        !git_same_object_identity(
+            &group->lock.parent_stat, &reopened_parent) ||
+        !git_file_at_matches_witness_after_close(
+            group->lock.dir_fd, group->lock.path, group->lock.leaf,
+            &group->lock.original_stat, group->lock.original_data,
+            group->lock.original_length, &refreshed)) {
+        errno = errno ? errno : EAGAIN;
+        return -1;
+    }
+    group->lock.parent_stat = reopened_parent;
+    group->lock.original_stat = refreshed;
+    group->restored_witness_ready = true;
+    *current_stat = refreshed;
+    return 0;
+}
+
+int git_retirement_transaction_restored_destination(
+    git_retirement_transaction_t *transaction, size_t index,
+    char *config_path, size_t path_size,
+    publication_identity_t *post_config) {
+    size_t position = 0U;
+
+    if (!transaction || !config_path || path_size == 0U || !post_config ||
+        transaction->state != GIT_RETIREMENT_TRANSACTION_ABORTED) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid restored Git retirement destination query");
+        return -1;
+    }
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_retirement_group_t *group = &transaction->groups[i];
+        struct stat current_stat;
+
+        if (!git_retirement_group_is_abort_reconciled(group)) continue;
+        if (position++ != index) continue;
+        if (safe_strncpy(config_path, group->lock.path, path_size) != 0) {
+            errno = ENAMETOOLONG;
+            set_error(ERR_INVALID_ARGS,
+                      "Restored Git retirement path buffer is too small");
+            return -1;
+        }
+        /* A changed group was re-proved by abort while an unchanged group
+         * never passed through the reverse-exchange path. Checked-clean both
+         * transaction namespaces before sealing their post-cleanup identity,
+         * then retain exact bytes for the post-ledger commit reproof. */
+        if (git_retirement_group_finalize_restored_witness(
+                group, &current_stat) != 0) {
+            errno = errno ? errno : EAGAIN;
+            set_system_error(
+                ERR_GIT_CONFIG_FAILED,
+                "Git retirement reconciliation destination changed after abort");
+            return -1;
+        }
+        publication_identity_from_stat(post_config, &current_stat);
+        return 0;
+    }
+    errno = ERANGE;
+    set_error(ERR_INVALID_ARGS,
+              "Restored Git retirement destination index is out of range");
+    return -1;
+}
+
+int git_retirement_transaction_commit(
+    git_retirement_transaction_t **transaction_ptr) {
+    git_retirement_transaction_t *transaction;
+    error_accumulator_t failures;
+    int result = 0;
+
+    if (!transaction_ptr || !*transaction_ptr) return 0;
+    transaction = *transaction_ptr;
+    error_accumulator_init(&failures);
+    for (size_t i = 0U; i < transaction->group_count; i++) {
+        git_retirement_group_t *group = &transaction->groups[i];
+        char label[96];
+
+        if (group->restored_witness_ready) {
+            struct stat refreshed;
+
+            if (!git_file_at_matches_witness_after_close(
+                    group->lock.dir_fd, group->lock.path,
+                    group->lock.leaf,
+                    &group->lock.original_stat,
+                    group->lock.original_data,
+                    group->lock.original_length, &refreshed) ||
+                !git_same_file_observation(
+                    &group->lock.original_stat, &refreshed)) {
+                errno = errno ? errno : EAGAIN;
+                set_system_error(
+                    ERR_GIT_CONFIG_FAILED,
+                    "Restored Git destination changed during publication-ledger reconciliation");
+                (void)snprintf(
+                    label, sizeof(label),
+                    "destination %zu post-refresh verification (%s)",
+                    group->representative + 1U,
+                    git_scope_diagnostic_label(group->scope));
+                (void)error_accumulator_add_last(&failures, label);
+                result = -1;
+            }
+            continue;
+        }
+
+        if (!group->lock_ready || group->settled) continue;
+        if (git_scope_lock_discard_checked(&group->lock, true) != 0) {
+            (void)snprintf(label, sizeof(label),
+                           "destination %zu commit cleanup (%s)",
+                           group->representative + 1U,
+                           git_scope_diagnostic_label(group->scope));
+            (void)error_accumulator_add_last(&failures, label);
+            result = -1;
+        }
+        group->lock_ready = false;
+        group->settled = true;
+    }
+    git_retirement_transaction_release(transaction);
+    *transaction_ptr = NULL;
+    if (failures.active) (void)error_accumulator_publish(&failures);
+    return result;
+}
+
+int git_retire_account_identity_published(
+    const account_t *account, const publication_record_t *publication,
+    size_t *cleared) {
+    const publication_record_t *records[1] = {publication};
+
+    return git_retire_account_identity_publications(account, records, 1U,
+                                                    cleared);
+}
+
+int git_retire_account_identity_publications(
+    const account_t *account,
+    const publication_record_t *const publications[],
+    size_t publication_count, size_t *cleared) {
+    const account_t *accounts[PUBLICATION_LEDGER_MAX_RECORDS];
+    git_retirement_transaction_t *transaction = NULL;
+    size_t published_cleared = 0U;
+    int publish_result;
+    int commit_result;
+
+    if (cleared) *cleared = 0U;
+    if (!account || !publications || publication_count == 0U ||
+        publication_count > PUBLICATION_LEDGER_MAX_RECORDS) {
+        errno = EINVAL;
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid durable Git publication retirement set");
+        return -1;
+    }
+    for (size_t i = 0U; i < publication_count; i++) {
+        accounts[i] = account;
+    }
+    if (git_retirement_transaction_prepare_internal(
+            accounts, publications, publication_count, true,
+            &transaction) != 0) {
+        return -1;
+    }
+    publish_result = git_retirement_transaction_publish(
+        transaction, &published_cleared);
+    commit_result = git_retirement_transaction_commit(&transaction);
+    if (publish_result != 0) {
+        if (cleared) *cleared = published_cleared;
+        return -1;
+    }
+    if (commit_result != 0) return -1;
+    if (cleared) *cleared = published_cleared;
     return 0;
 }
 
@@ -4099,7 +7998,10 @@ int git_retire_account_identity(const account_t *account, size_t *cleared) {
  * rest of git_ops does not use). */
 
 /* Validate the account model Git will actually consume. */
-int git_test_config(const account_t *account, git_scope_t scope) {
+int git_test_config(const account_t *account, git_scope_t scope,
+                    const char *expected_gpg_program) {
+    bool gpg_expected;
+
     if (!account) {
         set_error(ERR_INVALID_ARGS, "NULL account to git_test_config");
         return -1;
@@ -4109,13 +8011,29 @@ int git_test_config(const account_t *account, git_scope_t scope) {
         return -1;
     }
 
+    gpg_expected = account->gpg_enabled && account->gpg_key_id[0] != '\0';
+    if (gpg_expected) {
+        if (!expected_gpg_program || expected_gpg_program[0] != '/') {
+            set_error(ERR_INVALID_ARGS,
+                      "GPG-enabled Git validation requires the bound absolute OpenPGP program");
+            return -1;
+        }
+    } else if (expected_gpg_program && expected_gpg_program[0] != '\0') {
+        set_error(ERR_INVALID_ARGS,
+                  "Git validation received a GPG program for an account without GPG");
+        return -1;
+    }
+
     log_info("Testing git configuration for account: %s", account->name);
 
     /* Reuse the switch path's strict merged-account model: exact identity,
-     * SSH command, signing key/state and format, with every managed GPG
-     * program override absent. A selected-scope-only read is insufficient
-     * because a higher-precedence scope may override the values Git uses. */
-    if (git_verify_merged_account(account) != 0) return -1;
+     * SSH command, signing key/state and format, with the exact bound OpenPGP
+     * program and no foreign program selectors. A selected-scope-only read is
+     * insufficient because a higher-precedence scope may override the values
+     * Git uses. */
+    if (git_verify_merged_account(account,
+                                  gpg_expected ? expected_gpg_program : NULL) != 0)
+        return -1;
 
     /* Check local key availability when signing is configured. This does not
      * create a commit or signature; functional signing must be tested by a
@@ -4123,10 +8041,11 @@ int git_test_config(const account_t *account, git_scope_t scope) {
      * consults is decided by GNUPGHOME — by the time a switch validates itself
      * that is already the account's isolated home. The probe is skipped when
      * an earlier spawn already proved the key's presence (AR-02 #14). */
-    if (account->gpg_enabled && account->gpg_key_id[0] != '\0' &&
+    if (gpg_expected &&
         !gpg_manager_key_available_cached(account->gpg_key_id)) {
         const char *gpg_argv[] = {
-            "gpg", "--list-secret-keys", account->gpg_key_id, NULL
+            expected_gpg_program, "--list-secret-keys",
+            account->gpg_key_id, NULL
         };
         run_opts_t gpg_opts;
         memset(&gpg_opts, 0, sizeof(gpg_opts));
@@ -4155,7 +8074,7 @@ int git_test_config(const account_t *account, git_scope_t scope) {
  * git-sourced value is safe. Normal (user-driven) writes keep the gate. */
 static int git_set_config_value_impl(const char *key, const char *value,
                                      git_scope_t scope, bool skip_validation) {
-    char output[256];
+    char output[256] = "";
     const char *scope_flag;
     git_transaction_vector_update_t post_update;
 
@@ -4205,7 +8124,11 @@ static int git_set_config_value_impl(const char *key, const char *value,
         git_transaction_discard_vector(&post_update);
         /* The key's on-disk state is now uncertain; never skip/serve it. */
         cfg_cache_store(s, k, CFG_UNKNOWN, false, "");
-        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git config %s: %s", key, output);
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to set git config %s: %s", key,
+                  output[0] != '\0'
+                      ? output
+                      : "git produced no diagnostic output");
         return -1;
     }
 
@@ -4215,7 +8138,9 @@ static int git_set_config_value_impl(const char *key, const char *value,
 }
 
 int git_set_config_value(const char *key, const char *value, git_scope_t scope) {
-    return git_set_config_value_impl(key, value, scope, false);
+    int result = git_set_config_value_impl(key, value, scope, false);
+    if (result == 0) git_taint_publication_after_raw_write(scope, key);
+    return result;
 }
 
 /* Get single git configuration value.
@@ -4412,7 +8337,9 @@ static int git_unset_config_value_impl(const char *key, git_scope_t scope,
 }
 
 int git_unset_config_value(const char *key, git_scope_t scope) {
-    return git_unset_config_value_impl(key, scope, false);
+    int result = git_unset_config_value_impl(key, scope, false);
+    if (result == 0) git_taint_publication_after_raw_write(scope, key);
+    return result;
 }
 
 /* List all git configuration values */
@@ -4521,6 +8448,23 @@ static int build_expected_ssh_command(const account_t *account,
                                       char *expanded_path,
                                       size_t expanded_path_size) {
     char ssh_path[MAX_PATH_LEN];
+
+    if (find_command_path("ssh", ssh_path, sizeof(ssh_path)) != 0) {
+        set_error(ERR_SSH_NOT_FOUND,
+                  "No trusted SSH executable was found in PATH");
+        return -1;
+    }
+    return build_expected_ssh_command_with_program(
+        account, ssh_path, command, command_size, expanded_path,
+        expanded_path_size);
+}
+
+/* Serialize the current account model using a previously proven absolute SSH
+ * executable. Status uses this path from the publication ledger so account
+ * key/hostname edits remain visible without repeating PATH resolution. */
+static int build_expected_ssh_command_with_program(
+    const account_t *account, const char *ssh_path, char *command,
+    size_t command_size, char *expanded_path, size_t expanded_path_size) {
     size_t used = 0;
     bool has_alias;
 
@@ -4529,8 +8473,8 @@ static int build_expected_ssh_command(const account_t *account,
                   "SSH command requested for an account without an SSH key");
         return -1;
     }
-    if (!command || command_size == 0 || !expanded_path ||
-        expanded_path_size == 0) {
+    if (!ssh_path || ssh_path[0] != '/' || !command || command_size == 0 ||
+        !expanded_path || expanded_path_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid SSH command output buffer");
         return -1;
     }
@@ -4564,16 +8508,9 @@ static int build_expected_ssh_command(const account_t *account,
         return -1;
     }
 
-    /* Resolve the executable through the same complete owner/mode/ACL ancestry
-     * proof used for immediate helper launches. Persisting a bare `ssh` would
-     * make a later Git process repeat PATH lookup under unrelated, possibly
-     * writable search directories. The absolute trusted spelling makes that
-     * later lookup impossible. */
-    if (find_command_path("ssh", ssh_path, sizeof(ssh_path)) != 0) {
-        set_error(ERR_SSH_NOT_FOUND,
-                  "No trusted SSH executable was found in PATH");
-        return -1;
-    }
+    /* The caller either just resolved this executable through the hardened
+     * trust walk or loaded the exact switch-time spelling from a validated
+     * publication record. Never substitute a new PATH result here. */
     for (const unsigned char *byte = (const unsigned char *)ssh_path;
          *byte; byte++) {
         if (*byte < 0x20 || *byte == 0x7f) {
@@ -4609,7 +8546,8 @@ int git_expected_ssh_command(const account_t *account, char *command,
 }
 
 /* Configure SSH command for git operations */
-int git_configure_ssh(const account_t *account, git_scope_t scope) {
+static int git_configure_ssh_impl(const account_t *account,
+                                  git_scope_t scope) {
     char ssh_command[GIT_CFG_VALUE_MAX];
     char expanded_key_path[MAX_PATH_LEN];
 
@@ -4653,8 +8591,18 @@ int git_configure_ssh(const account_t *account, git_scope_t scope) {
     return 0;
 }
 
+int git_configure_ssh(const account_t *account, git_scope_t scope) {
+    int result;
+
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    result = git_configure_ssh_impl(account, scope);
+    git_account_write_end();
+    return result;
+}
+
 /* Configure GPG for git operations */
-int git_configure_gpg(const account_t *account, git_scope_t scope) {
+static int git_configure_gpg_impl(const account_t *account,
+                                  git_scope_t scope) {
     if (!account || !account->gpg_enabled || strlen(account->gpg_key_id) == 0) {
         return 0; /* Nothing to configure */
     }
@@ -4675,6 +8623,80 @@ int git_configure_gpg(const account_t *account, git_scope_t scope) {
     }
     
     return 0;
+}
+
+int git_configure_gpg(const account_t *account, git_scope_t scope) {
+    int result;
+
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    result = git_configure_gpg_impl(account, scope);
+    git_account_write_end();
+    return result;
+}
+
+int git_configure_openpgp_publication(const account_t *account,
+                                      const char *gpg_program,
+                                      git_scope_t scope) {
+    const char *signing_value;
+    bool may_restore_complete_image;
+    int result = -1;
+
+    if (!account || !account->gpg_enabled ||
+        !git_signing_key_matches_fingerprint(account->gpg_key_id,
+                                             account->gpg_key_id) ||
+        !gpg_program || gpg_program[0] != '/' ||
+        strnlen(gpg_program, MAX_PATH_LEN) >= MAX_PATH_LEN ||
+        !is_valid_git_config_value(gpg_program)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid canonical OpenPGP publication request");
+        return -1;
+    }
+    may_restore_complete_image =
+        git_snapshot_publication_is_complete_for(account, scope);
+    if (git_account_write_begin(account, scope) != 0) return -1;
+    signing_value = account->gpg_signing_enabled ? "true" : "false";
+
+    if (git_set_config_value(GIT_CONFIG_USER_SIGNINGKEY,
+                             account->gpg_key_id, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set git signing key");
+        goto cleanup;
+    }
+    if (git_set_config_value(GIT_CONFIG_COMMIT_GPGSIGN,
+                             signing_value, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to set commit.gpgsign=%s",
+                  signing_value);
+        goto cleanup;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED, "Failed to clear gpg.program");
+        goto cleanup;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_X509_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to clear gpg.x509.program");
+        goto cleanup;
+    }
+    if (git_unset_config_value(GIT_CONFIG_GPG_SSH_PROGRAM, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to clear gpg.ssh.program");
+        goto cleanup;
+    }
+    if (git_set_config_value(GIT_CONFIG_GPG_OPENPGP_PROGRAM,
+                             gpg_program, scope) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Failed to set gpg.openpgp.program");
+        goto cleanup;
+    }
+    result = 0;
+    if (may_restore_complete_image &&
+        git_snapshot_publication_owner_matches(account) &&
+        !g_git_snapshot.publication_owner_tainted) {
+        g_git_snapshot.publication_full_image_written = true;
+    }
+
+cleanup:
+    git_account_write_end();
+    return result;
 }
 
 /* Check if current directory is a git repository.

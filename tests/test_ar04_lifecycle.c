@@ -3,12 +3,17 @@
 
 #include "test.h"
 #include "accounts.h"
+#include "config.h"
 #include "error.h"
+#include "git_ops.h"
+#include "publication.h"
 #include "gitswitch.h"
+#include "utils.h"
 
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -23,6 +28,13 @@
 
 static char g_bin[PATH_MAX];
 static char g_self[PATH_MAX];
+
+#define LIFE_WORK_INCARNATION \
+    "1111111111111111111111111111111111111111111111111111111111111111"
+#define LIFE_OTHER_INCARNATION \
+    "2222222222222222222222222222222222222222222222222222222222222222"
+
+int gitswitch_cli_main(int argc, char **argv);
 
 static int install_live_current_socket(const char *runtime,
                                        const char *account_name);
@@ -77,8 +89,8 @@ static int mkdir_private(const char *path) {
     return chmod(path, 0700);
 }
 
-static int join_path(char *dest, size_t size, const char *base,
-                     const char *suffix) {
+static int life_join_path(char *dest, size_t size, const char *base,
+                          const char *suffix) {
     size_t base_len = strlen(base);
     size_t suffix_len = strlen(suffix);
 
@@ -124,6 +136,145 @@ static int write_text(const char *path, const char *text, mode_t mode) {
     return chmod(path, mode);
 }
 
+static int write_all(int fd, const void *data, size_t length) {
+    const unsigned char *cursor = data;
+    size_t written = 0U;
+
+    while (written < length) {
+        ssize_t result = write(fd, cursor + written, length - written);
+
+        if (result > 0) {
+            written += (size_t)result;
+        } else if (result < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int life_git_config_set(const char *path, const char *key,
+                               const char *value) {
+    const char *argv[] = {
+        "git", "config", "--file", path, "--no-includes",
+        "--replace-all", key, value, NULL
+    };
+    run_result_t run;
+
+    memset(&run, 0, sizeof(run));
+    return run_argv_real(argv, NULL, &run);
+}
+
+/* M17 fixtures that reach Git retirement carry the same durable authority as
+ * a real completed switch: a persisted incarnation plus one exact PUBLISHED
+ * destination/generation. Credentialless cases retain only that destination;
+ * an SSH-bearing case also stores the exact core.sshCommand and executable
+ * generation that a completed switch would have sealed. */
+static int seed_global_publication(const char *home, uint32_t account_id,
+                                   const char *incarnation,
+                                   const char *runtime_needs,
+                                   const char *active_account,
+                                   const char *ssh_key) {
+    static const char git_body[] =
+        "[fixture]\n"
+        "\tgeneration = lifecycle\n";
+    char git_path[1024], state_path[1024], header[512];
+    char ssh_command[PUBLICATION_SSH_COMMAND_MAX] = "";
+    char ssh_program[MAX_PATH_LEN] = "";
+    account_t account;
+    publication_record_t record;
+    publication_ledger_t ledger;
+    unsigned char *tail = NULL;
+    size_t tail_length = 0U;
+    struct stat st;
+    int fd = -1;
+    int result = -1;
+    int written;
+
+    if (!home || !incarnation || !runtime_needs || !active_account ||
+        snprintf(git_path, sizeof(git_path), "%s/.gitconfig", home) < 0 ||
+        snprintf(state_path, sizeof(state_path),
+                 "%s/.config/gitswitch/.resume-hint", home) < 0) {
+        return -1;
+    }
+    written = snprintf(header, sizeof(header), "%s\nactive=%s\n",
+                       runtime_needs, active_account);
+    if (written < 0 || (size_t)written >= sizeof(header) ||
+        write_text(git_path, git_body, 0600) != 0) {
+        return -1;
+    }
+    if (ssh_key) {
+        memset(&account, 0, sizeof(account));
+        account.ssh_enabled = true;
+        if (safe_strncpy(account.ssh_key_path, ssh_key,
+                         sizeof(account.ssh_key_path)) != 0 ||
+            git_expected_ssh_command(&account, ssh_command,
+                                     sizeof(ssh_command)) != 0 ||
+            publication_extract_ssh_program(
+                ssh_command, ssh_program, sizeof(ssh_program)) != 0 ||
+            life_git_config_set(git_path, GIT_CONFIG_CORE_SSHCOMMAND,
+                                ssh_command) != 0) {
+            return -1;
+        }
+    }
+
+    publication_record_init(&record);
+    record.account_id = account_id;
+    record.scope = PUBLICATION_SCOPE_GLOBAL;
+    record.state = PUBLICATION_STATE_PUBLISHED;
+    record.capabilities = PUBLICATION_CAP_DESTINATION |
+                          PUBLICATION_CAP_POST_GENERATION;
+    if (safe_strncpy(record.account_incarnation, incarnation,
+                     sizeof(record.account_incarnation)) != 0 ||
+        safe_strncpy(record.config_path, git_path,
+                     sizeof(record.config_path)) != 0 ||
+        stat(home, &st) != 0) {
+        return -1;
+    }
+    publication_identity_from_stat(&record.config_parent, &st);
+    if (stat(git_path, &st) != 0) return -1;
+    publication_identity_from_stat(&record.post_config, &st);
+    if (ssh_key) {
+        record.capabilities |= PUBLICATION_CAP_SSH_COMMAND |
+                               PUBLICATION_CAP_SSH_PROGRAM;
+        if (safe_strncpy(record.ssh_command, ssh_command,
+                         sizeof(record.ssh_command)) != 0 ||
+            safe_strncpy(record.ssh_program, ssh_program,
+                         sizeof(record.ssh_program)) != 0 ||
+            stat(ssh_program, &st) != 0) {
+            return -1;
+        }
+        publication_identity_from_stat(&record.ssh_program_identity, &st);
+    }
+    if (publication_record_validate(&record) != 0) return -1;
+
+    publication_ledger_init(&ledger);
+    if (publication_ledger_upsert(&ledger, &record) != 0 ||
+        publication_ledger_serialize(&ledger, &tail, &tail_length) != 0) {
+        goto cleanup;
+    }
+    fd = open(state_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0 || write_all(fd, header, (size_t)written) != 0 ||
+        write_all(fd, tail, tail_length) != 0 || fsync(fd) != 0 ||
+        close(fd) != 0) {
+        if (fd >= 0) (void)close(fd);
+        fd = -1;
+        goto cleanup;
+    }
+    fd = -1;
+    result = 0;
+
+cleanup:
+    if (fd >= 0) (void)close(fd);
+    if (tail) {
+        secure_zero_memory(tail, tail_length);
+        free(tail);
+    }
+    publication_ledger_clear(&ledger);
+    return result;
+}
+
 static const char *slurp(const char *path, char *buf, size_t size) {
     FILE *f;
     size_t n;
@@ -160,6 +311,11 @@ static int prepare_home(const char *home, const char *config_body) {
     snprintf(path, sizeof(path), "%s/.gnupg", home);
     if (mkdir_private(path) != 0) return -1;
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
+    /* Each seed is a new pre-command generation. Reusing the inode through
+     * fopen("w") leaves FreeBSD UFS free to materialize the preceding ctime
+     * update after the child has loaded it, which correctly trips the
+     * production stale-generation guard. */
+    if (unlink(path) != 0 && errno != ENOENT) return -1;
     if (write_text(path, config_body, 0600) != 0) return -1;
 
     /* Historical active-only files predate the consolidated artifact. Remove
@@ -175,6 +331,7 @@ static const char *active_work_config(void) {
            "active_account = \"work\"\n"
            "\n"
            "[accounts.1]\n"
+           "incarnation = \"" LIFE_WORK_INCARNATION "\"\n"
            "name = \"work\"\n"
            "email = \"old@example.com\"\n"
            "description = \"old description\"\n"
@@ -356,6 +513,7 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     char link_target[1024];
     struct stat ssh_before, ssh_after, gpg_before, gpg_after;
     ssize_t link_len;
+    int edit_result;
     int listener = -1;
     static const char inactive_config[] =
         "[settings]\n"
@@ -476,8 +634,13 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
     CHECK(strstr(contents, "email = \"new@example.com\"") != NULL);
 
     CHECK_EQ_INT(prepare_home(home, inactive_config), 0);
-    CHECK_EQ_INT(run_edit(home, runtime, shims,
-                          "renamed\nnew@example.com\n\n\n\n\n", output), 0);
+    edit_result = run_edit(home, runtime, shims,
+                           "renamed\nnew@example.com\n\n\n\n\n", output);
+    if (edit_result != 0) {
+        slurp(output, contents, sizeof(contents));
+        fprintf(stderr, "  inactive edit output:\n%s\n", contents);
+    }
+    CHECK_EQ_INT(edit_result, 0);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "name = \"renamed\"") != NULL);
@@ -513,10 +676,89 @@ static int run_remove(const char *home, const char *runtime,
 
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
+             "GIT_CONFIG_GLOBAL='%s/.gitconfig' GIT_CONFIG_NOSYSTEM=1 "
              "PATH='%s:/usr/bin:/bin' "
              "'%s' -C -y remove '%s' </dev/null >'%s' 2>&1",
-             home, home, runtime, shim_dir, g_bin, account, output);
+             home, home, runtime, home, shim_dir, g_bin, account, output);
     return run_shell(cmd);
+}
+
+static size_t life_config_faults_remaining;
+
+static bool life_config_fault_once(config_io_boundary_t boundary) {
+    if (boundary != CONFIG_IO_STATE_BEFORE_RENAME ||
+        life_config_faults_remaining == 0U) {
+        return false;
+    }
+    life_config_faults_remaining--;
+    return true;
+}
+
+/* Drive the real CLI entry in an isolated child so the lifecycle suite can
+ * inject one precise PREINSTALL state-save failure. The callback is exhausted
+ * before rollback reconciliation writes the refreshed publication generation,
+ * proving the blocker is cleared only after that second write succeeds. */
+static int run_remove_with_one_shot_save_fault(
+    const char *home, const char *runtime, const char *shim_dir,
+    const char *account, const char *output) {
+    char trusted_path[2U * PATH_MAX];
+    char gnupg_home[PATH_MAX];
+    char git_config[PATH_MAX];
+    pid_t child;
+    int status = 0;
+
+    if (!home || !runtime || !shim_dir || !account || !output ||
+        safe_snprintf(trusted_path, sizeof(trusted_path),
+                      "%s:/usr/local/bin:/usr/bin:/bin", shim_dir) != 0 ||
+        safe_snprintf(gnupg_home, sizeof(gnupg_home),
+                      "%s/.gnupg", home) != 0 ||
+        safe_snprintf(git_config, sizeof(git_config),
+                      "%s/.gitconfig", home) != 0) {
+        return -1;
+    }
+    (void)fflush(NULL);
+    child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        char program[] = "gitswitch";
+        char no_color[] = "-C";
+        char assume_yes[] = "-y";
+        char remove[] = "remove";
+        char *argv[] = {
+            program, no_color, assume_yes, remove, (char *)account, NULL
+        };
+        int output_fd = open(output,
+                             O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                             0600);
+        int rc;
+
+        if (output_fd < 0 || dup2(output_fd, STDOUT_FILENO) < 0 ||
+            dup2(output_fd, STDERR_FILENO) < 0 ||
+            setenv("HOME", home, 1) != 0 ||
+            setenv("GNUPGHOME", gnupg_home, 1) != 0 ||
+            setenv("XDG_RUNTIME_DIR", runtime, 1) != 0 ||
+            setenv("GIT_CONFIG_GLOBAL", git_config, 1) != 0 ||
+            setenv("GIT_CONFIG_NOSYSTEM", "1", 1) != 0 ||
+            setenv("PATH", trusted_path, 1) != 0 ||
+            unsetenv("GIT_CONFIG_COUNT") != 0) {
+            if (output_fd >= 0) (void)close(output_fd);
+            _exit(120);
+        }
+        if (output_fd > STDERR_FILENO) (void)close(output_fd);
+        life_config_faults_remaining = 1U;
+        (void)config_set_io_fault_fn(life_config_fault_once);
+        optind = 1;
+        rc = gitswitch_cli_main(5, argv);
+        (void)fflush(NULL);
+        _exit(rc);
+    }
+    while (waitpid(child, &status, 0) < 0) {
+        if (errno != EINTR) return -1;
+    }
+    if (!WIFEXITED(status)) {
+        return WIFSIGNALED(status) ? -(1000 + WTERMSIG(status)) : -1;
+    }
+    return WEXITSTATUS(status);
 }
 
 static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
@@ -529,6 +771,8 @@ static void exercise_remove_runtime_teardown(const char *ssh_agent_path) {
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "none", "work", NULL), 0);
 
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
@@ -616,24 +860,19 @@ TEST(remove_reaps_real_agent_before_deleting_account) {
 }
 
 TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
-    char home[256], runtime[256], shims[512], config_dir[1024];
+    char home[256], runtime[256], shims[512];
     char path[1024], target[1024], output[1024], cmd[8192], contents[8192];
     char key_path[1024], config_body[4096], current_path[1024];
     char socket_path[1024], pid_path[1024], link_target[1024];
     struct stat st;
     ssize_t link_len;
     pid_t retry_pid = -1;
-    FILE *lock_file;
-
-    if (getuid() == 0) {
-        TS_SKIP("unprivileged",
-                "save permission denial requires an unprivileged uid");
-    }
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
-    CHECK_EQ_INT(join_path(key_path, sizeof(key_path), runtime, "/retry-key"), 0);
+    CHECK_EQ_INT(life_join_path(key_path, sizeof(key_path), runtime,
+                                "/retry-key"), 0);
     snprintf(cmd, sizeof(cmd),
              "PATH='/usr/bin:/bin:/usr/local/bin' ssh-keygen -q -t ed25519 "
              "-N '' -f '%s' >/dev/null 2>&1",
@@ -645,13 +884,16 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
              "active_account = \"work\"\n"
              "\n"
              "[accounts.1]\n"
+             "incarnation = \"%s\"\n"
              "name = \"work\"\n"
              "email = \"old@example.com\"\n"
              "description = \"old description\"\n"
              "preferred_scope = \"global\"\n"
              "ssh_key = \"%s\"\n",
-             key_path);
+             LIFE_WORK_INCARNATION, key_path);
     CHECK_EQ_INT(prepare_home(home, config_body), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "ssh", "work", key_path), 0);
 
     /* Give teardown a real owned GPG home to remove before persistence is
      * forced to fail. The on-disk account must remain as the retry handle. */
@@ -662,16 +904,13 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     snprintf(path, sizeof(path), "%s/gitswitch-gpg/current", runtime);
     CHECK_EQ_INT(symlink(target, path), 0);
 
-    snprintf(config_dir, sizeof(config_dir), "%s/.config/gitswitch", home);
-    CHECK_EQ_INT(join_path(path, sizeof(path), config_dir, "/.config.lock"), 0);
-    lock_file = fopen(path, "w");
-    CHECK(lock_file != NULL);
-    if (lock_file) fclose(lock_file);
-    CHECK_EQ_INT(chmod(path, 0600), 0);
-    CHECK_EQ_INT(chmod(config_dir, 0500), 0);
-
+    /* M18 publishes its durable blocker before runtime teardown, so inject a
+     * one-shot state-save fault only after the runtime and Git retirement
+     * phases. The rollback refresh gets a clean second write and must clear
+     * the blocker while retaining the durable account retry handle. */
     snprintf(output, sizeof(output), "%s/remove-save-failure.out", runtime);
-    CHECK(run_remove(home, runtime, shims, "work", output) != 0);
+    CHECK(run_remove_with_one_shot_save_fault(
+              home, runtime, shims, "work", output) != 0);
     slurp(output, contents, sizeof(contents));
     CHECK(strstr(contents, "Failed to save configuration changes") != NULL);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg/work", runtime);
@@ -684,12 +923,12 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     /* Reload by switching again after the persistence fault is removed. This
      * proves the retained account is not merely listable: its SSH runtime can
      * be recreated cleanly after the earlier teardown. */
-    CHECK_EQ_INT(chmod(config_dir, 0700), 0);
     snprintf(cmd, sizeof(cmd),
              "HOME='%s' GNUPGHOME='%s/.gnupg' XDG_RUNTIME_DIR='%s' "
+             "GIT_CONFIG_GLOBAL='%s/.gitconfig' GIT_CONFIG_NOSYSTEM=1 "
              "PATH='%s:/usr/local/bin:/usr/bin:/bin' "
              "'%s' -C -y work >'%s' 2>&1",
-             home, home, runtime, shims, g_bin, output);
+             home, home, runtime, home, shims, g_bin, output);
     int switch_rc = run_shell(cmd);
     slurp(output, contents, sizeof(contents));
     if (switch_rc != 0) {
@@ -698,12 +937,12 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     CHECK_EQ_INT(switch_rc, 0);
     CHECK(strstr(contents, "SSH key loaded") != NULL);
 
-    CHECK_EQ_INT(join_path(socket_path, sizeof(socket_path), runtime,
-                           "/gitswitch-ssh/ssh-agent.work.sock"), 0);
-    CHECK_EQ_INT(join_path(current_path, sizeof(current_path), runtime,
-                           "/gitswitch-ssh/current.sock"), 0);
-    CHECK_EQ_INT(join_path(pid_path, sizeof(pid_path), runtime,
-                           "/gitswitch-ssh/ssh-agent.work.pid"), 0);
+    CHECK_EQ_INT(life_join_path(socket_path, sizeof(socket_path), runtime,
+                                "/gitswitch-ssh/ssh-agent.work.sock"), 0);
+    CHECK_EQ_INT(life_join_path(current_path, sizeof(current_path), runtime,
+                                "/gitswitch-ssh/current.sock"), 0);
+    CHECK_EQ_INT(life_join_path(pid_path, sizeof(pid_path), runtime,
+                                "/gitswitch-ssh/ssh-agent.work.pid"), 0);
     CHECK_EQ_INT(lstat(current_path, &st), 0);
     CHECK(S_ISLNK(st.st_mode));
     link_len = readlink(current_path, link_target, sizeof(link_target) - 1);
@@ -714,7 +953,8 @@ TEST(remove_save_failure_keeps_retry_handle_after_runtime_teardown) {
     }
     CHECK_EQ_INT(stat(current_path, &st), 0);
     CHECK(S_ISSOCK(st.st_mode));
-    CHECK_EQ_INT(join_path(path, sizeof(path), runtime, "/gitswitch-ssh"), 0);
+    CHECK_EQ_INT(life_join_path(path, sizeof(path), runtime,
+                                "/gitswitch-ssh"), 0);
     CHECK_EQ_INT(directory_has_entry_prefix(path, ".key-fingerprint."), 0);
     slurp(pid_path, contents, sizeof(contents));
     retry_pid = (pid_t)strtol(contents, NULL, 10);
@@ -742,11 +982,14 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     char home[256], runtime[256], shims[512], path[1024], target[1024];
     char output[1024], contents[8192];
     struct stat link_st;
+    int listener = -1;
 
     CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "none", "work", NULL), 0);
     snprintf(target, sizeof(target), "%s/foreign-ssh", runtime);
     CHECK_EQ_INT(mkdir_private(target), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
@@ -778,10 +1021,14 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
-    snprintf(path, sizeof(path), "%s/gitswitch-ssh", runtime);
-    CHECK_EQ_INT(mkdir_private(path), 0);
-    snprintf(target, sizeof(target), "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
-    CHECK_EQ_INT(write_text(target, "socket fixture\n", 0600), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "none", "work", NULL), 0);
+    listener = install_live_current_socket(runtime, "work");
+    CHECK(listener >= 0);
+    if (listener >= 0) {
+        CHECK_EQ_INT(close(listener), 0);
+        listener = -1;
+    }
     snprintf(path, sizeof(path), "%s/gitswitch-gpg", runtime);
     CHECK_EQ_INT(mkdir_private(path), 0);
     snprintf(path, sizeof(path), "%s/gitswitch-gpg/.lock", runtime);
@@ -789,6 +1036,10 @@ TEST(remove_failure_retains_account_and_attempts_other_manager) {
     snprintf(output, sizeof(output), "%s/remove.out", runtime);
     CHECK(run_remove(home, runtime, shims, "work", output) != 0);
     snprintf(path, sizeof(path), "%s/gitswitch-ssh/ssh-agent.work.sock", runtime);
+    if (access(path, F_OK) == 0) {
+        slurp(output, contents, sizeof(contents));
+        fprintf(stderr, "  partial cleanup output:\n%s\n", contents);
+    }
     CHECK(access(path, F_OK) != 0);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
@@ -810,11 +1061,13 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
         "active_account = \"other\"\n"
         "\n"
         "[accounts.1]\n"
+        "incarnation = \"" LIFE_WORK_INCARNATION "\"\n"
         "name = \"work\"\n"
         "email = \"work@example.com\"\n"
         "preferred_scope = \"global\"\n"
         "\n"
         "[accounts.2]\n"
+        "incarnation = \"" LIFE_OTHER_INCARNATION "\"\n"
         "name = \"other\"\n"
         "email = \"other@example.com\"\n"
         "preferred_scope = \"global\"\n";
@@ -823,6 +1076,8 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
     CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
     CHECK_EQ_INT(prepare_home(home, body), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "none", "other", NULL), 0);
 
     /* Give the active account real stable entry points. Removing the inactive
      * account must not tear either one down. */
@@ -849,7 +1104,8 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
     CHECK(strstr(contents, "active_account") == NULL);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/.resume-hint", home);
     slurp(path, contents, sizeof(contents));
-    CHECK_STR_EQ(contents, "none\nactive=other\n");
+    CHECK(strncmp(contents, "none\nactive=other\n",
+                  strlen("none\nactive=other\n")) == 0);
     link_len = readlink(ssh_current, link_target, sizeof(link_target) - 1);
     CHECK(link_len > 0);
     if (link_len > 0) {
@@ -871,15 +1127,27 @@ TEST(remove_inactive_account_with_no_runtime_preserves_active_account) {
 
 TEST(remove_rebinds_current_pointer_after_array_compaction) {
     gitswitch_ctx_t ctx;
-    char runtime[256];
+    char home[256], runtime[256], config_path[1024];
 
     memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
     CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
+    CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
+    CHECK_EQ_INT(seed_global_publication(home, 1U, LIFE_WORK_INCARNATION,
+                                         "none", "work", NULL), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", runtime, 1), 0);
+    snprintf(config_path, sizeof(config_path),
+             "%s/.config/gitswitch/accounts.toml", home);
+    CHECK_EQ_INT(safe_strncpy(ctx.config.config_path, config_path,
+                              sizeof(ctx.config.config_path)), 0);
 
     ctx.account_count = 3;
     ctx.config.assume_yes = true;
     ctx.accounts[0].id = 1;
+    ctx.accounts[0].incarnation_persisted = true;
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].incarnation,
+                              LIFE_WORK_INCARNATION,
+                              sizeof(ctx.accounts[0].incarnation)), 0);
     snprintf(ctx.accounts[0].name, sizeof(ctx.accounts[0].name), "remove-me");
     ctx.accounts[1].id = 2;
     snprintf(ctx.accounts[1].name, sizeof(ctx.accounts[1].name), "current");
@@ -895,6 +1163,31 @@ TEST(remove_rebinds_current_pointer_after_array_compaction) {
     CHECK_STR_EQ(ctx.config.active_account, "current");
 
     unsetenv("XDG_RUNTIME_DIR");
+    remove_tree(home);
+    remove_tree(runtime);
+}
+
+TEST(remove_without_publication_provenance_retains_account_for_retry) {
+    char home[256], runtime[256], shims[512], output[1024], path[1024];
+    char contents[8192];
+
+    CHECK_EQ_INT(make_temp_dir(home, sizeof(home)), 0);
+    CHECK_EQ_INT(make_temp_dir(runtime, sizeof(runtime)), 0);
+    CHECK_EQ_INT(prepare_shims(shims, sizeof(shims)), 0);
+    CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
+
+    snprintf(output, sizeof(output), "%s/remove-no-provenance.out", runtime);
+    CHECK(run_remove(home, runtime, shims, "work", output) != 0);
+    snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
+    slurp(path, contents, sizeof(contents));
+    CHECK(strstr(contents, "name = \"work\"") != NULL);
+    CHECK(strstr(contents, "active_account = \"work\"") != NULL);
+    slurp(output, contents, sizeof(contents));
+    CHECK(strstr(contents, "Failed to remove account") != NULL);
+    CHECK(strstr(contents, "No canonical publication provenance exists") != NULL);
+    CHECK(strstr(contents, "removed successfully") == NULL);
+
+    remove_tree(home);
     remove_tree(runtime);
 }
 
@@ -922,15 +1215,30 @@ static int install_live_current_socket(const char *runtime,
                                        const char *account_name) {
     char dir[1024];
     char current[1024];
+    char lock_path[1024];
     char socket_path[1024];
     struct sockaddr_un addr;
     int fd;
+    int lock_fd;
 
     if ((size_t)snprintf(dir, sizeof(dir), "%s/gitswitch-ssh", runtime) >=
         sizeof(dir)) {
         return -1;
     }
     if (mkdir_private(dir) != 0) return -1;
+    if ((size_t)snprintf(lock_path, sizeof(lock_path), "%s/.lock", dir) >=
+        sizeof(lock_path)) {
+        return -1;
+    }
+    lock_fd = open(lock_path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (lock_fd < 0) return -1;
+    if (fchmod(lock_fd, 0600) != 0) {
+        int saved_errno = errno;
+        close(lock_fd);
+        errno = saved_errno;
+        return -1;
+    }
+    if (close(lock_fd) != 0) return -1;
     if ((size_t)snprintf(socket_path, sizeof(socket_path),
                          "%s/ssh-agent.%s.sock", dir, account_name) >=
         sizeof(socket_path)) {
@@ -1032,6 +1340,7 @@ int main(int argc, char **argv) {
     RUN_TEST(remove_failure_retains_account_and_attempts_other_manager);
     RUN_TEST(remove_inactive_account_with_no_runtime_preserves_active_account);
     RUN_TEST(remove_rebinds_current_pointer_after_array_compaction);
+    RUN_TEST(remove_without_publication_provenance_retains_account_for_retry);
     RUN_TEST(sock_substrings_round_trip_and_malformed_links_fall_back);
     error_cleanup();
     return ts_test_finish();

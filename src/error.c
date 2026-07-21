@@ -17,6 +17,10 @@
 
 /* Global error context */
 error_context_t g_last_error = {0};
+/* New causal reports advance independently of the context bytes. This lets a
+ * caller distinguish an identical consecutive diagnostic from stale global
+ * state without clearing or rewriting a previously retained failure. */
+static uint64_t g_error_report_generation = 0U;
 
 /* Logging configuration */
 log_level_t g_log_level = LOG_LEVEL_INFO;
@@ -36,6 +40,14 @@ static void copy_bounded_text(char *destination, size_t destination_size,
     if (length >= destination_size) length = destination_size - 1U;
     memcpy(destination, text, length);
     destination[length] = '\0';
+}
+
+static void error_advance_report_generation(void) {
+    g_error_report_generation++;
+    if (g_error_report_generation == 0U) {
+        /* Reserve zero for the process-start state after unsigned wrap. */
+        g_error_report_generation = 1U;
+    }
 }
 
 static void mark_text_truncated(char *destination, size_t destination_size) {
@@ -233,9 +245,14 @@ int error_init(log_level_t level, const char *log_file_path) {
     if (log_file_path) {
         replacement = fopen(log_file_path, "a");
         if (!replacement) {
+            int saved_errno = errno;
+
             /* First-ever init still needs a usable sink for the diagnostic. */
             if (!g_log_file) g_log_file = stderr;
-            set_error(ERR_FILE_IO, "Failed to open log file: %s", log_file_path);
+            errno = saved_errno;
+            (void)set_system_error(ERR_FILE_IO, "Failed to open log file: %s",
+                                   log_file_path);
+            errno = saved_errno;
             return -1;
         }
         /* Set log file to line buffered for immediate output */
@@ -295,6 +312,7 @@ int set_error_context(error_code_t code, const char *file, int line,
     }
 
     g_last_error = next;
+    error_advance_report_generation();
 
     /* AR-10 L10: recorded at INFO, not ERROR. Many set_error sites are
      * expected misses their callers recover from (absent config, first-run
@@ -337,6 +355,7 @@ int set_system_error_context(error_code_t code, const char *file, int line,
     }
 
     g_last_error = next;
+    error_advance_report_generation();
 
     /* AR-10 L10: INFO, not ERROR — see set_error_context. */
     log_info("System error: %s [errno=%d: %s] (%s:%d in %s)",
@@ -350,9 +369,201 @@ const error_context_t *get_last_error(void) {
     return &g_last_error;
 }
 
+uint64_t error_report_generation(void) {
+    return g_error_report_generation;
+}
+
+int error_run_observational(error_observation_fn operation, void *context) {
+    error_context_t saved_error;
+    uint64_t saved_generation;
+    int saved_errno;
+    int result;
+
+    if (!operation) {
+        errno = EINVAL;
+        (void)set_system_error(ERR_INVALID_ARGS,
+                               "NULL observational error callback");
+        errno = EINVAL;
+        return -1;
+    }
+
+    saved_errno = errno;
+    saved_error = g_last_error;
+    saved_generation = g_error_report_generation;
+    result = operation(context);
+    g_last_error = saved_error;
+    g_error_report_generation = saved_generation;
+    errno = saved_errno;
+    return result;
+}
+
 /* Clear last error */
 void clear_error(void) {
     memset(&g_last_error, 0, sizeof(g_last_error));
+}
+
+/* Append one later failure without allocating or routing through an error
+ * setter. The accumulator's details buffer is always terminated after its
+ * first capture, even when a malformed caller supplied an unterminated first
+ * details field. */
+static bool error_accumulator_append_entry(error_accumulator_t *accumulator,
+                                           const char *label,
+                                           const error_context_t *error) {
+    static const char unknown_label[] = "unknown";
+    const char *entry_label = label ? label : unknown_label;
+    size_t used = strnlen(accumulator->accumulated_details,
+                          sizeof(accumulator->accumulated_details));
+    size_t message_length = strnlen(error->message,
+                                    sizeof(error->message));
+    size_t details_length = strnlen(error->details,
+                                    sizeof(error->details));
+    size_t label_length = strnlen(entry_label,
+                                  sizeof(accumulator->accumulated_details));
+    bool complete = true;
+    bool span_complete;
+
+    span_complete = append_display_span(accumulator->accumulated_details,
+                                        sizeof(accumulator->accumulated_details),
+                                        &used, "; [", sizeof("; [") - 1U);
+    complete = span_complete && complete;
+    span_complete = append_display_span(accumulator->accumulated_details,
+                                        sizeof(accumulator->accumulated_details),
+                                        &used, entry_label, label_length);
+    complete = span_complete && complete;
+    span_complete = append_display_span(accumulator->accumulated_details,
+                                        sizeof(accumulator->accumulated_details),
+                                        &used, "] ", sizeof("] ") - 1U);
+    complete = span_complete && complete;
+    span_complete = append_display_span(accumulator->accumulated_details,
+                                        sizeof(accumulator->accumulated_details),
+                                        &used, error->message, message_length);
+    complete = span_complete && complete;
+    if (details_length > 0) {
+        const char *separator = error->details[0] == ';' ? "" : "; ";
+        size_t separator_length = strlen(separator);
+
+        span_complete = append_display_span(
+            accumulator->accumulated_details,
+            sizeof(accumulator->accumulated_details), &used, separator,
+            separator_length);
+        complete = span_complete && complete;
+        span_complete = append_display_span(
+            accumulator->accumulated_details,
+            sizeof(accumulator->accumulated_details), &used, error->details,
+            details_length);
+        complete = span_complete && complete;
+    }
+    if (label_length == sizeof(accumulator->accumulated_details)) {
+        complete = false;
+    }
+    if (message_length == sizeof(error->message) || error->message_truncated) {
+        complete = false;
+    }
+    if (details_length == sizeof(error->details) ||
+        error->details_truncated) {
+        complete = false;
+    }
+
+    if (!complete) {
+        mark_text_truncated(accumulator->accumulated_details,
+                            sizeof(accumulator->accumulated_details));
+        accumulator->chain_truncated = true;
+    }
+    return complete;
+}
+
+void error_accumulator_init(error_accumulator_t *accumulator) {
+    int saved_errno = errno;
+
+    if (accumulator) memset(accumulator, 0, sizeof(*accumulator));
+    errno = saved_errno;
+}
+
+bool error_accumulator_add(error_accumulator_t *accumulator,
+                           const char *label,
+                           const error_context_t *error) {
+    int saved_errno = errno;
+    bool complete = false;
+
+    if (!accumulator || !error) {
+        errno = saved_errno;
+        return false;
+    }
+
+    if (!accumulator->active) {
+        size_t details_length;
+
+        memcpy(&accumulator->first_error, error,
+               sizeof(accumulator->first_error));
+        memcpy(accumulator->accumulated_details, error->details,
+               sizeof(accumulator->accumulated_details));
+        accumulator->first_errno = saved_errno;
+        accumulator->failure_count = 1U;
+        accumulator->rendered_count = 1U;
+        accumulator->active = true;
+        accumulator->chain_truncated = error->details_truncated;
+
+        details_length = strnlen(accumulator->accumulated_details,
+                                 sizeof(accumulator->accumulated_details));
+        if (details_length == sizeof(accumulator->accumulated_details)) {
+            accumulator->accumulated_details[
+                sizeof(accumulator->accumulated_details) - 1U] = '\0';
+            mark_text_truncated(accumulator->accumulated_details,
+                                sizeof(accumulator->accumulated_details));
+            accumulator->chain_truncated = true;
+        }
+        complete = !accumulator->chain_truncated;
+    } else {
+        if (accumulator->failure_count != (size_t)-1) {
+            accumulator->failure_count++;
+        } else {
+            accumulator->chain_truncated = true;
+        }
+
+        if (!accumulator->chain_truncated &&
+            error_accumulator_append_entry(accumulator, label, error)) {
+            if (accumulator->rendered_count != (size_t)-1) {
+                accumulator->rendered_count++;
+                complete = true;
+            } else {
+                accumulator->chain_truncated = true;
+            }
+        }
+    }
+
+    errno = saved_errno;
+    return complete;
+}
+
+bool error_accumulator_add_last(error_accumulator_t *accumulator,
+                                const char *label) {
+    error_context_t current;
+    int saved_errno = errno;
+    bool complete;
+
+    memcpy(&current, &g_last_error, sizeof(current));
+    complete = error_accumulator_add(accumulator, label, &current);
+    errno = saved_errno;
+    return complete;
+}
+
+bool error_accumulator_publish(const error_accumulator_t *accumulator) {
+    error_context_t published;
+    int saved_errno = errno;
+
+    if (!accumulator || !accumulator->active) {
+        errno = saved_errno;
+        return false;
+    }
+
+    memcpy(&published, &accumulator->first_error, sizeof(published));
+    memcpy(published.details, accumulator->accumulated_details,
+           sizeof(published.details));
+    published.details_truncated = published.details_truncated ||
+                                  accumulator->chain_truncated;
+    memcpy(&g_last_error, &published, sizeof(g_last_error));
+    errno = accumulator->first_errno;
+    return true;
 }
 
 /* Convert error code to human-readable string */
@@ -371,6 +582,7 @@ void log_message(log_level_t level, const char *file, int line,
     va_list args;
     char timestamp[32];
     char message[1024];
+    int formatted_length;
     
     /* Check if this level should be logged */
     if (!should_log(level)) {
@@ -380,11 +592,16 @@ void log_message(log_level_t level, const char *file, int line,
     /* Format the message. AR-10 L11: a vsnprintf encoding failure leaves the
      * buffer indeterminate; never hand that to fprintf. */
     va_start(args, fmt);
-    if (vsnprintf(message, sizeof(message), fmt, args) < 0) { /* Flawfinder: ignore — bounded; fmt from internal callers */
+    formatted_length = vsnprintf( /* Flawfinder: ignore — bounded; fmt from
+                                   * internal callers; truncation checked */
+        message, sizeof(message), fmt, args);
+    va_end(args);
+    if (formatted_length < 0) {
         static const char unformattable[] = "(unformattable log message)";
         memcpy(message, unformattable, sizeof(unformattable));
+    } else if ((size_t)formatted_length >= sizeof(message)) {
+        mark_text_truncated(message, sizeof(message));
     }
-    va_end(args);
     
     /* Get timestamp */
     get_timestamp(timestamp, sizeof(timestamp));
@@ -566,22 +783,64 @@ int safe_strncpy(char *dest, const char *src, size_t dest_size) {
     return 0;
 }
 
+/* Pointer equality is defined even for unrelated objects; ordering and
+ * subtraction are not. Two overlapping contiguous spans must contain at
+ * least one another's start, so equality-only walks keep this ISO C portable
+ * without forming or comparing one-past pointers. */
+static bool byte_range_contains(const unsigned char *range, size_t range_size,
+                                const unsigned char *candidate) {
+    size_t index;
+
+    for (index = 0; index < range_size; index++) {
+        if (range + index == candidate) return true;
+    }
+    return false;
+}
+
+static bool byte_ranges_overlap(const void *first, size_t first_size,
+                                const void *second, size_t second_size) {
+    const unsigned char *first_bytes = first;
+    const unsigned char *second_bytes = second;
+
+    if (first_size == 0 || second_size == 0) return false;
+    return byte_range_contains(first_bytes, first_size, second_bytes) ||
+           byte_range_contains(second_bytes, second_size, first_bytes);
+}
+
 /* Safe string concatenation with error context */
 int safe_strncat(char *dest, const char *src, size_t dest_size) {
+    size_t dest_len;
+    size_t remaining;
+    size_t src_len;
+    size_t copy_size;
+
     if (!dest || !src || dest_size == 0) {
         set_error(ERR_INVALID_ARGS, "Invalid arguments to safe_strncat");
         return -1;
     }
-    
-    size_t dest_len = strlen(dest);
-    size_t src_len = strlen(src);
-    
-    if (dest_len + src_len >= dest_size) {
+
+    dest_len = strnlen(dest, dest_size);
+    if (dest_len == dest_size) {
+        set_error(ERR_INVALID_ARGS,
+                  "Destination string is not terminated within buffer");
+        return -1;
+    }
+
+    remaining = dest_size - dest_len;
+    src_len = strnlen(src, remaining);
+    if (src_len == remaining) {
         set_error(ERR_INVALID_ARGS, "String concatenation would overflow buffer");
         return -1;
     }
-    
-    strncat(dest, src, dest_size - dest_len - 1);
+
+    copy_size = src_len + 1U;
+    if (byte_ranges_overlap(src, copy_size, dest + dest_len, copy_size)) {
+        set_error(ERR_INVALID_ARGS,
+                  "Source and destination append ranges overlap");
+        return -1;
+    }
+
+    memcpy(dest + dest_len, src, copy_size);
     return 0;
 }
 

@@ -24,6 +24,7 @@
 #include "gpg_manager.h"
 #include "utils.h"
 #include "error.h"
+#include "trusted_command_fixture.h"
 
 #include <errno.h>
 #include <dirent.h>
@@ -44,10 +45,19 @@
 #include <sys/mount.h>
 #endif
 
+static bool unsets_environment(const run_opts_t *opts, const char *name) {
+    if (!opts || !opts->unset_env || !name) return false;
+    for (size_t i = 0; opts->unset_env[i]; i++) {
+        if (strcmp(opts->unset_env[i], name) == 0) return true;
+    }
+    return false;
+}
+
 /* Swallow gpgconf --kill (and anything else) without executing it. */
 static int null_runner(const char *const argv[], const run_opts_t *opts,
                        run_result_t *result) {
     (void)argv;
+    CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     if (result) {
         memset(result, 0, sizeof(*result));
@@ -82,6 +92,7 @@ static int failing_gpgconf_runner(const char *const argv[], const run_opts_t *op
                   cwd_st.st_ino == g_bad_home_ino;
     bool fail = !g_fail_only_bad_home || is_bad;
     (void)argv;
+    CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
     if (result) {
         memset(result, 0, sizeof(*result));
         result->spawned = true;
@@ -89,6 +100,76 @@ static int failing_gpgconf_runner(const char *const argv[], const run_opts_t *op
     }
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     return fail ? -1 : 0;
+}
+
+static struct stat g_causal_homes[2];
+static size_t g_causal_order[2];
+static size_t g_causal_runner_calls;
+static struct stat g_causal_nested_fault;
+static bool g_causal_nested_fault_ready;
+static size_t g_causal_mount_failures;
+
+/* Create the first failure only after reset's all-home preflight: a nested
+ * directory whose mount-identity probe fails with ENOSPC. The next account's
+ * agent stop then fails with EBUSY. Recording actual traversal order avoids
+ * assuming any filesystem-specific readdir order. */
+static int causal_gpgconf_runner(const char *const argv[],
+                                 const run_opts_t *opts,
+                                 run_result_t *result) {
+    struct stat cwd_st;
+    size_t home_index = 2U;
+    size_t call_index = g_causal_runner_calls;
+
+    (void)argv;
+    CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
+    CHECK(opts && opts->use_cwd_fd && opts->cwd_fd >= 0);
+    if (opts && opts->use_cwd_fd && opts->cwd_fd >= 0 &&
+        fstat(opts->cwd_fd, &cwd_st) == 0) {
+        for (size_t i = 0; i < 2U; i++) {
+            if (cwd_st.st_dev == g_causal_homes[i].st_dev &&
+                cwd_st.st_ino == g_causal_homes[i].st_ino) {
+                home_index = i;
+                break;
+            }
+        }
+    }
+    CHECK(home_index < 2U);
+    CHECK(g_causal_runner_calls < 2U);
+    if (home_index < 2U && g_causal_runner_calls < 2U) {
+        g_causal_order[g_causal_runner_calls] = home_index;
+    }
+    g_causal_runner_calls++;
+    if (result) {
+        memset(result, 0, sizeof(*result));
+        result->spawned = true;
+    }
+    if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
+    if (call_index == 0U) {
+        CHECK_EQ_INT(mkdirat(opts->cwd_fd, "l29-primary-fault", 0700), 0);
+        CHECK_EQ_INT(fstatat(opts->cwd_fd, "l29-primary-fault",
+                            &g_causal_nested_fault,
+                            AT_SYMLINK_NOFOLLOW), 0);
+        g_causal_nested_fault_ready = true;
+        return 0;
+    }
+    if (result) result->exit_code = 9;
+    errno = EBUSY;
+    return -1;
+}
+
+static int causal_mount_identity(int fd, uint64_t *identity) {
+    struct stat st;
+
+    if (fd < 0 || !identity || fstat(fd, &st) != 0) return -1;
+    if (g_causal_nested_fault_ready &&
+        st.st_dev == g_causal_nested_fault.st_dev &&
+        st.st_ino == g_causal_nested_fault.st_ino) {
+        g_causal_mount_failures++;
+        errno = ENOSPC;
+        return -1;
+    }
+    *identity = 1U;
+    return 0;
 }
 
 /* Fresh scratch XDG_RUNTIME_DIR; returns 0 on success. */
@@ -111,16 +192,28 @@ static int touch(const char *path) {
 
 static int g_reset_sync_calls;
 static bool g_fail_reset_sync;
+static int g_reset_sync_errno = EIO;
 
 static int record_reset_sync(int base_fd) {
     struct stat st;
     g_reset_sync_calls++;
     if (fstat(base_fd, &st) != 0 || !S_ISDIR(st.st_mode)) return -1;
     if (g_fail_reset_sync) {
-        errno = EIO;
+        errno = g_reset_sync_errno;
         return -1;
     }
     return fsync(base_fd);
+}
+
+static void check_reset_witness_sync_failure_chain(void) {
+    const error_context_t *error = get_last_error();
+
+    CHECK_EQ_INT(error->code, ERR_FILE_IO);
+    CHECK_EQ_INT(error->system_errno, EIO);
+    CHECK_STR_EQ(error->function, "gpg_remove_captured_current_locked");
+    CHECK(strstr(error->message, "Cannot synchronize GPG reset witness") !=
+          NULL);
+    CHECK(strstr(error->details, "base directory is not durable") != NULL);
 }
 
 static const char *g_reset_replacement_target;
@@ -153,6 +246,7 @@ static int swapping_gpgconf_runner(const char *const argv[],
     struct stat named_st;
     const char *home = extra_env_value(opts, "GNUPGHOME=");
     (void)argv;
+    CHECK(unsets_environment(opts, "GPG_AGENT_INFO"));
     if (opts && opts->out && opts->out_size > 0) opts->out[0] = '\0';
     if (result) {
         memset(result, 0, sizeof(*result));
@@ -525,6 +619,119 @@ TEST(gpg_manager_reset_all_aggregates_failures_and_continues) {
     CHECK(S_ISLNK(st.st_mode));
 }
 
+TEST(gpg_manager_reset_all_retains_first_structured_cause) {
+    char xdg[128], base[256], homes[2][320], markers[2][384];
+    char primary_fault[MAX_PATH_LEN];
+    char first_errno_detail[32];
+    char sync_errno_detail[32];
+    const char *first_home;
+    const char *later_home;
+    error_context_t error;
+    int retained_errno;
+    const char *first_errno;
+    const char *home_label;
+    const char *later_failure;
+    const char *sync_label;
+    const char *sync_failure;
+    const char *sync_errno;
+    const char *entry;
+    size_t rendered_entries = 0U;
+    gpg_mount_identity_probe_fn old_probe;
+    gpg_sync_base_fn old_sync;
+    command_runner_fn old_runner;
+
+    CHECK_EQ_INT(make_xdg(xdg, sizeof(xdg)), 0);
+    snprintf(base, sizeof(base), "%s/gitswitch-gpg", xdg);
+    snprintf(homes[0], sizeof(homes[0]), "%s/alpha", base);
+    snprintf(homes[1], sizeof(homes[1]), "%s/beta", base);
+    snprintf(markers[0], sizeof(markers[0]), "%s/private.key", homes[0]);
+    snprintf(markers[1], sizeof(markers[1]), "%s/private.key", homes[1]);
+    CHECK_EQ_INT(mkdir(base, 0700), 0);
+    for (size_t i = 0; i < 2U; i++) {
+        CHECK_EQ_INT(mkdir(homes[i], 0700), 0);
+        CHECK_EQ_INT(touch(markers[i]), 0);
+        CHECK_EQ_INT(stat(homes[i], &g_causal_homes[i]), 0);
+    }
+
+    memset(g_causal_order, 0, sizeof(g_causal_order));
+    memset(&g_causal_nested_fault, 0, sizeof(g_causal_nested_fault));
+    g_causal_runner_calls = 0U;
+    g_causal_nested_fault_ready = false;
+    g_causal_mount_failures = 0U;
+    g_reset_sync_calls = 0;
+    g_fail_reset_sync = true;
+    g_reset_sync_errno = EROFS;
+    old_probe = gpg_manager_set_mount_identity_probe_fn(
+        causal_mount_identity);
+    old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
+    old_runner = run_set_runner(causal_gpgconf_runner);
+
+    clear_error();
+    errno = 0;
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    memcpy(&error, get_last_error(), sizeof(error));
+    retained_errno = errno;
+    run_set_runner(old_runner);
+    gpg_manager_set_sync_base_fn(old_sync);
+    gpg_manager_set_mount_identity_probe_fn(old_probe);
+    g_fail_reset_sync = false;
+    g_reset_sync_errno = EIO;
+
+    CHECK_EQ_INT(g_causal_runner_calls, 2);
+    CHECK_EQ_INT(g_causal_mount_failures, 1);
+    CHECK_EQ_INT(g_reset_sync_calls, 1);
+    CHECK(g_causal_order[0] < 2U && g_causal_order[1] < 2U);
+    CHECK(g_causal_order[0] != g_causal_order[1]);
+    first_home = homes[g_causal_order[0]];
+    later_home = homes[g_causal_order[1]];
+    snprintf(primary_fault, sizeof(primary_fault), "%s/l29-primary-fault",
+             first_home);
+    snprintf(first_errno_detail, sizeof(first_errno_detail), "errno=%d",
+             ENOSPC);
+    snprintf(sync_errno_detail, sizeof(sync_errno_detail), "errno=%d",
+             EROFS);
+    CHECK_EQ_INT(error.code, ERR_PERMISSION_DENIED);
+    CHECK_EQ_INT(error.system_errno, ENOSPC);
+    CHECK_STR_EQ(error.function, "gpg_walk_tree_contents_fd");
+    CHECK(error.line > 0);
+    CHECK(strstr(error.file, "gpg_manager.c") != NULL);
+    CHECK(strstr(error.message, "Cannot prove GPG reset mount boundary") !=
+          NULL);
+    CHECK(strstr(error.message, primary_fault) != NULL);
+    CHECK(!error.message_truncated);
+    CHECK(!error.details_truncated);
+    first_errno = strstr(error.details, first_errno_detail);
+    home_label = strstr(error.details, "; [GPG home cleanup] ");
+    later_failure = strstr(error.details, later_home);
+    sync_label = strstr(error.details,
+                        "; [GPG base directory synchronization] ");
+    sync_failure = strstr(error.details, "base directory is not durable");
+    sync_errno = sync_failure ? strstr(sync_failure, sync_errno_detail) : NULL;
+    entry = error.details;
+    while ((entry = strstr(entry, "; [")) != NULL) {
+        rendered_entries++;
+        entry += sizeof("; [") - 1U;
+    }
+    CHECK(first_errno != NULL);
+    CHECK(home_label != NULL);
+    CHECK(later_failure != NULL);
+    CHECK(sync_label != NULL);
+    CHECK(sync_failure != NULL);
+    CHECK(sync_errno != NULL);
+    CHECK_EQ_INT(rendered_entries, 2);
+    if (first_errno && home_label && later_failure && sync_label &&
+        sync_failure && sync_errno) {
+        CHECK(first_errno < home_label);
+        CHECK(home_label < later_failure);
+        CHECK(later_failure < sync_label);
+        CHECK(sync_label < sync_failure);
+        CHECK(sync_failure < sync_errno);
+    }
+    CHECK_EQ_INT(retained_errno, ENOSPC);
+    CHECK(path_exists(markers[0]));
+    CHECK(path_exists(markers[1]));
+}
+
 /* readdir(3) reports EOF and I/O failure through the same NULL return. The
  * manager must clear/check errno or an unreadable tail becomes a false clean
  * reset that can also drop the stable link while homes remain. */
@@ -708,14 +915,17 @@ TEST(targeted_reset_sync_failure_is_retryable) {
     old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
     previous = run_set_runner(null_runner);
     CHECK_EQ_INT(gpg_manager_reset("work"), -1);
-    CHECK_EQ_INT(g_reset_sync_calls, 1);
-    CHECK(strstr(get_last_error()->message, "not durable") != NULL);
+    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    check_reset_witness_sync_failure_chain();
     CHECK(lstat(home, &st) != 0 && errno == ENOENT);
-    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+    /* Reset cannot publish its quarantine until the identity witness is
+     * durable, so an early fsync failure deliberately retains `current`. */
+    CHECK_EQ_INT(lstat(current, &st), 0);
 
     g_fail_reset_sync = false;
     CHECK_EQ_INT(gpg_manager_reset("work"), 0);
-    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    CHECK_EQ_INT(g_reset_sync_calls, 8);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
     run_set_runner(previous);
     gpg_manager_set_sync_base_fn(old_sync);
 }
@@ -741,14 +951,15 @@ TEST(full_reset_sync_failure_is_retryable) {
     old_sync = gpg_manager_set_sync_base_fn(record_reset_sync);
     previous = run_set_runner(null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
-    CHECK_EQ_INT(g_reset_sync_calls, 1);
-    CHECK(strstr(get_last_error()->message, "not durable") != NULL);
+    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    check_reset_witness_sync_failure_chain();
     CHECK(lstat(home, &st) != 0 && errno == ENOENT);
-    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
+    CHECK_EQ_INT(lstat(current, &st), 0);
 
     g_fail_reset_sync = false;
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
-    CHECK_EQ_INT(g_reset_sync_calls, 2);
+    CHECK_EQ_INT(g_reset_sync_calls, 8);
+    CHECK(lstat(current, &st) != 0 && errno == ENOENT);
     run_set_runner(previous);
     gpg_manager_set_sync_base_fn(old_sync);
 }
@@ -872,7 +1083,16 @@ TEST(create_isolated_home_refuses_persistent_xdg_base) {
 }
 
 TEST_MAIN_BEGIN()
+    static const char *const trusted_commands[] = {"gpgconf", NULL};
+    ts_trusted_command_fixture_t command_fixture = {0};
+
     error_init(LOG_LEVEL_ERROR, NULL);
+    if (ts_trusted_command_fixture_install(
+            &command_fixture, "gsw-ar11-gpg-reset", trusted_commands) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot install trusted gpgconf fixture\n");
+        return 1;
+    }
     RUN_TEST(gpg_manager_reset_rejects_empty_selector_without_mutation);
     RUN_TEST(gpg_manager_reset_rejects_traversal);
     RUN_TEST(gpg_manager_reset_refuses_symlinked_base);
@@ -882,6 +1102,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(gpg_manager_reset_retains_home_when_agent_stop_fails);
     RUN_TEST(gpg_manager_reset_reports_recursive_removal_failure);
     RUN_TEST(gpg_manager_reset_all_aggregates_failures_and_continues);
+    RUN_TEST(gpg_manager_reset_all_retains_first_structured_cause);
     RUN_TEST(gpg_manager_reset_all_reports_readdir_failure);
     RUN_TEST(gpg_manager_reset_reports_stable_link_cleanup_failure);
     RUN_TEST(gpg_manager_reset_all_drops_external_live_target);
@@ -892,4 +1113,9 @@ TEST_MAIN_BEGIN()
     RUN_TEST(full_reset_sync_failure_is_retryable);
     RUN_TEST(targeted_reset_restores_current_replaced_after_capture);
     RUN_TEST(create_isolated_home_refuses_persistent_xdg_base);
+    if (ts_trusted_command_fixture_restore(&command_fixture) != 0) {
+        fprintf(stderr,
+                "HARNESS FAIL: cannot restore PATH after GPG reset tests\n");
+        return 1;
+    }
 TEST_MAIN_END()

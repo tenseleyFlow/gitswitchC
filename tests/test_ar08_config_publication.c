@@ -993,8 +993,7 @@ static void exercise_concurrent_public_save(
             start != 1) {
             _exit(2);
         }
-        initialize_concurrent_writer_context(&second, GIT_SCOPE_LOCAL,
-                                             active_transition, false);
+        second = initial;
         errno = 0;
         result.result = config_save_transactional(&second, path,
                                                   &second_installed);
@@ -1025,9 +1024,12 @@ static void exercise_concurrent_public_save(
     memset(&g_concurrent_writer_result, 0,
            sizeof(g_concurrent_writer_result));
     g_concurrent_writer_result_received = false;
-    initialize_concurrent_writer_context(&first, GIT_SCOPE_GLOBAL,
-                                         active_transition,
-                                         active_transition);
+    first = initial;
+    first.config.default_scope = GIT_SCOPE_GLOBAL;
+    if (active_transition) {
+        snprintf(first.config.active_account,
+                 sizeof(first.config.active_account), "alice");
+    }
     installed = false;
     config_set_io_fault_fn(publication_observer);
     first_result = config_save_transactional(&first, path, &installed);

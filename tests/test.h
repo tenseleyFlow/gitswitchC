@@ -1,11 +1,12 @@
 /* Minimal dependency-free test harness for gitswitch-c.
  *
  * Each test file defines tests with TEST(), registers them in main() via
- * RUN_TEST(), and exits 0 when every test passed or was optionally skipped, or
- * 1 if any failed/required capability was unavailable (AR-06 F79: it is a
- * boolean status, not the failure count), so the Makefile `test` target fails
- * the build on any failure. CHECK* macros are non-fatal (they record a failure
- * but let the rest of the test run). */
+ * RUN_TEST(), and exits 0 when at least one test ran and every test passed or
+ * was optionally skipped, or 1 if the suite was empty, any test failed, or a
+ * required capability was unavailable (AR-06 F79: it is a boolean status, not
+ * the failure count), so the Makefile `test` target fails the build on any
+ * failure. CHECK* macros are non-fatal (they record a failure but let the rest
+ * of the test run). */
 #ifndef GITSWITCH_TEST_H
 #define GITSWITCH_TEST_H
 
@@ -87,6 +88,21 @@ static inline int ts_trusted_chdir(const char *path) {
 static inline int ts_same_identity(const struct stat *a,
                                    const struct stat *b) {
     return a && b && a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+/* Command fakes must model the caller's argument contract without assuming
+ * PATH lookup. Production increasingly passes canonical absolute argv[0]
+ * spellings, so compare the final component explicitly. */
+static inline const char *ts_command_basename(const char *path) {
+    const char *slash;
+
+    if (!path) return "";
+    slash = strrchr(path, '/');
+    return slash ? slash + 1 : path;
+}
+
+static inline int ts_command_is(const char *path, const char *name) {
+    return name && strcmp(ts_command_basename(path), name) == 0;
 }
 
 static inline int ts_set_cloexec(int fd) {
@@ -473,6 +489,7 @@ static inline const char *ts_capability_name(int index) {
         "high-fd",
         "freebsd-acl",
         "mount-namespace",
+        "freebsd-nullfs",
         /* AR-10 L37: test_ar09_runner_stdin skipped with this token while it
          * was unregistered, so a cat-less host FAILED the suite instead of
          * skipping (TS_SKIP rejects unknown capabilities). */
@@ -545,6 +562,7 @@ static inline int ts_test_finish(void) {
         ts_tests_skipped >= 0 &&
         ts_tests_run ==
             ts_tests_passed + ts_tests_failed + ts_tests_skipped;
+    int tests_executed = ts_tests_run != 0;
     unsigned long required_skips =
         required_capabilities & ts_skipped_capabilities;
 
@@ -555,6 +573,9 @@ static inline int ts_test_finish(void) {
     if (!accounting_valid) {
         fprintf(stderr,
                 "HARNESS FAIL: test accounting invariant violated\n");
+    }
+    if (!tests_executed) {
+        fprintf(stderr, "HARNESS FAIL: no tests executed\n");
     }
     if (policy_valid) {
         for (int index = 0;; index++) {
@@ -569,7 +590,7 @@ static inline int ts_test_finish(void) {
     }
 
     int failed = ts_tests_failed != 0 || !policy_valid ||
-                 !accounting_valid || required_skips != 0;
+                 !accounting_valid || !tests_executed || required_skips != 0;
     printf("\n%s: %d run, %d passed, %d failed, %d skipped\n",
            failed ? "RESULT FAIL" : "RESULT OK", ts_tests_run,
            ts_tests_passed, ts_tests_failed, ts_tests_skipped);

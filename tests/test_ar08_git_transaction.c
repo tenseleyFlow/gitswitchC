@@ -9,6 +9,7 @@
 #include "test.h"
 #include "error.h"
 #include "git_ops.h"
+#include "gpg_manager.h"
 #include "utils.h"
 
 #include <limits.h>
@@ -383,12 +384,16 @@ static void add_name_before_restore_lock(git_scope_t scope) {
 }
 
 static void replace_config_after_rollback_publish(git_scope_t scope) {
+    static const char replacement[] =
+        "[user]\n"
+        "\tname = later-replacement\n"
+        "[audit]\n"
+        "\treplacement = must-survive\n";
+
     if (scope != GIT_SCOPE_LOCAL || g_postpublish_writer_calls != 0) return;
     g_postpublish_writer_calls++;
     if (rename(g_postpublish_config, g_postpublish_installed) != 0 ||
-        git_set_file(g_postpublish_config, "user.name", "later-replacement") != 0 ||
-        git_set_file(g_postpublish_config, "audit.replacement",
-                     "must-survive") != 0) {
+        write_text_file(g_postpublish_config, replacement, 0600) != 0) {
         g_postpublish_writer_calls = -1;
     }
 }
@@ -619,6 +624,7 @@ TEST(real_git_proves_narrow_ssh_environment_precedence_and_api_rejects_it) {
 }
 
 TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
+    static const char bound_program[] = "/trusted/ar11/transaction-gpg";
     static const char *const scopes[] = {
         "--global", "--local", "--worktree"
     };
@@ -627,6 +633,7 @@ TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
     char actual[1024];
     char value[256];
     git_current_config_t current;
+    gpg_config_t gpg_config;
     account_t account;
 
     if (!fixture_init(&fixture)) {
@@ -660,8 +667,20 @@ TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
     }
 
     account = basic_account(&fixture, true);
+    memset(&gpg_config, 0, sizeof(gpg_config));
+    CHECK_EQ_INT(safe_strncpy(gpg_config.current_key_id,
+                              account.gpg_key_id,
+                              sizeof(gpg_config.current_key_id)), 0);
+    CHECK_EQ_INT(safe_strncpy(gpg_config.executable_path, bound_program,
+                              sizeof(gpg_config.executable_path)), 0);
+    /* This transaction test owns Git publication/rollback, not keyring
+     * inventory. Model the activation proof that accounts_switch completes
+     * before it reaches these writes. */
+    gpg_manager_note_key_available(account.gpg_key_id);
     CHECK_EQ_INT(git_config_snapshot(GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_set_config(&account, GIT_SCOPE_GLOBAL), 0);
+    CHECK_EQ_INT(gpg_configure_git_signing(&gpg_config, &account,
+                                           GIT_SCOPE_GLOBAL), 0);
     CHECK_EQ_INT(git_config_seal(), 0);
     CHECK_EQ_INT(git_get_all("--global", "gpg.format", actual,
                              sizeof(actual)), 0);
@@ -670,8 +689,15 @@ TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
         for (size_t key = scope == 0 ? 1U : 0U;
              key < sizeof(g_gpg_model_keys) / sizeof(g_gpg_model_keys[0]);
              key++) {
+            int expected_present = scope == 0 && key == 2U;
             CHECK_EQ_INT(git_get_all(scopes[scope], g_gpg_model_keys[key],
-                                     actual, sizeof(actual)), -1);
+                                     actual, sizeof(actual)),
+                         expected_present ? 0 : -1);
+            if (expected_present) {
+                CHECK((size_t)snprintf(value, sizeof(value), "%s\n",
+                                       bound_program) < sizeof(value));
+                CHECK_STR_EQ(actual, value);
+            }
         }
     }
     memset(&current, 0, sizeof(current));
@@ -679,6 +705,11 @@ TEST(all_gpg_format_and_program_keys_normalize_and_restore_exactly) {
     CHECK(current.valid);
     CHECK_STR_EQ(current.name, account.name);
     CHECK_STR_EQ(current.signing_key, account.gpg_key_id);
+    CHECK(!current.gpg_program.present);
+    CHECK(current.gpg_openpgp_program.present);
+    CHECK_STR_EQ(current.gpg_openpgp_program.value, bound_program);
+    CHECK(!current.gpg_x509_program.present);
+    CHECK(!current.gpg_ssh_program.present);
 
     CHECK_EQ_INT(git_config_restore(), 0);
     for (size_t scope = 0; scope < 3; scope++) {
