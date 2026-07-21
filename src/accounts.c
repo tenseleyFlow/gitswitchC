@@ -3147,6 +3147,21 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
             printf("[ERROR]: SSH key failed validation: %s (try again, or Enter to skip)\n", expanded_path);
             continue;
         }
+        /* AR-12 H4: a path the TOML sanitizer would alter (quote/backslash)
+         * would be admitted here but skipped by the loader's schema on the
+         * next start. Refuse it up front like the over-long case. */
+        {
+            char roundtrip_path[MAX_PATH_LEN];
+
+            if (toml_sanitize_string(expanded_path, roundtrip_path,
+                                     sizeof(roundtrip_path)) != 0 ||
+                strcmp(roundtrip_path, expanded_path) != 0) {
+                printf("[ERROR]: SSH key path contains characters that cannot "
+                       "be saved faithfully: %s (try again, or Enter to skip)\n",
+                       expanded_path);
+                continue;
+            }
+        }
         safe_strncpy(acct.ssh_key_path, expanded_path, sizeof(acct.ssh_key_path));
         acct.ssh_enabled = true;
         printf("[OK]: SSH key validated: %s\n", expanded_path);

@@ -8663,8 +8663,13 @@ static int validate_account_security(const account_t *account) {
         return -1;
     }
 
+    /* AR-12 H4: the ssh_key path is included so admission can never write a
+     * document whose bytes the loader's schema refuses (write-accepts /
+     * load-rejects asymmetry). */
     if (validate_field_roundtrips("name", account->name) != 0 ||
         validate_field_roundtrips("description", account->description) != 0 ||
+        validate_field_roundtrips("SSH key path",
+                                  account->ssh_key_path) != 0 ||
         validate_field_roundtrips("SSH host alias", account->ssh_host_alias) != 0 ||
         validate_field_roundtrips("SSH canonical hostname",
                                   account->ssh_hostname) != 0) {

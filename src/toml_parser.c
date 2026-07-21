@@ -893,10 +893,21 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                          * callers would receive. */
                         if (toml_sanitize_string(kv->value, sanitized, sizeof(sanitized)) != 0 ||
                             strcmp(sanitized, kv->value) != 0) {
-                            set_error(ERR_CONFIG_INVALID,
-                                      "SSH key path contains characters that cannot "
-                                      "round-trip: %s", kv->value);
-                            return -1;
+                            /* AR-12 H4: skip THIS account like the over-long
+                             * case below rather than failing the whole
+                             * parse. The value is never handed to callers
+                             * (the section is hidden), the skip count blocks
+                             * rewrites, and one bad field no longer bricks
+                             * every command. Admission now rejects such
+                             * paths at add/edit, so this is repair-path
+                             * tolerance for hand edits and old writers. */
+                            log_warning("Account section [%s]: ssh_key contains "
+                                        "characters that cannot round-trip; "
+                                        "skipping this account, the rest of "
+                                        "the config still loads",
+                                        section->name);
+                            skip_section = true;
+                            break;
                         }
                         /* Over-long path: skip THIS account, not the file
                          * (AR-03 M5). The writer historically accepted up to

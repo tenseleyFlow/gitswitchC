@@ -1019,14 +1019,16 @@ TEST(accepts_non_allowlisted_absolute_ssh_key) {
     toml_cleanup_document(&doc);
 }
 
-/* Traversal is a property of the path, not its prefix, and stays fatal —
- * including the backslash-resynthesis spelling: ".\./id" contains no ".."
- * substring, but sanitizing it resynthesizes "../id" (AR-02 #29). Since M6
- * the schema enforces sanitized == raw for ssh_key, so any byte the
- * sanitizer would touch is rejected outright, which subsumes the old
- * validate-the-sanitized-bytes defense. */
+/* Plain traversal is a property of the path and stays whole-file fatal. The
+ * backslash-resynthesis spelling (".\./id" has no ".." substring, but
+ * sanitizing resynthesizes "../id", AR-02 #29) is caught by the sanitized ==
+ * raw round-trip gate; since AR-12 H4 that gate SKIPS the section (hidden
+ * from getters, counted, rewrites blocked) instead of failing the parse, so
+ * one unloadable value cannot brick every command. The hostile bytes are
+ * never handed to any caller either way. */
 TEST(rejects_traversal_and_resynthesized_traversal_ssh_key) {
     toml_document_t doc;
+    char buf[64];
     CHECK_EQ_INT(parse(
         "[settings]\n"
         "default_scope = \"local\"\n"
@@ -1041,7 +1043,12 @@ TEST(rejects_traversal_and_resynthesized_traversal_ssh_key) {
         "[accounts.1]\n"
         "name = \"alice\"\n"
         "email = \"a@b.com\"\n"
-        "ssh_key = \"/home/alice/.\\\\./id_ed25519\"\n", &doc), -1);
+        "ssh_key = \"/home/alice/.\\\\./id_ed25519\"\n", &doc), 0);
+    /* The skipped section is hidden from the getters entirely. */
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "ssh_key", buf,
+                                 sizeof(buf)), -1);
+    CHECK_EQ_INT(toml_get_string(&doc, "accounts.1", "name", buf,
+                                 sizeof(buf)), -1);
     toml_cleanup_document(&doc);
 }
 

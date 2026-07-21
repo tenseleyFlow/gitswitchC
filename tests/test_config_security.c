@@ -1466,6 +1466,51 @@ TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load) {
     CHECK(ctx.config.active_account[0] == '\0');
 }
 
+/* AR-12 H4: a non-round-trippable ssh_key must be rejected at add/edit
+ * admission, and a document already containing one (hand edit, old writer)
+ * must skip that account on load instead of failing the whole parse. */
+TEST(non_roundtrip_ssh_key_rejected_at_admission_and_skipped_on_load) {
+    char dir[128], path[256], cfg[2048];
+    gitswitch_ctx_t ctx;
+    account_t candidate;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+
+    /* Loader side: an escaped quote parses into the value; the schema must
+     * skip the section, not brick the file. */
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"good\"\n"
+                   "email = \"good@example.com\"\n"
+                   "[accounts.2]\n"
+                   "name = \"bad\"\n"
+                   "email = \"bad@example.com\"\n"
+                   "ssh_key = \"/tmp/id\\\"quote\"\n") < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) CHECK_STR_EQ(ctx.accounts[0].name, "good");
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+
+    /* Admission side: the same bytes can never be saved in the first
+     * place. */
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.id = 7;
+    snprintf(candidate.name, sizeof(candidate.name), "quoted");
+    snprintf(candidate.email, sizeof(candidate.email), "q@example.com");
+    candidate.preferred_scope = GIT_SCOPE_LOCAL;
+    snprintf(candidate.ssh_key_path, sizeof(candidate.ssh_key_path),
+             "/tmp/id\"quote");
+    candidate.ssh_enabled = true;
+    CHECK_EQ_INT(config_add_account(&ctx, &candidate), -1);
+    CHECK(strstr(get_last_error()->message, "SSH key path") != NULL);
+}
+
 TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     static const char *const invalid[] = {
         "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
@@ -2476,4 +2521,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip);
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
     RUN_TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load);
+    RUN_TEST(non_roundtrip_ssh_key_rejected_at_admission_and_skipped_on_load);
 TEST_MAIN_END()
