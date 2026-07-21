@@ -1562,9 +1562,10 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
         CHECK_EQ_INT(ctx.account_count, 0);
     }
 
-    /* A hand-edited endpoint spelling must fail at schema validation instead
-     * of loading a destination that OpenSSH would treat as a literal hostname
-     * on its default port. */
+    /* AR-12 M7: a hand-edited or pre-narrowing endpoint spelling skips just
+     * that account (counted, rewrite-blocked) — it must never load a
+     * destination OpenSSH would treat as a literal hostname, and must never
+     * brick the rest of the config either. */
     CHECK(snprintf(cfg, sizeof(cfg),
                    "[settings]\n"
                    "default_scope = \"local\"\n"
@@ -1576,9 +1577,10 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
                    key) < (int)sizeof(cfg));
     CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
     memset(&ctx, 0, sizeof(ctx));
-    CHECK_EQ_INT(config_load(&ctx, path), -1);
-    CHECK_EQ_INT(get_last_error()->code, ERR_CONFIG_INVALID);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
     CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
 
     /* Save is also a public boundary: an invalid in-memory destination must
      * not replace a previously valid file. */

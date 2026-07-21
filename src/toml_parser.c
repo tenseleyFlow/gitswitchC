@@ -954,10 +954,17 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         return -1;
                     }
                     if (!toml_validate_ssh_host_alias(kv->value)) {
-                        set_error(ERR_CONFIG_INVALID,
-                                  "ssh_host must contain only ASCII letters, digits, "
-                                  "'.', '-', '_', '*', or '?'");
-                        return -1;
+                        /* AR-12 M7: releases before the strict alias grammar
+                         * persisted arbitrary prompt input here. Own-writer
+                         * legacy values skip THIS section (AR-03 M5
+                         * granularity) instead of bricking the whole file. */
+                        log_warning("Account section [%s]: ssh_host contains "
+                                    "characters outside the managed alias "
+                                    "grammar; skipping this account, the "
+                                    "rest of the config still loads",
+                                    section->name);
+                        skip_section = true;
+                        break;
                     }
                 }
 
@@ -969,11 +976,17 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         return -1;
                     }
                     if (!toml_validate_ssh_hostname(kv->value)) {
-                        set_error(ERR_CONFIG_INVALID,
-                                  "ssh_hostname must be a host-only ASCII name "
-                                  "or IPv4 value, or a valid unbracketed IPv6 "
-                                  "literal; embedded ports are unsupported");
-                        return -1;
+                        /* AR-12 M7: the pre-M25 validator admitted values
+                         * (e.g. host:port) the narrowed grammar refuses.
+                         * Skip the section, never the whole file. */
+                        log_warning("Account section [%s]: ssh_hostname is "
+                                    "not a host-only name/IP under the "
+                                    "narrowed grammar; skipping this "
+                                    "account, the rest of the config still "
+                                    "loads",
+                                    section->name);
+                        skip_section = true;
+                        break;
                     }
                 }
                 
