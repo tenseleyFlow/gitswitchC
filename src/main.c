@@ -7,6 +7,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
 #include <unistd.h>
@@ -896,6 +897,22 @@ int main(int argc, char *argv[]) {
     int config_lock_fd = -1;
     int opt;
 
+    /* AR-12 L14: when invoked with a standard descriptor closed
+     * (e.g. `gitswitch ... 2>&-`), the first internal open — a lock file,
+     * flock anchor, or token pipe — would occupy fd 0/1/2, and every later
+     * stdout/stderr write would corrupt that private file. Reserve the
+     * stdio slots with /dev/null before any other open; if even /dev/null
+     * cannot be opened nothing can be reported safely, so fail closed. */
+    {
+        int reserved;
+
+        do {
+            reserved = open("/dev/null", O_RDWR);
+            if (reserved < 0) return EXIT_FAILURE;
+        } while (reserved <= STDERR_FILENO);
+        close(reserved);
+    }
+
     /* Restrict permissions on everything we create (config, keys, agent dirs,
      * gpg homes): files born 0600, dirs 0700, closing fopen-then-chmod windows. */
     umask(077);
@@ -983,6 +1000,14 @@ int main(int argc, char *argv[]) {
                 no_color = true;
                 break;
             case 'V':
+                /* AR-12 L15: the option contract presents -V and -d as
+                 * distinct; make that true. Verbose enables INFO logging
+                 * (and the verbose display paths below), while -d keeps the
+                 * full DEBUG stream. -d wins regardless of order. */
+                if (!should_log(LOG_LEVEL_DEBUG)) {
+                    set_log_level(LOG_LEVEL_INFO);
+                }
+                break;
             case 'd':
                 set_log_level(LOG_LEVEL_DEBUG);
                 break;
@@ -1243,7 +1268,8 @@ int main(int argc, char *argv[]) {
     ctx->config.force_global = force_global;
     ctx->config.force_local = force_local;
     ctx->config.assume_yes = assume_yes;
-    ctx->config.verbose = should_log(LOG_LEVEL_DEBUG);
+    /* AR-12 L15: verbose display paths engage at -V (INFO) as well as -d. */
+    ctx->config.verbose = should_log(LOG_LEVEL_INFO);
     /* accounts.c historically re-raised interrupted direct/library calls at
      * its own rollback boundary. The CLI owns additional resources beyond
      * that boundary, so its common tail performs the truthful re-raise only
@@ -2236,26 +2262,25 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
             display_success("DRY RUN complete - no changes were made");
             return EXIT_SUCCESS;
         }
-        printf("Create default configuration? (y/N): ");
-        fflush(stdout);
-        
-        char input[64];
-        if (fgets(input, sizeof(input), stdin)) {
-            char *answer;
+        /* AR-12 L28: use the T11 checked-prompt boundary — the hand-rolled
+         * printf+fgets never observed a broken/redirected stdout, so the
+         * question could go unseen while the answer was still consumed. */
+        {
+            int confirmed = prompt_confirm_exact_yes_prompt(
+                "Create default configuration? (yes/No): ");
 
-            input[strcspn(input, "\n")] = '\0';
-            /* AR-10 L20: use the trimmed pointer — the discarded return left
-             * a leading-space " y" rejected here while other prompts trimmed. */
-            answer = trim_whitespace(input);
-
-            /* Cast to unsigned char first: passing a plain (possibly signed)
-             * char to a ctype function is UB for negative values (mem-2). */
-            if (tolower((unsigned char)answer[0]) == 'y') {
+            if (confirmed < 0) {
+                display_error("Failed to read confirmation", "%s",
+                              get_last_error()->message);
+                return EXIT_FAILURE;
+            }
+            if (confirmed == 1) {
                 if (config_create_default(ctx->config.config_path) == 0) {
                     display_success("Default configuration created");
                     printf("Please edit the file to add your accounts.\n");
                 } else {
-                    display_error("Failed to create default configuration", "%s", get_last_error()->message);
+                    display_error("Failed to create default configuration",
+                                  "%s", get_last_error()->message);
                     return EXIT_FAILURE;
                 }
             }

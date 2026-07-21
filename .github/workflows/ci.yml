@@ -199,7 +199,7 @@ jobs:
         # them in either build configuration.
         run: brew install dash fish gnupg ksh93 readline
       - name: Build + test (ASan/UBSan, warnings-as-errors)
-        run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
+        run: /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
           # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin.
           # AR-10 L31: the Linux lanes list mount-namespace as a REQUIRED
@@ -207,15 +207,15 @@ jobs:
           # enforced rather than assumed; every portable runtime is mandatory.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Clean before the release build
-        run: make clean
+        run: /usr/bin/make clean
       - name: Release build + full NDEBUG suite (warnings-as-errors)
-        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
           # Same sole OS-specific exclusion as the debug lane above.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Release artifact hardening (built + staged)
-        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
       # Exercises Darwin's descriptor-bound atomic clone publisher, including
       # adoption, retained-source, and cleanup-race behavior.
       - name: Release input consistency and dirty-tree refusal
-        run: make release-contract-test
+        run: /usr/bin/make release-contract-test

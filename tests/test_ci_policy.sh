@@ -352,6 +352,21 @@ check_policy()
             return count % 2
         }
         function mutates_executable_resolution(command) {
+            # AR-12 L25: overwriting a tool in its canonical root
+            # (/usr/bin, /usr/sbin, /bin, /sbin) is the same substitution
+            # the /usr/local fixtures already reject; ban mutation verbs
+            # and redirections that target those roots. Reviewed apt/pkg
+            # provisioning never spells such paths.
+            if (command ~ /(^|[;&|[:space:]])(sudo[[:space:]]+)?(install|cp|mv|ln|rsync)([[:space:]][^;&|]*)?[[:space:]]\/(usr\/)?s?bin\/[^[:space:];&|]*[[:space:]]*($|[;&|])/)
+                return 1
+            if (command ~ /(^|[;&|[:space:]])(sudo[[:space:]]+)?tee[[:space:]]([^;&|]*[[:space:]])?\/(usr\/)?s?bin\//)
+                return 1
+            if (command ~ /of=\/(usr\/)?s?bin\//)
+                return 1
+            if (command ~ /(^|[;&|[:space:]])(sudo[[:space:]]+)?(chmod|chown|touch)[[:space:]]([^;&|]*[[:space:]])?\/(usr\/)?s?bin\//)
+                return 1
+            if (command ~ />>?[[:space:]]*\/(usr\/)?s?bin\//)
+                return 1
             return command ~ /^(alias|eval|source|trap)[[:space:]]/ ||
                 command ~ /^\.[[:space:]]/ ||
                 command ~ /^(export[[:space:]]+)?(PATH|MAKEFLAGS|MFLAGS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS)=/ ||
@@ -555,11 +570,16 @@ check_policy()
                     else if (command == "/usr/bin/make release-contract-test")
                         gate = "linux-contract"
                 } else if (current_job == "macos" && source == "direct") {
-                    if (command == "make BUILD_TYPE=release READLINE=1 WERROR=1 test")
+                    # AR-12 L25: macOS gates bind to the SIP-protected
+                    # /usr/bin/make so a brew-shadowed make on PATH cannot
+                    # substitute the build tool.
+                    if (command ~ /(^|[;&|][[:space:]]*)(sudo[[:space:]]+)?make([[:space:]]|$)/)
+                        macos_unqualified_make = 1
+                    if (command == "/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test")
                         gate = "macos-test"
-                    else if (command == "make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
+                    else if (command == "/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
                         gate = "macos-artifact"
-                    else if (command == "make release-contract-test")
+                    else if (command == "/usr/bin/make release-contract-test")
                         gate = "macos-contract"
                 } else if (current_job == "freebsd" && source == "direct") {
                     if (command == "gmake BUILD_TYPE=release WERROR=1 test")
@@ -1418,6 +1438,8 @@ check_policy()
                 reject("Linux CI policy self-check must immediately follow checkout")
             if (linux_unqualified_make)
                 reject("Linux build commands must use verified /usr/bin/make")
+            if (macos_unqualified_make)
+                reject("macOS build commands must use pinned /usr/bin/make")
             if (linux_coverage_upload_count != 1 ||
                 release_gate_step_serial["linux-coverage"] + 1 != release_gate_step_serial["linux-coverage-provenance"] ||
                 release_gate_step_serial["linux-coverage-provenance"] + 1 != linux_coverage_upload_step_serial ||
@@ -2289,9 +2311,9 @@ linux|linux-symbol-contract|/usr/bin/make -B release-symbol-contract-test
 linux|linux-contract|/usr/bin/make release-contract-test
 linux|linux-clang-test|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
 linux|linux-clang-artifact|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
-macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test
-macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
-macos|macos-contract|make release-contract-test
+macos|macos-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
+macos|macos-artifact|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+macos|macos-contract|/usr/bin/make release-contract-test
 freebsd|freebsd-test|gmake BUILD_TYPE=release WERROR=1 test
 freebsd|freebsd-artifact|gmake BUILD_TYPE=release WERROR=1 release-artifact-test
 freebsd|freebsd-contract|gmake release-contract-test
@@ -2591,12 +2613,12 @@ linux|linux-clang-artifact|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 
 linux|linux-clang-artifact|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
 linux|linux-clang-artifact|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|READLINE=1|READLINE=0
 linux|linux-clang-artifact|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|WERROR=1|WERROR=0
-macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
-macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|READLINE=1|READLINE=0
-macos|macos-test|make BUILD_TYPE=release READLINE=1 WERROR=1 test|WERROR=1|WERROR=0
-macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
-macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|READLINE=1|READLINE=0
-macos|macos-artifact|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|WERROR=1|WERROR=0
+macos|macos-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
+macos|macos-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test|READLINE=1|READLINE=0
+macos|macos-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test|WERROR=1|WERROR=0
+macos|macos-artifact|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
+macos|macos-artifact|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|READLINE=1|READLINE=0
+macos|macos-artifact|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|WERROR=1|WERROR=0
 freebsd|freebsd-test|gmake BUILD_TYPE=release WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
 freebsd|freebsd-test|gmake BUILD_TYPE=release WERROR=1 test|WERROR=1|WERROR=0
 freebsd|freebsd-artifact|gmake BUILD_TYPE=release WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
@@ -2690,7 +2712,7 @@ while IFS='|' read -r matrix_job matrix_command; do
         "required release gate step cannot set working-directory"
 done <<'EOF'
 linux|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
-macos|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+macos|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
 freebsd|gmake BUILD_TYPE=release WERROR=1 test
 EOF
 
@@ -2805,7 +2827,7 @@ while IFS='|' read -r matrix_job matrix_command; do
 done <<'EOF'
 linux|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
 linux|/usr/bin/make CC=clang BUILD_TYPE=release READLINE=1 WERROR=1 test
-macos|make BUILD_TYPE=release READLINE=1 WERROR=1 test
+macos|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
 EOF
 
 awk '
@@ -2880,7 +2902,7 @@ while IFS='|' read -r matrix_job matrix_command; do
         "required release gate environment is missing or unsafe"
 done <<'EOF'
 linux|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
-macos|make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+macos|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
 freebsd|gmake BUILD_TYPE=release WERROR=1 release-artifact-test
 EOF
 
@@ -3043,8 +3065,8 @@ expect_structural_rejected_for "Linux false-and release bypass" \
     "$tmp/linux-false-and.yml" "$today" \
     "missing or duplicate exact release gate: linux-gcc-test"
 
-mutate_release_command macos "make release-contract-test" \
-    "make release-contract-test || true" "$tmp/macos-or-true.yml"
+mutate_release_command macos "/usr/bin/make release-contract-test" \
+    "/usr/bin/make release-contract-test || true" "$tmp/macos-or-true.yml"
 expect_structural_rejected_for "macOS suppressed release contract" \
     "$tmp/macos-or-true.yml" "$today" \
     "missing or duplicate exact release gate: macos-contract"
@@ -3063,8 +3085,8 @@ expect_structural_rejected_for "FreeBSD block comment contract decoy" \
     "$tmp/freebsd-comment-decoy.yml" "$today" \
     "missing or duplicate exact release gate: freebsd-contract"
 
-mutate_release_command macos "make release-contract-test" \
-    "echo make release-contract-test" "$tmp/macos-echo-decoy.yml"
+mutate_release_command macos "/usr/bin/make release-contract-test" \
+    "echo /usr/bin/make release-contract-test" "$tmp/macos-echo-decoy.yml"
 expect_structural_rejected_for "macOS echo contract decoy" \
     "$tmp/macos-echo-decoy.yml" "$today" \
     "missing or duplicate exact release gate: macos-contract"
@@ -3076,11 +3098,11 @@ awk '
     }
     in_macos && !named &&
         $0 == "      - name: Release input consistency and dirty-tree refusal" {
-        print "      - name: make release-contract-test"
+        print "      - name: /usr/bin/make release-contract-test"
         named = 1
         next
     }
-    in_macos && !changed && $0 == "        run: make release-contract-test" {
+    in_macos && !changed && $0 == "        run: /usr/bin/make release-contract-test" {
         print "        run: true"
         changed = 1
         next
@@ -3097,10 +3119,10 @@ awk '
     /^  [A-Za-z0-9_-]+:[[:space:]]*$/ && $0 !~ /^  macos:/ {
         in_macos = 0
     }
-    in_macos && !changed && $0 == "        run: make release-contract-test" {
+    in_macos && !changed && $0 == "        run: /usr/bin/make release-contract-test" {
         print "        run: true"
         print "        env:"
-        print "          FAKE_POLICY_TEXT: make release-contract-test"
+        print "          FAKE_POLICY_TEXT: /usr/bin/make release-contract-test"
         changed = 1
         next
     }
@@ -3211,14 +3233,14 @@ awk '
     }
     !first &&
         in_macos &&
-        $0 == "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test" {
-        print "        run: make release-contract-test"
+        $0 == "        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test" {
+        print "        run: /usr/bin/make release-contract-test"
         first = 1
         next
     }
     in_macos && first && !second &&
-        $0 == "        run: make release-contract-test" {
-        print "        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test"
+        $0 == "        run: /usr/bin/make release-contract-test" {
+        print "        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test"
         second = 1
         next
     }

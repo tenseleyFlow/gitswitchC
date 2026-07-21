@@ -194,6 +194,60 @@ TEST(file_parser_enforces_the_same_line_ending_grammar) {
     toml_cleanup_document(&doc);
 }
 
+/* AR-12 L23: duplicate/collision diagnostics anchor at the offending
+ * construct's start, not one past its end. */
+TEST(duplicate_diagnostics_anchor_at_construct_start) {
+    static const char dup_key[] =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "default_scope = \"local\"\n";
+    static const char dup_section[] =
+        "[settings]\n"
+        "default_scope = \"local\"\n"
+        "[settings]\n";
+    toml_document_t doc;
+
+    clear_error();
+    CHECK_EQ_INT(toml_parse_string(dup_key, sizeof(dup_key) - 1U, &doc), -1);
+    CHECK(strstr(get_last_error()->message, "Duplicate key") != NULL);
+    CHECK(strstr(get_last_error()->message, "line 3, column 1") != NULL);
+    toml_cleanup_document(&doc);
+
+    clear_error();
+    CHECK_EQ_INT(toml_parse_string(dup_section, sizeof(dup_section) - 1U,
+                                   &doc), -1);
+    CHECK(strstr(get_last_error()->message, "Duplicate section") != NULL);
+    CHECK(strstr(get_last_error()->message, "line 3, column 1") != NULL);
+    toml_cleanup_document(&doc);
+}
+
+/* AR-12 L22: the permission gate must reject group/other WRITE access, not
+ * just read — a writing peer can redirect ssh_key and alter the identity. */
+TEST(file_parser_rejects_group_or_other_writable_configs) {
+    static const mode_t unsafe_modes[] = {0620, 0602, 0622};
+    static const char body[] =
+        "[settings]\n"
+        "default_scope = \"local\"\n";
+    toml_document_t doc;
+    char dir[128], path[192];
+
+    for (size_t i = 0; i < sizeof(unsafe_modes) / sizeof(unsafe_modes[0]);
+         i++) {
+        if (make_temp_toml_path(dir, sizeof(dir), path, sizeof(path)) != 0 ||
+            write_exact_toml_bytes(path, body, sizeof(body) - 1U) != 0) {
+            CHECK(0);
+            return;
+        }
+        CHECK_EQ_INT(chmod(path, unsafe_modes[i]), 0);
+        clear_error();
+        CHECK_EQ_INT(toml_parse_file(path, &doc), -1);
+        CHECK(strstr(get_last_error()->message, "unsafe permissions") !=
+              NULL);
+        toml_cleanup_document(&doc);
+        remove(path);
+    }
+}
+
 TEST(rejects_overlong_string_value) {
     toml_document_t doc;
     char big[700];
@@ -1059,6 +1113,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(rejects_bare_carriage_return_line_endings);
     RUN_TEST(crlf_diagnostics_and_escaped_cr_remain_distinct);
     RUN_TEST(file_parser_enforces_the_same_line_ending_grammar);
+    RUN_TEST(duplicate_diagnostics_anchor_at_construct_start);
+    RUN_TEST(file_parser_rejects_group_or_other_writable_configs);
     RUN_TEST(rejects_overlong_string_value);
     RUN_TEST(rejects_overlong_section_name);
     RUN_TEST(get_string_rejects_value_too_long_for_dest);
