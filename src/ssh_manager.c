@@ -2199,7 +2199,15 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
     /* A requested alias is part of the account's SSH routing contract. If the
      * managed block cannot be installed safely, fail the switch so the account
      * layer rolls back the agent/runtime commit instead of claiming success
-     * with stale user SSH configuration. */
+     * with stale user SSH configuration.
+     *
+     * AR-12 U2 (adjudicated, kept): this one-call library path deliberately
+     * folds every alias-install outcome into pass/fail — an
+     * installed-but-uncertain publication reports failure and the runtime
+     * rolls back around the (benign) already-public block. The CLI's
+     * prepared/commit path uses ssh_configure_host_alias_result to
+     * distinguish retained commits; direct callers keep the simpler
+     * historical contract. */
     if (strlen(account->ssh_host_alias) > 0) {
         if (ssh_configure_host_alias(account) != 0) {
             log_warning("Failed to configure SSH host alias: %s", account->ssh_host_alias);

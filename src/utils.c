@@ -4424,13 +4424,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                      wait_result.wait_errno == EINTR &&
                      wait_result.mask_errno == 0);
 
-            if (wait_result.mask_errno != 0) {
-                wait_failed = true;
-                wait_errno = wait_result.mask_errno;
-                if (infd >= 0) { close(infd); infd = -1; }
-                if (outfd >= 0) { close(outfd); outfd = -1; }
-                break;
-            } else if (wait_result.waited == pid) {
+            /* AR-12 U4: process a successful reap FIRST even when a
+             * mask-restore failure is reported alongside it — the PID is
+             * consumed and the exit status is valid; discarding the reap
+             * left child_reaped false and re-waited a released PID. The
+             * mask failure still fails the call afterwards. */
+            if (wait_result.waited == pid) {
                 child_reaped = true;
                 if (infd >= 0) {
                     if (in_off < opts->input_len) input_failed = true;
@@ -4448,6 +4447,19 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                         capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
                     }
                 }
+                if (wait_result.mask_errno != 0) {
+                    wait_failed = true;
+                    wait_errno = wait_result.mask_errno;
+                    if (infd >= 0) { close(infd); infd = -1; }
+                    if (outfd >= 0) { close(outfd); outfd = -1; }
+                    break;
+                }
+            } else if (wait_result.mask_errno != 0) {
+                wait_failed = true;
+                wait_errno = wait_result.mask_errno;
+                if (infd >= 0) { close(infd); infd = -1; }
+                if (outfd >= 0) { close(outfd); outfd = -1; }
+                break;
             } else if (wait_result.waited < 0) {
                 wait_failed = true;
                 wait_errno = wait_result.wait_errno;
@@ -5874,7 +5886,10 @@ int get_terminal_size(int *width, int *height) {
     }
 
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) {
-        set_system_error(ERR_SYSTEM_CALL, "Failed to get terminal size");
+        /* AR-12 U5: fail silently like the isatty and 0x0 branches —
+         * display_init falls back to defaults and returns success, so a
+         * live global error here would surface in unrelated later
+         * diagnostics. */
         return -1;
     }
 
