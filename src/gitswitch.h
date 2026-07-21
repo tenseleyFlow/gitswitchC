@@ -88,6 +88,12 @@ typedef struct {
     /* SSH configuration */
     bool ssh_enabled;
     char ssh_key_path[MAX_PATH_LEN];
+    /* AR-12 L8: the exact persisted ssh_key spelling (e.g. '~/.ssh/id_x')
+     * captured at load before tilde expansion. Save re-emits it verbatim
+     * while it still expands to ssh_key_path, so a load+save cycle never
+     * silently rewrites the user's portable spelling. Empty when the model
+     * value did not come from a differing on-disk spelling. */
+    char ssh_key_spelling[MAX_PATH_LEN];
     char ssh_host_alias[MAX_NAME_LEN]; /* Managed `Host` alias (`ssh_host`). */
     char ssh_hostname[MAX_NAME_LEN];   /* Canonical destination (`ssh_hostname`). */
     

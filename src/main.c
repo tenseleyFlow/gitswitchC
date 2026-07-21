@@ -1683,9 +1683,14 @@ int main(int argc, char *argv[]) {
                                     "unknown persistence error");
             } else if (reset_outcome ==
                        ACCOUNTS_RETIREMENT_SAVE_DURABLE) {
+                /* AR-12 L13: a targeted reset of a non-active account runs
+                 * no save at all; do not claim one completed durably. */
                 display_error(
-                    "Reset state was saved, but retirement cleanup is incomplete",
-                    "the active-state save completed durably%s%s",
+                    "Reset completed, but retirement cleanup is incomplete",
+                    "%s%s%s",
+                    mutation.save_kind == COMMAND_SAVE_NONE
+                        ? "no active-state change was required"
+                        : "the active-state save completed durably",
                     reset_finalize_detail[0] ? "; finalization error: " : "",
                     reset_finalize_detail[0] ? reset_finalize_detail : "");
             } else {

@@ -1119,8 +1119,14 @@ static int publication_parse_record(publication_reader_t *reader,
     READ_FIELD("post_config");
     if (publication_parse_identity(value, length, &record->post_config) != 0) return -1;
     READ_FIELD("capabilities");
-    if (length != 8U || publication_copy_token(value, length, token,
-                                               sizeof(token)) != 0) return -1;
+    /* AR-12 L16: name the rejection instead of surfacing a stale earlier
+     * diagnostic through the bare -1. */
+    if (length != 8U) {
+        return publication_invalid(
+            "Invalid publication capability mask length");
+    }
+    if (publication_copy_token(value, length, token,
+                               sizeof(token)) != 0) return -1;
     for (size_t i = 0; i < length; i++) {
         if (!isdigit((unsigned char)token[i]) &&
             (token[i] < 'A' || token[i] > 'F')) {
@@ -1137,9 +1143,17 @@ static int publication_parse_record(publication_reader_t *reader,
         record->capabilities = (uint32_t)parsed;
     }
     READ_FIELD("gpg_fingerprint");
+    /* AR-12 L17: '-' is the ONLY canonical empty spelling; a zero-length
+     * value would alias it, breaking the byte-for-byte round-trip the
+     * serializer guarantees. */
     if (length == 1U && value[0] == '-') record->gpg_fingerprint[0] = '\0';
-    else if (publication_copy_token(value, length, record->gpg_fingerprint,
-                                    sizeof(record->gpg_fingerprint)) != 0) return -1;
+    else if (length == 0U) {
+        return publication_invalid(
+            "Empty publication gpg_fingerprint requires '-'");
+    } else if (publication_copy_token(value, length, record->gpg_fingerprint,
+                                      sizeof(record->gpg_fingerprint)) != 0) {
+        return -1;
+    }
     /* Selector provenance was added to v1 while it was still an internal,
      * unreleased ledger. Accept the older fingerprint->program sequence so
      * such records remain available for exact retirement, but leave the
@@ -1148,6 +1162,9 @@ static int publication_parse_record(publication_reader_t *reader,
         READ_FIELD("gpg_selector");
         if (length == 1U && value[0] == '-') {
             record->gpg_selector[0] = '\0';
+        } else if (length == 0U) {
+            return publication_invalid(
+                "Empty publication gpg_selector requires '-'");
         } else if (publication_copy_token(
                        value, length, record->gpg_selector,
                        sizeof(record->gpg_selector)) != 0) {
@@ -1226,10 +1243,19 @@ int publication_ledger_parse(const unsigned char *data, size_t length,
     reader.cursor = data;
     reader.end = data + length;
     if (publication_expect_literal(&reader, "publications=v1") != 0 ||
-        publication_read_line(&reader, &value, &value_length) != 0 ||
-        value_length < sizeof("count=") - 1U ||
-        memcmp(value, "count=", sizeof("count=") - 1U) != 0 ||
-        publication_parse_uintmax(
+        publication_read_line(&reader, &value, &value_length) != 0) {
+        publication_ledger_clear(&parsed);
+        return -1;
+    }
+    /* AR-12 L16: name the count-line rejection instead of returning a bare
+     * -1 that surfaces a stale earlier diagnostic. */
+    if (value_length < sizeof("count=") - 1U ||
+        memcmp(value, "count=", sizeof("count=") - 1U) != 0) {
+        publication_ledger_clear(&parsed);
+        return publication_invalid(
+            "Malformed publication ledger count line");
+    }
+    if (publication_parse_uintmax(
             value + sizeof("count=") - 1U,
             value_length - (sizeof("count=") - 1U),
             PUBLICATION_LEDGER_MAX_RECORDS, &count) != 0) {

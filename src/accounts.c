@@ -2570,6 +2570,9 @@ static int restore_pending_edit_alias(void) {
 
     if (!g_pending_edit.routing_changed) return 0;
 
+    /* AR-12 L4: both rollback legs may fail in one abort; keep the FIRST
+     * failing leg's diagnostic as the published cause instead of letting
+     * the second overwrite it. */
     if (g_pending_edit.candidate_alias_attempted) {
         if (account_has_managed_alias(candidate) &&
             account_has_managed_alias(original) &&
@@ -2578,13 +2581,18 @@ static int restore_pending_edit_alias(void) {
             g_pending_edit.original_alias_exclusive) {
             if (ssh_configure_host_alias(original) != 0) {
                 complete = false;
-                safe_strncpy(detail, get_last_error()->message,
-                             sizeof(detail));
+                if (detail[0] == '\0') {
+                    safe_strncpy(detail, get_last_error()->message,
+                                 sizeof(detail));
+                }
             }
         } else if (candidate->ssh_host_alias[0] != '\0' &&
                    ssh_remove_host_alias(candidate->ssh_host_alias) != 0) {
             complete = false;
-            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            if (detail[0] == '\0') {
+                safe_strncpy(detail, get_last_error()->message,
+                             sizeof(detail));
+            }
         }
     }
 
@@ -2596,7 +2604,10 @@ static int restore_pending_edit_alias(void) {
                                   original->ssh_host_alias))) {
         if (ssh_configure_host_alias(original) != 0) {
             complete = false;
-            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            if (detail[0] == '\0') {
+                safe_strncpy(detail, get_last_error()->message,
+                             sizeof(detail));
+            }
         }
     }
 

@@ -6549,15 +6549,11 @@ static int git_retire_validate_publication(
                   "Account has no exact durable Git publication provenance");
         return -1;
     }
-    if ((publication->capabilities &
-         PUBLICATION_CAP_GPG_FINGERPRINT) != 0U &&
-        !git_signing_key_matches_fingerprint(
-            publication->gpg_fingerprint,
-            publication->gpg_fingerprint)) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Publication record has no canonical signing fingerprint");
-        return -1;
-    }
+    /* AR-12 L9: no fingerprint re-check here — publication_record_validate()
+     * above already enforces the canonical 40/64-hex grammar for any record
+     * carrying PUBLICATION_CAP_GPG_FINGERPRINT, and record-driven retirement
+     * deliberately does not re-bind the record to the account's current
+     * gpg_key_id (the incarnation match above is the ownership proof). */
     return 0;
 }
 

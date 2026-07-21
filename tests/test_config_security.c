@@ -1515,6 +1515,62 @@ TEST(non_roundtrip_ssh_key_rejected_at_admission_and_skipped_on_load) {
     CHECK(strstr(get_last_error()->message, "SSH key path") != NULL);
 }
 
+/* AR-12 L8: a load+save cycle must re-emit the user's portable '~/...'
+ * ssh_key spelling instead of silently persisting the expanded absolute
+ * path; an API edit that changes the path falls back to the new bytes. */
+TEST(tilde_ssh_key_spelling_survives_load_and_save) {
+    char dir[128], path[256], sshdir[300], key[360], cfg[2048];
+    char saved_home[4096], after[4096];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(setenv("HOME", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(sshdir, sizeof(sshdir), "%s/.ssh", dir);
+    CHECK_EQ_INT(mkdir(sshdir, 0700), 0);
+    snprintf(key, sizeof(key), "%s/id_tilde", sshdir);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"tilde\"\n"
+                   "email = \"tilde@example.com\"\n"
+                   "ssh_key = \"~/.ssh/id_tilde\"\n") < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    /* The model works on the expanded path... */
+    CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, key);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    /* ...but the persisted bytes keep the user's spelling. */
+    CHECK(strstr(after, "ssh_key = \"~/.ssh/id_tilde\"") != NULL);
+    CHECK(strstr(after, dir) == NULL || strstr(after, key) == NULL);
+
+    /* An API edit to a different path persists the new bytes, not the
+     * stale spelling. */
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].ssh_key_path, key,
+                              sizeof(ctx.accounts[0].ssh_key_path)), 0);
+    snprintf(key, sizeof(key), "%s/id_other", sshdir);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].ssh_key_path, key,
+                              sizeof(ctx.accounts[0].ssh_key_path)), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    CHECK(strstr(after, "id_other") != NULL);
+    CHECK(strstr(after, "ssh_key = \"~/.ssh/id_tilde\"") == NULL);
+
+    restore_home_env(saved_home);
+}
+
 TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     static const char *const invalid[] = {
         "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
@@ -2528,4 +2584,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
     RUN_TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load);
     RUN_TEST(non_roundtrip_ssh_key_rejected_at_admission_and_skipped_on_load);
+    RUN_TEST(tilde_ssh_key_spelling_survives_load_and_save);
 TEST_MAIN_END()

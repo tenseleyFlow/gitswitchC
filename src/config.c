@@ -8289,9 +8289,15 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             if (fs == FIELD_LOADED && strlen(account.ssh_key_path) > 0) {
                 account.ssh_enabled = true;
 
-                /* Expand path if needed */
+                /* Expand path if needed. AR-12 L8: retain the persisted
+                 * spelling first so a later save can re-emit the user's
+                 * portable '~/...' form instead of the expanded path. */
                 char expanded_path[MAX_PATH_LEN];
-                if (expand_path(account.ssh_key_path, expanded_path, sizeof(expanded_path)) == 0) {
+                if (expand_path(account.ssh_key_path, expanded_path, sizeof(expanded_path)) == 0 &&
+                    strcmp(expanded_path, account.ssh_key_path) != 0) {
+                    safe_strncpy(account.ssh_key_spelling,
+                                 account.ssh_key_path,
+                                 sizeof(account.ssh_key_spelling));
                     safe_strncpy(account.ssh_key_path, expanded_path, sizeof(account.ssh_key_path));
                 }
 
@@ -8883,8 +8889,20 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
 
         /* Save SSH configuration */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
+            /* AR-12 L8: re-emit the user's persisted spelling while it
+             * still expands to the live model value; an edited path (stale
+             * spelling) falls back to the expanded bytes. */
+            const char *ssh_key_value = account->ssh_key_path;
+            char respelled[MAX_PATH_LEN];
+
+            if (account->ssh_key_spelling[0] != '\0' &&
+                expand_path(account->ssh_key_spelling, respelled,
+                            sizeof(respelled)) == 0 &&
+                strcmp(respelled, account->ssh_key_path) == 0) {
+                ssh_key_value = account->ssh_key_spelling;
+            }
             if (toml_set_string(doc, section_name, "ssh_key",
-                                account->ssh_key_path) != 0) {
+                                ssh_key_value) != 0) {
                 set_error(ERR_CONFIG_INVALID, "Failed to save SSH key path");
                 return -1;
             }

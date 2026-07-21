@@ -375,8 +375,10 @@ int create_directory_recursive(const char *path, mode_t mode) {
     struct stat named;
 
     if (!path || !*path) {
-        /* Reject an empty path too (AR-06 F78): the trailing-slash check below
-         * reads temp_path[len-1], an out-of-bounds stack read when len == 0. */
+        /* Reject NULL/empty (AR-06 F78, rationale updated AR-12 L24): the
+         * component walk below requires at least one component, and the
+         * absolute-vs-relative dispatch must not consult path[0] of an
+         * empty string. */
         set_error(ERR_INVALID_ARGS, "NULL or empty path to create_directory_recursive");
         return -1;
     }
@@ -3510,6 +3512,10 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->spawned = false;
     result->out_len = 0;
     result->out_truncated = false;
+    /* AR-12 L12 (defense in depth): terminate the caller's capture buffer
+     * before any early-return validation path, so a pre-spawn failure never
+     * leaves callers formatting uninitialized bytes. */
+    if (opts->out && opts->out_size > 0) opts->out[0] = '\0';
     g_test_fd_close_observation_valid = false;
     memset(&g_test_fd_close_observation, 0,
            sizeof(g_test_fd_close_observation));

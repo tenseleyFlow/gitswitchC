@@ -5252,7 +5252,10 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
      * silent cap then fed the corrupt armor straight to `gpg --import`
      * (AR-02 #4). Truncation is detected and refused explicitly below. */
     enum { KEY_DATA_CAP = 512 * 1024 };
-    char import_diag[1024];
+    /* AR-12 L12: run_argv has early-return paths that never touch the
+     * capture buffer; initialize so a pre-spawn failure cannot format
+     * uninitialized stack bytes into the user-facing diagnostic. */
+    char import_diag[1024] = "";
     const char *env[2] = {"GNUPGHOME=.", NULL};
     char *key_data;
     char imported_fingerprint[GPG_FINGERPRINT_BUFSIZE];

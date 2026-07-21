@@ -1974,7 +1974,10 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
     
     skip_whitespace(state);
     
-    /* Determine value type and parse */
+    /* Determine value type and parse. AR-12 L21: cast for isdigit — an
+     * unquoted value may begin with a UTF-8 lead byte, which is negative on
+     * signed-char platforms and UB to pass to isdigit() raw (the sibling
+     * call in parse_integer_value already casts). */
     char c = current_char(state);
     
     if (c == '"') {
@@ -1995,7 +1998,7 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
             return 0;
         }
         return -1;
-    } else if (isdigit(c) || c == '-' || c == '+') {
+    } else if (isdigit((unsigned char)c) || c == '-' || c == '+') {
         /* Integer value */
         kv->type = TOML_TYPE_INTEGER;
         int int_val;
