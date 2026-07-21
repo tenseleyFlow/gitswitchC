@@ -2269,6 +2269,16 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         git_config_commit();
     }
 
+    /* AR-12 M1/L3: the installed alias publication above and this Git
+     * commit are the transaction's point of no return. Report the committed
+     * state NOW: a later ownership-release or signal-guard failure returns
+     * -1, and NOT_COMMITTED at that point would authorize the caller to
+     * restore persistence before-images around a switch that has fully
+     * committed (main keys its rollback branch off exactly this state). */
+    if (state) {
+        *state = final_state;
+    }
+
     accounts_transaction_token_t token = g_pending_switch.token;
     runtime_state_lock_release(g_pending_switch.runtime_lock_fd);
     g_pending_switch.runtime_lock_fd = -1;
@@ -2291,9 +2301,6 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         finish_signal_guard_checked(
             "Prepared switch committed, but restoring the caller's signal dispositions failed") != 0) {
         return -1;
-    }
-    if (state) {
-        *state = final_state;
     }
     if (final_state != ACCOUNTS_SWITCH_COMMIT_COMPLETE) {
         set_retained_alias_publication_error(target->name,

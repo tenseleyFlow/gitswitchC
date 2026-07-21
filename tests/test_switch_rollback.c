@@ -4804,6 +4804,42 @@ TEST(abort_only_pending_switch_excludes_competing_entry_matrix) {
     }
 }
 
+/* AR-12 M1: failures in the post-commit finalization tail (ownership
+ * release, signal-guard restore) occur after the switch's point of no
+ * return: the alias has published and git_config_commit() discarded the
+ * before-image. The commit-state out-parameter must then report the
+ * committed state, never NOT_COMMITTED — which would authorize main to
+ * restore persistence before-images around a fully committed switch. */
+TEST(guard_restore_failure_after_commit_reports_committed_state) {
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    accounts_switch_commit_state_t state =
+        ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED;
+    int rc;
+
+    CHECK_EQ_INT(setup_empty_runtime_dir(), 0);
+    CHECK_EQ_INT(signals_guard_end(), 0);
+    signals_rollback_end();
+    ctx = make_ctx();
+    seed_previous_git_identity();
+    previous_runner = run_set_runner(fake_runner);
+    CHECK_EQ_INT(accounts_switch_prepare(&ctx, "testacct"), 0);
+    signals_test_fail_sigaction(SIGTERM, SIGNALS_TEST_SIGACTION_RESTORE,
+                                EIO);
+    rc = accounts_switch_commit_result(&ctx, &state);
+    signals_test_fail_sigaction(0, SIGNALS_TEST_SIGACTION_NONE, 0);
+    run_set_runner(previous_runner);
+
+    CHECK_EQ_INT(rc, -1);
+    CHECK_EQ_INT(state, ACCOUNTS_SWITCH_COMMIT_COMPLETE);
+    /* The switch really committed. */
+    CHECK_STR_EQ(g_store_name, "testacct");
+    CHECK_STR_EQ(g_store_email, "test@example.com");
+    signals_rollback_end();
+    (void)signals_guard_end();
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+}
+
 static void fail_guard_restore_retry(void) {
     signals_test_fail_sigaction(SIGINT, SIGNALS_TEST_SIGACTION_RESTORE,
                                 EAGAIN);
@@ -5597,6 +5633,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(prepared_switch_gates_public_account_model_mutation_matrix);
     RUN_TEST(prepared_commit_accepts_unchanged_tilde_ssh_path);
     RUN_TEST(abort_only_pending_switch_excludes_competing_entry_matrix);
+    RUN_TEST(guard_restore_failure_after_commit_reports_committed_state);
     RUN_TEST(guard_begin_partial_restore_is_synchronously_released);
     RUN_TEST(guard_begin_restore_retry_publishes_abort_only_handle);
     RUN_TEST(failed_prepare_releases_callers_signal_dispositions);
