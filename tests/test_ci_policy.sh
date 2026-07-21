@@ -478,7 +478,9 @@ check_policy()
                                        freebsd_errexit_count,
                                        freebsd_errexit_serial,
                                        first_gate_serial,
-                                       direct_release_test) {
+                                       direct_release_test,
+                                       sanitizer_release_test,
+                                       repro_release_test) {
             step_gate_count = 0
             first_gate_serial = 0
             for (i = 1; i <= step_command_count; i++) {
@@ -523,6 +525,25 @@ check_policy()
                             gate = "linux-extra-clean"
                     } else if (command == "/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test")
                         gate = "linux-gcc-test"
+                    else if (command == "/usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test") {
+                        # AR-12 M9: the debug ASan/UBSan lane and the QA/
+                        # memory-safety lanes below could be silently deleted
+                        # from ci.yml without failing this guardian.
+                        gate = "linux-asan-test"
+                        sanitizer_release_test = 1
+                    } else if (command == "/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 memcheck")
+                        gate = "linux-memcheck"
+                    else if (command == "/usr/bin/make distcheck")
+                        gate = "linux-distcheck"
+                    else if (command == "/usr/bin/make qa-contract-test")
+                        gate = "linux-qa-contract"
+                    else if (command == "/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 sig-repro-test") {
+                        gate = "linux-sig-repro"
+                        repro_release_test = 1
+                    } else if (command == "/usr/bin/make analyze")
+                        gate = "linux-analyze"
+                    else if (command == "/usr/bin/make security-scan")
+                        gate = "linux-security-scan"
                     else if (command == "/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test")
                         gate = "linux-gcc-artifact"
                     else if (command == "/usr/bin/make -B release-symbol-contract-test")
@@ -597,7 +618,17 @@ check_policy()
                          step_caps_value != (current_job == "linux" ? \
                              "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace" : \
                              "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets"))) ||
-                       (!direct_release_test &&
+                       (sanitizer_release_test &&
+                        (step_env_map_count != 1 || step_env_count != 3 ||
+                         step_sanitizer_env_count != 2 ||
+                         step_caps_count != 1 ||
+                         step_caps_value != "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace")) ||
+                       (repro_release_test &&
+                        (step_env_map_count != 1 || step_env_count != 1 ||
+                         step_caps_count != 1 ||
+                         step_caps_value != "openssh")) ||
+                       (!direct_release_test && !sanitizer_release_test &&
+                        !repro_release_test &&
                         (step_env_map_count != 0 || step_env_count != 0))) {
                 reject("required release gate environment is missing or unsafe")
             }
@@ -700,6 +731,7 @@ check_policy()
             step_env_map_count = 0
             step_env_count = 0
             step_env_unsafe = 0
+            step_sanitizer_env_count = 0
             step_caps_count = 0
             step_caps_value = ""
             block_scalar_purpose = ""
@@ -1209,6 +1241,16 @@ check_policy()
                 if (entry_key == "GITSWITCH_TEST_REQUIRED_CAPS") {
                     step_caps_count++
                     step_caps_value = scalar_value
+                } else if (entry_key == "ASAN_OPTIONS") {
+                    # AR-12 M9: the sanitizer lane pins its exact strictness;
+                    # a weakened option set is the same silent-deletion class.
+                    step_sanitizer_env_count++
+                    if (scalar_value != "detect_leaks=1:abort_on_error=1:strict_string_checks=1")
+                        step_env_unsafe = 1
+                } else if (entry_key == "UBSAN_OPTIONS") {
+                    step_sanitizer_env_count++
+                    if (scalar_value != "halt_on_error=1:print_stacktrace=1")
+                        step_env_unsafe = 1
                 } else {
                     step_env_unsafe = 1
                 }
@@ -1321,6 +1363,13 @@ check_policy()
             close_job()
             require_release_gate("linux-make-provenance")
             require_release_gate("linux-policy")
+            require_release_gate("linux-asan-test")
+            require_release_gate("linux-memcheck")
+            require_release_gate("linux-distcheck")
+            require_release_gate("linux-qa-contract")
+            require_release_gate("linux-sig-repro")
+            require_release_gate("linux-analyze")
+            require_release_gate("linux-security-scan")
             require_release_gate("linux-coverage")
             require_release_gate("linux-coverage-provenance")
             require_release_gate("linux-gcc-clean")
@@ -2512,21 +2561,23 @@ expect_structural_rejected_for "duplicate policy self-check" \
 # every required knob on every affected platform/compiler/command combination.
 config_matrix_index=0
 while IFS='|' read -r matrix_job matrix_gate matrix_command matrix_token \
-    matrix_replacement; do
+    matrix_replacement matrix_reason; do
     config_matrix_index=$((config_matrix_index + 1))
     matrix_fixture=$tmp/release-config-$config_matrix_index.yml
     matrix_mutated=$(printf '%s\n' "$matrix_command" |
         sed "s/$matrix_token/$matrix_replacement/")
     [ "$matrix_mutated" != "$matrix_command" ] ||
         fail "release configuration mutation did not change $matrix_gate"
+    [ -n "$matrix_reason" ] ||
+        matrix_reason="missing or duplicate exact release gate: $matrix_gate"
     mutate_release_command "$matrix_job" "$matrix_command" "$matrix_mutated" \
         "$matrix_fixture"
     expect_structural_rejected_for \
         "$matrix_gate with mutated $matrix_token configuration" \
         "$matrix_fixture" "$today" \
-        "missing or duplicate exact release gate: $matrix_gate"
+        "$matrix_reason"
 done <<'EOF'
-linux|linux-gcc-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug
+linux|linux-gcc-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test|BUILD_TYPE=release|BUILD_TYPE=debug|required release gate environment is missing or unsafe
 linux|linux-gcc-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test|READLINE=1|READLINE=0
 linux|linux-gcc-test|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test|WERROR=1|WERROR=0
 linux|linux-gcc-artifact|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test|BUILD_TYPE=release|BUILD_TYPE=debug
@@ -2653,25 +2704,30 @@ expect_structural_rejected_for "redirected Linux policy self-check" \
     "$tmp/workdir-linux-policy-self-check.yml" "$today" \
     "required release gate step cannot set working-directory"
 
+# AR-12 M9: the QA/memory-safety lanes are now exact release gates, so their
+# redirection trips the gate-specific check; non-gate direct steps keep the
+# job-wide message.
 linux_workdir_index=0
-while IFS='|' read -r matrix_label matrix_command; do
+while IFS='|' read -r matrix_label matrix_command matrix_reason; do
     linux_workdir_index=$((linux_workdir_index + 1))
     matrix_fixture=$tmp/workdir-linux-$linux_workdir_index.yml
+    [ -n "$matrix_reason" ] ||
+        matrix_reason="direct steps in required release jobs cannot set working-directory"
     add_release_step_field linux "$matrix_command" \
         "working-directory: fixtures/noop" "$matrix_fixture"
     expect_structural_rejected_for \
         "redirected Linux $matrix_label step" \
         "$matrix_fixture" "$today" \
-        "direct steps in required release jobs cannot set working-directory"
+        "$matrix_reason"
 done <<'EOF'
 shell static policy|/usr/bin/make shell-static-test
-debug sanitizer suite|/usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test
-Valgrind suite|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 memcheck
-distribution check|/usr/bin/make distcheck
-static analysis|/usr/bin/make analyze
-security scan|/usr/bin/make security-scan
-QA negative contracts|/usr/bin/make qa-contract-test
-signal repro|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 sig-repro-test
+debug sanitizer suite|/usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test|required release gate step cannot set working-directory
+Valgrind suite|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 memcheck|required release gate step cannot set working-directory
+distribution check|/usr/bin/make distcheck|required release gate step cannot set working-directory
+static analysis|/usr/bin/make analyze|required release gate step cannot set working-directory
+security scan|/usr/bin/make security-scan|required release gate step cannot set working-directory
+QA negative contracts|/usr/bin/make qa-contract-test|required release gate step cannot set working-directory
+signal repro|/usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 sig-repro-test|required release gate step cannot set working-directory
 EOF
 
 awk '
