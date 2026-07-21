@@ -130,9 +130,17 @@ typedef struct {
     char alias[MAX_NAME_LEN];
     bool alias_exclusive;
     pending_retirement_t retirement;
+    /* AR-12 P1: the deleted account's pre-removal snapshot, so a
+     * PREINSTALL_FAILED finalize can restore the in-memory model to agree
+     * with the durable file it declares the retry handle. */
+    account_t removed_account;
+    bool removed_valid;
+    bool removed_was_active;
+    bool removed_was_current;
 } pending_remove_t;
 
 static pending_remove_t g_pending_remove = {0};
+static account_t g_pending_remove_snapshot;
 
 typedef struct {
     bool active;
@@ -3589,7 +3597,37 @@ int accounts_remove_finalize(
 
     /* A pre-install outcome deliberately leaves the durable account/alias
      * pair intact. Runtime teardown cannot be undone, but the account remains
-     * the exact supported retry handle after Git/ledger rollback. */
+     * the exact supported retry handle after Git/ledger rollback.
+     * AR-12 P1: restore the in-memory model to match — a caller that later
+     * runs a full save from this context must not erase the preserved
+     * account or persist the cleared active name. */
+    if (outcome == ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED &&
+        g_pending_remove.removed_valid &&
+        ctx->account_count < MAX_ACCOUNTS) {
+        bool already_present = false;
+
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            if (ctx->accounts[i].id ==
+                g_pending_remove.removed_account.id) {
+                already_present = true;
+                break;
+            }
+        }
+        if (!already_present) {
+            account_t *restored = &ctx->accounts[ctx->account_count];
+
+            *restored = g_pending_remove.removed_account;
+            ctx->account_count++;
+            if (g_pending_remove.removed_was_active) {
+                (void)safe_strncpy(ctx->config.active_account,
+                                   restored->name,
+                                   sizeof(ctx->config.active_account));
+            }
+            if (g_pending_remove.removed_was_current) {
+                ctx->current_account = restored;
+            }
+        }
+    }
     memset(&g_pending_remove, 0, sizeof(g_pending_remove));
     if (ctx->config.defer_signal_cleanup &&
         g_transaction_owner.rollback_depth > 0) {
@@ -3914,8 +3952,14 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         }
     }
 
-    /* Only a complete teardown permits deleting the configuration handle. */
+    /* Only a complete teardown permits deleting the configuration handle.
+     * AR-12 P1: snapshot the account first — an aborted (pre-install)
+     * finalize restores it so the model cannot diverge from the retained
+     * durable file. */
+    g_pending_remove_snapshot = *account;
     if (config_remove_account_owned(ctx, account_id, token) != 0) {
+        secure_zero_memory(&g_pending_remove_snapshot,
+                           sizeof(g_pending_remove_snapshot));
         goto remove_done;
     }
 
@@ -3954,6 +3998,12 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         outer_retirement_prepared = false;
         outer_retirement_published = false;
     }
+    g_pending_remove.removed_account = g_pending_remove_snapshot;
+    g_pending_remove.removed_valid = true;
+    g_pending_remove.removed_was_active = was_active;
+    g_pending_remove.removed_was_current = was_current;
+    secure_zero_memory(&g_pending_remove_snapshot,
+                       sizeof(g_pending_remove_snapshot));
     (void)transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_REMOVE, token,
                                  ACCOUNTS_TRANSACTION_PREPARED);
 

@@ -3313,6 +3313,10 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
     for (;;) {
         int remaining;
         int remaining_rc = deadline_remaining(deadline, &remaining);
+        /* AR-12 P7: preserve the clock failure's own errno — the
+         * supervision below may overwrite it, and the caller's diagnostic
+         * would otherwise name an unrelated stale error. */
+        int clock_errno = remaining_rc < 0 ? (errno ? errno : EIO) : 0;
         int producer_rc;
         int poll_rc;
         int poll_timeout;
@@ -3327,9 +3331,7 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
             if (producer_rc > 0) {
                 return PRODUCER_STREAM_FAILURE;
             }
-            if (remaining_rc == 0) {
-                errno = ETIMEDOUT;
-            }
+            errno = remaining_rc == 0 ? ETIMEDOUT : clock_errno;
             return PRODUCER_STREAM_CAPTURE_ERROR;
         }
         poll_timeout = producer_succeeded || remaining <= 50 ? remaining : 50;

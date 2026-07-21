@@ -2363,6 +2363,17 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
                   TOML_MAX_VALUE_LEN - 1);
         return -1;
     }
+    /* AR-12 P5 (L12 residual): the reader SKIPS any account whose persisted
+     * ssh_key exceeds 256 bytes, so writing a 257-511 byte value would emit
+     * a document this same tool then refuses to load back. Enforce the
+     * reader's cap at the writer too. */
+    if (strcmp(key_name, "ssh_key") == 0 && value_length > 256U) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Value for %s.ssh_key is %zu bytes (max 256); the loader "
+                  "would skip the account, so refusing to write it",
+                  section_name, value_length);
+        return -1;
+    }
     if (!decoded_string_value_is_valid(value, value_length)) {
         set_error(ERR_CONFIG_INVALID,
                   "Value for %s.%s contains an unsupported control byte or "

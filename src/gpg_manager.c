@@ -1120,6 +1120,13 @@ static int gpg_current_path_from_base(const char *base, char *buf, size_t size) 
     return 0;
 }
 
+enum {
+    GPG_SOURCE_PROOF_MAX_DEPTH = 64,
+    GPG_SOURCE_PROOF_MAX_DIRECTORIES = 16384,
+    GPG_SOURCE_PROOF_MAX_ENTRIES = 65536,
+    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32
+};
+
 #define GPG_ROLLBACK_PREFIX ".gitswitch-gpg-rollback."
 #define GPG_PUBLISH_PREFIX ".gitswitch-gpg-publish."
 #define GPG_RESET_PREFIX ".gitswitch-gpg-reset."
@@ -2918,7 +2925,13 @@ out:
  * same inode) keeps st_dev while crossing into a distinct mount. statx's mount
  * ID closes that gap. macOS and FreeBSD expose the corresponding filesystem
  * identity through fstatfs; uncertainty on an unsupported platform fails
- * closed instead of silently weakening reset. */
+ * closed instead of silently weakening reset.
+ *
+ * AR-12 P10 (documented floor): STATX_MNT_ID needs Linux kernel >= 5.8
+ * (stx_mask leaves the bit clear on older kernels), so ISOLATED-mode GPG
+ * operations fail closed with ENOTSUP there. Shared-mode GPG is unaffected.
+ * 5.8 predates every supported distribution's floor; raising a clearer
+ * diagnostic below keeps the constraint visible rather than silent. */
 static int gpg_mount_identity_fd(int fd, gpg_mount_identity_t *identity) {
     if (fd < 0 || !identity) {
         errno = EINVAL;
@@ -3019,9 +3032,13 @@ static bool gpg_same_file_version(const struct stat *left,
  * unlink. Thus a pre-existing hardlink leaves the entire home untouched, while
  * a link or mount introduced between passes is still caught before that entry
  * is removed. */
+/* AR-12 P3: bounded like the twin source-proof walk — each frame holds a
+ * DIR stream and a child fd, so unbounded recursion is both a stack and an
+ * fd-exhaustion hazard on an adversarially deep tree. */
 static int gpg_walk_tree_contents_fd(
     int dir_fd, const char *display_path,
-    const gpg_mount_identity_t *root_mount, bool remove_entries) {
+    const gpg_mount_identity_t *root_mount, bool remove_entries,
+    unsigned int depth) {
     int scan_flags = O_RDONLY | O_CLOEXEC;
     int scan_fd;
     DIR *dir;
@@ -3033,6 +3050,13 @@ static int gpg_walk_tree_contents_fd(
 #ifdef O_NOFOLLOW
     scan_flags |= O_NOFOLLOW;
 #endif
+    if (depth > GPG_SOURCE_PROOF_MAX_DEPTH) {
+        errno = ELOOP;
+        set_error(ERR_INVALID_PATH,
+                  "Isolated GPG home exceeds the bounded reset walk depth: %s",
+                  display_path);
+        return -1;
+    }
     scan_fd = openat(dir_fd, ".", scan_flags);
     dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
     if (!dir) {
@@ -3115,7 +3139,7 @@ static int gpg_walk_tree_contents_fd(
                 return -1;
             }
             if (gpg_walk_tree_contents_fd(child_fd, child_display, root_mount,
-                                          remove_entries) != 0) {
+                                          remove_entries, depth + 1U) != 0) {
                 close(child_fd);
                 closedir(dir);
                 return -1;
@@ -3228,7 +3252,7 @@ static int gpg_preflight_home_at(int base_fd, const char *base,
                   "Refusing mounted isolated GPG home during reset: %s", home);
         return -1;
     }
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -3466,7 +3490,7 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     /* Preflight the complete tree before stopping the agent or unlinking any
      * state. This makes a pre-existing mount or hardlink an all-or-nothing
      * refusal for this home. */
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -3502,7 +3526,7 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     /* gpgconf may have changed sockets or files while shutting down. Validate
      * its final tree as a whole, then give tests a deterministic race seam;
      * destructive traversal independently revalidates every entry. */
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -3511,7 +3535,7 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
         set_error(ERR_FILE_IO, "GPG cleanup pre-delete hook failed: %s", home);
         return -1;
     }
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, true) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, true, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -6583,13 +6607,6 @@ static int gpg_user_source_home(char *buf, size_t size) {
     }
     return 0;
 }
-
-enum {
-    GPG_SOURCE_PROOF_MAX_DEPTH = 64,
-    GPG_SOURCE_PROOF_MAX_DIRECTORIES = 16384,
-    GPG_SOURCE_PROOF_MAX_ENTRIES = 65536,
-    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32
-};
 
 typedef struct {
     size_t directories;

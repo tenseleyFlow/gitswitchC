@@ -271,11 +271,18 @@ int expand_path(const char *path, char *expanded_path, size_t path_size) {
 
 int get_home_directory(char *home_path, size_t path_size) {
     const char *home = getenv("HOME");
-    
+
+    /* AR-12 P11: an empty or relative HOME would silently anchor the config
+     * at '/' or the CWD — inconsistent with the validated XDG_RUNTIME_DIR
+     * and git_ops HOME guards. Treat it like an absent HOME and fall back
+     * to the password database. */
+    if (home && home[0] != '/') {
+        home = NULL;
+    }
     if (!home) {
         /* Fall back to password database */
         struct passwd *pw = getpwuid(getuid());
-        if (!pw) {
+        if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/') {
             set_system_error(ERR_SYSTEM_CALL, "Failed to get user home directory");
             return -1;
         }
@@ -2193,6 +2200,12 @@ static int copy_file_split_destination(const char *path, char **parent_out,
     return 0;
 }
 
+/* AR-12 P6 (adjudicated, kept as-is): this copies IN PLACE — the
+ * destination is truncated before the loop, so a mid-copy failure leaves
+ * truncated/partial bytes with the prior content destroyed. Production code
+ * does not call this surface (config.c uses its own atomic temp+rename
+ * writers); it is retained for tests and external API users, who must
+ * treat the destination as expendable on failure. */
 int copy_file(const char *src_path, const char *dst_path) {
     FILE *src = NULL;
     FILE *dst = NULL;

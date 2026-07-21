@@ -8297,9 +8297,13 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
                 char expanded_path[MAX_PATH_LEN];
                 if (expand_path(account.ssh_key_path, expanded_path, sizeof(expanded_path)) == 0 &&
                     strcmp(expanded_path, account.ssh_key_path) != 0) {
-                    safe_strncpy(account.ssh_key_spelling,
-                                 account.ssh_key_path,
-                                 sizeof(account.ssh_key_spelling));
+                    if (safe_strncpy(account.ssh_key_spelling,
+                                     account.ssh_key_path,
+                                     sizeof(account.ssh_key_spelling)) != 0) {
+                        /* Preservation is best-effort; the expanded path
+                         * remains authoritative. */
+                        account.ssh_key_spelling[0] = '\0';
+                    }
                     safe_strncpy(account.ssh_key_path, expanded_path, sizeof(account.ssh_key_path));
                 }
 

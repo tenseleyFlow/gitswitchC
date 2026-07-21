@@ -6796,9 +6796,6 @@ static bool git_retirement_stale_snapshot_is_clean(
     const publication_record_t *representative;
     const git_snapshot_key_t *ssh_command;
     const git_snapshot_key_t *signing_key;
-    const git_snapshot_key_t *signing_enabled;
-    const git_snapshot_key_t *gpg_format;
-    const git_snapshot_key_t *openpgp_program;
 
     if (!group || !snapshot || !publications ||
         group->representative >= publication_count) {
@@ -6809,12 +6806,6 @@ static bool git_retirement_stale_snapshot_is_clean(
         snapshot, GIT_CONFIG_CORE_SSHCOMMAND);
     signing_key = git_snapshot_key_by_name(
         snapshot, GIT_CONFIG_USER_SIGNINGKEY);
-    signing_enabled = git_snapshot_key_by_name(
-        snapshot, GIT_CONFIG_COMMIT_GPGSIGN);
-    gpg_format = git_snapshot_key_by_name(
-        snapshot, GIT_CONFIG_GPG_FORMAT);
-    openpgp_program = git_snapshot_key_by_name(
-        snapshot, GIT_CONFIG_GPG_OPENPGP_PROGRAM);
 
     for (size_t i = 0U; i < publication_count; i++) {
         const publication_record_t *publication = publications[i];
@@ -6842,28 +6833,13 @@ static bool git_retirement_stale_snapshot_is_clean(
                 }
             }
         }
-        if ((publication->capabilities &
-             PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U) {
-            const char *expected = publication->gpg_signing_enabled
-                                       ? "true" : "false";
-            if (signing_enabled &&
-                git_snapshot_key_exact_count(signing_enabled,
-                                             expected) != 0U) {
-                return false;
-            }
-        } else if (signing_enabled && signing_enabled->count != 0U) {
-            return false;
-        }
-        if (gpg_format &&
-            git_snapshot_key_exact_count(
-                gpg_format, GIT_GPG_FORMAT_OPENPGP) != 0U) {
-            return false;
-        }
-        if (openpgp_program &&
-            git_snapshot_key_exact_count(
-                openpgp_program, publication->gpg_program) != 0U) {
-            return false;
-        }
+        /* AR-12 P2: without the live fingerprint anchor, generic companion
+         * values — commit.gpgsign, gpg.format=openpgp, a common gpg
+         * program path — are not attributable to this record; the planner
+         * refuses to remove companions without the anchor for exactly this
+         * reason. Treating a user-recreated commit.gpgsign as our residue
+         * wedged every guarded retirement retry against values we would
+         * never touch. */
     }
     return true;
 }
