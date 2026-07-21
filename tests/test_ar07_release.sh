@@ -1360,6 +1360,8 @@ check_manifest_contract()
 
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/gitswitch-release-contract.XXXXXX") ||
         fail "cannot create temporary release-contract directory"
+    tmp=$(CDPATH='' cd "$tmp" && pwd -P) ||
+        fail "cannot resolve physical release-contract directory"
     copy_pid=
     copy_watchdog_pid=
     copy_watchdog_cancel=
@@ -1485,6 +1487,8 @@ check_manifest_contract()
         fail "cannot create linked checkout with spaces"
     linked_git_dir=$(git -C "$linked_checkout" rev-parse \
         --absolute-git-dir) || fail "cannot resolve linked-checkout Git dir"
+    linked_git_dir_physical=$(CDPATH='' cd "$linked_git_dir" && pwd -P) ||
+        fail "cannot resolve physical linked-checkout Git dir"
     linked_common_git_dir=$(git -C "$linked_checkout" rev-parse \
         --git-common-dir) || fail "cannot resolve linked-checkout common Git dir"
     linked_common_git_dir=$(CDPATH='' cd "$linked_common_git_dir" && pwd -P) ||
@@ -1502,12 +1506,12 @@ check_manifest_contract()
             *) fail "linked Git fixture lost its literal dollar sign: $linked_dollar_path" ;;
         esac
     done
-    case $linked_git_dir in
-        "$linked_bare"/worktrees/*) ;;
-        *) fail "linked checkout selected the wrong Git-private state root" ;;
+    case $linked_git_dir_physical in
+        "$linked_bare_physical"/worktrees/*) ;;
+        *) fail "linked checkout selected the wrong physical Git-private state root" ;;
     esac
-    linked_tools=$linked_git_dir/gitswitch-release-tools
-    linked_lock=$linked_git_dir/gitswitch-release-publish.lock
+    linked_tools=$linked_git_dir_physical/gitswitch-release-tools
+    linked_lock=$linked_git_dir_physical/gitswitch-release-publish.lock
     linked_archive=$linked_checkout/build/dist/$dist_root.tar.gz
 
     # A root-local .git directory or gitfile proves that this is a checkout even
