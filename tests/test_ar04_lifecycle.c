@@ -657,12 +657,14 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
                             "test\n-----END OPENSSH PRIVATE KEY-----\n",
                             0600), 0);
     snprintf(input, sizeof(input),
-             "\n\n\n%s\ngithub.com-work\nABCDEF0123456789\ny\n\n", key);
+             "\n\n\n%s\ngithub.com-work\ngithub.com\nABCDEF0123456789\ny\n\n",
+             key);
     CHECK_EQ_INT(run_edit(home, runtime, shims, input, output), 0);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "ssh_key = ") != NULL);
     CHECK(strstr(contents, "ssh_host = \"github.com-work\"") != NULL);
+    CHECK(strstr(contents, "ssh_hostname = \"github.com\"") != NULL);
     CHECK(strstr(contents, "gpg_key = \"ABCDEF0123456789\"") != NULL);
 
     remove_tree(home);

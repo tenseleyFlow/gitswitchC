@@ -1089,11 +1089,11 @@ TEST(add_reprompts_invalid_host_alias_until_valid) {
     long_alias[sizeof(long_alias) - 1] = '\0';
 
     /* name, email, description, SSH key, then three alias answers: a quoted
-     * one (charset), an overlong one (length), then a valid one; GPG skip,
-     * scope default. */
+     * one (charset), an overlong one (length), then a valid one; canonical
+     * hostname (AR-12 M2), GPG skip, scope default. */
     snprintf(script, sizeof(script),
              "aliasacct\na@example.com\nalias test\n%s\n"
-             "bad\"alias\n%s\ngithub.com-good\n\n\n",
+             "bad\"alias\n%s\ngithub.com-good\ngithub.com\n\n\n",
              key_path, long_alias);
     CHECK_EQ_INT(write_stdin_script(rt, script, stdin_path, sizeof(stdin_path)), 0);
     snprintf(out_path, sizeof(out_path), "%s/add.out", rt);

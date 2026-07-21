@@ -843,10 +843,11 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
     }
     gpg_manager_note_key_available("ABCDEF0123456789");
 
-    /* Every one of accounts.c's nine prompt sites receives an overlong answer
+    /* Every one of accounts.c's ten prompt sites receives an overlong answer
      * followed by the answer that must actually reach the account model:
-     * name, email, description, SSH path and alias, GPG ID and signing choice,
-     * scope, then final confirmation. */
+     * name, email, description, SSH path, alias and canonical hostname
+     * (AR-12 M2), GPG ID and signing choice, scope, then final
+     * confirmation. */
     CHECK_EQ_INT(write_long_line(input, 'n'), 0);
     CHECK(fputs("goodname\n", input) != EOF);
     CHECK_EQ_INT(write_long_line(input, 'e'), 0);
@@ -857,6 +858,8 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
     CHECK(fprintf(input, "%s\n", key_path) > 0);
     CHECK_EQ_INT(write_long_line(input, 'a'), 0);
     CHECK(fputs("github.com-work\n", input) != EOF);
+    CHECK_EQ_INT(write_long_line(input, 'h'), 0);
+    CHECK(fputs("github.com\n", input) != EOF);
     CHECK_EQ_INT(write_long_line(input, 'g'), 0);
     CHECK(fputs("ABCDEF0123456789\n", input) != EOF);
     CHECK_EQ_INT(write_long_line(input, 'y'), 0);
@@ -890,6 +893,7 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
         CHECK(ctx.accounts[0].ssh_enabled);
         CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, key_path);
         CHECK_STR_EQ(ctx.accounts[0].ssh_host_alias, "github.com-work");
+        CHECK_STR_EQ(ctx.accounts[0].ssh_hostname, "github.com");
         CHECK(ctx.accounts[0].gpg_enabled);
         CHECK_STR_EQ(ctx.accounts[0].gpg_key_id, "ABCDEF0123456789");
         CHECK(ctx.accounts[0].gpg_signing_enabled);
@@ -900,7 +904,7 @@ TEST(account_flow_reprompts_without_accepting_any_prefix) {
         size_t size = fread(output, 1, sizeof(output) - 1, capture);
         output[size] = '\0';
     }
-    CHECK_EQ_INT(count_occurrences(output, "Input is too long"), 9);
+    CHECK_EQ_INT(count_occurrences(output, "Input is too long"), 10);
 
 cleanup:
     restore_fd(STDOUT_FILENO, &redirected_output);

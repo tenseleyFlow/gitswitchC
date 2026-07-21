@@ -3203,6 +3203,43 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
             }
             break;
         }
+
+        /* AR-12 M2: the alias is not the destination — the suffix style the
+         * prompt above suggests ('github.com-work') is not a resolvable DNS
+         * name, and admission would otherwise silently pin HostName to it.
+         * Ask for the canonical destination whenever an alias is set. */
+        while (acct.ssh_host_alias[0] != '\0') {
+            if (edit && acct.ssh_hostname[0])
+                snprintf(prompt_text, sizeof(prompt_text),
+                         "SSH Canonical Hostname [%s] (Enter to keep): ",
+                         acct.ssh_hostname);
+            else
+                snprintf(prompt_text, sizeof(prompt_text),
+                         "SSH Canonical Hostname (the real host, e.g. "
+                         "github.com; Enter to use the alias): ");
+            if (account_read_prompt(prompt_text, input, sizeof(input),
+                                    false, "SSH canonical hostname") != 0) {
+                return -1;
+            }
+            if (strlen(input) == 0) {
+                if (acct.ssh_hostname[0] == '\0') {
+                    printf("[WARNING]: No canonical hostname set; the "
+                           "managed ~/.ssh/config block will use HostName "
+                           "%s, which must resolve as a real host.\n",
+                           acct.ssh_host_alias);
+                }
+                break;                              /* keep current / skip */
+            }
+            if (!toml_validate_ssh_hostname(input) ||
+                safe_strncpy(acct.ssh_hostname, input,
+                             sizeof(acct.ssh_hostname)) != 0) {
+                printf("[ERROR]: Invalid canonical hostname (host-only "
+                       "ASCII name/IPv4 or unbracketed IPv6; no port). "
+                       "Try again, or Enter to skip.\n");
+                continue;
+            }
+            break;
+        }
         break;
     }
 
