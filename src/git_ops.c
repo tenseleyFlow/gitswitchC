@@ -4968,6 +4968,54 @@ int git_publication_verify_program_identity(
     return 0;
 }
 
+/* AR-12 H2: expose only the destination identity of the active snapshot so
+ * the publication-capacity preflight can recognize an in-place replacement
+ * before any mutation. Available from git_config_snapshot() on; requires no
+ * sealed post-image. */
+int git_config_snapshot_export_destination(publication_record_t *out) {
+    const git_scope_generation_t *generation;
+
+    if (!out) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git snapshot destination export request");
+        return -1;
+    }
+    if (!g_git_snapshot.valid) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "No Git snapshot is available to export a destination");
+        return -1;
+    }
+    generation = &g_git_snapshot.primary_generation;
+    if (!generation->valid) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git snapshot has no captured destination generation");
+        return -1;
+    }
+    publication_record_init(out);
+    if (git_publication_scope_from_git(g_git_snapshot.scope,
+                                       &out->scope) != 0 ||
+        safe_strncpy(out->config_path, generation->path,
+                     sizeof(out->config_path)) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git snapshot destination exceeds durable storage");
+        return -1;
+    }
+    publication_identity_from_stat(&out->config_parent,
+                                   &generation->parent_stat);
+    if (generation->repository_present) {
+        if (safe_strncpy(out->repository_path,
+                         generation->repository_path,
+                         sizeof(out->repository_path)) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git snapshot repository path exceeds durable storage");
+            return -1;
+        }
+        publication_identity_from_stat(&out->repository,
+                                       &generation->repository_stat);
+    }
+    return 0;
+}
+
 int git_config_export_sealed_publication(publication_record_t *out,
                                          const char *gpg_selector) {
     publication_record_t record;

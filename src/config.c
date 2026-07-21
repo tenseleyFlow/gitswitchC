@@ -4685,9 +4685,39 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         }
     }
 
-    if (publication &&
-        publication_ledger_upsert(&publications, publication) != 0) {
-        goto state_cleanup;
+    if (publication) {
+        /* AR-12 H2: an at-capacity ledger only blocks genuinely new
+         * destinations. A replacement never grows the ledger, and before an
+         * append is refused, provably-absent destinations are reclaimed —
+         * mirroring config_publication_preflight_check() exactly. */
+        if (!publication_ledger_destination_present(&publications,
+                                                    publication)) {
+            bool exhausted =
+                publications.count >= PUBLICATION_LEDGER_MAX_RECORDS;
+
+            if (!exhausted) {
+                unsigned char *trial = NULL;
+                size_t trial_length = 0U;
+
+                if (publication_ledger_serialize(&publications, &trial,
+                                                 &trial_length) != 0) {
+                    goto state_cleanup;
+                }
+                exhausted =
+                    CONFIG_PUBLICATION_RECORD_RESERVE >
+                        PUBLICATION_LEDGER_MAX_BYTES ||
+                    trial_length > PUBLICATION_LEDGER_MAX_BYTES -
+                                       CONFIG_PUBLICATION_RECORD_RESERVE;
+                secure_zero_memory(trial, trial_length);
+                free(trial);
+            }
+            if (exhausted) {
+                (void)publication_ledger_reclaim_absent(&publications);
+            }
+        }
+        if (publication_ledger_upsert(&publications, publication) != 0) {
+            goto state_cleanup;
+        }
     }
     if (publication_ledger_serialize(&publications, &ledger_bytes,
                                      &ledger_length) != 0) {
@@ -5849,11 +5879,18 @@ int config_load_publication_ledger(const char *config_path,
                                     ledger);
 }
 
-int config_publication_preflight(const char *config_path) {
+/* One worst-case record must fit after the upsert. A destination that
+ * already has a ledger record is replaced in place, so its existing record
+ * is excluded from the simulation; when capacity is still exhausted, the
+ * same provably-absent reclamation that the save path performs is simulated
+ * before rejecting (AR-12 H2). */
+static int config_publication_preflight_check(
+    const char *config_path, const publication_record_t *destination) {
     config_active_state_t state;
     publication_ledger_t ledger;
     unsigned char *serialized = NULL;
     size_t serialized_length = 0U;
+    bool reclaim_attempted = false;
     int result = -1;
 
     if (!config_path) {
@@ -5863,15 +5900,50 @@ int config_publication_preflight(const char *config_path) {
     }
     publication_ledger_init(&ledger);
     if (config_read_active_state(config_path, &state, false, NULL,
-                                 &ledger) != 0 ||
-        publication_ledger_serialize(&ledger, &serialized,
-                                     &serialized_length) != 0) {
+                                 &ledger) != 0) {
         goto cleanup;
     }
-    if (ledger.count >= PUBLICATION_LEDGER_MAX_RECORDS ||
-        CONFIG_PUBLICATION_RECORD_RESERVE > PUBLICATION_LEDGER_MAX_BYTES ||
-        serialized_length >
-            PUBLICATION_LEDGER_MAX_BYTES - CONFIG_PUBLICATION_RECORD_RESERVE) {
+    if (destination &&
+        publication_ledger_destination_present(&ledger, destination)) {
+        /* The upsert will replace this record without growing the ledger;
+         * remove it from the capacity simulation. */
+        size_t kept = 0U;
+
+        for (size_t i = 0U; i < ledger.count; i++) {
+            if (publication_record_same_destination(&ledger.records[i],
+                                                    destination)) {
+                continue;
+            }
+            if (kept != i) ledger.records[kept] = ledger.records[i];
+            kept++;
+        }
+        if (kept != ledger.count) {
+            secure_zero_memory(&ledger.records[kept],
+                               (ledger.count - kept) *
+                                   sizeof(*ledger.records));
+            ledger.count = kept;
+        }
+    }
+    for (;;) {
+        if (publication_ledger_serialize(&ledger, &serialized,
+                                         &serialized_length) != 0) {
+            goto cleanup;
+        }
+        if (ledger.count < PUBLICATION_LEDGER_MAX_RECORDS &&
+            CONFIG_PUBLICATION_RECORD_RESERVE <=
+                PUBLICATION_LEDGER_MAX_BYTES &&
+            serialized_length <= PUBLICATION_LEDGER_MAX_BYTES -
+                                     CONFIG_PUBLICATION_RECORD_RESERVE) {
+            break;
+        }
+        secure_zero_memory(serialized, serialized_length);
+        free(serialized);
+        serialized = NULL;
+        serialized_length = 0U;
+        if (!reclaim_attempted) {
+            reclaim_attempted = true;
+            if (publication_ledger_reclaim_absent(&ledger) != 0U) continue;
+        }
         errno = ENOSPC;
         set_error(ERR_CONFIG_INVALID,
                   "Publication ledger has no capacity for another worst-case record");
@@ -5886,6 +5958,15 @@ cleanup:
     }
     publication_ledger_clear(&ledger);
     return result;
+}
+
+int config_publication_preflight(const char *config_path) {
+    return config_publication_preflight_check(config_path, NULL);
+}
+
+int config_publication_preflight_destination(
+    const char *config_path, const publication_record_t *destination) {
+    return config_publication_preflight_check(config_path, destination);
 }
 
 int config_restore_active_account(gitswitch_ctx_t *ctx,

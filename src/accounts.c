@@ -1422,16 +1422,41 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * contract and can invoke config_publication_preflight() themselves
          * for the persistence destination they own. */
         if (write_git && defer_commit &&
-            ctx->config.defer_signal_cleanup &&
-            config_publication_preflight(ctx->config.config_path) != 0) {
-            error_context_t preflight_error = *get_last_error();
-            int preflight_errno = errno;
+            ctx->config.defer_signal_cleanup) {
+            /* AR-12 H2: the snapshot above pinned the exact destination this
+             * switch will publish to. A destination that already has a
+             * ledger record is an in-place replacement, which an at-capacity
+             * ledger must still admit. Probe-export or allocation failure
+             * falls back to the conservative append-capacity check. */
+            publication_record_t *destination_probe =
+                calloc(1U, sizeof(*destination_probe));
+            const publication_record_t *probe = NULL;
+            int preflight_result;
 
-            git_config_commit();
-            runtime_state_lock_release(runtime_lock_fd);
-            g_last_error = preflight_error;
-            errno = preflight_errno;
-            return -1;
+            if (destination_probe &&
+                git_config_snapshot_export_destination(
+                    destination_probe) == 0) {
+                probe = destination_probe;
+            } else {
+                clear_error();
+            }
+            preflight_result = config_publication_preflight_destination(
+                ctx->config.config_path, probe);
+            if (destination_probe) {
+                secure_zero_memory(destination_probe,
+                                   sizeof(*destination_probe));
+                free(destination_probe);
+            }
+            if (preflight_result != 0) {
+                error_context_t preflight_error = *get_last_error();
+                int preflight_errno = errno;
+
+                git_config_commit();
+                runtime_state_lock_release(runtime_lock_fd);
+                g_last_error = preflight_error;
+                errno = preflight_errno;
+                return -1;
+            }
         }
 
         /* Nothing durable has been touched yet, so a signal up to here could

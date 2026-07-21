@@ -353,6 +353,14 @@ int git_config_export_sealed_publication(publication_record_t *out,
                                          const char *gpg_selector);
 
 /**
+ * Export only the destination identity (scope, config path/parent,
+ * repository) of the active snapshot for publication-capacity preflight.
+ * Valid from git_config_snapshot() on; no sealed post-image is required.
+ * `out` carries no account owner or credential values (AR-12 H2).
+ */
+int git_config_snapshot_export_destination(publication_record_t *out);
+
+/**
  * Restore the most recent git_config_snapshot(), rebuilding every key with its
  * exact ordered values only while the current vector still matches the sealed
  * transaction-owned state and the repository, config namespace, and sealed

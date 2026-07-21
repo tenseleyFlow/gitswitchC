@@ -121,6 +121,14 @@ int publication_record_verify_live_destination(
     const publication_record_t **live_generation);
 bool publication_record_same_destination(const publication_record_t *left,
                                          const publication_record_t *right);
+/* AR-12 H2: capacity reclamation for destinations that provably no longer
+ * exist (ENOENT or changed object identity on the recorded anchor). */
+bool publication_record_destination_provably_absent(
+    const publication_record_t *record);
+size_t publication_ledger_reclaim_absent(publication_ledger_t *ledger);
+bool publication_ledger_destination_present(
+    const publication_ledger_t *ledger,
+    const publication_record_t *record);
 
 void publication_ledger_init(publication_ledger_t *ledger);
 void publication_ledger_clear(publication_ledger_t *ledger);

@@ -374,6 +374,11 @@ int config_load_publication_ledger(const char *config_path,
  * This deliberately remains conservative when a later upsert may replace an
  * existing record. */
 int config_publication_preflight(const char *config_path);
+/* AR-12 H2: destination-aware capacity preflight. A destination that already
+ * has a ledger record is admitted as an in-place replacement; NULL falls
+ * back to the conservative worst-case-append check. */
+int config_publication_preflight_destination(
+    const char *config_path, const publication_record_t *destination);
 int config_restore_active_account(gitswitch_ctx_t *ctx,
                                   const char *config_path);
 

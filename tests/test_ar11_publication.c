@@ -2752,6 +2752,210 @@ TEST(removed_account_publication_reserves_recycled_id_without_git_mutation) {
     ts_rm_rf(home);
 }
 
+/* AR-12 H2: only PUBLISHED records with provably dead destinations (ENOENT
+ * or changed object identity on the recorded anchor) are reclaimable.
+ * RETIRING residue and indeterminate probes must survive reclamation. */
+TEST(reclaim_absent_drops_only_provably_dead_published_records) {
+    publication_ledger_t ledger;
+    publication_record_t record;
+    publication_record_t dead_probe;
+    char dead_repo[] = "/tmp/ar12-h2-dead-XXXXXX";
+    char live_repo[] = "/tmp/ar12-h2-live-XXXXXX";
+    char mismatch_repo[] = "/tmp/ar12-h2-mismatch-XXXXXX";
+    char retiring_repo[] = "/tmp/ar12-h2-retiring-XXXXXX";
+    struct stat st;
+
+    CHECK(ts_mkdtemp(dead_repo) != NULL);
+    CHECK(ts_mkdtemp(live_repo) != NULL);
+    CHECK(ts_mkdtemp(mismatch_repo) != NULL);
+    CHECK(ts_mkdtemp(retiring_repo) != NULL);
+    publication_ledger_init(&ledger);
+
+    /* Dead destination: real identity captured, directory then removed. */
+    fill_gpg_record(&record, dead_repo, FINGERPRINT_A);
+    snprintf(record.config_path, sizeof(record.config_path),
+             "%s/.git/config", dead_repo);
+    CHECK_EQ_INT(stat(dead_repo, &st), 0);
+    publication_identity_from_stat(&record.repository, &st);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+    dead_probe = record;
+
+    /* Live destination with the real identity: must be kept. */
+    fill_gpg_record(&record, live_repo, FINGERPRINT_A);
+    snprintf(record.config_path, sizeof(record.config_path),
+             "%s/.git/config", live_repo);
+    CHECK_EQ_INT(stat(live_repo, &st), 0);
+    publication_identity_from_stat(&record.repository, &st);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+
+    /* Live path whose recorded identity no longer matches: reclaimable. */
+    fill_gpg_record(&record, mismatch_repo, FINGERPRINT_A);
+    snprintf(record.config_path, sizeof(record.config_path),
+             "%s/.git/config", mismatch_repo);
+    fill_identity(&record.repository, UINTMAX_C(9999),
+                  (uintmax_t)(S_IFDIR | 0700), UINTMAX_C(0));
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+
+    /* Dead destination in RETIRING state: retirement recovery owns it. */
+    fill_gpg_record(&record, retiring_repo, FINGERPRINT_A);
+    snprintf(record.config_path, sizeof(record.config_path),
+             "%s/.git/config", retiring_repo);
+    CHECK_EQ_INT(stat(retiring_repo, &st), 0);
+    publication_identity_from_stat(&record.repository, &st);
+    record.state = PUBLICATION_STATE_RETIRING;
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+
+    CHECK_EQ_INT(rmdir(dead_repo), 0);
+    CHECK_EQ_INT(rmdir(retiring_repo), 0);
+    CHECK(!publication_record_destination_provably_absent(NULL));
+    CHECK(publication_record_destination_provably_absent(&dead_probe));
+
+    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 2);
+    CHECK_EQ_INT((long)ledger.count, 2);
+    CHECK(!publication_ledger_destination_present(&ledger, &dead_probe));
+    for (size_t i = 0U; i < ledger.count; i++) {
+        CHECK(strstr(ledger.records[i].repository_path,
+                     "ar12-h2-mismatch") == NULL);
+    }
+
+    publication_ledger_clear(&ledger);
+    (void)rmdir(live_repo);
+    (void)rmdir(mismatch_repo);
+}
+
+/* AR-12 H2: a full 128-record ledger must still admit a switch whose
+ * destination already has a record (in-place replacement), and must reclaim
+ * provably dead destinations rather than deterministically blocking every
+ * new destination for the config's lifetime. */
+TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations) {
+    char home[MAX_PATH_LEN];
+    char config_path[MAX_PATH_LEN];
+    char state_path[MAX_PATH_LEN];
+    char git_config_path[MAX_PATH_LEN];
+    char dead_repo[MAX_PATH_LEN];
+    char *saved_home = NULL;
+    const char *home_before = getenv("HOME");
+    gitswitch_ctx_t ctx;
+    publication_record_t record;
+    publication_record_t probe;
+    publication_ledger_t ledger;
+    config_resume_hint_snapshot_t snapshot = {0};
+    struct stat home_stat;
+    struct stat repo_stat;
+    bool installed = false;
+
+    if (home_before) {
+        saved_home = strdup(home_before);
+        CHECK(saved_home != NULL);
+    }
+    CHECK_EQ_INT(make_private_config_home(
+                     home, sizeof(home), config_path, sizeof(config_path),
+                     state_path, sizeof(state_path)), 0);
+    CHECK_EQ_INT(setenv("HOME", home, 1), 0);
+    fill_active_context(&ctx);
+    CHECK_EQ_INT(config_save(&ctx, config_path), 0);
+    CHECK_EQ_INT(stat(home, &home_stat), 0);
+    CHECK_EQ_INT(join_path(dead_repo, sizeof(dead_repo), home,
+                           "doomed-repository"), 0);
+    CHECK_EQ_INT(mkdir(dead_repo, 0700), 0);
+    CHECK_EQ_INT(stat(dead_repo, &repo_stat), 0);
+
+    /* Record 0 is a local destination in a repository that will later be
+     * deleted; records 1..127 are live global destinations under HOME. */
+    fill_gpg_record(&record, dead_repo, FINGERPRINT_A);
+    CHECK_EQ_INT(safe_snprintf(record.config_path,
+                               sizeof(record.config_path),
+                               "%s/.git/config", dead_repo), 0);
+    publication_identity_from_stat(&record.repository, &repo_stat);
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&snapshot), 0);
+    installed = false;
+    CHECK_EQ_INT(
+        config_save_active_account_publication_transactional_guarded(
+            &ctx, config_path, &record, &installed, &snapshot), 0);
+    CHECK(installed);
+    config_resume_hint_snapshot_clear(&snapshot);
+    for (size_t i = 1U; i < PUBLICATION_LEDGER_MAX_RECORDS; i++) {
+        char leaf[64];
+
+        snprintf(leaf, sizeof(leaf), "global-%03zu.gitconfig", i);
+        CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path),
+                               home, leaf), 0);
+        fill_global_gpg_record(&record, UINT32_C(41), git_config_path,
+                               FINGERPRINT_A);
+        publication_identity_from_stat(&record.config_parent, &home_stat);
+        CHECK_EQ_INT(config_resume_hint_snapshot_capture(&snapshot), 0);
+        installed = false;
+        CHECK_EQ_INT(
+            config_save_active_account_publication_transactional_guarded(
+                &ctx, config_path, &record, &installed, &snapshot), 0);
+        CHECK(installed);
+        config_resume_hint_snapshot_clear(&snapshot);
+    }
+    publication_ledger_init(&ledger);
+    CHECK_EQ_INT(config_load_publication_ledger(config_path, &ledger), 0);
+    CHECK_EQ_INT((long)ledger.count,
+                 (long)PUBLICATION_LEDGER_MAX_RECORDS);
+    publication_ledger_clear(&ledger);
+
+    /* Conservative append preflight: full and fully live -> no capacity. */
+    errno = 0;
+    CHECK_EQ_INT(config_publication_preflight(config_path), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+
+    /* A destination that already has a record is a replacement. */
+    CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
+                           "global-005.gitconfig"), 0);
+    fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
+                           FINGERPRINT_A);
+    publication_identity_from_stat(&probe.config_parent, &home_stat);
+    CHECK_EQ_INT(config_publication_preflight_destination(
+                     config_path, &probe), 0);
+
+    /* A genuinely new destination is still refused while every recorded
+     * destination remains alive... */
+    CHECK_EQ_INT(join_path(git_config_path, sizeof(git_config_path), home,
+                           "global-new.gitconfig"), 0);
+    fill_global_gpg_record(&probe, UINT32_C(41), git_config_path,
+                           FINGERPRINT_A);
+    publication_identity_from_stat(&probe.config_parent, &home_stat);
+    errno = 0;
+    CHECK_EQ_INT(config_publication_preflight_destination(
+                     config_path, &probe), -1);
+    CHECK_EQ_INT(errno, ENOSPC);
+
+    /* ...but once a recorded repository is provably gone, both the
+     * preflight and the durable save reclaim it. */
+    CHECK_EQ_INT(rmdir(dead_repo), 0);
+    CHECK_EQ_INT(config_publication_preflight_destination(
+                     config_path, &probe), 0);
+    record = probe;
+    CHECK_EQ_INT(config_resume_hint_snapshot_capture(&snapshot), 0);
+    installed = false;
+    CHECK_EQ_INT(
+        config_save_active_account_publication_transactional_guarded(
+            &ctx, config_path, &record, &installed, &snapshot), 0);
+    CHECK(installed);
+    config_resume_hint_snapshot_clear(&snapshot);
+    publication_ledger_init(&ledger);
+    CHECK_EQ_INT(config_load_publication_ledger(config_path, &ledger), 0);
+    CHECK_EQ_INT((long)ledger.count,
+                 (long)PUBLICATION_LEDGER_MAX_RECORDS);
+    CHECK(publication_ledger_destination_present(&ledger, &probe));
+    for (size_t i = 0U; i < ledger.count; i++) {
+        CHECK(strstr(ledger.records[i].repository_path,
+                     "doomed-repository") == NULL);
+    }
+    publication_ledger_clear(&ledger);
+
+    if (saved_home) {
+        CHECK_EQ_INT(setenv("HOME", saved_home, 1), 0);
+    } else {
+        CHECK_EQ_INT(unsetenv("HOME"), 0);
+    }
+    free(saved_home);
+    ts_rm_rf(home);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(empty_tail_is_an_explicit_legacy_ledger_absence);
@@ -2783,4 +2987,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(malformed_publication_never_falls_back_to_legacy_ssh_retirement);
     RUN_TEST(same_numeric_id_different_incarnation_is_never_live_publication_owner);
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
+    RUN_TEST(reclaim_absent_drops_only_provably_dead_published_records);
+    RUN_TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations);
 TEST_MAIN_END()

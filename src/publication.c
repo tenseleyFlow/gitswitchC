@@ -623,6 +623,90 @@ bool publication_record_same_destination(const publication_record_t *left,
                                              &right->repository));
 }
 
+/* AR-12 H2: a record whose destination anchor is provably gone — ENOENT on
+ * the recorded repository (or config parent directory for global records),
+ * or a live object with a different device/inode identity — can never match
+ * publication_record_same_destination() again. Such records only consume
+ * ledger capacity. Any indeterminate probe (EACCES, ELOOP, ...) keeps the
+ * record: absence must be proven, not assumed. */
+bool publication_record_destination_provably_absent(
+    const publication_record_t *record) {
+    struct stat st;
+    const char *probe;
+    const publication_identity_t *identity;
+    char parent[MAX_PATH_LEN];
+
+    if (!record) return false;
+    if (record->repository_path[0] != '\0') {
+        probe = record->repository_path;
+        identity = &record->repository;
+    } else {
+        const char *slash = strrchr(record->config_path, '/');
+        size_t length;
+
+        if (!slash) return false;
+        length = slash == record->config_path
+                     ? 1U
+                     : (size_t)(slash - record->config_path);
+        if (length >= sizeof(parent)) return false;
+        memcpy(parent, record->config_path, length);
+        parent[length] = '\0';
+        probe = parent;
+        identity = &record->config_parent;
+    }
+    if (!identity->present) return false;
+    errno = 0;
+    if (stat(probe, &st) != 0) return errno == ENOENT;
+    {
+        publication_identity_t live;
+
+        publication_identity_from_stat(&live, &st);
+        return !publication_identity_same_object(identity, &live);
+    }
+}
+
+/* Drop PUBLISHED records whose destinations are provably absent, compacting
+ * in place. RETIRING records are never reclaimed here: their settlement
+ * belongs to the retirement recovery machinery. Returns the removed count. */
+size_t publication_ledger_reclaim_absent(publication_ledger_t *ledger) {
+    size_t kept = 0U;
+    size_t removed;
+
+    if (!ledger || !ledger->present || ledger->count == 0U ||
+        !ledger->records) {
+        return 0U;
+    }
+    for (size_t i = 0U; i < ledger->count; i++) {
+        if (ledger->records[i].state == PUBLICATION_STATE_PUBLISHED &&
+            publication_record_destination_provably_absent(
+                &ledger->records[i])) {
+            continue;
+        }
+        if (kept != i) ledger->records[kept] = ledger->records[i];
+        kept++;
+    }
+    removed = ledger->count - kept;
+    if (removed != 0U) {
+        secure_zero_memory(&ledger->records[kept],
+                           removed * sizeof(*ledger->records));
+        ledger->count = kept;
+    }
+    return removed;
+}
+
+bool publication_ledger_destination_present(
+    const publication_ledger_t *ledger,
+    const publication_record_t *record) {
+    if (!ledger || !record) return false;
+    for (size_t i = 0U; i < ledger->count; i++) {
+        if (publication_record_same_destination(&ledger->records[i],
+                                                record)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void publication_ledger_init(publication_ledger_t *ledger) {
     if (!ledger) return;
     memset(ledger, 0, sizeof(*ledger));
