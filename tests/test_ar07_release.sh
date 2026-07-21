@@ -4163,6 +4163,7 @@ EOF
     assert_archive_metadata "$archive" "$dist_root" "$version"
     cmp -s "$archive" "$tmp/hermetic-archive.baseline" ||
         fail "repository-local archive configuration changed release bytes"
+    inspect_dist_residue "$archive" "$copy_platform"
 
     # Each validation gate gets a causal failure mode. The compressor shim
     # makes two valid but byte-distinct gzip streams, the Git shim perturbs only
