@@ -685,25 +685,21 @@ static int initialize_direct_context(gitswitch_ctx_t *ctx,
     return 0;
 }
 
-TEST(direct_remove_without_publication_retains_retry_metadata) {
+/* AR-12 H1: a direct/library remove of an account that never published any
+ * durable Git credentials must succeed vacuously — there is nothing to
+ * retire, so the model deletion may proceed. */
+TEST(direct_remove_without_publication_succeeds_vacuously) {
     remove_fixture_t fixture;
     gitswitch_ctx_t ctx;
-    char incarnation[ACCOUNT_INCARNATION_LEN];
 
     CHECK_EQ_INT(fixture_setup(&fixture, false), 0);
     CHECK_EQ_INT(setenv("HOME", fixture.home, 1), 0);
     CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", fixture.runtime, 1), 0);
     CHECK_EQ_INT(initialize_direct_context(&ctx, &fixture,
                                            "direct-missing", false), 0);
-    CHECK_EQ_INT(safe_strncpy(incarnation, ctx.accounts[0].incarnation,
-                              sizeof(incarnation)), 0);
 
-    CHECK_EQ_INT(accounts_remove(&ctx, "direct-missing"), -1);
-    CHECK_EQ_INT((int)ctx.account_count, 1);
-    CHECK_STR_EQ(ctx.accounts[0].name, "direct-missing");
-    CHECK_STR_EQ(ctx.accounts[0].incarnation, incarnation);
-    CHECK(strstr(get_last_error()->message,
-                 "No canonical publication provenance") != NULL);
+    CHECK_EQ_INT(accounts_remove(&ctx, "direct-missing"), 0);
+    CHECK_EQ_INT((int)ctx.account_count, 0);
 
     (void)unsetenv("HOME");
     (void)unsetenv("XDG_RUNTIME_DIR");
@@ -749,7 +745,7 @@ TEST(direct_remove_restores_callers_signal_dispositions) {
 int main(void) {
     RUN_TEST(repeated_signals_defer_through_complete_removal_transaction);
     RUN_TEST(config_faults_keep_account_and_alias_on_preinstall_failure);
-    RUN_TEST(direct_remove_without_publication_retains_retry_metadata);
+    RUN_TEST(direct_remove_without_publication_succeeds_vacuously);
     RUN_TEST(direct_remove_restores_callers_signal_dispositions);
     return ts_test_finish();
 }

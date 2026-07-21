@@ -113,6 +113,9 @@ typedef struct {
     config_retirement_owner_t owners[MAX_ACCOUNTS];
     size_t owner_count;
     pending_retirement_phase_t phase;
+    /* No target had a durable publication: nothing to retire, so no Git
+     * transaction or guard exists and publish/finalize are no-ops. */
+    bool vacuous;
 } pending_retirement_t;
 
 /* CLI removal cannot retire an exclusive ~/.ssh/config alias until the
@@ -3465,7 +3468,8 @@ int accounts_remove_finalize(
     error_accumulator_init(&failures);
     g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
 
-    if (g_pending_remove.retirement.git &&
+    if ((g_pending_remove.retirement.git ||
+         g_pending_remove.retirement.vacuous) &&
         pending_retirement_finalize(
             ctx, &g_pending_remove.retirement, outcome) != 0) {
         (void)error_accumulator_add_last(
@@ -4228,17 +4232,35 @@ static account_publication_lookup_result_t load_account_publications(
                   "Invalid durable-publication lookup arguments");
         return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
     }
+    publication_ledger_clear(ledger);
+    publication_ledger_init(ledger);
+    if (config_load_publication_ledger(ctx->config.config_path, ledger) != 0) {
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    /* AR-12 H1: report a record-less account as ABSENT before demanding a
+     * persisted incarnation, so never-switched and pre-ledger accounts are
+     * distinguishable from provenance corruption. */
+    {
+        size_t id_records = 0U;
+
+        for (size_t i = 0; i < ledger->count; i++) {
+            if (ledger->records[i].account_id == account->id) id_records++;
+        }
+        if (id_records == 0U) {
+            errno = ENOENT;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "No canonical publication provenance exists for account '%s'; switch it again before attributing durable Git credentials",
+                account->name);
+            return ACCOUNT_PUBLICATION_LOOKUP_ABSENT;
+        }
+    }
     if (!account->incarnation_persisted ||
         !account_incarnation_is_valid(account->incarnation)) {
         errno = ESTALE;
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Account '%s' has no persisted immutable incarnation",
                   account->name);
-        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
-    }
-    publication_ledger_clear(ledger);
-    publication_ledger_init(ledger);
-    if (config_load_publication_ledger(ctx->config.config_path, ledger) != 0) {
         return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
     }
     for (size_t i = 0; i < ledger->count; i++) {
@@ -4352,13 +4374,13 @@ static int pending_retirement_prepare(
     }
     for (size_t i = 0U; i < target_count; i++) {
         const account_t *account = targets[i];
-        size_t matches = 0U;
+        size_t id_records = 0U;
+        size_t owner_slot;
 
-        if (!account || !account->incarnation_persisted ||
-            !account_incarnation_is_valid(account->incarnation)) {
-            errno = ESTALE;
-            set_error(ERR_GIT_CONFIG_FAILED,
-                      "Retirement account has no persisted immutable incarnation");
+        if (!account) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "NULL target in outer Git retirement preparation");
             goto done;
         }
         for (size_t j = 0U; j < i; j++) {
@@ -4370,13 +4392,32 @@ static int pending_retirement_prepare(
                 goto done;
             }
         }
-        retirement->owners[i].account_id = account->id;
-        if (safe_strncpy(
-                retirement->owners[i].account_incarnation,
-                account->incarnation,
-                sizeof(retirement->owners[i].account_incarnation)) != 0) {
+        for (size_t j = 0U; j < ledger.count; j++) {
+            if (ledger.records[j].account_id == account->id) id_records++;
+        }
+        /* AR-12 H1: an account with no ledger records at all — never
+         * successfully switched, or loaded from a pre-ledger config — has
+         * nothing durable to retire. Its retirement leg is vacuously
+         * satisfied; runtime teardown and model removal proceed without
+         * demanding a switch-first round trip. */
+        if (id_records == 0U) continue;
+        if (!account->incarnation_persisted ||
+            !account_incarnation_is_valid(account->incarnation)) {
+            errno = ESTALE;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Retirement account has no persisted immutable incarnation");
             goto done;
         }
+        owner_slot = retirement->owner_count;
+        retirement->owners[owner_slot].account_id = account->id;
+        if (safe_strncpy(
+                retirement->owners[owner_slot].account_incarnation,
+                account->incarnation,
+                sizeof(retirement->owners[owner_slot].account_incarnation)) !=
+            0) {
+            goto done;
+        }
+        retirement->owner_count++;
         for (size_t j = 0U; j < ledger.count; j++) {
             const publication_record_t *publication = &ledger.records[j];
 
@@ -4413,18 +4454,16 @@ static int pending_retirement_prepare(
             account_refs[item_count] = account;
             publication_refs[item_count] = publication;
             item_count++;
-            matches++;
-        }
-        if (matches == 0U) {
-            errno = ENOENT;
-            set_error(
-                ERR_GIT_CONFIG_FAILED,
-                "No canonical publication provenance exists for account '%s'; switch it again before attributing durable Git credentials",
-                account->name);
-            goto done;
         }
     }
-    retirement->owner_count = target_count;
+    if (item_count == 0U) {
+        /* Every target was vacuous: no Git transaction or guard is needed
+         * because no canonical destination will be touched. */
+        retirement->vacuous = true;
+        retirement->phase = PENDING_RETIREMENT_PREPARED;
+        result = 0;
+        goto done;
+    }
     if (git_retirement_transaction_prepare(
             account_refs, publication_refs, item_count,
             &retirement->git) != 0) {
@@ -4472,7 +4511,9 @@ static int pending_retirement_cancel_unpublished(
     bool created;
     bool git_clean = true;
 
-    if (!retirement || !retirement->git || !retirement->guard) {
+    if (!retirement ||
+        (!retirement->vacuous &&
+         (!retirement->git || !retirement->guard))) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid unpublished Git retirement cancellation");
@@ -4483,6 +4524,10 @@ static int pending_retirement_cancel_unpublished(
         set_error(ERR_SYSTEM_CALL,
                   "Only a prepared Git retirement can be cancelled");
         return -1;
+    }
+    if (retirement->vacuous) {
+        secure_zero_memory(retirement, sizeof(*retirement));
+        return 0;
     }
     error_accumulator_init(&failures);
     created = config_retirement_guard_was_created(retirement->guard);
@@ -4511,7 +4556,9 @@ static int pending_retirement_cancel_unpublished(
 static int pending_retirement_publish(pending_retirement_t *retirement,
                                       size_t *cleared) {
     if (cleared) *cleared = 0U;
-    if (!retirement || !retirement->git || !retirement->guard) {
+    if (!retirement ||
+        (!retirement->vacuous &&
+         (!retirement->git || !retirement->guard))) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid prepared outer Git retirement");
@@ -4522,6 +4569,10 @@ static int pending_retirement_publish(pending_retirement_t *retirement,
         set_error(ERR_SYSTEM_CALL,
                   "Only a prepared Git retirement can be published");
         return -1;
+    }
+    if (retirement->vacuous) {
+        retirement->phase = PENDING_RETIREMENT_PUBLISHED;
+        return 0;
     }
     if (git_retirement_transaction_publish(retirement->git, cleared) != 0) {
         return pending_retirement_publish_failure(
@@ -4542,8 +4593,10 @@ static int pending_retirement_finalize(
     bool refresh_witnesses_stable = false;
     size_t destination_count = 0U;
 
-    if (!ctx || !retirement || !retirement->git || !retirement->guard ||
-        retirement->owner_count == 0U ||
+    if (!ctx || !retirement ||
+        (!retirement->vacuous &&
+         (!retirement->git || !retirement->guard ||
+          retirement->owner_count == 0U)) ||
         retirement->owner_count > MAX_ACCOUNTS ||
         outcome < ACCOUNTS_RETIREMENT_SAVE_DURABLE ||
         outcome > ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED) {
@@ -4557,6 +4610,12 @@ static int pending_retirement_finalize(
         set_error(ERR_SYSTEM_CALL,
                   "Only a published Git retirement can be finalized");
         return -1;
+    }
+    if (retirement->vacuous) {
+        /* No destination was touched and no guard exists; every save
+         * outcome settles to the same empty state. */
+        secure_zero_memory(retirement, sizeof(*retirement));
+        return 0;
     }
     error_accumulator_init(&failures);
     created = config_retirement_guard_was_created(retirement->guard);
@@ -4737,6 +4796,14 @@ int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
         ctx, account,
         PUBLICATION_CAP_DESTINATION | PUBLICATION_CAP_POST_GENERATION,
         true, &ledger, &publication_count);
+    if (lookup_result == ACCOUNT_PUBLICATION_LOOKUP_ABSENT) {
+        /* AR-12 H1: nothing was ever durably published for this account, so
+         * there is nothing to retire — vacuous success, not a demand to
+         * switch first. */
+        publication_ledger_clear(&ledger);
+        clear_error();
+        return 0;
+    }
     if (lookup_result != ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
         publication_ledger_clear(&ledger);
         return -1;
