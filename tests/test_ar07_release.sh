@@ -3968,6 +3968,7 @@ EOF
     assert_archive_metadata "$archive" "$dist_root" "$version"
     cmp -s "$archive" "$tmp/hermetic-archive.baseline" ||
         fail "repository-private attributes changed release bytes"
+    inspect_dist_residue "$archive" "$copy_platform"
     rm -f "$archive" "$clean_git_dir/info/attributes"
 
     # A workspace root can be created successfully while its first child path
