@@ -2036,9 +2036,14 @@ static bool config_refresh_publication_identity(
         return false;
     }
 
-    source_fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* AR-12 L6: O_NONBLOCK is inert for regular files and prevents a
+     * raced-in FIFO from wedging while the publication lock is held; the
+     * fstat/S_ISREG checks below reject the non-regular descriptor. */
+    source_fd = open(config_path,
+                     O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (source_fd < 0) goto refresh_done;
-    backup_fd = open(backup_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    backup_fd = open(backup_path,
+                     O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (backup_fd < 0 || fstat(source_fd, &source_after) != 0 ||
         fstat(backup_fd, &backup_before) != 0) {
         goto refresh_done;
@@ -4311,7 +4316,7 @@ static int config_resume_hint_snapshot_restore_at(
                   "Cannot verify restored resume hint: %s", hint);
         return -1;
     }
-    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         close(dir_fd);
         set_system_error(ERR_FILE_IO,
@@ -4952,11 +4957,13 @@ state_cleanup:
 /* Shared atomic-write tail for config_save and config_save_active_account:
  * validate the destination, back up the existing file, write doc to a fresh
  * 0600 temp, rename it into place, refresh the resume hint. */
+/* AR-12 L7: the former make_backup/update_hint parameters are gone — every
+ * caller passed true/false, and the dead update_hint branch was the only
+ * site publishing CONFIG_SOURCE_GENERATION_UNBOUND state, a latent bypass
+ * of the M5/M6 generation binding waiting for a future caller to flip it. */
 static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                                         const toml_document_t *doc,
                                         const char *config_path,
-                                        bool make_backup,
-                                        bool update_hint,
                                         bool *config_installed,
                                         struct stat *committed_generation) {
     char dir_path[MAX_PATH_LEN];
@@ -5072,7 +5079,7 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
      * account DATA is unchanged, the write is atomic (temp+rename), and backing
      * up on each switch churned five backups for five switches, rotating real
      * account-edit backups out of the bounded set. */
-    if (make_backup && destination_existed) {
+    if (destination_existed) {
         if (config_backup_internal(config_path, &destination_before) != 0) {
             /* A successful save promises a durable, parseable recovery copy.
              * If that promise cannot be established, the config replacement
@@ -5306,12 +5313,6 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
             proof_errno == ESTALE ? ERR_FILE_IO : ERR_CONFIG_WRITE_FAILED,
             "Durable config generation changed before context refresh: %s",
             config_path);
-        goto document_fail;
-    }
-    if (update_hint &&
-        config_update_resume_hint(ctx, config_path, NULL,
-                                  CONFIG_SOURCE_GENERATION_UNBOUND,
-                                  NULL, NULL, NULL) != 0) {
         goto document_fail;
     }
     if (committed_generation) {
@@ -5596,8 +5597,8 @@ static int config_save_mode(gitswitch_ctx_t *ctx,
             goto cleanup;
         }
     }
-    result = config_write_document_atomic(ctx, toml_doc, config_path, true,
-                                          false, &document_installed,
+    result = config_write_document_atomic(ctx, toml_doc, config_path,
+                                          &document_installed,
                                           &committed_generation);
     if (config_installed) {
         *config_installed = document_installed;
@@ -7668,7 +7669,8 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
                          "Cannot identify private backup source: %s", src_path);
         return -1;
     }
-    sfd = open(src_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    sfd = open(src_path,
+               O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (sfd < 0) {
         set_system_error(ERR_FILE_IO, "Cannot open backup source (symlink?): %s", src_path);
         return -1;

@@ -4775,14 +4775,21 @@ static int ssh_write_config_atomic_at(
                   "Failed to allocate a unique temporary SSH config");
         return -1;
     }
-    if (fchmod(fd, 0600) != 0 || fstat(fd, &temp_identity) != 0 ||
+    /* AR-12 L20: capture the temp's identity FIRST — a failure in the
+     * securing checks below must still reach the guarded unlink in the fail
+     * path, or the just-created O_EXCL file is orphaned permanently in the
+     * user's real ~/.ssh. */
+    if (fstat(fd, &temp_identity) == 0) {
+        have_temp_identity = true;
+    }
+    if (!have_temp_identity || fchmod(fd, 0600) != 0 ||
         !S_ISREG(temp_identity.st_mode) || temp_identity.st_uid != getuid() ||
         temp_identity.st_nlink != 1 ||
+        fstat(fd, &temp_identity) != 0 ||
         (temp_identity.st_mode & 0777) != 0600) {
         set_system_error(ERR_FILE_IO, "Failed to secure temporary SSH config");
         goto fail;
     }
-    have_temp_identity = true;
     if (signals_scratch_register(temp_path) != 0) {
         set_error(ERR_FILE_IO,
                   "Failed to register temporary SSH config for cleanup");

@@ -1244,10 +1244,85 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
             safe_strncpy(stale, entry->d_name, sizeof(stale));
             closedir(dir);
             set_error(ERR_FILE_IO,
-                      "Unresolved GPG runtime quarantine blocks mutation: %s",
+                      "Unresolved GPG runtime quarantine blocks mutation: %s (run 'gitswitch reset' to retire it)",
                       stale);
             return -1;
         }
+    }
+    closedir(dir);
+    return 0;
+}
+
+/* AR-12 L11: a SIGKILL/power loss between quarantine creation and its
+ * unlink orphans a .gitswitch-gpg-rollback.* / .gitswitch-gpg-publish.*
+ * symlink with no in-memory token, and the stale-quarantine gate then
+ * blocks every switch, drop, AND reset forever. Full reset deletes every
+ * managed home anyway, so an owned orphaned quarantine SYMLINK preserves
+ * nothing — retire it. Anything that is not an owned symlink stays fatal. */
+static int gpg_retire_orphan_quarantines_locked(int base_fd) {
+    int scan_flags = O_RDONLY | O_CLOEXEC;
+    int scan_fd;
+    DIR *dir;
+    struct dirent *entry;
+
+#ifdef O_DIRECTORY
+    scan_flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    scan_flags |= O_NOFOLLOW;
+#endif
+    scan_fd = openat(base_fd, ".", scan_flags);
+    if (scan_fd < 0 || !(dir = fdopendir(scan_fd))) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect GPG quarantine residue");
+        return -1;
+    }
+    for (;;) {
+        struct stat orphan;
+
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot enumerate GPG quarantine residue");
+                return -1;
+            }
+            break;
+        }
+        if (!gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) &&
+            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)) {
+            continue;
+        }
+        if (fstatat(base_fd, entry->d_name, &orphan,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect GPG quarantine residue: %s",
+                             entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        if (!S_ISLNK(orphan.st_mode) || orphan.st_uid != getuid()) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing foreign GPG quarantine residue: %s",
+                      entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        if (unlinkat(base_fd, entry->d_name, 0) != 0 && errno != ENOENT) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot retire orphaned GPG quarantine: %s",
+                             entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        log_warning("Retired orphaned GPG quarantine residue: %s",
+                    entry->d_name);
     }
     closedir(dir);
     return 0;
@@ -2336,13 +2411,30 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
         return -1;
     }
     prev_existed = prev_rc == 0;
-    if (prev_existed &&
-        (!gpg_target_is_managed_child(base, prev_target) ||
-         gpg_live_private_home(base_fd, base, prev_target) != 0)) {
-        set_error(ERR_INVALID_PATH,
-                  "Refusing to replace unsafe previous GNUPGHOME target: %s",
-                  prev_target);
-        return -1;
+    if (prev_existed) {
+        int prev_live = -1;
+
+        if (gpg_target_is_managed_child(base, prev_target)) {
+            prev_live = gpg_live_private_home(base_fd, base, prev_target);
+        }
+        if (prev_live == 1) {
+            /* AR-12 L10: `current` dangles — a crash between home removal
+             * and current retirement (or a manual rm of one home) leaves
+             * current -> <deleted-account>. There is no home to preserve,
+             * so proceed and let a failed retarget restore ABSENCE rather
+             * than the dangling spelling. */
+            log_warning(
+                "Previous GNUPGHOME target no longer exists; replacing the dangling current link: %s",
+                prev_target);
+            clear_error();
+            prev_existed = false;
+        } else if (prev_live != 0) {
+            set_error(
+                ERR_INVALID_PATH,
+                "Refusing to replace unsafe previous GNUPGHOME target: %s",
+                prev_target);
+            return -1;
+        }
     }
     result->previous_present = prev_existed;
     if (prev_existed) {
@@ -3715,6 +3807,10 @@ int gpg_manager_reset(const char *account) {
         return -1;
     }
     if (gpg_reconcile_reset_retry_locked(base_fd) != 0) {
+        unlock_gpg_dir(base_fd, lock_fd);
+        return -1;
+    }
+    if (!account && gpg_retire_orphan_quarantines_locked(base_fd) != 0) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }

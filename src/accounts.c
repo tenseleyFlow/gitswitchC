@@ -3780,7 +3780,16 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
 
     /* CLI removal owns a later accounts.toml save, so prepare exact Git
      * before-images and publish the durable blocker before any runtime or Git
-     * mutation.  Direct/library callers keep the historical one-call path. */
+     * mutation.  Direct/library callers keep the historical one-call path.
+     *
+     * AR-12 L5 (known hold window): preparation acquires Git's own canonical
+     * <config>.lock names for every recorded destination and holds them
+     * across the SSH/GPG runtime teardown below, so a concurrent `git
+     * config` write fails with git's could-not-lock error until finalize.
+     * This is deliberate fail-before-mutate ordering: releasing and
+     * re-acquiring at publish would let another writer change the sealed
+     * generation mid-remove. Teardown is bounded (agent kill/gpgconf
+     * timeouts), keeping the window short. */
     if (ctx->config.defer_signal_cleanup) {
         retirement_targets[0] = account;
         if (pending_retirement_prepare(
