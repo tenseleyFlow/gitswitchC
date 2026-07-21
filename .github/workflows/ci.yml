@@ -136,13 +136,6 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Free host disk for the VM backing store
-        # The guest disk is a sparse raw file on the host; on the smaller
-        # hosted-compute agents the default free space is exhausted while
-        # guest pkg writes materialize blocks, surfacing inside the VM as
-        # 'Failed writing received data to disk'. Drop bundled toolchains
-        # this job never uses.
-        run: df -h / && sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache && df -h /
       - name: Start FreeBSD 14.4 VM
         uses: cross-platform-actions/action@5ea7e8e4677bd726033a10b094ba1c5762b15dee # v1.3.0
         with:
@@ -170,18 +163,16 @@ jobs:
           # ksh stays best-effort: FreeBSD's ksh93 packaging does not reliably
           # install a binary literally named `ksh`, which is what the suites
           # resolve.
-          # The refreshed quarterly catalogue's on-disk database now exhausts
-          # the image's free space (pkg fetches fail ENOSPC; catalogue
-          # processing OOMed the default-memory VM). Drop base-system weight
-          # this lane never uses before installing, and clean the download
-          # cache afterwards; df brackets keep the real numbers in the log.
-          df -h /
-          sudo rm -rf /usr/tests /usr/lib32 /usr/lib/debug /var/db/freebsd-update
-          df -h /
+          # The quarterly branch's CDN currently 404s hashed package objects
+          # its own metadata references (probed directly: HTTP 404 on the
+          # exact URL pkg fetches; pkg reports it as a misleading write
+          # error). Pin this VM to the 'latest' branch until upstream heals.
+          sudo mkdir -p /usr/local/etc/pkg/repos
+          printf 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }\n' \
+            | sudo tee /usr/local/etc/pkg/repos/FreeBSD.conf
+          sudo pkg update -f
           sudo pkg install -y gmake gcc git binutils \
             bash dash fish gnupg readline zsh
-          sudo pkg clean -ay
-          df -h /
           # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
           # run_argv passes the verified script as /dev/fd/4 and never falls
           # back to its mutable pathname. The minimal CI image does not mount
