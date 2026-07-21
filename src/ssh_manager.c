@@ -5172,6 +5172,23 @@ int ssh_configure_host_alias_result(
                     pinned_config_fd, buf, buf_len) != 0) {
                 goto done;
             }
+            /* AR-12 M6: this retry may follow a rename whose directory sync
+             * failed (DURABILITY_UNCERTAIN was reported and the switch
+             * retained). Content identity alone cannot convert that
+             * uncertainty into success — re-prove the directory entry's
+             * durability now, mirroring unlink_ssh_runtime_entry's
+             * sync-the-observed-state principle. */
+            if (g_ssh_dirsync(directory.dir_fd) != 0) {
+                if (publication) {
+                    *publication =
+                        SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+                }
+                set_system_error(
+                    ERR_FILE_IO,
+                    "SSH config is already current but its directory sync "
+                    "failed; publication durability remains uncertain");
+                goto done;
+            }
             log_debug(
                 "SSH host alias block already current and private; "
                 "skipping rewrite");
