@@ -170,8 +170,18 @@ jobs:
           # ksh stays best-effort: FreeBSD's ksh93 packaging does not reliably
           # install a binary literally named `ksh`, which is what the suites
           # resolve.
+          # The refreshed quarterly catalogue's on-disk database now exhausts
+          # the image's free space (pkg fetches fail ENOSPC; catalogue
+          # processing OOMed the default-memory VM). Drop base-system weight
+          # this lane never uses before installing, and clean the download
+          # cache afterwards; df brackets keep the real numbers in the log.
+          df -h /
+          sudo rm -rf /usr/tests /usr/lib32 /usr/lib/debug /var/db/freebsd-update
+          df -h /
           sudo pkg install -y gmake gcc git binutils \
             bash dash fish gnupg readline zsh
+          sudo pkg clean -ay
+          df -h /
           # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
           # run_argv passes the verified script as /dev/fd/4 and never falls
           # back to its mutable pathname. The minimal CI image does not mount
