@@ -1248,20 +1248,29 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
             ctx, ctx->config.active_account);
         if (!state_account) {
             if (ctx->accounts_skipped_on_load > 0) {
-                set_error(ERR_CONFIG_INVALID,
-                          "Active-state account '%s' could not be validated because account sections were skipped",
-                          ctx->config.active_account);
-                return -1;
+                /* AR-12 H3: the active account's own section was skipped —
+                 * commonly a deleted, rotated, or chmod'd key file. One
+                 * unloadable account must not take down every command:
+                 * degrade to inactive-with-warning like the stale-name
+                 * branch below, so list/status/reset/switch keep running as
+                 * repair paths. Full-document saves stay blocked by the
+                 * skip counters, preserving the on-disk section. */
+                display_warning(
+                    "Active-state account '%s' was skipped on load; treating the session as inactive until the account is repaired",
+                    ctx->config.active_account);
+                ctx->config.active_account[0] = '\0';
+            } else {
+                /* A crash after accounts.toml removed/renamed the active
+                 * account but before the state phase completed leaves a
+                 * syntactically valid stale artifact. Resolve that state
+                 * deterministically to inactive. Loading stays
+                 * observational: read-only commands do not own the mutation
+                 * lock, so cleanup is deferred to the next
+                 * already-serialized active/full save. */
+                display_warning("Ignoring stale active-state account '%s': it is not present in %s",
+                                ctx->config.active_account, config_path);
+                ctx->config.active_account[0] = '\0';
             }
-            /* A crash after accounts.toml removed/renamed the active account
-             * but before the state phase completed leaves a syntactically
-             * valid stale artifact. Resolve that state deterministically to
-             * inactive. Loading stays observational: read-only commands do
-             * not own the mutation lock, so cleanup is deferred to the next
-             * already-serialized active/full save. */
-            display_warning("Ignoring stale active-state account '%s': it is not present in %s",
-                            ctx->config.active_account, config_path);
-            ctx->config.active_account[0] = '\0';
         } else if (active_state.exists &&
                    !active_state.legacy_needs_only &&
                    strcmp(active_state.needs,

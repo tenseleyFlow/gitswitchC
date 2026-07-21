@@ -1412,6 +1412,60 @@ TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
     }
 }
 
+/* AR-12 H3: deleting or chmod-ing the ACTIVE account's key file skips that
+ * account on load; the load must degrade to an inactive session instead of
+ * hard-failing every command (which would brick the repair paths too). */
+TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load) {
+    char dir[128], path[256], key[256], cfg[2048];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_worker", dir);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "active_account = \"worker\"\n"
+                   "[accounts.1]\n"
+                   "name = \"worker\"\n"
+                   "email = \"worker@example.com\"\n"
+                   "ssh_key = \"%s\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_STR_EQ(ctx.config.active_account, "worker");
+    /* Persist the two-line state artifact ('ssh\nactive=worker'). */
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+
+    /* Key deleted (rotation/unmount): the active account is skipped, and
+     * the session degrades to inactive instead of failing config_load. */
+    CHECK_EQ_INT(unlink(key), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK(ctx.config.active_account[0] == '\0');
+    /* Full-document rewrites stay blocked while the section is skipped. */
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+
+    /* Same degrade for a key that exists with unusable permissions. */
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK_EQ_INT(chmod(key, 0644), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK(ctx.config.active_account[0] == '\0');
+}
+
 TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     static const char *const invalid[] = {
         "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
@@ -2421,4 +2475,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_rejects_ssh_key_path_over_256_chars_api);
     RUN_TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip);
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
+    RUN_TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load);
 TEST_MAIN_END()
