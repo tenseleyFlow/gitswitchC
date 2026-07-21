@@ -141,6 +141,10 @@ jobs:
         with:
           operating_system: freebsd
           version: '14.4'
+          # pkg's catalogue processing now OOMs at the action's default VM
+          # memory (deterministic exit-137 during provisioning); the host
+          # runner has 16G, so give the VM enough headroom.
+          memory: 8G
       - name: Build + test on FreeBSD
         # Tests run in release mode here: FreeBSD enables ASLR, which is
         # incompatible with ASan/PIE binaries (they abort on init). The

@@ -722,6 +722,9 @@ check_policy()
             step_version_count = 0
             step_version_value = ""
             step_version_in_with = 0
+            step_memory_count = 0
+            step_memory_value = ""
+            step_memory_in_with = 0
             step_input_name_count = 0
             step_input_name_value = ""
             step_input_name_in_with = 0
@@ -776,12 +779,17 @@ check_policy()
                     reject("checkout action/ref/comment must match canonical v7.0.0 pin")
             }
             if (normalized_action ~ /^cross-platform-actions\/action@/) {
+                # The reviewed VM memory is pinned: pkg catalogue processing
+                # OOMs at the action default, and an unreviewed value could
+                # silently shrink the lane back into deterministic 137s.
                 if (current_job != "freebsd" ||
-                    step_with_input_count != 2 ||
+                    step_with_input_count != 3 ||
                     step_os_count != 1 || !step_os_in_with ||
                     step_os_value != "freebsd" ||
                     step_version_count != 1 || !step_version_in_with ||
-                    step_version_value !~ /^[0-9]+\.[0-9]+$/)
+                    step_version_value !~ /^[0-9]+\.[0-9]+$/ ||
+                    step_memory_count != 1 || !step_memory_in_with ||
+                    step_memory_value != "8G")
                     reject("FreeBSD VM action configuration is missing or unsafe")
                 if (step_action_run_count != 0 ||
                     step_direct_run_count != 0 ||
@@ -866,6 +874,12 @@ check_policy()
                 if (!scalar_ok) reject()
                 step_version_value = scalar_value
                 if (inside) step_version_in_with = 1
+            } else if (key == "memory") {
+                step_memory_count++
+                decode_scalar(value)
+                if (!scalar_ok) reject()
+                step_memory_value = scalar_value
+                if (inside) step_memory_in_with = 1
             } else if (key == "name") {
                 step_input_name_count++
                 decode_scalar(value)
@@ -2976,7 +2990,7 @@ expect_structural_rejected_for "FreeBSD command left in action text" \
 
 awk '
     { print }
-    !changed && $0 == "          version: '\''14.4'\''" {
+    !changed && $0 == "          memory: 8G" {
         print "      - name: Intervening host step"
         print "        run: true"
         changed = 1
