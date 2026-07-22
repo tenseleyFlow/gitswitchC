@@ -4763,6 +4763,26 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     }
     if (state_before.existed && state_before.length == length &&
         memcmp(state_before.data, content, length) == 0) {
+        /* AR-13 M1 (AR-12 M6 class): the on-disk bytes already match, but a
+         * prior write may have installed them and then failed its directory
+         * fsync — returning -1 with the content cache-visible yet not durable.
+         * Returning success here without re-proving durability would convert
+         * that uncertain state into a reported-durable success on retry. Re-sync
+         * the parent directory (the same commit the mutation path performs)
+         * before treating the no-op as committed. */
+        int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        if (dir_fd < 0 ||
+            config_io_fault(CONFIG_IO_STATE_BEFORE_DIR_SYNC,
+                            "active-state directory sync") ||
+            fsync(dir_fd) != 0) {
+            int saved_errno = errno;
+            if (dir_fd >= 0) close(dir_fd);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot durably commit resume hint: %s", hint);
+            goto state_cleanup;
+        }
+        close(dir_fd);
         result = 0;
         goto state_cleanup;
     }

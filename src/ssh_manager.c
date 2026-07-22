@@ -4981,7 +4981,18 @@ int ssh_remove_host_alias(const char *alias) {
         goto done;
     }
     if (removed == 0) {
-        rc = 0; /* no managed block for this alias */
+        /* AR-13 M2 (AR-12 M6 class): the current on-disk config has no managed
+         * block for this alias — but a prior removal may have written exactly
+         * this content and then failed its directory sync, leaving the removal
+         * cache-visible yet not durable. Re-prove durability with the same
+         * directory sync the write path performs before reporting the no-op
+         * committed, rather than converting that uncertainty into success. */
+        if (g_ssh_dirsync(directory.dir_fd) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to durably commit SSH config directory");
+            goto done; /* rc remains -1 */
+        }
+        rc = 0;
         goto done;
     }
 
