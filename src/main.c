@@ -1628,18 +1628,47 @@ int main(int argc, char *argv[]) {
         } else if (mutation.switch_prepare_state ==
                        ACCOUNTS_SWITCH_PREPARE_PREPARED &&
                    switch_commit_retained) {
-            /* The SSH config rename crossed its publication point. The
-             * structured account result has already committed Git/runtime and
-             * released rollback ownership, so retain the matching active file
-             * and resume hint too. Exit nonzero because verification or
-             * durability was not proven; never misreport this as success. */
-            display_error(
-                "Account switch committed, but SSH alias publication is uncertain",
-                "%s; active metadata, Git identity, runtime state, and the "
-                "installed alias were retained together. Verify ~/.ssh/config "
-                "and its filesystem durability before retrying",
-                save_error[0] ? save_error :
-                                "unknown SSH alias publication error");
+            /* The structured account result has already committed Git/runtime
+             * and released rollback ownership, so retain the matching active
+             * file and resume hint too. Exit nonzero because the post-commit
+             * tail did not fully complete; never misreport this as success.
+             * AR-13 L8: describe the ACTUAL retained state — only the
+             * alias-unverified / durability-uncertain states are about
+             * ~/.ssh/config; a completed or cleanup-failed commit must not
+             * send the user to verify an alias that was fine. */
+            {
+                const char *detail = save_error[0] ? save_error :
+                                     "unknown post-commit error";
+
+                switch (switch_commit_state) {
+                case ACCOUNTS_SWITCH_COMMIT_ALIAS_UNVERIFIED:
+                case ACCOUNTS_SWITCH_COMMIT_ALIAS_DURABILITY_UNCERTAIN:
+                    display_error(
+                        "Account switch committed, but SSH alias publication is uncertain",
+                        "%s; active metadata, Git identity, runtime state, and "
+                        "the installed alias were retained together. Verify "
+                        "~/.ssh/config and its filesystem durability before "
+                        "retrying", detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_ALIAS_CLEANUP_FAILED:
+                    display_error(
+                        "Account switch committed, but post-commit resource "
+                        "cleanup failed",
+                        "%s; the switch is in effect — active metadata, Git "
+                        "identity, runtime state, and the alias were retained "
+                        "together", detail);
+                    break;
+                case ACCOUNTS_SWITCH_COMMIT_COMPLETE:
+                case ACCOUNTS_SWITCH_COMMIT_NOT_COMMITTED:
+                default:
+                    display_error(
+                        "Account switch committed, but final cleanup failed",
+                        "%s; the switch is in effect — active metadata, Git "
+                        "identity, runtime state, and the alias were retained "
+                        "together", detail);
+                    break;
+                }
+            }
             exit_code = EXIT_FAILURE;
             if (signals_pending()) {
                 signals_rollback_begin();
@@ -2269,20 +2298,34 @@ static int handle_config_command(gitswitch_ctx_t *ctx) {
             int confirmed = prompt_confirm_exact_yes_prompt(
                 "Create default configuration? (yes/No): ");
 
-            if (confirmed < 0) {
-                display_error("Failed to read confirmation", "%s",
+            if (confirmed == PROMPT_LINE_ERROR) {
+                /* AR-13 L18: only a real display/read I/O failure is a command
+                 * failure; preserve errno so the message is truthful (mirrors
+                 * the reset confirmation site). */
+                int confirmation_errno = errno != 0 ? errno : EIO;
+
+                errno = confirmation_errno;
+                set_system_error(
+                    ERR_FILE_IO,
+                    "Failed to display or read the create-default confirmation");
+                display_error("Cannot confirm configuration creation", "%s",
                               get_last_error()->message);
                 return EXIT_FAILURE;
             }
-            if (confirmed == 1) {
-                if (config_create_default(ctx->config.config_path) == 0) {
-                    display_success("Default configuration created");
-                    printf("Please edit the file to add your accounts.\n");
-                } else {
-                    display_error("Failed to create default configuration",
-                                  "%s", get_last_error()->message);
-                    return EXIT_FAILURE;
-                }
+            if (confirmed != 1) {
+                /* AR-13 L18/L19: a clean EOF or any non-'yes' answer (including
+                 * a bare 'y') is a polite decline — print it, rather than
+                 * exiting 1 on EOF or silently doing nothing on 'y'. */
+                printf("No configuration created.\n");
+                return EXIT_SUCCESS;
+            }
+            if (config_create_default(ctx->config.config_path) == 0) {
+                display_success("Default configuration created");
+                printf("Please edit the file to add your accounts.\n");
+            } else {
+                display_error("Failed to create default configuration",
+                              "%s", get_last_error()->message);
+                return EXIT_FAILURE;
             }
         }
         return EXIT_SUCCESS;
