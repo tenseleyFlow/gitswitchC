@@ -921,6 +921,7 @@ int main(int argc, char *argv[]) {
     bool show_help = false;
     bool show_version = false;
     bool dry_run = false;
+    bool verbose_requested = false;
     bool force_global = false;
     bool force_local = false;
     bool assume_yes = false;
@@ -1000,15 +1001,20 @@ int main(int argc, char *argv[]) {
                 no_color = true;
                 break;
             case 'V':
-                /* AR-12 L15: the option contract presents -V and -d as
-                 * distinct; make that true. Verbose enables INFO logging
-                 * (and the verbose display paths below), while -d keeps the
-                 * full DEBUG stream. -d wins regardless of order. */
+                /* AR-12 L15 / AR-13 L9: the option contract presents -V and -d
+                 * as distinct; make that true. -V enables INFO logging and the
+                 * verbose display paths; -d keeps the full DEBUG stream. -d
+                 * wins regardless of order. Track the request explicitly so the
+                 * display-verbosity flag below does not read the global log
+                 * level, whose default is build-type dependent (INFO in DEBUG
+                 * builds), which made -V a no-op there. */
+                verbose_requested = true;
                 if (!should_log(LOG_LEVEL_DEBUG)) {
                     set_log_level(LOG_LEVEL_INFO);
                 }
                 break;
             case 'd':
+                verbose_requested = true;
                 set_log_level(LOG_LEVEL_DEBUG);
                 break;
             case 'n':
@@ -1268,8 +1274,10 @@ int main(int argc, char *argv[]) {
     ctx->config.force_global = force_global;
     ctx->config.force_local = force_local;
     ctx->config.assume_yes = assume_yes;
-    /* AR-12 L15: verbose display paths engage at -V (INFO) as well as -d. */
-    ctx->config.verbose = should_log(LOG_LEVEL_INFO);
+    /* AR-12 L15 / AR-13 L9: verbose display engages at -V or -d, driven by the
+     * explicit request — not the global log level (whose default is INFO in
+     * DEBUG builds, which would force verbose on and make -V a no-op there). */
+    ctx->config.verbose = verbose_requested;
     /* accounts.c historically re-raised interrupted direct/library calls at
      * its own rollback boundary. The CLI owns additional resources beyond
      * that boundary, so its common tail performs the truthful re-raise only
