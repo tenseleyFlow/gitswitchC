@@ -1013,12 +1013,19 @@ static int run_informational_ssh_probe(const account_t *account,
 static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
                                   const account_t *switch_target,
                                   git_scope_t scope, bool write_git,
-                                  bool ssh_ok, bool gpg_ok) {
+                                  bool ssh_ok, bool gpg_ok, bool full_success) {
     if (!ctx || !account || !switch_target) {
         return;
     }
 
-    if (!ctx->config.dry_run && account->ssh_enabled &&
+    /* AR-13 L7: the affirmative outputs here (the SSH probe [OK]/[--] line, the
+     * shell-init Tip, and the 'Successfully switched' log) assert a fully
+     * completed switch. On a retained-but-uncertain commit (alias unverified,
+     * durability uncertain, or post-commit cleanup failed) the CLI reports
+     * failure, so emitting unqualified success would contradict the exit
+     * status. Gate them on full_success; the local-validation warnings below
+     * are diagnostic and run regardless. */
+    if (full_success && !ctx->config.dry_run && account->ssh_enabled &&
         strlen(account->ssh_key_path) > 0 && ssh_ok &&
         !ctx->config.resuming &&
         !g_session.ssh_config.reused_existing_agent && !signals_pending()) {
@@ -1065,7 +1072,7 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
         }
     }
 
-    if (ssh_ok || gpg_ok) {
+    if (full_success && (ssh_ok || gpg_ok)) {
         printf("\n  Tip: wire your shell once so every switch takes effect transparently:\n");
         printf("    capture `gitswitch init <shell>` first, then evaluate/source it only\n");
         printf("    when generation succeeds (see README: shell integration).\n");
@@ -1077,8 +1084,14 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
         }
     }
 
-    log_info("Successfully switched to account: %s (%s)", account->name,
-             account->description);
+    if (full_success) {
+        log_info("Successfully switched to account: %s (%s)", account->name,
+                 account->description);
+    } else {
+        log_info("Account switch for '%s' committed, but post-commit "
+                 "verification did not complete; see the command error output",
+                 account->name);
+    }
 }
 
 static bool ssh_alias_publication_is_installed(
@@ -2055,7 +2068,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
     }
 
     finish_switch_success(ctx, account, &switch_target, scope, write_git,
-                          ssh_ok, gpg_ok);
+                          ssh_ok, gpg_ok, true);
 
     /* AR-08 M6: accounts_switch() is a complete one-call API. A successful
      * direct call must not leave this process running gitswitch's handlers or
@@ -2299,7 +2312,8 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                           g_pending_switch.scope,
                           g_pending_switch.git_written,
                           g_pending_switch.ssh_ok,
-                          g_pending_switch.gpg_ok);
+                          g_pending_switch.gpg_ok,
+                          final_state == ACCOUNTS_SWITCH_COMMIT_COMPLETE);
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));
     if (g_transaction_owner.rollback_depth > 0 &&
         accounts_transaction_rollback_end(
