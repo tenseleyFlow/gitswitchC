@@ -1468,6 +1468,10 @@ TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load) {
     CHECK_EQ_INT(ctx.account_count, 0);
     CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
     CHECK(ctx.config.active_account[0] == '\0');
+    /* AR-13 M9: pin the rewrite block on the permission-degrade path too, not
+     * just the key-deleted path above — a skipped active section must keep
+     * full-document rewrites refused in every H3 degrade case. */
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
 }
 
 /* AR-12 H4: a non-round-trippable ssh_key must be rejected at add/edit
