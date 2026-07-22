@@ -2390,6 +2390,16 @@ static int accounts_switch_abort_accumulated(
     if (pending.runtime_lock_fd < 0) {
         pending.runtime_lock_fd = runtime_state_lock_acquire();
         if (pending.runtime_lock_fd < 0) {
+            /* AR-13 M3: the owner phase was optimistically advanced to
+             * FINALIZING just above, but a retry-handle record
+             * (runtime_lock_fd < 0) means this abort has not actually run.
+             * Restore ABORT_ONLY before returning: abort/commit admission
+             * accepts only PREPARED/ABORT_ONLY, so leaving FINALIZING strands
+             * the transaction owner forever once the cross-HOME runtime lock
+             * contention (which is non-blocking/fail-fast) is merely transient.
+             * abort_only stays false so a successful retry still replays the
+             * retained dirty rollback. */
+            g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
             (void)error_accumulator_add_last(errors,
                                              "runtime lock reacquisition");
             return publish_abort_result(errors, -1);
