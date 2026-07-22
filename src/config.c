@@ -8764,6 +8764,37 @@ static int validate_account_security(const account_t *account) {
                       "SSH key path contains terminal control bytes or malformed UTF-8");
             return -1;
         }
+
+        /* AR-13 R0 (config-selfbrick): the loader's schema
+         * (toml_validate_gitswitch_schema) hard-fails the WHOLE file — not the
+         * per-account skip_section — when a persisted ssh_key contains ".."
+         * (toml_parser.c toml_validate_file_path) or is not '/'- or
+         * '~'-anchored (toml_parser.c). Admission historically enforced only
+         * the sanitizer round-trip and the 256-byte expanded cap; expand_path
+         * passes ".." through untouched and ssh_validate_key_file open()s the
+         * path, so the kernel resolves ".."/CWD-relative segments and the key
+         * validates — letting an account this tool admits and saves be one the
+         * same tool then refuses to load, bricking every command on next start.
+         * The AR-12 H4 comment above claims admission is symmetric with the
+         * loader; these two checks are what actually make it so. They run on
+         * the persisted spelling(s), before expand_path collapses '~'. */
+        if (!toml_validate_file_path(account->ssh_key_path) ||
+            (account->ssh_key_spelling[0] != '\0' &&
+             !toml_validate_file_path(account->ssh_key_spelling))) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "SSH key path may not contain '..': %s", account->ssh_key_path);
+            return -1;
+        }
+        if ((account->ssh_key_path[0] != '/' && account->ssh_key_path[0] != '~') ||
+            (account->ssh_key_spelling[0] != '\0' &&
+             account->ssh_key_spelling[0] != '/' &&
+             account->ssh_key_spelling[0] != '~')) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "ssh_key must be an absolute or ~-anchored path, not relative: %s",
+                      account->ssh_key_path);
+            return -1;
+        }
+
         if (expand_path(account->ssh_key_path, expanded_path, sizeof(expanded_path)) != 0) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid SSH key path: %s", account->ssh_key_path);
             return -1;

@@ -2398,6 +2398,75 @@ TEST(add_rejects_ssh_key_path_over_256_chars_api) {
     CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_INVALID);
 }
 
+TEST(add_rejects_traversal_and_relative_ssh_key_that_loader_bricks_on) {
+    /* AR-13 R0: the loader hard-fails the WHOLE file (toml_validate_gitswitch_schema
+     * returns -1, not skip_section) when a persisted ssh_key contains ".." or is
+     * not '/'- or '~'-anchored. Pre-fix, admission checked neither: expand_path
+     * passes ".." through and ssh_validate_key_file open()s the resolved path, so
+     * config_add_account accepted these, config_save persisted them, and the very
+     * next config_load returned -1 with zero accounts — bricking every command.
+     * Admission must now reject exactly what the loader rejects. */
+    static const char *const key_body =
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n";
+    char dir[128], path[256], subdir[256], key[256], trav[512], cfg[2048];
+    gitswitch_ctx_t ctx;
+    account_t a;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(subdir, sizeof(subdir), "%s/sub", dir);
+    CHECK_EQ_INT(mkdir(subdir, 0700), 0);
+    snprintf(key, sizeof(key), "%s/id_ok", dir);
+    CHECK_EQ_INT(write_config(key, key_body, strlen(key_body)), 0); /* 0600 */
+
+    /* Absolute-but-traversal spelling that resolves to the real 0600 key:
+     * '/'-anchored (anchor rule ok) yet contains ".." (traversal rule fires). */
+    snprintf(trav, sizeof(trav), "%s/sub/../id_ok", dir);
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&a, 1, "trav", "t@x.com", "d");
+    a.ssh_enabled = true;
+    strncpy(a.ssh_key_path, trav, sizeof(a.ssh_key_path) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_INVALID);
+
+    /* Relative spelling: rejected by the anchor rule before existence matters. */
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&a, 1, "rel", "r@x.com", "d");
+    a.ssh_enabled = true;
+    strncpy(a.ssh_key_path, "relkeys/id", sizeof(a.ssh_key_path) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &a), -1); /* pre-fix: 0 */
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(get_last_error()->code, ERR_ACCOUNT_INVALID);
+
+    /* Positive control: the clean anchored key round-trips add -> save -> load. */
+    memset(&ctx, 0, sizeof(ctx));
+    fill_account(&a, 1, "clean", "c@x.com", "d");
+    a.ssh_enabled = true;
+    strncpy(a.ssh_key_path, key, sizeof(a.ssh_key_path) - 1);
+    CHECK_EQ_INT(config_add_account(&ctx, &a), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+
+    /* Loader half of the asymmetry: a hand-written config carrying a ".."
+     * ssh_key hard-fails the whole file (not a per-account skip). This is the
+     * exact state admission now prevents us from ever producing. */
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"trav\"\n"
+                   "email = \"trav@example.com\"\n"
+                   "ssh_key = \"%s\"\n",
+                   trav) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), -1);
+    CHECK_EQ_INT(ctx.account_count, 0);
+}
+
 /* AR-08 L5 integration: a caller may repair a schema-skipped document in
  * memory and persist it. Revalidation must clear the stale visibility state
  * before the repaired document is written and loaded through config.c. */
@@ -2580,6 +2649,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(resume_hint_reflects_account_runtime_needs);
     RUN_TEST(resume_hint_refuses_unsafe_nodes_and_replaces_regular_file_atomically);
     RUN_TEST(add_rejects_ssh_key_path_over_256_chars_api);
+    RUN_TEST(add_rejects_traversal_and_relative_ssh_key_that_loader_bricks_on);
     RUN_TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip);
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
     RUN_TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load);
