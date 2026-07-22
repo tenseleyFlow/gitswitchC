@@ -2879,15 +2879,19 @@ TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild) {
     publication_identity_from_stat(&record.repository, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
 
-    /* All anchors live: not reclaimable. */
-    CHECK(!publication_record_destination_provably_absent(&record));
+    /* All anchors live and matching: not reclaimable. */
+    CHECK(!publication_record_destination_provably_absent(&ledger.records[0]));
 
-    /* Rebuild .git in place: worktree root unchanged, new .git inode on the
-     * same filesystem. */
-    CHECK_EQ_INT(rmdir(gitdir), 0);
-    CHECK_EQ_INT(mkdir(gitdir, 0700), 0);
+    /* An in-place `rm -rf .git && git init` leaves the worktree root untouched
+     * but gives .git a new inode on the SAME filesystem. Simulate that exact
+     * state deterministically by staling only the recorded config_parent inode
+     * (a real rmdir+mkdir can reuse the freed inode on ext4/UFS, leaving the
+     * identity unchanged). The live .git still exists, so the config-parent
+     * anchor reads present-but-different-object on the same device -> provably
+     * dead, while the repository anchor stays live. */
+    ledger.records[0].config_parent.inode ^= UINTMAX_C(1);
 
-    CHECK(publication_record_destination_provably_absent(&record));
+    CHECK(publication_record_destination_provably_absent(&ledger.records[0]));
     CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 1);
     CHECK_EQ_INT((long)ledger.count, 0);
 

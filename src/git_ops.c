@@ -6484,9 +6484,12 @@ static bool git_retirement_destination_provably_absent(
             *slash = '\0';
         }
         errno = 0;
-        if (lstat(path, &st) == 0) {
-            /* Deepest existing ancestor: absence is proven only if it is a
-             * directory on the recorded filesystem. */
+        /* stat, not lstat, on ANCESTORS: a symlinked ancestor (e.g. /tmp ->
+         * /private/tmp on macOS) is a normal path component and must resolve
+         * to the real directory it names — only the leaf needs lstat (dangling-
+         * symlink-is-present). Absence is proven only if the deepest existing
+         * ancestor resolves to a directory on the recorded filesystem. */
+        if (stat(path, &st) == 0) {
             return S_ISDIR(st.st_mode) &&
                    (uintmax_t)st.st_dev == publication->config_parent.device;
         }
