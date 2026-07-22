@@ -448,7 +448,7 @@ expect_status 'post-mkdir TERM' 143 "$signal_status" "$tmp/signal.err"
 assert_absent "$signal_lock" 'post-mkdir TERM cleanup'
 
 # The direct child may leave an inherited descendant alive after TERM. A
-# newline written on descriptor 9 proves the observer drains until EOF instead
+# newline written on descriptor 7 proves the observer drains until EOF instead
 # of treating one read as completion. Releasing that descendant within the
 # bound must let the supervisor return the original signal status and retire
 # the complete lock only afterward.

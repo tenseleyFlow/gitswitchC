@@ -1424,9 +1424,11 @@ install:
 			command -v greadelf >/dev/null 2>&1 || { \
 			echo 'ERROR: release install verifies artifact hardening and needs an ELF inspector; install binutils (readelf) or llvm (llvm-readelf)' >&2; \
 			exit 1; }; ;; \
-		macho) command -v otool >/dev/null 2>&1 || { \
-			echo 'ERROR: release install verifies artifact hardening and needs otool (Xcode command line tools)' >&2; \
-			exit 1; }; ;; \
+		macho) for t in otool nm lipo; do \
+			command -v "$$t" >/dev/null 2>&1 || { \
+			echo 'ERROR: release install verifies artifact hardening and needs otool, nm, and lipo (Xcode command line tools)' >&2; \
+			exit 1; }; \
+			done; ;; \
 		esac; \
 		GITSWITCH_RELEASE_FORMAT="$$built_format" \
 			sh tests/test_ar07_release.sh artifact-publish \

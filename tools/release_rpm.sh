@@ -203,14 +203,14 @@ rpm_home_physical=$(CDPATH='' cd "$rpm_home" && pwd -P) ||
 [ "$rpm_home_physical" = "$rpm_home" ] ||
     rpm_fail "HOME is not its exact physical path"
 
-rpm_topdir=$(mktemp -d "$rpm_home_physical/.gitswitch-rpmbuild.XXXXXX") ||
-    rpm_fail "cannot create private RPM namespace"
-# Install cleanup before trusting mktemp's output.  The cleanup path repeats
-# the strict parent/name/type/physical-identity checks before it removes
-# anything, so an unsafe return value is rejected rather than acted upon.
-# AR-12 M8: signals must pin a nonzero exit status before cleanup runs —
-# a single shared EXIT/signal handler read $? as 0 on the signal path and
-# made an aborted `make rpm` report success (matching Makefile install and
+# AR-13 L10: arm signal/EXIT cleanup BEFORE mktemp, so a signal in the window
+# between creating the private namespace and installing the handler can no
+# longer leak it. rpm_cleanup guards on an empty rpm_topdir (still unset here),
+# and the cleanup path repeats the strict parent/name/type/physical-identity
+# checks before it removes anything, so an unsafe value is rejected rather than
+# acted upon. AR-12 M8: signals must pin a nonzero exit status before cleanup
+# runs — a single shared EXIT/signal handler read $? as 0 on the signal path
+# and made an aborted `make rpm` report success (matching Makefile install and
 # release_publish_lock.sh, which already pass explicit statuses).
 rpm_cleanup_signal()
 {
@@ -222,6 +222,8 @@ trap 'rpm_cleanup_signal 129' 1
 trap 'rpm_cleanup_signal 130' 2
 trap 'rpm_cleanup_signal 131' 3
 trap 'rpm_cleanup_signal 143' 15
+rpm_topdir=$(mktemp -d "$rpm_home_physical/.gitswitch-rpmbuild.XXXXXX") ||
+    rpm_fail "cannot create private RPM namespace"
 rpm_normalize_private_acl "$rpm_topdir" ||
     rpm_fail "cannot secure private RPM namespace ACL"
 if ! rpm_private_name_is_safe "$rpm_topdir" ||

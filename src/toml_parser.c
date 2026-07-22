@@ -1039,8 +1039,10 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                  * loader counts it in accounts_skipped_on_load and
                  * config_save refuses to rewrite the file — a skip must
                  * never decay into silent erasure. toml_write_file likewise
-                 * still emits its keys, so a document written back preserves
-                 * the section byte-for-byte for the user to fix. */
+                 * still emits the section's keys and values, so a document
+                 * written back preserves them for the user to fix — re-
+                 * serialized in normalized form, not the original bytes
+                 * (comments and incidental formatting are not retained). */
                 section->is_set = false;
                 continue;
             }
