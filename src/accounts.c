@@ -2178,7 +2178,11 @@ int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
 
 /* Compare semantic account fields one by one. Avoiding a struct memcmp keeps
  * padding out of the generation contract while still binding every persisted
- * field, including metadata and currently-disabled routing selectors. */
+ * field, including metadata and currently-disabled routing selectors. AR-13
+ * L22: ssh_key_spelling is persisted too (it is the exact ssh_key text written
+ * back), so a spelling-only change is a real on-disk change and must be bound
+ * here; the disable paths clear it alongside ssh_key_path so a disabled account
+ * never carries stale spelling residue. */
 static bool account_fields_equal_exact(const account_t *left,
                                        const account_t *right) {
     return left && right && left->id == right->id &&
@@ -2190,6 +2194,7 @@ static bool account_fields_equal_exact(const account_t *left,
            left->preferred_scope == right->preferred_scope &&
            left->ssh_enabled == right->ssh_enabled &&
            strcmp(left->ssh_key_path, right->ssh_key_path) == 0 &&
+           strcmp(left->ssh_key_spelling, right->ssh_key_spelling) == 0 &&
            strcmp(left->ssh_host_alias, right->ssh_host_alias) == 0 &&
            strcmp(left->ssh_hostname, right->ssh_hostname) == 0 &&
            left->gpg_enabled == right->gpg_enabled &&
@@ -2764,6 +2769,7 @@ static int accounts_edit_candidate_prepare_owned(
     edited = *candidate;
     if (!edited.ssh_enabled) {
         edited.ssh_key_path[0] = '\0';
+        edited.ssh_key_spelling[0] = '\0'; /* AR-13 L22: no stale spelling */
         edited.ssh_host_alias[0] = '\0';
         edited.ssh_hostname[0] = '\0';
     } else if (edited.ssh_host_alias[0] != '\0' &&
@@ -3156,6 +3162,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
         if (strcmp(input, "none") == 0) {              /* disable */
             acct.ssh_enabled = false;
             acct.ssh_key_path[0] = '\0';
+            acct.ssh_key_spelling[0] = '\0'; /* AR-13 L22: no stale spelling */
             acct.ssh_host_alias[0] = '\0';
             acct.ssh_hostname[0] = '\0';
             break;
