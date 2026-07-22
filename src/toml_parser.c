@@ -1052,28 +1052,38 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
             }
 
 
-            /* These keys are emitted only for an enabled subsystem.  A
-             * present dependent without its enabling key used to load as an
-             * innocuous disabled account and vanish on the next save.  Reject
-             * every such combination at admission with a field-specific
-             * diagnostic, before any in-memory mutation can be persisted. */
+            /* These keys are emitted only for an enabled subsystem, so a
+             * dependent present without its enabling key is an own-writer-
+             * shaped hand edit, never gitswitch's own output. AR-13 M7: treat
+             * it like the value-grammar problems above — skip just this section
+             * (counted in accounts_skipped_on_load, rewrite-blocked, bytes
+             * preserved) rather than failing the whole file. Bricking every
+             * command over one hand-edited account inverts the H3 gradient
+             * (list/status/reset/switch must stay usable as repair paths) and
+             * is stricter than the malformed-VALUE cases that already skip. The
+             * hard invariant is still enforced on the add/edit admission path
+             * (config_validate_account_model), so no dependency-gap account can
+             * be created or persisted programmatically. */
             if (has_ssh_host && !has_nonempty_ssh_key) {
-                set_error(ERR_CONFIG_INVALID,
-                          "%s.ssh_host requires a non-empty ssh_key",
-                          section->name);
-                return -1;
+                log_warning("Account section [%s]: ssh_host requires a "
+                            "non-empty ssh_key; skipping this account, the "
+                            "rest of the config still loads", section->name);
+                section->is_set = false;
+                continue;
             }
             if (has_ssh_hostname && !has_nonempty_ssh_key) {
-                set_error(ERR_CONFIG_INVALID,
-                          "%s.ssh_hostname requires a non-empty ssh_key",
-                          section->name);
-                return -1;
+                log_warning("Account section [%s]: ssh_hostname requires a "
+                            "non-empty ssh_key; skipping this account, the "
+                            "rest of the config still loads", section->name);
+                section->is_set = false;
+                continue;
             }
             if (has_gpg_signing_enabled && !has_nonempty_gpg_key) {
-                set_error(ERR_CONFIG_INVALID,
-                          "%s.gpg_signing_enabled requires a non-empty gpg_key",
-                          section->name);
-                return -1;
+                log_warning("Account section [%s]: gpg_signing_enabled requires "
+                            "a non-empty gpg_key; skipping this account, the "
+                            "rest of the config still loads", section->name);
+                section->is_set = false;
+                continue;
             }
 
             section->is_set = true;
