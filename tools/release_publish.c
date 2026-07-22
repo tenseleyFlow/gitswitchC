@@ -82,6 +82,20 @@ extern char **environ;
  * diagnostic INTO the published artifact after fsync while still exiting 0.
  * Pin the standard slots to /dev/null before any other open. Deliberately no
  * O_CLOEXEC: the producer child must inherit real descriptors too. */
+/* AR-12 L27: on Darwin fsync(2) only reaches the drive, not through its
+ * cache; power-loss durability — the guarantee the stage barriers and rpm
+ * retirement advertise — needs F_FULLFSYNC. Fall back to fsync only when
+ * the volume/descriptor does not support the fcntl. */
+static int full_fsync(int fd)
+{
+#if defined(__APPLE__)
+    if (fcntl(fd, F_FULLFSYNC) == 0) {
+        return 0;
+    }
+#endif
+    return fsync(fd);
+}
+
 static int reserve_standard_descriptors(void)
 {
     for (;;) {
@@ -625,7 +639,7 @@ static int run_internal_retire_tree(const char *home_path,
                 strerror(errno));
         goto cleanup;
     }
-    if (fsync(home_fd) != 0) {
+    if (full_fsync(home_fd) != 0) {
         fprintf(stderr, "ERROR: cannot sync HOME after RPM retirement: %s\n",
                 strerror(errno));
         goto cleanup;
@@ -735,7 +749,7 @@ static int durability_sync(int fd, char stage)
 #else
     (void)stage;
 #endif
-    return fsync(fd);
+    return full_fsync(fd);
 }
 
 #define SHA256_BLOCK_SIZE 64U
@@ -1809,14 +1823,16 @@ static int archive_workspace_create(archive_workspace_t *workspace,
         }
         workspace->head_created = true;
         if (write_all(head_fd, head_contents,
-                      sizeof(head_contents) - 1U) != 0 ||
-            close(head_fd) != 0) {
+                      sizeof(head_contents) - 1U) != 0) {
             int saved_errno = errno;
 
-            if (head_fd >= 0) {
-                (void)close(head_fd);
-            }
+            (void)close(head_fd);
             errno = saved_errno;
+            return -1;
+        }
+        /* AR-12 L26: close() deallocates the descriptor even on failure —
+         * never close the same number twice. */
+        if (close(head_fd) != 0) {
             return -1;
         }
     }
@@ -3297,6 +3313,10 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
     for (;;) {
         int remaining;
         int remaining_rc = deadline_remaining(deadline, &remaining);
+        /* AR-12 P7: preserve the clock failure's own errno — the
+         * supervision below may overwrite it, and the caller's diagnostic
+         * would otherwise name an unrelated stale error. */
+        int clock_errno = remaining_rc < 0 ? (errno ? errno : EIO) : 0;
         int producer_rc;
         int poll_rc;
         int poll_timeout;
@@ -3311,9 +3331,7 @@ static producer_stream_result_t copy_producer_stream(int input_fd,
             if (producer_rc > 0) {
                 return PRODUCER_STREAM_FAILURE;
             }
-            if (remaining_rc == 0) {
-                errno = ETIMEDOUT;
-            }
+            errno = remaining_rc == 0 ? ETIMEDOUT : clock_errno;
             return PRODUCER_STREAM_CAPTURE_ERROR;
         }
         poll_timeout = producer_succeeded || remaining <= 50 ? remaining : 50;

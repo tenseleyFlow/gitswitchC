@@ -141,6 +141,10 @@ jobs:
         with:
           operating_system: freebsd
           version: '14.4'
+          # pkg's catalogue processing now OOMs at the action's default VM
+          # memory (deterministic exit-137 during provisioning); the host
+          # runner has 16G, so give the VM enough headroom.
+          memory: 8G
       - name: Build + test on FreeBSD
         # Tests run in release mode here: FreeBSD enables ASLR, which is
         # incompatible with ASan/PIE binaries (they abort on init). The
@@ -159,6 +163,14 @@ jobs:
           # ksh stays best-effort: FreeBSD's ksh93 packaging does not reliably
           # install a binary literally named `ksh`, which is what the suites
           # resolve.
+          # The quarterly branch's CDN currently 404s hashed package objects
+          # its own metadata references (probed directly: HTTP 404 on the
+          # exact URL pkg fetches; pkg reports it as a misleading write
+          # error). Pin this VM to the 'latest' branch until upstream heals.
+          sudo mkdir -p /usr/local/etc/pkg/repos
+          printf 'FreeBSD: { url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }\n' \
+            | sudo tee /usr/local/etc/pkg/repos/FreeBSD.conf
+          sudo pkg update -f
           sudo pkg install -y gmake gcc git binutils \
             bash dash fish gnupg readline zsh
           # FreeBSD needs fdescfs for descriptor-pinned interpreted helpers:
@@ -199,7 +211,7 @@ jobs:
         # them in either build configuration.
         run: brew install dash fish gnupg ksh93 readline
       - name: Build + test (ASan/UBSan, warnings-as-errors)
-        run: make BUILD_TYPE=debug READLINE=1 WERROR=1 test
+        run: /usr/bin/make BUILD_TYPE=debug READLINE=1 WERROR=1 test
         env:
           # Linux-only pidfd/mount-namespace seams are inapplicable on Darwin.
           # AR-10 L31: the Linux lanes list mount-namespace as a REQUIRED
@@ -207,15 +219,15 @@ jobs:
           # enforced rather than assumed; every portable runtime is mandatory.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Clean before the release build
-        run: make clean
+        run: /usr/bin/make clean
       - name: Release build + full NDEBUG suite (warnings-as-errors)
-        run: make BUILD_TYPE=release READLINE=1 WERROR=1 test
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 test
         env:
           # Same sole OS-specific exclusion as the debug lane above.
           GITSWITCH_TEST_REQUIRED_CAPS: pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets
       - name: Release artifact hardening (built + staged)
-        run: make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
+        run: /usr/bin/make BUILD_TYPE=release READLINE=1 WERROR=1 release-artifact-test
       # Exercises Darwin's descriptor-bound atomic clone publisher, including
       # adoption, retained-source, and cleanup-race behavior.
       - name: Release input consistency and dirty-tree refusal
-        run: make release-contract-test
+        run: /usr/bin/make release-contract-test

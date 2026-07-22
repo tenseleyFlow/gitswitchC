@@ -420,13 +420,14 @@ TEST(full_reset_rejects_every_unknown_base_entry_before_deletion) {
     CHECK(path_exists(marker));
     CHECK_EQ_INT(unlink(stray), 0);
 
+    /* AR-12 L11: a crash-orphaned publish/rollback quarantine SYMLINK no
+     * longer bricks full reset forever — reset retires the owned residue
+     * and completes the teardown it was asked for. */
     CHECK_EQ_INT(symlink(home, publish), 0);
     previous = run_set_runner(recording_null_runner);
-    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
     run_set_runner(previous);
-    CHECK(path_exists(marker));
-    CHECK_EQ_INT(lstat(publish, &(struct stat){0}), 0);
-    CHECK_EQ_INT(unlink(publish), 0);
+    CHECK(lstat(publish, &(struct stat){0}) != 0 && errno == ENOENT);
 
     previous = run_set_runner(recording_null_runner);
     CHECK_EQ_INT(gpg_manager_reset(NULL), 0);

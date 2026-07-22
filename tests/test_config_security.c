@@ -439,7 +439,11 @@ TEST(failed_reload_preserves_complete_context) {
         "[settings]\ndefault_scope = \"local\"\n"
         "[accounts.1]\nname = \"alice\"\nemail = \"a@b.com\"\n";
     static const char malformed_state[] = "garbage\n";
-    static const char mismatched_state[] = "ssh\nactive=alice\n";
+    /* AR-12 M3 note: a stale-but-well-formed needs token now degrades to
+     * inactive instead of failing the load, so the late active-state
+     * validation boundary is exercised with an unsafe active name, which
+     * remains a hard failure. */
+    static const char mismatched_state[] = "none\nactive=bad/name\n";
     char dir[128], path[256], hint[256];
     gitswitch_ctx_t ctx;
     gitswitch_ctx_t *before;
@@ -1412,6 +1416,161 @@ TEST(legacy_wildcard_alias_requires_explicit_canonical_hostname) {
     }
 }
 
+/* AR-12 H3: deleting or chmod-ing the ACTIVE account's key file skips that
+ * account on load; the load must degrade to an inactive session instead of
+ * hard-failing every command (which would brick the repair paths too). */
+TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load) {
+    char dir[128], path[256], key[256], cfg[2048];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(key, sizeof(key), "%s/id_worker", dir);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "active_account = \"worker\"\n"
+                   "[accounts.1]\n"
+                   "name = \"worker\"\n"
+                   "email = \"worker@example.com\"\n"
+                   "ssh_key = \"%s\"\n",
+                   key) < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_STR_EQ(ctx.config.active_account, "worker");
+    /* Persist the two-line state artifact ('ssh\nactive=worker'). */
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+
+    /* Key deleted (rotation/unmount): the active account is skipped, and
+     * the session degrades to inactive instead of failing config_load. */
+    CHECK_EQ_INT(unlink(key), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK(ctx.config.active_account[0] == '\0');
+    /* Full-document rewrites stay blocked while the section is skipped. */
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+
+    /* Same degrade for a key that exists with unusable permissions. */
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK_EQ_INT(chmod(key, 0644), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK(ctx.config.active_account[0] == '\0');
+}
+
+/* AR-12 H4: a non-round-trippable ssh_key must be rejected at add/edit
+ * admission, and a document already containing one (hand edit, old writer)
+ * must skip that account on load instead of failing the whole parse. */
+TEST(non_roundtrip_ssh_key_rejected_at_admission_and_skipped_on_load) {
+    char dir[128], path[256], cfg[2048];
+    gitswitch_ctx_t ctx;
+    account_t candidate;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+
+    /* Loader side: an escaped quote parses into the value; the schema must
+     * skip the section, not brick the file. */
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"good\"\n"
+                   "email = \"good@example.com\"\n"
+                   "[accounts.2]\n"
+                   "name = \"bad\"\n"
+                   "email = \"bad@example.com\"\n"
+                   "ssh_key = \"/tmp/id\\\"quote\"\n") < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    if (ctx.account_count == 1) CHECK_STR_EQ(ctx.accounts[0].name, "good");
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+
+    /* Admission side: the same bytes can never be saved in the first
+     * place. */
+    memset(&candidate, 0, sizeof(candidate));
+    candidate.id = 7;
+    snprintf(candidate.name, sizeof(candidate.name), "quoted");
+    snprintf(candidate.email, sizeof(candidate.email), "q@example.com");
+    candidate.preferred_scope = GIT_SCOPE_LOCAL;
+    snprintf(candidate.ssh_key_path, sizeof(candidate.ssh_key_path),
+             "/tmp/id\"quote");
+    candidate.ssh_enabled = true;
+    CHECK_EQ_INT(config_add_account(&ctx, &candidate), -1);
+    CHECK(strstr(get_last_error()->message, "SSH key path") != NULL);
+}
+
+/* AR-12 L8: a load+save cycle must re-emit the user's portable '~/...'
+ * ssh_key spelling instead of silently persisting the expanded absolute
+ * path; an API edit that changes the path falls back to the new bytes. */
+TEST(tilde_ssh_key_spelling_survives_load_and_save) {
+    char dir[128], path[256], sshdir[300], key[360], cfg[2048];
+    char saved_home[4096], after[4096];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(make_scratch_dir(dir, sizeof(dir)), 0);
+    save_home_env(saved_home, sizeof(saved_home));
+    CHECK_EQ_INT(setenv("HOME", dir, 1), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    snprintf(sshdir, sizeof(sshdir), "%s/.ssh", dir);
+    CHECK_EQ_INT(mkdir(sshdir, 0700), 0);
+    snprintf(key, sizeof(key), "%s/id_tilde", sshdir);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK(snprintf(cfg, sizeof(cfg),
+                   "[settings]\n"
+                   "default_scope = \"local\"\n"
+                   "[accounts.1]\n"
+                   "name = \"tilde\"\n"
+                   "email = \"tilde@example.com\"\n"
+                   "ssh_key = \"~/.ssh/id_tilde\"\n") < (int)sizeof(cfg));
+    CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    /* The model works on the expanded path... */
+    CHECK_STR_EQ(ctx.accounts[0].ssh_key_path, key);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    /* ...but the persisted bytes keep the user's spelling. */
+    CHECK(strstr(after, "ssh_key = \"~/.ssh/id_tilde\"") != NULL);
+    CHECK(strstr(after, dir) == NULL || strstr(after, key) == NULL);
+
+    /* An API edit to a different path persists the new bytes, not the
+     * stale spelling. */
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].ssh_key_path, key,
+                              sizeof(ctx.accounts[0].ssh_key_path)), 0);
+    snprintf(key, sizeof(key), "%s/id_other", sshdir);
+    CHECK_EQ_INT(write_config(key,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n",
+        sizeof("-----BEGIN OPENSSH PRIVATE KEY-----\nfixture\n") - 1), 0);
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[0].ssh_key_path, key,
+                              sizeof(ctx.accounts[0].ssh_key_path)), 0);
+    CHECK_EQ_INT(config_save(&ctx, path), 0);
+    CHECK(slurp(path, after, sizeof(after)) > 0);
+    CHECK(strstr(after, "id_other") != NULL);
+    CHECK(strstr(after, "ssh_key = \"~/.ssh/id_tilde\"") == NULL);
+
+    restore_home_env(saved_home);
+}
+
 TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
     static const char *const invalid[] = {
         "bad host", "bad\thost", "bad\"host", "bad\\host", "bad%h",
@@ -1459,9 +1618,10 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
         CHECK_EQ_INT(ctx.account_count, 0);
     }
 
-    /* A hand-edited endpoint spelling must fail at schema validation instead
-     * of loading a destination that OpenSSH would treat as a literal hostname
-     * on its default port. */
+    /* AR-12 M7: a hand-edited or pre-narrowing endpoint spelling skips just
+     * that account (counted, rewrite-blocked) — it must never load a
+     * destination OpenSSH would treat as a literal hostname, and must never
+     * brick the rest of the config either. */
     CHECK(snprintf(cfg, sizeof(cfg),
                    "[settings]\n"
                    "default_scope = \"local\"\n"
@@ -1473,9 +1633,10 @@ TEST(ssh_hostname_schema_and_api_reject_unsafe_values) {
                    key) < (int)sizeof(cfg));
     CHECK_EQ_INT(write_config(path, cfg, strlen(cfg)), 0);
     memset(&ctx, 0, sizeof(ctx));
-    CHECK_EQ_INT(config_load(&ctx, path), -1);
-    CHECK_EQ_INT(get_last_error()->code, ERR_CONFIG_INVALID);
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
     CHECK_EQ_INT(ctx.account_count, 0);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
 
     /* Save is also a public boundary: an invalid in-memory destination must
      * not replace a previously valid file. */
@@ -2421,4 +2582,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(add_rejects_ssh_key_path_over_256_chars_api);
     RUN_TEST(repaired_overlong_ssh_key_writes_and_loads_without_stale_skip);
     RUN_TEST(add_rejects_values_that_cannot_roundtrip);
+    RUN_TEST(skipped_active_account_degrades_to_inactive_instead_of_failing_load);
+    RUN_TEST(non_roundtrip_ssh_key_rejected_at_admission_and_skipped_on_load);
+    RUN_TEST(tilde_ssh_key_spelling_survives_load_and_save);
 TEST_MAIN_END()

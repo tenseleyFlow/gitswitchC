@@ -117,10 +117,10 @@ esac
 case ${1-} in
     --lease-descendant-worker)
         [ "$#" -eq 3 ] || fail 'invalid lease-worker fixture invocation'
-        [ "${GITSWITCH_RELEASE_LOCK_LEASE_FD-}" = 9 ] ||
+        [ "${GITSWITCH_RELEASE_LOCK_LEASE_FD-}" = 7 ] ||
             fail 'lease worker did not inherit the reserved descriptor'
         trap '' 1 2 3 15
-        printf '%s\n' noise >&9 || fail 'lease worker cannot write its lease'
+        printf '%s\n' noise >&7 || fail 'lease worker cannot write its lease'
         printf '%s\n' "$$" >"$2" ||
             fail 'lease worker cannot publish readiness'
         wait_for_release "$3" 'lease worker'
@@ -128,7 +128,7 @@ case ${1-} in
         ;;
     --lease-parent)
         [ "$#" -eq 6 ] || fail 'invalid lease-parent fixture invocation'
-        [ "${GITSWITCH_RELEASE_LOCK_LEASE_FD-}" = 9 ] ||
+        [ "${GITSWITCH_RELEASE_LOCK_LEASE_FD-}" = 7 ] ||
             fail 'lease parent did not inherit the reserved descriptor'
         lease_worker_ready=$2
         lease_worker_release=$3

@@ -632,7 +632,16 @@ signals_child_wait_result_t signals_wait_child(pid_t pid, int *status,
     }
 #endif
 
-    if ((result.waited == pid && terminal_status) ||
+    /* AR-12 L18: judge retirement by what waitpid actually REAPED, not the
+     * pre-reap observe verdict — with WUNTRACED/WCONTINUED the observe leg
+     * can report a stop/continue while the child dies in the window before
+     * waitpid, which then releases the PID with a death status. The stale
+     * verdict would skip retirement and leave the handler publication
+     * pointing at a reusable PID. When the caller gave no status buffer the
+     * observe verdict remains the only evidence available. */
+    if ((result.waited == pid &&
+         (status ? (WIFEXITED(*status) || WIFSIGNALED(*status))
+                 : terminal_status)) ||
         (result.waited < 0 && result.wait_errno == ECHILD)) {
         /* waitpid has either released the PID or proved that this process no
          * longer owns it. Retire while every handler that could consult the

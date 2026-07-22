@@ -96,6 +96,12 @@ rpm_directory_is_exact()
 rpm_cleanup()
 {
     rpm_cleanup_status=$?
+    # AR-12 M8: on a signal path $? is the last command's status (usually 0);
+    # the signal handler pins the conventional 128+N status here so an
+    # aborted build can never report success.
+    if [ -n "${rpm_cleanup_forced-}" ]; then
+        rpm_cleanup_status=$rpm_cleanup_forced
+    fi
     trap - 0 1 2 3 15
     rpm_cleanup_failed=0
     if [ -n "$rpm_topdir" ]; then
@@ -202,7 +208,20 @@ rpm_topdir=$(mktemp -d "$rpm_home_physical/.gitswitch-rpmbuild.XXXXXX") ||
 # Install cleanup before trusting mktemp's output.  The cleanup path repeats
 # the strict parent/name/type/physical-identity checks before it removes
 # anything, so an unsafe return value is rejected rather than acted upon.
-trap rpm_cleanup 0 1 2 3 15
+# AR-12 M8: signals must pin a nonzero exit status before cleanup runs —
+# a single shared EXIT/signal handler read $? as 0 on the signal path and
+# made an aborted `make rpm` report success (matching Makefile install and
+# release_publish_lock.sh, which already pass explicit statuses).
+rpm_cleanup_signal()
+{
+    rpm_cleanup_forced=$1
+    rpm_cleanup
+}
+trap rpm_cleanup 0
+trap 'rpm_cleanup_signal 129' 1
+trap 'rpm_cleanup_signal 130' 2
+trap 'rpm_cleanup_signal 131' 3
+trap 'rpm_cleanup_signal 143' 15
 rpm_normalize_private_acl "$rpm_topdir" ||
     rpm_fail "cannot secure private RPM namespace ACL"
 if ! rpm_private_name_is_safe "$rpm_topdir" ||

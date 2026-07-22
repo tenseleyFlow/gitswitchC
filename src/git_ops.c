@@ -446,6 +446,51 @@ static int git_reject_ssh_command_override(void) {
     return 0;
 }
 
+/* AR-12 M5: Git's section and variable names are case-insensitive, but the
+ * SUBSECTION of a three-part key (gpg.openpgp.program, gpg.ssh.program,
+ * gpg.x509.program) is case-sensitive. `[gpg "OpenPGP"] program` is a
+ * distinct key Git never consults; folding it into the managed slot made
+ * verification and rollback adopt an inert foreign value. Compare the outer
+ * parts case-insensitively and the subsection byte-exactly. */
+static bool git_managed_key_equals_n(const char *key, size_t key_len,
+                                     const char *managed) {
+    size_t managed_len = strlen(managed);
+    const char *managed_first = strchr(managed, '.');
+    const char *managed_last = strrchr(managed, '.');
+    const char *key_first;
+    const char *key_last = NULL;
+    size_t section_len;
+    size_t subsection_len;
+    size_t variable_len;
+
+    if (key_len != managed_len) return false;
+    if (!managed_first || managed_first == managed_last) {
+        return strncasecmp(key, managed, key_len) == 0;
+    }
+    key_first = memchr(key, '.', key_len);
+    if (!key_first) return false;
+    for (const char *p = key + key_len; p > key;) {
+        p--;
+        if (*p == '.') {
+            key_last = p;
+            break;
+        }
+    }
+    if (!key_last || key_first == key_last) return false;
+    section_len = (size_t)(managed_first - managed);
+    subsection_len = (size_t)(managed_last - managed_first) - 1U;
+    variable_len = managed_len - (size_t)(managed_last - managed) - 1U;
+    if ((size_t)(key_first - key) != section_len ||
+        (size_t)(key_last - key_first) - 1U != subsection_len) {
+        return false;
+    }
+    return strncasecmp(key, managed, section_len) == 0 &&
+           strncmp(key_first + 1U, managed_first + 1U,
+                   subsection_len) == 0 &&
+           strncasecmp(key_last + 1U, managed_last + 1U,
+                       variable_len) == 0;
+}
+
 /* Parse `git config --show-origin --show-scope -z --list`. Git emits three
  * NUL-terminated fields per record: scope, origin, then "key\nvalue". Last
  * match wins, preserving Git's effective precedence including includes and
@@ -482,9 +527,8 @@ static int parse_effective_listing(const char *buf, size_t len,
         size_t key_len = newline ? (size_t)(newline - record) : record_len;
         int key_index = -1;
         for (int i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-            size_t managed_len = strlen(g_managed_keys[i]);
-            if (key_len == managed_len &&
-                strncasecmp(record, g_managed_keys[i], key_len) == 0) {
+            if (git_managed_key_equals_n(record, key_len,
+                                         g_managed_keys[i])) {
                 key_index = i;
                 break;
             }
@@ -765,9 +809,7 @@ static void git_snapshot_clear(git_config_snapshot_t *snapshot) {
 
 static int git_managed_key_index_n(const char *key, size_t key_len) {
     for (int i = 0; i < GIT_MANAGED_KEY_COUNT; i++) {
-        size_t managed_len = strlen(g_managed_keys[i]);
-        if (key_len == managed_len &&
-            strncasecmp(key, g_managed_keys[i], key_len) == 0) {
+        if (git_managed_key_equals_n(key, key_len, g_managed_keys[i])) {
             return i;
         }
     }
@@ -4968,6 +5010,54 @@ int git_publication_verify_program_identity(
     return 0;
 }
 
+/* AR-12 H2: expose only the destination identity of the active snapshot so
+ * the publication-capacity preflight can recognize an in-place replacement
+ * before any mutation. Available from git_config_snapshot() on; requires no
+ * sealed post-image. */
+int git_config_snapshot_export_destination(publication_record_t *out) {
+    const git_scope_generation_t *generation;
+
+    if (!out) {
+        set_error(ERR_INVALID_ARGS,
+                  "Invalid Git snapshot destination export request");
+        return -1;
+    }
+    if (!g_git_snapshot.valid) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "No Git snapshot is available to export a destination");
+        return -1;
+    }
+    generation = &g_git_snapshot.primary_generation;
+    if (!generation->valid) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git snapshot has no captured destination generation");
+        return -1;
+    }
+    publication_record_init(out);
+    if (git_publication_scope_from_git(g_git_snapshot.scope,
+                                       &out->scope) != 0 ||
+        safe_strncpy(out->config_path, generation->path,
+                     sizeof(out->config_path)) != 0) {
+        set_error(ERR_GIT_CONFIG_FAILED,
+                  "Git snapshot destination exceeds durable storage");
+        return -1;
+    }
+    publication_identity_from_stat(&out->config_parent,
+                                   &generation->parent_stat);
+    if (generation->repository_present) {
+        if (safe_strncpy(out->repository_path,
+                         generation->repository_path,
+                         sizeof(out->repository_path)) != 0) {
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Git snapshot repository path exceeds durable storage");
+            return -1;
+        }
+        publication_identity_from_stat(&out->repository,
+                                       &generation->repository_stat);
+    }
+    return 0;
+}
+
 int git_config_export_sealed_publication(publication_record_t *out,
                                          const char *gpg_selector) {
     publication_record_t record;
@@ -6343,6 +6433,20 @@ static bool git_retirement_directory_identity_matches(
                ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
 }
 
+/* AR-12 M4: a destination whose recorded config path is provably absent
+ * (every component resolves and the leaf is ENOENT, or a parent component is
+ * gone) cannot carry any published value. Only a definitive ENOENT counts;
+ * permission or loop errors stay indeterminate and fail closed. */
+static bool git_retirement_destination_provably_absent(
+    const publication_record_t *publication) {
+    struct stat st;
+
+    if (!publication || publication->config_path[0] != '/') return false;
+    errno = 0;
+    if (stat(publication->config_path, &st) == 0) return false;
+    return errno == ENOENT;
+}
+
 /* A completed atomic retirement necessarily changes the config generation.
  * For retry/idempotence, retain the durable namespace and repository proof
  * while allowing the caller to inspect whether every exact owned value is
@@ -6445,15 +6549,11 @@ static int git_retire_validate_publication(
                   "Account has no exact durable Git publication provenance");
         return -1;
     }
-    if ((publication->capabilities &
-         PUBLICATION_CAP_GPG_FINGERPRINT) != 0U &&
-        !git_signing_key_matches_fingerprint(
-            publication->gpg_fingerprint,
-            publication->gpg_fingerprint)) {
-        set_error(ERR_GIT_CONFIG_FAILED,
-                  "Publication record has no canonical signing fingerprint");
-        return -1;
-    }
+    /* AR-12 L9: no fingerprint re-check here — publication_record_validate()
+     * above already enforces the canonical 40/64-hex grammar for any record
+     * carrying PUBLICATION_CAP_GPG_FINGERPRINT, and record-driven retirement
+     * deliberately does not re-bind the record to the account's current
+     * gpg_key_id (the incarnation match above is the ownership proof). */
     return 0;
 }
 
@@ -6696,9 +6796,6 @@ static bool git_retirement_stale_snapshot_is_clean(
     const publication_record_t *representative;
     const git_snapshot_key_t *ssh_command;
     const git_snapshot_key_t *signing_key;
-    const git_snapshot_key_t *signing_enabled;
-    const git_snapshot_key_t *gpg_format;
-    const git_snapshot_key_t *openpgp_program;
 
     if (!group || !snapshot || !publications ||
         group->representative >= publication_count) {
@@ -6709,12 +6806,6 @@ static bool git_retirement_stale_snapshot_is_clean(
         snapshot, GIT_CONFIG_CORE_SSHCOMMAND);
     signing_key = git_snapshot_key_by_name(
         snapshot, GIT_CONFIG_USER_SIGNINGKEY);
-    signing_enabled = git_snapshot_key_by_name(
-        snapshot, GIT_CONFIG_COMMIT_GPGSIGN);
-    gpg_format = git_snapshot_key_by_name(
-        snapshot, GIT_CONFIG_GPG_FORMAT);
-    openpgp_program = git_snapshot_key_by_name(
-        snapshot, GIT_CONFIG_GPG_OPENPGP_PROGRAM);
 
     for (size_t i = 0U; i < publication_count; i++) {
         const publication_record_t *publication = publications[i];
@@ -6742,28 +6833,13 @@ static bool git_retirement_stale_snapshot_is_clean(
                 }
             }
         }
-        if ((publication->capabilities &
-             PUBLICATION_CAP_GPG_SIGNING_STATE) != 0U) {
-            const char *expected = publication->gpg_signing_enabled
-                                       ? "true" : "false";
-            if (signing_enabled &&
-                git_snapshot_key_exact_count(signing_enabled,
-                                             expected) != 0U) {
-                return false;
-            }
-        } else if (signing_enabled && signing_enabled->count != 0U) {
-            return false;
-        }
-        if (gpg_format &&
-            git_snapshot_key_exact_count(
-                gpg_format, GIT_GPG_FORMAT_OPENPGP) != 0U) {
-            return false;
-        }
-        if (openpgp_program &&
-            git_snapshot_key_exact_count(
-                openpgp_program, publication->gpg_program) != 0U) {
-            return false;
-        }
+        /* AR-12 P2: without the live fingerprint anchor, generic companion
+         * values — commit.gpgsign, gpg.format=openpgp, a common gpg
+         * program path — are not attributable to this record; the planner
+         * refuses to remove companions without the anchor for exactly this
+         * reason. Treating a user-recreated commit.gpgsign as our residue
+         * wedged every guarded retirement retry against values we would
+         * never touch. */
     }
     return true;
 }
@@ -7252,6 +7328,23 @@ static int git_retirement_transaction_prepare_internal(
         if (git_retirement_verify_live_namespace(
                 transaction->publication_refs[i]) == 0) {
             transaction->items[i].namespace_ready = true;
+            clear_error();
+            continue;
+        }
+        /* AR-12 M4: a recorded config file that provably no longer exists
+         * (deleted repository, removed global config) carries none of the
+         * published values, so this leg is vacuously retired: nothing
+         * attributable is live and no mutation is needed. Failing instead
+         * would strand the durable retirement guard forever — no retry can
+         * re-verify a namespace that is gone. Indeterminate probes (EACCES,
+         * ELOOP, changed identity) keep the fail-closed path. */
+        if (git_retirement_destination_provably_absent(
+                transaction->publication_refs[i])) {
+            log_warning(
+                "Recorded Git destination %s no longer exists; treating "
+                "account '%s' retirement leg as already retired",
+                transaction->publication_refs[i]->config_path,
+                transaction->items[i].account.name);
             clear_error();
             continue;
         }

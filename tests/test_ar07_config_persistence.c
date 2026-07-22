@@ -1594,9 +1594,16 @@ TEST(active_state_rejects_corruption_and_crash_mismatches) {
     CHECK_EQ_INT(write_private(hint, "none\nactive=bad/name\n"), 0);
     memset(&ctx, 0, sizeof(ctx));
     CHECK_EQ_INT(config_load(&ctx, path), -1);
+    /* AR-12 M3: a stale needs token (hand edit or gitswitch's own crash
+     * window between state install and document rename) is repairable
+     * staleness: degrade to inactive without mutating the artifact from an
+     * unlocked read, instead of hard-failing every command. */
     CHECK_EQ_INT(write_private(hint, "ssh\nactive=alice\n"), 0);
     memset(&ctx, 0, sizeof(ctx));
-    CHECK_EQ_INT(config_load(&ctx, path), -1); /* edit changed runtime needs */
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_STR_EQ(ctx.config.active_account, "");
+    CHECK(read_text(hint, text, sizeof(text)) > 0);
+    CHECK_STR_EQ(text, "ssh\nactive=alice\n");
 
     /* State-first active removal crash: old accounts remain, but resume is
      * safely inactive because the authoritative state artifact is absent. */

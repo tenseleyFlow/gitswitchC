@@ -1030,7 +1030,11 @@ cleanup_case:
     }
 }
 
-TEST(credentialless_no_ledger_is_not_clean_retirement) {
+/* AR-12 H1: a credentialless account with no publication-ledger records has
+ * nothing durable to retire. remove and reset must succeed vacuously instead
+ * of demanding a switch-first round trip that would publish the identity
+ * being torn down. */
+TEST(credentialless_no_ledger_retires_vacuously) {
     const m17_command_t commands[] = {
         M17_COMMAND_REMOVE,
         M17_COMMAND_RESET_ONE,
@@ -1039,8 +1043,7 @@ TEST(credentialless_no_ledger_is_not_clean_retirement) {
 
     for (size_t i = 0U; i < sizeof(commands) / sizeof(commands[0]); i++) {
         m17_fixture_t *fixture = calloc(1U, sizeof(*fixture));
-        m17_bytes_t accounts_before = {0};
-        m17_bytes_t state_before = {0};
+        m17_bytes_t accounts_after = {0};
         m17_bytes_t output = {0};
         int setup_result;
         int status;
@@ -1049,31 +1052,91 @@ TEST(credentialless_no_ledger_is_not_clean_retirement) {
         if (!fixture) continue;
         setup_result = m17_fixture_setup(fixture, false, false);
         CHECK_EQ_INT(setup_result, 0);
-        if (setup_result != 0) goto negative_cleanup;
-        if (m17_read_bytes(fixture->accounts_path, &accounts_before) != 0 ||
-            m17_read_bytes(fixture->state_path, &state_before) != 0) {
-            CHECK(false);
-            goto negative_cleanup;
-        }
+        if (setup_result != 0) goto vacuous_cleanup;
         status = m17_run_cli(fixture, commands[i], M17_FAULT_NONE, NULL);
         CHECK(WIFEXITED(status));
         if (WIFEXITED(status)) {
-            CHECK_EQ_INT(WEXITSTATUS(status), EXIT_FAILURE);
+            CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
         }
-        CHECK(m17_file_equals(fixture->accounts_path, &accounts_before));
-        CHECK(m17_file_equals(fixture->state_path, &state_before));
         CHECK_EQ_INT(m17_read_bytes(fixture->output_path, &output), 0);
-        CHECK(m17_output_has_no_success((const char *)output.data));
         CHECK(strstr((const char *)output.data,
-                     "No canonical publication provenance") != NULL);
+                     m17_success_text(commands[i])) != NULL);
+        CHECK(strstr((const char *)output.data,
+                     "No canonical publication provenance") == NULL);
+        CHECK_EQ_INT(m17_read_bytes(fixture->accounts_path,
+                                    &accounts_after), 0);
+        if (commands[i] == M17_COMMAND_REMOVE) {
+            /* Removal deletes the durable account entry. */
+            CHECK(strstr((const char *)accounts_after.data,
+                         "name = \"work\"") == NULL);
+        } else {
+            /* Reset tears down runtime state but keeps the account. */
+            CHECK(strstr((const char *)accounts_after.data,
+                         "name = \"work\"") != NULL);
+        }
         m17_bytes_clear(&output);
 
-negative_cleanup:
-        m17_bytes_clear(&accounts_before);
-        m17_bytes_clear(&state_before);
+vacuous_cleanup:
+        m17_bytes_clear(&accounts_after);
         m17_bytes_clear(&output);
         free(fixture);
     }
+}
+
+/* AR-12 M4: a recorded destination whose config file was deleted (removed
+ * repository, deleted global config) carries none of the published values.
+ * Its retirement leg must settle vacuously — remove succeeds, the other
+ * live destination is really retired, and no durable .retirement-incomplete
+ * fence survives to brick every future command. */
+TEST(deleted_destination_retires_vacuously_and_clears_guard) {
+    m17_fixture_t *fixture = calloc(1U, sizeof(*fixture));
+    m17_bytes_t output = {0};
+    m17_bytes_t survivor = {0};
+    char marker[MAX_PATH_LEN];
+    int setup_result;
+    int status;
+
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+    setup_result = m17_fixture_setup(fixture, true, true);
+    CHECK_EQ_INT(setup_result, 0);
+    if (setup_result != 0) goto vacuous_guard_cleanup;
+    CHECK_EQ_INT(unlink(fixture->git_paths[0]), 0);
+    status = m17_run_cli(fixture, M17_COMMAND_REMOVE, M17_FAULT_NONE, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->output_path, &output), 0);
+    CHECK(strstr((const char *)output.data,
+                 m17_success_text(M17_COMMAND_REMOVE)) != NULL);
+    /* The guard is settled: an incomplete marker may remain on disk only
+     * when paired with its completion certificate, and no fence blocks the
+     * next mutating command. */
+    CHECK_EQ_INT(safe_snprintf(marker, sizeof(marker), "%s/%s",
+                               fixture->config_dir,
+                               ".retirement-incomplete"), 0);
+    if (access(marker, F_OK) == 0) {
+        CHECK_EQ_INT(safe_snprintf(marker, sizeof(marker), "%s/%s",
+                                   fixture->config_dir,
+                                   ".retirement-complete"), 0);
+        CHECK_EQ_INT(access(marker, F_OK), 0);
+    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->git_paths[1], &survivor), 0);
+    CHECK(strstr((const char *)survivor.data, "sshCommand") == NULL);
+    CHECK(strstr((const char *)survivor.data, "marker = keep") != NULL);
+    /* A follow-up mutating command must not be fenced. */
+    status = m17_run_cli(fixture, M17_COMMAND_RESET_ALL, M17_FAULT_NONE,
+                         NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+
+vacuous_guard_cleanup:
+    m17_bytes_clear(&output);
+    m17_bytes_clear(&survivor);
+    free(fixture);
 }
 
 TEST_MAIN_BEGIN()
@@ -1083,5 +1146,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(all_reset_retirement_failures_are_nonzero_and_retryable);
     RUN_TEST(reset_all_continues_after_first_account_retirement_failure);
     RUN_TEST(reset_cleanup_failures_append_without_replacing_retirement_cause);
-    RUN_TEST(credentialless_no_ledger_is_not_clean_retirement);
+    RUN_TEST(credentialless_no_ledger_retires_vacuously);
+    RUN_TEST(deleted_destination_retires_vacuously_and_clears_guard);
 TEST_MAIN_END()

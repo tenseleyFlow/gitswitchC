@@ -253,8 +253,11 @@ int toml_parse_file(const char *file_path, toml_document_t *doc) {
         goto cleanup;
     }
     
-    /* Security: Check file permissions (should not be world-readable) */
-    if (file_stat.st_mode & (S_IRGRP | S_IROTH)) {
+    /* Security: group/other must have neither read NOR write access — a
+     * peer who can WRITE the config can redirect ssh_key and alter the
+     * identity, which is strictly worse than reading it (AR-12 L22; matches
+     * config.c's production gate). */
+    if (file_stat.st_mode & (S_IRGRP | S_IROTH | S_IWGRP | S_IWOTH)) {
         set_error(ERR_PERMISSION_DENIED, "Configuration file has unsafe permissions: %o", 
                   file_stat.st_mode & 0777);
         goto cleanup;
@@ -405,6 +408,11 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         
         /* Parse section header */
         if (c == '[') {
+            /* AR-12 L23: anchor duplicate/collision diagnostics at the
+             * offending construct's START, not one past its end. */
+            size_t construct_line = state.line_number;
+            size_t construct_column = state.column_number;
+
             if (parse_section_header(&state, section_name) == 0) {
                 /* Reject a repeated table header per the TOML spec (AR-05
                  * L10), matching the duplicate-KEY rejection below. Silently
@@ -422,10 +430,14 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
                     snprintf(dup_msg, sizeof(dup_msg),
                              "Duplicate section [%s] (TOML forbids defining "
                              "a table twice)", section_name);
+                    state.line_number = construct_line;
+                    state.column_number = construct_column;
                     set_parser_error(&state, dup_msg);
                     break;
                 }
                 if (!toml_table_namespace_is_available(doc, section_name)) {
+                    state.line_number = construct_line;
+                    state.column_number = construct_column;
                     set_parser_error(
                         &state,
                         "Table name collides with an existing scalar value");
@@ -446,6 +458,10 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
         
         /* Parse key-value pair */
         if (ascii_key_initial_is_valid((unsigned char)c)) {
+            /* AR-12 L23: see the section-header anchor above. */
+            size_t construct_line = state.line_number;
+            size_t construct_column = state.column_number;
+
             if (!current_section) {
                 /* Create default section if none exists */
                 current_section = find_or_create_section(doc, "");
@@ -479,11 +495,15 @@ int toml_parse_string(const char *toml_string, size_t length, toml_document_t *d
                     snprintf(dup_msg, sizeof(dup_msg),
                              "Duplicate key '%s' in section [%s] (TOML forbids "
                              "defining a key twice)", kv->key, current_section->name);
+                    state.line_number = construct_line;
+                    state.column_number = construct_column;
                     set_parser_error(&state, dup_msg);
                     break;
                 }
                 if (!toml_scalar_namespace_is_available(
                         doc, current_section->name, kv->key)) {
+                    state.line_number = construct_line;
+                    state.column_number = construct_column;
                     set_parser_error(
                         &state,
                         "Scalar key collides with an existing table namespace");
@@ -893,10 +913,21 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                          * callers would receive. */
                         if (toml_sanitize_string(kv->value, sanitized, sizeof(sanitized)) != 0 ||
                             strcmp(sanitized, kv->value) != 0) {
-                            set_error(ERR_CONFIG_INVALID,
-                                      "SSH key path contains characters that cannot "
-                                      "round-trip: %s", kv->value);
-                            return -1;
+                            /* AR-12 H4: skip THIS account like the over-long
+                             * case below rather than failing the whole
+                             * parse. The value is never handed to callers
+                             * (the section is hidden), the skip count blocks
+                             * rewrites, and one bad field no longer bricks
+                             * every command. Admission now rejects such
+                             * paths at add/edit, so this is repair-path
+                             * tolerance for hand edits and old writers. */
+                            log_warning("Account section [%s]: ssh_key contains "
+                                        "characters that cannot round-trip; "
+                                        "skipping this account, the rest of "
+                                        "the config still loads",
+                                        section->name);
+                            skip_section = true;
+                            break;
                         }
                         /* Over-long path: skip THIS account, not the file
                          * (AR-03 M5). The writer historically accepted up to
@@ -943,10 +974,17 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         return -1;
                     }
                     if (!toml_validate_ssh_host_alias(kv->value)) {
-                        set_error(ERR_CONFIG_INVALID,
-                                  "ssh_host must contain only ASCII letters, digits, "
-                                  "'.', '-', '_', '*', or '?'");
-                        return -1;
+                        /* AR-12 M7: releases before the strict alias grammar
+                         * persisted arbitrary prompt input here. Own-writer
+                         * legacy values skip THIS section (AR-03 M5
+                         * granularity) instead of bricking the whole file. */
+                        log_warning("Account section [%s]: ssh_host contains "
+                                    "characters outside the managed alias "
+                                    "grammar; skipping this account, the "
+                                    "rest of the config still loads",
+                                    section->name);
+                        skip_section = true;
+                        break;
                     }
                 }
 
@@ -958,11 +996,17 @@ int toml_validate_gitswitch_schema(toml_document_t *doc) {
                         return -1;
                     }
                     if (!toml_validate_ssh_hostname(kv->value)) {
-                        set_error(ERR_CONFIG_INVALID,
-                                  "ssh_hostname must be a host-only ASCII name "
-                                  "or IPv4 value, or a valid unbracketed IPv6 "
-                                  "literal; embedded ports are unsupported");
-                        return -1;
+                        /* AR-12 M7: the pre-M25 validator admitted values
+                         * (e.g. host:port) the narrowed grammar refuses.
+                         * Skip the section, never the whole file. */
+                        log_warning("Account section [%s]: ssh_hostname is "
+                                    "not a host-only name/IP under the "
+                                    "narrowed grammar; skipping this "
+                                    "account, the rest of the config still "
+                                    "loads",
+                                    section->name);
+                        skip_section = true;
+                        break;
                     }
                 }
                 
@@ -1950,7 +1994,10 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
     
     skip_whitespace(state);
     
-    /* Determine value type and parse */
+    /* Determine value type and parse. AR-12 L21: cast for isdigit — an
+     * unquoted value may begin with a UTF-8 lead byte, which is negative on
+     * signed-char platforms and UB to pass to isdigit() raw (the sibling
+     * call in parse_integer_value already casts). */
     char c = current_char(state);
     
     if (c == '"') {
@@ -1971,7 +2018,7 @@ static int parse_key_value_pair(toml_parser_state_t *state, toml_keyvalue_t *kv)
             return 0;
         }
         return -1;
-    } else if (isdigit(c) || c == '-' || c == '+') {
+    } else if (isdigit((unsigned char)c) || c == '-' || c == '+') {
         /* Integer value */
         kv->type = TOML_TYPE_INTEGER;
         int int_val;
@@ -2314,6 +2361,17 @@ int toml_set_string(toml_document_t *doc, const char *section_name,
                   "refusing to store it truncated or empty",
                   section_name, key_name, TOML_MAX_VALUE_LEN,
                   TOML_MAX_VALUE_LEN - 1);
+        return -1;
+    }
+    /* AR-12 P5 (L12 residual): the reader SKIPS any account whose persisted
+     * ssh_key exceeds 256 bytes, so writing a 257-511 byte value would emit
+     * a document this same tool then refuses to load back. Enforce the
+     * reader's cap at the writer too. */
+    if (strcmp(key_name, "ssh_key") == 0 && value_length > 256U) {
+        set_error(ERR_CONFIG_INVALID,
+                  "Value for %s.ssh_key is %zu bytes (max 256); the loader "
+                  "would skip the account, so refusing to write it",
+                  section_name, value_length);
         return -1;
     }
     if (!decoded_string_value_is_valid(value, value_length)) {

@@ -105,6 +105,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(config_migrate_account_incarnations);
     REQUIRE_PUBLIC_API(config_parse_scope);
     REQUIRE_PUBLIC_API(config_publication_preflight);
+    REQUIRE_PUBLIC_API(config_publication_preflight_destination);
     REQUIRE_PUBLIC_API(config_refresh_retirement_publications_transactional);
     REQUIRE_PUBLIC_API(config_remove_account);
     REQUIRE_PUBLIC_API(config_remove_account_owned);
@@ -191,6 +192,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(git_config_restore);
     REQUIRE_PUBLIC_API(git_config_seal);
     REQUIRE_PUBLIC_API(git_config_snapshot);
+    REQUIRE_PUBLIC_API(git_config_snapshot_export_destination);
     REQUIRE_PUBLIC_API(git_configure_gpg);
     REQUIRE_PUBLIC_API(git_configure_openpgp_publication);
     REQUIRE_PUBLIC_API(git_configure_ssh);
@@ -278,11 +280,14 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(publication_extract_ssh_program);
     REQUIRE_PUBLIC_API(publication_normalize_gpg_selector);
     REQUIRE_PUBLIC_API(publication_ledger_clear);
+    REQUIRE_PUBLIC_API(publication_ledger_destination_present);
     REQUIRE_PUBLIC_API(publication_ledger_find);
     REQUIRE_PUBLIC_API(publication_ledger_init);
     REQUIRE_PUBLIC_API(publication_ledger_parse);
+    REQUIRE_PUBLIC_API(publication_ledger_reclaim_absent);
     REQUIRE_PUBLIC_API(publication_ledger_serialize);
     REQUIRE_PUBLIC_API(publication_ledger_upsert);
+    REQUIRE_PUBLIC_API(publication_record_destination_provably_absent);
     REQUIRE_PUBLIC_API(publication_record_init);
     REQUIRE_PUBLIC_API(publication_record_same_config_destination);
     REQUIRE_PUBLIC_API(publication_record_same_destination);

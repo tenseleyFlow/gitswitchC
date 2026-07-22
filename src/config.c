@@ -1248,29 +1248,45 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
             ctx, ctx->config.active_account);
         if (!state_account) {
             if (ctx->accounts_skipped_on_load > 0) {
-                set_error(ERR_CONFIG_INVALID,
-                          "Active-state account '%s' could not be validated because account sections were skipped",
-                          ctx->config.active_account);
-                return -1;
+                /* AR-12 H3: the active account's own section was skipped —
+                 * commonly a deleted, rotated, or chmod'd key file. One
+                 * unloadable account must not take down every command:
+                 * degrade to inactive-with-warning like the stale-name
+                 * branch below, so list/status/reset/switch keep running as
+                 * repair paths. Full-document saves stay blocked by the
+                 * skip counters, preserving the on-disk section. */
+                display_warning(
+                    "Active-state account '%s' was skipped on load; treating the session as inactive until the account is repaired",
+                    ctx->config.active_account);
+                ctx->config.active_account[0] = '\0';
+            } else {
+                /* A crash after accounts.toml removed/renamed the active
+                 * account but before the state phase completed leaves a
+                 * syntactically valid stale artifact. Resolve that state
+                 * deterministically to inactive. Loading stays
+                 * observational: read-only commands do not own the mutation
+                 * lock, so cleanup is deferred to the next
+                 * already-serialized active/full save. */
+                display_warning("Ignoring stale active-state account '%s': it is not present in %s",
+                                ctx->config.active_account, config_path);
+                ctx->config.active_account[0] = '\0';
             }
-            /* A crash after accounts.toml removed/renamed the active account
-             * but before the state phase completed leaves a syntactically
-             * valid stale artifact. Resolve that state deterministically to
-             * inactive. Loading stays observational: read-only commands do
-             * not own the mutation lock, so cleanup is deferred to the next
-             * already-serialized active/full save. */
-            display_warning("Ignoring stale active-state account '%s': it is not present in %s",
-                            ctx->config.active_account, config_path);
-            ctx->config.active_account[0] = '\0';
         } else if (active_state.exists &&
                    !active_state.legacy_needs_only &&
                    strcmp(active_state.needs,
                           config_account_runtime_needs(state_account)) != 0) {
-            set_error(ERR_CONFIG_INVALID,
-                      "Active-state runtime needs '%s' do not match account '%s' (expected '%s')",
-                      active_state.needs, ctx->config.active_account,
-                      config_account_runtime_needs(state_account));
-            return -1;
+            /* AR-12 M3: a stale needs token is repairable staleness, not
+             * corruption. Two supported producers exist: a hand edit that
+             * changed the active account's ssh/gpg features, and gitswitch's
+             * own crash window between state install and document rename.
+             * Hard-failing here bricked every command including the repair
+             * paths; degrade to inactive like the branches above and let the
+             * next serialized save rewrite the artifact. */
+            display_warning(
+                "Active-state runtime needs '%s' do not match account '%s' (expected '%s'); treating the session as inactive until the next switch",
+                active_state.needs, ctx->config.active_account,
+                config_account_runtime_needs(state_account));
+            ctx->config.active_account[0] = '\0';
         } else if (safe_strncpy(ctx->config.active_account,
                                 state_account->name,
                                 sizeof(ctx->config.active_account)) != 0) {
@@ -2020,9 +2036,14 @@ static bool config_refresh_publication_identity(
         return false;
     }
 
-    source_fd = open(config_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    /* AR-12 L6: O_NONBLOCK is inert for regular files and prevents a
+     * raced-in FIFO from wedging while the publication lock is held; the
+     * fstat/S_ISREG checks below reject the non-regular descriptor. */
+    source_fd = open(config_path,
+                     O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (source_fd < 0) goto refresh_done;
-    backup_fd = open(backup_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    backup_fd = open(backup_path,
+                     O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (backup_fd < 0 || fstat(source_fd, &source_after) != 0 ||
         fstat(backup_fd, &backup_before) != 0) {
         goto refresh_done;
@@ -4295,7 +4316,7 @@ static int config_resume_hint_snapshot_restore_at(
                   "Cannot verify restored resume hint: %s", hint);
         return -1;
     }
-    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    fd = open(hint, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (fd < 0) {
         close(dir_fd);
         set_system_error(ERR_FILE_IO,
@@ -4685,9 +4706,39 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
         }
     }
 
-    if (publication &&
-        publication_ledger_upsert(&publications, publication) != 0) {
-        goto state_cleanup;
+    if (publication) {
+        /* AR-12 H2: an at-capacity ledger only blocks genuinely new
+         * destinations. A replacement never grows the ledger, and before an
+         * append is refused, provably-absent destinations are reclaimed —
+         * mirroring config_publication_preflight_check() exactly. */
+        if (!publication_ledger_destination_present(&publications,
+                                                    publication)) {
+            bool exhausted =
+                publications.count >= PUBLICATION_LEDGER_MAX_RECORDS;
+
+            if (!exhausted) {
+                unsigned char *trial = NULL;
+                size_t trial_length = 0U;
+
+                if (publication_ledger_serialize(&publications, &trial,
+                                                 &trial_length) != 0) {
+                    goto state_cleanup;
+                }
+                exhausted =
+                    CONFIG_PUBLICATION_RECORD_RESERVE >
+                        PUBLICATION_LEDGER_MAX_BYTES ||
+                    trial_length > PUBLICATION_LEDGER_MAX_BYTES -
+                                       CONFIG_PUBLICATION_RECORD_RESERVE;
+                secure_zero_memory(trial, trial_length);
+                free(trial);
+            }
+            if (exhausted) {
+                (void)publication_ledger_reclaim_absent(&publications);
+            }
+        }
+        if (publication_ledger_upsert(&publications, publication) != 0) {
+            goto state_cleanup;
+        }
     }
     if (publication_ledger_serialize(&publications, &ledger_bytes,
                                      &ledger_length) != 0) {
@@ -4906,11 +4957,13 @@ state_cleanup:
 /* Shared atomic-write tail for config_save and config_save_active_account:
  * validate the destination, back up the existing file, write doc to a fresh
  * 0600 temp, rename it into place, refresh the resume hint. */
+/* AR-12 L7: the former make_backup/update_hint parameters are gone — every
+ * caller passed true/false, and the dead update_hint branch was the only
+ * site publishing CONFIG_SOURCE_GENERATION_UNBOUND state, a latent bypass
+ * of the M5/M6 generation binding waiting for a future caller to flip it. */
 static int config_write_document_atomic(gitswitch_ctx_t *ctx,
                                         const toml_document_t *doc,
                                         const char *config_path,
-                                        bool make_backup,
-                                        bool update_hint,
                                         bool *config_installed,
                                         struct stat *committed_generation) {
     char dir_path[MAX_PATH_LEN];
@@ -5026,7 +5079,7 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
      * account DATA is unchanged, the write is atomic (temp+rename), and backing
      * up on each switch churned five backups for five switches, rotating real
      * account-edit backups out of the bounded set. */
-    if (make_backup && destination_existed) {
+    if (destination_existed) {
         if (config_backup_internal(config_path, &destination_before) != 0) {
             /* A successful save promises a durable, parseable recovery copy.
              * If that promise cannot be established, the config replacement
@@ -5260,12 +5313,6 @@ static int config_write_document_atomic(gitswitch_ctx_t *ctx,
             proof_errno == ESTALE ? ERR_FILE_IO : ERR_CONFIG_WRITE_FAILED,
             "Durable config generation changed before context refresh: %s",
             config_path);
-        goto document_fail;
-    }
-    if (update_hint &&
-        config_update_resume_hint(ctx, config_path, NULL,
-                                  CONFIG_SOURCE_GENERATION_UNBOUND,
-                                  NULL, NULL, NULL) != 0) {
         goto document_fail;
     }
     if (committed_generation) {
@@ -5550,8 +5597,8 @@ static int config_save_mode(gitswitch_ctx_t *ctx,
             goto cleanup;
         }
     }
-    result = config_write_document_atomic(ctx, toml_doc, config_path, true,
-                                          false, &document_installed,
+    result = config_write_document_atomic(ctx, toml_doc, config_path,
+                                          &document_installed,
                                           &committed_generation);
     if (config_installed) {
         *config_installed = document_installed;
@@ -5849,11 +5896,18 @@ int config_load_publication_ledger(const char *config_path,
                                     ledger);
 }
 
-int config_publication_preflight(const char *config_path) {
+/* One worst-case record must fit after the upsert. A destination that
+ * already has a ledger record is replaced in place, so its existing record
+ * is excluded from the simulation; when capacity is still exhausted, the
+ * same provably-absent reclamation that the save path performs is simulated
+ * before rejecting (AR-12 H2). */
+static int config_publication_preflight_check(
+    const char *config_path, const publication_record_t *destination) {
     config_active_state_t state;
     publication_ledger_t ledger;
     unsigned char *serialized = NULL;
     size_t serialized_length = 0U;
+    bool reclaim_attempted = false;
     int result = -1;
 
     if (!config_path) {
@@ -5863,15 +5917,50 @@ int config_publication_preflight(const char *config_path) {
     }
     publication_ledger_init(&ledger);
     if (config_read_active_state(config_path, &state, false, NULL,
-                                 &ledger) != 0 ||
-        publication_ledger_serialize(&ledger, &serialized,
-                                     &serialized_length) != 0) {
+                                 &ledger) != 0) {
         goto cleanup;
     }
-    if (ledger.count >= PUBLICATION_LEDGER_MAX_RECORDS ||
-        CONFIG_PUBLICATION_RECORD_RESERVE > PUBLICATION_LEDGER_MAX_BYTES ||
-        serialized_length >
-            PUBLICATION_LEDGER_MAX_BYTES - CONFIG_PUBLICATION_RECORD_RESERVE) {
+    if (destination &&
+        publication_ledger_destination_present(&ledger, destination)) {
+        /* The upsert will replace this record without growing the ledger;
+         * remove it from the capacity simulation. */
+        size_t kept = 0U;
+
+        for (size_t i = 0U; i < ledger.count; i++) {
+            if (publication_record_same_destination(&ledger.records[i],
+                                                    destination)) {
+                continue;
+            }
+            if (kept != i) ledger.records[kept] = ledger.records[i];
+            kept++;
+        }
+        if (kept != ledger.count) {
+            secure_zero_memory(&ledger.records[kept],
+                               (ledger.count - kept) *
+                                   sizeof(*ledger.records));
+            ledger.count = kept;
+        }
+    }
+    for (;;) {
+        if (publication_ledger_serialize(&ledger, &serialized,
+                                         &serialized_length) != 0) {
+            goto cleanup;
+        }
+        if (ledger.count < PUBLICATION_LEDGER_MAX_RECORDS &&
+            CONFIG_PUBLICATION_RECORD_RESERVE <=
+                PUBLICATION_LEDGER_MAX_BYTES &&
+            serialized_length <= PUBLICATION_LEDGER_MAX_BYTES -
+                                     CONFIG_PUBLICATION_RECORD_RESERVE) {
+            break;
+        }
+        secure_zero_memory(serialized, serialized_length);
+        free(serialized);
+        serialized = NULL;
+        serialized_length = 0U;
+        if (!reclaim_attempted) {
+            reclaim_attempted = true;
+            if (publication_ledger_reclaim_absent(&ledger) != 0U) continue;
+        }
         errno = ENOSPC;
         set_error(ERR_CONFIG_INVALID,
                   "Publication ledger has no capacity for another worst-case record");
@@ -5886,6 +5975,15 @@ cleanup:
     }
     publication_ledger_clear(&ledger);
     return result;
+}
+
+int config_publication_preflight(const char *config_path) {
+    return config_publication_preflight_check(config_path, NULL);
+}
+
+int config_publication_preflight_destination(
+    const char *config_path, const publication_record_t *destination) {
+    return config_publication_preflight_check(config_path, destination);
 }
 
 int config_restore_active_account(gitswitch_ctx_t *ctx,
@@ -7571,7 +7669,8 @@ static int copy_file_nofollow(const char *src_path, const char *dst_path,
                          "Cannot identify private backup source: %s", src_path);
         return -1;
     }
-    sfd = open(src_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    sfd = open(src_path,
+               O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     if (sfd < 0) {
         set_system_error(ERR_FILE_IO, "Cannot open backup source (symlink?): %s", src_path);
         return -1;
@@ -8192,9 +8291,19 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             if (fs == FIELD_LOADED && strlen(account.ssh_key_path) > 0) {
                 account.ssh_enabled = true;
 
-                /* Expand path if needed */
+                /* Expand path if needed. AR-12 L8: retain the persisted
+                 * spelling first so a later save can re-emit the user's
+                 * portable '~/...' form instead of the expanded path. */
                 char expanded_path[MAX_PATH_LEN];
-                if (expand_path(account.ssh_key_path, expanded_path, sizeof(expanded_path)) == 0) {
+                if (expand_path(account.ssh_key_path, expanded_path, sizeof(expanded_path)) == 0 &&
+                    strcmp(expanded_path, account.ssh_key_path) != 0) {
+                    if (safe_strncpy(account.ssh_key_spelling,
+                                     account.ssh_key_path,
+                                     sizeof(account.ssh_key_spelling)) != 0) {
+                        /* Preservation is best-effort; the expanded path
+                         * remains authoritative. */
+                        account.ssh_key_spelling[0] = '\0';
+                    }
                     safe_strncpy(account.ssh_key_path, expanded_path, sizeof(account.ssh_key_path));
                 }
 
@@ -8573,8 +8682,13 @@ static int validate_account_security(const account_t *account) {
         return -1;
     }
 
+    /* AR-12 H4: the ssh_key path is included so admission can never write a
+     * document whose bytes the loader's schema refuses (write-accepts /
+     * load-rejects asymmetry). */
     if (validate_field_roundtrips("name", account->name) != 0 ||
         validate_field_roundtrips("description", account->description) != 0 ||
+        validate_field_roundtrips("SSH key path",
+                                  account->ssh_key_path) != 0 ||
         validate_field_roundtrips("SSH host alias", account->ssh_host_alias) != 0 ||
         validate_field_roundtrips("SSH canonical hostname",
                                   account->ssh_hostname) != 0) {
@@ -8781,8 +8895,20 @@ static int save_accounts_to_toml(const gitswitch_ctx_t *ctx, toml_document_t *do
 
         /* Save SSH configuration */
         if (account->ssh_enabled && strlen(account->ssh_key_path) > 0) {
+            /* AR-12 L8: re-emit the user's persisted spelling while it
+             * still expands to the live model value; an edited path (stale
+             * spelling) falls back to the expanded bytes. */
+            const char *ssh_key_value = account->ssh_key_path;
+            char respelled[MAX_PATH_LEN];
+
+            if (account->ssh_key_spelling[0] != '\0' &&
+                expand_path(account->ssh_key_spelling, respelled,
+                            sizeof(respelled)) == 0 &&
+                strcmp(respelled, account->ssh_key_path) == 0) {
+                ssh_key_value = account->ssh_key_spelling;
+            }
             if (toml_set_string(doc, section_name, "ssh_key",
-                                account->ssh_key_path) != 0) {
+                                ssh_key_value) != 0) {
                 set_error(ERR_CONFIG_INVALID, "Failed to save SSH key path");
                 return -1;
             }

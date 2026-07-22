@@ -1120,6 +1120,13 @@ static int gpg_current_path_from_base(const char *base, char *buf, size_t size) 
     return 0;
 }
 
+enum {
+    GPG_SOURCE_PROOF_MAX_DEPTH = 64,
+    GPG_SOURCE_PROOF_MAX_DIRECTORIES = 16384,
+    GPG_SOURCE_PROOF_MAX_ENTRIES = 65536,
+    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32
+};
+
 #define GPG_ROLLBACK_PREFIX ".gitswitch-gpg-rollback."
 #define GPG_PUBLISH_PREFIX ".gitswitch-gpg-publish."
 #define GPG_RESET_PREFIX ".gitswitch-gpg-reset."
@@ -1244,10 +1251,85 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
             safe_strncpy(stale, entry->d_name, sizeof(stale));
             closedir(dir);
             set_error(ERR_FILE_IO,
-                      "Unresolved GPG runtime quarantine blocks mutation: %s",
+                      "Unresolved GPG runtime quarantine blocks mutation: %s (run 'gitswitch reset' to retire it)",
                       stale);
             return -1;
         }
+    }
+    closedir(dir);
+    return 0;
+}
+
+/* AR-12 L11: a SIGKILL/power loss between quarantine creation and its
+ * unlink orphans a .gitswitch-gpg-rollback.* / .gitswitch-gpg-publish.*
+ * symlink with no in-memory token, and the stale-quarantine gate then
+ * blocks every switch, drop, AND reset forever. Full reset deletes every
+ * managed home anyway, so an owned orphaned quarantine SYMLINK preserves
+ * nothing — retire it. Anything that is not an owned symlink stays fatal. */
+static int gpg_retire_orphan_quarantines_locked(int base_fd) {
+    int scan_flags = O_RDONLY | O_CLOEXEC;
+    int scan_fd;
+    DIR *dir;
+    struct dirent *entry;
+
+#ifdef O_DIRECTORY
+    scan_flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    scan_flags |= O_NOFOLLOW;
+#endif
+    scan_fd = openat(base_fd, ".", scan_flags);
+    if (scan_fd < 0 || !(dir = fdopendir(scan_fd))) {
+        if (scan_fd >= 0) close(scan_fd);
+        set_system_error(ERR_FILE_IO,
+                         "Cannot inspect GPG quarantine residue");
+        return -1;
+    }
+    for (;;) {
+        struct stat orphan;
+
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                int saved_errno = errno;
+                closedir(dir);
+                errno = saved_errno;
+                set_system_error(ERR_FILE_IO,
+                                 "Cannot enumerate GPG quarantine residue");
+                return -1;
+            }
+            break;
+        }
+        if (!gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) &&
+            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)) {
+            continue;
+        }
+        if (fstatat(base_fd, entry->d_name, &orphan,
+                    AT_SYMLINK_NOFOLLOW) != 0) {
+            if (errno == ENOENT) continue;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot inspect GPG quarantine residue: %s",
+                             entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        if (!S_ISLNK(orphan.st_mode) || orphan.st_uid != getuid()) {
+            set_error(ERR_PERMISSION_DENIED,
+                      "Refusing foreign GPG quarantine residue: %s",
+                      entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        if (unlinkat(base_fd, entry->d_name, 0) != 0 && errno != ENOENT) {
+            set_system_error(ERR_FILE_IO,
+                             "Cannot retire orphaned GPG quarantine: %s",
+                             entry->d_name);
+            closedir(dir);
+            return -1;
+        }
+        log_warning("Retired orphaned GPG quarantine residue: %s",
+                    entry->d_name);
     }
     closedir(dir);
     return 0;
@@ -2336,13 +2418,30 @@ static int gpg_retarget_current_locked(int base_fd, const char *base,
         return -1;
     }
     prev_existed = prev_rc == 0;
-    if (prev_existed &&
-        (!gpg_target_is_managed_child(base, prev_target) ||
-         gpg_live_private_home(base_fd, base, prev_target) != 0)) {
-        set_error(ERR_INVALID_PATH,
-                  "Refusing to replace unsafe previous GNUPGHOME target: %s",
-                  prev_target);
-        return -1;
+    if (prev_existed) {
+        int prev_live = -1;
+
+        if (gpg_target_is_managed_child(base, prev_target)) {
+            prev_live = gpg_live_private_home(base_fd, base, prev_target);
+        }
+        if (prev_live == 1) {
+            /* AR-12 L10: `current` dangles — a crash between home removal
+             * and current retirement (or a manual rm of one home) leaves
+             * current -> <deleted-account>. There is no home to preserve,
+             * so proceed and let a failed retarget restore ABSENCE rather
+             * than the dangling spelling. */
+            log_warning(
+                "Previous GNUPGHOME target no longer exists; replacing the dangling current link: %s",
+                prev_target);
+            clear_error();
+            prev_existed = false;
+        } else if (prev_live != 0) {
+            set_error(
+                ERR_INVALID_PATH,
+                "Refusing to replace unsafe previous GNUPGHOME target: %s",
+                prev_target);
+            return -1;
+        }
     }
     result->previous_present = prev_existed;
     if (prev_existed) {
@@ -2826,7 +2925,13 @@ out:
  * same inode) keeps st_dev while crossing into a distinct mount. statx's mount
  * ID closes that gap. macOS and FreeBSD expose the corresponding filesystem
  * identity through fstatfs; uncertainty on an unsupported platform fails
- * closed instead of silently weakening reset. */
+ * closed instead of silently weakening reset.
+ *
+ * AR-12 P10 (documented floor): STATX_MNT_ID needs Linux kernel >= 5.8
+ * (stx_mask leaves the bit clear on older kernels), so ISOLATED-mode GPG
+ * operations fail closed with ENOTSUP there. Shared-mode GPG is unaffected.
+ * 5.8 predates every supported distribution's floor; raising a clearer
+ * diagnostic below keeps the constraint visible rather than silent. */
 static int gpg_mount_identity_fd(int fd, gpg_mount_identity_t *identity) {
     if (fd < 0 || !identity) {
         errno = EINVAL;
@@ -2927,9 +3032,13 @@ static bool gpg_same_file_version(const struct stat *left,
  * unlink. Thus a pre-existing hardlink leaves the entire home untouched, while
  * a link or mount introduced between passes is still caught before that entry
  * is removed. */
+/* AR-12 P3: bounded like the twin source-proof walk — each frame holds a
+ * DIR stream and a child fd, so unbounded recursion is both a stack and an
+ * fd-exhaustion hazard on an adversarially deep tree. */
 static int gpg_walk_tree_contents_fd(
     int dir_fd, const char *display_path,
-    const gpg_mount_identity_t *root_mount, bool remove_entries) {
+    const gpg_mount_identity_t *root_mount, bool remove_entries,
+    unsigned int depth) {
     int scan_flags = O_RDONLY | O_CLOEXEC;
     int scan_fd;
     DIR *dir;
@@ -2941,6 +3050,13 @@ static int gpg_walk_tree_contents_fd(
 #ifdef O_NOFOLLOW
     scan_flags |= O_NOFOLLOW;
 #endif
+    if (depth > GPG_SOURCE_PROOF_MAX_DEPTH) {
+        errno = ELOOP;
+        set_error(ERR_INVALID_PATH,
+                  "Isolated GPG home exceeds the bounded reset walk depth: %s",
+                  display_path);
+        return -1;
+    }
     scan_fd = openat(dir_fd, ".", scan_flags);
     dir = scan_fd >= 0 ? fdopendir(scan_fd) : NULL;
     if (!dir) {
@@ -3023,7 +3139,7 @@ static int gpg_walk_tree_contents_fd(
                 return -1;
             }
             if (gpg_walk_tree_contents_fd(child_fd, child_display, root_mount,
-                                          remove_entries) != 0) {
+                                          remove_entries, depth + 1U) != 0) {
                 close(child_fd);
                 closedir(dir);
                 return -1;
@@ -3136,7 +3252,7 @@ static int gpg_preflight_home_at(int base_fd, const char *base,
                   "Refusing mounted isolated GPG home during reset: %s", home);
         return -1;
     }
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -3374,7 +3490,7 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     /* Preflight the complete tree before stopping the agent or unlinking any
      * state. This makes a pre-existing mount or hardlink an all-or-nothing
      * refusal for this home. */
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -3410,7 +3526,7 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
     /* gpgconf may have changed sockets or files while shutting down. Validate
      * its final tree as a whole, then give tests a deterministic race seam;
      * destructive traversal independently revalidates every entry. */
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, false, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -3419,7 +3535,7 @@ static int gpg_kill_and_remove_home(int base_fd, const char *base,
         set_error(ERR_FILE_IO, "GPG cleanup pre-delete hook failed: %s", home);
         return -1;
     }
-    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, true) != 0) {
+    if (gpg_walk_tree_contents_fd(home_fd, home, &base_mount, true, 0U) != 0) {
         close(home_fd);
         return -1;
     }
@@ -3715,6 +3831,10 @@ int gpg_manager_reset(const char *account) {
         return -1;
     }
     if (gpg_reconcile_reset_retry_locked(base_fd) != 0) {
+        unlock_gpg_dir(base_fd, lock_fd);
+        return -1;
+    }
+    if (!account && gpg_retire_orphan_quarantines_locked(base_fd) != 0) {
         unlock_gpg_dir(base_fd, lock_fd);
         return -1;
     }
@@ -5252,7 +5372,10 @@ static int copy_key_from_system_keyring(const gpg_config_t *gpg_config,
      * silent cap then fed the corrupt armor straight to `gpg --import`
      * (AR-02 #4). Truncation is detected and refused explicitly below. */
     enum { KEY_DATA_CAP = 512 * 1024 };
-    char import_diag[1024];
+    /* AR-12 L12: run_argv has early-return paths that never touch the
+     * capture buffer; initialize so a pre-spawn failure cannot format
+     * uninitialized stack bytes into the user-facing diagnostic. */
+    char import_diag[1024] = "";
     const char *env[2] = {"GNUPGHOME=.", NULL};
     char *key_data;
     char imported_fingerprint[GPG_FINGERPRINT_BUFSIZE];
@@ -6484,13 +6607,6 @@ static int gpg_user_source_home(char *buf, size_t size) {
     }
     return 0;
 }
-
-enum {
-    GPG_SOURCE_PROOF_MAX_DEPTH = 64,
-    GPG_SOURCE_PROOF_MAX_DIRECTORIES = 16384,
-    GPG_SOURCE_PROOF_MAX_ENTRIES = 65536,
-    GPG_SOURCE_PROOF_MAX_NULLFS_HOPS = 32
-};
 
 typedef struct {
     size_t directories;

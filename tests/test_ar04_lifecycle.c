@@ -657,12 +657,14 @@ TEST(active_description_edit_and_inactive_live_edits_still_work) {
                             "test\n-----END OPENSSH PRIVATE KEY-----\n",
                             0600), 0);
     snprintf(input, sizeof(input),
-             "\n\n\n%s\ngithub.com-work\nABCDEF0123456789\ny\n\n", key);
+             "\n\n\n%s\ngithub.com-work\ngithub.com\nABCDEF0123456789\ny\n\n",
+             key);
     CHECK_EQ_INT(run_edit(home, runtime, shims, input, output), 0);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
     CHECK(strstr(contents, "ssh_key = ") != NULL);
     CHECK(strstr(contents, "ssh_host = \"github.com-work\"") != NULL);
+    CHECK(strstr(contents, "ssh_hostname = \"github.com\"") != NULL);
     CHECK(strstr(contents, "gpg_key = \"ABCDEF0123456789\"") != NULL);
 
     remove_tree(home);
@@ -1167,7 +1169,11 @@ TEST(remove_rebinds_current_pointer_after_array_compaction) {
     remove_tree(runtime);
 }
 
-TEST(remove_without_publication_provenance_retains_account_for_retry) {
+/* AR-12 H1: an account with no publication-ledger records (never switched,
+ * or loaded from a pre-ledger config) has nothing durable to retire. Its
+ * removal must succeed vacuously instead of demanding a switch-first round
+ * trip that would publish the identity being deleted. */
+TEST(remove_without_publication_provenance_succeeds_vacuously) {
     char home[256], runtime[256], shims[512], output[1024], path[1024];
     char contents[8192];
 
@@ -1177,15 +1183,14 @@ TEST(remove_without_publication_provenance_retains_account_for_retry) {
     CHECK_EQ_INT(prepare_home(home, active_work_config()), 0);
 
     snprintf(output, sizeof(output), "%s/remove-no-provenance.out", runtime);
-    CHECK(run_remove(home, runtime, shims, "work", output) != 0);
+    CHECK_EQ_INT(run_remove(home, runtime, shims, "work", output), 0);
     snprintf(path, sizeof(path), "%s/.config/gitswitch/accounts.toml", home);
     slurp(path, contents, sizeof(contents));
-    CHECK(strstr(contents, "name = \"work\"") != NULL);
-    CHECK(strstr(contents, "active_account = \"work\"") != NULL);
+    CHECK(strstr(contents, "name = \"work\"") == NULL);
+    CHECK(strstr(contents, "active_account") == NULL);
     slurp(output, contents, sizeof(contents));
-    CHECK(strstr(contents, "Failed to remove account") != NULL);
-    CHECK(strstr(contents, "No canonical publication provenance exists") != NULL);
-    CHECK(strstr(contents, "removed successfully") == NULL);
+    CHECK(strstr(contents, "Failed to remove account") == NULL);
+    CHECK(strstr(contents, "No canonical publication provenance exists") == NULL);
 
     remove_tree(home);
     remove_tree(runtime);
@@ -1340,7 +1345,7 @@ int main(int argc, char **argv) {
     RUN_TEST(remove_failure_retains_account_and_attempts_other_manager);
     RUN_TEST(remove_inactive_account_with_no_runtime_preserves_active_account);
     RUN_TEST(remove_rebinds_current_pointer_after_array_compaction);
-    RUN_TEST(remove_without_publication_provenance_retains_account_for_retry);
+    RUN_TEST(remove_without_publication_provenance_succeeds_vacuously);
     RUN_TEST(sock_substrings_round_trip_and_malformed_links_fall_back);
     error_cleanup();
     return ts_test_finish();

@@ -316,6 +316,12 @@ cleanup_lock()
     exit "$cleanup_status"
 }
 
+# AR-12 P8 (adjudicated, accepted residual risk): POSIX shell cannot
+# atomically prove $child_pid still names our child before signalling, so a
+# kernel that recycles the PID inside the bounded escalation window could
+# receive a stray TERM/KILL. The kill -0 probe narrows the window and the
+# supervisor reaps its own child promptly; closing it fully needs process
+# groups/pidfds unavailable to portable sh.
 # shellcheck disable=SC2329
 terminate_child()
 {
@@ -458,7 +464,10 @@ lease_reader_pid=$!
 abort_if_signalled
 
 GITSWITCH_RELEASE_LOCK_TOKEN=$token_dir
-GITSWITCH_RELEASE_LOCK_LEASE_FD=9
+# AR-12 P9: fd 7 — fd 9 collided with the named-fixture report descriptor
+# that seamed helpers rebind (9>...), silently detaching those subtrees from
+# the descendant lease; fd 8 is likewise taken by durability traces.
+GITSWITCH_RELEASE_LOCK_LEASE_FD=7
 export GITSWITCH_RELEASE_LOCK_TOKEN
 export GITSWITCH_RELEASE_LOCK_LEASE_FD
 
@@ -472,18 +481,18 @@ launch_owned_command()
         case $reset_command_int:$reset_command_quit in
             1:1)
                 exec env --default-signal=INT --default-signal=QUIT \
-                    "$@" 9>"$lease_path"
+                    "$@" 7>"$lease_path"
                 ;;
             1:0)
-                exec env --default-signal=INT "$@" 9>"$lease_path"
+                exec env --default-signal=INT "$@" 7>"$lease_path"
                 ;;
             0:1)
-                exec env --default-signal=QUIT "$@" 9>"$lease_path"
+                exec env --default-signal=QUIT "$@" 7>"$lease_path"
                 ;;
         esac
     fi
     trap - INT QUIT
-    exec "$@" 9>"$lease_path"
+    exec "$@" 7>"$lease_path"
 }
 (
     launch_owned_command "$@"

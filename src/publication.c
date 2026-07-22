@@ -623,6 +623,90 @@ bool publication_record_same_destination(const publication_record_t *left,
                                              &right->repository));
 }
 
+/* AR-12 H2: a record whose destination anchor is provably gone — ENOENT on
+ * the recorded repository (or config parent directory for global records),
+ * or a live object with a different device/inode identity — can never match
+ * publication_record_same_destination() again. Such records only consume
+ * ledger capacity. Any indeterminate probe (EACCES, ELOOP, ...) keeps the
+ * record: absence must be proven, not assumed. */
+bool publication_record_destination_provably_absent(
+    const publication_record_t *record) {
+    struct stat st;
+    const char *probe;
+    const publication_identity_t *identity;
+    char parent[MAX_PATH_LEN];
+
+    if (!record) return false;
+    if (record->repository_path[0] != '\0') {
+        probe = record->repository_path;
+        identity = &record->repository;
+    } else {
+        const char *slash = strrchr(record->config_path, '/');
+        size_t length;
+
+        if (!slash) return false;
+        length = slash == record->config_path
+                     ? 1U
+                     : (size_t)(slash - record->config_path);
+        if (length >= sizeof(parent)) return false;
+        memcpy(parent, record->config_path, length);
+        parent[length] = '\0';
+        probe = parent;
+        identity = &record->config_parent;
+    }
+    if (!identity->present) return false;
+    errno = 0;
+    if (stat(probe, &st) != 0) return errno == ENOENT;
+    {
+        publication_identity_t live;
+
+        publication_identity_from_stat(&live, &st);
+        return !publication_identity_same_object(identity, &live);
+    }
+}
+
+/* Drop PUBLISHED records whose destinations are provably absent, compacting
+ * in place. RETIRING records are never reclaimed here: their settlement
+ * belongs to the retirement recovery machinery. Returns the removed count. */
+size_t publication_ledger_reclaim_absent(publication_ledger_t *ledger) {
+    size_t kept = 0U;
+    size_t removed;
+
+    if (!ledger || !ledger->present || ledger->count == 0U ||
+        !ledger->records) {
+        return 0U;
+    }
+    for (size_t i = 0U; i < ledger->count; i++) {
+        if (ledger->records[i].state == PUBLICATION_STATE_PUBLISHED &&
+            publication_record_destination_provably_absent(
+                &ledger->records[i])) {
+            continue;
+        }
+        if (kept != i) ledger->records[kept] = ledger->records[i];
+        kept++;
+    }
+    removed = ledger->count - kept;
+    if (removed != 0U) {
+        secure_zero_memory(&ledger->records[kept],
+                           removed * sizeof(*ledger->records));
+        ledger->count = kept;
+    }
+    return removed;
+}
+
+bool publication_ledger_destination_present(
+    const publication_ledger_t *ledger,
+    const publication_record_t *record) {
+    if (!ledger || !record) return false;
+    for (size_t i = 0U; i < ledger->count; i++) {
+        if (publication_record_same_destination(&ledger->records[i],
+                                                record)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void publication_ledger_init(publication_ledger_t *ledger) {
     if (!ledger) return;
     memset(ledger, 0, sizeof(*ledger));
@@ -1035,8 +1119,14 @@ static int publication_parse_record(publication_reader_t *reader,
     READ_FIELD("post_config");
     if (publication_parse_identity(value, length, &record->post_config) != 0) return -1;
     READ_FIELD("capabilities");
-    if (length != 8U || publication_copy_token(value, length, token,
-                                               sizeof(token)) != 0) return -1;
+    /* AR-12 L16: name the rejection instead of surfacing a stale earlier
+     * diagnostic through the bare -1. */
+    if (length != 8U) {
+        return publication_invalid(
+            "Invalid publication capability mask length");
+    }
+    if (publication_copy_token(value, length, token,
+                               sizeof(token)) != 0) return -1;
     for (size_t i = 0; i < length; i++) {
         if (!isdigit((unsigned char)token[i]) &&
             (token[i] < 'A' || token[i] > 'F')) {
@@ -1053,9 +1143,17 @@ static int publication_parse_record(publication_reader_t *reader,
         record->capabilities = (uint32_t)parsed;
     }
     READ_FIELD("gpg_fingerprint");
+    /* AR-12 L17: '-' is the ONLY canonical empty spelling; a zero-length
+     * value would alias it, breaking the byte-for-byte round-trip the
+     * serializer guarantees. */
     if (length == 1U && value[0] == '-') record->gpg_fingerprint[0] = '\0';
-    else if (publication_copy_token(value, length, record->gpg_fingerprint,
-                                    sizeof(record->gpg_fingerprint)) != 0) return -1;
+    else if (length == 0U) {
+        return publication_invalid(
+            "Empty publication gpg_fingerprint requires '-'");
+    } else if (publication_copy_token(value, length, record->gpg_fingerprint,
+                                      sizeof(record->gpg_fingerprint)) != 0) {
+        return -1;
+    }
     /* Selector provenance was added to v1 while it was still an internal,
      * unreleased ledger. Accept the older fingerprint->program sequence so
      * such records remain available for exact retirement, but leave the
@@ -1064,6 +1162,9 @@ static int publication_parse_record(publication_reader_t *reader,
         READ_FIELD("gpg_selector");
         if (length == 1U && value[0] == '-') {
             record->gpg_selector[0] = '\0';
+        } else if (length == 0U) {
+            return publication_invalid(
+                "Empty publication gpg_selector requires '-'");
         } else if (publication_copy_token(
                        value, length, record->gpg_selector,
                        sizeof(record->gpg_selector)) != 0) {
@@ -1142,10 +1243,19 @@ int publication_ledger_parse(const unsigned char *data, size_t length,
     reader.cursor = data;
     reader.end = data + length;
     if (publication_expect_literal(&reader, "publications=v1") != 0 ||
-        publication_read_line(&reader, &value, &value_length) != 0 ||
-        value_length < sizeof("count=") - 1U ||
-        memcmp(value, "count=", sizeof("count=") - 1U) != 0 ||
-        publication_parse_uintmax(
+        publication_read_line(&reader, &value, &value_length) != 0) {
+        publication_ledger_clear(&parsed);
+        return -1;
+    }
+    /* AR-12 L16: name the count-line rejection instead of returning a bare
+     * -1 that surfaces a stale earlier diagnostic. */
+    if (value_length < sizeof("count=") - 1U ||
+        memcmp(value, "count=", sizeof("count=") - 1U) != 0) {
+        publication_ledger_clear(&parsed);
+        return publication_invalid(
+            "Malformed publication ledger count line");
+    }
+    if (publication_parse_uintmax(
             value + sizeof("count=") - 1U,
             value_length - (sizeof("count=") - 1U),
             PUBLICATION_LEDGER_MAX_RECORDS, &count) != 0) {

@@ -1145,7 +1145,9 @@ TEST(zsh_completion_queries_accounts_only_for_account_operands) {
         "probe bare-account gitswitch ''; "
         "for cmd in edit remove rm delete reset switch; do "
         "probe account-$cmd gitswitch -g $cmd ''; done; "
-        "probe delimited-account gitswitch edit -- '';",
+        "probe delimited-account gitswitch edit -- ''; "
+        "probe quoted-command gitswitch '\"edit\"' ''; "
+        "probe quoted-option gitswitch '\"--global\"' edit '';",
         stub, count_path);
     CHECK(written >= 0 && (size_t)written < sizeof(script));
     if (written < 0 || (size_t)written >= sizeof(script)) return;
@@ -1167,7 +1169,11 @@ TEST(zsh_completion_queries_accounts_only_for_account_operands) {
         "A:Alpha|Colon\\:Name|Space Name\nC:account-delete:1\n"
         "A:Alpha|Colon\\:Name|Space Name\nC:account-reset:1\n"
         "A:Alpha|Colon\\:Name|Space Name\nC:account-switch:1\n"
-        "A:Alpha|Colon\\:Name|Space Name\nC:delimited-account:1\n");
+        "A:Alpha|Colon\\:Name|Space Name\nC:delimited-account:1\n"
+        /* AR-12 L1: quoted spellings must classify like their dequoted
+         * forms instead of degrading to the options-only branch. */
+        "A:Alpha|Colon\\:Name|Space Name\nC:quoted-command:1\n"
+        "A:Alpha|Colon\\:Name|Space Name\nC:quoted-option:1\n");
 }
 
 /* AR-10 L25/L26: ${(f)} over an empty capture yields one EMPTY element, so a

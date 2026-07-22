@@ -14,7 +14,11 @@ _gitswitch_scan() {
     _gitswitch_operand_count=0
     _gitswitch_options_enabled=1
     for (( i = 2; i < limit; i++ )); do
-        token=${words[i]}
+        # AR-12 L1: $words retains quoting as typed; dequote before
+        # classification so '"edit"' or 'e\dit' is recognized as the edit
+        # command and '"--global"' as an option (the bash M35 / fish L41
+        # counterpart).
+        token=${(Q)words[i]}
         if (( _gitswitch_options_enabled )); then
             if [[ $token == -- ]]; then
                 _gitswitch_options_enabled=0
@@ -109,7 +113,7 @@ _gitswitch() {
 
     # The word being completed is itself an option: offer options only before
     # the explicit delimiter.
-    if (( options_enabled )) && [[ "${words[CURRENT]}" == -* ]]; then
+    if (( options_enabled )) && [[ "${(Q)words[CURRENT]}" == -* ]]; then
         _values 'option' $options
         return
     fi

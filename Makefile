@@ -1418,6 +1418,16 @@ install:
 		esac; \
 		built_format=`sed -n 's/^release_artifact_format=//p' "$(BUILDTYPE_STAMP)"`; \
 		built_triple=`sed -n 's/^target_triple=//p' "$(BUILDTYPE_STAMP)"`; \
+		case "$$built_format" in \
+		elf) command -v readelf >/dev/null 2>&1 || \
+			command -v llvm-readelf >/dev/null 2>&1 || \
+			command -v greadelf >/dev/null 2>&1 || { \
+			echo 'ERROR: release install verifies artifact hardening and needs an ELF inspector; install binutils (readelf) or llvm (llvm-readelf)' >&2; \
+			exit 1; }; ;; \
+		macho) command -v otool >/dev/null 2>&1 || { \
+			echo 'ERROR: release install verifies artifact hardening and needs otool (Xcode command line tools)' >&2; \
+			exit 1; }; ;; \
+		esac; \
 		GITSWITCH_RELEASE_FORMAT="$$built_format" \
 			sh tests/test_ar07_release.sh artifact-publish \
 			"$$source_binary" "$$staged_binary" \
@@ -1810,7 +1820,8 @@ MEMCHECK_TARGETS = $(BINDIR)/test_runner $(BINDIR)/test_security \
 	$(BINDIR)/test_toml $(BINDIR)/test_validation \
 	$(BINDIR)/test_config_security $(BINDIR)/test_git_ops \
 	$(BINDIR)/test_gpg_parse $(BINDIR)/test_ar05_unit \
-	$(BINDIR)/test_display
+	$(BINDIR)/test_display \
+	$(BINDIR)/test_ar11_publication $(BINDIR)/test_ar11_toml_invariants
 
 .PHONY: memcheck
 ifeq ($(BUILD_TYPE),release)
@@ -2056,6 +2067,10 @@ deps:
 	@echo "Required tools:"
 	@command -v $(CC) >/dev/null 2>&1 && echo "   $(CC)" || echo "   $(CC) - REQUIRED"
 	@command -v make >/dev/null 2>&1 && echo "   make" || echo "   make - REQUIRED"
+	@echo "Required for 'make install' of a release build (AR-12 L2):"
+	@{ command -v readelf >/dev/null 2>&1 || command -v llvm-readelf >/dev/null 2>&1 || command -v greadelf >/dev/null 2>&1 || command -v otool >/dev/null 2>&1; } \
+		&& echo "   readelf/llvm-readelf (or otool on macOS)" \
+		|| echo "   readelf/llvm-readelf (or otool on macOS) - REQUIRED to verify artifact hardening at install"
 	@echo "Optional tools:"
 	@command -v cppcheck >/dev/null 2>&1 && echo "   cppcheck" || echo "   cppcheck - for static analysis"
 	@command -v clang-format >/dev/null 2>&1 && echo "   clang-format" || echo "   clang-format - for formatting"
@@ -2076,7 +2091,7 @@ help:
 	@echo "  ci-policy-test Verify immutable, least-privilege CI policy"
 	@echo "  coverage     Run tests and enforce the GCC/gcovr coverage ratchet"
 	@echo "  coverage-contract-test Verify gcovr threshold failure plumbing"
-	@echo "  install      Install to system"
+	@echo "  install      Install to system (release installs verify hardening; needs readelf/llvm-readelf, or otool on macOS)"
 	@echo "  uninstall    Remove from system"
 	@echo "  clean        Remove build files"
 	@echo "  distclean    Remove generated worktree files (preserves Git-private release cache)"

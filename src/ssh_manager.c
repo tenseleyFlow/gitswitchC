@@ -890,11 +890,19 @@ static ssh_process_outcome_t pid_is_our_ssh_agent(
     while (offset < process_args_len && process_args[offset] == '\0') {
         offset++;
     }
-    matched = offset < process_args_len &&
-              counted_argv_is_our_ssh_agent(process_args + offset,
-                                             process_args_len - offset,
-                                             argc, expected_sock,
-                                             runtime_dir_fd);
+    /* AR-12 H5: never collapse ssh_process_outcome_t through a boolean
+     * expression — `&&` would map INDETERMINATE (3) to UNRELATED (1) and an
+     * exhausted argv region to OWNED (0), both inverting the fail-closed
+     * contract in ssh_manager.h. A truncated argument area is an
+     * indeterminate inspection, and the enum must flow through intact. */
+    if (offset >= process_args_len) {
+        free(process_args);
+        return SSH_PROCESS_INDETERMINATE;
+    }
+    matched = counted_argv_is_our_ssh_agent(process_args + offset,
+                                            process_args_len - offset,
+                                            argc, expected_sock,
+                                            runtime_dir_fd);
     free(process_args);
     return matched;
 #elif defined(__FreeBSD__)
@@ -2191,7 +2199,15 @@ int ssh_switch_account(ssh_config_t *ssh_config, const account_t *account) {
     /* A requested alias is part of the account's SSH routing contract. If the
      * managed block cannot be installed safely, fail the switch so the account
      * layer rolls back the agent/runtime commit instead of claiming success
-     * with stale user SSH configuration. */
+     * with stale user SSH configuration.
+     *
+     * AR-12 U2 (adjudicated, kept): this one-call library path deliberately
+     * folds every alias-install outcome into pass/fail — an
+     * installed-but-uncertain publication reports failure and the runtime
+     * rolls back around the (benign) already-public block. The CLI's
+     * prepared/commit path uses ssh_configure_host_alias_result to
+     * distinguish retained commits; direct callers keep the simpler
+     * historical contract. */
     if (strlen(account->ssh_host_alias) > 0) {
         if (ssh_configure_host_alias(account) != 0) {
             log_warning("Failed to configure SSH host alias: %s", account->ssh_host_alias);
@@ -4767,14 +4783,21 @@ static int ssh_write_config_atomic_at(
                   "Failed to allocate a unique temporary SSH config");
         return -1;
     }
-    if (fchmod(fd, 0600) != 0 || fstat(fd, &temp_identity) != 0 ||
+    /* AR-12 L20: capture the temp's identity FIRST — a failure in the
+     * securing checks below must still reach the guarded unlink in the fail
+     * path, or the just-created O_EXCL file is orphaned permanently in the
+     * user's real ~/.ssh. */
+    if (fstat(fd, &temp_identity) == 0) {
+        have_temp_identity = true;
+    }
+    if (!have_temp_identity || fchmod(fd, 0600) != 0 ||
         !S_ISREG(temp_identity.st_mode) || temp_identity.st_uid != getuid() ||
         temp_identity.st_nlink != 1 ||
+        fstat(fd, &temp_identity) != 0 ||
         (temp_identity.st_mode & 0777) != 0600) {
         set_system_error(ERR_FILE_IO, "Failed to secure temporary SSH config");
         goto fail;
     }
-    have_temp_identity = true;
     if (signals_scratch_register(temp_path) != 0) {
         set_error(ERR_FILE_IO,
                   "Failed to register temporary SSH config for cleanup");
@@ -5162,6 +5185,23 @@ int ssh_configure_host_alias_result(
             if (ssh_config_recheck_public_unchanged(
                     home, &directory, ssh_config_path, &config_identity,
                     pinned_config_fd, buf, buf_len) != 0) {
+                goto done;
+            }
+            /* AR-12 M6: this retry may follow a rename whose directory sync
+             * failed (DURABILITY_UNCERTAIN was reported and the switch
+             * retained). Content identity alone cannot convert that
+             * uncertainty into success — re-prove the directory entry's
+             * durability now, mirroring unlink_ssh_runtime_entry's
+             * sync-the-observed-state principle. */
+            if (g_ssh_dirsync(directory.dir_fd) != 0) {
+                if (publication) {
+                    *publication =
+                        SSH_CONFIG_PUBLICATION_DURABILITY_UNCERTAIN;
+                }
+                set_system_error(
+                    ERR_FILE_IO,
+                    "SSH config is already current but its directory sync "
+                    "failed; publication durability remains uncertain");
                 goto done;
             }
             log_debug(

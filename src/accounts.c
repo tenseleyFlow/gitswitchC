@@ -113,6 +113,9 @@ typedef struct {
     config_retirement_owner_t owners[MAX_ACCOUNTS];
     size_t owner_count;
     pending_retirement_phase_t phase;
+    /* No target had a durable publication: nothing to retire, so no Git
+     * transaction or guard exists and publish/finalize are no-ops. */
+    bool vacuous;
 } pending_retirement_t;
 
 /* CLI removal cannot retire an exclusive ~/.ssh/config alias until the
@@ -127,9 +130,17 @@ typedef struct {
     char alias[MAX_NAME_LEN];
     bool alias_exclusive;
     pending_retirement_t retirement;
+    /* AR-12 P1: the deleted account's pre-removal snapshot, so a
+     * PREINSTALL_FAILED finalize can restore the in-memory model to agree
+     * with the durable file it declares the retry handle. */
+    account_t removed_account;
+    bool removed_valid;
+    bool removed_was_active;
+    bool removed_was_current;
 } pending_remove_t;
 
 static pending_remove_t g_pending_remove = {0};
+static account_t g_pending_remove_snapshot;
 
 typedef struct {
     bool active;
@@ -1419,16 +1430,41 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
          * contract and can invoke config_publication_preflight() themselves
          * for the persistence destination they own. */
         if (write_git && defer_commit &&
-            ctx->config.defer_signal_cleanup &&
-            config_publication_preflight(ctx->config.config_path) != 0) {
-            error_context_t preflight_error = *get_last_error();
-            int preflight_errno = errno;
+            ctx->config.defer_signal_cleanup) {
+            /* AR-12 H2: the snapshot above pinned the exact destination this
+             * switch will publish to. A destination that already has a
+             * ledger record is an in-place replacement, which an at-capacity
+             * ledger must still admit. Probe-export or allocation failure
+             * falls back to the conservative append-capacity check. */
+            publication_record_t *destination_probe =
+                calloc(1U, sizeof(*destination_probe));
+            const publication_record_t *probe = NULL;
+            int preflight_result;
 
-            git_config_commit();
-            runtime_state_lock_release(runtime_lock_fd);
-            g_last_error = preflight_error;
-            errno = preflight_errno;
-            return -1;
+            if (destination_probe &&
+                git_config_snapshot_export_destination(
+                    destination_probe) == 0) {
+                probe = destination_probe;
+            } else {
+                clear_error();
+            }
+            preflight_result = config_publication_preflight_destination(
+                ctx->config.config_path, probe);
+            if (destination_probe) {
+                secure_zero_memory(destination_probe,
+                                   sizeof(*destination_probe));
+                free(destination_probe);
+            }
+            if (preflight_result != 0) {
+                error_context_t preflight_error = *get_last_error();
+                int preflight_errno = errno;
+
+                git_config_commit();
+                runtime_state_lock_release(runtime_lock_fd);
+                g_last_error = preflight_error;
+                errno = preflight_errno;
+                return -1;
+            }
         }
 
         /* Nothing durable has been touched yet, so a signal up to here could
@@ -2241,6 +2277,16 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         git_config_commit();
     }
 
+    /* AR-12 M1/L3: the installed alias publication above and this Git
+     * commit are the transaction's point of no return. Report the committed
+     * state NOW: a later ownership-release or signal-guard failure returns
+     * -1, and NOT_COMMITTED at that point would authorize the caller to
+     * restore persistence before-images around a switch that has fully
+     * committed (main keys its rollback branch off exactly this state). */
+    if (state) {
+        *state = final_state;
+    }
+
     accounts_transaction_token_t token = g_pending_switch.token;
     runtime_state_lock_release(g_pending_switch.runtime_lock_fd);
     g_pending_switch.runtime_lock_fd = -1;
@@ -2263,9 +2309,6 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
         finish_signal_guard_checked(
             "Prepared switch committed, but restoring the caller's signal dispositions failed") != 0) {
         return -1;
-    }
-    if (state) {
-        *state = final_state;
     }
     if (final_state != ACCOUNTS_SWITCH_COMMIT_COMPLETE) {
         set_retained_alias_publication_error(target->name,
@@ -2535,6 +2578,9 @@ static int restore_pending_edit_alias(void) {
 
     if (!g_pending_edit.routing_changed) return 0;
 
+    /* AR-12 L4: both rollback legs may fail in one abort; keep the FIRST
+     * failing leg's diagnostic as the published cause instead of letting
+     * the second overwrite it. */
     if (g_pending_edit.candidate_alias_attempted) {
         if (account_has_managed_alias(candidate) &&
             account_has_managed_alias(original) &&
@@ -2543,13 +2589,18 @@ static int restore_pending_edit_alias(void) {
             g_pending_edit.original_alias_exclusive) {
             if (ssh_configure_host_alias(original) != 0) {
                 complete = false;
-                safe_strncpy(detail, get_last_error()->message,
-                             sizeof(detail));
+                if (detail[0] == '\0') {
+                    safe_strncpy(detail, get_last_error()->message,
+                                 sizeof(detail));
+                }
             }
         } else if (candidate->ssh_host_alias[0] != '\0' &&
                    ssh_remove_host_alias(candidate->ssh_host_alias) != 0) {
             complete = false;
-            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            if (detail[0] == '\0') {
+                safe_strncpy(detail, get_last_error()->message,
+                             sizeof(detail));
+            }
         }
     }
 
@@ -2561,7 +2612,10 @@ static int restore_pending_edit_alias(void) {
                                   original->ssh_host_alias))) {
         if (ssh_configure_host_alias(original) != 0) {
             complete = false;
-            safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+            if (detail[0] == '\0') {
+                safe_strncpy(detail, get_last_error()->message,
+                             sizeof(detail));
+            }
         }
     }
 
@@ -3119,6 +3173,21 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
             printf("[ERROR]: SSH key failed validation: %s (try again, or Enter to skip)\n", expanded_path);
             continue;
         }
+        /* AR-12 H4: a path the TOML sanitizer would alter (quote/backslash)
+         * would be admitted here but skipped by the loader's schema on the
+         * next start. Refuse it up front like the over-long case. */
+        {
+            char roundtrip_path[MAX_PATH_LEN];
+
+            if (toml_sanitize_string(expanded_path, roundtrip_path,
+                                     sizeof(roundtrip_path)) != 0 ||
+                strcmp(roundtrip_path, expanded_path) != 0) {
+                printf("[ERROR]: SSH key path contains characters that cannot "
+                       "be saved faithfully: %s (try again, or Enter to skip)\n",
+                       expanded_path);
+                continue;
+            }
+        }
         safe_strncpy(acct.ssh_key_path, expanded_path, sizeof(acct.ssh_key_path));
         acct.ssh_enabled = true;
         printf("[OK]: SSH key validated: %s\n", expanded_path);
@@ -3149,6 +3218,43 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
                 printf("[ERROR]: Invalid host alias (letters, digits, and "
                        ". - _ * ? only; under %d chars). Try again, or Enter to skip.\n",
                        MAX_NAME_LEN);
+                continue;
+            }
+            break;
+        }
+
+        /* AR-12 M2: the alias is not the destination — the suffix style the
+         * prompt above suggests ('github.com-work') is not a resolvable DNS
+         * name, and admission would otherwise silently pin HostName to it.
+         * Ask for the canonical destination whenever an alias is set. */
+        while (acct.ssh_host_alias[0] != '\0') {
+            if (edit && acct.ssh_hostname[0])
+                snprintf(prompt_text, sizeof(prompt_text),
+                         "SSH Canonical Hostname [%s] (Enter to keep): ",
+                         acct.ssh_hostname);
+            else
+                snprintf(prompt_text, sizeof(prompt_text),
+                         "SSH Canonical Hostname (the real host, e.g. "
+                         "github.com; Enter to use the alias): ");
+            if (account_read_prompt(prompt_text, input, sizeof(input),
+                                    false, "SSH canonical hostname") != 0) {
+                return -1;
+            }
+            if (strlen(input) == 0) {
+                if (acct.ssh_hostname[0] == '\0') {
+                    printf("[WARNING]: No canonical hostname set; the "
+                           "managed ~/.ssh/config block will use HostName "
+                           "%s, which must resolve as a real host.\n",
+                           acct.ssh_host_alias);
+                }
+                break;                              /* keep current / skip */
+            }
+            if (!toml_validate_ssh_hostname(input) ||
+                safe_strncpy(acct.ssh_hostname, input,
+                             sizeof(acct.ssh_hostname)) != 0) {
+                printf("[ERROR]: Invalid canonical hostname (host-only "
+                       "ASCII name/IPv4 or unbracketed IPv6; no port). "
+                       "Try again, or Enter to skip.\n");
                 continue;
             }
             break;
@@ -3465,7 +3571,8 @@ int accounts_remove_finalize(
     error_accumulator_init(&failures);
     g_transaction_owner.phase = ACCOUNTS_TRANSACTION_FINALIZING;
 
-    if (g_pending_remove.retirement.git &&
+    if ((g_pending_remove.retirement.git ||
+         g_pending_remove.retirement.vacuous) &&
         pending_retirement_finalize(
             ctx, &g_pending_remove.retirement, outcome) != 0) {
         (void)error_accumulator_add_last(
@@ -3490,7 +3597,37 @@ int accounts_remove_finalize(
 
     /* A pre-install outcome deliberately leaves the durable account/alias
      * pair intact. Runtime teardown cannot be undone, but the account remains
-     * the exact supported retry handle after Git/ledger rollback. */
+     * the exact supported retry handle after Git/ledger rollback.
+     * AR-12 P1: restore the in-memory model to match — a caller that later
+     * runs a full save from this context must not erase the preserved
+     * account or persist the cleared active name. */
+    if (outcome == ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED &&
+        g_pending_remove.removed_valid &&
+        ctx->account_count < MAX_ACCOUNTS) {
+        bool already_present = false;
+
+        for (size_t i = 0; i < ctx->account_count; i++) {
+            if (ctx->accounts[i].id ==
+                g_pending_remove.removed_account.id) {
+                already_present = true;
+                break;
+            }
+        }
+        if (!already_present) {
+            account_t *restored = &ctx->accounts[ctx->account_count];
+
+            *restored = g_pending_remove.removed_account;
+            ctx->account_count++;
+            if (g_pending_remove.removed_was_active) {
+                (void)safe_strncpy(ctx->config.active_account,
+                                   restored->name,
+                                   sizeof(ctx->config.active_account));
+            }
+            if (g_pending_remove.removed_was_current) {
+                ctx->current_account = restored;
+            }
+        }
+    }
     memset(&g_pending_remove, 0, sizeof(g_pending_remove));
     if (ctx->config.defer_signal_cleanup &&
         g_transaction_owner.rollback_depth > 0) {
@@ -3681,7 +3818,16 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
 
     /* CLI removal owns a later accounts.toml save, so prepare exact Git
      * before-images and publish the durable blocker before any runtime or Git
-     * mutation.  Direct/library callers keep the historical one-call path. */
+     * mutation.  Direct/library callers keep the historical one-call path.
+     *
+     * AR-12 L5 (known hold window): preparation acquires Git's own canonical
+     * <config>.lock names for every recorded destination and holds them
+     * across the SSH/GPG runtime teardown below, so a concurrent `git
+     * config` write fails with git's could-not-lock error until finalize.
+     * This is deliberate fail-before-mutate ordering: releasing and
+     * re-acquiring at publish would let another writer change the sealed
+     * generation mid-remove. Teardown is bounded (agent kill/gpgconf
+     * timeouts), keeping the window short. */
     if (ctx->config.defer_signal_cleanup) {
         retirement_targets[0] = account;
         if (pending_retirement_prepare(
@@ -3806,8 +3952,14 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         }
     }
 
-    /* Only a complete teardown permits deleting the configuration handle. */
+    /* Only a complete teardown permits deleting the configuration handle.
+     * AR-12 P1: snapshot the account first — an aborted (pre-install)
+     * finalize restores it so the model cannot diverge from the retained
+     * durable file. */
+    g_pending_remove_snapshot = *account;
     if (config_remove_account_owned(ctx, account_id, token) != 0) {
+        secure_zero_memory(&g_pending_remove_snapshot,
+                           sizeof(g_pending_remove_snapshot));
         goto remove_done;
     }
 
@@ -3846,6 +3998,12 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
         outer_retirement_prepared = false;
         outer_retirement_published = false;
     }
+    g_pending_remove.removed_account = g_pending_remove_snapshot;
+    g_pending_remove.removed_valid = true;
+    g_pending_remove.removed_was_active = was_active;
+    g_pending_remove.removed_was_current = was_current;
+    secure_zero_memory(&g_pending_remove_snapshot,
+                       sizeof(g_pending_remove_snapshot));
     (void)transaction_mark_phase(ctx, ACCOUNTS_TRANSACTION_REMOVE, token,
                                  ACCOUNTS_TRANSACTION_PREPARED);
 
@@ -4228,17 +4386,35 @@ static account_publication_lookup_result_t load_account_publications(
                   "Invalid durable-publication lookup arguments");
         return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
     }
+    publication_ledger_clear(ledger);
+    publication_ledger_init(ledger);
+    if (config_load_publication_ledger(ctx->config.config_path, ledger) != 0) {
+        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
+    }
+    /* AR-12 H1: report a record-less account as ABSENT before demanding a
+     * persisted incarnation, so never-switched and pre-ledger accounts are
+     * distinguishable from provenance corruption. */
+    {
+        size_t id_records = 0U;
+
+        for (size_t i = 0; i < ledger->count; i++) {
+            if (ledger->records[i].account_id == account->id) id_records++;
+        }
+        if (id_records == 0U) {
+            errno = ENOENT;
+            set_error(
+                ERR_GIT_CONFIG_FAILED,
+                "No canonical publication provenance exists for account '%s'; switch it again before attributing durable Git credentials",
+                account->name);
+            return ACCOUNT_PUBLICATION_LOOKUP_ABSENT;
+        }
+    }
     if (!account->incarnation_persisted ||
         !account_incarnation_is_valid(account->incarnation)) {
         errno = ESTALE;
         set_error(ERR_GIT_CONFIG_FAILED,
                   "Account '%s' has no persisted immutable incarnation",
                   account->name);
-        return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
-    }
-    publication_ledger_clear(ledger);
-    publication_ledger_init(ledger);
-    if (config_load_publication_ledger(ctx->config.config_path, ledger) != 0) {
         return ACCOUNT_PUBLICATION_LOOKUP_ERROR;
     }
     for (size_t i = 0; i < ledger->count; i++) {
@@ -4352,13 +4528,13 @@ static int pending_retirement_prepare(
     }
     for (size_t i = 0U; i < target_count; i++) {
         const account_t *account = targets[i];
-        size_t matches = 0U;
+        size_t id_records = 0U;
+        size_t owner_slot;
 
-        if (!account || !account->incarnation_persisted ||
-            !account_incarnation_is_valid(account->incarnation)) {
-            errno = ESTALE;
-            set_error(ERR_GIT_CONFIG_FAILED,
-                      "Retirement account has no persisted immutable incarnation");
+        if (!account) {
+            errno = EINVAL;
+            set_error(ERR_INVALID_ARGS,
+                      "NULL target in outer Git retirement preparation");
             goto done;
         }
         for (size_t j = 0U; j < i; j++) {
@@ -4370,13 +4546,32 @@ static int pending_retirement_prepare(
                 goto done;
             }
         }
-        retirement->owners[i].account_id = account->id;
-        if (safe_strncpy(
-                retirement->owners[i].account_incarnation,
-                account->incarnation,
-                sizeof(retirement->owners[i].account_incarnation)) != 0) {
+        for (size_t j = 0U; j < ledger.count; j++) {
+            if (ledger.records[j].account_id == account->id) id_records++;
+        }
+        /* AR-12 H1: an account with no ledger records at all — never
+         * successfully switched, or loaded from a pre-ledger config — has
+         * nothing durable to retire. Its retirement leg is vacuously
+         * satisfied; runtime teardown and model removal proceed without
+         * demanding a switch-first round trip. */
+        if (id_records == 0U) continue;
+        if (!account->incarnation_persisted ||
+            !account_incarnation_is_valid(account->incarnation)) {
+            errno = ESTALE;
+            set_error(ERR_GIT_CONFIG_FAILED,
+                      "Retirement account has no persisted immutable incarnation");
             goto done;
         }
+        owner_slot = retirement->owner_count;
+        retirement->owners[owner_slot].account_id = account->id;
+        if (safe_strncpy(
+                retirement->owners[owner_slot].account_incarnation,
+                account->incarnation,
+                sizeof(retirement->owners[owner_slot].account_incarnation)) !=
+            0) {
+            goto done;
+        }
+        retirement->owner_count++;
         for (size_t j = 0U; j < ledger.count; j++) {
             const publication_record_t *publication = &ledger.records[j];
 
@@ -4413,18 +4608,16 @@ static int pending_retirement_prepare(
             account_refs[item_count] = account;
             publication_refs[item_count] = publication;
             item_count++;
-            matches++;
-        }
-        if (matches == 0U) {
-            errno = ENOENT;
-            set_error(
-                ERR_GIT_CONFIG_FAILED,
-                "No canonical publication provenance exists for account '%s'; switch it again before attributing durable Git credentials",
-                account->name);
-            goto done;
         }
     }
-    retirement->owner_count = target_count;
+    if (item_count == 0U) {
+        /* Every target was vacuous: no Git transaction or guard is needed
+         * because no canonical destination will be touched. */
+        retirement->vacuous = true;
+        retirement->phase = PENDING_RETIREMENT_PREPARED;
+        result = 0;
+        goto done;
+    }
     if (git_retirement_transaction_prepare(
             account_refs, publication_refs, item_count,
             &retirement->git) != 0) {
@@ -4472,7 +4665,9 @@ static int pending_retirement_cancel_unpublished(
     bool created;
     bool git_clean = true;
 
-    if (!retirement || !retirement->git || !retirement->guard) {
+    if (!retirement ||
+        (!retirement->vacuous &&
+         (!retirement->git || !retirement->guard))) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid unpublished Git retirement cancellation");
@@ -4483,6 +4678,10 @@ static int pending_retirement_cancel_unpublished(
         set_error(ERR_SYSTEM_CALL,
                   "Only a prepared Git retirement can be cancelled");
         return -1;
+    }
+    if (retirement->vacuous) {
+        secure_zero_memory(retirement, sizeof(*retirement));
+        return 0;
     }
     error_accumulator_init(&failures);
     created = config_retirement_guard_was_created(retirement->guard);
@@ -4511,7 +4710,9 @@ static int pending_retirement_cancel_unpublished(
 static int pending_retirement_publish(pending_retirement_t *retirement,
                                       size_t *cleared) {
     if (cleared) *cleared = 0U;
-    if (!retirement || !retirement->git || !retirement->guard) {
+    if (!retirement ||
+        (!retirement->vacuous &&
+         (!retirement->git || !retirement->guard))) {
         errno = EINVAL;
         set_error(ERR_INVALID_ARGS,
                   "Invalid prepared outer Git retirement");
@@ -4522,6 +4723,10 @@ static int pending_retirement_publish(pending_retirement_t *retirement,
         set_error(ERR_SYSTEM_CALL,
                   "Only a prepared Git retirement can be published");
         return -1;
+    }
+    if (retirement->vacuous) {
+        retirement->phase = PENDING_RETIREMENT_PUBLISHED;
+        return 0;
     }
     if (git_retirement_transaction_publish(retirement->git, cleared) != 0) {
         return pending_retirement_publish_failure(
@@ -4542,8 +4747,10 @@ static int pending_retirement_finalize(
     bool refresh_witnesses_stable = false;
     size_t destination_count = 0U;
 
-    if (!ctx || !retirement || !retirement->git || !retirement->guard ||
-        retirement->owner_count == 0U ||
+    if (!ctx || !retirement ||
+        (!retirement->vacuous &&
+         (!retirement->git || !retirement->guard ||
+          retirement->owner_count == 0U)) ||
         retirement->owner_count > MAX_ACCOUNTS ||
         outcome < ACCOUNTS_RETIREMENT_SAVE_DURABLE ||
         outcome > ACCOUNTS_RETIREMENT_SAVE_PREINSTALL_FAILED) {
@@ -4557,6 +4764,12 @@ static int pending_retirement_finalize(
         set_error(ERR_SYSTEM_CALL,
                   "Only a published Git retirement can be finalized");
         return -1;
+    }
+    if (retirement->vacuous) {
+        /* No destination was touched and no guard exists; every save
+         * outcome settles to the same empty state. */
+        secure_zero_memory(retirement, sizeof(*retirement));
+        return 0;
     }
     error_accumulator_init(&failures);
     created = config_retirement_guard_was_created(retirement->guard);
@@ -4737,6 +4950,14 @@ int accounts_retire_git_identity(const gitswitch_ctx_t *ctx,
         ctx, account,
         PUBLICATION_CAP_DESTINATION | PUBLICATION_CAP_POST_GENERATION,
         true, &ledger, &publication_count);
+    if (lookup_result == ACCOUNT_PUBLICATION_LOOKUP_ABSENT) {
+        /* AR-12 H1: nothing was ever durably published for this account, so
+         * there is nothing to retire — vacuous success, not a demand to
+         * switch first. */
+        publication_ledger_clear(&ledger);
+        clear_error();
+        return 0;
+    }
     if (lookup_result != ACCOUNT_PUBLICATION_LOOKUP_FOUND) {
         publication_ledger_clear(&ledger);
         return -1;

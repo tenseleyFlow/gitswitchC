@@ -51,6 +51,20 @@ terminal `add`/`edit` prompts get line editing, and the SSH key path prompt gets
 TAB filename completion. Redirected prompts and builds without readline use
 bounded plain stdio input.
 
+### SSH host alias vs. canonical hostname
+
+An account with an SSH key can carry two host fields in `accounts.toml`:
+
+- `ssh_host` — the managed OpenSSH `Host` alias gitswitch writes into
+  `~/.ssh/config` (e.g. `github.com-work`). Use it as the host in remotes:
+  `git@github.com-work:org/repo.git`.
+- `ssh_hostname` — the canonical destination the alias resolves to
+  (`HostName`, e.g. `github.com`). If unset, the alias itself is used as the
+  destination, which only works when the alias is a real DNS name.
+
+`add`/`edit` prompt for both; suffix-style aliases like `github.com-work`
+need an explicit `ssh_hostname` to be reachable.
+
 ### command-line completion
 
 `make install` ships bash, zsh, and fish completion scripts (also under

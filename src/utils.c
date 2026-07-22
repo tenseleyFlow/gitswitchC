@@ -271,11 +271,18 @@ int expand_path(const char *path, char *expanded_path, size_t path_size) {
 
 int get_home_directory(char *home_path, size_t path_size) {
     const char *home = getenv("HOME");
-    
+
+    /* AR-12 P11: an empty or relative HOME would silently anchor the config
+     * at '/' or the CWD — inconsistent with the validated XDG_RUNTIME_DIR
+     * and git_ops HOME guards. Treat it like an absent HOME and fall back
+     * to the password database. */
+    if (home && home[0] != '/') {
+        home = NULL;
+    }
     if (!home) {
         /* Fall back to password database */
         struct passwd *pw = getpwuid(getuid());
-        if (!pw) {
+        if (!pw || !pw->pw_dir || pw->pw_dir[0] != '/') {
             set_system_error(ERR_SYSTEM_CALL, "Failed to get user home directory");
             return -1;
         }
@@ -375,8 +382,10 @@ int create_directory_recursive(const char *path, mode_t mode) {
     struct stat named;
 
     if (!path || !*path) {
-        /* Reject an empty path too (AR-06 F78): the trailing-slash check below
-         * reads temp_path[len-1], an out-of-bounds stack read when len == 0. */
+        /* Reject NULL/empty (AR-06 F78, rationale updated AR-12 L24): the
+         * component walk below requires at least one component, and the
+         * absolute-vs-relative dispatch must not consult path[0] of an
+         * empty string. */
         set_error(ERR_INVALID_ARGS, "NULL or empty path to create_directory_recursive");
         return -1;
     }
@@ -2191,6 +2200,12 @@ static int copy_file_split_destination(const char *path, char **parent_out,
     return 0;
 }
 
+/* AR-12 P6 (adjudicated, kept as-is): this copies IN PLACE — the
+ * destination is truncated before the loop, so a mid-copy failure leaves
+ * truncated/partial bytes with the prior content destroyed. Production code
+ * does not call this surface (config.c uses its own atomic temp+rename
+ * writers); it is retained for tests and external API users, who must
+ * treat the destination as expendable on failure. */
 int copy_file(const char *src_path, const char *dst_path) {
     FILE *src = NULL;
     FILE *dst = NULL;
@@ -3510,6 +3525,10 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
     result->spawned = false;
     result->out_len = 0;
     result->out_truncated = false;
+    /* AR-12 L12 (defense in depth): terminate the caller's capture buffer
+     * before any early-return validation path, so a pre-spawn failure never
+     * leaves callers formatting uninitialized bytes. */
+    if (opts->out && opts->out_size > 0) opts->out[0] = '\0';
     g_test_fd_close_observation_valid = false;
     memset(&g_test_fd_close_observation, 0,
            sizeof(g_test_fd_close_observation));
@@ -4405,13 +4424,12 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                      wait_result.wait_errno == EINTR &&
                      wait_result.mask_errno == 0);
 
-            if (wait_result.mask_errno != 0) {
-                wait_failed = true;
-                wait_errno = wait_result.mask_errno;
-                if (infd >= 0) { close(infd); infd = -1; }
-                if (outfd >= 0) { close(outfd); outfd = -1; }
-                break;
-            } else if (wait_result.waited == pid) {
+            /* AR-12 U4: process a successful reap FIRST even when a
+             * mask-restore failure is reported alongside it — the PID is
+             * consumed and the exit status is valid; discarding the reap
+             * left child_reaped false and re-waited a released PID. The
+             * mask failure still fails the call afterwards. */
+            if (wait_result.waited == pid) {
                 child_reaped = true;
                 if (infd >= 0) {
                     if (in_off < opts->input_len) input_failed = true;
@@ -4429,6 +4447,19 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
                         capture_deadline = now + RUNNER_CAPTURE_GRACE_MS;
                     }
                 }
+                if (wait_result.mask_errno != 0) {
+                    wait_failed = true;
+                    wait_errno = wait_result.mask_errno;
+                    if (infd >= 0) { close(infd); infd = -1; }
+                    if (outfd >= 0) { close(outfd); outfd = -1; }
+                    break;
+                }
+            } else if (wait_result.mask_errno != 0) {
+                wait_failed = true;
+                wait_errno = wait_result.mask_errno;
+                if (infd >= 0) { close(infd); infd = -1; }
+                if (outfd >= 0) { close(outfd); outfd = -1; }
+                break;
             } else if (wait_result.waited < 0) {
                 wait_failed = true;
                 wait_errno = wait_result.wait_errno;
@@ -5855,7 +5886,10 @@ int get_terminal_size(int *width, int *height) {
     }
 
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1) {
-        set_system_error(ERR_SYSTEM_CALL, "Failed to get terminal size");
+        /* AR-12 U5: fail silently like the isatty and 0x0 branches —
+         * display_init falls back to defaults and returns success, so a
+         * live global error here would surface in unrelated later
+         * diagnostics. */
         return -1;
     }
 
