@@ -4709,8 +4709,13 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     if (publication) {
         /* AR-12 H2: an at-capacity ledger only blocks genuinely new
          * destinations. A replacement never grows the ledger, and before an
-         * append is refused, provably-absent destinations are reclaimed —
-         * mirroring config_publication_preflight_check() exactly. */
+         * append is refused, provably-absent destinations are reclaimed. AR-13
+         * L1: this enforces the same RECORD-count cap the preflight
+         * (config_publication_preflight_check) admits against; it does not
+         * re-run the preflight's byte-reserve check here, because the count cap
+         * and PUBLICATION_LEDGER_MAX_BYTES are jointly satisfiable (the P4
+         * dismissal), so an admitted count can always be serialized. The byte
+         * reserve is a reclamation trigger, not a second post-reclaim gate. */
         if (!publication_ledger_destination_present(&publications,
                                                     publication)) {
             bool exhausted =
