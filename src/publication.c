@@ -623,46 +623,117 @@ bool publication_record_same_destination(const publication_record_t *left,
                                              &right->repository));
 }
 
-/* AR-12 H2: a record whose destination anchor is provably gone — ENOENT on
- * the recorded repository (or config parent directory for global records),
- * or a live object with a different device/inode identity — can never match
- * publication_record_same_destination() again. Such records only consume
- * ledger capacity. Any indeterminate probe (EACCES, ELOOP, ...) keeps the
- * record: absence must be proven, not assumed. */
-bool publication_record_destination_provably_absent(
-    const publication_record_t *record) {
+/* AR-13 R1/R2: classify one recorded destination anchor against the live
+ * filesystem. publication_record_same_destination() requires the config
+ * parent AND (for local records) the repository anchor to match, so a single
+ * anchor that is *definitively* gone proves the record can never match again.
+ * But a bare ENOENT / changed-identity probe cannot distinguish a genuinely
+ * replaced anchor (git re-init or rm -rf on the same filesystem) from a merely
+ * unavailable one: an unmounted volume presents its mountpoint with a
+ * different device, or a removed mountpoint as ENOENT. Discriminate by device:
+ * a replacement on the SAME recorded filesystem is provably dead; anything on
+ * a different device stays indeterminate and fails closed, so PUBLISHED
+ * provenance for a temporarily-unavailable destination is never discarded
+ * (it returns intact on remount). lstat, not stat, so a symlink that replaced
+ * the anchor reads as a distinct object rather than chasing its target. */
+typedef enum {
+    PUBLICATION_ANCHOR_LIVE,          /* present, same object -> may still match */
+    PUBLICATION_ANCHOR_DEAD,          /* provably non-matchable forever */
+    PUBLICATION_ANCHOR_INDETERMINATE  /* ambiguous -> fail closed, keep record */
+} publication_anchor_status_t;
+
+static publication_anchor_status_t publication_anchor_status(
+    const char *probe, const publication_identity_t *identity) {
     struct stat st;
-    const char *probe;
-    const publication_identity_t *identity;
-    char parent[MAX_PATH_LEN];
+    char path[MAX_PATH_LEN];
 
-    if (!record) return false;
-    if (record->repository_path[0] != '\0') {
-        probe = record->repository_path;
-        identity = &record->repository;
-    } else {
-        const char *slash = strrchr(record->config_path, '/');
-        size_t length;
-
-        if (!slash) return false;
-        length = slash == record->config_path
-                     ? 1U
-                     : (size_t)(slash - record->config_path);
-        if (length >= sizeof(parent)) return false;
-        memcpy(parent, record->config_path, length);
-        parent[length] = '\0';
-        probe = parent;
-        identity = &record->config_parent;
-    }
-    if (!identity->present) return false;
+    if (!identity || !identity->present) return PUBLICATION_ANCHOR_INDETERMINATE;
     errno = 0;
-    if (stat(probe, &st) != 0) return errno == ENOENT;
-    {
+    if (lstat(probe, &st) == 0) {
         publication_identity_t live;
 
         publication_identity_from_stat(&live, &st);
-        return !publication_identity_same_object(identity, &live);
+        if (publication_identity_same_object(identity, &live)) {
+            return PUBLICATION_ANCHOR_LIVE;
+        }
+        /* Present but a different object: an in-place replacement on the same
+         * recorded filesystem is permanently non-matchable; a different device
+         * may be an unmounted volume's mountpoint, so fail closed. */
+        return (uintmax_t)st.st_dev == identity->device
+                   ? PUBLICATION_ANCHOR_DEAD
+                   : PUBLICATION_ANCHOR_INDETERMINATE;
     }
+    if (errno != ENOENT) return PUBLICATION_ANCHOR_INDETERMINATE;
+    /* ENOENT: walk up to the deepest still-existing ancestor; deletion is
+     * proven only if that ancestor is a directory on the recorded filesystem.
+     * An unmounted/other-device ancestor stays indeterminate. */
+    if (safe_strncpy(path, probe, sizeof(path)) != 0) {
+        return PUBLICATION_ANCHOR_INDETERMINATE;
+    }
+    for (;;) {
+        char *slash = strrchr(path, '/');
+
+        if (!slash) return PUBLICATION_ANCHOR_INDETERMINATE;
+        if (slash == path) {
+            path[1] = '\0';
+        } else {
+            *slash = '\0';
+        }
+        errno = 0;
+        if (lstat(path, &st) == 0) {
+            return (S_ISDIR(st.st_mode) &&
+                    (uintmax_t)st.st_dev == identity->device)
+                       ? PUBLICATION_ANCHOR_DEAD
+                       : PUBLICATION_ANCHOR_INDETERMINATE;
+        }
+        if (errno != ENOENT) return PUBLICATION_ANCHOR_INDETERMINATE;
+        if (slash == path) return PUBLICATION_ANCHOR_INDETERMINATE;
+    }
+}
+
+/* AR-12 H2 / AR-13 R1+R2: a record whose destination is provably gone can
+ * never match publication_record_same_destination() again and only consumes
+ * ledger capacity. Because same_destination() compares BOTH the config parent
+ * and (for local records) the repository, a single provably-dead anchor is
+ * conclusive. AR-13 R2: the old oracle probed ONLY the repository for local
+ * records, so an in-place `.git` rebuild (rm -rf .git && git init) — which
+ * changes the .git inode but leaves the worktree root — left the record
+ * un-reclaimable forever while it could never match again, slowly exhausting
+ * the 128-slot ledger. AR-13 R1: a changed/ENOENT anchor is treated as dead
+ * only when the change is on the recorded filesystem; a different-device
+ * probe (possible unmount) stays indeterminate and fails closed. */
+bool publication_record_destination_provably_absent(
+    const publication_record_t *record) {
+    char parent[MAX_PATH_LEN];
+    const char *slash;
+    size_t length;
+
+    if (!record) return false;
+
+    /* Config parent anchor: the .git directory for local records; the sole
+     * anchor for global records. */
+    slash = strrchr(record->config_path, '/');
+    if (!slash) return false;
+    length = slash == record->config_path ? 1U
+                                          : (size_t)(slash - record->config_path);
+    if (length >= sizeof(parent)) return false;
+    memcpy(parent, record->config_path, length);
+    parent[length] = '\0';
+    if (publication_anchor_status(parent, &record->config_parent) ==
+        PUBLICATION_ANCHOR_DEAD) {
+        return true;
+    }
+
+    /* Repository anchor (local records only): a dead worktree root is likewise
+     * conclusive. */
+    if (record->repository_path[0] != '\0' &&
+        publication_anchor_status(record->repository_path,
+                                  &record->repository) ==
+            PUBLICATION_ANCHOR_DEAD) {
+        return true;
+    }
+
+    return false;
 }
 
 /* Drop PUBLISHED records whose destinations are provably absent, compacting

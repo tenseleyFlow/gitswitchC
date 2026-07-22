@@ -2762,12 +2762,14 @@ TEST(reclaim_absent_drops_only_provably_dead_published_records) {
     char dead_repo[] = "/tmp/ar12-h2-dead-XXXXXX";
     char live_repo[] = "/tmp/ar12-h2-live-XXXXXX";
     char mismatch_repo[] = "/tmp/ar12-h2-mismatch-XXXXXX";
+    char unmount_repo[] = "/tmp/ar12-h2-unmount-XXXXXX";
     char retiring_repo[] = "/tmp/ar12-h2-retiring-XXXXXX";
     struct stat st;
 
     CHECK(ts_mkdtemp(dead_repo) != NULL);
     CHECK(ts_mkdtemp(live_repo) != NULL);
     CHECK(ts_mkdtemp(mismatch_repo) != NULL);
+    CHECK(ts_mkdtemp(unmount_repo) != NULL);
     CHECK(ts_mkdtemp(retiring_repo) != NULL);
     publication_ledger_init(&ledger);
 
@@ -2788,12 +2790,28 @@ TEST(reclaim_absent_drops_only_provably_dead_published_records) {
     publication_identity_from_stat(&record.repository, &st);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
 
-    /* Live path whose recorded identity no longer matches: reclaimable. */
+    /* AR-13 R1: live path whose recorded identity changed ON THE SAME
+     * filesystem (same st_dev, different inode) is an in-place replacement —
+     * provably non-matchable, so reclaimable. */
     fill_gpg_record(&record, mismatch_repo, FINGERPRINT_A);
     snprintf(record.config_path, sizeof(record.config_path),
              "%s/.git/config", mismatch_repo);
-    fill_identity(&record.repository, UINTMAX_C(9999),
-                  (uintmax_t)(S_IFDIR | 0700), UINTMAX_C(0));
+    CHECK_EQ_INT(stat(mismatch_repo, &st), 0);
+    publication_identity_from_stat(&record.repository, &st);
+    record.repository.inode ^= UINTMAX_C(1); /* same device, wrong inode */
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+
+    /* AR-13 R1: live path whose recorded identity differs on a DIFFERENT
+     * device is indeterminate — an unmounted volume presents its mountpoint
+     * with the parent filesystem's device — so it must be KEPT (fail closed),
+     * not silently reclaimed with its PUBLISHED provenance. */
+    fill_gpg_record(&record, unmount_repo, FINGERPRINT_A);
+    snprintf(record.config_path, sizeof(record.config_path),
+             "%s/.git/config", unmount_repo);
+    CHECK_EQ_INT(stat(unmount_repo, &st), 0);
+    publication_identity_from_stat(&record.repository, &st);
+    record.repository.device += UINTMAX_C(1); /* different device */
+    record.repository.inode ^= UINTMAX_C(1);
     CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
 
     /* Dead destination in RETIRING state: retirement recovery owns it. */
@@ -2810,17 +2828,72 @@ TEST(reclaim_absent_drops_only_provably_dead_published_records) {
     CHECK(!publication_record_destination_provably_absent(NULL));
     CHECK(publication_record_destination_provably_absent(&dead_probe));
 
+    /* Reclaimed: dead (deleted on the recorded fs) + same-device mismatch.
+     * Kept: live, the different-device "unmount" mismatch, and RETIRING. */
     CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 2);
-    CHECK_EQ_INT((long)ledger.count, 2);
+    CHECK_EQ_INT((long)ledger.count, 3);
     CHECK(!publication_ledger_destination_present(&ledger, &dead_probe));
-    for (size_t i = 0U; i < ledger.count; i++) {
-        CHECK(strstr(ledger.records[i].repository_path,
-                     "ar12-h2-mismatch") == NULL);
+    {
+        bool saw_unmount = false;
+        for (size_t i = 0U; i < ledger.count; i++) {
+            CHECK(strstr(ledger.records[i].repository_path,
+                         "ar12-h2-mismatch") == NULL);
+            if (strstr(ledger.records[i].repository_path,
+                       "ar12-h2-unmount") != NULL) {
+                saw_unmount = true;
+            }
+        }
+        CHECK(saw_unmount); /* different-device change failed closed */
     }
 
     publication_ledger_clear(&ledger);
     (void)rmdir(live_repo);
     (void)rmdir(mismatch_repo);
+    (void)rmdir(unmount_repo);
+}
+
+/* AR-13 R2: an in-place .git rebuild (rm -rf .git && git init) changes the
+ * .git directory's inode while the worktree root is untouched. The config
+ * parent is one of the identities same_destination() compares, so the record
+ * can never match again and must be reclaimable. The old oracle probed only
+ * the repository anchor for local records, kept such records forever, and
+ * would eventually exhaust the 128-slot ledger. */
+TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild) {
+    publication_ledger_t ledger;
+    publication_record_t record;
+    char repo[] = "/tmp/ar13-r2-repo-XXXXXX";
+    char gitdir[sizeof(repo) + 8];
+    struct stat st;
+
+    CHECK(ts_mkdtemp(repo) != NULL);
+    snprintf(gitdir, sizeof(gitdir), "%s/.git", repo);
+    CHECK_EQ_INT(mkdir(gitdir, 0700), 0);
+    publication_ledger_init(&ledger);
+
+    fill_gpg_record(&record, repo, FINGERPRINT_A);
+    snprintf(record.config_path, sizeof(record.config_path), "%s/.git/config",
+             repo);
+    CHECK_EQ_INT(stat(gitdir, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
+    CHECK_EQ_INT(stat(repo, &st), 0);
+    publication_identity_from_stat(&record.repository, &st);
+    CHECK_EQ_INT(publication_ledger_upsert(&ledger, &record), 0);
+
+    /* All anchors live: not reclaimable. */
+    CHECK(!publication_record_destination_provably_absent(&record));
+
+    /* Rebuild .git in place: worktree root unchanged, new .git inode on the
+     * same filesystem. */
+    CHECK_EQ_INT(rmdir(gitdir), 0);
+    CHECK_EQ_INT(mkdir(gitdir, 0700), 0);
+
+    CHECK(publication_record_destination_provably_absent(&record));
+    CHECK_EQ_INT((long)publication_ledger_reclaim_absent(&ledger), 1);
+    CHECK_EQ_INT((long)ledger.count, 0);
+
+    publication_ledger_clear(&ledger);
+    (void)rmdir(gitdir);
+    (void)rmdir(repo);
 }
 
 /* AR-12 H2: a full 128-record ledger must still admit a switch whose
@@ -2988,5 +3061,6 @@ TEST_MAIN_BEGIN()
     RUN_TEST(same_numeric_id_different_incarnation_is_never_live_publication_owner);
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
     RUN_TEST(reclaim_absent_drops_only_provably_dead_published_records);
+    RUN_TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild);
     RUN_TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations);
 TEST_MAIN_END()
