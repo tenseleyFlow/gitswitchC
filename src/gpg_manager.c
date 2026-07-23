@@ -1250,8 +1250,14 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
             char stale[GPG_QUARANTINE_NAME_LEN];
             safe_strncpy(stale, entry->d_name, sizeof(stale));
             closedir(dir);
+            /* AR-13 L24: only a FULL reset (no account argument) retires this
+             * residue, and a full reset rebuilds every account's isolated GPG
+             * home — say so rather than implying a cheap targeted fix. */
             set_error(ERR_FILE_IO,
-                      "Unresolved GPG runtime quarantine blocks mutation: %s (run 'gitswitch reset' to retire it)",
+                      "Unresolved GPG runtime quarantine blocks mutation: %s "
+                      "(run 'gitswitch reset' with no account to retire it; "
+                      "note a full reset rebuilds every account's isolated GPG "
+                      "home)",
                       stale);
             return -1;
         }
