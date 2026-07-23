@@ -46,7 +46,12 @@ enum {
 typedef enum {
     M17_COMMAND_REMOVE = 0,
     M17_COMMAND_RESET_ONE,
-    M17_COMMAND_RESET_ALL
+    M17_COMMAND_RESET_ALL,
+    /* A genuinely guarded command (switch is an activation command) against an
+     * absent account: it traverses the retirement-guard gate before any config
+     * load, unlike the exempt recovery remove/reset commands. Used to prove the
+     * guard is really clear, not merely that a command bypasses it. */
+    M17_COMMAND_SWITCH_ABSENT
 } m17_command_t;
 
 typedef enum {
@@ -547,7 +552,9 @@ static int m17_run_cli_with_cleanup_fault(
         char assume_yes[] = "-y";
         char remove[] = "remove";
         char reset[] = "reset";
+        char switch_cmd[] = "switch";
         char work[] = "work";
+        char absent[] = "no-such-account";
         char *remove_argv[] = {
             program, no_color, assume_yes, remove, work, NULL
         };
@@ -557,11 +564,16 @@ static int m17_run_cli_with_cleanup_fault(
         char *reset_all_argv[] = {
             program, no_color, assume_yes, reset, NULL
         };
+        char *switch_absent_argv[] = {
+            program, no_color, assume_yes, switch_cmd, absent, NULL
+        };
         char **argv = command == M17_COMMAND_REMOVE
                           ? remove_argv
                           : command == M17_COMMAND_RESET_ONE
                                 ? reset_one_argv
-                                : reset_all_argv;
+                                : command == M17_COMMAND_SWITCH_ABSENT
+                                      ? switch_absent_argv
+                                      : reset_all_argv;
         int argc = command == M17_COMMAND_RESET_ALL ? 4 : 5;
         int rc;
         char observed = '0';
@@ -1125,13 +1137,25 @@ TEST(deleted_destination_retires_vacuously_and_clears_guard) {
     CHECK_EQ_INT(m17_read_bytes(fixture->git_paths[1], &survivor), 0);
     CHECK(strstr((const char *)survivor.data, "sshCommand") == NULL);
     CHECK(strstr((const char *)survivor.data, "marker = keep") != NULL);
-    /* A follow-up mutating command must not be fenced. */
-    status = m17_run_cli(fixture, M17_COMMAND_RESET_ALL, M17_FAULT_NONE,
+    /* A genuinely GUARDED command must not be fenced. `reset` is exempt from
+     * the retirement gate (it is a recovery command), so a passing reset proves
+     * nothing about the guard being cleared. `switch` is an activation command
+     * that traverses the gate before config load: with the guard truly clear it
+     * reaches normal dispatch and reports the absent account, never the fence
+     * rejection. A surviving durable marker would instead stop it at the gate
+     * with "Git retirement is incomplete". */
+    m17_bytes_clear(&output);
+    status = m17_run_cli(fixture, M17_COMMAND_SWITCH_ABSENT, M17_FAULT_NONE,
                          NULL);
     CHECK(WIFEXITED(status));
-    if (WIFEXITED(status)) {
-        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
-    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->output_path, &output), 0);
+    /* Never fenced: the gate rejection message is absent. Positively, the switch
+     * handler ran its own dispatch — the gate sits BEFORE config load, so the
+     * handler's failure proves the command passed through the cleared guard. */
+    CHECK(strstr((const char *)output.data,
+                 "Git retirement is incomplete") == NULL);
+    CHECK(strstr((const char *)output.data,
+                 "Failed to switch account") != NULL);
 
 vacuous_guard_cleanup:
     m17_bytes_clear(&output);
