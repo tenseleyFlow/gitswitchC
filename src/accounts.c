@@ -3220,6 +3220,17 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
             }
         }
         safe_strncpy(acct.ssh_key_path, expanded_path, sizeof(acct.ssh_key_path));
+        /* AR-13 L23: preserve the exact text the user typed (e.g. '~/.ssh/id')
+         * so the L8 save guard re-emits that spelling instead of the expanded
+         * absolute path. If they typed the absolute path itself, clear any
+         * stale spelling so an explicit absolute respelling of the same file
+         * wins over an old tilde rather than being overridden by the guard. */
+        if (strcmp(input, expanded_path) != 0) {
+            safe_strncpy(acct.ssh_key_spelling, input,
+                         sizeof(acct.ssh_key_spelling));
+        } else {
+            acct.ssh_key_spelling[0] = '\0';
+        }
         acct.ssh_enabled = true;
         printf("[OK]: SSH key validated: %s\n", expanded_path);
 
