@@ -480,6 +480,39 @@ static int m17_multi_account_fixture_setup(m17_fixture_t *fixture) {
     return m17_write_state(fixture, true, true);
 }
 
+/* Two LEGACY (pre-ledger) accounts: neither carries an incarnation, an ssh_key,
+ * or any publication record. The account-document uniformity invariant forbids
+ * mixing legacy and incarnation-bound accounts in one config, so this all-legacy
+ * shape — not a literal "one bound + one unbound" pair — is the realizable form
+ * of the AR-12 H1 record-less case. Each account's retirement leg is vacuously
+ * satisfied by the id_records==0 skip. */
+static int m17_legacy_pair_fixture_setup(m17_fixture_t *fixture) {
+    char config_body[3U * MAX_PATH_LEN];
+    int written;
+
+    if (m17_fixture_setup(fixture, false, false) != 0) {
+        return -1;
+    }
+    written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "active_account = \"work\"\n"
+        "[accounts.1]\n"
+        "name = \"work\"\n"
+        "email = \"work@example.test\"\n"
+        "preferred_scope = \"global\"\n"
+        "[accounts.2]\n"
+        "name = \"later\"\n"
+        "email = \"later@example.test\"\n"
+        "preferred_scope = \"global\"\n");
+    if (written < 0 || (size_t)written >= sizeof(config_body) ||
+        m17_write_text(fixture->accounts_path, config_body, 0600) != 0) {
+        return -1;
+    }
+    return m17_write_state(fixture, false, false);
+}
+
 static bool m17_retirement_hook(git_retirement_test_stage_t stage,
                                 const char *path, const char *key,
                                 const char *value) {
@@ -1163,6 +1196,34 @@ vacuous_guard_cleanup:
     free(fixture);
 }
 
+/* AR-13 L41 / AR-12 H1: reset-all over a multi-account LEGACY config (every
+ * account record-less and without a persisted incarnation) must settle every
+ * retirement leg vacuously and succeed. The id_records==0 `continue` is what
+ * lets each legacy account through without demanding a persisted incarnation it
+ * never had; removing it turns the skip into a hard ESTALE failure at the first
+ * account, bricking reset for the whole config. */
+TEST(reset_all_over_legacy_pair_settles_vacuously) {
+    m17_fixture_t *fixture = calloc(1U, sizeof(*fixture));
+    m17_bytes_t output = {0};
+    int status;
+
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+    CHECK_EQ_INT(m17_legacy_pair_fixture_setup(fixture), 0);
+
+    status = m17_run_cli(fixture, M17_COMMAND_RESET_ALL, M17_FAULT_NONE, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->output_path, &output), 0);
+    CHECK(strstr((const char *)output.data,
+                 m17_success_text(M17_COMMAND_RESET_ALL)) != NULL);
+
+    m17_bytes_clear(&output);
+    free(fixture);
+}
+
 TEST_MAIN_BEGIN()
     error_init(LOG_LEVEL_WARNING, NULL);
     RUN_TEST(remove_retirement_failures_are_nonzero_and_retryable);
@@ -1172,4 +1233,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reset_cleanup_failures_append_without_replacing_retirement_cause);
     RUN_TEST(credentialless_no_ledger_retires_vacuously);
     RUN_TEST(deleted_destination_retires_vacuously_and_clears_guard);
+    RUN_TEST(reset_all_over_legacy_pair_settles_vacuously);
 TEST_MAIN_END()
