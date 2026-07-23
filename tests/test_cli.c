@@ -1111,6 +1111,63 @@ TEST(add_reprompts_invalid_host_alias_until_valid) {
     remove_tree(rt);
 }
 
+/* AR-13 L33 / AR-12 M2: the canonical-hostname prompt has two branches the
+ * alias-reprompt test never reached. (1) Empty input warns that the managed
+ * ~/.ssh/config will pin HostName to the alias — which is not a resolvable DNS
+ * name — and leaves the hostname unset. (2) A syntactically invalid hostname
+ * re-prompts until a valid one is given rather than being accepted verbatim. */
+TEST(add_hostname_prompt_warns_on_empty_and_reprompts_on_invalid) {
+    char home[256], rt[256], stdin_path[4352], out_path[4352];
+    char key_path[512], toml_path[4352], toml[8192], out[8192], script[1024];
+    int rc;
+
+    if (!make_temp_dir(home, sizeof(home)) || !make_temp_dir(rt, sizeof(rt))) {
+        CHECK(!"mkdtemp failed");
+        return;
+    }
+    CHECK_EQ_INT(write_config(home,
+        "[settings]\ndefault_scope = \"global\"\n"), 0);
+    snprintf(key_path, sizeof(key_path), "%s/id_test", home);
+    CHECK_EQ_INT(write_key_file(key_path), 0);
+
+    /* Add #1: alias set, canonical hostname left empty -> default-to-alias
+     * warning; name, email, description, ssh key, alias, hostname(empty),
+     * gpg(skip), scope(default). */
+    snprintf(script, sizeof(script),
+             "warnacct\nw@example.com\ndesc\n%s\nwarnhost\n\n\n\n",
+             key_path);
+    CHECK_EQ_INT(write_stdin_script(rt, script, stdin_path,
+                                    sizeof(stdin_path)), 0);
+    snprintf(out_path, sizeof(out_path), "%s/warn.out", rt);
+    rc = run_add(home, rt, stdin_path, out_path);
+    CHECK_EQ_INT(rc, 0);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "No canonical hostname set") != NULL);
+    CHECK(strstr(out, "HostName warnhost") != NULL);
+
+    /* Add #2: an invalid hostname must re-prompt, then accept a valid one. */
+    snprintf(script, sizeof(script),
+             "reacct\nr@example.com\ndesc\n%s\nrehost\nbad host!\n"
+             "example.com\n\n\n",
+             key_path);
+    CHECK_EQ_INT(write_stdin_script(rt, script, stdin_path,
+                                    sizeof(stdin_path)), 0);
+    snprintf(out_path, sizeof(out_path), "%s/host.out", rt);
+    rc = run_add(home, rt, stdin_path, out_path);
+    CHECK_EQ_INT(rc, 0);
+    slurp(out_path, out, sizeof(out));
+    CHECK(strstr(out, "Invalid canonical hostname") != NULL);
+
+    snprintf(toml_path, sizeof(toml_path),
+             "%s/.config/gitswitch/accounts.toml", home);
+    slurp(toml_path, toml, sizeof(toml));
+    CHECK(strstr(toml, "example.com") != NULL);  /* valid hostname persisted */
+    CHECK(strstr(toml, "warnhost") != NULL);     /* add #1's alias persisted */
+
+    remove_tree(home);
+    remove_tree(rt);
+}
+
 /* AR-03 M5 (write entry): the loader skips accounts whose ssh_key exceeds 256
  * chars, so the add prompt must refuse such a path up front with a re-prompt —
  * pre-fix it saved the account and the very next invocation dropped it. */
@@ -1560,6 +1617,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(no_color_output_contains_no_escape_bytes);
     RUN_TEST(add_after_uint32_max_id_does_not_wrap_to_zero);
     RUN_TEST(add_reprompts_invalid_host_alias_until_valid);
+    RUN_TEST(add_hostname_prompt_warns_on_empty_and_reprompts_on_invalid);
     RUN_TEST(add_refuses_ssh_key_path_over_256_chars);
     RUN_TEST(add_reprompts_email_at_exact_length_bound);
     RUN_TEST(switch_writes_resume_hint_and_reset_clears_it);
