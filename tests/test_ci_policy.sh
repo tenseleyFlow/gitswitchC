@@ -3305,4 +3305,45 @@ awk '
 expect_rejected "duplicated ASAN_OPTIONS dropping UBSAN_OPTIONS" \
     "$tmp/sanitizer-dup-asan.yml" "$today"
 
+# AR-13 L36: the FreeBSD VM memory input is pinned at 8G (pkg-catalogue OOM
+# guard); shrinking or deleting it must be rejected, matching the coverage the
+# os/version/caps pins already have.
+awk '
+    $0 == "          memory: 8G" { print "          memory: 4G"; m=1; next }
+    { print }
+    END { if (!m) exit 1 }
+' "$workflow" >"$tmp/vm-memory-shrunk.yml" ||
+    fail "could not build the shrunk-VM-memory fixture"
+expect_rejected "shrunk FreeBSD VM memory pin" "$tmp/vm-memory-shrunk.yml" "$today"
+awk '
+    $0 == "          memory: 8G" { m=1; next }
+    { print }
+    END { if (!m) exit 1 }
+' "$workflow" >"$tmp/vm-memory-deleted.yml" ||
+    fail "could not build the deleted-VM-memory fixture"
+expect_rejected "deleted FreeBSD VM memory pin" "$tmp/vm-memory-deleted.yml" "$today"
+
+# AR-13 L38: the sanitizer lane pins ASAN_OPTIONS and UBSAN_OPTIONS at exact
+# values (the substance of M9). Weakening either must be rejected.
+awk '
+    $0 == "          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1" {
+        print "          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1"
+        a = 1; next
+    }
+    { print }
+    END { if (!a) exit 1 }
+' "$workflow" >"$tmp/asan-weakened.yml" ||
+    fail "could not build the weakened-ASAN fixture"
+expect_rejected "weakened ASAN_OPTIONS value" "$tmp/asan-weakened.yml" "$today"
+awk '
+    $0 == "          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1" {
+        print "          UBSAN_OPTIONS: halt_on_error=0:print_stacktrace=1"
+        u = 1; next
+    }
+    { print }
+    END { if (!u) exit 1 }
+' "$workflow" >"$tmp/ubsan-weakened.yml" ||
+    fail "could not build the weakened-UBSAN fixture"
+expect_rejected "weakened UBSAN_OPTIONS value" "$tmp/ubsan-weakened.yml" "$today"
+
 printf 'ci-policy: PASS (immutable, least-privilege, supported-platform workflow)\n'
