@@ -742,10 +742,67 @@ TEST(direct_remove_restores_callers_signal_dispositions) {
     ts_rm_rf(fixture.root);
 }
 
+/* AR-13 L40: the P1 in-memory-model restore on an aborted remove was
+ * revert-invisible — no test observed process state after the restore, so
+ * deleting the fix left the whole suite green. Remove the active+current
+ * account of a two-account model, then abort, and assert the snapshot is fully
+ * restored: the account reappears by id with identical name/incarnation, and
+ * active_account / current_account point back at it. */
+TEST(direct_remove_abort_restores_p1_snapshot_and_active_current) {
+    remove_fixture_t fixture;
+    gitswitch_ctx_t ctx;
+    account_t *restored = NULL;
+
+    /* Non-credentialled: no retirement machinery, so finalize exercises exactly
+     * the P1 in-memory-model restore in isolation. */
+    CHECK_EQ_INT(fixture_setup(&fixture, false), 0);
+    CHECK_EQ_INT(setenv("HOME", fixture.home, 1), 0);
+    CHECK_EQ_INT(setenv("XDG_RUNTIME_DIR", fixture.runtime, 1), 0);
+    CHECK_EQ_INT(initialize_direct_context(&ctx, &fixture, "direct", false), 0);
+
+    /* Second account so the model is non-trivial; the removed one (id 1,
+     * "direct") is the active + current account. */
+    ctx.account_count = 2;
+    ctx.accounts[1].id = UINT32_C(2);
+    ctx.accounts[1].incarnation_persisted = true;
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[1].incarnation, REMOVE_INCARNATION,
+                              sizeof(ctx.accounts[1].incarnation)), 0);
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[1].name, "survivor",
+                              sizeof(ctx.accounts[1].name)), 0);
+    CHECK_EQ_INT(safe_strncpy(ctx.accounts[1].email, "survivor@example.com",
+                              sizeof(ctx.accounts[1].email)), 0);
+    CHECK_EQ_INT(safe_strncpy(ctx.config.active_account, "direct",
+                              sizeof(ctx.config.active_account)), 0);
+    ctx.current_account = &ctx.accounts[0];
+    ctx.config.defer_signal_cleanup = true;
+
+    CHECK_EQ_INT(accounts_remove(&ctx, "direct"), 0);
+    CHECK_EQ_INT((int)ctx.account_count, 1); /* removed from the model */
+
+    CHECK_EQ_INT(accounts_remove_abort(&ctx), 0);
+    /* P1 restored the snapshot: count, identity, active + current. */
+    CHECK_EQ_INT((int)ctx.account_count, 2);
+    for (size_t i = 0; i < ctx.account_count; i++) {
+        if (ctx.accounts[i].id == UINT32_C(1)) restored = &ctx.accounts[i];
+    }
+    CHECK(restored != NULL);
+    if (restored) {
+        CHECK(strcmp(restored->name, "direct") == 0);
+        CHECK(strcmp(restored->incarnation, REMOVE_INCARNATION) == 0);
+    }
+    CHECK(strcmp(ctx.config.active_account, "direct") == 0);
+    CHECK(ctx.current_account == restored);
+
+    (void)unsetenv("HOME");
+    (void)unsetenv("XDG_RUNTIME_DIR");
+    ts_rm_rf(fixture.root);
+}
+
 int main(void) {
     RUN_TEST(repeated_signals_defer_through_complete_removal_transaction);
     RUN_TEST(config_faults_keep_account_and_alias_on_preinstall_failure);
     RUN_TEST(direct_remove_without_publication_succeeds_vacuously);
     RUN_TEST(direct_remove_restores_callers_signal_dispositions);
+    RUN_TEST(direct_remove_abort_restores_p1_snapshot_and_active_current);
     return ts_test_finish();
 }

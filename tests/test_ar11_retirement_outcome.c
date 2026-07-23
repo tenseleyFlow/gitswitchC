@@ -46,7 +46,12 @@ enum {
 typedef enum {
     M17_COMMAND_REMOVE = 0,
     M17_COMMAND_RESET_ONE,
-    M17_COMMAND_RESET_ALL
+    M17_COMMAND_RESET_ALL,
+    /* A genuinely guarded command (switch is an activation command) against an
+     * absent account: it traverses the retirement-guard gate before any config
+     * load, unlike the exempt recovery remove/reset commands. Used to prove the
+     * guard is really clear, not merely that a command bypasses it. */
+    M17_COMMAND_SWITCH_ABSENT
 } m17_command_t;
 
 typedef enum {
@@ -475,6 +480,39 @@ static int m17_multi_account_fixture_setup(m17_fixture_t *fixture) {
     return m17_write_state(fixture, true, true);
 }
 
+/* Two LEGACY (pre-ledger) accounts: neither carries an incarnation, an ssh_key,
+ * or any publication record. The account-document uniformity invariant forbids
+ * mixing legacy and incarnation-bound accounts in one config, so this all-legacy
+ * shape — not a literal "one bound + one unbound" pair — is the realizable form
+ * of the AR-12 H1 record-less case. Each account's retirement leg is vacuously
+ * satisfied by the id_records==0 skip. */
+static int m17_legacy_pair_fixture_setup(m17_fixture_t *fixture) {
+    char config_body[3U * MAX_PATH_LEN];
+    int written;
+
+    if (m17_fixture_setup(fixture, false, false) != 0) {
+        return -1;
+    }
+    written = snprintf(
+        config_body, sizeof(config_body),
+        "[settings]\n"
+        "default_scope = \"global\"\n"
+        "active_account = \"work\"\n"
+        "[accounts.1]\n"
+        "name = \"work\"\n"
+        "email = \"work@example.test\"\n"
+        "preferred_scope = \"global\"\n"
+        "[accounts.2]\n"
+        "name = \"later\"\n"
+        "email = \"later@example.test\"\n"
+        "preferred_scope = \"global\"\n");
+    if (written < 0 || (size_t)written >= sizeof(config_body) ||
+        m17_write_text(fixture->accounts_path, config_body, 0600) != 0) {
+        return -1;
+    }
+    return m17_write_state(fixture, false, false);
+}
+
 static bool m17_retirement_hook(git_retirement_test_stage_t stage,
                                 const char *path, const char *key,
                                 const char *value) {
@@ -547,7 +585,9 @@ static int m17_run_cli_with_cleanup_fault(
         char assume_yes[] = "-y";
         char remove[] = "remove";
         char reset[] = "reset";
+        char switch_cmd[] = "switch";
         char work[] = "work";
+        char absent[] = "no-such-account";
         char *remove_argv[] = {
             program, no_color, assume_yes, remove, work, NULL
         };
@@ -557,11 +597,16 @@ static int m17_run_cli_with_cleanup_fault(
         char *reset_all_argv[] = {
             program, no_color, assume_yes, reset, NULL
         };
+        char *switch_absent_argv[] = {
+            program, no_color, assume_yes, switch_cmd, absent, NULL
+        };
         char **argv = command == M17_COMMAND_REMOVE
                           ? remove_argv
                           : command == M17_COMMAND_RESET_ONE
                                 ? reset_one_argv
-                                : reset_all_argv;
+                                : command == M17_COMMAND_SWITCH_ABSENT
+                                      ? switch_absent_argv
+                                      : reset_all_argv;
         int argc = command == M17_COMMAND_RESET_ALL ? 4 : 5;
         int rc;
         char observed = '0';
@@ -1125,17 +1170,57 @@ TEST(deleted_destination_retires_vacuously_and_clears_guard) {
     CHECK_EQ_INT(m17_read_bytes(fixture->git_paths[1], &survivor), 0);
     CHECK(strstr((const char *)survivor.data, "sshCommand") == NULL);
     CHECK(strstr((const char *)survivor.data, "marker = keep") != NULL);
-    /* A follow-up mutating command must not be fenced. */
-    status = m17_run_cli(fixture, M17_COMMAND_RESET_ALL, M17_FAULT_NONE,
+    /* A genuinely GUARDED command must not be fenced. `reset` is exempt from
+     * the retirement gate (it is a recovery command), so a passing reset proves
+     * nothing about the guard being cleared. `switch` is an activation command
+     * that traverses the gate before config load: with the guard truly clear it
+     * reaches normal dispatch and reports the absent account, never the fence
+     * rejection. A surviving durable marker would instead stop it at the gate
+     * with "Git retirement is incomplete". */
+    m17_bytes_clear(&output);
+    status = m17_run_cli(fixture, M17_COMMAND_SWITCH_ABSENT, M17_FAULT_NONE,
                          NULL);
     CHECK(WIFEXITED(status));
-    if (WIFEXITED(status)) {
-        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
-    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->output_path, &output), 0);
+    /* Never fenced: the gate rejection message is absent. Positively, the switch
+     * handler ran its own dispatch — the gate sits BEFORE config load, so the
+     * handler's failure proves the command passed through the cleared guard. */
+    CHECK(strstr((const char *)output.data,
+                 "Git retirement is incomplete") == NULL);
+    CHECK(strstr((const char *)output.data,
+                 "Failed to switch account") != NULL);
 
 vacuous_guard_cleanup:
     m17_bytes_clear(&output);
     m17_bytes_clear(&survivor);
+    free(fixture);
+}
+
+/* AR-13 L41 / AR-12 H1: reset-all over a multi-account LEGACY config (every
+ * account record-less and without a persisted incarnation) must settle every
+ * retirement leg vacuously and succeed. The id_records==0 `continue` is what
+ * lets each legacy account through without demanding a persisted incarnation it
+ * never had; removing it turns the skip into a hard ESTALE failure at the first
+ * account, bricking reset for the whole config. */
+TEST(reset_all_over_legacy_pair_settles_vacuously) {
+    m17_fixture_t *fixture = calloc(1U, sizeof(*fixture));
+    m17_bytes_t output = {0};
+    int status;
+
+    CHECK(fixture != NULL);
+    if (!fixture) return;
+    CHECK_EQ_INT(m17_legacy_pair_fixture_setup(fixture), 0);
+
+    status = m17_run_cli(fixture, M17_COMMAND_RESET_ALL, M17_FAULT_NONE, NULL);
+    CHECK(WIFEXITED(status));
+    if (WIFEXITED(status)) {
+        CHECK_EQ_INT(WEXITSTATUS(status), EXIT_SUCCESS);
+    }
+    CHECK_EQ_INT(m17_read_bytes(fixture->output_path, &output), 0);
+    CHECK(strstr((const char *)output.data,
+                 m17_success_text(M17_COMMAND_RESET_ALL)) != NULL);
+
+    m17_bytes_clear(&output);
     free(fixture);
 }
 
@@ -1148,4 +1233,5 @@ TEST_MAIN_BEGIN()
     RUN_TEST(reset_cleanup_failures_append_without_replacing_retirement_cause);
     RUN_TEST(credentialless_no_ledger_retires_vacuously);
     RUN_TEST(deleted_destination_retires_vacuously_and_clears_guard);
+    RUN_TEST(reset_all_over_legacy_pair_settles_vacuously);
 TEST_MAIN_END()

@@ -2852,6 +2852,63 @@ TEST(reclaim_absent_drops_only_provably_dead_published_records) {
     (void)rmdir(unmount_repo);
 }
 
+/* AR-13 L42: R1/R2 made the oracle probe the config_parent anchor too, but the
+ * reclaim test above drives only the repository anchor (config_parent left
+ * synthetic device=17), so the config_parent ENOENT walk-up had no real
+ * coverage. Prove both directions with real captured identities on a
+ * config-parent-only (global) record: a parent removed above a surviving
+ * same-device ancestor directory is provably DEAD, while an ancestor replaced
+ * by a regular file makes the leaf probe fail with ENOTDIR — indeterminate, so
+ * the record must be KEPT (fail closed). ENOTDIR is not privilege-bypassable,
+ * so this is deterministic on every CI platform including the root FreeBSD VM,
+ * unlike a chmod/EACCES construction. */
+TEST(config_parent_anchor_is_dead_on_dir_ancestor_but_fails_closed_on_nondir) {
+    char root[] = "/tmp/ar13-l42-XXXXXX";
+    publication_record_t record;
+    char sub[MAX_PATH_LEN];
+    char leafdir[MAX_PATH_LEN];
+    struct stat st;
+    int fd;
+
+    CHECK(ts_mkdtemp(root) != NULL);
+    CHECK((size_t)snprintf(sub, sizeof(sub), "%s/sub", root) < sizeof(sub));
+    CHECK((size_t)snprintf(leafdir, sizeof(leafdir), "%s/leaf", sub) <
+          sizeof(leafdir));
+    CHECK_EQ_INT(mkdir(sub, 0700), 0);
+    CHECK_EQ_INT(mkdir(leafdir, 0700), 0);
+
+    /* Config-parent-only record: repository anchor cleared so the oracle's
+     * verdict is driven solely by the config_parent walk-up. */
+    fill_gpg_record(&record, "/unused", FINGERPRINT_A);
+    record.scope = PUBLICATION_SCOPE_GLOBAL;
+    record.repository_path[0] = '\0';
+    memset(&record.repository, 0, sizeof(record.repository));
+    CHECK((size_t)snprintf(record.config_path, sizeof(record.config_path),
+                           "%s/config", leafdir) < sizeof(record.config_path));
+    CHECK_EQ_INT(stat(leafdir, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
+
+    /* Parent gone, same-device ancestor directory survives: provably DEAD. */
+    CHECK_EQ_INT(rmdir(leafdir), 0);
+    CHECK(publication_record_destination_provably_absent(&record));
+
+    /* Recreate and re-capture, then replace the <root>/sub ancestor with a
+     * regular file: the leaf lstat now returns ENOTDIR (not ENOENT), which is
+     * indeterminate and must fail closed. */
+    CHECK_EQ_INT(mkdir(leafdir, 0700), 0);
+    CHECK_EQ_INT(stat(leafdir, &st), 0);
+    publication_identity_from_stat(&record.config_parent, &st);
+    CHECK_EQ_INT(rmdir(leafdir), 0);
+    CHECK_EQ_INT(rmdir(sub), 0);
+    fd = open(sub, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    CHECK(fd >= 0);
+    if (fd >= 0) CHECK_EQ_INT(close(fd), 0);
+    CHECK(!publication_record_destination_provably_absent(&record));
+
+    (void)unlink(sub);
+    (void)rmdir(root);
+}
+
 /* AR-13 R2: an in-place .git rebuild (rm -rf .git && git init) changes the
  * .git directory's inode while the worktree root is untouched. The config
  * parent is one of the identities same_destination() compares, so the record
@@ -3136,6 +3193,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(same_numeric_id_different_incarnation_is_never_live_publication_owner);
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
     RUN_TEST(reclaim_absent_drops_only_provably_dead_published_records);
+    RUN_TEST(config_parent_anchor_is_dead_on_dir_ancestor_but_fails_closed_on_nondir);
     RUN_TEST(ledger_parse_rejects_l16_l17_grammar_tightenings);
     RUN_TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild);
     RUN_TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations);

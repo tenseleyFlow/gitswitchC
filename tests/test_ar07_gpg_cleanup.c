@@ -479,6 +479,86 @@ TEST(full_reset_refuses_live_owned_quarantine_but_retires_own) {
     CHECK(!path_exists(home));
 }
 
+/* AR-13 L34 / L11: an UNWITNESSED reset-prefix quarantine is the residue of an
+ * interrupted reset whose completion witness never landed — its retry state is
+ * indeterminate. Full reset must fail CLOSED: preserve the quarantine, block
+ * the fresh teardown, and destroy nothing, rather than silently deleting an
+ * incomplete transaction's only recovery handle. (The reset prefix has its own
+ * quarantine+witness retry machinery, distinct from the rollback/publish
+ * orphan path — a bare reset symlink is exactly this unwitnessed residue.) */
+TEST(full_reset_fails_closed_on_unwitnessed_reset_quarantine) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    char residue[416];
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "work"), 0);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    snprintf(residue, sizeof(residue),
+             "%s/.gitswitch-gpg-reset.1.0123456789abcdef", base);
+    CHECK_EQ_INT(symlink(home, residue), 0);
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(previous);
+    CHECK(strstr(get_last_error()->message,
+                 "Unwitnessed GPG reset quarantine preserved") != NULL);
+    CHECK(lstat(residue, &(struct stat){0}) == 0); /* residue preserved */
+    CHECK(path_exists(marker));                    /* nothing destroyed */
+    CHECK_EQ_INT(unlink(residue), 0);
+}
+
+/* AR-13 L34 / AR-12 P3: the removal walk is depth-bounded (each frame holds a
+ * DIR stream and a child fd, so an adversarially deep home is both a stack and
+ * an fd-exhaustion hazard). Nest a directory chain past GPG_SOURCE_PROOF_MAX_DEPTH
+ * (64) under a managed home and assert reset refuses with the bounded-depth
+ * diagnostic and destroys nothing, rather than descending without limit. */
+TEST(reset_walk_refuses_adversarially_deep_home) {
+    char xdg[128], base[256], home[320], marker[384], deep[2048];
+    command_runner_fn previous;
+    size_t len;
+    size_t home_len;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "work"), 0);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
+
+    home_len = strlen(home);
+    len = (size_t)snprintf(deep, sizeof(deep), "%s", home);
+    CHECK(len < sizeof(deep));
+    /* 66 nested levels: strictly deeper than the depth-64 bound (home is walked
+     * at depth 0, so a chain of >64 dirs forces a walk at depth 65). */
+    for (int i = 0; i < 66; i++) {
+        CHECK(len + 2U < sizeof(deep));
+        deep[len++] = '/';
+        deep[len++] = 'd';
+        deep[len] = '\0';
+        CHECK_EQ_INT(mkdir(deep, 0700), 0);
+    }
+
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(previous);
+    CHECK(strstr(get_last_error()->message,
+                 "bounded reset walk depth") != NULL);
+    CHECK(path_exists(marker)); /* refused before destroying anything */
+
+    /* Unwind the deep chain so fixture teardown can remove the tree. */
+    while (len > home_len) {
+        deep[len] = '\0';
+        (void)rmdir(deep);
+        len -= 2U;
+    }
+    deep[len] = '\0';
+    (void)unlink(marker);
+    (void)rmdir(home);
+    (void)rmdir(base);
+}
+
 static int inject_late_residue(int base_fd) {
     int fd = openat(base_fd, ".late-residue",
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
@@ -1076,6 +1156,8 @@ TEST_MAIN_BEGIN()
     RUN_TEST(hardlink_added_between_validation_and_delete_is_rejected);
     RUN_TEST(full_reset_rejects_every_unknown_base_entry_before_deletion);
     RUN_TEST(full_reset_refuses_live_owned_quarantine_but_retires_own);
+    RUN_TEST(full_reset_fails_closed_on_unwitnessed_reset_quarantine);
+    RUN_TEST(reset_walk_refuses_adversarially_deep_home);
     RUN_TEST(final_enumeration_catches_late_unknown_survivor);
 #ifdef __linux__
     RUN_TEST(nested_bind_mount_is_never_traversed);
