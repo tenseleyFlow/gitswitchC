@@ -4920,12 +4920,20 @@ static int ssh_write_config_atomic_at(
 
 fail:
     if (fd >= 0) close(fd);
-    if (!renamed && have_temp_identity &&
+    /* AR-13 L12: the initial fstat of the temp may have failed (have_temp_identity
+     * false), but the O_EXCL entry we created microseconds ago inside the
+     * already-verified user-owned 0700 ~/.ssh is still ours to retire. Always
+     * apply the ownership safety checks (regular, our uid, single hard link)
+     * and require the captured identity to match ONLY when we have one — so an
+     * fstat failure no longer orphans the temp permanently (the exact outcome
+     * L20's capture-first was meant to prevent). */
+    if (!renamed &&
         fstatat(dir_fd, temp_name, &current_temp, AT_SYMLINK_NOFOLLOW) == 0 &&
         S_ISREG(current_temp.st_mode) && current_temp.st_uid == getuid() &&
         current_temp.st_nlink == 1 &&
-        current_temp.st_dev == temp_identity.st_dev &&
-        current_temp.st_ino == temp_identity.st_ino) {
+        (!have_temp_identity ||
+         (current_temp.st_dev == temp_identity.st_dev &&
+          current_temp.st_ino == temp_identity.st_ino))) {
         (void)unlinkat(dir_fd, temp_name, 0);
     }
     if (temp_registered) signals_scratch_unregister(temp_path);
