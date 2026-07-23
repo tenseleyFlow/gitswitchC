@@ -2858,6 +2858,77 @@ TEST(reclaim_absent_drops_only_provably_dead_published_records) {
  * can never match again and must be reclaimable. The old oracle probed only
  * the repository anchor for local records, kept such records forever, and
  * would eventually exhaust the 128-slot ledger. */
+/* AR-13 L44: the AR-12 L16/L17 ledger-parse tightenings (named errors for the
+ * capability-mask length and the count line; '-' as the ONLY canonical empty
+ * spelling for gpg_fingerprint/gpg_selector) had zero coverage. Serialize a
+ * valid record, then splice each field to its rejected form and assert the
+ * named message — an any-error-to-bare--1 regression would otherwise pass. */
+TEST(ledger_parse_rejects_l16_l17_grammar_tightenings) {
+    publication_ledger_t source, loaded;
+    publication_record_t record;
+    unsigned char *serialized = NULL;
+    size_t serialized_length = 0U;
+    struct {
+        const char *prefix;
+        const char *replacement;
+        const char *msg;
+    } cases[] = {
+        {"p.0.gpg_fingerprint=", "",
+         "Empty publication gpg_fingerprint requires '-'"},
+        {"p.0.gpg_selector=", "",
+         "Empty publication gpg_selector requires '-'"},
+        {"p.0.capabilities=", "1234567",
+         "Invalid publication capability mask length"},
+        {"p.0.capabilities=", "123456789",
+         "Invalid publication capability mask length"},
+    };
+
+    fill_gpg_record(&record, "/tmp/ar13-l44-repo", FINGERPRINT_A);
+    publication_ledger_init(&source);
+    CHECK_EQ_INT(publication_record_validate(&record), 0);
+    CHECK_EQ_INT(publication_ledger_upsert(&source, &record), 0);
+    CHECK_EQ_INT(publication_ledger_serialize(&source, &serialized,
+                                              &serialized_length), 0);
+    CHECK(serialized != NULL);
+
+    for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        unsigned char *bad = NULL;
+        size_t bad_length = 0U;
+
+        bad = replace_serialized_field_value(serialized, serialized_length,
+                                             cases[i].prefix,
+                                             cases[i].replacement, &bad_length);
+        CHECK(bad != NULL);
+        publication_ledger_init(&loaded);
+        clear_error();
+        CHECK_EQ_INT(publication_ledger_parse(bad, bad_length, &loaded), -1);
+        CHECK(strstr(get_last_error()->message, cases[i].msg) != NULL);
+        free(bad);
+        publication_ledger_clear(&loaded);
+    }
+
+    /* Removing the count line leaves a non-'count=' line where the count is
+     * expected -> the named malformed-count-line rejection. */
+    {
+        unsigned char *bad = NULL;
+        size_t bad_length = 0U;
+
+        bad = remove_serialized_field_line(serialized, serialized_length,
+                                           "count=", &bad_length);
+        CHECK(bad != NULL);
+        publication_ledger_init(&loaded);
+        clear_error();
+        CHECK_EQ_INT(publication_ledger_parse(bad, bad_length, &loaded), -1);
+        CHECK(strstr(get_last_error()->message,
+                     "Malformed publication ledger count line") != NULL);
+        free(bad);
+        publication_ledger_clear(&loaded);
+    }
+
+    free(serialized);
+    publication_ledger_clear(&source);
+}
+
 TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild) {
     publication_ledger_t ledger;
     publication_record_t record;
@@ -3065,6 +3136,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(same_numeric_id_different_incarnation_is_never_live_publication_owner);
     RUN_TEST(removed_account_publication_reserves_recycled_id_without_git_mutation);
     RUN_TEST(reclaim_absent_drops_only_provably_dead_published_records);
+    RUN_TEST(ledger_parse_rejects_l16_l17_grammar_tightenings);
     RUN_TEST(reclaim_absent_drops_local_record_after_in_place_git_rebuild);
     RUN_TEST(at_capacity_ledger_admits_replacement_and_reclaims_dead_destinations);
 TEST_MAIN_END()
