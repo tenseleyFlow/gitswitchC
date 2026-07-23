@@ -1419,16 +1419,19 @@ install:
 		built_format=`sed -n 's/^release_artifact_format=//p' "$(BUILDTYPE_STAMP)"`; \
 		built_triple=`sed -n 's/^target_triple=//p' "$(BUILDTYPE_STAMP)"`; \
 		case "$$built_format" in \
-		elf) command -v readelf >/dev/null 2>&1 || \
+		elf) { [ -n "$$READELF" ] && command -v "$$READELF" >/dev/null 2>&1; } || \
+			command -v readelf >/dev/null 2>&1 || \
 			command -v llvm-readelf >/dev/null 2>&1 || \
 			command -v greadelf >/dev/null 2>&1 || { \
-			echo 'ERROR: release install verifies artifact hardening and needs an ELF inspector; install binutils (readelf) or llvm (llvm-readelf)' >&2; \
+			echo 'ERROR: release install verifies artifact hardening and needs an ELF inspector; set READELF, or install binutils (readelf) or llvm (llvm-readelf)' >&2; \
 			exit 1; }; ;; \
 		macho) for t in otool nm lipo; do \
 			command -v "$$t" >/dev/null 2>&1 || { \
 			echo 'ERROR: release install verifies artifact hardening and needs otool, nm, and lipo (Xcode command line tools)' >&2; \
 			exit 1; }; \
 			done; ;; \
+		*) echo "ERROR: release install: unrecognized artifact format '$$built_format'; refusing to skip the hardening pre-check" >&2; \
+			exit 1; ;; \
 		esac; \
 		GITSWITCH_RELEASE_FORMAT="$$built_format" \
 			sh tests/test_ar07_release.sh artifact-publish \
