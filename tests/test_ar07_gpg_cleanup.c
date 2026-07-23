@@ -437,6 +437,48 @@ TEST(full_reset_rejects_every_unknown_base_entry_before_deletion) {
     CHECK(base_contains_only_lock(base));
 }
 
+/* AR-13 M8: a quarantine name embeds the creating pid. A crash orphan has a
+ * dead pid, but a quarantine whose pid belongs to a DIFFERENT live process is
+ * the live retry handle of a concurrent gitswitch. Full reset must refuse
+ * (leaving that owner's recovery intact) rather than unlink it before the
+ * destructive pass; this process's own residue is still cleared. */
+TEST(full_reset_refuses_live_owned_quarantine_but_retires_own) {
+    char xdg[128], base[256], home[320], marker[384], current[320];
+    char live[416], mine[416];
+    command_runner_fn previous;
+
+    CHECK_EQ_INT(make_home(xdg, sizeof(xdg), base, sizeof(base),
+                           home, sizeof(home), "work"), 0);
+    snprintf(marker, sizeof(marker), "%s/private.key", home);
+    snprintf(current, sizeof(current), "%s/current", base);
+    CHECK_EQ_INT(make_file(marker, "secret\n"), 0);
+    CHECK_EQ_INT(symlink(home, current), 0);
+
+    /* pid 1 (init) is always live; kill(1,0) yields 0 or EPERM, both meaning
+     * "process exists" -> the reset must refuse and preserve the quarantine. */
+    snprintf(live, sizeof(live),
+             "%s/.gitswitch-gpg-rollback.1.0123456789abcdef", base);
+    CHECK_EQ_INT(symlink(home, live), 0);
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), -1);
+    run_set_runner(previous);
+    CHECK(lstat(live, &(struct stat){0}) == 0); /* live-owned: preserved */
+    CHECK(path_exists(marker));                  /* nothing destroyed */
+    CHECK_EQ_INT(unlink(live), 0);
+
+    /* This process's own residue is a clearable orphan: reset retires it and
+     * proceeds with the teardown it was asked for. */
+    snprintf(mine, sizeof(mine),
+             "%s/.gitswitch-gpg-rollback.%ld.0123456789abcdef",
+             base, (long)getpid());
+    CHECK_EQ_INT(symlink(home, mine), 0);
+    previous = run_set_runner(recording_null_runner);
+    CHECK_EQ_INT(gpg_manager_reset(NULL), 0);
+    run_set_runner(previous);
+    CHECK(lstat(mine, &(struct stat){0}) != 0 && errno == ENOENT);
+    CHECK(!path_exists(home));
+}
+
 static int inject_late_residue(int base_fd) {
     int fd = openat(base_fd, ".late-residue",
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
@@ -1033,6 +1075,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(preexisting_hardlink_blocks_before_agent_stop_or_deletion);
     RUN_TEST(hardlink_added_between_validation_and_delete_is_rejected);
     RUN_TEST(full_reset_rejects_every_unknown_base_entry_before_deletion);
+    RUN_TEST(full_reset_refuses_live_owned_quarantine_but_retires_own);
     RUN_TEST(final_enumeration_catches_late_unknown_survivor);
 #ifdef __linux__
     RUN_TEST(nested_bind_mount_is_never_traversed);

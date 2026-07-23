@@ -6433,18 +6433,69 @@ static bool git_retirement_directory_identity_matches(
                ((uintmax_t)st->st_mode & (uintmax_t)S_IFMT);
 }
 
-/* AR-12 M4: a destination whose recorded config path is provably absent
- * (every component resolves and the leaf is ENOENT, or a parent component is
- * gone) cannot carry any published value. Only a definitive ENOENT counts;
- * permission or loop errors stay indeterminate and fail closed. */
+/* AR-12 M4 / AR-13 R1: prove a recorded config path is *definitively* absent —
+ * genuinely deleted from a still-live directory — as distinct from merely
+ * unreachable (an unmounted removable/network volume, or a parent renamed
+ * away). A bare stat()==ENOENT conflates the two: POSIX returns ENOENT
+ * identically for a deleted leaf and for a leaf whose ancestor is temporarily
+ * gone, so the old oracle vacuously retired a leg while its private-key
+ * sshCommand / signing-key residue sat intact on an unmounted volume, then
+ * flipped the ledger record to a non-authorizing RETIRING tombstone that no
+ * later command could ever retire once the volume returned.
+ *
+ * Two changes make the ENOENT proof sound:
+ *   1. lstat, not stat, on the leaf — a dangling symlink at the recorded path
+ *      must read as present (fail closed), not chase a missing target to a
+ *      spurious "absent".
+ *   2. On leaf ENOENT, walk up to the deepest still-existing ancestor and
+ *      require it to be a directory on the SAME filesystem the record was
+ *      published against (config_parent.device is the recorded .git dir's
+ *      st_dev). `rm -rf repo` on the still-mounted fs — the case M4 targets —
+ *      leaves that ancestor sharing the recorded device, so absence is proven.
+ *      An unmounted/renamed-away volume leaves the deepest existing ancestor
+ *      above the old mountpoint on a *different* device, so it stays
+ *      indeterminate and fails closed, preserving the guard/retry handle so a
+ *      remount + retry retires exactly. Note config_parent itself is destroyed
+ *      by `rm -rf repo` (it removes .git too), so it cannot be the anchor — the
+ *      surviving-ancestor device is what discriminates deletion from unmount.
+ * Any non-ENOENT errno (permission, loop) stays indeterminate. */
 static bool git_retirement_destination_provably_absent(
     const publication_record_t *publication) {
     struct stat st;
+    char path[MAX_PATH_LEN];
 
     if (!publication || publication->config_path[0] != '/') return false;
+    if (!publication->config_parent.present) return false;
+
     errno = 0;
-    if (stat(publication->config_path, &st) == 0) return false;
-    return errno == ENOENT;
+    if (lstat(publication->config_path, &st) == 0) return false; /* present */
+    if (errno != ENOENT) return false; /* indeterminate -> fail closed */
+
+    if (safe_strncpy(path, publication->config_path, sizeof(path)) != 0) {
+        return false;
+    }
+    for (;;) {
+        char *slash = strrchr(path, '/');
+
+        if (!slash) return false;
+        if (slash == path) {
+            path[1] = '\0'; /* probe "/" */
+        } else {
+            *slash = '\0';
+        }
+        errno = 0;
+        /* stat, not lstat, on ANCESTORS: a symlinked ancestor (e.g. /tmp ->
+         * /private/tmp on macOS) is a normal path component and must resolve
+         * to the real directory it names — only the leaf needs lstat (dangling-
+         * symlink-is-present). Absence is proven only if the deepest existing
+         * ancestor resolves to a directory on the recorded filesystem. */
+        if (stat(path, &st) == 0) {
+            return S_ISDIR(st.st_mode) &&
+                   (uintmax_t)st.st_dev == publication->config_parent.device;
+        }
+        if (errno != ENOENT) return false; /* indeterminate -> fail closed */
+        if (slash == path) return false;   /* nothing down to root existed */
+    }
 }
 
 /* A completed atomic retirement necessarily changes the config generation.

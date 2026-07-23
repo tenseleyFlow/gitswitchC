@@ -82,15 +82,24 @@ extern char **environ;
  * diagnostic INTO the published artifact after fsync while still exiting 0.
  * Pin the standard slots to /dev/null before any other open. Deliberately no
  * O_CLOEXEC: the producer child must inherit real descriptors too. */
-/* AR-12 L27: on Darwin fsync(2) only reaches the drive, not through its
- * cache; power-loss durability — the guarantee the stage barriers and rpm
- * retirement advertise — needs F_FULLFSYNC. Fall back to fsync only when
- * the volume/descriptor does not support the fcntl. */
+/* AR-12 L27 / AR-13 L3: on Darwin fsync(2) only reaches the drive, not through
+ * its cache; power-loss durability — the guarantee the stage barriers and rpm
+ * retirement advertise — needs F_FULLFSYNC. Fall back to plain fsync ONLY when
+ * the volume/descriptor cannot support the fcntl (ENOTSUP/ENOTTY/EINVAL);
+ * retry EINTR; propagate any other errno as a hard failure rather than masking
+ * a real flush error as durable success. */
 static int full_fsync(int fd)
 {
 #if defined(__APPLE__)
-    if (fcntl(fd, F_FULLFSYNC) == 0) {
+    int rc;
+    do {
+        rc = fcntl(fd, F_FULLFSYNC);
+    } while (rc != 0 && errno == EINTR);
+    if (rc == 0) {
         return 0;
+    }
+    if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL) {
+        return -1;
     }
 #endif
     return fsync(fd);

@@ -1321,6 +1321,48 @@ static int gpg_retire_orphan_quarantines_locked(int base_fd) {
             closedir(dir);
             return -1;
         }
+        /* AR-13 M8: a quarantine name is {prefix}{pid}.{16-hex}. If that pid is
+         * a DIFFERENT still-live process of ours, this is not a crash orphan
+         * but the live retry handle of a concurrent gitswitch (a rollback token
+         * retained across lock releases after an I/O/hook failure). Retiring it
+         * here — before the destructive pass, and even if the all-or-nothing
+         * preflight later aborts and deletes nothing else — would strand that
+         * owner's recovery. Fail the reset instead of deleting live-owned state;
+         * the user can retry once the other process completes. A genuine crash
+         * orphan has a dead pid (kill -> ESRCH), and this process's own residue
+         * (pid == getpid()) is still cleared, so L11's wedge-clearing holds. */
+        {
+            const char *pid_str = entry->d_name +
+                (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX)
+                     ? strlen(GPG_ROLLBACK_PREFIX)
+                     : strlen(GPG_PUBLISH_PREFIX));
+
+            if (*pid_str >= '1' && *pid_str <= '9') {
+                long pid = 0;
+                bool parsed = true;
+
+                for (; *pid_str && *pid_str != '.'; pid_str++) {
+                    if (!isdigit((unsigned char)*pid_str) ||
+                        pid > (LONG_MAX - 9) / 10) {
+                        parsed = false;
+                        break;
+                    }
+                    pid = pid * 10 + (*pid_str - '0');
+                }
+                if (parsed && pid > 0 && (pid_t)pid != getpid()) {
+                    errno = 0;
+                    if (kill((pid_t)pid, 0) == 0 || errno == EPERM) {
+                        set_error(ERR_FILE_IO,
+                                  "Refusing to retire a GPG quarantine held by "
+                                  "a live gitswitch process (pid %ld): %s; "
+                                  "retry reset after it completes",
+                                  pid, entry->d_name);
+                        closedir(dir);
+                        return -1;
+                    }
+                }
+            }
+        }
         if (unlinkat(base_fd, entry->d_name, 0) != 0 && errno != ENOENT) {
             set_system_error(ERR_FILE_IO,
                              "Cannot retire orphaned GPG quarantine: %s",

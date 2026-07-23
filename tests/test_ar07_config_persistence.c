@@ -425,6 +425,25 @@ static void expect_load_error(const char *body, const char *needle) {
     CHECK(strstr(get_last_error()->message, needle) != NULL);
 }
 
+/* AR-13 M7: a hand-edited account with a dependent key but no enabling key is
+ * an own-writer-shaped edit, so it is skipped (counted, rewrite-blocked) and
+ * the rest of the config still loads — not a whole-file brick. The body carries
+ * one bad [accounts.1] plus a valid [accounts.2] that must survive. */
+static void expect_dependency_gap_section_skipped(const char *body) {
+    char dir[128], path[256];
+    gitswitch_ctx_t ctx;
+
+    CHECK_EQ_INT(private_dir(dir, sizeof(dir)), 0);
+    snprintf(path, sizeof(path), "%s/accounts.toml", dir);
+    CHECK_EQ_INT(write_private(path, body), 0);
+    memset(&ctx, 0, sizeof(ctx));
+    clear_error();
+    CHECK_EQ_INT(config_load(&ctx, path), 0);
+    CHECK_EQ_INT(ctx.account_count, 1);
+    CHECK_EQ_INT(ctx.accounts_skipped_on_load, 1);
+    CHECK_EQ_INT(config_check_rewritable(&ctx), -1);
+}
+
 TEST(schema_rejects_lossy_types_and_dependent_keys) {
     expect_load_error("[settings]\ndefault_scope=\"local\"\nactive_account=7\n",
                       "active_account must be a string");
@@ -441,18 +460,24 @@ TEST(schema_rejects_lossy_types_and_dependent_keys) {
                       "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
                       "gpg_signing_enabled=1\n",
                       "gpg_signing_enabled must be a boolean");
-    expect_load_error("[settings]\ndefault_scope=\"local\"\n"
-                      "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
-                      "ssh_host=\"github.com\"\n",
-                      "ssh_host requires a non-empty ssh_key");
-    expect_load_error("[settings]\ndefault_scope=\"local\"\n"
-                      "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
-                      "ssh_key=\"\"\nssh_hostname=\"github.com\"\n",
-                      "ssh_hostname requires a non-empty ssh_key");
-    expect_load_error("[settings]\ndefault_scope=\"local\"\n"
-                      "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
-                      "gpg_key=\"\"\ngpg_signing_enabled=false\n",
-                      "gpg_signing_enabled requires a non-empty gpg_key");
+    /* AR-13 M7: the three cross-field DEPENDENCY gaps now skip the offending
+     * section instead of bricking the whole file (unlike the type errors
+     * above, which stay hard rejects). A valid sibling account still loads. */
+    expect_dependency_gap_section_skipped(
+        "[settings]\ndefault_scope=\"local\"\n"
+        "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+        "ssh_host=\"github.com\"\n"
+        "[accounts.2]\nname=\"bob\"\nemail=\"b@b.com\"\n");
+    expect_dependency_gap_section_skipped(
+        "[settings]\ndefault_scope=\"local\"\n"
+        "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+        "ssh_key=\"\"\nssh_hostname=\"github.com\"\n"
+        "[accounts.2]\nname=\"bob\"\nemail=\"b@b.com\"\n");
+    expect_dependency_gap_section_skipped(
+        "[settings]\ndefault_scope=\"local\"\n"
+        "[accounts.1]\nname=\"alice\"\nemail=\"a@b.com\"\n"
+        "gpg_key=\"\"\ngpg_signing_enabled=false\n"
+        "[accounts.2]\nname=\"bob\"\nemail=\"b@b.com\"\n");
 }
 
 TEST(default_create_fault_matrix_is_atomic_and_closes_fds) {

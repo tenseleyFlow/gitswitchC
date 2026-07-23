@@ -2983,6 +2983,70 @@ TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry) {
     setenv("HOME", saved_home, 1);
 }
 
+/* AR-13 M3: a retained incomplete-rollback record from a prepared/integrated
+ * switch (so abort_only == false) must survive a retry whose runtime-lock
+ * reacquisition fails under transient cross-HOME contention. The abort path
+ * advances the owner phase to FINALIZING before reacquiring the lock; if that
+ * failure return left the phase FINALIZING, admission (PREPARED/ABORT_ONLY
+ * only) would reject every subsequent abort and commit, stranding the owner —
+ * armed signal guard, retained Git retry image and all — with no API able to
+ * consume it. The failure return must restore ABORT_ONLY. */
+TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention) {
+    static const char original[] = "Host personal\n  User old\n";
+    char home[600], saved_home[4096], config_path[700];
+    char after[4096], detail[sizeof(g_last_error.message)];
+    gitswitch_ctx_t ctx;
+    command_runner_fn previous_runner;
+    ssh_config_commit_hook_fn previous_hook;
+    runtime_lock_holder_t holder = {0, -1};
+    int rc;
+
+    CHECK_EQ_INT(setup_runtime_dir(), 0);
+    CHECK_EQ_INT(setup_alias_config_file(
+                     home, sizeof(home), saved_home, sizeof(saved_home),
+                     config_path, sizeof(config_path), original), 0);
+    ctx = make_ctx();
+    CHECK_EQ_INT(setup_alias_ctx(&ctx, "github.com-tgt"), 0);
+    safe_strncpy(ctx.config.active_account, "prev",
+                 sizeof(ctx.config.active_account));
+    seed_previous_git_identity();
+    g_fail_user_name_set = false;
+    g_raise_on_user_name = false;
+    g_log = NULL;
+    previous_runner = run_set_runner(ssh_git_runner);
+    previous_hook = ssh_manager_set_config_commit_hook_fn(
+        replace_git_name_and_fail_alias_commit);
+    rc = accounts_switch(&ctx, "testacct");
+    safe_strncpy(detail, get_last_error()->message, sizeof(detail));
+    ssh_manager_set_config_commit_hook_fn(previous_hook);
+
+    /* Integrated switch left an incomplete rollback retained for retry. */
+    CHECK_EQ_INT(rc, -1);
+    CHECK(strstr(detail, "retry ownership retained") != NULL);
+    after[0] = '\0';
+    CHECK(read_file_to_string(config_path, after, sizeof(after)) >= 0);
+    CHECK_STR_EQ(after, original);
+
+    /* Retry abort while another process holds the shared runtime lock: the
+     * reacquisition at the top of the abort path fails and returns -1. */
+    CHECK_EQ_INT(start_runtime_lock_holder(&holder), 0);
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK_EQ_INT(stop_runtime_lock_holder(&holder), 0);
+
+    /* Lock free again: repair the conflicting vector and retry. Pre-fix the
+     * owner was stranded in FINALIZING and this returned -1 ("Cannot abort
+     * switch transaction from phase 4") forever. */
+    safe_strncpy(g_store_name, "testacct", sizeof(g_store_name));
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), 0);
+    CHECK_STR_EQ(g_store_name, "Previous Name");
+    CHECK_EQ_INT(accounts_switch_abort(&ctx, false), -1);
+    CHECK(strstr(get_last_error()->message,
+                 "No prepared account switch") != NULL);
+    CHECK_EQ_INT(accounts_session_cleanup(), 0);
+    run_set_runner(previous_runner);
+    setenv("HOME", saved_home, 1);
+}
+
 /* The alias writer is the final commit, so a Git failure must leave the
  * existing SSH config byte-for-byte untouched without invoking a rollback
  * writer at all. */
@@ -5590,6 +5654,7 @@ TEST_MAIN_BEGIN()
     RUN_TEST(identical_insecure_alias_prerename_failure_remains_abortable);
     RUN_TEST(identical_insecure_alias_dirsync_failure_retains_normalized_commit);
     RUN_TEST(late_alias_failure_retains_incomplete_direct_git_rollback_for_retry);
+    RUN_TEST(incomplete_rollback_retry_survives_transient_runtime_lock_contention);
     RUN_TEST(failed_switch_never_rewrites_existing_ssh_config);
     RUN_TEST(failed_switch_never_creates_ssh_config);
     RUN_TEST(failed_switch_preserves_concurrent_ssh_config_replacement);

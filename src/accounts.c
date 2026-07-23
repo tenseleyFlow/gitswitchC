@@ -1013,12 +1013,19 @@ static int run_informational_ssh_probe(const account_t *account,
 static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
                                   const account_t *switch_target,
                                   git_scope_t scope, bool write_git,
-                                  bool ssh_ok, bool gpg_ok) {
+                                  bool ssh_ok, bool gpg_ok, bool full_success) {
     if (!ctx || !account || !switch_target) {
         return;
     }
 
-    if (!ctx->config.dry_run && account->ssh_enabled &&
+    /* AR-13 L7: the affirmative outputs here (the SSH probe [OK]/[--] line, the
+     * shell-init Tip, and the 'Successfully switched' log) assert a fully
+     * completed switch. On a retained-but-uncertain commit (alias unverified,
+     * durability uncertain, or post-commit cleanup failed) the CLI reports
+     * failure, so emitting unqualified success would contradict the exit
+     * status. Gate them on full_success; the local-validation warnings below
+     * are diagnostic and run regardless. */
+    if (full_success && !ctx->config.dry_run && account->ssh_enabled &&
         strlen(account->ssh_key_path) > 0 && ssh_ok &&
         !ctx->config.resuming &&
         !g_session.ssh_config.reused_existing_agent && !signals_pending()) {
@@ -1065,7 +1072,7 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
         }
     }
 
-    if (ssh_ok || gpg_ok) {
+    if (full_success && (ssh_ok || gpg_ok)) {
         printf("\n  Tip: wire your shell once so every switch takes effect transparently:\n");
         printf("    capture `gitswitch init <shell>` first, then evaluate/source it only\n");
         printf("    when generation succeeds (see README: shell integration).\n");
@@ -1077,8 +1084,14 @@ static void finish_switch_success(gitswitch_ctx_t *ctx, account_t *account,
         }
     }
 
-    log_info("Successfully switched to account: %s (%s)", account->name,
-             account->description);
+    if (full_success) {
+        log_info("Successfully switched to account: %s (%s)", account->name,
+                 account->description);
+    } else {
+        log_info("Account switch for '%s' committed, but post-commit "
+                 "verification did not complete; see the command error output",
+                 account->name);
+    }
 }
 
 static bool ssh_alias_publication_is_installed(
@@ -2055,7 +2068,7 @@ static int accounts_switch_impl(gitswitch_ctx_t *ctx, const char *identifier,
     }
 
     finish_switch_success(ctx, account, &switch_target, scope, write_git,
-                          ssh_ok, gpg_ok);
+                          ssh_ok, gpg_ok, true);
 
     /* AR-08 M6: accounts_switch() is a complete one-call API. A successful
      * direct call must not leave this process running gitswitch's handlers or
@@ -2178,7 +2191,11 @@ int accounts_switch_prepare(gitswitch_ctx_t *ctx, const char *identifier) {
 
 /* Compare semantic account fields one by one. Avoiding a struct memcmp keeps
  * padding out of the generation contract while still binding every persisted
- * field, including metadata and currently-disabled routing selectors. */
+ * field, including metadata and currently-disabled routing selectors. AR-13
+ * L22: ssh_key_spelling is persisted too (it is the exact ssh_key text written
+ * back), so a spelling-only change is a real on-disk change and must be bound
+ * here; the disable paths clear it alongside ssh_key_path so a disabled account
+ * never carries stale spelling residue. */
 static bool account_fields_equal_exact(const account_t *left,
                                        const account_t *right) {
     return left && right && left->id == right->id &&
@@ -2190,6 +2207,7 @@ static bool account_fields_equal_exact(const account_t *left,
            left->preferred_scope == right->preferred_scope &&
            left->ssh_enabled == right->ssh_enabled &&
            strcmp(left->ssh_key_path, right->ssh_key_path) == 0 &&
+           strcmp(left->ssh_key_spelling, right->ssh_key_spelling) == 0 &&
            strcmp(left->ssh_host_alias, right->ssh_host_alias) == 0 &&
            strcmp(left->ssh_hostname, right->ssh_hostname) == 0 &&
            left->gpg_enabled == right->gpg_enabled &&
@@ -2294,7 +2312,8 @@ int accounts_switch_commit_result(gitswitch_ctx_t *ctx,
                           g_pending_switch.scope,
                           g_pending_switch.git_written,
                           g_pending_switch.ssh_ok,
-                          g_pending_switch.gpg_ok);
+                          g_pending_switch.gpg_ok,
+                          final_state == ACCOUNTS_SWITCH_COMMIT_COMPLETE);
     memset(&g_pending_switch, 0, sizeof(g_pending_switch));
     if (g_transaction_owner.rollback_depth > 0 &&
         accounts_transaction_rollback_end(
@@ -2390,6 +2409,16 @@ static int accounts_switch_abort_accumulated(
     if (pending.runtime_lock_fd < 0) {
         pending.runtime_lock_fd = runtime_state_lock_acquire();
         if (pending.runtime_lock_fd < 0) {
+            /* AR-13 M3: the owner phase was optimistically advanced to
+             * FINALIZING just above, but a retry-handle record
+             * (runtime_lock_fd < 0) means this abort has not actually run.
+             * Restore ABORT_ONLY before returning: abort/commit admission
+             * accepts only PREPARED/ABORT_ONLY, so leaving FINALIZING strands
+             * the transaction owner forever once the cross-HOME runtime lock
+             * contention (which is non-blocking/fail-fast) is merely transient.
+             * abort_only stays false so a successful retry still replays the
+             * retained dirty rollback. */
+            g_transaction_owner.phase = ACCOUNTS_TRANSACTION_ABORT_ONLY;
             (void)error_accumulator_add_last(errors,
                                              "runtime lock reacquisition");
             return publish_abort_result(errors, -1);
@@ -2754,6 +2783,7 @@ static int accounts_edit_candidate_prepare_owned(
     edited = *candidate;
     if (!edited.ssh_enabled) {
         edited.ssh_key_path[0] = '\0';
+        edited.ssh_key_spelling[0] = '\0'; /* AR-13 L22: no stale spelling */
         edited.ssh_host_alias[0] = '\0';
         edited.ssh_hostname[0] = '\0';
     } else if (edited.ssh_host_alias[0] != '\0' &&
@@ -3146,6 +3176,7 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
         if (strcmp(input, "none") == 0) {              /* disable */
             acct.ssh_enabled = false;
             acct.ssh_key_path[0] = '\0';
+            acct.ssh_key_spelling[0] = '\0'; /* AR-13 L22: no stale spelling */
             acct.ssh_host_alias[0] = '\0';
             acct.ssh_hostname[0] = '\0';
             break;

@@ -359,6 +359,18 @@ check_policy()
             # provisioning never spells such paths.
             if (command ~ /(^|[;&|[:space:]])(sudo[[:space:]]+)?(install|cp|mv|ln|rsync)([[:space:]][^;&|]*)?[[:space:]]\/(usr\/)?s?bin\/[^[:space:];&|]*[[:space:]]*($|[;&|])/)
                 return 1
+            # AR-13 M5: install -t DIR / --target-directory DIR names the
+            # canonical root with no trailing slash, so the destination-argument
+            # rule above misses it. The match is scoped to the install target
+            # flag so legitimate /usr/bin/make invocations are untouched.
+            if (command ~ /(^|[;&|[:space:]])(sudo[[:space:]]+)?install[[:space:]]([^;&|]*[[:space:]])?(-t|--target-directory)[[:space:]]+\/(usr\/)?s?bin(\/|[[:space:]]|[;&|]|$)/)
+                return 1
+            # AR-13 M5: `cd` into a canonical bin root sets up a relative-name
+            # overwrite (`cd /usr/bin && cp evil make`) the destination rule
+            # cannot see; mirror the /usr/local cd handling for the canonical
+            # roots. Reviewed CI never changes into these directories.
+            if (command ~ /(^|[;&|[:space:]])cd[[:space:]]+\/(usr\/)?s?bin(\/|[[:space:]]|[;&|]|$)/)
+                return 1
             if (command ~ /(^|[;&|[:space:]])(sudo[[:space:]]+)?tee[[:space:]]([^;&|]*[[:space:]])?\/(usr\/)?s?bin\//)
                 return 1
             if (command ~ /of=\/(usr\/)?s?bin\//)
@@ -641,6 +653,7 @@ check_policy()
                        (sanitizer_release_test &&
                         (step_env_map_count != 1 || step_env_count != 3 ||
                          step_sanitizer_env_count != 2 ||
+                         step_asan_env_count != 1 || step_ubsan_env_count != 1 ||
                          step_caps_count != 1 ||
                          step_caps_value != "pty,readline,bash,zsh,fish,sh,dash,ksh,openssh,gpg,unix-sockets,mount-namespace")) ||
                        (repro_release_test &&
@@ -755,6 +768,8 @@ check_policy()
             step_env_count = 0
             step_env_unsafe = 0
             step_sanitizer_env_count = 0
+            step_asan_env_count = 0
+            step_ubsan_env_count = 0
             step_caps_count = 0
             step_caps_value = ""
             block_scalar_purpose = ""
@@ -1278,11 +1293,16 @@ check_policy()
                 } else if (entry_key == "ASAN_OPTIONS") {
                     # AR-12 M9: the sanitizer lane pins its exact strictness;
                     # a weakened option set is the same silent-deletion class.
+                    # AR-13 M4: count ASAN and UBSAN independently (not one
+                    # shared sanitizer counter) so a duplicated ASAN_OPTIONS can
+                    # no longer stand in for a dropped UBSAN_OPTIONS.
                     step_sanitizer_env_count++
+                    step_asan_env_count++
                     if (scalar_value != "detect_leaks=1:abort_on_error=1:strict_string_checks=1")
                         step_env_unsafe = 1
                 } else if (entry_key == "UBSAN_OPTIONS") {
                     step_sanitizer_env_count++
+                    step_ubsan_env_count++
                     if (scalar_value != "halt_on_error=1:print_stacktrace=1")
                         step_env_unsafe = 1
                 } else {
@@ -2461,6 +2481,9 @@ redirection|sudo sh -c 'echo true > /usr/local/bin/cppcheck; chmod 0755 /usr/loc
 quoted install|sudo install -m 0755 /bin/true "/usr/local/bin/valgrind"
 directory change|cd /usr/local/bin && sudo cp /bin/true valgrind
 sbin install|sudo install -m 0755 /bin/true /usr/local/sbin/valgrind
+canonical directory change|cd /usr/bin && sudo cp /bin/true make
+canonical install target|sudo install -m 0755 -t /usr/bin /bin/true
+canonical install target-directory|sudo install --target-directory /sbin /bin/true
 EOF
 
 awk '
@@ -3264,5 +3287,22 @@ awk '
 expect_structural_rejected_for "reordered macOS release gates" \
     "$tmp/reordered-macos-release-gates.yml" "$today" \
     "required release gates are out of order"
+
+# AR-13 M4: the sanitizer lane pins one ASAN_OPTIONS and one UBSAN_OPTIONS at
+# exact values. Duplicating ASAN_OPTIONS to stand in for a dropped
+# UBSAN_OPTIONS keeps env_count==3 and the old shared sanitizer counter at 2,
+# but silently disables the UBSAN strictness. The per-key counts must reject it.
+awk '
+    $0 == "          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1" {
+        print "          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1"
+        dropped = 1
+        next
+    }
+    { print }
+    END { if (!dropped) exit 1 }
+' "$workflow" >"$tmp/sanitizer-dup-asan.yml" ||
+    fail "could not build the duplicated-ASAN sanitizer fixture"
+expect_rejected "duplicated ASAN_OPTIONS dropping UBSAN_OPTIONS" \
+    "$tmp/sanitizer-dup-asan.yml" "$today"
 
 printf 'ci-policy: PASS (immutable, least-privilege, supported-platform workflow)\n'

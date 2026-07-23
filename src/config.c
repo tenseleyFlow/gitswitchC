@@ -4709,8 +4709,13 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     if (publication) {
         /* AR-12 H2: an at-capacity ledger only blocks genuinely new
          * destinations. A replacement never grows the ledger, and before an
-         * append is refused, provably-absent destinations are reclaimed —
-         * mirroring config_publication_preflight_check() exactly. */
+         * append is refused, provably-absent destinations are reclaimed. AR-13
+         * L1: this enforces the same RECORD-count cap the preflight
+         * (config_publication_preflight_check) admits against; it does not
+         * re-run the preflight's byte-reserve check here, because the count cap
+         * and PUBLICATION_LEDGER_MAX_BYTES are jointly satisfiable (the P4
+         * dismissal), so an admitted count can always be serialized. The byte
+         * reserve is a reclamation trigger, not a second post-reclaim gate. */
         if (!publication_ledger_destination_present(&publications,
                                                     publication)) {
             bool exhausted =
@@ -4763,6 +4768,26 @@ static int config_update_resume_hint(const gitswitch_ctx_t *ctx,
     }
     if (state_before.existed && state_before.length == length &&
         memcmp(state_before.data, content, length) == 0) {
+        /* AR-13 M1 (AR-12 M6 class): the on-disk bytes already match, but a
+         * prior write may have installed them and then failed its directory
+         * fsync — returning -1 with the content cache-visible yet not durable.
+         * Returning success here without re-proving durability would convert
+         * that uncertain state into a reported-durable success on retry. Re-sync
+         * the parent directory (the same commit the mutation path performs)
+         * before treating the no-op as committed. */
+        int dir_fd = open(dir, O_RDONLY | O_CLOEXEC | O_DIRECTORY | O_NOFOLLOW);
+        if (dir_fd < 0 ||
+            config_io_fault(CONFIG_IO_STATE_BEFORE_DIR_SYNC,
+                            "active-state directory sync") ||
+            fsync(dir_fd) != 0) {
+            int saved_errno = errno;
+            if (dir_fd >= 0) close(dir_fd);
+            errno = saved_errno;
+            set_system_error(ERR_FILE_IO,
+                             "Cannot durably commit resume hint: %s", hint);
+            goto state_cleanup;
+        }
+        close(dir_fd);
         result = 0;
         goto state_cleanup;
     }
@@ -8764,6 +8789,37 @@ static int validate_account_security(const account_t *account) {
                       "SSH key path contains terminal control bytes or malformed UTF-8");
             return -1;
         }
+
+        /* AR-13 R0 (config-selfbrick): the loader's schema
+         * (toml_validate_gitswitch_schema) hard-fails the WHOLE file — not the
+         * per-account skip_section — when a persisted ssh_key contains ".."
+         * (toml_parser.c toml_validate_file_path) or is not '/'- or
+         * '~'-anchored (toml_parser.c). Admission historically enforced only
+         * the sanitizer round-trip and the 256-byte expanded cap; expand_path
+         * passes ".." through untouched and ssh_validate_key_file open()s the
+         * path, so the kernel resolves ".."/CWD-relative segments and the key
+         * validates — letting an account this tool admits and saves be one the
+         * same tool then refuses to load, bricking every command on next start.
+         * The AR-12 H4 comment above claims admission is symmetric with the
+         * loader; these two checks are what actually make it so. They run on
+         * the persisted spelling(s), before expand_path collapses '~'. */
+        if (!toml_validate_file_path(account->ssh_key_path) ||
+            (account->ssh_key_spelling[0] != '\0' &&
+             !toml_validate_file_path(account->ssh_key_spelling))) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "SSH key path may not contain '..': %s", account->ssh_key_path);
+            return -1;
+        }
+        if ((account->ssh_key_path[0] != '/' && account->ssh_key_path[0] != '~') ||
+            (account->ssh_key_spelling[0] != '\0' &&
+             account->ssh_key_spelling[0] != '/' &&
+             account->ssh_key_spelling[0] != '~')) {
+            set_error(ERR_ACCOUNT_INVALID,
+                      "ssh_key must be an absolute or ~-anchored path, not relative: %s",
+                      account->ssh_key_path);
+            return -1;
+        }
+
         if (expand_path(account->ssh_key_path, expanded_path, sizeof(expanded_path)) != 0) {
             set_error(ERR_ACCOUNT_INVALID, "Invalid SSH key path: %s", account->ssh_key_path);
             return -1;

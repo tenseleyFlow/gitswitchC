@@ -209,7 +209,25 @@ static ssh_reap_test_ops_t g_reap_ops = {
 static ssh_pid_commit_hook_fn g_pid_commit_hook;
 static ssh_pid_commit_hook_fn g_pid_postrename_hook;
 static ssh_namespace_commit_hook_fn g_namespace_commit_hook;
-static ssh_dirsync_fn g_ssh_dirsync = fsync;
+
+/* AR-13 L2: on Darwin fsync(2) only reaches the drive, not through its cache;
+ * the M6 no-op re-proof, the post-rename COMMITTED barrier, and the HOME-entry
+ * syncs all advertise power-loss durability, which needs F_FULLFSYNC. Fall back
+ * to plain fsync only when the volume/descriptor cannot support the fcntl
+ * (ENOTSUP/ENOTTY/EINVAL); retry EINTR; any other errno is a real flush failure
+ * that must not be masked as durable success. */
+static int ssh_full_fsync(int fd) {
+#if defined(__APPLE__)
+    int rc;
+    do {
+        rc = fcntl(fd, F_FULLFSYNC);
+    } while (rc != 0 && errno == EINTR);
+    if (rc == 0) return 0;
+    if (errno != ENOTSUP && errno != ENOTTY && errno != EINVAL) return -1;
+#endif
+    return fsync(fd);
+}
+static ssh_dirsync_fn g_ssh_dirsync = ssh_full_fsync;
 static ssh_config_commit_hook_fn g_ssh_config_commit_hook;
 static ssh_config_postrename_hook_fn g_ssh_config_postrename_hook;
 static ssh_current_cleanup_hook_fn g_current_cleanup_hook;
@@ -302,7 +320,7 @@ ssh_namespace_commit_hook_fn ssh_manager_set_namespace_commit_hook_fn(
 
 ssh_dirsync_fn ssh_manager_set_dirsync_fn(ssh_dirsync_fn fn) {
     ssh_dirsync_fn previous = g_ssh_dirsync;
-    g_ssh_dirsync = fn ? fn : fsync;
+    g_ssh_dirsync = fn ? fn : ssh_full_fsync;
     return previous;
 }
 
@@ -4981,7 +4999,18 @@ int ssh_remove_host_alias(const char *alias) {
         goto done;
     }
     if (removed == 0) {
-        rc = 0; /* no managed block for this alias */
+        /* AR-13 M2 (AR-12 M6 class): the current on-disk config has no managed
+         * block for this alias — but a prior removal may have written exactly
+         * this content and then failed its directory sync, leaving the removal
+         * cache-visible yet not durable. Re-prove durability with the same
+         * directory sync the write path performs before reporting the no-op
+         * committed, rather than converting that uncertainty into success. */
+        if (g_ssh_dirsync(directory.dir_fd) != 0) {
+            set_system_error(ERR_FILE_IO,
+                             "Failed to durably commit SSH config directory");
+            goto done; /* rc remains -1 */
+        }
+        rc = 0;
         goto done;
     }
 

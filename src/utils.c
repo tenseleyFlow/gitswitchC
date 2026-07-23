@@ -4483,11 +4483,20 @@ int run_argv_real(const char *const argv[], const run_opts_t *opts, run_result_t
         } while (wait_result.waited < 0 &&
                  wait_result.wait_errno == EINTR &&
                  wait_result.mask_errno == 0);
-        if (wait_result.mask_errno != 0) {
+        /* AR-13 L6: mirror the U4 ordering used in the WNOHANG loop — record a
+         * successful reap FIRST so the child's exit status is not discarded
+         * when guarded-mask restoration fails alongside it; only then surface
+         * the mask failure. The pre-fix mask-first order dropped child_reaped,
+         * losing the exit code the later WIFEXITED/WIFSIGNALED extraction needs. */
+        if (wait_result.waited == pid) {
+            child_reaped = true;
+            if (wait_result.mask_errno != 0) {
+                wait_failed = true;
+                wait_errno = wait_result.mask_errno;
+            }
+        } else if (wait_result.mask_errno != 0) {
             wait_failed = true;
             wait_errno = wait_result.mask_errno;
-        } else if (wait_result.waited == pid) {
-            child_reaped = true;
         } else {
             wait_failed = true;
             wait_errno = wait_result.wait_errno;
