@@ -206,8 +206,12 @@ bool toml_validate_ssh_hostname(const char *hostname);
 /**
  * Get list of all sections in document
  */
-int toml_get_sections(const toml_document_t *doc, char sections[][TOML_MAX_SECTION_LEN], 
+int toml_get_sections(const toml_document_t *doc, char sections[][TOML_MAX_SECTION_LEN],
                       size_t max_sections, size_t *section_count);
+
+/* True if an enumerated section was hidden by schema validation (is_set
+ * cleared), i.e. skipped-on-load rather than genuinely absent. */
+bool toml_section_is_hidden(const toml_document_t *doc, const char *section);
 
 
 /**

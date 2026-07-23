@@ -1255,9 +1255,17 @@ static int config_load_mode_inplace(gitswitch_ctx_t *ctx,
                  * branch below, so list/status/reset/switch keep running as
                  * repair paths. Full-document saves stay blocked by the
                  * skip counters, preserving the on-disk section. */
+                /* AR-13 L16: do not assert the active account's OWN section was
+                 * the skipped one — an unrelated section may have been skipped
+                 * while the active name is merely a stale artifact. State what
+                 * is actually known: the active account could not be resolved
+                 * and N sections were skipped. */
                 display_warning(
-                    "Active-state account '%s' was skipped on load; treating the session as inactive until the account is repaired",
-                    ctx->config.active_account);
+                    "Active-state account '%s' could not be loaded and %zu "
+                    "account section(s) were skipped on load; treating the "
+                    "session as inactive until the config is repaired",
+                    ctx->config.active_account,
+                    (size_t)ctx->accounts_skipped_on_load);
                 ctx->config.active_account[0] = '\0';
             } else {
                 /* A crash after accounts.toml removed/renamed the active
@@ -8232,7 +8240,16 @@ static int load_accounts_from_toml(gitswitch_ctx_t *ctx, const toml_document_t *
             fs = get_account_field(doc, sections[i], "name", account.name, sizeof(account.name));
             if (fs != FIELD_LOADED) {
                 ctx->accounts_skipped_on_load++;
-                if (fs == FIELD_ABSENT) {
+                if (toml_section_is_hidden(doc, sections[i])) {
+                    /* AR-13 L15: the schema hid this whole section (a bad
+                     * ssh_key/ssh_hostname/dependency gap), so every field
+                     * reads absent — do not misreport it as a missing 'name'.
+                     * The offending field was already warned about at parse. */
+                    display_warning("Account section [%s] was skipped by schema "
+                                    "validation; see the preceding parser "
+                                    "warning for the offending field.",
+                                    sections[i]);
+                } else if (fs == FIELD_ABSENT) {
                     display_warning("Account section [%s] was skipped: 'name' is missing. "
                                     "Fix it in the config file.", sections[i]);
                 } else {

@@ -2328,8 +2328,22 @@ int toml_get_sections(const toml_document_t *doc, char sections[][TOML_MAX_SECTI
         safe_strncpy(sections[*section_count], doc->sections[i].name, TOML_MAX_SECTION_LEN);
         (*section_count)++;
     }
-    
+
     return 0;
+}
+
+/* AR-13 L15: report whether an enumerated section was hidden by schema
+ * validation (is_set cleared). The getters treat such a section's fields as
+ * absent, so the loader must distinguish "the schema skipped this section"
+ * from a genuinely missing key when it explains the skip to the user. */
+bool toml_section_is_hidden(const toml_document_t *doc, const char *section) {
+    if (!doc || !section) return false;
+    for (size_t i = 0; i < doc->section_count; i++) {
+        if (strcmp(doc->sections[i].name, section) == 0) {
+            return !doc->sections[i].is_set;
+        }
+    }
+    return false;
 }
 
 /* Set string value in document */
