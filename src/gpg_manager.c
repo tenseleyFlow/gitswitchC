@@ -1307,8 +1307,17 @@ static int gpg_retire_orphan_quarantines_locked(int base_fd) {
             }
             break;
         }
+        /* AR-13 L4: also retire orphaned reset-prefix residue. Full reset runs
+         * gpg_reconcile_reset_retry_locked first (and fails closed if it does
+         * not succeed), which retires every VALID witnessed reset retry, so any
+         * reset-prefix name still present here is a malformed or unwitnessed
+         * orphan — previously it had no auto-clear path and bricked switch,
+         * drop AND reset via the stale-quarantine gate. The S_ISLNK/uid gate
+         * and the live-owner (pid) guard below apply to it exactly as to the
+         * rollback/publish residue. */
         if (!gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) &&
-            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)) {
+            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) &&
+            !gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) {
             continue;
         }
         if (fstatat(base_fd, entry->d_name, &orphan,
@@ -1341,7 +1350,9 @@ static int gpg_retire_orphan_quarantines_locked(int base_fd) {
             const char *pid_str = entry->d_name +
                 (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX)
                      ? strlen(GPG_ROLLBACK_PREFIX)
-                     : strlen(GPG_PUBLISH_PREFIX));
+                 : gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)
+                     ? strlen(GPG_PUBLISH_PREFIX)
+                     : strlen(GPG_RESET_PREFIX));
 
             if (*pid_str >= '1' && *pid_str <= '9') {
                 long pid = 0;
