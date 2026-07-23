@@ -305,15 +305,6 @@ static int fail_dirsync(int dir_fd) {
     return -1;
 }
 
-/* AR-12 M6: the byte-identical no-op path must re-prove directory-entry
- * durability with one sync (a retry may follow a rename whose directory
- * fsync failed), while still performing no write work. */
-static int count_dirsync(int dir_fd) {
-    (void)dir_fd;
-    g_dirsync_calls++;
-    return 0;
-}
-
 static void reset_dirsync_observations(const struct stat *home_identity,
                                        bool fail_home) {
     memset(g_dirsync_observations, 0, sizeof(g_dirsync_observations));
@@ -1052,9 +1043,10 @@ TEST(byte_identical_config_skips_all_write_and_sync_work) {
 
         g_identical_commit_hook_calls = 0;
         g_dirsync_calls = 0;
+        reset_dirsync_observations(&fixture.ssh_identity, false);
         previous_commit = ssh_manager_set_config_commit_hook_fn(
             fail_identical_config_commit);
-        previous_sync = ssh_manager_set_dirsync_fn(count_dirsync);
+        previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
         rc = ssh_configure_host_alias_result(&fixture.account, &publication);
         ssh_manager_set_dirsync_fn(previous_sync);
         ssh_manager_set_config_commit_hook_fn(previous_commit);
@@ -1062,9 +1054,13 @@ TEST(byte_identical_config_skips_all_write_and_sync_work) {
         CHECK_EQ_INT(rc, 0);
         CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
         CHECK_EQ_INT(g_identical_commit_hook_calls, 0);
-        /* AR-12 M6: exactly one directory sync re-proves durability; no
-         * write work happens (identity, mtime, and bytes are untouched). */
-        CHECK_EQ_INT(g_dirsync_calls, 1);
+        /* AR-12 M6 / AR-13 L32: exactly one directory sync re-proves durability
+         * and it targets the ~/.ssh directory — the old count-only assertion
+         * would pass even if the wrong directory were synced. No write work
+         * happens (identity, mtime, and bytes are untouched). */
+        CHECK_EQ_INT((int)g_dirsync_observation_count, 1);
+        CHECK(ts_same_identity(&g_dirsync_observations[0],
+                               &fixture.ssh_identity));
         CHECK_EQ_INT(stat(fixture.config, &after), 0);
         CHECK(ts_same_identity(&fixture.config_identity, &after));
         CHECK(same_mtime(&fixture.config_identity, &after));
@@ -1282,9 +1278,10 @@ TEST(byte_identical_safe_hardlink_remains_unchanged) {
 
     g_identical_commit_hook_calls = 0;
     g_dirsync_calls = 0;
+    reset_dirsync_observations(&fixture.ssh_identity, false);
     previous_commit = ssh_manager_set_config_commit_hook_fn(
         fail_identical_config_commit);
-    previous_sync = ssh_manager_set_dirsync_fn(count_dirsync);
+    previous_sync = ssh_manager_set_dirsync_fn(observe_dirsync);
     rc = ssh_configure_host_alias_result(&fixture.account, &publication);
     ssh_manager_set_dirsync_fn(previous_sync);
     ssh_manager_set_config_commit_hook_fn(previous_commit);
@@ -1292,8 +1289,10 @@ TEST(byte_identical_safe_hardlink_remains_unchanged) {
     CHECK_EQ_INT(rc, 0);
     CHECK_EQ_INT(publication, SSH_CONFIG_PUBLICATION_UNCHANGED);
     CHECK_EQ_INT(g_identical_commit_hook_calls, 0);
-    /* AR-12 M6: one durability-proving sync; no write work. */
-    CHECK_EQ_INT(g_dirsync_calls, 1);
+    /* AR-12 M6 / AR-13 L32: one durability-proving sync, targeting ~/.ssh; no
+     * write work. Verifying the synced directory catches a wrong-dir sync. */
+    CHECK_EQ_INT((int)g_dirsync_observation_count, 1);
+    CHECK(ts_same_identity(&g_dirsync_observations[0], &fixture.ssh_identity));
     CHECK_EQ_INT(lstat(fixture.config, &after), 0);
     CHECK_EQ_INT(lstat(witness, &witness_after), 0);
     CHECK(ts_same_identity(&before, &after));

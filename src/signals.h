@@ -56,11 +56,14 @@
 /**
  * Install the deferring handler for SIGINT/SIGTERM/SIGHUP/SIGQUIT and clear
  * any previously pending signal. Idempotent while a guard is active.
- * SA_RESTART restarts the wait family and status-pipe reads, but poll() is
- * NEVER restarted after a handler (signal(7)) — a guarded signal delivered
- * while run_argv is blocked in poll always yields EINTR, and run_argv's
- * explicit EINTR fall-through into its waitpid maintenance is what the
- * window's correctness actually rests on (AR-12 L19). Returns
+ * SA_RESTART restarts the wait family and status-pipe reads. On Linux poll()
+ * is never restarted after a handler (signal(7)), so a guarded signal
+ * delivered while run_argv is blocked in poll yields EINTR and run_argv's
+ * explicit EINTR fall-through runs its waitpid maintenance promptly (AR-12
+ * L19). Correctness does not depend on that platform detail, though: run_argv
+ * always polls with a bounded slice (RUNNER_POLL_SLICE_MS, 50ms), so even where
+ * a poll is restarted or the signal is coalesced, the maintenance runs within
+ * that bound — the EINTR path only makes it prompt, not correct. Returns
  * 0 on success and -1 if any disposition query or installation fails. A
  * failed begin restores every disposition it already changed and preserves
  * the originating errno; only an inherited SIG_IGN is intentionally skipped.

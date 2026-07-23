@@ -424,6 +424,7 @@ TEST(all_retained_public_apis_compile_and_link) {
     REQUIRE_PUBLIC_API(toml_get_boolean);
     REQUIRE_PUBLIC_API(toml_get_integer);
     REQUIRE_PUBLIC_API(toml_get_sections);
+    REQUIRE_PUBLIC_API(toml_section_is_hidden);
     REQUIRE_PUBLIC_API(toml_get_string);
     REQUIRE_PUBLIC_API(toml_init_document);
     REQUIRE_PUBLIC_API(toml_parse_file);

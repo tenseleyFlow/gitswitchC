@@ -3220,6 +3220,17 @@ static int add_or_edit_account(gitswitch_ctx_t *ctx, account_t *existing,
             }
         }
         safe_strncpy(acct.ssh_key_path, expanded_path, sizeof(acct.ssh_key_path));
+        /* AR-13 L23: preserve the exact text the user typed (e.g. '~/.ssh/id')
+         * so the L8 save guard re-emits that spelling instead of the expanded
+         * absolute path. If they typed the absolute path itself, clear any
+         * stale spelling so an explicit absolute respelling of the same file
+         * wins over an old tilde rather than being overridden by the guard. */
+        if (strcmp(input, expanded_path) != 0) {
+            safe_strncpy(acct.ssh_key_spelling, input,
+                         sizeof(acct.ssh_key_spelling));
+        } else {
+            acct.ssh_key_spelling[0] = '\0';
+        }
         acct.ssh_enabled = true;
         printf("[OK]: SSH key validated: %s\n", expanded_path);
 
@@ -3659,7 +3670,7 @@ int accounts_remove_finalize(
             }
         }
     }
-    memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    secure_zero_memory(&g_pending_remove, sizeof(g_pending_remove));
     if (ctx->config.defer_signal_cleanup &&
         g_transaction_owner.rollback_depth > 0) {
         signals_rollback_begin();
@@ -4013,14 +4024,19 @@ int accounts_remove(gitswitch_ctx_t *ctx, const char *identifier) {
     }
     REMOVE_TEST_CHECKPOINT(3);
 
-    memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+    secure_zero_memory(&g_pending_remove, sizeof(g_pending_remove));
     g_pending_remove.active = true;
     g_pending_remove.token = token;
     g_pending_remove.ctx = ctx;
     g_pending_remove.alias_exclusive = removed_alias_exclusive;
     if (safe_strncpy(g_pending_remove.alias, removed_alias,
                      sizeof(g_pending_remove.alias)) != 0) {
-        memset(&g_pending_remove, 0, sizeof(g_pending_remove));
+        secure_zero_memory(&g_pending_remove, sizeof(g_pending_remove));
+        /* AR-13 L30: the snapshot still holds the removed account's bytes on
+         * this failure path (it is only cleared on the success path below), so
+         * scrub it too rather than leaking stale account data in the static. */
+        secure_zero_memory(&g_pending_remove_snapshot,
+                           sizeof(g_pending_remove_snapshot));
         goto remove_done;
     }
     if (outer_retirement_prepared) {

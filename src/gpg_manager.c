@@ -1250,8 +1250,14 @@ static int gpg_reject_stale_quarantines_locked(int base_fd,
             char stale[GPG_QUARANTINE_NAME_LEN];
             safe_strncpy(stale, entry->d_name, sizeof(stale));
             closedir(dir);
+            /* AR-13 L24: only a FULL reset (no account argument) retires this
+             * residue, and a full reset rebuilds every account's isolated GPG
+             * home — say so rather than implying a cheap targeted fix. */
             set_error(ERR_FILE_IO,
-                      "Unresolved GPG runtime quarantine blocks mutation: %s (run 'gitswitch reset' to retire it)",
+                      "Unresolved GPG runtime quarantine blocks mutation: %s "
+                      "(run 'gitswitch reset' with no account to retire it; "
+                      "note a full reset rebuilds every account's isolated GPG "
+                      "home)",
                       stale);
             return -1;
         }
@@ -1301,8 +1307,17 @@ static int gpg_retire_orphan_quarantines_locked(int base_fd) {
             }
             break;
         }
+        /* AR-13 L4: also retire orphaned reset-prefix residue. Full reset runs
+         * gpg_reconcile_reset_retry_locked first (and fails closed if it does
+         * not succeed), which retires every VALID witnessed reset retry, so any
+         * reset-prefix name still present here is a malformed or unwitnessed
+         * orphan — previously it had no auto-clear path and bricked switch,
+         * drop AND reset via the stale-quarantine gate. The S_ISLNK/uid gate
+         * and the live-owner (pid) guard below apply to it exactly as to the
+         * rollback/publish residue. */
         if (!gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX) &&
-            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)) {
+            !gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX) &&
+            !gpg_name_has_prefix(entry->d_name, GPG_RESET_PREFIX)) {
             continue;
         }
         if (fstatat(base_fd, entry->d_name, &orphan,
@@ -1335,7 +1350,9 @@ static int gpg_retire_orphan_quarantines_locked(int base_fd) {
             const char *pid_str = entry->d_name +
                 (gpg_name_has_prefix(entry->d_name, GPG_ROLLBACK_PREFIX)
                      ? strlen(GPG_ROLLBACK_PREFIX)
-                     : strlen(GPG_PUBLISH_PREFIX));
+                 : gpg_name_has_prefix(entry->d_name, GPG_PUBLISH_PREFIX)
+                     ? strlen(GPG_PUBLISH_PREFIX)
+                     : strlen(GPG_RESET_PREFIX));
 
             if (*pid_str >= '1' && *pid_str <= '9') {
                 long pid = 0;
